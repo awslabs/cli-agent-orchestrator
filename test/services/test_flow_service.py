@@ -1,5 +1,6 @@
 """Tests for flow service."""
 
+import asyncio
 import json
 import tempfile
 from datetime import datetime
@@ -855,6 +856,130 @@ Prompt.
         assert result is False
         mock_create_terminal.assert_not_called()
         mock_get_backend.return_value.kill_session.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.flow_service.send_input")
+    @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
+    @patch("cli_agent_orchestrator.services.flow_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.flow_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.flow_service.get_backend")
+    @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_run_times")
+    @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
+    async def test_busy_check_consults_the_conductor_not_a_worker(
+        self,
+        mock_db_get,
+        mock_update_times,
+        mock_get_backend,
+        mock_list_terminals,
+        mock_status_monitor,
+        mock_create_terminal,
+        mock_send_input,
+    ):
+        """The busy check must read index 0, the conductor — not any other terminal.
+
+        This is the consumer of ``list_terminals_by_session``'s oldest-first
+        contract with real blast radius. If the read's order changed so that a
+        quiet WORKER landed at index 0, the busy check would consult the worker,
+        pass, and let the ``kill_session`` below tear down a session whose
+        conductor is mid-run. A busy conductor followed by an idle worker is the
+        arrangement that catches it: asserting only "skips when busy" would pass
+        even if the wrong terminal were consulted, so this pins WHICH id is read.
+        """
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+            f.write(
+                "---\nname: conductor-flow\nschedule: '* * * * *'\n"
+                "agent_profile: supervisor\n---\nPrompt.\n"
+            )
+            f.flush()
+            mock_flow = Flow(
+                name="conductor-flow",
+                file_path=f.name,
+                schedule="* * * * *",
+                agent_profile="supervisor",
+                provider="kiro_cli",
+                script="",
+                enabled=True,
+                next_run=datetime.now(),
+            )
+        mock_db_get.return_value = mock_flow
+        mock_get_backend.return_value.session_exists.return_value = True
+        # Oldest first: the conductor, then a worker it spawned.
+        mock_list_terminals.return_value = [
+            {"id": "conductor", "agent_profile": "supervisor"},
+            {"id": "worker", "agent_profile": "developer"},
+        ]
+        busy_by_id = {"conductor": TerminalStatus.PROCESSING, "worker": TerminalStatus.IDLE}
+        mock_status_monitor.get_status.side_effect = lambda tid: busy_by_id[tid]
+
+        result = await execute_flow("conductor-flow")
+
+        assert result is False, "a busy conductor must block flow recycling"
+        mock_get_backend.return_value.kill_session.assert_not_called()
+        # The whole point: the conductor's id was consulted, and ONLY it --
+        # assert_called_once_with also pins the docstring's "only check the
+        # first (conductor) terminal", which an index into call_args_list would
+        # miss, and it does not break if the call ever becomes keyword-style.
+        mock_status_monitor.get_status.assert_called_once_with("conductor")
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.flow_service.send_input")
+    @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
+    @patch("cli_agent_orchestrator.services.flow_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.flow_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.flow_service.get_backend")
+    @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_run_times")
+    @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
+    async def test_execute_flow_busy_check_dispatches_via_to_thread(
+        self,
+        mock_db_get,
+        mock_update_times,
+        mock_get_backend,
+        mock_list_terminals,
+        mock_status_monitor,
+        mock_create_terminal,
+        mock_send_input,
+    ):
+        """#558: the conductor busy check reads status_monitor.get_status(), which for a
+        PROCESSING terminal can fork a real tmux capture-pane subprocess (the
+        stale-PROCESSING fallback), and execute_flow runs on the shared event loop. Pin
+        the asyncio.to_thread dispatch -- the busy tests above mock the status monitor
+        and cannot see HOW the check was called."""
+        from cli_agent_orchestrator.services import flow_service
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+            f.write(
+                "---\nname: pin-flow\nschedule: '* * * * *'\nagent_profile: developer\n---\nPrompt.\n"
+            )
+            f.flush()
+            mock_flow = Flow(
+                name="pin-flow",
+                file_path=f.name,
+                schedule="* * * * *",
+                agent_profile="developer",
+                provider="kiro_cli",
+                script="",
+                enabled=True,
+                next_run=datetime.now(),
+            )
+        mock_db_get.return_value = mock_flow
+        mock_get_backend.return_value.session_exists.return_value = True
+        mock_list_terminals.return_value = [{"id": "t1", "agent_profile": "developer"}]
+        mock_status_monitor.get_status.return_value = TerminalStatus.PROCESSING
+
+        with patch(
+            "cli_agent_orchestrator.services.flow_service.asyncio.to_thread",
+            wraps=asyncio.to_thread,
+        ) as mock_to_thread:
+            result = await execute_flow("pin-flow")
+            busy_calls = [
+                c
+                for c in mock_to_thread.call_args_list
+                if c.args[0] == flow_service._is_terminal_busy
+            ]
+
+        assert result is False
+        assert busy_calls, "_is_terminal_busy was never dispatched via to_thread"
+        assert busy_calls[0].args[1] == "t1"
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.flow_service.delete_terminals_by_session")

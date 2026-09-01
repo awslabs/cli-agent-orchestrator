@@ -5,6 +5,8 @@ Endpoint logic is isolated by patching the _get_memory_service factory
 gate at the seam the endpoints read.
 """
 
+import asyncio
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -12,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from cli_agent_orchestrator.models.memory import Memory
+from cli_agent_orchestrator.services.memory_service import MemoryPartialWriteError
 
 MEMORY_BASE = Path("/home/user/.aws/cli-agent-orchestrator/memory")
 
@@ -81,6 +84,46 @@ class TestMemorySettingsEndpoint:
         assert body["enabled"] is False
         # learning is a child of memory: disabled memory forces it off
         assert body["learning_enabled"] is False
+
+
+class TestInternalMemoryStore:
+    def test_partial_write_returns_typed_recovery_envelope(self, mock_service):
+        from cli_agent_orchestrator.api import main
+
+        error = MemoryPartialWriteError(
+            key="partial-topic",
+            scope="global",
+            scope_id=None,
+            file_path="/safe/memory/global/wiki/global/partial-topic.md",
+        )
+        mock_service.store = AsyncMock(side_effect=error)
+
+        response = asyncio.run(
+            main.internal_memory_store(
+                main.InternalMemoryStoreRequest(
+                    **{
+                        "content": "already durable",
+                        "scope": "global",
+                        "memory_type": "reference",
+                        "key": "partial-topic",
+                    }
+                ),
+                [],
+            )
+        )
+
+        assert response.status_code == 500
+        assert json.loads(response.body) == {
+            "error_kind": "memory_metadata_partial_write",
+            "partial_write": {
+                "key": "partial-topic",
+                "scope": "global",
+                "scope_id": None,
+                "file_path": "/safe/memory/global/wiki/global/partial-topic.md",
+                "completed_phases": ["wiki", "index"],
+                "repair_command": "cao memory repair --apply",
+            },
+        }
 
 
 class TestListMemories:

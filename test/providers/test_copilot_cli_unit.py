@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import shlex
 from unittest.mock import patch
@@ -264,6 +265,46 @@ class TestCopilotCliProviderInitialization:
         assert result is True
         # Initial trust handling + the in-loop WAITING_USER_ANSWER handling.
         assert mock_accept.call_count >= 2
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    @patch("cli_agent_orchestrator.providers.copilot_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
+    @patch.object(CopilotCliProvider, "_accept_trust_prompts")
+    async def test_initialize_polls_get_status_via_to_thread(
+        self,
+        mock_accept,
+        mock_tmux,
+        mock_wait_shell,
+        mock_status_monitor,
+    ):
+        """#558: status_monitor.get_status() is no longer in-memory only -- for a
+        PROCESSING terminal it can fork a real tmux capture-pane subprocess (the
+        stale-PROCESSING fallback), and copilot init is exactly the regime that trips it
+        (cached PROCESSING, pane quiet during auth/MCP boot). Pin the asyncio.to_thread
+        dispatch of the init poll -- the other init tests mock the status monitor and
+        cannot see HOW it was called."""
+        mock_wait_shell.return_value = True
+        mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+
+        with patch(
+            "cli_agent_orchestrator.providers.copilot_cli.asyncio.to_thread",
+            wraps=asyncio.to_thread,
+        ) as mock_to_thread:
+            result = await provider.initialize()
+            # initialize() also offloads _command and send_keys -- count only the
+            # get_status dispatches.
+            get_status_calls = [
+                c
+                for c in mock_to_thread.call_args_list
+                if c.args[0] == mock_status_monitor.get_status
+            ]
+
+        assert result is True
+        assert get_status_calls, "status_monitor.get_status was never dispatched via to_thread"
+        assert all(c.args[1] == "test1234" for c in get_status_calls)
 
 
 class TestCopilotCliProviderTrustPrompts:

@@ -17,6 +17,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     create_engine,
+    literal_column,
 )
 from sqlalchemy.orm import DeclarativeBase, declarative_base, sessionmaker
 
@@ -55,6 +56,59 @@ class TerminalModel(Base):
     # literally named "metadata" per #432's design.
     metadata_json = Column("metadata", Text, nullable=True)
     last_active = Column(DateTime, default=datetime.now)
+
+    # ORDERING CONTRACT: the two session-scoped reads -- ``list_terminals_by_session``
+    # and ``list_terminals_in_sessions`` -- order by SQLite's implicit ``rowid``,
+    # so index 0 of a session's terminals is its OLDEST SURVIVING row.
+    # (``list_siblings_by_group_prefix`` also reads this table by session and is
+    # deliberately NOT ordered: its consumer matches on group prefixes and does
+    # not take a first element. Order it too if that ever changes.) Several consumers
+    # treat that as the session's conductor and one of them kills sessions on it.
+    # rowid is not declared above, so the dependency is invisible here. Three
+    # things break it SILENTLY:
+    #   * an ``INSERT OR REPLACE``/upsert against terminals -- a replace deletes
+    #     and re-inserts, so the row gets a NEW rowid and jumps to the end of its
+    #     session. Nothing does this today and
+    #     ``test_no_upsert_against_the_terminals_table`` fails the build if it
+    #     starts; use an UPDATE.
+    #   * writing ``rowid`` explicitly (``INSERT (rowid, ...) VALUES (-5, ...)``).
+    #   * giving ``id`` INTEGER affinity, which makes rowid an alias for it and
+    #     hands the order back to a random uuid.
+    # Declaring the table WITHOUT ROWID also breaks it but fails LOUDLY
+    # (``no such column: terminals.rowid``), as does reading it through
+    # ``aliased()`` or ``union()``.
+    #
+    # New rows sort after existing ones because SQLite assigns ``max(rowid)+1``
+    # among surviving rows -- so deleting rows recycles values but cannot reorder
+    # the ones still present. The exception is a table holding a row at
+    # 2**63-1, where SQLite picks random unused rowids and within-session order
+    # scrambles; unreachable without an explicit rowid write.
+    #
+    # Deliberately NOT a ``created_at`` column: rowid already records insertion
+    # order exactly and correctly for every row in every existing database,
+    # whereas a new column has to invent the value for rows that predate it, and
+    # there is no honest source for it -- ``last_active`` is written only on
+    # input delivery (send_input/send_special_key), so it is LATEST for the
+    # busiest terminal, which is usually the conductor, and backfilling from it
+    # inverts the very order this contract exists to preserve.
+    #
+    # Deliberately NOT ``caller_id`` either, and this one was priced rather than
+    # dismissed. A conductor created through ``create_session`` records no
+    # caller while an MCP-spawned worker records its supervisor, so
+    # ``caller_id IS NOT NULL`` looks like root-terminal identity. On its own it
+    # is not total -- ``caller_id`` is an optional parameter of the agent-step
+    # create path, so a root carrying an explicit caller would be outranked by a
+    # later terminal without one. It CAN be made total by also requiring the
+    # parent to be in the same session (a correlated ``EXISTS`` on
+    # ``tmux_session``, which is immutable after insert, so a root's caller can
+    # never be in its own session). Measured, that costs ~+29% on this read
+    # (50 sessions over 5k rows: 9.0ms -> 11.6ms) and couples the conductor pick
+    # to referential integrity nothing enforces -- there is no FK on
+    # ``caller_id`` and ghost terminals are deleted in three places, so a
+    # deleted root leaves every worker's caller dangling. Rejected on that cost
+    # and coupling, for a hazard the upsert guard above already turns into a red
+    # build. ``caller_id`` is still the right thing to read for a specific
+    # terminal's spawn parent; it is not worth its price as a sort key.
 
 
 class InboxModel(Base):
@@ -1378,9 +1432,56 @@ def list_siblings_by_group_prefix(
 
 
 def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
-    """List all terminals in a tmux session."""
+    """List a tmux session's terminals, oldest first.
+
+    **Index 0 is the session's oldest surviving terminal -- normally its
+    conductor.** That is a contract, not an accident of the query plan:
+    ``flow_service`` decides whether to kill a session by whether index 0 is
+    busy, ``cao session status``/``list`` label index 0 as the Conductor over
+    HTTP, and ``session_service`` derives a session's reported profile and
+    directory from the earliest terminal that HAS either (#497) -- a first-match
+    scan rather than a bare index, so a conductor row with both fields NULL
+    still cedes ownership to a worker. Callers should cite this docstring rather
+    than restate the rule.
+
+    Ordered by ``rowid``, which is insertion order, and normally creation order:
+    every row is written at one site (``db_create_terminal``, called from
+    ``terminal_service.create_terminal``), and a worker's row cannot precede its
+    conductor's because the MCP handoff either resolves a caller that already
+    has a row (``GET /terminals/{caller_id}``, which raises if the id is stale)
+    or, when it is running outside a CAO terminal, records no caller at all and
+    starts a NEW session in which the worker is itself the conductor. Reuse
+    after deletion does not reorder surviving rows -- see ``TerminalModel`` for
+    the mechanism and its limits.
+
+    Two known gaps, both pre-existing and neither introduced here:
+
+    * ``session_lifecycle_lock`` serialises creation against teardown, but it is
+      a ``threading.Lock`` and therefore per-PROCESS. ``cao schedule run`` calls
+      ``execute_flow`` in the CLI process, and ``flow_service`` does not take the
+      lock at all, so its kill-and-recreate is not serialised against cao-server.
+      A worker insert landing inside that window can take index 0.
+    * Index 0 is the oldest SURVIVING row, which is not the conductor once the
+      conductor's own row is gone -- ``DELETE /terminals/{id}`` has no guard, the
+      MCP tool exposes it, and ghost-terminal cleanup deletes rows while the
+      session lives on.
+
+    Both mean consumers should treat index 0 as best-effort, which is what
+    ``_enrich_session_ownership`` already does. The ordering is what makes it
+    *predictable*; it does not make it an identity.
+
+    This ORDER BY does not change what this function returned before it was
+    added -- an unordered scan of a rowid table already yielded rowid order.
+    It states the order instead of inheriting it, so an index added later
+    cannot quietly change which terminal is the conductor.
+    """
     with SessionLocal() as db:
-        terminals = db.query(TerminalModel).filter(TerminalModel.tmux_session == tmux_session).all()
+        terminals = (
+            db.query(TerminalModel)
+            .filter(TerminalModel.tmux_session == tmux_session)
+            .order_by(literal_column("terminals.rowid"))
+            .all()
+        )
         return [
             {
                 "id": t.id,
@@ -1416,6 +1517,64 @@ def update_terminal_shell_command(terminal_id: str, shell_command: str) -> bool:
             db.commit()
             return True
         return False
+
+
+def list_terminals_in_sessions(tmux_sessions: List[str]) -> List[Dict[str, Any]]:
+    """List terminals for several tmux sessions in one query.
+
+    Exists so ``list_sessions`` can enrich N sessions without N queries (issue
+    #629) while still reading only the rows it will use. ``list_all_terminals``
+    would also collapse the query count, but its cost scales with the whole
+    table — including rows for sessions tmux no longer reports, which accumulate
+    because ``cleanup_service.cleanup_old_data`` only runs at server startup, so
+    a long-uptime server never sweeps them. Bounding the read by the live
+    session names keeps the cost proportional to the workload instead of to the
+    leak.
+
+    Ordered by ``rowid``, identically to ``list_terminals_by_session`` -- see
+    that function for the index-0-is-the-conductor contract and why rowid
+    expresses creation order. The two MUST order the same way: the caller picks
+    a session's "first known terminal", so the pick is order-sensitive, and an
+    ordered batched read beside an unordered per-session read is what let this
+    function silently disagree with the one it replaced.
+
+    The ORDER BY is not decoration. Without it the order is whatever the engine
+    plans: today every plan is a rowid scan (there is no index on
+    ``tmux_session``), but adding one -- the obvious reaction to a slow
+    per-session lookup -- reorders the probe. Measured, a plain ASC index on
+    ``(tmux_session, id)`` makes an unordered read return a worker ahead of the
+    session creator; ordering here is what keeps the conductor first.
+
+    Ordering by ``id`` would NOT do that: ``id`` is ``uuid4().hex[:8]``
+    (utils/terminal.generate_terminal_id), so it makes the conductor a
+    deterministic *random* terminal, and a session whose creator happens to sort
+    above one of its own workers advertises the worker's profile and directory as
+    the session's.
+
+    Returns an empty list without querying when given no session names.
+    """
+    if not tmux_sessions:
+        return []
+    with SessionLocal() as db:
+        terminals = (
+            db.query(TerminalModel)
+            .filter(TerminalModel.tmux_session.in_(tmux_sessions))
+            .order_by(literal_column("terminals.rowid"))
+            .all()
+        )
+        return [
+            {
+                "id": t.id,
+                "tmux_session": t.tmux_session,
+                "tmux_window": t.tmux_window,
+                "provider": t.provider,
+                "agent_profile": t.agent_profile,
+                "working_directory": t.working_directory,
+                "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
+                "last_active": t.last_active,
+            }
+            for t in terminals
+        ]
 
 
 def list_all_terminals() -> List[Dict[str, Any]]:

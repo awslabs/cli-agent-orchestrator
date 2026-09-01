@@ -409,6 +409,33 @@ def install_agent(
                 for name, cfg in profile.mcpServers.items()
             }
 
+        # Record the provider we actually installed for into the LOCAL store
+        # copy, so later provider resolution on this node is deterministic.
+        #
+        # Without this, `cao install <p> --provider <x>` materialised the
+        # provider-specific config (below) but left no trace of <x> anywhere
+        # readable: resolve_provider() re-reads the profile, finds no
+        # frontmatter `provider:` key, and silently falls back to the caller's
+        # provider or DEFAULT_PROVIDER. Locally that is usually masked because
+        # the fallback is inherited from the calling terminal, but on the
+        # cross-node assign/handoff path `_assign_remote` deliberately omits
+        # the provider and lets the TARGET node resolve it — so the target
+        # would resolve DEFAULT_PROVIDER regardless of what was installed
+        # there, and remote placement fails on any node whose installed
+        # provider is not the default.
+        #
+        # Only the resolved `provider:` key is added; the body and every other
+        # frontmatter key are preserved verbatim, and raw (unresolved) content
+        # is stored so ${VARS} keep their placeholder form like the context
+        # file. Note this materialises a local-store copy of a built-in
+        # profile, which then shadows the packaged one on this node — that is
+        # intended (the install is a per-node fact), but it does mean later CAO
+        # upgrades will not change this profile's body on this node.
+        if profile.provider != provider:
+            stored = frontmatter.loads(raw_content)
+            stored["provider"] = provider
+            write_profile(agent_name, frontmatter.dumps(stored), overwrite=True)
+
         unresolved_vars = sorted(set(re.findall(r"\$\{(\w+)\}", resolved_content)))
         context_file = _write_context_file(profile.name, raw_content)
 

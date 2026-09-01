@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import logging
 import os
 import shlex
 import uuid
@@ -19,6 +20,7 @@ from cli_agent_orchestrator.clients import database as db_mod
 from cli_agent_orchestrator.clients.database import get_terminal_metadata
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.services import fifo_reader as fifo_reader_mod
+from cli_agent_orchestrator.services import session_service as session_service_mod
 from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.session_service import (
@@ -131,6 +133,24 @@ class TestCreateSession:
         mock_create_terminal.assert_not_called()
 
 
+def _swallowed_log(caplog, message):
+    """Return the record ``session_service`` emitted for ``message``.
+
+    Selecting by logger name AND message, not by level: a level-only scan
+    (``any(r.exc_info for r in caplog.records if r.levelname == ...)``) passes
+    when ANY logger emits a record with a traceback at that level, so the
+    handler under test can lose its own ``exc_info`` and the assertion still
+    holds. ``caplog.text`` does not save it either — traceback text is included
+    in ``.text``, so a substring check is satisfiable by the traceback alone.
+    """
+    return next(
+        r
+        for r in caplog.records
+        if r.name == "cli_agent_orchestrator.services.session_service"
+        and r.getMessage().startswith(message)
+    )
+
+
 class TestListSessions:
     """Tests for list_sessions function."""
 
@@ -150,16 +170,16 @@ class TestListSessions:
                 raise value
             return value
 
-    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_in_sessions")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
-    def test_list_sessions_success(self, mock_get_backend, mock_list_terminals):
+    def test_list_sessions_success(self, mock_get_backend, mock_list_in_sessions):
         """Test listing sessions successfully."""
         mock_get_backend.return_value.list_sessions.return_value = [
             {"id": "cao-session1", "name": "Session 1"},
             {"id": "cao-session2", "name": "Session 2"},
             {"id": "other-session", "name": "Other"},
         ]
-        mock_list_terminals.return_value = []
+        mock_list_in_sessions.return_value = []
 
         result = list_sessions()
 
@@ -177,9 +197,9 @@ class TestListSessions:
 
         assert result == []
 
-    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_in_sessions")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
-    def test_list_sessions_no_cao_sessions(self, mock_get_backend, mock_list_terminals):
+    def test_list_sessions_no_cao_sessions(self, mock_get_backend, mock_list_in_sessions):
         """Test listing sessions when no CAO sessions exist."""
         mock_get_backend.return_value.list_sessions.return_value = [
             {"id": "other-session1", "name": "Other 1"},
@@ -189,7 +209,7 @@ class TestListSessions:
         result = list_sessions()
 
         assert result == []
-        mock_list_terminals.assert_not_called()
+        mock_list_in_sessions.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_list_sessions_error(self, mock_get_backend):
@@ -200,10 +220,10 @@ class TestListSessions:
 
         assert result == []
 
-    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_in_sessions")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_list_sessions_prefers_persisted_working_directory(
-        self, mock_get_backend, mock_list_terminals
+        self, mock_get_backend, mock_list_in_sessions
     ):
         """Launch-time cwd from terminal metadata is the preferred ownership signal."""
         fake_client = self._FakeTmuxClient(
@@ -211,7 +231,7 @@ class TestListSessions:
             {("cao-owned", "developer-abcd"): AssertionError("pane cwd should not be used")},
         )
         mock_get_backend.return_value = TmuxBackend(client=fake_client)
-        mock_list_terminals.return_value = [
+        mock_list_in_sessions.return_value = [
             {
                 "id": "term1",
                 "tmux_session": "cao-owned",
@@ -234,10 +254,10 @@ class TestListSessions:
         ]
         assert fake_client.cwd_calls == []
 
-    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_in_sessions")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_list_sessions_falls_back_to_pane_working_directory(
-        self, mock_get_backend, mock_list_terminals
+        self, mock_get_backend, mock_list_in_sessions
     ):
         """When no launch cwd is stored, list_sessions resolves the pane cwd."""
         fake_client = self._FakeTmuxClient(
@@ -245,7 +265,7 @@ class TestListSessions:
             {("cao-owned", "developer-abcd"): "/pane/project"},
         )
         mock_get_backend.return_value = TmuxBackend(client=fake_client)
-        mock_list_terminals.return_value = [
+        mock_list_in_sessions.return_value = [
             {
                 "id": "term1",
                 "tmux_session": "cao-owned",
@@ -261,10 +281,10 @@ class TestListSessions:
         assert result[0]["agent_profile"] == "developer"
         assert fake_client.cwd_calls == [("cao-owned", "developer-abcd")]
 
-    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_in_sessions")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_list_sessions_keeps_session_when_working_directory_unresolvable(
-        self, mock_get_backend, mock_list_terminals
+        self, mock_get_backend, mock_list_in_sessions
     ):
         """A cwd resolution failure affects only that field, not the session list."""
         fake_client = self._FakeTmuxClient(
@@ -272,7 +292,7 @@ class TestListSessions:
             {("cao-owned", "developer-abcd"): RuntimeError("pane unavailable")},
         )
         mock_get_backend.return_value = TmuxBackend(client=fake_client)
-        mock_list_terminals.return_value = [
+        mock_list_in_sessions.return_value = [
             {
                 "id": "term1",
                 "tmux_session": "cao-owned",
@@ -289,10 +309,10 @@ class TestListSessions:
         assert result[0]["working_directory"] is None
         assert result[0]["agent_profile"] == "developer"
 
-    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_in_sessions")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_list_sessions_handles_orphaned_tmux_session(
-        self, mock_get_backend, mock_list_terminals
+        self, mock_get_backend, mock_list_in_sessions
     ):
         """A tmux session with no DB terminals still lists (null metadata)."""
         fake_client = self._FakeTmuxClient(
@@ -300,7 +320,7 @@ class TestListSessions:
             {},
         )
         mock_get_backend.return_value = TmuxBackend(client=fake_client)
-        mock_list_terminals.return_value = []
+        mock_list_in_sessions.return_value = []
 
         result = list_sessions()
 
@@ -309,12 +329,18 @@ class TestListSessions:
         assert result[0]["working_directory"] is None
         assert result[0]["agent_profile"] is None
 
-    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_in_sessions")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
-    def test_list_sessions_handles_enrichment_exception_gracefully(
-        self, mock_get_backend, mock_list_terminals
+    def test_list_sessions_lists_a_session_with_no_terminal_rows(
+        self, mock_get_backend, mock_list_in_sessions
     ):
-        """One session's enrichment failure doesn't blank the entire list."""
+        """A session absent from the terminal read still lists, with null metadata.
+
+        Previously this mocked a per-session query that raised for the second
+        session. With one bulk read there is no per-session failure to simulate:
+        the read either succeeds (this test — ``cao-bad`` simply has no rows) or
+        fails wholesale (``test_list_sessions_survives_a_failed_bulk_terminal_read``).
+        """
         fake_client = self._FakeTmuxClient(
             [
                 {"id": "cao-good", "name": "Good", "status": "active"},
@@ -323,17 +349,14 @@ class TestListSessions:
             {("cao-good", "win-good"): "/home/user/project"},
         )
         mock_get_backend.return_value = TmuxBackend(client=fake_client)
-        mock_list_terminals.side_effect = [
-            [
-                {
-                    "id": "term-good",
-                    "tmux_session": "cao-good",
-                    "tmux_window": "win-good",
-                    "agent_profile": "developer",
-                    "working_directory": None,
-                }
-            ],
-            Exception("DB connection failed"),
+        mock_list_in_sessions.return_value = [
+            {
+                "id": "term-good",
+                "tmux_session": "cao-good",
+                "tmux_window": "win-good",
+                "agent_profile": "developer",
+                "working_directory": None,
+            }
         ]
 
         result = list_sessions()
@@ -346,17 +369,17 @@ class TestListSessions:
         assert result[1]["working_directory"] is None
         assert result[1]["agent_profile"] is None
 
-    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_in_sessions")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_list_sessions_ignores_none_id_without_blanking_result(
-        self, mock_get_backend, mock_list_terminals
+        self, mock_get_backend, mock_list_in_sessions
     ):
         """A backend row with id=None should be skipped without blanking valid rows."""
         mock_get_backend.return_value.list_sessions.return_value = [
             {"id": None, "name": "Bad"},
             {"id": "cao-good", "name": "Good"},
         ]
-        mock_list_terminals.return_value = []
+        mock_list_in_sessions.return_value = []
 
         result = list_sessions()
 
@@ -369,10 +392,10 @@ class TestListSessions:
             }
         ]
 
-    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_in_sessions")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_list_sessions_uses_one_terminal_for_profile_and_directory(
-        self, mock_get_backend, mock_list_terminals
+        self, mock_get_backend, mock_list_in_sessions
     ):
         """Ownership metadata should not mix profile and cwd from different terminals."""
         fake_client = self._FakeTmuxClient(
@@ -380,7 +403,7 @@ class TestListSessions:
             {("cao-owned", "developer-abcd"): "/pane/developer"},
         )
         mock_get_backend.return_value = TmuxBackend(client=fake_client)
-        mock_list_terminals.return_value = [
+        mock_list_in_sessions.return_value = [
             {
                 "id": "term1",
                 "tmux_session": "cao-owned",
@@ -402,6 +425,227 @@ class TestListSessions:
         assert result[0]["agent_profile"] == "developer"
         assert result[0]["working_directory"] == "/pane/developer"
         assert fake_client.cwd_calls == [("cao-owned", "developer-abcd")]
+
+    # ── The terminal read scales with neither session count nor table size ──
+    #
+    # Issue #629. These assert the PROPERTY, not which function gets called: a
+    # pin on `list_terminals_in_sessions.call_count == 1` would have to be
+    # deleted by anyone changing the read's shape again, which makes it a
+    # restatement of the implementation rather than a guard on its behaviour.
+
+    @pytest.mark.parametrize("session_count", [1, 3, 30])
+    def test_terminal_read_count_does_not_grow_with_session_count(self, session_count, monkeypatch):
+        """Listing N sessions must not cost O(N) terminal reads.
+
+        Regression guard for the N+1: enrichment used to issue one
+        ``list_terminals_by_session`` per tmux session, so a shared cao-server
+        paid a query per session every time this path was polled. Counting reads
+        across several session counts is what catches a reintroduction, however
+        it is spelled.
+        """
+        reads: list = []
+
+        def _counting_read(names):
+            reads.append(list(names))
+            return [
+                {
+                    "id": f"term{n}",
+                    "tmux_session": f"cao-session{n}",
+                    "tmux_window": f"developer-{n}",
+                    "agent_profile": "developer",
+                    "working_directory": f"/project/{n}",
+                }
+                for n in range(session_count)
+            ]
+
+        def _boom(session_name):
+            raise AssertionError(f"per-session query reintroduced for {session_name}")
+
+        monkeypatch.setattr(session_service_mod, "list_terminals_in_sessions", _counting_read)
+        monkeypatch.setattr(session_service_mod, "list_terminals_by_session", _boom)
+        monkeypatch.setattr(
+            session_service_mod,
+            "get_backend",
+            lambda: MagicMock(
+                list_sessions=lambda: [
+                    {"id": f"cao-session{n}", "name": f"Session {n}"} for n in range(session_count)
+                ]
+            ),
+        )
+
+        result = list_sessions()
+
+        assert len(result) == session_count
+        # One read, whatever N is -- and no per-session query (``_boom``).
+        assert len(reads) == 1
+        # Each session gets ITS OWN terminal's metadata, not the first row of
+        # the batch: the grouping has to key on tmux_session.
+        assert [s["working_directory"] for s in result] == [
+            f"/project/{n}" for n in range(session_count)
+        ]
+
+    def test_terminal_read_is_bounded_to_the_live_sessions(self, monkeypatch):
+        """The read must ask only for sessions tmux actually reports.
+
+        Rows for sessions tmux no longer reports are only swept by
+        ``cleanup_service.cleanup_old_data``, which runs at server startup, so a
+        long-uptime server accumulates them indefinitely. Reading the whole
+        table would make this path scale with that accumulation instead of with
+        the sessions being listed -- which measured *slower* than the
+        per-session version it replaced once enough rows had piled up.
+        """
+        requested: list = []
+
+        def _capturing_read(names):
+            requested.append(sorted(names))
+            return []
+
+        monkeypatch.setattr(session_service_mod, "list_terminals_in_sessions", _capturing_read)
+        monkeypatch.setattr(
+            session_service_mod,
+            "get_backend",
+            lambda: MagicMock(
+                list_sessions=lambda: [
+                    {"id": "cao-alpha", "name": "cao-alpha"},
+                    {"id": "cao-beta", "name": "cao-beta"},
+                    {"id": "other-not-ours", "name": "other-not-ours"},
+                ]
+            ),
+        )
+
+        list_sessions()
+
+        # Only the live CAO sessions -- not the foreign session, and crucially
+        # not an unbounded "everything in the table" read.
+        assert requested == [["cao-alpha", "cao-beta"]]
+
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_in_sessions")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_list_sessions_groups_bulk_read_by_session(
+        self, mock_get_backend, mock_list_in_sessions
+    ):
+        """A flat terminal read is bucketed per session, ignoring foreign rows."""
+        mock_get_backend.return_value.list_sessions.return_value = [
+            {"id": "cao-alpha", "name": "cao-alpha"},
+            {"id": "cao-beta", "name": "cao-beta"},
+        ]
+        mock_list_in_sessions.return_value = [
+            # Interleaved, and including a row for a session tmux no longer
+            # reports plus one with no tmux_session at all.
+            {
+                "id": "t-beta",
+                "tmux_session": "cao-beta",
+                "tmux_window": "w",
+                "agent_profile": "reviewer",
+                "working_directory": "/beta",
+            },
+            {
+                "id": "t-orphan",
+                "tmux_session": "cao-gone",
+                "tmux_window": "w",
+                "agent_profile": "ghost",
+                "working_directory": "/gone",
+            },
+            {
+                "id": "t-alpha",
+                "tmux_session": "cao-alpha",
+                "tmux_window": "w",
+                "agent_profile": "developer",
+                "working_directory": "/alpha",
+            },
+            {
+                "id": "t-nosession",
+                "tmux_session": None,
+                "tmux_window": "w",
+                "agent_profile": "nobody",
+                "working_directory": "/nowhere",
+            },
+        ]
+
+        result = list_sessions()
+
+        by_id = {s["id"]: s for s in result}
+        assert by_id["cao-alpha"]["agent_profile"] == "developer"
+        assert by_id["cao-alpha"]["working_directory"] == "/alpha"
+        assert by_id["cao-beta"]["agent_profile"] == "reviewer"
+        assert by_id["cao-beta"]["working_directory"] == "/beta"
+        assert "cao-gone" not in by_id
+
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_in_sessions")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_list_sessions_survives_a_failed_bulk_terminal_read(
+        self, mock_get_backend, mock_list_in_sessions, caplog
+    ):
+        """A DB failure degrades ownership fields, it does not blank the list.
+
+        Collapsing N queries into one concentrates the failure, so the swallow
+        matters more than it did: losing the metadata read must still return
+        every session rather than an empty list.
+        """
+        mock_get_backend.return_value.list_sessions.return_value = [
+            {"id": "cao-one", "name": "cao-one"},
+            {"id": "cao-two", "name": "cao-two"},
+        ]
+        mock_list_in_sessions.side_effect = RuntimeError("database is locked")
+
+        with caplog.at_level(logging.WARNING):
+            result = list_sessions()
+
+        assert [s["id"] for s in result] == ["cao-one", "cao-two"]
+        assert all(s["agent_profile"] is None for s in result)
+        assert all(s["working_directory"] is None for s in result)
+        # The traceback must survive the swallow, or a DB problem here is
+        # undiagnosable without reproducing locally.
+        assert "database is locked" in caplog.text
+        assert _swallowed_log(caplog, "Failed to load terminal metadata").exc_info
+
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_in_sessions")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_unresolvable_pane_directory_logs_a_traceback(
+        self, mock_get_backend, mock_list_in_sessions, caplog
+    ):
+        """The pane-cwd fallback's swallowed failure also keeps its traceback."""
+        fake_client = self._FakeTmuxClient(
+            [{"id": "cao-owned", "name": "cao-owned"}],
+            {("cao-owned", "developer-abcd"): OSError("pane vanished")},
+        )
+        mock_get_backend.return_value = TmuxBackend(client=fake_client)
+        mock_list_in_sessions.return_value = [
+            {
+                "id": "term1",
+                "tmux_session": "cao-owned",
+                "tmux_window": "developer-abcd",
+                "agent_profile": "developer",
+                "working_directory": None,
+            }
+        ]
+
+        with caplog.at_level(logging.WARNING):
+            result = list_sessions()
+
+        assert result[0]["working_directory"] is None
+        assert result[0]["agent_profile"] == "developer"
+        assert "pane vanished" in caplog.text
+        assert _swallowed_log(caplog, "Failed to resolve working directory").exc_info
+
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_whole_listing_failure_logs_a_traceback(self, mock_get_backend, caplog):
+        """The outer handler keeps its traceback too — it blanks the ENTIRE response.
+
+        The two tests above cover the WARNING-level handlers, which degrade one
+        session's metadata. This one covers the ERROR-level net around the whole
+        function: callers get `[]` and cannot tell "no sessions" from "the
+        backend failed", so the traceback in the log is the only evidence the
+        failure happened at all.
+        """
+        mock_get_backend.return_value.list_sessions.side_effect = RuntimeError("tmux is gone")
+
+        with caplog.at_level(logging.ERROR):
+            result = list_sessions()
+
+        assert result == []
+        assert "tmux is gone" in caplog.text
+        assert _swallowed_log(caplog, "Failed to list sessions").exc_info
 
 
 @pytest.fixture
@@ -901,3 +1145,47 @@ class TestDeleteSession:
             mock_capture.assert_any_call(tid)
             mock_dismantle.assert_any_call(tid, ANY, kill_window=False)
             mock_delete_row.assert_any_call(tid, ANY, registry=ANY)
+
+
+def test_list_sessions_reports_the_creator_as_owner(real_session_db, monkeypatch):
+    """End-to-end guard for #629's regression, at the layer users actually see.
+
+    The regression that prompted this test was caught by review, not by CI: the
+    unit test covering the batched read was GREEN while asserting the wrong
+    contract, because it pinned ``ORDER BY id`` — the very thing that broke
+    ownership. A test one layer up, on ``list_sessions()`` itself, would have
+    failed instead of endorsing it.
+
+    The ids matter: the creator's uuid4 prefix sorts ABOVE its worker's, so
+    ordering by ``id`` reports the worker's profile and worktree as the
+    session's, while creation order reports the creator's.
+    """
+    session_name = "cao-owner"
+    db_mod.create_terminal(
+        terminal_id="f0000000",
+        tmux_session=session_name,
+        tmux_window="supervisor-aaaa",
+        provider="kiro_cli",
+        agent_profile="supervisor",
+        working_directory="/repo/owner",
+    )
+    db_mod.create_terminal(
+        terminal_id="10000000",
+        tmux_session=session_name,
+        tmux_window="developer-bbbb",
+        provider="kiro_cli",
+        agent_profile="developer",
+        working_directory="/tmp/child-worktree",
+    )
+
+    backend = MagicMock()
+    backend.list_sessions.return_value = [{"id": session_name, "name": session_name}]
+    backend.get_pane_working_directory.side_effect = AssertionError(
+        "working_directory is persisted; the pane fallback must not be reached"
+    )
+    monkeypatch.setattr(session_service_mod, "get_backend", lambda: backend)
+
+    reported = list_sessions()[0]
+
+    assert reported["agent_profile"] == "supervisor"
+    assert reported["working_directory"] == "/repo/owner"

@@ -210,6 +210,58 @@ class TestDeliverPending:
         assert mock_update.call_args_list[-1] == call(1, MessageStatus.PENDING)
         assert call(1, MessageStatus.FAILED) not in mock_update.call_args_list
 
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_concurrent_delivery_for_one_terminal_sends_exactly_once(
+        self, mock_get, mock_monitor, mock_term_svc, mock_update
+    ):
+        """deliver_pending is read(PENDING) -> status check -> mark DELIVERED -> send,
+        with no atomic claim at the DB layer. Its callers genuinely overlap on worker
+        threads (the status-event consumer, the immediate POST path, the OpenCode poller,
+        the reconcile sweep), and two calls both reading the same oldest row before
+        either marks it would execute one agent task twice. The per-terminal lock must
+        serialize the whole sequence: with the mark artificially slowed to hold the
+        read->mark window open, two racing threads must produce exactly one send."""
+        import threading
+        import time
+
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        message = _make_message()
+        store = {"status": MessageStatus.PENDING}
+        store_guard = threading.Lock()
+
+        def read_pending(terminal_id, limit=1):
+            with store_guard:
+                return [message] if store["status"] == MessageStatus.PENDING else []
+
+        def slow_mark(message_id, status):
+            # Hold the read->mark window open long enough that an unserialized second
+            # thread would re-read the row as PENDING.
+            time.sleep(0.15)
+            with store_guard:
+                store["status"] = status
+
+        mock_get.side_effect = read_pending
+        mock_update.side_effect = slow_mark
+
+        svc = InboxService()
+        start = threading.Barrier(2)
+
+        def race():
+            start.wait(timeout=5)
+            svc.deliver_pending("term-1")
+
+        threads = [threading.Thread(target=race) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        assert mock_term_svc.send_input.call_count == 1
+        assert store["status"] == MessageStatus.DELIVERED
+
 
 class TestEagerInboxDelivery:
     """Tests for eager inbox delivery (CAO_EAGER_INBOX_DELIVERY).

@@ -222,7 +222,9 @@ async def _wait_for_completion(
         if cancel_event is not None and cancel_event.is_set():
             raise StepCancelledError(terminal_id=terminal_id)
 
-        current = status_monitor.get_status(terminal_id)
+        # Off the event loop — get_status() can shell out to a real tmux capture-pane
+        # subprocess (status_monitor.py's stale-PROCESSING fallback) or a herdr CLI call.
+        current = await asyncio.to_thread(status_monitor.get_status, terminal_id)
         if current == TerminalStatus.ERROR:
             raise StepExecutionError(
                 f"terminal {terminal_id} reached ERROR status",
@@ -256,7 +258,9 @@ async def _wait_for_completion(
         if time.monotonic() >= deadline:
             # Defensive: a terminal that flipped to ERROR right at the deadline is
             # a crash, not a slow run (preserve the kind="error" vs "timeout" split).
-            if status_monitor.get_status(terminal_id) == TerminalStatus.ERROR:
+            if (
+                await asyncio.to_thread(status_monitor.get_status, terminal_id)
+            ) == TerminalStatus.ERROR:
                 raise StepExecutionError(
                     f"terminal {terminal_id} reached ERROR status",
                     kind="error",
