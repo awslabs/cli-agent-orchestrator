@@ -55,6 +55,7 @@ class TestDeliverPending:
         mock_get.return_value = [_make_message()]
         mock_claim.return_value = [_make_message(status=MessageStatus.DELIVERED)]
         mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_monitor.get_status_generation.return_value = 0
 
         svc = InboxService()
         svc.deliver_pending("term-1")
@@ -74,6 +75,7 @@ class TestDeliverPending:
         mock_get.return_value = [_make_message()]
         mock_claim.return_value = [_make_message(status=MessageStatus.DELIVERED)]
         mock_monitor.get_status.return_value = TerminalStatus.COMPLETED
+        mock_monitor.get_status_generation.return_value = 0
 
         svc = InboxService()
         svc.deliver_pending("term-1")
@@ -140,6 +142,7 @@ class TestDeliverPending:
             _make_message(id=2, message="world", status=MessageStatus.DELIVERED),
         ]
         mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_monitor.get_status_generation.return_value = 0
 
         svc = InboxService()
         svc.deliver_pending("term-1", num_messages=2)
@@ -163,6 +166,7 @@ class TestDeliverPending:
             _make_message(id=i, message=f"msg{i}", status=MessageStatus.DELIVERED) for i in range(3)
         ]
         mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_monitor.get_status_generation.return_value = 0
 
         svc = InboxService()
         svc.deliver_pending("term-1", num_messages=0)
@@ -207,6 +211,7 @@ class TestDeliverPending:
         """
         mock_get.return_value = [_make_message()]
         mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_monitor.get_status_generation.return_value = 0
 
         order = []
 
@@ -304,6 +309,7 @@ class TestConcurrentDeliverySerialization:
             patch("cli_agent_orchestrator.services.inbox_service.terminal_service") as mock_term,
         ):
             mock_monitor.get_status.return_value = TerminalStatus.IDLE
+            mock_monitor.get_status_generation.return_value = 0
             mock_term.send_input.side_effect = fake_send_input
 
             threads = [threading.Thread(target=worker) for _ in range(2)]
@@ -436,6 +442,64 @@ class TestConcurrentDeliverySerialization:
                 m.status for m in check.query(InboxModel).filter_by(receiver_id="term-1").all()
             )
         assert statuses == sorted([MessageStatus.DELIVERED.value, MessageStatus.PENDING.value])
+
+    def test_completion_inside_send_input_does_not_starve_the_next_message(
+        self, isolated_memory_db
+    ):
+        """Reviewer-reproduced sixth-round finding on #709: send_input's own
+        notify_input_sent(assume_processing=True) applies one PROCESSING
+        transition synchronously before the tmux paste, so a single generation
+        bump between the pre- and post-send_input reads is expected and the
+        marker is meant to survive it. If a genuine completion transition ALSO
+        lands inside send_input's own blocking window (e.g. real output
+        arriving during the tmux submit-delay path for a very fast turn), two
+        bumps happen before deliver_pending ever gets to snapshot a baseline,
+        and marking busy against that already-final generation would wait for
+        a transition that already happened and will not repeat, coalescing
+        every future message to this terminal forever. Confirmed this fails
+        without the fix: the second message is left PENDING with no future
+        event able to release it."""
+        with database.SessionLocal() as seed:
+            seed.add_all(
+                [
+                    InboxModel(
+                        sender_id="s",
+                        receiver_id="term-1",
+                        message=f"m{i}",
+                        status=MessageStatus.PENDING.value,
+                        created_at=datetime.now(),
+                    )
+                    for i in range(2)
+                ]
+            )
+            seed.commit()
+
+        with (
+            patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as mock_monitor,
+            patch("cli_agent_orchestrator.services.inbox_service.terminal_service") as mock_term,
+        ):
+            mock_monitor.get_status.return_value = TerminalStatus.IDLE
+            # First delivery: pre-dispatch read is 0; by the time send_input
+            # returns, TWO real transitions already landed (its own PROCESSING
+            # bump plus a genuine completion) so the post-dispatch read is 2.
+            # Second delivery: pre=2, post=3 (one ordinary PROCESSING bump),
+            # the normal case, so this one does re-arm the marker; it just
+            # must not block the send that gets it there.
+            mock_monitor.get_status_generation.side_effect = [0, 2, 2, 3]
+            svc = InboxService()
+
+            svc.deliver_pending("term-1")
+            assert mock_term.send_input.call_count == 1
+            assert inbox_service_module._is_dispatch_active("term-1") is False
+
+            svc.deliver_pending("term-1")
+            assert mock_term.send_input.call_count == 2
+
+        with database.SessionLocal() as check:
+            statuses = sorted(
+                m.status for m in check.query(InboxModel).filter_by(receiver_id="term-1").all()
+            )
+        assert statuses == sorted([MessageStatus.DELIVERED.value, MessageStatus.DELIVERED.value])
 
 
 class TestEagerInboxDelivery:

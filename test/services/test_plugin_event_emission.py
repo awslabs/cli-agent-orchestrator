@@ -711,6 +711,7 @@ class TestMessagePluginEvents:
         mock_claim_pending_messages.return_value = [claimed]
         # Status is sourced from the event-driven StatusMonitor, not the provider.
         mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_status_monitor.get_status_generation.return_value = 0
 
         inbox_service.deliver_pending("abcd1234", registry=registry)
 
