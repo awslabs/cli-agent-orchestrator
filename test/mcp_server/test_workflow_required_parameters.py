@@ -45,9 +45,7 @@ def test_direct_workflow_run_call_uses_json_safe_omitted_optional_defaults():
         payloads.append(json)
         raise requests.ConnectionError("down")
 
-    with patch(
-        "cli_agent_orchestrator.mcp_server.server.requests.post", side_effect=post
-    ):
+    with patch("cli_agent_orchestrator.mcp_server.server.requests.post", side_effect=post):
         result = asyncio.run(server.workflow_run("demo"))
 
     assert inspect.signature(server.workflow_run).parameters["inputs"].default is None
@@ -69,14 +67,9 @@ def test_direct_workflow_return_call_uses_json_safe_omitted_optional_defaults(
         payloads.append(json)
         raise requests.ConnectionError("down")
 
-    with patch(
-        "cli_agent_orchestrator.mcp_server.server.requests.post", side_effect=post
-    ):
+    with patch("cli_agent_orchestrator.mcp_server.server.requests.post", side_effect=post):
         result = asyncio.run(server.workflow_return({"answer": 42}))
 
-    assert (
-        inspect.signature(server.workflow_return).parameters["output_schema"].default
-        is None
-    )
+    assert inspect.signature(server.workflow_return).parameters["output_schema"].default is None
     assert payloads == [{"output": {"answer": 42}}]
     assert result["ok"] is False
