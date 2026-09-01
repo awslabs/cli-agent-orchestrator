@@ -69,6 +69,7 @@ def test_workflow_run_columns(patched_db):
         "finished_at",
         "tier",
         "generation",
+        "manifest_json",
     }
     # run_id is the primary key; the nullable columns are current_step_id/finished_at.
     assert cols["run_id"][5] == 1
@@ -79,6 +80,19 @@ def test_workflow_run_columns(patched_db):
     # U3 additive columns (E1): tier/generation default to the YAML-preserving values.
     assert cols["tier"][4] == "'yaml'"
     assert cols["generation"][4] == "'1'"
+    # manifest-column additive column (issue #583 Bolt 2, ADR-583-12): one TEXT column
+    # defaulting to NULL, so every pre-Bolt-2 row reads as "manifest absent".
+    #
+    # THIS ASSERTION IS THE UNIT'S WHOLE MITIGATION FOR THE SILENT-MIGRATION RISK, not a
+    # routine column check. ``_migrate_workflow_run``'s body is wrapped in
+    # ``except Exception`` -> ``logger.debug``, so a failed ALTER leaves the column absent
+    # with no visible signal; the symptom then appears at the Bolt 2 approval gate, which
+    # reads an absent manifest as "never approved" and refuses the run — arbitrarily far
+    # from the cause. Asserting on a FRESH database is what turns that from assumed into
+    # verified. Do not delete it as redundant with the column-set assertion above: the set
+    # proves presence, these two prove the shape a reader depends on.
+    assert cols["manifest_json"][2] == "TEXT"
+    assert cols["manifest_json"][4] == "NULL"
 
 
 def test_workflow_run_no_loop_columns(patched_db):
@@ -275,6 +289,12 @@ def test_workflow_run_indexes_do_not_change_columns(patched_db):
         "finished_at",
         "tier",
         "generation",
+        # manifest-column (issue #583 Bolt 2): this set is MIRRORED from
+        # test_workflow_run_columns, so an additive column has to be added in both places.
+        # There is a third mirror in production code —
+        # workflow_journal._REQUIRED_RUN_COLUMNS — guarded by its own equality assertion in
+        # test_workflow_journal_connection_posture.py. Three places, one column set.
+        "manifest_json",
     }
 
 

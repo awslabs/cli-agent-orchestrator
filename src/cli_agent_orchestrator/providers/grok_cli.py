@@ -531,7 +531,10 @@ class GrokCliProvider(BaseProvider):
                     "project-local configuration (for example .mcp.json or .grok/) before "
                     "launching this CAO terminal."
                 )
-            if status_monitor.get_status(self.terminal_id) in {
+            # Off the loop: get_status() can fork a tmux capture-pane for a PROCESSING
+            # terminal (status_monitor.py's stale-PROCESSING fallback) and this polls
+            # every second on the shared event loop during init.
+            if (await asyncio.to_thread(status_monitor.get_status, self.terminal_id)) in {
                 TerminalStatus.IDLE,
                 TerminalStatus.COMPLETED,
             }:

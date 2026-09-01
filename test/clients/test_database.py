@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.clients.database import (
@@ -31,6 +31,7 @@ from cli_agent_orchestrator.clients.database import (
     list_pending_receiver_ids_older_than,
     list_siblings_by_group_prefix,
     list_terminals_by_session,
+    list_terminals_in_sessions,
     update_flow_enabled,
     update_flow_run_times,
     update_last_active,
@@ -218,7 +219,7 @@ class TestTerminalOperations:
         mock_terminal.last_active = datetime.now()
 
         mock_query = MagicMock()
-        mock_query.filter.return_value.all.return_value = [mock_terminal]
+        mock_query.filter.return_value.order_by.return_value.all.return_value = [mock_terminal]
         mock_session.query.return_value = mock_query
         mock_session_class.return_value = mock_session
 
@@ -1768,3 +1769,311 @@ class TestProjectAliasMigration:
         with sqlite3.connect(str(db_file)) as conn:
             rows = conn.execute("SELECT alias, project_id FROM project_aliases").fetchall()
         assert rows == [("a1", "p1")], "current-schema table must be left intact"
+
+
+class TestListTerminalsInSessions:
+    """Real-SQLite tests for the batched terminal read (issue #629).
+
+    Mocked-``SessionLocal`` tests cannot cover what matters here — that the
+    ``IN`` filter and the ``ORDER BY`` are actually applied by SQL — so these
+    run against a real database.
+    """
+
+    @pytest.fixture
+    def db(self, tmp_path, monkeypatch):
+        engine = create_engine(
+            f"sqlite:///{tmp_path / 'terminals.db'}",
+            connect_args={"check_same_thread": False},
+        )
+        Base.metadata.create_all(bind=engine)
+        Local = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.clients.database.SessionLocal",
+            Local,
+        )
+        return Local
+
+    @staticmethod
+    def _add(Local, terminal_id, tmux_session, agent_profile="developer"):
+        with Local() as s:
+            s.add(
+                TerminalModel(
+                    id=terminal_id,
+                    tmux_session=tmux_session,
+                    tmux_window=f"win-{terminal_id}",
+                    provider="kiro_cli",
+                    agent_profile=agent_profile,
+                    working_directory=f"/w/{terminal_id}",
+                    last_active=datetime.now(),
+                )
+            )
+            s.commit()
+
+    def test_returns_only_the_requested_sessions(self, db):
+        """Rows for other sessions are not read — this is what bounds the query.
+
+        Rows for sessions tmux no longer reports are only swept at server
+        startup by ``cleanup_service.cleanup_old_data``, so on a long-uptime
+        server they accumulate. A whole-table read would make every caller pay
+        for them.
+        """
+        self._add(db, "a1", "cao-alpha")
+        self._add(db, "b1", "cao-beta")
+        for n in range(25):
+            self._add(db, f"dead{n:02d}", f"cao-dead-{n}")
+
+        result = list_terminals_in_sessions(["cao-alpha", "cao-beta"])
+
+        assert {t["id"] for t in result} == {"a1", "b1"}
+        assert {t["tmux_session"] for t in result} == {"cao-alpha", "cao-beta"}
+
+    def test_no_session_names_does_not_query(self, db):
+        """An empty request short-circuits rather than degenerating to a scan.
+
+        ``IN ()`` is a SQLAlchemy warning and an empty result anyway; the guard
+        makes it explicit and free.
+        """
+        self._add(db, "a1", "cao-alpha")
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal") as mock_local:
+            assert list_terminals_in_sessions([]) == []
+            mock_local.assert_not_called()
+
+    # ``indexed`` is not a detail — it is what makes this test discriminating.
+    # Without an index on ``tmux_session`` an UNORDERED read already scans in
+    # rowid order, so the unindexed case alone would pass with no ``ORDER BY``
+    # at all: it pins "not ordered by id" but not "ordered at all". The indexed
+    # case closes that, because the index makes an unordered probe return the
+    # lower-sorting worker first. Both cases are run so a reader can see which
+    # guarantee each one buys.
+    @pytest.mark.parametrize("indexed", [False, True], ids=["no_index", "with_index"])
+    def test_session_creator_is_first_not_the_lowest_uuid(self, db, indexed):
+        """The conductor wins the ownership pick even when its id sorts last.
+
+        ``_enrich_session_ownership`` takes a session's *first* terminal, so this
+        order decides which terminal's agent_profile/working_directory is
+        reported as the session's. Ordering by ``id`` would decide it by
+        ``uuid4().hex[:8]`` — a deterministic *random* terminal.
+
+        The ids are the ones from the #703 review, and the insertion order is the
+        REACHABLE one: the creator is inserted first (a child cannot be spawned
+        by a caller that has no row yet — the MCP handoff 404s on
+        ``GET /terminals/{caller_id}``) but its uuid sorts ABOVE the child's. So
+        ``ORDER BY id`` fails this, and with ``indexed`` so does no ORDER BY.
+        """
+        self._add(db, "f0000000", "cao-alpha", agent_profile="supervisor")
+        self._add(db, "10000000", "cao-alpha", agent_profile="developer")
+        if indexed:
+            with db() as s:
+                s.execute(text("CREATE INDEX ix_probe ON terminals (tmux_session, id)"))
+                s.commit()
+            # Sanity: with the index, an unordered read really does put the
+            # worker first — so this case is exercising the ORDER BY and not
+            # asserting a no-op. Which index shapes reorder is unintuitive and
+            # is a property of these ids rather than a general rule: measured
+            # for this pair, ``(tmux_session, id)`` and ``(tmux_session DESC,
+            # id)`` reorder the probe while ``(tmux_session, id DESC)`` and
+            # ``(tmux_session)`` alone do not. Hence the guard below rather than
+            # an assumption.
+            # Probe with the SAME column list the production read selects. A
+            # bare ``SELECT id`` gets a covering-index plan, which could keep
+            # reordering after the production plan stopped — leaving the real
+            # assertions below vacuous while this guard still passed.
+            with db() as s:
+                probe = [
+                    r[0]
+                    for r in s.execute(
+                        text(
+                            "SELECT id, tmux_session, tmux_window, provider, agent_profile, "
+                            "working_directory, engine, last_active FROM terminals "
+                            "WHERE tmux_session = 'cao-alpha'"
+                        )
+                    )
+                ]
+            assert (
+                probe[0] == "10000000"
+            ), "index no longer reorders; case has stopped discriminating"
+
+        for read in (
+            list_terminals_in_sessions(["cao-alpha"]),
+            list_terminals_by_session("cao-alpha"),
+        ):
+            assert [t["id"] for t in read] == ["f0000000", "10000000"]
+            assert read[0]["agent_profile"] == "supervisor"
+
+    def test_order_is_creation_order_not_recent_activity(self, db):
+        """Activity must not reorder a session. Pins the case against ``last_active``.
+
+        ``last_active`` is the obvious-looking "cleanup" for an implicit rowid
+        order — a real, declared column instead of a storage detail — and it is
+        exactly wrong. It is written only on input delivery
+        (``send_input``/``send_special_key``), so the conductor, which receives
+        operator input plus every worker callback, ends up with the LATEST value
+        and sorts LAST. ``TerminalModel`` argues this in prose; without this test
+        nothing enforces it, because every other test here happens to write
+        ``last_active`` in creation order, which makes the two orderings agree.
+
+        One keystroke to the conductor is enough to tell them apart: after it,
+        ``ORDER BY last_active`` returns the worker first while creation order
+        does not move. It also covers any write that re-inserts the row rather
+        than updating it in place (a delete-plus-insert reassigns rowid), which
+        the source-level upsert guard cannot see.
+        """
+        self._add(db, "f0000000", "cao-alpha", agent_profile="supervisor")
+        self._add(db, "10000000", "cao-alpha", agent_profile="developer")
+
+        update_last_active("f0000000")  # the conductor receives one keystroke
+
+        for read in (
+            list_terminals_in_sessions(["cao-alpha"]),
+            list_terminals_by_session("cao-alpha"),
+        ):
+            assert [t["id"] for t in read] == ["f0000000", "10000000"]
+            assert read[0]["agent_profile"] == "supervisor"
+
+    def test_rowid_reuse_after_deletion_does_not_reorder(self, db):
+        """Deleting the newest terminal and adding another keeps the creator first.
+
+        ``rowid`` is not ``AUTOINCREMENT``, so a deleted row's rowid can be handed
+        out again — the one property that could plausibly make insertion order an
+        unsafe key. It cannot invert a session's order, because SQLite assigns
+        ``max(rowid)+1`` over the whole table and so a new row outranks every
+        LIVE row, including all of its own session's.
+        """
+        self._add(db, "f0000000", "cao-alpha", agent_profile="supervisor")
+        self._add(db, "20000000", "cao-alpha", agent_profile="developer")
+        delete_terminal("20000000")  # frees the max rowid
+        self._add(db, "10000000", "cao-alpha", agent_profile="developer")
+
+        result = list_terminals_in_sessions(["cao-alpha"])
+
+        assert [t["id"] for t in result] == ["f0000000", "10000000"]
+        assert result[0]["agent_profile"] == "supervisor"
+
+    def test_matches_the_per_session_read_shape_and_order(self, db):
+        """Same keys AND same order as ``list_terminals_by_session``.
+
+        Callers are documented as interchangeable, and an ordered batched read
+        beside an unordered per-session read is exactly what let the two
+        disagree about the conductor. Uses a multi-row session whose creation
+        order disagrees with id order, so a single-row check cannot pass this by
+        proving nothing.
+        """
+        self._add(db, "zzz", "cao-alpha", agent_profile="supervisor")
+        self._add(db, "aaa", "cao-alpha")
+        # A row in ANOTHER session, so "same result" is a real claim: without it,
+        # dropping either read's session filter is indistinguishable from keeping
+        # it, and only a mock call-shape assertion elsewhere notices.
+        self._add(db, "other", "cao-beta")
+
+        batched = list_terminals_in_sessions(["cao-alpha"])
+        per_session = list_terminals_by_session("cao-alpha")
+
+        assert batched == per_session
+        assert [t["id"] for t in batched] == ["zzz", "aaa"]
+        # Keys pinned absolutely, not just against each other — a key dropped
+        # from BOTH projections would otherwise pass while breaking consumers.
+        assert set(batched[0]) == {
+            "id",
+            "tmux_session",
+            "tmux_window",
+            "provider",
+            "agent_profile",
+            "working_directory",
+            "engine",
+            "last_active",
+        }
+
+    def test_an_upsert_would_break_the_ordering_contract(self, db):
+        """Demonstrates the one operation that moves a row within its session.
+
+        ``INSERT OR REPLACE`` (and any upsert on the primary key) is a delete
+        plus an insert, so the replaced row is assigned a NEW rowid and jumps to
+        the END of its session — which would silently make a session report the
+        wrong conductor. This is not a bug being asserted as correct: it is the
+        documented limit of the ordering contract on ``TerminalModel``, pinned so
+        the consequence is visible rather than folded into a comment.
+
+        The companion guard below is what actually prevents it: this test shows
+        WHY that guard exists.
+        """
+        self._add(db, "f0000000", "cao-alpha", agent_profile="supervisor")
+        self._add(db, "10000000", "cao-alpha", agent_profile="developer")
+        assert [t["id"] for t in list_terminals_by_session("cao-alpha")] == [
+            "f0000000",
+            "10000000",
+        ]
+
+        with db() as s:
+            s.execute(
+                text(
+                    "INSERT OR REPLACE INTO terminals "
+                    "(id, tmux_session, tmux_window, provider, agent_profile) "
+                    "VALUES ('f0000000', 'cao-alpha', 'win-f0000000', 'kiro_cli', 'supervisor')"
+                )
+            )
+            s.commit()
+
+        assert [t["id"] for t in list_terminals_by_session("cao-alpha")] == [
+            "10000000",
+            "f0000000",
+        ], "an upsert must be understood to move the row; if this ever passes unchanged, re-read the contract"
+
+
+def test_no_upsert_against_the_terminals_table():
+    """No code path may upsert ``terminals`` — it would silently reassign rowid.
+
+    The ownership contract (index 0 of a terminals read is a session's oldest
+    surviving row) rests on rowid being insertion order. A replace is a delete
+    plus an insert, so the row gets a NEW rowid and jumps to the end of its
+    session, handing the conductor slot to a worker — silently, with no test
+    failing anywhere near the change. A comment on the model cannot prevent that,
+    so this scans the source instead: same shape as ``test/test_no_ffi_guard.py``,
+    a cheap structural guard for an invariant no unit test can express. Use an
+    ``UPDATE``.
+
+    Covers the three spellings that actually reassign rowid, each required to
+    name ``terminals`` directly. Deliberately does NOT cover ``Session.merge``:
+    it emits an UPDATE for an existing primary key, so the rowid — and the order
+    — survive. Verified rather than assumed.
+
+    Known limitation: a docstring that spells one of these statements verbatim
+    against ``terminals`` will trip this. ``#`` comments are skipped (which is
+    why the ``TerminalModel`` contract can discuss the hazard), so use one, or
+    break up the phrase.
+    """
+    import re
+
+    src_root = Path(__file__).resolve().parents[2] / "src"
+    assert src_root.is_dir(), src_root
+
+    quote = r"""["'`]?"""
+    upsert = re.compile(
+        # SQL text: the table name must follow the verb, so an upsert on some
+        # other table cannot be dragged in by the word "terminals" appearing
+        # nearby -- which a proximity window did, making the pre-existing
+        # workflow_run_step upsert safe only by distance.
+        rf"(?:INSERT\s+OR\s+REPLACE\s+INTO|REPLACE\s+INTO)\s+{quote}terminals\b"
+        # SQLAlchemy construct: the table is not adjacent, so fall back to
+        # requiring TerminalModel/terminals in the same statement.
+        r"|on_conflict_do_update[^\n]*",
+        re.I,
+    )
+    offenders = []
+    for path in src_root.rglob("*.py"):
+        text_ = path.read_text(encoding="utf-8", errors="replace")
+        for match in upsert.finditer(text_):
+            line_no = text_.count("\n", 0, match.start()) + 1
+            line = text_.splitlines()[line_no - 1]
+            if line.lstrip().startswith("#"):
+                continue
+            if match.group(0).lower().startswith("on_conflict") and not re.search(
+                r"TerminalModel|\bterminals\b", match.group(0), re.I
+            ):
+                continue
+            offenders.append(f"{path.relative_to(src_root)}:{line_no}: {line.strip()}")
+
+    assert not offenders, (
+        "upsert against terminals would break the ownership ordering contract "
+        "(see TerminalModel); use UPDATE instead:\n  " + "\n  ".join(offenders)
+    )

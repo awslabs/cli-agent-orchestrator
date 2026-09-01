@@ -262,6 +262,46 @@ class TestGetSkillContent:
 # ── Sessions CRUD ────────────────────────────────────────────────────
 
 
+class TestValidateResumeSessionId:
+    """Focused tests on the resume_session_id validation boundary.
+
+    This validator guards a string that is later interpolated into the
+    provider shell command (``claude --resume <sid>``); these tests pin the
+    accepted charset so a future regex edit cannot silently widen what
+    reaches the shell command.
+    """
+
+    def test_valid_ids_pass(self):
+        from cli_agent_orchestrator.api.main import _validate_resume_session_id
+
+        for value in [
+            "abcdefgh",  # 8 chars: minimum length
+            "01234567-89ab-cdef-0123-456789abcdef",  # UUID shape
+            "A1.b2_c3-d4",
+            "a" * 64,  # maximum length
+        ]:
+            _validate_resume_session_id(value)  # must not raise
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "abc defg",  # embedded space
+            "abcdefg;",  # shell separator
+            "$(whoami)x",  # command substitution
+            "abcdefg",  # 7 chars: too short
+            "a" * 65,  # 65 chars: too long
+            ".abcdefgh",  # leading dot
+            "abcdefgh\n",  # trailing newline (regex must anchor with \\Z)
+            "",  # empty
+        ],
+    )
+    def test_invalid_ids_raise(self, value):
+        from cli_agent_orchestrator.api.main import _validate_resume_session_id
+
+        with pytest.raises(ValueError):
+            _validate_resume_session_id(value)
+
+
 class TestCreateSession:
     """Tests for POST /sessions endpoint — success and error cases."""
 
@@ -304,6 +344,7 @@ class TestCreateSession:
             initial_message=None,
             initial_message_orchestration_type=None,
             model=None,
+            resume_session_id=None,
             group=None,
             metadata=None,
         )
@@ -704,6 +745,31 @@ class TestGetSession:
 
         assert response.status_code == 500
         assert "Failed to get session" in response.json()["detail"]
+
+    def test_get_session_dispatches_via_to_thread(self, client):
+        """#558: session_service.get_session() calls status_monitor.get_status() once per
+        terminal in the session, which for a PROCESSING terminal can shell out to a real
+        tmux capture-pane subprocess (the stale-PROCESSING fallback) -- a session with N
+        processing terminals would fork N times inline on the event loop per request
+        otherwise, and the web UI polls this endpoint. Pin the asyncio.to_thread wrapping
+        directly: the tests above mock session_service entirely and cannot see HOW it was
+        called, so a regression back to a bare synchronous call would stay green."""
+        mock_session = {"id": "test-session", "windows": []}
+        with (
+            patch("cli_agent_orchestrator.api.main.session_service") as mock_svc,
+            patch(
+                "cli_agent_orchestrator.api.main.asyncio.to_thread", wraps=asyncio.to_thread
+            ) as mock_to_thread,
+        ):
+            mock_svc.get_session.return_value = mock_session
+            response = client.get("/sessions/test-session")
+            get_session_calls = [
+                c for c in mock_to_thread.call_args_list if c.args[0] == mock_svc.get_session
+            ]
+
+        assert response.status_code == 200
+        assert get_session_calls, "session_service.get_session was never dispatched via to_thread"
+        assert get_session_calls[0].args[1] == "test-session"
 
 
 class TestDeleteSession:

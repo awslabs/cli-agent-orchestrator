@@ -1,6 +1,6 @@
 //! The static run-policy table: what the TUI offers, and how (issue #321).
 //!
-//! One row per leaf command of the CAO Click tree — **74 of them** — each classified `InApp`,
+//! One row per leaf command of the CAO Click tree — **75 of them** — each classified `InApp`,
 //! `Handoff`, or `Hidden`. Three infallible lookups read that table and nothing else.
 //!
 //! # No I/O, and that is the security property (SR-1)
@@ -64,11 +64,18 @@ use std::vec::Vec;
 
 /// The number of leaf commands in the CAO Click tree.
 ///
-/// **74 as of this branch.** Two separate merges from `main` each brought four new leaf commands
-/// that this table did not know about, and both were caught by
-/// `test/test_command_catalog_matches_click.py` rather than by review — the second one in CI,
+/// **75 as of this branch.** Three separate merges from `main` have now brought new leaf commands
+/// that this table did not know about — four, then four, then one — and every one was caught by
+/// `test/test_command_catalog_matches_click.py` rather than by review, the later ones in CI,
 /// because CI tests the PR MERGED against `main` while a local run only sees the branch. That is
-/// the guard doing exactly what it exists for, twice.
+/// the guard doing exactly what it exists for, three times.
+///
+/// The third was `cao workflow approve`, added to `main` by PR #650 (issue #583 Bolt 2, commit
+/// `8852d26`) while this branch was open. It is HIDE, per the same unclassified-command default:
+/// approving a plan identifier authorises later runs, which is not something the TUI's front door
+/// should offer. Note that this one arrived as a *single* leaf rather than a group of four, which
+/// is worth recording because it is the case a reviewer eyeballing a diff is least likely to
+/// notice — the count moves by one and every other number in the file stays plausible.
 ///
 /// The four `cao workflow *` leaves — `runs`, `wait`, `result`, `events` — arrived with PR #525
 /// (issue #505, commit `e2e6318`). The four `cao memory relationships *` leaves were added by
@@ -86,7 +93,7 @@ use std::vec::Vec;
 /// must not offer itself — giving **33 IN-APP / 5 HANDOFF / 23 HIDE = 61**. Recorded here
 /// because a reader comparing the design's 60 against this 61 would otherwise suspect drift.
 /// (#321)
-const COMMAND_COUNT: usize = 74;
+const COMMAND_COUNT: usize = 75;
 
 /// What the TUI does with a command.
 ///
@@ -183,7 +190,7 @@ pub struct Command {
 ///
 /// `pub(crate)` since Bolt 3: `server-client`'s route-table tests walk it to assert that every
 /// IN-APP command has a route and that no HANDOFF or HIDE command does. Deriving that set any
-/// other way would mean re-listing 74 commands in a second place, which is a worse trade than
+/// other way would mean re-listing 75 commands in a second place, which is a worse trade than
 /// widening the visibility of a compile-time constant. Still crate-private — no consumer outside
 /// this crate exists, and the table is not a public API. (#321)
 pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
@@ -249,6 +256,7 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::SkillsList,
     CommandId::SkillsRemove,
     CommandId::TerminalRestore,
+    CommandId::WorkflowApprove,
     CommandId::WorkflowCancel,
     CommandId::WorkflowDelete,
     CommandId::WorkflowEvents,
@@ -263,7 +271,7 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::WorkflowValidate,
 ];
 
-/// One variant per leaf command — **all 74**.
+/// One variant per leaf command — **all 75**.
 ///
 /// Why an enum rather than a `String` key is the subject of this module's own docs: it is what
 /// makes an unclassified command a **compile error** instead of a runtime `None` (FR-4.2).
@@ -418,6 +426,8 @@ pub enum CommandId {
     TerminalRestore,
 
     // `cao workflow *`
+    /// `cao workflow approve`
+    WorkflowApprove,
     /// `cao workflow cancel`
     WorkflowCancel,
     /// `cao workflow delete`
@@ -1122,6 +1132,20 @@ fn entry(id: CommandId) -> Command {
             // HIDE: human ruled out; recovery-by-terminal-ID tooling, not a launcher action
         },
 
+        CommandId::WorkflowApprove => Command {
+            id: CommandId::WorkflowApprove,
+            parent: Some("workflow"),
+            leaf_name: "approve",
+            summary: "Approve a plan identifier so runs of that plan may start.",
+            // Hidden per the mandated default: an unclassified command defaults to HIDE so an
+            // unvetted command cannot surface half-working. Not reviewed for in-app use, and there
+            // is a reason not to rush that review — approving a plan is a deliberate human
+            // authorisation act, and surfacing it as a one-click pane entry is exactly the shape
+            // that would make it casual. (#583 Bolt 2, approval-operation)
+            policy: Policy::Hidden,
+            params: &[Param { name: "plan_id", required: true, kind: ParamKind::Text }],
+            handoff_reason: None,
+        },
         CommandId::WorkflowCancel => Command {
             id: CommandId::WorkflowCancel,
             parent: Some("workflow"),
@@ -1337,7 +1361,7 @@ mod tests {
         counts
     }
 
-    /// Test 1 — **the policy distribution is 24 IN-APP / 18 HANDOFF / 32 HIDE, totalling 74.**
+    /// Test 1 — **the policy distribution is 24 IN-APP / 18 HANDOFF / 33 HIDE, totalling 75.**
     ///
     /// Every number here is a **hard-coded literal**, and that is the entire design of the test.
     /// Deriving any of them from the table — `assert_eq!(in_app, TABLE.iter().filter(..).count())`
@@ -1372,31 +1396,34 @@ mod tests {
     /// not. `runs`/`result` are ordinary journal reads (IN-APP); `wait`/`events` are unbounded
     /// (HANDOFF). That gave **24/18/27 = 69**. U11-A then added five local `memory vault`
     /// maintenance commands, all HIDE because no TUI or MCP path may schedule vault reads,
-    /// yielding **24/18/32 = 74**. Note what the shape of this failure was: every count here was internally
-    /// consistent and every test green, because nothing compared the table against the CLI. That
-    /// is what `test/test_command_catalog_matches_click.py` now does. (Review on PR #547.)
+    /// yielding **24/18/32 = 74**. A third merge from `main` then brought a single leaf,
+    /// `cao workflow approve` (PR #650, issue #583 Bolt 2) — HIDE, because authorising a plan
+    /// identifier is not a front-door action — giving **24/18/33 = 75**. Note what the shape of
+    /// this failure was: every count here was internally consistent and every test green, because
+    /// nothing compared the table against the CLI. That is what
+    /// `test/test_command_catalog_matches_click.py` now does. (Review on PR #547.)
     #[test]
-    fn the_policy_distribution_is_twentyfour_eighteen_thirtytwo() {
+    fn the_policy_distribution_is_twentyfour_eighteen_thirtythree() {
         let (in_app, handoff, hidden) = distribution();
 
         assert_eq!(in_app, 24, "expected 24 IN-APP commands, found {in_app}");
         assert_eq!(handoff, 18, "expected 18 HANDOFF commands, found {handoff}");
-        assert_eq!(hidden, 32, "expected 32 HIDE commands, found {hidden}");
+        assert_eq!(hidden, 33, "expected 33 HIDE commands, found {hidden}");
         assert_eq!(
             in_app + handoff + hidden,
-            74,
-            "the three policy counts must account for all 74 leaf commands of the Click tree"
+            75,
+            "the three policy counts must account for all 75 leaf commands of the Click tree"
         );
 
-        // The three counts summing to 74 does not prove 74 *distinct* commands were counted: a
+        // The three counts summing to 75 does not prove 75 *distinct* commands were counted: a
         // duplicated entry in DISPLAY_ORDER would inflate one policy while a real command went
         // uncounted, and the arithmetic above would still close. DISPLAY_ORDER is generated, so
         // this is a live hazard rather than a theoretical one.
         let distinct: BTreeSet<CommandId> = DISPLAY_ORDER.iter().copied().collect();
         assert_eq!(
             distinct.len(),
-            74,
-            "DISPLAY_ORDER must list 74 DISTINCT commands; a duplicate would let one command go \
+            75,
+            "DISPLAY_ORDER must list 75 DISTINCT commands; a duplicate would let one command go \
              uncounted while the totals still summed correctly"
         );
     }
@@ -1525,6 +1552,7 @@ mod tests {
                     CommandId::SkillsList => CommandId::SkillsList,
                     CommandId::SkillsRemove => CommandId::SkillsRemove,
                     CommandId::TerminalRestore => CommandId::TerminalRestore,
+                    CommandId::WorkflowApprove => CommandId::WorkflowApprove,
                     CommandId::WorkflowCancel => CommandId::WorkflowCancel,
                     CommandId::WorkflowDelete => CommandId::WorkflowDelete,
                     CommandId::WorkflowEvents => CommandId::WorkflowEvents,
@@ -1604,6 +1632,7 @@ mod tests {
                 CommandId::SkillsList,
                 CommandId::SkillsRemove,
                 CommandId::TerminalRestore,
+                CommandId::WorkflowApprove,
                 CommandId::WorkflowCancel,
                 CommandId::WorkflowDelete,
                 CommandId::WorkflowEvents,

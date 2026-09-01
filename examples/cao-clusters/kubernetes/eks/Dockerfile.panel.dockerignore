@@ -1,0 +1,17 @@
+# Build context for examples/cao-clusters/kubernetes/eks/Dockerfile.panel only.
+#
+# BuildKit prefers `<dockerfile-path>.dockerignore` over the context-root
+# `.dockerignore`, which is what this file exists for. The root file excludes
+# `examples` outright to keep the cao-server context small, and that exclusion
+# would leave the panel's own source out of its own image. Rather than loosening
+# the root file for every build, this narrows the context to just the panel.
+#
+# Excludes everything, then re-includes only the two directories the panel image
+# copies. Ordering matters: the last matching pattern wins.
+**
+!examples/fleet/panel/app
+!examples/fleet/panel/static
+examples/fleet/panel/**/__pycache__
+examples/fleet/panel/**/*.pyc
+examples/fleet/panel/static/test
+examples/fleet/panel/static/package.json

@@ -42,10 +42,16 @@ class ProviderManager:
         skill_prompt: Optional[str] = None,
         model: Optional[str] = None,
         engine: Optional[KiroEngine] = None,
+        resume_session_id: Optional[str] = None,
     ) -> BaseProvider:
         """Create and store provider instance."""
         try:
             provider: BaseProvider
+            if resume_session_id and provider_type != ProviderType.CLAUDE_CODE.value:
+                raise ValueError(
+                    "resume_session_id is only supported by the claude_code provider "
+                    f"(got provider '{provider_type}')"
+                )
             if provider_type == ProviderType.KIRO_CLI.value:
                 if not agent_profile:
                     raise ValueError("Kiro CLI provider requires agent_profile parameter")
@@ -70,6 +76,7 @@ class ProviderManager:
                     allowed_tools,
                     skill_prompt=skill_prompt,
                     model=model,
+                    resume_session_id=resume_session_id,
                 )
             elif provider_type == ProviderType.CODEX.value:
                 provider = CodexProvider(

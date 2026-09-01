@@ -184,7 +184,7 @@ async def test_omitted_engine_launches_as_explicitly_pinned_v2():
         )
 
     assert terminal.engine == KiroEngine.V2
-    probe.assert_called_once_with(KiroEngine.V2, {"profile", "trust", "ui"})
+    probe.assert_called_once_with(KiroEngine.V2, {"profile", "trust"})
     assert providers.create_provider.call_args.kwargs["engine"] == KiroEngine.V2
     assert db_create.call_args.kwargs["engine"] == "v2"
 
@@ -238,8 +238,14 @@ async def test_explicit_model_override_is_probed_even_when_profile_has_none():
 
 
 @pytest.mark.asyncio
-async def test_non_yolo_v2_missing_legacy_ui_rejects_before_allocation():
-    """The optional fallback flag is probed before any v2 lifecycle allocation."""
+async def test_v2_launches_on_a_wrapper_that_does_not_advertise_legacy_ui():
+    """A wrapper without --legacy-ui is fully usable and must not be rejected.
+
+    CAO no longer has a legacy-UI retry to fall back to, so the flag is not a
+    requested capability. It cannot be one: --legacy-ui conflicts with
+    --agent-engine=v2 and its bare form selects the v1 engine, which serves no
+    MCP tools at all.
+    """
 
     def missing_ui_probe(engine: KiroEngine, requested: set[str]) -> KiroCapabilities:
         def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
@@ -254,31 +260,33 @@ async def test_non_yolo_v2_missing_legacy_ui_rejects_before_allocation():
 
     probe = Mock(side_effect=missing_ui_probe)
     profile = AgentProfile(name="developer", description="Developer")
+    provider = MagicMock()
+    provider.initialize = AsyncMock(return_value=True)
+    provider.shell_baseline = None
 
     with (
         patch(f"{_MODULE}.load_agent_profile", return_value=profile),
         patch(f"{_MODULE}.get_backend") as backend,
-        patch(f"{_MODULE}.db_create_terminal") as db_create,
-        patch(f"{_MODULE}.fifo_manager") as fifo,
+        patch(f"{_MODULE}.db_create_terminal"),
+        patch(f"{_MODULE}.delete_terminals_by_session"),
+        patch(f"{_MODULE}.fifo_manager"),
         patch(f"{_MODULE}.provider_manager") as providers,
+        patch(f"{_MODULE}.get_herdr_inbox_service", return_value=None),
     ):
-        with pytest.raises(KiroCapabilityError, match="--legacy-ui") as exc_info:
-            await create_terminal(
-                provider="kiro_cli",
-                agent_profile="developer",
-                new_session=True,
-                kiro_capability_probe=probe,
-            )
+        backend.return_value.session_exists.return_value = False
+        backend.return_value.supports_event_inbox.return_value = True
+        providers.create_provider.return_value = provider
 
-    assert exc_info.value.kind == "unsupported_capability"
-    assert exc_info.value.engine == KiroEngine.V2
-    assert exc_info.value.capability == "--legacy-ui"
-    probe.assert_called_once_with(KiroEngine.V2, {"profile", "trust", "ui"})
-    backend.return_value.create_session.assert_not_called()
-    backend.return_value.create_window.assert_not_called()
-    db_create.assert_not_called()
-    fifo.create_reader.assert_not_called()
-    providers.create_provider.assert_not_called()
+        terminal = await create_terminal(
+            provider="kiro_cli",
+            agent_profile="developer",
+            new_session=True,
+            kiro_capability_probe=probe,
+        )
+
+    # The probe ran against help text WITHOUT --legacy-ui and still allocated.
+    assert terminal.engine == KiroEngine.V2
+    probe.assert_called_once_with(KiroEngine.V2, {"profile", "trust"})
 
 
 @pytest.mark.asyncio
@@ -321,7 +329,7 @@ async def test_yolo_v2_prose_only_trust_flag_rejects_before_allocation():
     assert exc_info.value.kind == "unsupported_capability"
     assert exc_info.value.engine == KiroEngine.V2
     assert exc_info.value.capability == "--trust-all-tools"
-    probe.assert_called_once_with(KiroEngine.V2, {"profile", "ui", "trust"})
+    probe.assert_called_once_with(KiroEngine.V2, {"profile", "trust"})
     backend.return_value.create_session.assert_not_called()
     backend.return_value.create_window.assert_not_called()
     db_create.assert_not_called()
@@ -367,7 +375,7 @@ async def test_yolo_v2_required_value_trust_flag_rejects_before_allocation():
     assert exc_info.value.kind == "unsupported_capability"
     assert exc_info.value.engine == KiroEngine.V2
     assert exc_info.value.capability == "--trust-all-tools"
-    probe.assert_called_once_with(KiroEngine.V2, {"profile", "ui", "trust"})
+    probe.assert_called_once_with(KiroEngine.V2, {"profile", "trust"})
     terminal_id.assert_not_called()
     backend.return_value.create_session.assert_not_called()
     backend.return_value.create_window.assert_not_called()
@@ -412,7 +420,7 @@ async def test_v2_agent_engine_value_exclusion_rejects_before_allocation():
     assert exc_info.value.kind == "unsupported_capability"
     assert exc_info.value.engine == KiroEngine.V2
     assert exc_info.value.capability == "--agent-engine=v2"
-    probe.assert_called_once_with(KiroEngine.V2, {"profile", "trust", "ui"})
+    probe.assert_called_once_with(KiroEngine.V2, {"profile", "trust"})
     backend.return_value.create_session.assert_not_called()
     backend.return_value.create_window.assert_not_called()
     db_create.assert_not_called()

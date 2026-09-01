@@ -391,8 +391,12 @@ def test_binding_aware_query_helpers_default_to_native_without_call_site_changes
             # than weakening a native-default query.
             assert len(source_kind_keywords) == 1
             source_kind_value = source_kind_keywords[0].value
+            # Either injection entry point: PR #693 extracted
+            # `get_memory_context(terminal_context)` out of
+            # `get_memory_context_for_terminal(terminal_id)` for elastic worker
+            # nodes, moving this dual-source query into the new name.
             explicit_renderer_source = (
-                current.name == "get_memory_context_for_terminal"
+                current.name in {"get_memory_context", "get_memory_context_for_terminal"}
                 and isinstance(source_kind_value, ast.Constant)
                 and source_kind_value.value in {"native", "vault"}
             )

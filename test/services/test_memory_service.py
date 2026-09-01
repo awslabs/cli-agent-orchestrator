@@ -1181,6 +1181,83 @@ class TestSessionScopeIdRoundTrip:
         results_all = await svc.recall(scope="session", terminal_context=None, scan_all=True)
         assert {m.key for m in results_all} == {"a-key", "b-key"}
 
+    @pytest.mark.asyncio
+    async def test_unscoped_recall_isolates_private_scope_ids(self, tmp_path):
+        """An unscoped worker recall cannot enumerate other private contexts."""
+        svc = MemoryService(base_dir=tmp_path)
+        ctx_a = _make_terminal_context(
+            cwd=str(tmp_path / "project"),
+            session_name="session-a",
+            agent_profile="agent-a",
+        )
+        ctx_b = _make_terminal_context(
+            cwd=str(tmp_path / "project"),
+            session_name="session-b",
+            agent_profile="agent-b",
+        )
+
+        for key, scope, ctx in (
+            ("session-a-key", "session", ctx_a),
+            ("session-b-key", "session", ctx_b),
+            ("agent-a-key", "agent", ctx_a),
+            ("agent-b-key", "agent", ctx_b),
+            ("project-key", "project", ctx_a),
+            ("global-key", "global", None),
+        ):
+            await svc.store(
+                content=f"content for {key}",
+                scope=scope,
+                memory_type="reference",
+                key=key,
+                terminal_context=ctx,
+            )
+
+        results = await svc.recall(
+            terminal_context=ctx_a,
+            search_mode="metadata",
+            limit=20,
+        )
+        assert {m.key for m in results} == {
+            "session-a-key",
+            "agent-a-key",
+            "project-key",
+            "global-key",
+        }
+
+        results_all = await svc.recall(
+            terminal_context=ctx_a,
+            scan_all=True,
+            search_mode="metadata",
+            limit=20,
+        )
+        assert {m.key for m in results_all} == {
+            "session-a-key",
+            "session-b-key",
+            "agent-a-key",
+            "agent-b-key",
+            "project-key",
+            "global-key",
+        }
+
+    @pytest.mark.asyncio
+    async def test_context_without_private_identity_denies_that_tier(self, tmp_path):
+        svc = MemoryService(base_dir=tmp_path)
+        owner_ctx = _make_terminal_context(session_name="session-a", agent_profile="agent-a")
+        await svc.store(
+            content="private session content",
+            scope="session",
+            memory_type="reference",
+            key="session-key",
+            terminal_context=owner_ctx,
+        )
+
+        results = await svc.recall(
+            scope="session",
+            terminal_context={"cwd": owner_ctx["cwd"]},
+            search_mode="metadata",
+        )
+        assert results == []
+
 
 # ===========================================================================
 # FEDERATED scope (issue #313) — machine-wide shared tier

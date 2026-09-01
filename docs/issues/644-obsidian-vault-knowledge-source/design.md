@@ -937,7 +937,7 @@ is in [test-strategy.md](test-strategy.md).
 | `graph/sinks/obsidian.py` | Unchanged, plus one validation rule: an export `dest` resolving under a configured vault root is refused, so a projection can never be mistaken for a source |
 | `settings_service.py` / `config_service.py` | `get_vault_config()`, `MemoryConfig.vault`, one env var |
 | `cli/commands/memory.py` | New `vault` sub-group |
-| `tui/src/catalog.rs` | New `CommandId` variants, `COMMAND_COUNT` 69 to 74, `DISPLAY_ORDER`, both exhaustive matches, doc-comment counts |
+| `tui/src/catalog.rs` | New `CommandId` variants, `COMMAND_COUNT` +5 (70 to 75 after merging `main`; 69 to 74 when this was written), `DISPLAY_ORDER`, both exhaustive matches, doc-comment counts |
 | `mcp_server/server.py` | `memory_recall` result gains the source fields; `memory_forget` gains `action`/`path` and its docstring is corrected. No new MCP tool |
 | `api/main.py` | `MemorySummary`/`MemoryDetail` gain the source fields; read-only `GET /memory/vault/status` |
 | `skills/cao-memory/SKILL.md` **and** `src/cli_agent_orchestrator/skills/cao-memory/SKILL.md` | Forget wording corrected; vault section added. Byte-identical via `python scripts/sync_skills.py` |

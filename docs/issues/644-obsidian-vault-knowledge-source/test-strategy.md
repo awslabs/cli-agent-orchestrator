@@ -394,7 +394,7 @@ one `tmp_path` vault, following `test/services/test_memory_durability_and_concur
 
 | Guard | Tripped by | Required action |
 | --- | --- | --- |
-| `test/test_command_catalog_matches_click.py` | U11's five CLI leaves | Update `tui/src/catalog.rs`: `CommandId`, `COMMAND_COUNT` 69 to 74, `DISPLAY_ORDER`, both exhaustive matches, module doc-comment counts — same pull request |
+| `test/test_command_catalog_matches_click.py` | U11's five CLI leaves | Update `tui/src/catalog.rs`: `CommandId`, `COMMAND_COUNT` +5 (70 to 75 after merging `main`), `DISPLAY_ORDER`, both exhaustive matches, module doc-comment counts — same pull request. The absolute number is a moving target: `main` added `cao workflow approve` while this branch was open, so only the +5 delta is this branch's |
 | **`test/test_skill_packaging_parity.py`** | U8's `forget()` wording change and U12's vault section | Edit via `python scripts/sync_skills.py`; both `skills/cao-memory/SKILL.md` and `src/cli_agent_orchestrator/skills/cao-memory/SKILL.md` must stay byte-identical under `filecmp.cmp` |
 | `test/test_fixtures_no_personal_pii.py` | The factory, if any address is not `@example.com` | Use `user@example.com` only |
 | `test/clients/test_memory_relationships_migration.py` | U5, if it edits `_backfill_legacy_related_keys` | Do not edit that function; its source text is hashed at line 119. Adding `vault` to `VALID_ORIGINS` does not touch it |

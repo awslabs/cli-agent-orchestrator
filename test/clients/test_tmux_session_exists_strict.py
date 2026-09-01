@@ -259,11 +259,18 @@ class TestConfirmedAnswers:
         """
         _start_session(tmux_socket, "cao-alive")
         client = _client_on(tmux_socket)
+        server_pid = _server_pid(tmux_socket)
         assert client.session_exists_strict("cao-alive") is True
 
         subprocess.run(
             ["tmux", "-S", str(tmux_socket), "kill-server"], capture_output=True, check=True
         )
+        # kill-server returns once the kill is delivered, not once the server is
+        # gone. A list-sessions that connects while it is still tearing down is
+        # answered "server exited unexpectedly", which is neither of the markers
+        # this vector is meant to exercise, so the lookup fails closed and the
+        # test flakes. Wait for the process the way every other kill here does.
+        assert _wait_until(lambda: not _process_is_alive(server_pid))
 
         assert client.session_exists_strict("cao-alive") is False
 

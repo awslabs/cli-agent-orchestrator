@@ -185,23 +185,35 @@ def test_injected_context_call_sites_explicitly_name_their_consumer():
     """Every injection entry point must opt into the non-waivable consumer gate."""
     path = SOURCE_ROOT / "services" / "memory_service.py"
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    renderer = next(
+    # BOTH entry points, because the injection body has already moved between
+    # them once: PR #693 extracted `get_memory_context(terminal_context)` out of
+    # `get_memory_context_for_terminal(terminal_id)` so an elastic worker node
+    # could supply its own context, leaving the older name a delegator with zero
+    # candidate calls in it. The
+    # `>= 2` floor below is what turned that refactor into a visible failure
+    # instead of a guard that inspected an empty function and passed — which is
+    # the whole reason the floor is asserted separately from `violations`.
+    entry_point_names = {"get_memory_context", "get_memory_context_for_terminal"}
+    renderers = [
         node
         for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name == "get_memory_context_for_terminal"
-    )
+        if isinstance(node, ast.FunctionDef) and node.name in entry_point_names
+    ]
+    assert renderers, f"no injection entry point found; {entry_point_names} were all renamed"
+
     injected_calls: list[str] = []
     violations: list[str] = []
-    for node in ast.walk(renderer):
-        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
-            continue
-        if node.func.attr not in {"_vault_candidates", "_load_related_vault_memory"}:
-            continue
-        location = f"memory_service.py:{node.lineno}"
-        injected_calls.append(node.func.attr)
-        consumer = next((item.value for item in node.keywords if item.arg == "consumer"), None)
-        if not isinstance(consumer, ast.Constant) or consumer.value != "injected_context":
-            violations.append(location)
+    for renderer in renderers:
+        for node in ast.walk(renderer):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            if node.func.attr not in {"_vault_candidates", "_load_related_vault_memory"}:
+                continue
+            location = f"memory_service.py:{node.lineno}"
+            injected_calls.append(node.func.attr)
+            consumer = next((item.value for item in node.keywords if item.arg == "consumer"), None)
+            if not isinstance(consumer, ast.Constant) or consumer.value != "injected_context":
+                violations.append(location)
 
     assert len(injected_calls) >= 2
     assert violations == []
