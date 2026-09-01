@@ -101,7 +101,7 @@ from cli_agent_orchestrator.models.memory import (
     MemoryScopeId,
     MemoryType,
 )
-from cli_agent_orchestrator.models.terminal import Terminal, TerminalId
+from cli_agent_orchestrator.models.terminal import Terminal, TerminalId, TerminalLimitError
 from cli_agent_orchestrator.models.workflow import RecoveryPolicy
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.base import OutputExtractionError
@@ -159,6 +159,7 @@ from cli_agent_orchestrator.services.terminal_service import (
     TERMINAL_RANGE_MAX_LENGTH,
     OutputMode,
     TerminalInputBlockedError,
+    _notify_elastic_terminal_ended,
 )
 from cli_agent_orchestrator.services.workflow_journal import (
     _TERMINAL_RUN_STATES as _JOURNAL_TERMINAL_RUN_STATES,
@@ -2984,6 +2985,10 @@ async def create_session(
 
         return result
 
+    except TerminalLimitError as e:
+        # Node is at its tracked-terminal cap (CAO_MAX_TERMINALS) — a capacity
+        # rejection, not a bad request: the caller should retry on another node.
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:
@@ -3018,7 +3023,13 @@ async def get_session(
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     try:
-        return session_service.get_session(session_name)
+        # session_service.get_session() calls status_monitor.get_status() once per
+        # terminal in the session, which for a PROCESSING terminal can shell out to a
+        # real tmux capture-pane subprocess (the stale-PROCESSING fallback). A session
+        # with N processing terminals would otherwise fork N times inline on the event
+        # loop per request — and the web UI polls this endpoint. Run it off the loop,
+        # matching GET /terminals/{id}'s established pattern for the identical hazard.
+        return await asyncio.to_thread(session_service.get_session, session_name)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -3199,6 +3210,11 @@ async def create_terminal_in_session(
         # a rejected engine is a bad request, not a missing resource. Matches
         # POST /sessions, which already returns 400 for the identical failure.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except TerminalLimitError as e:
+        # Node is at its tracked-terminal cap (CAO_MAX_TERMINALS) — a capacity
+        # rejection, not a bad request or a missing session: the caller should
+        # retry on another node.
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except WorktreeError as e:
@@ -3215,7 +3231,20 @@ async def create_terminal_in_session(
 
 @app.get("/sessions/{session_name}/terminals")
 async def list_terminals_in_session(session_name: str) -> List[Dict]:
-    """List all terminals in a session."""
+    """List a session's terminals, oldest first.
+
+    The order is significant and part of this endpoint's contract: **index 0 is
+    the session's oldest surviving terminal**, which is normally its conductor.
+    `cao session status` and `cao session list` rely on it to label the
+    Conductor, and they reach it through this endpoint rather than the database,
+    so the guarantee has to be stated here too.
+
+    "Normally" is deliberate: if the conductor's own terminal is deleted while
+    the session lives on, index 0 becomes the oldest remaining worker. Treat it
+    as best-effort rather than as an identity. Clients needing a different order
+    (most-recently-active first, say) should sort client-side on `last_active`
+    rather than assume this one will change.
+    """
     try:
         validate_tmux_name(session_name, "session_name")
     except ValueError as e:
@@ -3586,6 +3615,17 @@ async def exit_terminal(
         )
 
 
+def _schedule_elastic_terminal_ended(
+    background_tasks: BackgroundTasks,
+    terminal_id: str,
+    *,
+    teardown: bool,
+    reuse_terminal_id: Optional[str],
+) -> None:
+    if teardown and reuse_terminal_id is None:
+        background_tasks.add_task(_notify_elastic_terminal_ended, terminal_id)
+
+
 @app.post(
     TERMINALS_RUN_STEP_ROUTE,
     response_model=RunStepResponse,
@@ -3602,6 +3642,7 @@ async def exit_terminal(
 )
 async def run_step(
     request: Request,
+    background_tasks: BackgroundTasks,
     body: RunStepRequest,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> RunStepResponse:
@@ -3912,6 +3953,12 @@ async def run_step(
             result.status.value if hasattr(result.status, "value") else str(result.status)
         )
         _settle_step(result.terminal_id, None, result.last_message, response_status)
+        _schedule_elastic_terminal_ended(
+            background_tasks,
+            result.terminal_id,
+            teardown=body.teardown,
+            reuse_terminal_id=body.reuse_terminal_id,
+        )
         return RunStepResponse(
             terminal_id=result.terminal_id,
             last_message=result.last_message,
@@ -4006,6 +4053,12 @@ async def run_step(
         # plain-string detail, no ``kind``), not 404 (issue #570).
         _settle_step(None, str(e))
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+    except TerminalLimitError as e:
+        # The node is at its tracked-terminal cap (CAO_MAX_TERMINALS) — surfaced
+        # as 429 so a step scheduler can retry on a different node instead of
+        # reading a kind-less 500.
+        _settle_step(None, str(e))
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
     except ValueError as e:
         # Unknown terminal / bad input surfaced by the terminal layer.
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -6457,7 +6510,12 @@ async def create_inbox_message_endpoint(
     # Attempt immediate delivery if terminal is already IDLE.
     # If not, InboxService will deliver on next IDLE status event.
     try:
-        inbox_service.deliver_pending(receiver_id, registry=get_plugin_registry(request))
+        # deliver_pending reads status_monitor.get_status() (which can fork a tmux
+        # capture-pane via the stale-PROCESSING fallback) and, on delivery, paste-bombs
+        # the pane — blocking I/O either way, so keep it off the event loop.
+        await asyncio.to_thread(
+            inbox_service.deliver_pending, receiver_id, registry=get_plugin_registry(request)
+        )
     except Exception as e:
         logger.warning(f"Immediate delivery attempt failed for {receiver_id}: {e}")
 
@@ -6954,6 +7012,146 @@ def _get_memory_service():
     from cli_agent_orchestrator.services.memory_service import MemoryService
 
     return MemoryService()
+
+
+def _memory_partial_write_response(error: Any) -> JSONResponse:
+    """Preserve the typed partial-write contract across the HTTP boundary."""
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={
+            "error_kind": error.error_kind,
+            "partial_write": {
+                "key": error.key,
+                "scope": error.scope,
+                "scope_id": error.scope_id,
+                "file_path": error.file_path,
+                "completed_phases": error.completed_phases,
+                "repair_command": error.repair_command,
+            },
+        },
+    )
+
+
+class InternalMemoryContext(BaseModel):
+    terminal_id: Optional[str] = None
+    session_name: Optional[str] = None
+    provider: Optional[str] = None
+    agent_profile: Optional[str] = None
+    cwd: Optional[str] = None
+
+
+class InternalMemoryStoreRequest(BaseModel):
+    content: str
+    scope: MemoryScope = MemoryScope.PROJECT
+    memory_type: MemoryType = MemoryType.PROJECT
+    key: Optional[MemoryKey] = None
+    tags: str = ""
+    terminal_context: Optional[InternalMemoryContext] = None
+
+
+class InternalMemoryRecallRequest(BaseModel):
+    query: Optional[str] = None
+    scope: Optional[MemoryScope] = None
+    memory_type: Optional[MemoryType] = None
+    limit: int = Field(default=10, ge=1, le=100)
+    terminal_context: Optional[InternalMemoryContext] = None
+    search_mode: str = "hybrid"
+    sort_by: str = "recency"
+    include_related: bool = False
+
+
+class InternalMemoryForgetRequest(BaseModel):
+    key: MemoryKey
+    scope: MemoryScope = MemoryScope.PROJECT
+    terminal_context: Optional[InternalMemoryContext] = None
+
+
+class InternalMemoryInjectionRequest(BaseModel):
+    terminal_context: InternalMemoryContext
+    budget_chars: int = Field(default=3000, ge=0, le=20000)
+
+
+@app.post("/internal/memory/store")
+async def internal_memory_store(
+    body: InternalMemoryStoreRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Any:
+    """Store memory on this node for a remote CAO worker."""
+    from cli_agent_orchestrator.services.memory_service import MemoryPartialWriteError
+
+    _require_memory_enabled()
+    try:
+        memory = await _get_memory_service().store(
+            content=body.content,
+            scope=body.scope.value,
+            memory_type=body.memory_type.value,
+            key=body.key,
+            tags=body.tags,
+            terminal_context=(
+                body.terminal_context.model_dump(exclude_none=True)
+                if body.terminal_context
+                else None
+            ),
+        )
+    except MemoryPartialWriteError as error:
+        return _memory_partial_write_response(error)
+    return {
+        "memory": memory.model_dump(mode="json"),
+        "action": memory.action,
+    }
+
+
+@app.post("/internal/memory/recall")
+async def internal_memory_recall(
+    body: InternalMemoryRecallRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Recall memory using context resolved by a remote worker node."""
+    _require_memory_enabled()
+    memories = await _get_memory_service().recall(
+        query=body.query,
+        scope=body.scope.value if body.scope else None,
+        memory_type=body.memory_type.value if body.memory_type else None,
+        limit=body.limit,
+        terminal_context=(
+            body.terminal_context.model_dump(exclude_none=True) if body.terminal_context else None
+        ),
+        search_mode=body.search_mode,
+        sort_by=body.sort_by,
+        include_related=body.include_related,
+    )
+    return {"memories": [memory.model_dump(mode="json") for memory in memories]}
+
+
+@app.post("/internal/memory/forget")
+async def internal_memory_forget(
+    body: InternalMemoryForgetRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Forget memory using context resolved by a remote worker node."""
+    _require_memory_enabled()
+    deleted = await _get_memory_service().forget(
+        key=body.key,
+        scope=body.scope.value,
+        terminal_context=(
+            body.terminal_context.model_dump(exclude_none=True) if body.terminal_context else None
+        ),
+    )
+    return {"deleted": deleted}
+
+
+@app.post("/internal/memory/context")
+async def internal_memory_context(
+    body: InternalMemoryInjectionRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, str]:
+    """Build the startup memory block for a terminal owned by another node."""
+    _require_memory_enabled()
+    context = _get_memory_service().get_memory_context(
+        body.terminal_context.model_dump(exclude_none=True),
+        budget_chars=body.budget_chars,
+    )
+    return {"context": context}
 
 
 def _require_memory_enabled() -> None:

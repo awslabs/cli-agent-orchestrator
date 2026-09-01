@@ -1,0 +1,407 @@
+# NetworkPolicy — restrict access to worker pods' port 9889.
+# Only the supervisor can reach workers.
+# This is critical: cao-server is an unauthenticated command-execution surface;
+# NetworkPolicy is the minimum trust boundary in k8s.
+#
+# These select `app.kubernetes.io/name: cao-elastic-worker`, the label broker.py
+# stamps on every Job it mints — so a worker that exists for 40 seconds is
+# covered from the moment it starts, with nothing to apply per task. The
+# kubelet's readiness probe to 9889 is not affected by an ingress policy;
+# verified on this cluster, where probes succeed under exactly these rules.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cao-worker-ingress
+  namespace: cao-cluster
+  labels:
+    app.kubernetes.io/part-of: cao-fleet
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: cao-elastic-worker
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # Allow supervisor to reach workers (remote agent placement via
+        # assign/handoff target_host)
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cao-supervisor
+        # The panel probes every node in its fleet registry to build the view.
+        # Without this it renders the node as permanently unreachable.
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cao-fleet-panel
+      ports:
+        - port: 9889
+          protocol: TCP
+---
+# NetworkPolicy — ingress to the broker's lease API.
+#
+# Two callers, and both are needed for a lease to complete its cycle:
+#   supervisor      POST /workers        to take a lease (assign_elastic)
+#   elastic worker  completion, terminal-ended, inbox and memory gateway calls
+#
+# Leaving the worker out is a tempting simplification and a bad one: the worker's
+# release call would be dropped, the reaper would eventually mark the lease
+# `expired`, and every delegation would look like it timed out 900s after a task
+# that actually finished in 40s.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cao-broker-ingress
+  namespace: cao-cluster
+  labels:
+    app.kubernetes.io/part-of: cao-fleet
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: cao-worker-broker
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cao-supervisor
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cao-elastic-worker
+      ports:
+        - port: 9890
+          protocol: TCP
+---
+# NetworkPolicy — egress FROM the broker.
+#
+# Deliberately NOT a copy of the agent egress rules. The broker runs no agent and
+# holds no credentials, so it needs neither vendor HTTPS nor the Pod Identity
+# endpoint — it needs DNS, the Kubernetes API server, and one fixed path to the
+# supervisor pod for its allowlisted worker gateway. That makes it the most
+# tightly bounded pod in the namespace despite being the only one that can
+# create another pod.
+#
+# The API server rule is the subtle part. Copying the agents' `0.0.0.0/0` +
+# private-range-`except` rule onto the broker BLOCKS it: `kubernetes.default`
+# resolves to 172.20.0.1, inside the 172.16.0.0/12 carve-out, and the control
+# plane ENIs the traffic actually lands on are inside the VPC CIDR carve-out. The
+# broker's own /health does not touch the API server, so it would come up Ready
+# and then fail every single lease request — a healthy pod that cannot do its
+# job. Hence an explicit allow, rendered from the stack's VpcCidrBlock output.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cao-broker-egress
+  namespace: cao-cluster
+  labels:
+    app.kubernetes.io/part-of: cao-fleet
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: cao-worker-broker
+  policyTypes:
+    - Egress
+  egress:
+    # Narrow gateway upstream. Workers cannot reach the supervisor directly;
+    # the broker authenticates their per-worker release token and forwards only
+    # the explicit inbox and memory routes.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cao-supervisor
+      ports:
+        - port: 9889
+          protocol: TCP
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # Kubernetes API server: Job and Service create/delete, pod status polling.
+    # The service ClusterIP and the in-VPC control plane ENIs are both reached
+    # through this rule.
+    - to:
+        - ipBlock:
+            cidr: <vpc-cidr>
+        - ipBlock:
+            cidr: 172.20.0.0/16
+      ports:
+        - port: 443
+          protocol: TCP
+---
+# NetworkPolicy — restrict egress FROM worker pods. A worker agent has command
+# execution by design; bounding its egress to intra-namespace traffic + DNS
+# limits what a prompt-injected or misbehaving agent can exfiltrate to.
+#
+# SECURITY: this egress policy is also the SSRF mitigation for the injected
+# callback route — a worker's CAO_CALLBACK_URL env var arrives from its
+# creator and the worker will POST to it, so egress bounds where such a URL
+# can actually reach (intra-namespace only, by default).
+#
+# NOTE: the provider CLI calls an HTTPS endpoint (for claude_code on Bedrock,
+# bedrock-runtime in this region), so an egress rule for it is required — see the
+# ipBlock rule below, and the caveats attached to it. Narrowing that rule to the
+# service's published ranges, or routing it through an authenticating egress
+# proxy, is what would turn it from a reachability bound into an exfiltration
+# bound.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cao-worker-egress
+  namespace: cao-cluster
+  labels:
+    app.kubernetes.io/part-of: cao-fleet
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: cao-elastic-worker
+  policyTypes:
+    - Egress
+  egress:
+    # Intra-namespace: the authenticated broker gateway and peer services.
+    # The supervisor's ingress policy independently rejects worker pods.
+    - to:
+        - podSelector: {}
+    # DNS: workers resolve the supervisor's/peers' service DNS names.
+    # The k8s-app=kube-dns label matches CoreDNS/kube-dns on EKS and most
+    # kubeadm clusters; other distros may label their DNS pods differently
+    # (e.g. Rancher/k3s) — adjust the selector to your cluster's DNS pods.
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # Provider API egress (required once a REAL provider replaces mock_cli —
+    # claude_code calls bedrock-runtime over HTTPS; with only the two rules above
+    # a worker agent hangs with no network error, which looks like a CAO bug
+    # rather than a policy denial).
+    #
+    # This is public-internet HTTPS only, with the private ranges and the
+    # instance metadata endpoint carved back out. That keeps the property the
+    # egress policy exists for: CAO_CALLBACK_URL arrives from a worker's
+    # creator and the worker POSTs to it, so a hostile/injected URL still
+    # cannot reach another VPC service, a peered network, or IMDS to steal the
+    # node role's credentials. Intra-namespace traffic is unaffected — it is
+    # allowed by the podSelector rule above, not by this ipBlock.
+    #
+    # Two caveats before treating this as a tight boundary:
+    #   - It is still egress to the whole public internet on 443, so it does
+    #     NOT stop exfiltration to an attacker-controlled host. Narrow `cidr`
+    #     to the vendor's published ranges, or route through an authenticating
+    #     egress proxy, if that matters for your threat model.
+    #   - `except` must actually be honoured by your CNI's policy engine.
+    #     Verified on this cluster (AWS VPC CNI, network policy enforcement
+    #     enabled): public 443 succeeds while 169.254.169.254 and in-VPC
+    #     private addresses are refused. Re-verify after a CNI upgrade.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+      ports:
+        - port: 443
+          protocol: TCP
+    # EKS Pod Identity credential endpoint. Claude Code signs Bedrock requests
+    # with SigV4, so the pod must be able to fetch credentials — and this is the
+    # ONE hole that has to be punched in the link-local block above.
+    #
+    # It is deliberately a /32 on port 80 rather than a relaxation of the
+    # 169.254.0.0/16 carve-out. The two link-local addresses that matter are
+    # adjacent but not equivalent:
+    #
+    #   169.254.170.23  Pod Identity Agent — hands out THIS pod's scoped
+    #                   credentials, whose only permission is Bedrock invoke.
+    #   169.254.169.254 IMDS — hands out the NODE ROLE's credentials, which
+    #                   include ECR pull and the VPC CNI's ENI permissions.
+    #                   Stays blocked.
+    #
+    # Widening this to 169.254.0.0/16 would hand a prompt-injected agent the node
+    # role, which is a materially worse position than the pod role. Plain HTTP is
+    # correct here: the endpoint is on the node itself and is not reachable off-host.
+    - to:
+        - ipBlock:
+            cidr: 169.254.170.23/32
+      ports:
+        - port: 80
+          protocol: TCP
+---
+# NetworkPolicy — restrict access to supervisor pod.
+# Workers deliberately cannot reach this port. Their callbacks and shared-memory
+# calls go to the broker's authenticated, allowlisted gateway; only the broker
+# can forward those requests here.
+#
+# The panel still needs the full API for fleet probes. The broker runs no agent
+# and forwards only five fixed routes, so it is the narrow application-layer
+# boundary NetworkPolicy itself cannot express.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cao-supervisor-ingress
+  namespace: cao-cluster
+  labels:
+    app.kubernetes.io/part-of: cao-fleet
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: cao-supervisor
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cao-worker-broker
+        # The panel probes every node in its fleet registry to build the view.
+        # Without this it renders the node as permanently unreachable.
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cao-fleet-panel
+      ports:
+        - port: 9889
+          protocol: TCP
+---
+# NetworkPolicy — restrict egress FROM the supervisor pod.
+#
+# This exists because the worker egress policy alone made the trust boundary
+# one-sided. NetworkPolicy is additive and only becomes deny-by-default for a
+# pod once a policy of that policyType selects it, so with only the three
+# policies above the supervisor had UNRESTRICTED egress — despite being the pod
+# that runs a command-capable agent (code_supervisor) AND the pod that mints the
+# CAO_CALLBACK_URL values workers are told to POST to. A prompt-injected
+# supervisor agent could reach any in-VPC service or the instance metadata
+# endpoint and steal the node role's credentials. The rules below mirror
+# cao-worker-egress so both roles are bounded the same way.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cao-supervisor-egress
+  namespace: cao-cluster
+  labels:
+    app.kubernetes.io/part-of: cao-fleet
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: cao-supervisor
+  policyTypes:
+    - Egress
+  egress:
+    # Intra-namespace, all ports. This is what lets the supervisor reach the
+    # broker on 9890 to take a lease, and then the leased worker on 9889 at the
+    # per-worker Service the broker created for it. Worker Services come and go
+    # per task, so a rule enumerating destinations by name could not work here;
+    # the bound that matters is "this namespace only", which this keeps.
+    - to:
+        - podSelector: {}
+    # DNS: the supervisor resolves the broker's and each leased worker's service
+    # name. Note a lease hands back an FQDN, not a bare pod name — a bare pod
+    # name does not resolve, which is the first thing that breaks in any
+    # cross-pod delegation and reads like a CAO bug.
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # Provider API egress. The supervisor runs a real provider too
+    # (CAO_INSTALL_PROFILES=code_supervisor:claude_code), so it needs the same
+    # vendor-HTTPS path as workers — without this rule the supervisor's own
+    # agent hangs with no network error. Identical carve-outs: private ranges
+    # and the metadata endpoint stay unreachable, so this does not reopen the
+    # SSRF hole for the callback URLs the supervisor itself injects. See the
+    # longer note on the worker egress rule for the residual risk (public 443
+    # is still open, so this bounds reachability, not exfiltration).
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+      ports:
+        - port: 443
+          protocol: TCP
+    # EKS Pod Identity credential endpoint. Claude Code signs Bedrock requests
+    # with SigV4, so the pod must be able to fetch credentials — and this is the
+    # ONE hole that has to be punched in the link-local block above.
+    #
+    # It is deliberately a /32 on port 80 rather than a relaxation of the
+    # 169.254.0.0/16 carve-out. The two link-local addresses that matter are
+    # adjacent but not equivalent:
+    #
+    #   169.254.170.23  Pod Identity Agent — hands out THIS pod's scoped
+    #                   credentials, whose only permission is Bedrock invoke.
+    #   169.254.169.254 IMDS — hands out the NODE ROLE's credentials, which
+    #                   include ECR pull and the VPC CNI's ENI permissions.
+    #                   Stays blocked.
+    #
+    # Widening this to 169.254.0.0/16 would hand a prompt-injected agent the node
+    # role, which is a materially worse position than the pod role. Plain HTTP is
+    # correct here: the endpoint is on the node itself and is not reachable off-host.
+    - to:
+        - ipBlock:
+            cidr: 169.254.170.23/32
+      ports:
+        - port: 80
+          protocol: TCP
+---
+# The panel reaches nothing but DNS and the fleet's own API port. It is the only
+# component here that serves a human, so leaving it unbounded would make it the
+# soft spot in a namespace where everything else is fenced.
+#
+# There is deliberately no matching ingress policy. Access is by port-forward,
+# which arrives from the node rather than from a pod, so an ingress allowlist
+# risks cutting off the only way in; the panel's token guards the origin instead.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cao-panel-egress
+  namespace: cao-cluster
+  labels:
+    app.kubernetes.io/part-of: cao-fleet
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: cao-fleet-panel
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # The fleet: the supervisor, and whichever workers hold a lease. Both answer
+    # the cao-server API on 9889.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cao-supervisor
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cao-elastic-worker
+      ports:
+        - port: 9889
+          protocol: TCP

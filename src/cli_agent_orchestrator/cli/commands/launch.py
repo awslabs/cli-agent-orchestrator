@@ -242,12 +242,15 @@ def launch(
                     f"  Directory: {display_dir}\n"
                 )
                 if provider == "kiro_cli":
-                    # kiro-cli 2.0.1 TUI blocks on an interactive "Yes, I accept"
-                    # consent dialog when --trust-all-tools is set. CAO cannot
-                    # answer it headlessly, so yolo launches use --legacy-ui.
+                    # The kiro-cli TUI blocks on an interactive "Yes, I accept"
+                    # consent dialog when --trust-all-tools is set. CAO answers
+                    # it automatically after launch (the provider verifies the
+                    # dialog first), so no --legacy-ui suppression is needed —
+                    # and --legacy-ui must not be used, because it selects the
+                    # v1 engine, which serves the agent no MCP tools.
                     click.echo(
-                        "  Note: kiro_cli will launch in --legacy-ui mode so "
-                        "--trust-all-tools can be applied non-interactively.\n"
+                        "  Note: kiro_cli's --trust-all-tools consent dialog will be "
+                        "auto-answered at startup.\n"
                     )
                 elif provider == "opencode_cli":
                     # opencode's TUI has no runtime skip-permissions flag

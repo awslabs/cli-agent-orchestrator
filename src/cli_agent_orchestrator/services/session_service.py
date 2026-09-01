@@ -30,6 +30,7 @@ from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
     delete_terminals_by_ids,
     list_terminals_by_session,
+    list_terminals_in_sessions,
 )
 from cli_agent_orchestrator.constants import SESSION_PREFIX
 from cli_agent_orchestrator.models.inbox import OrchestrationType
@@ -123,10 +124,54 @@ async def create_session(
     return terminal
 
 
+def _terminals_grouped_by_session(session_names: List[str]) -> Dict[str, List[Dict[str, Any]]]:
+    """Group the given sessions' terminals by tmux session name in ONE query.
+
+    ``list_sessions`` used to reach ``list_terminals_by_session`` once per tmux
+    session from inside ``_enrich_session_ownership`` (issue #629): a query per
+    session on a read path that ``GET /sessions`` and the fleet snapshot both
+    poll.
+
+    Reads only the LIVE sessions' rows, not the whole table. That distinction is
+    the point rather than an optimization detail: rows for sessions tmux no
+    longer reports are never swept on a long-uptime server (see
+    ``list_terminals_in_sessions``), so a whole-table read would make this path
+    scale with accumulated dead rows instead of with the sessions being listed —
+    slower than the per-session version it replaced once enough had piled up.
+
+    ``list_terminals_in_sessions`` orders explicitly, so the order-sensitive
+    "first known terminal" pick below is specified rather than dependent on
+    whichever plan the query engine happens to choose.
+    """
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    try:
+        terminals = list_terminals_in_sessions(session_names)
+    except Exception:
+        # Swallowed on purpose: a metadata read failure must degrade the
+        # ownership fields to None rather than blank the whole session list,
+        # which is what callers render. exc_info so a DB or schema problem is
+        # diagnosable from the log instead of only by reproducing locally.
+        logger.warning("Failed to load terminal metadata for session ownership", exc_info=True)
+        return grouped
+
+    # Every row came back matching one of session_names, so tmux_session is
+    # populated by construction — no falsy-key guard needed here.
+    for terminal in terminals:
+        grouped.setdefault(terminal["tmux_session"], []).append(terminal)
+    return grouped
+
+
 def _enrich_session_ownership(
-    backend: TerminalBackend, session_data: Dict[str, Any]
+    backend: TerminalBackend,
+    session_data: Dict[str, Any],
+    terminals_by_session: Dict[str, List[Dict[str, Any]]],
 ) -> Dict[str, Any]:
-    """Add best-effort ownership metadata from the session's first known terminal."""
+    """Add best-effort ownership metadata from the session's first known terminal.
+
+    ``terminals_by_session`` is the pre-grouped result of one bulk terminal
+    read (see ``_terminals_grouped_by_session``) rather than a per-session
+    query, so enriching N sessions costs one query instead of N.
+    """
     enriched = dict(session_data)
     enriched.setdefault("working_directory", None)
     enriched.setdefault("agent_profile", None)
@@ -138,11 +183,7 @@ def _enrich_session_ownership(
     if not session_name:
         return enriched
 
-    try:
-        terminals = list_terminals_by_session(session_name)
-    except Exception as e:
-        logger.warning(f"Failed to load terminal metadata for {session_name}: {e}")
-        terminals = []
+    terminals = terminals_by_session.get(session_name, [])
 
     ownership_terminal: Dict[str, Any] = {}
     for terminal in terminals:
@@ -166,8 +207,13 @@ def _enrich_session_ownership(
                 enriched["working_directory"] = backend.get_pane_working_directory(
                     session_name, ownership_terminal["tmux_window"]
                 )
-            except Exception as e:
-                logger.warning(f"Failed to resolve working directory for {session_name}: {e}")
+            except Exception:
+                # Also swallowed on purpose — an unreadable pane cwd must not
+                # drop the session from the listing. exc_info for the same
+                # reason as the bulk read above.
+                logger.warning(
+                    "Failed to resolve working directory for %s", session_name, exc_info=True
+                )
 
     return enriched
 
@@ -177,8 +223,8 @@ def list_sessions() -> List[Dict]:
     try:
         backend = get_backend()
         tmux_sessions = backend.list_sessions()
-        return [
-            _enrich_session_ownership(backend, s)
+        cao_sessions = [
+            s
             for s in tmux_sessions
             # Use .get() rather than s["id"]: a backend that returns a session
             # dict without an "id" key must not blank the entire list (KeyError
@@ -187,13 +233,34 @@ def list_sessions() -> List[Dict]:
             # future backend that does not.
             if (s.get("id") or "").startswith(SESSION_PREFIX)
         ]
-    except Exception as e:
-        logger.error(f"Failed to list sessions: {e}")
+        # Filter BEFORE the terminal read: it is what bounds the read to live
+        # CAO sessions, and it keeps a host running only non-CAO tmux sessions
+        # at zero queries, as it was when the read was per-session and therefore
+        # never reached.
+        if not cao_sessions:
+            return []
+        terminals_by_session = _terminals_grouped_by_session([s["id"] for s in cao_sessions])
+        return [_enrich_session_ownership(backend, s, terminals_by_session) for s in cao_sessions]
+    except Exception:
+        # Swallowed to keep a caller's listing from raising, so exc_info for the
+        # same reason as the two handlers above -- more so, in fact: this one
+        # blanks the ENTIRE response rather than one session's metadata, and it
+        # is the net for anything the grouping/enrichment above throws.
+        logger.error("Failed to list sessions", exc_info=True)
         return []
 
 
 def get_session(session_name: str) -> Dict:
-    """Get session with terminals."""
+    """Get session with terminals, oldest first.
+
+    ``terminals`` carries the same ordering contract as
+    ``list_terminals_by_session`` (see it): index 0 is the session's oldest
+    surviving terminal, normally its conductor. Stated here because this is the
+    path that reaches it over HTTP via ``GET /sessions/{name}`` --
+    ``examples/fleet/panel`` routes a user's message to ``terminals[0]``, and
+    ``ops_mcp_server.get_session_info`` hands the array to an external
+    supervisor that will read the first entry as the conductor.
+    """
     try:
         if not get_backend().session_exists(session_name):
             raise ValueError(f"Session '{session_name}' not found")

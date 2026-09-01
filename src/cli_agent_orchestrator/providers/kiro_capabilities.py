@@ -398,15 +398,27 @@ def build_kiro_command(
     *,
     model: Optional[str] = None,
     yolo: bool = False,
-    legacy_ui: bool = False,
 ) -> list[str]:
-    """Build a deterministic Kiro command without executing it."""
+    """Build a deterministic Kiro command without executing it.
+
+    There is deliberately no ``legacy_ui`` option, because ``--legacy-ui`` can
+    no longer be combined with the engine CAO pins. kiro-cli rejects the pair
+    outright ("Conflicting options: --legacy-ui cannot be used with
+    --agent-engine=v2"), and the bare flag implicitly selects the v1 engine,
+    which does not expose MCP tools to the model. Since CAO's whole
+    orchestration surface (``assign``/``handoff``/``report_outcome``) arrives
+    over MCP, a v1 launch yields an agent that starts cleanly and then cannot
+    orchestrate — silently, because the MCP server itself still boots and logs
+    "✓ cao-mcp-server loaded".
+
+    The startup consent dialog that ``--legacy-ui`` used to suppress is now
+    auto-answered after launch instead; see
+    ``KiroCliProvider._wait_ready_accepting_trust_dialog``.
+    """
     if engine == KiroEngine.KAS:
         command = ["kiro-cli", "--v3", "chat"]
     else:
         command = ["kiro-cli", "chat", "--agent-engine", KiroEngine.V2.value]
-        if legacy_ui:
-            command.append("--legacy-ui")
         if yolo:
             command.append("--trust-all-tools")
     if model:
@@ -418,14 +430,17 @@ def build_kiro_command(
 def requested_kiro_capabilities(
     engine: KiroEngine, *, model: Optional[str], yolo: bool
 ) -> set[str]:
-    """Return every wrapper feature used by the launch and fallback lifecycle."""
+    """Return every wrapper feature used by the launch lifecycle.
+
+    ``ui`` (``--legacy-ui``) is deliberately absent: there is no longer a
+    legacy-UI retry to verify, because the flag is incompatible with
+    ``--agent-engine=v2`` and its bare form drops the wrapper to the v1 engine,
+    which serves no MCP tools. Requiring it would also reject wrappers that are
+    otherwise fully usable. See ``build_kiro_command``.
+    """
     requested = {"profile"}
     if model:
         requested.add("model")
-    if engine == KiroEngine.V2:
-        # Non-yolo launches may retry with --legacy-ui after a TUI startup
-        # timeout, so this flag must be verified before any allocation.
-        requested.add("ui")
-        if yolo:
-            requested.add("trust")
+    if engine == KiroEngine.V2 and yolo:
+        requested.add("trust")
     return requested

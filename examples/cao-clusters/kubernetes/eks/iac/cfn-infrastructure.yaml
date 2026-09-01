@@ -1,0 +1,1205 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+# Every AWS resource the CAO fleet demo needs, in one stack: the network, the
+# EKS cluster and its add-ons, and the CAO-specific resources (provider secret,
+# External Secrets Operator IAM role and Pod Identity association, container
+# repositories, shared EFS workspace).
+#
+# A brand-new AWS account has only a default VPC, which has no private subnets
+# and none of the tags EKS looks for, so there is nothing to build on. Keeping
+# everything in one stack means nothing has to be wired by hand: the workspace
+# security group references the cluster's own security group, and the mount
+# targets reference the same private subnets the nodes run in.
+#
+# WHAT IT DOES NOT DO. It does not create the Kubernetes objects — those ship
+# with the kustomization in ../, including the StorageClasses. It also does not
+# build or push the container image; see ../README.md.
+#
+# ORDER: this stack -> build and push the image -> the manifests in ../.
+#
+# By DEFAULT there is no provider secret and no External Secrets Operator, since
+# Claude Code on Bedrock authenticates as the pod's own identity and nothing
+# needs a key pasted in by hand. Set ProviderSecretName to create the secret and
+# the ESO plumbing for a provider that does use an API key.
+#
+# Deploy (about 15 minutes, most of it the control plane):
+#   aws cloudformation deploy \
+#     --template-file examples/cao-clusters/kubernetes/eks/iac/cfn-infrastructure.yaml \
+#     --stack-name cao-workshop \
+#     --capabilities CAPABILITY_NAMED_IAM \
+#     --parameter-overrides ClusterName=cao-workshop
+#
+# COST while running: EKS control plane, two nodes, and one NAT gateway all bill
+# hourly. Delete the stack when the demo is over.
+
+Description: >-
+  CAO demo infrastructure: a two-AZ VPC, an EKS cluster with the required
+  add-ons, and the CAO provider secret, IAM, container repositories and shared
+  EFS workspace.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Cluster }
+        Parameters: [ClusterName, KubernetesVersion]
+      - Label: { default: Nodes }
+        Parameters: [NodeInstanceType, NodeDesiredSize, NodeMaxSize, NodeDiskSize]
+      - Label: { default: Network }
+        Parameters: [VpcCidr]
+      - Label: { default: CAO resources }
+        Parameters: [NamePrefix, AgentNamespace, SupervisorServiceAccount, WorkerServiceAccount]
+      - Label: { default: Access }
+        Parameters: [ClusterAdminPrincipalArn]
+
+Parameters:
+  ClusterName:
+    Type: String
+    Default: cao-workshop
+    Description: EKS cluster name. Also used for subnet discovery tags.
+    AllowedPattern: "^[a-zA-Z][a-zA-Z0-9-_]{1,99}$"
+
+  KubernetesVersion:
+    Type: String
+    Default: "1.35"
+    Description: >-
+      Kubernetes version. Pinned to the version the CAO fleet was actually
+      validated on rather than tracking the current EKS default, so a new EKS
+      default cannot change what a workshop deploys underneath it.
+    AllowedPattern: "^1\\.(3[3-9]|4[0-9])$"
+
+  NodeInstanceType:
+    Type: String
+    Default: m7g.xlarge
+    Description: >-
+      Node instance type. .xlarge (16 GiB) rather than .large because each CAO
+      pod requests 1Gi and may use up to 3Gi: a running agent settles near
+      660Mi. Two .large nodes would leave the fleet one burst away from
+      eviction.
+
+      Graviton (m7g) rather than Intel or AMD, so the node architecture matches
+      the Workshop Studio code editor, which is m8g.large - arm64. The images are
+      built on the code editor and pushed to this account's ECR, so an x86 node
+      group would mean either a cross-build under emulation or an image that
+      simply will not start. Keep this and AmiType below in agreement.
+
+      Graviton is also the cheaper end of this size class: in both us-east-1 and
+      us-west-2, m7g.xlarge is 0.1632 USD/hour against 0.1728 for m6a.xlarge and
+      0.1920 for m6i.xlarge. There is no cost argument for leaving arm64, only a
+      convenience one for a build host that is not arm64 - and here it is.
+
+      An architecture mismatch is not caught at deploy time: the pull succeeds and
+      the pod dies with an exec format error, so it reads as a crash loop rather
+      than as a configuration fault.
+
+  NodeDesiredSize:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    Description: Desired node count. Two comfortably holds a supervisor, three workers and the panel.
+
+  NodeMaxSize:
+    Type: Number
+    Default: 4
+    MinValue: 1
+    Description: Maximum node count.
+
+  NodeDiskSize:
+    Type: Number
+    Default: 50
+    MinValue: 20
+    Description: >-
+      Node root volume in GiB. Larger than the 20 GiB default because the CAO
+      server image with a bundled provider CLI is well over a gigabyte.
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: >-
+      VPC CIDR, which must be a /16. Four /20 subnets are carved from it
+      automatically, leaving the upper half free. Subnets are sized generously
+      because the VPC CNI gives every pod a real VPC address, so pod density is
+      bounded by subnet size rather than node count.
+    AllowedPattern: "^10\\.\\d{1,3}\\.0\\.0/16$"
+
+  NamePrefix:
+    Type: String
+    Default: cao
+    Description: >-
+      Prefix for the CAO resource names (IAM role, container repositories).
+      Change it to run two fleets in one account.
+    AllowedPattern: "^[a-z][a-z0-9-]{1,20}$"
+
+  AgentNamespace:
+    Type: String
+    Default: cao-cluster
+    Description: >-
+      Namespace the CAO fleet runs in. Must match `namespace:` in
+      ../kustomization.yaml, or the Pod Identity associations below deliver
+      credentials to a namespace with no pods in it.
+
+  SupervisorServiceAccount:
+    Type: String
+    Default: cao-supervisor
+    Description: Service account of the supervisor pod.
+
+  WorkerServiceAccount:
+    Type: String
+    Default: cao-elastic-worker
+    Description: >-
+      Service account of the worker pods. Must match
+      CAO_ELASTIC_WORKER_SERVICE_ACCOUNT on the broker, which is what actually
+      stamps this name onto each Job it mints. A mismatch is not a deploy error:
+      the worker starts, becomes Ready, and then fails its first model call.
+
+  ClusterAdminPrincipalArn:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^arn:[a-z0-9-]+:iam::[0-9]{12}:(role|user)/[A-Za-z0-9+=,.@_/-]+$"
+    ConstraintDescription: >-
+      Must be empty or a permanent IAM role/user ARN. STS assumed-role session
+      ARNs are temporary and EKS access entries reject them.
+    Description: >-
+      Optional IAM principal to grant cluster-admin via an EKS access entry.
+      REQUIRED in Workshop Studio: the stack is deployed by the WS provisioning
+      role, so BootstrapClusterCreatorAdminPermissions grants admin to THAT
+      principal and the participant role gets no cluster access at all - every
+      kubectl command in the workshop then fails Unauthorized. Set this to the
+      permanent participant IAM role ARN, never the STS assumed-role session ARN
+      returned by get-caller-identity. Leave empty when deploying by hand, where
+      the deploying principal is already the creator.
+
+  # ---------------------------------------------------------------------------
+  # Provider secret — only for providers that authenticate with an API key
+  # ---------------------------------------------------------------------------
+  #
+  # Empty by default, which is what makes the four resources below conditional.
+  # Claude Code on Bedrock needs none of them: the pods authenticate with SigV4
+  # from their own EKS Pod Identity credentials, so there is nothing to fetch
+  # from Secrets Manager and requiring the External Secrets Operator would be a
+  # dependency that path never uses.
+  #
+  # Set this to `cao/provider-credentials` to enable the API-key path; the
+  # secret, its read policy, the ESO role and the Pod Identity association are
+  # all created. Install ESO in the cluster, then select `kiro` mode in
+  # ../deploy.sh. That mode enables the component containing the ExternalSecret;
+  # it is not part of the default apply because its CRDs are absent on a cluster
+  # that has no ESO.
+  ProviderSecretName:
+    Type: String
+    Default: ""
+    Description: >-
+      Secrets Manager secret holding the provider credential. Leave EMPTY for
+      providers that use Pod Identity (Claude Code on Bedrock). Set it to create
+      the secret and the External Secrets Operator plumbing; created empty, so
+      set the value before deploying the manifests. Use
+      cao/provider-credentials, which is the key extracted by
+      ../components/kiro/external-secret.yaml.
+
+  ExternalSecretsNamespace:
+    Type: String
+    Default: external-secrets
+    Description: >-
+      Namespace where the External Secrets Operator controller runs. Ignored
+      unless ProviderSecretName is set.
+
+  ExternalSecretsServiceAccount:
+    Type: String
+    Default: external-secrets
+    Description: >-
+      Service account of the ESO controller. The IAM role is granted to the
+      OPERATOR, not to the CAO pods. Ignored unless ProviderSecretName is set.
+
+Conditions:
+  HasClusterAdminPrincipal: !Not [!Equals [!Ref ClusterAdminPrincipalArn, ""]]
+  HasProviderSecret: !Not [!Equals [!Ref ProviderSecretName, ""]]
+  UseBedrock: !Equals [!Ref ProviderSecretName, ""]
+
+Resources:
+  # ===========================================================================
+  # Network — two Availability Zones, one NAT gateway
+  # ===========================================================================
+
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      # Both required by EKS: nodes resolve the cluster endpoint by DNS, and EFS
+      # mount targets are addressed by DNS name.
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-vpc"
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-igw"
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  # Subnet CIDRs are carved with Fn::Cidr rather than taken as parameters, so
+  # there is nothing to compute by hand. The third argument is the host-bit
+  # count, so 12 yields /20s (4091 usable each): 0-1 public, 2-3 private.
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 4, 12]]
+      # Needed for the NAT gateway and any internet-facing load balancer.
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-public-a"
+        # Marks the subnet usable for internet-facing load balancers.
+        - Key: kubernetes.io/role/elb
+          Value: "1"
+        - Key: !Sub "kubernetes.io/cluster/${ClusterName}"
+          Value: shared
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 4, 12]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-public-b"
+        - Key: kubernetes.io/role/elb
+          Value: "1"
+        - Key: !Sub "kubernetes.io/cluster/${ClusterName}"
+          Value: shared
+
+  # Nodes, pods and EFS mount targets live here.
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 4, 12]]
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-private-a"
+        # Marks the subnet usable for internal load balancers.
+        - Key: kubernetes.io/role/internal-elb
+          Value: "1"
+        - Key: !Sub "kubernetes.io/cluster/${ClusterName}"
+          Value: shared
+        - Key: karpenter.sh/discovery
+          Value: !Ref ClusterName
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [3, !Cidr [!Ref VpcCidr, 4, 12]]
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-private-b"
+        - Key: kubernetes.io/role/internal-elb
+          Value: "1"
+        - Key: !Sub "kubernetes.io/cluster/${ClusterName}"
+          Value: shared
+        - Key: karpenter.sh/discovery
+          Value: !Ref ClusterName
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-public"
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-nat"
+
+  # A single NAT gateway in the first AZ. Both private subnets egress through it,
+  # which is the right trade for a demo: one NAT instead of two roughly halves
+  # the standing cost. The accepted consequence is that losing this AZ removes
+  # outbound internet for the whole cluster, and that traffic from the second AZ
+  # crosses an AZ boundary. For production, add a NAT per AZ and give each
+  # private subnet its own route table.
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-nat"
+
+  # One shared private route table, since both AZs use the same NAT gateway.
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-private"
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ===========================================================================
+  # Cluster
+  # ===========================================================================
+
+  ClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: eks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+
+  # Envelope encryption for Kubernetes Secrets in etcd.
+  #
+  # There is exactly one Secret in this namespace and it is worth wrapping:
+  # `cao-elastic-broker-token`, minted by ../deploy.sh, is the credential that
+  # authorises asking the broker to create a pod. Everything else authenticates
+  # through Pod Identity and puts nothing in etcd.
+  #
+  # Create-time only. EKS will not accept EncryptionConfig on a running cluster,
+  # so a cluster built without this has to be replaced to get it.
+  SecretsKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Description: !Sub "Envelope encryption for Kubernetes Secrets in ${ClusterName}"
+      Enabled: true
+      EnableKeyRotation: true
+      # The minimum KMS allows. A key is only ever scheduled for deletion, never
+      # deleted outright, so the shortest window leaves the least behind.
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          # KMS rejects a policy that locks out every principal, and an IAM policy
+          # granting kms:Decrypt means nothing unless the key policy delegates to
+          # the account. This is that delegation, not a wildcard grant.
+          - Sid: DelegateToAccountIam
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action: kms:*
+            Resource: "*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-secrets"
+
+  # Granted through IAM rather than by naming ClusterRole as a Principal in the key
+  # policy above, because KMS validates principals as the policy is written and a
+  # role created moments earlier in the same stack is not always visible yet. The
+  # symptom is an intermittent MalformedPolicyDocumentException about an invalid
+  # principal. Naming the key from the role is the same authorisation without the
+  # timing dependency.
+  ClusterKmsPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: secrets-envelope-encryption
+      Roles:
+        - !Ref ClusterRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # CreateGrant is required: EKS grants the encryption provider in the
+          # managed control plane rather than calling KMS with this role on every
+          # Secret read.
+          - Effect: Allow
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:DescribeKey
+              - kms:CreateGrant
+            Resource: !GetAtt SecretsKey.Arn
+
+  Cluster:
+    Type: AWS::EKS::Cluster
+    # EncryptionConfig is validated at create time with no retry, so the grant has
+    # to exist first.
+    DependsOn: ClusterKmsPolicy
+    Properties:
+      Name: !Ref ClusterName
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt ClusterRole.Arn
+      ResourcesVpcConfig:
+        SubnetIds:
+          - !Ref PrivateSubnetA
+          - !Ref PrivateSubnetB
+        # Public access is on so kubectl works from a workstation without a
+        # bastion or VPN, which a demo needs. Private access is also on so
+        # in-cluster traffic to the API server stays inside the VPC. Restrict
+        # PublicAccessCidrs for anything longer-lived than a demo.
+        EndpointPublicAccess: true
+        EndpointPrivateAccess: true
+      AccessConfig:
+        # API_AND_CONFIG_MAP keeps the aws-auth ConfigMap working alongside
+        # access entries, which is the friendlier default for tooling that still
+        # expects it.
+        AuthenticationMode: API_AND_CONFIG_MAP
+        # Grants cluster-admin to whoever deploys this stack, so kubectl works
+        # immediately afterwards with no extra wiring.
+        BootstrapClusterCreatorAdminPermissions: true
+      # `secrets` is the only resource EKS supports here.
+      EncryptionConfig:
+        - Resources:
+            - secrets
+          Provider:
+            KeyArn: !GetAtt SecretsKey.Arn
+      Tags:
+        - Key: Name
+          Value: !Ref ClusterName
+
+  # ===========================================================================
+  # Nodes
+  # ===========================================================================
+
+  NodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        # Lets the VPC CNI attach ENIs and assign pod addresses. Granted on the
+        # node role rather than through Pod Identity because the CNI runs before
+        # any credential-delivery mechanism is available.
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        # Pull permission for the CAO images in ECR.
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+
+  NodeGroup:
+    Type: AWS::EKS::Nodegroup
+    Properties:
+      ClusterName: !Ref Cluster
+      NodegroupName: !Sub "${ClusterName}-nodes"
+      NodeRole: !GetAtt NodeRole.Arn
+      # Private subnets only: nodes have no public addresses and reach the
+      # internet through the NAT gateway.
+      Subnets:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+      # Must match the architecture of NodeInstanceType.
+      AmiType: AL2023_ARM_64_STANDARD
+      InstanceTypes:
+        - !Ref NodeInstanceType
+      DiskSize: !Ref NodeDiskSize
+      ScalingConfig:
+        MinSize: 1
+        DesiredSize: !Ref NodeDesiredSize
+        MaxSize: !Ref NodeMaxSize
+      Labels:
+        role: cao-fleet
+
+  # ===========================================================================
+  # Add-ons
+  # ===========================================================================
+
+  # Must exist before any Pod Identity association can deliver credentials, so
+  # the CSI driver add-ons below depend on it.
+  PodIdentityAgentAddon:
+    Type: AWS::EKS::Addon
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: eks-pod-identity-agent
+      ResolveConflicts: OVERWRITE
+
+  VpcCniAddon:
+    Type: AWS::EKS::Addon
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: vpc-cni
+      ResolveConflicts: OVERWRITE
+      # NetworkPolicy enforcement is OFF in the CNI by default, and without it
+      # the policies shipped in ../networkpolicy.yaml are silently inert: they
+      # are accepted by the API server and simply never enforced. The CAO fleet
+      # relies on them to bound what a command-capable agent can reach.
+      ConfigurationValues: '{"enableNetworkPolicy":"true"}'
+
+  KubeProxyAddon:
+    Type: AWS::EKS::Addon
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: kube-proxy
+      ResolveConflicts: OVERWRITE
+
+  # CoreDNS runs as pods, so it cannot become healthy until nodes exist.
+  CoreDnsAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: NodeGroup
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: coredns
+      ResolveConflicts: OVERWRITE
+
+  MetricsServerAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: NodeGroup
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: metrics-server
+      ResolveConflicts: OVERWRITE
+
+  # --- EBS CSI: per-pod state volumes -----------------------------------------
+
+  EbsCsiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: pods.eks.amazonaws.com
+            # Pod Identity requires TagSession alongside AssumeRole; the assume
+            # call fails without it.
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy
+
+  EbsCsiAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: [NodeGroup, PodIdentityAgentAddon]
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: aws-ebs-csi-driver
+      ResolveConflicts: OVERWRITE
+      # The add-on creates its own Pod Identity association, so there is no
+      # separate association resource and no IRSA/OIDC provider to manage.
+      PodIdentityAssociations:
+        - RoleArn: !GetAtt EbsCsiRole.Arn
+          ServiceAccount: ebs-csi-controller-sa
+
+  # --- EFS CSI: shared agent workspace ----------------------------------------
+
+  EfsCsiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: pods.eks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEFSCSIDriverPolicy
+
+  EfsCsiAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: [NodeGroup, PodIdentityAgentAddon]
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: aws-efs-csi-driver
+      ResolveConflicts: OVERWRITE
+      PodIdentityAssociations:
+        - RoleArn: !GetAtt EfsCsiRole.Arn
+          ServiceAccount: efs-csi-controller-sa
+
+  # ===========================================================================
+  # CAO application resources
+  #
+  # These exist because of CAO rather than because of Kubernetes. They live in
+  # the same stack as the cluster so nothing has to be wired by hand: the
+  # workspace security group references the cluster's own security group, and the
+  # mount targets reference the same private subnets the nodes run in.
+  # ===========================================================================
+
+  # Bedrock access for the agent pods.
+  #
+  # Created only on the default Bedrock path. Setting ProviderSecretName selects
+  # API-key mode, where only the External Secrets Operator receives AWS identity
+  # and the agent pods remain credential-free.
+  #
+  # The mitigation is scope, not absence. This role grants model invocation and
+  # nothing else: no S3, no Secrets Manager, no IAM, no EC2. A prompt-injected
+  # agent that exfiltrates these credentials gains only the ability to call a
+  # model it was already calling on the operator's behalf.
+  #
+  # Note the asymmetry with the API-key path above: there the IAM role goes to
+  # the ESO CONTROLLER and the agent pods hold no AWS credentials, reading only a
+  # plain Kubernetes Secret. If that property matters more to you than unattended
+  # startup, prefer that path.
+  AgentBedrockPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Condition: UseBedrock
+    Properties:
+      ManagedPolicyName: !Sub "${NamePrefix}-agent-bedrock"
+      Description: >-
+        Bedrock model invocation for the CAO agent pods. Deliberately the only
+        AWS permission these pods hold.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # Claude Code uses the Bedrock INVOKE API, not Converse. A working
+          # `aws bedrock-runtime converse` call proves nothing about this grant.
+          - Sid: InvokeModels
+            Effect: Allow
+            Action:
+              - bedrock:InvokeModel
+              - bedrock:InvokeModelWithResponseStream
+            Resource: "*"
+          # Claude Code probes inference profiles during startup.
+          - Sid: ReadModelCatalogue
+            Effect: Allow
+            Action:
+              - bedrock:ListInferenceProfiles
+              - bedrock:GetInferenceProfile
+              - bedrock:ListFoundationModels
+              - bedrock:GetFoundationModel
+            Resource: "*"
+          # The first invocation of an Anthropic model in an account that has
+          # not activated it makes Bedrock auto-initiate an AWS Marketplace
+          # subscription, and that subscribe call authorises against the CALLING
+          # principal. Without this the symptom is a 403 naming marketplace
+          # actions, which reads like a model problem rather than a permissions
+          # one. Anthropic models need it; Amazon, Meta, Mistral, DeepSeek and
+          # OpenAI models do not. The condition scopes it to Bedrock's own
+          # subscribe call so it can never authorise a direct one.
+          - Sid: MarketplaceActivationViaBedrockOnly
+            Effect: Allow
+            Action:
+              - aws-marketplace:ViewSubscriptions
+              - aws-marketplace:Subscribe
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:CalledViaLast: bedrock.amazonaws.com
+
+  AgentBedrockRole:
+    Type: AWS::IAM::Role
+    Condition: UseBedrock
+    Properties:
+      RoleName: !Sub "${NamePrefix}-agent-bedrock-role"
+      Description: Assumed by the CAO supervisor and worker pods through EKS Pod Identity.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EksPodIdentity
+            Effect: Allow
+            Principal:
+              Service: pods.eks.amazonaws.com
+            # Pod Identity requires TagSession alongside AssumeRole; the assume
+            # call fails without it.
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+      ManagedPolicyArns:
+        - !Ref AgentBedrockPolicy
+
+  # One association per service account. Pod Identity binds a role to a
+  # (namespace, service account) pair, so the supervisor and the workers each
+  # need their own even though they share one role.
+  #
+  # Credentials arrive through a mutating admission webhook at POD CREATION, so
+  # a pod that started before its association existed never receives them and
+  # falls back to the node instance role with no failing probe to signal it.
+  # Both associations are created by this stack before any CAO pod exists, so
+  # ordering is safe here — but adding one under a running fleet needs a
+  # rollout restart.
+  SupervisorPodIdentity:
+    Type: AWS::EKS::PodIdentityAssociation
+    Condition: UseBedrock
+    DependsOn: PodIdentityAgentAddon
+    Properties:
+      ClusterName: !Ref Cluster
+      Namespace: !Ref AgentNamespace
+      ServiceAccount: !Ref SupervisorServiceAccount
+      RoleArn: !GetAtt AgentBedrockRole.Arn
+
+  WorkerPodIdentity:
+    Type: AWS::EKS::PodIdentityAssociation
+    Condition: UseBedrock
+    DependsOn: PodIdentityAgentAddon
+    Properties:
+      ClusterName: !Ref Cluster
+      Namespace: !Ref AgentNamespace
+      ServiceAccount: !Ref WorkerServiceAccount
+      RoleArn: !GetAtt AgentBedrockRole.Arn
+
+  # Grants cluster-admin to a principal that is not this stack's creator.
+  # BootstrapClusterCreatorAdminPermissions covers only the deploying principal,
+  # which in Workshop Studio is the provisioning role rather than the
+  # participant — see the ClusterAdminPrincipalArn parameter.
+  ClusterAdminAccessEntry:
+    Type: AWS::EKS::AccessEntry
+    Condition: HasClusterAdminPrincipal
+    Properties:
+      ClusterName: !Ref Cluster
+      PrincipalArn: !Ref ClusterAdminPrincipalArn
+      Type: STANDARD
+      AccessPolicies:
+        - PolicyArn: !Sub "arn:${AWS::Partition}:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
+          AccessScope:
+            Type: cluster
+
+  # ===========================================================================
+  # Provider API key — created only when ProviderSecretName is set
+  # ===========================================================================
+  #
+  # All four resources here are gated on HasProviderSecret, so the Bedrock path
+  # creates none of them. They exist for providers that authenticate with an API
+  # key rather than with the pod's own AWS identity.
+
+  # Created with NO value on purpose. Omitting both SecretString and
+  # GenerateSecretString yields an empty secret, so a forgotten "paste the key"
+  # step fails loudly: GetSecretValue returns ResourceNotFoundException, the
+  # ExternalSecret reports SecretSynced=False, the Kubernetes Secret is never
+  # created, and pods stop at CreateContainerConfigError. A generated placeholder
+  # would instead sync a plausible-looking value and fail later as a confusing
+  # authentication error.
+  #
+  # Never put the key in this template. Set it out of band; see ../README.md.
+  # Later stack updates will not overwrite the value, because SecretString is
+  # absent here.
+  ProviderSecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: HasProviderSecret
+    # Keep credentials when the infrastructure stack is deleted accidentally.
+    # A retained named secret must be imported, renamed, or deleted manually
+    # before recreating a stack with the same ProviderSecretName.
+    #
+    # Deliberately NOT the same as WorkspaceFileSystem below, which is Delete.
+    # The asymmetry is the point and should not be "tidied up": this holds a key a
+    # human pasted in by hand and cannot regenerate, while the workspace holds
+    # checkouts an agent clones again on the next run. Retain costs a manual
+    # delete before a same-named redeploy; that is cheaper than losing the key.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: !Ref ProviderSecretName
+      Description: !Sub "Provider API key consumed by ${NamePrefix} via External Secrets Operator"
+      # No KmsKeyId: encrypted with the AWS-managed key. To use a
+      # customer-managed key, set it here and add kms:Decrypt on that key to the
+      # policy below, or the role cannot read the secret.
+      Tags:
+        - Key: Name
+          Value: !Ref ProviderSecretName
+
+  # The permission lives in a standalone managed policy rather than an inline
+  # Policies block so it is independently auditable and versioned.
+  ReadProviderSecretPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Condition: HasProviderSecret
+    Properties:
+      ManagedPolicyName: !Sub "${NamePrefix}-read-provider-secret"
+      Description: !Sub "Read-only access to the ${NamePrefix} provider API key secret."
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # Scoped to this one secret ARN. !Ref on a Secret returns the full ARN
+          # including the six-character suffix Secrets Manager appends, so no
+          # wildcard is needed.
+          - Sid: ReadProviderSecretOnly
+            Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+              - secretsmanager:DescribeSecret
+            Resource: !Ref ProviderSecret
+
+  # Assumed by the External Secrets Operator controller, NOT by the CAO pods. CAO
+  # agents execute arbitrary commands by design, so an AWS identity on those pods
+  # would be inheritable by a prompt-injected agent. With this split the agent
+  # pods read a plain Kubernetes Secret and hold no AWS credentials at all.
+  ExternalSecretsRole:
+    Type: AWS::IAM::Role
+    Condition: HasProviderSecret
+    Properties:
+      RoleName: !Sub "${NamePrefix}-external-secrets-role"
+      Description: Lets External Secrets Operator read the CAO provider secret.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EksPodIdentity
+            Effect: Allow
+            Principal:
+              Service: pods.eks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+      ManagedPolicyArns:
+        - !Ref ReadProviderSecretPolicy
+
+  # Delivers the role above to the ESO controller pods. The association is
+  # created even though ESO is installed later — EKS does not require the
+  # namespace or service account to exist yet.
+  #
+  # Credentials are injected by a mutating admission webhook at POD CREATION, so
+  # ESO pods started before this exists never receive them and fall back to the
+  # node instance role. Restart ESO after this stack completes.
+  ExternalSecretsPodIdentity:
+    Type: AWS::EKS::PodIdentityAssociation
+    Condition: HasProviderSecret
+    DependsOn: PodIdentityAgentAddon
+    Properties:
+      ClusterName: !Ref Cluster
+      Namespace: !Ref ExternalSecretsNamespace
+      ServiceAccount: !Ref ExternalSecretsServiceAccount
+      RoleArn: !GetAtt ExternalSecretsRole.Arn
+
+  # IMMUTABLE tags are deliberate. A mutable tag previously let a cluster run a
+  # build that predated cross-node placement while the manifests advertised it,
+  # with nothing to indicate the mismatch. Immutability makes that impossible: a
+  # tag always means one image.
+  ServerRepository:
+    Type: AWS::ECR::Repository
+    # CKV_AWS_136 wants EncryptionConfiguration with a KMS CMK. Suppressed rather
+    # than implemented, unlike the etcd key above, and the difference is the
+    # threat: this repository holds images built from a public git repo and public
+    # package registries, so there is no secret material in it. A CMK would mean
+    # granting kms:Decrypt on the IMAGE PULL path, and a missing grant there
+    # surfaces as ImagePullBackOff on a pod that pulled fine yesterday.
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_136
+            comment: >-
+              Repository holds images built from public sources and is already
+              encrypted at rest with AES256. A CMK would add a kms:Decrypt grant
+              to the image-pull path for no confidentiality gain.
+    Properties:
+      RepositoryName: !Sub "${NamePrefix}-server"
+      ImageTagMutability: IMMUTABLE
+      # Without this the stack cannot be deleted. ECR refuses to drop a repository
+      # that still holds images, and the build steps in README.md push one here, so
+      # a delete-stack ALWAYS hits `cannot be deleted because it still contains
+      # images` and leaves the stack DELETE_FAILED - taking the VPC with it,
+      # because the subnets fail alongside it. Observed on the first teardown of
+      # the workshop twin of this template.
+      EmptyOnDelete: true
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Expire untagged images after 14 days",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 14
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+  # The broker image, from Dockerfile.broker. A separate repository rather
+  # than a second tag in the one above, because the two images share nothing: the
+  # server image is a ~310 MiB arm64 build carrying a provider CLI, the broker is
+  # python:3.12-slim plus one file. Same tag in both, always, since one CodeBuild
+  # run builds both from one commit.
+  WorkerBrokerRepository:
+    Type: AWS::ECR::Repository
+    # Same CKV_AWS_136 reasoning as ServerRepository above.
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_136
+            comment: >-
+              Repository holds one image built from public sources and is already
+              encrypted at rest with AES256. A CMK would add a kms:Decrypt grant
+              to the image-pull path for no confidentiality gain.
+    Properties:
+      RepositoryName: !Sub "${NamePrefix}-worker-broker"
+      ImageTagMutability: IMMUTABLE
+      # Same reason as ServerRepository above; a missing flag here fails the whole
+      # delete, not just this resource.
+      EmptyOnDelete: true
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Expire untagged images after 14 days",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 14
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+  # No Pod Identity association for the broker's service account, deliberately.
+  # It is the only pod that can reach the Kubernetes API and the only one with no
+  # AWS credentials at all — it forwards the region and the model pins into the
+  # Jobs it mints and never calls a model itself. Adding an association here would
+  # hand pod-creation and Bedrock invoke to the same identity for no reason.
+
+  # No panel repository. The fleet panel is not part of this deployment: the CAO
+  # repository ships no Dockerfile for it, so the image cannot be built from
+  # source here.
+
+  # Only the cluster's own nodes may mount the workspace. Being in the same stack
+  # as the cluster, this can reference the security group EKS created rather than
+  # taking it as a parameter.
+  # Image for the fleet panel, built by Dockerfile.panel. Separate
+  # from the server repository because the panel is an operator console with its
+  # own release cadence, and IMMUTABLE like the others so a deployed tag always
+  # names one image.
+  PanelRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${NamePrefix}-fleet-panel"
+      ImageTagMutability: IMMUTABLE
+      # Same reason as ServerRepository above; a missing flag here fails the whole
+      # delete, not just this resource.
+      EmptyOnDelete: true
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Expire untagged images after 14 days",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 14
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+  # Only the cluster's own nodes may mount the workspace. Being in the same stack
+  # as the cluster, this can reference the security group EKS created rather than
+  # taking it as a parameter.
+
+  WorkspaceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "NFS access to the ${NamePrefix} shared workspace"
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - Description: NFS from cluster nodes
+          IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !GetAtt Cluster.ClusterSecurityGroupId
+      # Egress restricted to loopback rather than left at CloudFormation's
+      # default allow-all. Mount targets never initiate connections — they only
+      # answer NFS — and security groups are stateful, so replies to permitted
+      # inbound traffic are allowed regardless of egress rules. Verified on a
+      # live cluster: a pod mounted this file system as nfs4 and wrote to it with
+      # the access point's uid/gid, with these egress rules in place.
+      SecurityGroupEgress:
+        - Description: No egress required; mount targets only answer inbound NFS
+          IpProtocol: "-1"
+          CidrIp: 127.0.0.1/32
+      Tags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-workspace-nfs"
+
+  # Holds the agents' shared checkout.
+  #
+  # Delete, not Retain: a retained file system keeps billing after the stack is
+  # gone and has to be found and removed by hand. For a workshop that is torn
+  # down and rebuilt, leaving nothing behind is worth more than preserving the
+  # checkout — agents clone into it as a setup step. Switch to Retain if the
+  # workspace holds anything you cannot recreate.
+  WorkspaceFileSystem:
+    Type: AWS::EFS::FileSystem
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Retain
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      ThroughputMode: elastic
+      # DISABLED deliberately, and it has to agree with DeletionPolicy above.
+      # AWS Backup recovery points are NOT owned by the file system: enabling
+      # backups and then deleting the stack leaves recovery points behind in the
+      # default vault, still billing, with the file system that explains them
+      # gone. For a workshop torn down and rebuilt many times that is a slow
+      # leak nobody goes looking for. Enable this only alongside
+      # DeletionPolicy: Retain, where something is actually worth recovering.
+      BackupPolicy:
+        Status: DISABLED
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-workspace"
+
+  # The access point is what makes the shared volume usable without root: it pins
+  # every NFS client to uid/gid 1000, the `cao` user in the container image. A
+  # mismatch here surfaces as permission errors under /home/cao/workspace.
+  #
+  # CreationInfo must be present and must specify all three properties. Without
+  # it EFS will not create the root directory and mounts fail.
+  WorkspaceAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref WorkspaceFileSystem
+      PosixUser:
+        Uid: "1000"
+        Gid: "1000"
+      RootDirectory:
+        Path: /cao-workspace
+        CreationInfo:
+          OwnerUid: "1000"
+          OwnerGid: "1000"
+          Permissions: "0755"
+      AccessPointTags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-workspace-ap"
+
+  # One mount target per AZ. A pod scheduled in an AZ with no mount target cannot
+  # mount the workspace.
+  WorkspaceMountTargetA:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref WorkspaceFileSystem
+      SubnetId: !Ref PrivateSubnetA
+      SecurityGroups:
+        - !Ref WorkspaceSecurityGroup
+
+  WorkspaceMountTargetB:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref WorkspaceFileSystem
+      SubnetId: !Ref PrivateSubnetB
+      SecurityGroups:
+        - !Ref WorkspaceSecurityGroup
+
+Outputs:
+  ClusterName:
+    Description: EKS cluster name.
+    Value: !Ref Cluster
+
+  KubeconfigCommand:
+    Description: Run this to point kubectl at the cluster.
+    Value: !Sub "aws eks update-kubeconfig --region ${AWS::Region} --name ${Cluster}"
+
+  AgentBedrockRoleArn:
+    Condition: UseBedrock
+    Description: >-
+      IAM role the supervisor and worker pods assume through Pod Identity. Their
+      only AWS permission is Bedrock model invocation.
+    Value: !GetAtt AgentBedrockRole.Arn
+
+  WorkspaceVolumeHandle:
+    Description: Rendered into spec.csi.volumeHandle in ../storage.yaml by ../deploy.sh.
+    Value: !Sub "${WorkspaceFileSystem}::${WorkspaceAccessPoint}"
+
+  ServerRepositoryUri:
+    Description: Push the CAO server image here, and use it in ../kustomization.yaml.
+    Value: !GetAtt ServerRepository.RepositoryUri
+
+  WorkerBrokerRepositoryUri:
+    Description: Push the worker-broker image here. ../deploy.sh reads this.
+    Value: !GetAtt WorkerBrokerRepository.RepositoryUri
+
+  PanelRepositoryUri:
+    Description: Push the fleet panel image here. ../deploy.sh reads this.
+    Value: !GetAtt PanelRepository.RepositoryUri
+
+  # Both emitted only when the API-key path is enabled, so a Bedrock stack's
+  # output list stays free of plumbing it never created.
+  ProviderSecretName:
+    Condition: HasProviderSecret
+    Description: Set this secret's value before deploying the manifests.
+    Value: !Ref ProviderSecretName
+
+  ExternalSecretsRoleArn:
+    Condition: HasProviderSecret
+    Description: Role the External Secrets Operator assumes to read the provider secret.
+    Value: !GetAtt ExternalSecretsRole.Arn
+
+  VpcId:
+    Description: VPC holding the cluster.
+    Value: !Ref Vpc
+
+  VpcCidrBlock:
+    Description: >-
+      Rendered into the broker's egress NetworkPolicy by ../deploy.sh. The broker
+      needs to reach the Kubernetes API server, whose control plane ENIs sit in
+      this range - and the agent pods' egress policy blocks it, so the broker gets
+      an explicit allow instead of a copy of their rules.
+    Value: !Ref VpcCidr
+
+  PrivateSubnetIds:
+    Description: Private subnets holding the nodes, pods and EFS mount targets.
+    Value: !Join [",", [!Ref PrivateSubnetA, !Ref PrivateSubnetB]]
+
+  PublicSubnetIds:
+    Description: Public subnets for the NAT gateway and internet-facing load balancers.
+    Value: !Join [",", [!Ref PublicSubnetA, !Ref PublicSubnetB]]
