@@ -2199,13 +2199,23 @@ def _schedule_deferred_init(
     # the event loop first schedules _run instead of relying on it winning a race.
     if initial_message:
         _mark_initial_delivery_pending(terminal_id)
-    # Only _run's finally can release the mark, so anything that prevents _run
-    # from ever running has to release it here. create_task raises RuntimeError
-    # if the loop closed between get_running_loop() above and this line (server
-    # teardown racing a create_terminal), and create_terminal's own exception
-    # cleanup does not know about this mark. Without this the terminal_id stays
-    # in the module-level set for the life of the process, reporting UNKNOWN for
-    # a terminal that is already gone.
+    # Only _run's finally releases the mark, so a create_task that raises would
+    # leave it set with nothing left to clear it — create_terminal's own exception
+    # cleanup does not know about this mark. Cheap to close, so closed.
+    #
+    # Deliberately NOT claiming the obvious trigger: "the loop closed between the
+    # check above and this line" cannot happen. get_running_loop() only succeeds
+    # on the loop thread, so reaching here means we ARE the running loop, and
+    # loop.close() on a running loop raises "Cannot close a running event loop".
+    # What remains is the unglamorous set: _run() not being a coroutine
+    # (programming error), MemoryError, or a KeyboardInterrupt landing in the gap.
+    #
+    # Known and deliberately unguarded: after loop.stop(), create_task SUCCEEDS
+    # and the coroutine is never run, so the mark leaks with nothing raised for
+    # this to catch. That only arises while the loop is being torn down, and
+    # _pending_initial_delivery is module state that dies with the process, so
+    # there is nothing for it to leak into. Guarding it would mean a shutdown hook
+    # for state that cannot outlive shutdown.
     try:
         task = loop.create_task(_run())
     except BaseException:
