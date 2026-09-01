@@ -2199,7 +2199,18 @@ def _schedule_deferred_init(
     # the event loop first schedules _run instead of relying on it winning a race.
     if initial_message:
         _mark_initial_delivery_pending(terminal_id)
-    task = loop.create_task(_run())
+    # Only _run's finally can release the mark, so anything that prevents _run
+    # from ever running has to release it here. create_task raises RuntimeError
+    # if the loop closed between get_running_loop() above and this line (server
+    # teardown racing a create_terminal), and create_terminal's own exception
+    # cleanup does not know about this mark. Without this the terminal_id stays
+    # in the module-level set for the life of the process, reporting UNKNOWN for
+    # a terminal that is already gone.
+    try:
+        task = loop.create_task(_run())
+    except BaseException:
+        _clear_initial_delivery_pending(terminal_id)
+        raise
     _deferred_init_tasks.add(task)
     task.add_done_callback(_deferred_init_tasks.discard)
 

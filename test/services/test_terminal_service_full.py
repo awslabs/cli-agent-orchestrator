@@ -3569,6 +3569,56 @@ class TestDeferredDeliveryNotCompletableBeforeDispatch:
 
 
 
+class TestPendingMarkNeverLeaks:
+    """The mark is module-level state, so a leak poisons a terminal_id for the
+    life of the process: every later GET /terminals/{id} reports UNKNOWN for a
+    terminal that may already be deleted. Only ``_run``'s finally releases it,
+    so any path that stops ``_run`` from running must release it directly.
+
+    Found by adversarial review of the round-4 fix. Pre-existing since the mask
+    was introduced rather than new to that commit, but it is this mechanism's
+    defect either way.
+    """
+
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_create_task_raising_does_not_leak_the_mark(self, mock_meta):
+        import asyncio
+
+        from cli_agent_orchestrator.services.terminal_service import (
+            _schedule_deferred_init,
+            initial_delivery_pending,
+        )
+
+        TERMINAL_ID = "1eak1eak"
+        mock_meta.return_value = None
+
+        class ClosedLoop:
+            """A loop that accepted get_running_loop() then closed underneath us."""
+
+            def create_task(self, coro):
+                coro.close()  # avoid an un-awaited-coroutine warning
+                raise RuntimeError("Event loop is closed")
+
+        provider_instance = AsyncMock()
+        provider_instance.shell_baseline = None
+
+        assert not initial_delivery_pending(TERMINAL_ID)
+        with patch.object(asyncio, "get_running_loop", return_value=ClosedLoop()):
+            with pytest.raises(RuntimeError, match="Event loop is closed"):
+                _schedule_deferred_init(
+                    provider_instance,
+                    TERMINAL_ID,
+                    "do the task",
+                    OrchestrationType.ASSIGN,
+                    None,
+                )
+        assert not initial_delivery_pending(TERMINAL_ID), (
+            "the pending mark leaked: create_task raised after the mark was set, so "
+            "_run never ran and its finally never released it — this terminal_id now "
+            "reports UNKNOWN forever"
+        )
+
+
 class TestReportedStatusMasking:
     """The masking matrix ``reported_status`` documents, pinned.
 
