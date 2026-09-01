@@ -475,6 +475,41 @@ class MemoryService:
 
         return None
 
+    def _private_recall_scope_ids(
+        self,
+        terminal_context: Optional[dict],
+        scan_all: bool,
+    ) -> dict[str, Optional[str]]:
+        """Return the private scope IDs visible to a contextual recall.
+
+        Session and agent memories share the global index and wiki tree. A
+        terminal context therefore constrains those tiers even when ``scope``
+        is omitted. Context-free and explicit ``scan_all`` calls retain the
+        operator/CLI behavior of enumerating every private scope ID.
+        """
+        if not terminal_context or scan_all:
+            return {}
+        return {
+            MemoryScope.SESSION.value: self.resolve_scope_id(
+                MemoryScope.SESSION.value, terminal_context
+            ),
+            MemoryScope.AGENT.value: self.resolve_scope_id(
+                MemoryScope.AGENT.value, terminal_context
+            ),
+        }
+
+    @staticmethod
+    def _private_scope_is_visible(
+        scope: str,
+        scope_id: Optional[str],
+        private_scope_ids: dict[str, Optional[str]],
+    ) -> bool:
+        """Check a session/agent entry against contextual recall visibility."""
+        if scope not in private_scope_ids:
+            return True
+        expected_scope_id = private_scope_ids[scope]
+        return expected_scope_id is not None and scope_id == expected_scope_id
+
     @staticmethod
     def _sanitize_scope_id(value: str) -> str:
         """Sanitize a scope_id to prevent path traversal.
@@ -2168,20 +2203,10 @@ class MemoryService:
         # Determine which project dirs to search
         search_dirs = self._get_search_dirs(scope, terminal_context, scan_all=scan_all)
 
-        # For session/agent scopes, all entries share the global
-        # index. If the caller passes a terminal_context that resolves
-        # to a scope_id, narrow the result set to memories for THAT
-        # session/agent — otherwise a recall would leak memories
-        # across sessions or agents that happen to share keys.
-        # ``scan_all`` (CLI inspection) and missing context still see
-        # every entry.
-        scope_id_filter: Optional[str] = None
-        if (
-            scope in (MemoryScope.SESSION.value, MemoryScope.AGENT.value)
-            and not scan_all
-            and terminal_context
-        ):
-            scope_id_filter = self.resolve_scope_id(scope, terminal_context)
+        # Session/agent scopes share the global index. Bind both private tiers
+        # to the caller's context even for an unscoped recall; context-free and
+        # explicit scan_all calls preserve operator enumeration.
+        private_scope_ids = self._private_recall_scope_ids(terminal_context, scan_all)
 
         for project_dir in search_dirs:
             index_path = project_dir / "wiki" / "index.md"
@@ -2200,9 +2225,9 @@ class MemoryService:
                 # Filter by memory_type
                 if memory_type and entry["memory_type"] != memory_type:
                     continue
-                # Filter session/agent entries by scope_id when caller
-                # has a relevant context (see scope_id_filter above).
-                if scope_id_filter and entry.get("scope_id") != scope_id_filter:
+                if not self._private_scope_is_visible(
+                    entry["scope"], entry.get("scope_id"), private_scope_ids
+                ):
                     continue
 
                 # Read the wiki file
@@ -2305,6 +2330,7 @@ class MemoryService:
         # A candidate-only corpus collapses when every candidate contains the
         # query term (df == N → negative IDF → all-zero).
         search_dirs = self._get_search_dirs(scope, terminal_context, scan_all=scan_all)
+        private_scope_ids = self._private_recall_scope_ids(terminal_context, scan_all)
         wanted = {self._identity(m) for m in memories}
         identities: list[Optional[tuple]] = []  # parallel to corpus_tokens
         corpus_tokens: list[list[str]] = []
@@ -2334,6 +2360,8 @@ class MemoryService:
                 elif file_scope == MemoryScope.PROJECT.value:
                     # Project rows store the project-hash container as scope_id.
                     file_scope_id = project_dir.name if project_dir.name != "global" else None
+                if not self._private_scope_is_visible(file_scope, file_scope_id, private_scope_ids):
+                    continue
                 corpus_tokens.append(tokens)
                 # Only track identities we'll report; others stay in the corpus
                 # (for IDF) but map to None so they're skipped on readback.
@@ -2383,6 +2411,7 @@ class MemoryService:
             return []
 
         search_dirs = self._get_search_dirs(scope, terminal_context, scan_all=scan_all)
+        private_scope_ids = self._private_recall_scope_ids(terminal_context, scan_all)
 
         candidates: list[tuple[Path, dict]] = []
         seen: set[Path] = set()
@@ -2412,6 +2441,10 @@ class MemoryService:
                 if scope and file_scope != scope:
                     continue
                 if scope_id and entry_scope_id != scope_id:
+                    continue
+                if not self._private_scope_is_visible(
+                    file_scope, entry_scope_id, private_scope_ids
+                ):
                     continue
                 key = wiki_file.stem
                 if key in exclude_keys:
@@ -2758,11 +2791,23 @@ class MemoryService:
         Returns ``""`` when ``memory.enabled`` is False (U5 / SC-6) — never
         reads index.md or wiki files.
         """
-        if not _is_memory_enabled():
-            return ""
-
         terminal_context = self._get_terminal_context(terminal_id)
         if not terminal_context:
+            return ""
+        return self.get_memory_context(terminal_context, budget_chars=budget_chars)
+
+    def get_memory_context(
+        self,
+        terminal_context: dict,
+        budget_chars: int = 3000,
+    ) -> str:
+        """Build an injection block from explicit caller context.
+
+        Distributed CAO nodes use this entry point because the memory owner
+        does not have the worker terminal in its local database. The existing
+        terminal-ID method above remains the local compatibility path.
+        """
+        if not _is_memory_enabled():
             return ""
 
         scopes_in_order = [

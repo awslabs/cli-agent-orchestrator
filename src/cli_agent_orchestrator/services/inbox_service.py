@@ -186,6 +186,10 @@ class InboxService:
         When a plugin registry is supplied, the originating sender and a
         ``send_message`` orchestration type are threaded to ``terminal_service``
         so ``PostSendMessageEvent`` hooks fire with correct attribution.
+
+        Safe to call from any thread: the whole read→mark→send sequence is
+        serialized per terminal (see _terminal_delivery_lock for why that is
+        load-bearing).
         """
         with _terminal_delivery_lock(terminal_id):
             if _is_dispatch_active(terminal_id):

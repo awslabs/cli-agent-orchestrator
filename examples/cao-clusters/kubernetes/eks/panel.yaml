@@ -1,0 +1,105 @@
+# Fleet panel — the web console for the fleet, built by Dockerfile.panel.
+#
+# The fleet registry it mounts, `cao-fleet-config`, is jointly owned:
+# configmap-fleet.yaml supplies the supervisor entry, and the broker adds and
+# removes worker entries as it leases and releases them, because elastic workers
+# are Jobs whose names nothing can know in advance. See configmap-fleet.yaml.
+#
+# The panel is reached with a port-forward; it is not exposed through an Ingress:
+#   kubectl -n cao-cluster port-forward svc/cao-fleet-panel 9888:9888
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cao-fleet-panel
+  namespace: cao-cluster
+  labels:
+    app.kubernetes.io/name: cao-fleet-panel
+    app.kubernetes.io/part-of: cao-elastic-fleet
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cao-fleet-panel
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cao-fleet-panel
+        app.kubernetes.io/part-of: cao-elastic-fleet
+    spec:
+      containers:
+        - name: fleet-panel
+          image: <panel-image>:latest
+          ports:
+            - name: http
+              containerPort: 9888
+          env:
+            - name: CAO_PANEL_HOST
+              value: "0.0.0.0"
+            - name: CAO_PANEL_PORT
+              value: "9888"
+            - name: CAO_FLEET_CONFIG
+              value: /config/fleet.json
+            - name: CAO_PANEL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: cao-panel-secret
+                  key: token
+          # exec, not httpGet: the token guards the whole origin including
+          # /api/fleet, and an httpGet probe cannot read a header value from a
+          # secret, so it would receive 401 and restart the pod forever.
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - >-
+                  curl -fsS -o /dev/null
+                  -H "Authorization: Bearer $CAO_PANEL_TOKEN"
+                  http://127.0.0.1:9888/api/fleet
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 10
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - >-
+                  curl -fsS -o /dev/null
+                  -H "Authorization: Bearer $CAO_PANEL_TOKEN"
+                  http://127.0.0.1:9888/api/fleet
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: fleet-config
+              mountPath: /config
+              readOnly: true
+      volumes:
+        - name: fleet-config
+          configMap:
+            name: cao-fleet-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cao-fleet-panel
+  namespace: cao-cluster
+  labels:
+    app.kubernetes.io/name: cao-fleet-panel
+    app.kubernetes.io/part-of: cao-elastic-fleet
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: cao-fleet-panel
+  ports:
+    - name: http
+      port: 9888
+      targetPort: 9888
