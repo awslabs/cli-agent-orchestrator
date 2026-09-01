@@ -158,17 +158,6 @@ def assign_cmd(agent_profile, message, working_directory, engine, model, use_wor
     default=False,
     help="Return immediately after creating the worker; don't wait for it to complete.",
 )
-@click.option(
-    "--idempotency-key",
-    "idempotency_key",
-    default=None,
-    help=(
-        "Make a retry of THIS SAME command safe -- reattaches instead of creating a "
-        "duplicate. Matched together with the request, so reusing a key for a "
-        "different command fails with a conflict rather than returning the earlier "
-        "worker."
-    ),
-)
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit the result as JSON.")
 def handoff_cmd(
     agent_profile,
@@ -179,7 +168,6 @@ def handoff_cmd(
     model,
     use_worktree,
     no_wait,
-    idempotency_key,
     as_json,
 ):
     """Hand off a task to a worker terminal and BLOCK until it completes.
@@ -197,34 +185,11 @@ def handoff_cmd(
     `cao agent result TERMINAL_ID`, or free it with `cao agent cancel --delete
     TERMINAL_ID`.
 
-    For automatic retry-safety (not just a manual handle), pass
-    --idempotency-key KEY: re-running this exact command with the SAME key
-    after a kill reattaches to the worker the first, already-committed
-    attempt created, instead of creating a second one -- this covers even a
-    response that never reached this process at all, not just a `Ctrl-C`
-    after the terminal_id was already printed above. Omit it (the default)
-    and a retry creates a new worker, same as today.
-
-    The key alone does not identify the request. It is matched together with
-    the agent profile, provider, session, working directory, model and
-    worktree flag, so a key you already used for a DIFFERENT command fails
-    with a conflict instead of handing you back that earlier, unrelated
-    worker -- the keys people actually pick (`retry`, `job-1`) collide
-    otherwise, and two agents on one cao-server pick the same ones. Reusing a
-    key whose worker has since been torn down is not a conflict; it just
-    creates a fresh one.
-
-    What the key does NOT cover, stated plainly because it is the one place
-    this is weaker than it reads: MESSAGE is not part of what is matched here,
-    so the same command with a different message reuses the worker and sends
-    the new text rather than conflicting. That is because this command delivers
-    MESSAGE as a separate step AFTER the worker exists -- only the creation is
-    keyed, so only the creation is deduplicated. (Where a task IS part of the
-    create, as with the API's initial_message, it IS matched and a different
-    task does conflict.) The consequence: if a retry cannot tell whether the
-    first attempt's message ever landed, this reattaches and sends again.
-    Making the SUBMISSION idempotent too needs a durable run record keyed by
-    this same key, tracked in #715.
+    That handle is a MANUAL recovery route, not an automatic one: re-running
+    this command after a kill creates a NEW worker. Retry-safety needs a
+    durable run record so a retry can return the existing run instead of
+    starting the task again -- tracked in #715, which is also what closes
+    #616's "killing the CLI process does not lose the job or its result".
 
     --no-wait: returns as soon as the worker exists and has been sent MESSAGE,
     without waiting for -- or extracting -- its result, and without tearing it
@@ -278,7 +243,6 @@ def handoff_cmd(
                 use_worktree=use_worktree,
                 on_terminal_id=_report_terminal_id,
                 wait=not no_wait,
-                idempotency_key=idempotency_key,
             )
         )
     except KeyboardInterrupt:

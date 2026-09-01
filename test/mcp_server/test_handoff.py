@@ -738,10 +738,16 @@ class TestHandoffEarlyTerminalId:
     def test_waiting_path_forwards_idempotency_key_to_create_terminal(
         self, mock_create, mock_provider, _nudge
     ):
-        """Review on PR #634, issue #616: cao agent handoff --idempotency-key
-        reaches _create_terminal, not just the run-step reuse payload (which
-        run_agent_step would ignore anyway -- the key protects the CREATE
-        step, not the reuse step)."""
+        """A supplied key reaches _create_terminal, not just the run-step reuse
+        payload (which run_agent_step would ignore anyway -- the key protects the
+        CREATE step, not the reuse step).
+
+        Review on PR #634. Drives `_handoff_impl` directly on purpose: the
+        `--idempotency-key` CLI flag that used to reach this was removed, because
+        keying creation alone cannot make a handoff retry safe. The parameter and
+        this test are retained for #715, which adds the durable run record and
+        re-exposes the key once a retry can resolve to an existing RUN.
+        """
         mock_provider.return_value = _ctx("kiro_cli")
         mock_create.return_value = ("dev-t1", "kiro_cli")
 

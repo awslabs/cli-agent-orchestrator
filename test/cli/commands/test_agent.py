@@ -191,25 +191,26 @@ class TestHandoff:
             "model": "fable-5",
             "use_worktree": True,
             "wait": True,
-            "idempotency_key": None,
         }
 
-    @patch("cli_agent_orchestrator.cli.commands.agent._handoff_impl")
-    def test_idempotency_key_forwarded(self, mock_impl, runner):
-        """Review on PR #634, issue #616."""
+    def test_handoff_exposes_no_idempotency_key_flag(self, runner):
+        """`--idempotency-key` was REMOVED from this surface (review on PR #634).
 
-        async def _fake_handoff(*args, **kwargs):
-            return HandoffResult(success=True, message="ok", output=None, terminal_id="w1")
-
-        mock_impl.side_effect = _fake_handoff
-
+        Keying terminal creation alone cannot make a handoff retry safe: the
+        message is delivered after the worker exists and nothing records whether
+        that delivery happened, so a retry can neither skip the send (dropping
+        the task) nor repeat it (running it twice). The server-side substrate is
+        retained for #715, which adds the durable run record and can then expose
+        a key that actually holds. Pinned so the flag is not reintroduced ahead
+        of that.
+        """
         result = runner.invoke(
             agent,
             ["handoff", "developer", "do it", "--idempotency-key", "retry-1"],
         )
 
-        assert result.exit_code == 0, result.output
-        assert mock_impl.call_args.kwargs["idempotency_key"] == "retry-1"
+        assert result.exit_code != 0
+        assert "no such option" in result.output.lower()
 
     @patch("cli_agent_orchestrator.cli.commands.agent._handoff_impl")
     def test_no_wait_forwards_wait_false_and_skips_the_waiting_line(self, mock_impl, runner):

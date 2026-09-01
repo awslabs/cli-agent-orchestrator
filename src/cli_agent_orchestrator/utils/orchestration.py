@@ -554,12 +554,11 @@ def _create_terminal(
         # fresh uuid4, and without this a keyed retry on this branch could never
         # match (review on PR #634, issue #616). The server fingerprints
         # session_name, and this branch mints a new one per invocation, so two
-        # retries of one `cao agent handoff --idempotency-key K` from outside a
-        # CAO terminal produced different fingerprints for the same logical
-        # request: the retry 409'd against its own first attempt instead of
-        # reattaching to it. Deriving the name makes the request byte-identical
-        # across attempts, which is the precondition the fingerprint check has
-        # always assumed.
+        # keyed retries from outside a CAO terminal produced different
+        # fingerprints for the same logical request: the retry 409'd against its
+        # own first attempt instead of reattaching to it. Deriving the name makes
+        # the request byte-identical across attempts, which is the precondition
+        # the fingerprint check has always assumed.
         #
         # sha256 of the key, truncated to the same 8 hex chars
         # `generate_session_name` uses, so the result is indistinguishable in
@@ -1036,17 +1035,27 @@ async def _handoff_impl(
     worker, and ``wait=False`` (``--no-wait``) to return immediately after
     creation without waiting, extracting, or tearing down at all.
 
-    ``idempotency_key`` (review on PR #634, issue #616 -- haofeif's follow-up
-    pass): closes the gap the paragraph above used to describe as
-    out-of-scope. Forwarded to ``_create_terminal``'s early-terminal-id
-    create call, which forwards it to the server; the server persists
-    ``(idempotency_key -> terminal_id)`` atomically with the terminal row
-    (see ``terminal_service.create_terminal``'s docstring), so a caller that
-    supplies the SAME key on a retry -- including one whose FIRST attempt's
-    HTTP response was lost entirely, not just a caller who saw a
-    ``terminal_id`` and then died -- gets back the terminal that first,
-    already-committed attempt created, not a second worker. ``None``
-    (default, and always for the MCP tool): today's unprotected behavior.
+    ``idempotency_key``: NO CALLER PASSES THIS TODAY, deliberately. It is
+    forwarded to ``_create_terminal``'s early-terminal-id create call, which
+    forwards it to the server; the server persists
+    ``(idempotency_key -> terminal_id)`` atomically with the terminal row (see
+    ``terminal_service.create_terminal``'s docstring), so a caller supplying the
+    SAME key on a retry gets back the terminal the first, already-committed
+    attempt created rather than a second worker.
+
+    That deduplicates terminal CREATION only. It does NOT deduplicate the
+    submission: the message is delivered after the worker exists, and nothing
+    records whether that delivery happened, so a retry can neither safely skip
+    the send (which would silently drop the task) nor safely repeat it (which
+    would run it twice). A ``cao agent handoff --idempotency-key`` flag briefly
+    existed here and was REMOVED for exactly that reason (review on PR #634):
+    a user-facing retry-safety contract that only half holds is worse than none,
+    and #616's "killing the CLI process does not lose the job or its result"
+    needs the durable run record, not this key alone.
+
+    The parameter and its tests stay because #715 builds the run record on top
+    of this substrate and will re-expose the key once a retry can resolve to an
+    existing RUN. Unreachable, not dead -- do not delete it as unused.
 
     ``target_host`` (one-agent-per-pod topology): when set, the single
     run-step call goes to THAT node's cao-server instead of the local one, so
@@ -1101,16 +1110,21 @@ async def _handoff_impl(
 
     # See the docstring: these three drive the pre-create path, which is
     # API_BASE_URL-only. Refuse rather than half-honor the placement.
+    #
+    # `idempotency_key` is included even though no CLI flag reaches it today
+    # (that flag was removed -- see the parameter's own docstring note): the
+    # parameter is still live for #715 to re-expose, and the guard has to be
+    # correct when it is, not retrofitted then.
     if target_host and (on_terminal_id is not None or not wait or idempotency_key):
         return HandoffResult(
             success=False,
             message=(
                 "Handoff failed: target_host is not supported together with "
-                "--no-wait or --idempotency-key (those paths create and drive the "
-                "worker through this node's own API, so a remote placement would "
-                "silently target the wrong node; the idempotency mapping is "
-                "node-local too). Omit target_host, or drop the other flag and use "
-                "the default blocking handoff."
+                "--no-wait or a request idempotency key (those paths create and "
+                "drive the worker through this node's own API, so a remote "
+                "placement would silently target the wrong node; the idempotency "
+                "mapping is node-local too). Omit target_host, or drop the other "
+                "option and use the default blocking handoff."
             ),
             output=None,
             terminal_id=None,
