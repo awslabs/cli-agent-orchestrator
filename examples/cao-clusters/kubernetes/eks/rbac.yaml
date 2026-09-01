@@ -1,0 +1,103 @@
+# Every identity in the namespace, in one file, because the interesting property
+# is the comparison: exactly one of these three can talk to the Kubernetes API,
+# and it is the one that runs no agent.
+#
+# All three are also Pod Identity subjects. Pod Identity keys on a (namespace,
+# serviceAccount) pair, so each name here must match an association in
+# iac/cfn-infrastructure.yaml - a name that matches nothing is a scheduling success
+# and an auth failure, which reads as a broken model rather than a broken binding.
+---
+# The supervisor: the pod a participant actually talks to. No Role and no
+# RoleBinding, so it holds no Kubernetes permissions at all. It asks the broker
+# for a worker over HTTP instead, which is the whole point of the broker - the
+# pod running a command-capable agent cannot create pods.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cao-supervisor
+  namespace: cao-cluster
+  labels:
+    app.kubernetes.io/name: cao-supervisor
+    app.kubernetes.io/part-of: cao-elastic-fleet
+---
+# Minted workers. Same story: no Role, no RoleBinding, and the API token is not
+# mounted either.
+#
+# automountServiceAccountToken: false is expected not to disturb Bedrock: Pod
+# Identity does not use this token, the webhook injects its own projected volume
+# at /var/run/secrets/pods.eks.amazonaws.com/serviceaccount/, and that volume is
+# not governed by this field.
+#
+# UNVERIFIED on this path. The branch this came from authenticated its workers
+# with a Kiro API key, so it never exercised Pod Identity with the token off. If a
+# worker comes up Ready and then fails its first model call, flip this to true and
+# re-test before looking anywhere else. First live deploy must probe
+# 169.254.170.23 from inside a minted worker (http=200 expected) and confirm IMDS
+# at 169.254.169.254 still times out.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cao-elastic-worker
+  namespace: cao-cluster
+  labels:
+    app.kubernetes.io/name: cao-elastic-worker
+    app.kubernetes.io/part-of: cao-elastic-fleet
+automountServiceAccountToken: false
+---
+# The broker: the one identity with API access, and the only one that needs its
+# token mounted.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cao-worker-broker
+  namespace: cao-cluster
+  labels:
+    app.kubernetes.io/name: cao-worker-broker
+    app.kubernetes.io/part-of: cao-elastic-fleet
+automountServiceAccountToken: true
+---
+# Scoped to disposable worker Jobs and their Services, in this namespace only.
+#
+# Note what is absent. No `pods/exec`, so the broker cannot get a shell in a
+# worker it created. No `secrets`, so it cannot read the very token it
+# authenticates callers with. No `create` on pods directly - only Jobs, which
+# means every worker pod carries a Job's ownerReference and a bounded
+# activeDeadlineSeconds whether the broker remembers to clean up or not.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cao-worker-broker
+  namespace: cao-cluster
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  # The broker publishes each ready worker into the panel's fleet ConfigMap and
+  # withdraws it on release, because nothing else can enumerate Job-backed
+  # workers. Read plus update only: it merges into a ConfigMap the kustomization
+  # owns, and never creates or deletes one.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "update"]
+---
+# A Role and RoleBinding rather than the Cluster- forms, so the blast radius of a
+# compromised broker stops at this namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cao-worker-broker
+  namespace: cao-cluster
+subjects:
+  - kind: ServiceAccount
+    name: cao-worker-broker
+    namespace: cao-cluster
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: cao-worker-broker

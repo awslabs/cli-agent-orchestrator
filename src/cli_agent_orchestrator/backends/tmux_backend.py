@@ -45,6 +45,9 @@ class TmuxBackend(TerminalBackend):
     def session_exists(self, session_name: str) -> bool:
         return self._client.session_exists(session_name)
 
+    def session_exists_strict(self, session_name: str) -> bool:
+        return self._client.session_exists_strict(session_name)
+
     def list_sessions(self) -> List[Dict[str, str]]:
         return self._client.list_sessions()
 

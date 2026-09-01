@@ -2,6 +2,7 @@ import React from 'react';
 import Link from '@docusaurus/Link';
 import useBaseUrl from '@docusaurus/useBaseUrl';
 import Layout from '@theme/Layout';
+import ThemedImage from '@theme/ThemedImage';
 import styles from './index.module.css';
 
 const providers = [
@@ -71,7 +72,22 @@ function HeroSection() {
       </div>
       <div className={`container ${styles.heroContainer}`}>
         <div className={styles.badge}>Open Source Multi-Agent Framework</div>
-        <h1 className={styles.heroTitle}>CLI Agent Orchestrator</h1>
+        {/* The lockup carries the project name, so the alt text is the
+            heading's accessible name rather than a description of the image.
+            Two files because the hero background flips to black in dark mode
+            and the lockup's navy would disappear against it. */}
+        <h1 className={styles.heroLogo}>
+          <ThemedImage
+            className={styles.heroLockup}
+            alt="CLI Agent Orchestrator"
+            sources={{
+              light: useBaseUrl('/img/cao-lockup.png'),
+              dark: useBaseUrl('/img/cao-lockup-dark.png'),
+            }}
+            width={1800}
+            height={480}
+          />
+        </h1>
         <p className={styles.heroTagline}>
           Lightweight orchestration for multi-agent AI workflows
         </p>

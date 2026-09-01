@@ -27,9 +27,7 @@ class TestSetSessionEnvEndpoint:
         clear_session_env(SESSION)
 
     def test_rehydrates_env_for_live_session(self, client):
-        with patch(
-            "cli_agent_orchestrator.api.main.get_backend", return_value=_mock_backend()
-        ):
+        with patch("cli_agent_orchestrator.api.main.get_backend", return_value=_mock_backend()):
             resp = client.post(
                 f"/sessions/{SESSION}/env",
                 json={"env_vars": {"KIMI_MODEL_NAME": "kimi-k2.5"}},
@@ -41,9 +39,7 @@ class TestSetSessionEnvEndpoint:
 
     def test_merges_on_top_of_existing_map(self, client):
         set_session_env(SESSION, {"KEEP": "old", "SHARED": "old"})
-        with patch(
-            "cli_agent_orchestrator.api.main.get_backend", return_value=_mock_backend()
-        ):
+        with patch("cli_agent_orchestrator.api.main.get_backend", return_value=_mock_backend()):
             resp = client.post(
                 f"/sessions/{SESSION}/env",
                 json={"env_vars": {"SHARED": "new", "ADDED": "x"}},
@@ -57,9 +53,7 @@ class TestSetSessionEnvEndpoint:
             "cli_agent_orchestrator.api.main.get_backend",
             return_value=_mock_backend(exists=False),
         ):
-            resp = client.post(
-                f"/sessions/{SESSION}/env", json={"env_vars": {"A": "b"}}
-            )
+            resp = client.post(f"/sessions/{SESSION}/env", json={"env_vars": {"A": "b"}})
 
         assert resp.status_code == 404
         assert get_session_env(SESSION) == {}
@@ -67,9 +61,7 @@ class TestSetSessionEnvEndpoint:
     def test_blocked_prefix_rejected_loudly(self, client):
         """The merge layer would silently drop CLAUDE*-prefixed keys at window
         creation; the boundary must reject them with a clear 400 instead."""
-        with patch(
-            "cli_agent_orchestrator.api.main.get_backend", return_value=_mock_backend()
-        ):
+        with patch("cli_agent_orchestrator.api.main.get_backend", return_value=_mock_backend()):
             resp = client.post(
                 f"/sessions/{SESSION}/env",
                 json={"env_vars": {"CLAUDE_SECRET": "x"}},
@@ -80,12 +72,8 @@ class TestSetSessionEnvEndpoint:
         assert get_session_env(SESSION) == {}
 
     def test_invalid_name_and_oversized_value_rejected(self, client):
-        with patch(
-            "cli_agent_orchestrator.api.main.get_backend", return_value=_mock_backend()
-        ):
-            bad_name = client.post(
-                f"/sessions/{SESSION}/env", json={"env_vars": {"1BAD": "x"}}
-            )
+        with patch("cli_agent_orchestrator.api.main.get_backend", return_value=_mock_backend()):
+            bad_name = client.post(f"/sessions/{SESSION}/env", json={"env_vars": {"1BAD": "x"}})
             too_big = client.post(
                 f"/sessions/{SESSION}/env", json={"env_vars": {"BIG": "x" * 4096}}
             )

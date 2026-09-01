@@ -209,6 +209,20 @@ PIPE_LIVENESS_COLD_START_GRACE_S = _env_float("CAO_PIPE_LIVENESS_COLD_START_GRAC
 # After this many attempts, give up loudly and drop the terminal from the
 # watchdog, exactly like the rearm()-exception path already does.
 PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS = _env_int("CAO_PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS", 5)
+# Cap on consecutive liveness-PROBE failures per terminal (harness-control#845). The
+# probe (a tmux ``capture-pane``/``get_history``) raises — e.g. libtmux
+# ``ObjectDoesNotExist`` — when the session, window, or the whole tmux server is gone.
+# That exception path reaches NEITHER the rearm-failure NOR the cold-start counter above
+# (both sit downstream of a probe that RETURNED), so before this bound a terminal whose
+# session/server had died was re-probed every PIPE_LIVENESS_CHECK_INTERVAL_S forever, each
+# tick emitting a full-traceback ERROR — an unbounded, self-amplifying log/CPU storm across
+# every ghost terminal exactly when the box is already unhealthy (live incident: ~578k
+# error lines, a strong contributor to a near-simultaneous mass session teardown). After
+# this many consecutive probe failures, give up loudly ONCE and drop the terminal from the
+# watchdog, exactly like the rearm-exception and cold-start paths already do. The counter
+# resets on any successful probe, so a brief transient (a session momentarily unavailable
+# but not gone) never accumulates to a false drop.
+PIPE_LIVENESS_MAX_PROBE_FAILURES = _env_int("CAO_PIPE_LIVENESS_MAX_PROBE_FAILURES", 5)
 
 # pyte-rendered status detection. When enabled, the StatusMonitor feeds each
 # terminal's output through a pyte terminal emulator and runs detection against
@@ -355,6 +369,28 @@ API_BASE_URL = f"http://{SERVER_HOST}:{SERVER_PORT}"
 # Default timeout (seconds) for HTTP calls to the CAO API server.
 MCP_REQUEST_TIMEOUT = 30
 
+# Cross-node placement + callback routing (one-agent-per-pod topology).
+# Defined here — not in mcp_server/server.py — because BOTH the MCP client
+# (which injects/reads them for routing) and terminal_service (which reads the
+# persisted session env to notify a cross-node supervisor of a deferred-init
+# failure) need the names, and services must not import from mcp_server.
+#
+#   ADVERTISED_URL_ENV        set on a SUPERVISOR node: base URL at which peers
+#                             (worker pods) can reach this node's cao-server.
+#   ELASTIC_CALLBACK_URL_ENV  set on an elastic SUPERVISOR: narrow broker URL
+#                             workers use instead of the supervisor control API.
+#   CALLBACK_URL_ENV /        injected by the supervisor into a REMOTE worker
+#   CALLBACK_TERMINAL_ID_ENV  terminal's env at creation: the supervisor
+#                             node's advertised URL + supervisor terminal ID.
+ADVERTISED_URL_ENV = "CAO_ADVERTISED_URL"
+ELASTIC_CALLBACK_URL_ENV = "CAO_ELASTIC_CALLBACK_URL"
+CALLBACK_URL_ENV = "CAO_CALLBACK_URL"
+CALLBACK_TERMINAL_ID_ENV = "CAO_CALLBACK_TERMINAL_ID"
+ELASTIC_WORKER_ID_ENV = "CAO_ELASTIC_WORKER_ID"
+ELASTIC_RELEASE_TOKEN_ENV = "CAO_ELASTIC_RELEASE_TOKEN"
+ELASTIC_WORKER_ID_HEADER = "X-CAO-Worker-ID"
+ELASTIC_RELEASE_TOKEN_HEADER = "X-CAO-Release-Token"
+
 
 # Operators can extend network allowlists via the env vars handled below.
 # Same comma-separated pattern as ``CAO_PROFILE_ALLOWED_HOSTS`` in install_service.
@@ -493,12 +529,6 @@ def _origin_scheme_and_authority(origin: str) -> "tuple[str, str] | None":
     return parts.scheme, parts.netloc.rsplit("@", 1)[-1]
 
 
-def _origin_authority(origin: str) -> "str | None":
-    """Return the ``host[:port]`` authority of an http/https ``Origin``."""
-    parsed = _origin_scheme_and_authority(origin)
-    return None if parsed is None else parsed[1]
-
-
 def _is_same_origin(origin: str, host: str, scheme: "str | None") -> bool:
     """Whether ``origin`` is same-origin with the request ``host``/``scheme``.
 
@@ -515,6 +545,14 @@ def _is_same_origin(origin: str, host: str, scheme: "str | None") -> bool:
     genuinely made over TLS. Rejecting that direction would break working
     reverse-proxy and Codespaces deployments without closing a real hole, since
     forging it means already controlling the victim's own origin over TLS.
+
+    That leniency has a corollary worth stating: the comparison only does
+    anything where ``scheme`` is trustworthy, meaning uvicorn terminates TLS
+    itself or the proxy is listed in ``TRUSTED_FORWARDER_IPS``. Behind an
+    untrusted proxy ``scheme`` is ``"http"`` on a request the browser made over
+    TLS, and the check is then inert in both directions: the ``http`` Origin is
+    accepted as well. Operators who want it enforced should set
+    ``CAO_FORWARDED_ALLOW_IPS`` to the proxy address.
 
     ``scheme=None`` skips the comparison entirely, preserving the behaviour
     callers had before the scheme was threaded through.
@@ -769,6 +807,25 @@ WORKFLOW_INPUTS_MAX_BYTES = 32768
 # constant, while being loose accumulates SILENTLY in a shared database that has no
 # eviction for this column.
 WORKFLOW_JOURNAL_RESULT_MAX_BYTES = 32768
+
+# Byte bound on the persisted execution manifest envelope (issue #583 Bolt 2, NFR-1 /
+# ADR-583-12). Applied to the compact-JSON encoding AFTER redaction (never before — a
+# secret straddling the bound would otherwise survive), on the UTF-8 byte length rather
+# than the character count, because the bound is a storage limit.
+#
+# 256 KiB MATCHES WORKFLOW_MAX_SPEC_BYTES RATHER THAN THE 32768 USED BY ITS TWO
+# NEIGHBOURS, AND THE ARITHMETIC IS THE REASON. The manifest CONTAINS the resolved
+# inputs map, which is separately allowed up to WORKFLOW_INPUTS_MAX_BYTES (32768). A
+# 32 KiB manifest bound would therefore be tighter than one of its own eleven fields:
+# any workflow using its full inputs allowance would truncate on EVERY run, and what
+# gets sacrificed is the frozen memory content — FR-9's entire payload. Truncation would
+# become the normal case, destroying the ``truncated`` flag's value as a signal.
+#
+# The cost is accepted deliberately: this is the loosest of the workflow bounds, in a
+# column with no eviction. Mitigating facts — it is one row per RUN rather than per step,
+# the flag makes truncation visible when it does fire, and this is a named constant that
+# is cheap to tighten if truncation is never observed in practice.
+WORKFLOW_MANIFEST_MAX_BYTES = 256 * 1024
 
 # Units (from units-generation) whose constructs are EXECUTABLE in the current
 # Bolt. Empty in Bolt 1: the run engine (N5) is not shipped, so every

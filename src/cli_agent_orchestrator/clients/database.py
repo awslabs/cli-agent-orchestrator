@@ -17,6 +17,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     create_engine,
+    literal_column,
 )
 from sqlalchemy.orm import DeclarativeBase, declarative_base, sessionmaker
 
@@ -55,6 +56,59 @@ class TerminalModel(Base):
     # literally named "metadata" per #432's design.
     metadata_json = Column("metadata", Text, nullable=True)
     last_active = Column(DateTime, default=datetime.now)
+
+    # ORDERING CONTRACT: the two session-scoped reads -- ``list_terminals_by_session``
+    # and ``list_terminals_in_sessions`` -- order by SQLite's implicit ``rowid``,
+    # so index 0 of a session's terminals is its OLDEST SURVIVING row.
+    # (``list_siblings_by_group_prefix`` also reads this table by session and is
+    # deliberately NOT ordered: its consumer matches on group prefixes and does
+    # not take a first element. Order it too if that ever changes.) Several consumers
+    # treat that as the session's conductor and one of them kills sessions on it.
+    # rowid is not declared above, so the dependency is invisible here. Three
+    # things break it SILENTLY:
+    #   * an ``INSERT OR REPLACE``/upsert against terminals -- a replace deletes
+    #     and re-inserts, so the row gets a NEW rowid and jumps to the end of its
+    #     session. Nothing does this today and
+    #     ``test_no_upsert_against_the_terminals_table`` fails the build if it
+    #     starts; use an UPDATE.
+    #   * writing ``rowid`` explicitly (``INSERT (rowid, ...) VALUES (-5, ...)``).
+    #   * giving ``id`` INTEGER affinity, which makes rowid an alias for it and
+    #     hands the order back to a random uuid.
+    # Declaring the table WITHOUT ROWID also breaks it but fails LOUDLY
+    # (``no such column: terminals.rowid``), as does reading it through
+    # ``aliased()`` or ``union()``.
+    #
+    # New rows sort after existing ones because SQLite assigns ``max(rowid)+1``
+    # among surviving rows -- so deleting rows recycles values but cannot reorder
+    # the ones still present. The exception is a table holding a row at
+    # 2**63-1, where SQLite picks random unused rowids and within-session order
+    # scrambles; unreachable without an explicit rowid write.
+    #
+    # Deliberately NOT a ``created_at`` column: rowid already records insertion
+    # order exactly and correctly for every row in every existing database,
+    # whereas a new column has to invent the value for rows that predate it, and
+    # there is no honest source for it -- ``last_active`` is written only on
+    # input delivery (send_input/send_special_key), so it is LATEST for the
+    # busiest terminal, which is usually the conductor, and backfilling from it
+    # inverts the very order this contract exists to preserve.
+    #
+    # Deliberately NOT ``caller_id`` either, and this one was priced rather than
+    # dismissed. A conductor created through ``create_session`` records no
+    # caller while an MCP-spawned worker records its supervisor, so
+    # ``caller_id IS NOT NULL`` looks like root-terminal identity. On its own it
+    # is not total -- ``caller_id`` is an optional parameter of the agent-step
+    # create path, so a root carrying an explicit caller would be outranked by a
+    # later terminal without one. It CAN be made total by also requiring the
+    # parent to be in the same session (a correlated ``EXISTS`` on
+    # ``tmux_session``, which is immutable after insert, so a root's caller can
+    # never be in its own session). Measured, that costs ~+29% on this read
+    # (50 sessions over 5k rows: 9.0ms -> 11.6ms) and couples the conductor pick
+    # to referential integrity nothing enforces -- there is no FK on
+    # ``caller_id`` and ghost terminals are deleted in three places, so a
+    # deleted root leaves every worker's caller dangling. Rejected on that cost
+    # and coupling, for a hazard the upsert guard above already turns into a red
+    # build. ``caller_id`` is still the right thing to read for a specific
+    # terminal's spawn parent; it is not worth its price as a sort key.
 
 
 class InboxModel(Base):
@@ -314,6 +368,9 @@ def init_db() -> None:
     # #504 also migrates, so registry order is immaterial — never reorder the
     # entries above.
     _migrate_memory_relationships()
+    # Appended LAST (issue #583 Bolt 2, ``approval-store``). Disjoint from every table above —
+    # its own new table, no shared columns — so registry order is immaterial here too.
+    _migrate_workflow_plan_approval()
 
 
 def _restrict_db_file_permissions() -> None:
@@ -539,6 +596,52 @@ def _migrate_memory_relationships() -> None:
         logger.debug(f"memory_relationships migration skipped: {e}")
 
 
+def _migrate_workflow_plan_approval() -> None:
+    """Create the durable ``workflow_plan_approval`` table if missing (issue #583 Bolt 2, ``approval-store``).
+
+    FR-8's re-approval mechanism: one row per APPROVED PLAN, keyed by the ``plan_id`` that
+    ``plan_identifier.compute`` derives from a run's execution-affecting fields. A changed plan produces a
+    different ``plan_id``, finds no row, and is refused until it is approved in its own right.
+
+    ``plan_id`` IS THE PRIMARY KEY, so one-approval-per-plan is enforced by the database rather than by code
+    remembering to check. Combined with ``INSERT OR IGNORE`` in ``services/approval_store.py``, that makes an
+    approval WRITE-ONCE: a repeated grant cannot overwrite the original ``approved_at`` / ``approved_by``, and
+    there is no update path at all. That absence is deliberate and is the unit's central control — an update
+    would let an existing approval be pointed at a changed plan, so the row would read as approved while the
+    work behind it had never been reviewed.
+
+    KEYED BY PLAN, NOT BY RUN, and deliberately carrying NO foreign key to ``workflow_run``: an approval's
+    lifetime is independent of any run, so deleting a run must not be able to revoke one.
+
+    Idempotent, zero-arg, self-connecting; failure logged at debug and never propagated (B4-BR-1 / B4-RD-4),
+    same precedent as every migrator above. Because that failure is SILENT, the table's existence is VERIFIED
+    rather than assumed: see ``test/services/test_approval_store.py`` for the ``PRAGMA table_info`` assertion on
+    a fresh database. A missing table makes every approval lookup answer False, which refuses every run —
+    fail-closed, but diagnosed far from its cause.
+
+    NOT registered in ``workflow_journal``'s ``_REQUIRED_RUN_COLUMNS`` / ``_REQUIRED_STEP_COLUMNS``. That
+    verification is scoped to the columns the JOURNAL's own SQL reads, and this table is read by neither, so
+    coupling the journal's connection cache to it would be wrong. The consequence is that this table gets no
+    runtime self-healing the way ``manifest_json`` does; ``approval_store._connect`` runs this migrator on every
+    connect instead, so a transient failure is retried on the next operation.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS workflow_plan_approval ("
+                "plan_id TEXT PRIMARY KEY, "
+                "approved_at TEXT NOT NULL, "
+                "approved_by TEXT NOT NULL"
+                ")"
+            )
+    except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug (B4-RD-4)
+        logger.debug(f"workflow_plan_approval migration skipped: {e}")
+
+
 def _backfill_legacy_related_keys(conn: Any) -> None:
     """One-time, idempotent backfill of ``memory_metadata.related_keys`` into
     ``memory_relationships`` as ``type=relates_to, origin=legacy_related_keys,
@@ -731,6 +834,28 @@ def _migrate_workflow_run() -> None:
     rows back-fill to ``tier='yaml'``, ``generation='1'``. ``generation`` is TEXT,
     not INTEGER, so it compares byte-identically against the env-var-transported
     string generation value (domain-entities B4 fix).
+
+    ``manifest-column`` (issue #583 Bolt 2, ADR-583-12) additively appends ONE
+    column, ``manifest_json``, through the same PRAGMA-gated idiom — the frozen
+    execution manifest envelope, carrying source hash, inputs, repository and
+    worktree baseline, provider, model, profile, permissions, limits, retry
+    policy, the resolved-memory record, and the ``plan_id`` derived from them.
+    ``DEFAULT NULL`` means "manifest absent", which every pre-Bolt-2 row is, so
+    such a row reads back observably identical to its pre-extension form
+    (INV-1/INV-2) and no back-fill is attempted — a manifest records how a run was
+    LAUNCHED, which is not recoverable for a run that already started.
+
+    Because this body's failure is silent (see the ``except`` below), the column's
+    existence is VERIFIED rather than assumed: ``test_workflow_run_columns`` in
+    ``test/clients/test_workflow_run_migration.py`` asserts it on a fresh database,
+    with its TEXT type and NULL default. A silent failure would otherwise surface
+    far from its cause, as every run losing its manifest — which the Bolt 2
+    approval gate reads as "never approved" and refuses. That direction is
+    fail-closed, but the diagnosis is still remote, hence the assertion.
+
+    This column is NOT indexed (ADR-583-12: re-approval compares a ``plan_id``
+    read out of the envelope and no query filters on it). Writing and reading it
+    belong to the ``manifest-freeze`` unit, not to this migrator.
     """
     import sqlite3
 
@@ -761,6 +886,9 @@ def _migrate_workflow_run() -> None:
                     "ALTER TABLE workflow_run ADD COLUMN generation TEXT NOT NULL DEFAULT '1'"
                 )
                 logger.info("Migration: added generation column to workflow_run")
+            if "manifest_json" not in columns:
+                conn.execute("ALTER TABLE workflow_run ADD COLUMN manifest_json TEXT DEFAULT NULL")
+                logger.info("Migration: added manifest_json column to workflow_run")
     except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug (B4-RD-4)
         logger.debug(f"workflow_run migration skipped: {e}")
 
@@ -812,8 +940,22 @@ def _migrate_workflow_run_step() -> None:
     block, so the combined body now issues FOUR guarded ``ALTER`` statements, not
     one. The risk #583 minimised is materially larger than either change assumed
     alone. #583's mitigation (assert the column exists on a fresh database) is
-    therefore MORE load-bearing after this merge, and #504's three columns have no
-    equivalent assertion. Flagged rather than silently reconciled.
+    therefore MORE load-bearing after this merge. Flagged rather than silently
+    reconciled.
+
+    CORRECTION (2026-08-18, issue #583 Bolt 2, unit ``manifest-column``). The
+    sentence above previously ended by claiming that "#504's three columns have no
+    equivalent assertion". **That claim was false and has been removed.** All three
+    ARE asserted, in ``test/clients/test_workflow_run_migration.py``: ``terminal_id``,
+    ``reprompted`` and ``error_kind`` appear in ``test_workflow_run_step_columns``'s
+    exact ``set(cols) == {...}`` column set, and each carries a nullable check
+    (``[3] == 0``) plus a default check (``[4] == "NULL"``) in the same test. The
+    locations are named here so the denial cannot rot back: a reader who believed it
+    would add a duplicate assertion to close a gap that does not exist. What DOES
+    survive from the note above is the crowding itself — four guarded ``ALTER``
+    statements under one silent ``except`` is a real and growing risk, and adopting a
+    migration framework for it is recorded as a candidate decision (out of scope for
+    a single additive column).
     """
     import sqlite3
 
@@ -1290,9 +1432,56 @@ def list_siblings_by_group_prefix(
 
 
 def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
-    """List all terminals in a tmux session."""
+    """List a tmux session's terminals, oldest first.
+
+    **Index 0 is the session's oldest surviving terminal -- normally its
+    conductor.** That is a contract, not an accident of the query plan:
+    ``flow_service`` decides whether to kill a session by whether index 0 is
+    busy, ``cao session status``/``list`` label index 0 as the Conductor over
+    HTTP, and ``session_service`` derives a session's reported profile and
+    directory from the earliest terminal that HAS either (#497) -- a first-match
+    scan rather than a bare index, so a conductor row with both fields NULL
+    still cedes ownership to a worker. Callers should cite this docstring rather
+    than restate the rule.
+
+    Ordered by ``rowid``, which is insertion order, and normally creation order:
+    every row is written at one site (``db_create_terminal``, called from
+    ``terminal_service.create_terminal``), and a worker's row cannot precede its
+    conductor's because the MCP handoff either resolves a caller that already
+    has a row (``GET /terminals/{caller_id}``, which raises if the id is stale)
+    or, when it is running outside a CAO terminal, records no caller at all and
+    starts a NEW session in which the worker is itself the conductor. Reuse
+    after deletion does not reorder surviving rows -- see ``TerminalModel`` for
+    the mechanism and its limits.
+
+    Two known gaps, both pre-existing and neither introduced here:
+
+    * ``session_lifecycle_lock`` serialises creation against teardown, but it is
+      a ``threading.Lock`` and therefore per-PROCESS. ``cao schedule run`` calls
+      ``execute_flow`` in the CLI process, and ``flow_service`` does not take the
+      lock at all, so its kill-and-recreate is not serialised against cao-server.
+      A worker insert landing inside that window can take index 0.
+    * Index 0 is the oldest SURVIVING row, which is not the conductor once the
+      conductor's own row is gone -- ``DELETE /terminals/{id}`` has no guard, the
+      MCP tool exposes it, and ghost-terminal cleanup deletes rows while the
+      session lives on.
+
+    Both mean consumers should treat index 0 as best-effort, which is what
+    ``_enrich_session_ownership`` already does. The ordering is what makes it
+    *predictable*; it does not make it an identity.
+
+    This ORDER BY does not change what this function returned before it was
+    added -- an unordered scan of a rowid table already yielded rowid order.
+    It states the order instead of inheriting it, so an index added later
+    cannot quietly change which terminal is the conductor.
+    """
     with SessionLocal() as db:
-        terminals = db.query(TerminalModel).filter(TerminalModel.tmux_session == tmux_session).all()
+        terminals = (
+            db.query(TerminalModel)
+            .filter(TerminalModel.tmux_session == tmux_session)
+            .order_by(literal_column("terminals.rowid"))
+            .all()
+        )
         return [
             {
                 "id": t.id,
@@ -1328,6 +1517,64 @@ def update_terminal_shell_command(terminal_id: str, shell_command: str) -> bool:
             db.commit()
             return True
         return False
+
+
+def list_terminals_in_sessions(tmux_sessions: List[str]) -> List[Dict[str, Any]]:
+    """List terminals for several tmux sessions in one query.
+
+    Exists so ``list_sessions`` can enrich N sessions without N queries (issue
+    #629) while still reading only the rows it will use. ``list_all_terminals``
+    would also collapse the query count, but its cost scales with the whole
+    table — including rows for sessions tmux no longer reports, which accumulate
+    because ``cleanup_service.cleanup_old_data`` only runs at server startup, so
+    a long-uptime server never sweeps them. Bounding the read by the live
+    session names keeps the cost proportional to the workload instead of to the
+    leak.
+
+    Ordered by ``rowid``, identically to ``list_terminals_by_session`` -- see
+    that function for the index-0-is-the-conductor contract and why rowid
+    expresses creation order. The two MUST order the same way: the caller picks
+    a session's "first known terminal", so the pick is order-sensitive, and an
+    ordered batched read beside an unordered per-session read is what let this
+    function silently disagree with the one it replaced.
+
+    The ORDER BY is not decoration. Without it the order is whatever the engine
+    plans: today every plan is a rowid scan (there is no index on
+    ``tmux_session``), but adding one -- the obvious reaction to a slow
+    per-session lookup -- reorders the probe. Measured, a plain ASC index on
+    ``(tmux_session, id)`` makes an unordered read return a worker ahead of the
+    session creator; ordering here is what keeps the conductor first.
+
+    Ordering by ``id`` would NOT do that: ``id`` is ``uuid4().hex[:8]``
+    (utils/terminal.generate_terminal_id), so it makes the conductor a
+    deterministic *random* terminal, and a session whose creator happens to sort
+    above one of its own workers advertises the worker's profile and directory as
+    the session's.
+
+    Returns an empty list without querying when given no session names.
+    """
+    if not tmux_sessions:
+        return []
+    with SessionLocal() as db:
+        terminals = (
+            db.query(TerminalModel)
+            .filter(TerminalModel.tmux_session.in_(tmux_sessions))
+            .order_by(literal_column("terminals.rowid"))
+            .all()
+        )
+        return [
+            {
+                "id": t.id,
+                "tmux_session": t.tmux_session,
+                "tmux_window": t.tmux_window,
+                "provider": t.provider,
+                "agent_profile": t.agent_profile,
+                "working_directory": t.working_directory,
+                "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
+                "last_active": t.last_active,
+            }
+            for t in terminals
+        ]
 
 
 def list_all_terminals() -> List[Dict[str, Any]]:
@@ -1408,6 +1655,27 @@ def delete_terminals_by_session(tmux_session: str) -> int:
     with SessionLocal() as db:
         deleted = (
             db.query(TerminalModel).filter(TerminalModel.tmux_session == tmux_session).delete()
+        )
+        db.commit()
+        return deleted
+
+
+def delete_terminals_by_ids(terminal_ids: List[str]) -> int:
+    """Delete specific terminal rows by id. Returns the number deleted.
+
+    Unlike ``delete_terminals_by_session`` (which deletes EVERY row for a
+    session name), this deletes only the given ids. Session teardown uses it to
+    scope its reconciliation sweep to the incarnation it started tearing down,
+    so a concurrent same-name recreate — whose rows carry freshly generated ids
+    — is never swept (#498).
+    """
+    if not terminal_ids:
+        return 0
+    with SessionLocal() as db:
+        deleted = (
+            db.query(TerminalModel)
+            .filter(TerminalModel.id.in_(terminal_ids))
+            .delete(synchronize_session=False)
         )
         db.commit()
         return deleted

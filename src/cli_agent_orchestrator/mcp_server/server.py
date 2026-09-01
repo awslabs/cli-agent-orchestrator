@@ -12,9 +12,13 @@ from fastmcp import FastMCP
 from pydantic import Field
 
 from cli_agent_orchestrator.constants import (
+    ADVERTISED_URL_ENV,
     API_BASE_URL,
+    CALLBACK_TERMINAL_ID_ENV,
+    CALLBACK_URL_ENV,
     DEFAULT_PROVIDER,
     DISCOVERY_TOOL_MARKER,
+    ELASTIC_CALLBACK_URL_ENV,
     WORKFLOW_EVENTS_CONNECT_TIMEOUT,
     WORKFLOW_EVENTS_MCP_MAX_EVENTS,
     WORKFLOW_EVENTS_MCP_MAX_SECONDS,
@@ -27,6 +31,9 @@ from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.models.workflow_runtime import ReturnAck, parse_decision
+from cli_agent_orchestrator.services.elastic_worker_gateway import (
+    elastic_worker_gateway_headers,
+)
 from cli_agent_orchestrator.services.memory_service import (
     MEMORY_DISABLED_MESSAGE,
     MemoryDisabledError,
@@ -55,6 +62,44 @@ ENABLE_WORKING_DIRECTORY = os.getenv("CAO_ENABLE_WORKING_DIRECTORY", "false").lo
 # supervisor LLM remembering to hand-write its terminal ID into the message.
 ENABLE_SENDER_ID_INJECTION = os.getenv("CAO_ENABLE_SENDER_ID_INJECTION", "true").lower() == "true"
 
+# --- Cross-node placement + callback routing (one-agent-per-pod topology) ---
+# A supervisor may delegate to a REMOTE CAO node by passing ``target_host`` to
+# assign/handoff. The worker terminal is then created on that node via its REST
+# API instead of the caller's local cao-server. For replies to route back
+# cross-node, two env vars are involved:
+#
+#   CAO_ADVERTISED_URL        set on the SUPERVISOR's node: the base URL at
+#                             which peers (worker pods) can reach THIS node's
+#                             cao-server (e.g. http://cao-supervisor:9889).
+#                             Required for remote assign — without it the
+#                             remote worker would have no reachable address to
+#                             send results back to.
+#   CAO_ELASTIC_CALLBACK_URL  optional narrow broker gateway used only by
+#                             assign_elastic workers, so they never receive the
+#                             supervisor control API URL.
+#   CAO_CALLBACK_URL /        injected by the supervisor into the REMOTE worker
+#   CAO_CALLBACK_TERMINAL_ID  terminal's environment at creation time: the
+#                             supervisor cao-server's advertised URL and the
+#                             supervisor's terminal ID. send_message on the
+#                             worker uses them to deliver replies to the
+#                             supervisor's node (its own local DB has no row
+#                             for the supervisor's terminal).
+#
+# All three unset = single-node behavior, byte-for-byte unchanged. The env-var
+# NAMES live in constants.py (imported above) because terminal_service also
+# reads them server-side to notify a cross-node supervisor of deferred-init
+# failures.
+
+# Default port assumed for a bare ``target_host`` DNS name (every CAO node in
+# the k8s manifests listens on 9889; override by passing host:port or a URL).
+DEFAULT_TARGET_PORT = 9889
+
+# Connect-leg timeout (seconds) for HTTP calls to a REMOTE node. Remote calls
+# use a (connect, read) tuple so a black-holed/unreachable node fails in
+# seconds instead of consuming the full read budget (which for handoff is
+# timeout+180s).
+REMOTE_CONNECT_TIMEOUT = 10.0
+
 # Terminal count threshold for cleanup nudge
 TERMINAL_CLEANUP_NUDGE_THRESHOLD = 10
 MAX_USER_PROMPT_ANSWER_LENGTH = 4000
@@ -71,6 +116,159 @@ def _current_terminal_id() -> Optional[str]:
             "Invalid CAO_TERMINAL_ID: expected an 8-character lowercase hexadecimal terminal ID"
         )
     return terminal_id
+
+
+def _callback_route() -> Tuple[Optional[str], Optional[str]]:
+    """Return ``(callback_base_url, callback_terminal_id)`` for a remote worker.
+
+    Both come from the env vars the supervisor injected at remote-creation time
+    (see the CALLBACK_* constants above). ``(None, None)``-ish values mean this
+    terminal was created locally — callers must leave behavior unchanged then.
+    """
+    url = os.environ.get(CALLBACK_URL_ENV)
+    terminal_id = os.environ.get(CALLBACK_TERMINAL_ID_ENV)
+    return (url.rstrip("/") if url else None, terminal_id or None)
+
+
+def _resolve_target_base_url(target_host: str) -> str:
+    """Normalize a ``target_host`` value into a cao-server base URL.
+
+    Accepts a full URL (``http://host:port``), a ``host:port`` pair, or a bare
+    DNS name / hostname (port defaults to DEFAULT_TARGET_PORT, the port every
+    CAO node in the k8s manifests listens on).
+
+    Note: a BARE IPv6 literal (e.g. ``::1`` or ``fd00::2``) contains ``:`` and
+    would be misparsed by the host:port branch below — pass IPv6 targets as a
+    full bracketed URL instead (``http://[fd00::2]:9889``), which the ``://``
+    branch handles verbatim.
+    """
+    host = target_host.strip()
+    if not host:
+        raise ValueError("target_host must not be empty")
+    if "://" in host:
+        return host.rstrip("/")
+    if ":" in host:
+        return f"http://{host}"
+    return f"http://{host}:{DEFAULT_TARGET_PORT}"
+
+
+def _wait_remote_ready(base_url: str, timeout: float) -> None:
+    """Poll a remote node's ``/health`` until it answers, or raise.
+
+    Exists because "the pod is Ready" and "the Service in front of the pod is
+    routable" are different claims, and only the second one is what a caller
+    needs. A broker that leases a worker the moment its Job and Service objects
+    exist is handing back an address that becomes usable shortly afterwards -
+    endpoint published, kube-proxy rules programmed on this node - and the
+    difference is a second or two that no readiness probe on the pod can observe.
+    Waiting here, on the address actually about to be used, is the only check
+    that covers both.
+
+    Polls rather than retrying the real request, and polls a GET, because that is
+    what makes this safe: ``POST /sessions`` is not idempotent, so retrying it
+    through a connection error risks two terminals on a node that allows one.
+    ``GET /health`` can be retried as often as we like.
+
+    A short per-attempt connect timeout on purpose: the expected failure while a
+    Service converges is a fast refusal or a DNS miss, and spending 10s on each
+    would turn a 2s wait into one attempt.
+
+    Raises:
+        ValueError: the node did not answer within ``timeout``.
+    """
+    deadline = time.monotonic() + timeout
+    attempt = 0
+    last_error = "no attempt made"
+    while True:
+        attempt += 1
+        try:
+            response = requests.get(f"{base_url}/health", timeout=(2.0, 5.0))
+            if response.status_code < 400:
+                if attempt > 1:
+                    logger.info("Remote node %s answered /health on attempt %d", base_url, attempt)
+                return
+            last_error = f"HTTP {response.status_code}"
+        except requests.RequestException as exc:
+            last_error = str(exc)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ValueError(
+                f"remote CAO node at {base_url} did not become reachable within "
+                f"{timeout:.0f}s ({attempt} attempts, last error: {last_error}); "
+                f"check the pod's status, CoreDNS, and any NetworkPolicy on "
+                f"worker ingress"
+            )
+        time.sleep(min(0.5, remaining))
+
+
+def _resolve_remote_provider(base_url: str, agent_profile: str) -> str:
+    """Resolve a worker's provider from the REMOTE node's own profile store.
+
+    Mirrors ``utils.agent_profiles.resolve_provider`` but over HTTP: profiles
+    are installed per node, so the caller's local store is the wrong place to
+    look for a profile that will run remotely (the supervisor node typically
+    only installs supervisor profiles). Falls back to DEFAULT_PROVIDER only when
+    the remote profile is missing (404) or a successful response does not pin a
+    provider — the remote node's provider init will surface a clear error if that
+    guess is wrong. Other HTTP failures are raised rather than silently changing
+    providers.
+
+    A CONNECTION-level failure raises instead of falling back: it doubles as
+    the reachability probe for the whole remote call, and guessing a provider
+    only to post the real work to the same dead node would waste the caller's
+    full timeout budget on a node we already know is unreachable.
+
+    Raises:
+        ValueError: the remote node could not be reached at all, or returned an
+            unexpected non-error status.
+        requests.HTTPError: the profile lookup returned an HTTP error other than
+            404.
+    """
+    try:
+        response = requests.get(
+            f"{base_url}/agents/profiles/{agent_profile}",
+            timeout=(REMOTE_CONNECT_TIMEOUT, _mcp_timeout()),
+        )
+    except requests.RequestException as exc:
+        raise ValueError(
+            f"cannot reach remote CAO node at {base_url} ({exc}); check "
+            f"target_host and that the node's cao-server is up"
+        )
+    if response.status_code == 404:
+        return DEFAULT_PROVIDER
+    if response.status_code != 200:
+        response.raise_for_status()
+        raise ValueError(
+            f"remote profile lookup at {base_url} returned unexpected "
+            f"HTTP {response.status_code}"
+        )
+    provider = response.json().get("provider")
+    if provider:
+        return str(provider)
+    return DEFAULT_PROVIDER
+
+
+def _cleanup_remote_terminal(base_url: str, terminal_id: str) -> bool:
+    """Best-effort DELETE of a terminal on a REMOTE node.
+
+    Used when a remote handoff step fails/times out: ``run_agent_step`` only
+    tears the worker terminal down on SUCCESS, and on a CAO_MAX_TERMINALS=1
+    worker pod a leftover terminal occupies the pod's only slot — permanently,
+    since the supervisor's local delete cannot reach it. A 404 counts as
+    cleaned (already gone). Never raises; returns False so the caller can put
+    the manual cleanup route in its failure message.
+    """
+    try:
+        response = requests.delete(
+            f"{base_url}/terminals/{terminal_id}",
+            timeout=(REMOTE_CONNECT_TIMEOUT, _mcp_timeout()),
+        )
+        if response.status_code == 404:
+            return True
+        return response.status_code < 400
+    except requests.RequestException as exc:
+        logger.warning("Cleanup of remote terminal %s at %s failed: %s", terminal_id, base_url, exc)
+        return False
 
 
 def _get_cleanup_nudge() -> str:
@@ -655,6 +853,16 @@ def _parse_run_step_error(
 def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
     """Send message to another terminal's inbox (queued delivery when IDLE).
 
+    Cross-node routing (one-agent-per-pod topology): when this terminal was
+    created remotely, the supervisor's terminal lives on ANOTHER node — its row
+    does not exist in this node's DB, so a local POST would 404. If the
+    receiver is the recorded cross-node supervisor (CAO_CALLBACK_TERMINAL_ID),
+    deliver through CAO_CALLBACK_URL. For ordinary remote workers that is the
+    supervisor's cao-server; elastic workers use the authenticated broker
+    gateway. A local 404 for any other receiver is also retried against the
+    callback URL once, so an explicitly quoted supervisor ID still routes.
+    Single-node behavior (no callback env) is unchanged.
+
     Args:
         receiver_id: Target terminal ID
         message: Message content
@@ -670,14 +878,29 @@ def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
     if not sender_id:
         raise ValueError("CAO_TERMINAL_ID not set - cannot determine sender")
 
+    callback_url, callback_terminal_id = _callback_route()
+    base_url = API_BASE_URL
+    if callback_url and receiver_id == callback_terminal_id:
+        base_url = callback_url
+
+    params = {"sender_id": sender_id, "message": message}
+    gateway_headers = elastic_worker_gateway_headers() or None
     response = requests.post(
-        f"{API_BASE_URL}/terminals/{receiver_id}/inbox/messages",
-        params={
-            "sender_id": sender_id,
-            "message": message,
-        },
+        f"{base_url}/terminals/{receiver_id}/inbox/messages",
+        params=params,
+        headers=gateway_headers,
         timeout=_mcp_timeout(),
     )
+    if response.status_code == 404 and callback_url and base_url != callback_url:
+        # Receiver unknown on this node but a cross-node supervisor is
+        # recorded — the caller likely quoted a terminal ID that lives on the
+        # supervisor's node. One retry against that node before failing.
+        response = requests.post(
+            f"{callback_url}/terminals/{receiver_id}/inbox/messages",
+            params=params,
+            headers=gateway_headers,
+            timeout=_mcp_timeout(),
+        )
     response.raise_for_status()
     return response.json()
 
@@ -724,8 +947,27 @@ async def _handoff_impl(
     engine: Optional[str] = None,
     model: Optional[str] = None,
     use_worktree: bool = False,
+    target_host: Optional[str] = None,
 ) -> HandoffResult:
     """Implementation of handoff logic.
+
+    ``target_host`` (one-agent-per-pod topology): when set, the single
+    run-step call goes to THAT node's cao-server instead of the local one, so
+    the worker terminal (and its fresh session) is created on the remote node.
+    The provider is resolved from the remote node's own profile store —
+    failing FAST if the node is unreachable (never guess a provider and then
+    post work to a dead node) — no ``session_name``/``caller_id`` is sent
+    (the supervisor's session and terminal row exist only on the supervisor's
+    node, and handoff is blocking — the result returns in this HTTP response,
+    no callback needed), and ``working_directory`` is interpreted on the
+    remote filesystem. ``use_worktree`` is rejected together with
+    ``target_host`` (same rule as assign — see the target_host field
+    description). A failed/timed-out remote step leaves its terminal alive
+    server-side, which on a CAO_MAX_TERMINALS=1 worker pod occupies the pod's
+    only slot — so remote failures trigger a best-effort DELETE of that
+    terminal here, and the failure message carries the manual cleanup route
+    when even that fails. Omitting ``target_host`` preserves local behavior
+    byte-for-byte.
 
     Single-seam refactor (issue #312, N0). This MCP-process function is an HTTP
     client; it MUST NOT import services/clients. Its former six granular
@@ -746,16 +988,47 @@ async def _handoff_impl(
     start_time = time.time()
     terminal_id: Optional[str] = None
 
+    # Same rule as assign (kept symmetric on purpose): remote worktree
+    # provisioning is not supported — the remote pod's default workspace is
+    # not a git checkout, so use_worktree would only fail later and wedge the
+    # worker's slot. Reject the combination up front.
+    if target_host and use_worktree:
+        return HandoffResult(
+            success=False,
+            message=(
+                "Handoff failed: use_worktree is not supported together with "
+                "target_host (remote nodes have no shared git checkout to "
+                "provision a worktree from). Omit one of the two."
+            ),
+            output=None,
+            terminal_id=None,
+        )
+
     try:
-        # Resolve the supervisor context WITHOUT creating a terminal, so the
-        # codex fast-fail (which needs CAO_TERMINAL_ID) and the codex
-        # prompt-shaping can both run caller-side before the single combined
-        # call. The context also carries the supervisor's session_name,
-        # caller_id and inherited allowed_tools so the server creates the worker
-        # in the SAME session with #284 callback routing and tool inheritance
-        # preserved (BR-8 observable-behavior parity). The endpoint then
-        # creates + drives + tears down the terminal.
-        ctx = _resolve_handoff_provider(agent_profile)
+        if target_host:
+            # Remote placement: the worker runs on target_host's node in a
+            # fresh session there. The supervisor's session/caller_id/allowed
+            # -tools context is local-node state and is deliberately NOT sent
+            # (the remote DB has no row for the supervisor's terminal); the
+            # provider comes from the remote node's own profile store.
+            base_url = _resolve_target_base_url(target_host)
+            ctx = HandoffContext(
+                provider=_resolve_remote_provider(base_url, agent_profile),
+                session_name=None,
+                caller_id=None,
+                allowed_tools=None,
+            )
+        else:
+            # Resolve the supervisor context WITHOUT creating a terminal, so the
+            # codex fast-fail (which needs CAO_TERMINAL_ID) and the codex
+            # prompt-shaping can both run caller-side before the single combined
+            # call. The context also carries the supervisor's session_name,
+            # caller_id and inherited allowed_tools so the server creates the worker
+            # in the SAME session with #284 callback routing and tool inheritance
+            # preserved (BR-8 observable-behavior parity). The endpoint then
+            # creates + drives + tears down the terminal.
+            base_url = API_BASE_URL
+            ctx = _resolve_handoff_provider(agent_profile)
         provider = ctx.provider
 
         # Fail fast for codex: its handoff banner requires CAO_TERMINAL_ID. We
@@ -803,17 +1076,35 @@ async def _handoff_impl(
 
         # Allow the full step time plus the server-side ready-wait (up to 120s)
         # plus headroom; the server enforces the per-step timeout internally.
+        # Remote calls use a (connect, read) tuple: without it, a black-holed
+        # node would consume the FULL read budget (~timeout+180s) just failing
+        # to connect. Local calls keep the plain timeout (localhost connect
+        # cannot black-hole meaningfully) so their behavior is unchanged.
         client_timeout = float(timeout) + 180.0
+        request_timeout: Any = (
+            (REMOTE_CONNECT_TIMEOUT, client_timeout) if target_host else client_timeout
+        )
         try:
             response = requests.post(
-                f"{API_BASE_URL}/terminals/run-step",
+                f"{base_url}/terminals/run-step",
                 json=payload,
-                timeout=client_timeout,
+                timeout=request_timeout,
             )
         except requests.Timeout:
+            timeout_msg = f"Handoff timed out after {timeout} seconds"
+            if target_host:
+                # Client-side timeout: the remote step may still be running and
+                # its terminal id is unknown here, so it cannot be auto-cleaned.
+                # On a CAO_MAX_TERMINALS=1 worker that terminal occupies the
+                # pod's only slot — hand the operator the manual route.
+                timeout_msg += (
+                    f". A worker terminal may remain on {target_host}; inspect "
+                    f"GET {base_url}/sessions and free the slot with "
+                    f"delete_terminal(<id>, target_host='{target_host}')."
+                )
             return HandoffResult(
                 success=False,
-                message=f"Handoff timed out after {timeout} seconds",
+                message=timeout_msg,
                 output=None,
                 terminal_id=None,
             )
@@ -835,6 +1126,21 @@ async def _handoff_impl(
                 msg = f"Handoff timed out after {timeout} seconds"
             else:
                 msg = f"Handoff failed: {structured_detail}"
+            if target_host and tid:
+                # A failed/timed-out step leaves its terminal ALIVE server-side
+                # (run_agent_step only tears down on success). Locally the
+                # supervisor can delete_terminal it; remotely that terminal
+                # occupies a max=1 worker pod's ONLY slot and the local delete
+                # cannot reach it — so clean it up here, best-effort.
+                if _cleanup_remote_terminal(base_url, tid):
+                    msg += f" (remote terminal {tid} on {target_host} cleaned up)"
+                else:
+                    msg += (
+                        f". Cleanup of remote terminal {tid} failed — it still "
+                        f"occupies a slot on {target_host}; terminal {tid} lives "
+                        f"on {target_host}; DELETE {base_url}/terminals/{tid} "
+                        f"(or delete_terminal('{tid}', target_host='{target_host}'))."
+                    )
             return HandoffResult(success=False, message=msg, output=None, terminal_id=tid)
 
         data = response.json()
@@ -851,10 +1157,11 @@ async def _handoff_impl(
         output = data["last_message"]
 
         execution_time = time.time() - start_time
+        placement = f" on node {target_host}" if target_host else ""
         return HandoffResult(
             success=True,
-            message=f"Successfully handed off to {agent_profile} ({provider}) in {execution_time:.2f}s"
-            + _get_cleanup_nudge(),
+            message=f"Successfully handed off to {agent_profile} ({provider})"
+            f"{placement} in {execution_time:.2f}s" + _get_cleanup_nudge(),
             output=output,
             terminal_id=terminal_id,
         )
@@ -868,7 +1175,19 @@ async def _handoff_impl(
         )
 
 
-# Shared by both handoff and assign's tool signatures below.
+# Shared field descriptions for both handoff and assign's tool signatures below.
+_target_host_field_desc = (
+    "Optional remote CAO node to place the worker on (one-agent-per-pod "
+    "cluster topologies): a DNS name (e.g. 'cao-worker-0.cao-workers'), a "
+    "'host:port' pair, or a full 'http://host:port' URL of that node's "
+    "cao-server (IPv6 literals must use the bracketed-URL form). When set, "
+    "the worker terminal is created on that node in a fresh session via its "
+    "REST API; working_directory (if given) refers to the remote filesystem. "
+    "Not combinable with use_worktree (remote nodes have no shared git "
+    "checkout to provision from — same rule for assign and handoff). Omit "
+    "for the default local placement (behavior unchanged)."
+)
+
 _model_field_desc = (
     "Optional model override for the worker agent (e.g. a concrete model name/id "
     "accepted by the resolved provider's own --model flag). Takes precedence over "
@@ -915,6 +1234,7 @@ if ENABLE_WORKING_DIRECTORY:
                 "repository."
             ),
         ),
+        target_host: Optional[str] = Field(default=None, description=_target_host_field_desc),
     ) -> HandoffResult:
         """Hand off a task to another agent via CAO terminal and wait for completion.
 
@@ -971,6 +1291,7 @@ if ENABLE_WORKING_DIRECTORY:
             working_directory: Optional directory path where agent should execute
             model: Optional model override (not honored by every provider)
             use_worktree: If true, isolate this handoff in its own git worktree
+            target_host: Optional remote CAO node to run the worker on
 
         Returns:
             HandoffResult with success status, message, and agent output
@@ -983,6 +1304,7 @@ if ENABLE_WORKING_DIRECTORY:
             engine=engine,
             model=model,
             use_worktree=use_worktree,
+            target_host=target_host,
         )
 
 else:
@@ -1015,6 +1337,7 @@ else:
                 "supervisor's current directory to be inside a git repository."
             ),
         ),
+        target_host: Optional[str] = Field(default=None, description=_target_host_field_desc),
     ) -> HandoffResult:
         """Hand off a task to another agent via CAO terminal and wait for completion.
 
@@ -1059,6 +1382,7 @@ else:
             timeout: Maximum wait time in seconds
             model: Optional model override (not honored by every provider)
             use_worktree: If true, isolate this handoff in its own git worktree
+            target_host: Optional remote CAO node to run the worker on
 
         Returns:
             HandoffResult with success status, message, and agent output
@@ -1071,7 +1395,158 @@ else:
             engine=engine,
             model=model,
             use_worktree=use_worktree,
+            target_host=target_host,
         )
+
+
+def _assign_remote(
+    *,
+    agent_profile: str,
+    worker_message: str,
+    current_terminal_id: str,
+    target_host: str,
+    working_directory: Optional[str],
+    engine: Optional[str],
+    model: Optional[str],
+    use_worktree: bool,
+    ready_wait_seconds: float = 0.0,
+    callback_url: Optional[str] = None,
+    remote_session_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Create an assign worker on a REMOTE CAO node (one-agent-per-pod topology).
+
+    Uses the remote node's ``POST /sessions`` deferred-init path: a fresh
+    session is created there (the supervisor's session exists only on this
+    node) and the task is delivered once the remote provider initializes. The
+    remote node resolves the provider from its OWN installed profile store
+    (``provider`` is deliberately omitted from the request).
+
+    Callback routing: assign is non-blocking, so results come back via the
+    worker's ``send_message``. The worker's node has no DB row for this
+    supervisor terminal, so we inject ``CAO_CALLBACK_URL`` and
+    ``CAO_CALLBACK_TERMINAL_ID`` into the remote terminal's environment. Plain
+    remote assign uses this node's ``CAO_ADVERTISED_URL``; elastic assign passes
+    its authenticated broker gateway as ``callback_url`` so workers never learn
+    the supervisor control API URL.
+
+    Elastic assign also passes the broker-issued ``remote_session_name``. The
+    broker binds memory authorization to that immutable session identity before
+    the worker exists, avoiding a registration race with deferred initialization.
+
+    ``ready_wait_seconds`` > 0 waits for the target's ``/health`` before posting
+    (see ``_wait_remote_ready``). It defaults to 0, which keeps every existing
+    caller byte-identical: a ``target_host`` naming a long-running pod is either
+    up or genuinely broken, and a node that is down should still fail in seconds
+    rather than after a wait. Only a caller that just CREATED the target - the
+    elastic path - has reason to expect it to arrive shortly.
+    """
+    advertised_url = callback_url or os.environ.get(ADVERTISED_URL_ENV)
+    if not advertised_url:
+        return {
+            "success": False,
+            "terminal_id": None,
+            "message": (
+                f"Assignment failed: target_host={target_host!r} requires "
+                f"{ADVERTISED_URL_ENV} to be set on this node (the base URL at "
+                f"which the remote worker can reach this cao-server, e.g. "
+                f"http://cao-supervisor:9889) — without it the worker's results "
+                f"cannot route back."
+            ),
+        }
+    if use_worktree:
+        return {
+            "success": False,
+            "terminal_id": None,
+            "message": (
+                "Assignment failed: use_worktree is not supported together with "
+                "target_host (the remote session-creation API has no worktree "
+                "provisioning). Omit one of the two."
+            ),
+        }
+
+    base_url = _resolve_target_base_url(target_host)
+    if ready_wait_seconds > 0:
+        _wait_remote_ready(base_url, ready_wait_seconds)
+    params: Dict[str, Any] = {"agent_profile": agent_profile}
+    if remote_session_name:
+        params["session_name"] = remote_session_name
+    if working_directory:
+        # Interpreted on the REMOTE node's filesystem; the supervisor's own
+        # cwd is deliberately NOT inherited cross-node (it is meaningless
+        # on another pod's filesystem).
+        params["working_directory"] = working_directory
+    if engine is not None:
+        params["engine"] = engine
+    if model is not None:
+        params["model"] = model
+
+    response = requests.post(
+        f"{base_url}/sessions",
+        params=params,
+        json={
+            "initial_message": worker_message,
+            "initial_message_orchestration_type": OrchestrationType.ASSIGN.value,
+            "env_vars": {
+                CALLBACK_URL_ENV: advertised_url.rstrip("/"),
+                CALLBACK_TERMINAL_ID_ENV: current_terminal_id,
+            },
+        },
+        timeout=(REMOTE_CONNECT_TIMEOUT, _mcp_timeout()),
+    )
+    if response.status_code >= 400:
+        # Surface the remote node's JSON detail (e.g. a 429 "Terminal limit
+        # reached ... target a different node" from a full max=1 worker)
+        # instead of a bare status line the supervisor cannot act on.
+        detail = _extract_error_detail(response, f"status {response.status_code}")
+        return {
+            "success": False,
+            "terminal_id": None,
+            "target_host": target_host,
+            "message": f"Assignment failed on node {target_host}: {detail}",
+        }
+    data = response.json()
+    terminal_id = data["id"]
+    session_name = data.get("session_name")
+    if remote_session_name and session_name != remote_session_name:
+        return {
+            "success": False,
+            "terminal_id": terminal_id,
+            "target_host": target_host,
+            "message": (
+                f"Assignment failed on node {target_host}: requested bound session "
+                f"{remote_session_name!r}, but remote node returned {session_name!r}"
+            ),
+        }
+    # Ready-made cleanup route. NOTE: DELETE /sessions/{name} requires the
+    # admin scope (SCOPE_ADMIN) when the node's OAuth layer is enabled;
+    # DELETE /terminals/{id} (write scope) is the lighter alternative.
+    delete_url = f"{base_url}/sessions/{session_name}" if session_name else None
+
+    message_text = (
+        f"Task assigned to {agent_profile} on node {target_host} "
+        f"(remote terminal: {terminal_id}"
+        + (f", session: {session_name}" if session_name else "")
+        + f"). The worker is initializing in the background; your task will "
+        f"be delivered once it is ready and results will arrive via "
+        f"send_message. Cleanup when finished: "
+        f"delete_terminal('{terminal_id}', target_host='{target_host}')"
+        + (
+            f", or drop the whole remote session with DELETE {delete_url} "
+            f"(requires admin scope when auth is enabled)."
+            if delete_url
+            else "."
+        )
+    )
+    result = {
+        "success": True,
+        "terminal_id": terminal_id,
+        "target_host": target_host,
+        "message": message_text,
+    }
+    if session_name:
+        result["session_name"] = session_name
+        result["delete_url"] = delete_url
+    return result
 
 
 # Implementation function for assign
@@ -1082,6 +1557,10 @@ def _assign_impl(
     engine: Optional[str] = None,
     model: Optional[str] = None,
     use_worktree: bool = False,
+    target_host: Optional[str] = None,
+    ready_wait_seconds: float = 0.0,
+    callback_url: Optional[str] = None,
+    remote_session_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Implementation of assign logic.
 
@@ -1092,6 +1571,16 @@ def _assign_impl(
     under kiro-cli 2.11's ~60s per-tool client timeout, and lets multiple
     concurrent assigns from the same LLM turn run their init phases in
     parallel instead of blocking one behind the other.
+
+    ``target_host`` (one-agent-per-pod topology): when set, the worker is
+    created on THAT node via its ``POST /sessions`` deferred-init path (fresh
+    session, provider resolved from the remote node's own profile store). For
+    the worker's results to route back cross-node, this supervisor node must
+    advertise a peer-reachable base URL in ``CAO_ADVERTISED_URL``; it is
+    injected into the remote worker's env as ``CAO_CALLBACK_URL`` together
+    with ``CAO_CALLBACK_TERMINAL_ID`` (this supervisor's terminal), which the
+    worker-side ``send_message`` uses to deliver replies to this node.
+    Omitting ``target_host`` preserves local behavior byte-for-byte.
     """
     terminal_id: Optional[str] = None
     try:
@@ -1128,6 +1617,21 @@ def _assign_impl(
             )
         else:
             worker_message = message
+
+        if target_host:
+            return _assign_remote(
+                agent_profile=agent_profile,
+                worker_message=worker_message,
+                current_terminal_id=current_terminal_id,
+                target_host=target_host,
+                working_directory=working_directory,
+                engine=engine,
+                model=model,
+                use_worktree=use_worktree,
+                ready_wait_seconds=ready_wait_seconds,
+                callback_url=callback_url,
+                remote_session_name=remote_session_name,
+            )
 
         # Create terminal in DEFERRED-INIT mode: cao-server returns as soon
         # as the tmux window is up and the DB row is written; the actual
@@ -1231,6 +1735,10 @@ Args:
     desc += """
     model: Optional model override for the worker (not honored by every provider)
     use_worktree: If true, isolate this worker in its own git worktree
+    target_host: Optional remote CAO node to place the worker on (one-agent-per-pod
+        topologies). The worker is created on that node in a fresh session; results
+        route back automatically via send_message (requires CAO_ADVERTISED_URL on
+        this node). Not combinable with use_worktree.
 
 Returns:
     Dict with success status, worker terminal_id, and message"""
@@ -1273,6 +1781,7 @@ if ENABLE_WORKING_DIRECTORY:
                 "resolved working directory to be inside a git repository."
             ),
         ),
+        target_host: Optional[str] = Field(default=None, description=_target_host_field_desc),
     ) -> Dict[str, Any]:
         return _assign_impl(
             agent_profile,
@@ -1281,6 +1790,7 @@ if ENABLE_WORKING_DIRECTORY:
             engine=engine,
             model=model,
             use_worktree=use_worktree,
+            target_host=target_host,
         )
 
 else:
@@ -1306,6 +1816,7 @@ else:
                 "supervisor's current directory to be inside a git repository."
             ),
         ),
+        target_host: Optional[str] = Field(default=None, description=_target_host_field_desc),
     ) -> Dict[str, Any]:
         return _assign_impl(
             agent_profile,
@@ -1314,7 +1825,168 @@ else:
             engine=engine,
             model=model,
             use_worktree=use_worktree,
+            target_host=target_host,
         )
+
+
+def _elastic_broker_config() -> Tuple[str, str]:
+    url = os.environ.get("CAO_ELASTIC_BROKER_URL", "").strip().rstrip("/")
+    token = os.environ.get("CAO_ELASTIC_BROKER_TOKEN", "").strip()
+    if not url or not token:
+        raise ValueError(
+            "elastic workers are not configured: set CAO_ELASTIC_BROKER_URL "
+            "and CAO_ELASTIC_BROKER_TOKEN on the supervisor"
+        )
+    return url, token
+
+
+# How long the elastic path waits for a freshly leased worker to answer through
+# its Service. The broker returns a lease as soon as the Job and Service objects
+# exist, so this covers the worker's whole boot plus endpoint propagation - and it
+# is the ONE place that wait now happens, instead of once in the broker (on pod
+# readiness) and then implicitly again here (on a connect timeout, unretried).
+#
+# Generous rather than tight: the failure this replaces was a 10s connect timeout
+# on a worker that was 3 seconds from being usable, and the cost of waiting too
+# long is a slow delegation, while the cost of waiting too little is a destroyed
+# worker and a failed task. The broker's own READY_TIMEOUT (300s) remains the
+# outer bound - it settles the lease `failed` whether or not anyone is waiting.
+def _elastic_ready_wait() -> float:
+    try:
+        return max(0.0, float(os.environ.get("CAO_ELASTIC_WORKER_READY_WAIT", "120")))
+    except ValueError:
+        return 120.0
+
+
+def _release_elastic_worker(broker_url: str, broker_token: str, worker_id: str) -> bool:
+    try:
+        response = requests.delete(
+            f"{broker_url}/workers/{worker_id}",
+            headers={"X-CAO-Broker-Token": broker_token},
+            timeout=(REMOTE_CONNECT_TIMEOUT, _mcp_timeout()),
+        )
+        return response.status_code < 400 or response.status_code == 404
+    except requests.RequestException as exc:
+        logger.warning("Failed to release elastic worker %s: %s", worker_id, exc)
+        return False
+
+
+@mcp.tool()
+async def assign_elastic(
+    agent_profile: str = Field(
+        description='Agent profile for the disposable worker (for example "developer")'
+    ),
+    message: str = Field(description="Task for the disposable worker"),
+    provider: Optional[str] = Field(
+        default=None,
+        description=(
+            "Provider to install in the worker. Omit to use the broker's "
+            "configured default, which is what the deployment's image actually "
+            "contains."
+        ),
+    ),
+    engine: Optional[str] = Field(default=None, description="Optional Kiro engine override"),
+    model: Optional[str] = Field(default=None, description=_model_field_desc),
+) -> Dict[str, Any]:
+    """Provision one Kubernetes Job and assign one task to it.
+
+    The worker must call ``complete_assignment`` exactly once after producing
+    its final result. That tool durably delivers the callback before releasing
+    this worker's Job.
+
+    A successful return means the task was PLACED, not that it finished - the
+    result arrives later through the supervisor's inbox. So a worker that dies
+    before calling ``complete_assignment`` is indistinguishable from a slow one
+    here, and nothing on this side can tell them apart. The broker resolves it:
+    it holds the lease, reaps a worker whose pod ended or whose completion never
+    arrived, and records which happened. Query ``GET /workers`` on the broker
+    when a delegation reports success and produces no artifact.
+    """
+    try:
+        callback_terminal_id = _current_terminal_id()
+        if not callback_terminal_id:
+            raise ValueError("assign_elastic must run from inside a CAO terminal")
+        broker_url, broker_token = _elastic_broker_config()
+        # `provider` is omitted rather than defaulted here on purpose. A default
+        # baked into this signature silently overrides the broker's, so a fleet
+        # whose image ships one provider would still be asked for another - and
+        # the failure names a CLI the caller never mentioned. The provider a
+        # worker can actually run is a property of the deployment, so the
+        # deployment decides it.
+        #
+        # The isinstance check is not defensive noise. Called through FastMCP,
+        # `provider` arrives resolved to a string or None; called directly - as
+        # the tests do - the unfilled default is the `FieldInfo` object itself,
+        # which a plain truthiness test would happily place into the request body.
+        payload: Dict[str, Any] = {
+            "agent_profile": agent_profile,
+            "callback_terminal_id": callback_terminal_id,
+        }
+        if isinstance(provider, str) and provider.strip():
+            payload["provider"] = provider.strip()
+        # `requests` is blocking, and this coroutine runs on the MCP server's
+        # event loop. Called once that costs nothing; called five times in one
+        # LLM turn - the fan-out this tool exists for - the awaits could not
+        # interleave, so five placements ran strictly one after another. Measured
+        # from the broker's access log: the five POSTs never overlapped, 16-17s
+        # apart, 76s from first to last, and a failed worker's DELETE landed
+        # before the next POST was even sent.
+        #
+        # to_thread moves the block off the loop so the gather actually gathers.
+        # It changes nothing for a single delegation - that call was never the
+        # latency, the worker's boot was - and the broker was always ready for it:
+        # `create_worker` is a sync `def`, so Starlette already runs it in its own
+        # threadpool worker.
+        response = await asyncio.to_thread(
+            lambda: requests.post(
+                f"{broker_url}/workers",
+                headers={"X-CAO-Broker-Token": broker_token},
+                json=payload,
+                timeout=(REMOTE_CONNECT_TIMEOUT, 360),
+            )
+        )
+        response.raise_for_status()
+        lease = response.json()
+        worker_id = str(lease["worker_id"])
+        worker_message = (
+            message + "\n\n[Elastic worker lifecycle: make every tool call you "
+            "need BEFORE you write any prose. Text that settles before your first "
+            "tool call is read as the end of your turn, and this terminal is then "
+            "killed with the task unfinished. When the task is fully complete, "
+            "call complete_assignment with your final result. Do not use "
+            "send_message for the final result; complete_assignment acknowledges "
+            "delivery before terminating this disposable worker.]"
+        )
+        # Also off the loop: _assign_impl waits for the new worker to answer and
+        # then posts the task to it, both blocking. This is the longer of the two
+        # blocks, so threading only the broker call above would have left the
+        # serialisation almost entirely in place.
+        result = await asyncio.to_thread(
+            _assign_impl,
+            agent_profile,
+            worker_message,
+            str(lease["working_directory"]),
+            engine=engine,
+            model=model,
+            target_host=str(lease["target_host"]),
+            ready_wait_seconds=_elastic_ready_wait(),
+            callback_url=os.environ.get(ELASTIC_CALLBACK_URL_ENV) or None,
+            remote_session_name=str(lease["session_name"]),
+        )
+        result["worker_id"] = worker_id
+        result["elastic"] = True
+        if not result.get("success"):
+            result["worker_released"] = await asyncio.to_thread(
+                _release_elastic_worker, broker_url, broker_token, worker_id
+            )
+        return result
+    except Exception as exc:
+        return {
+            "success": False,
+            "terminal_id": None,
+            "elastic": True,
+            "message": f"Elastic assignment failed: {exc}",
+        }
 
 
 # Implementation function for send_message
@@ -1326,6 +1998,13 @@ def _send_message_impl(receiver_id: Optional[str], message: str) -> Dict[str, An
         # Default the receiver to the recorded caller (issue #284): handoff/
         # assign persist the creating terminal's ID on the worker's row, so a
         # worker can reply without parsing an ID out of the task message text.
+        # A REMOTE worker has no local caller row; its cross-node supervisor is
+        # recorded in CAO_CALLBACK_TERMINAL_ID instead (injected at creation) —
+        # _send_to_inbox routes that ID to the supervisor's node.
+        if not receiver_id:
+            _, callback_terminal_id = _callback_route()
+            if callback_terminal_id:
+                receiver_id = callback_terminal_id
         if not receiver_id:
             if not own_terminal_id:
                 return {
@@ -1434,6 +2113,48 @@ async def send_message(
 
 
 @mcp.tool()
+async def complete_assignment(
+    message: str = Field(description="Final result to deliver to the assigning supervisor"),
+) -> Dict[str, Any]:
+    """Deliver an elastic worker's final result, then release its Kubernetes Job."""
+    worker_id = os.environ.get("CAO_ELASTIC_WORKER_ID", "").strip()
+    broker_url = os.environ.get("CAO_ELASTIC_BROKER_URL", "").strip().rstrip("/")
+    release_token = os.environ.get("CAO_ELASTIC_RELEASE_TOKEN", "").strip()
+    if not worker_id or not broker_url or not release_token:
+        return {
+            "success": False,
+            "error": "complete_assignment is only available inside an elastic worker",
+        }
+
+    delivered = _send_message_impl(None, message)
+    if not delivered.get("success"):
+        return {
+            "success": False,
+            "delivered": delivered,
+            "error": "result delivery failed; worker was not released",
+        }
+    try:
+        response = requests.post(
+            f"{broker_url}/workers/{worker_id}/complete",
+            headers={"X-CAO-Release-Token": release_token},
+            timeout=(REMOTE_CONNECT_TIMEOUT, _mcp_timeout()),
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        return {
+            "success": False,
+            "delivered": delivered,
+            "error": f"result delivered but worker release failed: {exc}",
+        }
+    return {
+        "success": True,
+        "delivered": delivered,
+        "worker_id": worker_id,
+        "release_scheduled": True,
+    }
+
+
+@mcp.tool()
 async def emit_ui(
     component: str = Field(
         description=(
@@ -1511,6 +2232,15 @@ def delete_terminal(
     terminal_id: str = Field(
         description="The terminal ID to delete (obtained from assign or handoff results)"
     ),
+    target_host: Optional[str] = Field(
+        default=None,
+        description=(
+            "Remote CAO node hosting the terminal (same format as assign/handoff "
+            "target_host: DNS name, host:port, or URL). Required to delete a "
+            "terminal created remotely — its record lives on that node, not "
+            "this one. Omit for local terminals (behavior unchanged)."
+        ),
+    ),
 ) -> Dict[str, Any]:
     """Delete a terminal that is no longer needed, freeing system resources.
 
@@ -1519,24 +2249,37 @@ def delete_terminal(
     removes the terminal record.
 
     Handoff terminals are automatically cleaned up on success — you only need
-    to call this for assign terminals.
+    to call this for assign terminals, or for a REMOTE terminal a failed
+    handoff/assign left behind on a target_host node (on CAO_MAX_TERMINALS=1
+    worker pods a leftover terminal — including one stuck in ERROR — occupies
+    the pod's only slot until deleted).
 
     Args:
         terminal_id: The terminal ID to delete
+        target_host: Remote CAO node hosting the terminal; omit for local
 
     Returns:
         Dict with success status and message
     """
+    # Direct (non-MCP) invocation — e.g. existing unit tests calling the
+    # function positionally — receives the pydantic FieldInfo object as the
+    # default instead of None. Normalize anything that isn't a usable host
+    # string to "local", preserving the pre-target_host behavior exactly.
+    if not isinstance(target_host, str) or not target_host.strip():
+        target_host = None
     try:
+        base_url = _resolve_target_base_url(target_host) if target_host else API_BASE_URL
+        location = f" on node {target_host}" if target_host else ""
         response = requests.delete(
-            f"{API_BASE_URL}/terminals/{terminal_id}", timeout=_mcp_timeout()
+            f"{base_url}/terminals/{terminal_id}",
+            timeout=(REMOTE_CONNECT_TIMEOUT, _mcp_timeout()) if target_host else _mcp_timeout(),
         )
         if response.status_code == 409:
             return {
                 "success": False,
                 "message": (
-                    f"Terminal {terminal_id} cleanup is pending; retry delete_terminal "
-                    "after the Grok process exits."
+                    f"Terminal {terminal_id}{location} cleanup is pending; retry "
+                    "delete_terminal after the Grok process exits."
                 ),
             }
         response.raise_for_status()
@@ -1545,20 +2288,23 @@ def delete_terminal(
             return {
                 "success": False,
                 "message": (
-                    f"Terminal {terminal_id} cleanup is pending; retry delete_terminal "
-                    "after the Grok process exits."
+                    f"Terminal {terminal_id}{location} cleanup is pending; retry "
+                    "delete_terminal after the Grok process exits."
                 ),
             }
-        return {"success": True, "message": f"Terminal {terminal_id} deleted successfully"}
+        return {
+            "success": True,
+            "message": f"Terminal {terminal_id}{location} deleted successfully",
+        }
     except requests.HTTPError as e:
         if e.response is not None and e.response.status_code == 404:
-            return {"success": False, "message": f"Terminal {terminal_id} not found"}
+            return {"success": False, "message": f"Terminal {terminal_id}{location} not found"}
         if e.response is not None and e.response.status_code == 409:
             return {
                 "success": False,
                 "message": (
-                    f"Terminal {terminal_id} cleanup is pending; retry delete_terminal "
-                    "after the Grok process exits."
+                    f"Terminal {terminal_id}{location} cleanup is pending; retry "
+                    "delete_terminal after the Grok process exits."
                 ),
             }
         return {"success": False, "message": f"Failed to delete terminal: {str(e)}"}
@@ -1911,19 +2657,29 @@ async def memory_store(
     Use this to persist facts, decisions, user preferences, and project conventions
     that should be available across agent sessions.
     """
+    from cli_agent_orchestrator.services.memory_gateway import remote_memory_url, store_memory
     from cli_agent_orchestrator.services.memory_service import MemoryService
 
     try:
-        service = MemoryService()
         terminal_context = _get_terminal_context_from_env()
-        memory = await service.store(
-            content=content,
-            scope=scope,
-            memory_type=memory_type,
-            key=key,
-            tags=tags or "",
-            terminal_context=terminal_context,
-        )
+        if remote_memory_url():
+            memory = await store_memory(
+                content=content,
+                scope=scope,
+                memory_type=memory_type,
+                key=key,
+                tags=tags or "",
+                terminal_context=terminal_context,
+            )
+        else:
+            memory = await MemoryService().store(
+                content=content,
+                scope=scope,
+                memory_type=memory_type,
+                key=key,
+                tags=tags or "",
+                terminal_context=terminal_context,
+            )
         return {
             "success": True,
             "key": memory.key,
@@ -1998,6 +2754,7 @@ async def memory_recall(
 
     Use this to check if relevant knowledge already exists before asking the user.
     """
+    from cli_agent_orchestrator.services.memory_gateway import recall_memory, remote_memory_url
     from cli_agent_orchestrator.services.memory_service import MemoryService
     from cli_agent_orchestrator.services.settings_service import is_memory_enabled
 
@@ -2010,17 +2767,23 @@ async def memory_recall(
         }
 
     try:
-        service = MemoryService()
         terminal_context = _get_terminal_context_from_env()
-        memories = await service.recall(
-            query=query,
-            scope=scope,
-            memory_type=memory_type,
-            limit=limit,
-            terminal_context=terminal_context,
-            search_mode=search_mode,
-            sort_by=sort_by,
-            include_related=bool(include_related) if isinstance(include_related, bool) else False,
+        kwargs = {
+            "query": query,
+            "scope": scope,
+            "memory_type": memory_type,
+            "limit": limit,
+            "terminal_context": terminal_context,
+            "search_mode": search_mode,
+            "sort_by": sort_by,
+            "include_related": (
+                bool(include_related) if isinstance(include_related, bool) else False
+            ),
+        }
+        memories = (
+            await recall_memory(**kwargs)
+            if remote_memory_url()
+            else await MemoryService().recall(**kwargs)
         )
         return {
             "success": True,
@@ -2058,15 +2821,23 @@ async def memory_forget(
 
     Deletes the wiki topic file and removes the entry from index.md.
     """
+    from cli_agent_orchestrator.services.memory_gateway import forget_memory, remote_memory_url
     from cli_agent_orchestrator.services.memory_service import MemoryService
 
     try:
-        service = MemoryService()
         terminal_context = _get_terminal_context_from_env()
-        deleted = await service.forget(
-            key=key,
-            scope=scope,
-            terminal_context=terminal_context,
+        deleted = (
+            await forget_memory(
+                key=key,
+                scope=scope,
+                terminal_context=terminal_context,
+            )
+            if remote_memory_url()
+            else await MemoryService().forget(
+                key=key,
+                scope=scope,
+                terminal_context=terminal_context,
+            )
         )
         return {
             "success": True,
@@ -2637,6 +3408,59 @@ async def workflow_start(
         "run_id": data.get("run_id"),
         "state": data.get("state"),
         "status_url": links.get("status"),
+    }
+
+
+@mcp.tool()
+async def workflow_plan_approval(
+    run_id: str = Field(description="The run id to report on (from workflow_start / workflow_run)"),
+) -> Dict[str, Any]:
+    """Report a run's plan identifier and whether that plan is approved (issue #583 FR-8).
+
+    READ-ONLY. THERE IS DELIBERATELY NO TOOL THAT GRANTS AN APPROVAL, and that absence is the
+    control: an approval is a human decision about a plan, and a tool that let you approve the plan
+    you just wrote would make the approval gate decorative in exactly the case it was designed for.
+    Approving is ``cao workflow approve <plan_id>`` at a human's terminal, behind the ``cao:admin``
+    scope. Use this tool to tell the operator which ``plan_id`` to approve.
+
+    WHAT IS NOT IMPLEMENTED, stated because you may otherwise assume it: a plan identifier covers the
+    workflow's execution-affecting fields, so changing any of them yields a different ``plan_id`` that
+    needs its own approval. But **rejection of an update presenting a stale source hash is NOT yet
+    implemented** — do not rely on a stale-hash check having run. Six manifest fields (provider,
+    model, profile, permissions, limits, retry policy) are also **omitted rather than recorded**,
+    because script-tier steps are discovered by executing the Python and so have no run-level value at
+    freeze time; they are covered transitively by the source hash.
+
+    Approval enforcement is **off by default**. When it is off, an unapproved plan still runs, and
+    ``approved: false`` here is informational rather than a prediction that the run will be refused.
+
+    ``plan_id`` is ``null`` for a YAML run (which never freezes a manifest) and for a script run whose
+    freeze failed. That is reported distinctly from "not approved", because the two call for entirely
+    different actions.
+
+    Returns a structured envelope on EVERY path — never raises into the agent loop (EV-1).
+    """
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}/workflows/runs/{run_id}/plan",
+            timeout=_mcp_timeout(),
+        )
+    except requests.RequestException as e:
+        return {"ok": False, "error": f"could not reach cao-server: {e}"}
+
+    if response.status_code != 200:
+        detail = _extract_error_detail(response, f"status {response.status_code}")
+        return {"ok": False, "error": detail}
+
+    data = response.json()
+    return {
+        "ok": True,
+        "run_id": data.get("run_id"),
+        "tier": data.get("tier"),
+        "plan_id": data.get("plan_id"),
+        "approved": data.get("approved"),
+        "approved_at": data.get("approved_at"),
+        "approved_by": data.get("approved_by"),
     }
 
 

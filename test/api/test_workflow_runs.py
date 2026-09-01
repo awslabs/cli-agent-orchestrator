@@ -8,6 +8,11 @@ unknown run/spec, 400 invalid inputs, 409 cancel-of-finished, 501 reserved mode,
 
 from __future__ import annotations
 
+import asyncio
+import json
+import threading
+from types import SimpleNamespace
+
 import pytest
 
 from cli_agent_orchestrator.models.workflow import (
@@ -281,6 +286,94 @@ def test_script_run_resolved_inputs_passed_to_runner(client, script_run_env):
     assert script_run_env["spy"]["called"] is True
     # ``note`` is optional with no default -> omitted; ``topic`` kept.
     assert script_run_env["spy"]["inputs"] == {"topic": "birds"}
+
+
+def test_blocking_script_start_returns_approval_refusal(client, monkeypatch):
+    """A script approval refusal is actionable rather than an internal error."""
+    from cli_agent_orchestrator.models.workflow import ScriptSpec
+    from cli_agent_orchestrator.services import approval_gate, script_runner
+
+    spec = ScriptSpec(
+        name="scr",
+        path="/tmp/scr.py",
+        source="def main():\n    pass\n",
+        content_hash="deadbeef",
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.workflow_spec_service.get_workflow",
+        lambda name_or_path, scan_dir=None: spec,
+    )
+
+    async def _refuse(spec_arg, inputs, run_id):
+        raise approval_gate.PlanApprovalRequiredError(
+            "Plan 'plan-v1:blocked' has not been approved.",
+            plan_id="plan-v1:blocked",
+        )
+
+    monkeypatch.setattr(script_runner, "run_script_workflow", _refuse)
+
+    response = client.post(
+        "/workflows/runs",
+        json={"name_or_path": "scr", "inputs": {}, "run_id": "approval-refusal"},
+    )
+
+    assert response.status_code == 403
+    assert "plan-v1:blocked" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_blocking_script_manifest_freeze_is_offloaded_from_event_loop(monkeypatch):
+    """The blocking script start leaves the event loop schedulable while freezing."""
+    from cli_agent_orchestrator.models.workflow import ScriptSpec
+    from cli_agent_orchestrator.services import manifest_freeze, script_runner
+
+    probe_started = threading.Event()
+    same_loop_sentinel = threading.Event()
+    release_probe = threading.Event()
+    observed = {}
+    event_loop_thread_id = threading.get_ident()
+
+    def blocking_manifest(*, source_hash, inputs):
+        observed["manifest_thread_id"] = threading.get_ident()
+        probe_started.set()
+        observed["sentinel_ran_while_blocked"] = same_loop_sentinel.wait(timeout=1)
+        assert release_probe.wait(timeout=1)
+        return '{"plan_id":"plan-v1:offloaded"}'
+
+    async def advance_same_loop() -> None:
+        while not probe_started.is_set():
+            await asyncio.sleep(0)
+        same_loop_sentinel.set()
+
+    async def _drive(record, path, env):
+        return _result()
+
+    spec = ScriptSpec(
+        name="scr",
+        path="/tmp/scr.py",
+        source="def main():\n    pass\n",
+        content_hash="deadbeef",
+    )
+    monkeypatch.setattr(manifest_freeze, "build_manifest_json", blocking_manifest)
+    monkeypatch.setattr(
+        script_runner, "lint_script", lambda source, path: SimpleNamespace(status="pass")
+    )
+    monkeypatch.setattr(script_runner.approval_gate, "ensure_plan_approved", lambda **kwargs: None)
+    monkeypatch.setattr(script_runner.workflow_journal, "insert_run", lambda *args: None)
+    monkeypatch.setattr(script_runner, "_drive_process", _drive)
+
+    run_task = asyncio.create_task(script_runner.run_script_workflow(spec, {}, "manifest-blocking"))
+    sentinel_task = asyncio.create_task(advance_same_loop())
+    while not probe_started.is_set():
+        await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    release_probe.set()
+
+    await run_task
+    await sentinel_task
+
+    assert observed["manifest_thread_id"] != event_loop_thread_id
+    assert observed["sentinel_ran_while_blocked"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -773,6 +866,107 @@ def test_submit_script_tier_202_and_drives(client, async_script_env):
             break
     assert final == "completed"
     assert async_script_env["prepared"]["called"] is True
+
+
+def test_submit_script_manifest_freezes_resolved_inputs(client, async_script_env, monkeypatch):
+    """The async script manifest, journal, and drive share resolved inputs."""
+    from cli_agent_orchestrator.api import main as api_main
+    from cli_agent_orchestrator.models.workflow import InputDecl
+    from cli_agent_orchestrator.services import manifest_freeze, workflow_spec_service
+
+    resolved_inputs = {"topic": "default topic"}
+    spec = async_script_env["spec"].model_copy(
+        update={"inputs": {"topic": InputDecl(type="string", default="default topic")}}
+    )
+    captured = {}
+
+    monkeypatch.setattr(
+        workflow_spec_service, "get_workflow", lambda name_or_path, scan_dir=None: spec
+    )
+
+    def _capture_manifest(*, source_hash, inputs):
+        captured["manifest_inputs"] = inputs
+        return '{"plan_id":"plan-v1:resolved-inputs"}'
+
+    def _capture_schedule(record, spec_arg, run_id, tier, inputs):
+        captured["scheduled_inputs"] = inputs
+
+    monkeypatch.setattr(manifest_freeze, "build_manifest_json", _capture_manifest)
+    monkeypatch.setattr(api_main, "_schedule_background_drive", _capture_schedule)
+
+    response = client.post(
+        "/workflows/runs:submit",
+        json={"name_or_path": "scr", "inputs": {}, "run_id": "async-resolved-inputs"},
+    )
+
+    assert response.status_code == 202
+    assert captured["manifest_inputs"] == resolved_inputs
+    assert (
+        json.loads(workflow_journal.get_run("async-resolved-inputs").inputs_json) == resolved_inputs
+    )
+    assert captured["scheduled_inputs"] == resolved_inputs
+
+
+@pytest.mark.asyncio
+async def test_submit_script_manifest_freeze_is_offloaded_from_event_loop(monkeypatch):
+    """The submit script start leaves the event loop schedulable while freezing."""
+    from cli_agent_orchestrator.api import main as api_main
+    from cli_agent_orchestrator.models.workflow import ScriptSpec
+    from cli_agent_orchestrator.services import (
+        manifest_freeze,
+        script_runner,
+        workflow_spec_service,
+    )
+
+    probe_started = threading.Event()
+    same_loop_sentinel = threading.Event()
+    release_probe = threading.Event()
+    observed = {}
+    event_loop_thread_id = threading.get_ident()
+
+    def blocking_manifest(*, source_hash, inputs):
+        observed["manifest_thread_id"] = threading.get_ident()
+        probe_started.set()
+        observed["sentinel_ran_while_blocked"] = same_loop_sentinel.wait(timeout=1)
+        assert release_probe.wait(timeout=1)
+        return '{"plan_id":"plan-v1:offloaded"}'
+
+    async def advance_same_loop() -> None:
+        while not probe_started.is_set():
+            await asyncio.sleep(0)
+        same_loop_sentinel.set()
+
+    spec = ScriptSpec(
+        name="scr",
+        path="/tmp/scr.py",
+        source="def main():\n    pass\n",
+        content_hash="deadbeef",
+    )
+    monkeypatch.setattr(workflow_spec_service, "get_workflow", lambda name_or_path: spec)
+    monkeypatch.setattr(workflow_service, "_validate_inputs", lambda spec, inputs: inputs)
+    monkeypatch.setattr(workflow_service, "_now", lambda: "2026-01-01T00:00:00Z")
+    monkeypatch.setattr(manifest_freeze, "build_manifest_json", blocking_manifest)
+    monkeypatch.setattr(
+        script_runner, "lint_script", lambda source, path: SimpleNamespace(status="pass")
+    )
+    monkeypatch.setattr(api_main.approval_gate, "ensure_plan_approved", lambda **kwargs: None)
+    monkeypatch.setattr(workflow_journal, "insert_run", lambda *args: None)
+    monkeypatch.setattr(api_main, "_schedule_background_drive", lambda *args: None)
+
+    body = api_main.WorkflowRunRequest(name_or_path="scr", inputs={}, run_id="manifest-submit")
+    submit_task = asyncio.create_task(api_main.submit_workflow_run_endpoint(body, []))
+    sentinel_task = asyncio.create_task(advance_same_loop())
+    while not probe_started.is_set():
+        await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    release_probe.set()
+
+    response = await submit_task
+    await sentinel_task
+
+    assert response["state"] == "running"
+    assert observed["manifest_thread_id"] != event_loop_thread_id
+    assert observed["sentinel_ran_while_blocked"] is True
 
 
 def test_submit_script_lint_fail_422_no_row(client, async_script_env):

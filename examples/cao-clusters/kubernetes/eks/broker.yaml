@@ -1,0 +1,160 @@
+# The only component in this namespace that can create a pod.
+#
+# Everything else runs with no API access at all, which is the point: a
+# participant's agent can ask for "a worker running the reviewer profile" and
+# cannot ask for "a privileged pod mounting the host filesystem". The request
+# body the broker accepts has exactly two fields, both regex-bounded.
+#
+# It is also where a lease is supervised - see the reaper in broker.py.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cao-worker-broker
+  namespace: cao-cluster
+  labels:
+    app.kubernetes.io/name: cao-worker-broker
+    app.kubernetes.io/part-of: cao-elastic-fleet
+spec:
+  # MUST stay 1, and the strategy MUST be Recreate. The lease ledger lives in
+  # the broker's memory, so a second replica would reap only the leases it
+  # happened to create and leave the others to sit until the Job's own
+  # activeDeadlineSeconds an hour later. That deadline is the backstop for a
+  # broker restart; it is not a substitute for a single reaper.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cao-worker-broker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cao-worker-broker
+        app.kubernetes.io/part-of: cao-elastic-fleet
+    spec:
+      serviceAccountName: cao-worker-broker
+      containers:
+        - name: broker
+          image: <broker-image>:latest
+          ports:
+            - name: http
+              containerPort: 9890
+          env:
+            - name: CAO_ELASTIC_NAMESPACE
+              value: cao-cluster
+            # Set by kustomize, NOT by hand and NOT by deploy.sh's sed. The
+            # `replacements:` block in kustomization.yaml copies the supervisor's
+            # own already-tag-rewritten image into this value, so the workers the
+            # broker mints can never run a different build from the supervisor
+            # that delegates to them. Verified that `replacements` runs after the
+            # `images` transformer, so what lands here carries the real tag.
+            - name: CAO_ELASTIC_WORKER_IMAGE
+              value: set-by-kustomize-replacements
+            - name: CAO_ELASTIC_WORKER_SERVICE_ACCOUNT
+              value: cao-elastic-worker
+            - name: CAO_ELASTIC_WORKSPACE_PVC
+              value: cao-elastic-workspace
+            - name: CAO_ELASTIC_WORKSPACE_ROOT
+              value: /home/cao/workspace/jobs
+            - name: CAO_ELASTIC_PROJECT_ID
+              value: cao-cluster
+            # Fixed upstream for the broker's allowlisted callback/memory
+            # gateway. Workers receive the broker URL instead and cannot reach
+            # this supervisor URL through NetworkPolicy.
+            - name: CAO_SUPERVISOR_API_URL
+              value: http://cao-supervisor.cao-cluster.svc.cluster.local:9889
+            - name: CAO_ELASTIC_BROKER_URL
+              value: http://cao-worker-broker.cao-cluster.svc.cluster.local:9890
+            - name: CAO_ELASTIC_BROKER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: cao-elastic-broker-token
+                  key: token
+            # A lease with no completion inside this window is reaped and marked
+            # `expired`. Generous enough for a slow delegated task, far below the
+            # Job's own 3600s deadline so the broker always reaps first and can
+            # say WHY it reaped.
+            - name: CAO_ELASTIC_COMPLETION_TIMEOUT
+              value: "900"
+            # A lease whose pod has not reported Ready inside this window is
+            # reaped and marked `failed`. This is a REAPER deadline, not a wait:
+            # POST /workers returns as soon as the Job and Service exist, and the
+            # supervisor then waits on the worker's /health through the Service —
+            # which is the address it actually uses, and which a pod-level
+            # readiness probe cannot speak for. Set CAO_ELASTIC_GATE_ON_READY=1
+            # to restore the old behaviour, where this window was spent inside
+            # POST /workers on every single delegation.
+            - name: CAO_ELASTIC_READY_TIMEOUT
+              value: "300"
+            # ---- forwarded verbatim into every worker Job ----
+            # The broker never calls a model and holds no credentials of its own;
+            # these exist so the region and the model pins are written in ONE
+            # place, rendered once by deploy.sh, and copied into each Job by
+            # broker.py. It refuses to start if any name listed in
+            # CAO_ELASTIC_WORKER_ENV_PASSTHROUGH is missing here - a dropped
+            # model pin would otherwise schedule fine and 401 at the first call.
+            - name: CLAUDE_CODE_USE_BEDROCK
+              value: "1"
+            - name: AWS_REGION
+              value: "<region>"
+            - name: ANTHROPIC_MODEL
+              value: "global.anthropic.claude-opus-4-6-v1"
+            - name: ANTHROPIC_DEFAULT_OPUS_MODEL
+              value: "global.anthropic.claude-opus-4-6-v1"
+            - name: ANTHROPIC_DEFAULT_SONNET_MODEL
+              value: "global.anthropic.claude-opus-4-6-v1"
+            - name: ANTHROPIC_DEFAULT_HAIKU_MODEL
+              value: "global.anthropic.claude-haiku-4-5-20251001-v1:0"
+            - name: CAO_PROVIDER_INIT_TIMEOUT
+              value: "180"
+            - name: CAO_MCP_REQUEST_TIMEOUT
+              value: "240"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9890
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9890
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          # This container can create pods, so it gets the tightest context in
+          # the namespace. The image already runs as 65532; asserting it here
+          # means a rebuilt image that forgets USER fails to start rather than
+          # quietly running the pod-creating process as root.
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cao-worker-broker
+  namespace: cao-cluster
+spec:
+  selector:
+    app.kubernetes.io/name: cao-worker-broker
+  ports:
+    - name: http
+      port: 9890
+      targetPort: 9890

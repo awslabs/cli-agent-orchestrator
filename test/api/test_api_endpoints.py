@@ -262,6 +262,46 @@ class TestGetSkillContent:
 # ── Sessions CRUD ────────────────────────────────────────────────────
 
 
+class TestValidateResumeSessionId:
+    """Focused tests on the resume_session_id validation boundary.
+
+    This validator guards a string that is later interpolated into the
+    provider shell command (``claude --resume <sid>``); these tests pin the
+    accepted charset so a future regex edit cannot silently widen what
+    reaches the shell command.
+    """
+
+    def test_valid_ids_pass(self):
+        from cli_agent_orchestrator.api.main import _validate_resume_session_id
+
+        for value in [
+            "abcdefgh",  # 8 chars: minimum length
+            "01234567-89ab-cdef-0123-456789abcdef",  # UUID shape
+            "A1.b2_c3-d4",
+            "a" * 64,  # maximum length
+        ]:
+            _validate_resume_session_id(value)  # must not raise
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "abc defg",  # embedded space
+            "abcdefg;",  # shell separator
+            "$(whoami)x",  # command substitution
+            "abcdefg",  # 7 chars: too short
+            "a" * 65,  # 65 chars: too long
+            ".abcdefgh",  # leading dot
+            "abcdefgh\n",  # trailing newline (regex must anchor with \\Z)
+            "",  # empty
+        ],
+    )
+    def test_invalid_ids_raise(self, value):
+        from cli_agent_orchestrator.api.main import _validate_resume_session_id
+
+        with pytest.raises(ValueError):
+            _validate_resume_session_id(value)
+
+
 class TestCreateSession:
     """Tests for POST /sessions endpoint — success and error cases."""
 
@@ -304,6 +344,7 @@ class TestCreateSession:
             initial_message=None,
             initial_message_orchestration_type=None,
             model=None,
+            resume_session_id=None,
             group=None,
             metadata=None,
         )

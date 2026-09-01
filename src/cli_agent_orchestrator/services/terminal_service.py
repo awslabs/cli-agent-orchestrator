@@ -25,7 +25,9 @@ import threading
 import time
 from datetime import datetime
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import requests
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
@@ -36,6 +38,7 @@ from cli_agent_orchestrator.clients.database import delete_terminal as db_delete
 from cli_agent_orchestrator.clients.database import (
     delete_terminals_by_session,
     get_terminal_metadata,
+    list_all_terminals,
     list_siblings_by_group_prefix,
     update_last_active,
     update_terminal_group,
@@ -43,6 +46,8 @@ from cli_agent_orchestrator.clients.database import (
     update_terminal_shell_command,
 )
 from cli_agent_orchestrator.constants import (
+    CALLBACK_TERMINAL_ID_ENV,
+    CALLBACK_URL_ENV,
     FIFO_DIR,
     PIPE_LIVENESS_TAIL_LINES,
     SESSION_PREFIX,
@@ -55,6 +60,7 @@ from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import (
     Terminal,
     TerminalInputBlockedError,
+    TerminalLimitError,
     TerminalStatus,
 )
 from cli_agent_orchestrator.plugins import (
@@ -72,8 +78,15 @@ from cli_agent_orchestrator.providers.kiro_capabilities import (
 )
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services import worktree_service
+from cli_agent_orchestrator.services.elastic_worker_gateway import (
+    elastic_worker_gateway_headers,
+)
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.herdr_inbox_registry import get_herdr_inbox_service
+from cli_agent_orchestrator.services.memory_gateway import (
+    memory_context_for_terminal,
+    remote_memory_url,
+)
 from cli_agent_orchestrator.services.memory_service import MemoryService
 from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_event
 from cli_agent_orchestrator.services.session_env import (
@@ -81,6 +94,8 @@ from cli_agent_orchestrator.services.session_env import (
     get_session_env,
     set_session_env,
 )
+from cli_agent_orchestrator.services.session_lock import session_lifecycle_lock
+from cli_agent_orchestrator.services.settings_service import get_max_terminals
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
@@ -104,6 +119,12 @@ logger = logging.getLogger(__name__)
 # response size to a fixed, predictable amount regardless of on-disk log size.
 TERMINAL_RANGE_MAX_LENGTH = 1024 * 1024
 
+# Timeout (seconds) for the cross-node deferred-failure notification POST to a
+# remote supervisor's inbox. Runs on a worker thread, so a slow peer only
+# delays this one notification — but still bounded so a black-holed node can't
+# pin the thread.
+CROSS_NODE_NOTIFY_TIMEOUT = 10.0
+
 # Track terminals that have already received memory injection (first message only).
 _memory_injected_terminals: set = set()
 _memory_injected_lock = threading.Lock()
@@ -115,24 +136,71 @@ _memory_injected_lock = threading.Lock()
 _deferred_init_tasks: set = set()
 
 
-def inject_memory_context(first_message: str, terminal_id: str) -> str:
+def inject_memory_context(
+    first_message: str, terminal_id: str, frozen_memory: str | None = None
+) -> str:
     """Prepend <cao-memory> context block to the first user message.
 
     Tracks which terminals have already been injected so that only the very
     first user message after init receives the memory block.
 
-    Calls MemoryService.get_memory_context_for_terminal() which returns
-    a formatted <cao-memory>...</cao-memory> block (or empty string if
-    no memories exist). Stateless — no file mutation, no backup/restore.
+    Calls the configured memory backend, which returns a formatted
+    <cao-memory>...</cao-memory> block (or empty string if no memories exist).
+    Stateless — no file mutation, no backup/restore.
+
+    ``frozen_memory`` is an OPTIONAL PRE-RESOLVED BLOCK (issue #583 FR-9). When it
+    is not None the block is injected verbatim and MemoryService is never
+    consulted, so a replayed workflow run sees the memory the ORIGINAL run
+    recorded rather than whatever the store holds today. When it is None this
+    function behaves exactly as it always has, which is what keeps every
+    non-workflow terminal in CAO unaffected — and this module deliberately knows
+    nothing about workflows: the parameter is named for its content, not its
+    origin.
     """
     with _memory_injected_lock:
         if terminal_id in _memory_injected_terminals:
             return first_message
         _memory_injected_terminals.add(terminal_id)
 
+    if frozen_memory is not None:
+        # "" is a SUPPLIED block, not an absent one: it means the original run
+        # resolved no memory, so prepend nothing — and, crucially, do NOT fall
+        # through to the live path. Deciding the arm on `is not None` while
+        # deciding the prepend on truthiness is deliberate; collapsing the two
+        # into one truthiness test is exactly how a run that legitimately froze
+        # an empty block would pick up memories written after it, which is the
+        # drift FR-9 exists to prevent.
+        if not frozen_memory:
+            return first_message
+        # The operator's kill switch binds this path too. Skipping MemoryService
+        # would otherwise skip its is_memory_enabled() check, and a workflow run
+        # would paste memory into the context of someone who turned memory off.
+        # The cost is that a replay under a disabled switch differs from the
+        # original run — acceptable because the manifest records that memory was
+        # frozen, so the difference is explainable, whereas a bypassed control
+        # would leave no trace at all. Imported lazily for the same
+        # settings -> memory circular-import reason memory_service documents.
+        from cli_agent_orchestrator.services.settings_service import is_memory_enabled
+
+        if not is_memory_enabled():
+            return first_message
+        # No try/except here on purpose: string concatenation cannot fail on I/O,
+        # so the only thing a guard could swallow is a programming error — and
+        # swallowing it would silently downgrade a replay to live memory, which
+        # is a wrong answer wearing a right answer's clothes.
+        return frozen_memory + "\n\n" + first_message
+
     try:
-        svc = MemoryService()
-        context = svc.get_curated_memory_context(terminal_id, task_description=first_message[:200])
+        if remote_memory_url():
+            context = memory_context_for_terminal(
+                terminal_id,
+                task_description=first_message[:200],
+            )
+        else:
+            context = MemoryService().get_curated_memory_context(
+                terminal_id,
+                task_description=first_message[:200],
+            )
         if context:
             return context + "\n\n" + first_message
     except Exception as e:
@@ -187,6 +255,132 @@ def _resolve_working_directory(working_directory: Optional[str]) -> str:
     )
 
 
+def _roll_back_backend_create_locked(
+    session_name: str,
+    window_name: str,
+    *,
+    created_session: bool,
+) -> None:
+    """Undo the backend resource a create just made. CALLER MUST HOLD the
+    lifecycle lock for ``session_name``.
+
+    Used by ``create_terminal``'s locked critical section so a failure between
+    the backend create and the registry write cannot leave a live tmux
+    session/window with no row. Both branches matter and they are NOT the same
+    teardown:
+
+    * ``created_session=True`` -- this call created the whole session, so kill the
+      session and drop any forwarded env stashed for the name, so secrets don't
+      linger in memory or bleed into a future reuse of the name.
+    * ``created_session=False`` -- this call only added a WINDOW to a session that
+      already existed (``new_session=False``: every MCP spawn/assign-into-an-
+      existing-session call). Kill ONLY that window, so the pre-existing session
+      and its other terminals are left alone. Note this is not a guarantee that
+      the session survives: tmux drops a session when its last window dies, and
+      the peer window that made the session non-empty at the `session_exists`
+      check can be reaped by its own process exiting before this rollback runs --
+      the lifecycle lock serializes CAO's transitions, not a pane's exit. In that
+      race the session collapses and the peer's registry row is left pointing at
+      a dead session. Killing the whole session instead would be strictly worse
+      (it would destroy peers that ARE alive, which is the common case), so this
+      stays window-scoped; the residual race is the same one the outer `except`
+      path already carries and is tracked separately.
+
+    Best-effort and never raises: it runs while an exception is already in
+    flight, and that original failure is the one the caller must see.
+    """
+    if created_session:
+        # `finally`, not a following statement: the env mapping must be dropped
+        # however the kill turns out -- including when it raises a BaseException
+        # (KeyboardInterrupt/SystemExit), which `except Exception` does not catch.
+        # Sequencing these as two independent try blocks skipped the clear on
+        # exactly that path, leaving a forwarded secret in the process-global map
+        # keyed to a session name that is gone and may later be reused.
+        # `finally` still lets a BaseException propagate, which is what we want:
+        # a Ctrl-C must not be swallowed here.
+        try:
+            if not get_backend().kill_session(session_name):
+                # Falsy means the backend could not confirm the kill (or found
+                # nothing to kill). Either way the name may still be live, so say
+                # so -- a silent branch here is how an orphan goes unnoticed.
+                logger.warning(
+                    f"Rollback: kill_session({session_name}) did not confirm the kill; "
+                    "the session may still be live"
+                )
+        except Exception:
+            logger.exception(f"Rollback: failed to kill session {session_name}")
+        finally:
+            try:
+                clear_session_env(session_name)
+            except Exception:
+                logger.exception(f"Rollback: failed to clear session env for {session_name}")
+    else:
+        try:
+            if not get_backend().kill_window(session_name, window_name):
+                logger.warning(
+                    f"Rollback: kill_window({session_name}:{window_name}) did not confirm "
+                    "the kill; the window may still be live"
+                )
+        except Exception:
+            logger.exception(f"Rollback: failed to kill window {session_name}:{window_name}")
+
+
+def _roll_back_cancelled_create(
+    session_name: str,
+    terminal_id: str,
+    window_name: str,
+    *,
+    created_session: bool,
+) -> None:
+    """Undo a create whose awaiter was cancelled AFTER the worker succeeded.
+
+    Runs on a worker thread. Unlike the in-closure rollback this must
+    REACQUIRE the lifecycle lock: the worker released it when it returned, and
+    an unlocked late kill could destroy a NEW incarnation of the name that
+    another caller legitimately built in between — the same
+    never-observable-half-built argument the closure's docstring makes. Under
+    the lock, kill the session/window THIS call created, then drop the
+    committed row, so the cancelled create leaves both stores exactly as it
+    found them.
+
+    Best-effort like its sibling: the cancellation is already propagating and
+    is what the caller must see.
+    """
+    with session_lifecycle_lock(session_name):
+        _roll_back_backend_create_locked(session_name, window_name, created_session=created_session)
+        try:
+            db_delete_terminal(terminal_id)
+        except Exception:
+            logger.exception(
+                f"Rollback: failed to delete registry row {terminal_id} " "after a cancelled create"
+            )
+
+
+async def _finish_and_roll_back_cancelled_create(
+    create_worker: "asyncio.Task[Tuple[str, bool, bool]]",
+    session_name: str,
+    terminal_id: str,
+) -> None:
+    """Await the un-cancellable create worker, then compensate its outcome.
+
+    If the worker RAISED, its locked closure already rolled the backend
+    resource back and never wrote the row — nothing to do. If it RETURNED, it
+    built a session/window and committed a row that no caller will ever hear
+    about; roll both back under the lifecycle lock.
+    """
+    try:
+        window_name, session_created, _ = await create_worker
+    except BaseException:
+        return
+    await asyncio.to_thread(
+        _roll_back_cancelled_create,
+        session_name,
+        terminal_id,
+        window_name,
+        created_session=session_created,
+    )
+
+
 async def create_terminal(
     provider: str,
     agent_profile: str,
@@ -203,6 +397,7 @@ async def create_terminal(
     engine: Optional[KiroEngine | str] = None,
     kiro_capability_probe: Optional[Callable[[KiroEngine, set[str]], KiroCapabilities]] = None,
     model: Optional[str] = None,
+    resume_session_id: Optional[str] = None,
     use_worktree: bool = False,
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
@@ -261,8 +456,26 @@ async def create_terminal(
 
     Raises:
         ValueError: If session already exists (new_session=True) or not found (new_session=False)
+        TerminalLimitError: If the node's tracked-terminal cap (CAO_MAX_TERMINALS /
+            server.max_terminals; unset = unlimited) is already reached
         TimeoutError: If provider initialization times out
     """
+    # Per-node terminal cap (one-agent-per-pod k8s topology; worker pods set
+    # CAO_MAX_TERMINALS=1). Checked FIRST, before any resource (worktree, tmux
+    # window, DB row, provider process) is allocated, so a full node rejects
+    # cleanly with nothing to roll back. Best-effort under concurrency: two
+    # simultaneous creates can both pass the check (no cross-request lock),
+    # which is acceptable for the cap's placement-guard purpose.
+    max_terminals = get_max_terminals()
+    if max_terminals is not None:
+        tracked_count = len(list_all_terminals())
+        if tracked_count >= max_terminals:
+            raise TerminalLimitError(
+                f"Terminal limit reached: this node already has {tracked_count} tracked "
+                f"terminal(s) and CAO_MAX_TERMINALS/server.max_terminals is "
+                f"{max_terminals}. Delete a terminal or target a different node."
+            )
+
     terminal_id: Optional[str] = None
     session_created = False  # tracks whether THIS call created the tmux session
     # harness-control#186: tracks whether THIS call created a new WINDOW in an
@@ -372,52 +585,13 @@ async def create_terminal(
         # terminal's working_directory. This is the effective launch cwd either way.
         resolved_working_directory = _resolve_working_directory(working_directory)
 
-        # Step 2: Create tmux session or window
-        if new_session:
+        # Normalize the session name BEFORE anything keys off it: the lifecycle
+        # lock below is per session NAME, so it must be taken on the SAME string
+        # the tmux create and the registry row use, or a create and a teardown of
+        # what is really one session would take two different locks.
+        if new_session and not session_name.startswith(SESSION_PREFIX):
             # Ensure session name has the CAO prefix for identification
-            if not session_name.startswith(SESSION_PREFIX):
-                session_name = f"{SESSION_PREFIX}{session_name}"
-
-            # Prevent duplicate sessions
-            if get_backend().session_exists(session_name):
-                raise ValueError(f"Session '{session_name}' already exists")
-
-            # Wipe any stale mapping a prior aborted lifecycle for this name
-            # may have left behind, so a no-env relaunch can't inherit them.
-            clear_session_env(session_name)
-
-            # Create new tmux session with initial window
-            get_backend().create_session(
-                session_name,
-                window_name,
-                terminal_id,
-                resolved_working_directory,
-                extra_env=env_vars,
-            )
-            session_created = True  # only set after successful creation
-            delete_terminals_by_session(session_name)
-
-            # Persist forwarded env only after the tmux session actually
-            # exists; the failure path below clears it if a later step
-            # tears the session back down.
-            if env_vars:
-                set_session_env(session_name, env_vars)
-        else:
-            # Add window to existing session
-            if not get_backend().session_exists(session_name):
-                raise ValueError(f"Session '{session_name}' not found")
-            # Merge explicit per-step env_vars over the persisted session env
-            # (per-step wins on conflict): workflow routing ids like
-            # CAO_WORKFLOW_RUN_ID must reach the window even when it joins an
-            # existing session (issue #408).
-            window_name = get_backend().create_window(
-                session_name,
-                window_name,
-                terminal_id,
-                resolved_working_directory,
-                extra_env={**get_session_env(session_name), **(env_vars or {})},
-            )
-            window_created = True  # only set after successful creation
+            session_name = f"{SESSION_PREFIX}{session_name}"
 
         # Step 3: Build a runtime skill catalog only for providers that consume
         # it at launch time (see RUNTIME_SKILL_PROMPT_PROVIDERS).
@@ -441,21 +615,196 @@ async def create_terminal(
                 f"copilot_cli."
             )
 
-        # Step 3c: Persist terminal metadata to database after restrictions
-        # are resolved so API reads and snapshots report the actual launch policy.
-        db_create_terminal(
-            terminal_id,
-            session_name,
-            window_name,
-            provider,
-            agent_profile,
-            allowed_tools,
-            caller_id=caller_id,
-            engine=resolved_engine.value if resolved_engine is not None else None,
-            group=group,
-            metadata=metadata,
-            working_directory=resolved_working_directory,
-        )
+        # Step 3c: Create the tmux session/window and its registry row as ONE
+        # atomic step, under the per-session-name lifecycle lock (#498). This
+        # merges what used to be two separate steps -- the tmux create and the
+        # metadata persist -- precisely because they must become visible together.
+        #
+        # Note that everything above is already outside the lock by
+        # construction: profile load, Kiro engine resolution, tool-policy
+        # resolution and worktree provisioning are either pure reads or concern
+        # no session state, so the critical section stays down to the tmux +
+        # registry writes that actually have to be atomic against a concurrent
+        # teardown. That also lets the registry row be written exactly once, with
+        # its final allowed_tools and engine, inside the section.
+        #
+        # Why locked: without mutual exclusion a concurrent delete_session for
+        # the same name interleaves arbitrarily -- the teardown can decide the
+        # name is dead and then kill the session this call just created, or
+        # sweep between the tmux create and the row write, leaving one store
+        # holding state the other doesn't know about. Serializing per NAME (not
+        # globally) leaves creates of DIFFERENT sessions fully concurrent.
+        #
+        # Why on a worker thread: the lock is a threading primitive (the only
+        # kind reachable from both this coroutine and the synchronous teardown
+        # the API runs via to_thread -- see services/session_lock.py). Acquiring
+        # it directly here would block the EVENT LOOP for as long as a
+        # concurrent teardown of this name holds it (its tmux kill-verify poll
+        # and per-terminal FIFO joins are each seconds), freezing every other
+        # request. Off-loop, only this worker thread waits.
+        #
+        # Why the section ends here: provider.initialize() below can take tens
+        # of seconds, and a teardown of this name must never queue behind an
+        # agent launch. Everything inside is short, synchronous state mutation.
+        def _create_session_or_window_locked() -> Tuple[str, bool, bool]:
+            """Runs under the lifecycle lock on a worker thread.
+
+            Returns (window_name, session_created, window_created) -- the caller
+            needs all three: create_window may rename the window, and the
+            failure path keys its cleanup off which one this call created.
+
+            A failure after the backend create RETURNS rolls that resource back
+            HERE, still holding the lock, before re-raising: on return the tmux
+            session/window and its registry row both exist, and on such a raise
+            neither does. Without that the outer flags below would still be False
+            (they are only assigned from a successful RETURN), the `except`
+            cleanup would tear down nothing, and the failure would leave a live
+            tmux session with no registry row -- the exact divergence #498 exists
+            to eliminate. A "database is locked" OperationalError out of
+            db_create_terminal is an ordinary outcome under CAO's concurrent
+            writers, so this is a routine path, not a pathological one.
+
+            NOT covered (pre-existing, and deliberately not claimed): a failure
+            INSIDE the backend create itself, after it has already made the tmux
+            resource but before it returns. `TmuxClient.create_session` lands the
+            session at `server.new_session(...)` and only then reads
+            `session.windows[0].name` -- a fresh list-windows fetch that can raise
+            (IndexError, or its own `ValueError` when the name is None), with
+            `create_window` shaped the same way. That leaks a session/window this
+            closure never learns about, so the rollback below cannot fire. Same
+            gap existed pre-#498, which set its flag only after the create
+            returned. Closing it needs the guard to extend INTO the backend
+            create; tracked separately.
+
+            Why the rollback is INSIDE the lock rather than reported out to the
+            outer cleanup path: the lock's entire purpose is that, for one
+            session NAME, create and teardown are serialized so the name is
+            never observable half-built. Rolling back after release would reopen
+            that window -- between the release and the kill, another thread can
+            acquire the name and legitimately succeed (a new_session=False
+            create adding a window to what it sees as a live session, or a
+            teardown plus a fresh new_session=True create rebuilding the name) --
+            and the late kill would then destroy an incarnation this call does
+            not own, leaving ITS row pointing at nothing. Under the lock the
+            name goes free -> free with no observable intermediate state.
+            """
+            assert session_name is not None  # narrowed by the caller
+            with session_lifecycle_lock(session_name):
+                if new_session:
+                    # Prevent duplicate sessions
+                    if get_backend().session_exists(session_name):
+                        raise ValueError(f"Session '{session_name}' already exists")
+
+                    # Wipe any stale mapping a prior aborted lifecycle for this
+                    # name may have left behind, so a no-env relaunch can't
+                    # inherit them.
+                    clear_session_env(session_name)
+
+                    # Create new tmux session with initial window
+                    get_backend().create_session(
+                        session_name,
+                        window_name,
+                        terminal_id,
+                        resolved_working_directory,
+                        extra_env=env_vars,
+                    )
+                    created_window_name = window_name
+                    created_session, created_window = True, False
+                else:
+                    # Add window to existing session. Same lock, same reason: a
+                    # window added mid-teardown would otherwise survive the
+                    # session kill (or its row would be swept while the window
+                    # lives on).
+                    if not get_backend().session_exists(session_name):
+                        raise ValueError(f"Session '{session_name}' not found")
+                    # Merge explicit per-step env_vars over the persisted session
+                    # env (per-step wins on conflict): workflow routing ids like
+                    # CAO_WORKFLOW_RUN_ID must reach the window even when it
+                    # joins an existing session (issue #408).
+                    created_window_name = get_backend().create_window(
+                        session_name,
+                        window_name,
+                        terminal_id,
+                        resolved_working_directory,
+                        extra_env={**get_session_env(session_name), **(env_vars or {})},
+                    )
+                    created_session, created_window = False, True
+
+                # From here the backend resource EXISTS, so every remaining step
+                # is guarded: on failure the resource is rolled back under this
+                # same lock before the exception leaves the closure. See the
+                # docstring for why the rollback belongs here and not in the
+                # caller's `except`.
+                try:
+                    if created_session:
+                        # Drop rows a previous incarnation of this session name
+                        # left behind. Inside the lock, so it can never race the
+                        # row write of a concurrent create for the same name.
+                        delete_terminals_by_session(session_name)
+
+                        if env_vars:
+                            # Persist forwarded env only after the tmux session
+                            # actually exists; rolled back below if a later step
+                            # tears the session down again.
+                            set_session_env(session_name, env_vars)
+
+                    # Persist the registry row INSIDE the critical section so the
+                    # tmux session/window and its row become visible together. A
+                    # teardown that observes the new tmux state is then guaranteed
+                    # to also observe the row, instead of killing a session whose
+                    # row it cannot see and leaving it orphaned. The row carries
+                    # the launch policy already resolved above (allowed_tools,
+                    # engine), so API reads and snapshots report what was actually
+                    # launched.
+                    db_create_terminal(
+                        terminal_id,
+                        session_name,
+                        created_window_name,
+                        provider,
+                        agent_profile,
+                        allowed_tools,
+                        caller_id=caller_id,
+                        engine=resolved_engine.value if resolved_engine is not None else None,
+                        group=group,
+                        metadata=metadata,
+                        working_directory=resolved_working_directory,
+                    )
+                except BaseException:
+                    _roll_back_backend_create_locked(
+                        session_name,
+                        created_window_name,
+                        created_session=created_session,
+                    )
+                    raise
+                return created_window_name, created_session, created_window
+
+        # The worker is UN-CANCELLABLE once dispatched: cancelling this await
+        # detaches only the awaiter, while the thread proceeds to take the
+        # lifecycle lock, create the backend session/window, and commit the
+        # registry row — into the void. CancelledError is a BaseException, so
+        # the `except Exception` cleanup below never sees it, and the outer
+        # created-flags are still False so it would tear down nothing anyway:
+        # a live session + row with no FIFO, no provider, and no caller that
+        # knows the terminal exists — the exact divergence #498 eliminates.
+        # So shield the worker, and on cancellation hand its outcome to a
+        # compensator that rolls back whatever it built (under the lifecycle
+        # lock) before letting the cancellation continue.
+        create_worker = asyncio.ensure_future(asyncio.to_thread(_create_session_or_window_locked))
+        try:
+            window_name, session_created, window_created = await asyncio.shield(create_worker)
+        except asyncio.CancelledError:
+            if not create_worker.cancelled():
+                compensator = asyncio.ensure_future(
+                    _finish_and_roll_back_cancelled_create(create_worker, session_name, terminal_id)
+                )
+                try:
+                    await asyncio.shield(compensator)
+                except asyncio.CancelledError:
+                    # A repeat cancellation landed while the compensator ran;
+                    # the shielded task still completes on the loop. The
+                    # ORIGINAL cancellation is re-raised below either way.
+                    pass
+            raise
 
         # Step 4/5: Set up the FIFO event-driven output pipeline for pipe-pane
         # backends (tmux). Event-inbox backends (herdr) deliver via their own
@@ -509,6 +858,7 @@ async def create_terminal(
             skill_prompt=skill_prompt,
             model=model or (profile.model if profile else None),
             engine=resolved_engine,
+            resume_session_id=resume_session_id,
         )
 
         # Deferred-init path: return fast so callers (e.g. MCP assign) do not
@@ -673,6 +1023,70 @@ async def create_terminal(
         raise
 
 
+def _notify_cross_node_caller(terminal_id: str, session_name: str, message: str) -> bool:
+    """Deliver a deferred-init failure to a CROSS-NODE supervisor, if one is recorded.
+
+    A worker created remotely (assign with ``target_host``) has no local
+    ``caller_id`` row — its supervisor's terminal lives on ANOTHER node. The
+    creating supervisor injected ``CAO_CALLBACK_URL`` / ``CAO_CALLBACK_TERMINAL_ID``
+    into the session env at creation time (persisted via ``set_session_env``),
+    so read them back and POST the failure through that callback endpoint.
+    Elastic workers use the authenticated broker gateway; ordinary remote
+    workers call the supervisor directly. Best-effort; returns True only when
+    the remote POST succeeded. Note the session-env store is process-local -
+    after a cao-server restart the route is gone and this degrades to the
+    log-only path.
+    """
+    try:
+        session_env = get_session_env(session_name)
+        callback_url = (session_env.get(CALLBACK_URL_ENV) or "").rstrip("/")
+        callback_terminal_id = session_env.get(CALLBACK_TERMINAL_ID_ENV)
+        if not callback_url or not callback_terminal_id:
+            return False
+        response = requests.post(
+            f"{callback_url}/terminals/{callback_terminal_id}/inbox/messages",
+            params={"sender_id": terminal_id, "message": message},
+            headers=elastic_worker_gateway_headers() or None,
+            timeout=CROSS_NODE_NOTIFY_TIMEOUT,
+        )
+        response.raise_for_status()
+        return True
+    except Exception as exc:  # noqa: BLE001 — notification is best-effort
+        logger.warning(
+            "Deferred-init failure notify: cross-node delivery for worker %s failed: %s",
+            terminal_id,
+            exc,
+        )
+        return False
+
+
+def _notify_elastic_terminal_ended(terminal_id: str) -> None:
+    """Tell the broker that a one-shot worker terminal ended without completion."""
+    worker_id = os.environ.get("CAO_ELASTIC_WORKER_ID", "").strip()
+    broker_url = os.environ.get("CAO_ELASTIC_BROKER_URL", "").strip().rstrip("/")
+    release_token = os.environ.get("CAO_ELASTIC_RELEASE_TOKEN", "").strip()
+    if not worker_id or not broker_url or not release_token:
+        return
+    try:
+        response = requests.post(
+            f"{broker_url}/workers/{worker_id}/terminal-ended",
+            json={"terminal_id": terminal_id},
+            headers={"X-CAO-Release-Token": release_token},
+            timeout=5.0,
+        )
+        # A completion or another teardown signal may already have released the
+        # lease. In that case this notification is redundant.
+        if response.status_code != 404:
+            response.raise_for_status()
+    except requests.RequestException as exc:
+        logger.warning(
+            "Could not report terminal %s ending for elastic worker %s: %s",
+            terminal_id,
+            worker_id,
+            exc,
+        )
+
+
 def _notify_caller_of_deferred_failure(
     terminal_id: str,
     message: str,
@@ -685,15 +1099,21 @@ def _notify_caller_of_deferred_failure(
     Runs in a worker thread (blocking DB + tmux I/O). The supervisor is the
     worker's ``caller_id``; we enqueue a PENDING inbox message to it so the
     failure surfaces as the supervisor's next input instead of leaving it to
-    wait forever on a callback that will never come. Every step is best-effort
-    and independently guarded — a failure to notify must not prevent teardown,
+    wait forever on a callback that will never come. When there is no LOCAL
+    caller row, the worker may have been created by a CROSS-NODE supervisor
+    (assign with ``target_host``) — in that case the failure is POSTed to the
+    supervisor node recorded in the session's callback env (see
+    ``_notify_cross_node_caller``). Every step is best-effort and
+    independently guarded — a failure to notify must not prevent teardown,
     and a failure to tear down must not crash the background task.
     """
     caller_id = None
+    session_name = None
     try:
         metadata = get_terminal_metadata(terminal_id)
         if metadata:
             caller_id = metadata.get("caller_id")
+            session_name = metadata.get("tmux_session")
     except Exception as exc:  # noqa: BLE001 — notification is best-effort
         logger.warning(
             "Deferred-init failure notify: could not read metadata for %s: %s",
@@ -712,6 +1132,8 @@ def _notify_caller_of_deferred_failure(
                 terminal_id,
                 exc,
             )
+    elif session_name and _notify_cross_node_caller(terminal_id, session_name, message):
+        pass  # delivered to the cross-node supervisor's inbox
     else:
         logger.warning(
             "Deferred-init failure for %s has no caller_id to notify; failure is " "log-only.",
@@ -730,6 +1152,10 @@ def _notify_caller_of_deferred_failure(
                 terminal_id,
                 exc,
             )
+        # This process is PID 1 in an elastic worker pod, so deleting its tmux
+        # terminal does not change the pod phase. Tell the broker explicitly or
+        # the failed lease remains Ready until its completion timeout.
+        _notify_elastic_terminal_ended(terminal_id)
 
 
 # --- deferred-init submit verification ----------------------------------------
@@ -793,7 +1219,14 @@ def _worker_is_started_direct(terminal_id: str, provider) -> bool:
 
 
 def _message_visible_in_box(terminal_id: str, message: str) -> bool:
-    """True when the delivered message is still sitting in the input box.
+    """True when the delivered message is still visible in the rendered pane.
+
+    Despite the name, this matches against ``get_output`` — the whole rendered
+    pane, which includes the transcript above the composer, not just the input
+    box. A prompt echoed in the transcript therefore also reads as "visible",
+    which is safe for the Enter-vs-full-resend decision (both actions are
+    recovery for a worker believed idle) but must not be read as proof the
+    text sits unsubmitted in the composer.
 
     Decides the resubmit action: if our text is there the paste landed and only
     the Enter was dropped (send a bare Enter); if it is absent the paste itself
@@ -812,6 +1245,96 @@ def _message_visible_in_box(terminal_id: str, message: str) -> bool:
     except Exception:
         return False
     return probe in re.sub(r"[^a-z0-9]", "", rendered.lower())
+
+
+def redeliver_dropped_message(
+    terminal_id: str,
+    message: str,
+    attempt: int,
+    provider=None,
+    *,
+    full_resend_requires_probe: bool = False,
+    registry: "PluginRegistry | None" = None,
+    sender_id: Optional[str] = None,
+    orchestration_type: Optional[OrchestrationType] = None,
+) -> bool:
+    """Re-deliver a message the TUI never accepted (blocking; to_thread it).
+
+    One attempt of the confirm-and-redeliver loop shared by the deferred-init
+    path (#479) and the synchronous step path (#562). First, when the provider
+    opts in via ``supports_direct_status_probe``, a live capture-pane check
+    catches a worker that IS already running but whose cached status lags
+    behind (#496) — returns True (started) without sending anything. A caller
+    that already holds the provider instance passes it; otherwise it is
+    resolved from the registry, best-effort (a resolution failure means no
+    probe, never a failed redelivery). Then the box check picks the
+    redelivery: if the delivered text is still visible in the rendered pane
+    only the Enter was swallowed (send a bare Enter); if it is absent the
+    paste itself was dropped (re-deliver in full). See
+    ``_message_visible_in_box`` for why guessing wrong must be avoided.
+
+    ``full_resend_requires_probe`` gates the full re-send on the provider
+    being probe-capable. Reason: ``_message_visible_in_box`` scans the whole
+    rendered pane, and under the pyte screen path status detection runs only
+    at rising-edge/quiescence — a whole turn can process inside one burst,
+    leaving the cached status IDLE throughout while the prompt scrolls off —
+    so for a provider without a direct status probe there is no way to
+    distinguish "paste dropped" from "worker already ran" — and re-pasting
+    the full message into a working worker silently runs the task twice.
+    When the gate is on and the provider is not probe-capable, the
+    bare-Enter branch (which cannot duplicate a task) is still taken
+    whenever the text is visible; otherwise nothing is sent and False is
+    returned, leaving the caller's own timeout to classify the outcome. The
+    deferred-init path keeps the default (off) because it loops on
+    ``wait_until_status`` for the PROCESSING edge before ever reaching here,
+    and that pre-existing behavior is unchanged by this helper's extraction.
+
+    Returns True when the worker was found already started and nothing was
+    sent; False when a redelivery was attempted (or deliberately skipped).
+    """
+    if provider is None:
+        try:
+            provider = provider_manager.get_provider(terminal_id)
+        except Exception:
+            provider = None
+    probe_capable = provider is not None and getattr(
+        provider, "supports_direct_status_probe", False
+    )
+    if probe_capable:
+        if _worker_is_started_direct(terminal_id, provider):
+            return True
+    if _message_visible_in_box(terminal_id, message):
+        logger.warning(
+            "Delivery to %s unsubmitted (Enter swallowed); " "re-submitting via Enter (attempt %d)",
+            terminal_id,
+            attempt,
+        )
+        send_special_key(terminal_id, "Enter")
+        return False
+    if full_resend_requires_probe and not probe_capable:
+        # No probe → cannot rule out a working worker whose prompt left the
+        # pane; a full re-send could silently duplicate the task. Skip the
+        # re-send and let the caller's own deadline classify the outcome.
+        logger.warning(
+            "Delivery to %s not accepted and provider is not probe-capable; "
+            "skipping full re-send to avoid a duplicate task (attempt %d)",
+            terminal_id,
+            attempt,
+        )
+        return False
+    logger.warning(
+        "Delivery to %s not accepted (paste dropped); " "re-delivering message (attempt %d)",
+        terminal_id,
+        attempt,
+    )
+    send_input(
+        terminal_id,
+        message,
+        registry=registry,
+        sender_id=sender_id,
+        orchestration_type=orchestration_type,
+    )
+    return False
 
 
 async def _confirm_worker_started_or_resubmit(
@@ -837,40 +1360,21 @@ async def _confirm_worker_started_or_resubmit(
         return True
 
     for attempt in range(1, _DEFERRED_SUBMIT_MAX_RESUBMITS + 1):
-        # The cached status_monitor status is event-driven (pyte screener at
-        # rising-edge/quiescence only) and can lag behind reality. Before
-        # re-delivering, do a direct capture-pane / visible-screen check via
-        # the provider to catch cases where the worker IS processing but the
-        # cached status hasn't caught up yet (e.g. OpenCode's ``esc interrupt``
-        # footer appearing between pyte detection edges). Only providers that
-        # opt in via ``supports_direct_status_probe = True`` take this path.
-        if provider is not None and getattr(provider, "supports_direct_status_probe", False):
-            if await asyncio.to_thread(_worker_is_started_direct, terminal_id, provider):
-                return True
-
-        if await asyncio.to_thread(_message_visible_in_box, terminal_id, message):
-            logger.warning(
-                "Deferred assign to %s unsubmitted (Enter swallowed); "
-                "re-submitting via Enter (attempt %d)",
-                terminal_id,
-                attempt,
-            )
-            await asyncio.to_thread(send_special_key, terminal_id, "Enter")
-        else:
-            logger.warning(
-                "Deferred assign to %s not accepted (paste dropped); "
-                "re-delivering message (attempt %d)",
-                terminal_id,
-                attempt,
-            )
-            await asyncio.to_thread(
-                send_input,
-                terminal_id,
-                message,
-                registry=registry,
-                sender_id=sender_id,
-                orchestration_type=orchestration_type,
-            )
+        # The redelivery decision (box check + #496's direct-probe guard for
+        # providers that opt in) lives in ``redeliver_dropped_message`` —
+        # shared with the synchronous step path (#562).
+        already_started = await asyncio.to_thread(
+            redeliver_dropped_message,
+            terminal_id,
+            message,
+            attempt,
+            provider,
+            registry=registry,
+            sender_id=sender_id,
+            orchestration_type=orchestration_type,
+        )
+        if already_started:
+            return True
         if await wait_until_status(
             terminal_id,
             _DEFERRED_STARTED_STATUSES,
@@ -1171,6 +1675,7 @@ def send_input(
     registry: PluginRegistry | None = None,
     sender_id: str | None = None,
     orchestration_type: OrchestrationType | None = None,
+    frozen_memory: str | None = None,
 ) -> bool:
     """Send input to terminal via tmux paste buffer.
 
@@ -1178,6 +1683,12 @@ def send_input(
     of Enter keys sent after pasting is determined by the provider's
     ``paste_enter_count`` property (e.g., some TUIs need 2 Enters because
     bracketed paste triggers multi-line mode).
+
+    ``frozen_memory`` is forwarded UNCHANGED to :func:`inject_memory_context` and
+    is otherwise none of this function's business — not inspected, not validated,
+    not logged. It is last and defaulted so existing positional callers (notably
+    ``agent_step.run_agent_step``, which passes exactly two arguments) are
+    unaffected.
     """
     try:
         metadata = get_terminal_metadata(terminal_id)
@@ -1230,7 +1741,7 @@ def send_input(
         # plugins/webhooks see what the caller sent — not the
         # internal <cao-memory> block that we paste into the TUI.
         original_message = message
-        message = inject_memory_context(message, terminal_id)
+        message = inject_memory_context(message, terminal_id, frozen_memory)
 
         # Check how many Enter keys the provider needs after paste
         enter_count = provider.paste_enter_count if provider else 1
@@ -1633,145 +2144,242 @@ def read_output_range(terminal_id: str, offset: int, length: int) -> str:
     return data.decode("utf-8", errors="replace")
 
 
-def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) -> bool:
-    """Delete terminal and kill its tmux window."""
+def capture_terminal_snapshot(terminal_id: str) -> Optional[Dict]:
+    """Persist a terminal's scrollback + metadata snapshot. NON-DESTRUCTIVE.
+
+    The read-only first third of terminal teardown, split out so session
+    teardown can run it BEFORE the session kill while leaving every destructive
+    step until AFTER the kill is confirmed (#498). It has to precede the kill --
+    scrollback only exists while the pane does -- and because it only reads tmux
+    and writes two files under ``TERMINAL_LOG_DIR``, running it ahead of a kill
+    that then fails to confirm changes no terminal state at all.
+
+    Returns the terminal's metadata (both later thirds need it), or None when no
+    registry row exists -- i.e. there is nothing to tear down. The returned dict
+    carries one key that is NOT a registry column: ``live_working_directory``,
+    the pane's cwd read here while the pane still exists.
+    ``dismantle_terminal_runtime`` needs it for issue #100's worktree cleanup and
+    cannot read it itself -- on the session-teardown path the pane is already
+    gone by the time it runs -- so the single read is captured here and passed
+    along rather than repeated.
+    """
+    metadata = get_terminal_metadata(terminal_id)
+    if not metadata:
+        return None
+
+    # Read the pane's live working directory BEFORE anything destroys the pane.
+    # Single read, reused for two purposes: the scrollback snapshot below, and
+    # issue #100 Phase 1's worktree cleanup (recognizing a worktree-backed
+    # terminal from its live cwd alone -- there is no separate CAO-side record
+    # of which terminals are worktree-backed). Best-effort: a read failure
+    # means the snapshot's working_directory field is None and no worktree
+    # cleanup runs later.
+    live_working_directory = None
     try:
-        # Unregister from herdr inbox service
-        svc = get_herdr_inbox_service()
-        if svc:
-            try:
-                svc.unregister_terminal(terminal_id)
-            except Exception as e:
-                logger.warning(f"Failed to unregister terminal {terminal_id} from herdr inbox: {e}")
+        live_working_directory = get_backend().get_pane_working_directory(
+            metadata["tmux_session"], metadata["tmux_window"]
+        )
+    except Exception as e:
+        logger.warning(f"Failed to read working directory for {terminal_id}: {e}")
+    metadata["live_working_directory"] = live_working_directory
 
-        # Get metadata before deletion
-        metadata = get_terminal_metadata(terminal_id)
+    # Snapshot scrollback + metadata before killing (for debugging/restore)
+    try:
+        # Capture plain text full scrollback (no -e, no line cap)
+        scrollback = get_backend().get_history(
+            metadata["tmux_session"],
+            metadata["tmux_window"],
+            strip_escapes=True,
+            full_history=True,
+        )
+        scrollback_path = TERMINAL_LOG_DIR / f"{terminal_id}.scrollback"
+        scrollback_path.write_text(scrollback, encoding="utf-8")
 
-        if metadata:
-            # Read the pane's live working directory BEFORE kill_window below
-            # destroys the pane. Single read, reused for two purposes: the
-            # scrollback snapshot below, and issue #100 Phase 1's worktree
-            # cleanup (recognizing a worktree-backed terminal from its live
-            # cwd alone -- there is no separate CAO-side record of which
-            # terminals are worktree-backed). Best-effort: a read failure
-            # means the snapshot's working_directory field is None and no
-            # worktree cleanup runs below.
-            live_working_directory = None
-            try:
-                live_working_directory = get_backend().get_pane_working_directory(
-                    metadata["tmux_session"], metadata["tmux_window"]
-                )
-            except Exception as e:
-                logger.warning(f"Failed to read working directory for {terminal_id}: {e}")
+        import json as _json
 
-            # Snapshot scrollback + metadata before killing (for debugging/restore)
-            try:
-                # Capture plain text full scrollback (no -e, no line cap)
-                scrollback = get_backend().get_history(
-                    metadata["tmux_session"],
-                    metadata["tmux_window"],
-                    strip_escapes=True,
-                    full_history=True,
-                )
-                scrollback_path = TERMINAL_LOG_DIR / f"{terminal_id}.scrollback"
-                scrollback_path.write_text(scrollback, encoding="utf-8")
+        snapshot = {
+            "terminal_id": terminal_id,
+            "session_name": metadata["tmux_session"],
+            "window_name": metadata["tmux_window"],
+            "agent_profile": metadata.get("agent_profile"),
+            "provider": metadata["provider"],
+            "working_directory": live_working_directory,
+            "allowed_tools": metadata.get("allowed_tools"),
+            "caller_id": metadata.get("caller_id"),
+        }
+        snapshot_path = TERMINAL_LOG_DIR / f"{terminal_id}.snapshot.json"
+        snapshot_path.write_text(_json.dumps(snapshot, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"Failed to snapshot terminal {terminal_id}: {e}")
 
-                import json as _json
+    return metadata
 
-                snapshot = {
-                    "terminal_id": terminal_id,
-                    "session_name": metadata["tmux_session"],
-                    "window_name": metadata["tmux_window"],
-                    "agent_profile": metadata.get("agent_profile"),
-                    "provider": metadata["provider"],
-                    "working_directory": live_working_directory,
-                    "allowed_tools": metadata.get("allowed_tools"),
-                    "caller_id": metadata.get("caller_id"),
-                }
-                snapshot_path = TERMINAL_LOG_DIR / f"{terminal_id}.snapshot.json"
-                snapshot_path.write_text(_json.dumps(snapshot, indent=2), encoding="utf-8")
-            except Exception as e:
-                logger.warning(f"Failed to snapshot terminal {terminal_id}: {e}")
 
-            # Stop pipe-pane logging
-            try:
-                get_backend().stop_pipe_pane(metadata["tmux_session"], metadata["tmux_window"])
-            except Exception as e:
-                logger.warning(f"Failed to stop pipe-pane for {terminal_id}: {e}")
+def dismantle_terminal_runtime(
+    terminal_id: str,
+    metadata: Optional[Dict],
+    kill_window: bool = True,
+) -> bool:
+    """Tear down a terminal's runtime state, but NOT its registry row.
 
-            # Stop FIFO reader and cleanup FIFO file. Must run BEFORE kill_window
-            # so the reader thread (which reopens the FIFO on EOF) unblocks and
-            # joins before the pane disappears.
-            try:
-                fifo_manager.stop_reader(terminal_id)
-            except Exception as e:
-                logger.warning(f"Failed to stop FIFO reader for {terminal_id}: {e}")
+    The destructive middle third: herdr inbox deregistration, pipe-pane stop,
+    FIFO reader stop, status-monitor clear, the tmux window kill, worktree
+    cleanup, provider cleanup, and the per-terminal bookkeeping registries. Every
+    step is individually guarded and idempotent, so re-running it on an
+    already-dismantled terminal is a no-op -- which is what makes a re-run after
+    a failed session teardown safe.
 
-            # Clear state detector buffers for this terminal
-            try:
-                status_monitor.clear_terminal(terminal_id)
-            except Exception as e:
-                logger.warning(f"Failed to clear state detector for {terminal_id}: {e}")
+    ``kill_window=False`` skips the two tmux-facing steps (pipe-pane stop and the
+    window kill). Session teardown passes False because it has already confirmed
+    the whole tmux SESSION gone, so the window no longer exists and both calls
+    would only produce spurious warnings.
 
+    Returns False when provider cleanup was DEFERRED (Grok's private-home owner
+    could not yet be inspected/stopped), meaning the caller must keep the
+    registry row so a later DELETE can retry; True when the runtime is fully
+    dismantled. Reporting True on a deferral would turn a temporary process race
+    into a permanent private-home leak.
+
+    Ordering note: stopping the FIFO reader before killing the window is
+    preferred but not load-bearing -- since issue #382 the reader loop uses a
+    non-blocking fd plus a ``select`` timeout and holds its own keepalive write
+    end, so it can never park waiting on the pane and always observes the stop
+    flag within one poll interval.
+    """
+    # Unregister from herdr inbox service
+    svc = get_herdr_inbox_service()
+    if svc:
+        try:
+            svc.unregister_terminal(terminal_id)
+        except Exception as e:
+            logger.warning(f"Failed to unregister terminal {terminal_id} from herdr inbox: {e}")
+
+    if metadata and kill_window:
+        # Stop pipe-pane logging. Before the FIFO steps below, so the pane stops
+        # writing to the FIFO before its reader (and the FIFO file) go away.
+        try:
+            get_backend().stop_pipe_pane(metadata["tmux_session"], metadata["tmux_window"])
+        except Exception as e:
+            logger.warning(f"Failed to stop pipe-pane for {terminal_id}: {e}")
+
+    # Deliberately OUTSIDE the `if metadata:` block below: both of these need
+    # only terminal_id. Gating them on metadata meant a failed snapshot (a
+    # `get_terminal_metadata` that raised, or "database is locked") skipped them,
+    # orphaning the FIFO reader thread and the status-detector buffers for a
+    # terminal whose row the by-id sweep then deleted anyway -- a reader with
+    # nothing left to read from and no record it exists.
+    try:
+        fifo_manager.stop_reader(terminal_id)
+    except Exception as e:
+        logger.warning(f"Failed to stop FIFO reader for {terminal_id}: {e}")
+
+    # Clear state detector buffers for this terminal
+    try:
+        status_monitor.clear_terminal(terminal_id)
+    except Exception as e:
+        logger.warning(f"Failed to clear state detector for {terminal_id}: {e}")
+
+    if metadata:
+        if kill_window:
             # Kill the tmux window (this terminates the agent process)
             try:
                 get_backend().kill_window(metadata["tmux_session"], metadata["tmux_window"])
             except Exception as e:
                 logger.warning(f"Failed to kill tmux window for {terminal_id}: {e}")
 
-            # issue #100 Phase 1: if this terminal was worktree-backed (its live
-            # cwd matched the CAO-managed worktree path shape), remove the
-            # worktree + branch now that the process using it is gone.
-            # `remove_worktree` is itself best-effort/never-raises, matching
-            # every other step in this teardown.
-            #
-            # The parsed terminal_id MUST match the terminal actually being
-            # deleted here, not just "some" CAO worktree path. Without this
-            # guard: a worktree-backed terminal A (cwd
-            # .../.cao/worktrees/A) can spawn a non-worktree terminal B with
-            # working_directory explicitly set to A's cwd (handoff/assign
-            # both accept an explicit working_directory, and "here" -- the
-            # caller's own directory -- is a common choice). Deleting B --
-            # including handoff's automatic success teardown -- would then
-            # read B's pane cwd (== A's worktree path), parse terminal_id
-            # "A" out of it, and force-remove A's still-running worktree.
-            # Mismatched parses now fall through as a no-op leak (Phase 3
-            # territory) instead of destroying another terminal's checkout.
-            parsed = worktree_service.parse_worktree_path(live_working_directory)
-            if parsed is not None:
-                worktree_repo_root, worktree_terminal_id = parsed
-                if worktree_terminal_id == terminal_id:
-                    worktree_service.remove_worktree(worktree_repo_root, worktree_terminal_id)
+        # issue #100 Phase 1: if this terminal was worktree-backed (its live
+        # cwd matched the CAO-managed worktree path shape), remove the
+        # worktree + branch now that the process using it is gone.
+        # `remove_worktree` is itself best-effort/never-raises, matching
+        # every other step in this teardown.
+        #
+        # The parsed terminal_id MUST match the terminal actually being
+        # deleted here, not just "some" CAO worktree path. Without this
+        # guard: a worktree-backed terminal A (cwd
+        # .../.cao/worktrees/A) can spawn a non-worktree terminal B with
+        # working_directory explicitly set to A's cwd (handoff/assign
+        # both accept an explicit working_directory, and "here" -- the
+        # caller's own directory -- is a common choice). Deleting B --
+        # including handoff's automatic success teardown -- would then
+        # read B's pane cwd (== A's worktree path), parse terminal_id
+        # "A" out of it, and force-remove A's still-running worktree.
+        # Mismatched parses now fall through as a no-op leak (Phase 3
+        # territory) instead of destroying another terminal's checkout.
+        parsed = worktree_service.parse_worktree_path(metadata.get("live_working_directory"))
+        if parsed is not None:
+            worktree_repo_root, worktree_terminal_id = parsed
+            if worktree_terminal_id == terminal_id:
+                worktree_service.remove_worktree(worktree_repo_root, worktree_terminal_id)
 
-        # Grok cleanup can be deferred when a private-home owner cannot yet be
-        # inspected/stopped.  Keep both the provider mapping and DB metadata so
-        # a subsequent DELETE can retry; reporting success here would turn a
-        # temporary process race into a permanent private-home leak.
-        if provider_manager.cleanup_provider(terminal_id) is False:
+    # Grok cleanup can be deferred when a private-home owner cannot yet be
+    # inspected/stopped.  Keep both the provider mapping and DB metadata so
+    # a subsequent DELETE can retry; reporting success here would turn a
+    # temporary process race into a permanent private-home leak.
+    if provider_manager.cleanup_provider(terminal_id) is False:
+        return False
+    with _memory_injected_lock:
+        _memory_injected_terminals.discard(terminal_id)
+    # Drop any per-curator dispatch lock so the registry doesn't grow
+    # forever as memory_manager terminals come and go.
+    from cli_agent_orchestrator.services.memory_service import _curator_locks
+
+    _curator_locks.pop(terminal_id, None)
+    return True
+
+
+def delete_terminal_row(
+    terminal_id: str,
+    metadata: Optional[Dict],
+    registry: PluginRegistry | None = None,
+) -> bool:
+    """Drop a terminal's registry row and emit ``post_kill_terminal``.
+
+    The final third of terminal teardown, split out so session teardown can
+    defer it past its kill-confirmation point (#498) -- deleting a row for a
+    session that turns out to still be alive is exactly how the registry and
+    tmux diverge. ``metadata`` is what ``capture_terminal_snapshot`` returned;
+    it is needed for the event payload because the row is gone by the time the
+    event is built.
+
+    ``registry=None`` drops the row WITHOUT emitting. Session teardown passes
+    None and emits the events itself once it has released the lifecycle lock, so
+    that no third-party plugin ever runs inside its critical section; the
+    single-terminal ``delete_terminal`` path holds no such lock and passes its
+    registry straight through.
+    """
+    deleted = db_delete_terminal(terminal_id)
+    logger.info(f"Deleted terminal: {terminal_id}")
+    if deleted and metadata:
+        dispatch_plugin_event(
+            registry,
+            "post_kill_terminal",
+            PostKillTerminalEvent(
+                session_id=metadata["tmux_session"],
+                terminal_id=terminal_id,
+                agent_name=metadata.get("agent_profile"),
+            ),
+        )
+    return deleted
+
+
+def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) -> bool:
+    """Delete terminal and kill its tmux window.
+
+    Single-terminal teardown: all three thirds back to back, in the order they
+    have always run. Session teardown does NOT use this -- it interleaves its own
+    tmux kill-confirmation between them (see ``services/session_service.py``).
+
+    Returns False when the teardown was deferred (see
+    ``dismantle_terminal_runtime``), leaving the row in place for a retry.
+    """
+    try:
+        metadata = capture_terminal_snapshot(terminal_id)
+        if not dismantle_terminal_runtime(terminal_id, metadata):
             logger.warning(
                 "Terminal %s cleanup deferred; retaining metadata for a retry", terminal_id
             )
             return False
-        with _memory_injected_lock:
-            _memory_injected_terminals.discard(terminal_id)
-        # Drop any per-curator dispatch lock so the registry doesn't grow
-        # forever as memory_manager terminals come and go.
-        from cli_agent_orchestrator.services.memory_service import _curator_locks
-
-        _curator_locks.pop(terminal_id, None)
-        deleted = db_delete_terminal(terminal_id)
-        logger.info(f"Deleted terminal: {terminal_id}")
-        if deleted and metadata:
-            dispatch_plugin_event(
-                registry,
-                "post_kill_terminal",
-                PostKillTerminalEvent(
-                    session_id=metadata["tmux_session"],
-                    terminal_id=terminal_id,
-                    agent_name=metadata.get("agent_profile"),
-                ),
-            )
-        return deleted
+        return delete_terminal_row(terminal_id, metadata, registry=registry)
 
     except Exception as e:
         logger.error(f"Failed to delete terminal {terminal_id}: {e}")

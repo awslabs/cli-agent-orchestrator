@@ -1,0 +1,200 @@
+# The one long-lived pod in the fleet. It holds the conversation a participant
+# drives, and every unit of delegated work becomes a Job that the broker mints
+# and destroys - so this is the only place CAO state persists.
+#
+# A StatefulSet rather than a Deployment for a stable name: `cao-supervisor` is
+# what the broker points CAO_MEMORY_API_URL at, and what workers call back to.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: cao-supervisor
+  namespace: cao-cluster
+  labels:
+    app.kubernetes.io/name: cao-supervisor
+    app.kubernetes.io/part-of: cao-elastic-fleet
+spec:
+  serviceName: cao-supervisor
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cao-supervisor
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cao-supervisor
+        app.kubernetes.io/part-of: cao-elastic-fleet
+    spec:
+      # REQUIRED for Bedrock. Pod Identity binds to a (namespace,
+      # serviceAccount) pair, so a pod running as `default` schedules fine and
+      # then dies at its first model call - which reads as a model problem, not
+      # an auth one. The association is created in
+      # iac/cfn-infrastructure.yaml.
+      serviceAccountName: cao-supervisor
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: cao-node
+          image: <server-image>:latest
+          ports:
+            - name: http
+              containerPort: 9889
+          # Provider credentials, for a provider that authenticates with a key
+          # rather than with Pod Identity (kiro-cli). Created by
+          # components/kiro/external-secret.yaml, which is not in the default
+          # apply.
+          #
+          # `optional: true` is what makes this free on the Bedrock path: that
+          # Secret does not exist there, and a non-optional secretRef would hold
+          # every pod in CreateContainerConfigError instead.
+          #
+          # envFrom rather than a named key, so a provider needing a different
+          # variable - or more than one - changes the secret's contents and
+          # nothing here. It is listed before `env:` to match precedence:
+          # explicit `env` entries below win over anything the secret carries.
+          envFrom:
+            - secretRef:
+                name: cao-provider-credentials
+                optional: true
+          env:
+            - name: CAO_BIND_HOST
+              value: "0.0.0.0"
+            - name: CAO_API_PORT
+              value: "9889"
+            - name: CAO_ALLOWED_HOSTS
+              value: "cao-supervisor,cao-supervisor.cao-cluster.svc.cluster.local,localhost"
+            - name: CAO_ADVERTISED_URL
+              value: "http://cao-supervisor.cao-cluster.svc.cluster.local:9889"
+            # Elastic workers receive this URL for callbacks instead of the
+            # full supervisor control API. The broker authenticates their
+            # per-worker release token and forwards only inbox/memory routes.
+            - name: CAO_ELASTIC_CALLBACK_URL
+              value: "http://cao-worker-broker.cao-cluster.svc.cluster.local:9890"
+            - name: CAO_HOME_DIR
+              value: /home/cao/.cao/state
+            - name: CAO_PROJECT_ID
+              value: cao-cluster
+            # Installed by the entrypoint at pod start. The provider MUST be
+            # pinned: a delegation resolves the provider from the target node's
+            # store, and no built-in profile pins one, so an unpinned profile
+            # falls back to DEFAULT_PROVIDER (kiro_cli) and fails with
+            # "kiro-cli was not found" - naming a CLI nobody asked for.
+            - name: CAO_INSTALL_PROFILES
+              value: "code_supervisor:claude_code"
+            # Claude Code's cold start is ~45s for a ~330MB native binary, which
+            # blows the 60s/30s defaults intermittently - and reports a timeout
+            # rather than slowness, so it reads as a broken CLI.
+            - name: CAO_PROVIDER_INIT_TIMEOUT
+              value: "180"
+            - name: CAO_MCP_REQUEST_TIMEOUT
+              value: "240"
+            - name: CAO_ELASTIC_BROKER_URL
+              value: http://cao-worker-broker.cao-cluster.svc.cluster.local:9890
+            - name: CAO_ELASTIC_BROKER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: cao-elastic-broker-token
+                  key: token
+            # How long assign_elastic polls a NEW worker's /health through its
+            # Service before giving up on it. The broker hands the lease back as
+            # soon as the Job and Service exist, so this is where the worker's boot
+            # is waited out - on the address the task is about to be posted to,
+            # which is the only check that covers both "the pod came up" and "the
+            # Service in front of it routes". Generous on purpose: the failure it
+            # replaces was a 10s connect timeout destroying a worker that was three
+            # seconds from usable. Only assign_elastic reads it; a plain `assign`
+            # to a long-running node still fails fast.
+            - name: CAO_ELASTIC_WORKER_READY_WAIT
+              value: "120"
+            # SigV4 against Bedrock, credentials from Pod Identity. Note this is
+            # NOT CLAUDE_CODE_USE_ANTHROPIC_AWS, which is a different product
+            # and needs a workspace ID a vended account does not have.
+            - name: CLAUDE_CODE_USE_BEDROCK
+              value: "1"
+            - name: AWS_REGION
+              value: "<region>"
+            # Every tier pinned to ONE id, deliberately. Claude Code's built-in
+            # defaults point at 5.x models, which are unentitled in a vended
+            # account, so any unpinned tier 401s as soon as something reaches
+            # for it. Marketplace activation is also per model, and the
+            # entrypoint warms each distinct id listed here.
+            - name: ANTHROPIC_MODEL
+              value: "global.anthropic.claude-opus-4-6-v1"
+            - name: ANTHROPIC_DEFAULT_OPUS_MODEL
+              value: "global.anthropic.claude-opus-4-6-v1"
+            - name: ANTHROPIC_DEFAULT_SONNET_MODEL
+              value: "global.anthropic.claude-opus-4-6-v1"
+            - name: ANTHROPIC_DEFAULT_HAIKU_MODEL
+              value: "global.anthropic.claude-haiku-4-5-20251001-v1:0"
+          volumeMounts:
+            - name: state
+              mountPath: /home/cao/.cao
+            - name: workspace
+              mountPath: /home/cao/workspace
+          # The entrypoint warms both pinned Bedrock models before starting the
+          # server, and each warm-up has a 180s timeout. A startup probe suppresses
+          # liveness/readiness until that bounded initialization finishes; without
+          # it the 20s liveness delay restarts a healthy first boot mid-warm-up.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 9889
+              httpHeaders:
+                - name: Host
+                  value: localhost
+            periodSeconds: 10
+            failureThreshold: 40
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9889
+              httpHeaders:
+                - name: Host
+                  value: localhost
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9889
+              httpHeaders:
+                - name: Host
+                  value: localhost
+            initialDelaySeconds: 20
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 250m
+              memory: 1Gi
+            limits:
+              cpu: "1"
+              memory: 3Gi
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: cao-elastic-workspace
+  # State is per pod and stays on EBS. It holds a SQLite DB, flock locks and
+  # FIFOs, all of which are unsafe over NFS - so it must not live on the shared
+  # EFS workspace even though only one supervisor writes it today.
+  volumeClaimTemplates:
+    - metadata:
+        name: state
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: gp3
+        resources:
+          requests:
+            storage: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cao-supervisor
+  namespace: cao-cluster
+spec:
+  selector:
+    app.kubernetes.io/name: cao-supervisor
+  ports:
+    - name: http
+      port: 9889
+      targetPort: 9889

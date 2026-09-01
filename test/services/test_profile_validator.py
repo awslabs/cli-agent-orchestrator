@@ -765,6 +765,60 @@ class TestAggregateFindingBudget:
         assert len(findings) == _MAX_FINDINGS
         assert findings[-1] == ValidationMessage("error", _OMISSION_MESSAGE)
 
+    @staticmethod
+    def _schema_validator_yielding(monkeypatch: pytest.MonkeyPatch, count: int) -> None:
+        """Replace the schema validator with one yielding exactly ``count`` errors."""
+
+        class FakeError:
+            def __init__(self, index: int) -> None:
+                self.path = [f"field{index:04}"]
+                self.absolute_path = self.path
+                self.message = f"error {index:04}"
+
+        class FakeValidator:
+            def __init__(self, schema: dict) -> None:
+                del schema
+
+            def iter_errors(self, metadata: dict):
+                del metadata
+                yield from (FakeError(index) for index in range(count))
+
+        monkeypatch.setattr(profile_validator, "Draft202012Validator", FakeValidator)
+
+    def test_exactly_filling_the_budget_emits_no_marker(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The ``+ 1`` lookahead must not fire the marker when nothing is omitted.
+
+        With a document producing no other findings, the regular budget is
+        ``_MAX_FINDINGS - 1``. Exactly that many schema errors must surface in
+        full with no omission marker: the lookahead peeks one past the budget,
+        finds nothing, and stays silent.
+        """
+        self._schema_validator_yielding(monkeypatch, _MAX_FINDINGS - 1)
+
+        findings = validate_frontmatter({"name": "agent"})
+
+        assert len(findings) == _MAX_FINDINGS - 1
+        assert not any(f.message == _OMISSION_MESSAGE for f in findings)
+
+    def test_one_error_past_the_budget_emits_exactly_one_marker(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Dropping the ``+ 1`` lookahead would silently stop reporting truncation.
+
+        One error beyond the regular budget is the smallest input where
+        truncation occurs, and the lookahead entry is the only evidence a tail
+        existed. The marker must appear exactly once, last, at error severity.
+        """
+        self._schema_validator_yielding(monkeypatch, _MAX_FINDINGS)
+
+        findings = validate_frontmatter({"name": "agent"})
+
+        assert len(findings) == _MAX_FINDINGS
+        assert sum(f.message == _OMISSION_MESSAGE for f in findings) == 1
+        assert findings[-1] == ValidationMessage("error", _OMISSION_MESSAGE)
+
     def test_ordered_additional_properties_is_lazy_with_real_validator(self) -> None:
         """The real keyword handler must not inspect the omitted tail."""
         from itertools import islice

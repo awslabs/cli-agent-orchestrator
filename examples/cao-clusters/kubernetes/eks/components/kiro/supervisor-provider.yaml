@@ -1,0 +1,25 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: cao-supervisor
+  namespace: cao-cluster
+spec:
+  template:
+    spec:
+      containers:
+        - name: cao-node
+          env:
+            - name: CAO_INSTALL_PROFILES
+              value: "code_supervisor:kiro_cli"
+            - name: CLAUDE_CODE_USE_BEDROCK
+              $patch: delete
+            - name: AWS_REGION
+              $patch: delete
+            - name: ANTHROPIC_MODEL
+              $patch: delete
+            - name: ANTHROPIC_DEFAULT_OPUS_MODEL
+              $patch: delete
+            - name: ANTHROPIC_DEFAULT_SONNET_MODEL
+              $patch: delete
+            - name: ANTHROPIC_DEFAULT_HAIKU_MODEL
+              $patch: delete

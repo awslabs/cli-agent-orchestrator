@@ -284,6 +284,51 @@ def get_server_settings() -> Dict[str, Any]:
     return dict(result)
 
 
+def get_max_terminals() -> Optional[int]:
+    """Max terminals this node will track, or None for unlimited.
+
+    Precedence: ``CAO_MAX_TERMINALS`` env var > ``server.max_terminals`` in
+    settings.json > None (unlimited — the pre-cap default, so existing
+    deployments are unaffected).
+
+    Used by ``terminal_service.create_terminal`` to reject creation when the
+    node is full. The one-agent-per-pod Kubernetes topology sets
+    ``CAO_MAX_TERMINALS=1`` on worker pods so each pod hosts exactly one agent.
+
+    Counts TRACKED terminals, meaning rows in the terminals table, not probed
+    liveness: a terminal row is only removed by an explicit ``delete_terminal``,
+    so a terminal whose process died without cleanup still occupies a slot. That
+    is harmless in the topology the cap exists for (a worker pod is a disposable
+    Job, so its rows die with it) but an operator who sets ``server.max_terminals``
+    on a long-lived node may have to delete a stale row by hand. Deliberately not
+    probed here: this check runs before anything is allocated precisely so it can
+    stay cheap, and per-row liveness probing would put tmux calls in that path.
+
+    Not folded into ``_SERVER_DEFAULTS`` because that table's validation forces
+    every key to a positive int default; this setting's default is "absent"
+    (unlimited), which that machinery cannot represent. Invalid or non-positive
+    values are ignored with a warning (unlimited) rather than treated as 0,
+    which would brick all terminal creation on a typo.
+    """
+    raw = os.environ.get("CAO_MAX_TERMINALS")
+    source = "CAO_MAX_TERMINALS"
+    if raw is None or raw.strip() == "":
+        saved = _load().get("server", {})
+        raw = saved.get("max_terminals") if isinstance(saved, dict) else None
+        source = "server.max_terminals"
+        if raw is None:
+            return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning(f"Ignoring invalid {source}={raw!r} (expected int); terminals unlimited")
+        return None
+    if value <= 0:
+        logger.warning(f"Ignoring non-positive {source}={value}; terminals unlimited")
+        return None
+    return value
+
+
 def get_memory_settings() -> Dict[str, Any]:
     """Get memory-related settings.
 
@@ -428,6 +473,52 @@ def is_learning_enabled() -> bool:
         return bool(settings.get("enabled", True)) and bool(settings.get("learning_enabled", False))
     except Exception as e:
         logger.warning(f"Failed to read memory.learning_enabled, defaulting to False: {e}")
+        return False
+
+
+def is_workflow_approval_required() -> bool:
+    """Return True when an unapproved script-tier workflow run must be refused (issue #583 FR-8).
+
+    Default is **False**: enforcement is opt-in. A ``plan_id`` does not exist until run start, so a
+    plan that has never run cannot have been approved and its first run is refused by design. Making
+    that the default would break every existing script-tier caller one Bolt before the authoring
+    sequence that presents a plan and takes approval BEFORE running.
+
+    PRECEDENCE IS DELIBERATELY ASYMMETRIC, AND THIS IS NOT AN OVERSIGHT. Every sibling setting here
+    resolves ``CAO_* env var > settings.json > default`` — see :func:`is_memory_enabled`. This one
+    does NOT:
+
+        ``CAO_WORKFLOW_REQUIRE_APPROVAL`` may turn the gate **ON**.
+        Only ``settings.json`` can turn it **OFF**.
+
+    The reason is that this setting is a CONTROL, not a feature toggle. Under the house precedence,
+    anything able to set an environment variable could switch the approval gate off while the
+    operator's settings file still read as configured on — which would make the weakest
+    configuration mechanism in the system the one that decides whether runs are authorised. The
+    asymmetry is monotonic in the safe direction: nothing that merely influences an environment can
+    weaken the gate, while enabling it for a single test or trial stays a one-liner.
+
+    Read failure resolves to the default (disabled) with a warning, which is the ONE place this
+    mechanism is deliberately not fail-closed. Treating an unreadable settings file as "gate on"
+    would refuse every script run in the installation on the strength of a JSON typo. Resolving to
+    disabled makes the unreadable case behave like the unconfigured case, and the asymmetry above
+    bounds the residual: an operator who enabled the gate via the environment is unaffected by a
+    corrupt file.
+    """
+    env = os.environ.get("CAO_WORKFLOW_REQUIRE_APPROVAL")
+    if env is not None and env.strip().lower() in ("1", "true", "yes"):
+        # Enable-only: a falsy env value is NOT consulted, so it cannot override an enabling
+        # settings.json below. Returning early on truthy is what makes the precedence asymmetric.
+        return True
+    try:
+        workflow_settings = _load().get("workflow", {})
+        if not isinstance(workflow_settings, dict):
+            return False
+        return bool(workflow_settings.get("require_approval", False))
+    except Exception as e:
+        logger.warning(
+            "Failed to read workflow.require_approval, defaulting to False (gate disabled): %s", e
+        )
         return False
 
 
