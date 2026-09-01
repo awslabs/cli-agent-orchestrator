@@ -38,9 +38,7 @@ class TestReadoptTerminalsAtStartup:
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.list_all_terminals")
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    async def test_rearms_live_terminal(
-        self, mock_backend, mock_list, mock_fifo, mock_db_delete
-    ):
+    async def test_rearms_live_terminal(self, mock_backend, mock_list, mock_fifo, mock_db_delete):
         mock_backend.supports_event_inbox.return_value = False
         mock_backend.session_exists.return_value = True
         mock_backend.get_history.return_value = "$ "
@@ -142,9 +140,7 @@ class TestEarlySnapshot:
 
     def test_write_terminal_snapshot_never_raises(self, tmp_path):
         """Best-effort contract: a bad log dir must not break the caller."""
-        with patch.object(
-            terminal_service, "TERMINAL_LOG_DIR", tmp_path / "missing" / "nested"
-        ):
+        with patch.object(terminal_service, "TERMINAL_LOG_DIR", tmp_path / "missing" / "nested"):
             _write_terminal_snapshot(
                 "t10",
                 session_name="s",

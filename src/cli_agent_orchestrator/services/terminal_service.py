@@ -2250,9 +2250,7 @@ async def readopt_terminals_at_startup() -> Dict[str, int]:
                     get_backend().stop_pipe_pane(s, w)
                     get_backend().pipe_pane(s, w, p)
 
-                fifo_manager.create_reader(
-                    terminal_id, pane_probe=_probe_pane, rearm=_rearm_pipe
-                )
+                fifo_manager.create_reader(terminal_id, pane_probe=_probe_pane, rearm=_rearm_pipe)
                 # stop-then-start, NOT a bare pipe_pane(): after the old
                 # server died the pane may still report pane_pipe=1, and
                 # tmux's ``pipe-pane -o`` toggle would switch it OFF.
@@ -2275,14 +2273,10 @@ async def readopt_terminals_at_startup() -> Dict[str, int]:
                     log_path = TERMINAL_LOG_DIR / f"{terminal_id}.log"
                     if log_path.exists():
                         raw = log_path.read_text(encoding="utf-8", errors="replace")
-                        scrollback_path.write_text(
-                            strip_terminal_escapes(raw), encoding="utf-8"
-                        )
+                        scrollback_path.write_text(strip_terminal_escapes(raw), encoding="utf-8")
                 db_delete_terminal(terminal_id)
                 counts["finalized"] += 1
-                logger.info(
-                    f"Finalized dead terminal {terminal_id} ({session_name}:{window_name})"
-                )
+                logger.info(f"Finalized dead terminal {terminal_id} ({session_name}:{window_name})")
             except Exception as e:
                 logger.warning(f"Failed to finalize terminal {terminal_id}: {e}")
 
