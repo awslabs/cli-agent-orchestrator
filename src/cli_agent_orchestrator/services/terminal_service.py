@@ -2054,27 +2054,46 @@ def _schedule_deferred_init(
                 effective_orchestration_type = orchestration_type or OrchestrationType.ASSIGN
                 # send_input is blocking tmux I/O — off the loop so it can't
                 # freeze the server for concurrent requests.
-                try:
-                    await asyncio.to_thread(
-                        send_input,
-                        terminal_id,
-                        initial_message,
-                        registry=registry,
-                        sender_id=caller_id,
-                        orchestration_type=effective_orchestration_type,
-                    )
-                finally:
-                    # The dispatch boundary, and the earliest point at which a
-                    # completion poller's evidence can be downstream of this send.
-                    # Released here rather than at the end of _run so a task that
-                    # finishes DURING _confirm_worker_started_or_resubmit is still
-                    # observable — holding the mark across the confirm/resubmit
-                    # window would hide a genuine early completion and strand the
-                    # poller until its timeout. In ``finally`` because a raising
-                    # send_input (TerminalInputBlockedError: the pane is parked on
-                    # a prompt) must also stop masking: the terminal is then
-                    # honestly WAITING_USER_ANSWER and the operator has to see it.
-                    _clear_initial_delivery_pending(terminal_id)
+                await asyncio.to_thread(
+                    send_input,
+                    terminal_id,
+                    initial_message,
+                    registry=registry,
+                    sender_id=caller_id,
+                    orchestration_type=effective_orchestration_type,
+                )
+                # The pending mark is deliberately NOT released here.
+                #
+                # Round-4 review (haofeif), P1. An earlier revision cleared it at
+                # this dispatch boundary, reasoning that a keystroke had been
+                # issued so a poller's evidence was now downstream of the send. It
+                # isn't. send_input only calls status_monitor.notify_input_sent(),
+                # which ARMS the next transition without changing the cached
+                # status, and no current provider enables
+                # assume_processing_on_dispatch. The status a poller reads right
+                # after this line is therefore still the pre-send IDLE, and stays
+                # that way until the agent's first output chunk is detected. The
+                # reviewer measured ~1.4s of it against a real worker; the
+                # regression test here reproduced 0.93s. Either way it is far
+                # longer than idle_stable_polls samples, so releasing at this line
+                # only moved the false-completion window from before the send to
+                # after it.
+                #
+                # _run's outer ``finally`` releases it instead, which is reached
+                # only after _confirm_worker_started_or_resubmit has observed a
+                # status in _DEFERRED_STARTED_STATUSES. That set includes
+                # COMPLETED, so holding the mark across the confirm window does
+                # NOT hide a genuine early completion (the concern that motivated
+                # releasing here): confirm returns as soon as the completion is
+                # visible, and the mark lifts with it.
+                #
+                # Cost of the change: when NO started status is ever observed the
+                # mark is now held for the confirm loop's whole budget
+                # (_DEFERRED_SUBMIT_CONFIRM_TIMEOUT x (1 + max resubmits) = ~32s)
+                # instead of being dropped at dispatch. That is inside `cao
+                # launch`'s 420s headless budget, and the worker is torn down at
+                # the end of it anyway, so UNKNOWN is the honest reading for a
+                # delivery we cannot confirm.
                 # Delivery can be silently dropped (Enter swallowed / paste lost)
                 # when the TUI isn't input-ready. Confirm the worker actually
                 # started and re-submit if not; if it never starts, surface the
@@ -2152,10 +2171,17 @@ def _schedule_deferred_init(
                 delete_worker=True,
             )
         finally:
-            # Safety net for every path that never reached the send at all —
-            # initialize() raising, or the loop being torn down — so a terminal
-            # can't be left permanently masked. Idempotent: the happy path has
-            # already cleared it at the dispatch boundary above.
+            # The single release point for every path, and on the happy path the
+            # first moment a completion poller's evidence is genuinely downstream
+            # of the send: reached only once _confirm_worker_started_or_resubmit
+            # has seen PROCESSING, COMPLETED or WAITING_USER_ANSWER.
+            #
+            # It also covers every abnormal exit, so a terminal can never be left
+            # permanently masked: initialize() raising, send_input raising
+            # TerminalInputBlockedError (the pane is parked on a prompt — the
+            # terminal is then honestly WAITING_USER_ANSWER and the operator has
+            # to see it), the worker never starting after all resubmits, or the
+            # loop being torn down. Idempotent, so double-clearing is harmless.
             _clear_initial_delivery_pending(terminal_id)
 
     try:

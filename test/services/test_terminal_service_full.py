@@ -3314,34 +3314,158 @@ class TestDeferredDeliveryNotCompletableBeforeDispatch:
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service._notify_caller_of_deferred_failure")
     @patch("cli_agent_orchestrator.services.terminal_service.update_terminal_shell_command")
-    @patch(
-        "cli_agent_orchestrator.services.terminal_service._confirm_worker_started_or_resubmit",
-        new_callable=AsyncMock,
-    )
+    @patch("cli_agent_orchestrator.services.terminal_service.redeliver_dropped_message")
     @patch("cli_agent_orchestrator.services.terminal_service.send_input")
-    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
-    async def test_mask_is_released_at_dispatch_not_after_delivery_confirmation(
-        self,
-        mock_meta,
-        mock_status_monitor,
-        mock_send_input,
-        mock_confirm_started,
-        mock_update_shell,
-        mock_notify,
+    async def test_poll_cannot_complete_on_the_stale_post_dispatch_idle(
+        self, mock_meta, mock_send_input, mock_redeliver, mock_update_shell, mock_notify
     ):
-        """The mask must be released when the send is ISSUED, not when
-        ``_confirm_worker_started_or_resubmit`` finishes.
+        """Round-4 review (haofeif), P1: issuing the send is not evidence of it.
 
-        Holding it across the confirm/resubmit window would swap this bug for its
-        mirror image: a short task can finish while that window is still open, and
-        a poller masked for the whole of it would sit through a completion that
-        already happened — stranded until its own timeout. The dispatch boundary is
-        the narrowest mark that still makes the poller's evidence causal.
+        An earlier revision released the mask when ``send_input()`` returned, on
+        the reasoning that a keystroke had been dispatched so a poller's evidence
+        was now causal. It isn't. ``send_input`` only calls
+        ``notify_input_sent()``, which arms the next transition without touching
+        the cached status, and no provider enables
+        ``assume_processing_on_dispatch`` — so the reading right after dispatch is
+        still the pre-send IDLE, for as long as it takes the agent's first output
+        chunk to be detected (~1.4s measured against the real scheduler).
 
-        Fails if ``_clear_initial_delivery_pending`` is moved to the end of
-        ``_run`` (or into the outer ``finally`` alone): the poll then cannot
-        return until confirmation is over.
+        This runs the REAL ``_confirm_worker_started_or_resubmit`` against a status
+        fixture with that post-dispatch IDLE lag, and fails on the head that
+        released at the dispatch boundary: ``poll_until_done`` returned 0.93s
+        before the first PROCESSING signal ever appeared.
+        """
+        import asyncio
+        import threading
+        import time as _time
+
+        from cli_agent_orchestrator.services.terminal_service import (
+            _deferred_init_tasks,
+            _schedule_deferred_init,
+            get_terminal,
+        )
+        from cli_agent_orchestrator.utils.terminal import poll_until_done
+
+        TERMINAL_ID = "abcd1234"
+        INIT_SECONDS = 0.10
+        PRE_DISPATCH_SECONDS = 0.20
+        POST_DISPATCH_IDLE_LAG = 0.60
+        POST_DISPATCH_WORK_SECONDS = 3.00
+        POLL_INTERVAL = 0.02
+
+        mock_meta.return_value = {
+            "id": TERMINAL_ID,
+            "tmux_window": "developer-abcd",
+            "tmux_session": "cao-session",
+            "provider": "kiro_cli",
+            "agent_profile": "developer",
+            "caller_id": None,
+            "allowed_tools": None,
+            "engine": None,
+            "group": None,
+            "metadata": None,
+            "last_active": datetime.now(),
+        }
+
+        init_done = threading.Event()
+        dispatched = threading.Event()
+        dispatched_at = {}
+        first_processing_at = {}
+
+        def fake_get_status(terminal_id):
+            if dispatched.is_set():
+                elapsed = _time.monotonic() - dispatched_at["t"]
+                if elapsed < POST_DISPATCH_IDLE_LAG:
+                    return TerminalStatus.IDLE  # the stale pre-send reading
+                if elapsed < POST_DISPATCH_IDLE_LAG + POST_DISPATCH_WORK_SECONDS:
+                    first_processing_at.setdefault("t", _time.monotonic())
+                    return TerminalStatus.PROCESSING
+                return TerminalStatus.IDLE
+            if init_done.is_set():
+                return TerminalStatus.IDLE
+            return TerminalStatus.WAITING_USER_ANSWER
+
+        fake_monitor = MagicMock()
+        fake_monitor.get_status.side_effect = fake_get_status
+
+        def fake_send_input(terminal_id, message, **kwargs):
+            _time.sleep(PRE_DISPATCH_SECONDS)
+            dispatched_at["t"] = _time.monotonic()
+            dispatched.set()
+            return True
+
+        mock_send_input.side_effect = fake_send_input
+        mock_redeliver.return_value = False
+
+        async def fake_initialize():
+            await asyncio.sleep(INIT_SECONDS)
+            init_done.set()
+            return True
+
+        provider_instance = AsyncMock()
+        provider_instance.initialize.side_effect = fake_initialize
+        provider_instance.shell_baseline = None
+
+        def fake_requests_get(url, **kwargs):
+            resp = MagicMock()
+            resp.raise_for_status.return_value = None
+            resp.json.return_value = {"status": get_terminal(TERMINAL_ID)["status"]}
+            return resp
+
+        poll_returned_at = {}
+
+        def run_poll():
+            with patch("cli_agent_orchestrator.utils.terminal.requests.get", fake_requests_get):
+                poll_until_done(TERMINAL_ID, timeout=30.0, polling_interval=POLL_INTERVAL)
+            poll_returned_at["t"] = _time.monotonic()
+
+        # wait_until_status imports the singleton at call time, so patching
+        # terminal_service.status_monitor alone would not reach the confirm loop.
+        with patch(
+            "cli_agent_orchestrator.services.status_monitor.status_monitor", fake_monitor
+        ), patch("cli_agent_orchestrator.services.terminal_service.status_monitor", fake_monitor):
+            before_tasks = set(_deferred_init_tasks)
+            _schedule_deferred_init(
+                provider_instance, TERMINAL_ID, "do the task", OrchestrationType.ASSIGN, None
+            )
+            (task,) = set(_deferred_init_tasks) - before_tasks
+            await asyncio.gather(task, asyncio.to_thread(run_poll))
+
+        assert dispatched.is_set(), "fixture bug: the initial send never ran"
+        assert "t" in first_processing_at, (
+            "fixture bug: the agent never reached PROCESSING, so the test proves nothing"
+        )
+        assert poll_returned_at["t"] > first_processing_at["t"], (
+            "poll_until_done returned before the first post-dispatch PROCESSING signal — "
+            "it completed on the stale pre-send IDLE that survives send_input()'s return, "
+            "so `cao launch` exits 0 with empty output while the agent is about to start"
+        )
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service._notify_caller_of_deferred_failure")
+    @patch("cli_agent_orchestrator.services.terminal_service.update_terminal_shell_command")
+    @patch("cli_agent_orchestrator.services.terminal_service.redeliver_dropped_message")
+    @patch("cli_agent_orchestrator.services.terminal_service.send_input")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    async def test_a_genuine_early_completion_is_not_hidden_by_the_mask(
+        self, mock_meta, mock_send_input, mock_redeliver, mock_update_shell, mock_notify
+    ):
+        """The mirror-image regression, pinned with the REAL confirm loop.
+
+        Replaces an earlier test that asserted the mask had to be released at the
+        dispatch boundary. That test's premise was a fixture artifact: it mocked
+        ``_confirm_worker_started_or_resubmit`` as a flat 1.5s sleep that returned
+        True regardless of status, so holding the mark across it necessarily
+        stranded the poller. The real function's first action is
+        ``wait_until_status(_DEFERRED_STARTED_STATUSES, polling_interval=0.5)``,
+        and that set contains COMPLETED — so it returns as soon as a completion is
+        visible, and the mark lifts with it.
+
+        Here a turn finishes without the pipeline ever publishing PROCESSING
+        (IDLE -> COMPLETED directly), which is the case that release point existed
+        to protect. The poll must still return promptly rather than sit out the
+        confirm window.
         """
         import asyncio
         import threading
@@ -3355,8 +3479,8 @@ class TestDeferredDeliveryNotCompletableBeforeDispatch:
         from cli_agent_orchestrator.utils.terminal import poll_until_done
 
         TERMINAL_ID = "beef5678"
-        POST_DISPATCH_WORK_SECONDS = 0.10
-        CONFIRM_SECONDS = 1.50
+        INIT_SECONDS = 0.10
+        COMPLETION_LAG = 0.30
         POLL_INTERVAL = 0.02
 
         mock_meta.return_value = {
@@ -3373,18 +3497,22 @@ class TestDeferredDeliveryNotCompletableBeforeDispatch:
             "last_active": datetime.now(),
         }
 
+        init_done = threading.Event()
         dispatched = threading.Event()
-        confirm_finished = threading.Event()
         dispatched_at = {}
+        saw_processing = {"value": False}
 
         def fake_get_status(terminal_id):
-            if not dispatched.is_set():
+            if dispatched.is_set():
+                if _time.monotonic() - dispatched_at["t"] < COMPLETION_LAG:
+                    return TerminalStatus.IDLE
+                return TerminalStatus.COMPLETED  # never PROCESSING
+            if init_done.is_set():
                 return TerminalStatus.IDLE
-            if _time.monotonic() - dispatched_at["t"] < POST_DISPATCH_WORK_SECONDS:
-                return TerminalStatus.PROCESSING
-            return TerminalStatus.IDLE
+            return TerminalStatus.WAITING_USER_ANSWER
 
-        mock_status_monitor.get_status.side_effect = fake_get_status
+        fake_monitor = MagicMock()
+        fake_monitor.get_status.side_effect = fake_get_status
 
         def fake_send_input(terminal_id, message, **kwargs):
             dispatched_at["t"] = _time.monotonic()
@@ -3392,49 +3520,53 @@ class TestDeferredDeliveryNotCompletableBeforeDispatch:
             return True
 
         mock_send_input.side_effect = fake_send_input
+        mock_redeliver.return_value = False
 
-        async def fake_confirm(*args, **kwargs):
-            # A probe-capable provider's verification, plus the pickup grace the
-            # resubmit path waits out. The agent's turn completes inside it.
-            await asyncio.sleep(CONFIRM_SECONDS)
-            confirm_finished.set()
+        async def fake_initialize():
+            await asyncio.sleep(INIT_SECONDS)
+            init_done.set()
             return True
 
-        mock_confirm_started.side_effect = fake_confirm
-
         provider_instance = AsyncMock()
-        provider_instance.initialize.return_value = True
+        provider_instance.initialize.side_effect = fake_initialize
         provider_instance.shell_baseline = None
 
         def fake_requests_get(url, **kwargs):
             resp = MagicMock()
             resp.raise_for_status.return_value = None
-            resp.json.return_value = {"status": get_terminal(TERMINAL_ID)["status"]}
+            status = get_terminal(TERMINAL_ID)["status"]
+            if status == TerminalStatus.PROCESSING.value:
+                saw_processing["value"] = True
+            resp.json.return_value = {"status": status}
             return resp
 
-        before_tasks = set(_deferred_init_tasks)
-        _schedule_deferred_init(
-            provider_instance, TERMINAL_ID, "do the task", OrchestrationType.ASSIGN, None
-        )
-        (task,) = set(_deferred_init_tasks) - before_tasks
-
-        observed = {}
+        elapsed = {}
 
         def run_poll():
+            started = _time.monotonic()
             with patch("cli_agent_orchestrator.utils.terminal.requests.get", fake_requests_get):
                 poll_until_done(TERMINAL_ID, timeout=30.0, polling_interval=POLL_INTERVAL)
-            observed["dispatched"] = dispatched.is_set()
-            observed["confirm_finished"] = confirm_finished.is_set()
+            elapsed["t"] = _time.monotonic() - started
 
-        await asyncio.gather(task, asyncio.to_thread(run_poll))
+        with patch(
+            "cli_agent_orchestrator.services.status_monitor.status_monitor", fake_monitor
+        ), patch("cli_agent_orchestrator.services.terminal_service.status_monitor", fake_monitor):
+            before_tasks = set(_deferred_init_tasks)
+            _schedule_deferred_init(
+                provider_instance, TERMINAL_ID, "do the task", OrchestrationType.ASSIGN, None
+            )
+            (task,) = set(_deferred_init_tasks) - before_tasks
+            await asyncio.gather(task, asyncio.to_thread(run_poll))
 
-        mock_notify.assert_not_called()
-        assert observed["dispatched"] is True, "poll returned before dispatch (the P1 itself)"
-        assert observed["confirm_finished"] is False, (
-            "poll_until_done did not return until delivery confirmation had finished — "
-            "the pending mark is being held past the dispatch boundary, so a task that "
-            "completes during the confirm/resubmit window is invisible to the caller"
+        assert (
+            saw_processing["value"] is False
+        ), "fixture bug: this must exercise the no-PROCESSING path"
+        assert elapsed["t"] < 3.0, (
+            f"poll_until_done took {elapsed['t']:.2f}s for a turn that completed "
+            f"{COMPLETION_LAG:.2f}s after dispatch — the mask is stranding a genuine "
+            "early completion"
         )
+
 
 
 class TestReportedStatusMasking:
