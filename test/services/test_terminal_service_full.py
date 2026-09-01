@@ -3598,10 +3598,14 @@ class TestPendingMarkNeverLeaks:
         mock_meta.return_value = None
 
         class RefusingLoop:
-            """Stands in for any create_task failure, not for a closed loop."""
+            """Stands in for any create_task failure, not for a closed loop.
+
+            Deliberately does NOT close the coroutine: a real loop doesn't either,
+            and the production guard is what has to close it. Leaving that to the
+            fake would hide an un-awaited-coroutine warning in real use.
+            """
 
             def create_task(self, coro):
-                coro.close()  # avoid an un-awaited-coroutine warning
                 raise RuntimeError("create_task refused")
 
         provider_instance = AsyncMock()

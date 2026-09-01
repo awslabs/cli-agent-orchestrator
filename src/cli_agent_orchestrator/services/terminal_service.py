@@ -2216,10 +2216,23 @@ def _schedule_deferred_init(
     # _pending_initial_delivery is module state that dies with the process, so
     # there is nothing for it to leak into. Guarding it would mean a shutdown hook
     # for state that cannot outlive shutdown.
+    # BaseException rather than Exception is deliberate, and matches the rollback
+    # guards at :415 and :796. KeyboardInterrupt is one of the two realistic
+    # triggers named above and is not an Exception subclass, so narrowing this
+    # would skip the case it exists for. The bare ``raise`` leaves shutdown
+    # semantics intact — this only cleans up on the way past.
+    coro = _run()
     try:
-        task = loop.create_task(_run())
+        task = loop.create_task(coro)
     except BaseException:
-        _clear_initial_delivery_pending(terminal_id)
+        # The coroutine object exists but was never handed to a task, so close it
+        # or the interpreter warns "coroutine was never awaited" when it is GC'd.
+        coro.close()
+        # Only clear what this call may have set: with no initial_message no mark
+        # was taken, and an unconditional discard would be reaching for state this
+        # call does not own.
+        if initial_message:
+            _clear_initial_delivery_pending(terminal_id)
         raise
     _deferred_init_tasks.add(task)
     task.add_done_callback(_deferred_init_tasks.discard)
