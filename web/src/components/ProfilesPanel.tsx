@@ -210,6 +210,11 @@ export function ProfilesPanel() {
   const searchSeq = useRef(0)
   const { showSnackbar } = useStore()
 
+  // Bumped after an in-place edit: remounts ProfileDetail (via its key) so
+  // the parsed-profile fetch re-runs even though the selected NAME is
+  // unchanged (#692 review: stale provider/model/tags after save).
+  const [detailReload, setDetailReload] = useState(0)
+
   const refreshCatalog = () =>
     api.listProfiles()
       .then(p => { setCatalog(p); setCatalogError(null) })
@@ -218,14 +223,22 @@ export function ProfilesPanel() {
 
   useEffect(() => { refreshCatalog() }, [])
 
-  const handleSaved = (name: string, warnings: ProfileValidationMessage[]) => {
+  const handleSaved = async (name: string, warnings: ProfileValidationMessage[]) => {
     showSnackbar(
       warnings.length > 0
         ? { type: 'info', message: `Profile '${name}' saved with ${warnings.length} warning${warnings.length !== 1 ? 's' : ''}: ${warnings[0].message}` }
         : { type: 'success', message: `Profile '${name}' saved` },
     )
+    // Select after the refresh resolves: a clone's new name is not in the
+    // catalog yet, and selecting first rendered "Select a profile…" until the
+    // refetch landed (or forever, if it failed -- the catalog error alert is
+    // the visible path out) (#692 review).
+    await refreshCatalog()
     setSelected(name)
-    refreshCatalog()
+    // The detail fetch is keyed on the profile NAME, which an in-place edit
+    // does not change -- without an explicit reload token the pane kept
+    // showing pre-edit provider/model/tags after a successful save.
+    setDetailReload(n => n + 1)
   }
 
   const handleDelete = async () => {
@@ -253,7 +266,7 @@ export function ProfilesPanel() {
     }
   }
 
-  const handleCreated = (name: string, warnings: ProfileValidationMessage[]) => {
+  const handleCreated = async (name: string, warnings: ProfileValidationMessage[]) => {
     // Surface post-save advisories (the backend allowed the write; these are
     // warning-severity findings a user should still see).
     showSnackbar(
@@ -261,8 +274,10 @@ export function ProfilesPanel() {
         ? { type: 'info', message: `Profile '${name}' created with ${warnings.length} warning${warnings.length !== 1 ? 's' : ''}: ${warnings[0].message}` }
         : { type: 'success', message: `Profile '${name}' created` },
     )
+    // Select only after the refetch lands so the new row exists to render
+    // (selecting first showed "Select a profile…" until the refresh resolved).
+    await refreshCatalog()
     setSelected(name)
-    refreshCatalog()
   }
 
   // Debounced server search: one request per >=300ms-quiet keystroke burst.
@@ -401,6 +416,7 @@ export function ProfilesPanel() {
           <div className="bg-gray-900/60 border border-gray-800 rounded-xl min-h-[200px]">
             {selectedRow ? (
               <ProfileDetail
+                key={`${selectedRow.name}:${detailReload}`}
                 row={selectedRow}
                 onEdit={name => setEditor({ mode: 'edit', name })}
                 onClone={name => setEditor({ mode: 'clone', name })}

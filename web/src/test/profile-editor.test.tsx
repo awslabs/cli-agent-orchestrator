@@ -388,14 +388,22 @@ describe('backdrop close gating during save', () => {
     fireEvent.click(backdrop)
     expect(onClose).not.toHaveBeenCalled()
 
+    // The header X is gated the same way: the panel renders the editor
+    // conditionally, so a mid-flight close UNMOUNTS it and a late 400
+    // rejection lands nowhere (#692 review)
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }))
+    expect(onClose).not.toHaveBeenCalled()
+
     // Release the save; modal closes through the normal success path
     resolvePut!(undefined)
     await act(async () => {})
     expect(onClose).toHaveBeenCalledTimes(1)
 
-    // And once idle, the backdrop works again on a fresh modal
+    // And once idle, the backdrop and X work again on a fresh modal
     fireEvent.click(backdrop)
     expect(onClose).toHaveBeenCalledTimes(2)
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }))
+    expect(onClose).toHaveBeenCalledTimes(3)
   })
 })
 
@@ -409,5 +417,77 @@ describe('Stage 4 — editor source loading error', () => {
     await act(async () => {})
     expect(screen.getByRole('alert')).toHaveTextContent(/not found/)
     expect(screen.getByRole('button', { name: /save changes/i })).toBeDisabled()
+  })
+})
+
+describe('detail pane refreshes after an in-place edit (#692 review)', () => {
+  it('refetches the parsed profile and shows the post-edit values', async () => {
+    // The detail fetch was keyed on the profile NAME, which an in-place edit
+    // does not change -- the pane kept showing pre-edit provider/model until
+    // the user selected away and back.
+    let saved = false
+    vi.stubGlobal('fetch', vi.fn(async (url: string, opts?: any) => {
+      if (url.includes('/validate')) return okJson({ valid: true, messages: [] })
+      if (url.includes('/source')) return okJson({ name: 'local-agent', content: SOURCE })
+      if (opts?.method === 'PUT') { saved = true; return okJson({ name: 'local-agent', warnings: [] }) }
+      if (/\/agents\/profiles\/[^/?]+$/.test(url)) {
+        return okJson({ name: 'local-agent', description: 'Mine', model: saved ? 'claude-opus-5' : 'claude-sonnet-4' })
+      }
+      if (url.includes('/agents/profiles')) return okJson(CATALOG)
+      return okJson([])
+    }))
+    const detail = await openDetail('local-agent')
+    await screen.findByText('claude-sonnet-4')
+
+    fireEvent.click(within(detail).getByRole('button', { name: /edit/i }))
+    await screen.findByRole('textbox', { name: /profile source/i })
+    fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
+    await act(async () => {})
+
+    // The pane must show the post-edit model, proving a refetch happened
+    expect(await screen.findByText('claude-opus-5')).toBeInTheDocument()
+    expect(screen.queryByText('claude-sonnet-4')).not.toBeInTheDocument()
+  })
+})
+
+describe('panel-level create flow (#692 review)', () => {
+  it('New profile -> from scratch -> create wires snackbar, refresh, and selection', async () => {
+    // Every prior create test rendered the modal in isolation; this pins the
+    // handleCreated wiring: snackbar, catalog refetch, and selection of the
+    // new row only after the refetch lands.
+    let created = false
+    const NEW_ROW = { name: 'fresh-agent', description: 'Newly made', source: 'local' }
+    vi.stubGlobal('fetch', vi.fn(async (url: string, opts?: any) => {
+      if (url.includes('/validate')) return okJson({ valid: true, messages: [] })
+      if (url.includes('/agents/profiles/schema')) return okJson({
+        type: 'object', required: ['name'],
+        properties: { name: { type: 'string' }, description: { type: 'string' } },
+      })
+      if (url.includes('/agents/profiles/templates')) return okJson([])
+      if (url.includes('/agents/providers')) return okJson([])
+      if (url.endsWith('/agents/profiles') && opts?.method === 'POST') {
+        created = true
+        return okJson({ name: 'fresh-agent', warnings: [] })
+      }
+      if (/\/agents\/profiles\/[^/?]+$/.test(url)) return okJson({ name: 'fresh-agent', description: 'Newly made' })
+      if (url.includes('/agents/profiles')) return okJson(created ? [...CATALOG, NEW_ROW] : CATALOG)
+      return okJson([])
+    }))
+    useStore.setState({ snackbar: null })
+    render(<ProfilesPanel />)
+    await screen.findByRole('option', { name: /local-agent/ })
+
+    fireEvent.click(screen.getByRole('button', { name: /new profile/i }))
+    fireEvent.click(await screen.findByRole('tab', { name: 'From scratch' }))
+    await act(async () => {})
+    fireEvent.change(screen.getByRole('textbox', { name: 'Profile name' }), { target: { value: 'fresh-agent' } })
+    fireEvent.click(screen.getByRole('button', { name: /create profile/i }))
+    await act(async () => {})
+
+    expect(useStore.getState().snackbar?.type).toBe('success')
+    expect(useStore.getState().snackbar?.message).toContain("'fresh-agent' created")
+    // Selection landed AFTER the refetch, so the new row renders in both panes
+    expect(await screen.findByRole('option', { name: /fresh-agent/ })).toBeInTheDocument()
+    expect(within(screen.getByTestId('profile-detail')).getByText('Newly made')).toBeInTheDocument()
   })
 })

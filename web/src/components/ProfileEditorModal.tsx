@@ -123,7 +123,10 @@ export function ProfileEditorModal({ open, mode, name, onClose, onSaved }: Profi
           <h3 className="text-base font-semibold text-white flex-1">
             {mode === 'edit' ? <>Edit <span className="font-mono">{name}</span></> : <>Clone <span className="font-mono">{name}</span></>}
           </h3>
-          <button onClick={onClose} aria-label="Close" className="p-1 text-gray-500 hover:text-white rounded transition-colors">
+          {/* Gated like Cancel and the backdrop: closing mid-save unmounts
+              the modal, so a late 400 rejection lands nowhere and the user
+              believes the save succeeded (#692 review). */}
+          <button onClick={saving ? undefined : onClose} disabled={saving} aria-label="Close" className="p-1 text-gray-500 hover:text-white rounded transition-colors disabled:opacity-50">
             <X size={16} />
           </button>
         </div>

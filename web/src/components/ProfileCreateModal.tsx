@@ -272,6 +272,10 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
   const [profileName, setProfileName] = useState('')
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
+  // A failed profile-schema fetch must not masquerade as "still loading":
+  // mapping the failure onto the same null left From-scratch mode on a
+  // permanent spinner with no indication of why (#692 review).
+  const [schemaError, setSchemaError] = useState<string | null>(null)
   const [findings, setFindings] = useState<ProfileValidationMessage[]>([])
 
   // --- template mode state ---
@@ -321,6 +325,7 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
     setProfileName('')
     setSaving(false)
     setSaveError(null)
+    setSchemaError(null)
     setFindings([])
     setTemplate('')
     setTemplateSchema(null)
@@ -333,9 +338,23 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
     setAdvancedOpen(false)
     nameTouched.current = false
     api.listProfileTemplates().then(setTemplates).catch(() => setTemplates([]))
-    api.getProfileSchema().then(setProfileSchema).catch(() => setProfileSchema(null))
+    api.getProfileSchema()
+      .then(s => { setProfileSchema(s); setSchemaError(null) })
+      .catch(e => { setProfileSchema(null); setSchemaError(e?.detail || e?.message || 'Failed to load profile schema') })
     api.listProviders().then(setProviders).catch(() => setProviders([]))
   }, [open])
+
+  // Switching between From-template and From-scratch clears the shared error
+  // surfaces: findings/saveError/previewError (and their derived red field
+  // boundaries) otherwise bleed across modes -- a template-mode validation
+  // failure stayed rendered on the scratch form, painting same-named fields
+  // (name, provider, ...) red and auto-expanding Advanced for a finding that
+  // came from the other mode (#692 review).
+  useEffect(() => {
+    setFindings([])
+    setSaveError(null)
+    setPreviewError(null)
+  }, [mode])
 
   // Template selection loads that template's schema and resets its config.
   useEffect(() => {
@@ -493,7 +512,10 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
   }
 
   const buildScratchContent = (): string => {
-    const values: Record<string, unknown> = { name: profileName, ...scratchValues }
+    // Trimmed to match the POST's name: an untrimmed frontmatter name fails
+    // the server pattern with an invisible-whitespace error while the same
+    // input succeeds in template mode (#692 review).
+    const values: Record<string, unknown> = { name: profileName.trim(), ...scratchValues }
     for (const [k, draft] of Object.entries(jsonDrafts)) {
       if (draft.trim() !== '' && !jsonErrors[k]) values[k] = JSON.parse(draft)
     }
@@ -586,7 +608,10 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
               From scratch
             </button>
           </div>
-          <button onClick={onClose} aria-label="Close" className="p-1 text-gray-500 hover:text-white rounded transition-colors">
+          {/* Gated like Cancel and the backdrop: closing mid-save leaves the
+              modal rendering null, so a late 400's saveError is invisible and
+              then wiped by the next open's reset (#692 review). */}
+          <button onClick={saving ? undefined : onClose} disabled={saving} aria-label="Close" className="p-1 text-gray-500 hover:text-white rounded transition-colors disabled:opacity-50">
             <X size={16} />
           </button>
         </div>
@@ -672,9 +697,15 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
           {mode === 'scratch' && (
             <>
               {!profileSchema ? (
-                <div className="flex items-center gap-2 text-sm text-gray-500" data-testid="profile-schema-loading">
-                  <Loader2 size={14} className="animate-spin" /> Loading profile schema…
-                </div>
+                schemaError ? (
+                  <div className="flex items-start gap-2 p-3 rounded-lg bg-red-900/20 border border-red-700/40 text-red-300 text-xs" role="alert">
+                    {schemaError}
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-2 text-sm text-gray-500" data-testid="profile-schema-loading">
+                    <Loader2 size={14} className="animate-spin" /> Loading profile schema…
+                  </div>
+                )
               ) : (
                 <>
                   <div className="grid grid-cols-2 gap-4">

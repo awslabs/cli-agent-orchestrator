@@ -626,3 +626,100 @@ describe('ProfileCreateModal — stale preview invalidation (#692 review)', () =
     expect(screen.getByRole('textbox', { name: 'queue_url' })).toBeInTheDocument()
   })
 })
+
+describe('ProfileCreateModal — round-3 review fixes (#692)', () => {
+  beforeEach(() => vi.useFakeTimers())
+  afterEach(() => vi.useRealTimers())
+
+  async function openScratchMode() {
+    render(<ProfileCreateModal open={true} onClose={() => {}} onCreated={() => {}} />)
+    await act(async () => {})
+    fireEvent.click(screen.getByRole('tab', { name: 'From scratch' }))
+    await act(async () => {})
+  }
+
+  it('the header X is inert while a save is in flight', async () => {
+    let releasePost!: () => void
+    const postGate = new Promise<any>(res => { releasePost = () => res(okJson({ name: 'x', warnings: [] })) })
+    const onClose = vi.fn()
+    vi.stubGlobal('fetch', vi.fn(async (url: string, opts?: any) => {
+      if (String(url).includes('/agents/profiles/validate')) return okJson({ valid: true, messages: [] })
+      if (String(url).endsWith('/agents/profiles') && opts?.method === 'POST') return postGate
+      if (String(url).includes('/agents/profiles/schema')) return okJson(PROFILE_SCHEMA)
+      return okJson([])
+    }))
+    render(<ProfileCreateModal open={true} onClose={onClose} onCreated={() => {}} />)
+    await act(async () => {})
+    fireEvent.click(screen.getByRole('tab', { name: 'From scratch' }))
+    await act(async () => {})
+    fireEvent.change(screen.getByRole('textbox', { name: 'Profile name' }), { target: { value: 'x' } })
+    fireEvent.click(screen.getByRole('button', { name: /create profile/i }))
+    await act(async () => {})
+
+    // POST parked on the gate: X must be inert, matching Cancel and backdrop
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }))
+    expect(onClose).not.toHaveBeenCalled()
+
+    await act(async () => { releasePost() })
+    expect(onClose).toHaveBeenCalledTimes(1) // normal success close
+  })
+
+  it('the scratch-mode document embeds the TRIMMED name, matching the POST', async () => {
+    // 'my-agent ' (trailing space) previously produced a frontmatter of
+    // name: "my-agent " while the POST sent "my-agent" -- the pre-save gate
+    // then blocked on a pattern error whose defect is invisible.
+    const mock = routedFetch()
+    vi.stubGlobal('fetch', mock)
+    await openScratchMode()
+    fireEvent.change(screen.getByRole('textbox', { name: 'Profile name' }), { target: { value: 'my-agent ' } })
+    fireEvent.click(screen.getByRole('button', { name: /create profile/i }))
+    await act(async () => {})
+
+    const post = mock.mock.calls.find(([u, o]) => String(u).endsWith('/agents/profiles') && o?.method === 'POST')
+    expect(post).toBeTruthy()
+    const body = JSON.parse(post![1].body)
+    expect(body.name).toBe('my-agent')
+    expect(body.content).toContain('name: "my-agent"')
+    expect(body.content).not.toContain('my-agent ')
+  })
+
+  it('a failed profile-schema fetch surfaces an error, not a permanent spinner', async () => {
+    vi.stubGlobal('fetch', routedFetch({
+      '/agents/profiles/schema': () => errJson(500, 'schema exploded'),
+    }))
+    await openScratchMode()
+    expect(screen.getByRole('alert')).toHaveTextContent('schema exploded')
+    expect(screen.queryByTestId('profile-schema-loading')).not.toBeInTheDocument()
+  })
+
+  it('switching modes clears findings, save error, and red boundaries from the other mode', async () => {
+    // A template-mode validation failure previously stayed rendered on the
+    // scratch form: findings panel, saveError box, and red borders on
+    // same-named fields (name, provider, ...).
+    const mock = routedFetch({
+      '/agents/profiles/validate': () => okJson({
+        valid: false,
+        messages: [{ severity: 'error', message: 'template-mode failure', path: 'name' }],
+      }),
+    })
+    vi.stubGlobal('fetch', mock)
+    render(<ProfileCreateModal open={true} onClose={() => {}} onCreated={() => {}} />)
+    await act(async () => {})
+    await pickOption('Template', 'aws/sqs-monitor')
+    await act(async () => {})
+    await act(() => vi.advanceTimersByTimeAsync(PREVIEW_DEBOUNCE_MS + 10))
+    fireEvent.click(screen.getByRole('button', { name: /create profile/i }))
+    await act(async () => {})
+    // Findings + saveError rendered in template mode
+    expect(screen.getByText('template-mode failure')).toBeInTheDocument()
+    const nameBox = screen.getByRole('textbox', { name: 'Profile name' })
+    expect(nameBox.className).toContain('border-red-500')
+
+    // Switch to From scratch: all error surfaces from template mode clear
+    fireEvent.click(screen.getByRole('tab', { name: 'From scratch' }))
+    await act(async () => {})
+    expect(screen.queryByText('template-mode failure')).not.toBeInTheDocument()
+    expect(screen.queryByText(/validation failed/i)).not.toBeInTheDocument()
+    expect(screen.getByRole('textbox', { name: 'Profile name' }).className).not.toContain('border-red-500')
+  })
+})
