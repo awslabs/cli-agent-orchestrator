@@ -446,19 +446,19 @@ class TestConcurrentDeliverySerialization:
     def test_completion_inside_send_input_does_not_starve_the_next_message(
         self, isolated_memory_db
     ):
-        """Reviewer-reproduced sixth-round finding on #709: send_input's own
-        notify_input_sent(assume_processing=True) applies one PROCESSING
-        transition synchronously before the tmux paste, so a single generation
-        bump between the pre- and post-send_input reads is expected and the
-        marker is meant to survive it. If a genuine completion transition ALSO
-        lands inside send_input's own blocking window (e.g. real output
-        arriving during the tmux submit-delay path for a very fast turn), two
-        bumps happen before deliver_pending ever gets to snapshot a baseline,
-        and marking busy against that already-final generation would wait for
-        a transition that already happened and will not repeat, coalescing
-        every future message to this terminal forever. Confirmed this fails
-        without the fix: the second message is left PENDING with no future
-        event able to release it."""
+        """Reviewer-reproduced seventh-round finding on #709: no provider sets
+        assume_processing_on_dispatch, so send_input never bumps the
+        generation itself; the previous fix's "<=1 bump is our own synthetic
+        transition, still busy" heuristic was built on a premise that does not
+        hold in production. A genuine completion transition landing inside
+        send_input's own blocking window (e.g. real output arriving during the
+        tmux submit-delay path for a very fast turn) is exactly one bump, and
+        the old heuristic marked busy against that already-final generation,
+        waiting for a transition that had already happened and would not
+        repeat, coalescing every future message to this terminal forever. The
+        fix trusts a changed generation over the bump count: it consults the
+        actual status the real pipeline detected, and only marks busy if that
+        status is still not ready."""
         with database.SessionLocal() as seed:
             seed.add_all(
                 [
@@ -478,13 +478,21 @@ class TestConcurrentDeliverySerialization:
             patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as mock_monitor,
             patch("cli_agent_orchestrator.services.inbox_service.terminal_service") as mock_term,
         ):
-            mock_monitor.get_status.return_value = TerminalStatus.IDLE
             # First delivery: pre-dispatch read is 0; by the time send_input
-            # returns, TWO real transitions already landed (its own PROCESSING
-            # bump plus a genuine completion) so the post-dispatch read is 2.
-            # Second delivery: pre=2, post=3 (one ordinary PROCESSING bump),
-            # the normal case, so this one does re-arm the marker; it just
-            # must not block the send that gets it there.
+            # returns, a genuine completion transition already landed (no
+            # provider bumps this synthetically), so the post-dispatch read is
+            # 2 and the real status behind it is already COMPLETED, nothing
+            # left to confirm. Second delivery: pre=2, post=3, a single
+            # ordinary transition, and the status behind it is PROCESSING (the
+            # terminal genuinely picked up the message), so this one does
+            # re-arm the marker; it just must not block the send that gets it
+            # there.
+            mock_monitor.get_status.side_effect = [
+                TerminalStatus.IDLE,
+                TerminalStatus.COMPLETED,
+                TerminalStatus.IDLE,
+                TerminalStatus.PROCESSING,
+            ]
             mock_monitor.get_status_generation.side_effect = [0, 2, 2, 3]
             svc = InboxService()
 

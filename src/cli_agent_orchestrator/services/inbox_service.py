@@ -267,20 +267,27 @@ class InboxService:
                     # the terminal's own output, so a concurrent or immediately
                     # following call must not read the still-stale ready status.
                     #
-                    # send_input's own notify_input_sent(assume_processing=True)
-                    # applies a PROCESSING transition synchronously, before the
-                    # tmux paste even happens, so one generation bump between
-                    # pre_dispatch_generation and here is expected and is what the
-                    # marker is meant to survive (#709 sixth review round). If MORE
-                    # than one bump already landed, a genuine completion transition
-                    # (not just our own PROCESSING one) happened inside send_input's
-                    # own blocking window, e.g. output arriving during the tmux
-                    # submit-delay path, and the turn is already over. Marking
-                    # busy against that already-stale generation would wait for a
-                    # transition that has already happened and will never repeat,
-                    # coalescing every future message to this terminal forever.
+                    # No provider sets assume_processing_on_dispatch, so
+                    # send_input never bumps the generation on its own (#709
+                    # seventh review round, correcting the sixth round's premise
+                    # that one bump is always its synthetic PROCESSING marker).
+                    # An unchanged generation means nothing has been detected
+                    # since the pre-dispatch read, so the cached status is
+                    # unproven either way: stay conservative and mark busy. A
+                    # changed generation means a REAL transition landed during
+                    # the blocking send; trust it rather than the bump count.
+                    # Only mark busy if it says the terminal is still not ready,
+                    # never against a generation that has already proven the
+                    # turn complete (that would wait for a later transition with
+                    # no reason to arrive, coalescing every future message to
+                    # this terminal forever).
                     post_dispatch_generation = status_monitor.get_status_generation(terminal_id)
-                    if post_dispatch_generation - pre_dispatch_generation <= 1:
+                    if post_dispatch_generation == pre_dispatch_generation:
+                        _mark_dispatch_active(terminal_id, post_dispatch_generation)
+                    elif status_monitor.get_status(terminal_id) not in (
+                        TerminalStatus.IDLE,
+                        TerminalStatus.COMPLETED,
+                    ):
                         _mark_dispatch_active(terminal_id, post_dispatch_generation)
                 except TerminalNotFoundError as e:
                     # Pane not resolvable yet (e.g. a herdr pane that isn't mapped
