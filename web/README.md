@@ -67,7 +67,7 @@ The main dashboard showing all active sessions with their terminals. Provides se
 
 ### Profiles (`ProfilesPanel.tsx`)
 
-Master-detail browser for agent profiles over the profile management APIs. One catalog fetch on mount (no polling) plus a 300 ms-debounced, server-ranked search rendered in server order. The detail pane shows source, provider, model, tags, capabilities, and a `duplicated_in` shadowing warning. Local-store profiles support Edit (raw source via `/source`, placeholders unresolved), Clone, and Delete (type-to-confirm); read-only sources offer "Clone to customise". Creation runs through `ProfileCreateModal`; every write is validated first, with error findings blocking and warnings allowed through.
+Master-detail browser for agent profiles over the profile management APIs. One catalog fetch on mount (no polling) plus a 300 ms-debounced, server-ranked search rendered in server order. The detail pane shows source, provider, model, role, tags, capabilities, and a `duplicated_in` shadowing warning. Local-store profiles support Edit (raw source via `/source`, placeholders unresolved), Clone, and Delete (type-to-confirm); read-only sources offer "Clone to customise". Creation runs through `ProfileCreateModal`; every write is validated first, with error findings blocking and warnings allowed through.
 
 ### Agents (`AgentPanel.tsx`)
 

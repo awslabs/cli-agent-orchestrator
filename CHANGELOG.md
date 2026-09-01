@@ -4,7 +4,8 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-## [2.5.0] - 2026-08-28
+
+## [Unreleased]
 
 ### Added
 
@@ -12,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   preview, or from scratch via a schema-driven form), edit, clone, and delete
   agent profiles over the profile management APIs, with validate-before-save
   surfacing bounded findings and the truncation-marker contract (#510)
+
+## [2.5.0] - 2026-08-28
+
+### Added
+
 - MiniMax Code (`mcode`) provider with per-terminal authentication and profile
   isolation, model and MCP configuration, multi-turn TUI orchestration,
   supervisor/worker E2E coverage, and provider documentation (#624)

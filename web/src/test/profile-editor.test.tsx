@@ -350,6 +350,26 @@ describe('post-save warnings surface via snackbar', () => {
 })
 
 describe('editor textarea red boundary on validation errors', () => {
+  it('editing after a blocked save clears the stale findings and red boundary', async () => {
+    // Findings describe the PREVIOUS document; keeping them (and the red
+    // border) while the user types is misleading feedback (#692 review).
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.includes('/validate')) return okJson({ valid: false, messages: [{ severity: 'error', message: 'name is required', path: 'name' }] })
+      if (url.includes('/source')) return okJson({ name: 'local-agent', content: SOURCE })
+      return okJson([])
+    }))
+    render(<ProfileEditorModal open={true} mode="edit" name="local-agent" onClose={() => {}} onSaved={() => {}} />)
+    const box = await screen.findByRole('textbox', { name: /profile source/i })
+    fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
+    await act(async () => {})
+    expect(screen.getByText('name is required')).toBeInTheDocument()
+    expect(box.className).toContain('border-red-500')
+
+    fireEvent.change(box, { target: { value: SOURCE + '\nedited' } })
+    expect(screen.queryByText('name is required')).not.toBeInTheDocument()
+    expect(box.className).not.toContain('border-red-500')
+  })
+
   it('the source textarea gets the thick red boundary when validate returns errors', async () => {
     vi.stubGlobal('fetch', vi.fn(async (url: string, opts?: any) => {
       if (url.includes('/validate')) return okJson({ valid: false, messages: [{ severity: 'error', message: 'name is required', path: 'name' }] })

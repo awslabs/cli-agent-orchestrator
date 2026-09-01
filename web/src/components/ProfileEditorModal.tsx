@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { api, ApiError, ProfileValidationMessage } from '../api'
 import { rewriteFrontmatterName } from './ProfileCreateModal'
 import { ValidationFindings } from './ValidationFindings'
@@ -37,6 +37,8 @@ export function ProfileEditorModal({ open, mode, name, onClose, onSaved }: Profi
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
   const [findings, setFindings] = useState<ProfileValidationMessage[]>([])
+  // Closes the double-submit window: state updates are async, a ref is not.
+  const saveGuard = useRef(false)
 
   useEffect(() => {
     if (!open) return
@@ -58,6 +60,11 @@ export function ProfileEditorModal({ open, mode, name, onClose, onSaved }: Profi
   const canSave = !saving && !loading && !loadError && content.trim() !== '' && targetName !== ''
 
   const handleSave = async () => {
+    // Ref-based guard: two synchronous clicks before the re-render both
+    // observe saving === false, opening a double-submit window that state
+    // alone cannot close (#692 review).
+    if (saveGuard.current) return
+    saveGuard.current = true
     setSaving(true)
     setSaveError(null)
     setFindings([])
@@ -103,6 +110,7 @@ export function ProfileEditorModal({ open, mode, name, onClose, onSaved }: Profi
         if (meta?.errors?.length) setFindings(meta.errors)
       }
     } finally {
+      saveGuard.current = false
       setSaving(false)
     }
   }
@@ -170,7 +178,14 @@ export function ProfileEditorModal({ open, mode, name, onClose, onSaved }: Profi
             <textarea
               aria-label="Profile source"
               value={content}
-              onChange={e => setContent(e.target.value)}
+              onChange={e => {
+                setContent(e.target.value)
+                // Stale feedback: findings and the red boundary describe the
+                // PREVIOUS document; keeping them while the user edits is
+                // misleading (#692 review). The next save re-validates.
+                if (findings.length > 0) setFindings([])
+                if (saveError) setSaveError(null)
+              }}
               rows={18}
               spellCheck={false}
               className={`${inputClass} font-mono text-xs leading-relaxed${

@@ -78,11 +78,16 @@ function DetailField({ label, value }: { label: string; value: string | undefine
  */
 function ProfileDetail({
   row,
+  duplicatedIn,
   onEdit,
   onClone,
   onDelete,
 }: {
   row: ProfileRow
+  /** Shadowing metadata from the CATALOG row: search results do not carry
+      duplicated_in, so the panel resolves it by name for both row types
+      (#692 review: the amber banner was invisible when reached via search). */
+  duplicatedIn: string[] | undefined
   onEdit: (name: string) => void
   onClone: (name: string) => void
   onDelete: (name: string) => void
@@ -102,8 +107,6 @@ function ProfileDetail({
       .finally(() => { if (!cancelled) setLoading(false) })
     return () => { cancelled = true }
   }, [row.name])
-
-  const duplicatedIn = !isSearchRow(row) ? row.duplicated_in : undefined
 
   return (
     <div className="p-5 space-y-5" data-testid="profile-detail">
@@ -418,6 +421,7 @@ export function ProfilesPanel() {
               <ProfileDetail
                 key={`${selectedRow.name}:${detailReload}`}
                 row={selectedRow}
+                duplicatedIn={catalog.find(c => c.name === selectedRow.name)?.duplicated_in}
                 onEdit={name => setEditor({ mode: 'edit', name })}
                 onClone={name => setEditor({ mode: 'clone', name })}
                 onDelete={name => setPendingDelete(name)}

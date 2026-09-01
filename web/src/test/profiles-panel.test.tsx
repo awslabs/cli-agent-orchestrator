@@ -141,6 +141,29 @@ describe('ProfilesPanel — list and detail (stage 2)', () => {
     expect(within(detail).getByText(/also defined in: custom/i)).toBeInTheDocument()
   })
 
+  it('shows the duplicated_in warning when the profile is reached through SEARCH', async () => {
+    // Search results carry no duplicated_in; the panel resolves the shadowing
+    // metadata from the catalog by name, so the amber banner renders for both
+    // row types (#692 review: it was invisible via search).
+    vi.stubGlobal('fetch', routedFetch({
+      '/agents/profiles/search': () => okJson([
+        { name: 'analyst', description: 'Analyzes data', capabilities: [], tags: [], role: '', source: 'built-in', coverage: 1, score: 1.0 },
+      ]),
+    }))
+    vi.useFakeTimers()
+    try {
+      render(<ProfilesPanel />)
+      await act(async () => {})
+      fireEvent.change(screen.getByRole('searchbox', { name: /search profiles/i }), { target: { value: 'analyst' } })
+      await act(() => vi.advanceTimersByTimeAsync(SEARCH_DEBOUNCE_MS + 10))
+      fireEvent.click(screen.getByRole('option', { name: /analyst/i }))
+      await act(async () => {})
+      expect(within(screen.getByTestId('profile-detail')).getByText(/also defined in: custom/i)).toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('surfaces a detail load failure without breaking the list', async () => {
     vi.stubGlobal('fetch', routedFetch({
       '/agents/profiles/analyst': () => errJson(500, 'detail exploded'),

@@ -293,6 +293,10 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
   const templateSeq = useRef(0)
   // Tracks whether the user typed a name; if not, follow the template default.
   const nameTouched = useRef(false)
+  // Staleness token for the open-reset fetches (templates/schema/providers).
+  const openSeq = useRef(0)
+  // Closes the double-submit window: state updates are async, a ref is not.
+  const saveGuard = useRef(false)
 
   // Invalidate any scheduled or in-flight preview render: bumping the token
   // makes a late response fail its `seq === previewSeq.current` check and be
@@ -337,11 +341,19 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
     setSystemPrompt('')
     setAdvancedOpen(false)
     nameTouched.current = false
-    api.listProfileTemplates().then(setTemplates).catch(() => setTemplates([]))
+    // Staleness token: these three fetches are idempotent, but a rapid
+    // close -> reopen could repopulate from the EARLIER open's response --
+    // the one async class here without the seq-token discipline (#692 review).
+    const seq = ++openSeq.current
+    api.listProfileTemplates()
+      .then(t => { if (seq === openSeq.current) setTemplates(t) })
+      .catch(() => { if (seq === openSeq.current) setTemplates([]) })
     api.getProfileSchema()
-      .then(s => { setProfileSchema(s); setSchemaError(null) })
-      .catch(e => { setProfileSchema(null); setSchemaError(e?.detail || e?.message || 'Failed to load profile schema') })
-    api.listProviders().then(setProviders).catch(() => setProviders([]))
+      .then(s => { if (seq === openSeq.current) { setProfileSchema(s); setSchemaError(null) } })
+      .catch(e => { if (seq === openSeq.current) { setProfileSchema(null); setSchemaError(e?.detail || e?.message || 'Failed to load profile schema') } })
+    api.listProviders()
+      .then(p => { if (seq === openSeq.current) setProviders(p) })
+      .catch(() => { if (seq === openSeq.current) setProviders([]) })
   }, [open])
 
   // Switching between From-template and From-scratch clears the shared error
@@ -503,7 +515,16 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
     suggestions: k === 'role' ? ROLE_SUGGESTIONS : undefined,
   })
 
+  // Stale feedback after a blocked save: findings and the red boundaries
+  // describe the PREVIOUS attempt; clearing them as the user edits avoids
+  // misleading error markers on already-corrected fields (#692 review).
+  const clearBlockedSave = () => {
+    setFindings(f => (f.length > 0 ? [] : f))
+    setSaveError(s => (s ? null : s))
+  }
+
   const handleScratchChange = (name: string, value: unknown) => {
+    clearBlockedSave()
     if (scratchProps[name]?.type === 'object') {
       setJsonDrafts(d => ({ ...d, [name]: (value as string) ?? '' }))
     } else {
@@ -530,6 +551,11 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
     (mode === 'template' ? preview !== null && !previewLoading : Object.keys(jsonErrors).length === 0)
 
   const handleCreate = async () => {
+    // Ref-based guard: two synchronous clicks before the re-render both
+    // observe saving === false, opening a double-submit window that state
+    // alone cannot close (#692 review).
+    if (saveGuard.current) return
+    saveGuard.current = true
     setSaving(true)
     setSaveError(null)
     setFindings([])
@@ -577,6 +603,7 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
         if (meta?.errors?.length) setFindings(meta.errors)
       }
     } finally {
+      saveGuard.current = false
       setSaving(false)
     }
   }
@@ -626,7 +653,7 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
               aria-label="Profile name"
               type="text"
               value={profileName}
-              onChange={e => { nameTouched.current = true; setProfileName(e.target.value) }}
+              onChange={e => { nameTouched.current = true; clearBlockedSave(); setProfileName(e.target.value) }}
               className={inputClass + (errorFields.has('name') ? ' border-2 !border-red-500 ring-2 ring-red-500/30' : '')}
               placeholder="my-agent"
             />
@@ -662,7 +689,7 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
                       value={config[k]}
                       jsonErrors={{}}
                       hasError={templateErrorFields.has(k)}
-                      onChange={(n, v) => setConfig(c => ({ ...c, [n]: v }))}
+                      onChange={(n, v) => { clearBlockedSave(); setConfig(c => ({ ...c, [n]: v })) }}
                     />
                   ))}
                 </div>
