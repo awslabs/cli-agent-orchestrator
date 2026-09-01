@@ -3422,9 +3422,10 @@ class TestDeferredDeliveryNotCompletableBeforeDispatch:
 
         # wait_until_status imports the singleton at call time, so patching
         # terminal_service.status_monitor alone would not reach the confirm loop.
-        with patch(
-            "cli_agent_orchestrator.services.status_monitor.status_monitor", fake_monitor
-        ), patch("cli_agent_orchestrator.services.terminal_service.status_monitor", fake_monitor):
+        with (
+            patch("cli_agent_orchestrator.services.status_monitor.status_monitor", fake_monitor),
+            patch("cli_agent_orchestrator.services.terminal_service.status_monitor", fake_monitor),
+        ):
             before_tasks = set(_deferred_init_tasks)
             _schedule_deferred_init(
                 provider_instance, TERMINAL_ID, "do the task", OrchestrationType.ASSIGN, None
@@ -3433,9 +3434,9 @@ class TestDeferredDeliveryNotCompletableBeforeDispatch:
             await asyncio.gather(task, asyncio.to_thread(run_poll))
 
         assert dispatched.is_set(), "fixture bug: the initial send never ran"
-        assert "t" in first_processing_at, (
-            "fixture bug: the agent never reached PROCESSING, so the test proves nothing"
-        )
+        assert (
+            "t" in first_processing_at
+        ), "fixture bug: the agent never reached PROCESSING, so the test proves nothing"
         assert poll_returned_at["t"] > first_processing_at["t"], (
             "poll_until_done returned before the first post-dispatch PROCESSING signal — "
             "it completed on the stale pre-send IDLE that survives send_input()'s return, "
@@ -3548,9 +3549,10 @@ class TestDeferredDeliveryNotCompletableBeforeDispatch:
                 poll_until_done(TERMINAL_ID, timeout=30.0, polling_interval=POLL_INTERVAL)
             elapsed["t"] = _time.monotonic() - started
 
-        with patch(
-            "cli_agent_orchestrator.services.status_monitor.status_monitor", fake_monitor
-        ), patch("cli_agent_orchestrator.services.terminal_service.status_monitor", fake_monitor):
+        with (
+            patch("cli_agent_orchestrator.services.status_monitor.status_monitor", fake_monitor),
+            patch("cli_agent_orchestrator.services.terminal_service.status_monitor", fake_monitor),
+        ):
             before_tasks = set(_deferred_init_tasks)
             _schedule_deferred_init(
                 provider_instance, TERMINAL_ID, "do the task", OrchestrationType.ASSIGN, None
@@ -3566,7 +3568,6 @@ class TestDeferredDeliveryNotCompletableBeforeDispatch:
             f"{COMPLETION_LAG:.2f}s after dispatch — the mask is stranding a genuine "
             "early completion"
         )
-
 
 
 class TestPendingMarkNeverLeaks:
