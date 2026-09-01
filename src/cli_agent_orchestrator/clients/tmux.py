@@ -1169,15 +1169,21 @@ class TmuxClient:
         tail_lines: Optional[int] = None,
         strip_escapes: bool = False,
         full_history: bool = False,
+        visible_only: bool = False,
     ) -> str:
         """Get window history.
 
         Args:
             session_name: Name of tmux session
             window_name: Name of window in session
-            tail_lines: Number of lines to capture from end (default: TMUX_HISTORY_LINES)
+            tail_lines: Number of lines to capture from end (default: TMUX_HISTORY_LINES).
+                NOTE this maps to capture-pane ``-S -N``, which starts N lines of
+                HISTORY above the viewport and then includes the viewport — it is
+                "viewport plus N lines of scrollback", not a viewport bounded to N rows.
             strip_escapes: If True, capture plain text without ANSI escape sequences
             full_history: If True, capture entire scrollback buffer (overrides tail_lines)
+            visible_only: If True, capture exactly the currently rendered viewport
+                (``-S 0``) and nothing from scrollback (overrides tail_lines/full_history)
 
         Raises:
             ValueError: The session or window is genuinely gone.
@@ -1200,7 +1206,11 @@ class TmuxClient:
 
             # Use cmd to run capture-pane with -e (escape sequences) and -p (print) flags
             pane = self._find_first_pane(window, session_name, window_name)
-            if full_history:
+            if visible_only:
+                # "-S 0" starts at the first line of the visible pane (default -E
+                # already ends at its last line): the rendered viewport, no scrollback.
+                flags = ["-p", "-S", "0"]
+            elif full_history:
                 # "-S -" captures from the start of the scrollback buffer
                 flags = ["-p", "-S", "-"]
             else:

@@ -6,7 +6,7 @@ import os
 import re
 import time
 import uuid
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import Annotated, Any, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import requests
 from fastmcp import FastMCP
@@ -3176,14 +3176,18 @@ async def store_lesson(
 
 @mcp.tool()
 async def workflow_return(
-    output: Dict[str, Any] = Field(description="The structured JSON output for this workflow step"),
-    output_schema: Optional[Dict[str, Any]] = Field(
-        default=None,
-        description=(
-            "Optional JSON-Schema (Draft 2020-12) to validate the output against. "
-            "Pass the step's declared output_schema so the seam can validate it."
+    output: Annotated[
+        Dict[str, Any], Field(description="The structured JSON output for this workflow step")
+    ],
+    output_schema: Annotated[
+        Optional[Dict[str, Any]],
+        Field(
+            description=(
+                "Optional JSON-Schema (Draft 2020-12) to validate the output against. "
+                "Pass the step's declared output_schema so the seam can validate it."
+            )
         ),
-    ),
+    ] = None,
 ) -> Dict[str, Any]:
     """Return a structured output for the current workflow step (issue #312, N4).
 
@@ -3238,18 +3242,23 @@ async def workflow_return(
 
 @mcp.tool()
 async def workflow_run(
-    name_or_path: str = Field(description="Workflow name (indexed) or path to a spec YAML file"),
-    inputs: Optional[Dict[str, Any]] = Field(
-        default=None, description="Run inputs, validated against the spec's declared inputs"
-    ),
-    run_id: Optional[str] = Field(
-        default=None,
-        description=(
-            "Optional explicit run id (matches WORKFLOW_NAME_RE); the server mints "
-            "one if omitted. Validation and the uniqueness/admission gate are "
-            "server-side — a collision surfaces as the ok=False error envelope."
+    name_or_path: Annotated[
+        str, Field(description="Workflow name (indexed) or path to a spec YAML file")
+    ],
+    inputs: Annotated[
+        Optional[Dict[str, Any]],
+        Field(description="Run inputs, validated against the spec's declared inputs"),
+    ] = None,
+    run_id: Annotated[
+        Optional[str],
+        Field(
+            description=(
+                "Optional explicit run id (matches WORKFLOW_NAME_RE); the server mints "
+                "one if omitted. Validation and the uniqueness/admission gate are "
+                "server-side — a collision surfaces as the ok=False error envelope."
+            )
         ),
-    ),
+    ] = None,
 ) -> Dict[str, Any]:
     """Run a workflow to completion and return the aggregated result (issue #312, N5).
 
@@ -3309,20 +3318,22 @@ async def workflow_run(
 
 @mcp.tool()
 async def workflow_resume(
-    run_id: str = Field(description="The run id to resume (a crashed/failed prior run)"),
-    decisions: Optional[Dict[str, str]] = Field(
-        default=None,
-        description=(
-            "Optional per-step recovery decisions for a halted script run: "
-            "{step_id: 'rerun'|'skip'}. 'rerun' authorises re-executing the step; "
-            "'skip' authorises using its stored result. Applied before the script is "
-            "spawned; an unknown step id or value applies nothing at all. Each "
-            "decision authorises exactly ONE attempt: if that attempt crashes before "
-            "it settles, the next resume asks again rather than re-executing on old "
-            "consent, so a decision is never standing authorisation for a later "
-            "resume and must not be presented to a user as one."
+    run_id: Annotated[str, Field(description="The run id to resume (a crashed/failed prior run)")],
+    decisions: Annotated[
+        Optional[Dict[str, str]],
+        Field(
+            description=(
+                "Optional per-step recovery decisions for a halted script run: "
+                "{step_id: 'rerun'|'skip'}. 'rerun' authorises re-executing the step; "
+                "'skip' authorises using its stored result. Applied before the script is "
+                "spawned; an unknown step id or value applies nothing at all. Each "
+                "decision authorises exactly ONE attempt: if that attempt crashes before "
+                "it settles, the next resume asks again rather than re-executing on old "
+                "consent, so a decision is never standing authorisation for a later "
+                "resume and must not be presented to a user as one."
+            )
         ),
-    ),
+    ] = None,
 ) -> Dict[str, Any]:
     """Resume a crashed or failed workflow run from its durable journal (issue #312, N6).
 
@@ -3394,7 +3405,7 @@ async def workflow_resume(
 
 @mcp.tool()
 async def workflow_cancel(
-    run_id: str = Field(description="The run id to cancel (from a prior workflow_run)"),
+    run_id: Annotated[str, Field(description="The run id to cancel (from a prior workflow_run)")],
 ) -> Dict[str, Any]:
     """Cooperatively cancel a running workflow (issue #312, N5).
 
@@ -3429,17 +3440,22 @@ async def workflow_cancel(
 # ---------------------------------------------------------------------------
 @mcp.tool()
 async def workflow_start(
-    name_or_path: str = Field(description="Workflow name (indexed) or path to a spec YAML file"),
-    inputs: Optional[Dict[str, Any]] = Field(
-        default=None, description="Run inputs, validated against the spec's declared inputs"
-    ),
-    run_id: Optional[str] = Field(
-        default=None,
-        description=(
-            "Optional explicit run id (matches WORKFLOW_NAME_RE); the server mints "
-            "one if omitted. A collision surfaces as the ok=False error envelope."
+    name_or_path: Annotated[
+        str, Field(description="Workflow name (indexed) or path to a spec YAML file")
+    ],
+    inputs: Annotated[
+        Optional[Dict[str, Any]],
+        Field(description="Run inputs, validated against the spec's declared inputs"),
+    ] = None,
+    run_id: Annotated[
+        Optional[str],
+        Field(
+            description=(
+                "Optional explicit run id (matches WORKFLOW_NAME_RE); the server mints "
+                "one if omitted. A collision surfaces as the ok=False error envelope."
+            )
         ),
-    ),
+    ] = None,
 ) -> Dict[str, Any]:
     """Submit a workflow run ASYNCHRONOUSLY and return its handle immediately (issue #505, U6).
 
@@ -3487,7 +3503,9 @@ async def workflow_start(
 
 @mcp.tool()
 async def workflow_plan_approval(
-    run_id: str = Field(description="The run id to report on (from workflow_start / workflow_run)"),
+    run_id: Annotated[
+        str, Field(description="The run id to report on (from workflow_start / workflow_run)")
+    ],
 ) -> Dict[str, Any]:
     """Report a run's plan identifier and whether that plan is approved (issue #583 FR-8).
 
@@ -3540,7 +3558,9 @@ async def workflow_plan_approval(
 
 @mcp.tool()
 async def workflow_status(
-    run_id: str = Field(description="The run id to snapshot (from workflow_start / workflow_run)"),
+    run_id: Annotated[
+        str, Field(description="The run id to snapshot (from workflow_start / workflow_run)")
+    ],
 ) -> Dict[str, Any]:
     """Return a point-in-time status snapshot for a run (issue #505, U6).
 
@@ -3572,7 +3592,7 @@ async def workflow_status(
 
 @mcp.tool()
 async def workflow_result(
-    run_id: str = Field(description="The run id whose retained result to fetch"),
+    run_id: Annotated[str, Field(description="The run id whose retained result to fetch")],
 ) -> Dict[str, Any]:
     """Return the complete retained result for a run (issue #505, U6; FR-7.2).
 
@@ -3605,10 +3625,11 @@ async def workflow_result(
 
 @mcp.tool()
 async def workflow_list(
-    state: Optional[str] = Field(
-        default=None, description="Filter by run state (e.g. running, completed, failed, cancelled)"
-    ),
-    limit: int = Field(default=50, description="Max rows to return (server clamps to [1, 500])"),
+    state: Annotated[
+        Optional[str],
+        Field(description="Filter by run state (e.g. running, completed, failed, cancelled)"),
+    ] = None,
+    limit: Annotated[int, Field(description="Max rows to return (server clamps to [1, 500])")] = 50,
 ) -> Dict[str, Any]:
     """List journaled workflow runs newest-first (issue #505, U6; FR-3.5).
 
@@ -3637,7 +3658,9 @@ async def workflow_list(
 
 @mcp.tool()
 async def workflow_wait(
-    run_id: str = Field(description="The run id to follow until it reaches a terminal state"),
+    run_id: Annotated[
+        str, Field(description="The run id to follow until it reaches a terminal state")
+    ],
 ) -> Dict[str, Any]:
     """Follow a submitted run to a terminal state, then return its result (issue #505, U6).
 
@@ -3741,22 +3764,26 @@ def _classify_events_404(run_id: str, detail: str) -> tuple:
 
 @mcp.tool()
 async def workflow_events(
-    run_id: str = Field(description="The run id whose live event stream to follow"),
-    after_seq: Optional[int] = Field(
-        default=None,
-        description=(
-            "Resume strictly after this per-run seq (exact, dedupe-free). Omit to "
-            "read from the start of the run's event stream."
+    run_id: Annotated[str, Field(description="The run id whose live event stream to follow")],
+    after_seq: Annotated[
+        Optional[int],
+        Field(
+            description=(
+                "Resume strictly after this per-run seq (exact, dedupe-free). Omit to "
+                "read from the start of the run's event stream."
+            )
         ),
-    ),
-    max_events: Optional[int] = Field(
-        default=None,
-        description=(
-            "Stop after draining this many events (an MCP call cannot stream "
-            "indefinitely). Defaults to a bounded ceiling; the follower also stops "
-            "at a terminal state, whichever comes first."
+    ] = None,
+    max_events: Annotated[
+        Optional[int],
+        Field(
+            description=(
+                "Stop after draining this many events (an MCP call cannot stream "
+                "indefinitely). Defaults to a bounded ceiling; the follower also stops "
+                "at a terminal state, whichever comes first."
+            )
         ),
-    ),
+    ] = None,
 ) -> Dict[str, Any]:
     """Follow a run's live event stream, BOUNDED, and return a dict envelope (issue #505, U10).
 
