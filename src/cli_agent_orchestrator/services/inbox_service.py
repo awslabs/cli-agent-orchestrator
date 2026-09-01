@@ -117,7 +117,9 @@ def _terminal_delivery_lock(terminal_id: str) -> Iterator[None]:
     are unaffected since each gets its own lock.
     """
     with _delivery_registry_guard:
-        lock, count = _delivery_locks.get(terminal_id, (threading.Lock(), 0))
+        if terminal_id not in _delivery_locks:
+            _delivery_locks[terminal_id] = (threading.Lock(), 0)
+        lock, count = _delivery_locks[terminal_id]
         _delivery_locks[terminal_id] = (lock, count + 1)
     try:
         with lock:
@@ -142,10 +144,13 @@ class InboxService:
             try:
                 event = await queue.get()
                 status_value = event["data"]["status"]
-                # Other publishers share this topic (e.g. ApprovalBridge) and don't
-                # carry a generation, so default to 0 rather than raise: that never
-                # clears a real dispatch marker early, it just leaves this one
-                # event unable to confirm one (see _clear_dispatch_active).
+                # StatusMonitor is the only production publisher of this topic
+                # and always includes a generation; ApprovalBridge only
+                # subscribes to it. Default to 0 rather than raise so a
+                # differently-shaped event (e.g. from a test harness) can't
+                # take this consumer down: that never clears a real dispatch
+                # marker early, it just leaves this one event unable to
+                # confirm one (see _clear_dispatch_active).
                 event_generation = event["data"].get("generation", 0)
                 terminal_id = terminal_id_from_topic(event["topic"])
                 # A published status event means _apply_detection ran a genuine
