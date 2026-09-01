@@ -325,9 +325,7 @@ class KimiCliProvider(BaseProvider):
                 result = subprocess.run(
                     ["kimi", "--help"], capture_output=True, text=True, timeout=10
                 )
-                cls._markdown_agent_file_cache = "Markdown file" in (
-                    result.stdout + result.stderr
-                )
+                cls._markdown_agent_file_cache = "Markdown file" in (result.stdout + result.stderr)
             except (OSError, subprocess.SubprocessError):
                 cls._markdown_agent_file_cache = False
         return cls._markdown_agent_file_cache
@@ -405,9 +403,7 @@ class KimiCliProvider(BaseProvider):
                         raw_name = getattr(profile, "name", None) or "cao-agent"
                         name = re.sub(r"[^a-z0-9]+", "-", str(raw_name).lower()).strip("-")
                         name = name or "cao-agent"
-                        description = (
-                            getattr(profile, "description", None) or "CAO-managed agent"
-                        )
+                        description = getattr(profile, "description", None) or "CAO-managed agent"
                         header = (
                             "---\n"
                             f"name: {json.dumps(name)}\n"
@@ -633,9 +629,7 @@ class KimiCliProvider(BaseProvider):
                 if not trust_answered and re.search(TRUST_PROMPT_PATTERN, clean_output):
                     from cli_agent_orchestrator.services.status_monitor import status_monitor
 
-                    logger.info(
-                        "Kimi Code workspace-trust dialog detected, trusting CAO temp dir"
-                    )
+                    logger.info("Kimi Code workspace-trust dialog detected, trusting CAO temp dir")
                     status_monitor.notify_input_sent(self.terminal_id)
                     # Menu cursor defaults to "Don't trust"; Up selects
                     # "Trust this folder", Enter confirms (validated manually

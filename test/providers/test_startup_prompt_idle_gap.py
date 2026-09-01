@@ -295,9 +295,7 @@ class TestKimiCliIdleGap:
     @patch("cli_agent_orchestrator.providers.kimi_cli.asyncio.sleep")
     @patch("cli_agent_orchestrator.providers.kimi_cli.time")
     @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
-    async def test_kimi_code_trust_dialog_answered(
-        self, mock_get_backend, mock_time, mock_sleep
-    ):
+    async def test_kimi_code_trust_dialog_answered(self, mock_get_backend, mock_time, mock_sleep):
         """kimi-code's workspace-trust dialog is answered once (Up + Enter).
 
         With --mcp-config in a fresh CAO temp dir, kimi-code blocks before the

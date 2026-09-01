@@ -261,9 +261,7 @@ class TestKimiCliProviderInitialization:
         KimiCliProvider._markdown_agent_file_cache = None
         try:
             fake = MagicMock()
-            fake.stdout = (
-                "--agent-file <path>  Load an agent definition from a Markdown file"
-            )
+            fake.stdout = "--agent-file <path>  Load an agent definition from a Markdown file"
             fake.stderr = ""
             with patch(
                 "cli_agent_orchestrator.providers.kimi_cli.subprocess.run",
