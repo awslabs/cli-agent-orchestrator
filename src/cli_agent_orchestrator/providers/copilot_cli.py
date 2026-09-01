@@ -15,10 +15,12 @@ from typing import Optional
 
 from libtmux.exc import LibTmuxException
 
+from cli_agent_orchestrator.agent_plugins.mcp_delivery import with_plugin_mcp as _with_plugin_mcp
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
+from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_cao_mcp_command
 from cli_agent_orchestrator.utils.terminal import wait_for_shell
 
@@ -196,6 +198,34 @@ class CopilotCliProvider(BaseProvider):
                 "env": {"CAO_TERMINAL_ID": self.terminal_id},
             }
         }
+
+        # Agent Plugins: this runtime config is the only MCP configuration Copilot
+        # reads, so a plugin server absent here is a plugin server Copilot never
+        # sees. Review on #584 found it hardcoded to cao-mcp-server alone, which
+        # meant plugin MCP delivery silently did not reach this provider at all.
+        if self._agent_profile is not None:
+            try:
+                profile = _with_plugin_mcp(load_agent_profile(self._agent_profile), "copilot_cli")
+            except Exception as exc:
+                # Never block a launch on plugin delivery.
+                logger.warning(
+                    "Could not load profile '%s' for Copilot MCP config: %s",
+                    self._agent_profile,
+                    exc,
+                )
+                profile = None
+
+            for name, cfg in ((profile.mcpServers if profile else None) or {}).items():
+                if name in merged_servers:
+                    # CAO's own in-session server is not replaceable by a plugin.
+                    continue
+                entry = dict(cfg) if isinstance(cfg, dict) else cfg.model_dump(exclude_none=True)
+                env = dict(entry.get("env", {}))
+                env.setdefault("CAO_TERMINAL_ID", self.terminal_id)
+                entry["env"] = env
+                entry.setdefault("disabled", False)
+                merged_servers[name] = entry
+
         return json.dumps({"mcpServers": merged_servers}, ensure_ascii=False)
 
     def _send_enter(self) -> None:

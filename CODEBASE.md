@@ -110,7 +110,7 @@ respective persistence and projection behavior.
 `plugins/base.py` and `plugins/events.py` define the extension contract;
 `plugins/registry.py` discovers entry points from the `cao.plugins` group.
 Built-in integrations live under `plugins/builtin/`. See
-[Plugins](docs/plugins.md) before changing hook behavior.
+[Event Plugins](docs/plugins.md) before changing hook behavior.
 
 Authentication and authorization helpers live under `security/`, while
 network allowlists and server defaults are defined through configuration and

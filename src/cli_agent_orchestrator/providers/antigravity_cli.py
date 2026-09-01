@@ -52,6 +52,7 @@ import time
 from pathlib import Path
 from typing import List, Optional
 
+from cli_agent_orchestrator.agent_plugins.mcp_delivery import with_plugin_mcp as _with_plugin_mcp
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import SECURITY_PROMPT
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -274,7 +275,7 @@ class AntigravityCliProvider(BaseProvider):
         if self._agent_profile is None:
             return None
         try:
-            return load_agent_profile(self._agent_profile)
+            return _with_plugin_mcp(load_agent_profile(self._agent_profile), "antigravity_cli")
         except Exception:
             return None
 
@@ -309,7 +310,9 @@ class AntigravityCliProvider(BaseProvider):
         profile = None
         if self._agent_profile is not None:
             try:
-                profile = load_agent_profile(self._agent_profile)
+                profile = _with_plugin_mcp(
+                    load_agent_profile(self._agent_profile), "antigravity_cli"
+                )
             except Exception as exc:
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {exc}")
 

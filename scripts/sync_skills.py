@@ -32,6 +32,15 @@ from typing import List
 
 # Canonical, explicit allowlist of skills that ship inside the package.
 # Keep this in sync with the repo-root ``skills/`` directories intended to ship.
+#
+# RENAMING an entry here is not a one-line change on its own: ``seed_default_skills()``
+# skips a destination that already exists and never removes one, so an upgraded
+# installation would keep both the old and the new folder. Add the pair to
+# ``SKILL_RENAMES`` in ``cli/commands/init.py`` in the same change — that map is the
+# one-shot retirement step, and it is currently empty pending maintainer decision
+# **M4** (``cao-plugin`` to ``cao-event-plugin``). The contributor agent-plugin
+# package's allowlist in ``scripts/build_agent_plugin.py`` needs the same edit,
+# since a packaged skill folder name must equal its frontmatter ``name``.
 SHIPPED_SKILLS: List[str] = [
     "agui-author",
     "cao-agent-routing",

@@ -30,7 +30,7 @@ def paste_enter_count(self) -> int:
 
 **Problem:** CLI tools frequently update their TUI. Kiro CLI changed from `[agent] >` to `agent · model · ◔ N%` with `ask a question, or describe a task` as the idle indicator. The old regex stopped matching.
 
-**Fix:** 
+**Fix:**
 - Build detection for multiple prompt formats (old and new)
 - Use fallback patterns: check the primary pattern first, then fall back to alternatives
 - Consider adding a `--legacy-ui` flag if the CLI supports it
