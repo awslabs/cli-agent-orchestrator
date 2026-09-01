@@ -378,19 +378,64 @@ class TestConcurrentDeliverySerialization:
             )
         assert statuses == sorted([MessageStatus.DELIVERED.value, MessageStatus.DELIVERED.value])
 
-    def test_dispatch_marker_expires_after_coalesce_window(self):
-        """Fallback for a terminal that never produces another status
-        transition after the dispatch: the marker must not wedge
-        deliver_pending shut forever, or it would also block the reconcile
-        sweep (#131) that exists specifically to un-stick exactly that case."""
-        with patch(
-            "cli_agent_orchestrator.services.inbox_service.INBOX_DISPATCH_COALESCE_WINDOW_S",
-            0.01,
+    def test_dispatch_marker_survives_elapsed_time_with_no_transition(self):
+        """Reviewer-reproduced fifth-round finding on #709: a provider is not
+        contractually bound to emit output or a PROCESSING transition inside
+        any fixed window, so elapsed time alone must never authorize another
+        send. Only a genuinely newer generation (a real transition) may clear
+        the marker; simply waiting must not."""
+        inbox_service_module._mark_dispatch_active("term-1")
+        assert inbox_service_module._is_dispatch_active("term-1") is True
+        time.sleep(0.2)
+        assert inbox_service_module._is_dispatch_active("term-1") is True
+
+    def test_two_deliveries_with_no_status_event_still_coalesce_past_the_old_window(
+        self, isolated_memory_db
+    ):
+        """Reviewer-reproduced fifth-round finding on #709: with the cached
+        status and generation unchanged the whole time (no status event at
+        all, matching a slow/silent provider start), a second deliver_pending
+        call must still coalesce even once real time has moved well past what
+        used to be the five-second coalescing window. Mirrors
+        test_coalesced_message_delivers_on_next_status_event but never clears
+        the marker, so a second real send here means the guard authorized
+        itself on elapsed time alone."""
+        with database.SessionLocal() as seed:
+            seed.add_all(
+                [
+                    InboxModel(
+                        sender_id="s",
+                        receiver_id="term-1",
+                        message=f"m{i}",
+                        status=MessageStatus.PENDING.value,
+                        created_at=datetime.now(),
+                    )
+                    for i in range(2)
+                ]
+            )
+            seed.commit()
+
+        with (
+            patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as mock_monitor,
+            patch("cli_agent_orchestrator.services.inbox_service.terminal_service") as mock_term,
         ):
-            inbox_service_module._mark_dispatch_active("term-1")
-            assert inbox_service_module._is_dispatch_active("term-1") is True
-            time.sleep(0.02)
-            assert inbox_service_module._is_dispatch_active("term-1") is False
+            mock_monitor.get_status.return_value = TerminalStatus.IDLE
+            mock_monitor.get_status_generation.return_value = 0
+            svc = InboxService()
+
+            svc.deliver_pending("term-1")
+            assert mock_term.send_input.call_count == 1
+
+            time.sleep(0.2)
+
+            svc.deliver_pending("term-1")
+            assert mock_term.send_input.call_count == 1
+
+        with database.SessionLocal() as check:
+            statuses = sorted(
+                m.status for m in check.query(InboxModel).filter_by(receiver_id="term-1").all()
+            )
+        assert statuses == sorted([MessageStatus.DELIVERED.value, MessageStatus.PENDING.value])
 
 
 class TestEagerInboxDelivery:

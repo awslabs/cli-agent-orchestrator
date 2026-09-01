@@ -6,7 +6,6 @@ Consumer: terminal.{id}.status
 import asyncio
 import logging
 import threading
-import time
 from contextlib import contextmanager
 from itertools import groupby
 from typing import Dict, Iterator, Tuple
@@ -21,7 +20,6 @@ from cli_agent_orchestrator.clients.database import (
 )
 from cli_agent_orchestrator.constants import (
     EAGER_INBOX_DELIVERY,
-    INBOX_DISPATCH_COALESCE_WINDOW_S,
     INBOX_RECONCILE_GRACE_SECONDS,
 )
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
@@ -43,32 +41,38 @@ logger = logging.getLogger(__name__)
 _delivery_registry_guard = threading.Lock()
 _delivery_locks: Dict[str, Tuple[threading.Lock, int]] = {}
 
-# terminal_id -> (monotonic time of the last dispatch not yet confirmed by a
-# real status transition, status_monitor's transition generation at the
-# moment of that dispatch). The lock above serializes deliver_pending calls
-# but does not stop a queued caller from proceeding once it is its turn:
-# status_monitor.get_status() still returns the cached IDLE/COMPLETED from
-# before the first send, because notify_input_sent() only arms the next
-# PROCESSING detection, it does not flip the cached status itself, and the
-# real detection needs actual terminal output to run. A second caller that
-# only checks status would see the same stale ready value and dispatch its
-# own message into a terminal that has not started working on the first one
-# yet (reviewer-reproduced on #709: two IDLE checks and two sends in one
-# cycle). This marker closes that window: it is set right after a successful
-# send and normally cleared once InboxService.run() observes a status event
-# whose generation is strictly newer than the one recorded at dispatch time.
+# terminal_id -> status_monitor's transition generation at the moment of the
+# last dispatch not yet confirmed by a real status transition. The lock above
+# serializes deliver_pending calls but does not stop a queued caller from
+# proceeding once it is its turn: status_monitor.get_status() still returns
+# the cached IDLE/COMPLETED from before the first send, because
+# notify_input_sent() only arms the next PROCESSING detection, it does not
+# flip the cached status itself, and the real detection needs actual terminal
+# output to run. A second caller that only checks status would see the same
+# stale ready value and dispatch its own message into a terminal that has not
+# started working on the first one yet (reviewer-reproduced on #709: two IDLE
+# checks and two sends in one cycle). This marker closes that window: it is
+# set right after a successful send and cleared only once InboxService.run()
+# observes a status event whose generation is strictly newer than the one
+# recorded at dispatch time.
+#
 # The generation check matters because run()'s queue can already hold an
 # older, stale event at dispatch time (the immediate API, OpenCode poller and
 # reconcile paths all call deliver_pending() outside this consumer): clearing
 # on ANY event, rather than only a genuinely later one, would let that stale
 # event wipe the marker before the real post-dispatch transition arrives,
 # reopening the exact window the marker exists to close (#709 third review
-# round). INBOX_DISPATCH_COALESCE_WINDOW_S is only the fallback for a
-# terminal that stops producing status transitions entirely after the
-# dispatch, so this can never wedge deliver_pending shut against the
-# reconcile sweep the way an un-expiring flag would.
+# round). A prior version also expired this marker on elapsed time alone, but
+# a provider is not contractually bound to emit any output within a fixed
+# window, so a slow or silent start left the cached status unchanged and let
+# the next caller (in particular the five-second OpenCode poller) dispatch a
+# second message into the same unconfirmed cycle (#709 fifth review round).
+# The marker now only ever clears on a genuine transition; a terminal whose
+# provider truly never produces another status event again holds its
+# remaining PENDING messages rather than risk another interleaved send, the
+# same terminal already received the first message that set the marker.
 _dispatch_active_guard = threading.Lock()
-_dispatch_active: Dict[str, Tuple[float, int]] = {}
+_dispatch_active: Dict[str, int] = {}
 
 
 def _clear_dispatch_active(terminal_id: str, event_generation: int) -> None:
@@ -78,34 +82,26 @@ def _clear_dispatch_active(terminal_id: str, event_generation: int) -> None:
     (or is a duplicate of one already accounted for) and proves nothing about
     what happened after the send (#709)."""
     with _dispatch_active_guard:
-        entry = _dispatch_active.get(terminal_id)
-        if entry is None:
+        generation_at_dispatch = _dispatch_active.get(terminal_id)
+        if generation_at_dispatch is None:
             return
-        _dispatched_at, generation_at_dispatch = entry
         if event_generation > generation_at_dispatch:
             del _dispatch_active[terminal_id]
 
 
 def _is_dispatch_active(terminal_id: str) -> bool:
-    """True while a dispatch for this terminal is still within its coalescing
-    window and no later status event has cleared it. Expires stale entries in
-    place so a terminal that never produces another status transition does
-    not stay wedged shut forever."""
+    """True while a dispatch for this terminal has not yet been confirmed by
+    a later status event. Elapsed time alone never clears this: only a
+    genuinely newer transition (see _clear_dispatch_active) proves the cycle
+    advanced (#709 fifth review round)."""
     with _dispatch_active_guard:
-        entry = _dispatch_active.get(terminal_id)
-        if entry is None:
-            return False
-        dispatched_at, _generation_at_dispatch = entry
-        if time.monotonic() - dispatched_at < INBOX_DISPATCH_COALESCE_WINDOW_S:
-            return True
-        del _dispatch_active[terminal_id]
-        return False
+        return terminal_id in _dispatch_active
 
 
 def _mark_dispatch_active(terminal_id: str) -> None:
     generation = status_monitor.get_status_generation(terminal_id)
     with _dispatch_active_guard:
-        _dispatch_active[terminal_id] = (time.monotonic(), generation)
+        _dispatch_active[terminal_id] = generation
 
 
 @contextmanager
