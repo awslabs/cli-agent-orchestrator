@@ -142,7 +142,11 @@ class InboxService:
             try:
                 event = await queue.get()
                 status_value = event["data"]["status"]
-                event_generation = event["data"]["generation"]
+                # Other publishers share this topic (e.g. ApprovalBridge) and don't
+                # carry a generation, so default to 0 rather than raise: that never
+                # clears a real dispatch marker early, it just leaves this one
+                # event unable to confirm one (see _clear_dispatch_active).
+                event_generation = event["data"].get("generation", 0)
                 terminal_id = terminal_id_from_topic(event["topic"])
                 # A published status event means _apply_detection ran a genuine
                 # transition for this terminal (it dedupes no-op repeats), so a

@@ -1719,37 +1719,45 @@ def get_pending_messages(receiver_id: str, limit: int = 1) -> List[InboxMessage]
 def claim_pending_messages(receiver_id: str, limit: int = 1) -> List[InboxMessage]:
     """Atomically move up to `limit` PENDING messages for receiver_id to DELIVERED.
 
-    Picks the oldest PENDING rows and flips them to DELIVERED in a single
-    ``UPDATE ... WHERE status = 'pending' ... RETURNING``, so concurrent callers
-    (the status-event path, the immediate-delivery path, and the retry sweep
-    can all reach the same receiver_id) never select and mark the same row
-    twice: whichever transaction's UPDATE lands first claims it, and every
-    later one finds it already DELIVERED and returns nothing for it.
+    Picks the oldest PENDING rows and flips them to DELIVERED inside one
+    ``BEGIN IMMEDIATE`` transaction, so concurrent callers (the status-event
+    path, the immediate-delivery path, and the retry sweep can all reach the
+    same receiver_id) never select and mark the same row twice: the immediate
+    write lock is taken before the SELECT runs, so no other writer's claim can
+    interleave between the pick and the flip. Avoids ``UPDATE ... RETURNING``,
+    which needs SQLite 3.35+ and is not verified at this project's CI floor
+    (see workflow_journal.py's ``_connect`` docstring on the same tradeoff).
     """
     with SessionLocal() as db:
-        pick = (
-            select(InboxModel.id)
-            .where(
-                InboxModel.receiver_id == receiver_id,
-                InboxModel.status == MessageStatus.PENDING.value,
+        raw_conn = db.connection().connection.dbapi_connection
+        raw_conn.execute("BEGIN IMMEDIATE")
+        try:
+            pick = (
+                select(
+                    InboxModel.id,
+                    InboxModel.sender_id,
+                    InboxModel.receiver_id,
+                    InboxModel.message,
+                    InboxModel.created_at,
+                )
+                .where(
+                    InboxModel.receiver_id == receiver_id,
+                    InboxModel.status == MessageStatus.PENDING.value,
+                )
+                .order_by(InboxModel.created_at.asc())
+                .limit(limit)
             )
-            .order_by(InboxModel.created_at.asc())
-            .limit(limit)
-        )
-        stmt = (
-            update(InboxModel)
-            .where(InboxModel.id.in_(pick))
-            .values(status=MessageStatus.DELIVERED.value)
-            .returning(
-                InboxModel.id,
-                InboxModel.sender_id,
-                InboxModel.receiver_id,
-                InboxModel.message,
-                InboxModel.created_at,
-            )
-        )
-        rows = db.execute(stmt).all()
-        db.commit()
+            rows = db.execute(pick).all()
+            if rows:
+                db.execute(
+                    update(InboxModel)
+                    .where(InboxModel.id.in_([row.id for row in rows]))
+                    .values(status=MessageStatus.DELIVERED.value)
+                )
+            raw_conn.commit()
+        except Exception:
+            raw_conn.rollback()
+            raise
         claimed = [
             InboxMessage(
                 id=row.id,
