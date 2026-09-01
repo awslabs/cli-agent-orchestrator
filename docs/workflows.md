@@ -313,11 +313,13 @@ a sentinel where a human decision was required. Re-raise when `.status == 409`.
 
 ## CLI reference
 
-All thirteen verbs live under `cao workflow`.
+All fifteen verbs live under `cao workflow`.
 
 | Verb | Flags | Description |
 | --- | --- | --- |
 | `validate <file>` | `--json` | Validate a spec file without running it. Exit 0 valid, 1 invalid. |
+| `create <name>` | `--from-file <path>` (required), `--json` | Create a **new** Python spec named `<name>` from a source file. Refuses to overwrite an existing spec — use `update`. Python only; a YAML-tier name is refused with a message naming the restriction. The source is sent as text and the **server** decides where it lands (validation, lint gate, path containment, atomic write, index update all happen server-side). Prints the new `content_hash`, which is what `update` wants next. Exit 0 created, 1 refused/errored. |
+| `update <name>` | `--from-file <path>` (required), `--expected-hash <hash>` (required), `--json` | Replace an **existing** spec's source, refusing a stale update. Refuses to create — use `create`. `--expected-hash` is required and is never computed for you: it is your assertion about what you believe you are replacing, and a hash derived from the file about to be overwritten would always match. There is no `--force`. Get the current hash from `get <name>` (the `Hash:` line). |
 | `list` | `--dir <path>`, `--json` | List indexed workflows (rebuilt from spec files on disk). Script-tier rows show `-` for step count. |
 | `get <name>` | `--json` | Show the parsed/validated spec for a name or file path. |
 | `delete <name>` | `--yes` / `-y` | Delete a workflow's spec file and index row (prompts unless `--yes`). |
@@ -333,11 +335,15 @@ All thirteen verbs live under `cao workflow`.
 
 ## MCP tool reference (from inside an agent session)
 
-Eleven workflow tools are exposed over MCP. Each returns a structured `{ok, ...}` envelope on
+Fifteen workflow tools are exposed over MCP. Each returns a structured `{ok, ...}` envelope on
 every path and never raises into the agent loop.
 
 | Tool | Description |
 | --- | --- |
+| `workflow_create` | Create a **new** Python spec from source **text** (not a path). Thin client over `POST /workflows`; refuses to overwrite an existing spec. |
+| `workflow_update` | Replace an existing spec's source, refusing a stale update. Requires `expected_hash` — the hash you believe the spec currently has. |
+| `workflow_get` | Read a spec back, including its source and `content_hash`. FR-10's "inspect" operation: what the workflow currently **is**, not what you last sent. |
+| `workflow_validate` | Lint spec source **without creating anything**. Takes text, so a draft can be checked before it exists anywhere — validate, revise, then create. |
 | `workflow_run` | Run a workflow to completion **inline** (blocking). Bounded by the MCP host's per-tool-call timeout — see the ceiling note above. |
 | `workflow_start` | Submit a run **asynchronously**; returns the run id immediately without waiting. |
 | `workflow_status` | Point-in-time status snapshot for one run. |
@@ -357,6 +363,10 @@ before assuming a verb and a tool with similar names do the same thing:
 
 | Concept | CLI verb | MCP tool |
 | --- | --- | --- |
+| Create a spec | `create --from-file <path>` | `workflow_create` (source **text**) |
+| Update a spec | `update --from-file <path> --expected-hash` | `workflow_update` (source **text**) |
+| Read a spec | `get <name>` | `workflow_get` |
+| Validate a draft | `validate <file>` | `workflow_validate` (source **text**) |
 | List workflow **specs** | `list` | *(none — MCP has no spec-listing tool)* |
 | List workflow **runs** | `runs` | `workflow_list` |
 | Submit asynchronously | `run` (the default) | `workflow_start` |
@@ -364,6 +374,12 @@ before assuming a verb and a tool with similar names do the same thing:
 | **Grant** a plan approval | `approve <plan_id>` | *(none — deliberately)* |
 | **Report** a plan's approval | *(none)* | `workflow_plan_approval` |
 
+> **The four authoring pairs line up by name but not by input.** `create`, `update` and `validate`
+> take a **file path** on the CLI and **source text** over MCP. That is deliberate — an agent holds a
+> draft in context and has nowhere to put a file, whereas a person already has one on disk — but it
+> means the CLI flag and the tool argument are not interchangeable. In both directions the server does
+> the validating, containment-checking and writing; neither surface writes to the spec directory itself.
+>
 > **`list` and `workflow_list` are false friends.** The CLI's `list` lists **specs**; the
 > MCP `workflow_list` lists **runs**. An agent reaching for "the list tool" expecting specs
 > gets runs. The CLI equivalent of `workflow_list` is `cao workflow runs`.
@@ -380,27 +396,89 @@ before assuming a verb and a tool with similar names do the same thing:
 
 ## Plan approval (script tier)
 
-**Nothing in this section applies to YAML workflows**, and nothing in it is active by default.
+**Nothing in this section applies to YAML workflows.** Script-tier approval enforcement is active by
+default.
 
 A script-tier run freezes an **execution manifest** at run start — the workflow's source hash, its
 resolved inputs, and the repository/worktree baseline — and derives a **plan identifier** (`plan_id`,
 of the form `plan-v1:<digest>`) from the execution-affecting fields. Change any of them and the
 `plan_id` changes, which is the mechanism by which a changed plan needs its own approval.
 
-### Enabling it
+### It is on by default
 
-Approval enforcement is **off by default**. With it off, `plan_id`s are still computed and frozen, and
-runs start regardless of whether an approval exists.
+Approval enforcement is **on by default**.
+
+> **This is a behaviour change, not a fix.** A script-tier plan that ran yesterday under no approval
+> is refused today. If you run script-tier workflows non-interactively, approve each plan first with
+> `cao workflow approve <plan_id>`, or opt out as shown below. YAML-tier workflows are unaffected.
+
+Nothing is required to enable it. The environment variable still works and is now useful for
+re-asserting the default rather than switching it on:
 
 ```bash
-# start the CAO server with approval enforcement enabled
+# the default -- the gate is already on
+cao-server
+
+# re-assert it explicitly (for example in a script whose settings.json you do not control)
 CAO_WORKFLOW_REQUIRE_APPROVAL=1 cao-server
 
 # invoke the CLI client normally
 cao workflow run my-script
-
-# alternatively, persist workflow.require_approval = true in the server's settings.json
 ```
+
+#### Opting out
+
+Only the server's `settings.json` can turn the gate off:
+
+```json
+{
+  "workflow": {
+    "require_approval": false
+  }
+}
+```
+
+#### Recovering from malformed settings
+
+With `CAO_WORKFLOW_REQUIRE_APPROVAL` unset, unreadable, undecodable, malformed JSON, or invalid
+approval settings **fail closed**: the gate remains on. Repair `settings.json` and restart or reload
+the CAO server. A valid explicit JSON boolean `workflow.require_approval: false` is the only
+settings-file opt-out; `null`, strings, and numbers are invalid and do not disable enforcement.
+
+#### What a refusal looks like
+
+The two refusals are deliberately different, because the operator's next action differs:
+
+| Status | Meaning | What to do |
+|---|---|---|
+| `403` | The plan's `plan_id` has no approval. | `cao workflow approve <plan_id>`, then run again. |
+| `503` | No plan identifier could be read from the run's frozen manifest — CAO's own freeze failed. Nothing about your request was wrong. | Retry. No approval will help. |
+
+The refusal body carries the identifier as a **field**, not only in the message
+(issue #583 Bolt 3), so a script or agent branches on it rather than parsing prose:
+
+```json
+{
+  "detail": {
+    "kind": "approval_required",
+    "plan_id": "plan-v1:9f3c…",
+    "message": "Plan 'plan-v1:9f3c…' has not been approved. …"
+  }
+}
+```
+
+`kind` is authoritative and the status mirrors it: `approval_required` → 403, and
+`plan_identity_unavailable` → 503 with `plan_id: null`, because in that case there is no identifier to
+approve. `cao workflow run` and the `workflow_run` tool both read that field and print — or return — the
+exact `approve` command.
+
+Note that a `plan_id` is computed at run start, so the **first run of a new or changed plan is
+refused by design** — that is the mechanism by which a changed plan needs its own approval.
+
+> **Known limitation.** If the approval database itself cannot be read, the run is refused (never
+> admitted) but is reported as `403` — "this plan has not been approved" — rather than as a database
+> fault. The refusal is safe; the message is misleading. If you see a `403` for a plan you are certain
+> you approved, check the server log for a SQLite error before re-approving.
 
 > **The variable configures the server, not the CLI client.** Setting
 > `CAO_WORKFLOW_REQUIRE_APPROVAL=1` only on a short-lived `cao workflow run` invocation does not
@@ -458,16 +536,21 @@ One consequence is worth stating plainly, because it differs from a non-workflow
 The recorded hash covers the full resolved content, taken **before** redaction, so it identifies what was resolved
 rather than what survived the redaction rules of the day.
 
-### Two things not yet implemented
+### One thing not yet recorded
 
-Stated here because their absence is easy to assume away:
+Stated here because its absence is easy to assume away:
 
-1. **Stale source-hash rejection.** A `plan_id` changes when the source changes, but an update
-   presenting a stale expected source hash is **not** rejected. Do not rely on such a check running.
-2. **Six manifest fields are omitted rather than recorded** — provider, model, profile, permissions,
+1. **Six manifest fields are omitted rather than recorded** — provider, model, profile, permissions,
    limits and retry policy. Script-tier steps are discovered by executing the Python, so those values
    have no run-level existence at freeze time; they are covered transitively by the source hash,
    because changing any of them means editing the script.
+
+> **Stale source-hash rejection now runs** (issue #583 Bolt 3). This section previously listed it as a
+> second gap. `cao workflow update` and the `workflow_update` tool both require the `content_hash` you
+> last read, and the write is refused if the spec has moved on since — so an edit made from a stale read
+> is stopped rather than silently overwriting someone else's. Do not work around it by re-reading the
+> hash immediately before writing: a hash read from the file you are about to overwrite always matches,
+> which removes the check instead of satisfying it.
 
 ## See also
 

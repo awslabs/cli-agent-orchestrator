@@ -318,7 +318,87 @@ def test_blocking_script_start_returns_approval_refusal(client, monkeypatch):
     )
 
     assert response.status_code == 403
-    assert "plan-v1:blocked" in response.json()["detail"]
+    detail = response.json()["detail"]
+
+    # REWRITTEN at issue #583 Bolt 3 (``authoring-sequence``). This asserted
+    # ``"plan-v1:blocked" in response.json()["detail"]``, which read the identifier out of a PROSE
+    # sentence. FR-10's sequence needs it as a FIELD: a refused start writes no run row, so
+    # ``workflow_plan_approval(run_id)`` -- the only structured carrier -- has nothing to read on the
+    # first run of a new plan, which by design is every newly authored workflow.
+    assert detail["kind"] == "approval_required"
+    # BYTE-IDENTICAL round trip, not a substring match. The caller's next act is to pass this to
+    # ``cao workflow approve``, and that command records why a normalisation is dangerous: "a
+    # normalisation is how two distinct plans could share one approval."
+    assert detail["plan_id"] == "plan-v1:blocked"
+    assert "plan-v1:blocked" in detail["message"], "the prose is kept verbatim alongside the field"
+    # An EXACT set (not a subset check): extend it when a field is added deliberately, because an
+    # exact set is what makes an UNINTENTIONAL field -- the manifest, the inputs, the spec path --
+    # show up as a failure. Relaxing this is the tempting move precisely because it never fails again.
+    assert set(detail) == {"kind", "plan_id", "message"}
+
+
+def test_script_start_returns_503_when_the_plan_identity_is_unavailable(client, monkeypatch):
+    """Issue #583 Bolt 3: a failed freeze is a CAO fault, not a permission problem.
+
+    The status is the deliverable. Enforcement now defaults on, so this path is reachable in a default
+    installation, and an operator or agent that reads 403 here will go looking for an approval to
+    grant when the identifier they would approve was never readable.
+    """
+    from cli_agent_orchestrator.models.workflow import ScriptSpec
+    from cli_agent_orchestrator.services import approval_gate, script_runner
+
+    spec = ScriptSpec(
+        name="scr",
+        path="/tmp/scr.py",
+        source="def main():\n    pass\n",
+        content_hash="deadbeef",
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.workflow_spec_service.get_workflow",
+        lambda name_or_path, scan_dir=None: spec,
+    )
+
+    async def _refuse(spec_arg, inputs, run_id):
+        raise approval_gate.PlanIdentityUnavailableError(
+            "This script-tier run has no readable plan identifier in its frozen execution manifest."
+        )
+
+    monkeypatch.setattr(script_runner, "run_script_workflow", _refuse)
+
+    response = client.post(
+        "/workflows/runs",
+        json={"name_or_path": "scr", "inputs": {}, "run_id": "identity-unavailable"},
+    )
+
+    assert response.status_code == 503, (
+        f"expected 503, got {response.status_code}: 403 would assert the caller lacked permission "
+        "for a freeze that CAO itself failed to complete"
+    )
+    # REWRITTEN at issue #583 Bolt 3 (``authoring-sequence``), and the history matters because the
+    # original was deliberate. It asserted ``isinstance(response.json()["detail"], str)`` with the
+    # reason: "this unit deliberately does not change the response shape, so the CLI's
+    # _extract_detail and any external client keep working unmodified."
+    #
+    # That PURPOSE is honoured and is what the replacement pins; only the WORDING changed. Both
+    # ``detail`` readers were updated in the same change (``_extract_detail`` and
+    # ``_extract_error_detail``), so neither degrades -- the CLI still prints one clean sentence and
+    # the MCP surface still returns a real message rather than "status 503". An external client that
+    # reads ``detail`` as a string on these three routes DOES break; that is a documented,
+    # human-approved break, and it is not novel -- this same route already returns
+    # ``detail={"findings": [...]}`` on a 422 lint failure.
+    #
+    # A shape check would have been the weak replacement: ``isinstance(detail, dict)`` passes for
+    # ``{}``. This asserts CONTENT.
+    detail = response.json()["detail"]
+    assert detail["kind"] == "plan_identity_unavailable", (
+        "the freeze failed, so the caller did nothing wrong -- an agent branching on this field must "
+        "retry rather than hunt for an approval to grant"
+    )
+    assert (
+        "plan_id" in detail
+    ), "present-and-null, never absent, so one reader handles both statuses"
+    assert detail["plan_id"] is None, "there is no identifier to approve; that IS the condition"
+    assert detail["message"], "the prose survives verbatim as the human-readable half"
 
 
 @pytest.mark.asyncio
@@ -821,6 +901,19 @@ def async_script_env(client, monkeypatch, tmp_path):
     _migrate_workflow_run_step()
     workflow_service.run_registry.clear()
     workflow_service._active_drives.clear()
+
+    # issue #583 Bolt 3 (``approval-enforcement-default``): approval enforcement now defaults ON, so
+    # a script-tier submit is refused with 403 unless the plan is approved. Every test on this fixture
+    # exercises SUBMIT MECHANICS -- 202-and-drives, a 409 integrity error, manifest freezing, a 422
+    # lint failure -- and none of them is about approval. Turned off through the REAL setting rather
+    # than by patching ``ensure_plan_approved`` out, so the gate's disabled path is still genuinely
+    # exercised here and a regression in it would surface rather than be hidden.
+    from cli_agent_orchestrator.services import settings_service
+
+    gate_off = tmp_path / "settings.json"
+    gate_off.write_text(json.dumps({"workflow": {"require_approval": False}}))
+    monkeypatch.setattr(settings_service, "SETTINGS_FILE", gate_off)
+    monkeypatch.delenv("CAO_WORKFLOW_REQUIRE_APPROVAL", raising=False)
 
     spec = ScriptSpec(
         name="scr",
@@ -1945,7 +2038,13 @@ def test_failure_envelope_adds_no_persisted_column(client, read_surface_db):
 def test_failure_envelope_json_shape_stable_across_surfaces(client, read_surface_db):
     """U9-T8 (ST-1 / NFR-3): the ``--json`` (REST body) envelope has the fixed field
     set and a next_command hint whose shape does not drift — the same shape the CLI
-    and MCP surfaces spread verbatim."""
+    and MCP surfaces spread verbatim.
+
+    ``classification`` was added by issue #583 Bolt 3 (``failure-classification``), FR-10's second Pass
+    criterion. THE EXACT-SET ASSERTION IS KEPT DELIBERATELY: relaxing it to a subset check would remove
+    this test's teeth for the sake of one intentional addition, and an exact set is what makes an
+    UNintentional field appear as a failure. Extend the set when a field is added on purpose.
+    """
     _seed_run(
         "shape",
         RunState.FAILED.value,
@@ -1958,6 +2057,7 @@ def test_failure_envelope_json_shape_stable_across_surfaces(client, read_surface
         "failing_step",
         "attempt",
         "error_kind",
+        "classification",
         "terminal_reference",
         "next_command",
     }

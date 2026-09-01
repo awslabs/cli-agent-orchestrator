@@ -75,6 +75,54 @@ class TestLoad:
         assert result == data
 
 
+class TestWorkflowApprovalPosture:
+    """Approval enforcement defaults on and malformed configuration cannot weaken it."""
+
+    @pytest.mark.parametrize(
+        ("contents", "source"),
+        [
+            ("{not valid json", settings_service.GATE_SOURCE_READ_FAILURE),
+            (json.dumps([]), "invalid-settings-fallback"),
+            (
+                json.dumps({"workflow": "not an object"}),
+                "invalid-settings-fallback",
+            ),
+            (
+                json.dumps({"workflow": {"require_approval": None}}),
+                "invalid-settings-fallback",
+            ),
+            (
+                json.dumps({"workflow": {"require_approval": "false"}}),
+                "invalid-settings-fallback",
+            ),
+            (
+                json.dumps({"workflow": {"require_approval": 0}}),
+                "invalid-settings-fallback",
+            ),
+        ],
+    )
+    def test_malformed_configuration_fails_closed(
+        self, settings_file, monkeypatch, contents, source
+    ):
+        monkeypatch.delenv("CAO_WORKFLOW_REQUIRE_APPROVAL", raising=False)
+        settings_file.write_text(contents)
+
+        posture = settings_service.resolve_workflow_approval_posture()
+
+        assert posture.required is True
+        assert posture.source == source
+
+    def test_explicit_boolean_false_is_the_only_file_opt_out(self, settings_file, monkeypatch):
+        monkeypatch.delenv("CAO_WORKFLOW_REQUIRE_APPROVAL", raising=False)
+        settings_file.write_text(json.dumps({"workflow": {"require_approval": False}}))
+
+        posture = settings_service.resolve_workflow_approval_posture()
+
+        assert posture == settings_service.WorkflowApprovalPosture(
+            False, settings_service.GATE_SOURCE_FILE
+        )
+
+
 class TestSave:
     """Tests for _save function."""
 

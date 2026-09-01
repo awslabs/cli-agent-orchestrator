@@ -96,6 +96,27 @@ def test_unapproved_plan_is_refused_before_any_run_row_is_written():
     )
 
 
+@pytest.mark.parametrize(
+    "contents",
+    [
+        "{not valid json",
+        json.dumps({"workflow": "not an object"}),
+        json.dumps({"workflow": {"require_approval": None}}),
+    ],
+)
+def test_malformed_settings_do_not_admit_an_unapproved_plan(contents, tmp_path, monkeypatch):
+    """Configuration failures cannot bypass the approval gate or create a run record."""
+    settings_file = tmp_path / "malformed-settings.json"
+    settings_file.write_text(contents)
+    monkeypatch.setattr(settings_service, "SETTINGS_FILE", settings_file)
+    monkeypatch.delenv("CAO_WORKFLOW_REQUIRE_APPROVAL", raising=False)
+
+    with pytest.raises(approval_gate.PlanApprovalRequiredError):
+        approval_gate.ensure_plan_approved(tier="script", manifest_json=_manifest())
+
+    assert workflow_journal.list_runs() == []
+
+
 # ---------------------------------------------------------------------------
 # 2. A refused resume does not bump the generation  ← the load-bearing one
 # ---------------------------------------------------------------------------
@@ -170,6 +191,84 @@ def test_the_resume_endpoint_answers_403_and_not_400_or_409():
         "caller looking for a malformed argument instead of approving a plan"
     )
     assert PLAN_ID in json.dumps(response.json()), "the refusal must carry the plan_id"
+
+    # STRENGTHENED at issue #583 Bolt 3 (``authoring-sequence``). The line above survived the shape
+    # change by accident -- ``json.dumps`` flattens a dict as readily as a string, so it would pass
+    # even if the identifier were reachable only as prose. FR-10's APPROVE step needs it as a FIELD,
+    # because a refused START writes no run row and the structured reader has nothing to query there.
+    detail = response.json()["detail"]
+    assert detail["kind"] == "approval_required"
+    assert detail["plan_id"] == PLAN_ID, "byte-identical: the next act is `cao workflow approve`"
+
+
+def test_the_resume_endpoint_answers_503_when_the_manifest_carries_no_identity():
+    """Issue #583 Bolt 3: a CAO-side freeze failure is not the caller's fault.
+
+    Driven over HTTP rather than by asserting on the raise, because the status code is the whole
+    deliverable here — the exception was already distinguishable in Python before this unit, and what
+    was missing was any way for a client to tell the two apart. A run row whose ``manifest_json`` is
+    NULL is exactly the shape a failed freeze leaves behind.
+    """
+    from fastapi.testclient import TestClient
+
+    from cli_agent_orchestrator.api.main import app
+
+    workflow_journal.insert_run(
+        "run-503",
+        "wf",
+        json.dumps({"source": "print(1)", "path": None, "content_hash": "sha256:abc"}),
+        "{}",
+        "failed",
+        "2026-08-19T00:00:00+00:00",
+        "script",
+        "1",
+        None,  # the freeze failed, so no manifest was written
+    )
+    client = TestClient(app, base_url="http://localhost")
+
+    response = client.post("/workflows/runs/run-503/resume")
+
+    assert response.status_code == 503, (
+        f"expected 503, got {response.status_code}: reporting a failed freeze as 403 tells the "
+        "operator to approve a plan whose identifier was never readable, when the correct action "
+        "is to retry"
+    )
+
+    # issue #583 Bolt 3: the same distinction, readable from the BODY rather than only the status, so
+    # a caller that branches on a field applies the retry remedy instead of hunting for an approval.
+    detail = response.json()["detail"]
+    assert detail["kind"] == "plan_identity_unavailable"
+    assert detail["plan_id"] is None, "present-and-null: there is no identifier to approve"
+
+
+def test_the_two_causes_do_not_share_a_status_on_the_resume_arm():
+    """The pair, asserted together, because either alone permits the collapsed implementation.
+
+    A test that only checked 403-for-unapproved would pass if BOTH causes returned 403, and a test
+    that only checked 503-for-unreadable would pass if both returned 503.
+    """
+    from fastapi.testclient import TestClient
+
+    from cli_agent_orchestrator.api.main import app
+
+    _insert_failed_script_run("run-pair-403")
+    workflow_journal.insert_run(
+        "run-pair-503",
+        "wf",
+        json.dumps({"source": "print(1)", "path": None, "content_hash": "sha256:abc"}),
+        "{}",
+        "failed",
+        "2026-08-19T00:00:00+00:00",
+        "script",
+        "1",
+        None,
+    )
+    client = TestClient(app, base_url="http://localhost")
+
+    unapproved = client.post("/workflows/runs/run-pair-403/resume").status_code
+    unreadable = client.post("/workflows/runs/run-pair-503/resume").status_code
+
+    assert (unapproved, unreadable) == (403, 503)
 
 
 # ---------------------------------------------------------------------------

@@ -5,7 +5,9 @@ import logging
 import os
 import re
 import time
+from collections.abc import Mapping
 from typing import Annotated, Any, Dict, List, NamedTuple, Optional, Tuple, Union
+from urllib.parse import quote
 
 import requests
 from fastmcp import FastMCP
@@ -23,6 +25,7 @@ from cli_agent_orchestrator.constants import (
     WORKFLOW_EVENTS_MCP_MAX_EVENTS,
     WORKFLOW_EVENTS_MCP_MAX_SECONDS,
     WORKFLOW_EVENTS_READ_TIMEOUT,
+    WORKFLOW_NAME_RE,
     WORKFLOW_POLL_INTERVAL_SECONDS,
     WORKFLOW_RUN_REQUEST_TIMEOUT,
 )
@@ -840,6 +843,9 @@ def _parse_run_step_error(
         fallback = f"status {response.status_code}"
         return None, fallback, None
 
+    if not isinstance(payload, Mapping):
+        fallback = f"status {response.status_code}"
+        return None, fallback, None
     detail = payload.get("detail")
     if isinstance(detail, dict):
         message = detail.get("message") or f"status {response.status_code}"
@@ -905,14 +911,108 @@ def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
     return response.json()
 
 
+def _render_lint_findings(findings: Any) -> str:
+    """Render a 422 ``findings`` body into one readable line per finding.
+
+    All FOUR ``LintFinding`` fields -- ``line`` is a REQUIRED 1-based anchor (FR-2.3), so dropping it
+    would discard the field the finding exists to provide. Source is never echoed: a finding names a
+    line so the author can look.
+
+    DUPLICATED, deliberately, with ``cli/commands/workflow.py::_render_lint_findings``.
+    ``render_findings`` returns ``List[dict]`` rather than strings and no shared renderer exists, so
+    unifying would mean a new module for two call sites of four lines. The trigger for consolidating is
+    a THIRD caller, not a second.
+    """
+    if not isinstance(findings, list):
+        return ""
+    lines = []
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+        lines.append(
+            f"{finding.get('severity', '?')} {finding.get('rule_id', '?')} "
+            f"at line {finding.get('line', '?')}: {finding.get('message', '')}"
+        )
+    return "; ".join(lines)
+
+
+def _refusal_envelope_fields(response: requests.Response) -> Dict[str, Any]:
+    """Extra ``ok=False`` envelope fields for an approval refusal, or ``{}`` if this is not one.
+
+    Issue #583 Bolt 3 (``authoring-sequence``) -- the APPROVE step of FR-10's sequence, made
+    branchable. An agent must be able to tell these apart WITHOUT parsing prose:
+
+    * ``class: "approval_required"`` with a ``plan_id`` -> present that identifier to the human, tell
+      them to run ``cao workflow approve <plan_id>``, and STOP. Do not retry: a loop around a human
+      authorisation gate is a bypass by repetition. There is deliberately no tool that grants an
+      approval.
+    * ``class: "plan_identity_unavailable"`` with ``plan_id: None`` -> CAO could not complete its own
+      freeze. Retry. Presenting an approval prompt here would send someone hunting for a plan to grant
+      when nothing about the caller was wrong.
+
+    Returns ``{}`` for every other body, INCLUDING a string ``detail`` from an older server -- so the
+    envelope simply keeps its previous shape rather than growing a null ``class``.
+
+    Follows the classed-refusal convention the four authoring tools established. The other eleven
+    workflow tools still return a bare ``error`` string; widening them is the retrofit named at
+    ``authoring-mcp-tools``' BR-9.
+    """
+    try:
+        payload = response.json()
+    except ValueError:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    detail = payload.get("detail")
+    if not isinstance(detail, dict):
+        return {}
+    kind = detail.get("kind")
+    if kind not in ("approval_required", "plan_identity_unavailable"):
+        return {}
+    return {"class": kind, "plan_id": detail.get("plan_id")}
+
+
 def _extract_error_detail(response: requests.Response, fallback: str) -> str:
-    """Extract a human-readable error detail from an API response."""
+    """Extract a human-readable error detail from an API response.
+
+    THE OBJECT ARM IS THE POINT OF THIS FUNCTION'S CHANGE at issue #583 Bolt 3
+    (``authoring-sequence``), and it repairs a defect that was ALREADY LIVE rather than only serving the
+    new refusal shape. Two object shapes exist and the set is CLOSED -- check ``api/main.py`` before
+    adding a third:
+
+    * ``{kind, plan_id, message}`` -- an approval refusal (403) or a failed freeze (503). New here.
+    * ``{findings: [...]}`` -- a 422 lint failure, which has shipped since Bolt 2 and which THIS
+      FUNCTION HAS BEEN SWALLOWING: an agent that called ``workflow_run`` on a spec with a lint error
+      received ``"status 422"`` and nothing else, because the pre-Bolt-3 body of this function returned
+      the fallback for any non-string ``detail``.
+
+    THIS READER DEGRADED SILENTLY AND THE CLI'S DID NOT, which is why the object arm is asserted
+    directly rather than inferred from the CLI's behaviour. ``isinstance(detail, str)`` returning a
+    fallback produces a plausible-looking ``"status 403"`` with no error and no log; the CLI's
+    ``str(detail)`` produced a visible dict repr a human would report. A silent degradation is not the
+    one you notice.
+
+    THE STRING ARM IS PERMANENT. Most of this API returns a string ``detail``, and the MCP server can
+    be installed from a DIFFERENT REVISION than the running API server -- so a newer reader must keep
+    working against an older server. Removing it would not be a cleanup.
+
+    A ``list`` falls through: FastAPI's own request-validation errors produce
+    ``{"detail": [{"loc": ..., "msg": ...}]}``, and subscripting that with a string key raises.
+    """
     try:
         payload = response.json()
     except ValueError:
         return fallback
+    if not isinstance(payload, dict):
+        return fallback
 
     detail = payload.get("detail")
+    if isinstance(detail, dict):
+        message = detail.get("message")
+        if isinstance(message, str) and message:
+            return message
+        rendered = _render_lint_findings(detail.get("findings"))
+        return rendered or fallback
     if isinstance(detail, str) and detail:
         return detail
     return fallback
@@ -3231,7 +3331,9 @@ async def workflow_run(
 
     if response.status_code != 200:
         detail = _extract_error_detail(response, f"status {response.status_code}")
-        return {"ok": False, "error": detail}
+        # FR-10 APPROVE step: carry the refusal class and plan_id as FIELDS so an
+        # agent branches rather than scraping the message. {} for any other body.
+        return {"ok": False, "error": detail, **_refusal_envelope_fields(response)}
 
     data = response.json()
     return {
@@ -3318,7 +3420,9 @@ async def workflow_resume(
 
     if response.status_code != 200:
         detail = _extract_error_detail(response, f"status {response.status_code}")
-        return {"ok": False, "error": detail}
+        # FR-10 APPROVE step: carry the refusal class and plan_id as FIELDS so an
+        # agent branches rather than scraping the message. {} for any other body.
+        return {"ok": False, "error": detail, **_refusal_envelope_fields(response)}
 
     data = response.json()
     return {
@@ -3415,7 +3519,9 @@ async def workflow_start(
 
     if response.status_code != 202:
         detail = _extract_error_detail(response, f"status {response.status_code}")
-        return {"ok": False, "error": detail}
+        # FR-10 APPROVE step: carry the refusal class and plan_id as FIELDS so an
+        # agent branches rather than scraping the message. {} for any other body.
+        return {"ok": False, "error": detail, **_refusal_envelope_fields(response)}
 
     data = response.json()
     links = data.get("links") or {}
@@ -3441,16 +3547,24 @@ async def workflow_plan_approval(
     Approving is ``cao workflow approve <plan_id>`` at a human's terminal, behind the ``cao:admin``
     scope. Use this tool to tell the operator which ``plan_id`` to approve.
 
-    WHAT IS NOT IMPLEMENTED, stated because you may otherwise assume it: a plan identifier covers the
-    workflow's execution-affecting fields, so changing any of them yields a different ``plan_id`` that
-    needs its own approval. But **rejection of an update presenting a stale source hash is NOT yet
-    implemented** — do not rely on a stale-hash check having run. Six manifest fields (provider,
-    model, profile, permissions, limits, retry policy) are also **omitted rather than recorded**,
+    A plan identifier covers the workflow's execution-affecting fields, so changing any of them yields a
+    different ``plan_id`` that needs its own approval. **Rejection of an update presenting a stale source
+    hash IS implemented** (issue #583 Bolt 3): ``workflow_update`` requires an ``expected_hash`` and the
+    server refuses the write when the spec has moved on, so a caller that edits from a stale read is
+    stopped rather than silently overwriting. You therefore do NOT need to re-verify the hash yourself —
+    and you must not fetch it immediately before writing, because a hash read from the file you are about
+    to overwrite always matches, which removes the check rather than satisfying it.
+
+    WHAT IS STILL NOT RECORDED, stated because you may otherwise assume it: six manifest fields
+    (provider, model, profile, permissions, limits, retry policy) are **omitted rather than recorded**,
     because script-tier steps are discovered by executing the Python and so have no run-level value at
     freeze time; they are covered transitively by the source hash.
 
-    Approval enforcement is **off by default**. When it is off, an unapproved plan still runs, and
-    ``approved: false`` here is informational rather than a prediction that the run will be refused.
+    Approval enforcement is **on by default** since issue #583 Bolt 3, so ``approved: false`` here
+    normally DOES predict that a run of this plan will be refused. It is informational rather than
+    predictive only where the gate has been turned off — which only ``workflow.require_approval:
+    false`` in the server's ``settings.json`` can do — or where the settings file could not be read at
+    all, in which case the gate is disabled for that process and the server log says so at startup.
 
     ``plan_id`` is ``null`` for a YAML run (which never freezes a manifest) and for a script run whose
     freeze failed. That is reported distinctly from "not approved", because the two call for entirely
@@ -3529,6 +3643,17 @@ async def workflow_result(
     terminal-failed/cancelled run, U9/FR-7.1, spread through verbatim from the body).
     Returns a structured envelope on EVERY path — never raises into the agent loop
     (EV-1).
+
+    **TO DECIDE WHETHER TO RETRY OR TO FIX THE WORKFLOW, READ
+    ``failure_envelope.classification``** (issue #583 FR-10): ``transient`` means the
+    same run may succeed on retry; ``artifact_defect`` means a new run needs a changed
+    spec first; ``cancelled`` means a human stopped it and no action is implied. Branch
+    on that FIELD rather than on ``error_kind``, which records the cause rather than the
+    remedy, and never on the message text.
+
+    Two related conditions never appear here, because neither is a run outcome: a replay
+    divergence and a halt awaiting a recovery decision are both returned as a ``kind`` on
+    a 409 from the step-execution route, and neither is persisted.
 
     No run-level ``output`` (PR #525 review): the journal has no column for one, so
     the key this docstring used to advertise was always null. Per-step outputs are
@@ -3871,6 +3996,262 @@ async def workflow_events(
         "gaps": gaps,
         "timed_out": timed_out,
     }
+
+
+# ---------------------------------------------------------------------------
+# Conversational authoring (issue #583 Bolt 3, ``authoring-mcp-tools``).
+#
+# The four operations FR-10 asks for, and the surface its Pass criterion is actually about: "an agent can
+# carry a workflow from description to running without the user choosing a format". Python is the only
+# format written, so no format question is ever put to anyone.
+#
+# THERE IS NO GRANT TOOL HERE, AND THERE NEVER WILL BE. Approving a plan stays a human act performed
+# through ``cao workflow approve``. Bolt 2 made ``workflow_plan_approval`` read-only for this reason: an
+# MCP grant tool lets an agent approve the plan it just wrote, which collapses the human authorisation
+# FR-8 exists to preserve. Adding four authoring tools is precisely the moment someone would "complete
+# the set", so the absence is enforced by a test over the registered tool inventory rather than by this
+# comment alone — see ``test_no_mcp_tool_grants_an_approval``.
+#
+# EVERY PARAMETER BELOW IS REQUIRED, VIA ``Annotated[str, Field(...)]`` RATHER THAN A DEFAULT. That shape
+# is load-bearing, not stylistic. A ``Field(...)`` sitting in a parameter's DEFAULT arrives as a truthy
+# ``FieldInfo`` sentinel when a Python caller omits the argument — which is how this module's own tests
+# call these tools — so a guard written as ``if value:`` would treat "nothing supplied" as "something
+# supplied". That trap is live here and mitigated inline three times elsewhere in this file. With nothing
+# optional it cannot occur at all, and ``test_authoring_tools_declare_no_field_defaults`` keeps it that
+# way rather than trusting that no one adds a convenience argument later.
+#
+# Refusals carry a machine-readable ``class`` alongside the server's own message. This departs from the
+# 11 older workflow tools, which return a bare string: FR-10's criterion is about what an AGENT can do,
+# and ``services.md`` tells callers to branch on a field and never to scrape a message, so a surface
+# built for agents that forces prose-parsing satisfies the letter and misses the point. Retrofitting the
+# other 11 is the correct end state and is deliberately NOT done here (it would mean reaching into tools
+# this unit does not own); it needs ``_extract_error_detail`` widened to return the status alongside the
+# detail.
+# ---------------------------------------------------------------------------
+
+#: Status -> refusal class, per calling tool. Knowing the TOOL is what lets ``create``'s 409
+#: (already_exists) and ``update``'s 409 (stale_hash) carry different classes — a discrimination the CLI
+#: could not make, because it maps from the status alone.
+_AUTHORING_CLASS_BY_STATUS = {
+    "create": {409: "already_exists", 400: "invalid_request"},
+    "update": {404: "not_found", 409: "stale_hash", 400: "invalid_request"},
+    "get": {404: "not_found", 400: "invalid_request", 409: "conflict"},
+    "validate": {400: "invalid_request", 404: "not_found"},
+}
+
+
+def _authoring_refusal(op: str, response: requests.Response) -> Dict[str, Any]:
+    """Build the classed refusal envelope for an authoring tool.
+
+    Lint failures reach authoring callers as 400 invalid-request responses because the service flattens
+    them into ``ValueError``. The classifier deliberately does not sniff messages, so a hypothetical 422
+    falls through to the generic ``error`` class rather than advertising a dead branch.
+    """
+    detail = _extract_error_detail(response, f"status {response.status_code}")
+    klass = _AUTHORING_CLASS_BY_STATUS.get(op, {}).get(response.status_code, "error")
+    return {"ok": False, "class": klass, "error": detail}
+
+
+def _unreachable_refusal(exc: Exception) -> Dict[str, Any]:
+    """A transport failure is not a content refusal, and must never read like one.
+
+    The agent's next action differs completely — start the server versus fix the spec — so this carries
+    its own class rather than being folded into ``invalid_request``.
+    """
+    return {"ok": False, "class": "unreachable", "error": f"could not reach cao-server: {exc}"}
+
+
+def _workflow_name_refusal(name: object) -> Optional[Dict[str, Any]]:
+    """Validate the documented bare workflow-name contract before making an HTTP request."""
+    if isinstance(name, str) and re.fullmatch(WORKFLOW_NAME_RE, name):
+        return None
+    return {
+        "ok": False,
+        "class": "invalid_request",
+        "error": "workflow name must be a bare name matching [A-Za-z0-9_-]{1,64}",
+    }
+
+
+def _authoring_success(response: requests.Response) -> Dict[str, Any]:
+    """Return a successful authoring envelope without letting malformed JSON escape the tool."""
+    try:
+        body = response.json()
+    except ValueError:
+        return {
+            "ok": False,
+            "class": "error",
+            "error": "cao-server returned an invalid success response",
+        }
+    if not isinstance(body, Mapping):
+        return {
+            "ok": False,
+            "class": "error",
+            "error": "cao-server returned an unexpected success response",
+        }
+    return {**body, "ok": True}
+
+
+@mcp.tool()
+async def workflow_create(
+    name: Annotated[str, Field(description="Bare workflow name (no path, no extension)")],
+    source: Annotated[str, Field(description="The Python spec's full source text")],
+) -> Dict[str, Any]:
+    """Create a NEW Python workflow spec (issue #583 FR-10).
+
+    A thin HTTP client over ``POST /workflows``. Refuses to overwrite an existing spec — use
+    ``workflow_update`` for that. Python only; a YAML-tier name is refused with a message naming the
+    restriction.
+
+    Send the SOURCE TEXT, never a path: the server decides where a spec lands, and validation, the lint
+    gate, path containment, the atomic write and the index update all happen there. This tool opens no
+    files — going through CAO rather than using your own file tools is the point of the design.
+
+    On success returns ``{ok: True, name, path, content_hash}``. **Keep ``content_hash``** — it is what
+    ``workflow_update`` requires next, so the authoring loop needs no ``workflow_get`` between edits.
+
+    On refusal returns ``{ok: False, class, error}`` where ``class`` is one of ``already_exists`` (that
+    name is taken), ``invalid_request`` (bad name, wrong tier, YAML refused, over the size cap, or lint
+    errors that would make the spec unrunnable), or ``unreachable``. Branch on ``class``, not on the
+    message. Never raises into the agent loop (EV-1).
+    """
+    refusal = _workflow_name_refusal(name)
+    if refusal:
+        return refusal
+    try:
+        response = requests.post(
+            f"{API_BASE_URL}/workflows",
+            json={"name": name, "source": source},
+            timeout=_mcp_timeout(),
+        )
+    except requests.RequestException as e:
+        return _unreachable_refusal(e)
+
+    if response.status_code not in (200, 201):
+        return _authoring_refusal("create", response)
+
+    return _authoring_success(response)
+
+
+@mcp.tool()
+async def workflow_update(
+    name: Annotated[str, Field(description="Bare workflow name of the EXISTING spec")],
+    source: Annotated[str, Field(description="The replacement Python source text")],
+    expected_hash: Annotated[
+        str,
+        Field(
+            description="The content_hash you believe the spec currently has (see the tool docs)"
+        ),
+    ],
+) -> Dict[str, Any]:
+    """Replace an EXISTING spec's source, refusing a stale update (issue #583 FR-10, FR-8).
+
+    A thin HTTP client over ``PUT /workflows/{name}``. Refuses to create — use ``workflow_create``.
+
+    **WHERE ``expected_hash`` COMES FROM.** Use the ``content_hash`` returned by your previous
+    ``workflow_create`` or ``workflow_update`` call. The happy path therefore needs no extra call at all:
+    both write tools hand back the new hash, so an agent iterating on a spec already holds what the next
+    edit requires. If you have lost it, ``workflow_get`` returns it.
+
+    **DO NOT FETCH IT IMMEDIATELY BEFORE WRITING.** Calling ``workflow_get`` and passing the hash you just
+    received straight into this tool DEFEATS the check entirely rather than satisfying it: a hash read
+    from the file you are about to overwrite always matches, so the comparison passes unconditionally and
+    a concurrent edit between your read and your write is exactly what slips through unnoticed. The hash
+    is meaningful only as an assertion about what you believe you are replacing — which is why there is no
+    force flag and no way to omit it.
+
+    On success returns ``{ok: True, name, path, content_hash}`` with the NEW hash for your next edit.
+
+    On refusal returns ``{ok: False, class, error}`` where ``class`` is ``not_found`` (no such spec —
+    create it), ``stale_hash`` (someone changed it since your hash; re-read and re-apply your change),
+    ``invalid_request``, or ``unreachable``. Never raises into the agent loop (EV-1).
+    """
+    refusal = _workflow_name_refusal(name)
+    if refusal:
+        return refusal
+    encoded_name = quote(name, safe="")
+    try:
+        response = requests.put(
+            f"{API_BASE_URL}/workflows/{encoded_name}",
+            json={"source": source, "expected_hash": expected_hash},
+            timeout=_mcp_timeout(),
+        )
+    except requests.RequestException as e:
+        return _unreachable_refusal(e)
+
+    if response.status_code != 200:
+        return _authoring_refusal("update", response)
+
+    return _authoring_success(response)
+
+
+@mcp.tool()
+async def workflow_get(
+    name: Annotated[str, Field(description="Bare workflow name (no path, no extension)")],
+) -> Dict[str, Any]:
+    """Read back a workflow spec, including its source and ``content_hash`` (issue #583 FR-10).
+
+    A thin HTTP client over ``GET /workflows/{name}``. This is FR-10's "inspect" operation: it returns the
+    parsed, validated spec, so it is how you see what a workflow currently is rather than what you last
+    sent.
+
+    Use it to recover a ``content_hash`` you no longer have — but note ``workflow_create`` and
+    ``workflow_update`` both return the hash, so the ordinary editing loop does not need this call. Note
+    also that this route rebuilds the spec index, so calling it in a loop is the expensive way to do
+    anything.
+
+    On refusal returns ``{ok: False, class, error}`` with ``class`` of ``not_found``, ``conflict``
+    (remove or rename the colliding spec file), ``invalid_request``, or ``unreachable``. Never raises
+    into the agent loop (EV-1).
+    """
+    refusal = _workflow_name_refusal(name)
+    if refusal:
+        return refusal
+    encoded_name = quote(name, safe="")
+    try:
+        response = requests.get(f"{API_BASE_URL}/workflows/{encoded_name}", timeout=_mcp_timeout())
+    except requests.RequestException as e:
+        return _unreachable_refusal(e)
+
+    if response.status_code != 200:
+        return _authoring_refusal("get", response)
+
+    return _authoring_success(response)
+
+
+@mcp.tool()
+async def workflow_validate(
+    source: Annotated[str, Field(description="Python spec source text to lint, as a draft")],
+) -> Dict[str, Any]:
+    """Lint Python spec source WITHOUT creating anything (issue #583 FR-10).
+
+    A thin HTTP client over ``POST /workflows/validate``. Takes TEXT, not a name and not a path, so **a
+    draft can be checked before it exists anywhere** — which is the order to work in: validate, revise,
+    then ``workflow_create``. Creating first and learning about lint errors from a refused write is the
+    slower loop.
+
+    Nothing is written to disk to perform the check, and no file needs to exist.
+
+    To validate a spec that is already stored, call ``workflow_get`` and pass its ``source`` here.
+
+    On success returns ``{ok: True, **the ScriptValidationResult}`` — read its ``status`` (``pass`` or
+    ``fail``) and its ``findings``. **A lint ERROR means CAO would refuse to RUN the spec**, so treat a
+    failing verdict as work to do before creating, not as advice.
+
+    On refusal returns ``{ok: False, class, error}``. Never raises into the agent loop (EV-1).
+    """
+    try:
+        response = requests.post(
+            f"{API_BASE_URL}/workflows/validate",
+            json={"source": source},
+            timeout=_mcp_timeout(),
+        )
+    except requests.RequestException as e:
+        return _unreachable_refusal(e)
+
+    if response.status_code != 200:
+        return _authoring_refusal("validate", response)
+
+    return _authoring_success(response)
 
 
 # The MCP Apps surface — tools (render_dashboard / render_agent_view /
