@@ -48,7 +48,6 @@ def _row(state: str, run_id: str = "r1", current_step_id: str | None = None):
         ("completed", "error", None),  # a kind on a success is still not a failure
         ("running", None, None),
         ("failed", "timeout", "transient"),
-        ("failed", "provider_error", "transient"),
         ("failed", "error", "artifact_defect"),
         ("failed", None, "artifact_defect"),
         ("failed", "cancelled", "cancelled"),
@@ -67,7 +66,7 @@ def test_a_cancelled_run_with_a_step_error_is_still_cancelled():
     error whose kind may be anything. Classifying on the kind first would tell the operator to retry or
     to rewrite their spec, when in fact they stopped it themselves.
     """
-    for kind in ("timeout", "provider_error", "error", "something_new"):
+    for kind in ("timeout", "error", "something_new"):
         assert api_main._classify_failure(_row("cancelled"), kind) == "cancelled", (
             f"a cancelled run with kind={kind!r} must classify cancelled — the human's act is the "
             "more informative fact, and reading the kind first is the conflation FR-10 forbids"
@@ -171,13 +170,14 @@ def test_the_classification_is_reproducible():
     assert [api_main._classify_failure(row, "error") for _ in range(5)] == ["artifact_defect"] * 5
 
 
-def test_the_known_kind_set_is_closed_and_excludes_the_live_call_kinds():
+def test_the_known_kind_set_is_closed_and_excludes_the_unproduced_provider_error():
     """``diverged`` and ``decision_required`` are NOT classifications (BR-5, BR-9).
 
     Both are returned as a ``kind`` on a 409 from the step-execution route and neither is persisted, so
     a read-time classifier has no evidence to emit them from. If either ever appears in the transient
     set, someone has conflated a live-call condition with a run outcome.
     """
-    assert api_main._TRANSIENT_ERROR_KINDS == {"timeout", "provider_error"}
+    assert api_main._TRANSIENT_ERROR_KINDS == {"timeout"}
+    assert "provider_error" not in api_main._TRANSIENT_ERROR_KINDS
     assert "diverged" not in api_main._TRANSIENT_ERROR_KINDS
     assert "decision_required" not in api_main._TRANSIENT_ERROR_KINDS

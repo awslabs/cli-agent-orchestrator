@@ -25,22 +25,22 @@ _BOOL_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _BOOL_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 
 
-def _load_result() -> Tuple[Dict[str, Any], bool]:
-    """Load settings, reporting whether the file could actually be read.
+def _load_result_detail() -> Tuple[Dict[str, Any], bool, bool]:
+    """Load settings with distinct read/decode and parsed-content failures.
 
-    Returns ``(data, ok)``. THE POINT OF THIS FUNCTION IS THE SECOND ELEMENT: :func:`_load` cannot
+    Returns ``(data, ok, read_or_decode_failed)``. THE POINT OF THE STATUS VALUES is that :func:`_load` cannot
     distinguish an ABSENT settings file from an UNREADABLE one, because both produce ``{}``, and
     :func:`is_workflow_approval_required` needs them to resolve OPPOSITELY — an absent file is the
-    unconfigured case and the gate defaults ON, while an unreadable file resolves the gate OFF
-    (issue #583 Bolt 3, ``approval-enforcement-default``). Conflating the two toward "off" would
-    leave the approval gate inert on every fresh installation, and every test that supplies a
-    settings file would still pass.
+    unconfigured case and the gate defaults ON, while unreadable or malformed settings must leave
+    the gate ON too, with a diagnostic source. The distinction keeps startup reporting truthful and
+    tells operators whether to repair a read/decode failure or parsed invalid configuration.
 
-    Three states, not two:
+    Four states:
 
-    * file absent -> ``({}, True)``  -- not a failure; nothing was configured
-    * file present but unreadable, undecodable, unparseable, or not a JSON object -> ``({}, False)``
-    * file present and readable -> ``(data, True)``
+    * file absent -> ``({}, True, False)``  -- not a failure; nothing was configured
+    * file present but unreadable or undecodable -> ``({}, False, True)``
+    * file present and parsed but not a JSON object -> ``({}, False, False)``
+    * file present and readable -> ``(data, True, False)``
 
     ONE read, not a ``stat``-then-read: an ``exists()`` probe followed by a read is both a second
     syscall and a TOCTOU window in which the file can vanish. A file that disappears between the
@@ -56,19 +56,29 @@ def _load_result() -> Tuple[Dict[str, Any], bool]:
     try:
         raw = SETTINGS_FILE.read_text()
     except FileNotFoundError:
-        return {}, True
+        return {}, True, False
     except (OSError, ValueError) as e:
         # ValueError covers UnicodeDecodeError, which read_text raises and which is NOT an OSError.
         logger.warning(f"Failed to read settings: {e}")
-        return {}, False
+        return {}, False, True
     try:
         data = json.loads(raw)
     except ValueError as e:
         logger.warning(f"Failed to read settings: {e}")
-        return {}, False
+        return {}, False, True
     if not isinstance(data, dict):
-        return {}, False
-    return data, True
+        return {}, False, False
+    return data, True, False
+
+
+def _load_result() -> Tuple[Dict[str, Any], bool]:
+    """Load settings, reporting whether the file could actually be read.
+
+    The two-item return shape is retained for existing callers. Approval posture needs the richer
+    distinction provided by :func:`_load_result_detail`.
+    """
+    data, ok, _read_or_decode_failed = _load_result_detail()
+    return data, ok
 
 
 def _load() -> Dict[str, Any]:
@@ -481,15 +491,14 @@ GATE_SOURCE_ENV = "env"
 GATE_SOURCE_FILE = "settings.json"
 GATE_SOURCE_DEFAULT = "default"
 GATE_SOURCE_READ_FAILURE = "read-failure-fallback"
+GATE_SOURCE_INVALID_SETTINGS = "invalid-settings-fallback"
 
 
 class WorkflowApprovalPosture(NamedTuple):
     """A resolved approval-gate posture and the mechanism that decided it.
 
-    ``source`` exists so the startup line can tell an operator that the gate is OFF *because the
-    settings file could not be read* rather than because they configured it that way. Without the
-    source, the one hole in resolving a read failure to "disabled" — a corrupt file silently
-    weakening a control the operator believes defaults on — is as invisible as it was before.
+    ``source`` lets the startup line distinguish an explicit settings-file opt-out from a malformed
+    file that leaves enforcement enabled and needs repair.
     """
 
     required: bool
@@ -524,16 +533,11 @@ def resolve_workflow_approval_posture() -> WorkflowApprovalPosture:
     weaken the gate. Flipping the default does NOT reopen this; it only changes what the variable is
     useful for, from switching a control on to re-asserting one that is already on.
 
-    A READ FAILURE STILL RESOLVES TO DISABLED, AND ITS ORIGINAL JUSTIFICATION NO LONGER APPLIES.
-    That justification was that resolving to disabled "makes the unreadable case behave like the
-    unconfigured case" — an equivalence THIS FUNCTION'S NEW DEFAULT BREAKS, because unconfigured now
-    means enabled. The behaviour is kept anyway, on a different and narrower ground:
-    ``approval_gate``'s module docstring records that this is a same-user local control and not a
-    privilege boundary, so a corrupt file weakening the gate is outside its threat model, whereas one
-    JSON typo refusing every script-tier run in the installation is a live outage with no relation to
-    any run. The residual — a silent weakening — is closed by observability rather than by refusing
-    runs: the failure logs at ``error`` here, and the server's startup line reports the resolved
-    state together with :data:`GATE_SOURCE_READ_FAILURE`.
+    Read/decode failures and malformed configuration FAIL CLOSED: both preserve required enforcement
+    and log an error naming the repair path. :data:`GATE_SOURCE_READ_FAILURE` is reserved for a file
+    that could not be read or decoded; :data:`GATE_SOURCE_INVALID_SETTINGS` names content that parsed
+    but cannot configure this setting. A valid explicit JSON boolean ``false`` is the only settings
+    file opt-out.
 
     An ABSENT settings file is NOT a read failure. It is the unconfigured case and resolves to the
     default, which is now enabled. :func:`_load_result` is what makes the two distinguishable.
@@ -544,29 +548,43 @@ def resolve_workflow_approval_posture() -> WorkflowApprovalPosture:
         # settings.json below. Returning early on truthy is what makes the precedence asymmetric.
         return WorkflowApprovalPosture(True, GATE_SOURCE_ENV)
 
-    data, ok = _load_result()
+    data, ok, read_or_decode_failed = _load_result_detail()
     if not ok:
+        if read_or_decode_failed:
+            logger.error(
+                "Failed to read or decode workflow approval settings from %s; the approval gate "
+                "remains REQUIRED. Repair settings.json and restart or reload the server; "
+                "CAO_WORKFLOW_REQUIRE_APPROVAL=1 may explicitly affirm enabled enforcement.",
+                SETTINGS_FILE,
+            )
+            return WorkflowApprovalPosture(True, GATE_SOURCE_READ_FAILURE)
         logger.error(
-            "Failed to read workflow.require_approval from %s; the approval gate is DISABLED for "
-            "this process even though it is enabled by default. Fix the settings file to restore "
-            "it, or set CAO_WORKFLOW_REQUIRE_APPROVAL=1.",
+            "Invalid settings.json content in %s; the approval gate remains REQUIRED. Repair "
+            "settings.json and restart or reload the server; only an explicit JSON boolean "
+            "workflow.require_approval=false disables enforcement.",
             SETTINGS_FILE,
         )
-        return WorkflowApprovalPosture(False, GATE_SOURCE_READ_FAILURE)
+        return WorkflowApprovalPosture(True, GATE_SOURCE_INVALID_SETTINGS)
 
     workflow_settings = data.get("workflow", {})
     if not isinstance(workflow_settings, dict):
         logger.error(
-            "The 'workflow' key in %s is not an object; the approval gate is DISABLED for this "
-            "process even though it is enabled by default.",
+            "The 'workflow' key in %s is not an object; the approval gate remains REQUIRED. "
+            "Repair settings.json and restart or reload the server.",
             SETTINGS_FILE,
         )
-        return WorkflowApprovalPosture(False, GATE_SOURCE_READ_FAILURE)
+        return WorkflowApprovalPosture(True, GATE_SOURCE_INVALID_SETTINGS)
 
     if "require_approval" in workflow_settings:
-        return WorkflowApprovalPosture(
-            bool(workflow_settings["require_approval"]), GATE_SOURCE_FILE
+        required = workflow_settings["require_approval"]
+        if isinstance(required, bool):
+            return WorkflowApprovalPosture(required, GATE_SOURCE_FILE)
+        logger.error(
+            "workflow.require_approval in %s must be a JSON boolean; the approval gate remains "
+            "REQUIRED. Repair settings.json and restart or reload the server.",
+            SETTINGS_FILE,
         )
+        return WorkflowApprovalPosture(True, GATE_SOURCE_INVALID_SETTINGS)
     return WorkflowApprovalPosture(True, GATE_SOURCE_DEFAULT)
 
 

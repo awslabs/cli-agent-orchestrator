@@ -31,7 +31,7 @@ from types import SimpleNamespace
 import pytest
 
 from cli_agent_orchestrator.cli.commands.workflow import _extract_detail
-from cli_agent_orchestrator.mcp_server.server import _extract_error_detail
+from cli_agent_orchestrator.mcp_server.server import _extract_error_detail, _parse_run_step_error
 
 READERS = {
     "cli": _extract_detail,
@@ -97,6 +97,15 @@ def test_every_shape_returns_a_non_empty_string_and_never_raises(reader_name, sh
 @pytest.mark.parametrize("reader_name", sorted(READERS))
 def test_a_non_json_body_falls_back(reader_name):
     assert READERS[reader_name](_response(raises=True), "FALLBACK") == "FALLBACK"
+
+
+@pytest.mark.parametrize("shape_name", sorted(SHAPES))
+def test_run_step_error_reader_tolerates_every_json_shape(shape_name):
+    kind, message, terminal_id = _parse_run_step_error(_response(SHAPES[shape_name]))
+
+    assert isinstance(message, str) and message
+    assert kind is None or isinstance(kind, str)
+    assert terminal_id is None or isinstance(terminal_id, str)
 
 
 # ---------------------------------------------------------------------------

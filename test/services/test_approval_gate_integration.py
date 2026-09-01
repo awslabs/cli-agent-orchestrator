@@ -96,6 +96,27 @@ def test_unapproved_plan_is_refused_before_any_run_row_is_written():
     )
 
 
+@pytest.mark.parametrize(
+    "contents",
+    [
+        "{not valid json",
+        json.dumps({"workflow": "not an object"}),
+        json.dumps({"workflow": {"require_approval": None}}),
+    ],
+)
+def test_malformed_settings_do_not_admit_an_unapproved_plan(contents, tmp_path, monkeypatch):
+    """Configuration failures cannot bypass the approval gate or create a run record."""
+    settings_file = tmp_path / "malformed-settings.json"
+    settings_file.write_text(contents)
+    monkeypatch.setattr(settings_service, "SETTINGS_FILE", settings_file)
+    monkeypatch.delenv("CAO_WORKFLOW_REQUIRE_APPROVAL", raising=False)
+
+    with pytest.raises(approval_gate.PlanApprovalRequiredError):
+        approval_gate.ensure_plan_approved(tier="script", manifest_json=_manifest())
+
+    assert workflow_journal.list_runs() == []
+
+
 # ---------------------------------------------------------------------------
 # 2. A refused resume does not bump the generation  ← the load-bearing one
 # ---------------------------------------------------------------------------

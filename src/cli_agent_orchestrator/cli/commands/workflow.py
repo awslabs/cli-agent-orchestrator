@@ -71,7 +71,33 @@ def _render_lint_findings(findings: object) -> str:
     return "; ".join(lines)
 
 
-def _approval_refusal_message(response: requests.Response) -> str:
+def _approval_refusal_envelope(response: requests.Response) -> dict | None:
+    """Return the MCP-compatible JSON envelope for an approval refusal, if present."""
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    if not isinstance(body, dict):
+        return None
+    detail = body.get("detail")
+    if not isinstance(detail, dict):
+        return None
+
+    kind = detail.get("kind")
+    if kind not in ("approval_required", "plan_identity_unavailable"):
+        return None
+    message = detail.get("message")
+    return {
+        "ok": False,
+        "class": kind,
+        "plan_id": detail.get("plan_id"),
+        "error": (
+            message if isinstance(message, str) and message else f"status {response.status_code}"
+        ),
+    }
+
+
+def _approval_refusal_message(refusal: dict) -> str:
     """Turn an approval refusal into a message that names the next action, or "" if not one.
 
     Issue #583 Bolt 3 (``authoring-sequence``) -- the APPROVE step of FR-10's sequence. A 403 here is
@@ -90,18 +116,8 @@ def _approval_refusal_message(response: requests.Response) -> str:
     Returns "" when the body is not a refusal, so the caller falls back to its ordinary error path --
     including against an OLDER server that still sends a string ``detail``.
     """
-    try:
-        body = response.json()
-    except ValueError:
-        return ""
-    if not isinstance(body, dict):
-        return ""
-    detail = body.get("detail")
-    if not isinstance(detail, dict):
-        return ""
-
-    kind = detail.get("kind")
-    message = detail.get("message") or ""
+    kind = refusal["class"]
+    message = refusal["error"]
     if kind == "plan_identity_unavailable":
         return (
             f"{message}\n"
@@ -109,7 +125,7 @@ def _approval_refusal_message(response: requests.Response) -> str:
             "so there is nothing to approve. Retry the run."
         )
     if kind == "approval_required":
-        plan_id = detail.get("plan_id")
+        plan_id = refusal["plan_id"]
         if not plan_id:
             return ""
         return (
@@ -167,31 +183,39 @@ def _extract_detail(response: requests.Response, fallback: str) -> str:
 _AUTHORING_ERROR_CLASSES = {
     400: "invalid_request",
     404: "not_found",
-    409: "conflict",
-    422: "lint_failed",
 }
 
 
+def _emit_json_failure(envelope: dict) -> None:
+    """Write exactly one JSON failure document to stdout, then preserve exit status 1."""
+    click.echo(_json.dumps(envelope, indent=2))
+    raise click.exceptions.Exit(1)
+
+
 def _authoring_failure(
-    response: requests.Response, as_json: bool, fallback: str
+    response: requests.Response, as_json: bool, fallback: str, operation: str
 ) -> "click.ClickException":
     """Build the exception for a refused authoring call, honouring ``--json``.
 
     Exit stays 1 for every class (matching every other ``cao workflow`` verb); the machine-readable
-    distinction rides the envelope instead. ``conflict`` covers both "already exists" on create and
-    "your hash is stale" on update — the two can never apply to the same call, and the message
-    distinguishes them for a human.
+    distinction rides the envelope instead. Create and update use the same vocabulary as MCP:
+    ``already_exists`` and ``stale_hash`` respectively. Lint failures arrive as 400 invalid-request
+    responses; there is no live authoring 422 branch.
     """
     detail = _extract_detail(response, fallback)
     if not as_json:
         return click.ClickException(detail)
+    error_class = _AUTHORING_ERROR_CLASSES.get(response.status_code, "error")
+    if response.status_code == 409:
+        error_class = "already_exists" if operation == "create" else "stale_hash"
     envelope = {
         "ok": False,
-        "class": _AUTHORING_ERROR_CLASSES.get(response.status_code, "error"),
+        "class": error_class,
         "status": response.status_code,
         "message": detail,
     }
-    return click.ClickException(_json.dumps(envelope, indent=2))
+    _emit_json_failure(envelope)
+    raise AssertionError("unreachable")
 
 
 def _unreachable(exc: Exception, as_json: bool) -> "click.ClickException":
@@ -202,12 +226,10 @@ def _unreachable(exc: Exception, as_json: bool) -> "click.ClickException":
     """
     if not as_json:
         return click.ClickException(f"could not reach cao-server: {exc}")
-    return click.ClickException(
-        _json.dumps(
-            {"ok": False, "class": "unreachable", "message": f"could not reach cao-server: {exc}"},
-            indent=2,
-        )
+    _emit_json_failure(
+        {"ok": False, "class": "unreachable", "message": f"could not reach cao-server: {exc}"}
     )
+    raise AssertionError("unreachable")
 
 
 def _echo_spec_result(record: dict, as_json: bool, verb: str) -> None:
@@ -219,7 +241,7 @@ def _echo_spec_result(record: dict, as_json: bool, verb: str) -> None:
     mistake, and terminal output is the easiest place for that to leak.
     """
     if as_json:
-        click.echo(_json.dumps(record, indent=2))
+        click.echo(_json.dumps({**record, "ok": True}, indent=2))
         return
     click.echo(f"{verb} {record['name']}")
     click.echo(f"  path: {record.get('path')}")
@@ -275,7 +297,7 @@ def create_cmd(name, from_file, as_json):
         # The server's own message is surfaced verbatim rather than replaced by a generic phrase: the
         # over-cap refusal names the actual byte limit, and the YAML refusal names the restriction.
         # Substituting "invalid request" here would throw away the only actionable part.
-        raise _authoring_failure(response, as_json, f"status {response.status_code}")
+        raise _authoring_failure(response, as_json, f"status {response.status_code}", "create")
 
     _echo_spec_result(response.json(), as_json, "created")
 
@@ -329,7 +351,7 @@ def update_cmd(name, from_file, expected_hash, as_json):
         raise _unreachable(e, as_json)
 
     if response.status_code != 200:
-        raise _authoring_failure(response, as_json, f"status {response.status_code}")
+        raise _authoring_failure(response, as_json, f"status {response.status_code}", "update")
 
     _echo_spec_result(response.json(), as_json, "updated")
 
@@ -443,9 +465,13 @@ def get_cmd(name, as_json):
         click.echo(_json.dumps(spec, indent=2))
         return
     click.echo(f"Name:        {spec['name']}")
-    click.echo(f"Mode:        {spec['mode']}")
+    mode = spec.get("mode") or ("script" if "source" in spec else None)
+    if mode:
+        click.echo(f"Mode:        {mode}")
     click.echo(f"Description: {spec.get('description', '') or '(none)'}")
-    click.echo(f"Steps:       {len(spec.get('steps', []))}")
+    steps = spec.get("steps")
+    if isinstance(steps, list):
+        click.echo(f"Steps:       {len(steps)}")
     # issue #583 Bolt 3 (``authoring-cli-verbs``): ``cao workflow update`` requires an
     # ``--expected-hash`` and this was the only place a human could have found it — it was in the
     # ``--json`` output all along but absent from the table, so the required flag would have meant
@@ -824,9 +850,11 @@ def run_cmd(name_or_path, inputs, run_id, detach, wait, as_json):
                 _extract_detail(response, f"unknown workflow '{name_or_path}'")
             )
         # The APPROVE step of FR-10's sequence: name the identifier and the command, never just 403.
-        refusal = _approval_refusal_message(response)
+        refusal = _approval_refusal_envelope(response)
         if refusal:
-            raise click.ClickException(refusal)
+            if as_json:
+                _emit_json_failure(refusal)
+            raise click.ClickException(_approval_refusal_message(refusal))
         if response.status_code != 200:
             raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
         result = response.json()
@@ -850,9 +878,11 @@ def run_cmd(name_or_path, inputs, run_id, detach, wait, as_json):
     if response.status_code == 404:
         raise click.ClickException(_extract_detail(response, f"unknown workflow '{name_or_path}'"))
     # The APPROVE step of FR-10's sequence: name the identifier and the command, never just 403.
-    refusal = _approval_refusal_message(response)
+    refusal = _approval_refusal_envelope(response)
     if refusal:
-        raise click.ClickException(refusal)
+        if as_json:
+            _emit_json_failure(refusal)
+        raise click.ClickException(_approval_refusal_message(refusal))
     if response.status_code != 202:
         raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
 
@@ -1108,9 +1138,11 @@ def resume_cmd(run_id, decide, as_json):
         raise click.ClickException(f"unknown run '{run_id}'")
     # A resume is gated too (the fifth check in resume_script_run's admission ladder), so the same
     # actionable refusal applies -- a resume of a run whose plan was never approved is refused.
-    refusal = _approval_refusal_message(response)
+    refusal = _approval_refusal_envelope(response)
     if refusal:
-        raise click.ClickException(refusal)
+        if as_json:
+            _emit_json_failure(refusal)
+        raise click.ClickException(_approval_refusal_message(refusal))
     if response.status_code != 200:
         raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
 

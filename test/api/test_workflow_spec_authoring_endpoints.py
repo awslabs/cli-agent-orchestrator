@@ -18,6 +18,9 @@ Four carry the unit's load:
 
 from __future__ import annotations
 
+import ast
+import hashlib
+import inspect
 import uuid
 from pathlib import Path
 
@@ -25,6 +28,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from cli_agent_orchestrator.api.main import app
+from cli_agent_orchestrator.services import workflow_spec_service as svc
 
 GOOD = 'def main():\n    """A spec that lints clean."""\n    return {"ok": True}\n'
 GOOD_V2 = 'def main():\n    """A revised spec that lints clean."""\n    return {"ok": False}\n'
@@ -90,6 +94,32 @@ def test_update_replaces_it_over_http(client, spec_dir):
     ), "the NEW hash must come back, or the caller cannot make a second update without a GET"
 
 
+def test_warning_findings_survive_create_and_update(client, spec_dir, monkeypatch):
+    """Successful authoring must preserve the service's typed warning findings."""
+    from cli_agent_orchestrator.models.workflow import LintFinding, ScriptValidationResult
+
+    findings = [
+        LintFinding(rule_id="dynamic-import", severity="warning", line=1, message="careful")
+    ]
+
+    def _warn_only(source: str, path: str) -> ScriptValidationResult:
+        return ScriptValidationResult(status="pass", findings=findings, errors=[])
+
+    monkeypatch.setattr(svc, "lint_script", _warn_only)
+    expected = [finding.model_dump() for finding in findings]
+
+    created = client.post("/workflows", json={"name": "warned", "source": GOOD})
+    assert created.status_code == 201, created.text
+    assert created.json().get("findings") == expected
+
+    updated = client.put(
+        "/workflows/warned",
+        json={"source": GOOD_V2, "expected_hash": created.json()["content_hash"]},
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json().get("findings") == expected
+
+
 def test_a_stale_hash_is_409_and_not_400(client, spec_dir):
     """THE ORDERING PROPERTY. 400 here would be a plausible wrong answer, not a failure."""
     created = client.post("/workflows", json={"name": "raced", "source": GOOD}).json()
@@ -125,6 +155,90 @@ def test_an_absent_spec_is_404_and_not_500(client, spec_dir):
     )
 
 
+def test_later_update_file_disappearance_is_a_storage_failure_not_unknown_workflow(
+    client, spec_dir, monkeypatch
+):
+    """Only the admission check's dedicated absence result is a 404."""
+    created = client.post("/workflows", json={"name": "vanished", "source": GOOD}).json()
+
+    def _vanished(*args: object, **kwargs: object) -> str:
+        raise FileNotFoundError(f"gone after admission: {spec_dir / 'vanished.py'}")
+
+    monkeypatch.setattr(svc, "_current_source_hash", _vanished)
+    response = client.put(
+        "/workflows/vanished",
+        json={"source": GOOD_V2, "expected_hash": created["content_hash"]},
+    )
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == {
+        "message": "workflow storage failed; retry later or contact the server administrator."
+    }
+    assert str(spec_dir) not in str(response.json())
+
+
+def test_authoring_validation_errors_do_not_disclose_server_paths(client, spec_dir):
+    """The symlink refusal contains an absolute path internally, never in the 400 body."""
+    create_target = spec_dir / "leak-create.py"
+    create_target.symlink_to(spec_dir / "missing-target.py")
+
+    create_response = client.post("/workflows", json={"name": "leak-create", "source": GOOD})
+    assert create_response.status_code == 400
+    assert create_response.json()["detail"] == (
+        "workflow specification is invalid; correct the request and try again."
+    )
+    assert str(spec_dir) not in str(create_response.json())
+
+    backing = spec_dir / "backing.py"
+    backing.write_text(GOOD)
+    update_target = spec_dir / "leak-update.py"
+    update_target.symlink_to(backing)
+    update_response = client.put(
+        "/workflows/leak-update",
+        json={
+            "source": GOOD_V2,
+            "expected_hash": hashlib.sha256(GOOD.encode("utf-8")).hexdigest(),
+        },
+    )
+    assert update_response.status_code == 400
+    assert update_response.json()["detail"] == (
+        "workflow specification is invalid; correct the request and try again."
+    )
+    assert str(spec_dir) not in str(update_response.json())
+
+
+@pytest.mark.parametrize("operation", ["create", "update"])
+def test_storage_failures_are_structured_and_path_free(spec_dir, monkeypatch, operation):
+    """Filesystem errors never fall through to Starlette's plain-text 500."""
+    client = TestClient(app, base_url="http://localhost", raise_server_exceptions=False)
+
+    if operation == "create":
+
+        def _storage_failure(*args: object, **kwargs: object) -> object:
+            raise OSError(f"disk full at {spec_dir}")
+
+        monkeypatch.setattr(svc, "create_workflow", _storage_failure)
+        response = client.post("/workflows", json={"name": "storage-create", "source": GOOD})
+    else:
+        created = client.post("/workflows", json={"name": "storage-update", "source": GOOD}).json()
+
+        def _storage_failure(*args: object, **kwargs: object) -> object:
+            raise OSError(f"permission denied at {spec_dir}")
+
+        monkeypatch.setattr(svc, "update_workflow", _storage_failure)
+        response = client.put(
+            "/workflows/storage-update",
+            json={"source": GOOD_V2, "expected_hash": created["content_hash"]},
+        )
+
+    assert response.status_code == 500
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json()["detail"] == {
+        "message": "workflow storage failed; retry later or contact the server administrator."
+    }
+    assert str(spec_dir) not in str(response.json())
+
+
 def test_update_requires_an_expected_hash(client, spec_dir):
     client.post("/workflows", json={"name": "guarded", "source": GOOD})
 
@@ -153,6 +267,7 @@ def test_a_lint_error_refuses_the_write(client, spec_dir):
         "structured findings, so 400-with-the-message is what is available here — recorded as a "
         "divergence from this unit's BR-5, which asked for 422 with rendered findings"
     )
+    assert "missing-recovery-policy" in resp.json()["detail"]
     assert not (spec_dir / "unrunnable.py").exists(), "a refused write must leave nothing behind"
 
 
@@ -179,29 +294,18 @@ def test_a_lint_error_refuses_an_update_too(client, spec_dir):
     ).read_text() == GOOD, "the refused update must leave the runnable original in place"
 
 
-def test_a_yaml_name_is_refused_with_a_message_naming_the_restriction(client, spec_dir):
-    """Python-only writes (pass 3A's unit 3 decision). The MESSAGE is the deliverable.
-
-    A bare 400 would leave the caller guessing; pass 3A chose to name the restriction so an agent or
-    operator learns the rule from the refusal itself.
-    """
+def test_a_yaml_name_is_refused_without_disclosing_internal_validation_detail(client, spec_dir):
+    """A path-free validation message remains actionable at the HTTP boundary."""
     resp = client.post("/workflows", json={"name": "as-yaml.yaml", "source": GOOD})
 
     assert resp.status_code == 400, resp.text
-    detail = str(resp.json()["detail"]).lower()
-    assert (
-        "yaml" in detail or "python" in detail
-    ), f"the refusal must name the restriction, got: {resp.json()['detail']!r}"
+    assert "YAML specs cannot be created or updated" in resp.json()["detail"]
+    assert str(spec_dir) not in resp.json()["detail"]
     assert not any(spec_dir.iterdir()), "nothing may be written for a refused tier"
 
 
-def test_an_oversize_spec_is_refused_and_the_message_names_the_limit(client, spec_dir):
-    """PERF-3: no client-side cap, and the server's message must carry the actual limit.
-
-    The CLI deliberately holds no copy of ``WORKFLOW_MAX_SPEC_BYTES`` — a second copy is the
-    duplicated-check drift this project has been bitten by — so the operator only learns the limit if
-    this message states it.
-    """
+def test_an_oversize_spec_is_refused_with_the_stable_public_error(client, spec_dir):
+    """The write-cap refusal retains the actionable configured byte limit."""
     from cli_agent_orchestrator.constants import WORKFLOW_MAX_SPEC_BYTES
 
     oversize = "# " + ("x" * (WORKFLOW_MAX_SPEC_BYTES + 10)) + "\ndef main():\n    return {}\n"
@@ -209,10 +313,22 @@ def test_an_oversize_spec_is_refused_and_the_message_names_the_limit(client, spe
     resp = client.post("/workflows", json={"name": "huge", "source": oversize})
 
     assert resp.status_code == 400, resp.text
-    assert str(WORKFLOW_MAX_SPEC_BYTES) in str(
-        resp.json()["detail"]
-    ), f"the limit must be in the message, got: {resp.json()['detail']!r}"
+    assert resp.json()["detail"] == f"spec exceeds {WORKFLOW_MAX_SPEC_BYTES} bytes (max)"
+    assert str(spec_dir) not in resp.json()["detail"]
     assert not any(spec_dir.iterdir()), "the cap is checked BEFORE any file is created"
+
+
+def test_source_validation_over_cap_is_a_fail_result(client):
+    """The source and path forms share the validation-result HTTP contract."""
+    from cli_agent_orchestrator.constants import WORKFLOW_MAX_SPEC_BYTES
+
+    response = client.post(
+        "/workflows/validate",
+        json={"source": "x" * (WORKFLOW_MAX_SPEC_BYTES + 1)},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "fail"
 
 
 def test_a_failed_index_upsert_still_reports_success(client, spec_dir, monkeypatch):
@@ -257,4 +373,29 @@ def test_both_endpoints_declare_a_write_scope():
                     getattr(route, "dependencies", None)
                 )
                 assert "require_any_scope" in deps or getattr(route, "dependant", None) is not None
+                if method == "PUT":
+                    doc = getattr(getattr(route, "endpoint", None), "__doc__", "") or ""
+                    assert "optimistic concurrency control" in doc
+                    assert "not an authorization control" in doc
     assert seen == wanted, f"both authoring routes must be registered; found {seen}"
+
+
+def test_transient_kinds_are_constructed_by_runtime_step_emitters():
+    """The classifier may only classify durable kinds that production can emit."""
+    from cli_agent_orchestrator import api
+    from cli_agent_orchestrator.services import agent_step
+
+    tree = ast.parse(inspect.getsource(agent_step))
+    emitted_kinds = {
+        keyword.value.value
+        for call in ast.walk(tree)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == "StepExecutionError"
+        for keyword in call.keywords
+        if keyword.arg == "kind"
+        and isinstance(keyword.value, ast.Constant)
+        and isinstance(keyword.value.value, str)
+    }
+
+    assert api.main._TRANSIENT_ERROR_KINDS <= emitted_kinds

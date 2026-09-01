@@ -5,7 +5,9 @@ import logging
 import os
 import re
 import time
+from collections.abc import Mapping
 from typing import Annotated, Any, Dict, List, NamedTuple, Optional, Tuple, Union
+from urllib.parse import quote
 
 import requests
 from fastmcp import FastMCP
@@ -19,6 +21,7 @@ from cli_agent_orchestrator.constants import (
     WORKFLOW_EVENTS_MCP_MAX_EVENTS,
     WORKFLOW_EVENTS_MCP_MAX_SECONDS,
     WORKFLOW_EVENTS_READ_TIMEOUT,
+    WORKFLOW_NAME_RE,
     WORKFLOW_POLL_INTERVAL_SECONDS,
     WORKFLOW_RUN_REQUEST_TIMEOUT,
 )
@@ -642,6 +645,9 @@ def _parse_run_step_error(
         fallback = f"status {response.status_code}"
         return None, fallback, None
 
+    if not isinstance(payload, Mapping):
+        fallback = f"status {response.status_code}"
+        return None, fallback, None
     detail = payload.get("detail")
     if isinstance(detail, dict):
         message = detail.get("message") or f"status {response.status_code}"
@@ -3229,21 +3235,19 @@ async def workflow_events(
 #: (already_exists) and ``update``'s 409 (stale_hash) carry different classes — a discrimination the CLI
 #: could not make, because it maps from the status alone.
 _AUTHORING_CLASS_BY_STATUS = {
-    "create": {409: "already_exists", 400: "invalid_request", 422: "lint_failed"},
-    "update": {404: "not_found", 409: "stale_hash", 400: "invalid_request", 422: "lint_failed"},
-    "get": {404: "not_found", 400: "invalid_request", 409: "invalid_request"},
-    "validate": {400: "invalid_request", 404: "not_found", 422: "lint_failed"},
+    "create": {409: "already_exists", 400: "invalid_request"},
+    "update": {404: "not_found", 409: "stale_hash", 400: "invalid_request"},
+    "get": {404: "not_found", 400: "invalid_request", 409: "conflict"},
+    "validate": {400: "invalid_request", 404: "not_found"},
 }
 
 
 def _authoring_refusal(op: str, response: requests.Response) -> Dict[str, Any]:
     """Build the classed refusal envelope for an authoring tool.
 
-    ``lint_failed`` is reachable on ``create``/``update`` through a 400 whose detail names lint errors:
-    the service flattens a lint failure into a ``ValueError``, so the status alone cannot distinguish it.
-    Rather than sniff the message — which is the thing this whole design refuses to do — the class stays
-    ``invalid_request`` and the server's message names the failing rules. Recorded so a reader does not
-    mistake the map's ``422`` entries for the live lint path.
+    Lint failures reach authoring callers as 400 invalid-request responses because the service flattens
+    them into ``ValueError``. The classifier deliberately does not sniff messages, so a hypothetical 422
+    falls through to the generic ``error`` class rather than advertising a dead branch.
     """
     detail = _extract_error_detail(response, f"status {response.status_code}")
     klass = _AUTHORING_CLASS_BY_STATUS.get(op, {}).get(response.status_code, "error")
@@ -3257,6 +3261,36 @@ def _unreachable_refusal(exc: Exception) -> Dict[str, Any]:
     its own class rather than being folded into ``invalid_request``.
     """
     return {"ok": False, "class": "unreachable", "error": f"could not reach cao-server: {exc}"}
+
+
+def _workflow_name_refusal(name: object) -> Optional[Dict[str, Any]]:
+    """Validate the documented bare workflow-name contract before making an HTTP request."""
+    if isinstance(name, str) and re.fullmatch(WORKFLOW_NAME_RE, name):
+        return None
+    return {
+        "ok": False,
+        "class": "invalid_request",
+        "error": "workflow name must be a bare name matching [A-Za-z0-9_-]{1,64}",
+    }
+
+
+def _authoring_success(response: requests.Response) -> Dict[str, Any]:
+    """Return a successful authoring envelope without letting malformed JSON escape the tool."""
+    try:
+        body = response.json()
+    except ValueError:
+        return {
+            "ok": False,
+            "class": "error",
+            "error": "cao-server returned an invalid success response",
+        }
+    if not isinstance(body, Mapping):
+        return {
+            "ok": False,
+            "class": "error",
+            "error": "cao-server returned an unexpected success response",
+        }
+    return {**body, "ok": True}
 
 
 @mcp.tool()
@@ -3282,6 +3316,9 @@ async def workflow_create(
     errors that would make the spec unrunnable), or ``unreachable``. Branch on ``class``, not on the
     message. Never raises into the agent loop (EV-1).
     """
+    refusal = _workflow_name_refusal(name)
+    if refusal:
+        return refusal
     try:
         response = requests.post(
             f"{API_BASE_URL}/workflows",
@@ -3294,7 +3331,7 @@ async def workflow_create(
     if response.status_code not in (200, 201):
         return _authoring_refusal("create", response)
 
-    return {"ok": True, **response.json()}
+    return _authoring_success(response)
 
 
 @mcp.tool()
@@ -3330,9 +3367,13 @@ async def workflow_update(
     create it), ``stale_hash`` (someone changed it since your hash; re-read and re-apply your change),
     ``invalid_request``, or ``unreachable``. Never raises into the agent loop (EV-1).
     """
+    refusal = _workflow_name_refusal(name)
+    if refusal:
+        return refusal
+    encoded_name = quote(name, safe="")
     try:
         response = requests.put(
-            f"{API_BASE_URL}/workflows/{name}",
+            f"{API_BASE_URL}/workflows/{encoded_name}",
             json={"source": source, "expected_hash": expected_hash},
             timeout=_mcp_timeout(),
         )
@@ -3342,12 +3383,12 @@ async def workflow_update(
     if response.status_code != 200:
         return _authoring_refusal("update", response)
 
-    return {"ok": True, **response.json()}
+    return _authoring_success(response)
 
 
 @mcp.tool()
 async def workflow_get(
-    name: Annotated[str, Field(description="Bare workflow name, or a spec file path")],
+    name: Annotated[str, Field(description="Bare workflow name (no path, no extension)")],
 ) -> Dict[str, Any]:
     """Read back a workflow spec, including its source and ``content_hash`` (issue #583 FR-10).
 
@@ -3360,18 +3401,23 @@ async def workflow_get(
     also that this route rebuilds the spec index, so calling it in a loop is the expensive way to do
     anything.
 
-    On refusal returns ``{ok: False, class, error}`` with ``class`` of ``not_found``, ``invalid_request``
-    or ``unreachable``. Never raises into the agent loop (EV-1).
+    On refusal returns ``{ok: False, class, error}`` with ``class`` of ``not_found``, ``conflict``
+    (remove or rename the colliding spec file), ``invalid_request``, or ``unreachable``. Never raises
+    into the agent loop (EV-1).
     """
+    refusal = _workflow_name_refusal(name)
+    if refusal:
+        return refusal
+    encoded_name = quote(name, safe="")
     try:
-        response = requests.get(f"{API_BASE_URL}/workflows/{name}", timeout=_mcp_timeout())
+        response = requests.get(f"{API_BASE_URL}/workflows/{encoded_name}", timeout=_mcp_timeout())
     except requests.RequestException as e:
         return _unreachable_refusal(e)
 
     if response.status_code != 200:
         return _authoring_refusal("get", response)
 
-    return {"ok": True, **response.json()}
+    return _authoring_success(response)
 
 
 @mcp.tool()
@@ -3407,7 +3453,7 @@ async def workflow_validate(
     if response.status_code != 200:
         return _authoring_refusal("validate", response)
 
-    return {"ok": True, **response.json()}
+    return _authoring_success(response)
 
 
 # The MCP Apps surface — tools (render_dashboard / render_agent_view /

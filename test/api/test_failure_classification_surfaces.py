@@ -93,9 +93,9 @@ def test_the_two_classes_differ_over_http(client):
     )
 
 
-def test_a_provider_error_is_transient_over_http(client):
-    _failed_run("run-provider", "provider_error")
-    assert _envelope(client, "run-provider")["classification"] == "transient"
+def test_an_error_kind_is_an_artifact_defect_over_http(client):
+    _failed_run("run-error", "error")
+    assert _envelope(client, "run-error")["classification"] == "artifact_defect"
 
 
 def test_a_successful_run_carries_no_envelope_and_no_classification(client):

@@ -1278,16 +1278,21 @@ async def lifespan(app: FastAPI):
     # (``uvicorn cli_agent_orchestrator.api.main:app``) is covered too. Idempotent.
     install_access_log_redaction()
     # issue #583 Bolt 3 (``approval-enforcement-default``): report the approval gate's RESOLVED state
-    # AND the mechanism that decided it. The source is the point, not decoration: enforcement now
-    # defaults ON, but an unreadable settings.json resolves it OFF, and a line saying only "off" would
-    # leave that silent weakening as invisible as it was before. Logs only the boolean and a member of
-    # the closed source set -- never a settings value or file contents. Failure-isolated like the
+    # AND the mechanism that decided it. A malformed settings file fails closed, so the source tells
+    # the operator why enforcement remains ON and how to recover. Logs only the boolean and a member
+    # of the closed source set -- never a settings value or file contents. Failure-isolated like the
     # telemetry init below so it can never block boot.
     try:
         _posture = settings_service.resolve_workflow_approval_posture()
         if _posture.source == settings_service.GATE_SOURCE_READ_FAILURE:
             logger.warning(
-                "workflow approval gate: OFF (settings.json unreadable; the default is ON)"
+                "workflow approval gate: ON (settings.json unreadable or undecodable; repair it and "
+                "restart or reload the server)"
+            )
+        elif _posture.source == settings_service.GATE_SOURCE_INVALID_SETTINGS:
+            logger.warning(
+                "workflow approval gate: ON (settings.json approval configuration is invalid; repair "
+                "it and restart or reload the server)"
             )
         else:
             logger.info(
@@ -4103,6 +4108,13 @@ async def run_step(
 # this boundary maps them to HTTPException (B2-BR-9): ValueError -> 400,
 # FileNotFoundError/KeyError -> 404. The run/cancel/status endpoints are Bolt 3.
 
+_WORKFLOW_AUTHORING_PATH_REFUSED_DETAIL = (
+    "workflow specification is invalid; correct the request and try again."
+)
+_WORKFLOW_AUTHORING_STORAGE_DETAIL = {
+    "message": "workflow storage failed; retry later or contact the server administrator."
+}
+
 
 @app.post("/workflows/validate")
 async def validate_workflow_endpoint(
@@ -4142,15 +4154,16 @@ async def validate_workflow_endpoint(
 
     if body.source is not None:
         from cli_agent_orchestrator.constants import WORKFLOW_MAX_SPEC_BYTES
+        from cli_agent_orchestrator.models.workflow import ScriptValidationResult
         from cli_agent_orchestrator.services.script_lint import lint_script
 
         if len(body.source.encode("utf-8")) > WORKFLOW_MAX_SPEC_BYTES:
             # The same cap the write path enforces, checked here too so a caller cannot learn the
             # limit only by trying to create. Message names the limit (unit 2's PERF-3 discipline).
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"spec exceeds {WORKFLOW_MAX_SPEC_BYTES} bytes (max)",
-            )
+            return ScriptValidationResult(
+                status="fail",
+                errors=[f"spec exceeds {WORKFLOW_MAX_SPEC_BYTES} bytes (max)"],
+            ).model_dump()
         # "<draft>" is a placeholder, never opened. Always Python: a source body has no extension to
         # dispatch on, and pass 3A made writes Python-only.
         return lint_script(body.source, "<draft>").model_dump()
@@ -4324,9 +4337,9 @@ async def create_workflow_endpoint(
     (from the next batch) the MCP authoring tools, which reach CAO over HTTP like any other client.
 
     ``SCOPE_WRITE`` rather than ``SCOPE_ADMIN``: writing a spec is a write, not an administrative act.
-    ``DELETE``'s admin-only tier reflects that deletion is unrecoverable, whereas ``create`` refuses to
-    clobber and ``update`` requires a matching hash. (Note ``require_any_scope`` is default-off, so the
-    tier is inert unless auth is enabled.)
+    ``DELETE``'s admin-only tier reflects that deletion is unrecoverable, whereas create and replacement
+    are deliberate write-scoped operations. (Note ``require_any_scope`` is default-off, so the tier is
+    inert unless auth is enabled.)
 
     EVERY GUARANTEE IS THE SERVICE LAYER'S, NOT THIS HANDLER'S. Name and tier validation, the
     existence check, cross-tier collision, the lint gate, path containment, the atomic write and the
@@ -4346,18 +4359,25 @@ async def create_workflow_endpoint(
     except TierCollisionError as e:
         # A ValueError subclass, so it MUST precede the bare ValueError arm below.
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except workflow_spec_service.SpecPathRefusedError:
+        logger.error("workflow create refused unsafe spec path", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=_WORKFLOW_AUTHORING_PATH_REFUSED_DETAIL,
+        )
     except ValueError as e:
-        # This arm carries LINT FAILURES too, not only malformed names. ``_validated_script_spec``
-        # flattens a lint error into a ``ValueError`` whose message names the failing rules, rather
-        # than raising a findings-bearing error, so there is nothing structured to render and 422 is
-        # not available here without changing a committed pass-3A unit. The message does name the
-        # errors, so the refusal stays actionable. Divergence from this unit's ``business-rules.md``
-        # BR-5, recorded in ``code-summary.md``.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except OSError:
+        logger.error("workflow create storage failed", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=_WORKFLOW_AUTHORING_STORAGE_DETAIL,
+        )
     return {
         "name": spec.name,
         "path": spec.path,
         "content_hash": spec.content_hash,
+        "findings": [finding.model_dump() for finding in spec.findings],
     }
 
 
@@ -4375,6 +4395,8 @@ async def update_workflow_endpoint(
     ``expected_hash`` is required by ``update_workflow`` itself and is passed through verbatim. This
     handler NEVER computes or defaults it: doing so would remove FR-8's stale-update check rather than
     weaken it, since a hash read from the file about to be overwritten always matches.
+    It is optimistic concurrency control, not an authorization control: write scope authorizes the
+    replacement, while the hash prevents an older reader from overwriting newer content.
 
     ``StaleSpecError`` maps to 409 and its arm MUST precede the bare ``ValueError`` arm, because it is a
     ``ValueError`` subclass and Python matches ``except`` clauses in order. Ordered the other way it
@@ -4387,10 +4409,9 @@ async def update_workflow_endpoint(
 
     try:
         spec = workflow_spec_service.update_workflow(name, body.source, body.expected_hash)
-    except FileNotFoundError:
-        # ``update_workflow`` raises FileNotFoundError, NOT KeyError, when the spec is absent — an
-        # OSError, so it would escape a ValueError arm entirely and surface as 500. Verified against
-        # the function rather than assumed from ``delete_workflow``'s KeyError precedent.
+    except workflow_spec_service.WorkflowNotFoundError:
+        # Only the update admission check maps to 404. A later FileNotFoundError
+        # means storage changed during the operation and maps through OSError below.
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown workflow '{name}'"
         )
@@ -4398,13 +4419,25 @@ async def update_workflow_endpoint(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except TierCollisionError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except workflow_spec_service.SpecPathRefusedError:
+        logger.error("workflow update refused unsafe spec path", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=_WORKFLOW_AUTHORING_PATH_REFUSED_DETAIL,
+        )
     except ValueError as e:
-        # Carries lint failures as well as malformed names — see the note on the create endpoint.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except OSError:
+        logger.error("workflow update storage failed", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=_WORKFLOW_AUTHORING_STORAGE_DETAIL,
+        )
     return {
         "name": spec.name,
         "path": spec.path,
         "content_hash": spec.content_hash,
+        "findings": [finding.model_dump() for finding in spec.findings],
     }
 
 
@@ -5104,7 +5137,7 @@ async def submit_workflow_run_endpoint(
         # first run of a new plan is refused by design, so recording them would durably record runs
         # that never happened. The blocking arm in ``script_runner`` gates identically at its Step 0b,
         # because otherwise a run's approvability would depend on which route started it. No-ops
-        # entirely when enforcement is disabled, which is the default.
+        # entirely when enforcement is disabled through the explicit settings-file opt-out.
         manifest_json = await asyncio.to_thread(
             manifest_freeze.build_manifest_json,
             source_hash=spec.content_hash,
@@ -6254,7 +6287,7 @@ def _resolve_error_kind(row: Any, steps: List[Any]) -> Optional[str]:
 #: Bolt 3, ``failure-classification``). A CLOSED set: anything outside it takes the
 #: ``artifact_defect`` default AND logs, because an unrecognised kind is exactly the case where a
 #: confident answer would be unearned. See ``_classify_failure``.
-_TRANSIENT_ERROR_KINDS = frozenset({"timeout", "provider_error"})
+_TRANSIENT_ERROR_KINDS = frozenset({"timeout"})
 
 #: The three classifications this surface can emit. ``diverged`` and ``decision_required`` belong to the
 #: same vocabulary but are NOT here: both are live-call kinds returned as a 409 from the ``run_step``
@@ -6272,9 +6305,9 @@ def _classify_failure(row: Any, error_kind: Optional[str]) -> Optional[str]:
     sole owner of that criterion.
 
     ``error_kind`` IS A CAUSE TAXONOMY AND THIS IS A NEXT-ACTION TAXONOMY, which is the whole reason
-    the function exists rather than the endpoint simply surfacing ``error_kind``. ``timeout`` and
-    ``provider_error`` describe what went wrong; ``transient`` and ``artifact_defect`` describe what to
-    do about it, and the mapping between them is a judgement rather than a rename.
+    the function exists rather than the endpoint simply surfacing ``error_kind``. Production persistors
+    emit ``error``, ``timeout``, or ``cancelled``; ``transient`` and ``artifact_defect`` describe what
+    to do about those causes, and the mapping between them is a judgement rather than a rename.
 
     THE CANCELLED CHECK PRECEDES THE KIND, AND THE ORDER IS THE RULE. A run cancelled while a step was
     in flight carries BOTH ``state == CANCELLED`` and a step-level error, so reading the kind first

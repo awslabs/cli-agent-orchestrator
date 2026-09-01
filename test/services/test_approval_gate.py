@@ -304,22 +304,8 @@ def test_settings_json_can_enable_and_disable(monkeypatch, tmp_path):
     assert settings_service.is_workflow_approval_required() is False
 
 
-def test_an_unreadable_setting_resolves_to_disabled(monkeypatch, tmp_path, caplog):
-    """The ONE place this mechanism is deliberately not fail-closed.
-
-    Resolving an unparseable settings file to "gate on" would refuse every script run in the
-    installation on the strength of a JSON typo.
-
-    THE ORIGINAL JUSTIFICATION FOR THIS BEHAVIOUR EXPIRED AT BOLT 3 AND THE BEHAVIOUR DID NOT. It used
-    to be that resolving to disabled "makes the unreadable case behave like the unconfigured case" —
-    an equivalence the flipped default BREAKS, since unconfigured now means enabled. What keeps it
-    correct is narrower: ``approval_gate``'s docstring records this as a same-user local control and
-    not a privilege boundary, so a corrupt file weakening the gate is outside the threat model, while
-    the installation-wide outage is not.
-
-    The ``error`` record and the reported source are asserted, not incidental: without them the
-    degradation is silent, and a silently weakened control is indistinguishable from a healthy one.
-    """
+def test_an_unreadable_setting_resolves_to_enabled(monkeypatch, tmp_path, caplog):
+    """A read/decode failure keeps the default-on control enforced."""
     import logging
 
     monkeypatch.delenv("CAO_WORKFLOW_REQUIRE_APPROVAL", raising=False)
@@ -330,16 +316,17 @@ def test_an_unreadable_setting_resolves_to_disabled(monkeypatch, tmp_path, caplo
     with caplog.at_level(logging.ERROR, logger=settings_service.logger.name):
         posture = settings_service.resolve_workflow_approval_posture()
 
-    assert posture.required is False
+    assert posture.required is True
     assert posture.source == settings_service.GATE_SOURCE_READ_FAILURE
-    assert any(r.levelno >= logging.ERROR for r in caplog.records), (
-        "an unreadable settings file silently disables a control the operator believes defaults "
-        "on — the error record is the only thing that makes it visible"
-    )
-    assert settings_service.is_workflow_approval_required() is False
+    assert any(
+        r.levelno >= logging.ERROR for r in caplog.records
+    ), "a read/decode failure must be visible even though enforcement remains enabled"
+    assert settings_service.is_workflow_approval_required() is True
 
 
-def test_a_non_dict_workflow_section_resolves_to_disabled(monkeypatch, tmp_path, caplog):
+def test_a_non_dict_workflow_section_resolves_to_enabled_with_invalid_settings_source(
+    monkeypatch, tmp_path, caplog
+):
     import logging
 
     monkeypatch.delenv("CAO_WORKFLOW_REQUIRE_APPROVAL", raising=False)
@@ -350,9 +337,22 @@ def test_a_non_dict_workflow_section_resolves_to_disabled(monkeypatch, tmp_path,
     with caplog.at_level(logging.ERROR, logger=settings_service.logger.name):
         posture = settings_service.resolve_workflow_approval_posture()
 
-    assert posture.required is False
-    assert posture.source == settings_service.GATE_SOURCE_READ_FAILURE
+    assert posture.required is True
+    assert posture.source == "invalid-settings-fallback"
     assert any(r.levelno >= logging.ERROR for r in caplog.records)
+
+
+@pytest.mark.parametrize("value", [None, "false", 0, 1])
+def test_only_an_explicit_json_boolean_can_configure_approval(monkeypatch, tmp_path, value):
+    monkeypatch.delenv("CAO_WORKFLOW_REQUIRE_APPROVAL", raising=False)
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text(json.dumps({"workflow": {"require_approval": value}}))
+    monkeypatch.setattr(settings_service, "SETTINGS_FILE", settings_file)
+
+    posture = settings_service.resolve_workflow_approval_posture()
+
+    assert posture.required is True
+    assert posture.source == "invalid-settings-fallback"
 
 
 def test_an_empty_but_readable_settings_file_resolves_to_the_default(monkeypatch, tmp_path):
@@ -421,8 +421,8 @@ def test_a_vanished_settings_file_reads_as_absent_not_as_a_read_failure(monkeypa
     """One read, so there is no stat-then-read window (PERF-4).
 
     A file that does not exist raises FileNotFoundError from the single read, which is reported as
-    ABSENT rather than as a failure. The distinction matters because absent enables the gate and a
-    read failure disables it, so a spurious failure classification would weaken the control.
+    ABSENT rather than as a failure. Both cases preserve enabled enforcement, but their distinct
+    sources keep startup reporting truthful and actionable.
     """
     monkeypatch.delenv("CAO_WORKFLOW_REQUIRE_APPROVAL", raising=False)
     monkeypatch.setattr(settings_service, "SETTINGS_FILE", tmp_path / "never-created.json")

@@ -100,7 +100,7 @@ def test_exactly_one_form_is_required(client, body, why):
     assert "exactly one" in detail and "path" in detail and "source" in detail
 
 
-def test_an_oversize_draft_is_refused_and_the_message_names_the_limit(client):
+def test_an_oversize_draft_returns_a_fail_verdict_and_names_the_limit(client):
     """The same cap the write path enforces, so a caller cannot learn the limit only by trying to create."""
     from cli_agent_orchestrator.constants import WORKFLOW_MAX_SPEC_BYTES
 
@@ -108,5 +108,8 @@ def test_an_oversize_draft_is_refused_and_the_message_names_the_limit(client):
 
     resp = client.post("/workflows/validate", json={"source": oversize})
 
-    assert resp.status_code == 400
-    assert str(WORKFLOW_MAX_SPEC_BYTES) in str(resp.json()["detail"])
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "fail"
+    assert any(
+        str(WORKFLOW_MAX_SPEC_BYTES) in error for error in resp.json()["errors"]
+    ), resp.json()["errors"]

@@ -34,6 +34,7 @@ _HISTORICAL = {
     # know about — and the account is the most useful thing in that comment. Rewriting its figures
     # to the current count would destroy it, so the past-tense narrative keeps its own numbers.
     "24/18/27 = 69",
+    "24/18/28 = 70",
     "33/5/22",
     "33 IN-APP / 5 HANDOFF / 23 HIDE = 61",
     "22/16/23",
@@ -58,6 +59,33 @@ def _strip_historical(source: str) -> str:
     return source
 
 
+def _stale_prose_counts(source: str) -> list[tuple[str, str]]:
+    current = _declared_count(source)
+    scrubbed = _strip_historical(source)
+
+    # Two-digit numbers adjacent to count vocabulary. Narrow on purpose: this must not fire on
+    # `shell.resize(70, 20)` in renderer.rs (a terminal width, a different file entirely) nor on
+    # issue numbers, line references, or version pins.
+    patterns = [
+        r"\*\*(\d{2,3}) of them\*\*",
+        r"\*\*(\d{2,3}) as of this branch\*\*",
+        r"all (\d{2,3})\*\*",
+        r"re-listing (\d{2,3}) commands",
+        r"totalling (\d{2,3})",
+        r"account for all (\d{2,3}) leaf commands",
+        r"must list (\d{2,3}) DISTINCT",
+        r"summing to (\d{2,3})",
+        r"distinct\.len\(\) == (\d{2,3})",
+        r"\b\d{2,3}/\d{1,3}/\d{1,3}\s*=\s*(\d{2,3})\b",
+    ]
+    stale: list[tuple[str, str]] = []
+    for pattern in patterns:
+        for found in re.findall(pattern, scrubbed):
+            if int(found) != current:
+                stale.append((pattern, found))
+    return stale
+
+
 def test_the_guard_is_not_vacuous():
     """If the file stops parsing the way this test expects, fail loudly rather than pass silently.
 
@@ -77,27 +105,7 @@ def test_no_superseded_command_count_survives_in_prose():
     """Every count-shaped number in the file is either the current one or explicitly historical."""
     source = _source()
     current = _declared_count(source)
-    scrubbed = _strip_historical(source)
-
-    # Two-digit numbers adjacent to count vocabulary. Narrow on purpose: this must not fire on
-    # `shell.resize(70, 20)` in renderer.rs (a terminal width, a different file entirely) nor on
-    # issue numbers, line references, or version pins.
-    patterns = [
-        r"\*\*(\d{2,3}) of them\*\*",
-        r"\*\*(\d{2,3}) as of this branch\*\*",
-        r"all (\d{2,3})\*\*",
-        r"re-listing (\d{2,3}) commands",
-        r"totalling (\d{2,3})",
-        r"account for all (\d{2,3}) leaf commands",
-        r"must list (\d{2,3}) DISTINCT",
-        r"summing to (\d{2,3})",
-        r"distinct\.len\(\) == (\d{2,3})",
-    ]
-    stale: list[tuple[str, str]] = []
-    for pattern in patterns:
-        for found in re.findall(pattern, scrubbed):
-            if int(found) != current:
-                stale.append((pattern, found))
+    stale = _stale_prose_counts(source)
 
     assert not stale, (
         f"COMMAND_COUNT is {current} but the prose still says {sorted({s for _, s in stale})}. "
@@ -105,6 +113,20 @@ def test_no_superseded_command_count_survives_in_prose():
         "before Bolt 3 found them. Update them, or add the phrase to _HISTORICAL if it is a "
         "deliberate account of a past state."
     )
+
+
+def test_slash_separated_distribution_total_is_checked_for_staleness():
+    """The live distribution total is accepted, while a stale replacement is reported."""
+    source = _source()
+    current = _declared_count(source)
+    matches = re.finditer(r"\*\*\d{2,3}/\d{1,3}/\d{1,3}\s*=\s*(\d{2,3})\*\*", source)
+    live = next((match for match in matches if int(match.group(1)) == current), None)
+    assert live is not None, "expected the current slash-separated distribution total in catalog.rs"
+    assert not _stale_prose_counts(source)
+
+    stale_total = current - 1
+    stale_source = source[: live.start(1)] + str(stale_total) + source[live.end(1) :]
+    assert any(found == str(stale_total) for _, found in _stale_prose_counts(stale_source))
 
 
 def test_the_distribution_test_name_matches_its_assertions():

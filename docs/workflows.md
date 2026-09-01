@@ -396,7 +396,8 @@ before assuming a verb and a tool with similar names do the same thing:
 
 ## Plan approval (script tier)
 
-**Nothing in this section applies to YAML workflows**, and nothing in it is active by default.
+**Nothing in this section applies to YAML workflows.** Script-tier approval enforcement is active by
+default.
 
 A script-tier run freezes an **execution manifest** at run start — the workflow's source hash, its
 resolved inputs, and the repository/worktree baseline — and derives a **plan identifier** (`plan_id`,
@@ -436,6 +437,13 @@ Only the server's `settings.json` can turn the gate off:
   }
 }
 ```
+
+#### Recovering from malformed settings
+
+With `CAO_WORKFLOW_REQUIRE_APPROVAL` unset, unreadable, undecodable, malformed JSON, or invalid
+approval settings **fail closed**: the gate remains on. Repair `settings.json` and restart or reload
+the CAO server. A valid explicit JSON boolean `workflow.require_approval: false` is the only
+settings-file opt-out; `null`, strings, and numbers are invalid and do not disable enforcement.
 
 #### What a refusal looks like
 

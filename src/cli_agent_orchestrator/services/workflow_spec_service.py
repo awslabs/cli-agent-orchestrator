@@ -63,6 +63,26 @@ logger = logging.getLogger(__name__)
 
 _NAME_RE = re.compile(WORKFLOW_NAME_RE)
 
+
+class WorkflowNotFoundError(FileNotFoundError):
+    """The named workflow was absent when update admission checked for it.
+
+    This is deliberately narrower than a bare ``FileNotFoundError``: a later
+    filesystem disappearance while hashing or persisting is an operational
+    failure, not evidence that the requested workflow never existed.
+    """
+
+
+class SpecPathRefusedError(ValueError):
+    """A containment refusal whose diagnostic includes a server-derived path.
+
+    Authoring endpoints must retain ordinary validation details so callers can
+    correct their request. This narrow subtype identifies the containment and
+    symlink refusals whose messages instead include an internally derived
+    target path and must be redacted at the HTTP boundary.
+    """
+
+
 # Mode applied to a NEWLY created spec file (issue #583, Bolt 3, SR-3A2-6).
 # A workflow spec is ordinary user-authored source, so a CAO-written file should be
 # indistinguishable from a hand-written one. This constant is required rather than
@@ -167,7 +187,7 @@ def _safe_spec_path(path: Union[str, Path], base_dir: Optional[str] = None) -> s
     candidate = user_path if os.path.isabs(user_path) else os.path.join(safe_base, user_path)
     real_path = os.path.realpath(os.path.abspath(candidate))
     if real_path != safe_base and not real_path.startswith(safe_base + os.sep):
-        raise ValueError(f"workflow spec path '{path}' escapes its validated directory")
+        raise SpecPathRefusedError(f"workflow spec path '{path}' escapes its validated directory")
     return real_path
 
 
@@ -228,7 +248,7 @@ def _read_contained_spec_bytes(
     # SafeAccessCheck — single positive containment guard, colocated with the
     # open() sink below (a spec FILE is always strictly UNDER its base dir).
     if not real_path.startswith(safe_base + os.sep):
-        raise ValueError(f"workflow spec path '{path}' escapes its validated directory")
+        raise SpecPathRefusedError(f"workflow spec path '{path}' escapes its validated directory")
     if not os.path.isfile(real_path):
         raise FileNotFoundError(f"workflow spec not found: {path}")
     with open(real_path, "rb") as fh:
@@ -253,7 +273,7 @@ def _contained_spec_file(path: Union[str, Path], base_dir: Optional[str] = None)
     # not treat as a barrier. A candidate that resolves exactly to the base dir
     # is not a spec file, so rejecting it here is the right behavior anyway.
     if not real_path.startswith(safe_base + os.sep):
-        raise ValueError(f"workflow spec path '{path}' escapes its validated directory")
+        raise SpecPathRefusedError(f"workflow spec path '{path}' escapes its validated directory")
     return real_path if os.path.isfile(real_path) else None
 
 
@@ -349,12 +369,14 @@ def _write_contained_spec_bytes(
     # (1) SafeAccessCheck — single positive containment guard, colocated with every
     # sink below. A spec FILE is always strictly UNDER its base dir.
     if not real_path.startswith(safe_base + os.sep):
-        raise ValueError(f"workflow spec path '{path}' escapes its validated directory")
+        raise SpecPathRefusedError(f"workflow spec path '{path}' escapes its validated directory")
 
     # (2) Symlink check on the CALLER's original path, after containment and before
     # any sink. Checking real_path would miss a symlink realpath already collapsed.
     if os.path.islink(user_path):
-        raise ValueError(f"workflow spec path '{path}' is a symlink; refusing to write through it")
+        raise SpecPathRefusedError(
+            f"workflow spec path '{path}' is a symlink; refusing to write through it"
+        )
 
     # (3) Bound the payload before anything touches the filesystem.
     if len(data) > WORKFLOW_MAX_SPEC_BYTES:
@@ -1092,13 +1114,13 @@ def update_workflow(
 
     Raises:
         ValueError: invalid name, unwritable tier, lint errors, or malformed ``INPUTS``.
-        FileNotFoundError: no spec with that name exists.
+        WorkflowNotFoundError: no spec with that name existed at update admission.
         TierCollisionError: a same-stem sibling exists in the other tier.
         StaleSpecError: the spec changed on disk since ``expected_hash`` was read.
     """
     safe_base, target_path = _validate_write_target(name, scan_dir)
     if not os.path.exists(target_path):
-        raise FileNotFoundError(f"workflow '{name}' does not exist; use create to add it")
+        raise WorkflowNotFoundError(f"workflow '{name}' does not exist; use create to add it")
     _check_tier_collision(name, safe_base)
 
     # Placed AFTER existence and collision (each has a clearer error of its own) and

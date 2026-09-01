@@ -161,8 +161,9 @@ def test_create_refuses_an_existing_spec_and_leaves_it_byte_identical(
 def test_update_refuses_a_missing_spec_and_creates_nothing(tmp_path: Path) -> None:
     # Any hash will do: the existence check precedes the stale-hash comparison
     # (BR-3A4-6), so a missing spec is a FileNotFoundError and never a StaleSpecError.
-    with pytest.raises(FileNotFoundError, match="does not exist"):
+    with pytest.raises(FileNotFoundError, match="does not exist") as excinfo:
         svc.update_workflow("absent", GOOD, "0" * 64, scan_dir=str(tmp_path))
+    assert type(excinfo.value).__name__ == "WorkflowNotFoundError"
     assert _entries(tmp_path) == []
 
 
