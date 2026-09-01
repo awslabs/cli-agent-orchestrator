@@ -365,7 +365,13 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
   useEffect(() => {
     setFindings([])
     setSaveError(null)
-    setPreviewError(null)
+    // previewError DOUBLES as the template-schema load error. Clearing it
+    // while a template is selected and its schema is still missing would
+    // strand template mode on the loading spinner with no in-flight request
+    // and no visible reason -- the same defect class as the scratch-mode
+    // schema spinner. Only render-validation errors are cleared.
+    if (!(template && !templateSchema)) setPreviewError(null)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode])
 
   // Template selection loads that template's schema and resets its config.

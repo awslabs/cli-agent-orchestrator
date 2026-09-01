@@ -723,3 +723,35 @@ describe('ProfileCreateModal — round-3 review fixes (#692)', () => {
     expect(screen.getByRole('textbox', { name: 'Profile name' }).className).not.toContain('border-red-500')
   })
 })
+
+describe('mode round-trip must not strand template mode (adversarial probe)', () => {
+  beforeEach(() => vi.useFakeTimers())
+  afterEach(() => vi.useRealTimers())
+
+  it('a failed template-schema load survives a scratch round-trip: error stays visible, no permanent spinner', async () => {
+    // previewError doubles as the template-schema load error. If the
+    // mode-switch clear wipes it while templateSchema is still null, the
+    // render condition (template && !templateSchema && !previewError) falls
+    // back to the loading spinner FOREVER -- the same defect class as the
+    // scratch-mode schema spinner fixed this round.
+    vi.stubGlobal('fetch', routedFetch({
+      'aws/sqs-monitor/schema': () => errJson(500, 'template schema exploded'),
+    }))
+    render(<ProfileCreateModal open={true} onClose={() => {}} onCreated={() => {}} />)
+    await act(async () => {})
+    await pickOption('Template', 'aws/sqs-monitor')
+    await act(async () => {})
+    expect(screen.getByText(/template schema exploded/)).toBeInTheDocument()
+
+    // Round-trip through From scratch and back
+    fireEvent.click(screen.getByRole('tab', { name: 'From scratch' }))
+    await act(async () => {})
+    fireEvent.click(screen.getByRole('tab', { name: 'From template' }))
+    await act(async () => {})
+
+    // The load error must still be visible; a spinner with no in-flight
+    // request would be unrecoverable without closing the modal.
+    expect(screen.getByText(/template schema exploded/)).toBeInTheDocument()
+    expect(screen.queryByTestId('template-schema-loading')).not.toBeInTheDocument()
+  })
+})
