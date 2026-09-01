@@ -118,7 +118,11 @@ export function CustomSelect({ value, onChange, options, placeholder = 'Select..
       {open && createPortal(
         <div
           ref={menuRef}
-          role="listbox"
+          // Deliberately role-less (matching the pre-portal behaviour): a
+          // role="listbox" whose children are plain buttons announces a list
+          // box with zero items to assistive technology (#692 review). The
+          // complete combobox/option pattern changes the trigger's role for
+          // every consumer and is deferred to a dedicated follow-up.
           data-testid="custom-select-menu"
           style={{ position: 'fixed', left: pos.left, width: pos.width, top: pos.top, bottom: pos.bottom, maxHeight: MENU_MAX_H }}
           className="z-[80] bg-gray-900 border border-gray-700 rounded-lg shadow-xl shadow-black/30 overflow-y-auto"

@@ -715,7 +715,12 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
                         name={k}
                         schema={scratchProps[k]}
                         required={scratchRequired.has(k)}
-                        value={scratchValues[k]}
+                        // Same object-aware expression as the ADVANCED site:
+                        // object drafts live in jsonDrafts, and reading
+                        // scratchValues here would render a blank textarea
+                        // that still saves its JSON the moment an object-typed
+                        // field becomes primary (latent, #692 review).
+                        value={scratchProps[k].type === 'object' ? (jsonDrafts[k] ?? '') : scratchValues[k]}
                         jsonErrors={jsonErrors}
                         hasError={errorFields.has(k)}
                         {...fieldOverrides(k)}
