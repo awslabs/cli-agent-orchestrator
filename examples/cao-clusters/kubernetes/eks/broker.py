@@ -37,6 +37,7 @@ import secrets
 import threading
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import requests
@@ -64,10 +65,12 @@ BROKER_TOKEN = os.environ["CAO_ELASTIC_BROKER_TOKEN"]
 WORKSPACE_ROOT = os.environ.get("CAO_ELASTIC_WORKSPACE_ROOT", "/home/cao/workspace/jobs")
 PROJECT_ID = os.environ.get("CAO_ELASTIC_PROJECT_ID", "cao-cluster")
 WORKER_SERVICE_ACCOUNT = os.environ.get("CAO_ELASTIC_WORKER_SERVICE_ACCOUNT", "cao-elastic-worker")
-# Outer bound enforced by Kubernetes itself, as a backstop for a broker that
-# dies before it can reap. Set as activeDeadlineSeconds on the worker POD rather
-# than on a Job, which is where it used to live; the effect is the same kill, and
-# the reaper's replacement check turns the killed pod into a settled lease.
+# Outer bound on a worker's life, as a backstop for a broker that forgot it.
+# This used to be activeDeadlineSeconds on the worker's Job; a Deployment cannot
+# carry it at all (see the pod spec), so it is now enforced by
+# _sweep_orphan_workers, which deletes worker workloads this broker holds no live
+# lease for once they are older than this. Same number, same effect, one
+# REAPER_INTERVAL of slack.
 WORKER_TIMEOUT = int(os.environ.get("CAO_ELASTIC_WORKER_TIMEOUT", "3600"))
 READY_TIMEOUT = int(os.environ.get("CAO_ELASTIC_READY_TIMEOUT", "300"))
 # Does POST /workers block until the worker pod reports Ready?
@@ -387,11 +390,14 @@ def _worker_deployment(
         # check in _reap_once, which releases the lease, because the pod that
         # comes back has lost the agent and (on a replacement pod) its emptyDir.
         restart_policy="Always",
-        # The one Job property with no equivalent elsewhere: an outer bound that
-        # holds even if the broker is not running to reap. On a pod spec it still
-        # fires, and the ReplicaSet then makes a replacement - which the reaper
-        # settles as terminated, so the pair is still a cap rather than a loop.
-        active_deadline_seconds=WORKER_TIMEOUT,
+        # NO activeDeadlineSeconds here. It is the one Job property with no
+        # equivalent on a Deployment, and not merely in the sense of being
+        # ineffective: Kubernetes REFUSES the Deployment outright, with
+        # `spec.template.spec.activeDeadlineSeconds: Forbidden:
+        # activeDeadlineSeconds in ReplicaSet is not Supported` (422). Setting it
+        # does not weaken the cap, it stops every worker from being created. What
+        # the field bought is now _sweep_orphan_workers; see there for why age
+        # rather than existence is the trigger.
         # Pod Identity injects its own projected token volume via the webhook,
         # so the default SA mount stays off: nothing in a worker should be able
         # to talk to the API server.
@@ -684,6 +690,70 @@ def _release_and_settle(worker_id: str, state: str, reason: Optional[str] = None
         log.warning("release of worker %s failed: %s", worker_id, exc)
 
 
+def _sweep_orphan_workers() -> None:
+    """Delete worker workloads this broker holds no live lease for.
+
+    This is what replaced `activeDeadlineSeconds`, and the replacement was forced
+    rather than chosen: a Deployment's pod template may not carry that field, so
+    the Kubernetes-side cap that used to hold when the broker was not reaping had
+    to move into the broker. Which sounds circular, and is not quite: what breaks
+    a lease is not the process dying, it is the process forgetting.
+
+    Leases live in this process's memory. A broker restart therefore forgets every
+    one of them, and the ordinary reaper walks `_leases` -- so a worker minted by
+    the previous incarnation can never be settled by the next one, no matter how
+    long it runs. Under Jobs those orphans died on the Kubernetes deadline about an
+    hour later. Nothing else would collect them: their Service is ClusterIP, their
+    pod is Ready, and the supervisor terminal holding the release token is gone
+    too.
+
+    **Age, not absence of a lease, is the trigger.** A broker that restarts while
+    five workers are mid-task must not kill five running tasks -- under Jobs it
+    did not, and a task that finishes can still reach `/complete`. So an orphan
+    gets the same WORKER_TIMEOUT it always had, measured from pod creation, and
+    only then is it swept.
+
+    A worker with a LIVE lease is never touched here: the reaper owns those, with
+    reasons this function cannot supply. A worker whose lease has already settled
+    is fair game, because settling calls `_release` -- so if the workload is still
+    standing, that release failed, and this is the retry.
+    """
+    try:
+        pods = core_api.list_namespaced_pod(
+            NAMESPACE,
+            label_selector="app.kubernetes.io/name=cao-elastic-worker",
+        ).items
+    except ApiException as exc:  # pragma: no cover - transient API errors
+        log.warning("orphan sweep could not list worker pods: %s", exc)
+        return
+
+    now = datetime.now(timezone.utc)
+    for pod in pods:
+        meta = pod.metadata
+        worker_id = (meta.labels or {}).get("cao.aws/worker-id") if meta else None
+        if not worker_id:
+            continue
+        with _leases_lock:
+            lease = _leases.get(worker_id)
+            if lease is not None and lease["state"] in _LIVE_LEASE_STATES:
+                continue
+        created = meta.creation_timestamp if meta else None
+        if created is None:
+            continue
+        age = (now - created).total_seconds()
+        if age <= WORKER_TIMEOUT:
+            continue
+        log.warning(
+            "orphan sweep: worker %s has no live lease and is %ss old, deleting",
+            worker_id,
+            int(age),
+        )
+        try:
+            _release(worker_id)
+        except Exception as exc:  # pragma: no cover - sweep must not kill the reaper
+            log.warning("orphan sweep could not delete worker %s: %s", worker_id, exc)
+
+
 def _reap_once() -> None:
     """Release leases that will never be completed, and say why.
 
@@ -701,7 +771,7 @@ def _reap_once() -> None:
       keeps the deadline and gives up only exactness about when it is noticed.
     - `expired`: the pod is still Ready but /complete never arrived within
       COMPLETION_TIMEOUT. Without this the pod squats a whole node's worth of
-      memory until activeDeadlineSeconds, an hour later.
+      memory until the orphan sweep collects it, an hour later.
 
     The restart case is the one thing the Deployment made the reaper responsible
     for. Under a Job, `restartPolicy: Never` and `backoffLimit: 0` meant a worker
@@ -846,6 +916,10 @@ def _reap_once() -> None:
                 f"no completion within {COMPLETION_TIMEOUT}s",
             )
             log.warning("worker %s: lease expired after %ss, released", worker_id, int(age))
+
+    # Last, and outside the per-lease loop: this one walks the CLUSTER rather than
+    # the ledger, which is the only way to see a worker the ledger has forgotten.
+    _sweep_orphan_workers()
 
 
 def _reaper() -> None:  # pragma: no cover - background loop

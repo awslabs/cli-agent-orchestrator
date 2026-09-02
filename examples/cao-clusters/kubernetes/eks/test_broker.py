@@ -23,6 +23,7 @@ import os
 import sys
 import time
 import types
+from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock, patch
 
 os.environ.update({
@@ -79,6 +80,10 @@ def _fake_pod(name, labels):
             name=f"{name}-{STATE['pod_seq']:05d}",
             uid=f"pod-uid-{STATE['pod_seq']}",
             labels=dict(labels),
+            # The orphan sweep reads this, and a real pod always has it. Now, so
+            # every pod these tests create is age 0 and no sweep fires behind the
+            # lease-state sections; the sweep's own section backdates it.
+            creation_timestamp=datetime.now(timezone.utc),
         ),
         status=k8s.V1PodStatus(
             phase=STATE["new_pods_phase"],
@@ -116,8 +121,19 @@ class FakeCore:
         STATE["services"].pop(name, None)
 
     def list_namespaced_pod(self, ns, label_selector=None):
-        wid = label_selector.split("=", 1)[1]
-        pod = STATE["pods"].get(wid)
+        # Two selectors reach here, and they mean different things. The reaper asks
+        # by worker id; the orphan sweep asks by app name, because the whole point
+        # of it is to find workers whose ids the broker no longer knows.
+        key, value = label_selector.split("=", 1)
+        if key == "app.kubernetes.io/name":
+            return types.SimpleNamespace(
+                items=[
+                    pod
+                    for pod in STATE["pods"].values()
+                    if (pod.metadata.labels or {}).get(key) == value
+                ]
+            )
+        pod = STATE["pods"].get(value)
         return types.SimpleNamespace(items=[pod] if pod else [])
 
     def read_namespaced_pod_log(self, name, ns, tail_lines=None, **kwargs):
@@ -180,10 +196,14 @@ check("update strategy is Recreate", wire["spec"]["strategy"]["type"] == "Recrea
       json.dumps(wire["spec"].get("strategy")))
 check("restartPolicy is Always, the only value a Deployment accepts",
       spec["restartPolicy"] == "Always", spec.get("restartPolicy"))
-# The one Job property that had no home elsewhere: an outer bound that still
-# holds when the broker is not running to reap.
-check("activeDeadlineSeconds moved onto the pod",
-      spec["activeDeadlineSeconds"] == broker.WORKER_TIMEOUT,
+# The one Job property with no home on a Deployment at all. Setting it does not
+# merely fail to work: the API server refuses the Deployment with
+# `activeDeadlineSeconds in ReplicaSet is not Supported` (422), so a worker
+# carrying it cannot be created. Found on a live cluster, because the fake
+# apps_api below accepts any body -- which is exactly why this assertion is
+# phrased as an absence and pinned here.
+check("no activeDeadlineSeconds on the pod (a ReplicaSet template forbids it)",
+      "activeDeadlineSeconds" not in spec,
       str(spec.get("activeDeadlineSeconds")))
 check("no Job-only fields survive",
       not any(k in wire["spec"] for k in ("backoffLimit", "ttlSecondsAfterFinished")),
@@ -820,6 +840,71 @@ _probe = subprocess.run(
 check("broker refuses to start with a passthrough var unset",
       _probe.returncode != 0 and "ANTHROPIC_DEFAULT_HAIKU_MODEL" in _probe.stderr,
       (_probe.stderr or _probe.stdout)[-300:])
+
+# --- 11. the orphan sweep, which replaced activeDeadlineSeconds -----------
+#
+# The case it exists for cannot be reached through the API: leases live in the
+# broker's memory, so an orphan is a worker whose lease this process never had.
+# That is what a broker restart leaves behind, and it is why the sweep queries
+# the cluster by app label instead of walking `_leases`.
+STATE["deleted_deployments"].clear()
+STATE["deleted_svcs"].clear()
+
+
+def _plant_worker(worker_id, age_seconds):
+    """A worker workload with no lease, as a restarted broker would find it."""
+    name = f"cao-worker-{worker_id}"
+    STATE["deployments"][name] = types.SimpleNamespace(
+        metadata=types.SimpleNamespace(name=name)
+    )
+    pod = _fake_pod(name, broker._labels(worker_id))
+    pod.metadata.creation_timestamp = datetime.now(timezone.utc) - timedelta(
+        seconds=age_seconds
+    )
+    STATE["pods"][worker_id] = pod
+
+
+with patch.object(broker, "_update_fleet_config"):
+    # Old enough: this is the pod activeDeadlineSeconds used to kill.
+    _plant_worker("aaaaaaaa", broker.WORKER_TIMEOUT + 60)
+    # Not old enough. A broker that restarts mid-task must not kill the task -
+    # under Jobs it did not, and the worker could still call /complete.
+    _plant_worker("bbbbbbbb", broker.WORKER_TIMEOUT - 60)
+    broker._sweep_orphan_workers()
+
+check("orphan sweep deletes a leaseless worker past WORKER_TIMEOUT",
+      "cao-worker-aaaaaaaa" in STATE["deleted_deployments"],
+      json.dumps(STATE["deleted_deployments"]))
+check("orphan sweep takes the worker's Service with it",
+      "cao-worker-aaaaaaaa" in STATE["deleted_svcs"],
+      json.dumps(STATE["deleted_svcs"]))
+check("orphan sweep spares a leaseless worker inside WORKER_TIMEOUT",
+      "cao-worker-bbbbbbbb" not in STATE["deleted_deployments"],
+      json.dumps(STATE["deleted_deployments"]))
+
+# The assertion that stops the sweep being a fleet-wide kill switch. A worker with
+# a LIVE lease belongs to the reaper, which can say WHY it released it; the sweep
+# can only delete. Age alone must never be enough.
+STATE["deleted_deployments"].clear()
+with patch.object(broker, "_update_fleet_config"):
+    _plant_worker("cccccccc", broker.WORKER_TIMEOUT * 10)
+    with broker._leases_lock:
+        broker._leases["cccccccc"] = {
+            "state": "leased",
+            "reason": None,
+            "leased_at": time.monotonic(),
+            "settled_at": None,
+            "ready_at": time.monotonic(),
+            "pod_observed_at": time.monotonic(),
+            "pod_uid": None,
+            "agent_profile": "developer",
+            "provider": "claude_code",
+            "release_token": "rt",
+        }
+    broker._sweep_orphan_workers()
+check("orphan sweep never touches a worker with a live lease, at any age",
+      "cao-worker-cccccccc" not in STATE["deleted_deployments"],
+      json.dumps(STATE["deleted_deployments"]))
 
 print()
 print("FAILURES:", FAILS if FAILS else "none")

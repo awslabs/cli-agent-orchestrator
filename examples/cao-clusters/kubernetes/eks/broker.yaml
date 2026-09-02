@@ -17,9 +17,9 @@ metadata:
 spec:
   # MUST stay 1, and the strategy MUST be Recreate. The lease ledger lives in
   # the broker's memory, so a second replica would reap only the leases it
-  # happened to create and leave the others to sit until the worker pod's own
-  # activeDeadlineSeconds an hour later. That deadline is the backstop for a
-  # broker restart; it is not a substitute for a single reaper.
+  # happened to create and leave the others to the orphan sweep an hour later.
+  # That sweep is the backstop for a broker restart; it is not a substitute for a
+  # single reaper, because it can only delete a worker, never say why.
   replicas: 1
   strategy:
     type: Recreate
