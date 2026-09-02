@@ -163,6 +163,46 @@ def set_disabled_agent_dirs(dirs: List[str]) -> List[str]:
     return cleaned
 
 
+# Longest label accepted for a session alias. Long enough for a sentence-style
+# run name, short enough to stay on one line in any listing.
+SESSION_LABEL_MAX_LENGTH = 60
+
+
+def get_session_labels() -> Dict[str, str]:
+    """Operator-assigned friendly names for sessions (session_name -> label)."""
+    settings = _load()
+    labels = settings.get("session_labels", {})
+    return labels if isinstance(labels, dict) else {}
+
+
+def set_session_label(session_name: str, label: str) -> Dict[str, str]:
+    """Set, or clear with an empty/blank label, a session's friendly name.
+
+    Stored separately from the tmux session name so nothing that references
+    the real name (terminals, DB rows, the backend) is disturbed: a pure
+    display alias. Whitespace is trimmed and the label is capped at
+    ``SESSION_LABEL_MAX_LENGTH``. Returns the full label map after the update.
+    """
+    settings = _load()
+    labels = settings.get("session_labels", {})
+    if not isinstance(labels, dict):
+        labels = {}
+    clean = label.strip()[:SESSION_LABEL_MAX_LENGTH]
+    if clean:
+        if labels.get(session_name) == clean:
+            return labels
+        labels[session_name] = clean
+    elif session_name in labels:
+        del labels[session_name]
+    else:
+        # Nothing to clear: do not rewrite settings.json for a no-op. Session
+        # teardown clears unconditionally, so this is the common case.
+        return labels
+    settings["session_labels"] = labels
+    _save(settings)
+    return labels
+
+
 # Default server tuning values
 _SERVER_DEFAULTS = {
     "mcp_request_timeout": 30,

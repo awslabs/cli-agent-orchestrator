@@ -174,6 +174,7 @@ from cli_agent_orchestrator.services.worktree_service import WorktreeError
 from cli_agent_orchestrator.telemetry import init_telemetry, shutdown_telemetry
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
 from cli_agent_orchestrator.utils.logging import install_access_log_redaction, setup_logging
+from cli_agent_orchestrator.utils.paths import normalize_working_directory
 from cli_agent_orchestrator.utils.skills import (
     SkillNameError,
     load_skill_content,
@@ -1485,6 +1486,24 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def add_server_time_header(request: Request, call_next):
+    """Stamp every response with the server's wall clock as ``X-Server-Time``.
+
+    Browser clients render relative times ("2 minutes ago") from server
+    timestamps, and the two clocks are not the same clock: WSL2 hosts have been
+    observed hours adrift from the Windows browser next to them. One header on
+    every response lets a client measure the skew once and correct for it.
+    Offset-aware ISO-8601 so a browser in a different timezone parses it
+    unambiguously (a naive string is read as browser-local time, which is the
+    skew this header exists to remove). Purely informational; clients that
+    ignore it are unaffected.
+    """
+    response = await call_next(request)
+    response.headers["X-Server-Time"] = datetime.now().astimezone().isoformat()
+    return response
+
+
 @app.exception_handler(RequestValidationError)
 async def _redact_env_vars_validation_error(
     request: Request, exc: RequestValidationError
@@ -2745,6 +2764,55 @@ async def get_agent_dirs_endpoint(
     }
 
 
+@app.get("/fs/dirs")
+async def list_directories(
+    path: Optional[str] = None,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """List the subdirectories of one server-side folder, for a folder picker.
+
+    Directory names only: never file names, sizes, or contents. Accepts the
+    same operator-typed spellings ``POST /sessions`` accepts for
+    ``working_directory`` (``~``, quoted, Windows drive paths translated to the
+    WSL mount) but never creates anything. Defaults to the server user's home.
+    Hidden folders are listed after the visible ones rather than dropped,
+    because provider homes (``~/.kiro``, ``~/.aws``) are exactly what an
+    operator browsing for a profile directory is after.
+
+    Read-scope gated when auth is enabled, like ``GET /settings/agent-dirs``:
+    the response discloses local filesystem layout. It discloses nothing a
+    caller could not already probe through ``working_directory`` on session
+    creation, and it is confined to the same localhost-only posture as the
+    rest of the API.
+    """
+    try:
+        if path:
+            resolved = Path(normalize_working_directory(path, create_missing=False) or "")
+        else:
+            resolved = Path.home()
+        resolved = resolved.resolve()
+        if not resolved.is_dir():
+            raise ValueError(f"Not a folder: {resolved}")
+        visible: List[str] = []
+        hidden: List[str] = []
+        for entry in sorted(resolved.iterdir(), key=lambda e: e.name.lower()):
+            try:
+                if not entry.is_dir():
+                    continue
+            except OSError:
+                continue  # unreadable entry (dangling symlink, EACCES): skip, not fail
+            (hidden if entry.name.startswith(".") else visible).append(entry.name)
+        parent = str(resolved.parent) if resolved.parent != resolved else None
+        return {"path": str(resolved), "parent": parent, "dirs": visible + hidden}
+    except PermissionError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No permission to read that folder",
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
 class AgentDirsUpdate(BaseModel):
     agent_dirs: Optional[Dict[str, str]] = None
     extra_dirs: Optional[List[str]] = None
@@ -2935,6 +3003,10 @@ async def create_session(
     # values fail Pydantic body parsing and FastAPI returns 422 automatically,
     # before this function body ever runs.
     try:
+        # Accept the spellings an operator actually types into a browser field
+        # (``~``, Explorer-quoted, Windows drive paths on WSL) and reject an
+        # unusable one as a clear 400 here, instead of a 500 deep in tmux.
+        working_directory = normalize_working_directory(working_directory)
         if session_name is not None:
             # terminal_service.create_terminal prepends SESSION_PREFIX
             # ("cao-") if missing, so an API caller's 64-char valid name
@@ -3074,6 +3146,34 @@ async def list_sessions(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to list sessions: {str(e)}",
         )
+
+
+class SessionLabelUpdate(BaseModel):
+    label: str = Field(..., max_length=1024)
+
+
+@app.post("/sessions/{session_name}/label")
+async def set_session_label_endpoint(
+    session_name: str,
+    body: SessionLabelUpdate,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Set, or clear with an empty string, a friendly display name for a session.
+
+    Stored separately from the tmux session name so nothing that references
+    the real name (terminals, DB rows, the backend) is disturbed: a pure
+    display alias, surfaced as ``label`` on ``GET /sessions`` and
+    ``GET /sessions/{name}``. Trimmed and capped server-side; the response
+    carries the label as stored (``None`` once cleared).
+    """
+    try:
+        validate_tmux_name(session_name, "session_name")
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    from cli_agent_orchestrator.services.settings_service import set_session_label
+
+    labels = set_session_label(session_name, body.label)
+    return {"session_name": session_name, "label": labels.get(session_name)}
 
 
 @app.get("/sessions/{session_name}")
@@ -3223,6 +3323,12 @@ async def create_terminal_in_session(
             resolved_provider = resolve_provider(agent_profile, fallback_provider="kiro_cli")
         else:
             resolved_provider = provider
+
+        # Same operator-typed spellings POST /sessions accepts (see there).
+        try:
+            working_directory = normalize_working_directory(working_directory)
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
         # Parse comma-separated allowed_tools string into list
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None

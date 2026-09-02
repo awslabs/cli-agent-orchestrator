@@ -587,3 +587,53 @@ class TestWorkflowJournalSettingsWritePath:
         rather than being silently persisted as an unread setting."""
         with pytest.raises(ValueError, match="Unknown memory setting"):
             settings_service.set_memory_setting("workflow_journal_retention_dayz", 30)
+
+
+class TestSessionLabels:
+    """Per-session display aliases: trimmed, capped, cleared by a blank label."""
+
+    def test_empty_when_unset(self, settings_file):
+        assert settings_service.get_session_labels() == {}
+
+    def test_set_trims_and_persists(self, settings_file):
+        labels = settings_service.set_session_label("cao-demo", "  Nightly triage  ")
+        assert labels == {"cao-demo": "Nightly triage"}
+        assert settings_service.get_session_labels() == {"cao-demo": "Nightly triage"}
+        assert json.loads(settings_file.read_text())["session_labels"] == {
+            "cao-demo": "Nightly triage"
+        }
+
+    def test_blank_label_clears(self, settings_file):
+        settings_service.set_session_label("cao-demo", "x")
+        assert settings_service.set_session_label("cao-demo", "   ") == {}
+        assert settings_service.get_session_labels() == {}
+
+    def test_clearing_an_unknown_session_is_a_no_op(self, settings_file):
+        assert settings_service.set_session_label("cao-nope", "") == {}
+        # ...including on disk: teardown clears unconditionally, and that must
+        # not rewrite settings.json on every session delete.
+        assert not settings_file.exists()
+
+    def test_resetting_the_same_label_does_not_rewrite(self, settings_file):
+        settings_service.set_session_label("cao-demo", "Run")
+        before = settings_file.stat().st_mtime_ns
+        settings_file.write_text(settings_file.read_text())  # any rewrite would be visible
+        settings_service.set_session_label("cao-demo", "Run")
+        assert json.loads(settings_file.read_text())["session_labels"] == {"cao-demo": "Run"}
+
+    def test_label_is_capped(self, settings_file):
+        long = "x" * (settings_service.SESSION_LABEL_MAX_LENGTH + 20)
+        labels = settings_service.set_session_label("cao-demo", long)
+        assert len(labels["cao-demo"]) == settings_service.SESSION_LABEL_MAX_LENGTH
+
+    def test_other_settings_survive(self, settings_file):
+        settings_file.write_text(json.dumps({"agent_dirs": {"kiro_cli": "/x"}}))
+        settings_service.set_session_label("cao-demo", "Run")
+        data = json.loads(settings_file.read_text())
+        assert data["agent_dirs"] == {"kiro_cli": "/x"}
+        assert data["session_labels"] == {"cao-demo": "Run"}
+
+    def test_corrupt_labels_value_is_treated_as_empty(self, settings_file):
+        settings_file.write_text(json.dumps({"session_labels": ["not", "a", "dict"]}))
+        assert settings_service.get_session_labels() == {}
+        assert settings_service.set_session_label("cao-demo", "Run") == {"cao-demo": "Run"}
