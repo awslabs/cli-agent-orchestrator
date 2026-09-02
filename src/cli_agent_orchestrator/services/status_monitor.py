@@ -274,9 +274,7 @@ class StatusMonitor:
             )
             logger.info(f"Terminal {terminal_id} status changed: {detected.value}")
 
-    def _apply_detection_locked(
-        self, terminal_id: str, detected: TerminalStatus
-    ) -> Optional[int]:
+    def _apply_detection_locked(self, terminal_id: str, detected: TerminalStatus) -> Optional[int]:
         """Sticky-latch core of _apply_detection. Caller MUST hold self._lock.
 
         Split out so callers that need to validate a precondition and apply in
