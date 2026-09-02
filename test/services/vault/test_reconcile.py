@@ -254,6 +254,26 @@ def test_rename_plus_edit_reports_without_guessing_identity(tmp_path, monkeypatc
     )
 
 
+def test_rename_plus_edit_dry_run_reports_without_writing_state(tmp_path, monkeypatch):
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    old_path = tmp_path / "vault" / "Mapped" / "Old.md"
+    old_path.write_text("original", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="edit-preview-before")
+    old_path.rename(old_path.with_name("New.md"))
+    (tmp_path / "vault" / "Mapped" / "New.md").write_text("edited", encoding="utf-8")
+
+    report = reconcile(vault, apply=False, run_id="edit-preview")
+
+    with Session() as db:
+        assert [note.vault_relpath for note in db.query(VaultNoteModel).all()] == ["Mapped/Old.md"]
+        assert db.query(VaultFindingModel).count() == 0
+    assert report.findings == 1
+    assert report.deleted == 0
+
+
 def test_rename_plus_edit_removes_former_source_edges_through_service(tmp_path, monkeypatch):
     from cli_agent_orchestrator.services.vault import reconcile as module
 
@@ -292,6 +312,31 @@ def test_duplicate_content_rename_reports_ambiguity_without_guessing(tmp_path, m
     with Session() as db:
         finding = db.query(VaultFindingModel).filter_by(code="rename_ambiguous").one()
     assert finding.detail == "count=1; code=rename_ambiguous; detail=rename_ambiguous"
+
+
+def test_duplicate_content_rename_dry_run_reports_without_writing_state(tmp_path, monkeypatch):
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    mapped = tmp_path / "vault" / "Mapped"
+    (mapped / "One.md").write_text("same", encoding="utf-8")
+    (mapped / "Two.md").write_text("same", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="ambiguous-preview-before")
+    (mapped / "One.md").unlink()
+    (mapped / "Two.md").unlink()
+    (mapped / "New.md").write_text("same", encoding="utf-8")
+
+    report = reconcile(vault, apply=False, run_id="ambiguous-preview")
+
+    with Session() as db:
+        assert sorted(note.vault_relpath for note in db.query(VaultNoteModel).all()) == [
+            "Mapped/One.md",
+            "Mapped/Two.md",
+        ]
+        assert db.query(VaultFindingModel).count() == 0
+    assert report.findings == 1
+    assert report.deleted == 0
 
 
 def test_indexed_note_retracts_and_reindexes_metadata_and_edges(tmp_path, monkeypatch):

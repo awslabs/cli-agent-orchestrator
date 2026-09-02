@@ -1,5 +1,6 @@
 import os
 from test.services.vault.test_scan_exclusions import _vault
+from types import SimpleNamespace
 
 import pytest
 
@@ -25,16 +26,26 @@ def test_same_size_mutation_between_read_stats_is_skipped(tmp_path, monkeypatch)
 
     original_fstat = scan.os.fstat
     calls = 0
+    before_stat = None
 
     def mutate(fd: int):
-        nonlocal calls
+        nonlocal before_stat, calls
         calls += 1
         result = original_fstat(fd)
         if calls == 1:
+            before_stat = result
             original_mtime = target.stat().st_mtime_ns
             target.write_text("after!", encoding="utf-8")
             os.utime(target, ns=(original_mtime, original_mtime))
-        return result
+            return result
+        assert before_stat is not None
+        return SimpleNamespace(
+            st_dev=before_stat.st_dev,
+            st_ino=before_stat.st_ino,
+            st_size=before_stat.st_size,
+            st_mtime_ns=before_stat.st_mtime_ns,
+            st_ctime_ns=before_stat.st_ctime_ns + 1,
+        )
 
     monkeypatch.setattr(scan.os, "fstat", mutate)
     report = scan_vault(_vault(root))

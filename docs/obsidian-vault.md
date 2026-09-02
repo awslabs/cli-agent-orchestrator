@@ -141,6 +141,13 @@ entry and are capped at five across one context build. A recallable note can
 therefore be absent from an agent prompt because its mapping is not injectable,
 its scope is agent, or it lost a per-scope or related-entry budget decision.
 Vault status reports injection budget effects without recording note content.
+Before any vault-backed line is added to provider-bound automatic context, CAO
+unconditionally replaces credential-shaped substrings with named redaction
+markers. This also covers credentials added after the last reconciliation.
+Explicit recall remains verbatim, and the source note is never rewritten.
+Vault status exposes only content-free
+`injection_redaction.memories_redacted` and
+`injection_redaction.pattern_matches` counters.
 
 When a same-session memory curator is available, CAO may use its returned
 context block. Any curator failure, busy state, timeout, unavailable provider,
@@ -158,8 +165,10 @@ Each mapping has a `secret_gate`:
 
 Pattern matching is deliberately conservative. A note about credential
 handling can legitimately match a credential-shaped pattern; `warn` is the
-operator escape hatch for that case. CAO does not silently remove or redact
-the note.
+operator escape hatch for indexing and explicit recall in that case. CAO does
+not alter the note, but automatic provider-bound vault injection always
+redacts credential-shaped substrings, including on `warn` mappings configured
+with `inject: true`. That configuration remains visible as a status warning.
 
 For managed writes, the gate checks the authored body and CAO-generated
 `cao` metadata before publishing. Preserved user frontmatter is not scanned or
@@ -187,6 +196,11 @@ cao memory vault migrate --scope {global|project|agent} [--scope-id ID] [--apply
 `status` reports the derived vault projection and configuration warnings. Its
 `process_local_unmapped_project_writes` field is explicitly process-local; a
 fresh CLI process cannot present it as a durable count.
+
+For the meaning and outcome of every finding code, see the canonical
+[ADR-004 boundary table](issues/644-obsidian-vault-knowledge-source/adr-004-supported-markdown-boundary.md#the-boundary-table).
+For example, `invalid_cao_block` means that a note contains invalid `cao`
+metadata; the note is quarantined rather than coerced to a default.
 
 `scan` is read-only. `--dry-run` is accepted for review workflows, but scanning
 does not write files or derived rows with or without the flag.

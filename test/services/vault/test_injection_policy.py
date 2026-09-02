@@ -18,7 +18,10 @@ from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.clients.database import Base, MemoryMetadataModel, TerminalModel
 from cli_agent_orchestrator.models.memory import Memory
-from cli_agent_orchestrator.services.memory_service import MemoryService
+from cli_agent_orchestrator.services.memory_service import (
+    MemoryService,
+    _redact_injected_vault_content,
+)
 from cli_agent_orchestrator.services.vault.binding import (
     VaultBinding,
     collect_binding_warnings,
@@ -559,6 +562,163 @@ def test_identityless_server_projection_suppresses_ambient_terminal_identity(tmp
     assert result == []
     assert result.policy_arm == "no_terminal"
     assert result.exit_arm == "curator_agent_scope_refused"
+
+
+def test_distributed_context_without_terminal_id_suppresses_ambient_identity(tmp_path, monkeypatch):
+    """An omitted request identity cannot inherit the memory owner's pane identity."""
+    from test.services.vault.test_vault_injection_renderer import _injectable_renderer
+
+    from cli_agent_orchestrator.services import memory_service
+
+    service, Session, _vault_root, _config = _injectable_renderer(tmp_path, monkeypatch)
+    with Session() as db:
+        db.add(
+            TerminalModel(
+                id="ambient-manager",
+                tmux_session="policy",
+                tmux_window="manager",
+                provider="claude_code",
+                agent_profile="memory_manager",
+            )
+        )
+        db.commit()
+    monkeypatch.setenv("CAO_TERMINAL_ID", "ambient-manager")
+    real_resolve_policy = memory_service._resolve_injection_policy
+    resolutions = []
+
+    def record_policy(require_injectable, *, consumer, terminal_id):
+        policy = real_resolve_policy(
+            require_injectable,
+            consumer=consumer,
+            terminal_id=terminal_id,
+        )
+        resolutions.append((terminal_id, policy.arm))
+        return policy
+
+    monkeypatch.setattr(memory_service, "_resolve_injection_policy", record_policy)
+    context = dict(service._get_terminal_context("worker"))
+    context.pop("terminal_id")
+
+    block = service.get_memory_context(context)
+
+    assert "- [project] design: Design" in block
+    assert resolutions == [(NO_REQUESTER_IDENTITY, "no_terminal")]
+
+
+def test_automatic_vault_redactor_leaves_native_content_and_removes_secret_shapes():
+    """The provider-bound helper changes vault content only and returns safe pattern names."""
+    clean = SimpleNamespace(source_kind="native", content="password: hunter2sixteen")
+    access_key = "AKIA" + "1234567890ABCDEF"
+    secret = SimpleNamespace(
+        source_kind="vault",
+        content=f"password: hunter2sixteen {access_key}",
+    )
+
+    assert _redact_injected_vault_content(clean) == (clean.content, ())
+    redacted, patterns = _redact_injected_vault_content(secret)
+
+    assert "hunter2sixteen" not in redacted
+    assert access_key not in redacted
+    assert "[REDACTED:secret_assignment]" in redacted
+    assert "[REDACTED:aws_access_key]" in redacted
+    assert patterns == ("aws_access_key", "secret_assignment")
+
+
+def test_warn_mode_vault_secret_is_redacted_only_for_automatic_injection(tmp_path, monkeypatch):
+    """Warn mode keeps source fidelity while the provider payload is always redacted."""
+    from test.services.vault.test_vault_injection_renderer import (
+        _counter_values,
+        _injectable_renderer,
+    )
+
+    from cli_agent_orchestrator.services import settings_service
+    from cli_agent_orchestrator.services.vault.config import VaultConfig
+
+    service, _Session, vault_root, config = _injectable_renderer(tmp_path, monkeypatch)
+    mappings = [
+        (
+            mapping.model_copy(update={"secret_gate": "warn"})
+            if mapping.folder == "Projects/CAO Design"
+            else mapping
+        )
+        for mapping in config.vaults[0].mappings
+    ]
+    vault = config.vaults[0].model_copy(update={"mappings": mappings})
+    warn_config = VaultConfig(enabled=True, vaults=[vault])
+    monkeypatch.setattr(settings_service, "get_vault_config", lambda: warn_config)
+    secret_value = "hunter2sixteen"
+    note = vault_root / "Projects" / "CAO Design" / "Design.md"
+    note.write_text(
+        f"---\ncao:\n  key: design\n---\npassword: {secret_value}",
+        encoding="utf-8",
+    )
+    reconcile(
+        vault,
+        apply=True,
+        run_id="warn-redaction",
+        run_started_at=datetime(2025, 1, 2, tzinfo=timezone.utc),
+    )
+
+    block = service.get_memory_context_for_terminal("worker")
+
+    assert secret_value not in block
+    assert "[REDACTED:secret_assignment]" in block
+    assert _counter_values(_Session) == {
+        "injection_redaction.memories_redacted": 1,
+        "injection_redaction.pattern_matches": 1,
+    }
+    binding = resolve("project", "fixture-project", vault_config=warn_config)
+    assert isinstance(binding, VaultBinding)
+    candidate = resolve_candidates(
+        binding,
+        scope="project",
+        scope_id="fixture-project",
+        require_injectable=False,
+        terminal_id=NO_REQUESTER_IDENTITY,
+        consumer="explicit_recall",
+    )[0]
+    recalled = load_candidate(candidate, max_body_chars=4096, require_injectable=False)
+    assert recalled is not None
+    assert secret_value in recalled.content
+
+
+def test_post_reconcile_secret_drift_is_redacted_from_automatic_injection(tmp_path, monkeypatch):
+    """Read-time redaction also covers credentials introduced after indexing."""
+    from test.services.vault.test_vault_injection_renderer import (
+        _counter_values,
+        _injectable_renderer,
+    )
+
+    service, Session, vault_root, config = _injectable_renderer(tmp_path, monkeypatch)
+    secret_value = "drifted-secret"
+    note = vault_root / "Projects" / "CAO Design" / "Design.md"
+    note.write_text(
+        f"---\ncao:\n  key: design\n---\npassword: {secret_value}",
+        encoding="utf-8",
+    )
+
+    block = service.get_memory_context_for_terminal("worker")
+
+    assert secret_value not in block
+    assert "[REDACTED:secret_assignment]" in block
+    assert _counter_values(Session) == {
+        "injection_redaction.memories_redacted": 1,
+        "injection_redaction.pattern_matches": 1,
+    }
+    binding = resolve("project", "fixture-project", vault_config=config)
+    assert isinstance(binding, VaultBinding)
+    candidate = resolve_candidates(
+        binding,
+        scope="project",
+        scope_id="fixture-project",
+        require_injectable=False,
+        terminal_id=NO_REQUESTER_IDENTITY,
+        consumer="explicit_recall",
+    )[0]
+    recalled = load_candidate(candidate, max_body_chars=4096, require_injectable=False)
+    assert recalled is not None
+    assert recalled.index_freshness == "stale"
+    assert secret_value in recalled.content
 
 
 def test_curator_refuses_indexed_agent_mapping_before_it_reaches_worker_context(

@@ -26,9 +26,12 @@ from cli_agent_orchestrator.services.memory_format import (
     normalize_memory_tags,
     parse_index_entry,
 )
+from cli_agent_orchestrator.services.secret_gate import redact_secrets
 from cli_agent_orchestrator.services.vault.binding import VaultBinding
 from cli_agent_orchestrator.services.vault.reader import (
     MEMORY_MANAGER_PROFILE,
+    NO_REQUESTER_IDENTITY,
+    RequesterIdentity,
     VaultCandidate,
     VaultCandidateBatch,
     VaultInjectionPolicy,
@@ -50,6 +53,14 @@ VALID_SEARCH_MODES = ("metadata", "bm25", "hybrid")
 MEMORY_DISABLED_MESSAGE = (
     "memory subsystem is disabled. Set memory.enabled=true in settings.json " "to re-enable."
 )
+
+
+def _redact_injected_vault_content(memory: Memory) -> tuple[str, tuple[str, ...]]:
+    """Redact vault credentials only at the automatic provider-bound boundary."""
+    if getattr(memory, "source_kind", "native") != "vault":
+        return memory.content, ()
+    content, fired = redact_secrets(memory.content)
+    return content, tuple(fired)
 
 
 class MemoryDisabledError(RuntimeError):
@@ -2000,7 +2011,7 @@ class MemoryService:
         scope_id: Optional[str],
         *,
         require_injectable: bool,
-        terminal_id: Optional[str] = None,
+        terminal_id: RequesterIdentity = None,
         consumer: Literal["injected_context", "explicit_recall"],
         policy: Optional[VaultInjectionPolicy] = None,
     ) -> Optional[Memory]:
@@ -2698,7 +2709,7 @@ class MemoryService:
         bindings: list[VaultBinding],
         *,
         require_injectable: bool,
-        terminal_id: Optional[str] = None,
+        terminal_id: RequesterIdentity = None,
         consumer: Literal["injected_context", "explicit_recall"],
         policy: Optional[VaultInjectionPolicy] = None,
     ) -> VaultCandidateBatch:
@@ -3420,12 +3431,13 @@ class MemoryService:
         related_added_total = 0  # global per-build fanout cap
         # Read the requester identity out of the caller's context rather than a
         # parameter: this method is also the distributed entry point, where no
-        # terminal row exists locally. A context without one yields None, which
-        # is the fail-closed input `_resolve_injection_policy` expects — it must
-        # not fall back to the process's ambient CAO_TERMINAL_ID. Bound once so
-        # the policy decision and every candidate query below cannot disagree
-        # about who is asking.
+        # terminal row exists locally. An omitted identity must use the explicit
+        # sentinel so the resolver cannot inherit this process's ambient
+        # CAO_TERMINAL_ID. Bound once so the policy decision and every candidate
+        # query below cannot disagree about who is asking.
         requester_terminal_id = (terminal_context or {}).get("terminal_id")
+        if not requester_terminal_id:
+            requester_terminal_id = NO_REQUESTER_IDENTITY
         injection_policy = _resolve_injection_policy(
             True,
             consumer="injected_context",
@@ -3553,7 +3565,8 @@ class MemoryService:
             scope_used_chars = 0
             for position, mem in enumerate(scope_memories):
                 tag = " [related]" if getattr(mem, "is_related", False) else ""
-                line = f"- [{mem.scope}] {mem.key}{tag}: {mem.content}"
+                rendered_content, redacted_patterns = _redact_injected_vault_content(mem)
+                line = f"- [{mem.scope}] {mem.key}{tag}: {rendered_content}"
                 line_len = len(line) + 1
                 if scope_used_chars + line_len > scope_char_cap:
                     if getattr(mem, "is_related", False):
@@ -3573,6 +3586,8 @@ class MemoryService:
                     break
                 lines.append(line)
                 scope_used_chars += line_len
+                if redacted_patterns:
+                    self._record_vault_injection_redaction(mem, len(redacted_patterns))
 
         if not lines:
             return ""
@@ -3623,6 +3638,26 @@ class MemoryService:
             )
         except Exception as exc:  # noqa: BLE001 -- counters never block injection
             logger.debug("vault related injection skip counter skipped: %s", exc)
+
+    def _record_vault_injection_redaction(self, memory: Memory, matched_pattern_count: int) -> None:
+        """Record content-free redaction counts for a provider-bound vault line."""
+        if getattr(memory, "source_kind", "native") != "vault" or matched_pattern_count <= 0:
+            return
+        try:
+            from cli_agent_orchestrator.services.settings_service import get_vault_config
+            from cli_agent_orchestrator.services.vault.binding import VaultBinding, resolve
+
+            binding = resolve(memory.scope, memory.scope_id, vault_config=get_vault_config())
+            if not isinstance(binding, VaultBinding):
+                return
+            increment_counter(binding.vault_id, "injection_redaction.memories_redacted", 1)
+            increment_counter(
+                binding.vault_id,
+                "injection_redaction.pattern_matches",
+                matched_pattern_count,
+            )
+        except Exception as exc:  # noqa: BLE001 -- counters never block injection
+            logger.debug("vault injection redaction counter skipped: %s", exc)
 
     # -------------------------------------------------------------------------
     # U9 — Curated injection via context-manager agent

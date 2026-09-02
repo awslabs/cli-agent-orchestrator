@@ -6,7 +6,7 @@ import hashlib
 from collections import Counter, defaultdict
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import Iterable, Optional
+from typing import Iterable, Optional, cast
 
 from cli_agent_orchestrator.clients.database import (
     MemoryMetadataModel,
@@ -130,6 +130,8 @@ def reconcile(
         )
         _replace_vault_edges(projected)
         _emit_audit_events(vault.id, plan.run_id, projected, indexed, quarantined, skipped)
+    else:
+        findings = _preview_rename_findings(vault.id, projected, findings)
 
     return ReconcileReport(
         vault.id,
@@ -140,6 +142,24 @@ def reconcile(
         len(findings),
         deleted,
         rebuild,
+    )
+
+
+def _preview_rename_findings(
+    vault_id: str,
+    projected: tuple[_ProjectedNote, ...],
+    findings: tuple[tuple[str, str, str, str], ...],
+) -> tuple[tuple[str, str, str, str], ...]:
+    """Run rename classification against current rows without changing derived state."""
+    with SessionLocal() as db:
+        prior_by_path: dict[str, VaultNoteModel] = {
+            cast(str, row.vault_relpath): row
+            for row in db.query(VaultNoteModel).filter(VaultNoteModel.vault_id == vault_id).all()
+        }
+    resolutions = _resolve_renames(vault_id, projected, prior_by_path)
+    return _merge_findings(
+        findings,
+        tuple(resolution.finding for resolution in resolutions if resolution.finding is not None),
     )
 
 

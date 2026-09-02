@@ -300,6 +300,8 @@ def test_rule_20_warn_and_inject_loads_with_persistent_warning(tmp_path, caplog)
 
     config = _load(document)
 
+    assert config.vaults[0].mappings[1].inject is True
+    assert config.vaults[0].mappings[1].secret_gate == "warn"
     assert config.warnings == ("mapping 'References' has secret_gate='warn' with inject=true",)
     assert "secret_gate='warn' with inject=true" in caplog.text
 
