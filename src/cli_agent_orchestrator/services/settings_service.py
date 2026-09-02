@@ -298,8 +298,8 @@ def get_max_terminals() -> Optional[int]:
     Counts TRACKED terminals, meaning rows in the terminals table, not probed
     liveness: a terminal row is only removed by an explicit ``delete_terminal``,
     so a terminal whose process died without cleanup still occupies a slot. That
-    is harmless in the topology the cap exists for (a worker pod is a disposable
-    Job, so its rows die with it) but an operator who sets ``server.max_terminals``
+    is harmless in the topology the cap exists for (a worker pod is disposable and
+    its state is an emptyDir, so its rows die with it) but an operator who sets ``server.max_terminals``
     on a long-lived node may have to delete a stale row by hand. Deliberately not
     probed here: this check runs before anything is allocated precisely so it can
     stay cheap, and per-row liveness probing would put tmux calls in that path.

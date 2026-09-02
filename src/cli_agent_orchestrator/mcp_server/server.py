@@ -632,7 +632,7 @@ def _elastic_broker_config() -> Tuple[str, str]:
 
 
 # How long the elastic path waits for a freshly leased worker to answer through
-# its Service. The broker returns a lease as soon as the Job and Service objects
+# its Service. The broker returns a lease as soon as the workload and Service objects
 # exist, so this covers the worker's whole boot plus endpoint propagation - and it
 # is the ONE place that wait now happens, instead of once in the broker (on pod
 # readiness) and then implicitly again here (on a connect timeout, unretried).
@@ -679,11 +679,11 @@ async def assign_elastic(
     engine: Optional[str] = Field(default=None, description="Optional Kiro engine override"),
     model: Optional[str] = Field(default=None, description=_model_field_desc),
 ) -> Dict[str, Any]:
-    """Provision one Kubernetes Job and assign one task to it.
+    """Provision one elastic worker and assign one task to it.
 
     The worker must call ``complete_assignment`` exactly once after producing
     its final result. That tool durably delivers the callback before releasing
-    this worker's Job.
+    this worker.
 
     A successful return means the task was PLACED, not that it finished - the
     result arrives later through the supervisor's inbox. So a worker that dies
@@ -815,7 +815,7 @@ async def send_message(
 async def complete_assignment(
     message: str = Field(description="Final result to deliver to the assigning supervisor"),
 ) -> Dict[str, Any]:
-    """Deliver an elastic worker's final result, then release its Kubernetes Job."""
+    """Deliver an elastic worker's final result, then release the worker itself."""
     worker_id = os.environ.get("CAO_ELASTIC_WORKER_ID", "").strip()
     broker_url = os.environ.get("CAO_ELASTIC_BROKER_URL", "").strip().rstrip("/")
     release_token = os.environ.get("CAO_ELASTIC_RELEASE_TOKEN", "").strip()
