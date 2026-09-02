@@ -378,11 +378,13 @@ kubectl -n cao-cluster exec cao-supervisor-0 -- \
 | `failed` | The lease never opened — the Deployment could not be created, or the pod never became Ready inside `CAO_ELASTIC_READY_TIMEOUT`. |
 
 A `terminated` or `expired` entry also means the broker released the worker on
-your behalf. Without that reaper the pod squats a node's worth of memory until
-its `activeDeadlineSeconds`, an hour later. That deadline remains as the backstop for
-a broker restart, which is also why the broker is pinned to `replicas: 1` with a
-`Recreate` strategy: the ledger is in memory, so a second reaper would know only
-its own half of it.
+your behalf. Without that reaper the pod squats a node's worth of memory until the
+orphan sweep collects it, an hour later (`CAO_ELASTIC_WORKER_TIMEOUT`). That sweep
+is the backstop for a broker restart: the ledger is in memory, so a restarted
+broker cannot settle a lease it never made, and the sweep walks the cluster instead
+of the ledger to find those workers. It is also why the broker is pinned to
+`replicas: 1` with a `Recreate` strategy — a second reaper would know only its own
+half of the ledger.
 
 ## Run a demo assignment
 

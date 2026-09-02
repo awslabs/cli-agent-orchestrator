@@ -62,9 +62,9 @@ automountServiceAccountToken: true
 # Note what is absent. No `pods/exec`, so the broker cannot get a shell in a
 # worker it created. No `secrets`, so it cannot read the very token it
 # authenticates callers with. No `create` on pods directly - only Deployments,
-# which means every worker pod is owned by a ReplicaSet the broker's own
-# Deployment controls, and carries the bounded activeDeadlineSeconds the broker
-# writes into its template whether it remembers to clean up or not.
+# which means every worker pod is owned by a ReplicaSet, so one Foreground delete
+# of the Deployment collects the pod too, and a worker the broker has forgotten is
+# still deletable by name from its worker id alone.
 #
 # No `replicasets` either: Foreground deletion of the Deployment removes the
 # ReplicaSet and the pod server-side, so the broker never names one.
