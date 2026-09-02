@@ -17,7 +17,7 @@ metadata:
 spec:
   # MUST stay 1, and the strategy MUST be Recreate. The lease ledger lives in
   # the broker's memory, so a second replica would reap only the leases it
-  # happened to create and leave the others to sit until the Job's own
+  # happened to create and leave the others to sit until the worker pod's own
   # activeDeadlineSeconds an hour later. That deadline is the backstop for a
   # broker restart; it is not a substitute for a single reaper.
   replicas: 1
@@ -72,13 +72,13 @@ spec:
                   key: token
             # A lease with no completion inside this window is reaped and marked
             # `expired`. Generous enough for a slow delegated task, far below the
-            # Job's own 3600s deadline so the broker always reaps first and can
+            # pod's own 3600s deadline so the broker always reaps first and can
             # say WHY it reaped.
             - name: CAO_ELASTIC_COMPLETION_TIMEOUT
               value: "900"
             # A lease whose pod has not reported Ready inside this window is
             # reaped and marked `failed`. This is a REAPER deadline, not a wait:
-            # POST /workers returns as soon as the Job and Service exist, and the
+            # POST /workers returns as soon as the Deployment and Service exist, and
             # supervisor then waits on the worker's /health through the Service —
             # which is the address it actually uses, and which a pod-level
             # readiness probe cannot speak for. Set CAO_ELASTIC_GATE_ON_READY=1
@@ -86,10 +86,10 @@ spec:
             # POST /workers on every single delegation.
             - name: CAO_ELASTIC_READY_TIMEOUT
               value: "300"
-            # ---- forwarded verbatim into every worker Job ----
+            # ---- forwarded verbatim into every worker pod ----
             # The broker never calls a model and holds no credentials of its own;
             # these exist so the region and the model pins are written in ONE
-            # place, rendered once by deploy.sh, and copied into each Job by
+            # place, rendered once by deploy.sh, and copied into each worker by
             # broker.py. It refuses to start if any name listed in
             # CAO_ELASTIC_WORKER_ENV_PASSTHROUGH is missing here - a dropped
             # model pin would otherwise schedule fine and 401 at the first call.

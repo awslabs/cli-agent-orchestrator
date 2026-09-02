@@ -1,16 +1,16 @@
 # CAO Elastic Workers
 
-One persistent CAO supervisor, one narrow broker, and one disposable Kubernetes
-Job per `assign_elastic` call. Worker runtime state is `emptyDir`; the supervisor
+One persistent CAO supervisor, one narrow broker, and one disposable
+single-replica Deployment per `assign_elastic` call. Worker runtime state is `emptyDir`; the supervisor
 owns durable CAO memory on its EBS claim. Both mount the shared EFS workspace.
 
 | Component | Kubernetes kind | Storage | Lifecycle |
 |---|---|---|---|
 | `cao-supervisor` | StatefulSet, one replica | EBS state + shared EFS workspace | Persistent |
 | `cao-worker-broker` | Deployment, one replica | None | Persistent |
-| `cao-worker-<id>` | One Job per assignment | `emptyDir` state + shared EFS workspace | Released on callback |
+| `cao-worker-<id>` | Deployment, one replica, one per assignment | `emptyDir` state + shared EFS workspace | Released on callback |
 
-The broker creates each worker Job and its temporary Service. Workers send
+The broker creates each worker Deployment and its temporary Service. Workers send
 authenticated memory and callback requests through the broker's narrow gateway;
 the broker forwards only those five routes to the supervisor, so project memory
 has one durable owner without exposing the supervisor control API.
@@ -35,7 +35,7 @@ remains authentication-free by default; this credential and routing behavior
 activates only inside elastic worker pods.
 
 **A worker cannot drift.** Its profile store is a fresh `emptyDir`, and
-`CAO_INSTALL_PROFILES` is set per Job to `<profile>:<provider>`. On a fixed fleet
+`CAO_INSTALL_PROFILES` is set per worker to `<profile>:<provider>`. On a fixed fleet
 the store is per pod and long-lived, so a profile installed on one node is
 invisible to the others and an unpinned profile falls back to a provider that is
 not in the image — the failure being `kiro-cli was not found`, naming a CLI
@@ -336,8 +336,8 @@ than `httpGet`: a probe cannot read a token from a secret, so an HTTP probe woul
 be answered 401 and restart the pod forever.
 
 The fleet view lists the supervisor from `configmap-fleet.yaml`, plus whichever
-workers hold a lease. The panel cannot discover a worker on its own -- they are
-Jobs with generated names -- so the broker publishes each one into that ConfigMap
+workers hold a lease. The panel cannot discover a worker on its own -- each is
+created on demand with a generated id -- so the broker publishes each one into that ConfigMap
 when it leases it and withdraws it on release. That ConfigMap is therefore
 jointly owned, and the live object differing from the checked-in file is expected
 rather than drift.
@@ -375,11 +375,11 @@ kubectl -n cao-cluster exec cao-supervisor-0 -- \
 | `completed` | The worker called `complete_assignment`. The normal path. |
 | `terminated` | The pod ended while the lease was open. Usually the turn-detection race above: the task was **not** necessarily done, and the supervisor's own transcript shows a clean success. |
 | `expired` | The pod was still healthy but never completed within `CAO_ELASTIC_COMPLETION_TIMEOUT` (900s). |
-| `failed` | The lease never opened — the Job could not be created, or the pod never became Ready inside `CAO_ELASTIC_READY_TIMEOUT`. |
+| `failed` | The lease never opened — the Deployment could not be created, or the pod never became Ready inside `CAO_ELASTIC_READY_TIMEOUT`. |
 
-A `terminated` or `expired` entry also means the broker released the Job on your
-behalf. Without that reaper the Job squats a node's worth of memory until
-`activeDeadlineSeconds`, an hour later. That deadline remains as the backstop for
+A `terminated` or `expired` entry also means the broker released the worker on
+your behalf. Without that reaper the pod squats a node's worth of memory until
+its `activeDeadlineSeconds`, an hour later. That deadline remains as the backstop for
 a broker restart, which is also why the broker is pinned to `replicas: 1` with a
 `Recreate` strategy: the ledger is in memory, so a second reaper would know only
 its own half of it.
@@ -394,10 +394,10 @@ memory; the consumer recalls it from the supervisor-owned memory service.
 > torn down. Treat the commands as the intended shape, and check the lease ledger
 > if a step reports success without an artifact.
 
-Watch Jobs and pods appear and disappear:
+Watch workers and their pods appear and disappear:
 
 ```bash
-kubectl -n cao-cluster get jobs,pods \
+kubectl -n cao-cluster get deployments,pods \
   -l app.kubernetes.io/name=cao-elastic-worker --watch
 ```
 
@@ -477,16 +477,16 @@ PY
 ```
 
 Verify by artifact, never by the reported status — the memory the producer stored
-is on the supervisor's EBS volume, and both Jobs should be gone because each
-worker called `complete_assignment`:
+is on the supervisor's EBS volume, and both workers should be gone because each
+called `complete_assignment`:
 
 ```bash
 kubectl -n cao-cluster exec cao-supervisor-0 -- \
   cao memory show elastic-demo-shared --scope project
-kubectl -n cao-cluster get jobs,services -l app.kubernetes.io/name=cao-elastic-worker
+kubectl -n cao-cluster get deployments,services -l app.kubernetes.io/name=cao-elastic-worker
 ```
 
-If the Jobs are gone but the memory is absent, read the lease ledger: a
+If the workers are gone but the memory is absent, read the lease ledger: a
 `terminated` entry is the turn-detection race, not a memory bug.
 
 ```bash

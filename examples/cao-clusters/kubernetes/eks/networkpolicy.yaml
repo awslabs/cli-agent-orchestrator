@@ -4,7 +4,7 @@
 # NetworkPolicy is the minimum trust boundary in k8s.
 #
 # These select `app.kubernetes.io/name: cao-elastic-worker`, the label broker.py
-# stamps on every Job it mints — so a worker that exists for 40 seconds is
+# stamps on every worker pod it mints — so a worker that exists for 40 seconds is
 # covered from the moment it starts, with nothing to apply per task. The
 # kubelet's readiness probe to 9889 is not affected by an ingress policy;
 # verified on this cluster, where probes succeed under exactly these rules.
@@ -122,7 +122,7 @@ spec:
           protocol: UDP
         - port: 53
           protocol: TCP
-    # Kubernetes API server: Job and Service create/delete, pod status polling.
+    # Kubernetes API server: Deployment and Service create/delete, pod status polling.
     # The service ClusterIP and the in-VPC control plane ENIs are both reached
     # through this rule.
     - to:
