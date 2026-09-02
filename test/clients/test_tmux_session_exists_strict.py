@@ -486,7 +486,7 @@ class TestPortableServerDetection:
         nothing bound cannot read as a confirmed absence. Where the socket under
         test is the only named unix socket present, which is the ordinary case in
         a container, the post-kill listing is empty and the detector answers
-        ``None``, so the final assertion below is unanswerable rather than false.
+        ``None``, so the final ``not in`` below raises instead of evaluating.
         """
         _start_session(tmux_socket, "cao-lsof")
         server_pid = _server_pid(tmux_socket)
