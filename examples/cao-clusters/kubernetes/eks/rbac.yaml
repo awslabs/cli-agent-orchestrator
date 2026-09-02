@@ -80,6 +80,14 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
+  # `cao worker logs`. Separate from `pods` above because it is a genuinely
+  # wider grant - a worker's log contains whatever its agent printed - and
+  # because it is the smallest thing that makes a worker that failed to boot
+  # diagnosable without handing the caller kubectl. Note what it is still not:
+  # `pods/log` reads, `pods/exec` runs, and the latter stays absent.
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
   - apiGroups: [""]
     resources: ["services"]
     verbs: ["create", "get", "list", "watch", "delete"]

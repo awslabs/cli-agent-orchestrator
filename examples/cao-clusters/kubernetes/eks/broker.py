@@ -18,6 +18,12 @@ The broker is also the workers' narrow gateway to supervisor-owned state.
 NetworkPolicy denies workers any direct route to the supervisor control API;
 the broker authenticates each worker's release token and forwards only inbox
 delivery and the four explicit memory operations.
+
+Finally it is the operator's way in. Worker Services are ClusterIP and last only
+as long as a task, so `cao worker` cannot port-forward to each one; instead it
+holds the broker token and the broker forwards an allowlisted set of read and
+send routes to the worker it names. See the operator plane at the end of this
+file for what is on that list and why.
 """
 
 from __future__ import annotations
@@ -34,9 +40,10 @@ from contextlib import asynccontextmanager
 from typing import Any, Optional
 
 import requests
-from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, status
-from fastapi.responses import Response
-from kubernetes import client, config
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request, status
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import Response, StreamingResponse
+from kubernetes import client, config, watch
 from kubernetes.client.rest import ApiException
 from pydantic import BaseModel, Field
 
@@ -650,12 +657,18 @@ def _release(worker_id: str) -> None:
             raise
 
 
+# The two states in which a worker still exists. Everything else -- released,
+# completed, failed, terminated, expired -- is terminal, which is why _settle
+# refuses to move a lease twice and the operator plane refuses to dial one.
+_LIVE_LEASE_STATES = frozenset({"creating", "leased"})
+
+
 def _settle(worker_id: str, state: str, reason: Optional[str] = None) -> bool:
     with _leases_lock:
         lease = _leases.get(worker_id)
         if lease is None:
             return False
-        if lease["state"] not in {"creating", "leased"}:
+        if lease["state"] not in _LIVE_LEASE_STATES:
             return False
         lease["state"] = state
         lease["reason"] = reason
@@ -1159,3 +1172,281 @@ def terminal_ended(
     if settled:
         background_tasks.add_task(_release, worker_id)
     return {"release_scheduled": settled}
+
+
+# ---------------------------------------------------------------------------
+# Operator plane: `cao worker` reaching a leased worker from outside the cluster.
+#
+# Everything above this line is the fleet talking to itself. This is for a human,
+# or the CLI acting for one, holding the broker token: one port-forward to the
+# broker reaches every worker. Port-forwarding each worker instead is not a
+# workflow - their Services are ClusterIP and exist only for the length of a
+# task, so the name to forward to does not exist until a lease is taken and is
+# gone before anyone types it.
+#
+# It is an allowlist of (method, path) and not a pass-through, for a reason worth
+# stating plainly: cao-server is an unauthenticated command-execution surface, so
+# forwarding arbitrary paths would publish the whole of it, on every worker, to
+# anyone holding one token. The list below is what `cao worker list/status/send`
+# and `cao worker sessions/attach` actually call, and nothing else.
+#
+# `POST /terminals/{id}/input` IS on it. That types into a live agent, which
+# sounds like the line not to cross, but the same token already creates and
+# deletes workers outright - being able to talk to a worker you can delete is not
+# an escalation, and `cao worker send` is the verb the whole plane exists for.
+#
+# Adding a route is a one-line change here. Deleting the allowlist is not a
+# simplification.
+_WORKER_API_PORT = 9889
+
+# One path segment. Deliberately narrow enough to exclude `/`, so segment counts
+# in the patterns below are load-bearing, and wide enough for a percent-encoded
+# session name - `cao session` quotes them with safe='' before they get here.
+_SEGMENT = r"[A-Za-z0-9._~%-]+"
+
+_WORKER_API_ALLOWLIST: dict[str, tuple[re.Pattern[str], ...]] = {
+    "GET": (
+        re.compile(r"health"),
+        re.compile(r"sessions"),
+        re.compile(rf"sessions/{_SEGMENT}/terminals"),
+        re.compile(rf"terminals/{_SEGMENT}"),
+        re.compile(rf"terminals/{_SEGMENT}/output"),
+        re.compile(rf"terminals/{_SEGMENT}/inbox/messages"),
+    ),
+    "POST": (re.compile(rf"terminals/{_SEGMENT}/input"),),
+}
+
+# Request headers forwarded to the worker. An allowlist, because the header that
+# must NOT travel is `x-cao-broker-token`: it is the broker's credential for the
+# broker's own API, a worker has no use for it, and a worker is the one pod here
+# running an agent that could be talked into repeating what it was handed.
+_FORWARD_REQUEST_HEADERS = frozenset(
+    {
+        "accept",
+        "accept-encoding",
+        "accept-language",
+        "cache-control",
+        "content-type",
+    }
+)
+
+# Response headers dropped on the way back. The hop-by-hop set describes the
+# broker<->worker connection rather than this one, and uvicorn writes its own
+# `date` and `server`.
+#
+# `content-length` and `content-encoding` are in here for a different reason, and
+# it is the one that bites: this proxy buffers, and `requests` has already
+# decompressed the body by the time it is read, so both headers now describe
+# bytes that no longer exist. Passing them through serves a gzip header over
+# plain text. The panel's streaming proxy keeps them precisely because it never
+# touches the bytes.
+_DROP_RESPONSE_HEADERS = frozenset(
+    {
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "date",
+        "server",
+        "content-length",
+        "content-encoding",
+    }
+)
+
+# Log tail ceiling. A whole worker boot log is a few hundred lines, and the point
+# of a cap is that `cao worker logs` cannot be turned into a way to pull an
+# arbitrary amount of an agent's transcript through the broker in one call.
+_LOG_TAIL_MAX = 2000
+
+
+def _worker_api_base(worker_id: str) -> str:
+    """Where a worker answers. The Service name, not the pod's.
+
+    The pod's own address would work today and stop working the moment the
+    ReplicaSet replaces it; the Service is stable for the life of the lease and is
+    also the name in the worker's own CAO_ALLOWED_HOSTS, so its DNS-rebinding
+    check passes.
+    """
+    name = _workload_name(worker_id)
+    return f"http://{name}.{NAMESPACE}.svc.cluster.local:{_WORKER_API_PORT}"
+
+
+def _require_leased_worker(worker_id: str) -> None:
+    """Refuse to dial a worker the ledger knows is gone, and say why it is gone.
+
+    Without this, a request to a released worker fails on DNS and surfaces as a
+    502 - which reads as a broken cluster rather than a finished task. The lease
+    ledger already knows better, and its `reason` is the useful half of the
+    answer.
+
+    An unrecognised worker_id is deliberately NOT refused. Leases live in this
+    process's memory while workloads live in the API server, so after a broker
+    restart every surviving worker is unknown here and every one of them is still
+    perfectly reachable.
+    """
+    if not re.fullmatch(r"[a-f0-9]{8}", worker_id):
+        raise HTTPException(status_code=404, detail="worker not found")
+    with _leases_lock:
+        lease = _leases.get(worker_id)
+        state = lease["state"] if lease else None
+        reason = lease["reason"] if lease else None
+    if state is not None and state not in _LIVE_LEASE_STATES:
+        detail = f"worker {worker_id} is no longer leased ({state})"
+        if reason:
+            detail = f"{detail}: {reason}"
+        raise HTTPException(status_code=409, detail=detail)
+
+
+def _worker_api_allowed(method: str, path: str) -> bool:
+    return any(
+        pattern.fullmatch(path)
+        for pattern in _WORKER_API_ALLOWLIST.get(method.upper(), ())
+    )
+
+
+def _forward_to_worker(
+    worker_id: str,
+    method: str,
+    path: str,
+    *,
+    query: str,
+    body: bytes,
+    headers: dict[str, str],
+) -> Response:
+    try:
+        upstream = requests.request(
+            method,
+            f"{_worker_api_base(worker_id)}/{path}",
+            params=query,
+            data=body or None,
+            headers=headers,
+            allow_redirects=False,
+            timeout=(5.0, 60.0),
+        )
+    except requests.RequestException as exc:
+        log.warning("worker %s api request failed for %s %s: %s", worker_id, method, path, exc)
+        raise HTTPException(
+            status_code=502,
+            detail=f"worker {worker_id} did not answer: {type(exc).__name__}",
+        ) from exc
+    return Response(
+        content=upstream.content,
+        status_code=upstream.status_code,
+        headers={
+            key: value
+            for key, value in upstream.headers.items()
+            if key.lower() not in _DROP_RESPONSE_HEADERS
+        },
+    )
+
+
+@app.api_route("/workers/{worker_id}/api/{path:path}", methods=["GET", "POST"])
+async def worker_api(
+    worker_id: str,
+    path: str,
+    request: Request,
+    x_cao_broker_token: Optional[str] = Header(default=None),
+) -> Response:
+    """Forward one allowlisted cao-server call to a leased worker.
+
+    Buffered rather than streamed, unlike the panel's node proxy: nothing on the
+    allowlist is a stream, and buffering is what lets the 502 above name the
+    worker that failed instead of tearing down a response already in flight.
+    """
+    _require_broker_token(x_cao_broker_token)
+    _require_leased_worker(worker_id)
+    if ".." in path.split("/"):
+        # requests leaves dot segments in the path and the worker's own server may
+        # resolve them, which would step outside the route just matched.
+        raise HTTPException(status_code=400, detail="invalid path")
+    if not _worker_api_allowed(request.method, path):
+        raise HTTPException(
+            status_code=404,
+            detail=f"'{request.method} /{path}' is not proxied to workers",
+        )
+    return await run_in_threadpool(
+        _forward_to_worker,
+        worker_id,
+        request.method,
+        path,
+        query=request.url.query,
+        body=await request.body(),
+        headers={
+            key: value
+            for key, value in request.headers.items()
+            if key.lower() in _FORWARD_REQUEST_HEADERS
+        },
+    )
+
+
+def _worker_pod_name(worker_id: str) -> str:
+    pods = core_api.list_namespaced_pod(
+        NAMESPACE,
+        label_selector=f"cao.aws/worker-id={worker_id}",
+    ).items
+    if not pods:
+        raise HTTPException(status_code=404, detail=f"worker {worker_id} has no pod")
+    # A Deployment can show two pods at once - the replacement and the pod being
+    # replaced - and the selector matches both in no fixed order. Prefer the one
+    # that is running; on a boot failure there is no such pod and the first one's
+    # log is exactly what the caller came for.
+    running = [pod for pod in pods if (pod.status.phase if pod.status else None) == "Running"]
+    return (running or pods)[0].metadata.name
+
+
+@app.get("/workers/{worker_id}/logs")
+def worker_logs(
+    worker_id: str,
+    tail_lines: int = 200,
+    follow: bool = False,
+    x_cao_broker_token: Optional[str] = Header(default=None),
+) -> Response:
+    """The worker container's log, which is where a boot failure is legible.
+
+    `GET /workers` can say a lease `failed`; it cannot say the image pull was
+    denied, or that the profile install died on a bad provider pin. Answering that
+    needs `pods/log` `get` added to the broker Role - a real widening, and the
+    narrowest one that makes a failed worker diagnosable without putting kubectl
+    in the caller's hands. It is still not `pods/exec`: the broker can read what a
+    worker printed and never run anything inside it.
+    """
+    _require_broker_token(x_cao_broker_token)
+    _require_leased_worker(worker_id)
+    tail = max(1, min(tail_lines, _LOG_TAIL_MAX))
+    pod_name = _worker_pod_name(worker_id)
+    if not follow:
+        try:
+            body = core_api.read_namespaced_pod_log(pod_name, NAMESPACE, tail_lines=tail)
+        except ApiException as exc:
+            if exc.status == 404:
+                raise HTTPException(status_code=404, detail="worker pod not found") from exc
+            raise HTTPException(
+                status_code=502,
+                detail=f"could not read worker log: {exc.reason}",
+            ) from exc
+        return Response(content=body, media_type="text/plain; charset=utf-8")
+
+    def _stream():
+        # Watch, not read_namespaced_pod_log(follow=True, _preload_content=False):
+        # the client library sets `follow` for any function documenting it and
+        # yields whole lines, so a live log arrives line by line instead of
+        # stalling inside a fixed-size socket read.
+        watcher = watch.Watch()
+        try:
+            for line in watcher.stream(
+                core_api.read_namespaced_pod_log,
+                name=pod_name,
+                namespace=NAMESPACE,
+                tail_lines=tail,
+            ):
+                yield f"{line}\n"
+        except ApiException as exc:  # pragma: no cover - live cluster only
+            log.warning("log follow for worker %s ended: %s", worker_id, exc)
+        finally:
+            watcher.stop()
+
+    return StreamingResponse(_stream(), media_type="text/plain; charset=utf-8")

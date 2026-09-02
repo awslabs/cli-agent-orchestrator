@@ -6,7 +6,7 @@ import logging
 import re
 import time
 import uuid
-from typing import Optional, Union
+from typing import Callable, Optional, Union
 
 import requests
 
@@ -244,6 +244,7 @@ def poll_until_done(
     timeout: float,
     polling_interval: float = 1.0,
     idle_stable_polls: int = 3,
+    read_status: Optional[Callable[[str], Optional[str]]] = None,
 ) -> None:
     """Poll terminal status until the agent is done, errored, or timeout.
 
@@ -265,6 +266,13 @@ def poll_until_done(
       against a momentary idle flap mid-turn. The COMPLETED path is byte-for-byte
       unchanged.
 
+    ``read_status`` overrides only WHERE the status is read from, returning the
+    same string ``GET /terminals/{id}`` puts in its ``status`` field. It exists so
+    a terminal on a remote node - a `cao worker` reached through a cluster broker -
+    is judged done by exactly this logic rather than by a second copy of it. The
+    IDLE-versus-COMPLETED reasoning above is provider behaviour, not transport
+    behaviour, so it must not be duplicated per transport.
+
     Raises click.ClickException on error, timeout, or request failure.
     """
     import click
@@ -282,11 +290,14 @@ def poll_until_done(
                 f"Timed out after {int(elapsed)}s waiting for terminal {terminal_id}"
             )
         try:
-            # Per-request timeout so a stalled server/network can't block past
-            # the outer timeout budget (matches wait_until_terminal_status).
-            resp = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=5.0)
-            resp.raise_for_status()
-            status = resp.json().get("status")
+            if read_status is not None:
+                status = read_status(terminal_id)
+            else:
+                # Per-request timeout so a stalled server/network can't block past
+                # the outer timeout budget (matches wait_until_terminal_status).
+                resp = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=5.0)
+                resp.raise_for_status()
+                status = resp.json().get("status")
             if status == TerminalStatus.COMPLETED.value:
                 return
             if status == TerminalStatus.ERROR.value:

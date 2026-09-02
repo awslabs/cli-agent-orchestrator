@@ -391,6 +391,18 @@ ELASTIC_RELEASE_TOKEN_ENV = "CAO_ELASTIC_RELEASE_TOKEN"
 ELASTIC_WORKER_ID_HEADER = "X-CAO-Worker-ID"
 ELASTIC_RELEASE_TOKEN_HEADER = "X-CAO-Release-Token"
 
+# The cluster's worker broker: where `cao cluster` and `cao worker` point, and
+# the token they authenticate with. Already set on a supervisor pod, which is why
+# these names are reused rather than invented — the same two values that let the
+# supervisor take a lease let an operator inspect and release one.
+#
+# The header is the broker's own, not a bearer token. It grants worker
+# create/list/release plus the broker's allowlisted per-worker routes; it is NOT a
+# credential for the node API behind them.
+ELASTIC_BROKER_URL_ENV = "CAO_ELASTIC_BROKER_URL"
+ELASTIC_BROKER_TOKEN_ENV = "CAO_ELASTIC_BROKER_TOKEN"
+ELASTIC_BROKER_TOKEN_HEADER = "X-CAO-Broker-Token"
+
 
 # Operators can extend network allowlists via the env vars handled below.
 # Same comma-separated pattern as ``CAO_PROFILE_ALLOWED_HOSTS`` in install_service.
