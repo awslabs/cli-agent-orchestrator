@@ -11,14 +11,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from cli_agent_orchestrator.services.memory_reconciliation import _first_symlink_component
+from cli_agent_orchestrator.services.memory_reconciliation import (
+    _first_symlink_component,
+)
 from cli_agent_orchestrator.services.vault.config import (
     ALWAYS_EXCLUDED_PATTERNS,
     FolderMapping,
     VaultSpec,
 )
 from cli_agent_orchestrator.services.vault.findings import FindingCode, finding_severity
-from cli_agent_orchestrator.services.vault.parser import ParseResult, classify_secret, parse_note
+from cli_agent_orchestrator.services.vault.parser import (
+    ParseResult,
+    classify_secret,
+    parse_note,
+)
 
 # Bounds the aggregate bytes opened in one scan even when independent config
 # ceilings would otherwise permit an impractical product.
@@ -152,7 +158,12 @@ def scan_vault(
         normalized = _normalize_line_endings(text)
         if "\x00" in normalized:
             notes.append(
-                _refused(candidate, FindingCode.NOTE_CONTAINS_NUL, "note contains NUL byte", after)
+                _refused(
+                    candidate,
+                    FindingCode.NOTE_CONTAINS_NUL,
+                    "note contains NUL byte",
+                    after,
+                )
             )
             continue
         parsed = parse_note(
@@ -216,6 +227,8 @@ def _discover_candidates(
     notes: list[ScanNote] = []
     root_path = Path(root)
     for mapping in vault.mappings:
+        if not mapping.index:
+            continue
         mapping_root = os.path.join(root, mapping.folder)
         if not os.path.isdir(mapping_root):
             notes.append(
@@ -267,7 +280,8 @@ def _discover_candidates(
                             FindingCode.MAPPING_FOLDER_UNREADABLE,
                             "mapping folder is unreadable",
                             finding_severity(
-                                FindingCode.MAPPING_FOLDER_UNREADABLE, secret_gate="reject"
+                                FindingCode.MAPPING_FOLDER_UNREADABLE,
+                                secret_gate="reject",
                             ),
                         ),
                     ),
@@ -295,7 +309,8 @@ def _discover_candidates(
                                     FindingCode.SYMLINK_REFUSED,
                                     "symlinked path component",
                                     finding_severity(
-                                        FindingCode.SYMLINK_REFUSED, secret_gate="reject"
+                                        FindingCode.SYMLINK_REFUSED,
+                                        secret_gate="reject",
                                     ),
                                 ),
                             ),
@@ -321,7 +336,8 @@ def _discover_candidates(
                                     FindingCode.SYMLINK_REFUSED,
                                     "symlinked path component",
                                     finding_severity(
-                                        FindingCode.SYMLINK_REFUSED, secret_gate="reject"
+                                        FindingCode.SYMLINK_REFUSED,
+                                        secret_gate="reject",
                                     ),
                                 ),
                             ),
@@ -340,7 +356,8 @@ def _discover_candidates(
                                     FindingCode.SYNC_ARTIFACT_SKIPPED,
                                     "sync-conflict filename",
                                     finding_severity(
-                                        FindingCode.SYNC_ARTIFACT_SKIPPED, secret_gate="reject"
+                                        FindingCode.SYNC_ARTIFACT_SKIPPED,
+                                        secret_gate="reject",
                                     ),
                                 ),
                             ),
@@ -367,7 +384,8 @@ def _discover_candidates(
                                     FindingCode.HARDLINK_REFUSED,
                                     "hardlink refused",
                                     finding_severity(
-                                        FindingCode.HARDLINK_REFUSED, secret_gate="reject"
+                                        FindingCode.HARDLINK_REFUSED,
+                                        secret_gate="reject",
                                     ),
                                 ),
                             ),
@@ -434,7 +452,13 @@ def _refusal_detail(code: FindingCode) -> str:
 
 def _stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
     """Signals changed by normal in-place writes, including same-size writes."""
-    return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
 
 
 def _case_collision_paths(candidates: tuple[_Candidate, ...]) -> set[str]:

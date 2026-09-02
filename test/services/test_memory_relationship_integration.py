@@ -189,6 +189,44 @@ def test_s2b_unscoped_delete_would_nuke_human_edge(bound, db_engine):
     ), "unscoped delete removes EVERYTHING incl the human edge (the bug S2 guards)"
 
 
+def test_replace_set_persists_supplied_status_and_clear_source_is_producer_scoped(bound, db_engine):
+    """Vault reconciliation must retain declared status while retiring only its own old edges."""
+    for key in ("source", "target-a", "target-b", "target-c"):
+        _seed_memory(db_engine, key)
+    svc = _svc()
+    svc.replace_set(
+        "global",
+        None,
+        "source",
+        "vault",
+        "relates_to",
+        [EdgeInput("target-a", status="proposal")],
+    )
+    svc.create("global", None, "source", "target-b", "contradiction", "vault")
+    svc.create("global", None, "source", "target-b", "relates_to", "human")
+    rejected = svc.create("global", None, "source", "target-c", "relates_to", "vault")
+    svc.reject(rejected.id)
+
+    assert (
+        svc.get(svc.list_relationships("global", None, "source", status="proposal")[0].id).status
+        == "proposal"
+    )
+
+    svc.clear_source("global", None, "source", "vault")
+
+    remaining = svc.list_relationships("global", None, "source", include_non_active=True)
+    assert [(edge.origin, edge.type, edge.target_key) for edge in remaining] == [
+        ("human", "relates_to", "target-b"),
+        ("vault", "relates_to", "target-c"),
+    ]
+
+    svc.clear_source("global", None, "source", "vault", preserve_terminal=False)
+    remaining = svc.list_relationships("global", None, "source", include_non_active=True)
+    assert [(edge.origin, edge.type, edge.target_key) for edge in remaining] == [
+        ("human", "relates_to", "target-b")
+    ]
+
+
 # --------------------------------------------------------------------------- #
 # S4 — multi-edge coexistence
 # --------------------------------------------------------------------------- #
@@ -244,7 +282,10 @@ def test_superseded_targets_batched(bound, db_engine):
     svc.create("global", None, "new1", "old1", "supersedes", "human")
     svc.create("global", None, "new2", "old2", "supersedes", "human")
     hits = svc.superseded_targets("global", None, ["old1", "old2", "new1", "unrelated"])
-    assert hits == {"old1", "old2"}  # targets of active supersedes; sources/unrelated excluded
+    assert hits == {
+        "old1",
+        "old2",
+    }  # targets of active supersedes; sources/unrelated excluded
 
 
 def test_s7_null_confidence_not_zero(bound, db_engine):
@@ -467,7 +508,10 @@ def test_s6_legacy_related_keys_unconverted_still_expands(bound, db_engine, tmp_
 
     async def _setup():
         await svc.store(
-            content="# root\nalpha unique-token", key="root", memory_type="project", scope="global"
+            content="# root\nalpha unique-token",
+            key="root",
+            memory_type="project",
+            scope="global",
         )
         await svc.store(
             content="# legacyfriend\nbeta",
@@ -869,7 +913,15 @@ def test_validate_attributes_rejects_unserialisable_as_valueerror(bound, db_engi
     _seed_memory(db_engine, "b")
     svc = _svc()
     with pytest.raises(ValueError, match="JSON-serialisable"):
-        svc.create("global", None, "a", "b", "relates_to", "human", attributes={"bad": {1, 2, 3}})
+        svc.create(
+            "global",
+            None,
+            "a",
+            "b",
+            "relates_to",
+            "human",
+            attributes={"bad": {1, 2, 3}},
+        )
 
 
 def test_replace_set_soft_rejects_unserialisable_edge_not_whole_batch(bound, db_engine):
@@ -1109,7 +1161,10 @@ def test_forget_purges_relationships_and_slug_reuse_inherits_nothing(
     # ...and a NEW memory reusing the slug inherits nothing.
     asyncio.run(
         svc.store(
-            content="# doomed\nreused slug", key="doomed", memory_type="project", scope="global"
+            content="# doomed\nreused slug",
+            key="doomed",
+            memory_type="project",
+            scope="global",
         )
     )
     assert (

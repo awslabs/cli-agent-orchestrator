@@ -28,7 +28,7 @@ import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 from sqlalchemy.exc import IntegrityError
 
@@ -132,6 +132,7 @@ class EdgeInput:
     """One edge in a ``replace_set`` batch."""
 
     target_key: str
+    status: str = "active"
     confidence: Optional[float] = None
     rank: Optional[int] = None
     attributes: Optional[Dict[str, Any]] = None
@@ -528,6 +529,7 @@ class MemoryRelationshipService:
                 # with self/dangling above (reviewer F3): one bad edge in a batch
                 # is reported, not a hard abort of the whole replace_set.
                 try:
+                    self._validate_status(edge.status)
                     self._validate_confidence(edge.confidence)
                     self._validate_attributes(edge.attributes)
                 except ValueError:
@@ -604,7 +606,7 @@ class MemoryRelationshipService:
                     r.confidence = self._validate_confidence(edge.confidence)
                     r.rank = edge.rank
                     r.attributes_json = attrs_json
-                    r.status = "active"
+                    r.status = edge.status
                     r.source_updated_at = src_updated
                     r.updated_at = now
                     report.kept += 1
@@ -618,7 +620,7 @@ class MemoryRelationshipService:
                             target_key=tgt,
                             type=type,
                             origin=origin,
-                            status="active",
+                            status=edge.status,
                             confidence=self._validate_confidence(edge.confidence),
                             rank=edge.rank,
                             attributes_json=attrs_json,
@@ -632,6 +634,51 @@ class MemoryRelationshipService:
         # so it must leave a forensic trail. Counts + endpoints/origin/type only,
         # never a memory body/prompt (NFR-1.7).
         self._audit_replace_set(scope, sentinel, src, origin, type, report)
+        return report
+
+    def clear_source(
+        self,
+        scope: str,
+        scope_id: Optional[str],
+        source_key: str,
+        origin: str,
+        *,
+        preserve_terminal: bool = True,
+        db: Any = None,
+    ) -> ReplaceReport:
+        """Clear one producer's rows for a source across every relationship type."""
+        self._validate_origin(origin)
+        src = self._sanitize_key(source_key)
+        sentinel = self._to_sentinel(scope_id)
+        report = ReplaceReport()
+        owns_session = db is None
+        session = SessionLocal() if owns_session else db
+        try:
+            rows = (
+                session.query(MemoryRelationshipModel)
+                .filter(
+                    MemoryRelationshipModel.scope == scope,
+                    MemoryRelationshipModel.scope_id == sentinel,
+                    MemoryRelationshipModel.source_key == src,
+                    MemoryRelationshipModel.origin == origin,
+                )
+                .all()
+            )
+            for row in rows:
+                row_status = cast(str, row.status)
+                row_target = cast(str, row.target_key)
+                if preserve_terminal and row_status in CURATION_TERMINAL_STATUSES:
+                    report.preserved.append({"target": row_target, "status": row_status})
+                    continue
+                session.delete(row)
+                report.removed += 1
+            if owns_session:
+                session.commit()
+        finally:
+            if owns_session:
+                session.close()
+        if owns_session:
+            self._audit_replace_set(scope, sentinel, src, origin, "all", report)
         return report
 
     def _audit_replace_set(

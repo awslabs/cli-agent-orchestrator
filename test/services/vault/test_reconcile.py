@@ -169,6 +169,162 @@ def test_vault_edges_use_the_relationship_service_with_vault_endpoints(tmp_path,
     )
 
 
+def test_vault_reconciliation_merges_canonical_and_body_links(tmp_path, monkeypatch):
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    mapped = tmp_path / "vault" / "Mapped"
+    (mapped / "Source.md").write_text(
+        """---
+cao:
+  links:
+    - to: target-a
+      type: relates_to
+      status: proposal
+      origin: human
+      confidence: 0.7
+---
+[[Target A#body-fragment]] [[Target B]]
+""",
+        encoding="utf-8",
+    )
+    (mapped / "Target A.md").write_text(
+        "---\ncao:\n  key: target-a\n---\ntarget a", encoding="utf-8"
+    )
+    (mapped / "Target B.md").write_text(
+        "---\ncao:\n  key: target-b\n---\ntarget b", encoding="utf-8"
+    )
+
+    reconcile(vault, apply=True, run_id="canonical-links")
+
+    with Session() as db:
+        edges = (
+            db.query(MemoryRelationshipModel)
+            .filter_by(origin="vault")
+            .order_by(MemoryRelationshipModel.target_key)
+            .all()
+        )
+    assert {(edge.type, edge.target_key) for edge in edges} == {
+        ("relates_to", "target-a"),
+        ("relates_to", "target-b"),
+    }
+    canonical = next(edge for edge in edges if edge.target_key == "target-a")
+    assert canonical.status == "proposal"
+    assert canonical.confidence == 0.7
+    assert canonical.attributes_json == (
+        '{"authored_origin":"human","canonical_only":true,"fragment":"body-fragment"}'
+    )
+
+
+def test_same_path_authored_key_change_migrates_projection_without_old_state(tmp_path, monkeypatch):
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    mapped = tmp_path / "vault" / "Mapped"
+    source = mapped / "One.md"
+    source.write_text("[[Target]]", encoding="utf-8")
+    (mapped / "Target.md").write_text("target", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="key-before")
+    with Session() as db:
+        old_note = db.query(VaultNoteModel).filter_by(vault_relpath="Mapped/One.md").one()
+        old_key = old_note.cao_key
+        old_scope = old_note.scope
+        old_scope_id = old_note.scope_id
+        metadata = db.query(MemoryMetadataModel).filter_by(source_kind="vault", key=old_key).one()
+        metadata.access_count = 9
+        db.add(
+            VaultNoteAliasModel(
+                vault_id=vault.id,
+                former_relpath="Mapped/Former.md",
+                cao_key=old_key,
+                scope=old_scope,
+                scope_id=old_scope_id,
+                content_sha256="old-content",
+                created_at=datetime.now(timezone.utc),
+            )
+        )
+        db.commit()
+
+    source.write_text("---\ncao:\n  key: new-key\n---\n[[Target]]", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="key-after")
+
+    with Session() as db:
+        rows = db.query(VaultNoteModel).filter_by(vault_relpath="Mapped/One.md").all()
+        old_metadata_count = (
+            db.query(MemoryMetadataModel).filter_by(source_kind="vault", key=old_key).count()
+        )
+        old_edge_count = (
+            db.query(MemoryRelationshipModel).filter_by(origin="vault", source_key=old_key).count()
+        )
+        old_alias_count = (
+            db.query(VaultNoteAliasModel).filter_by(vault_id=vault.id, cao_key=old_key).count()
+        )
+        new_metadata = (
+            db.query(MemoryMetadataModel).filter_by(source_kind="vault", key="new-key").one()
+        )
+    assert [(row.cao_key, row.vault_relpath) for row in rows] == [("new-key", "Mapped/One.md")]
+    assert (
+        old_metadata_count,
+        old_edge_count,
+        old_alias_count,
+        new_metadata.access_count,
+    ) == (0, 0, 0, 0)
+
+
+def test_same_path_authored_key_a_to_b_migrates_without_old_edges(tmp_path, monkeypatch):
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    mapped = tmp_path / "vault" / "Mapped"
+    source = mapped / "One.md"
+    source.write_text("---\ncao:\n  key: old-key\n---\n[[Target]]", encoding="utf-8")
+    (mapped / "Target.md").write_text("target", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="authored-key-before")
+
+    source.write_text("---\ncao:\n  key: new-key\n---\n[[Target]]", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="authored-key-after")
+
+    with Session() as db:
+        rows = db.query(VaultNoteModel).filter_by(vault_relpath="Mapped/One.md").all()
+        old_metadata_count = (
+            db.query(MemoryMetadataModel).filter_by(source_kind="vault", key="old-key").count()
+        )
+        old_edge_count = (
+            db.query(MemoryRelationshipModel)
+            .filter_by(origin="vault", source_key="old-key")
+            .count()
+        )
+    assert [(row.cao_key, row.vault_relpath) for row in rows] == [("new-key", "Mapped/One.md")]
+    assert old_metadata_count == old_edge_count == 0
+
+
+def test_same_path_key_change_keeps_forgotten_note_excluded(tmp_path, monkeypatch):
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    source = tmp_path / "vault" / "Mapped" / "One.md"
+    source.write_text("---\ncao:\n  key: old-key\n---\nbody", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="excluded-before")
+    with Session() as db:
+        db.query(VaultNoteModel).filter_by(cao_key="old-key").update({"status": "excluded"})
+        db.query(MemoryMetadataModel).filter_by(source_kind="vault", key="old-key").delete()
+        db.commit()
+
+    source.write_text("---\ncao:\n  key: new-key\n---\nbody", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="excluded-after")
+
+    with Session() as db:
+        migrated = db.query(VaultNoteModel).filter_by(vault_relpath="Mapped/One.md").one()
+        vault_metadata_count = db.query(MemoryMetadataModel).filter_by(source_kind="vault").count()
+    assert migrated.cao_key == "new-key"
+    assert migrated.status == "excluded"
+    assert vault_metadata_count == 0
+
+
 def test_fixed_mtime_reverse_fixture_scans_without_unstable_results(tmp_path):
     forward = build_vault_fixture(tmp_path / "forward", fixed_mtimes=True)
     reverse = build_vault_fixture(tmp_path / "reverse", creation_order="reverse", fixed_mtimes=True)

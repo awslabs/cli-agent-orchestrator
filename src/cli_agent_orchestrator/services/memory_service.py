@@ -2696,7 +2696,15 @@ class MemoryService:
                         MemoryScope.SESSION.value,
                     }:
                         continue
-                    binding = resolve(mapping.scope, mapping.scope_id, vault_config=config)
+                    if scan_all:
+                        binding_scope_id = mapping.scope_id
+                    elif mapping.scope == MemoryScope.GLOBAL.value:
+                        binding_scope_id = None
+                    elif terminal_context:
+                        binding_scope_id = self.resolve_scope_id(mapping.scope, terminal_context)
+                    else:
+                        continue
+                    binding = resolve(mapping.scope, binding_scope_id, vault_config=config)
                     if isinstance(binding, VaultBinding) and binding not in bindings:
                         bindings.append(binding)
             return native_dirs, bindings, config.max_recall_body_chars
@@ -3451,8 +3459,11 @@ class MemoryService:
             wiki_resolved = os.path.realpath(str(wiki_dir))
             index_path = wiki_dir / "index.md"
 
+            _native_dirs, vault_bindings, max_body_chars = self._resolve_sources(
+                scope_val, terminal_context, scan_all=False
+            )
             scope_entries = []
-            if index_path.exists():
+            if not vault_bindings and index_path.exists():
                 for e in self._parse_index(index_path):
                     if e["scope"] != scope_val:
                         continue
@@ -3490,9 +3501,6 @@ class MemoryService:
                 if memory:
                     scope_memories.append(memory)
 
-            _native_dirs, vault_bindings, max_body_chars = self._resolve_sources(
-                scope_val, terminal_context, scan_all=False
-            )
             for candidate in self._vault_candidates(
                 vault_bindings,
                 require_injectable=True,

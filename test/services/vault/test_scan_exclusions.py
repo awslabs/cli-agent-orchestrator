@@ -1,4 +1,3 @@
-import os
 import tempfile
 import unicodedata
 from pathlib import Path
@@ -79,7 +78,9 @@ def test_exclusions_are_applied_before_open_and_always_exclusions_are_unconditio
     }
 
 
-def test_exclusion_globs_match_root_case_insensitively_and_always_exclusions_anywhere(tmp_path):
+def test_exclusion_globs_match_root_case_insensitively_and_always_exclusions_anywhere(
+    tmp_path,
+):
     root = tmp_path / "vault"
     root.mkdir()
     (root / "CAO").mkdir()
@@ -99,7 +100,9 @@ def test_exclusion_globs_match_root_case_insensitively_and_always_exclusions_any
     assert report.notes == ()
 
 
-def test_fixture_parser_and_sync_refusals_are_reported_with_their_specific_codes(tmp_path):
+def test_fixture_parser_and_sync_refusals_are_reported_with_their_specific_codes(
+    tmp_path,
+):
     fixture = build_vault_fixture(tmp_path)
 
     report = scan_vault(fixture.vault)
@@ -200,6 +203,37 @@ def test_missing_and_unreadable_mapping_folders_are_reported(tmp_path, monkeypat
 
     assert FindingCode.MAPPING_FOLDER_MISSING in codes
     assert FindingCode.MAPPING_FOLDER_UNREADABLE in codes
+
+
+def test_disabled_mapping_is_omitted_while_enabled_mapping_is_scanned(tmp_path):
+    root = tmp_path / "vault"
+    root.mkdir()
+    (root / "CAO").mkdir()
+    (root / "Enabled").mkdir()
+    (root / "Disabled").mkdir()
+    (root / "Enabled" / "Note.md").write_text("enabled", encoding="utf-8")
+    (root / "Disabled" / "Note.md").write_text("disabled", encoding="utf-8")
+    vault = _vault(root)
+    vault.mappings = [
+        FolderMapping(
+            folder="Enabled",
+            scope="project",
+            scope_id="enabled-project",
+            writable=False,
+        ),
+        FolderMapping(
+            folder="Disabled",
+            scope="agent",
+            scope_id="disabled-agent",
+            index=False,
+        ),
+        FolderMapping(folder="CAO", scope="global", writable=True),
+    ]
+
+    report = scan_vault(vault)
+
+    assert "Disabled/Note.md" not in {note.vault_relpath for note in report.notes}
+    assert "Enabled/Note.md" in {note.vault_relpath for note in report.notes}
 
 
 def test_bom_is_removed_before_text_and_both_hashes(tmp_path):

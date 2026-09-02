@@ -8,10 +8,17 @@ import asyncio
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from cli_agent_orchestrator.models.memory import Memory
 from cli_agent_orchestrator.services.memory_service import MemoryService
+from cli_agent_orchestrator.services.vault.config import (
+    FolderMapping,
+    VaultConfig,
+    VaultSpec,
+)
 
 pytestmark = pytest.mark.usefixtures("isolated_memory_db")
 
@@ -114,7 +121,7 @@ class TestStoreUpdatesIndexMd:
         svc = MemoryService(base_dir=tmp_path)
         ctx = _make_terminal_context()
 
-        mem = _run(
+        _run(
             svc.store(
                 content="Always use type hints",
                 scope="project",
@@ -1257,6 +1264,133 @@ class TestSessionScopeIdRoundTrip:
             search_mode="metadata",
         )
         assert results == []
+
+
+class TestVaultScopeAuthority:
+    """Configured vault mappings replace native visibility for their identity."""
+
+    @pytest.mark.asyncio
+    async def test_unscoped_recall_only_uses_callers_project_vault_mapping(
+        self, tmp_path, monkeypatch
+    ):
+        """A project-A caller cannot enumerate project-B's configured vault."""
+        from cli_agent_orchestrator.services import memory_service, settings_service
+
+        vault_root = tmp_path / "vault"
+        vault_root.mkdir()
+        config = VaultConfig(
+            enabled=True,
+            vaults=[
+                VaultSpec(
+                    id="scope-test",
+                    root=str(vault_root),
+                    managed_folder="CAO",
+                    mappings=[
+                        FolderMapping(folder="ProjectA", scope="project", scope_id="project-a"),
+                        FolderMapping(folder="ProjectB", scope="project", scope_id="project-b"),
+                        FolderMapping(folder="CAO", scope="global", writable=True),
+                    ],
+                )
+            ],
+        )
+        monkeypatch.setattr(memory_service, "_is_memory_enabled", lambda: True)
+        monkeypatch.setattr(settings_service, "get_vault_config", lambda: config)
+        service = MemoryService(base_dir=tmp_path / "native")
+        caller_context = _make_terminal_context(cwd=str(tmp_path / "project-a"))
+        service.resolve_scope_id = lambda scope, _context: (  # type: ignore[method-assign]
+            "project-a" if scope == "project" else None
+        )
+
+        def candidates_for(bindings, **_kwargs):
+            return [
+                SimpleNamespace(
+                    binding=binding,
+                    metadata=SimpleNamespace(memory_type="reference"),
+                    require_injectable=False,
+                )
+                for binding in bindings
+                if binding.scope == "project"
+            ]
+
+        def memory_for(candidate, **_kwargs):
+            key = f"{candidate.binding.scope_id}-key"
+            return Memory(
+                id=key,
+                key=key,
+                memory_type="reference",
+                scope="project",
+                scope_id=candidate.binding.scope_id,
+                file_path=key,
+                created_at=datetime(2025, 1, 1, tzinfo=timezone.utc),
+                updated_at=datetime(2025, 1, 1, tzinfo=timezone.utc),
+                content=key,
+                source_kind="vault",
+            )
+
+        monkeypatch.setattr(service, "_vault_candidates", candidates_for)
+        monkeypatch.setattr(memory_service, "load_candidate", memory_for)
+
+        results = await service.recall(
+            terminal_context=caller_context,
+            search_mode="metadata",
+            limit=10,
+        )
+
+        assert {memory.key for memory in results} == {"project-a-key"}
+
+    def test_context_does_not_fall_back_to_native_peer_when_vault_injection_is_disabled(
+        self, tmp_path, monkeypatch
+    ):
+        """A mapped `inject=False` project suppresses both vault and native context."""
+        from cli_agent_orchestrator.services import memory_service, settings_service
+
+        service = MemoryService(base_dir=tmp_path / "native")
+        terminal_context = _make_terminal_context(cwd=str(tmp_path / "project-a"))
+        service.resolve_scope_id = lambda scope, _context: (  # type: ignore[method-assign]
+            "project-a" if scope == "project" else None
+        )
+        monkeypatch.setattr(memory_service, "_is_memory_enabled", lambda: True)
+        monkeypatch.setattr(
+            settings_service, "get_vault_config", lambda: VaultConfig(enabled=False)
+        )
+        _run(
+            service.store(
+                content="native-peer",
+                scope="project",
+                memory_type="reference",
+                key="native-peer",
+                terminal_context=terminal_context,
+            )
+        )
+
+        vault_root = tmp_path / "vault"
+        vault_root.mkdir()
+        config = VaultConfig(
+            enabled=True,
+            vaults=[
+                VaultSpec(
+                    id="context-test",
+                    root=str(vault_root),
+                    managed_folder="CAO",
+                    mappings=[
+                        FolderMapping(
+                            folder="ProjectA",
+                            scope="project",
+                            scope_id="project-a",
+                            inject=False,
+                        ),
+                        FolderMapping(folder="CAO", scope="global", writable=True),
+                    ],
+                )
+            ],
+        )
+        monkeypatch.setattr(settings_service, "get_vault_config", lambda: config)
+        monkeypatch.setattr(service, "_vault_candidates", lambda *_args, **_kwargs: [])
+
+        context = service.get_memory_context(terminal_context)
+
+        assert "native-peer" not in context
+        assert "vault-peer" not in context
 
 
 # ===========================================================================

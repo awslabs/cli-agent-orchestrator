@@ -9,7 +9,11 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from cli_agent_orchestrator.clients.database import Base, VaultNoteModel
+from cli_agent_orchestrator.clients.database import (
+    Base,
+    MemoryMetadataModel,
+    VaultNoteModel,
+)
 from cli_agent_orchestrator.services import memory_service, settings_service
 from cli_agent_orchestrator.services.memory_service import ForgetResult, MemoryService
 from cli_agent_orchestrator.services.vault import reader
@@ -30,7 +34,11 @@ def _vault_service(tmp_path, monkeypatch):
     fixture = build_vault_fixture(tmp_path)
     config = VaultConfig(enabled=True, vaults=[fixture.vault])
     monkeypatch.setattr(settings_service, "get_vault_config", lambda: config)
-    return MemoryService(base_dir=tmp_path / "native", db_engine=engine), fixture, Session
+    return (
+        MemoryService(base_dir=tmp_path / "native", db_engine=engine),
+        fixture,
+        Session,
+    )
 
 
 def test_forget_result_preserves_bool_contract() -> None:
@@ -64,8 +72,20 @@ def test_forget_deindexes_vault_note_without_unlinking(tmp_path, monkeypatch) ->
         note = db.query(VaultNoteModel).filter_by(cao_key="managed-topic").one()
         assert note.status == "excluded"
 
+    reconcile_module.reconcile(fixture.vault, apply=True, run_id="after-forget")
 
-def test_memory_forget_reports_legacy_bool_and_authoritative_action(monkeypatch) -> None:
+    with Session() as db:
+        note = db.query(VaultNoteModel).filter_by(cao_key="managed-topic").one()
+        vault_metadata = (
+            db.query(MemoryMetadataModel).filter_by(source_kind="vault", key="managed-topic").all()
+        )
+        assert note.status == "excluded"
+        assert vault_metadata == []
+
+
+def test_memory_forget_reports_legacy_bool_and_authoritative_action(
+    monkeypatch,
+) -> None:
     """MCP callers keep ``deleted`` while receiving the non-destructive outcome."""
     from cli_agent_orchestrator.mcp_server import server
 
@@ -127,7 +147,7 @@ def test_store_refuses_non_writable_vault_binding_without_native_fallback(
     monkeypatch.setattr(
         service,
         "resolve_scope_id",
-        lambda scope, _terminal_context: "fixture-project" if scope == "project" else None,
+        lambda scope, _terminal_context: ("fixture-project" if scope == "project" else None),
     )
     native_path = service.get_wiki_path("project", "fixture-project", "read-only-topic")
 
@@ -179,7 +199,6 @@ def test_store_refuses_vault_write_when_native_peer_exists(tmp_path, monkeypatch
 
 def test_store_refuses_native_write_when_vault_peer_exists(tmp_path, monkeypatch) -> None:
     service, fixture, _Session = _vault_service(tmp_path, monkeypatch)
-    config = VaultConfig(enabled=True, vaults=[fixture.vault])
     native_config = VaultConfig(enabled=False, vaults=[])
     asyncio.run(
         service.store(

@@ -129,6 +129,43 @@ def test_reader_rejects_non_injectable_mapping_when_required(tmp_path, monkeypat
     assert load_candidate(candidate, max_body_chars=4096, require_injectable=True) is None
 
 
+def test_reader_refuses_stale_projection_when_mapping_index_is_disabled(tmp_path, monkeypatch):
+    """A configured disabled mapping remains authoritative but supplies no candidates."""
+    from cli_agent_orchestrator.services.vault import reader
+    from cli_agent_orchestrator.services.vault import reconcile as reconcile_module
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'state.db'}")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    monkeypatch.setattr(reconcile_module, "SessionLocal", Session)
+    monkeypatch.setattr(reader, "SessionLocal", Session)
+    monkeypatch.setattr(reconcile_module, "_replace_vault_edges", lambda _notes: None)
+    monkeypatch.setattr(reconcile_module, "_emit_audit_events", lambda *_args: None)
+    fixture = build_vault_fixture(tmp_path)
+    reconcile(fixture.vault, apply=True, run_id="index-disabled")
+    mapping = next(item for item in fixture.vault.mappings if item.scope == "project")
+    disabled_mapping = mapping.model_copy(update={"index": False})
+    binding = VaultBinding(
+        scope="project",
+        scope_id="fixture-project",
+        vault_id=fixture.vault.id,
+        root=fixture.vault.root,
+        mapping=disabled_mapping,
+    )
+
+    resolution = resolve_candidates(
+        binding,
+        scope="project",
+        scope_id="fixture-project",
+        require_injectable=False,
+        terminal_id=None,
+        consumer="explicit_recall",
+    )
+
+    assert resolution.exit_arm == "index_disabled"
+    assert list(resolution) == []
+
+
 def test_metadata_recall_uses_vault_builder_not_native_wiki_parser(tmp_path, monkeypatch):
     """Vault recall returns ordinary Markdown that native parsing would drop."""
     from cli_agent_orchestrator.services import memory_service, settings_service
@@ -148,7 +185,8 @@ def test_metadata_recall_uses_vault_builder_not_native_wiki_parser(tmp_path, mon
 
     fixture = build_vault_fixture(tmp_path)
     (fixture.root / "CAO" / "Guide.md").write_text(
-        "---\ncao:\n  key: guide\n---\n# Guide\n\nordinary vault prose", encoding="utf-8"
+        "---\ncao:\n  key: guide\n---\n# Guide\n\nordinary vault prose",
+        encoding="utf-8",
     )
     config = VaultConfig(enabled=True, vaults=[fixture.vault])
     monkeypatch.setattr(settings_service, "get_vault_config", lambda: config)

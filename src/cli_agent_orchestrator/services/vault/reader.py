@@ -131,6 +131,8 @@ def resolve_candidates(
         consumer=consumer,
         terminal_id=terminal_id,
     )
+    if not binding.index:
+        return _resolution(policy, (), "index_disabled")
     # Curator recall is inserted verbatim into another terminal's context.
     # Agent-scoped mappings are explicit-recall-only, matching the builder.
     if policy.is_curator is not False and binding.scope == "agent":
@@ -387,7 +389,13 @@ def _strip_leading_h1(body: str) -> str:
 
 def _stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
     """Fields whose change means a caller must not consume this read window."""
-    return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
 
 
 def _open_confined_fd(root: str, real_path: str) -> tuple[int, os.stat_result]:

@@ -166,8 +166,8 @@ def _preview_rename_findings(
 def _clear_stale_vault_edges(vault_id: str, projected: tuple[_ProjectedNote, ...]) -> None:
     """Retract removed or non-indexed sources through the relationship boundary."""
     with SessionLocal() as db:
-        prior_by_path = {
-            row.vault_relpath: row
+        prior_by_path: dict[str, VaultNoteModel] = {
+            cast(str, row.vault_relpath): row
             for row in db.query(VaultNoteModel).filter(VaultNoteModel.vault_id == vault_id).all()
         }
         resolutions = _resolve_renames(vault_id, projected, prior_by_path)
@@ -191,14 +191,12 @@ def _clear_stale_vault_edges(vault_id: str, projected: tuple[_ProjectedNote, ...
         )
     service = MemoryRelationshipService()
     for row in removed + retracted:
-        service.replace_set(
-            row.scope,
-            None if row.scope_id == "" else row.scope_id,
-            row.cao_key,
+        service.clear_source(
+            cast(str, row.scope),
+            None if cast(str, row.scope_id) == "" else cast(str, row.scope_id),
+            cast(str, row.cao_key),
             "vault",
-            "relates_to",
-            [],
-            source_kind="vault",
+            preserve_terminal=False,
         )
 
 
@@ -297,8 +295,8 @@ def _apply_plan(
         else:
             db.query(VaultFindingModel).filter(VaultFindingModel.vault_id == vault.id).delete()
 
-        prior_by_path = {
-            row.vault_relpath: row
+        prior_by_path: dict[str, VaultNoteModel] = {
+            cast(str, row.vault_relpath): row
             for row in db.query(VaultNoteModel).filter(VaultNoteModel.vault_id == vault.id).all()
         }
         resolutions = _resolve_renames(vault.id, projected, prior_by_path)
@@ -379,6 +377,34 @@ def _delete_metadata_for_item(db, item: _ProjectedNote) -> None:
     ).delete()
 
 
+def _delete_metadata_for_identity(db, scope: str, stored_scope_id: str, key: str) -> None:
+    db.query(MemoryMetadataModel).filter(
+        MemoryMetadataModel.key == key,
+        MemoryMetadataModel.scope == scope,
+        (
+            MemoryMetadataModel.scope_id.is_(None)
+            if stored_scope_id == ""
+            else MemoryMetadataModel.scope_id == stored_scope_id
+        ),
+        MemoryMetadataModel.source_kind == "vault",
+    ).delete()
+
+
+def _delete_aliases_for_identity(
+    db, vault_id: str, scope: str, stored_scope_id: str, key: str
+) -> None:
+    db.query(VaultNoteAliasModel).filter(
+        VaultNoteAliasModel.vault_id == vault_id,
+        VaultNoteAliasModel.cao_key == key,
+        VaultNoteAliasModel.scope == scope,
+        (
+            VaultNoteAliasModel.scope_id.is_(None)
+            if stored_scope_id == ""
+            else VaultNoteAliasModel.scope_id == stored_scope_id
+        ),
+    ).delete()
+
+
 def _resolve_renames(
     vault_id: str,
     projected: tuple[_ProjectedNote, ...],
@@ -434,6 +460,8 @@ def _resolve_renames(
                     note_uid=existing.note_uid,
                     memory_id=_digest("memory", existing.note_uid),
                 )
+            if existing.status == "excluded" and item.note.status == "indexed":
+                item = replace(item, note=replace(item.note, status="excluded"))
             resolutions.append(_RenameResolution(item))
             continue
         same_scope = tuple(
@@ -536,7 +564,12 @@ def _refresh_alias_provenance(
 
 
 def _rename_finding(code: FindingCode, relpath: str) -> tuple[str, str, str, str]:
-    return (code.value, relpath, finding_severity(code, secret_gate="reject"), code.value)
+    return (
+        code.value,
+        relpath,
+        finding_severity(code, secret_gate="reject"),
+        code.value,
+    )
 
 
 def _merge_findings(
@@ -566,6 +599,15 @@ def _merge_findings(
 
 def _upsert_note(db, vault_id: str, item: _ProjectedNote, started: datetime) -> None:
     row = db.get(VaultNoteModel, item.note_uid)
+    if row is None:
+        row = (
+            db.query(VaultNoteModel)
+            .filter(
+                VaultNoteModel.vault_id == vault_id,
+                VaultNoteModel.vault_relpath == item.note.vault_relpath,
+            )
+            .first()
+        )
     values = {
         "vault_id": vault_id,
         "scope": item.note.scope,
@@ -583,6 +625,25 @@ def _upsert_note(db, vault_id: str, item: _ProjectedNote, started: datetime) -> 
     if row is None:
         db.add(VaultNoteModel(note_uid=item.note_uid, **values))
     else:
+        stored_scope = cast(str, row.scope)
+        stored_scope_id = cast(str, row.scope_id)
+        stored_key = cast(str, row.cao_key)
+        if (
+            stored_scope != item.note.scope
+            or stored_scope_id != (item.note.scope_id or "")
+            or stored_key != item.key
+        ):
+            MemoryRelationshipService().clear_source(
+                stored_scope,
+                None if stored_scope_id == "" else stored_scope_id,
+                stored_key,
+                "vault",
+                preserve_terminal=False,
+                db=db,
+            )
+            _delete_metadata_for_identity(db, stored_scope, stored_scope_id, stored_key)
+            _delete_aliases_for_identity(db, vault_id, stored_scope, stored_scope_id, stored_key)
+            row.note_uid = item.note_uid
         for key, value in values.items():
             setattr(row, key, value)
 
@@ -624,7 +685,9 @@ def _upsert_metadata(db, item: _ProjectedNote) -> None:
             setattr(row, key, value)
 
 
-def _group_findings(projected: Iterable[_ProjectedNote]) -> tuple[tuple[str, str, str, str], ...]:
+def _group_findings(
+    projected: Iterable[_ProjectedNote],
+) -> tuple[tuple[str, str, str, str], ...]:
     all_notes = tuple(projected)
     grouped: dict[tuple[str, str, str], list[str]] = defaultdict(list)
     candidates = tuple(
@@ -688,33 +751,67 @@ def _replace_vault_edges(projected: Iterable[_ProjectedNote]) -> None:
         # Vault edges are derived projection rows. Retire this producer's active
         # set before replacing it so service-minted IDs and provenance describe
         # the current reconcile run rather than a prior vault snapshot.
-        service.replace_set(
+        service.clear_source(
             item.note.scope,
             item.note.scope_id,
             item.key,
             "vault",
-            "relates_to",
-            [],
-            source_kind="vault",
         )
         if item.note.parsed is None:
             continue
-        edges = []
+        edges_by_type: dict[str, dict[str, EdgeInput]] = defaultdict(dict)
         for embed, raw in extract_wikilinks(item.note.parsed.region.body).links:
             outcome = resolve_wikilink(raw, embed=embed, candidates=candidates)
             if outcome.outcome == "resolved" and outcome.target_key is not None:
-                edges.append(
-                    EdgeInput(target_key=outcome.target_key, attributes=outcome.attributes)
+                edges_by_type["relates_to"][outcome.target_key] = EdgeInput(
+                    target_key=outcome.target_key,
+                    attributes=(
+                        dict(outcome.attributes) if outcome.attributes is not None else None
+                    ),
                 )
-        service.replace_set(
-            item.note.scope,
-            item.note.scope_id,
-            item.key,
-            "vault",
-            "relates_to",
-            edges,
-            source_kind="vault",
-        )
+        for link in item.note.parsed.cao.get("links", ()):
+            link_type = link.get("type", "relates_to")
+            raw_target = link["to"]
+            exact = next(
+                (candidate.key for candidate in candidates if candidate.key == raw_target),
+                None,
+            )
+            if exact is not None:
+                target_key = exact
+                canonical_attributes: dict[str, object] = {}
+            else:
+                outcome = resolve_wikilink(raw_target, embed=False, candidates=candidates)
+                if outcome.outcome != "resolved" or outcome.target_key is None:
+                    continue
+                target_key = outcome.target_key
+                canonical_attributes = (
+                    dict(outcome.attributes) if outcome.attributes is not None else {}
+                )
+            body_edge = edges_by_type[link_type].get(target_key)
+            merged_attributes = dict(body_edge.attributes or {}) if body_edge else {}
+            merged_attributes.update(canonical_attributes)
+            merged_attributes.update(
+                {
+                    "authored_origin": link.get("origin", "human"),
+                    "canonical_only": True,
+                }
+            )
+            edges_by_type[link_type][target_key] = EdgeInput(
+                target_key=target_key,
+                status=link.get("status", "active"),
+                confidence=link.get("confidence"),
+                attributes=merged_attributes,
+            )
+        for type_, edges in edges_by_type.items():
+            service.replace_set(
+                item.note.scope,
+                item.note.scope_id,
+                item.key,
+                "vault",
+                type_,
+                list(edges.values()),
+                source_kind="vault",
+            )
 
 
 def _emit_audit_events(
