@@ -101,12 +101,30 @@ def _is_dispatch_active(terminal_id: str) -> bool:
 def _mark_dispatch_active(terminal_id: str, generation: Optional[int] = None) -> None:
     """``generation`` defaults to a fresh read for callers (mainly tests) that
     just want "busy as of right now"; deliver_pending always passes the
-    generation it already read post-send_input explicitly, so the value
-    stored is the one it actually adjudicated (#709 sixth review round)."""
+    generation it read BEFORE calling send_input, so the marker exists for
+    the whole dispatch window and no status event confirming it can be
+    consumed before the marker does (#709 eighth review round: arming after
+    the send left a check-then-mark window between the post-dispatch read
+    and this call, wide enough for a fast completion event to be consumed by
+    InboxService.run() first, finding no marker to clear, and then this call
+    installing one for a generation that had already been confirmed and
+    would never be confirmed again)."""
     if generation is None:
         generation = status_monitor.get_status_generation(terminal_id)
     with _dispatch_active_guard:
         _dispatch_active[terminal_id] = generation
+
+
+def _abort_dispatch_active(terminal_id: str) -> None:
+    """Drop the marker unconditionally after a send that never reached the
+    terminal (#709 eighth review round). ``_mark_dispatch_active`` now runs
+    before ``send_input`` (see deliver_pending), so a failed or unresolved
+    send has already armed a marker that no real status event will ever
+    clear: nothing happened at the terminal, so there is nothing for
+    ``_clear_dispatch_active``'s generation check to confirm. Called from
+    both exception branches; safe to call when no marker is set."""
+    with _dispatch_active_guard:
+        _dispatch_active.pop(terminal_id, None)
 
 
 def _drop_dispatch_active_on_status_reset(terminal_id: str) -> None:
@@ -270,7 +288,25 @@ class InboxService:
             for sender_id, group in groupby(messages, key=lambda m: m.sender_id):
                 batch = list(group)
                 combined = "\n".join(m.message for m in batch)
+                # Mark busy BEFORE dispatch (#709 eighth review round), not after.
+                # Arming after send_input returns left a check-then-mark window: a
+                # fast completion event could be published and consumed by
+                # InboxService.run() while this call was still between its
+                # post-dispatch read and _mark_dispatch_active, find no marker to
+                # clear (none existed yet), and then this call would install one
+                # for a generation that event had already confirmed: nothing left
+                # to arrive would ever clear it, coalescing every later message to
+                # this terminal forever (reviewer-reproduced finding on #709).
+                # Arming here, before send_input is even called, closes the window:
+                # no status event caused by this dispatch can exist before the
+                # marker does, so _clear_dispatch_active's strictly-greater
+                # generation check is always checked against a marker that was
+                # already in place when the confirming event was published. If the
+                # send never reaches the terminal (see the except branches below),
+                # _abort_dispatch_active drops it again: nothing will ever confirm a
+                # dispatch that did not happen.
                 pre_dispatch_generation = status_monitor.get_status_generation(terminal_id)
+                _mark_dispatch_active(terminal_id, pre_dispatch_generation)
                 try:
                     if registry is None:
                         terminal_service.send_input(terminal_id, combined)
@@ -283,38 +319,12 @@ class InboxService:
                             orchestration_type=OrchestrationType.SEND_MESSAGE,
                         )
                     logger.info(f"Delivered {len(batch)} message(s) to terminal {terminal_id}")
-                    # Mark busy (#709): the dispatch went through, but the cached
-                    # status will not reflect it until the real pipeline detects
-                    # the terminal's own output, so a concurrent or immediately
-                    # following call must not read the still-stale ready status.
-                    #
-                    # No provider sets assume_processing_on_dispatch, so
-                    # send_input never bumps the generation on its own (#709
-                    # seventh review round, correcting the sixth round's premise
-                    # that one bump is always its synthetic PROCESSING marker).
-                    # An unchanged generation means nothing has been detected
-                    # since the pre-dispatch read, so the cached status is
-                    # unproven either way: stay conservative and mark busy. A
-                    # changed generation means a REAL transition landed during
-                    # the blocking send; trust it rather than the bump count.
-                    # Only mark busy if it says the terminal is still not ready,
-                    # never against a generation that has already proven the
-                    # turn complete (that would wait for a later transition with
-                    # no reason to arrive, coalescing every future message to
-                    # this terminal forever).
-                    post_dispatch_generation = status_monitor.get_status_generation(terminal_id)
-                    if post_dispatch_generation == pre_dispatch_generation:
-                        _mark_dispatch_active(terminal_id, post_dispatch_generation)
-                    elif status_monitor.get_status(terminal_id) not in (
-                        TerminalStatus.IDLE,
-                        TerminalStatus.COMPLETED,
-                    ):
-                        _mark_dispatch_active(terminal_id, post_dispatch_generation)
                 except TerminalNotFoundError as e:
                     # Pane not resolvable yet (e.g. a herdr pane that isn't mapped
                     # for this window). Treat as transient: reset to PENDING so the
                     # reconcile sweep retries rather than marking FAILED. These were
                     # optimistically set to DELIVERED above. (#271 semantic.)
+                    _abort_dispatch_active(terminal_id)
                     for message in batch:
                         update_message_status(message.id, MessageStatus.PENDING)
                     logger.warning(
@@ -322,6 +332,7 @@ class InboxService:
                         f"{len(batch)} message(s) pending for retry: {e}"
                     )
                 except Exception as e:
+                    _abort_dispatch_active(terminal_id)
                     for message in batch:
                         logger.error(
                             f"Failed to deliver message {message.id} to {terminal_id}: {e}"
