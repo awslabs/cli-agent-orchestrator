@@ -311,3 +311,97 @@ describe('ProfilesPanel — stale in-flight responses are discarded (#692 review
     expect(screen.queryByRole('alert')).not.toBeInTheDocument()
   })
 })
+
+describe('round-4 review: mutation vs search/catalog ordering (#692)', () => {
+  it('creating under an ACTIVE search clears the query and selects the new profile', async () => {
+    // The visible rows are `results ?? catalog`; refreshing only the catalog
+    // left the stale results in place, so the created profile was invisible
+    // and the detail pane read "Select a profile…" under a success snackbar
+    // (haofeif's round-4 P2 probe).
+    let created = false
+    const NEW_ROW = { name: 'fresh-agent', description: 'Newly made', source: 'local' }
+    vi.stubGlobal('fetch', vi.fn(async (url: string, opts?: any) => {
+      if (url.includes('/agents/profiles/validate')) return okJson({ valid: true, messages: [] })
+      if (url.includes('/agents/profiles/search')) return okJson([
+        { name: 'old-agent', description: 'Old', capabilities: [], tags: [], role: '', source: 'local', coverage: 1, score: 1.0 },
+      ])
+      if (url.includes('/agents/profiles/schema')) return okJson({
+        type: 'object', required: ['name'],
+        properties: { name: { type: 'string' }, description: { type: 'string' } },
+      })
+      if (url.includes('/agents/profiles/templates')) return okJson([])
+      if (url.includes('/agents/providers')) return okJson([])
+      if (url.endsWith('/agents/profiles') && opts?.method === 'POST') { created = true; return okJson({ name: 'fresh-agent', warnings: [] }) }
+      if (/\/agents\/profiles\/[^/?]+$/.test(url)) return okJson({ name: 'fresh-agent', description: 'Newly made' })
+      if (url.includes('/agents/profiles')) return okJson(created ? [...CATALOG, NEW_ROW] : CATALOG)
+      return okJson([])
+    }))
+    vi.useFakeTimers()
+    try {
+      render(<ProfilesPanel />)
+      await act(async () => {})
+      // Activate a search whose results will NOT contain the new profile
+      const box = screen.getByRole('searchbox', { name: /search profiles/i })
+      fireEvent.change(box, { target: { value: 'old' } })
+      await act(() => vi.advanceTimersByTimeAsync(400))
+      expect(screen.getByRole('option', { name: /old-agent/ })).toBeInTheDocument()
+
+      fireEvent.click(screen.getByRole('button', { name: /new profile/i }))
+      await act(async () => {}) // modal open-effect fetches settle
+      fireEvent.click(screen.getByRole('tab', { name: 'From scratch' }))
+      await act(async () => {})
+      fireEvent.change(screen.getByRole('textbox', { name: 'Profile name' }), { target: { value: 'fresh-agent' } })
+      fireEvent.click(screen.getByRole('button', { name: /create profile/i }))
+      await act(async () => {})
+
+      // Search cleared, new row visible AND selected
+      expect(box).toHaveValue('')
+      expect(screen.getByRole('option', { name: /fresh-agent/ })).toBeInTheDocument()
+      await act(async () => {})
+      expect(within(screen.getByTestId('profile-detail')).getByText('Newly made')).toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('a slow mount catalog load cannot overwrite a post-create refresh', async () => {
+    // Catalog loads now carry a monotonic token: previously the mount
+    // snapshot resolving AFTER the create-triggered refresh replaced the
+    // fresh catalog, deleting the just-created row (haofeif's round-4 P2).
+    let releaseMount!: () => void
+    const NEW_ROW = { name: 'fresh-agent', description: 'Newly made', source: 'local' }
+    let catalogCall = 0
+    let created = false
+    vi.stubGlobal('fetch', vi.fn(async (url: string, opts?: any) => {
+      if (url.includes('/agents/profiles/validate')) return okJson({ valid: true, messages: [] })
+      if (url.includes('/agents/profiles/schema')) return okJson({
+        type: 'object', required: ['name'], properties: { name: { type: 'string' } },
+      })
+      if (url.includes('/agents/profiles/templates')) return okJson([])
+      if (url.includes('/agents/providers')) return okJson([])
+      if (url.endsWith('/agents/profiles') && opts?.method === 'POST') { created = true; return okJson({ name: 'fresh-agent', warnings: [] }) }
+      if (/\/agents\/profiles\/[^/?]+$/.test(url)) return okJson({ name: 'fresh-agent', description: 'Newly made' })
+      if (url.includes('/agents/profiles')) {
+        catalogCall++
+        if (catalogCall === 1) return new Promise<any>(res => { releaseMount = () => res(okJson(CATALOG)) })
+        return okJson(created ? [...CATALOG, NEW_ROW] : CATALOG)
+      }
+      return okJson([])
+    }))
+    render(<ProfilesPanel />)
+    await act(async () => {}) // mount load in flight, gated
+
+    fireEvent.click(screen.getByRole('button', { name: /new profile/i }))
+    await act(async () => {}) // modal open-effect fetches settle
+    fireEvent.click(screen.getByRole('tab', { name: 'From scratch' }))
+    await act(async () => {})
+    fireEvent.change(screen.getByRole('textbox', { name: 'Profile name' }), { target: { value: 'fresh-agent' } })
+    fireEvent.click(screen.getByRole('button', { name: /create profile/i }))
+    await act(async () => {})
+    expect(screen.getByRole('option', { name: /fresh-agent/ })).toBeInTheDocument()
+
+    // The stale mount snapshot lands last: it must be discarded
+    await act(async () => { releaseMount() })
+    expect(screen.getByRole('option', { name: /fresh-agent/ })).toBeInTheDocument()
+  })
+})

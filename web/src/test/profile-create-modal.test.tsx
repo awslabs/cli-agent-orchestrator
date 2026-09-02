@@ -755,3 +755,70 @@ describe('mode round-trip must not strand template mode (adversarial probe)', ()
     expect(screen.queryByTestId('template-schema-loading')).not.toBeInTheDocument()
   })
 })
+
+describe('round-4 review: async ordering (#692)', () => {
+  beforeEach(() => vi.useFakeTimers())
+  afterEach(() => vi.useRealTimers())
+
+  const OLD_BODY = '---\nname: old-config-agent\ndescription: A\n---\n\nOLD-CONFIG-BODY\n'
+
+  it("a preview in flight for config A cannot land during config B's debounce window", async () => {
+    // The generation must advance when the FORM STATE changes, not when the
+    // debounced request is issued: without the early bump, A's response
+    // matched the sequence mid-debounce, installed A's body, and re-armed
+    // Create while the form displayed B (haofeif's round-4 P1 probe).
+    let releaseA!: () => void
+    let call = 0
+    const mock = routedFetch({
+      '/agents/profiles/templates/preview': () => {
+        call++
+        if (call === 1) return new Promise<any>(res => { releaseA = () => res(okJson({ template: 'aws/sqs-monitor', content: OLD_BODY })) })
+        return okJson({ template: 'aws/sqs-monitor', content: RENDERED })
+      },
+    })
+    vi.stubGlobal('fetch', mock)
+    render(<ProfileCreateModal open={true} onClose={() => {}} onCreated={() => {}} />)
+    await act(async () => {})
+    await pickOption('Template', 'aws/sqs-monitor')
+    await act(async () => {})
+    await act(() => vi.advanceTimersByTimeAsync(PREVIEW_DEBOUNCE_MS + 10)) // A in flight, gated
+
+    // Edit config to B; A's response is released DURING B's debounce window
+    fireEvent.change(screen.getByRole('textbox', { name: 'queue_url' }), { target: { value: 'https://sqs.new' } })
+    await act(async () => { releaseA() })
+
+    // A must be discarded: no stale body, Create still gated on the pending render
+    expect(screen.queryByText(/OLD-CONFIG-BODY/)).not.toBeInTheDocument()
+    fireEvent.change(screen.getByRole('textbox', { name: 'Profile name' }), { target: { value: 'victim' } })
+    expect(screen.getByRole('button', { name: /create profile/i })).toBeDisabled()
+
+    // B's own render lands normally once the debounce fires
+    await act(() => vi.advanceTimersByTimeAsync(PREVIEW_DEBOUNCE_MS + 10))
+    expect(screen.getByTestId('template-preview')).toHaveTextContent('# You watch queues.')
+  })
+
+  it('mode tabs are disabled while a save is in flight', async () => {
+    let releasePost!: () => void
+    const postGate = new Promise<any>(res => { releasePost = () => res(okJson({ name: 'x', warnings: [] })) })
+    vi.stubGlobal('fetch', vi.fn(async (url: string, opts?: any) => {
+      if (String(url).includes('/agents/profiles/validate')) return okJson({ valid: true, messages: [] })
+      if (String(url).endsWith('/agents/profiles') && opts?.method === 'POST') return postGate
+      if (String(url).includes('/agents/profiles/schema')) return okJson(PROFILE_SCHEMA)
+      return okJson([])
+    }))
+    render(<ProfileCreateModal open={true} onClose={() => {}} onCreated={() => {}} />)
+    await act(async () => {})
+    fireEvent.click(screen.getByRole('tab', { name: 'From scratch' }))
+    await act(async () => {})
+    fireEvent.change(screen.getByRole('textbox', { name: 'Profile name' }), { target: { value: 'x' } })
+    fireEvent.click(screen.getByRole('button', { name: /create profile/i }))
+    await act(async () => {})
+
+    // Mid-save: switching modes would let the old mode's result repopulate
+    // errors on the new form -- both tabs must be inert
+    expect(screen.getByRole('tab', { name: 'From template' })).toBeDisabled()
+    expect(screen.getByRole('tab', { name: 'From scratch' })).toBeDisabled()
+
+    await act(async () => { releasePost() })
+  })
+})

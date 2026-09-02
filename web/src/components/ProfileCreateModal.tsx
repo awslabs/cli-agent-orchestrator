@@ -405,18 +405,21 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
   // Debounced live preview: one render request per quiet burst of config edits.
   useEffect(() => {
     if (previewTimer.current) clearTimeout(previewTimer.current)
+    // Advance the generation IMMEDIATELY on any form-state change -- not when
+    // the debounced request is eventually issued. A response for the PRIOR
+    // state is stale the moment the state changes: without the early bump, a
+    // render in flight for config A landing during config B's 300ms debounce
+    // window still matched the sequence, installed A's body, and re-armed
+    // Create while the form displayed B (round-4 P1).
+    const seq = ++previewSeq.current
     if (!template || !templateSchema) {
-      // No render can be issued from this state, so any in-flight one is
-      // stale by definition (template switched or deselected mid-request).
-      // Without the bump, its late response still satisfied the seq check
-      // and silently re-armed Create with the previous template's body.
-      previewSeq.current++
+      // No render can be issued from this state; the bump above already
+      // invalidated anything in flight (template switched or deselected).
       setPreviewLoading(false)
       return
     }
     setPreviewLoading(true)
     previewTimer.current = setTimeout(() => {
-      const seq = ++previewSeq.current
       api.previewTemplate(template, config)
         .then(p => {
           if (seq !== previewSeq.current) return
@@ -633,11 +636,15 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
             <Package size={18} className="text-blue-400" />
           </div>
           <h3 className="text-base font-semibold text-white flex-1">Create profile</h3>
+          {/* Tabs are disabled while a save is in flight: a validation/POST
+              started in the old mode completing after a switch would
+              repopulate old-mode errors and red boundaries on the newly
+              selected form (round-4 review). */}
           <div className="flex gap-1" role="tablist" aria-label="Create mode">
-            <button role="tab" aria-selected={mode === 'template'} className={tabClass(mode === 'template')} onClick={() => setMode('template')}>
+            <button role="tab" aria-selected={mode === 'template'} disabled={saving} className={`${tabClass(mode === 'template')} disabled:opacity-50`} onClick={() => setMode('template')}>
               From template
             </button>
-            <button role="tab" aria-selected={mode === 'scratch'} className={tabClass(mode === 'scratch')} onClick={() => setMode('scratch')}>
+            <button role="tab" aria-selected={mode === 'scratch'} disabled={saving} className={`${tabClass(mode === 'scratch')} disabled:opacity-50`} onClick={() => setMode('scratch')}>
               From scratch
             </button>
           </div>

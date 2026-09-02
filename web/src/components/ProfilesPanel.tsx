@@ -217,12 +217,43 @@ export function ProfilesPanel() {
   // the parsed-profile fetch re-runs even though the selected NAME is
   // unchanged (#692 review: stale provider/model/tags after save).
   const [detailReload, setDetailReload] = useState(0)
+  // Monotonic catalog-load token: without it, a slow mount request resolving
+  // AFTER a post-write refresh overwrote the fresh catalog with its stale
+  // snapshot, deleting the just-created row (round-4 review).
+  const catalogSeq = useRef(0)
 
-  const refreshCatalog = () =>
-    api.listProfiles()
-      .then(p => { setCatalog(p); setCatalogError(null) })
-      .catch(e => setCatalogError(e?.detail || e?.message || 'Failed to load profiles'))
-      .finally(() => setCatalogLoading(false))
+  /** Refresh the catalog; resolves true only when THIS load's result was
+      applied (stale/discarded and failed loads resolve false). */
+  const refreshCatalog = () => {
+    const seq = ++catalogSeq.current
+    return api.listProfiles()
+      .then(p => {
+        if (seq !== catalogSeq.current) return false
+        setCatalog(p)
+        setCatalogError(null)
+        return true
+      })
+      .catch(e => {
+        if (seq !== catalogSeq.current) return false
+        setCatalogError(e?.detail || e?.message || 'Failed to load profiles')
+        return false
+      })
+      .finally(() => { if (seq === catalogSeq.current) setCatalogLoading(false) })
+  }
+
+  // After a successful write, the ACTIVE search's rows are stale (they never
+  // carry the new/renamed profile), so selecting the new name rendered
+  // "Select a profile…" under a success snackbar (round-4 review). Clear the
+  // search and select only once the refreshed catalog is the visible row set;
+  // a failed refresh stays a failure instead of continuing to selection.
+  const clearSearchAndSelect = (name: string) => {
+    searchSeq.current++
+    setQuery('')
+    setResults(null)
+    setSearchError(null)
+    setSearching(false)
+    setSelected(name)
+  }
 
   useEffect(() => { refreshCatalog() }, [])
 
@@ -232,12 +263,11 @@ export function ProfilesPanel() {
         ? { type: 'info', message: `Profile '${name}' saved with ${warnings.length} warning${warnings.length !== 1 ? 's' : ''}: ${warnings[0].message}` }
         : { type: 'success', message: `Profile '${name}' saved` },
     )
-    // Select after the refresh resolves: a clone's new name is not in the
-    // catalog yet, and selecting first rendered "Select a profile…" until the
-    // refetch landed (or forever, if it failed -- the catalog error alert is
-    // the visible path out) (#692 review).
-    await refreshCatalog()
-    setSelected(name)
+    // Select after the refresh resolves AND succeeded: a clone's new name is
+    // not in the catalog yet, and an active search's stale rows never carry
+    // it (round-4 review).
+    if (!(await refreshCatalog())) return
+    clearSearchAndSelect(name)
     // The detail fetch is keyed on the profile NAME, which an in-place edit
     // does not change -- without an explicit reload token the pane kept
     // showing pre-edit provider/model/tags after a successful save.
@@ -277,10 +307,12 @@ export function ProfilesPanel() {
         ? { type: 'info', message: `Profile '${name}' created with ${warnings.length} warning${warnings.length !== 1 ? 's' : ''}: ${warnings[0].message}` }
         : { type: 'success', message: `Profile '${name}' created` },
     )
-    // Select only after the refetch lands so the new row exists to render
-    // (selecting first showed "Select a profile…" until the refresh resolved).
-    await refreshCatalog()
-    setSelected(name)
+    // Select only after a SUCCESSFUL refetch and with any active search
+    // cleared, so the new row is actually in the visible row set (round-4
+    // review: under an active query the pane showed "Select a profile…"
+    // despite the success snackbar).
+    if (!(await refreshCatalog())) return
+    clearSearchAndSelect(name)
   }
 
   // Debounced server search: one request per >=300ms-quiet keystroke burst.
