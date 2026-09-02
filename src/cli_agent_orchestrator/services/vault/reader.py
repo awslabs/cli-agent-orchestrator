@@ -132,7 +132,7 @@ def resolve_candidates(
         terminal_id=terminal_id,
     )
     if not binding.index:
-        return _resolution(policy, (), "index_disabled")
+        return _resolution(policy, (), "not_indexable")
     # Curator recall is inserted verbatim into another terminal's context.
     # Agent-scoped mappings are explicit-recall-only, matching the builder.
     if policy.is_curator is not False and binding.scope == "agent":

@@ -21,7 +21,11 @@ from cli_agent_orchestrator.graph.providers import get_provider
 from cli_agent_orchestrator.graph.providers.memory import MemoryGraphProvider
 from cli_agent_orchestrator.services import settings_service, wiki_lint
 from cli_agent_orchestrator.services.memory_service import MemoryService
-from cli_agent_orchestrator.services.vault.binding import VaultConfigUnavailableError
+from cli_agent_orchestrator.services.vault.binding import (
+    VaultBinding,
+    VaultConfigUnavailableError,
+)
+from cli_agent_orchestrator.services.vault.config import FolderMapping
 from cli_agent_orchestrator.services.wiki_lint import LintIssue
 
 BODY = "A reasonably long article body so contradiction pairing engages." + " filler" * 10
@@ -527,10 +531,8 @@ class TestMemoryProviderEdgeCases:
         assert all(e.type != EdgeType.CONTRADICTION for e in view.edges)
 
     @pytest.mark.asyncio
-    async def test_unavailable_vault_binding_degrades_to_native_projection(
-        self, populated_scope, monkeypatch
-    ):
-        """Optional vault configuration cannot make graph projection unavailable."""
+    async def test_unavailable_vault_binding_fails_closed(self, populated_scope, monkeypatch):
+        """Unknown vault ownership must not expose a retained native projection."""
         run_lint = AsyncMock(return_value=[])
         monkeypatch.setattr(wiki_lint, "run_lint", run_lint)
 
@@ -545,5 +547,31 @@ class TestMemoryProviderEdgeCases:
 
         view = await provider.project(scope="global")
 
-        run_lint.assert_awaited_once()
-        assert {node.id for node in view.nodes} >= {"a", "b", "c"}
+        run_lint.assert_not_awaited()
+        assert view.nodes == []
+        assert view.edges == []
+        assert view.meta["boundary_cause"] == "vault_config_unavailable"
+
+    @pytest.mark.asyncio
+    async def test_index_disabled_vault_binding_has_empty_graph_with_boundary_cause(
+        self, populated_scope, tmp_path
+    ):
+        mapping = FolderMapping(folder="Mapped", scope="global", index=False)
+        resolved = VaultBinding(
+            scope="global",
+            scope_id=None,
+            vault_id="vault",
+            root=str(tmp_path),
+            mapping=mapping,
+        )
+        provider = MemoryGraphProvider(
+            memory_service=populated_scope,
+            lint_enabled=lambda: True,
+            binding_resolver=lambda *_args: resolved,
+        )
+
+        view = await provider.project(scope="global")
+
+        assert view.nodes == []
+        assert view.edges == []
+        assert view.meta["boundary_cause"] == "not_indexable"

@@ -63,6 +63,9 @@ def test_every_non_secret_finding_has_its_adr_severity():
         FindingCode.NOTE_CONTAINS_NUL: "error",
         FindingCode.RENAME_WITH_EDIT_UNRESOLVED: "warn",
         FindingCode.RENAME_AMBIGUOUS: "warn",
+        FindingCode.CAO_LINK_CONFLICT: "warn",
+        FindingCode.EDGE_LIMIT_EXCEEDED: "warn",
+        FindingCode.DEINDEXED_RETAINED: "warn",
     }
 
     assert dict(FINDING_SEVERITIES) == expected

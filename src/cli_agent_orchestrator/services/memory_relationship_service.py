@@ -812,6 +812,7 @@ class MemoryRelationshipService:
         *,
         spare_origins: tuple[str, ...] = ("vault",),
         origins: tuple[str, ...] | None = None,
+        db: Any = None,
     ) -> int:
         """HARD-delete selected rows touching ``key`` in either direction.
 
@@ -846,7 +847,9 @@ class MemoryRelationshipService:
 
         k = self._sanitize_key(key)
         sentinel = self._to_sentinel(scope_id)
-        with SessionLocal() as db:
+        owns_session = db is None
+        session = SessionLocal() if owns_session else db
+        try:
             filters = [
                 MemoryRelationshipModel.scope == scope,
                 MemoryRelationshipModel.scope_id == sentinel,
@@ -859,13 +862,18 @@ class MemoryRelationshipService:
                 filters.append(MemoryRelationshipModel.origin.notin_(spare_origins))
             else:
                 filters.append(MemoryRelationshipModel.origin.in_(origins))
-            rows = db.query(MemoryRelationshipModel).filter(*filters).all()
+            rows = session.query(MemoryRelationshipModel).filter(*filters).all()
             if not rows:
                 return 0
             for r in rows:
-                db.delete(r)
-            db.commit()
-        self._audit_purge(scope, sentinel, k, len(rows))
+                session.delete(r)
+            if owns_session:
+                session.commit()
+        finally:
+            if owns_session:
+                session.close()
+        if owns_session:
+            self._audit_purge(scope, sentinel, k, len(rows))
         return len(rows)
 
     # ------------------------------------------------------------------ #

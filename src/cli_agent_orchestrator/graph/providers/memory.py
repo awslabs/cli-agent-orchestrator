@@ -8,7 +8,7 @@ ABC, no edits to memory_service/wiki_lint) and awaiting
 
 import asyncio
 import logging
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, cast
 
 from cli_agent_orchestrator.graph.cache import GraphViewCache, make_meta
 from cli_agent_orchestrator.graph.models import Edge, EdgeType, GraphView, Node
@@ -114,14 +114,16 @@ class MemoryGraphProvider(GraphProvider):
         try:
             resolved_binding = self._binding_resolver(scope, scope_id)
             vault_bound = isinstance(resolved_binding, VaultBinding)
-        except VaultConfigUnavailableError:
-            # Graph projection is derived observability, not a vault enforcement
-            # path. An unavailable optional vault config must not hide native
-            # topology or prevent lint enrichment.
-            logger.warning(
-                "memory graph provider: vault binding unavailable; using native projection"
+        except VaultConfigUnavailableError as exc:
+            logger.warning("memory graph provider: vault binding unavailable: %s", exc)
+            meta.update(
+                {
+                    "boundary_cause": "vault_config_unavailable",
+                    "lint_enrichment": "unavailable_vault",
+                    "disabled_enrichments": _LINT_ENRICHMENTS,
+                }
             )
-            vault_bound = False
+            return GraphView(nodes=[], edges=[], meta=meta)
         if vault_bound:
             meta.update(
                 {
@@ -145,13 +147,12 @@ class MemoryGraphProvider(GraphProvider):
                 terminal_id=NO_REQUESTER_IDENTITY,
                 consumer="explicit_recall",
             )
-            if any(
-                resolution.exit_arm == "curator_agent_scope_refused"
-                for resolution in candidates.resolutions
-            ):
+            if candidates.exit_arm == "not_indexable":
+                meta["boundary_cause"] = candidates.exit_arm
+            if candidates.exit_arm == "curator_agent_scope_refused":
                 meta["agent_scope_omitted"] = True
             for candidate in candidates:
-                key = candidate.metadata.key
+                key = cast(str, candidate.metadata.key)
                 keys.append(key)
                 nodes[key] = Node(id=key, kind="topic", label=key, attrs={"is_vault": True})
         else:

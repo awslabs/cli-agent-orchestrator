@@ -44,6 +44,9 @@ class FindingCode(str, Enum):
     NOTE_CONTAINS_NUL = "note_contains_nul"
     RENAME_WITH_EDIT_UNRESOLVED = "rename_with_edit_unresolved"
     RENAME_AMBIGUOUS = "rename_ambiguous"
+    CAO_LINK_CONFLICT = "cao_link_conflict"
+    EDGE_LIMIT_EXCEEDED = "edge_limit_exceeded"
+    DEINDEXED_RETAINED = "deindexed_retained"
 
 
 @dataclass(frozen=True)
@@ -88,6 +91,9 @@ FINDING_SEVERITIES: Mapping[FindingCode, Severity] = MappingProxyType(
         FindingCode.NOTE_CONTAINS_NUL: "error",
         FindingCode.RENAME_WITH_EDIT_UNRESOLVED: "warn",
         FindingCode.RENAME_AMBIGUOUS: "warn",
+        FindingCode.CAO_LINK_CONFLICT: "warn",
+        FindingCode.EDGE_LIMIT_EXCEEDED: "warn",
+        FindingCode.DEINDEXED_RETAINED: "warn",
     }
 )
 
@@ -222,5 +228,23 @@ SUPPORTED_BOUNDARY: tuple[BoundaryRule, ...] = (
         "deferred",
         "treated as new; no identity guess",
         FindingCode.RENAME_AMBIGUOUS,
+    ),
+    BoundaryRule(
+        "conflicting duplicate cao.links entry",
+        "refused",
+        "no edge for the conflicting target/type tuple",
+        FindingCode.CAO_LINK_CONFLICT,
+    ),
+    BoundaryRule(
+        "more than 64 projected edges for one source/type",
+        "degraded",
+        "canonical entries then sorted body-only entries retained",
+        FindingCode.EDGE_LIMIT_EXCEEDED,
+    ),
+    BoundaryRule(
+        "excluded note changes identity at the same path",
+        "deferred",
+        "new identity remains excluded",
+        FindingCode.DEINDEXED_RETAINED,
     ),
 )

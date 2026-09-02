@@ -245,6 +245,40 @@ def test_typed_relationships_are_written_to_cao_links_and_round_trip(tmp_path, s
     assert parsed.frontmatter["tags"] == ["one", "two"]
 
 
+def test_cao_links_reemit_authored_origin_instead_of_vault_ownership(tmp_path, svc) -> None:
+    fixture = build_vault_fixture(tmp_path)
+    _store(svc, "linked")
+    relationships = _Relationships(
+        [
+            RelationshipDTO(
+                id="edge",
+                scope="global",
+                scope_id=None,
+                source_key="linked",
+                target_key="target",
+                type="relates_to",
+                origin="vault",
+                status="active",
+                confidence=None,
+                rank=None,
+                attributes={"authored_origin": "compiler"},
+                source_updated_at=None,
+                created_at=None,
+                updated_at=None,
+            )
+        ]
+    )
+
+    _migrate(svc, fixture, apply=True, relationship_service=relationships)
+
+    parsed = parse_note(
+        (fixture.root / "CAO" / "linked.md").read_text(encoding="utf-8"),
+        max_frontmatter_bytes=fixture.vault.max_frontmatter_bytes,
+        secret_gate="reject",
+    )
+    assert parsed.cao["links"][0]["origin"] == "compiler"
+
+
 def test_default_apply_keeps_native_row_when_vault_projection_is_refreshed(tmp_path, svc) -> None:
     fixture = build_vault_fixture(tmp_path)
     _store(svc, "coexists")

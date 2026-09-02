@@ -10,7 +10,7 @@ from cli_agent_orchestrator.graph.providers.memory import MemoryGraphProvider
 from cli_agent_orchestrator.services import wiki_lint
 from cli_agent_orchestrator.services.vault.binding import NativeBinding, VaultBinding
 from cli_agent_orchestrator.services.vault.config import FolderMapping
-from cli_agent_orchestrator.services.vault.reader import VaultCandidateBatch
+from cli_agent_orchestrator.services.vault.reader import VaultCandidateResolution
 
 
 class _IndexService:
@@ -61,7 +61,7 @@ async def test_lint_enrichment_cause_unavailable_vault(tmp_path, monkeypatch) ->
     monkeypatch.setattr(wiki_lint, "run_lint", run_lint)
     monkeypatch.setattr(
         "cli_agent_orchestrator.graph.providers.memory.resolve_candidates",
-        lambda *_args, **_kwargs: VaultCandidateBatch((), ()),
+        lambda *_args, **_kwargs: VaultCandidateResolution((), "explicit_recall", "candidates"),
     )
     provider = MemoryGraphProvider(
         memory_service=_IndexService(tmp_path / "index.md"),
@@ -113,9 +113,10 @@ async def test_vault_nodes_use_candidates_without_reading_note_content(
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.graph.providers.memory.resolve_candidates",
-        lambda *_args, **_kwargs: VaultCandidateBatch(
+        lambda *_args, **_kwargs: VaultCandidateResolution(
             (_graph_candidate("design"),),
-            (SimpleNamespace(exit_arm="candidates"),),
+            "explicit_recall",
+            "candidates",
         ),
     )
 
@@ -149,8 +150,10 @@ async def test_agent_scope_omission_is_visible_in_graph_metadata(tmp_path, monke
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.graph.providers.memory.resolve_candidates",
-        lambda *_args, **_kwargs: VaultCandidateBatch(
-            (), (SimpleNamespace(exit_arm="curator_agent_scope_refused"),)
+        lambda *_args, **_kwargs: VaultCandidateResolution(
+            (),
+            "memory_manager",
+            "curator_agent_scope_refused",
         ),
     )
 

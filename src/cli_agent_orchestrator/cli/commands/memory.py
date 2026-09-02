@@ -189,6 +189,8 @@ def vault_status(out_format):
         for name in ("status_counts", "finding_counts", "recall_counters"):
             counts = payload[name]
             click.echo(f"{name}: " + (", ".join(f"{key}={value}" for key, value in counts) or "-"))
+        for label, residual_rows in payload["inert_mappings"]:
+            click.echo(f"mapping: {label}; residual_rows={residual_rows}")
         for warning in payload["warnings"]:
             click.echo(f"warning: {warning}")
         click.echo(

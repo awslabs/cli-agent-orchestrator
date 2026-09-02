@@ -1392,6 +1392,44 @@ class TestVaultScopeAuthority:
         assert "native-peer" not in context
         assert "vault-peer" not in context
 
+    @pytest.mark.asyncio
+    async def test_malformed_vault_config_fails_closed_for_recall_and_injection(
+        self, tmp_path, monkeypatch
+    ):
+        from cli_agent_orchestrator.services import memory_service, settings_service
+
+        service = MemoryService(base_dir=tmp_path / "native")
+        terminal_context = _make_terminal_context(cwd=str(tmp_path / "project-a"))
+        service.resolve_scope_id = lambda scope, _context: (  # type: ignore[method-assign]
+            "project-a" if scope == "project" else None
+        )
+        monkeypatch.setattr(memory_service, "_is_memory_enabled", lambda: True)
+        monkeypatch.setattr(
+            settings_service, "get_vault_config", lambda: VaultConfig(enabled=False)
+        )
+        await service.store(
+            content="retained native replica",
+            scope="project",
+            memory_type="reference",
+            key="native-peer",
+            terminal_context=terminal_context,
+        )
+
+        def malformed_config():
+            raise ValueError("malformed vault config")
+
+        monkeypatch.setattr(settings_service, "get_vault_config", malformed_config)
+
+        assert (
+            await service.recall(
+                scope="project",
+                terminal_context=terminal_context,
+                search_mode="metadata",
+            )
+            == []
+        )
+        assert service.get_memory_context(terminal_context) == ""
+
 
 # ===========================================================================
 # FEDERATED scope (issue #313) — machine-wide shared tier

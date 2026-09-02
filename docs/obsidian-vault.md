@@ -116,6 +116,13 @@ can still yield no result when CAO cannot safely open or decode its current
 file. Run `cao memory vault reconcile --apply` after resolving a finding or
 changing vault content.
 
+A configured mapping remains the authoritative backend when `index: false`.
+That mapping is deliberately inert: recall, injection, and managed writes are
+all unavailable, and CAO never falls back to a retained native replica. The
+accepted consequence is that an `index: false` mapped scope has no memory
+content. `cao memory vault status` lists every inert mapping and its residual
+projection-row count; the next applied reconciliation retracts those rows.
+
 Recall returns this state in its `index_freshness` field as `fresh` or `stale`.
 CAO compares the current file size and modification time with the values
 recorded at reconciliation.
@@ -196,6 +203,10 @@ cao memory vault migrate --scope {global|project|agent} [--scope-id ID] [--apply
 `status` reports the derived vault projection and configuration warnings. Its
 `process_local_unmapped_project_writes` field is explicitly process-local; a
 fresh CLI process cannot present it as a durable count.
+
+For each mapping with `index: false`, `status` also prints an `inert` line naming
+recall, injection, and writes as off, plus the number of residual projection
+rows awaiting reconciliation.
 
 For the meaning and outcome of every finding code, see the canonical
 [ADR-004 boundary table](issues/644-obsidian-vault-knowledge-source/adr-004-supported-markdown-boundary.md#the-boundary-table).

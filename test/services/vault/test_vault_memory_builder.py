@@ -162,7 +162,48 @@ def test_reader_refuses_stale_projection_when_mapping_index_is_disabled(tmp_path
         consumer="explicit_recall",
     )
 
-    assert resolution.exit_arm == "index_disabled"
+    assert resolution.exit_arm == "not_indexable"
+    assert list(resolution) == []
+
+
+@pytest.mark.parametrize("consumer", ["explicit_recall", "injected_context"])
+@pytest.mark.parametrize("require_injectable", [False, True])
+@pytest.mark.parametrize("keys", [None, [], ["design"]])
+def test_not_indexable_gate_precedes_every_database_read(
+    tmp_path, monkeypatch, consumer, require_injectable, keys
+):
+    from cli_agent_orchestrator.services.vault import reader
+
+    mapping = FolderMapping(
+        folder="Mapped",
+        scope="project",
+        scope_id="fixture-project",
+        index=False,
+    )
+    binding = VaultBinding(
+        scope="project",
+        scope_id="fixture-project",
+        vault_id="fixture",
+        root=str(tmp_path),
+        mapping=mapping,
+    )
+
+    def forbidden_session():
+        raise AssertionError("index=false must return before SQL")
+
+    monkeypatch.setattr(reader, "SessionLocal", forbidden_session)
+
+    resolution = resolve_candidates(
+        binding,
+        keys=keys,
+        scope="project",
+        scope_id="fixture-project",
+        require_injectable=require_injectable,
+        terminal_id=None,
+        consumer=consumer,
+    )
+
+    assert resolution.exit_arm == "not_indexable"
     assert list(resolution) == []
 
 

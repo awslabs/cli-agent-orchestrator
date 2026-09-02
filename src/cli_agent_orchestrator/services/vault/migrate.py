@@ -17,6 +17,7 @@ from typing import Any, Optional
 
 from cli_agent_orchestrator.clients.database import MemoryMetadataModel
 from cli_agent_orchestrator.constants import MEMORY_BASE_DIR
+from cli_agent_orchestrator.models.relationship import VALID_ORIGINS
 from cli_agent_orchestrator.services.memory_relationship_service import (
     MemoryRelationshipService,
     RelationshipDTO,
@@ -200,11 +201,12 @@ def _links_for(
 
 
 def _link_from(dto: RelationshipDTO) -> dict[str, Any]:
+    authored_origin = (dto.attributes or {}).get("authored_origin")
     link: dict[str, Any] = {
         "to": dto.target_key,
         "type": dto.type,
         "status": dto.status,
-        "origin": dto.origin,
+        "origin": (authored_origin if authored_origin in VALID_ORIGINS else dto.origin),
     }
     if dto.confidence is not None:
         link["confidence"] = dto.confidence

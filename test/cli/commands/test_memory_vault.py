@@ -48,6 +48,8 @@ def test_vault_status_labels_unmapped_writes_as_process_local(monkeypatch) -> No
                 1,
                 0,
                 0,
+                (),
+                (("Archive (project:alpha) inert: recall=off inject=off write=off", 3),),
             ),
         ),
     )
@@ -63,6 +65,10 @@ def test_vault_status_labels_unmapped_writes_as_process_local(monkeypatch) -> No
         in result.output
     )
     assert "7" not in result.output
+    assert (
+        "mapping: Archive (project:alpha) inert: recall=off inject=off write=off; "
+        "residual_rows=3" in result.output
+    )
 
 
 def test_vault_scan_is_read_only_and_accepts_dry_run(monkeypatch) -> None:

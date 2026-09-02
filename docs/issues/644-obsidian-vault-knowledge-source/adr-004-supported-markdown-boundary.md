@@ -88,6 +88,9 @@ status view and the documentation cannot drift.
 | Missing mapping folder | Deferred | Mapping skipped | `mapping_folder_missing` (warn) |
 | Unreadable mapping folder | Deferred | Mapping skipped | `mapping_folder_unreadable` (warn) |
 | NUL byte in otherwise-valid UTF-8 note text | Refused | Note quarantined | `note_contains_nul` (error) |
+| Duplicate `cao.links` entries resolving to the same target/type with different status, confidence, or authored origin | Refused for that tuple | No row is projected; YAML list order cannot choose a winner | `cao_link_conflict` (warn) |
+| More than 64 projected edges for one source/type | Degraded | Canonical entries are retained first, then body-only entries in sorted-target order | `edge_limit_exceeded` (warn) |
+| An excluded note changes identity at the same path | Deferred | The new identity remains excluded and unpublished until explicitly restored | `deindexed_retained` (warn) |
 
 ### Rules that generalize the table
 

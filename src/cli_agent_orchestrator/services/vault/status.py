@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, cast
 
 from cli_agent_orchestrator.clients.database import (
     SessionLocal,
@@ -38,6 +38,7 @@ class VaultStatus:
     process_local_non_writable_write_refusals: int
     process_local_secret_gate_write_refusals: int
     recall_counters: tuple[tuple[str, int], ...] = ()
+    inert_mappings: tuple[tuple[str, int], ...] = ()
 
 
 def get_vault_status(
@@ -60,17 +61,40 @@ def get_vault_status(
             )
             warnings = list(config.warnings)
             warnings.extend(warning.detail for warning in collect_binding_warnings(config))
+            inert_mappings = []
+            for mapping in vault.mappings:
+                if mapping.index:
+                    continue
+                stored_scope_id = mapping.scope_id or ""
+                residual_rows = sum(
+                    1
+                    for note in notes
+                    if cast(str, note.scope) == mapping.scope
+                    and cast(str, note.scope_id) == stored_scope_id
+                )
+                label = (
+                    f"{mapping.folder} ({mapping.scope}"
+                    f"{':' + mapping.scope_id if mapping.scope_id else ''}) "
+                    "inert: recall=off inject=off write=off"
+                )
+                inert_mappings.append((label, residual_rows))
             statuses.append(
                 VaultStatus(
                     vault.id,
-                    tuple(sorted(Counter(note.status for note in notes).items())),
-                    tuple(sorted(Counter(finding.code for finding in findings).items())),
+                    tuple(sorted(Counter(cast(str, note.status) for note in notes).items())),
+                    tuple(sorted(Counter(cast(str, finding.code) for finding in findings).items())),
                     tuple(dict.fromkeys(warnings)),
                     unmapped_project_write_count(),
                     unmapped_project_identity_count(),
                     non_writable_write_refusal_count(vault.id),
                     secret_gate_write_refusal_count(vault.id),
-                    tuple(sorted((counter.counter_name, counter.value) for counter in counters)),
+                    tuple(
+                        sorted(
+                            (cast(str, counter.counter_name), cast(int, counter.value))
+                            for counter in counters
+                        )
+                    ),
+                    tuple(sorted(inert_mappings)),
                 )
             )
     return tuple(statuses)

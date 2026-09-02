@@ -3,6 +3,7 @@
 from datetime import datetime, timezone
 from test.fixtures.vault_factory import build_vault_fixture
 
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -213,8 +214,149 @@ cao:
     assert canonical.status == "proposal"
     assert canonical.confidence == 0.7
     assert canonical.attributes_json == (
-        '{"authored_origin":"human","canonical_only":true,"fragment":"body-fragment"}'
+        '{"attested_by":["body","frontmatter"],"authored_origin":"human",'
+        '"fragment":"body-fragment"}'
     )
+
+
+def test_index_disabled_mapping_retracts_projection_and_edges(tmp_path, monkeypatch):
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    mapped = tmp_path / "vault" / "Mapped"
+    (mapped / "Source.md").write_text("[[Target]]", encoding="utf-8")
+    (mapped / "Target.md").write_text("target", encoding="utf-8")
+
+    reconcile(vault, apply=True, run_id="index-on")
+    with Session() as db:
+        assert db.query(MemoryMetadataModel).filter_by(source_kind="vault").count() == 2
+        assert db.query(MemoryRelationshipModel).filter_by(origin="vault").count() == 1
+
+    vault.mappings[0] = vault.mappings[0].model_copy(update={"index": False})
+    reconcile(vault, apply=True, run_id="index-off")
+
+    with Session() as db:
+        assert db.query(VaultNoteModel).filter_by(scope="project").count() == 0
+        assert (
+            db.query(MemoryMetadataModel).filter_by(source_kind="vault", scope="project").count()
+            == 0
+        )
+        assert db.query(MemoryRelationshipModel).filter_by(origin="vault").count() == 0
+
+
+def test_typed_canonical_link_is_additive_and_removed_by_next_reconcile(tmp_path, monkeypatch):
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    mapped = tmp_path / "vault" / "Mapped"
+    source = mapped / "Source.md"
+    source.write_text(
+        """---
+cao:
+  links:
+    - {to: target, type: contradiction, status: proposal, confidence: 0.8}
+---
+[[Target]]
+""",
+        encoding="utf-8",
+    )
+    (mapped / "Target.md").write_text("---\ncao:\n  key: target\n---\ntarget", encoding="utf-8")
+
+    reconcile(vault, apply=True, run_id="typed-union")
+    with Session() as db:
+        rows = (
+            db.query(MemoryRelationshipModel)
+            .filter_by(origin="vault")
+            .order_by(MemoryRelationshipModel.type)
+            .all()
+        )
+        assert [(row.type, row.status, row.confidence) for row in rows] == [
+            ("contradiction", "proposal", 0.8),
+            ("relates_to", "active", None),
+        ]
+
+    source.write_text("[[Target]]", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="typed-removed")
+    with Session() as db:
+        rows = db.query(MemoryRelationshipModel).filter_by(origin="vault").all()
+        assert [(row.type, row.status) for row in rows] == [("relates_to", "active")]
+
+
+def test_conflicting_canonical_duplicates_emit_finding_and_no_edge(tmp_path, monkeypatch):
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    mapped = tmp_path / "vault" / "Mapped"
+    source = mapped / "Source.md"
+    (mapped / "Target.md").write_text("---\ncao:\n  key: target\n---\ntarget", encoding="utf-8")
+    first = (
+        "    - {to: target, type: relates_to, status: active}\n"
+        "    - {to: target, type: relates_to, status: proposal}\n"
+    )
+    second = (
+        "    - {to: target, type: relates_to, status: proposal}\n"
+        "    - {to: target, type: relates_to, status: active}\n"
+    )
+    dumps = []
+    for run_id, links in (("conflict-a", first), ("conflict-b", second)):
+        source.write_text(f"---\ncao:\n  links:\n{links}---\n", encoding="utf-8")
+        reconcile(vault, apply=True, run_id=run_id)
+        with Session() as db:
+            dumps.append(
+                [
+                    (
+                        row.source_key,
+                        row.target_key,
+                        row.type,
+                        row.status,
+                        row.attributes_json,
+                    )
+                    for row in db.query(MemoryRelationshipModel).filter_by(origin="vault").all()
+                ]
+            )
+            assert (
+                db.query(VaultFindingModel)
+                .filter_by(code="cao_link_conflict", vault_relpath="Mapped/Source.md")
+                .count()
+                == 1
+            )
+    assert dumps == [[], []]
+
+
+def test_body_edges_are_bounded_without_aborting_reconcile(tmp_path, monkeypatch):
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    mapped = tmp_path / "vault" / "Mapped"
+    targets = [f"target-{index:02d}" for index in range(70)]
+    (mapped / "Source.md").write_text(
+        " ".join(f"[[{target}]]" for target in targets), encoding="utf-8"
+    )
+    for target in targets:
+        (mapped / f"{target}.md").write_text(
+            f"---\ncao:\n  key: {target}\n---\n{target}", encoding="utf-8"
+        )
+
+    reconcile(vault, apply=True, run_id="edge-bound")
+
+    with Session() as db:
+        rows = (
+            db.query(MemoryRelationshipModel)
+            .filter_by(origin="vault", type="relates_to")
+            .order_by(MemoryRelationshipModel.target_key)
+            .all()
+        )
+        assert [row.target_key for row in rows] == targets[:64]
+        assert (
+            db.query(VaultFindingModel)
+            .filter_by(code="edge_limit_exceeded", vault_relpath="Mapped/Source.md")
+            .count()
+            == 1
+        )
 
 
 def test_same_path_authored_key_change_migrates_projection_without_old_state(tmp_path, monkeypatch):
@@ -232,8 +374,23 @@ def test_same_path_authored_key_change_migrates_projection_without_old_state(tmp
         old_key = old_note.cao_key
         old_scope = old_note.scope
         old_scope_id = old_note.scope_id
+        target_key = (
+            db.query(VaultNoteModel).filter_by(vault_relpath="Mapped/Target.md").one().cao_key
+        )
         metadata = db.query(MemoryMetadataModel).filter_by(source_kind="vault", key=old_key).one()
         metadata.access_count = 9
+        db.add(
+            MemoryRelationshipModel(
+                id="incoming-old-key",
+                scope=old_scope,
+                scope_id=old_scope_id,
+                source_key=target_key,
+                target_key=old_key,
+                type="supersedes",
+                origin="vault",
+                status="active",
+            )
+        )
         db.add(
             VaultNoteAliasModel(
                 vault_id=vault.id,
@@ -257,6 +414,9 @@ def test_same_path_authored_key_change_migrates_projection_without_old_state(tmp
         )
         old_edge_count = (
             db.query(MemoryRelationshipModel).filter_by(origin="vault", source_key=old_key).count()
+            + db.query(MemoryRelationshipModel)
+            .filter_by(origin="vault", target_key=old_key)
+            .count()
         )
         old_alias_count = (
             db.query(VaultNoteAliasModel).filter_by(vault_id=vault.id, cao_key=old_key).count()
@@ -320,9 +480,77 @@ def test_same_path_key_change_keeps_forgotten_note_excluded(tmp_path, monkeypatc
     with Session() as db:
         migrated = db.query(VaultNoteModel).filter_by(vault_relpath="Mapped/One.md").one()
         vault_metadata_count = db.query(MemoryMetadataModel).filter_by(source_kind="vault").count()
+        retained = (
+            db.query(VaultFindingModel)
+            .filter_by(
+                code="deindexed_retained",
+                vault_relpath="Mapped/One.md",
+            )
+            .one()
+        )
     assert migrated.cao_key == "new-key"
     assert migrated.status == "excluded"
     assert vault_metadata_count == 0
+    assert "deindexed_retained" in retained.detail
+
+
+def test_removing_authored_key_transitions_to_current_path_derived_key(tmp_path, monkeypatch):
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    source = tmp_path / "vault" / "Mapped" / "One.md"
+    source.write_text("---\ncao:\n  key: authored-key\n---\nbody", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="key-present")
+
+    source.write_text("body without authored key", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="key-removed")
+
+    expected = derive_cao_key("One.md")
+    with Session() as db:
+        note = db.query(VaultNoteModel).filter_by(vault_relpath="Mapped/One.md").one()
+        metadata = db.query(MemoryMetadataModel).filter_by(source_kind="vault").all()
+    assert note.cao_key == expected
+    assert [(row.key, row.file_path) for row in metadata] == [(expected, "Mapped/One.md")]
+
+
+def test_same_path_identity_migration_rolls_back_atomically_on_failure(tmp_path, monkeypatch):
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    mapped = tmp_path / "vault" / "Mapped"
+    source = mapped / "One.md"
+    source.write_text("---\ncao:\n  key: old-key\n---\n[[Target]]", encoding="utf-8")
+    (mapped / "Target.md").write_text("target", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="atomic-before")
+
+    original_upsert = module._upsert_note
+
+    def fail_new_identity(db, vault_id, item, started):
+        if item.key == "new-key":
+            raise RuntimeError("induced migration failure")
+        return original_upsert(db, vault_id, item, started)
+
+    monkeypatch.setattr(module, "_upsert_note", fail_new_identity)
+    source.write_text("---\ncao:\n  key: new-key\n---\n[[Target]]", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="induced migration failure"):
+        reconcile(vault, apply=True, run_id="atomic-after")
+
+    with Session() as db:
+        note = db.query(VaultNoteModel).filter_by(vault_relpath="Mapped/One.md").one()
+        old_metadata = (
+            db.query(MemoryMetadataModel).filter_by(source_kind="vault", key="old-key").count()
+        )
+        old_edges = (
+            db.query(MemoryRelationshipModel)
+            .filter_by(origin="vault", source_key="old-key")
+            .count()
+        )
+    assert note.cao_key == "old-key"
+    assert old_metadata == 1
+    assert old_edges == 1
 
 
 def test_fixed_mtime_reverse_fixture_scans_without_unstable_results(tmp_path):
@@ -366,6 +594,63 @@ def test_path_derived_pure_rename_preserves_identity_and_records_alias(tmp_path,
         ("Mapped/Old.md", original_key)
     ]
     assert [(row.key, row.file_path) for row in metadata] == [(original_key, "Mapped/New.md")]
+
+
+def test_pure_rename_of_deindexed_note_keeps_it_excluded(tmp_path, monkeypatch):
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    old_path = tmp_path / "vault" / "Mapped" / "Old.md"
+    old_path.write_text("same content", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="rename-excluded-before")
+    with Session() as db:
+        db.query(VaultNoteModel).update({"status": "excluded"})
+        db.query(MemoryMetadataModel).filter_by(source_kind="vault").delete()
+        db.commit()
+
+    old_path.rename(old_path.with_name("New.md"))
+    reconcile(vault, apply=True, run_id="rename-excluded-after")
+
+    with Session() as db:
+        note = db.query(VaultNoteModel).one()
+        metadata_count = db.query(MemoryMetadataModel).filter_by(source_kind="vault").count()
+        finding = (
+            db.query(VaultFindingModel)
+            .filter_by(code="deindexed_retained", vault_relpath="Mapped/New.md")
+            .one()
+        )
+    assert (note.vault_relpath, note.status) == ("Mapped/New.md", "excluded")
+    assert metadata_count == 0
+    assert "deindexed_retained" in finding.detail
+
+
+def test_rebuild_preserves_deindexed_tombstones(tmp_path, monkeypatch):
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    source = tmp_path / "vault" / "Mapped" / "One.md"
+    source.write_text("same content", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="rebuild-excluded-before")
+    with Session() as db:
+        db.query(VaultNoteModel).update({"status": "excluded"})
+        db.query(MemoryMetadataModel).filter_by(source_kind="vault").delete()
+        db.commit()
+
+    reconcile(vault, apply=True, rebuild=True, run_id="rebuild-excluded-after")
+
+    with Session() as db:
+        note = db.query(VaultNoteModel).one()
+        metadata_count = db.query(MemoryMetadataModel).filter_by(source_kind="vault").count()
+        finding = (
+            db.query(VaultFindingModel)
+            .filter_by(code="deindexed_retained", vault_relpath="Mapped/One.md")
+            .one()
+        )
+    assert (note.vault_relpath, note.status) == ("Mapped/One.md", "excluded")
+    assert metadata_count == 0
+    assert "deindexed_retained" in finding.detail
 
 
 def test_authored_key_pure_rename_preserves_canonical_identity(tmp_path, monkeypatch):

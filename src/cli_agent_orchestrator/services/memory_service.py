@@ -2667,50 +2667,54 @@ class MemoryService:
         vault source is selected from configuration and then queried through
         ``services.vault.reader``; it is never filesystem-enumerated here.
         """
-        native_dirs = self._get_search_dirs(scope, terminal_context, scan_all=scan_all)
         try:
             from cli_agent_orchestrator.services.settings_service import get_vault_config
-            from cli_agent_orchestrator.services.vault.binding import resolve
 
             config = get_vault_config()
-            if not config.enabled:
-                return native_dirs, [], config.max_recall_body_chars
-            if scope is not None:
-                scope_id = (
-                    self.resolve_scope_id(scope, terminal_context)
-                    if scope != MemoryScope.GLOBAL.value and terminal_context
-                    else None
-                )
-                binding = resolve(scope, scope_id, vault_config=config)
-                return (
-                    [] if isinstance(binding, VaultBinding) else native_dirs,
-                    [binding] if isinstance(binding, VaultBinding) else [],
-                    config.max_recall_body_chars,
-                )
-            bindings: list[VaultBinding] = []
-            for vault in config.vaults:
-                for mapping in vault.mappings:
-                    if not scan_all and mapping.scope not in {
-                        MemoryScope.GLOBAL.value,
-                        MemoryScope.PROJECT.value,
-                        MemoryScope.SESSION.value,
-                    }:
-                        continue
-                    if scan_all:
-                        binding_scope_id = mapping.scope_id
-                    elif mapping.scope == MemoryScope.GLOBAL.value:
-                        binding_scope_id = None
-                    elif terminal_context:
-                        binding_scope_id = self.resolve_scope_id(mapping.scope, terminal_context)
-                    else:
-                        continue
-                    binding = resolve(mapping.scope, binding_scope_id, vault_config=config)
-                    if isinstance(binding, VaultBinding) and binding not in bindings:
-                        bindings.append(binding)
-            return native_dirs, bindings, config.max_recall_body_chars
-        except Exception as exc:  # configuration unavailability preserves native recall
-            logger.debug("vault recall sources unavailable: %s", exc)
-            return native_dirs, [], 4096
+        except Exception as exc:
+            # Binding is a security boundary: when live configuration cannot be
+            # interpreted, CAO cannot know whether this scope is vault-owned.
+            # Fail closed instead of exposing a retained native replica.
+            logger.warning("vault recall sources unavailable; returning no content: %s", exc)
+            return [], [], 4096
+        from cli_agent_orchestrator.services.vault.binding import resolve
+
+        native_dirs = self._get_search_dirs(scope, terminal_context, scan_all=scan_all)
+        if not config.enabled:
+            return native_dirs, [], config.max_recall_body_chars
+        if scope is not None:
+            scope_id = (
+                self.resolve_scope_id(scope, terminal_context)
+                if scope != MemoryScope.GLOBAL.value and terminal_context
+                else None
+            )
+            binding = resolve(scope, scope_id, vault_config=config)
+            return (
+                [] if isinstance(binding, VaultBinding) else native_dirs,
+                [binding] if isinstance(binding, VaultBinding) else [],
+                config.max_recall_body_chars,
+            )
+        bindings: list[VaultBinding] = []
+        for vault in config.vaults:
+            for mapping in vault.mappings:
+                if not scan_all and mapping.scope not in {
+                    MemoryScope.GLOBAL.value,
+                    MemoryScope.PROJECT.value,
+                    MemoryScope.SESSION.value,
+                }:
+                    continue
+                if scan_all:
+                    binding_scope_id = mapping.scope_id
+                elif mapping.scope == MemoryScope.GLOBAL.value:
+                    binding_scope_id = None
+                elif terminal_context:
+                    binding_scope_id = self.resolve_scope_id(mapping.scope, terminal_context)
+                else:
+                    continue
+                binding = resolve(mapping.scope, binding_scope_id, vault_config=config)
+                if isinstance(binding, VaultBinding) and binding not in bindings:
+                    bindings.append(binding)
+        return native_dirs, bindings, config.max_recall_body_chars
 
     def _vault_candidates(
         self,
@@ -3459,11 +3463,11 @@ class MemoryService:
             wiki_resolved = os.path.realpath(str(wiki_dir))
             index_path = wiki_dir / "index.md"
 
-            _native_dirs, vault_bindings, max_body_chars = self._resolve_sources(
+            native_dirs, vault_bindings, max_body_chars = self._resolve_sources(
                 scope_val, terminal_context, scan_all=False
             )
             scope_entries = []
-            if not vault_bindings and index_path.exists():
+            if native_dirs and not vault_bindings and index_path.exists():
                 for e in self._parse_index(index_path):
                     if e["scope"] != scope_val:
                         continue
