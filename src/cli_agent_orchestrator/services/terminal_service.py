@@ -1178,7 +1178,7 @@ _DEFERRED_STARTED_STATUSES = {
 }
 
 
-def _worker_is_started_direct(terminal_id: str, provider) -> bool:
+def _worker_is_started_direct(terminal_id: str, provider, message: str = "") -> bool:
     """Direct visible-screen status check bypassing the event-driven status cache.
 
     The deferred-init retry loop polls ``status_monitor.get_status()`` which
@@ -1197,6 +1197,16 @@ def _worker_is_started_direct(terminal_id: str, provider) -> bool:
     providers (e.g. kiro_cli, antigravity_cli, cursor_cli) relies on
     dispatch bookkeeping and cannot distinguish IDLE from COMPLETED on a
     rendered capture-pane snapshot.
+
+    A started status is only half the verdict: the pane must also attribute it
+    to ``message``, the submission being confirmed. ``get_status`` classifies
+    the frame as a whole, so activity that predates the submission (a
+    provider's startup spinner or bullet still on screen) reads as started for
+    a pane whose task paste was dropped — and accepting it here would suppress
+    the redelivery this probe exists to gate. The provider decides attribution
+    through ``direct_probe_confirms_submission`` (default: the status alone,
+    for TUIs whose indicators are turn-scoped); a False there falls through
+    to the box check and redelivery like any other not-started read.
     """
     try:
         metadata = get_terminal_metadata(terminal_id)
@@ -1208,6 +1218,9 @@ def _worker_is_started_direct(terminal_id: str, provider) -> bool:
             return False
         output = get_backend().get_history(session_name, window_name, tail_lines=200)
         status = provider.get_status(output)
+        if status not in _DEFERRED_STARTED_STATUSES:
+            return False
+        return bool(provider.direct_probe_confirms_submission(output, message))
     except Exception:
         logger.debug(
             "Direct status probe for %s failed (falling through to cached path)",
@@ -1215,7 +1228,6 @@ def _worker_is_started_direct(terminal_id: str, provider) -> bool:
             exc_info=True,
         )
         return False
-    return status in _DEFERRED_STARTED_STATUSES
 
 
 def _message_visible_in_box(terminal_id: str, message: str) -> bool:
@@ -1301,7 +1313,7 @@ def redeliver_dropped_message(
         provider, "supports_direct_status_probe", False
     )
     if probe_capable:
-        if _worker_is_started_direct(terminal_id, provider):
+        if _worker_is_started_direct(terminal_id, provider, message):
             return True
     if _message_visible_in_box(terminal_id, message):
         logger.warning(

@@ -57,7 +57,8 @@ class TestRedeliverDroppedMessageHelper:
             started = ts.redeliver_dropped_message("t1", "Analyze the logs", 1)
         assert started is True
         mgr.get_provider.assert_called_once_with("t1")
-        probe.assert_called_once_with("t1", provider)
+        # The message rides along: the probe binds its verdict to it.
+        probe.assert_called_once_with("t1", provider, "Analyze the logs")
         key.assert_not_called()
         send.assert_not_called()
 
@@ -386,6 +387,8 @@ class TestCodexDirectProbeOptIn:
     this shape) goes red here — not just in a unit assert on the attribute.
     """
 
+    _MESSAGE = "[CAO Handoff] Supervisor terminal ID: sup-123. Do the task."
+
     # The shape from the issue report: handoff prompt in the transcript, live
     # Working spinner, TUI footer. Same frame family the codex provider unit
     # tests pin as PROCESSING.
@@ -398,6 +401,56 @@ class TestCodexDirectProbeOptIn:
         "\n"
         "  ? for shortcuts                     100% context left\n"
     )
+
+    # Startup chrome as Codex renders it before any task exists. The MCP
+    # startup spinner IS the TUI progress pattern, and any startup bullet is
+    # an assistant marker.
+    _STARTUP_BANNER = (
+        "╭──────────────────────────────────────────────╮\n"
+        "│ >_ OpenAI Codex (v0.145.0)                   │\n"
+        "│                                              │\n"
+        "│ model:       gpt-5.6-sol medium              │\n"
+        "│ directory:   ~/project                       │\n"
+        "│ permissions: YOLO mode                       │\n"
+        "╰──────────────────────────────────────────────╯\n"
+        "\n"
+        "• Starting MCP servers (4s • esc to interrupt)\n"
+    )
+    _IDLE_COMPOSER = (
+        "\n" "› Write tests for @filename\n" "\n" "  gpt-5.6-sol medium · Context 100% left\n"
+    )
+
+    @staticmethod
+    def _residue_frame(gap: int, composer: str) -> str:
+        """Startup spinner ``gap`` blank lines above the composer: outside the
+        bottom-15 window initialize() vetoes activity in, so the provider
+        reports ready, yet inside (or above) the wider tail get_status scans."""
+        return TestCodexDirectProbeOptIn._STARTUP_BANNER + "\n" * gap + composer
+
+    @staticmethod
+    async def _run_confirm(frame: str, message: str):
+        from cli_agent_orchestrator.providers.codex import CodexProvider
+
+        provider = CodexProvider("t1", "s1", "w0")
+        backend = MagicMock()
+        backend.get_history.return_value = frame
+        with (
+            # Cached status stays IDLE past every poll — the #496-class lag.
+            patch.object(ts, "wait_until_status", new=AsyncMock(return_value=False)),
+            patch.object(
+                ts,
+                "get_terminal_metadata",
+                return_value={"tmux_session": "s1", "tmux_window": "w0"},
+            ),
+            patch.object(ts, "get_backend", return_value=backend),
+            patch.object(ts, "get_output", return_value=frame),
+            patch.object(ts, "send_special_key") as key,
+            patch.object(ts, "send_input") as send,
+        ):
+            ok = await ts._confirm_worker_started_or_resubmit(
+                "t1", message, None, "sup", None, provider=provider
+            )
+        return ok, key, send
 
     def test_codex_opts_into_direct_status_probe(self):
         from cli_agent_orchestrator.providers.codex import CodexProvider
@@ -425,7 +478,7 @@ class TestCodexDirectProbeOptIn:
         ):
             ok = await ts._confirm_worker_started_or_resubmit(
                 "t1",
-                "Do the task",
+                self._MESSAGE,
                 None,
                 "sup",
                 None,
@@ -439,3 +492,121 @@ class TestCodexDirectProbeOptIn:
         # re-delivery (which would run the task twice) and no blind Enter.
         send.assert_not_called()
         key.assert_not_called()
+
+    # --- the verdict is bound to the submission, not to the pane's status -----
+    # get_status classifies the frame as a whole, so startup residue reads as
+    # started for a pane whose task paste was dropped. The probe must not take
+    # that as acceptance: it would skip the redelivery this path exists for and
+    # the task would be silently lost with the supervisor waiting forever.
+
+    @pytest.mark.parametrize(
+        "gap, expected_status",
+        [
+            (12, "processing"),  # spinner inside get_status's 25-line spinner tail
+            (20, "processing"),  # ...at its far edge
+            (28, "completed"),  # spinner out of the tail: the bullet is an assistant marker
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_startup_residue_on_a_dropped_task_still_redelivers(self, gap, expected_status):
+        from cli_agent_orchestrator.providers.codex import CodexProvider, _has_startup_idle_composer
+
+        frame = self._residue_frame(gap, self._IDLE_COMPOSER)
+        # Precondition — this is exactly the frame the finding describes: the
+        # provider reports ready (initialize() would have returned) while the
+        # whole-frame status says started, and the message is nowhere.
+        assert _has_startup_idle_composer(frame) is True
+        assert CodexProvider("t1", "s1", "w0").get_status(frame).value == expected_status
+        assert self._MESSAGE[:12] not in frame
+
+        ok, key, send = await self._run_confirm(frame, self._MESSAGE)
+
+        # Not started: the paste was dropped, so every attempt re-delivers the
+        # full message and the caller gets to classify the outcome.
+        assert ok is False
+        assert send.call_count == ts._DEFERRED_SUBMIT_MAX_RESUBMITS
+        key.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_startup_residue_with_unsubmitted_text_sends_enter(self):
+        # Paste landed, Enter was swallowed: the message sits in the composer
+        # under the residue. The bare-Enter recovery must still fire.
+        composer = "\n› " + self._MESSAGE + "\n\n  gpt-5.6-sol medium · Context 100% left\n"
+        frame = self._residue_frame(18, composer)
+
+        ok, key, send = await self._run_confirm(frame, self._MESSAGE)
+
+        assert ok is False
+        assert key.call_count == ts._DEFERRED_SUBMIT_MAX_RESUBMITS
+        send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_startup_residue_above_an_accepted_task_is_started(self):
+        # Residue AND a real accepted turn: the echo of our message with the
+        # turn's activity below it is the causal evidence; residue above it
+        # neither adds nor subtracts.
+        frame = self._residue_frame(18, self._WORKING_FRAME)
+
+        ok, key, send = await self._run_confirm(frame, self._MESSAGE)
+
+        assert ok is True
+        send.assert_not_called()
+        key.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_accepted_turn_on_an_approval_prompt_is_started(self):
+        # WAITING_USER_ANSWER after our turn (codex 0.147 approval menu, as in
+        # test/providers/fixtures/codex_approval_modal_raw.txt): the activity
+        # bullet below the echo binds it; the probe must not blind-Enter into
+        # the menu (that would select "Yes, proceed").
+        frame = (
+            "› " + self._MESSAGE + "\n"
+            "• Running mkdir -p /tmp/work/subdir\n"
+            "  Would you like to run the following command?\n"
+            "  $ mkdir -p /tmp/work/subdir\n"
+            "› 1. Yes, proceed (y)\n"
+            "  2. Yes, and don't ask again for commands that start with `mkdir` (p)\n"
+            "  3. No, and tell Codex what to do differently (esc)\n"
+            "  Press enter to confirm or esc to cancel\n"
+        )
+        ok, key, send = await self._run_confirm(frame, self._MESSAGE)
+
+        assert ok is True
+        send.assert_not_called()
+        key.assert_not_called()
+
+    def test_bullets_inside_the_pasted_message_do_not_self_attribute(self):
+        from cli_agent_orchestrator.providers.codex import CodexProvider
+
+        # An unsubmitted multi-line paste whose own lines are bullets: the
+        # bullets below the echo line belong to the message, not to a reply.
+        message = "Review these findings for me:\n• first finding\n• second finding"
+        frame = self._residue_frame(
+            18,
+            "\n› Review these findings for me:\n  • first finding\n  • second finding\n"
+            "\n  gpt-5.6-sol medium · Context 100% left\n",
+        )
+        provider = CodexProvider("t1", "s1", "w0")
+        assert provider.direct_probe_confirms_submission(frame, message) is False
+        # ...while a reply bullet under the same paste does bind it.
+        assert (
+            provider.direct_probe_confirms_submission(
+                frame.replace(
+                    "  • second finding\n", "  • second finding\n• Reviewing the findings\n"
+                ),
+                message,
+            )
+            is True
+        )
+
+    def test_short_message_cannot_bind(self):
+        from cli_agent_orchestrator.providers.codex import CodexProvider
+
+        # Below the 8-character floor the collapse cannot match reliably; the
+        # hook must refuse rather than guess (same floor as the box check).
+        assert (
+            CodexProvider("t1", "s1", "w0").direct_probe_confirms_submission(
+                "› hi\n• Working (3s • esc to interrupt)\n", "hi"
+            )
+            is False
+        )
