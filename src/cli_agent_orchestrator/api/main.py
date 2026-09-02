@@ -157,6 +157,7 @@ from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.services.terminal_service import (
     TERMINAL_RANGE_MAX_LENGTH,
+    IdempotencyKeyConflict,
     OutputMode,
     TerminalInputBlockedError,
     _notify_elastic_terminal_ended,
@@ -2869,6 +2870,8 @@ async def create_session(
     memory_manager: Optional[str] = None,
     engine: Optional[KiroEngine] = None,
     model: Optional[str] = None,
+    use_worktree: bool = False,
+    idempotency_key: Optional[str] = None,
     resume_session_id: Optional[str] = None,
     body: Optional[CreateSessionBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
@@ -2902,6 +2905,28 @@ async def create_session(
     the initial terminal at creation time (``group`` is also updatable later
     via ``PATCH /terminals/{id}/group``, ``metadata`` via the
     ``update_metadata`` MCP tool).
+
+    ``use_worktree`` (issue #100 Phase 1; review on PR #634): provision an
+    isolated git worktree for this terminal instead of sharing
+    ``working_directory`` as given, mirroring ``POST
+    /sessions/{name}/terminals``'s parameter of the same name. Previously only
+    that sibling endpoint threaded it through to
+    ``terminal_service.create_terminal`` -- a fresh (no existing session)
+    caller requesting a worktree had it silently dropped.
+
+    ``idempotency_key`` (review on PR #634, issue #616): a caller-supplied
+    token making a retry of this exact request safe. Supply the SAME key on
+    a retry (e.g. after the original response was lost) and this endpoint
+    returns the terminal the first, already-committed attempt created,
+    instead of creating a second one -- see
+    ``terminal_service.create_terminal``'s docstring for the mechanics.
+    Omitted (default): today's behavior, no retry protection.
+
+    The key is matched together with a fingerprint of the request, not on its
+    own, so presenting a key that a DIFFERENT request already claimed returns
+    **409 CONFLICT** rather than that other request's terminal. A key whose
+    terminal has since been torn down is stale, not conflicting, and simply
+    creates fresh.
     """
     initial_message = body.initial_message if body else None
     initial_message_orchestration_type = None
@@ -2957,6 +2982,8 @@ async def create_session(
             initial_message=initial_message,
             initial_message_orchestration_type=initial_message_orchestration_type,
             model=model,
+            use_worktree=use_worktree,
+            idempotency_key=idempotency_key,
             resume_session_id=resume_session_id,
             group=body.group if body else None,
             metadata=body.metadata if body else None,
@@ -2966,6 +2993,30 @@ async def create_session(
             registry = get_plugin_registry(request)
             sidecar_provider = provider or DEFAULT_PROVIDER
             sidecar_session = result.session_name
+            # The sidecar gets its OWN key, DERIVED from the caller's (review on
+            # PR #634, issue #616). This spawn is unconditional -- it runs after
+            # create_session whether the primary was created or resolved from an
+            # existing key -- and the returned Terminal cannot say which, so two
+            # identical keyed requests used to spawn two memory_manager workers
+            # for one primary: the exact no-duplicate-workers criterion the key
+            # exists to hold.
+            #
+            # Deriving a key rather than plumbing a created-vs-reused flag out
+            # through both create endpoints is the smaller correct fix, and it is
+            # strictly stronger: the sidecar create becomes idempotent in its own
+            # right, so the second request reuses the FIRST sidecar even in the
+            # races a boolean would miss (both requests seeing "created", or the
+            # first response being lost before the flag is read). The suffix
+            # keeps it out of the primary's namespace so it can never collide
+            # with the caller's own key.
+            #
+            # Sidecar args are all derived from the primary request or its
+            # result, so a genuine retry fingerprints identically and hits;
+            # anything else 409s inside the task and is logged below like any
+            # other sidecar failure, without failing the primary.
+            sidecar_idempotency_key = (
+                f"{idempotency_key}:memory-manager-sidecar" if idempotency_key else None
+            )
 
             async def _spawn_sidecar() -> None:
                 try:
@@ -2977,6 +3028,7 @@ async def create_session(
                         session_name=sidecar_session,
                         working_directory=working_directory,
                         registry=registry,
+                        idempotency_key=sidecar_idempotency_key,
                     )
                 except Exception as e:
                     logger.warning(f"Failed to spawn memory_manager sidecar: {e}")
@@ -2985,11 +3037,24 @@ async def create_session(
 
         return result
 
+    except IdempotencyKeyConflict as e:
+        # The key was already used for a DIFFERENT request (review on PR #634,
+        # issue #616). 409, matching Stripe/AWS IdempotentParameterMismatch,
+        # rather than silently serving the first call's terminal to a caller
+        # who asked for something else. IdempotencyKeyConflict subclasses
+        # Exception and NOT ValueError precisely so this arm cannot be
+        # shadowed by the 400 arm below -- which, note, sits FIRST here.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except TerminalLimitError as e:
         # Node is at its tracked-terminal cap (CAO_MAX_TERMINALS) — a capacity
         # rejection, not a bad request: the caller should retry on another node.
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
     except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except WorktreeError as e:
+        # use_worktree=true against a working_directory that isn't a git
+        # repo, or the 'git worktree add' itself failed -- a client-input
+        # problem, not a server crash. Mirrors POST /sessions/{name}/terminals.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:
         raise HTTPException(
@@ -3100,6 +3165,7 @@ async def create_terminal_in_session(
     defer_init: bool = False,
     model: Optional[str] = None,
     use_worktree: bool = False,
+    idempotency_key: Optional[str] = None,
     body: Optional[CreateTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
@@ -3131,6 +3197,20 @@ async def create_terminal_in_session(
     ``defer_init`` rather than moving into the JSON body. Runs synchronously
     before the deferred-init background task (if any) is scheduled, so it
     applies the same way regardless of ``defer_init``.
+
+    ``idempotency_key`` (review on PR #634, issue #616): a caller-supplied
+    token making a retry of this exact request safe. Supply the SAME key on
+    a retry (e.g. after the original response was lost) and this endpoint
+    returns the terminal the first, already-committed attempt created,
+    instead of creating a second one -- see
+    ``terminal_service.create_terminal``'s docstring for the mechanics.
+    Omitted (default): today's behavior, no retry protection.
+
+    The key is matched together with a fingerprint of the request, not on its
+    own, so presenting a key that a DIFFERENT request already claimed returns
+    **409 CONFLICT** rather than that other request's terminal. A key whose
+    terminal has since been torn down is stale, not conflicting, and simply
+    creates fresh.
     """
     try:
         validate_tmux_name(session_name, "session_name")
@@ -3199,12 +3279,20 @@ async def create_terminal_in_session(
             engine=engine,
             model=model,
             use_worktree=use_worktree,
+            idempotency_key=idempotency_key,
         )
         return result
     except HTTPException:
         # Deliberate 4xx (e.g. the initial_message/defer_init guard, invalid
         # orchestration_type) — propagate as-is instead of masking as a 500.
         raise
+    except IdempotencyKeyConflict as e:
+        # The key was already used for a DIFFERENT request (review on PR #634,
+        # issue #616) — 409, not the 404 the generic ValueError arm below would
+        # give it. Unlike the Kiro arm, this one does not depend on preceding
+        # that arm: IdempotencyKeyConflict is not a ValueError, so no reorder
+        # of the ValueError family can shadow it.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except (KiroPhase0KASError, KiroCapabilityError) as e:
         # Both subclass ValueError, so they must precede the generic arm below —
         # a rejected engine is a bad request, not a missing resource. Matches
