@@ -16,7 +16,7 @@ from typing import Any, Optional
 import yaml
 
 from cli_agent_orchestrator.backends.registry import get_backend
-from cli_agent_orchestrator.constants import CAO_HOME_DIR, SECURITY_PROMPT
+from cli_agent_orchestrator.constants import CAO_HOME_DIR, PYTE_SCREEN_COLS, SECURITY_PROMPT
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
@@ -37,13 +37,13 @@ _WAITING_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _PROCESSING_PATTERN = re.compile(
-    r"[⠁-⣿◇◆]\s+(?:Loading|Running)(?:\s+\d+s)?[^\n]*(?:Enter queue|Esc stop)",
+    rf"[⠁-⣿◇◆]\s+(?:Loading|Running)(?:\s+\d+s)?[^\n]{{0,{PYTE_SCREEN_COLS}}}(?:Enter queue|Esc stop)",
     re.IGNORECASE,
 )
 _READY_PATTERN = re.compile(r"●\s+Ready|Message\s+·\s+Enter send", re.IGNORECASE)
 _ERROR_PATTERN = re.compile(
-    r"Sign in required|Authentication failed|Not authenticated|" r"(?:^|\n)\s*(?:Fatal|Error):",
-    re.IGNORECASE,
+    r"Sign in required|Authentication failed|Not authenticated|^[^\S\n]*(?:Fatal|Error):",
+    re.IGNORECASE | re.MULTILINE,
 )
 _EXTRACTION_SKIP_PATTERN = re.compile(r"^(?:├|└|Called\s|Message\s+·|/[^ ]+\s+\|)")
 _BOX_CHROME_PATTERN = re.compile(r"^[╭│╰]")

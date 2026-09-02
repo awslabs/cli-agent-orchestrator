@@ -11,10 +11,13 @@ from unittest.mock import patch
 import pytest
 import yaml
 
+from cli_agent_orchestrator.constants import PYTE_SCREEN_COLS
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.minimax_code import (
     _COMPLETION_PATTERN,
+    _ERROR_PATTERN,
+    _PROCESSING_PATTERN,
     MiniMaxCodeProvider,
     ProviderError,
     _last_match_start,
@@ -41,6 +44,36 @@ def test_completion_marker_matches_after_blank_terminal_rows():
     output = "assistant output\n\n  └ Completed in 12s"
 
     assert _last_match_start(_COMPLETION_PATTERN, output) == output.index("  └")
+
+
+def test_error_pattern_anchors_indented_errors_without_scanning_newlines():
+    newline_heavy_non_error = "notice\n" * 200
+    indented_error = "normal output\nError: failed"
+
+    assert _last_match_start(_ERROR_PATTERN, newline_heavy_non_error) == -1
+    assert _last_match_start(_ERROR_PATTERN, indented_error) == indented_error.index("Error:")
+
+
+def test_processing_pattern_bounds_spinner_footer_gap():
+    spinner = "⠋ Running"
+    normal_short_gap = f"{spinner} status Esc stop"
+    footer_at_bound = f"{spinner}{'x' * PYTE_SCREEN_COLS}Esc stop"
+    footer_beyond_bound = f"{spinner}{'x' * (PYTE_SCREEN_COLS + 1)}Esc stop"
+    repeated_spinner_without_footer = " ".join([spinner] * 50)
+
+    assert _last_match_start(_PROCESSING_PATTERN, normal_short_gap) == 0
+    assert _last_match_start(_PROCESSING_PATTERN, footer_at_bound) == 0
+    assert _last_match_start(_PROCESSING_PATTERN, footer_beyond_bound) == -1
+    assert _last_match_start(_PROCESSING_PATTERN, repeated_spinner_without_footer) == -1
+
+
+def test_status_completion_and_error_marker_precedence():
+    later_error = "  └ Completed in 1s\nMessage · Enter send\nError: failed"
+    later_completion = "Error: failed\n  └ Completed in 1s\nMessage · Enter send"
+
+    assert _last_match_start(_ERROR_PATTERN, later_error) == later_error.index("Error:")
+    assert make_provider(agent_profile=None).get_status(later_error) == TerminalStatus.ERROR
+    assert make_provider(agent_profile=None).get_status(later_completion) == TerminalStatus.IDLE
 
 
 def test_prepare_runtime_isolates_auth_and_generates_private_mcp_plugin(
