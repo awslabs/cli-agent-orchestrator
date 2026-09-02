@@ -55,7 +55,7 @@ spec:
             - name: CAO_ELASTIC_WORKSPACE_PVC
               value: cao-elastic-workspace
             - name: CAO_ELASTIC_WORKSPACE_ROOT
-              value: /home/cao/workspace/jobs
+              value: /home/cao/workspace/workers
             - name: CAO_ELASTIC_PROJECT_ID
               value: cao-cluster
             # Fixed upstream for the broker's allowlisted callback/memory
