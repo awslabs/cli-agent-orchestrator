@@ -8,7 +8,7 @@ import asyncio
 import logging
 import threading
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from cli_agent_orchestrator.constants import (
     CAO_PYTE_STATUS,
@@ -170,6 +170,16 @@ class StatusMonitor:
         # this a detection task can be garbage-collected mid-run and silently drop
         # a status transition. Tasks remove themselves on completion.
         self._detect_tasks: set = set()
+        # Callbacks invoked with a terminal_id whenever clear_terminal or
+        # reset_buffer resets that terminal's state, i.e. whenever
+        # _status_generations restarts. inbox_service registers one here to
+        # drop its own dispatch-active marker in the same reset (#709): that
+        # marker is keyed off a generation snapshot, and a restarted counter
+        # means every future event's generation can be at or below the
+        # snapshot, so a plain module import (rather than this hook) would
+        # need inbox_service to import status_monitor AND status_monitor to
+        # import inbox_service back.
+        self._teardown_hooks: List[Callable[[str], None]] = []
 
     async def run(self) -> None:
         """Subscribe to output events and detect status changes.
@@ -632,6 +642,25 @@ class StatusMonitor:
             logger.error(f"Error detecting status for {terminal_id}: {e}")
             return TerminalStatus.UNKNOWN
 
+    def register_teardown_hook(self, hook: Callable[[str], None]) -> None:
+        """Register a callback run (outside ``self._lock``) with a terminal_id
+        whenever ``clear_terminal`` or ``reset_buffer`` resets that terminal's
+        ``_status_generations`` counter. Lets another service keep its own
+        per-terminal state consistent with that reset without a circular
+        import (#709)."""
+        self._teardown_hooks.append(hook)
+
+    def _run_teardown_hooks(self, terminal_id: str) -> None:
+        """Invoke every registered teardown hook for ``terminal_id``. Called
+        outside ``self._lock`` (a hook may take its own locks); a hook
+        exception is logged and never allowed to interrupt the reset it is
+        reacting to, since the reset itself already fully completed."""
+        for hook in self._teardown_hooks:
+            try:
+                hook(terminal_id)
+            except Exception as e:
+                logger.error(f"Error in status_monitor teardown hook for {terminal_id}: {e}")
+
     def clear_terminal(self, terminal_id: str) -> None:
         """Free buffer and status for a deleted terminal."""
         with self._lock:
@@ -648,6 +677,7 @@ class StatusMonitor:
             self._capture_generation.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
+        self._run_teardown_hooks(terminal_id)
 
     def reset_buffer(self, terminal_id: str) -> None:
         """Clear the rolling buffer + last-known status WITHOUT forgetting the
@@ -673,6 +703,7 @@ class StatusMonitor:
             self._capture_generation.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
+        self._run_teardown_hooks(terminal_id)
 
     def get_status(self, terminal_id: str) -> TerminalStatus:
         """Get current terminal status — the single source of truth for both backends.

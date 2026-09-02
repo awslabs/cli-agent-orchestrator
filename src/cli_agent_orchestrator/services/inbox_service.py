@@ -109,6 +109,27 @@ def _mark_dispatch_active(terminal_id: str, generation: Optional[int] = None) ->
         _dispatch_active[terminal_id] = generation
 
 
+def _drop_dispatch_active_on_status_reset(terminal_id: str) -> None:
+    """status_monitor teardown hook: fires from clear_terminal/reset_buffer,
+    i.e. exactly when ``_status_generations`` is popped for this terminal and
+    its counter restarts from 0. A recorded dispatch generation snapshotted
+    before that restart is no longer comparable to anything the terminal can
+    publish afterward: every post-reset event carries a generation at or
+    below the old snapshot, so _clear_dispatch_active's strictly-greater
+    check could never fire and the marker would survive forever, silently
+    and permanently stranding that terminal's inbox (reviewer-reported
+    finding on #709). Drop it unconditionally rather than re-deriving
+    anything: a reset means whatever the marker was confirming no longer
+    applies. This also reaps the entry when the terminal is torn down via
+    clear_terminal, which nothing previously did, closing the same-cause
+    slow leak the reviewer flagged alongside the stranding bug."""
+    with _dispatch_active_guard:
+        _dispatch_active.pop(terminal_id, None)
+
+
+status_monitor.register_teardown_hook(_drop_dispatch_active_on_status_reset)
+
+
 @contextmanager
 def _terminal_delivery_lock(terminal_id: str) -> Iterator[None]:
     """Serialize deliver_pending end to end for one terminal.

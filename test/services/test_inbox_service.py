@@ -16,6 +16,7 @@ from cli_agent_orchestrator.constants import INBOX_RECONCILE_GRACE_SECONDS
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.inbox_service import InboxService
+from cli_agent_orchestrator.services.status_monitor import status_monitor
 
 
 @pytest.fixture(autouse=True)
@@ -508,6 +509,104 @@ class TestConcurrentDeliverySerialization:
                 m.status for m in check.query(InboxModel).filter_by(receiver_id="term-1").all()
             )
         assert statuses == sorted([MessageStatus.DELIVERED.value, MessageStatus.DELIVERED.value])
+
+
+class TestDispatchActiveTeardown:
+    """gutosantos82's blocking finding on #709: status_monitor.clear_terminal
+    and reset_buffer pop _status_generations (the counter restarts) but never
+    told inbox_service to drop _dispatch_active, so a reset landing inside an
+    unconfirmed dispatch window permanently stranded that terminal's inbox.
+    These exercise the real status_monitor singleton, not a mock: the defect
+    was in the wiring between the two modules, not in either one alone."""
+
+    def test_clear_terminal_drops_a_stranded_dispatch_marker(self):
+        """Without the teardown hook, a marker recorded at generation 5
+        survives clear_terminal forever: the counter clear_terminal just
+        performed means every future event's generation restarts at 0, so it
+        can never exceed 5 and _clear_dispatch_active's strictly-greater
+        check never fires."""
+        inbox_service_module._mark_dispatch_active("term-reset-clear", generation=5)
+        assert inbox_service_module._is_dispatch_active("term-reset-clear") is True
+
+        status_monitor.clear_terminal("term-reset-clear")
+
+        assert inbox_service_module._is_dispatch_active("term-reset-clear") is False
+
+    def test_reset_buffer_drops_a_stranded_dispatch_marker(self):
+        """Same failure family via the other reset path the review named:
+        reset_buffer also pops _status_generations without touching
+        _dispatch_active."""
+        inbox_service_module._mark_dispatch_active("term-reset-buffer", generation=5)
+        assert inbox_service_module._is_dispatch_active("term-reset-buffer") is True
+
+        status_monitor.reset_buffer("term-reset-buffer")
+
+        assert inbox_service_module._is_dispatch_active("term-reset-buffer") is False
+
+    def test_terminal_teardown_reaps_an_unconfirmed_marker_instead_of_leaking(self):
+        """Secondary "Important" finding: a terminal deleted while holding an
+        unconfirmed marker previously leaked that _dispatch_active entry for
+        the process lifetime (clear_terminal pops _status_generations and
+        _delivery_locks self-cleans via refcounting, but nothing reaped this
+        dict). The same hook that fixes the stranding bug reaps it too."""
+        inbox_service_module._mark_dispatch_active("term-teardown-leak", generation=1)
+
+        status_monitor.clear_terminal("term-teardown-leak")
+
+        with inbox_service_module._dispatch_active_guard:
+            assert "term-teardown-leak" not in inbox_service_module._dispatch_active
+
+    def test_reset_mid_dispatch_no_longer_strands_delivery(self, isolated_memory_db):
+        """End-to-end reproduction of the reviewer's exact scenario: a
+        dispatch marker set at generation 5, then a reset lands inside the
+        still-unconfirmed window (status_monitor.clear_terminal, restarting
+        the counter). The first post-reset event carries generation 1,
+        at or below the stale marker's recorded 5, so the old
+        strictly-greater check in _clear_dispatch_active could never fire.
+        Before the fix this coalesces the still-PENDING message forever, with
+        no recovery short of a server restart; after the fix the teardown
+        hook already dropped the marker during the reset itself, so
+        deliver_pending sends normally."""
+        with database.SessionLocal() as seed:
+            seed.add(
+                InboxModel(
+                    sender_id="s",
+                    receiver_id="term-reset-e2e",
+                    message="hello",
+                    status=MessageStatus.PENDING.value,
+                    created_at=datetime.now(),
+                )
+            )
+            seed.commit()
+
+        with patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as mock_monitor:
+            mock_monitor.get_status_generation.return_value = 5
+            inbox_service_module._mark_dispatch_active("term-reset-e2e")
+        assert inbox_service_module._is_dispatch_active("term-reset-e2e") is True
+
+        # The terminal is reset/relaunched while the dispatch above is still
+        # unconfirmed. Use the real singleton: it is the one carrying the
+        # teardown hook under test.
+        status_monitor.clear_terminal("term-reset-e2e")
+
+        with (
+            patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as mock_monitor,
+            patch("cli_agent_orchestrator.services.inbox_service.terminal_service") as mock_term,
+        ):
+            # First post-reset event: the counter restarted, so this reads
+            # back as generation 1, at or below the stale marker's 5.
+            mock_monitor.get_status.return_value = TerminalStatus.IDLE
+            mock_monitor.get_status_generation.return_value = 1
+            svc = InboxService()
+            svc.deliver_pending("term-reset-e2e")
+
+        mock_term.send_input.assert_called_once()
+        with database.SessionLocal() as check:
+            statuses = [
+                m.status
+                for m in check.query(InboxModel).filter_by(receiver_id="term-reset-e2e").all()
+            ]
+        assert statuses == [MessageStatus.DELIVERED.value]
 
 
 class TestEagerInboxDelivery:
