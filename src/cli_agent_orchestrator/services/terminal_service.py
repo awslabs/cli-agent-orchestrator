@@ -18,6 +18,7 @@ Terminal Workflow:
 """
 
 import asyncio
+import hashlib
 import logging
 import os
 import re
@@ -28,15 +29,20 @@ from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
+from pydantic import ValidationError
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
 )
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
+from cli_agent_orchestrator.clients.database import (
+    delete_idempotency_key,
+)
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
 from cli_agent_orchestrator.clients.database import (
     delete_terminals_by_session,
+    get_idempotency_record,
     get_terminal_metadata,
     list_all_terminals,
     list_siblings_by_group_prefix,
@@ -109,6 +115,43 @@ from cli_agent_orchestrator.utils.terminal import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class IdempotencyKeyConflict(Exception):
+    """An idempotency key was reused for a DIFFERENT request.
+
+    Review on PR #634, issue #616. Surfaced as HTTP 409 by both create
+    endpoints -- the same shape Stripe and AWS use
+    (``IdempotentParameterMismatch``) rather than silently serving the first
+    call's result to a caller who asked for something else.
+
+    Subclasses ``Exception`` and NOT ``ValueError``, deliberately. Every
+    ``ValueError`` out of ``create_terminal`` is already spoken for by the
+    endpoints: ``create_session`` maps it to 400 and
+    ``create_terminal_in_session`` maps it to 404, and in ``create_session``
+    that arm sits FIRST -- so a ``ValueError`` subclass would be swallowed
+    into a 400 before any 409 arm could see it, and a later reorder could
+    silently re-break it. As a plain ``Exception`` the only ordering
+    requirement is that its arm precede the catch-all 500, which no reorder
+    of the ``ValueError``-family arms can violate. This also matches the
+    dominant convention in this repo (``WorktreeError(Exception)``,
+    ``ProviderError(Exception)``).
+    """
+
+
+class TerminalRecordCorruptError(Exception):
+    """A stored terminal row exists but does not satisfy the ``Terminal`` model.
+
+    Review on PR #634. Raised in place of the bare pydantic
+    ``ValidationError`` so the failure cannot be mistaken for a client error:
+    ``ValidationError`` subclasses ``ValueError``, so letting it escape would
+    surface as 400 from ``create_session`` and 404 from
+    ``create_terminal_in_session`` -- both of which blame the caller for a
+    corrupt server-side row. As a plain ``Exception`` it reaches each
+    endpoint's catch-all and is reported as a 500, which is what a
+    server-data fault is, and needs no new ``except`` arm to do it.
+    """
+
 
 # Upper bound (bytes) on a single offset-ranged read of a terminal log
 # (U5 / #504, BR-2). ``read_output_range`` clamps its ``length`` to this so a
@@ -381,6 +424,231 @@ async def _finish_and_roll_back_cancelled_create(
     )
 
 
+# ``allowed_tools=None`` and ``allowed_tools=[]`` are DIFFERENT requests --
+# ``None`` resolves the tool set from the agent profile while ``[]`` is an
+# explicit empty set that is not resolved (see the ``allowed_tools is None``
+# branch in ``create_terminal``) -- so they must not hash alike. These two
+# markers keep them apart by construction: an explicit list always starts with
+# ``_FP_TOOLS_SET``, so no list, not even one whose sole member is the unset
+# marker's own text, can produce the unset encoding.
+_FP_TOOLS_UNSET = "-"
+_FP_TOOLS_SET = "+"
+
+
+def _fingerprint_component(value: str) -> str:
+    """Length-prefix one fingerprint component so it cannot forge a boundary.
+
+    Review on PR #634. A separator alone is not enough when the
+    values are caller-controlled, and these are: ``allowed_tools`` arrives as a
+    query-param string split on ``","`` (``api/main.py``), and the scalar
+    fields are query params too, so a caller can embed the separator byte
+    itself via percent-encoding. Length-prefixing makes every component
+    self-delimiting, which kills the whole class in one place rather than
+    per-field: ``["a\x1fb"]`` can no longer serialise like ``["a", "b"]``, and
+    a ``NUL`` inside ``model`` can no longer forge the field boundary.
+    """
+    return f"{len(value)}:{value}"
+
+
+def _request_fingerprint(
+    provider: Optional[str],
+    agent_profile: Optional[str],
+    session_name: Optional[str],
+    working_directory: Optional[str],
+    caller_id: Optional[str],
+    model: Optional[str],
+    use_worktree: bool,
+    engine: Optional[KiroEngine | str],
+    allowed_tools: Optional[List[str]],
+    env_vars: Optional[Dict[str, str]],
+    resume_session_id: Optional[str],
+    initial_message: Optional[str],
+    initial_message_orchestration_type: Optional[OrchestrationType],
+) -> str:
+    """Fingerprint the create-terminal request an idempotency key stands for.
+
+    Review on PR #634, issue #616. Stored alongside the key so a later call
+    presenting the same key can be told apart: same fingerprint is a RETRY
+    (return the existing terminal), different fingerprint is a COLLISION
+    (raise ``IdempotencyKeyConflict``).
+
+    REQUESTED values, not resolved ones, and that is load-bearing. The key
+    check runs before ``create_terminal`` resolves the working directory,
+    provider fallback or Kiro engine, so resolved values do not exist yet;
+    computing them in order to compare would perform the very work the key
+    exists to skip. A genuine retry re-sends the same REQUEST, so
+    requested-vs-requested is the comparison that matches, and fingerprinting
+    resolved values would spuriously conflict a legitimate retry issued from
+    a different process cwd (whose ``working_directory=None`` resolves
+    differently) -- a false 409 on the exact case this feature serves.
+
+    ``caller_id`` is one of the fields, which is what makes a CROSS-CALLER
+    collision a mismatch rather than a silent hand-off of someone else's
+    worker: two supervisors reusing ``job-1`` fingerprint differently and the
+    second gets a loud 409. It is deliberately NOT additionally scoped in the
+    primary key -- see the accepted residuals in ``create_terminal``'s
+    docstring for the one case this cannot separate.
+
+    ``env_vars`` and ``resume_session_id`` are hashed for the same reason, and
+    ``env_vars`` has the sharpest precedent of any field here: ``RunStepRequest``
+    refuses ``env_vars`` together with ``reuse_terminal_id`` outright, because
+    "a silently dropped RUN_ID/GENERATION fence token is the quiet identity
+    failure NFR-SEC-4 exists to prevent". Unhashed, this function reproduced
+    exactly that -- a caller asking for one workflow run received a terminal
+    launched with ANOTHER run's fence tokens, silently.
+
+    ``allowed_tools`` AND ``engine`` ARE BOTH HASHED, and leaving either out
+    was a live privilege-escalation hole rather than a matter of taste
+    (review on PR #634). Both are persisted COLUMNS on
+    the ``terminals`` table (``database.py:43,46``), i.e. launch-time terminal
+    identity, and ``POST /sessions/{name}/terminals`` accepts either one in the
+    SAME call as ``idempotency_key``. Unhashed, a second call reusing a key
+    with a WIDER ``allowed_tools`` was handed the first call's narrow terminal
+    -- and in the other order, a caller asking for a narrow tool set received a
+    terminal holding ``execute_bash`` it never requested. ``allowed_tools`` is
+    baked in at launch, not re-evaluated per message, so that wrong policy is
+    PERMANENT for the terminal's life. Unhashed ``engine`` additionally let a
+    key hit skip the Kiro engine validation the same request would otherwise
+    have been rejected by (see ``create_terminal``'s docstring).
+
+    This is also the contract two other reuse paths in this repo already hold
+    us to: ``agent_step._validate_reused_terminal`` RAISES on an engine
+    mismatch, and ``api/main.py`` rejects ``env_vars`` with
+    ``reuse_terminal_id`` outright. ``step_fingerprint`` -- the other
+    fingerprint in this codebase -- hashes ``allowed_tools`` sorted (BR-4) and
+    says of ``engine`` that "it stays unconditionally hashed ... it is the
+    single easiest thing to get wrong here."
+
+    SERIALIZATION, following ``step_fingerprint``'s discipline:
+
+    - ``allowed_tools`` members are SORTED but NOT de-duplicated, because
+      ``["a","b"]`` and ``["b","a"]`` grant identical capability -- order
+      sensitivity would manufacture a false conflict for a caller who merely
+      reordered a comma list -- while ``["a","a"]`` differs from ``["a"]`` and
+      collapsing it would hide a real difference.
+    - EVERY component is LENGTH-PREFIXED by ``_fingerprint_component``, not
+      merely separated. The values are caller-controlled, so a separator alone
+      is forgeable; see that helper for the concrete collisions it prevents.
+    - ``None`` and ``[]`` hash DIFFERENTLY (``_FP_TOOLS_UNSET`` versus
+      ``_FP_TOOLS_SET``). They are genuinely different requests: ``None`` means
+      "resolve the tool policy from the agent profile" while ``[]`` is an
+      explicit empty set that is NOT resolved (see the ``allowed_tools is
+      None`` branch below), so collapsing them would let one caller be served
+      the other's privilege set. Note ``[]`` is NOT reachable over HTTP -- both
+      endpoints parse ``allowed_tools.split(",") if allowed_tools else None``,
+      so an empty query value arrives as ``None`` -- but it IS reachable from
+      the in-process callers (session, flow and step services), which is why
+      the distinction is kept rather than simplified away.
+    - ``env_vars`` is a MAPPING, so it sorts by key (declaration order is not
+      a difference) and length-prefixes key AND value, which no
+      single-axis scheme would do. Unlike ``allowed_tools``, ``None`` and
+      ``{}`` deliberately SHARE an encoding: every use in ``create_terminal``
+      collapses them already (``env_vars or {}``, ``if env_vars:``), so they
+      cannot yield materially different terminals. Same-shaped question as
+      ``allowed_tools``, opposite verified answer -- which is why the resolver
+      has to be read rather than the pattern matched.
+    - ``engine`` normalises through ``KiroEngine.value`` because the parameter
+      accepts the enum OR a plain string -- ``api/main.py`` forwards a query
+      string while ``parse_kiro_engine`` returns the member, and the same
+      logical request arriving by those two routes must produce ONE digest or
+      a legitimate retry 409s.
+
+    sha256 hexdigest rather than the joined text: the column stays a bounded
+    64 chars regardless of path length, and filesystem paths and profile names
+    are not left sitting in the database in cleartext. ``None`` normalises to
+    ``""`` for the scalar fields, and the field ORDER is fixed by this function
+    -- it is the only writer and the only reader, so the digest never has to be
+    stable across versions, only within one.
+    """
+    if allowed_tools is None:
+        tools = _FP_TOOLS_UNSET
+    else:
+        tools = _FP_TOOLS_SET + "".join(
+            _fingerprint_component(tool) for tool in sorted(allowed_tools)
+        )
+
+    # Normalised WITHOUT `parse_kiro_engine`, and the reason is purity rather
+    # than any particular status code: `parse_kiro_engine` VALIDATES, so calling
+    # it here would make digest computation a validation site. A fingerprint
+    # helper has one job -- map a request to a stable string -- and must not
+    # decide whether that request is acceptable; the engine is validated below,
+    # on the path that owns that decision. An invalid engine simply hashes as
+    # itself and mismatches, which is all this function needs to be correct.
+    # `KiroEngine` is a `str` Enum so joining a member happens to work, but
+    # `.value` is the documented contract (`step_fingerprint`: "a KiroEngine
+    # member's repr is not stable across versions") and an explicit branch
+    # cannot be broken by a later switch to a non-str Enum. `str()` runs only on
+    # the non-member path, so the unsafe `str(KiroEngine.V2) == "KiroEngine.V2"`
+    # form is unreachable.
+    if engine is None:
+        engine_value = ""
+    elif isinstance(engine, KiroEngine):
+        engine_value = engine.value
+    else:
+        engine_value = str(engine)
+
+    # `None` and `{}` share one encoding, and that is VERIFIED rather than
+    # assumed -- the opposite answer to `allowed_tools` above. Every use of
+    # `env_vars` in `create_terminal` collapses them (`env_vars or {}` when
+    # merging session env, and `if env_vars:` before persisting), so both mean
+    # "no extra environment" and no caller can be served a materially different
+    # terminal by the distinction. Sorted by key so declaration order cannot
+    # manufacture a false conflict, with key AND value each length-prefixed so
+    # no pair can forge a boundary.
+    env = "".join(
+        _fingerprint_component(key) + _fingerprint_component(value)
+        for key, value in sorted((env_vars or {}).items())
+    )
+
+    # The DELIVERED TASK is part of the request identity, and leaving it out was
+    # a silent-drop bug rather than a matter of taste (review on PR #634).
+    # `create_terminal` itself delivers `initial_message` -- it schedules the
+    # deferred init that sends it -- so a key hit returns EARLY, above that
+    # scheduling. Unhashed, seeding a key for task A and retrying the otherwise
+    # identical request with task B handed back A's terminal and discarded B
+    # entirely: no conflict, no delivery, no log line. Hashed, that second call
+    # is a 409, which is what both the endpoint's "exact request" contract and
+    # the CLI's own help text already promise.
+    #
+    # The orchestration type rides along because it selects HOW the message is
+    # delivered, so the same text under a different type is a different
+    # operation. `OrchestrationType` is normalised via `.value` for the reason
+    # `engine` is: the enum member's repr is not stable across versions.
+    #
+    # Note this does NOT change the handoff CLI path, where the message is sent
+    # AFTER creation by `_send_direct_input_handoff`/`_run_step_and_build_result`
+    # rather than passed here -- `initial_message` is None on both attempts, so
+    # a handoff retry still reuses its worker. That asymmetry is the honest one:
+    # these endpoints own delivery and can therefore conflict on it; the handoff
+    # path does not, and deduplicating ITS submission needs the durable run
+    # record tracked separately (#715), not this fingerprint.
+    if initial_message_orchestration_type is None:
+        orchestration_value = ""
+    elif isinstance(initial_message_orchestration_type, OrchestrationType):
+        orchestration_value = initial_message_orchestration_type.value
+    else:
+        orchestration_value = str(initial_message_orchestration_type)
+
+    parts = [
+        provider or "",
+        agent_profile or "",
+        session_name or "",
+        working_directory or "",
+        caller_id or "",
+        model or "",
+        "1" if use_worktree else "0",
+        engine_value,
+        tools,
+        env,
+        resume_session_id or "",
+        initial_message or "",
+        orchestration_value,
+    ]
+    return hashlib.sha256(
+        "\x00".join(_fingerprint_component(part) for part in parts).encode("utf-8")
+    ).hexdigest()
+
+
 async def create_terminal(
     provider: str,
     agent_profile: str,
@@ -401,10 +669,13 @@ async def create_terminal(
     use_worktree: bool = False,
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
+    idempotency_key: Optional[str] = None,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
     This function orchestrates the complete terminal creation workflow:
+    0. If ``idempotency_key`` maps to a terminal from a prior call, return
+       IT instead -- no tmux window, no provider process, no new DB row
     1. Generate unique terminal ID and window name
     2. Create tmux session/window (new or existing)
     3. Save terminal metadata to database
@@ -450,16 +721,286 @@ async def create_terminal(
         metadata: Free-form JSON describing what this terminal is doing.
             Also updatable later by the running agent via the
             ``update_metadata`` MCP tool.
+        idempotency_key: Review on PR #634, issue #616. When given and a PRIOR
+            call already created a terminal for the SAME KEY **and the same
+            request**, that terminal is returned as-is and nothing else in
+            this function runs -- no tmux window, no provider process, no new
+            DB row. This is what makes a retry after a lost response safe:
+            the caller that never saw the first response (e.g. a killed CLI
+            process) can call again with the SAME key and land on the terminal
+            the first, already-committed attempt produced, instead of creating
+            a second worker. Persisted atomically with the terminal row (see
+            ``database.create_terminal``); ``None`` (default) is the existing,
+            unprotected behavior every current caller keeps.
+
+            The key does NOT identify the request on its own -- it is matched
+            together with a fingerprint of ELEVEN fields (see
+            ``_request_fingerprint``). Presenting a key that a DIFFERENT
+            request already claimed raises ``IdempotencyKeyConflict``
+            (HTTP 409) rather than handing back a terminal that answers
+            someone else's question. A key whose terminal no longer exists is
+            treated as stale and simply creates fresh -- that is not a
+            conflict.
+
+            THE FIELD SET IS CLOSED BY ENUMERATION, not by however many review
+            rounds happened to run. Every caller-reachable parameter of BOTH
+            create endpoints -- ``POST /sessions`` (including everything
+            ``CreateSessionBody`` and its ``CreateTerminalBody`` base carry)
+            and ``POST /sessions/{name}/terminals`` -- is classified below,
+            hashed or excluded-with-a-reason. Adding a parameter to either
+            endpoint means classifying it here.
+
+            HASHED (11) -- these determine what the terminal IS, or what
+            privileges and context it launches with:
+            ``provider``, ``agent_profile``, ``session_name``,
+            ``working_directory``, ``caller_id``, ``model``, ``use_worktree``,
+            ``engine``, ``allowed_tools``, ``env_vars``,
+            ``resume_session_id``.
+
+            EXCLUDED, each for a checked reason:
+
+            - ``idempotency_key`` itself. It is the lookup key; hashing it
+              would make every key match only itself.
+            - ``group`` and ``metadata``. Discovery labels that are separately
+              mutable AFTER creation via ``PATCH /terminals/{id}/group`` and
+              the ``update_metadata`` MCP tool, so a create-time key is not
+              their integrity boundary -- a caller who cares about their value
+              cannot rely on creation to fix it anyway.
+            - ``initial_message`` and ``initial_message_orchestration_type``.
+              The delivered payload and its routing, not the terminal: neither
+              is persisted on the row, and a genuine retry re-sends the same
+              message. These create endpoints do not own the prompt.
+            - ``defer_init``. Excluded, and this one was decided against the
+              instinct that it looks like identity, because three things check
+              out against the code:
+              (a) On ``POST /sessions`` it is not caller-settable at all --
+              ``session_service.create_session`` derives it as
+              ``defer_init=initial_message is not None``. Hashing it would
+              therefore make two otherwise-identical requests conflict purely
+              because one supplied a message and the other did not, i.e. it
+              would partially hash ``initial_message`` through the back door,
+              contradicting the deliberate decision above not to hash the
+              prompt.
+              (b) It leaves NO permanent difference in the created terminal.
+              The only row column it touches is ``shell_command``, which the
+              deferred path sets to ``None`` up front and then writes after
+              ``provider.initialize()`` returns, converging on the same value
+              the synchronous path records immediately.
+              (c) On a key HIT the returned status is read live by
+              ``get_terminal``, not taken from this request, so ``defer_init``
+              cannot change what a hit returns. And the short-circuit never
+              waits for initialisation for ANY caller -- that is its purpose --
+              so there is no wait guarantee here for a differing
+              ``defer_init`` to violate. Hashing it would manufacture
+              conflicts while buying no guarantee.
+            - ``memory_manager``. Never reaches this function: the endpoint
+              uses it to spawn a SEPARATE sidecar terminal with
+              ``agent_profile="memory_manager"`` in a background task, so it
+              cannot alter the identity of the terminal this key maps to.
+              Excluded from the fingerprint, and no longer a duplication hole:
+              the spawn is gated only on the flag's truthiness and this
+              function still returns the same ``Terminal`` shape whether it
+              created one or matched a key, so the endpoint cannot tell a reuse
+              from a fresh create -- it therefore hands the sidecar its OWN key
+              derived from the caller's (``<key>:memory-manager-sidecar``),
+              making that create idempotent in its own right instead of relying
+              on a signal it cannot get. A keyed retry now resolves to the
+              first call's sidecar rather than spawning a second one.
+            - ``new_session``. Not a caller parameter on either endpoint --
+              each route passes its own fixed value -- so no caller can vary
+              it under a shared key.
+            - Framework and auth parameters (``request``,
+              ``background_tasks``, ``_scopes``) and the ``body`` wrapper
+              itself, which is expanded into its fields above.
+
+            ``engine`` being in that set also closes a validation BYPASS
+            (review on PR #634). The Kiro engine checks below run AFTER this
+            short-circuit, so a key hit used to return 200 for an ``engine``
+            the very same request would otherwise have been rejected with 400.
+            A first call carrying an invalid engine raises before any terminal
+            or key row is written, so a key hit implies the STORED engine was
+            valid -- and any later differing engine now mismatches the
+            fingerprint and is refused.
+
+            ACCEPTED MISATTRIBUTION, recorded rather than left silent. Two
+            cases, only one of which is this change's:
+
+            - USED key + invalid engine: was 200 (the bypass above), now 409
+              "this key was already used for a different request". So the
+              operator is told to change their KEY when their ENGINE is what
+              is wrong. Accepted rather than fixed, because reaching the real
+              validator means loading the agent profile and running the Kiro
+              capability probe -- a ``subprocess.run`` -- which is exactly the
+              work this short-circuit exists to skip; paying it on every retry
+              would trade away the property the feature is FOR in exchange for
+              a better message. The request is refused either way; only the
+              stated reason is imprecise.
+            - FRESH key + invalid engine: 404 on
+              ``POST /sessions/{name}/terminals`` (400 on ``POST /sessions``),
+              because the validator raises a BARE ``ValueError`` -- not a
+              ``KiroCapabilityError`` -- so it falls past that route's 400 arm
+              to its generic "not found" arm. That is PRE-EXISTING, is
+              unchanged by this change, and is deliberately not fixed here --
+              correcting it means reworking error mapping this change does not
+              own. Noted only so the 409 above is not mistaken for a
+              regression from a 400 that never existed.
+
+            This resolves an apparent tension with the commit directly beneath
+            this one, which stopped ``engine`` being forwarded to a non-Kiro
+            provider on the handoff reuse path. That change treats ``engine``
+            as provider-SPECIFIC; this one treats it as part of request
+            IDENTITY. Both hold: precisely because ``engine`` only means
+            something for one provider, two requests differing in it are
+            different requests, and the pair must not be conflated by a key.
+
+            Two accepted residuals, recorded so they are not mistaken for
+            bugs. Note neither is an exclusion from the field set above --
+            those are enumerated there with their reasons; these are limits of
+            what a fingerprint over those fields can distinguish:
+
+            1. Two callers that BOTH have ``caller_id=None`` and are otherwise
+               identical in all eleven fields are indistinguishable by
+               fingerprint, so the second reuses the first's terminal. At that
+               point the two requests are the same request by every property
+               the server can observe, and reuse is the defensible answer.
+               This is a REAL case rather than a hypothetical one, and
+               specifically on the fresh-session path: ``caller_id`` is a
+               caller parameter on ``POST /sessions/{name}/terminals`` ONLY --
+               ``POST /sessions`` does not expose it -- so every keyed
+               fresh-session create arrives with ``caller_id=None`` and this
+               residual is the norm there, not the exception.
+            2. The DELIVERED PROMPT is not hashed, so two same-shape requests
+               carrying different messages reuse one terminal. This is
+               deliberate and must not be "fixed" by adding the prompt -- a
+               genuine retry re-sends the same prompt, and these create
+               endpoints are not the prompt's owner.
+
+            KNOWN DIVERGENCE, stated so the next reader need not rediscover
+            it: even with eleven fields this remains a WEAKER contract than
+            the other reuse path in this repo.
+            ``agent_step._validate_reused_terminal`` RAISES on a provider or
+            engine mismatch against the PERSISTED row, and ``RunStepRequest``
+            rejects ``env_vars`` combined with ``reuse_terminal_id`` outright.
+            Here a mismatch is refused only insofar as it changes one of the
+            eleven hashed fields, and the comparison is
+            request-against-request rather than
+            request-against-persisted-metadata. The practical gap: a field
+            that is excluded above, or a difference between the request and
+            what the mapped terminal actually persisted, is not caught here.
 
     Returns:
         Terminal object with all metadata populated
 
     Raises:
         ValueError: If session already exists (new_session=True) or not found (new_session=False)
+        IdempotencyKeyConflict: If ``idempotency_key`` was already used for a
+            different request (surfaced as HTTP 409 by both create endpoints)
+        TerminalRecordCorruptError: If the terminal a key maps to has a stored
+            row that does not satisfy the ``Terminal`` model (HTTP 500)
         TerminalLimitError: If the node's tracked-terminal cap (CAO_MAX_TERMINALS /
             server.max_terminals; unset = unlimited) is already reached
         TimeoutError: If provider initialization times out
     """
+    # Idempotency resolution runs BEFORE the terminal cap check below, and the
+    # order is deliberate: a key HIT returns an already-existing terminal and
+    # allocates nothing, so charging it against the cap would 429 a legitimate
+    # retry on a full node -- the one case this feature exists to make safe.
+    # The cap still precedes every actual allocation (worktree, tmux window, DB
+    # row, provider process), which is all its own placement-guard needs.
+    request_fingerprint: Optional[str] = None
+    if idempotency_key:
+        request_fingerprint = _request_fingerprint(
+            provider,
+            agent_profile,
+            session_name,
+            working_directory,
+            caller_id,
+            model,
+            use_worktree,
+            engine,
+            allowed_tools,
+            env_vars,
+            resume_session_id,
+            initial_message,
+            initial_message_orchestration_type,
+        )
+        existing_record = get_idempotency_record(idempotency_key)
+        existing_terminal_id = existing_record.terminal_id if existing_record else None
+        if existing_terminal_id is not None:
+            # Only the LOOKUP is guarded. `Terminal(**row)` is deliberately
+            # OUTSIDE this try (review on PR #634): pydantic's ValidationError
+            # subclasses ValueError, so a single try around both would catch a
+            # row that EXISTS but does not validate and treat it as an absent
+            # one -- deleting a LIVE terminal's mapping below and creating a
+            # second worker for the same key, which is the exact duplication
+            # this feature exists to prevent, reported as "no longer exists".
+            # The `terminals` row and the `Terminal` model genuinely differ
+            # (no `working_directory` on the model, `metadata` vs
+            # `metadata_json`), so a future column rename reaches this arm; it
+            # must fail loudly rather than silently duplicate the job.
+            try:
+                row = get_terminal(existing_terminal_id)
+            except ValueError:
+                # The key's mapping outlived the terminal it pointed to (e.g.
+                # a completed-and-torn-down handoff, retried long after the
+                # fact) -- there is nothing left to recover, so fall through
+                # and create fresh rather than raising on an operator who
+                # simply reused a key from a job that already finished.
+                #
+                # The stale row must be deleted FIRST (review on PR #634):
+                # deleting a terminal does not cascade to idempotency_keys, so
+                # leaving this row in place would make the replacement
+                # terminal's own idempotency insert below collide on the same
+                # primary key and raise IntegrityError -- turning a graceful
+                # fallthrough into a guaranteed 500 on every such retry. The
+                # expected_terminal_id guard makes this a compare-and-delete:
+                # if a concurrent caller already replaced the mapping, this
+                # deletes nothing and this attempt's own insert below is the
+                # one that raises IntegrityError instead.
+                delete_idempotency_key(idempotency_key, existing_terminal_id)
+                logger.info(
+                    "idempotency_key %r maps to terminal %r, which no longer exists; "
+                    "creating a new terminal",
+                    idempotency_key,
+                    existing_terminal_id,
+                )
+            else:
+                # Reached ONLY once the mapped terminal is confirmed to still
+                # exist, and that ordering is the whole point: the stale-key
+                # branch above already fell through, so a key whose terminal is
+                # gone is never compared and never conflicts. Checking the
+                # fingerprint first would 409 the legitimate case this feature
+                # was built for -- an operator reusing a key from a job that
+                # already finished.
+                if existing_record is not None and (
+                    existing_record.request_fingerprint != request_fingerprint
+                ):
+                    # A different request under the same key is operator error,
+                    # not a retry, and returning the stored terminal here is not
+                    # a merely-wrong return value: _handoff_impl feeds it
+                    # straight into reuse_terminal_id, so this caller's prompt
+                    # would be delivered into the OTHER caller's running worker,
+                    # in that worker's session, under its tool restrictions --
+                    # and this caller's teardown would then delete it.
+                    raise IdempotencyKeyConflict(
+                        f"idempotency_key {idempotency_key!r} was already used for a "
+                        "different request; use a distinct key"
+                    )
+                # A genuine retry: same key, same request. Return the terminal
+                # the first call produced without doing any real work -- the
+                # property haofeif signed off on, unchanged by the check above.
+                try:
+                    return Terminal(**row)
+                except ValidationError as exc:
+                    # Re-raised as a non-ValueError so a corrupt STORED row is
+                    # reported as a 500 rather than being blamed on the caller
+                    # as a 400/404. See TerminalRecordCorruptError.
+                    raise TerminalRecordCorruptError(
+                        f"terminal {existing_terminal_id!r} is mapped by "
+                        f"idempotency_key {idempotency_key!r} but its stored row does "
+                        f"not satisfy the Terminal model: {exc}"
+                    ) from exc
+
     # Per-node terminal cap (one-agent-per-pod k8s topology; worker pods set
     # CAO_MAX_TERMINALS=1). Checked FIRST, before any resource (worktree, tmux
     # window, DB row, provider process) is allocated, so a full node rejects
@@ -768,6 +1309,8 @@ async def create_terminal(
                         group=group,
                         metadata=metadata,
                         working_directory=resolved_working_directory,
+                        idempotency_key=idempotency_key,
+                        request_fingerprint=request_fingerprint,
                     )
                 except BaseException:
                     _roll_back_backend_create_locked(

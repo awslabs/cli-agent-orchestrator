@@ -46,6 +46,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - frozen execution manifest, plan approval, and frozen run memory (#583 Bolt 2) (#650)
 
+- Add `cao agent assign|handoff|send-message|status|result|cancel` CLI
+  commands as a fallback for in-session MCP orchestration when a terminal's
+  `cao-mcp-server` connection is unavailable. Same behavior as the
+  `assign`/`handoff`/`send_message`/`delete_terminal` MCP tools, backed by a
+  shared `utils/orchestration` implementation module so neither entry point
+  can drift from the other (#616)
+
 
 ### Changed
 
