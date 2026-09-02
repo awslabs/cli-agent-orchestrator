@@ -13,11 +13,8 @@ from unittest.mock import MagicMock, patch
 
 import requests
 
-from cli_agent_orchestrator.mcp_server.server import (
-    HandoffContext,
-    _handoff_impl,
-    get_handoff_result,
-)
+from cli_agent_orchestrator.mcp_server.server import get_handoff_result
+from cli_agent_orchestrator.utils.orchestration import HandoffContext, _handoff_impl
 
 
 def _ctx(provider="kiro_cli", session_name=None, caller_id=None, allowed_tools=None):
@@ -41,12 +38,12 @@ def _ok_response(terminal_id="dev-t1", last_message="done"):
 
 
 class TestHandoffJobId:
-    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
-    @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
     def test_job_id_included_in_payload(self, mock_provider, _nudge):
         """Every handoff POST must include a job_id."""
         mock_provider.return_value = _ctx()
-        with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
+        with patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests:
             mock_requests.post.return_value = _ok_response()
             mock_requests.Timeout = Exception
             asyncio.run(_handoff_impl("developer", "do task"))
@@ -58,7 +55,7 @@ class TestHandoffJobId:
         assert isinstance(jid, str) and len(jid) == 32
         int(jid, 16)  # raises if not valid hex
 
-    @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
     def test_transport_timeout_returns_pending_result_with_job_id(self, mock_provider):
         """On requests.Timeout the HandoffResult must carry pending=True and
         a non-None job_id so the caller can poll the retrieval endpoint."""
@@ -67,7 +64,7 @@ class TestHandoffJobId:
         class FakeTimeout(Exception):
             pass
 
-        with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
+        with patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests:
             mock_requests.post.side_effect = FakeTimeout("timed out")
             mock_requests.Timeout = FakeTimeout
             result = asyncio.run(_handoff_impl("developer", "do task", timeout=600))
@@ -82,12 +79,12 @@ class TestHandoffJobId:
         assert "get_handoff_result" in result.message
         assert result.job_id in result.message
 
-    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
-    @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
     def test_success_path_has_no_pending(self, mock_provider, _nudge):
         """Normal synchronous success must not set pending=True on the result."""
         mock_provider.return_value = _ctx()
-        with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
+        with patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests:
             mock_requests.post.return_value = _ok_response()
             mock_requests.Timeout = Exception
             result = asyncio.run(_handoff_impl("developer", "do task"))
@@ -96,7 +93,7 @@ class TestHandoffJobId:
         # pending is None (not set) on the normal path — not True.
         assert result.pending is not True
 
-    @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
     def test_each_call_generates_unique_job_id(self, mock_provider):
         """Separate calls must generate distinct job_ids (no collision)."""
         mock_provider.return_value = _ctx()
@@ -106,7 +103,7 @@ class TestHandoffJobId:
             pass
 
         for _ in range(5):
-            with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
+            with patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests:
                 mock_requests.post.side_effect = FakeTimeout("timed out")
                 mock_requests.Timeout = FakeTimeout
                 result = asyncio.run(_handoff_impl("developer", "do task"))
