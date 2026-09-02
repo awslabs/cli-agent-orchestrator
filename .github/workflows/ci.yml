@@ -36,7 +36,9 @@ jobs:
 
       - name: Run unit tests with coverage
         run: |
-          uv run pytest test/ \
+          # CI intentionally includes integration-marked tests except for the Kiro
+          # provider test, which requires an authenticated external CLI.
+          uv run pytest test/ examples/workflow/tests/ \
             --ignore=test/providers/test_kiro_cli_integration.py \
             --ignore=test/e2e \
             -m "not e2e" \
@@ -175,7 +177,7 @@ jobs:
       - name: Backend coverage (for the ratchet floor)
         # Produces coverage.json (python floor) consumed by coverage:ratchet.
         run: |
-          uv run pytest test/ \
+          uv run pytest test/ examples/workflow/tests/ \
             --ignore=test/providers/test_kiro_cli_integration.py \
             --ignore=test/e2e \
             -m "not e2e" \

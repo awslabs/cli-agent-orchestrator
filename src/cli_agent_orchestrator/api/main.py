@@ -101,7 +101,7 @@ from cli_agent_orchestrator.models.memory import (
     MemoryScopeId,
     MemoryType,
 )
-from cli_agent_orchestrator.models.terminal import Terminal, TerminalId
+from cli_agent_orchestrator.models.terminal import Terminal, TerminalId, TerminalLimitError
 from cli_agent_orchestrator.models.workflow import RecoveryPolicy
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.base import OutputExtractionError
@@ -157,8 +157,10 @@ from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.services.terminal_service import (
     TERMINAL_RANGE_MAX_LENGTH,
+    IdempotencyKeyConflict,
     OutputMode,
     TerminalInputBlockedError,
+    _notify_elastic_terminal_ended,
 )
 from cli_agent_orchestrator.services.workflow_journal import (
     _TERMINAL_RUN_STATES as _JOURNAL_TERMINAL_RUN_STATES,
@@ -2881,6 +2883,8 @@ async def create_session(
     memory_manager: Optional[str] = None,
     engine: Optional[KiroEngine] = None,
     model: Optional[str] = None,
+    use_worktree: bool = False,
+    idempotency_key: Optional[str] = None,
     resume_session_id: Optional[str] = None,
     body: Optional[CreateSessionBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
@@ -2914,6 +2918,28 @@ async def create_session(
     the initial terminal at creation time (``group`` is also updatable later
     via ``PATCH /terminals/{id}/group``, ``metadata`` via the
     ``update_metadata`` MCP tool).
+
+    ``use_worktree`` (issue #100 Phase 1; review on PR #634): provision an
+    isolated git worktree for this terminal instead of sharing
+    ``working_directory`` as given, mirroring ``POST
+    /sessions/{name}/terminals``'s parameter of the same name. Previously only
+    that sibling endpoint threaded it through to
+    ``terminal_service.create_terminal`` -- a fresh (no existing session)
+    caller requesting a worktree had it silently dropped.
+
+    ``idempotency_key`` (review on PR #634, issue #616): a caller-supplied
+    token making a retry of this exact request safe. Supply the SAME key on
+    a retry (e.g. after the original response was lost) and this endpoint
+    returns the terminal the first, already-committed attempt created,
+    instead of creating a second one -- see
+    ``terminal_service.create_terminal``'s docstring for the mechanics.
+    Omitted (default): today's behavior, no retry protection.
+
+    The key is matched together with a fingerprint of the request, not on its
+    own, so presenting a key that a DIFFERENT request already claimed returns
+    **409 CONFLICT** rather than that other request's terminal. A key whose
+    terminal has since been torn down is stale, not conflicting, and simply
+    creates fresh.
     """
     initial_message = body.initial_message if body else None
     initial_message_orchestration_type = None
@@ -2969,6 +2995,8 @@ async def create_session(
             initial_message=initial_message,
             initial_message_orchestration_type=initial_message_orchestration_type,
             model=model,
+            use_worktree=use_worktree,
+            idempotency_key=idempotency_key,
             resume_session_id=resume_session_id,
             group=body.group if body else None,
             metadata=body.metadata if body else None,
@@ -2978,6 +3006,30 @@ async def create_session(
             registry = get_plugin_registry(request)
             sidecar_provider = provider or DEFAULT_PROVIDER
             sidecar_session = result.session_name
+            # The sidecar gets its OWN key, DERIVED from the caller's (review on
+            # PR #634, issue #616). This spawn is unconditional -- it runs after
+            # create_session whether the primary was created or resolved from an
+            # existing key -- and the returned Terminal cannot say which, so two
+            # identical keyed requests used to spawn two memory_manager workers
+            # for one primary: the exact no-duplicate-workers criterion the key
+            # exists to hold.
+            #
+            # Deriving a key rather than plumbing a created-vs-reused flag out
+            # through both create endpoints is the smaller correct fix, and it is
+            # strictly stronger: the sidecar create becomes idempotent in its own
+            # right, so the second request reuses the FIRST sidecar even in the
+            # races a boolean would miss (both requests seeing "created", or the
+            # first response being lost before the flag is read). The suffix
+            # keeps it out of the primary's namespace so it can never collide
+            # with the caller's own key.
+            #
+            # Sidecar args are all derived from the primary request or its
+            # result, so a genuine retry fingerprints identically and hits;
+            # anything else 409s inside the task and is logged below like any
+            # other sidecar failure, without failing the primary.
+            sidecar_idempotency_key = (
+                f"{idempotency_key}:memory-manager-sidecar" if idempotency_key else None
+            )
 
             async def _spawn_sidecar() -> None:
                 try:
@@ -2989,6 +3041,7 @@ async def create_session(
                         session_name=sidecar_session,
                         working_directory=working_directory,
                         registry=registry,
+                        idempotency_key=sidecar_idempotency_key,
                     )
                 except Exception as e:
                     logger.warning(f"Failed to spawn memory_manager sidecar: {e}")
@@ -2997,7 +3050,24 @@ async def create_session(
 
         return result
 
+    except IdempotencyKeyConflict as e:
+        # The key was already used for a DIFFERENT request (review on PR #634,
+        # issue #616). 409, matching Stripe/AWS IdempotentParameterMismatch,
+        # rather than silently serving the first call's terminal to a caller
+        # who asked for something else. IdempotencyKeyConflict subclasses
+        # Exception and NOT ValueError precisely so this arm cannot be
+        # shadowed by the 400 arm below -- which, note, sits FIRST here.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except TerminalLimitError as e:
+        # Node is at its tracked-terminal cap (CAO_MAX_TERMINALS) — a capacity
+        # rejection, not a bad request: the caller should retry on another node.
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
     except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except WorktreeError as e:
+        # use_worktree=true against a working_directory that isn't a git
+        # repo, or the 'git worktree add' itself failed -- a client-input
+        # problem, not a server crash. Mirrors POST /sessions/{name}/terminals.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:
         raise HTTPException(
@@ -3031,7 +3101,13 @@ async def get_session(
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     try:
-        return session_service.get_session(session_name)
+        # session_service.get_session() calls status_monitor.get_status() once per
+        # terminal in the session, which for a PROCESSING terminal can shell out to a
+        # real tmux capture-pane subprocess (the stale-PROCESSING fallback). A session
+        # with N processing terminals would otherwise fork N times inline on the event
+        # loop per request — and the web UI polls this endpoint. Run it off the loop,
+        # matching GET /terminals/{id}'s established pattern for the identical hazard.
+        return await asyncio.to_thread(session_service.get_session, session_name)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -3102,6 +3178,7 @@ async def create_terminal_in_session(
     defer_init: bool = False,
     model: Optional[str] = None,
     use_worktree: bool = False,
+    idempotency_key: Optional[str] = None,
     body: Optional[CreateTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
@@ -3133,6 +3210,20 @@ async def create_terminal_in_session(
     ``defer_init`` rather than moving into the JSON body. Runs synchronously
     before the deferred-init background task (if any) is scheduled, so it
     applies the same way regardless of ``defer_init``.
+
+    ``idempotency_key`` (review on PR #634, issue #616): a caller-supplied
+    token making a retry of this exact request safe. Supply the SAME key on
+    a retry (e.g. after the original response was lost) and this endpoint
+    returns the terminal the first, already-committed attempt created,
+    instead of creating a second one -- see
+    ``terminal_service.create_terminal``'s docstring for the mechanics.
+    Omitted (default): today's behavior, no retry protection.
+
+    The key is matched together with a fingerprint of the request, not on its
+    own, so presenting a key that a DIFFERENT request already claimed returns
+    **409 CONFLICT** rather than that other request's terminal. A key whose
+    terminal has since been torn down is stale, not conflicting, and simply
+    creates fresh.
     """
     try:
         validate_tmux_name(session_name, "session_name")
@@ -3201,17 +3292,30 @@ async def create_terminal_in_session(
             engine=engine,
             model=model,
             use_worktree=use_worktree,
+            idempotency_key=idempotency_key,
         )
         return result
     except HTTPException:
         # Deliberate 4xx (e.g. the initial_message/defer_init guard, invalid
         # orchestration_type) — propagate as-is instead of masking as a 500.
         raise
+    except IdempotencyKeyConflict as e:
+        # The key was already used for a DIFFERENT request (review on PR #634,
+        # issue #616) — 409, not the 404 the generic ValueError arm below would
+        # give it. Unlike the Kiro arm, this one does not depend on preceding
+        # that arm: IdempotencyKeyConflict is not a ValueError, so no reorder
+        # of the ValueError family can shadow it.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except (KiroPhase0KASError, KiroCapabilityError) as e:
         # Both subclass ValueError, so they must precede the generic arm below —
         # a rejected engine is a bad request, not a missing resource. Matches
         # POST /sessions, which already returns 400 for the identical failure.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except TerminalLimitError as e:
+        # Node is at its tracked-terminal cap (CAO_MAX_TERMINALS) — a capacity
+        # rejection, not a bad request or a missing session: the caller should
+        # retry on another node.
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except WorktreeError as e:
@@ -3228,7 +3332,20 @@ async def create_terminal_in_session(
 
 @app.get("/sessions/{session_name}/terminals")
 async def list_terminals_in_session(session_name: str) -> List[Dict]:
-    """List all terminals in a session."""
+    """List a session's terminals, oldest first.
+
+    The order is significant and part of this endpoint's contract: **index 0 is
+    the session's oldest surviving terminal**, which is normally its conductor.
+    `cao session status` and `cao session list` rely on it to label the
+    Conductor, and they reach it through this endpoint rather than the database,
+    so the guarantee has to be stated here too.
+
+    "Normally" is deliberate: if the conductor's own terminal is deleted while
+    the session lives on, index 0 becomes the oldest remaining worker. Treat it
+    as best-effort rather than as an identity. Clients needing a different order
+    (most-recently-active first, say) should sort client-side on `last_active`
+    rather than assume this one will change.
+    """
     try:
         validate_tmux_name(session_name, "session_name")
     except ValueError as e:
@@ -3599,6 +3716,17 @@ async def exit_terminal(
         )
 
 
+def _schedule_elastic_terminal_ended(
+    background_tasks: BackgroundTasks,
+    terminal_id: str,
+    *,
+    teardown: bool,
+    reuse_terminal_id: Optional[str],
+) -> None:
+    if teardown and reuse_terminal_id is None:
+        background_tasks.add_task(_notify_elastic_terminal_ended, terminal_id)
+
+
 @app.post(
     TERMINALS_RUN_STEP_ROUTE,
     response_model=RunStepResponse,
@@ -3615,6 +3743,7 @@ async def exit_terminal(
 )
 async def run_step(
     request: Request,
+    background_tasks: BackgroundTasks,
     body: RunStepRequest,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> RunStepResponse:
@@ -3925,6 +4054,12 @@ async def run_step(
             result.status.value if hasattr(result.status, "value") else str(result.status)
         )
         _settle_step(result.terminal_id, None, result.last_message, response_status)
+        _schedule_elastic_terminal_ended(
+            background_tasks,
+            result.terminal_id,
+            teardown=body.teardown,
+            reuse_terminal_id=body.reuse_terminal_id,
+        )
         return RunStepResponse(
             terminal_id=result.terminal_id,
             last_message=result.last_message,
@@ -4019,6 +4154,12 @@ async def run_step(
         # plain-string detail, no ``kind``), not 404 (issue #570).
         _settle_step(None, str(e))
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+    except TerminalLimitError as e:
+        # The node is at its tracked-terminal cap (CAO_MAX_TERMINALS) — surfaced
+        # as 429 so a step scheduler can retry on a different node instead of
+        # reading a kind-less 500.
+        _settle_step(None, str(e))
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
     except ValueError as e:
         # Unknown terminal / bad input surfaced by the terminal layer.
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -6517,7 +6658,12 @@ async def create_inbox_message_endpoint(
     # Attempt immediate delivery if terminal is already IDLE.
     # If not, InboxService will deliver on next IDLE status event.
     try:
-        inbox_service.deliver_pending(receiver_id, registry=get_plugin_registry(request))
+        # deliver_pending reads status_monitor.get_status() (which can fork a tmux
+        # capture-pane via the stale-PROCESSING fallback) and, on delivery, paste-bombs
+        # the pane — blocking I/O either way, so keep it off the event loop.
+        await asyncio.to_thread(
+            inbox_service.deliver_pending, receiver_id, registry=get_plugin_registry(request)
+        )
     except Exception as e:
         logger.warning(f"Immediate delivery attempt failed for {receiver_id}: {e}")
 
@@ -7014,6 +7160,146 @@ def _get_memory_service():
     from cli_agent_orchestrator.services.memory_service import MemoryService
 
     return MemoryService()
+
+
+def _memory_partial_write_response(error: Any) -> JSONResponse:
+    """Preserve the typed partial-write contract across the HTTP boundary."""
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={
+            "error_kind": error.error_kind,
+            "partial_write": {
+                "key": error.key,
+                "scope": error.scope,
+                "scope_id": error.scope_id,
+                "file_path": error.file_path,
+                "completed_phases": error.completed_phases,
+                "repair_command": error.repair_command,
+            },
+        },
+    )
+
+
+class InternalMemoryContext(BaseModel):
+    terminal_id: Optional[str] = None
+    session_name: Optional[str] = None
+    provider: Optional[str] = None
+    agent_profile: Optional[str] = None
+    cwd: Optional[str] = None
+
+
+class InternalMemoryStoreRequest(BaseModel):
+    content: str
+    scope: MemoryScope = MemoryScope.PROJECT
+    memory_type: MemoryType = MemoryType.PROJECT
+    key: Optional[MemoryKey] = None
+    tags: str = ""
+    terminal_context: Optional[InternalMemoryContext] = None
+
+
+class InternalMemoryRecallRequest(BaseModel):
+    query: Optional[str] = None
+    scope: Optional[MemoryScope] = None
+    memory_type: Optional[MemoryType] = None
+    limit: int = Field(default=10, ge=1, le=100)
+    terminal_context: Optional[InternalMemoryContext] = None
+    search_mode: str = "hybrid"
+    sort_by: str = "recency"
+    include_related: bool = False
+
+
+class InternalMemoryForgetRequest(BaseModel):
+    key: MemoryKey
+    scope: MemoryScope = MemoryScope.PROJECT
+    terminal_context: Optional[InternalMemoryContext] = None
+
+
+class InternalMemoryInjectionRequest(BaseModel):
+    terminal_context: InternalMemoryContext
+    budget_chars: int = Field(default=3000, ge=0, le=20000)
+
+
+@app.post("/internal/memory/store")
+async def internal_memory_store(
+    body: InternalMemoryStoreRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Any:
+    """Store memory on this node for a remote CAO worker."""
+    from cli_agent_orchestrator.services.memory_service import MemoryPartialWriteError
+
+    _require_memory_enabled()
+    try:
+        memory = await _get_memory_service().store(
+            content=body.content,
+            scope=body.scope.value,
+            memory_type=body.memory_type.value,
+            key=body.key,
+            tags=body.tags,
+            terminal_context=(
+                body.terminal_context.model_dump(exclude_none=True)
+                if body.terminal_context
+                else None
+            ),
+        )
+    except MemoryPartialWriteError as error:
+        return _memory_partial_write_response(error)
+    return {
+        "memory": memory.model_dump(mode="json"),
+        "action": memory.action,
+    }
+
+
+@app.post("/internal/memory/recall")
+async def internal_memory_recall(
+    body: InternalMemoryRecallRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Recall memory using context resolved by a remote worker node."""
+    _require_memory_enabled()
+    memories = await _get_memory_service().recall(
+        query=body.query,
+        scope=body.scope.value if body.scope else None,
+        memory_type=body.memory_type.value if body.memory_type else None,
+        limit=body.limit,
+        terminal_context=(
+            body.terminal_context.model_dump(exclude_none=True) if body.terminal_context else None
+        ),
+        search_mode=body.search_mode,
+        sort_by=body.sort_by,
+        include_related=body.include_related,
+    )
+    return {"memories": [memory.model_dump(mode="json") for memory in memories]}
+
+
+@app.post("/internal/memory/forget")
+async def internal_memory_forget(
+    body: InternalMemoryForgetRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Forget memory using context resolved by a remote worker node."""
+    _require_memory_enabled()
+    deleted = await _get_memory_service().forget(
+        key=body.key,
+        scope=body.scope.value,
+        terminal_context=(
+            body.terminal_context.model_dump(exclude_none=True) if body.terminal_context else None
+        ),
+    )
+    return {"deleted": deleted}
+
+
+@app.post("/internal/memory/context")
+async def internal_memory_context(
+    body: InternalMemoryInjectionRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, str]:
+    """Build the startup memory block for a terminal owned by another node."""
+    _require_memory_enabled()
+    context = _get_memory_service().get_memory_context(
+        body.terminal_context.model_dump(exclude_none=True),
+        budget_chars=body.budget_chars,
+    )
+    return {"context": context}
 
 
 def _require_memory_enabled() -> None:

@@ -1,6 +1,7 @@
 """Session utilities for CLI Agent Orchestrator."""
 
 import asyncio
+import hashlib
 import logging
 import re
 import time
@@ -53,6 +54,24 @@ def generate_session_name() -> str:
     """Generate a unique session name with SESSION_PREFIX."""
     session_uuid = uuid.uuid4().hex[:8]
     return validate_tmux_name(f"{SESSION_PREFIX}{session_uuid}", "session_name")
+
+
+def generate_session_name_for_key(idempotency_key: str) -> str:
+    """Derive a STABLE session name from an idempotency key.
+
+    Review on PR #634, issue #616. ``generate_session_name`` mints a fresh
+    uuid4 per call, which is right for an ordinary create but wrong for a
+    KEYED one: the server fingerprints ``session_name``, so a retry that
+    generated a new name produced a different fingerprint for the same logical
+    request and 409'd against its own first attempt instead of reattaching.
+
+    Same shape as ``generate_session_name`` (prefix + 8 hex chars) and run
+    through the same validator, so nothing downstream can tell the two apart.
+    sha256 rather than ``hash()`` because the latter is salted per process and
+    would defeat the entire point across two separate CLI invocations.
+    """
+    digest = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()[:8]
+    return validate_tmux_name(f"{SESSION_PREFIX}{digest}", "session_name")
 
 
 def generate_terminal_id() -> str:
@@ -169,6 +188,12 @@ async def wait_until_status(
     it returns the pushed pipeline status, and for event-inbox backends (herdr)
     it derives status on demand from the provider's native status. So this poll
     works for both backends without special-casing here.
+
+    get_status() is no longer purely in-memory: for a terminal stuck in PROCESSING it can
+    shell out to a real tmux capture-pane subprocess (the stale-PROCESSING fallback in
+    status_monitor.py), and on herdr it shells out to the herdr CLI. Offload each poll via
+    asyncio.to_thread so that blocking I/O can't fork/exec on the shared event loop —
+    matches the pattern GET /terminals/{id} (api/main.py) uses for the identical hazard.
     """
     from cli_agent_orchestrator.services.status_monitor import status_monitor
 
@@ -179,7 +204,7 @@ async def wait_until_status(
     )
     start = time.time()
     while time.time() - start < timeout:
-        current = status_monitor.get_status(terminal_id)
+        current = await asyncio.to_thread(status_monitor.get_status, terminal_id)
         if current in targets:
             logger.info(f"wait_until_status [{terminal_id}]: reached {current.value}")
             return True

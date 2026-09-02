@@ -1,6 +1,6 @@
 //! The static run-policy table: what the TUI offers, and how (issue #321).
 //!
-//! One row per leaf command of the CAO Click tree — **71 of them** — each classified `InApp`,
+//! One row per leaf command of the CAO Click tree — **77 of them** — each classified `InApp`,
 //! `Handoff`, or `Hidden`. Three infallible lookups read that table and nothing else.
 //!
 //! # No I/O, and that is the security property (SR-1)
@@ -64,15 +64,14 @@ use std::vec::Vec;
 
 /// The number of leaf commands in the CAO Click tree.
 ///
-/// **71 as of this branch.** Two separate merges from `main` each brought four new leaf commands
+/// **77 as of this branch.** Two separate merges from `main` each brought four new leaf commands
 /// that this table did not know about, and both were caught by
 /// `test/test_command_catalog_matches_click.py` rather than by review — the second one in CI,
 /// because CI tests the PR MERGED against `main` while a local run only sees the branch. That is
 /// the guard doing exactly what it exists for, twice.
 ///
-/// `cao workflow step` (issue #640) is another command this guard caught before review did. It
-/// and `cao workflow approve`, which this merge brought in from `main`, are together the reason
-/// the count is 71 rather than 69.
+/// `cao workflow step` (issue #640) is another command this guard caught before review did. It is
+/// HIDE, and it is the single reason this branch reads **77** where `main` reads 76.
 ///
 /// The four `cao workflow *` leaves — `runs`, `wait`, `result`, `events` — arrived with PR #525
 /// (issue #505, commit `e2e6318`). The four `cao memory relationships *` leaves were added by
@@ -83,6 +82,17 @@ use std::vec::Vec;
 /// `test/test_command_catalog_matches_click.py` now walks the live Click tree and fails on the
 /// difference, which is the check that was absent. (Reported by review on PR #547.)
 ///
+/// Six more arrived the same way with issue **#616**: `cao agent {assign, cancel, handoff,
+/// result, send-message, status}`, a CLI escape hatch for in-session orchestration for when a
+/// terminal's `cao-mcp-server` connection dies. All six are HIDE, per the same mandated default —
+/// none has been deliberately reviewed for IN-APP or HANDOFF yet, and `handoff` in particular
+/// blocks for up to an hour, which a reviewer will want to weigh before offering it in-pane. That
+/// moves the count to **76** on `main`, and the distribution to 24/18/34. (`main`'s own note said
+/// "from 69 to 76"; the step from 69 is two hops, not one — `cao workflow approve` had already
+/// taken 24/18/27 = 69 to 24/18/28 = 70 before the six `agent` leaves landed. Re-derived here
+/// rather than carried forward, per this module's own rule about fixing an instance without
+/// re-deriving the count.) With `cao workflow step` on top, this branch is 24/18/35 = **77**.
+///
 /// The count below the four additions was **61, not the 60 the design records** — and the discrepancy is a prediction coming true
 /// rather than a defect. `business-logic-model.md` wrote that `cao tui` was "absent from the
 /// table … `skeleton-wheel-bundle` adds the subcommand"; Bolt 1 then added it. The affirmed
@@ -90,7 +100,7 @@ use std::vec::Vec;
 /// must not offer itself — giving **33 IN-APP / 5 HANDOFF / 23 HIDE = 61**. Recorded here
 /// because a reader comparing the design's 60 against this 61 would otherwise suspect drift.
 /// (#321)
-const COMMAND_COUNT: usize = 71;
+const COMMAND_COUNT: usize = 77;
 
 /// What the TUI does with a command.
 ///
@@ -187,7 +197,7 @@ pub struct Command {
 ///
 /// `pub(crate)` since Bolt 3: `server-client`'s route-table tests walk it to assert that every
 /// IN-APP command has a route and that no HANDOFF or HIDE command does. Deriving that set any
-/// other way would mean re-listing 71 commands in a second place, which is a worse trade than
+/// other way would mean re-listing 77 commands in a second place, which is a worse trade than
 /// widening the visibility of a compile-time constant. Still crate-private — no consumer outside
 /// this crate exists, and the table is not a public API. (#321)
 pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
@@ -199,6 +209,12 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::Shutdown,
     CommandId::Tui,
     CommandId::Update,
+    CommandId::AgentAssign,
+    CommandId::AgentCancel,
+    CommandId::AgentHandoff,
+    CommandId::AgentResult,
+    CommandId::AgentSendMessage,
+    CommandId::AgentStatus,
     CommandId::ConfigGet,
     CommandId::ConfigList,
     CommandId::ConfigPath,
@@ -291,6 +307,20 @@ pub enum CommandId {
     Tui,
     /// `cao update`
     Update,
+
+    // `cao agent *`
+    /// `cao agent assign`
+    AgentAssign,
+    /// `cao agent cancel`
+    AgentCancel,
+    /// `cao agent handoff`
+    AgentHandoff,
+    /// `cao agent result`
+    AgentResult,
+    /// `cao agent send-message`
+    AgentSendMessage,
+    /// `cao agent status`
+    AgentStatus,
 
     // `cao config *`
     /// `cao config get`
@@ -530,6 +560,104 @@ fn entry(id: CommandId) -> Command {
             params: &[],
             handoff_reason: None,
             // HIDE: self-update may replace the binary under a running TUI
+        },
+
+        // ── `cao agent *` — all six HIDE ────────────────────────────────────────────────
+        //
+        // Added to the CLI by issue #616: a CLI escape hatch for in-session orchestration
+        // (assign/handoff/send-message/status/result/cancel) for use when a terminal's
+        // cao-mcp-server connection is unavailable. HIDE is not a shrug: project.md's mandated
+        // rule is that a new or unclassified CAO command defaults to HIDE in the TUI until it
+        // is deliberately classified, so that an unvetted command cannot surface half-working.
+        // Classifying any of these IN-APP or HANDOFF is a separate, reviewable decision — in
+        // particular `handoff` blocks for up to an hour (--timeout, default 600s) driving a
+        // worker terminal, exactly the unbounded-duration shape this crate's HANDOFF rows exist
+        // for, which a future reviewer will want to weigh before offering it captured in-pane.
+        CommandId::AgentAssign => Command {
+            id: CommandId::AgentAssign,
+            parent: Some("agent"),
+            leaf_name: "assign",
+            summary: "Assign a task to a new worker terminal without blocking.",
+            policy: Policy::Hidden,
+            params: &[
+                Param { name: "agent_profile", required: true, kind: ParamKind::Text },
+                Param { name: "message", required: true, kind: ParamKind::Text },
+                Param { name: "--working-directory", required: false, kind: ParamKind::Text },
+                Param { name: "--engine", required: false, kind: ParamKind::Text },
+                Param { name: "--model", required: false, kind: ParamKind::Text },
+                Param { name: "--use-worktree", required: false, kind: ParamKind::Flag },
+                Param { name: "--json", required: false, kind: ParamKind::Flag },
+            ],
+            handoff_reason: None,
+        },
+        CommandId::AgentCancel => Command {
+            id: CommandId::AgentCancel,
+            parent: Some("agent"),
+            leaf_name: "cancel",
+            summary: "Stop a worker terminal's current turn.",
+            policy: Policy::Hidden,
+            params: &[
+                Param { name: "terminal_id", required: true, kind: ParamKind::Text },
+                Param { name: "--delete", required: false, kind: ParamKind::Flag },
+                Param { name: "--json", required: false, kind: ParamKind::Flag },
+            ],
+            handoff_reason: None,
+        },
+        CommandId::AgentHandoff => Command {
+            id: CommandId::AgentHandoff,
+            parent: Some("agent"),
+            leaf_name: "handoff",
+            summary: "Hand off a task to a worker terminal and BLOCK until it completes.",
+            policy: Policy::Hidden,
+            params: &[
+                Param { name: "agent_profile", required: true, kind: ParamKind::Text },
+                Param { name: "message", required: true, kind: ParamKind::Text },
+                Param { name: "--timeout", required: false, kind: ParamKind::Text },
+                Param { name: "--working-directory", required: false, kind: ParamKind::Text },
+                Param { name: "--engine", required: false, kind: ParamKind::Text },
+                Param { name: "--model", required: false, kind: ParamKind::Text },
+                Param { name: "--use-worktree", required: false, kind: ParamKind::Flag },
+                Param { name: "--no-wait", required: false, kind: ParamKind::Flag },
+                Param { name: "--json", required: false, kind: ParamKind::Flag },
+            ],
+            handoff_reason: None,
+        },
+        CommandId::AgentResult => Command {
+            id: CommandId::AgentResult,
+            parent: Some("agent"),
+            leaf_name: "result",
+            summary: "Show a worker terminal's last response.",
+            policy: Policy::Hidden,
+            params: &[
+                Param { name: "terminal_id", required: true, kind: ParamKind::Text },
+                Param { name: "--json", required: false, kind: ParamKind::Flag },
+            ],
+            handoff_reason: None,
+        },
+        CommandId::AgentSendMessage => Command {
+            id: CommandId::AgentSendMessage,
+            parent: Some("agent"),
+            leaf_name: "send-message",
+            summary: "Send a message to another terminal's inbox.",
+            policy: Policy::Hidden,
+            params: &[
+                Param { name: "message", required: true, kind: ParamKind::Text },
+                Param { name: "--to", required: false, kind: ParamKind::Text },
+                Param { name: "--json", required: false, kind: ParamKind::Flag },
+            ],
+            handoff_reason: None,
+        },
+        CommandId::AgentStatus => Command {
+            id: CommandId::AgentStatus,
+            parent: Some("agent"),
+            leaf_name: "status",
+            summary: "Show a worker terminal's current status (idle, processing, ...).",
+            policy: Policy::Hidden,
+            params: &[
+                Param { name: "terminal_id", required: true, kind: ParamKind::Text },
+                Param { name: "--json", required: false, kind: ParamKind::Flag },
+            ],
+            handoff_reason: None,
         },
 
         CommandId::ConfigGet => Command {
@@ -1313,7 +1441,7 @@ mod tests {
         counts
     }
 
-    /// Test 1 — **the policy distribution is 24 IN-APP / 18 HANDOFF / 29 HIDE, totalling 71.**
+    /// Test 1 — **the policy distribution is 24 IN-APP / 18 HANDOFF / 35 HIDE, totalling 77.**
     ///
     /// Every number here is a **hard-coded literal**, and that is the entire design of the test.
     /// Deriving any of them from the table — `assert_eq!(in_app, TABLE.iter().filter(..).count())`
@@ -1350,33 +1478,38 @@ mod tests {
     /// consistent and every test green, because nothing compared the table against the CLI. That
     /// is what `test/test_command_catalog_matches_click.py` now does. (Review on PR #547.)
     ///
+    /// Then issue **#616** added six `cao agent *` leaves (assign/cancel/handoff/result/
+    /// send-message/status), all HIDE per the same mandated default — none has been deliberately
+    /// reviewed for IN-APP or HANDOFF yet. That gives **24/18/34 = 76**.
+    ///
     /// **And it happened again.** `cao workflow step` (issue #640) reached the Click tree with no
     /// row here, and the guard — not review — is what said so. It is HIDE, per `project.md`'s
-    /// mandated default for a command not yet deliberately reviewed. Merging `main` then brought
-    /// `cao workflow approve` (#583 Bolt 2), also HIDE, giving **24/18/29 = 71**. The guard
-    /// catching a missing row again is the argument for keeping the cross-language check.
+    /// mandated default for a command not yet deliberately reviewed. `cao workflow approve`
+    /// (#583 Bolt 2) arrived the same way, also HIDE. With `step` on top of the #616 six, the
+    /// figures are **24/18/35 = 77**. The guard catching a missing row again is the argument for
+    /// keeping the cross-language check.
     #[test]
-    fn the_policy_distribution_is_twentyfour_eighteen_twentynine() {
+    fn the_policy_distribution_is_twentyfour_eighteen_thirtyfive() {
         let (in_app, handoff, hidden) = distribution();
 
         assert_eq!(in_app, 24, "expected 24 IN-APP commands, found {in_app}");
         assert_eq!(handoff, 18, "expected 18 HANDOFF commands, found {handoff}");
-        assert_eq!(hidden, 29, "expected 29 HIDE commands, found {hidden}");
+        assert_eq!(hidden, 35, "expected 35 HIDE commands, found {hidden}");
         assert_eq!(
             in_app + handoff + hidden,
-            71,
-            "the three policy counts must account for all 71 leaf commands of the Click tree"
+            77,
+            "the three policy counts must account for all 77 leaf commands of the Click tree"
         );
 
-        // The three counts summing to 71 does not prove 71 *distinct* commands were counted: a
+        // The three counts summing to 77 does not prove 77 *distinct* commands were counted: a
         // duplicated entry in DISPLAY_ORDER would inflate one policy while a real command went
         // uncounted, and the arithmetic above would still close. DISPLAY_ORDER is generated, so
         // this is a live hazard rather than a theoretical one.
         let distinct: BTreeSet<CommandId> = DISPLAY_ORDER.iter().copied().collect();
         assert_eq!(
             distinct.len(),
-            71,
-            "DISPLAY_ORDER must list 71 DISTINCT commands; a duplicate would let one command go \
+            77,
+            "DISPLAY_ORDER must list 77 DISTINCT commands; a duplicate would let one command go \
              uncounted while the totals still summed correctly"
         );
     }
@@ -1451,6 +1584,12 @@ mod tests {
                     CommandId::Shutdown => CommandId::Shutdown,
                     CommandId::Tui => CommandId::Tui,
                     CommandId::Update => CommandId::Update,
+                    CommandId::AgentAssign => CommandId::AgentAssign,
+                    CommandId::AgentCancel => CommandId::AgentCancel,
+                    CommandId::AgentHandoff => CommandId::AgentHandoff,
+                    CommandId::AgentResult => CommandId::AgentResult,
+                    CommandId::AgentSendMessage => CommandId::AgentSendMessage,
+                    CommandId::AgentStatus => CommandId::AgentStatus,
                     CommandId::ConfigGet => CommandId::ConfigGet,
                     CommandId::ConfigList => CommandId::ConfigList,
                     CommandId::ConfigPath => CommandId::ConfigPath,
@@ -1527,6 +1666,12 @@ mod tests {
                 CommandId::Shutdown,
                 CommandId::Tui,
                 CommandId::Update,
+                CommandId::AgentAssign,
+                CommandId::AgentCancel,
+                CommandId::AgentHandoff,
+                CommandId::AgentResult,
+                CommandId::AgentSendMessage,
+                CommandId::AgentStatus,
                 CommandId::ConfigGet,
                 CommandId::ConfigList,
                 CommandId::ConfigPath,

@@ -149,6 +149,9 @@ See [Skills](skills.md) for discovery, installation, and catalog behavior.
 
 - `/sessions*` creates, lists, inspects, and deletes sessions.
 - `/sessions/{session_name}/terminals*` creates and lists session terminals.
+  The list is ordered oldest-first, and index 0 is the session's conductor —
+  `cao session status`/`list` rely on that. Sort client-side on `last_active`
+  if you need a different order.
 - `/terminals/{terminal_id}*` inspects terminals, sends input or keys, reads
   output and working-directory state, exits providers, and deletes terminals.
 - `GET /terminals/{terminal_id}/output?mode=full` returns the StatusMonitor
