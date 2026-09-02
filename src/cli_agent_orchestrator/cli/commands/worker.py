@@ -168,7 +168,16 @@ def sessions(worker_id, as_json):
     """List the sessions and terminals inside a worker."""
     client = ClusterClient.from_env()
     rows = [
-        {"session": s["name"], "terminals": client.terminals(worker_id, s["name"])}
+        {
+            "session": s["name"],
+            # The listing route omits `status`, so ask for each terminal by id.
+            # A worker holds one terminal, and a STATUS column that always read
+            # N/A would be worse than the extra call.
+            "terminals": [
+                client.terminal(worker_id, t["id"])
+                for t in client.terminals(worker_id, s["name"])
+            ],
+        }
         for s in client.sessions(worker_id)
     ]
     if as_json:
