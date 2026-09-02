@@ -551,7 +551,7 @@ with TestClient(broker.app) as c:
             "session_name": f"cao-worker-{wid}",
             "provider": "claude_code",
             "agent_profile": "developer",
-            "cwd": f"/home/cao/workspace/jobs/{wid}",
+            "cwd": f"/home/cao/workspace/workers/{wid}",
         },
         str(post.call_args),
     )
