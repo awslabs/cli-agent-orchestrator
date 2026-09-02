@@ -226,7 +226,7 @@ def _wait_remote_ready(base_url: str, timeout: float) -> None:
 
     Exists because "the pod is Ready" and "the Service in front of the pod is
     routable" are different claims, and only the second one is what a caller
-    needs. A broker that leases a worker the moment its Job and Service objects
+    needs. A broker that leases a worker the moment its workload and Service objects
     exist is handing back an address that becomes usable shortly afterwards -
     endpoint published, kube-proxy rules programmed on this node - and the
     difference is a second or two that no readiness probe on the pod can observe.

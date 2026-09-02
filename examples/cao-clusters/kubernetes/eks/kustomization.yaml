@@ -27,8 +27,11 @@ resources:
   # canonical Bedrock default.
 
 # There is no statefulset-workers.yaml and no service-workers-headless.yaml: a
-# worker is a Job the broker mints per task, and the broker gives each one its
-# own ClusterIP Service, so there is no fixed fleet to address by ordinal.
+# worker is a single-replica Deployment the broker mints per task, and the broker
+# gives each one its own ClusterIP Service, so there is no fixed fleet to address
+# by ordinal. Not a StatefulSet, because release is out of order - the broker
+# deletes whichever worker just finished, and a StatefulSet only scales down from
+# the highest ordinal.
 #
 # Claude Code on Bedrock needs no ExternalSecret at all - the pods authenticate
 # as their own Pod Identity, so there is nothing to fetch from Secrets Manager.

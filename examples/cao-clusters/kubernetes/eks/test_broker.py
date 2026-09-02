@@ -2,9 +2,9 @@
 
 Stubs the API server so the whole request path can run on a laptop. The point is
 to catch what only shows up at the first lease on a live cluster - a misspelled
-kwarg on a V1* model, a Job body the serializer mangles, a reaper that never
-releases. Every V1* object is pushed through the client's real serializer, which
-is what actually rejects a bad field name.
+kwarg on a V1* model, a Deployment body the serializer mangles, a reaper that
+never releases. Every V1* object is pushed through the client's real serializer,
+which is what actually rejects a bad field name.
 
 NOT part of the CAO test suite: broker.py lives outside the package and needs
 fastapi + the Kubernetes client, neither of which is a CAO dependency. Run it in
@@ -46,7 +46,13 @@ from kubernetes import config as k8s_config
 
 k8s_config.load_incluster_config = lambda: None
 
-STATE = {"jobs": {}, "services": {}, "pods": {}, "deleted_jobs": [], "deleted_svcs": []}
+STATE = {
+    "deployments": {},
+    "services": {},
+    "pods": {},
+    "deleted_deployments": [],
+    "deleted_svcs": [],
+}
 
 # What the fake API server hands back for the NEXT pod it creates. Readiness used
 # to be irrelevant to the fake (the broker waited for it, so a pod that was never
@@ -55,35 +61,46 @@ STATE = {"jobs": {}, "services": {}, "pods": {}, "deleted_jobs": [], "deleted_sv
 STATE["new_pods_ready"] = True
 STATE["new_pods_phase"] = "Running"
 STATE["create_pods"] = True
+# Every fake pod gets a distinct uid, because the reaper now tells a REPLACEMENT
+# pod from the original by uid and a fake that reused one would silently skip
+# that branch.
+STATE["pod_seq"] = 0
 
 
-class FakeBatch:
-    def create_namespaced_job(self, ns, body):
+def _fake_pod(name, labels):
+    STATE["pod_seq"] += 1
+    conditions = ([k8s.V1PodCondition(type="Ready", status="True")]
+                  if STATE["new_pods_ready"] else [])
+    return k8s.V1Pod(
+        metadata=k8s.V1ObjectMeta(
+            name=f"{name}-{STATE['pod_seq']:05d}",
+            uid=f"pod-uid-{STATE['pod_seq']}",
+            labels=dict(labels),
+        ),
+        status=k8s.V1PodStatus(
+            phase=STATE["new_pods_phase"],
+            conditions=conditions,
+        ),
+    )
+
+
+class FakeApps:
+    def create_namespaced_deployment(self, ns, body):
         body.metadata.uid = "uid-" + body.metadata.name
-        STATE["jobs"][body.metadata.name] = body
+        STATE["deployments"][body.metadata.name] = body
         wid = body.metadata.labels["cao.aws/worker-id"]
         if STATE["create_pods"]:
-            conditions = ([k8s.V1PodCondition(type="Ready", status="True")]
-                          if STATE["new_pods_ready"] else [])
-            pod = k8s.V1Pod(
-                metadata=k8s.V1ObjectMeta(name=body.metadata.name + "-abcde",
-                                          labels=dict(body.metadata.labels)),
-                status=k8s.V1PodStatus(
-                    phase=STATE["new_pods_phase"],
-                    conditions=conditions,
-                ),
-            )
-            STATE["pods"][wid] = pod
+            STATE["pods"][wid] = _fake_pod(body.metadata.name, body.metadata.labels)
         return body
 
-    def read_namespaced_job(self, name, ns):
-        if name not in STATE["jobs"]:
+    def read_namespaced_deployment(self, name, ns):
+        if name not in STATE["deployments"]:
             raise k8s.rest.ApiException(status=404)
-        return STATE["jobs"][name]
+        return STATE["deployments"][name]
 
-    def delete_namespaced_job(self, name, ns, propagation_policy=None):
-        STATE["deleted_jobs"].append(name)
-        STATE["jobs"].pop(name, None)
+    def delete_namespaced_deployment(self, name, ns, propagation_policy=None):
+        STATE["deleted_deployments"].append(name)
+        STATE["deployments"].pop(name, None)
 
 
 class FakeCore:
@@ -104,7 +121,7 @@ class FakeCore:
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import broker  # noqa: E402  (must follow the env setup above)
 
-broker.batch_api = FakeBatch()
+broker.apps_api = FakeApps()
 broker.core_api = FakeCore()
 
 from fastapi.testclient import TestClient
@@ -125,25 +142,51 @@ def worker_request():
     )
 
 
-# --- 1. the Job body survives the real serializer -------------------------
-job = broker._worker_job("deadbeef", "rt", worker_request())
-wire = k8s.ApiClient().sanitize_for_serialization(job)
+# --- 1. the Deployment body survives the real serializer ------------------
+workload = broker._worker_deployment("deadbeef", "rt", worker_request())
+wire = k8s.ApiClient().sanitize_for_serialization(workload)
 spec = wire["spec"]["template"]["spec"]
 env = {e["name"]: e.get("value") for e in spec["containers"][0]["env"]}
 
-check("job serializes to a dict", isinstance(wire, dict))
+check("deployment serializes to a dict", isinstance(wire, dict))
 annotations = wire["metadata"]["annotations"]
-check("job persists the authorized callback receiver",
+check("deployment persists the authorized callback receiver",
       annotations["cao.aws/callback-terminal-id"] == "abc12345")
-check("job persists the authorized memory session",
+check("deployment persists the authorized memory session",
       annotations["cao.aws/session-name"] == "cao-worker-deadbeef")
-check("job persists the authorized memory profile",
+check("deployment persists the authorized memory profile",
       annotations["cao.aws/agent-profile"] == "developer")
+# The annotations are read back off the workload by _require_release_token, so
+# putting them on the template instead would 401 every worker callback.
+check("lease claims are on the workload, not the pod template",
+      not (wire["spec"]["template"]["metadata"].get("annotations") or {}),
+      json.dumps(wire["spec"]["template"]["metadata"]))
+
+# --- 1b. the Deployment-shaped fields the Job did not have ----------------
+check("exactly one replica", wire["spec"]["replicas"] == 1, str(wire["spec"].get("replicas")))
+check("selector matches the worker id label",
+      wire["spec"]["selector"]["matchLabels"] == {"cao.aws/worker-id": "deadbeef"},
+      json.dumps(wire["spec"].get("selector")))
+# RollingUpdate would briefly run two pods sharing one working directory on the
+# RWX workspace volume, with the Service balancing across both.
+check("update strategy is Recreate", wire["spec"]["strategy"]["type"] == "Recreate",
+      json.dumps(wire["spec"].get("strategy")))
+check("restartPolicy is Always, the only value a Deployment accepts",
+      spec["restartPolicy"] == "Always", spec.get("restartPolicy"))
+# The one Job property that had no home elsewhere: an outer bound that still
+# holds when the broker is not running to reap.
+check("activeDeadlineSeconds moved onto the pod",
+      spec["activeDeadlineSeconds"] == broker.WORKER_TIMEOUT,
+      str(spec.get("activeDeadlineSeconds")))
+check("no Job-only fields survive",
+      not any(k in wire["spec"] for k in ("backoffLimit", "ttlSecondsAfterFinished")),
+      json.dumps(sorted(wire["spec"])))
 check("default provider is claude_code", env["CAO_INSTALL_PROFILES"] == "developer:claude_code",
       env.get("CAO_INSTALL_PROFILES"))
-# A credential must never be a literal in the Job body - the broker's Role has no
-# `secrets`, and a value here would end up in etcd and in `kubectl get job -o yaml`.
-check("no provider credential inlined in the Job", "KIRO_API_KEY" not in env)
+# A credential must never be a literal in the workload body - the broker's Role has
+# no `secrets`, and a value here would end up in etcd and in
+# `kubectl get deployment -o yaml`.
+check("no provider credential inlined in the workload", "KIRO_API_KEY" not in env)
 
 # The optional flag is the load-bearing half: without it the Bedrock path, which
 # creates no such Secret, would hold every worker in CreateContainerConfigError.
@@ -195,20 +238,22 @@ check("readiness probe starts immediately", probe["initialDelaySeconds"] == 0,
 check("readiness probe polls every second", probe["periodSeconds"] == 1,
       str(probe.get("periodSeconds")))
 
-# --- 2. the Service is owned by the Job ----------------------------------
+# --- 2. the Service is owned by the Deployment ---------------------------
 try:
-    broker._worker_service("deadbeef", job)
-    check("unsubmitted Job is refused rather than left unowned", False, "no error raised")
+    broker._worker_service("deadbeef", workload)
+    check("unsubmitted workload is refused rather than left unowned", False, "no error raised")
 except RuntimeError as exc:
-    check("unsubmitted Job is refused rather than left unowned", "has no uid" in str(exc))
+    check("unsubmitted workload is refused rather than left unowned", "has no uid" in str(exc))
 
-job = broker.batch_api.create_namespaced_job("cao-cluster", job)  # assigns a uid
-svc = broker._worker_service("deadbeef", job)
+workload = broker.apps_api.create_namespaced_deployment("cao-cluster", workload)  # assigns a uid
+svc = broker._worker_service("deadbeef", workload)
 swire = k8s.ApiClient().sanitize_for_serialization(svc)
 owners = swire["metadata"].get("ownerReferences") or []
 check("service has an ownerReference", len(owners) == 1, json.dumps(swire["metadata"]))
-check("owner is the Job by uid",
-      owners and owners[0]["kind"] == "Job" and owners[0]["uid"] == "uid-cao-worker-deadbeef",
+check("owner is the Deployment by uid",
+      owners and owners[0]["kind"] == "Deployment"
+      and owners[0]["apiVersion"] == "apps/v1"
+      and owners[0]["uid"] == "uid-cao-worker-deadbeef",
       json.dumps(owners))
 
 # --- 3. the lease returns before readiness; the reaper owns the deadline --
@@ -219,7 +264,7 @@ check("owner is the Job by uid",
 check("readiness gating is off by default", broker.GATE_ON_READY is False)
 
 # A reaper tick can overlap Kubernetes object creation. The lease must not be
-# considered active until both the Job and Service exist.
+# considered active until both the Deployment and Service exist.
 with broker._leases_lock:
     broker._leases["cafefeed"] = {
         "state": "creating",
@@ -228,6 +273,7 @@ with broker._leases_lock:
         "settled_at": None,
         "ready_at": None,
         "pod_observed_at": None,
+        "pod_uid": None,
         "agent_profile": "developer",
         "provider": "claude_code",
     }
@@ -240,8 +286,8 @@ check(
 with broker._leases_lock:
     del broker._leases["cafefeed"]
 
-# A Job exists before its controller creates a Pod. Empty Pod lists are normal
-# in that window and must not be called disappearance.
+# A Deployment exists before its ReplicaSet creates a Pod. Empty Pod lists are
+# normal in that window and must not be called disappearance.
 STATE["create_pods"] = False
 lease_waiting_for_pod = broker.create_worker(
     worker_request(), "test-token"
@@ -310,8 +356,8 @@ check("reaper fails a worker that never reported Ready",
 check("failed reason names never-Ready, not a completion timeout",
       "never reported Ready" in (broker._leases[w0]["reason"] or ""),
       str(broker._leases[w0]["reason"])[:200])
-check("failed worker's job is released", f"cao-worker-{w0}" in STATE["deleted_jobs"],
-      str(STATE["deleted_jobs"]))
+check("failed worker's deployment is released", f"cao-worker-{w0}" in STATE["deleted_deployments"],
+      str(STATE["deleted_deployments"]))
 
 # Once Ready has been SEEN, the readiness deadline is spent: a worker that goes
 # NotReady later is a completion problem, and must expire rather than fail.
@@ -367,8 +413,8 @@ with TestClient(broker.app) as c:
     check("create returns a lease", r.status_code == 200, r.text[:300])
     lease = r.json()
     wid = lease["worker_id"]
-    check("job created first, then service",
-          f"cao-worker-{wid}" in STATE["jobs"] and f"cao-worker-{wid}" in STATE["services"])
+    check("deployment created first, then service",
+          f"cao-worker-{wid}" in STATE["deployments"] and f"cao-worker-{wid}" in STATE["services"])
     check("target_host is the per-worker service FQDN",
           lease["target_host"] == f"cao-worker-{wid}.cao-cluster.svc.cluster.local",
           lease["target_host"])
@@ -470,8 +516,8 @@ with TestClient(broker.app) as c:
     r = c.post(f"/workers/{wid}/complete",
                headers={"X-CAO-Release-Token": lease["release_token"]})
     check("complete accepted with the right token", r.status_code == 200, r.text[:200])
-    check("completing releases the job", f"cao-worker-{wid}" in STATE["deleted_jobs"],
-          str(STATE["deleted_jobs"]))
+    check("completing releases the deployment", f"cao-worker-{wid}" in STATE["deleted_deployments"],
+          str(STATE["deleted_deployments"]))
     r = c.get("/workers", headers=H)
     check("ledger records completion",
           any(w["worker_id"] == wid and w["state"] == "completed" for w in r.json()), r.text[:300])
@@ -498,9 +544,9 @@ with TestClient(broker.app) as c:
         str(broker._leases[terminal_ended_id]["reason"]),
     )
     check(
-        "terminal-ended signal releases the worker Job",
-        f"cao-worker-{terminal_ended_id}" in STATE["deleted_jobs"],
-        str(STATE["deleted_jobs"]),
+        "terminal-ended signal releases the worker Deployment",
+        f"cao-worker-{terminal_ended_id}" in STATE["deleted_deployments"],
+        str(STATE["deleted_deployments"]),
     )
 
     # --- 6. pod terminal phase fallback, complete never arrives -----------
@@ -519,8 +565,8 @@ with TestClient(broker.app) as c:
           json.dumps(st))
     check("reaper reason names the truth, not a success",
           st["reason"] and "NOT necessarily done" in st["reason"], str(st.get("reason"))[:200])
-    check("reaper released the squatting job", f"cao-worker-{wid2}" in STATE["deleted_jobs"],
-          str(STATE["deleted_jobs"]))
+    check("reaper released the squatting deployment", f"cao-worker-{wid2}" in STATE["deleted_deployments"],
+          str(STATE["deleted_deployments"]))
 
     # --- 7. completion deadline on a still-healthy pod --------------------
     r = c.post("/workers", json=worker_payload, headers=H)
@@ -533,7 +579,61 @@ with TestClient(broker.app) as c:
         time.sleep(0.3)
     st = [w for w in c.get("/workers", headers=H).json() if w["worker_id"] == wid3][0]
     check("a healthy pod that never completes expires", st["state"] == "expired", json.dumps(st))
-    check("expired job is released", f"cao-worker-{wid3}" in STATE["deleted_jobs"])
+    check("expired deployment is released", f"cao-worker-{wid3}" in STATE["deleted_deployments"])
+
+    # --- 7b. the two failures the Deployment introduced -------------------
+    #
+    # Under a Job these could not happen: restartPolicy Never plus backoffLimit 0
+    # meant a dead worker stayed dead, and the "pod gone" / "pod Failed" branches
+    # above caught it. A Deployment brings the worker back, Ready and useless, so
+    # the reaper has to notice by identity rather than by phase.
+    r = c.post("/workers", json=worker_payload, headers=H)
+    restarted_id = r.json()["worker_id"]
+    STATE["pods"][restarted_id].status.container_statuses = [
+        k8s.V1ContainerStatus(
+            name="cao-node", image="x", image_id="x", ready=True, restart_count=1
+        )
+    ]
+    deadline = time.time() + 12
+    while time.time() < deadline:
+        st = [w for w in c.get("/workers", headers=H).json() if w["worker_id"] == restarted_id]
+        if st and st[0]["state"] != "leased":
+            break
+        time.sleep(0.3)
+    st = [w for w in c.get("/workers", headers=H).json() if w["worker_id"] == restarted_id][0]
+    check("a restarted container settles the lease as terminated",
+          st["state"] == "terminated", json.dumps(st))
+    check("restart reason says the agent is gone, not that the task finished",
+          st["reason"] and "restarted" in st["reason"], str(st.get("reason"))[:200])
+
+    r = c.post("/workers", json=worker_payload, headers=H)
+    replaced_id = r.json()["worker_id"]
+    # Wait for the reaper to record the ORIGINAL pod's uid before swapping it. A
+    # pod replaced before the broker ever saw the first one is indistinguishable
+    # from a slow start, and COMPLETION_TIMEOUT owns that case instead.
+    observed = time.time() + 6
+    while time.time() < observed and broker._leases[replaced_id].get("pod_uid") is None:
+        time.sleep(0.1)
+    check("reaper records the first pod's uid",
+          broker._leases[replaced_id].get("pod_uid") is not None)
+    # A ReplicaSet replacing the pod: same labels, same Service, new uid, and a
+    # brand new emptyDir with no profile store and no session in it.
+    STATE["pods"][replaced_id] = _fake_pod(f"cao-worker-{replaced_id}",
+                                           broker._labels(replaced_id))
+    deadline = time.time() + 12
+    while time.time() < deadline:
+        st = [w for w in c.get("/workers", headers=H).json() if w["worker_id"] == replaced_id]
+        if st and st[0]["state"] != "leased":
+            break
+        time.sleep(0.3)
+    st = [w for w in c.get("/workers", headers=H).json() if w["worker_id"] == replaced_id][0]
+    check("a replacement pod settles the lease as terminated",
+          st["state"] == "terminated", json.dumps(st))
+    check("replacement reason names the empty state volume",
+          st["reason"] and "empty state volume" in st["reason"], str(st.get("reason"))[:200])
+    check("replaced worker's deployment is released",
+          f"cao-worker-{replaced_id}" in STATE["deleted_deployments"],
+          str(STATE["deleted_deployments"]))
 
     # --- 8. input validation still bounded -------------------------------
     r = c.post("/workers",
@@ -546,7 +646,7 @@ with TestClient(broker.app) as c:
     check("caller cannot inject an image",
           r.status_code in (200, 422)
           and (r.status_code == 422
-               or STATE["jobs"][f"cao-worker-{r.json()['worker_id']}"]
+               or STATE["deployments"][f"cao-worker-{r.json()['worker_id']}"]
                .spec.template.spec.containers[0].image == os.environ["CAO_ELASTIC_WORKER_IMAGE"]),
           r.text[:200])
 

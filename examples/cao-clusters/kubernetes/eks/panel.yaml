@@ -3,7 +3,8 @@
 # The fleet registry it mounts, `cao-fleet-config`, is jointly owned:
 # configmap-fleet.yaml supplies the supervisor entry, and the broker adds and
 # removes worker entries as it leases and releases them, because elastic workers
-# are Jobs whose names nothing can know in advance. See configmap-fleet.yaml.
+# are created on demand with ids nothing can know in advance. See
+# configmap-fleet.yaml.
 #
 # The panel is reached with a port-forward; it is not exposed through an Ingress:
 #   kubectl -n cao-cluster port-forward svc/cao-fleet-panel 9888:9888
