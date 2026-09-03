@@ -55,7 +55,7 @@ def status(as_json):
 
 @fleet.command()
 @click.option("--yes", is_flag=True, help="Do not ask for confirmation")
-@click.option("--json", "as_json", is_flag=True, help="Output as JSON")
+@click.option("--json", "as_json", is_flag=True, help="Output as JSON (requires --yes)")
 def shutdown(yes, as_json):
     """Release every live worker in the fleet.
 
@@ -67,7 +67,20 @@ def shutdown(yes, as_json):
 
     Workers whose lease has already settled are skipped: the broker released them
     when it settled them, so there is nothing left to delete.
+
+    `--json` cannot ask for confirmation without corrupting its own output, so it
+    requires `--yes` and the two together are the only unattended form. The exit
+    code is non-zero if any worker could not be released, in both modes.
     """
+    if as_json and not yes:
+        # Fail closed, and before the broker is even contacted: a prompt would
+        # corrupt the JSON, so the alternative to this error is a flag that
+        # destroys a fleet silently. `status --json` is the read-only question.
+        raise click.ClickException(
+            "`--json` cannot ask for confirmation, so it needs `--yes` as well. "
+            "Use `cao fleet status --json` to see what is live without releasing it."
+        )
+
     client = FleetClient.from_env()
     live = [w for w in client.workers() if w.get("state") in LIVE_STATES]
     if not live:
@@ -99,10 +112,15 @@ def shutdown(yes, as_json):
 
     if as_json:
         click.echo(json.dumps({"released": released, "failed": failed}, indent=2))
-        return
-    for worker_id in released:
-        click.echo(f"✓ Released worker {worker_id}")
-    for entry in failed:
-        click.echo(f"✗ {entry['worker_id']}: {entry['error']}", err=True)
+    else:
+        for worker_id in released:
+            click.echo(f"✓ Released worker {worker_id}")
+        for entry in failed:
+            click.echo(f"✗ {entry['worker_id']}: {entry['error']}", err=True)
+
+    # After the report, not instead of it, and in both modes: the caller gets the
+    # full list of what did and did not go, AND an exit code that says the fleet
+    # is not clean. A script that only checks `$?` must not read a partial
+    # shutdown as a finished one.
     if failed:
         raise click.ClickException(f"{len(failed)} of {len(live)} worker(s) could not be released")
