@@ -431,11 +431,13 @@ def _read_stable_utf8(
     if not real_path.startswith(root + os.sep):
         return None, None, FindingCode.PATH_ESCAPES_ROOT
     try:
-        fd = os.open(real_path, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(real_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
         return None, None, FindingCode.UNSTABLE_SKIPPED
     try:
         before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            return None, before, FindingCode.NON_REGULAR_FILE_REFUSED
         if (before.st_dev, before.st_ino) != (
             candidate.discovery_stat.st_dev,
             candidate.discovery_stat.st_ino,
@@ -466,6 +468,7 @@ def _refusal_detail(code: FindingCode) -> str:
         FindingCode.PATH_ESCAPES_ROOT: "opened file does not match discovered in-root inode",
         FindingCode.NOTE_TOO_LARGE: "max_note_bytes exceeded",
         FindingCode.BYTE_BUDGET_EXCEEDED: "total scan byte budget exceeded",
+        FindingCode.NON_REGULAR_FILE_REFUSED: "opened path is not a regular file",
         FindingCode.UNSTABLE_SKIPPED: "file changed during read",
     }[code]
 

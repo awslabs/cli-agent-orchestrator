@@ -29,7 +29,8 @@ import uuid
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, cast
+from functools import partial
+from typing import Any, Callable, Dict, List, Optional, cast
 
 from sqlalchemy.exc import IntegrityError
 
@@ -489,6 +490,7 @@ class MemoryRelationshipService:
         *,
         source_kind: str = "native",
         db: Any = None,
+        audit_sink: Optional[List[Callable[[], None]]] = None,
     ) -> ReplaceReport:
         """Producer-scoped replacement (principle 6, FR-2.5).
 
@@ -637,8 +639,19 @@ class MemoryRelationshipService:
         # replace_set is the highest-volume path (compiler/lint every compile),
         # so it must leave a forensic trail. Counts + endpoints/origin/type only,
         # never a memory body/prompt (NFR-1.7).
+        emit_audit = partial(
+            self._audit_replace_set,
+            scope,
+            sentinel,
+            src,
+            origin,
+            type,
+            report,
+        )
         if owns_session:
-            self._audit_replace_set(scope, sentinel, src, origin, type, report)
+            emit_audit()
+        elif audit_sink is not None:
+            audit_sink.append(emit_audit)
         return report
 
     def clear_source(
@@ -818,6 +831,7 @@ class MemoryRelationshipService:
         spare_origins: tuple[str, ...] = ("vault",),
         origins: tuple[str, ...] | None = None,
         db: Any = None,
+        audit_sink: Optional[List[Callable[[], None]]] = None,
     ) -> int:
         """HARD-delete selected rows touching ``key`` in either direction.
 
@@ -877,8 +891,11 @@ class MemoryRelationshipService:
         finally:
             if owns_session:
                 session.close()
+        emit_audit = partial(self._audit_purge, scope, sentinel, k, len(rows))
         if owns_session:
-            self._audit_purge(scope, sentinel, k, len(rows))
+            emit_audit()
+        elif audit_sink is not None:
+            audit_sink.append(emit_audit)
         return len(rows)
 
     # ------------------------------------------------------------------ #

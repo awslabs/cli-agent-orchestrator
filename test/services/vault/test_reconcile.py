@@ -658,6 +658,92 @@ def test_authored_key_rename_preserves_exclusion_through_quarantine(tmp_path, mo
     assert (note.vault_relpath, note.status, metadata) == ("Mapped/New.md", "excluded", 0)
 
 
+def test_authored_key_tombstone_survives_rename_into_quarantine_and_restoration(
+    tmp_path, monkeypatch
+):
+    """A move through an unresolved quarantined identity cannot resurrect a forgotten note."""
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    old_path = tmp_path / "vault" / "Mapped" / "Old.md"
+    new_path = old_path.with_name("New.md")
+    old_path.write_text("---\ncao:\n  key: canonical\n---\nsafe", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="quarantined-rename-before")
+    with Session() as db:
+        db.query(VaultNoteModel).filter_by(cao_key="canonical").update({"status": "excluded"})
+        db.query(MemoryMetadataModel).filter_by(source_kind="vault", key="canonical").delete()
+        db.commit()
+
+    old_path.rename(new_path)
+    new_path.write_text("password: hunter2sixteen", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="quarantined-rename-middle")
+    with Session() as db:
+        middle = db.query(VaultNoteModel).filter_by(vault_relpath="Mapped/New.md").one()
+        middle_metadata = db.query(MemoryMetadataModel).filter_by(source_kind="vault").count()
+    assert (middle.status, middle_metadata) == ("excluded", 0)
+
+    new_path.write_text("---\ncao:\n  key: canonical\n---\nsafe", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="quarantined-rename-after")
+
+    with Session() as db:
+        restored = db.query(VaultNoteModel).filter_by(vault_relpath="Mapped/New.md").one()
+        metadata = db.query(MemoryMetadataModel).filter_by(source_kind="vault").count()
+        retained = (
+            db.query(VaultFindingModel)
+            .filter_by(code="deindexed_retained", vault_relpath="Mapped/New.md")
+            .count()
+        )
+    assert (restored.cao_key, restored.status, metadata) == ("canonical", "excluded", 0)
+    assert retained == 1
+
+
+def test_reconcile_relationship_audits_emit_after_commit_and_not_after_rollback(
+    tmp_path, monkeypatch
+):
+    from cli_agent_orchestrator.services import memory_relationship_service
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    mapped = tmp_path / "vault" / "Mapped"
+    source = mapped / "Source.md"
+    source.write_text("[[Target]]", encoding="utf-8")
+    (mapped / "Target.md").write_text("target", encoding="utf-8")
+    committed_edge_counts = []
+
+    def record_replace_audit(self, *_args):
+        with Session() as db:
+            committed_edge_counts.append(
+                db.query(MemoryRelationshipModel).filter_by(origin="vault").count()
+            )
+
+    monkeypatch.setattr(
+        memory_relationship_service.MemoryRelationshipService,
+        "_audit_replace_set",
+        record_replace_audit,
+    )
+    reconcile(vault, apply=True, run_id="audit-after-commit")
+
+    assert committed_edge_counts
+    assert set(committed_edge_counts) == {1}
+
+    committed_edge_counts.clear()
+    source.write_text("no links", encoding="utf-8")
+    monkeypatch.setattr(
+        module,
+        "_persist_findings",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("induced rollback")),
+    )
+
+    with pytest.raises(RuntimeError, match="induced rollback"):
+        reconcile(vault, apply=True, run_id="audit-after-rollback")
+
+    assert committed_edge_counts == []
+    with Session() as db:
+        assert db.query(MemoryRelationshipModel).filter_by(origin="vault").count() == 1
+
+
 def test_empty_and_scalar_frontmatter_aliases_are_normalized_for_link_projection(
     tmp_path, monkeypatch
 ):

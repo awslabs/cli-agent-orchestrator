@@ -74,6 +74,35 @@ def test_discovery_inode_mismatch_is_refused_on_the_open_descriptor(tmp_path):
     assert code == FindingCode.PATH_ESCAPES_ROOT
 
 
+def test_nonblocking_scan_open_refuses_fifo_swapped_after_discovery(tmp_path, monkeypatch):
+    root = tmp_path / "vault"
+    root.mkdir()
+    (root / "CAO").mkdir()
+    mapped = root / "Mapped"
+    mapped.mkdir()
+    target = mapped / "Changing.md"
+    target.write_text("before", encoding="utf-8")
+    from cli_agent_orchestrator.services.vault import scan
+
+    original_open = scan.os.open
+    swapped = False
+
+    def swap_before_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if os.fspath(path) == str(target) and not swapped:
+            assert flags & os.O_NONBLOCK
+            target.unlink()
+            os.mkfifo(target)
+            swapped = True
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(scan.os, "open", swap_before_open)
+    report = scan_vault(_vault(root))
+
+    assert swapped is True
+    assert report.notes[0].findings[0].code == FindingCode.NON_REGULAR_FILE_REFUSED
+
+
 def test_realpath_outside_root_is_refused_before_open(tmp_path, monkeypatch):
     root = tmp_path / "vault"
     root.mkdir()

@@ -26,6 +26,9 @@ from cli_agent_orchestrator.services.vault.config import MAX_FRONTMATTER_BYTES_L
 from cli_agent_orchestrator.services.vault.parser import split_frontmatter
 
 _TRUNCATION_MARKER = "\n\n[Content truncated for recall]"
+_MAX_UTF8_BYTES_PER_CHAR = 4
+# UTF-8 BOM plus CRLF opening/closing fences and the newline before the close.
+_MAX_FRONTMATTER_FRAMING_BYTES = 3 + len(b"---\r\n") + len(b"\r\n---\r\n")
 MEMORY_MANAGER_PROFILE = "memory_manager"
 MEMORY_MANAGER_POLICY_ARM = "memory_manager"
 logger = logging.getLogger(__name__)
@@ -298,10 +301,16 @@ def load_candidate(
         return None
     try:
         before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            return None
         if (before.st_dev, before.st_ino) != (expected.st_dev, expected.st_ino):
             _record_path_escape(candidate)
             return None
-        read_limit = MAX_FRONTMATTER_BYTES_LIMIT + (max_body_chars * 4)
+        read_limit = (
+            MAX_FRONTMATTER_BYTES_LIMIT
+            + _MAX_FRONTMATTER_FRAMING_BYTES
+            + (max_body_chars * _MAX_UTF8_BYTES_PER_CHAR)
+        )
         with os.fdopen(fd, "rb", closefd=False) as handle:
             raw = handle.read(read_limit + 1)
         after = os.fstat(fd)
@@ -441,7 +450,11 @@ def _open_confined_fd(root: str, real_path: str) -> tuple[int, os.stat_result]:
             parent_fd = child_fd
         expected = os.stat(segments[-1], dir_fd=parent_fd, follow_symlinks=False)
         try:
-            fd = os.open(segments[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
+            fd = os.open(
+                segments[-1],
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=parent_fd,
+            )
         except OSError as exc:
             _raise_if_symlink_error(exc, segments[-1], parent_fd)
             raise

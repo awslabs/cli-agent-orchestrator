@@ -346,6 +346,48 @@ def test_recall_body_read_is_bounded_and_records_truncation(tmp_path, monkeypatc
     assert counters == [(fixture.vault.id, "recall_body_truncated", 1)]
 
 
+def test_recall_budget_includes_bom_crlf_fences_and_multibyte_body_headroom(tmp_path, monkeypatch):
+    from cli_agent_orchestrator.services.vault import reader
+
+    _reader, _Session, fixture, candidate = _indexed_reader_candidate(
+        tmp_path, monkeypatch, run_id="bounded-frontmatter-framing"
+    )
+    note_path = fixture.root / "Projects" / "CAO Design" / "Design.md"
+    note_path.write_bytes(b"\xef\xbb\xbf---\r\ntag: one\r\n---\r\nx")
+    monkeypatch.setattr(reader, "MAX_FRONTMATTER_BYTES_LIMIT", 8)
+
+    memory = load_candidate(candidate, max_body_chars=1, require_injectable=False)
+
+    assert memory is not None
+    assert memory.content == "x"
+    assert memory.content_truncated is False
+
+
+def test_reader_nonblocking_open_refuses_fifo_swapped_after_final_stat(tmp_path, monkeypatch):
+    from cli_agent_orchestrator.services.vault import reader
+
+    _reader, _Session, fixture, candidate = _indexed_reader_candidate(
+        tmp_path, monkeypatch, run_id="reader-fifo-swap"
+    )
+    note_path = fixture.root / candidate.metadata.file_path
+    original_open = reader.os.open
+    swapped = False
+
+    def swap_final_file(path, flags, *, dir_fd=None):
+        nonlocal swapped
+        if path == note_path.name and dir_fd is not None and not swapped:
+            assert flags & os.O_NONBLOCK
+            note_path.unlink()
+            os.mkfifo(note_path)
+            swapped = True
+        return original_open(path, flags, dir_fd=dir_fd)
+
+    monkeypatch.setattr(reader.os, "open", swap_final_file)
+
+    assert load_candidate(candidate, max_body_chars=4096, require_injectable=False) is None
+    assert swapped is True
+
+
 def _indexed_reader_candidate(tmp_path, monkeypatch, *, run_id: str):
     """Build one real indexed row so read-boundary tests exercise recall."""
     from cli_agent_orchestrator.services.vault import reader

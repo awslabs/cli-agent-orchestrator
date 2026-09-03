@@ -6,7 +6,7 @@ import hashlib
 from collections import Counter, defaultdict
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import Any, Iterable, Optional, cast
+from typing import Any, Callable, Iterable, Optional, cast
 
 from cli_agent_orchestrator.clients.database import (
     MemoryMetadataModel,
@@ -125,15 +125,32 @@ def reconcile(
     deleted = 0
 
     if apply:
+        deferred_relationship_audits: list[Callable[[], None]] = []
         with SessionLocal() as db:
             with db.begin():
                 if not rebuild:
-                    _clear_stale_vault_edges(db, vault.id, projected)
+                    _clear_stale_vault_edges(db, vault.id, projected, deferred_relationship_audits)
                 deleted, findings, projected = _apply_plan(
-                    db, vault, plan, projected, findings, rebuild=rebuild
+                    db,
+                    vault,
+                    plan,
+                    projected,
+                    findings,
+                    deferred_relationship_audits,
+                    rebuild=rebuild,
                 )
-                findings = _merge_findings(findings, _replace_vault_edges(projected, db=db) or ())
+                findings = _merge_findings(
+                    findings,
+                    _replace_vault_edges(
+                        projected,
+                        db=db,
+                        audit_sink=deferred_relationship_audits,
+                    )
+                    or (),
+                )
                 _persist_findings(db, vault.id, plan, findings)
+        for emit_audit in deferred_relationship_audits:
+            emit_audit()
         _emit_audit_events(vault.id, plan.run_id, projected, indexed, quarantined, skipped)
     else:
         findings, projected = _preview_rename_findings(vault.id, projected, findings)
@@ -179,7 +196,12 @@ def _preview_rename_findings(
     )
 
 
-def _clear_stale_vault_edges(db, vault_id: str, projected: tuple[_ProjectedNote, ...]) -> None:
+def _clear_stale_vault_edges(
+    db,
+    vault_id: str,
+    projected: tuple[_ProjectedNote, ...],
+    audit_sink: list[Callable[[], None]],
+) -> None:
     """Retract removed or non-indexed sources through the relationship boundary."""
     prior_by_path: dict[str, VaultNoteModel] = {
         cast(str, row.vault_relpath): row
@@ -215,6 +237,7 @@ def _clear_stale_vault_edges(db, vault_id: str, projected: tuple[_ProjectedNote,
             cast(str, row.cao_key),
             origins=("vault",),
             db=db,
+            audit_sink=audit_sink,
         )
 
 
@@ -294,6 +317,7 @@ def _apply_plan(
     plan: ReconcilePlan,
     projected: tuple[_ProjectedNote, ...],
     findings: tuple[tuple[str, str, str, str], ...],
+    audit_sink: list[Callable[[], None]],
     *,
     rebuild: bool,
 ) -> tuple[int, tuple[tuple[str, str, str, str], ...], tuple[_ProjectedNote, ...]]:
@@ -385,6 +409,7 @@ def _apply_plan(
             stored_key,
             origins=("vault",),
             db=db,
+            audit_sink=audit_sink,
         )
         _delete_metadata_for_identity(db, stored_scope, stored_scope_id, stored_key)
         _delete_aliases_for_identity(db, vault.id, stored_scope, stored_scope_id, stored_key)
@@ -638,15 +663,24 @@ def _resolve_renames(
                 )
             )
         elif len(same_scope) == 1:
+            rename_findings = (
+                _rename_finding(
+                    FindingCode.RENAME_WITH_EDIT_UNRESOLVED,
+                    item.note.vault_relpath,
+                ),
+            )
+            if same_scope[0].status == "excluded" and item.note.status != "excluded":
+                item = replace(item, note=replace(item.note, status="excluded"))
+                rename_findings += (
+                    _rename_finding(
+                        FindingCode.DEINDEXED_RETAINED,
+                        item.note.vault_relpath,
+                    ),
+                )
             resolutions.append(
                 _RenameResolution(
                     item,
-                    findings=(
-                        _rename_finding(
-                            FindingCode.RENAME_WITH_EDIT_UNRESOLVED,
-                            item.note.vault_relpath,
-                        ),
-                    ),
+                    findings=rename_findings,
                 )
             )
         elif len(same_scope) > 1:
@@ -1010,6 +1044,7 @@ def _replace_vault_edges(
     projected: Iterable[_ProjectedNote],
     *,
     db=None,
+    audit_sink: Optional[list[Callable[[], None]]] = None,
 ) -> tuple[tuple[str, str, str, str], ...]:
     """Replace every vault-owned type group through the service boundary."""
     all_notes = tuple(projected)
@@ -1031,6 +1066,7 @@ def _replace_vault_edges(
                 [],
                 source_kind="vault",
                 db=db,
+                audit_sink=audit_sink,
             )
             service.replace_set(
                 item.note.scope,
@@ -1041,6 +1077,7 @@ def _replace_vault_edges(
                 list(groups.get((item.note.scope, item.note.scope_id, item.key, type_), ())),
                 source_kind="vault",
                 db=db,
+                audit_sink=audit_sink,
             )
     return findings
 
