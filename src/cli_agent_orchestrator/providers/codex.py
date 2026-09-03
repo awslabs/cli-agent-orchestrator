@@ -858,6 +858,36 @@ class CodexProvider(BaseProvider):
         if profile and profile.codexProfile and not yolo:
             command_parts = ["codex", "--profile", profile.codexProfile]
         else:
+            if profile and profile.codexProfile:
+                # The operator asked for containment and is not getting it. Naming a
+                # codexProfile is the ONLY way to keep Codex's sandbox and approval
+                # policy in effect under CAO, and allowed_tools containing "*"
+                # discards it. Silently dropping an explicit safety setting is worse
+                # than not offering one, so say so at the point it happens (#707).
+                logger.warning(
+                    "Terminal %s: profile '%s' sets codexProfile=%r, but allowed_tools "
+                    "contains '*', which forces --yolo and discards it. This worker "
+                    "runs with Codex approvals AND sandbox bypassed. Remove '*' from "
+                    "allowed_tools to keep codexProfile in effect.",
+                    self.terminal_id,
+                    self._agent_profile,
+                    profile.codexProfile,
+                )
+            else:
+                # --yolo is --dangerously-bypass-approvals-and-sandbox, so NOTHING in
+                # ~/.codex/config.toml's [sandbox_*] tables applies to this worker --
+                # including network_access. Operators have relied on that setting as a
+                # containment control (#707); it is inert here. Logged on every default
+                # codex launch because that is exactly when the expectation is set.
+                logger.info(
+                    "Terminal %s: launching codex with --yolo "
+                    "(--dangerously-bypass-approvals-and-sandbox). Codex sandbox "
+                    "settings in ~/.codex/config.toml, including "
+                    "[sandbox_workspace_write].network_access, do NOT apply. Set "
+                    "codexProfile on the agent profile to launch under a named "
+                    "[profiles.<name>] block instead.",
+                    self.terminal_id,
+                )
             command_parts = ["codex", "--yolo"]
         command_parts.extend(["--no-alt-screen", "--disable", "shell_snapshot"])
 
