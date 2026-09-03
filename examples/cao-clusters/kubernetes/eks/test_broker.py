@@ -443,6 +443,115 @@ finally:
     STATE["new_pods_ready"] = True
     STATE["new_pods_phase"] = "Running"
 
+# --- 3c. the ledger is a one-hour window, and its clock is settled_at -----
+#
+# `_release` deletes the Deployment immediately, so this in-memory row is the
+# ONLY place a settled worker's verdict survives - and the reaper drops it
+# LEASE_RETENTION seconds later. Nothing pinned that, and it is read wrong in two
+# directions worth catching:
+#
+#   * as unbounded. `cao worker list --all` looks like a full history, so an
+#     operator comes back after lunch for the `expired` reason and finds a table
+#     that no longer mentions the worker. Absence is not evidence of a clean run.
+#   * off the wrong clock. The AGE column is `now - leased_at`, and retention
+#     runs from `settled_at`. A row can show an age well past the hour and still
+#     be present, which makes a count cap the tempting (and wrong) explanation.
+check("settled leases are kept for an hour by default",
+      broker.LEASE_RETENTION == 3600, str(broker.LEASE_RETENTION))
+
+def _settled(worker_id, *, state, settled_ago, leased_ago=None):
+    """Put one synthetic settled lease in the ledger."""
+    now = time.monotonic()
+    with broker._leases_lock:
+        broker._leases[worker_id] = {
+            "state": state,
+            "reason": "released by caller",
+            "leased_at": now - (leased_ago if leased_ago is not None else settled_ago),
+            "settled_at": None if settled_ago is None else now - settled_ago,
+            "ready_at": now,
+            "pod_observed_at": now,
+            "pod_uid": None,
+            "agent_profile": "developer",
+            "provider": "claude_code",
+        }
+
+_settled("fade0001", state="completed", settled_ago=broker.LEASE_RETENTION - 5)
+_settled("fade0002", state="expired", settled_ago=broker.LEASE_RETENTION + 5)
+# Settled a second ago but leased long before the window: the row that proves
+# which of the two timestamps the prune reads.
+_settled("fade0003", state="released", settled_ago=1,
+         leased_ago=broker.LEASE_RETENTION * 2)
+# A lease still open, aged past the window. What saves it is that it has no
+# settle time yet, not its state: without that guard a running worker's lease
+# would be deleted out from under it, leaving the pod alive with nothing left
+# that knows it is owed a release.
+_settled("fade0004", state="leased", settled_ago=None,
+         leased_ago=broker.LEASE_RETENTION * 2)
+# The same row with a settle time it could not really have. `_settle` writes
+# state and settled_at together under one lock, so nothing reachable is both
+# open and settled - which makes the prune's `state != "leased"` clause pure
+# belt and braces. Pinned anyway, because the clause looks load-bearing and the
+# next reader should not be able to delete it and see a green suite.
+_settled("fade0007", state="leased", settled_ago=broker.LEASE_RETENTION + 5,
+         leased_ago=broker.LEASE_RETENTION * 2)
+
+broker._reap_once()
+
+check("a lease settled inside the window is still readable",
+      "fade0001" in broker._leases)
+check("a lease settled past the window is dropped",
+      "fade0002" not in broker._leases)
+check("retention runs from settled_at, not from leased_at",
+      "fade0003" in broker._leases)
+check("an open lease has no settle time, so no age can prune it",
+      "fade0004" in broker._leases, str(broker._leases.get("fade0004", {}).get("state")))
+check("an open lease survives even if it somehow carries a settle time",
+      "fade0007" in broker._leases)
+
+# A `creating` lease has no settle time at all, and `now - None` in that branch
+# would take the reaper thread down with it - after which nothing is reaped.
+_settled("fade0005", state="creating", settled_ago=None,
+         leased_ago=broker.LEASE_RETENTION * 2)
+broker._reap_once()
+check("a lease with no settled_at survives the prune rather than crashing it",
+      "fade0005" in broker._leases)
+
+# One tick can settle a lease and one tick can prune it, but never the same tick:
+# the prune reads settled_at from before this sweep, so a verdict is always
+# readable for a full retention window after it is written.
+_settled("fade0006", state="leased", settled_ago=None,
+         leased_ago=broker.COMPLETION_TIMEOUT + 1)
+broker._reap_once()
+check("a verdict written this tick is not pruned by the same tick",
+      "fade0006" in broker._leases,
+      str(broker._leases.get("fade0006", {}).get("state")))
+
+# And the coupling that makes that clause redundant deserves the pin more than
+# the clause does. `_settle` is the only writer of settled_at anywhere in the
+# broker, and it writes state in the same critical section, so "live" and
+# "settled" cannot both be true. That matters more than it reads: the prune
+# exempts the literal "leased" while every other test in the broker asks
+# _LIVE_LEASE_STATES, so a `creating` lease is live and NOT exempt by state. It
+# survives only because nothing gives it a settle time while it is coming up.
+_settled("fade0008", state="creating", settled_ago=None, leased_ago=1)
+_settled_ok = broker._settle("fade0008", "completed", "done")
+with broker._leases_lock:
+    _row = dict(broker._leases["fade0008"])
+check("_settle stamps settled_at and leaves the live set in one critical section",
+      _settled_ok
+      and _row["state"] not in broker._LIVE_LEASE_STATES
+      and _row["settled_at"] is not None,
+      f"{_row['state']} settled_at={_row['settled_at'] is not None}")
+check("a settled lease cannot be settled twice, so the first verdict is the one kept",
+      broker._settle("fade0008", "released", None) is False
+      and broker._leases["fade0008"]["reason"] == "done",
+      str(broker._leases["fade0008"]["reason"]))
+
+with broker._leases_lock:
+    for _wid in ("fade0001", "fade0003", "fade0004", "fade0005", "fade0006",
+                 "fade0007", "fade0008"):
+        broker._leases.pop(_wid, None)
+
 # --- 4. lease lifecycle over HTTP ---------------------------------------
 with TestClient(broker.app) as c:
     worker_payload = {
