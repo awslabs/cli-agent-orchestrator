@@ -320,7 +320,7 @@ class TestGetCuratedMemoryContext:
         service = MemoryService()
 
         def resolve_sources(*_args, **_kwargs):
-            return [], list(next(orders)), 4096
+            return [], list(next(orders)), 4096, None
 
         service._resolve_sources = resolve_sources  # type: ignore[method-assign]
 
