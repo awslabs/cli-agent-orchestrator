@@ -342,7 +342,10 @@ async def launch_session(
                 "in the JSON request body (never the URL, so a forwarded secret "
                 "stays out of the server access log). Keys must be POSIX "
                 "identifiers; the CLAUDE/CODEX_/__MISE_ prefixes are reserved "
-                "for provider env and >=2048-byte values are rejected."
+                "for provider env. Values must be UTF-8 with no NUL byte and "
+                "<2048 bytes each; at most 256 vars totalling <128 KiB are "
+                "accepted (tmux argv limits). Invalid input returns "
+                "success=False, it does not raise."
             )
         ),
     ] = None,

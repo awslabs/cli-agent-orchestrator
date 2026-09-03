@@ -17,13 +17,8 @@ from cli_agent_orchestrator.constants import (
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.forwarded_env import (
-    FORWARDED_ENV_BLOCKED_PREFIXES as _FORWARDED_ENV_BLOCKED_PREFIXES,
-)
-from cli_agent_orchestrator.utils.forwarded_env import (
-    FORWARDED_ENV_MAX_VALUE_BYTES as _FORWARDED_ENV_MAX_VALUE_BYTES,
-)
-from cli_agent_orchestrator.utils.forwarded_env import (
-    FORWARDED_ENV_PREFIX_ALLOWLIST as _FORWARDED_ENV_PREFIX_ALLOWLIST,
+    ForwardedEnvError,
+    validate_forwarded_env,
 )
 from cli_agent_orchestrator.utils.terminal import (
     poll_until_done,
@@ -50,47 +45,30 @@ PROVIDERS_REQUIRING_WORKSPACE_ACCESS = {
 # Validation constraints for ``--env`` forwarded vars live in
 # ``utils.forwarded_env`` (shared with the ops-MCP ``launch_session`` tool so
 # the two client paths cannot drift) and are mirrored server-side in
-# ``TmuxClient._merge_extra_env``. See issue #248. Imported above under the
-# historical private names ``_parse_env_pairs`` uses.
+# ``TmuxClient._merge_extra_env``. See issue #248.
 
 
 def _parse_env_pairs(pairs):
-    """Parse repeated ``KEY=VALUE`` entries into a dict, validating each.
+    """Parse repeated ``KEY=VALUE`` entries into a validated dict.
 
-    Mirrors the constraints applied to inherited env in TmuxClient so a
-    forwarded var that would be silently dropped server-side is rejected at
-    the CLI boundary with a clear error message instead.
+    Splitting each ``KEY=VALUE`` string (and the last-wins duplicate handling)
+    is CLI-specific, but every validation rule is delegated to the shared
+    ``validate_forwarded_env`` so ``--env`` and the ops-MCP ``launch_session``
+    tool can never drift. Each shared message begins with ``env ``; prefixing
+    with ``--`` reproduces the historical ``--env ...`` CLI messages exactly.
     """
-    result: dict[str, str] = {}
+    parsed: dict[str, str] = {}
     for raw in pairs:
         if "=" not in raw:
             raise click.ClickException(
                 f"--env expects KEY=VALUE (got {raw!r}); did you forget the '='?"
             )
         key, value = raw.split("=", 1)
-        # POSIX env names: leading letter/underscore, then alnum/underscore.
-        # Stricter than ``str.isidentifier`` only in that it forbids non-ASCII.
-        if (
-            not key
-            or not (key[0].isalpha() or key[0] == "_")
-            or not all(c.isalnum() or c == "_" for c in key)
-            or not key.isascii()
-        ):
-            raise click.ClickException(f"--env key must match [A-Za-z_][A-Za-z0-9_]* (got {key!r})")
-        if key not in _FORWARDED_ENV_PREFIX_ALLOWLIST and any(
-            key.startswith(p) for p in _FORWARDED_ENV_BLOCKED_PREFIXES
-        ):
-            raise click.ClickException(
-                f"--env key {key!r} uses a blocked prefix "
-                f"({', '.join(_FORWARDED_ENV_BLOCKED_PREFIXES)}) reserved for provider env"
-            )
-        if len(value.encode("utf-8")) >= _FORWARDED_ENV_MAX_VALUE_BYTES:
-            raise click.ClickException(
-                f"--env value for {key!r} exceeds {_FORWARDED_ENV_MAX_VALUE_BYTES} bytes "
-                "(tmux argv limit, PR #246)"
-            )
-        result[key] = value
-    return result
+        parsed[key] = value  # last-wins on a duplicate key
+    try:
+        return validate_forwarded_env(parsed)
+    except ForwardedEnvError as exc:
+        raise click.ClickException(f"--{exc}") from exc
 
 
 @click.command()

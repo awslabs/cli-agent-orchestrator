@@ -457,6 +457,44 @@ class TestSessionLifecycleTools:
         assert result.terminal_id is None
         mock_request.assert_not_called()
 
+    async def test_launch_session_rejects_non_utf8_env_without_crashing(self) -> None:
+        """A lone surrogate is a valid JSON/FastMCP str but is not UTF-8
+        encodable. It must return success=False (not raise a ToolError wrapping
+        UnicodeEncodeError) and make no HTTP request. Regression for the P2
+        review finding on PR #729."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+        ) as mock_request:
+            result = await launch_session(
+                agent_profile="developer",
+                session_name="bad-utf8",
+                env_vars={"X": "\ud800"},  # lone surrogate, not UTF-8 encodable
+            )
+
+        assert result.success is False
+        assert "not valid UTF-8" in result.message
+        assert result.terminal_id is None
+        mock_request.assert_not_called()
+
+    async def test_launch_session_rejects_nul_byte_env_without_crashing(self) -> None:
+        """A NUL byte in a value passes the length check but breaks Popen and
+        leaks the argv into logs. It must return success=False before any HTTP
+        request. Regression for the P1 review finding on PR #729."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+        ) as mock_request:
+            result = await launch_session(
+                agent_profile="developer",
+                session_name="bad-nul",
+                env_vars={"TOKEN": "secret\x00value"},
+            )
+
+        assert result.success is False
+        assert "NUL byte" in result.message
+        assert "secret" not in result.message  # value must not leak
+        assert result.terminal_id is None
+        mock_request.assert_not_called()
+
     async def test_launch_session_returns_invalid_model_error(self) -> None:
         """Request-boundary model errors are returned instead of ignored."""
         with patch(
