@@ -16,6 +16,15 @@ from cli_agent_orchestrator.constants import (
 )
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.settings_service import get_server_settings
+from cli_agent_orchestrator.utils.forwarded_env import (
+    FORWARDED_ENV_BLOCKED_PREFIXES as _FORWARDED_ENV_BLOCKED_PREFIXES,
+)
+from cli_agent_orchestrator.utils.forwarded_env import (
+    FORWARDED_ENV_MAX_VALUE_BYTES as _FORWARDED_ENV_MAX_VALUE_BYTES,
+)
+from cli_agent_orchestrator.utils.forwarded_env import (
+    FORWARDED_ENV_PREFIX_ALLOWLIST as _FORWARDED_ENV_PREFIX_ALLOWLIST,
+)
 from cli_agent_orchestrator.utils.terminal import (
     poll_until_done,
     sync_backend_from_server,
@@ -38,20 +47,11 @@ PROVIDERS_REQUIRING_WORKSPACE_ACCESS = {
     "omp",
 }
 
-# Validation constraints for ``--env`` forwarded vars (mirrored server-side
-# in ``TmuxClient._merge_extra_env``). See issue #248.
-_FORWARDED_ENV_BLOCKED_PREFIXES = ("CLAUDE", "CODEX_", "__MISE_")
-_FORWARDED_ENV_PREFIX_ALLOWLIST = frozenset(
-    {
-        "CLAUDE_CODE_USE_BEDROCK",
-        "CLAUDE_CODE_USE_VERTEX",
-        "CLAUDE_CODE_USE_FOUNDRY",
-        "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
-        "CLAUDE_CODE_SKIP_VERTEX_AUTH",
-        "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
-    }
-)
-_FORWARDED_ENV_MAX_VALUE_BYTES = 2048
+# Validation constraints for ``--env`` forwarded vars live in
+# ``utils.forwarded_env`` (shared with the ops-MCP ``launch_session`` tool so
+# the two client paths cannot drift) and are mirrored server-side in
+# ``TmuxClient._merge_extra_env``. See issue #248. Imported above under the
+# historical private names ``_parse_env_pairs`` uses.
 
 
 def _parse_env_pairs(pairs):
