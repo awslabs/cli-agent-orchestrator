@@ -1337,16 +1337,39 @@ _DROP_RESPONSE_HEADERS = frozenset(
 _LOG_TAIL_MAX = 2000
 
 
-def _worker_api_base(worker_id: str) -> str:
-    """Where a worker answers. The Service name, not the pod's.
+def _worker_api_target(worker_id: str) -> tuple[str, str]:
+    """Where a worker answers: (url base, Host header). The pod's IP, not the Service.
 
-    The pod's own address would work today and stop working the moment the
-    ReplicaSet replaces it; the Service is stable for the life of the lease and is
-    also the name in the worker's own CAO_ALLOWED_HOSTS, so its DNS-rebinding
-    check passes.
+    The Service name is the obvious address and it does not work from here. On EKS
+    with the VPC CNI's NetworkPolicy agent, a pod's egress is matched against the
+    address the pod DIALLED, before kube-proxy rewrites it - so a rule written as
+    `to: podSelector: cao-elastic-worker` never matches traffic aimed at a worker's
+    ClusterIP, and the connection hangs until it times out. Proven on a live
+    cluster: from this pod, the worker's pod IP connects in 0.00s and its ClusterIP
+    times out, and adding that one ClusterIP to the policy as an ipBlock makes it
+    connect. The supervisor reaches workers by Service name only because its own
+    egress rule is `podSelector: {}` with no ports - an allow-all the agent does not
+    have to resolve.
+
+    The alternative was an ipBlock for the whole Service CIDR on 9889, which would
+    let the broker reach every ClusterIP in the cluster to buy back an address it
+    does not need. Dialling the pod directly stays inside the existing podSelector
+    rule, and the pod is looked up per request, so a ReplicaSet replacement is
+    picked up on the next call rather than cached into a 502.
+
+    The Host header still carries the Service name: it is what the worker lists in
+    CAO_ALLOWED_HOSTS, and a bare pod IP there would fail its DNS-rebinding check.
     """
     name = _workload_name(worker_id)
-    return f"http://{name}.{NAMESPACE}.svc.cluster.local:{_WORKER_API_PORT}"
+    host = f"{name}.{NAMESPACE}.svc.cluster.local"
+    pod = _worker_pod(worker_id)
+    ip = pod.status.pod_ip if pod.status else None
+    if not ip:
+        raise HTTPException(
+            status_code=503,
+            detail=f"worker {worker_id} has no pod IP yet",
+        )
+    return f"http://{ip}:{_WORKER_API_PORT}", host
 
 
 def _require_leased_worker(worker_id: str) -> None:
@@ -1391,13 +1414,14 @@ def _forward_to_worker(
     body: bytes,
     headers: dict[str, str],
 ) -> Response:
+    base, host = _worker_api_target(worker_id)
     try:
         upstream = requests.request(
             method,
-            f"{_worker_api_base(worker_id)}/{path}",
+            f"{base}/{path}",
             params=query,
             data=body or None,
-            headers=headers,
+            headers={**headers, "host": host},
             allow_redirects=False,
             timeout=(5.0, 60.0),
         )
@@ -1457,7 +1481,8 @@ async def worker_api(
     )
 
 
-def _worker_pod_name(worker_id: str) -> str:
+def _worker_pod(worker_id: str) -> client.V1Pod:
+    """The one pod behind a worker id, for callers that must name it or dial it."""
     pods = core_api.list_namespaced_pod(
         NAMESPACE,
         label_selector=f"cao.aws/worker-id={worker_id}",
@@ -1469,7 +1494,11 @@ def _worker_pod_name(worker_id: str) -> str:
     # that is running; on a boot failure there is no such pod and the first one's
     # log is exactly what the caller came for.
     running = [pod for pod in pods if (pod.status.phase if pod.status else None) == "Running"]
-    return (running or pods)[0].metadata.name
+    return (running or pods)[0]
+
+
+def _worker_pod_name(worker_id: str) -> str:
+    return _worker_pod(worker_id).metadata.name
 
 
 @app.get("/workers/{worker_id}/logs")

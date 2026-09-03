@@ -120,6 +120,15 @@ spec:
     # Both destinations answer cao-server on 9889, and neither can be enumerated
     # by name — worker Services are minted per task — so the bound that holds is
     # "these two labels, this one port".
+    #
+    # A podSelector rule only covers traffic aimed at a POD IP. The VPC CNI's
+    # NetworkPolicy agent matches egress on the address the pod dialled, before
+    # kube-proxy rewrites it, so a request to a worker's ClusterIP is not covered
+    # by the selector below and hangs until it times out. That is why broker.py
+    # resolves the worker's pod and dials its IP with the Service name in the Host
+    # header (see _worker_api_target), and it is the same reason the API server
+    # rule further down has to name 172.20.0.0/16 as an ipBlock rather than
+    # selecting the API server's pods.
     - to:
         - podSelector:
             matchLabels:
