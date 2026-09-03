@@ -179,22 +179,29 @@ class BaseProvider(ABC):
     # this False — their COMPLETED/IDLE split is not screen-detectable.
     supports_direct_status_probe: bool = False
 
-    def direct_probe_confirms_submission(self, output: str, message: str) -> bool:
-        """Whether a started status read from ``output`` is attributable to
-        ``message`` — the text the direct status probe is confirming.
+    def direct_probe_confirms_dispatch(self, post_dispatch_output: str) -> bool:
+        """Whether ``post_dispatch_output`` proves this provider's TUI actually
+        began working on the submission the direct probe is confirming.
 
-        The deferred-submit probe (``supports_direct_status_probe``) reads a
-        started status off a live capture-pane snapshot and, when it holds,
-        skips redelivery. For a TUI whose activity indicators are turn-scoped
-        that status alone is evidence the submission was accepted, and the
-        default keeps that behavior. A provider whose startup chrome shares the
-        shape of its task-activity indicators (a startup spinner or bullet
-        that ``get_status`` reads as PROCESSING/COMPLETED before any task was
-        ever submitted) must override this and bind the verdict to evidence of
-        the current submission — otherwise the probe suppresses the recovery
-        it exists to perform and a dropped task is silently lost. Return False
-        whenever attribution cannot be established: the probe then falls
-        through to the redelivery decision.
+        ``post_dispatch_output`` is the StatusMonitor rolling byte buffer, which
+        ``send_input`` empties immediately BEFORE it sends the keystrokes (see
+        ``clear_rolling_buffer``). Every byte in it therefore arrived after the
+        dispatch, by construction — it cannot contain pre-dispatch scrollback,
+        cannot be defeated by a shared message prefix, and cannot be evicted by
+        a bounded capture-pane tail.
+
+        The direct probe reads a started status off the live rendered pane
+        (``get_status``), which classifies the frame as a whole and so cannot
+        tell a running turn from leftover chrome. This hook supplies the
+        causality that status alone lacks. The default keeps the status-only
+        verdict, for TUIs whose activity indicators are turn-scoped. A provider
+        whose startup chrome renders like task activity must override it and
+        name the byte-level evidence that only a real turn produces.
+
+        Returning False is not "not started": it means unproven, and the caller
+        treats it as such — the bare-Enter recovery still runs when the message
+        is on screen, and a full re-send is withheld whenever any post-dispatch
+        output exists, because absence of proof is not proof of a dropped paste.
         """
         return True
 

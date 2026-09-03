@@ -802,65 +802,44 @@ class CodexProvider(BaseProvider):
     # live capture-pane snapshot is a valid input; there is no dispatch
     # bookkeeping that a fresh capture would bypass (the kiro_cli-style
     # disqualifier documented on _worker_is_started_direct). The status alone
-    # is NOT the verdict, though — see direct_probe_confirms_submission below.
+    # is NOT the verdict, though — see direct_probe_confirms_dispatch below.
     supports_direct_status_probe = True
 
-    def direct_probe_confirms_submission(self, output: str, message: str) -> bool:
-        """Bind a started status to the submission being confirmed.
+    def direct_probe_confirms_dispatch(self, post_dispatch_output: str) -> bool:
+        """Prove a codex turn actually started, from post-dispatch bytes alone.
 
-        Codex's startup chrome shares the shape of its task activity: a
-        ``• Starting MCP servers (4s • esc to interrupt)`` spinner is the
-        TUI_PROGRESS_PATTERN, and any startup ``•`` line is an assistant
-        marker. ``initialize()`` returns once the bottom
-        STARTUP_PROMPT_BOTTOM_LINES are activity-free, but ``get_status``
-        scans a wider tail for the spinner and the whole capture for a
-        marker, so a task-less pane with that residue 16+ lines above the
-        idle composer reads PROCESSING (or COMPLETED once the spinner leaves
-        the tail). Accepting that as "started" would skip the redelivery a
-        dropped paste needs and lose the task silently.
+        Codex's startup chrome renders like its task activity: the
+        ``Starting MCP servers (4s - esc to interrupt)`` spinner IS
+        ``TUI_PROGRESS_PATTERN`` and any startup bullet is an assistant marker.
+        On a whole-frame ``get_status`` read that residue is indistinguishable
+        from a running turn, so the probe needs evidence tied to time rather
+        than to text.
 
-        A submitted turn leaves a causal trace instead: Codex echoes the
-        message as a ``›`` transcript line and renders the turn's activity
-        (spinner, ``•`` reply/tool bullets) BELOW it, whereas startup residue
-        sits ABOVE the composer and an unsubmitted paste sits in the composer
-        with nothing but the footer beneath. So the verdict is: the message
-        is visible, and a turn-activity line follows it. Bullets that are
-        part of the message text itself do not count — a pasted, unsubmitted
-        message containing its own ``•`` lines must not attribute activity
-        to itself. Anything short of that returns False and the probe falls
-        through to the redelivery decision (fail toward recovery).
+        ``post_dispatch_output`` supplies it: ``send_input`` empties the rolling
+        buffer immediately before sending the keystrokes, so a spinner that
+        stopped BEFORE the dispatch contributes no bytes here no matter where it
+        still sits on screen, while a live one repaints its elapsed counter and
+        necessarily does. The evidence is therefore the progress spinner alone.
 
-        Matching collapses both sides to ``[a-z0-9]`` and uses the message's
-        leading 24 characters, the same collapse ``_message_visible_in_box``
-        applies, so pane-width wrapping, unicode punctuation, and whitespace
-        cannot defeat the match.
+        A bullet is deliberately NOT accepted: the composer echoes the pasted
+        message as it renders, so a multi-line paste containing its own ``.``
+        bullet would emit one without any turn having started. The spinner's
+        ``(<n>s - esc to interrupt)`` shape cannot be produced that way.
+
+        False here is "unproven", never "idle" — see the base docstring. It is
+        also the honest answer on an event-inbox backend (herdr) that never
+        feeds a byte buffer: the probe then declines to vouch for the turn and
+        the caller falls back to its pre-existing behavior.
         """
-        probe = re.sub(r"[^a-z0-9]", "", message.lower())[:24]
-        if len(probe) < 8:
+        if not post_dispatch_output:
             return False
-        lines = strip_terminal_escapes(output).splitlines()
-        # Collapse the pane line by line, recording which line each kept
-        # character came from so the echo can be located by line.
-        collapsed: list[str] = []
-        owner: list[int] = []
-        for index, line in enumerate(lines):
-            kept = re.sub(r"[^a-z0-9]", "", line.lower())
-            collapsed.append(kept)
-            owner.extend([index] * len(kept))
-        hit = "".join(collapsed).find(probe)
-        if hit == -1:
-            return False
-        echo_line = owner[hit]
-        message_text = re.sub(r"[^a-z0-9]", "", message.lower())
-        for line in lines[echo_line + 1 :]:
-            if re.search(TUI_PROGRESS_PATTERN, line):
-                return True
-            if re.match(STARTUP_ACTIVITY_PATTERN, line):
-                kept = re.sub(r"[^a-z0-9]", "", line.lower())
-                if kept and kept in message_text:
-                    continue  # a bullet inside the pasted message, not a reply
-                return True
-        return False
+        return bool(
+            re.search(
+                TUI_PROGRESS_PATTERN,
+                strip_terminal_escapes(post_dispatch_output),
+                re.MULTILINE,
+            )
+        )
 
     def __init__(
         self,

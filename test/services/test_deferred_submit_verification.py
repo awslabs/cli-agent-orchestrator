@@ -50,6 +50,7 @@ class TestRedeliverDroppedMessageHelper:
         with (
             patch.object(ts, "provider_manager") as mgr,
             patch.object(ts, "_worker_is_started_direct", return_value=True) as probe,
+            patch.object(ts.status_monitor, "get_buffer", return_value="• Working (1s)"),
             patch.object(ts, "send_special_key") as key,
             patch.object(ts, "send_input") as send,
         ):
@@ -57,8 +58,9 @@ class TestRedeliverDroppedMessageHelper:
             started = ts.redeliver_dropped_message("t1", "Analyze the logs", 1)
         assert started is True
         mgr.get_provider.assert_called_once_with("t1")
-        # The message rides along: the probe binds its verdict to it.
-        probe.assert_called_once_with("t1", provider, "Analyze the logs")
+        # The post-dispatch bytes ride along: they are what binds the verdict
+        # to THIS submission, so the probe must receive them, not the message.
+        probe.assert_called_once_with("t1", provider, "• Working (1s)")
         key.assert_not_called()
         send.assert_not_called()
 
@@ -298,15 +300,15 @@ class TestWorkerIsStartedDirect:
 
     def test_returns_false_when_metadata_is_none(self):
         with patch.object(ts, "get_terminal_metadata", return_value=None):
-            assert ts._worker_is_started_direct("t1", MagicMock()) is False
+            assert ts._worker_is_started_direct("t1", MagicMock(), "evidence") is False
 
     def test_returns_false_when_session_key_missing(self):
         with patch.object(ts, "get_terminal_metadata", return_value={"tmux_window": "w1"}):
-            assert ts._worker_is_started_direct("t1", MagicMock()) is False
+            assert ts._worker_is_started_direct("t1", MagicMock(), "evidence") is False
 
     def test_returns_false_when_window_key_missing(self):
         with patch.object(ts, "get_terminal_metadata", return_value={"tmux_session": "s1"}):
-            assert ts._worker_is_started_direct("t1", MagicMock()) is False
+            assert ts._worker_is_started_direct("t1", MagicMock(), "evidence") is False
 
     def test_returns_false_when_get_history_raises(self):
         with (
@@ -321,7 +323,7 @@ class TestWorkerIsStartedDirect:
             patch.object(ts, "get_backend") as mock_be,
         ):
             mock_be.return_value.get_history.side_effect = Exception("capture failed")
-            assert ts._worker_is_started_direct("t1", MagicMock()) is False
+            assert ts._worker_is_started_direct("t1", MagicMock(), "evidence") is False
 
     def test_returns_false_when_get_status_raises(self):
         provider = MagicMock()
@@ -337,7 +339,7 @@ class TestWorkerIsStartedDirect:
             ),
             patch.object(ts, "get_backend") as mock_be,
         ):
-            assert ts._worker_is_started_direct("t1", provider) is False
+            assert ts._worker_is_started_direct("t1", provider, "evidence") is False
 
     def test_returns_true_when_status_is_processing(self):
         from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -355,7 +357,7 @@ class TestWorkerIsStartedDirect:
             ),
             patch.object(ts, "get_backend") as mock_be,
         ):
-            assert ts._worker_is_started_direct("t1", provider) is True
+            assert ts._worker_is_started_direct("t1", provider, "evidence") is True
 
     def test_returns_false_when_status_is_idle(self):
         from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -373,7 +375,7 @@ class TestWorkerIsStartedDirect:
             ),
             patch.object(ts, "get_backend") as mock_be,
         ):
-            assert ts._worker_is_started_direct("t1", provider) is False
+            assert ts._worker_is_started_direct("t1", provider, "evidence") is False
 
 
 class TestCodexDirectProbeOptIn:
@@ -382,16 +384,27 @@ class TestCodexDirectProbeOptIn:
     (detection fires only at rising-edge/quiescence, and a repainting spinner
     defers quiescence). Without the direct-probe opt-in the confirm loop
     re-delivers the task into the working pane up to three times and then tears
-    the worker down. These pin the opt-in end to end with the REAL provider and
-    a real rendered frame, so removing the flag (or breaking the detector on
-    this shape) goes red here — not just in a unit assert on the attribute.
+    the worker down.
+
+    The opt-in alone is not safe, though: ``get_status`` classifies a rendered
+    frame as a whole, and Codex's startup chrome renders like its task activity
+    (the ``Starting MCP servers`` spinner IS ``TUI_PROGRESS_PATTERN``; any
+    startup bullet is an assistant marker). So the verdict is bound to
+    POST-DISPATCH BYTES: ``send_input`` empties the StatusMonitor rolling buffer
+    immediately before sending keystrokes, so a spinner that stopped before the
+    dispatch contributes nothing there no matter where it still sits on screen,
+    while a live one repaints its counter and necessarily does.
+
+    These drive the REAL provider through the real redelivery decision, so a
+    regression in either half goes red here — not just in a unit assert.
     """
 
     _MESSAGE = "[CAO Handoff] Supervisor terminal ID: sup-123. Do the task."
+    _FOOTER = "  gpt-5.6-sol medium · Context 100% left\n"
+    _SPINNER = "• Working (3s • esc to interrupt)\n"
 
     # The shape from the issue report: handoff prompt in the transcript, live
-    # Working spinner, TUI footer. Same frame family the codex provider unit
-    # tests pin as PROCESSING.
+    # Working spinner, TUI footer.
     _WORKING_FRAME = (
         "› [CAO Handoff] Supervisor terminal ID: sup-123. Do the task.\n"
         "\n"
@@ -402,41 +415,38 @@ class TestCodexDirectProbeOptIn:
         "  ? for shortcuts                     100% context left\n"
     )
 
-    # Startup chrome as Codex renders it before any task exists. The MCP
-    # startup spinner IS the TUI progress pattern, and any startup bullet is
-    # an assistant marker.
+    # Startup chrome as Codex renders it before any task exists.
     _STARTUP_BANNER = (
         "╭──────────────────────────────────────────────╮\n"
         "│ >_ OpenAI Codex (v0.145.0)                   │\n"
-        "│                                              │\n"
-        "│ model:       gpt-5.6-sol medium              │\n"
-        "│ directory:   ~/project                       │\n"
         "│ permissions: YOLO mode                       │\n"
         "╰──────────────────────────────────────────────╯\n"
         "\n"
         "• Starting MCP servers (4s • esc to interrupt)\n"
     )
-    _IDLE_COMPOSER = (
-        "\n" "› Write tests for @filename\n" "\n" "  gpt-5.6-sol medium · Context 100% left\n"
-    )
+    _IDLE_COMPOSER = "\n› Write tests for @filename\n\n" + _FOOTER
 
-    @staticmethod
-    def _residue_frame(gap: int, composer: str) -> str:
+    @classmethod
+    def _residue_frame(cls, gap: int, composer: str) -> str:
         """Startup spinner ``gap`` blank lines above the composer: outside the
         bottom-15 window initialize() vetoes activity in, so the provider
         reports ready, yet inside (or above) the wider tail get_status scans."""
-        return TestCodexDirectProbeOptIn._STARTUP_BANNER + "\n" * gap + composer
+        return cls._STARTUP_BANNER + "\n" * gap + composer
 
     @staticmethod
-    async def _run_confirm(frame: str, message: str):
+    def _provider():
         from cli_agent_orchestrator.providers.codex import CodexProvider
 
-        provider = CodexProvider("t1", "s1", "w0")
+        return CodexProvider("t1", "s1", "w0")
+
+    @classmethod
+    def _redeliver(cls, frame: str, message: str, post_dispatch: str):
+        """One redelivery decision against a rendered ``frame`` and the bytes
+        that arrived since the dispatch. Returns (started, enter, full_resend)."""
+        provider = cls._provider()
         backend = MagicMock()
         backend.get_history.return_value = frame
         with (
-            # Cached status stays IDLE past every poll — the #496-class lag.
-            patch.object(ts, "wait_until_status", new=AsyncMock(return_value=False)),
             patch.object(
                 ts,
                 "get_terminal_metadata",
@@ -444,13 +454,12 @@ class TestCodexDirectProbeOptIn:
             ),
             patch.object(ts, "get_backend", return_value=backend),
             patch.object(ts, "get_output", return_value=frame),
+            patch.object(ts.status_monitor, "get_buffer", return_value=post_dispatch),
             patch.object(ts, "send_special_key") as key,
             patch.object(ts, "send_input") as send,
         ):
-            ok = await ts._confirm_worker_started_or_resubmit(
-                "t1", message, None, "sup", None, provider=provider
-            )
-        return ok, key, send
+            started = ts.redeliver_dropped_message("t1", message, 1, provider)
+        return started, key.called, send.called
 
     def test_codex_opts_into_direct_status_probe(self):
         from cli_agent_orchestrator.providers.codex import CodexProvider
@@ -459,9 +468,9 @@ class TestCodexDirectProbeOptIn:
 
     @pytest.mark.asyncio
     async def test_codex_confirm_succeeds_from_live_frame_without_redelivery(self):
-        from cli_agent_orchestrator.providers.codex import CodexProvider
-
-        provider = CodexProvider("t1", "s1", "w0")
+        """End to end through the confirm loop: cached status stays IDLE past
+        every poll, the pane shows a live turn, nothing is typed into it."""
+        provider = self._provider()
         backend = MagicMock()
         backend.get_history.return_value = self._WORKING_FRAME
         with (
@@ -473,16 +482,12 @@ class TestCodexDirectProbeOptIn:
                 return_value={"tmux_session": "s1", "tmux_window": "w0"},
             ),
             patch.object(ts, "get_backend", return_value=backend),
+            patch.object(ts.status_monitor, "get_buffer", return_value=self._SPINNER * 3),
             patch.object(ts, "send_special_key") as key,
             patch.object(ts, "send_input") as send,
         ):
             ok = await ts._confirm_worker_started_or_resubmit(
-                "t1",
-                self._MESSAGE,
-                None,
-                "sup",
-                None,
-                provider=provider,
+                "t1", self._MESSAGE, None, "sup", None, provider=provider
             )
 
         # Started: the caller must not classify this as a dropped submit, so the
@@ -493,120 +498,117 @@ class TestCodexDirectProbeOptIn:
         send.assert_not_called()
         key.assert_not_called()
 
-    # --- the verdict is bound to the submission, not to the pane's status -----
-    # get_status classifies the frame as a whole, so startup residue reads as
-    # started for a pane whose task paste was dropped. The probe must not take
-    # that as acceptance: it would skip the redelivery this path exists for and
-    # the task would be silently lost with the supervisor waiting forever.
+    # --- the verdict is bound to post-dispatch bytes, not to the frame -------
 
     @pytest.mark.parametrize(
         "gap, expected_status",
         [
-            (12, "processing"),  # spinner inside get_status's 25-line spinner tail
+            (12, "processing"),  # spinner inside get_status's 25-line tail
             (20, "processing"),  # ...at its far edge
-            (28, "completed"),  # spinner out of the tail: the bullet is an assistant marker
+            (28, "completed"),  # spinner out of the tail: the bullet is a marker
         ],
     )
-    @pytest.mark.asyncio
-    async def test_startup_residue_on_a_dropped_task_still_redelivers(self, gap, expected_status):
-        from cli_agent_orchestrator.providers.codex import CodexProvider, _has_startup_idle_composer
+    def test_startup_residue_on_a_dropped_task_still_redelivers(self, gap, expected_status):
+        """A task-less pane reads STARTED on the frame at every distance, yet
+        emitted nothing since the dispatch — so the task really was dropped."""
+        from cli_agent_orchestrator.providers.codex import _has_startup_idle_composer
 
         frame = self._residue_frame(gap, self._IDLE_COMPOSER)
-        # Precondition — this is exactly the frame the finding describes: the
-        # provider reports ready (initialize() would have returned) while the
-        # whole-frame status says started, and the message is nowhere.
+        # Precondition — the frame alone is genuinely misleading: the provider
+        # reports ready (initialize() would have returned) while the whole-frame
+        # status says started, and the message is nowhere.
         assert _has_startup_idle_composer(frame) is True
-        assert CodexProvider("t1", "s1", "w0").get_status(frame).value == expected_status
-        assert self._MESSAGE[:12] not in frame
+        assert self._provider().get_status(frame).value == expected_status
+        assert "sup-123" not in frame
 
-        ok, key, send = await self._run_confirm(frame, self._MESSAGE)
+        started, enter, full_resend = self._redeliver(frame, self._MESSAGE, "")
 
-        # Not started: the paste was dropped, so every attempt re-delivers the
-        # full message and the caller gets to classify the outcome.
-        assert ok is False
-        assert send.call_count == ts._DEFERRED_SUBMIT_MAX_RESUBMITS
-        key.assert_not_called()
+        assert started is False
+        assert full_resend is True
+        assert enter is False
 
-    @pytest.mark.asyncio
-    async def test_startup_residue_with_unsubmitted_text_sends_enter(self):
-        # Paste landed, Enter was swallowed: the message sits in the composer
-        # under the residue. The bare-Enter recovery must still fire.
-        composer = "\n› " + self._MESSAGE + "\n\n  gpt-5.6-sol medium · Context 100% left\n"
-        frame = self._residue_frame(18, composer)
-
-        ok, key, send = await self._run_confirm(frame, self._MESSAGE)
-
-        assert ok is False
-        assert key.call_count == ts._DEFERRED_SUBMIT_MAX_RESUBMITS
-        send.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_startup_residue_above_an_accepted_task_is_started(self):
-        # Residue AND a real accepted turn: the echo of our message with the
-        # turn's activity below it is the causal evidence; residue above it
-        # neither adds nor subtracts.
-        frame = self._residue_frame(18, self._WORKING_FRAME)
-
-        ok, key, send = await self._run_confirm(frame, self._MESSAGE)
-
-        assert ok is True
-        send.assert_not_called()
-        key.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_accepted_turn_on_an_approval_prompt_is_started(self):
-        # WAITING_USER_ANSWER after our turn (codex 0.147 approval menu, as in
-        # test/providers/fixtures/codex_approval_modal_raw.txt): the activity
-        # bullet below the echo binds it; the probe must not blind-Enter into
-        # the menu (that would select "Yes, proceed").
+    def test_stale_activity_of_a_previous_turn_does_not_confirm_a_new_message(self):
+        """A completed EARLIER handoff, still on screen, must not vouch for a
+        message that was never delivered. Its bullet predates the dispatch, so
+        it contributes no post-dispatch bytes."""
         frame = (
-            "› " + self._MESSAGE + "\n"
-            "• Running mkdir -p /tmp/work/subdir\n"
-            "  Would you like to run the following command?\n"
-            "  $ mkdir -p /tmp/work/subdir\n"
-            "› 1. Yes, proceed (y)\n"
-            "  2. Yes, and don't ask again for commands that start with `mkdir` (p)\n"
-            "  3. No, and tell Codex what to do differently (esc)\n"
-            "  Press enter to confirm or esc to cancel\n"
+            "› [CAO Handoff] Supervisor terminal ID: OLD-999. Do the old task.\n"
+            "• Finished the old task\n"
+            "\n› Write tests for @filename\n\n" + self._FOOTER
         )
-        ok, key, send = await self._run_confirm(frame, self._MESSAGE)
+        assert self._provider().get_status(frame).value == "completed"
 
-        assert ok is True
-        send.assert_not_called()
-        key.assert_not_called()
+        provider = self._provider()
+        assert provider.direct_probe_confirms_dispatch("") is False
+        assert ts._worker_is_started_direct("t1", provider, "") is False
 
-    def test_bullets_inside_the_pasted_message_do_not_self_attribute(self):
-        from cli_agent_orchestrator.providers.codex import CodexProvider
-
-        # An unsubmitted multi-line paste whose own lines are bullets: the
-        # bullets below the echo line belong to the message, not to a reply.
-        message = "Review these findings for me:\n• first finding\n• second finding"
-        frame = self._residue_frame(
-            18,
-            "\n› Review these findings for me:\n  • first finding\n  • second finding\n"
-            "\n  gpt-5.6-sol medium · Context 100% left\n",
+    def test_accepted_turn_is_confirmed_even_after_its_echo_scrolls_away(self):
+        """An accepted turn can out-scroll its own echo while a spinner remains.
+        The frame no longer contains the message, but the live spinner is
+        post-dispatch output, so the turn is confirmed and NOT re-sent."""
+        frame = (
+            "\n".join(f"  output line {i}" for i in range(190))
+            + "\n"
+            + self._SPINNER
+            + self._FOOTER
         )
-        provider = CodexProvider("t1", "s1", "w0")
-        assert provider.direct_probe_confirms_submission(frame, message) is False
-        # ...while a reply bullet under the same paste does bind it.
-        assert (
-            provider.direct_probe_confirms_submission(
-                frame.replace(
-                    "  • second finding\n", "  • second finding\n• Reviewing the findings\n"
-                ),
-                message,
-            )
-            is True
-        )
+        assert self._provider().get_status(frame).value == "processing"
+        assert "sup-123" not in frame
 
-    def test_short_message_cannot_bind(self):
-        from cli_agent_orchestrator.providers.codex import CodexProvider
+        started, enter, full_resend = self._redeliver(frame, self._MESSAGE, self._SPINNER * 4)
 
-        # Below the 8-character floor the collapse cannot match reliably; the
-        # hook must refuse rather than guess (same floor as the box check).
-        assert (
-            CodexProvider("t1", "s1", "w0").direct_probe_confirms_submission(
-                "› hi\n• Working (3s • esc to interrupt)\n", "hi"
-            )
-            is False
-        )
+        assert started is True
+        assert full_resend is False, "re-pasting here would run the task twice"
+        assert enter is False
+
+    def test_reply_wording_that_echoes_the_prompt_still_confirms(self):
+        """A valid fast reply whose words appear in the prompt must not be
+        discarded — the verdict never inspects the message text."""
+        message = "Reply with Done"
+        frame = "› Reply with Done\n• Done\n\n› Write tests for @filename\n\n" + self._FOOTER
+        assert self._provider().get_status(frame).value == "completed"
+
+        started, enter, full_resend = self._redeliver(frame, message, self._SPINNER + "• Done\n")
+
+        assert started is True
+        assert enter is False and full_resend is False
+
+    def test_pasted_bullets_cannot_confirm_their_own_delivery(self):
+        """The composer echoes a paste as it renders, so a multi-line message
+        carrying its own bullet emits one without any turn starting. Only the
+        spinner's ``(<n>s • esc to interrupt)`` shape counts as evidence."""
+        provider = self._provider()
+        echoed_paste = "› Review these findings:\n  • first finding\n  • second finding\n"
+
+        assert provider.direct_probe_confirms_dispatch(echoed_paste) is False
+        assert provider.direct_probe_confirms_dispatch(echoed_paste + self._SPINNER) is True
+
+    def test_unicode_and_empty_post_dispatch_output_are_unproven(self):
+        provider = self._provider()
+        assert provider.direct_probe_confirms_dispatch("") is False
+        assert provider.direct_probe_confirms_dispatch("› Review this:\n  • 日本語\n") is False
+
+    def test_spinner_is_recognized_through_terminal_escapes(self):
+        """The buffer holds the RAW byte stream, so the evidence must survive
+        the SGR/cursor sequences a repainting TUI interleaves."""
+        provider = self._provider()
+        raw = "\x1b[2K\x1b[1;32m• Working (12s • esc to interrupt)\x1b[0m\r\n"
+        assert provider.direct_probe_confirms_dispatch(raw) is True
+
+    def test_unproven_delivery_with_post_dispatch_output_withholds_the_resend(self):
+        """Absence of proof is not proof of a dropped paste: when the terminal
+        emitted output after the dispatch and our text is not on screen, the
+        full re-send (the only branch that can duplicate work) is withheld."""
+        frame = "\n".join(f"  output line {i}" for i in range(190)) + "\n" + self._FOOTER
+
+        started, enter, full_resend = self._redeliver(frame, self._MESSAGE, "  a line of output\n")
+
+        assert started is False
+        assert full_resend is False
+        assert enter is False
+
+    def test_probe_declines_when_the_backend_feeds_no_buffer(self):
+        """Event-inbox backends (herdr) never push a byte buffer. The probe then
+        vouches for nothing and the caller keeps its pre-existing behavior."""
+        provider = self._provider()
+        assert ts._worker_is_started_direct("t1", provider, "") is False
