@@ -88,6 +88,11 @@ def _fake_pod(name, labels):
         status=k8s.V1PodStatus(
             phase=STATE["new_pods_phase"],
             conditions=conditions,
+            # The operator plane dials this rather than the worker's Service name,
+            # so a pod without one is a 502 waiting to happen. Loopback, because
+            # section 10 points _WORKER_API_PORT at a stub server on 127.0.0.1 and
+            # then lets the real _worker_api_target build the URL.
+            pod_ip="127.0.0.1",
         ),
     )
 
@@ -716,7 +721,12 @@ with TestClient(broker.app) as c:
 
     _node = HTTPServer(("127.0.0.1", 0), _NodeHandler)
     threading.Thread(target=_node.serve_forever, daemon=True).start()
-    broker._worker_api_base = lambda worker_id: f"http://127.0.0.1:{_node.server_address[1]}"
+    # Only the port is stubbed. _worker_api_target itself runs for real, so the
+    # fake pod's IP is what gets dialled and the Service name it puts in the Host
+    # header is checked below on what the stub received - the two halves of the
+    # arrangement that makes a podSelector NetworkPolicy rule cover this hop.
+    _saved_port = broker._WORKER_API_PORT
+    broker._WORKER_API_PORT = _node.server_address[1]
 
     # The reaper's 3s completion deadline would settle this worker mid-section and
     # every proxied call would then correctly 409. Lift it for this section only.
@@ -730,6 +740,13 @@ with TestClient(broker.app) as c:
         check("allowlisted GET reaches the worker", r.status_code == 200, r.text[:200])
         check("proxied path arrives unchanged at the worker",
               NODE_CALLS[-1]["path"] == "/sessions", NODE_CALLS[-1]["path"])
+        # The request went to the pod's IP - the Service name does not resolve
+        # here, and on EKS it is not covered by the broker's egress rule - but the
+        # worker only trusts Host names it was given in CAO_ALLOWED_HOSTS.
+        check("the Host header carries the Service name, not the pod IP",
+              NODE_CALLS[-1]["headers"].get("host")
+              == f"cao-worker-{pid}.cao-cluster.svc.cluster.local",
+              str(NODE_CALLS[-1]["headers"].get("host")))
         # The one header that must not travel. It is the broker's credential for
         # the broker's own API, and a worker is the pod running an agent.
         check("broker token is not forwarded to the worker",
@@ -803,8 +820,20 @@ with TestClient(broker.app) as c:
         r = c.get(f"/workers/{pid}/api/sessions", headers=H)
         check("a worker with no lease row is still reachable",
               r.status_code == 200, r.text[:200])
+
+        # A pod that has not been assigned an IP cannot be dialled at all. Saying
+        # so beats a five-second connect timeout to nowhere.
+        _ip = STATE["pods"][pid].status.pod_ip
+        STATE["pods"][pid].status.pod_ip = None
+        try:
+            r = c.get(f"/workers/{pid}/api/sessions", headers=H)
+            check("a worker with no pod IP is refused, not dialled",
+                  r.status_code == 503 and "pod IP" in r.text, r.text[:200])
+        finally:
+            STATE["pods"][pid].status.pod_ip = _ip
     finally:
         broker.COMPLETION_TIMEOUT = _saved_completion
+        broker._WORKER_API_PORT = _saved_port
         _node.shutdown()
 
     # --- 10d. the allowlist itself, without a transport ---------------------
