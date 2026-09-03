@@ -6418,10 +6418,19 @@ async def replay_workflow_step_endpoint(
     the prompt TEMPLATE while keeping that resolution.
 
     Error taxonomy mirrors the resume route: unknown run or unknown step -> 404, an
-    undeserializable spec snapshot -> 422, a script-tier run or a prompt that cannot
-    be resolved from the recorded predecessors -> 400. A step that FAILS is a 200
-    whose body carries ``error`` / ``error_kind`` (a failed step is data, not a
-    transport fault).
+    undeserializable spec snapshot -> 422, a script-tier run, an empty
+    ``prompt_override``, or a prompt that cannot be resolved from the recorded
+    predecessors -> 400. A step that FAILS is a 200 whose body carries ``error`` /
+    ``error_kind`` (a failed step is data, not a transport fault).
+
+    **The immutability guarantee has an audit consequence, accepted deliberately.**
+    Writing no journal row and emitting no event is what makes replay safe on a
+    recorded run — and it also means a replay execution is INVISIBLE to anything
+    treating the journal or event stream as the execution audit log, and is not
+    gated by plan approval (which gates run *starts*). That is consistent with CAO's
+    local single-operator model; the service logs each replay at INFO, which is the
+    trail. A deployment that needs replays audited should read those logs, not the
+    journal.
     """
     from cli_agent_orchestrator.services import workflow_service
 

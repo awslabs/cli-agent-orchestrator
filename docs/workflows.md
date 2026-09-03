@@ -313,8 +313,9 @@ a sentinel where a human decision was required. Re-raise when `.status == 409`.
 
 ## Re-running one step
 
-`cao workflow step <run-id> <step-id>` re-executes **one** step of a run that already
-finished (or failed), without re-running the workflow. Authoring a long workflow used to
+`cao workflow step <run-id> <step-id>` re-executes **one** step of a recorded run — usually
+one that already finished (or failed) — without re-running the workflow. Authoring a long
+workflow used to
 mean a full re-run per prompt edit — fixing two sentences in step 55 of 57 cost reaching
 step 55 again. This verb closes that loop:
 
@@ -338,10 +339,21 @@ the recorded step's own output stays readable. Replay as many times as it takes.
 resolved prompt is printed alongside the output, because a wrong-looking output is usually
 a prompt that resolved differently than expected.
 
+A **still-running** run is fair game too, deliberately: the same immutability is what makes
+it safe, so you can iterate on step 12's prompt while the run is still grinding through
+step 30. Concurrent replays — of the same step, even — are independent; each one gets its
+own private slot for structured output.
+
 Limits: YAML-tier runs only (a script-tier step's inputs come from the script, not from a
 spec snapshot), and a step whose predecessor never produced output cannot be replayed —
-that fails with the missing reference named rather than running with a blank. Exit code is
-0 when the step ran, 1 when it failed.
+that fails with the missing reference named rather than running with a blank. An empty
+`--prompt-override` (or an empty `--prompt-file`) is rejected rather than run: omit the flag
+to reuse the recorded prompt. A replay is not cancellable — one watched step runs to the
+step timeout. Exit code is 0 when the step ran, 1 when it failed.
+
+Replays are deliberately absent from the journal and the event stream, which is what keeps
+them non-destructive — so they are also invisible to anything reading those as an execution
+audit log. Each one is logged at INFO by the server; that is the trail.
 
 ## CLI reference
 

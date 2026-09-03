@@ -807,7 +807,6 @@ def _replay_body(**overrides):
     body = {
         "run_id": "run1",
         "step_id": "s2",
-        "replay_run_id": "run1-replay",
         "provider": "claude_code",
         "agent": "reviewer",
         "prompt": "write about 42 for cats",
@@ -891,6 +890,43 @@ def test_step_missing_prompt_file_is_a_clear_error(runner, tmp_path):
     assert result.exit_code != 0
     assert "could not read --prompt-file" in result.output
     assert mock_req.post.called is False
+
+
+def test_step_empty_prompt_override_is_rejected_before_any_request(runner):
+    """An empty override is not ``None``: without this it POSTed a blank prompt."""
+    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+        result = runner.invoke(workflow, ["step", "run1", "s2", "--prompt-override", ""])
+    assert result.exit_code != 0
+    assert "--prompt-override is empty" in result.output
+    assert mock_req.post.called is False
+
+
+def test_step_whitespace_only_prompt_file_is_rejected_and_names_the_file(runner, tmp_path):
+    """The common shape of the mistake: a "prompt file" holding only a newline."""
+    prompt_path = tmp_path / "blank.md"
+    prompt_path.write_text("\n  \n", encoding="utf-8")
+    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+        result = runner.invoke(workflow, ["step", "run1", "s2", "--prompt-file", str(prompt_path)])
+    assert result.exit_code != 0
+    assert "is empty" in result.output
+    assert str(prompt_path) in result.output  # names the file, not just the flag
+    assert mock_req.post.called is False
+
+
+def test_step_renders_a_run_with_no_structured_output(runner):
+    """A step that emitted nothing structured still succeeds — output is just absent.
+
+    Distinct from the failure path below: no ``error``, so exit 0, and the render says
+    so explicitly rather than printing an empty ``Output:`` heading.
+    """
+    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+        mock_req.post.return_value = _resp(
+            200, _replay_body(output=None, validated=None, last_message="all done")
+        )
+        result = runner.invoke(workflow, ["step", "run1", "s2"])
+    assert result.exit_code == 0
+    assert "(no structured output)" in result.output
+    assert "all done" in result.output
 
 
 def test_step_unknown_run_surfaces_the_server_detail(runner):

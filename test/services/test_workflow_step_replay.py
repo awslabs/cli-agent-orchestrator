@@ -5,13 +5,17 @@ Covers ``workflow_service.replay_single_step``:
 - happy path: the step's prompt resolves from the journaled inputs + the recorded
   predecessor's output, and the step runs once
 - the replayed step's structured output is read back from the DERIVED key, whose
-  57-char truncation exactly fills the 64-char name cap
-- each replay is INDEPENDENT: a later replay that emits nothing reports ``None``
-  rather than the previous replay's leftover store entry
+  40-char prefix + ``-replay-`` + 16-hex nonce exactly fills the 64-char name cap
+- each replay is INDEPENDENT, in all three senses the derived key has to deliver:
+  sequentially (a later replay emitting nothing reports ``None``), CONCURRENTLY
+  (two replays of the same step never read each other's output), and against a
+  REAL run whose id happens to be ``<source>-replay``
+- the derived slot is RELEASED after the read-back, so a replay leaves the store
+  no larger than it found it
 - the SOURCE run is untouched: its journal rows and its own store entry are
   byte-identical after a replay
 - ``prompt_override`` replaces the TEMPLATE, and ``{{...}}`` inside the override
-  still resolves against the recorded run
+  still resolves against the recorded run; an empty override is rejected
 - error taxonomy: unknown run / unknown step (KeyError), script tier + unresolvable
   predecessor (ValueError), corrupt snapshot (ResumeCorruptError)
 - a step that fails is reported in the payload, never raised
@@ -24,7 +28,9 @@ engine), so each test states exactly the recorded state it replays against.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, Optional
 from unittest.mock import AsyncMock
@@ -51,7 +57,14 @@ from cli_agent_orchestrator.services.step_output_store import record_step_output
 
 _SCHEMA = {"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]}
 _RUN_ID = "runReplay"
-_REPLAY_KEY = f"{_RUN_ID}-replay"
+# The derived store key carries a per-call nonce, so no test may hard-code it: each
+# one reads the key the service actually handed the step out of the mock's kwargs.
+_DERIVED_KEY_RE = re.compile(rf"^{_RUN_ID}-replay-[0-9a-f]{{16}}$")
+
+
+def _derived_key(step_mock: AsyncMock) -> str:
+    """The ``CAO_WORKFLOW_RUN_ID`` the service handed the (mocked) step."""
+    return step_mock.await_args.kwargs["env_vars"]["CAO_WORKFLOW_RUN_ID"]
 
 
 @pytest.fixture(autouse=True)
@@ -143,15 +156,18 @@ def _seed_run(
         )
 
 
-def _emitting_step(output: Dict[str, Any], *, run_key: str = _REPLAY_KEY, step_id: str = "s2"):
+def _emitting_step(output: Dict[str, Any], *, step_id: str = "s2"):
     """An AsyncMock side effect standing in for a worker that calls ``workflow_return``.
 
     The real worker POSTs its structured return, which lands in ``step_output_store``
-    under the ``CAO_WORKFLOW_RUN_ID`` it was handed — so the fake writes the same
-    store slot the replay reads back.
+    under the ``CAO_WORKFLOW_RUN_ID`` it was HANDED — so the fake reads that key out
+    of its own kwargs rather than being told it. That is not just convenience now that
+    the key carries a nonce: a fake writing a key the service did not choose would
+    pass even if the service read back a different slot than it handed out.
     """
 
-    async def _side_effect(*_args, **_kwargs):
+    async def _side_effect(*_args, **kwargs):
+        run_key = kwargs["env_vars"]["CAO_WORKFLOW_RUN_ID"]
         ws.step_output_store.put(
             run_key,
             step_id,
@@ -202,10 +218,13 @@ async def test_replay_resolves_prompt_from_journaled_predecessor(monkeypatch):
     assert kwargs["prompt"] == "write about 42 for cats"
     assert kwargs["agent"] == "reviewer"
     # The step is handed the DERIVED run key, never the source run's id.
-    assert kwargs["env_vars"] == {
-        "CAO_WORKFLOW_RUN_ID": _REPLAY_KEY,
-        "CAO_WORKFLOW_STEP_ID": "s2",
-    }
+    assert set(kwargs["env_vars"]) == {"CAO_WORKFLOW_RUN_ID", "CAO_WORKFLOW_STEP_ID"}
+    assert kwargs["env_vars"]["CAO_WORKFLOW_STEP_ID"] == "s2"
+    derived = kwargs["env_vars"]["CAO_WORKFLOW_RUN_ID"]
+    assert derived != _RUN_ID
+    assert _DERIVED_KEY_RE.match(derived), derived
+    # The internal key is NOT leaked to the caller: it names nothing they can act on.
+    assert "replay_run_id" not in payload
 
 
 @pytest.mark.asyncio
@@ -237,40 +256,146 @@ async def test_replay_with_no_emitted_output_reports_none(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_a_replay_never_reports_the_previous_replays_output(monkeypatch):
-    """Every replay is independent of the ones before it: the slot is cleared first.
+    """Every replay is independent of the ones before it.
 
-    The derived key is the same for every replay of this step and the store lives for
-    the whole process, so an author who edits the prompt to STOP emitting structured
-    output must see ``None`` — not the earlier replay's leftover.
-
-    Deliberately no fixture help: the stale entry is written by the FIRST replay
-    inside this test, exactly as it happens in a live process where nothing cleans
-    the store between replays.
+    Two mechanisms make that true and this test would pass on either alone, which is
+    why the two below pin them separately: each call derives a FRESH nonced key, and
+    the slot is released after the read-back. An author who edits the prompt to STOP
+    emitting structured output must see ``None`` — never the earlier replay's
+    leftover.
     """
     _seed_run()
-    monkeypatch.setattr(
-        ws, "run_agent_step", AsyncMock(side_effect=_emitting_step({"answer": "first"}))
-    )
+    first_mock = AsyncMock(side_effect=_emitting_step({"answer": "first"}))
+    monkeypatch.setattr(ws, "run_agent_step", first_mock)
     first = await ws.replay_single_step(_RUN_ID, "s2")
     assert first["output"] == {"answer": "first"}
-    assert ws.step_output_store.get(_REPLAY_KEY, "s2") is not None  # the stale occupant
 
     # Same run, same step, prompt now edited to produce no structured return.
-    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(return_value=_ok()))
+    second_mock = AsyncMock(return_value=_ok())
+    monkeypatch.setattr(ws, "run_agent_step", second_mock)
     second = await ws.replay_single_step(_RUN_ID, "s2")
 
     assert second["output"] is None
     assert second["validated"] is None
+    # ...and the two replays did not even share a slot to go stale in.
+    assert _derived_key(first_mock) != _derived_key(second_mock)
+
+
+@pytest.mark.asyncio
+async def test_the_derived_slot_is_released_after_the_read_back(monkeypatch):
+    """A replay leaves the store exactly as large as it found it.
+
+    The nonced key is private to one call, so an entry left behind is unreachable
+    forever — it would just pin a slot and bring ``WORKFLOW_OUTPUT_STORE_MAX_ENTRIES``
+    eviction closer for the live runs sharing this process-wide store.
+    """
+    _seed_run()
+    step_mock = AsyncMock(side_effect=_emitting_step({"answer": "fresh"}))
+    monkeypatch.setattr(ws, "run_agent_step", step_mock)
+    before = len(ws.step_output_store)
+
+    payload = await ws.replay_single_step(_RUN_ID, "s2")
+
+    assert payload["output"] == {"answer": "fresh"}  # read back BEFORE the release
+    assert ws.step_output_store.get(_derived_key(step_mock), "s2") is None
+    assert len(ws.step_output_store) == before
+
+
+@pytest.mark.asyncio
+async def test_concurrent_replays_of_one_step_do_not_cross_read(monkeypatch):
+    """Two replays of the SAME (run_id, step_id) each report their OWN output.
+
+    The regression test for the review finding on PR #673. A fixed ``<prefix>-replay``
+    key put both calls in one store slot, so the interleaving forced below —
+    both steps in flight at once, then both emitting, then both reading — let the
+    last writer's output be reported to both callers. The nonce is what makes the
+    slots disjoint; ``asyncio.Event`` is what guarantees the overlap rather than
+    hoping for it.
+    """
+    _seed_run()
+    both_in_flight = asyncio.Event()
+    started = 0
+
+    async def _side_effect(*_args, **kwargs):
+        nonlocal started
+        run_key = kwargs["env_vars"]["CAO_WORKFLOW_RUN_ID"]
+        # The override IS the prompt here, so it doubles as the caller's identity.
+        mine = kwargs["prompt"]
+        started += 1
+        if started == 2:
+            both_in_flight.set()
+        await both_in_flight.wait()
+        ws.step_output_store.put(
+            run_key,
+            "s2",
+            StepOutputRecord(
+                run_id=run_key,
+                step_id="s2",
+                output={"answer": mine},
+                validated=True,
+                errors=[],
+                state=StepState.COMPLETED,
+            ),
+        )
+        return _ok()
+
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(side_effect=_side_effect))
+
+    first, second = await asyncio.gather(
+        ws.replay_single_step(_RUN_ID, "s2", prompt_override="A"),
+        ws.replay_single_step(_RUN_ID, "s2", prompt_override="B"),
+    )
+
+    # Each caller gets back what ITS OWN step emitted, not the other's.
+    assert first["prompt"] == "A" and first["output"] == {"answer": "A"}
+    assert second["prompt"] == "B" and second["output"] == {"answer": "B"}
+    # Both slots released, so nothing lingers from either.
+    assert len(ws.step_output_store) == 0
+
+
+@pytest.mark.asyncio
+async def test_replay_does_not_touch_a_real_run_named_like_the_derived_key(monkeypatch):
+    """A REAL run whose id is ``<source>-replay`` keeps its own store entry.
+
+    The second half of the review finding: ``<prefix>-replay`` is itself a valid run
+    id, so with a fixed derived key, replaying a step of ``foo`` deleted and then
+    clobbered run ``foo-replay``'s in-memory output — a live run's data destroyed by
+    an operation documented as never destructive to any run.
+    """
+    _seed_run()
+    sibling = f"{_RUN_ID}-replay"
+    ws.step_output_store.put(
+        sibling,
+        "s2",
+        StepOutputRecord(
+            run_id=sibling,
+            step_id="s2",
+            output={"answer": "the sibling run's own output"},
+            validated=True,
+            errors=[],
+            state=StepState.COMPLETED,
+        ),
+    )
+    monkeypatch.setattr(
+        ws, "run_agent_step", AsyncMock(side_effect=_emitting_step({"answer": "fresh"}))
+    )
+
+    payload = await ws.replay_single_step(_RUN_ID, "s2")
+
+    assert payload["output"] == {"answer": "fresh"}
+    survivor = ws.step_output_store.get(sibling, "s2")
+    assert survivor is not None, "the sibling run's store entry was deleted"
+    assert survivor.output == {"answer": "the sibling run's own output"}
 
 
 @pytest.mark.asyncio
 async def test_derived_replay_key_fills_the_64_char_name_cap(monkeypatch):
-    """A max-length run_id truncates to 57 chars so key + '-replay' is exactly 64.
+    """A max-length run_id truncates to 40 chars: 40 + '-replay-' (8) + 16 = 64.
 
-    57 is the largest prefix that fits WORKFLOW_NAME_RE's 64-char cap (64 - 7), and
-    ``record_step_output`` re-validates the key when the worker emits — so a longer
-    prefix would 400 the worker's return and a shorter one narrows the anti-collision
-    prefix for nothing.
+    64 is WORKFLOW_NAME_RE's cap, and ``record_step_output`` re-validates the key when
+    the worker emits — so an over-long key would 400 the worker's own return. The
+    budget is spent on the nonce first (it carries the isolation) and on the run_id
+    prefix second (it only makes the key legible in a log line).
     """
     long_run_id = "r" * 64
     _seed_run(long_run_id)
@@ -279,9 +404,9 @@ async def test_derived_replay_key_fills_the_64_char_name_cap(monkeypatch):
 
     await ws.replay_single_step(long_run_id, "s2")
 
-    derived = step_mock.await_args.kwargs["env_vars"]["CAO_WORKFLOW_RUN_ID"]
-    assert derived == "r" * 57 + "-replay"
+    derived = _derived_key(step_mock)
     assert len(derived) == 64
+    assert re.fullmatch(r"r{40}-replay-[0-9a-f]{16}", derived), derived
     # The boundary the worker's ``workflow_return`` crosses accepts it.
     assert record_step_output(derived, "s2", {"answer": "ok"}).run_id == derived
 
@@ -367,6 +492,26 @@ async def test_prompt_override_with_a_bad_reference_is_rejected_before_running(m
 
     with pytest.raises(ValueError, match="nope"):
         await ws.replay_single_step(_RUN_ID, "s2", prompt_override="{{steps.nope.output.x}}")
+    assert step_mock.await_count == 0
+
+
+@pytest.mark.parametrize("blank", ["", " ", "\n", "  \t\n "])
+@pytest.mark.asyncio
+async def test_an_empty_prompt_override_is_rejected_before_running(blank, monkeypatch):
+    """A blank override is a mistake, not a request to run the step with no prompt.
+
+    ``None`` already means "use the recorded template", so an override that is present
+    but empty cannot be expressing anything else — and an empty string is not ``None``,
+    which is exactly how it used to reach the agent as a blank prompt. Whitespace-only
+    is the same mistake with an invisible character in it (an empty ``--prompt-file``
+    is usually a trailing newline).
+    """
+    _seed_run()
+    step_mock = AsyncMock(return_value=_ok())
+    monkeypatch.setattr(ws, "run_agent_step", step_mock)
+
+    with pytest.raises(ValueError, match="empty"):
+        await ws.replay_single_step(_RUN_ID, "s2", prompt_override=blank)
     assert step_mock.await_count == 0
 
 

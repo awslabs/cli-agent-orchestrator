@@ -876,6 +876,16 @@ def step_cmd(run_id, step_id, prompt_file, prompt_override, as_json):
             prompt_override = Path(prompt_file).read_text(encoding="utf-8")
         except OSError as e:
             raise click.ClickException(f"could not read --prompt-file '{prompt_file}': {e}")
+    # Caught here as well as server-side so an empty file costs no round trip and the
+    # message can name the flag the operator actually typed.
+    if prompt_override is not None and not prompt_override.strip():
+        source = (
+            f"--prompt-file '{prompt_file}'" if prompt_file is not None else "--prompt-override"
+        )
+        raise click.ClickException(
+            f"{source} is empty; omit it to re-run the step's recorded prompt "
+            f"(a blank prompt would run the step with no instructions)"
+        )
 
     payload = {}
     if prompt_override is not None:

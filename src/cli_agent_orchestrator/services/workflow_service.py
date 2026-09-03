@@ -27,6 +27,7 @@ import asyncio
 import json
 import logging
 import re
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Protocol, Set, Union
@@ -1628,24 +1629,51 @@ async def replay_single_step(
 
     READ-ONLY with respect to ``run_id``: no ``_journal_*`` write-through runs, no
     event is emitted, no ``run_registry`` entry is created or mutated, and the
-    replayed step emits its structured output under a DERIVED key so the recorded
-    step's own store entry survives. Replaying a step is therefore never
-    destructive to the run it was read from, and can be repeated freely.
+    replayed step emits its structured output under a per-call NONCED key so the
+    recorded step's own store entry survives. Replaying a step is therefore never
+    destructive to the run it was read from, and can be repeated freely — including
+    CONCURRENTLY, since no two calls share a store key.
 
     ``prompt_override`` replaces the step's prompt TEMPLATE, not the resolved
     prompt: ``{{workflow.inputs.<name>}}`` / ``{{steps.<id>.output.<field>}}``
     references inside the override still resolve against the recorded run — which
-    is exactly what makes an edited prompt runnable in place.
+    is exactly what makes an edited prompt runnable in place. An override that is
+    empty or whitespace-only is REJECTED rather than run: ``None`` means "use the
+    recorded template", so a blank string can only be a mistake, and running a step
+    against a blank prompt burns a step budget to learn nothing.
+
+    Deliberately NOT restricted to a finished run. A step of a still-RUNNING run is
+    replayable, and safe for the same reason a repeat replay is: the source run's
+    journal, registry entry, and store slots are untouched, and the nonced key
+    cannot collide with the live drive's. Whether the step's predecessors have
+    actually produced output is answered by prompt resolution (-> 400 naming the
+    missing reference), which is a better answer than a blanket state guard —
+    iterating on step 12's prompt while the run is still grinding through step 30
+    is the authoring loop this exists for.
+
+    Also deliberately NOT cancellable: unlike the drive loop this passes no
+    ``cancel_event``, so a hung replay runs to the ``WORKFLOW_STEP_TIMEOUT``
+    ceiling. One watched step needs no cooperative-cancel machinery, and
+    ``cao workflow cancel`` targets a run this call never creates.
 
     Raises ``KeyError`` (-> 404) for an unknown run or an unknown step,
     :class:`ResumeCorruptError` (-> 422) when the run has no deserializable spec
-    snapshot, ``ValueError`` (-> 400) for a script-tier run or a prompt that cannot
-    be resolved from the recorded predecessors. A step that FAILS is reported in the
-    returned payload (``error`` / ``error_kind``), never raised — the same posture
-    as the drive loop, where a step failure is data rather than an exception.
+    snapshot, ``ValueError`` (-> 400) for a script-tier run, an empty override, or a
+    prompt that cannot be resolved from the recorded predecessors. A step that FAILS
+    is reported in the returned payload (``error`` / ``error_kind``), never raised —
+    the same posture as the drive loop, where a step failure is data rather than an
+    exception.
     """
     _validate_key_part(run_id, "run_id")
     _validate_key_part(step_id, "step_id")
+
+    # ``None`` is the "use the recorded template" signal, so an override that is
+    # present but blank is a caller mistake, not a request for a blank prompt.
+    if prompt_override is not None and not prompt_override.strip():
+        raise ValueError(
+            "prompt_override is empty; omit it to re-run the step's recorded prompt "
+            "(a blank prompt would run the step with no instructions)"
+        )
 
     row = workflow_journal.get_run(run_id)
     if row is None:
@@ -1683,15 +1711,19 @@ async def replay_single_step(
     # A replayed step still needs ``CAO_WORKFLOW_RUN_ID`` so its ``workflow_return``
     # has somewhere to land — but NOT the source run's key, which would overwrite
     # the recorded step's entry in the in-memory ``step_output_store``. Derive a
-    # never-journaled key: 57 chars + "-replay" (7) is exactly WORKFLOW_NAME_RE's
-    # 64-char cap, which ``record_step_output`` re-validates when the worker emits.
-    # Server-allocated ids are ``run-<16 hex>`` (20 chars) and never truncate; only
-    # a caller-supplied ``run_id`` over 57 chars can alias with a sibling sharing its
-    # first 57 chars. The slot is cleared before the step runs (below), so SEQUENTIAL
-    # replays — of this run or an aliasing sibling — are independent.
-    # ponytail: two CONCURRENT replays of 57-char-prefix siblings could still cross-read
-    # this slot; hash the run_id into the key if that ever bites.
-    replay_run_id = f"{run_id[:57]}-replay"
+    # PER-CALL key: 40 chars of run_id + "-replay-" (8) + a 16-hex nonce is exactly
+    # WORKFLOW_NAME_RE's 64-char cap, which ``record_step_output`` re-validates when
+    # the worker emits. The nonce is what makes the key private to this call, and it
+    # closes three holes a fixed ``<prefix>-replay`` key left open (found in review):
+    #   - a REAL run named ``<prefix>-replay`` no longer shares the keyspace, so
+    #     replaying ``foo`` cannot wipe or clobber run ``foo-replay``'s store entry;
+    #   - two CONCURRENT replays of the same (run_id, step_id) no longer share a key,
+    #     so neither can read the other's output as its own;
+    #   - truncation aliasing between run_ids sharing a long prefix is likewise moot.
+    # The run_id prefix is kept only so the key is legible in a log line; the nonce
+    # is what carries the isolation. Nothing reads this key back except the block
+    # below, which deletes it when done.
+    replay_run_id = f"{run_id[:40]}-replay-{uuid.uuid4().hex[:16]}"
 
     logger.info(
         "replay_single_step: re-running step '%s' of run '%s' (override=%s)",
@@ -1699,10 +1731,12 @@ async def replay_single_step(
         run_id,
         prompt_override is not None,
     )
+    # ``replay_run_id`` is deliberately NOT in the payload: it is an internal store
+    # key, now per-call, so it names nothing a caller can look up or act on. It stays
+    # in the log line above, which is where a maintainer tracing an emit wants it.
     payload: Dict[str, Any] = {
         "run_id": run_id,
         "step_id": step_id,
-        "replay_run_id": replay_run_id,
         "provider": step.provider,
         "agent": step.agent,
         "prompt": prompt,
@@ -1713,39 +1747,43 @@ async def replay_single_step(
         "error": None,
         "error_kind": None,
     }
-    # The derived key is REUSED by every replay of this step, and the store lives for
-    # the whole process. Clear the slot before running, or a replay that emits nothing
-    # reads the PREVIOUS replay's output and reports it as its own — each replay must
-    # be independent of the ones before it.
-    step_output_store.delete(replay_run_id, step_id)
     try:
-        result = await run_agent_step(
-            provider=step.provider,
-            agent=step.agent,
-            prompt=prompt,
-            teardown=True,
-            timeout=WORKFLOW_STEP_TIMEOUT,
-            engine=step.engine,
-            env_vars={
-                "CAO_WORKFLOW_RUN_ID": replay_run_id,
-                "CAO_WORKFLOW_STEP_ID": step_id,
-            },
-        )
-    except StepExecutionError as e:
-        # Recorded, not raised (the drive loop's posture). Deliberately NO retry and
-        # NO reprompt: a replay is one attempt an author is watching, so a failure
-        # must surface now rather than spend another step budget in silence.
-        payload["error"] = str(e)
-        payload["error_kind"] = e.kind
-        payload["terminal_id"] = e.terminal_id
-        return payload
-
-    payload["terminal_id"] = result.terminal_id
-    payload["last_message"] = result.last_message
-    emitted = step_output_store.get(replay_run_id, step_id)
-    if emitted is not None:
-        payload["output"] = emitted.output
-        payload["validated"] = emitted.validated
+        try:
+            result = await run_agent_step(
+                provider=step.provider,
+                agent=step.agent,
+                prompt=prompt,
+                teardown=True,
+                timeout=WORKFLOW_STEP_TIMEOUT,
+                engine=step.engine,
+                env_vars={
+                    "CAO_WORKFLOW_RUN_ID": replay_run_id,
+                    "CAO_WORKFLOW_STEP_ID": step_id,
+                },
+            )
+        except StepExecutionError as e:
+            # Recorded, not raised (the drive loop's posture). Deliberately NO retry
+            # and NO reprompt: a replay is one attempt an author is watching, so a
+            # failure must surface now rather than spend another step budget in
+            # silence.
+            payload["error"] = str(e)
+            payload["error_kind"] = e.kind
+            payload["terminal_id"] = e.terminal_id
+        else:
+            payload["terminal_id"] = result.terminal_id
+            payload["last_message"] = result.last_message
+            emitted = step_output_store.get(replay_run_id, step_id)
+            if emitted is not None:
+                payload["output"] = emitted.output
+                payload["validated"] = emitted.validated
+    finally:
+        # Hand the slot back once its value is in the payload. The nonced key is
+        # private to this call, so nothing else can ever read it again — leaving it
+        # would pin one entry per replay for the process lifetime and bring the
+        # WORKFLOW_OUTPUT_STORE_MAX_ENTRIES eviction line that much closer for the
+        # live runs sharing this store. In the failure arm too: a step can emit and
+        # then fail, and that entry is just as unreachable.
+        step_output_store.delete(replay_run_id, step_id)
     return payload
 
 

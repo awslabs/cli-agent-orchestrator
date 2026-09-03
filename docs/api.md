@@ -235,9 +235,11 @@ than calling these routes directly.
   predecessor outputs). Optional body `{prompt_override}` replaces the prompt *template*
   (its `{{...}}` references still resolve against the run). Write-scoped, because it runs
   an agent — but read-only with respect to the run: no journal row is written and no event
-  is emitted, so a step can be re-probed repeatedly. YAML tier only (script tier -> 400).
-  A step that FAILS is a `200` whose body carries `error`/`error_kind`; unknown run or
-  unknown step -> 404, unusable spec snapshot -> 422, unresolvable prompt -> 400.
+  is emitted, so a step can be re-probed repeatedly, concurrently, and on a run that is
+  still going. That also means replays are invisible to a journal-as-audit-log reader (they
+  are logged at INFO instead). YAML tier only (script tier -> 400). A step that FAILS is a
+  `200` whose body carries `error`/`error_kind`; unknown run or unknown step -> 404,
+  unusable spec snapshot -> 422, unresolvable or empty prompt -> 400.
 - `GET /workflows/runs/{run_id}/events` returns the run's ordered event timeline with
   any **declared** gaps. One content-negotiated path, two arms: send
   `Accept: text/event-stream` (or `?stream=true`) for a live SSE follow, otherwise a
