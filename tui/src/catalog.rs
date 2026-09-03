@@ -280,7 +280,7 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::WorkflowValidate,
 ];
 
-/// One variant per leaf command — **all 71**.
+/// One variant per leaf command — **all 77**, the same figure [`COMMAND_COUNT`] pins.
 ///
 /// Why an enum rather than a `String` key is the subject of this module's own docs: it is what
 /// makes an unclassified command a **compile error** instead of a runtime `None` (FR-4.2).
@@ -1428,7 +1428,7 @@ mod tests {
     ///
     /// Returns `(in_app, handoff, hidden)`. The counts are *derived*; every number they are
     /// compared against is a hard-coded literal in the test body. That direction matters — see
-    /// [`the_policy_distribution_is_twentytwo_sixteen_twentythree`].
+    /// [`the_policy_distribution_is_twentyfour_eighteen_thirtyfive`].
     fn distribution() -> (usize, usize, usize) {
         let mut counts = (0, 0, 0);
         for id in DISPLAY_ORDER {
@@ -1529,9 +1529,9 @@ mod tests {
     /// production. "The compiler has my back" is exactly where a contributor stops checking, so
     /// the uncovered case needs a test rather than a caveat in a doc comment.
     ///
-    /// Neither existing guard catches it. [`the_policy_distribution_is_twentytwo_sixteen_twentythree`]
+    /// Neither existing guard catches it. [`the_policy_distribution_is_twentyfour_eighteen_thirtyfive`]
     /// counts what `DISPLAY_ORDER` *contains*, so a variant missing from it is simply never
-    /// counted; and its `distinct.len() == 71` assertion detects a **duplicate**, which is the
+    /// counted; and its `distinct.len() == 77` assertion detects a **duplicate**, which is the
     /// opposite direction. [`COMMAND_COUNT`] pins the array's *length*, never its membership.
     ///
     /// # Why an exhaustive match and NOT a discriminant trick
@@ -1785,7 +1785,7 @@ mod tests {
     ///
     /// The length assertion is what stops this being vacuous in the other direction: a
     /// `commands()` that returned an empty `Vec` would satisfy "contains no `Hidden` entry"
-    /// perfectly. 38 is `33 + 5` written as a literal for the same reason as test 1. (#321)
+    /// perfectly. 42 is `24 + 18` written as a literal for the same reason as test 1. (#321)
     #[test]
     fn commands_excludes_every_hidden_entry() {
         let offered = commands();
@@ -1945,7 +1945,7 @@ mod tests {
     /// launching a second TUI from inside the first is either a no-op or a nested-terminal mess.
     ///
     /// This test is what guards the arithmetic correction described in test 1: if `cao tui` were
-    /// ever reclassified, or dropped from the table, the 33/5/23 distribution would stop
+    /// ever reclassified, or dropped from the table, the 24/18/35 distribution would stop
     /// describing reality and the reason would be this specific command. (#321)
     #[test]
     fn the_tui_command_does_not_offer_itself() {

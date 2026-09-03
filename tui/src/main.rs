@@ -13,7 +13,7 @@
 use std::io::{self, IsTerminal, Write};
 use std::sync::Arc;
 
-/// The static run-policy table (`command-catalog`): 61 leaf commands, each classified in-app,
+/// The static run-policy table (`command-catalog`): 77 leaf commands, each classified in-app,
 /// hand-off, or hidden. An unclassified command **fails to compile** — see the module docs.
 /// (#321)
 mod catalog;

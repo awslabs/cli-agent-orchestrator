@@ -2617,9 +2617,9 @@ mod tests {
 
     // ── The route table (BR-18, FR-3.1, OQ-6) ────────────────────────────────────────────
 
-    /// **21 routes for the 22 IN-APP commands, and `profile find` is the one without.**
+    /// **23 routes for the 24 IN-APP commands, and `profile find` is the one without.**
     ///
-    /// The distribution is settled ground truth — 22 IN-APP / 16 HANDOFF / 23 HIDE = 61 — and
+    /// The distribution is settled ground truth — 24 IN-APP / 18 HANDOFF / 35 HIDE = 77 — and
     /// every number below is a **hard-coded literal**. Deriving any of them from `route()` or
     /// from the catalog would compare production against itself, which is the vacuous shape this
     /// project has hit repeatedly.
