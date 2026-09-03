@@ -191,7 +191,7 @@ pub struct Route {
 /// silence `catalog.rs`'s own docs explain the enum exists to remove. [`TuiError::NoRoute`]
 /// stays a typed variant for the genuinely routeless (BR-18), not a fallback arm.
 ///
-/// # 21 routes for 22 IN-APP commands
+/// # 23 routes for 24 IN-APP commands
 ///
 /// `profile find` has **no** route and is served client-side by
 /// [`ServerClient::find_profiles`] (OQ-6 Q2). Every other IN-APP command maps to a route
@@ -484,7 +484,7 @@ fn route(id: CommandId) -> Option<Route> {
             }],
             &[],
         ),
-        // **`profile find` is the one IN-APP command with no route** — 21 routes for 22
+        // **`profile find` is the one IN-APP command with no route** — 23 routes for 24
         // commands. `search_profiles` is reachable only from the CLI (`profile.py:385`) and the
         // **stdio-only** MCP server (`mcp_server/server.py:2120`, `mcp.run()`), so it is not
         // HTTP-reachable at all. Served client-side by `find_profiles` over `GET
