@@ -66,6 +66,7 @@ def test_every_non_secret_finding_has_its_adr_severity():
         FindingCode.CAO_LINK_CONFLICT: "warn",
         FindingCode.EDGE_LIMIT_EXCEEDED: "warn",
         FindingCode.DEINDEXED_RETAINED: "warn",
+        FindingCode.NON_REGULAR_FILE_REFUSED: "warn",
     }
 
     assert dict(FINDING_SEVERITIES) == expected

@@ -80,12 +80,28 @@ class MemoryGraphProvider(GraphProvider):
         scope = str(filters.get("scope", "global"))
         raw_scope_id = filters.get("scope_id")
         scope_id: Optional[str] = None if raw_scope_id is None else str(raw_scope_id)
-
         lint_enabled = self._lint_enabled()
+        try:
+            resolved_binding = self._binding_resolver(scope, scope_id)
+        except VaultConfigUnavailableError as exc:
+            logger.warning("memory graph provider: vault binding unavailable: %s", exc)
+            return GraphView(
+                nodes=[],
+                edges=[],
+                meta={
+                    "provider": "memory",
+                    "scope": scope,
+                    "scope_id": scope_id,
+                    "boundary_cause": "vault_config_unavailable",
+                    "lint_enrichment": "unavailable_vault",
+                    "disabled_enrichments": _LINT_ENRICHMENTS,
+                },
+            )
+        scope_id = resolved_binding.scope_id
         key = ("memory", scope, scope_id, lint_enabled)
         view, cached, as_of = await _CACHE.get_or_build(
             key,
-            lambda: self._build(scope, scope_id, lint_enabled),
+            lambda: self._build(scope, scope_id, lint_enabled, resolved_binding),
         )
         # Re-wrap with fresh cache provenance without mutating the cached
         # instance's own meta (the same GraphView object is served to every hit).
@@ -95,7 +111,13 @@ class MemoryGraphProvider(GraphProvider):
             meta=make_meta(view.meta, cached=cached, as_of=as_of),
         )
 
-    async def _build(self, scope: str, scope_id: Optional[str], lint_enabled: bool) -> GraphView:
+    async def _build(
+        self,
+        scope: str,
+        scope_id: Optional[str],
+        lint_enabled: bool,
+        resolved_binding: ScopeBinding | None = None,
+    ) -> GraphView:
         """Project the scope's wiki into a GraphView (the uncached, ~148s path)."""
         meta: dict[str, Any] = {
             "provider": "memory",
@@ -110,9 +132,8 @@ class MemoryGraphProvider(GraphProvider):
                     "disabled_enrichments": _LINT_ENRICHMENTS,
                 }
             )
-        resolved_binding: ScopeBinding | None = None
         try:
-            resolved_binding = self._binding_resolver(scope, scope_id)
+            resolved_binding = resolved_binding or self._binding_resolver(scope, scope_id)
             vault_bound = isinstance(resolved_binding, VaultBinding)
         except VaultConfigUnavailableError as exc:
             logger.warning("memory graph provider: vault binding unavailable: %s", exc)

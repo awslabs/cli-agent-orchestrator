@@ -130,6 +130,32 @@ def test_real_sync_conflict_filename_patterns_are_skipped(tmp_path):
     assert all(note.findings[0].code == FindingCode.SYNC_ARTIFACT_SKIPPED for note in report.notes)
 
 
+def test_non_regular_markdown_entry_is_refused_before_open(tmp_path, monkeypatch):
+    root = tmp_path / "vault"
+    root.mkdir()
+    (root / "CAO").mkdir()
+    mapped = root / "Mapped"
+    mapped.mkdir()
+    fifo = mapped / "blocked.md"
+    try:
+        import os
+
+        os.mkfifo(fifo)
+    except (AttributeError, OSError) as exc:
+        pytest.skip(f"FIFO unavailable: {exc}")
+    from cli_agent_orchestrator.services.vault import scan
+
+    monkeypatch.setattr(
+        scan.os,
+        "open",
+        lambda *_args, **_kwargs: pytest.fail("non-regular entry reached open"),
+    )
+
+    report = scan_vault(_vault(root))
+
+    assert report.notes[0].findings[0].code == FindingCode.NON_REGULAR_FILE_REFUSED
+
+
 def test_per_note_and_total_byte_caps_refuse_before_open(tmp_path):
     root = tmp_path / "vault"
     root.mkdir()

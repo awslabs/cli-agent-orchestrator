@@ -24,6 +24,7 @@ from pydantic import (
     model_validator,
 )
 
+from cli_agent_orchestrator.clients.database import get_project_id_by_alias
 from cli_agent_orchestrator.constants import (
     CAO_HOME_DIR,
     MEMORY_BASE_DIR,
@@ -113,6 +114,20 @@ def _is_path_contained_by(candidate: str, base: str) -> bool:
 
 def _paths_overlap(left: str, right: str) -> bool:
     return _is_path_contained_by(left, right) or _is_path_contained_by(right, left)
+
+
+def canonical_scope_id(scope: str, scope_id: Optional[str]) -> Optional[str]:
+    """Return the durable identity used by every vault-facing scope boundary."""
+    if scope != "project" or scope_id is None:
+        return scope_id
+    return get_project_id_by_alias(scope_id) or scope_id
+
+
+def _mapping_identity(mapping: "FolderMapping") -> tuple[str, Optional[str]]:
+    scope_id = canonical_scope_id(mapping.scope, mapping.scope_id)
+    return mapping.scope, (
+        scope_id.casefold() if mapping.scope == "project" and scope_id else scope_id
+    )
 
 
 class FolderMapping(BaseModel):
@@ -251,7 +266,13 @@ class VaultSpec(BaseModel):
         if len(writable) != 1:
             raise ValueError("only the managed_folder mapping may be writable")
 
-        bindings = [(mapping.scope, mapping.scope_id) for mapping in self.mappings]
+        self.mappings = [
+            mapping.model_copy(
+                update={"scope_id": canonical_scope_id(mapping.scope, mapping.scope_id)}
+            )
+            for mapping in self.mappings
+        ]
+        bindings = [_mapping_identity(mapping) for mapping in self.mappings]
         if len(bindings) != len(set(bindings)):
             raise ValueError("mappings must not resolve to the same (scope, scope_id)")
         return self

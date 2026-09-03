@@ -47,6 +47,7 @@ class FindingCode(str, Enum):
     CAO_LINK_CONFLICT = "cao_link_conflict"
     EDGE_LIMIT_EXCEEDED = "edge_limit_exceeded"
     DEINDEXED_RETAINED = "deindexed_retained"
+    NON_REGULAR_FILE_REFUSED = "non_regular_file_refused"
 
 
 @dataclass(frozen=True)
@@ -94,6 +95,7 @@ FINDING_SEVERITIES: Mapping[FindingCode, Severity] = MappingProxyType(
         FindingCode.CAO_LINK_CONFLICT: "warn",
         FindingCode.EDGE_LIMIT_EXCEEDED: "warn",
         FindingCode.DEINDEXED_RETAINED: "warn",
+        FindingCode.NON_REGULAR_FILE_REFUSED: "warn",
     }
 )
 
@@ -216,6 +218,12 @@ SUPPORTED_BOUNDARY: tuple[BoundaryRule, ...] = (
     ),
     BoundaryRule(
         "NUL-containing note", "refused", "note quarantined", FindingCode.NOTE_CONTAINS_NUL
+    ),
+    BoundaryRule(
+        "non-regular Markdown entry",
+        "refused",
+        "never opened or indexed",
+        FindingCode.NON_REGULAR_FILE_REFUSED,
     ),
     BoundaryRule(
         "rename plus edit without cao.key",

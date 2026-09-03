@@ -368,6 +368,26 @@ def _discover_candidates(
                     metadata = os.lstat(path)
                 except OSError:
                     continue
+                if not stat.S_ISREG(metadata.st_mode):
+                    notes.append(
+                        ScanNote(
+                            relpath,
+                            mapping.scope,
+                            mapping.scope_id,
+                            "skipped",
+                            findings=(
+                                ScanFinding(
+                                    FindingCode.NON_REGULAR_FILE_REFUSED,
+                                    "non-regular Markdown entry",
+                                    finding_severity(
+                                        FindingCode.NON_REGULAR_FILE_REFUSED,
+                                        secret_gate="reject",
+                                    ),
+                                ),
+                            ),
+                        )
+                    )
+                    continue
                 if (
                     stat.S_ISREG(metadata.st_mode)
                     and metadata.st_nlink > 1

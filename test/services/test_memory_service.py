@@ -1270,6 +1270,49 @@ class TestVaultScopeAuthority:
     """Configured vault mappings replace native visibility for their identity."""
 
     @pytest.mark.asyncio
+    async def test_unscoped_recall_hides_native_replica_for_index_disabled_mapping(
+        self, tmp_path, monkeypatch
+    ):
+        from cli_agent_orchestrator.services import memory_service, settings_service
+
+        service = MemoryService(base_dir=tmp_path / "native")
+        monkeypatch.setattr(memory_service, "_is_memory_enabled", lambda: True)
+        monkeypatch.setattr(
+            settings_service, "get_vault_config", lambda: VaultConfig(enabled=False)
+        )
+        await service.store(
+            content="retained native global replica",
+            scope="global",
+            memory_type="reference",
+            key="native-replica",
+        )
+        assert {
+            memory.key for memory in await service.recall(search_mode="metadata", limit=10)
+        } == {"native-replica"}
+
+        vault_root = tmp_path / "vault"
+        vault_root.mkdir()
+        config = VaultConfig(
+            enabled=True,
+            vaults=[
+                VaultSpec(
+                    id="scope-test",
+                    root=str(vault_root),
+                    managed_folder="CAO",
+                    mappings=[
+                        FolderMapping(folder="Mapped", scope="global", index=False),
+                        FolderMapping(
+                            folder="CAO", scope="agent", scope_id="writer", writable=True
+                        ),
+                    ],
+                )
+            ],
+        )
+        monkeypatch.setattr(settings_service, "get_vault_config", lambda: config)
+
+        assert await service.recall(search_mode="metadata", limit=10) == []
+
+    @pytest.mark.asyncio
     async def test_unscoped_recall_only_uses_callers_project_vault_mapping(
         self, tmp_path, monkeypatch
     ):

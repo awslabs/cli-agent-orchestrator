@@ -12,7 +12,10 @@ from cli_agent_orchestrator.clients.database import (
     get_project_id_by_alias,
     list_aliases_for_project,
 )
-from cli_agent_orchestrator.services.vault.config import FolderMapping, VaultConfig
+from cli_agent_orchestrator.services.vault.config import (
+    FolderMapping,
+    VaultConfig,
+)
 
 logger = logging.getLogger(__name__)
 

@@ -2553,7 +2553,7 @@ class MemoryService:
 
         # Determine native dirs and vault projections without enumerating vault
         # directories on this read path.
-        search_dirs, vault_bindings, max_body_chars = self._resolve_sources(
+        search_dirs, vault_bindings, max_body_chars, vault_config = self._resolve_sources(
             scope, terminal_context, scan_all=scan_all
         )
 
@@ -2573,8 +2573,15 @@ class MemoryService:
             entries = self._parse_index(index_path)
 
             for entry in entries:
+                entry = dict(entry)
+                if entry["scope"] == MemoryScope.PROJECT.value:
+                    entry["scope_id"] = project_dir.name
                 # Filter by scope
                 if scope and entry["scope"] != scope:
+                    continue
+                if self._native_entry_is_vault_mapped(
+                    entry["scope"], entry.get("scope_id"), vault_config
+                ):
                     continue
                 # Filter by memory_type
                 if memory_type and entry["memory_type"] != memory_type:
@@ -2660,7 +2667,7 @@ class MemoryService:
         terminal_context: Optional[dict],
         *,
         scan_all: bool,
-    ) -> tuple[list[Path], list[VaultBinding], int]:
+    ) -> tuple[list[Path], list[VaultBinding], int, Any]:
         """Resolve native search directories plus indexed vault bindings.
 
         ``_get_search_dirs`` remains the native discovery implementation.  A
@@ -2676,12 +2683,12 @@ class MemoryService:
             # interpreted, CAO cannot know whether this scope is vault-owned.
             # Fail closed instead of exposing a retained native replica.
             logger.warning("vault recall sources unavailable; returning no content: %s", exc)
-            return [], [], 4096
+            return [], [], 4096, None
         from cli_agent_orchestrator.services.vault.binding import resolve
 
         native_dirs = self._get_search_dirs(scope, terminal_context, scan_all=scan_all)
         if not config.enabled:
-            return native_dirs, [], config.max_recall_body_chars
+            return native_dirs, [], config.max_recall_body_chars, config
         if scope is not None:
             scope_id = (
                 self.resolve_scope_id(scope, terminal_context)
@@ -2693,6 +2700,7 @@ class MemoryService:
                 [] if isinstance(binding, VaultBinding) else native_dirs,
                 [binding] if isinstance(binding, VaultBinding) else [],
                 config.max_recall_body_chars,
+                config,
             )
         bindings: list[VaultBinding] = []
         for vault in config.vaults:
@@ -2714,7 +2722,18 @@ class MemoryService:
                 binding = resolve(mapping.scope, binding_scope_id, vault_config=config)
                 if isinstance(binding, VaultBinding) and binding not in bindings:
                     bindings.append(binding)
-        return native_dirs, bindings, config.max_recall_body_chars
+        return native_dirs, bindings, config.max_recall_body_chars, config
+
+    @staticmethod
+    def _native_entry_is_vault_mapped(
+        scope: str, scope_id: Optional[str], vault_config: Any
+    ) -> bool:
+        """Hide retained native replicas whenever configuration owns their scope."""
+        if vault_config is None or not vault_config.enabled:
+            return False
+        from cli_agent_orchestrator.services.vault.binding import resolve
+
+        return isinstance(resolve(scope, scope_id, vault_config=vault_config), VaultBinding)
 
     def _vault_candidates(
         self,
@@ -2802,7 +2821,7 @@ class MemoryService:
         # A candidate-only corpus collapses when every candidate contains the
         # query term (df == N → negative IDF → all-zero).
         if vault_candidates is None:
-            search_dirs, vault_bindings, max_body_chars = self._resolve_sources(
+            search_dirs, vault_bindings, max_body_chars, vault_config = self._resolve_sources(
                 scope, terminal_context, scan_all=scan_all
             )
             # BM25 corpus population is deliberately ungated: withholding
@@ -2816,6 +2835,7 @@ class MemoryService:
             )
         else:
             search_dirs = self._get_search_dirs(scope, terminal_context, scan_all=scan_all)
+            vault_config = None
         # Constrains the NATIVE corpus only. The wiki tree is a shared glob, so
         # session/agent rows need this post-hoc filter; vault candidates are
         # resolved per binding in `_resolve_sources` and never enumerated here.
@@ -2849,6 +2869,8 @@ class MemoryService:
                 elif file_scope == MemoryScope.PROJECT.value:
                     # Project rows store the project-hash container as scope_id.
                     file_scope_id = project_dir.name if project_dir.name != "global" else None
+                if self._native_entry_is_vault_mapped(file_scope, file_scope_id, vault_config):
+                    continue
                 if not self._private_scope_is_visible(file_scope, file_scope_id, private_scope_ids):
                     continue
                 corpus_tokens.append(tokens)
@@ -2915,7 +2937,7 @@ class MemoryService:
             return []
 
         if vault_candidates is None:
-            search_dirs, vault_bindings, max_body_chars = self._resolve_sources(
+            search_dirs, vault_bindings, max_body_chars, vault_config = self._resolve_sources(
                 scope, terminal_context, scan_all=scan_all
             )
             # The corpus is intentionally ungated so hidden rows cannot alter
@@ -2929,6 +2951,7 @@ class MemoryService:
             )
         else:
             search_dirs = self._get_search_dirs(scope, terminal_context, scan_all=scan_all)
+            vault_config = None
         selection_policy = policy or _resolve_injection_policy(
             False,
             consumer="explicit_recall",
@@ -2961,8 +2984,12 @@ class MemoryService:
                     and len(rel_parts) >= 3
                 ):
                     entry_scope_id = rel_parts[1]
+                elif file_scope == MemoryScope.PROJECT.value:
+                    entry_scope_id = project_dir.name if project_dir.name != "global" else None
 
                 if scope and file_scope != scope:
+                    continue
+                if self._native_entry_is_vault_mapped(file_scope, entry_scope_id, vault_config):
                     continue
                 if scope_id and entry_scope_id != scope_id:
                     continue
@@ -3463,7 +3490,7 @@ class MemoryService:
             wiki_resolved = os.path.realpath(str(wiki_dir))
             index_path = wiki_dir / "index.md"
 
-            native_dirs, vault_bindings, max_body_chars = self._resolve_sources(
+            native_dirs, vault_bindings, max_body_chars, _vault_config = self._resolve_sources(
                 scope_val, terminal_context, scan_all=False
             )
             scope_entries = []
@@ -3706,7 +3733,7 @@ class MemoryService:
             MemoryScope.PROJECT.value,
             MemoryScope.GLOBAL.value,
         ):
-            _native_dirs, vault_bindings, _max_body_chars = self._resolve_sources(
+            _native_dirs, vault_bindings, _max_body_chars, _vault_config = self._resolve_sources(
                 scope, terminal_context, scan_all=False
             )
             bindings.update(

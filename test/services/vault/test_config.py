@@ -189,6 +189,26 @@ def test_rule_9_casefolds_mapping_paths_before_prefix_comparison():
     assert vault_config._is_path_prefix("Références", "Références")
 
 
+def test_alias_equivalent_project_mappings_are_rejected(tmp_path, monkeypatch):
+    document = _document(str(tmp_path))
+    document["vaults"][0]["mappings"][1].update(
+        folder="Other", scope="project", scope_id="old-project"
+    )
+    document["vaults"][0]["mappings"].append(
+        {"folder": "Elsewhere", "scope": "project", "scope_id": "renamed-project"}
+    )
+    monkeypatch.setattr(
+        vault_config,
+        "get_project_id_by_alias",
+        lambda scope_id: (
+            "canonical-project" if scope_id in {"old-project", "renamed-project"} else None
+        ),
+    )
+
+    with pytest.raises(ValidationError, match=r"same \(scope, scope_id\)"):
+        _load(document)
+
+
 @pytest.mark.parametrize("pattern", ["./Private/**", "Private/./**", "."])
 def test_rule_14_rejects_dot_segments_in_exclude_patterns(tmp_path, pattern):
     document = _document(str(tmp_path))

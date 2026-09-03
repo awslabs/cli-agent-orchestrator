@@ -322,6 +322,30 @@ def test_vault_memory_body_budget_marks_content_stale_and_truncated(tmp_path, mo
     assert memory.token_estimate == 16
 
 
+def test_recall_body_read_is_bounded_and_records_truncation(tmp_path, monkeypatch):
+    from cli_agent_orchestrator.services.vault import reader
+
+    _reader, _Session, fixture, candidate = _indexed_reader_candidate(
+        tmp_path, monkeypatch, run_id="bounded-read"
+    )
+    note_path = fixture.root / "Projects" / "CAO Design" / "Design.md"
+    note_path.write_text("x" * 4096, encoding="utf-8")
+    monkeypatch.setattr(reader, "MAX_FRONTMATTER_BYTES_LIMIT", 32)
+    counters = []
+    monkeypatch.setattr(
+        reader,
+        "increment_counter",
+        lambda vault_id, name, amount: counters.append((vault_id, name, amount)),
+    )
+
+    memory = load_candidate(candidate, max_body_chars=64, require_injectable=False)
+
+    assert memory is not None
+    assert memory.content_truncated is True
+    assert memory.content.endswith("[Content truncated for recall]")
+    assert counters == [(fixture.vault.id, "recall_body_truncated", 1)]
+
+
 def _indexed_reader_candidate(tmp_path, monkeypatch, *, run_id: str):
     """Build one real indexed row so read-boundary tests exercise recall."""
     from cli_agent_orchestrator.services.vault import reader

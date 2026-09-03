@@ -22,6 +22,7 @@ from cli_agent_orchestrator.clients.database import (
 from cli_agent_orchestrator.models.memory import Memory
 from cli_agent_orchestrator.services.memory_format import normalize_memory_tags
 from cli_agent_orchestrator.services.vault.binding import VaultBinding
+from cli_agent_orchestrator.services.vault.config import MAX_FRONTMATTER_BYTES_LIMIT
 from cli_agent_orchestrator.services.vault.parser import split_frontmatter
 
 _TRUNCATION_MARKER = "\n\n[Content truncated for recall]"
@@ -300,8 +301,9 @@ def load_candidate(
         if (before.st_dev, before.st_ino) != (expected.st_dev, expected.st_ino):
             _record_path_escape(candidate)
             return None
+        read_limit = MAX_FRONTMATTER_BYTES_LIMIT + (max_body_chars * 4)
         with os.fdopen(fd, "rb", closefd=False) as handle:
-            raw = handle.read()
+            raw = handle.read(read_limit + 1)
         after = os.fstat(fd)
     except OSError:
         return None
@@ -309,19 +311,26 @@ def load_candidate(
         os.close(fd)
     if _stat_identity(before) != _stat_identity(after):
         return None
+    byte_truncated = len(raw) > read_limit
+    if byte_truncated:
+        raw = raw[:read_limit]
     try:
         text = raw.decode("utf-8")
     except UnicodeError:
-        return None
-
+        if byte_truncated:
+            text = raw.decode("utf-8", errors="ignore")
+        else:
+            return None
+    if byte_truncated:
+        increment_counter(candidate.binding.vault_id, "recall_body_truncated", 1)
     try:
         # Reconciliation has already enforced the configured frontmatter cap.
         # This read-side split only separates the indexed body.
-        region = split_frontmatter(text, 65536)
+        region = split_frontmatter(text, MAX_FRONTMATTER_BYTES_LIMIT)
     except ValueError:
         return None
     body = _strip_leading_h1(region.body)
-    truncated = len(body) > max_body_chars
+    truncated = byte_truncated or len(body) > max_body_chars
     if truncated:
         body = body[: max(0, max_body_chars - len(_TRUNCATION_MARKER))] + _TRUNCATION_MARKER
 
