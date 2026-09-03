@@ -5,6 +5,7 @@ import { ProfileCreateModal } from './ProfileCreateModal'
 import { ProfileEditorModal } from './ProfileEditorModal'
 import { ConfirmModal } from './ConfirmModal'
 import { useStore } from '../store'
+import { useGeneration } from '../hooks/useGeneration'
 
 /**
  * Debounce interval for the search box. The contract from #510 is >= 300 ms so
@@ -210,13 +211,13 @@ export function ProfilesPanel() {
   const [deleting, setDeleting] = useState(false)
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   // Monotonic token so a slow earlier response can never clobber a newer one.
-  const searchSeq = useRef(0)
+  const searchGen = useGeneration()
   // User-navigation generation: bumped by every user-initiated search
   // keystroke and row selection. The post-save continuation captures it
   // before its catalog refresh and yields if it moved -- navigation
   // performed while the refresh was pending wins over the older
   // clear-and-select (round-5 P2).
-  const navSeq = useRef(0)
+  const navGen = useGeneration()
   const { showSnackbar } = useStore()
 
   // Bumped after an in-place edit: remounts ProfileDetail (via its key) so
@@ -226,25 +227,25 @@ export function ProfilesPanel() {
   // Monotonic catalog-load token: without it, a slow mount request resolving
   // AFTER a post-write refresh overwrote the fresh catalog with its stale
   // snapshot, deleting the just-created row (round-4 review).
-  const catalogSeq = useRef(0)
+  const catalogGen = useGeneration()
 
   /** Refresh the catalog; resolves true only when THIS load's result was
       applied (stale/discarded and failed loads resolve false). */
   const refreshCatalog = () => {
-    const seq = ++catalogSeq.current
+    const token = catalogGen.begin()
     return api.listProfiles()
       .then(p => {
-        if (seq !== catalogSeq.current) return false
+        if (!token.isCurrent()) return false
         setCatalog(p)
         setCatalogError(null)
         return true
       })
       .catch(e => {
-        if (seq !== catalogSeq.current) return false
+        if (!token.isCurrent()) return false
         setCatalogError(e?.detail || e?.message || 'Failed to load profiles')
         return false
       })
-      .finally(() => { if (seq === catalogSeq.current) setCatalogLoading(false) })
+      .finally(() => { if (token.isCurrent()) setCatalogLoading(false) })
   }
 
   // After a successful write, the ACTIVE search's rows are stale (they never
@@ -253,7 +254,7 @@ export function ProfilesPanel() {
   // search and select only once the refreshed catalog is the visible row set;
   // a failed refresh stays a failure instead of continuing to selection.
   const clearSearch = () => {
-    searchSeq.current++
+    searchGen.invalidate()
     setQuery('')
     setResults(null)
     setSearchError(null)
@@ -274,10 +275,10 @@ export function ProfilesPanel() {
     // navigated in the meantime (round-5 P2: the modal closes without
     // awaiting this continuation, so the panel is interactive while the
     // refresh is pending).
-    const nav = ++navSeq.current
+    const nav = navGen.begin()
     clearSearch()
     if (!(await refreshCatalog())) return
-    if (nav !== navSeq.current) return
+    if (!nav.isCurrent()) return
     setSelected(name)
     // The detail fetch is keyed on the profile NAME, which an in-place edit
     // does not change -- without an explicit reload token the pane kept
@@ -322,10 +323,10 @@ export function ProfilesPanel() {
     // only after a SUCCESSFUL refetch (round-4 review), and yield to any
     // navigation the user performed while the refresh was pending
     // (round-5 P2).
-    const nav = ++navSeq.current
+    const nav = navGen.begin()
     clearSearch()
     if (!(await refreshCatalog())) return
-    if (nav !== navSeq.current) return
+    if (!nav.isCurrent()) return
     setSelected(name)
   }
 
@@ -338,7 +339,7 @@ export function ProfilesPanel() {
     // generation, round-4 P1). Without the early bump, a response for prior
     // query A resolving during query B's 300ms debounce window still matched
     // the sequence and installed A's rows under B (round-5 P2).
-    const seq = ++searchSeq.current
+    const token = searchGen.begin()
     if (q === '') {
       setResults(null)
       setSearching(false)
@@ -349,16 +350,16 @@ export function ProfilesPanel() {
     debounceRef.current = setTimeout(() => {
       api.searchProfiles(q)
         .then(r => {
-          if (seq !== searchSeq.current) return
+          if (!token.isCurrent()) return
           setResults(r)
           setSearchError(null)
         })
         .catch(e => {
-          if (seq !== searchSeq.current) return
+          if (!token.isCurrent()) return
           setSearchError(e?.detail || e?.message || 'Search failed')
         })
         .finally(() => {
-          if (seq === searchSeq.current) setSearching(false)
+          if (token.isCurrent()) setSearching(false)
         })
     }, SEARCH_DEBOUNCE_MS)
     return () => { if (debounceRef.current) clearTimeout(debounceRef.current) }
@@ -399,7 +400,7 @@ export function ProfilesPanel() {
           aria-label="Search profiles"
           placeholder="Search by capability, e.g. 'monitor sqs'…"
           value={query}
-          onChange={e => { navSeq.current++; setQuery(e.target.value) }}
+          onChange={e => { navGen.invalidate(); setQuery(e.target.value) }}
           className="w-full pl-9 pr-3 py-2 bg-gray-900 border border-gray-700 rounded-lg text-sm text-gray-200 placeholder-gray-600 focus:outline-none focus:border-emerald-600"
         />
         {searching && <Loader2 size={14} className="animate-spin absolute right-3 top-1/2 -translate-y-1/2 text-gray-500" data-testid="search-spinner" />}
@@ -438,7 +439,7 @@ export function ProfilesPanel() {
                     <button
                       role="option"
                       aria-selected={selected === row.name}
-                      onClick={() => { navSeq.current++; setSelected(row.name) }}
+                      onClick={() => { navGen.invalidate(); setSelected(row.name) }}
                       className={`w-full text-left px-4 py-3 transition-colors ${
                         selected === row.name ? 'bg-emerald-900/30' : 'hover:bg-gray-800/60'
                       }`}

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { api, ApiError, TemplateSummary, ProfileValidationMessage, ProviderInfo } from '../api'
 import { ValidationFindings } from './ValidationFindings'
 import { CustomSelect, SelectOption } from './CustomSelect'
+import { useGeneration } from '../hooks/useGeneration'
 import { AlertTriangle, ChevronDown, ChevronRight, Loader2, Package, X } from 'lucide-react'
 
 /** Debounce for the template live preview, matching the search box contract. */
@@ -287,25 +288,25 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
   const [previewError, setPreviewError] = useState<string | null>(null)
   const [previewLoading, setPreviewLoading] = useState(false)
   const previewTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const previewSeq = useRef(0)
+  const previewGen = useGeneration()
   // Staleness token for the template-schema fetch: a fast A->B switch with
   // out-of-order resolution must never leave A's schema under B's selection.
-  const templateSeq = useRef(0)
+  const templateGen = useGeneration()
   // Tracks whether the user typed a name; if not, follow the template default.
   const nameTouched = useRef(false)
   // Staleness token for the open-reset fetches (templates/schema/providers).
-  const openSeq = useRef(0)
+  const openGen = useGeneration()
   // Closes the double-submit window: state updates are async, a ref is not.
   const saveGuard = useRef(false)
 
-  // Invalidate any scheduled or in-flight preview render: bumping the token
-  // makes a late response fail its `seq === previewSeq.current` check and be
-  // dropped. This must run at every site that clears the preview -- a token
-  // bumped only when a *new* request is issued left the "reason for the
-  // request disappeared" paths (template switch, deselect, modal close and
-  // reopen) able to silently re-land stale content (#692 review).
+  // Invalidate any scheduled or in-flight preview render: a late response
+  // fails its token's isCurrent() check and is dropped. This must run at
+  // every site that clears the preview -- a token bumped only when a *new*
+  // request is issued left the "reason for the request disappeared" paths
+  // (template switch, deselect, modal close and reopen) able to silently
+  // re-land stale content (#692 review).
   const invalidatePreview = () => {
-    previewSeq.current++
+    previewGen.invalidate()
     if (previewTimer.current) {
       clearTimeout(previewTimer.current)
       previewTimer.current = null
@@ -344,16 +345,16 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
     // Staleness token: these three fetches are idempotent, but a rapid
     // close -> reopen could repopulate from the EARLIER open's response --
     // the one async class here without the seq-token discipline (#692 review).
-    const seq = ++openSeq.current
+    const token = openGen.begin()
     api.listProfileTemplates()
-      .then(t => { if (seq === openSeq.current) setTemplates(t) })
-      .catch(() => { if (seq === openSeq.current) setTemplates([]) })
+      .then(t => { if (token.isCurrent()) setTemplates(t) })
+      .catch(() => { if (token.isCurrent()) setTemplates([]) })
     api.getProfileSchema()
-      .then(s => { if (seq === openSeq.current) { setProfileSchema(s); setSchemaError(null) } })
-      .catch(e => { if (seq === openSeq.current) { setProfileSchema(null); setSchemaError(e?.detail || e?.message || 'Failed to load profile schema') } })
+      .then(s => { if (token.isCurrent()) { setProfileSchema(s); setSchemaError(null) } })
+      .catch(e => { if (token.isCurrent()) { setProfileSchema(null); setSchemaError(e?.detail || e?.message || 'Failed to load profile schema') } })
     api.listProviders()
-      .then(p => { if (seq === openSeq.current) setProviders(p) })
-      .catch(() => { if (seq === openSeq.current) setProviders([]) })
+      .then(p => { if (token.isCurrent()) setProviders(p) })
+      .catch(() => { if (token.isCurrent()) setProviders([]) })
   }, [open])
 
   // Switching between From-template and From-scratch clears the shared error
@@ -376,7 +377,7 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
 
   // Template selection loads that template's schema and resets its config.
   useEffect(() => {
-    const seq = ++templateSeq.current
+    const token = templateGen.begin()
     if (!template) {
       invalidatePreview()
       setTemplateSchema(null)
@@ -387,7 +388,7 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
     setTemplateSchema(null)
     api.getTemplateSchema(template)
       .then(s => {
-        if (seq !== templateSeq.current) return
+        if (!token.isCurrent()) return
         setTemplateSchema(s)
         // Seed defaults so the preview renders something meaningful.
         const seeded: Record<string, unknown> = {}
@@ -397,7 +398,7 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
         setConfig(seeded)
       })
       .catch(e => {
-        if (seq !== templateSeq.current) return
+        if (!token.isCurrent()) return
         setPreviewError(e?.detail || e?.message || 'Failed to load template schema')
       })
   }, [template])
@@ -411,7 +412,7 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
     // render in flight for config A landing during config B's 300ms debounce
     // window still matched the sequence, installed A's body, and re-armed
     // Create while the form displayed B (round-4 P1).
-    const seq = ++previewSeq.current
+    const token = previewGen.begin()
     if (!template || !templateSchema) {
       // No render can be issued from this state; the bump above already
       // invalidated anything in flight (template switched or deselected).
@@ -429,7 +430,7 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
     previewTimer.current = setTimeout(() => {
       api.previewTemplate(template, config)
         .then(p => {
-          if (seq !== previewSeq.current) return
+          if (!token.isCurrent()) return
           setPreview(p.content)
           setPreviewError(null)
           if (!nameTouched.current) {
@@ -438,13 +439,13 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
           }
         })
         .catch((e: ApiError) => {
-          if (seq !== previewSeq.current) return
+          if (!token.isCurrent()) return
           // A config failing template validation is a normal mid-edit state.
           setPreview(null)
           setPreviewError(e?.detail || e?.message || 'Preview failed')
         })
         .finally(() => {
-          if (seq === previewSeq.current) setPreviewLoading(false)
+          if (token.isCurrent()) setPreviewLoading(false)
         })
     }, PREVIEW_DEBOUNCE_MS)
     return () => { if (previewTimer.current) clearTimeout(previewTimer.current) }

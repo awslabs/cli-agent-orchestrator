@@ -136,6 +136,8 @@ web/
 │   │   ├── ConfirmModal.tsx
 │   │   ├── CustomSelect.tsx
 │   │   └── ErrorBoundary.tsx
+│   ├── hooks/
+│   │   └── useGeneration.ts
 │   └── test/
 │       ├── setup.ts
 │       ├── api.test.ts
@@ -145,7 +147,8 @@ web/
 │       ├── profile-create-modal.test.tsx
 │       ├── profile-editor.test.tsx
 │       ├── validation-findings.test.tsx
-│       └── custom-select.test.tsx
+│       ├── custom-select.test.tsx
+│       └── use-generation.test.ts
 ├── vite.config.ts
 ├── tailwind.config.js
 ├── tsconfig.json
