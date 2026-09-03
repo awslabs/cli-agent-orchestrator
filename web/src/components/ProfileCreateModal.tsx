@@ -416,6 +416,13 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
       // No render can be issued from this state; the bump above already
       // invalidated anything in flight (template switched or deselected).
       setPreviewLoading(false)
+      // A SETTLED preview from the prior template must not survive either:
+      // canCreate keys on `preview !== null`, so leaving template A's
+      // rendered content here while B's schema is pending/failed lets Create
+      // persist A under B's identity (round-5 P1). previewError is left
+      // alone -- it doubles as the schema-load error for the CURRENT
+      // template (round-3 regression guard).
+      setPreview(null)
       return
     }
     setPreviewLoading(true)

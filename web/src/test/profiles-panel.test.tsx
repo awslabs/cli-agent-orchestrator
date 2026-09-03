@@ -405,3 +405,100 @@ describe('round-4 review: mutation vs search/catalog ordering (#692)', () => {
     expect(screen.getByRole('option', { name: /fresh-agent/ })).toBeInTheDocument()
   })
 })
+
+describe('round-5 review: settled-state and navigation ownership (#692)', () => {
+  it("a search for A resolving during B's debounce window never installs A's rows", async () => {
+    // searchSeq previously advanced when the debounced request STARTED, so a
+    // response for prior query A landing inside B's 300ms debounce window
+    // still matched the sequence and installed A's rows under B's query
+    // (haofeif's round-5 P2). The generation now advances on every query
+    // change, before the timer.
+    let releaseA!: () => void
+    const A_ROWS = [{ name: 'alpha-hit', description: 'A only', capabilities: [], tags: [], role: '', source: 'local', coverage: 1, score: 1.0 }]
+    const B_ROWS = [{ name: 'beta-hit', description: 'B only', capabilities: [], tags: [], role: '', source: 'local', coverage: 1, score: 1.0 }]
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.includes('/agents/profiles/search')) {
+        if (url.includes('q=alpha')) return new Promise<any>(res => { releaseA = () => res(okJson(A_ROWS)) })
+        return okJson(B_ROWS)
+      }
+      if (url.includes('/agents/profiles')) return okJson(CATALOG)
+      return okJson([])
+    }))
+    vi.useFakeTimers()
+    try {
+      render(<ProfilesPanel />)
+      await act(async () => {})
+      const box = screen.getByRole('searchbox', { name: /search profiles/i })
+      fireEvent.change(box, { target: { value: 'alpha' } })
+      await act(() => vi.advanceTimersByTimeAsync(SEARCH_DEBOUNCE_MS + 10)) // A in flight, gated
+
+      fireEvent.change(box, { target: { value: 'beta' } }) // B's debounce running
+      // A settles INSIDE B's debounce window: it must be discarded
+      await act(async () => { releaseA() })
+      expect(screen.queryByRole('option', { name: /alpha-hit/ })).not.toBeInTheDocument()
+
+      // B's own request proceeds normally and its rows land
+      await act(() => vi.advanceTimersByTimeAsync(SEARCH_DEBOUNCE_MS + 10))
+      expect(screen.getByRole('option', { name: /beta-hit/ })).toBeInTheDocument()
+      expect(screen.queryByRole('option', { name: /alpha-hit/ })).not.toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('navigation performed while the post-create refresh is pending wins over the older clear-and-select', async () => {
+    // The create modal closes without awaiting handleCreated, so the panel is
+    // interactive while refreshCatalog() is pending. Typing a new search in
+    // that window used to be clobbered when the older continuation resolved:
+    // it cleared the fresh query and force-selected the saved profile
+    // (haofeif's round-5 P2). The continuation now yields to any navigation
+    // performed after the mutation.
+    let releaseRefresh!: () => void
+    const NEW_ROW = { name: 'fresh-agent', description: 'Newly made', source: 'local' }
+    let catalogCall = 0
+    let created = false
+    vi.stubGlobal('fetch', vi.fn(async (url: string, opts?: any) => {
+      if (url.includes('/agents/profiles/validate')) return okJson({ valid: true, messages: [] })
+      if (url.includes('/agents/profiles/search')) return new Promise(() => {}) // user's search stays in flight
+      if (url.includes('/agents/profiles/schema')) return okJson({
+        type: 'object', required: ['name'], properties: { name: { type: 'string' } },
+      })
+      if (url.includes('/agents/profiles/templates')) return okJson([])
+      if (url.includes('/agents/providers')) return okJson([])
+      if (url.endsWith('/agents/profiles') && opts?.method === 'POST') { created = true; return okJson({ name: 'fresh-agent', warnings: [] }) }
+      if (/\/agents\/profiles\/[^/?]+$/.test(url)) return okJson({ name: 'fresh-agent', description: 'Newly made' })
+      if (url.includes('/agents/profiles')) {
+        catalogCall++
+        if (catalogCall > 1) return new Promise<any>(res => { releaseRefresh = () => res(okJson([...CATALOG, NEW_ROW])) })
+        return okJson(CATALOG)
+      }
+      return okJson([])
+    }))
+    vi.useFakeTimers()
+    try {
+      render(<ProfilesPanel />)
+      await act(async () => {})
+
+      fireEvent.click(screen.getByRole('button', { name: /new profile/i }))
+      await act(async () => {})
+      fireEvent.click(screen.getByRole('tab', { name: 'From scratch' }))
+      await act(async () => {})
+      fireEvent.change(screen.getByRole('textbox', { name: 'Profile name' }), { target: { value: 'fresh-agent' } })
+      fireEvent.click(screen.getByRole('button', { name: /create profile/i }))
+      await act(async () => {}) // POST settles; post-create refresh now in flight, gated
+
+      // User navigates while the refresh is pending
+      const box = screen.getByRole('searchbox', { name: /search profiles/i })
+      fireEvent.change(box, { target: { value: 'reviewer' } })
+      await act(async () => {})
+
+      // The older continuation resolves: it must NOT clear the new query or
+      // select the created profile over the user's navigation
+      await act(async () => { releaseRefresh() })
+      expect(box).toHaveValue('reviewer')
+      expect(screen.queryByTestId('profile-detail')).not.toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})

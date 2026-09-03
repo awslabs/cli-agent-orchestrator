@@ -211,6 +211,12 @@ export function ProfilesPanel() {
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   // Monotonic token so a slow earlier response can never clobber a newer one.
   const searchSeq = useRef(0)
+  // User-navigation generation: bumped by every user-initiated search
+  // keystroke and row selection. The post-save continuation captures it
+  // before its catalog refresh and yields if it moved -- navigation
+  // performed while the refresh was pending wins over the older
+  // clear-and-select (round-5 P2).
+  const navSeq = useRef(0)
   const { showSnackbar } = useStore()
 
   // Bumped after an in-place edit: remounts ProfileDetail (via its key) so
@@ -246,13 +252,12 @@ export function ProfilesPanel() {
   // "Select a profile…" under a success snackbar (round-4 review). Clear the
   // search and select only once the refreshed catalog is the visible row set;
   // a failed refresh stays a failure instead of continuing to selection.
-  const clearSearchAndSelect = (name: string) => {
+  const clearSearch = () => {
     searchSeq.current++
     setQuery('')
     setResults(null)
     setSearchError(null)
     setSearching(false)
-    setSelected(name)
   }
 
   useEffect(() => { refreshCatalog() }, [])
@@ -263,11 +268,17 @@ export function ProfilesPanel() {
         ? { type: 'info', message: `Profile '${name}' saved with ${warnings.length} warning${warnings.length !== 1 ? 's' : ''}: ${warnings[0].message}` }
         : { type: 'success', message: `Profile '${name}' saved` },
     )
-    // Select after the refresh resolves AND succeeded: a clone's new name is
-    // not in the catalog yet, and an active search's stale rows never carry
-    // it (round-4 review).
+    // Clear mutation-time state BEFORE the refresh (stale filtered rows
+    // never carry the new/renamed profile), then select only after the
+    // refresh resolves AND succeeded -- and only if the user has not
+    // navigated in the meantime (round-5 P2: the modal closes without
+    // awaiting this continuation, so the panel is interactive while the
+    // refresh is pending).
+    const nav = ++navSeq.current
+    clearSearch()
     if (!(await refreshCatalog())) return
-    clearSearchAndSelect(name)
+    if (nav !== navSeq.current) return
+    setSelected(name)
     // The detail fetch is keyed on the profile NAME, which an in-place edit
     // does not change -- without an explicit reload token the pane kept
     // showing pre-edit provider/model/tags after a successful save.
@@ -307,23 +318,28 @@ export function ProfilesPanel() {
         ? { type: 'info', message: `Profile '${name}' created with ${warnings.length} warning${warnings.length !== 1 ? 's' : ''}: ${warnings[0].message}` }
         : { type: 'success', message: `Profile '${name}' created` },
     )
-    // Select only after a SUCCESSFUL refetch and with any active search
-    // cleared, so the new row is actually in the visible row set (round-4
-    // review: under an active query the pane showed "Select a profile…"
-    // despite the success snackbar).
+    // Same shape as handleSaved: clear mutation-time state up front, select
+    // only after a SUCCESSFUL refetch (round-4 review), and yield to any
+    // navigation the user performed while the refresh was pending
+    // (round-5 P2).
+    const nav = ++navSeq.current
+    clearSearch()
     if (!(await refreshCatalog())) return
-    clearSearchAndSelect(name)
+    if (nav !== navSeq.current) return
+    setSelected(name)
   }
 
   // Debounced server search: one request per >=300ms-quiet keystroke burst.
   useEffect(() => {
     if (debounceRef.current) clearTimeout(debounceRef.current)
     const q = query.trim()
+    // Advance the generation IMMEDIATELY on any query change -- not when the
+    // debounced request is eventually issued (same rationale as the preview
+    // generation, round-4 P1). Without the early bump, a response for prior
+    // query A resolving during query B's 300ms debounce window still matched
+    // the sequence and installed A's rows under B (round-5 P2).
+    const seq = ++searchSeq.current
     if (q === '') {
-      // Invalidate any in-flight search: without the bump, its late response
-      // still satisfied the seq check and restored filtered rows under an
-      // empty search box (#692 review).
-      searchSeq.current++
       setResults(null)
       setSearching(false)
       setSearchError(null)
@@ -331,7 +347,6 @@ export function ProfilesPanel() {
     }
     setSearching(true)
     debounceRef.current = setTimeout(() => {
-      const seq = ++searchSeq.current
       api.searchProfiles(q)
         .then(r => {
           if (seq !== searchSeq.current) return
@@ -384,7 +399,7 @@ export function ProfilesPanel() {
           aria-label="Search profiles"
           placeholder="Search by capability, e.g. 'monitor sqs'…"
           value={query}
-          onChange={e => setQuery(e.target.value)}
+          onChange={e => { navSeq.current++; setQuery(e.target.value) }}
           className="w-full pl-9 pr-3 py-2 bg-gray-900 border border-gray-700 rounded-lg text-sm text-gray-200 placeholder-gray-600 focus:outline-none focus:border-emerald-600"
         />
         {searching && <Loader2 size={14} className="animate-spin absolute right-3 top-1/2 -translate-y-1/2 text-gray-500" data-testid="search-spinner" />}
@@ -423,7 +438,7 @@ export function ProfilesPanel() {
                     <button
                       role="option"
                       aria-selected={selected === row.name}
-                      onClick={() => setSelected(row.name)}
+                      onClick={() => { navSeq.current++; setSelected(row.name) }}
                       className={`w-full text-left px-4 py-3 transition-colors ${
                         selected === row.name ? 'bg-emerald-900/30' : 'hover:bg-gray-800/60'
                       }`}

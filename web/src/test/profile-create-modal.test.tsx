@@ -822,3 +822,45 @@ describe('round-4 review: async ordering (#692)', () => {
     await act(async () => { releasePost() })
   })
 })
+
+describe('round-5 review: a SETTLED preview cannot outlive its template (#692)', () => {
+  beforeEach(() => vi.useFakeTimers())
+  afterEach(() => vi.useRealTimers())
+
+  const A_BODY = '---\nname: template-a-agent\ndescription: A\n---\n\nTEMPLATE-A-BODY\n'
+
+  it("template A's fully-settled preview is cleared when B is selected with its schema pending", async () => {
+    // Round-4 closed the in-flight window; this is the adjacent settled-state
+    // case (haofeif's round-5 P1): A's preview has ALREADY landed when the
+    // user switches to B whose schema is pending/failed. The cannot-render
+    // branch used to leave the settled preview in state, so canCreate stayed
+    // true and Create persisted A's content while the UI identified B.
+    const mock = routedFetch({
+      'aws/stepfunction/schema': () => new Promise(() => {}), // B schema never resolves
+      '/agents/profiles/templates/preview': () => okJson({ template: 'aws/sqs-monitor', content: A_BODY }),
+    })
+    vi.stubGlobal('fetch', mock)
+    render(<ProfileCreateModal open={true} onClose={() => {}} onCreated={() => {}} />)
+    await act(async () => {})
+    await pickOption('Template', 'aws/sqs-monitor')
+    await act(async () => {})
+    await act(() => vi.advanceTimersByTimeAsync(PREVIEW_DEBOUNCE_MS + 10))
+    await act(async () => {})
+    // A's preview has fully settled: pane visible, Create armed
+    expect(screen.getByTestId('template-preview')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /create profile/i })).toBeEnabled()
+
+    // Switch to B; its schema stays pending, so nothing can render for B
+    await pickOption('Template', 'aws/stepfunction')
+    await act(async () => {})
+
+    // Nothing of A may remain actionable: no preview pane, Create disabled,
+    // and no POST can carry A's body under B's identity
+    expect(screen.queryByTestId('template-preview')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /create profile/i })).toBeDisabled()
+    fireEvent.click(screen.getByRole('button', { name: /create profile/i }))
+    await act(async () => {})
+    const posts = mock.mock.calls.filter(([u, o]: any[]) => String(u).endsWith('/agents/profiles') && o?.method === 'POST')
+    expect(posts).toHaveLength(0)
+  })
+})
