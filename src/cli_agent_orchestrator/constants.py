@@ -391,7 +391,7 @@ ELASTIC_RELEASE_TOKEN_ENV = "CAO_ELASTIC_RELEASE_TOKEN"
 ELASTIC_WORKER_ID_HEADER = "X-CAO-Worker-ID"
 ELASTIC_RELEASE_TOKEN_HEADER = "X-CAO-Release-Token"
 
-# The cluster's worker broker: where `cao cluster` and `cao worker` point, and
+# The cluster's worker broker: where `cao fleet` and `cao worker` point, and
 # the token they authenticate with. Already set on a supervisor pod, which is why
 # these names are reused rather than invented — the same two values that let the
 # supervisor take a lease let an operator inspect and release one.

@@ -1,11 +1,11 @@
-"""Cluster commands for CLI Agent Orchestrator.
+"""Fleet commands for CLI Agent Orchestrator.
 
-`cao cluster` is the fleet-wide view of what `cao worker` shows one row of. Both
+`cao fleet` is the fleet-wide view of what `cao worker` shows one row of. Both
 speak to a broker over HTTP and neither knows what Kubernetes is; see
-`utils/cluster.py` for the contract and the one port-forward it needs.
+`utils/fleet.py` for the contract and the one port-forward it needs.
 
 Note the name that is already taken: `cao shutdown` stops tmux sessions on THIS
-machine. `cao cluster shutdown` releases workers in a remote cluster. They are
+machine. `cao fleet shutdown` releases workers in a remote cluster. They are
 different verbs on different things, which is why the second one is spelled out.
 """
 
@@ -14,24 +14,24 @@ from collections import Counter
 
 import click
 
-from cli_agent_orchestrator.utils.cluster import LIVE_STATES, ClusterClient
+from cli_agent_orchestrator.utils.fleet import LIVE_STATES, FleetClient
 
 
 @click.group()
-def cluster():
-    """Inspect and tear down a CAO cluster's workers."""
+def fleet():
+    """Inspect and tear down a CAO fleet's workers."""
 
 
-@cluster.command()
+@fleet.command()
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON")
 def status(as_json):
-    """Summarise the cluster: is the broker there, and what is it holding.
+    """Summarise the fleet: is the broker there, and what is it holding.
 
     A settled count is not an error count. `completed` and `released` are the
     normal end of a task; `terminated`, `failed` and `expired` are the three the
     broker records a reason for, and `cao worker list --all` prints those reasons.
     """
-    client = ClusterClient.from_env()
+    client = FleetClient.from_env()
     workers = client.workers()
     counts = Counter(w.get("state", "unknown") for w in workers)
     live = [w for w in workers if w.get("state") in LIVE_STATES]
@@ -53,11 +53,11 @@ def status(as_json):
         click.echo("States:  no leases on record")
 
 
-@cluster.command()
+@fleet.command()
 @click.option("--yes", is_flag=True, help="Do not ask for confirmation")
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON")
 def shutdown(yes, as_json):
-    """Release every live worker in the cluster.
+    """Release every live worker in the fleet.
 
     This deletes the workers and the agent sessions inside them; nothing is
     resumable afterwards, because a released worker's state volume goes with it.
@@ -68,7 +68,7 @@ def shutdown(yes, as_json):
     Workers whose lease has already settled are skipped: the broker released them
     when it settled them, so there is nothing left to delete.
     """
-    client = ClusterClient.from_env()
+    client = FleetClient.from_env()
     live = [w for w in client.workers() if w.get("state") in LIVE_STATES]
     if not live:
         if as_json:

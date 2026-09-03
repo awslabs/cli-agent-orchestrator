@@ -1,6 +1,6 @@
-"""Client for a CAO cluster's worker broker.
+"""Client for a CAO fleet's worker broker.
 
-`cao cluster` and `cao worker` talk to a broker over HTTP. They do not talk to
+`cao fleet` and `cao worker` talk to a broker over HTTP. They do not talk to
 Kubernetes, and that is the point of this module living in core: the contract is
 four routes and one token, so the same commands work against the EKS broker in
 `examples/cao-clusters/kubernetes/eks`, against any other broker that implements
@@ -52,21 +52,21 @@ _READ_TIMEOUT = 60.0
 LIVE_STATES = frozenset({"creating", "leased"})
 
 
-class ClusterClient:
-    """One cluster, addressed through its broker."""
+class FleetClient:
+    """One fleet, addressed through its broker."""
 
     def __init__(self, url: str, token: str):
         self.url = url.rstrip("/")
         self._headers = {ELASTIC_BROKER_TOKEN_HEADER: token}
 
     @classmethod
-    def from_env(cls) -> "ClusterClient":
+    def from_env(cls) -> "FleetClient":
         url = os.environ.get(ELASTIC_BROKER_URL_ENV, "").strip()
         token = os.environ.get(ELASTIC_BROKER_TOKEN_ENV, "").strip()
         if not url or not token:
             raise click.ClickException(
-                f"No cluster configured. Set {ELASTIC_BROKER_URL_ENV} and "
-                f"{ELASTIC_BROKER_TOKEN_ENV} to point at your cluster's worker broker "
+                f"No fleet configured. Set {ELASTIC_BROKER_URL_ENV} and "
+                f"{ELASTIC_BROKER_TOKEN_ENV} to point at your fleet's worker broker "
                 "(port-forward it first if you are outside the cluster)."
             )
         return cls(url, token)
@@ -100,7 +100,7 @@ class ClusterClient:
                 timeout=(_CONNECT_TIMEOUT, None),
             )
         except requests.RequestException as exc:
-            raise click.ClickException(f"Failed to reach the cluster broker: {exc}") from exc
+            raise click.ClickException(f"Failed to reach the fleet broker: {exc}") from exc
         self._check(response)
         return response.iter_lines(decode_unicode=True)
 
@@ -175,7 +175,7 @@ class ClusterClient:
             )
         except requests.RequestException as exc:
             raise click.ClickException(
-                f"Failed to reach the cluster broker at {self.url}: {exc}"
+                f"Failed to reach the fleet broker at {self.url}: {exc}"
             ) from exc
         if raise_for_status:
             self._check(response)

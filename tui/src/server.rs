@@ -299,13 +299,13 @@ fn route(id: CommandId) -> Option<Route> {
         CommandId::AgentSendMessage => None,
         CommandId::AgentStatus => None,
 
-        // ── `cao cluster *` — both HIDE, and unroutable in principle (CAO on EKS v2) ──────
+        // ── `cao fleet *` — both HIDE, and unroutable in principle (CAO on EKS v2) ──────
         // Not "no route yet": these two do not address this cao-server at all. They address a
         // remote cluster's worker broker, whose URL and token live in the operator's environment,
         // so there is no path on `api/main.py` that could serve them. HIDE in catalog.rs, and a
         // HIDE command is unreachable through `commands()` regardless.
-        CommandId::ClusterShutdown => None,
-        CommandId::ClusterStatus => None,
+        CommandId::FleetShutdown => None,
+        CommandId::FleetStatus => None,
 
         // ── `cao config *`, `cao env *` ───────────────────────────────────────────────────
         // HIDE, and genuinely routeless: `cao env *` reads and writes the managed env store
@@ -603,7 +603,7 @@ fn route(id: CommandId) -> Option<Route> {
         // read `/sessions` and `/terminals/{id}` — the same paths this table serves for
         // `cao session *` — but on a DIFFERENT cao-server, the one inside a worker pod, reached
         // by proxy through a broker. Binding them to the local routes would report this machine's
-        // terminals as the remote worker's. See `utils/cluster.py`.
+        // terminals as the remote worker's. See `utils/fleet.py`.
         CommandId::WorkerAttach => None,
         CommandId::WorkerList => None,
         CommandId::WorkerLogs => None,

@@ -86,12 +86,12 @@ use std::vec::Vec;
 /// blocks for up to an hour, which a reviewer will want to weigh before offering it in-pane. That
 /// moves the count from 69 to **76**, and the distribution from 24/18/27 to 24/18/34.
 ///
-/// Nine more arrived with **CAO on EKS v2**: `cao cluster {status, shutdown}` and `cao worker
+/// Nine more arrived with **CAO on EKS v2**: `cao fleet {status, shutdown}` and `cao worker
 /// {list, status, send, sessions, attach, logs, release}`. All nine are HIDE, and here the default
 /// is doing real work rather than deferring a decision. Every one of them talks to a **remote**
 /// cluster's worker broker over HTTP, addressed by two environment variables the TUI does not set
 /// and cannot see the value of; a pane that offered them would offer commands that fail with "No
-/// cluster configured" on every machine that has not exported them. `cao cluster shutdown` also
+/// fleet configured" on every machine that has not exported them. `cao fleet shutdown` also
 /// deletes other people's running agent sessions, and `cao worker attach` is an interactive
 /// read/send loop with no terminal semantics — two more things a reviewer should weigh before any
 /// of this reaches navigation. That moves the count from 76 to **85**, and the distribution from
@@ -219,8 +219,6 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::AgentResult,
     CommandId::AgentSendMessage,
     CommandId::AgentStatus,
-    CommandId::ClusterShutdown,
-    CommandId::ClusterStatus,
     CommandId::ConfigGet,
     CommandId::ConfigList,
     CommandId::ConfigPath,
@@ -229,6 +227,8 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::EnvList,
     CommandId::EnvSet,
     CommandId::EnvUnset,
+    CommandId::FleetShutdown,
+    CommandId::FleetStatus,
     CommandId::FlowAdd,
     CommandId::FlowDisable,
     CommandId::FlowEnable,
@@ -334,12 +334,6 @@ pub enum CommandId {
     /// `cao agent status`
     AgentStatus,
 
-    // `cao cluster *`
-    /// `cao cluster shutdown`
-    ClusterShutdown,
-    /// `cao cluster status`
-    ClusterStatus,
-
     // `cao config *`
     /// `cao config get`
     ConfigGet,
@@ -359,6 +353,12 @@ pub enum CommandId {
     EnvSet,
     /// `cao env unset`
     EnvUnset,
+
+    // `cao fleet *`
+    /// `cao fleet shutdown`
+    FleetShutdown,
+    /// `cao fleet status`
+    FleetStatus,
 
     // `cao flow *`
     /// `cao flow add`
@@ -692,38 +692,6 @@ fn entry(id: CommandId) -> Command {
             handoff_reason: None,
         },
 
-        // ── `cao cluster *` — both HIDE (CAO on EKS v2) ─────────────────────────────────
-        //
-        // These do not talk to the cao-server on this machine. They talk to a REMOTE cluster's
-        // worker broker over HTTP, addressed by CAO_ELASTIC_BROKER_URL and
-        // CAO_ELASTIC_BROKER_TOKEN — two environment variables the TUI neither sets nor can read
-        // the value of. Offering them in-pane would offer commands that fail with "No cluster
-        // configured" on every machine that has not exported them, which is worse than not
-        // offering them at all. `shutdown` additionally deletes running agent sessions belonging
-        // to whoever is using that cluster. HIDE per project.md's mandated default, and both are
-        // a deliberate review away from anything else.
-        CommandId::ClusterShutdown => Command {
-            id: CommandId::ClusterShutdown,
-            parent: Some("cluster"),
-            leaf_name: "shutdown",
-            summary: "Release every live worker in the cluster.",
-            policy: Policy::Hidden,
-            params: &[
-                Param { name: "--yes", required: false, kind: ParamKind::Flag },
-                Param { name: "--json", required: false, kind: ParamKind::Flag },
-            ],
-            handoff_reason: None,
-        },
-        CommandId::ClusterStatus => Command {
-            id: CommandId::ClusterStatus,
-            parent: Some("cluster"),
-            leaf_name: "status",
-            summary: "Summarise the cluster: is the broker there, and what is it holding.",
-            policy: Policy::Hidden,
-            params: &[Param { name: "--json", required: false, kind: ParamKind::Flag }],
-            handoff_reason: None,
-        },
-
         CommandId::ConfigGet => Command {
             id: CommandId::ConfigGet,
             parent: Some("config"),
@@ -804,6 +772,38 @@ fn entry(id: CommandId) -> Command {
             params: &[Param { name: "key", required: true, kind: ParamKind::Text }],
             handoff_reason: None,
             // HIDE: no HTTP route exists; ADR-02 forbids subprocess execution
+        },
+
+        // ── `cao fleet *` — both HIDE (CAO on EKS v2) ─────────────────────────────────
+        //
+        // These do not talk to the cao-server on this machine. They talk to a REMOTE cluster's
+        // worker broker over HTTP, addressed by CAO_ELASTIC_BROKER_URL and
+        // CAO_ELASTIC_BROKER_TOKEN — two environment variables the TUI neither sets nor can read
+        // the value of. Offering them in-pane would offer commands that fail with "No cluster
+        // configured" on every machine that has not exported them, which is worse than not
+        // offering them at all. `shutdown` additionally deletes running agent sessions belonging
+        // to whoever is using that cluster. HIDE per project.md's mandated default, and both are
+        // a deliberate review away from anything else.
+        CommandId::FleetShutdown => Command {
+            id: CommandId::FleetShutdown,
+            parent: Some("fleet"),
+            leaf_name: "shutdown",
+            summary: "Release every live worker in the fleet.",
+            policy: Policy::Hidden,
+            params: &[
+                Param { name: "--yes", required: false, kind: ParamKind::Flag },
+                Param { name: "--json", required: false, kind: ParamKind::Flag },
+            ],
+            handoff_reason: None,
+        },
+        CommandId::FleetStatus => Command {
+            id: CommandId::FleetStatus,
+            parent: Some("fleet"),
+            leaf_name: "status",
+            summary: "Summarise the fleet: is the broker there, and what is it holding.",
+            policy: Policy::Hidden,
+            params: &[Param { name: "--json", required: false, kind: ParamKind::Flag }],
+            handoff_reason: None,
         },
 
         CommandId::FlowAdd => Command {
@@ -1252,7 +1252,7 @@ fn entry(id: CommandId) -> Command {
         // ── `cao worker *` — all seven HIDE (CAO on EKS v2) ─────────────────────────────
         //
         // The remote counterpart of `cao session`, and hidden for the same reason as
-        // `cao cluster *` above: a broker URL and token this process cannot see. `attach` is worth
+        // `cao fleet *` above: a broker URL and token this process cannot see. `attach` is worth
         // singling out — it is a prompt/read loop over two HTTP routes, NOT a pty, so a TUI pane
         // that treated it as a terminal would misrepresent what the user is holding.
         CommandId::WorkerAttach => Command {
@@ -1607,7 +1607,7 @@ mod tests {
     /// send-message/status), all HIDE per the same mandated default — none has been deliberately
     /// reviewed for IN-APP or HANDOFF yet. That gives **24/18/34 = 76**.
     ///
-    /// Then **CAO on EKS v2** added nine: `cao cluster {status, shutdown}` and `cao worker {list,
+    /// Then **CAO on EKS v2** added nine: `cao fleet {status, shutdown}` and `cao worker {list,
     /// status, send, sessions, attach, logs, release}`, all HIDE. Unlike every earlier addition,
     /// these are HIDE for a reason beyond "not yet reviewed" — they address a remote cluster
     /// through two environment variables this process cannot read, so an offered row would be a
@@ -1714,8 +1714,6 @@ mod tests {
                     CommandId::AgentResult => CommandId::AgentResult,
                     CommandId::AgentSendMessage => CommandId::AgentSendMessage,
                     CommandId::AgentStatus => CommandId::AgentStatus,
-                    CommandId::ClusterShutdown => CommandId::ClusterShutdown,
-                    CommandId::ClusterStatus => CommandId::ClusterStatus,
                     CommandId::ConfigGet => CommandId::ConfigGet,
                     CommandId::ConfigList => CommandId::ConfigList,
                     CommandId::ConfigPath => CommandId::ConfigPath,
@@ -1724,6 +1722,8 @@ mod tests {
                     CommandId::EnvList => CommandId::EnvList,
                     CommandId::EnvSet => CommandId::EnvSet,
                     CommandId::EnvUnset => CommandId::EnvUnset,
+                    CommandId::FleetShutdown => CommandId::FleetShutdown,
+                    CommandId::FleetStatus => CommandId::FleetStatus,
                     CommandId::FlowAdd => CommandId::FlowAdd,
                     CommandId::FlowDisable => CommandId::FlowDisable,
                     CommandId::FlowEnable => CommandId::FlowEnable,
@@ -1804,8 +1804,6 @@ mod tests {
                 CommandId::AgentResult,
                 CommandId::AgentSendMessage,
                 CommandId::AgentStatus,
-                CommandId::ClusterShutdown,
-                CommandId::ClusterStatus,
                 CommandId::ConfigGet,
                 CommandId::ConfigList,
                 CommandId::ConfigPath,
@@ -1814,6 +1812,8 @@ mod tests {
                 CommandId::EnvList,
                 CommandId::EnvSet,
                 CommandId::EnvUnset,
+                CommandId::FleetShutdown,
+                CommandId::FleetStatus,
                 CommandId::FlowAdd,
                 CommandId::FlowDisable,
                 CommandId::FlowEnable,

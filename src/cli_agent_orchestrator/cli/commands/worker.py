@@ -3,7 +3,7 @@
 `cao worker` is `cao session` for an agent that is not on this machine. The verbs
 line up on purpose — list, status, send, sessions — because the thing at the other
 end IS a cao-server; only the route to it differs, and it differs enough that it
-cannot be the same command. See `utils/cluster.py` for that route.
+cannot be the same command. See `utils/fleet.py` for that route.
 
 What is deliberately NOT here: create. Workers are minted by a supervisor agent
 calling `assign_elastic`, sized to the task it is delegating. A `cao worker create`
@@ -16,7 +16,7 @@ import time
 
 import click
 
-from cli_agent_orchestrator.utils.cluster import LIVE_STATES, ClusterClient
+from cli_agent_orchestrator.utils.fleet import LIVE_STATES, FleetClient
 from cli_agent_orchestrator.utils.terminal import poll_until_done
 
 # Default poll timeout for a sync send, matching `cao session send`. A worker is
@@ -56,7 +56,7 @@ def list_workers(show_all, as_json):
     broker recorded and the reason it recorded it, which the supervisor's own
     transcript does not contain.
     """
-    workers = _rows(ClusterClient.from_env().workers(), live_only=not show_all)
+    workers = _rows(FleetClient.from_env().workers(), live_only=not show_all)
     if as_json:
         click.echo(json.dumps(workers, indent=2))
         return
@@ -77,7 +77,7 @@ def status(worker_id, as_json):
     is working. They disagree in exactly the case worth catching — a Ready pod
     whose agent finished minutes ago without saying so.
     """
-    client = ClusterClient.from_env()
+    client = FleetClient.from_env()
     lease = next((w for w in client.workers() if w.get("worker_id") == worker_id), None)
     terminal = None
     last_output = None
@@ -134,7 +134,7 @@ def status(worker_id, as_json):
 )
 def send(worker_id, message, is_async, timeout):
     """Send a message to a worker's agent and print its reply."""
-    client = ClusterClient.from_env()
+    client = FleetClient.from_env()
     terminal_id = client.sole_terminal(worker_id)["id"]
     client.send_input(worker_id, terminal_id, message)
     if is_async:
@@ -166,7 +166,7 @@ def send(worker_id, message, is_async, timeout):
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON")
 def sessions(worker_id, as_json):
     """List the sessions and terminals inside a worker."""
-    client = ClusterClient.from_env()
+    client = FleetClient.from_env()
     rows = [
         {
             "session": s["name"],
@@ -208,7 +208,7 @@ def attach(worker_id):
 
     Type `exit` or press Ctrl-D to leave. Leaving does not release the worker.
     """
-    client = ClusterClient.from_env()
+    client = FleetClient.from_env()
     terminal = client.sole_terminal(worker_id)
     terminal_id = terminal["id"]
     click.echo(
@@ -253,7 +253,7 @@ def logs(worker_id, tail_lines, follow):
     can only report what the lease and the terminal say, and neither exists yet
     when the failure is an image pull or a profile install that died at boot.
     """
-    client = ClusterClient.from_env()
+    client = FleetClient.from_env()
     if not follow:
         click.echo(client.logs(worker_id, tail_lines=tail_lines).rstrip("\n"))
         return
@@ -273,5 +273,5 @@ def release(worker_id):
     without saying so squats a node's worth of memory until the broker's
     completion deadline. This is how you take it back now.
     """
-    ClusterClient.from_env().release(worker_id)
+    FleetClient.from_env().release(worker_id)
     click.echo(f"✓ Released worker {worker_id}")

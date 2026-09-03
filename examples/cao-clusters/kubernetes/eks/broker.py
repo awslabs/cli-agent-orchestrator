@@ -269,7 +269,7 @@ def _worker_deployment(
     container never exits and the Job never completed. Its lifecycle was doing no
     work - nothing read `.status.succeeded`, and the reaper watches Pods, not
     Jobs. What a Job did contribute was a batch shape that made `cao worker` and
-    `cao cluster` awkward to explain and impossible to restart.
+    `cao fleet` awkward to explain and impossible to restart.
 
     Not a StatefulSet, despite the per-pod identity looking like a fit: release is
     out of order. `_release` deletes whichever single worker just finished, and a

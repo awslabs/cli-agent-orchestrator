@@ -5,7 +5,7 @@ from importlib.metadata import PackageNotFoundError, version
 import click
 
 from cli_agent_orchestrator.cli.commands.agent import agent
-from cli_agent_orchestrator.cli.commands.cluster import cluster
+from cli_agent_orchestrator.cli.commands.fleet import fleet
 from cli_agent_orchestrator.cli.commands.config import config
 from cli_agent_orchestrator.cli.commands.env import env
 from cli_agent_orchestrator.cli.commands.info import info
@@ -54,9 +54,9 @@ cli.add_command(memory)
 cli.add_command(skills)
 cli.add_command(session)
 cli.add_command(terminal)
-# Remote fleets. `cao cluster`/`cao worker` reach a cluster's worker broker over
+# Remote fleets. `cao fleet`/`cao worker` reach a cluster's worker broker over
 # HTTP; every other command here talks to the cao-server on this machine.
-cli.add_command(cluster)
+cli.add_command(fleet)
 cli.add_command(worker)
 cli.add_command(workflow)
 cli.add_command(update)
