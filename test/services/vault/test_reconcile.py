@@ -28,7 +28,7 @@ def test_rebuild_deletes_only_vault_rows_and_groups_same_code_findings(tmp_path,
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
     monkeypatch.setattr(module, "SessionLocal", Session)
-    monkeypatch.setattr(module, "_replace_vault_edges", lambda _notes: None)
+    monkeypatch.setattr(module, "_replace_vault_edges", lambda _notes, **_kwargs: None)
     monkeypatch.setattr(module, "_emit_audit_events", lambda *_args: None)
     (tmp_path / "vault").mkdir()
     vault = _vault(tmp_path)
@@ -88,7 +88,7 @@ def test_reconcile_emits_completion_note_and_secret_audits(tmp_path, monkeypatch
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
     monkeypatch.setattr(module, "SessionLocal", Session)
-    monkeypatch.setattr(module, "_replace_vault_edges", lambda _notes: None)
+    monkeypatch.setattr(module, "_replace_vault_edges", lambda _notes, **_kwargs: None)
     events = []
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.audit_log.write_audit_nowait",
@@ -118,7 +118,7 @@ def test_warn_mode_secret_still_emits_detection_audit(tmp_path, monkeypatch):
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
     monkeypatch.setattr(module, "SessionLocal", Session)
-    monkeypatch.setattr(module, "_replace_vault_edges", lambda _notes: None)
+    monkeypatch.setattr(module, "_replace_vault_edges", lambda _notes, **_kwargs: None)
     events = []
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.audit_log.write_audit_nowait",
@@ -623,6 +623,148 @@ def test_pure_rename_of_deindexed_note_keeps_it_excluded(tmp_path, monkeypatch):
     assert (note.vault_relpath, note.status) == ("Mapped/New.md", "excluded")
     assert metadata_count == 0
     assert "deindexed_retained" in finding.detail
+
+
+def test_authored_key_rename_preserves_exclusion_through_quarantine(tmp_path, monkeypatch):
+    """An explicitly forgotten authored identity cannot republish after a move."""
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    old_path = tmp_path / "vault" / "Mapped" / "Old.md"
+    old_path.write_text("---\ncao:\n  key: canonical\n---\nsafe", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="authored-tombstone-before")
+    with Session() as db:
+        db.query(VaultNoteModel).filter_by(cao_key="canonical").update({"status": "excluded"})
+        db.query(MemoryMetadataModel).filter_by(source_kind="vault", key="canonical").delete()
+        db.commit()
+
+    old_path.write_text(
+        "---\ncao:\n  key: canonical\n---\npassword: hunter2sixteen",
+        encoding="utf-8",
+    )
+    reconcile(vault, apply=True, run_id="authored-tombstone-quarantined")
+    old_path.rename(old_path.with_name("New.md"))
+    (tmp_path / "vault" / "Mapped" / "New.md").write_text(
+        "---\ncao:\n  key: canonical\n---\nsafe", encoding="utf-8"
+    )
+    reconcile(vault, apply=True, run_id="authored-tombstone-renamed")
+
+    with Session() as db:
+        note = db.query(VaultNoteModel).filter_by(cao_key="canonical").one()
+        metadata = (
+            db.query(MemoryMetadataModel).filter_by(source_kind="vault", key="canonical").count()
+        )
+    assert (note.vault_relpath, note.status, metadata) == ("Mapped/New.md", "excluded", 0)
+
+
+def test_empty_and_scalar_frontmatter_aliases_are_normalized_for_link_projection(
+    tmp_path, monkeypatch
+):
+    """Null aliases are empty; a scalar alias is one alias, never characters."""
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    mapped = tmp_path / "vault" / "Mapped"
+    (mapped / "Source.md").write_text("[[Whole Alias]] [[Missing]]", encoding="utf-8")
+    (mapped / "Target.md").write_text("---\naliases: Whole Alias\n---\ntarget", encoding="utf-8")
+    (mapped / "Empty.md").write_text("---\naliases:\n---\nempty", encoding="utf-8")
+
+    report = reconcile(vault, apply=True, run_id="normalized-aliases")
+
+    with Session() as db:
+        edges = db.query(MemoryRelationshipModel).filter_by(origin="vault").all()
+        dangling = db.query(VaultFindingModel).filter_by(code="link_dangling").count()
+    assert report.indexed == 3
+    assert [(edge.source_key, edge.target_key) for edge in edges] == [
+        (derive_cao_key("Source.md"), derive_cao_key("Target.md"))
+    ]
+    assert dangling == 1
+
+
+def test_invalid_frontmatter_alias_shape_is_ignored_without_aborting_reconcile(
+    tmp_path, monkeypatch
+):
+    """A non-string alias member is ignored without aborting reconciliation."""
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    mapped = tmp_path / "vault" / "Mapped"
+    (mapped / "Source.md").write_text("[[42]]", encoding="utf-8")
+    (mapped / "Target.md").write_text("---\naliases: [42]\n---\ntarget", encoding="utf-8")
+
+    report = reconcile(vault, apply=True, run_id="invalid-aliases")
+
+    with Session() as db:
+        edge_count = db.query(MemoryRelationshipModel).filter_by(origin="vault").count()
+        dangling = db.query(VaultFindingModel).filter_by(code="link_dangling").count()
+    assert (report.indexed, edge_count, dangling) == (2, 0, 1)
+
+
+def test_path_reuse_across_repeated_renames_upserts_former_path_alias(tmp_path, monkeypatch):
+    """A -> B -> A -> B must not collide on the former-path alias primary key."""
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    mapped = tmp_path / "vault" / "Mapped"
+    current = mapped / "A.md"
+    current.write_text("same content", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="path-reuse-before")
+    for run_id, name in (
+        ("path-reuse-b", "B.md"),
+        ("path-reuse-a", "A.md"),
+        ("path-reuse-b-again", "B.md"),
+    ):
+        next_path = mapped / name
+        current.rename(next_path)
+        current = next_path
+        reconcile(vault, apply=True, run_id=run_id)
+
+    with Session() as db:
+        notes = db.query(VaultNoteModel).all()
+        aliases = db.query(VaultNoteAliasModel).order_by(VaultNoteAliasModel.former_relpath).all()
+    assert [(note.vault_relpath, note.status) for note in notes] == [("Mapped/B.md", "indexed")]
+    assert [alias.former_relpath for alias in aliases] == ["Mapped/A.md", "Mapped/B.md"]
+
+
+def test_reconcile_rolls_back_stale_edge_retraction_when_projection_fails(tmp_path, monkeypatch):
+    """A failed apply leaves edge, projection, and findings at the prior committed state."""
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    mapped = tmp_path / "vault" / "Mapped"
+    source = mapped / "Source.md"
+    source.write_text("[[Target]]", encoding="utf-8")
+    (mapped / "Target.md").write_text("target", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="atomic-retraction-before")
+
+    original_upsert = module._upsert_note
+
+    def fail_quarantined_source(db, vault_id, item, started):
+        if item.note.vault_relpath == "Mapped/Source.md":
+            raise RuntimeError("induced projection failure")
+        return original_upsert(db, vault_id, item, started)
+
+    monkeypatch.setattr(module, "_upsert_note", fail_quarantined_source)
+    source.write_text("password: hunter2sixteen", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="induced projection failure"):
+        reconcile(vault, apply=True, run_id="atomic-retraction-after")
+
+    with Session() as db:
+        source_note = db.query(VaultNoteModel).filter_by(vault_relpath="Mapped/Source.md").one()
+        source_metadata = (
+            db.query(MemoryMetadataModel)
+            .filter_by(source_kind="vault", key=source_note.cao_key)
+            .count()
+        )
+        vault_edges = db.query(MemoryRelationshipModel).filter_by(origin="vault").count()
+        findings = db.query(VaultFindingModel).count()
+    assert (source_note.status, source_metadata, vault_edges, findings) == ("indexed", 1, 1, 0)
 
 
 def test_rebuild_preserves_deindexed_tombstones(tmp_path, monkeypatch):

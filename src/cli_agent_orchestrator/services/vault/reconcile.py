@@ -125,13 +125,15 @@ def reconcile(
     deleted = 0
 
     if apply:
-        if not rebuild:
-            _clear_stale_vault_edges(vault.id, projected)
-        deleted, findings, projected = _apply_plan(
-            vault, plan, projected, findings, rebuild=rebuild
-        )
-        findings = _merge_findings(findings, _replace_vault_edges(projected) or ())
-        _persist_findings(vault.id, plan, findings)
+        with SessionLocal() as db:
+            with db.begin():
+                if not rebuild:
+                    _clear_stale_vault_edges(db, vault.id, projected)
+                deleted, findings, projected = _apply_plan(
+                    db, vault, plan, projected, findings, rebuild=rebuild
+                )
+                findings = _merge_findings(findings, _replace_vault_edges(projected, db=db) or ())
+                _persist_findings(db, vault.id, plan, findings)
         _emit_audit_events(vault.id, plan.run_id, projected, indexed, quarantined, skipped)
     else:
         findings, projected = _preview_rename_findings(vault.id, projected, findings)
@@ -177,35 +179,34 @@ def _preview_rename_findings(
     )
 
 
-def _clear_stale_vault_edges(vault_id: str, projected: tuple[_ProjectedNote, ...]) -> None:
+def _clear_stale_vault_edges(db, vault_id: str, projected: tuple[_ProjectedNote, ...]) -> None:
     """Retract removed or non-indexed sources through the relationship boundary."""
-    with SessionLocal() as db:
-        prior_by_path: dict[str, VaultNoteModel] = {
-            cast(str, row.vault_relpath): row
-            for row in db.query(VaultNoteModel).filter(VaultNoteModel.vault_id == vault_id).all()
-        }
-        carried_alias_keys = _alias_identity_set(db, vault_id)
-        resolutions = _resolve_renames(
-            vault_id, projected, prior_by_path, carried_alias_keys=carried_alias_keys
-        )
-        retained = {
-            resolution.retained_former_path
-            for resolution in resolutions
-            if resolution.retained_former_path is not None
-        }
-        current = {item.note.vault_relpath for item in projected}
-        removed = tuple(
-            row
-            for path, row in prior_by_path.items()
-            if path not in current and path not in retained and row.status == "indexed"
-        )
-        retracted = tuple(
-            prior_by_path[item.note.vault_relpath]
-            for item in projected
-            if item.note.status != "indexed"
-            and item.note.vault_relpath in prior_by_path
-            and prior_by_path[item.note.vault_relpath].status == "indexed"
-        )
+    prior_by_path: dict[str, VaultNoteModel] = {
+        cast(str, row.vault_relpath): row
+        for row in db.query(VaultNoteModel).filter(VaultNoteModel.vault_id == vault_id).all()
+    }
+    carried_alias_keys = _alias_identity_set(db, vault_id)
+    resolutions = _resolve_renames(
+        vault_id, projected, prior_by_path, carried_alias_keys=carried_alias_keys
+    )
+    retained = {
+        resolution.retained_former_path
+        for resolution in resolutions
+        if resolution.retained_former_path is not None
+    }
+    current = {item.note.vault_relpath for item in projected}
+    removed = tuple(
+        row
+        for path, row in prior_by_path.items()
+        if path not in current and path not in retained and row.status == "indexed"
+    )
+    retracted = tuple(
+        prior_by_path[item.note.vault_relpath]
+        for item in projected
+        if item.note.status != "indexed"
+        and item.note.vault_relpath in prior_by_path
+        and prior_by_path[item.note.vault_relpath].status == "indexed"
+    )
     service = MemoryRelationshipService()
     for row in removed + retracted:
         service.purge_for_key(
@@ -213,6 +214,7 @@ def _clear_stale_vault_edges(vault_id: str, projected: tuple[_ProjectedNote, ...
             None if cast(str, row.scope_id) == "" else cast(str, row.scope_id),
             cast(str, row.cao_key),
             origins=("vault",),
+            db=db,
         )
 
 
@@ -287,6 +289,7 @@ def _quarantine_key_collisions(
 
 
 def _apply_plan(
+    db,
     vault: VaultSpec,
     plan: ReconcilePlan,
     projected: tuple[_ProjectedNote, ...],
@@ -295,140 +298,133 @@ def _apply_plan(
     rebuild: bool,
 ) -> tuple[int, tuple[tuple[str, str, str, str], ...], tuple[_ProjectedNote, ...]]:
     """Apply only vault-scoped deletes; native rows remain structurally untouched."""
-    with SessionLocal() as db:
-        rebuild_excluded_paths: set[str] = set()
-        if rebuild:
-            rebuild_excluded_paths = {
-                cast(str, row.vault_relpath)
-                for row in db.query(VaultNoteModel)
-                .filter(
-                    VaultNoteModel.vault_id == vault.id,
-                    VaultNoteModel.status == "excluded",
-                )
-                .all()
-            }
-            # Every rebuild delete is scoped to its derived producer. Release
-            # one permits one configured vault, so metadata has no vault id.
-            db.query(VaultNoteModel).filter(VaultNoteModel.vault_id == vault.id).delete()
-            db.query(VaultFindingModel).filter(VaultFindingModel.vault_id == vault.id).delete()
-            db.query(VaultNoteAliasModel).filter(VaultNoteAliasModel.vault_id == vault.id).delete()
-            db.query(MemoryMetadataModel).filter(
-                MemoryMetadataModel.source_kind == "vault"
-            ).delete()
-            db.query(MemoryRelationshipModel).filter(
-                MemoryRelationshipModel.origin == "vault"
-            ).delete()
-        else:
-            db.query(VaultFindingModel).filter(VaultFindingModel.vault_id == vault.id).delete()
-
-        prior_by_path: dict[str, VaultNoteModel] = {
-            cast(str, row.vault_relpath): row
-            for row in db.query(VaultNoteModel).filter(VaultNoteModel.vault_id == vault.id).all()
-        }
-        carried_alias_keys = _alias_identity_set(db, vault.id)
-        resolutions = _resolve_renames(
-            vault.id,
-            projected,
-            prior_by_path,
-            carried_alias_keys=carried_alias_keys,
-        )
-        if rebuild_excluded_paths:
-            resolutions = tuple(
-                (
-                    replace(
-                        resolution,
-                        item=replace(
-                            resolution.item,
-                            note=replace(resolution.item.note, status="excluded"),
-                        ),
-                        findings=resolution.findings
-                        + (
-                            _rename_finding(
-                                FindingCode.DEINDEXED_RETAINED,
-                                resolution.item.note.vault_relpath,
-                            ),
-                        ),
-                    )
-                    if resolution.item.note.vault_relpath in rebuild_excluded_paths
-                    and resolution.item.note.status == "indexed"
-                    else resolution
-                )
-                for resolution in resolutions
+    rebuild_excluded_paths: set[str] = set()
+    if rebuild:
+        rebuild_excluded_paths = {
+            cast(str, row.vault_relpath)
+            for row in db.query(VaultNoteModel)
+            .filter(
+                VaultNoteModel.vault_id == vault.id,
+                VaultNoteModel.status == "excluded",
             )
-        projected = tuple(resolution.item for resolution in resolutions)
-        findings = _merge_findings(
-            findings,
-            tuple(finding for resolution in resolutions for finding in resolution.findings),
-        )
-        retained_paths = {
-            resolution.retained_former_path
+            .all()
+        }
+        # Every rebuild delete is scoped to its derived producer. Release
+        # one permits one configured vault, so metadata has no vault id.
+        db.query(VaultNoteModel).filter(VaultNoteModel.vault_id == vault.id).delete()
+        db.query(VaultFindingModel).filter(VaultFindingModel.vault_id == vault.id).delete()
+        db.query(VaultNoteAliasModel).filter(VaultNoteAliasModel.vault_id == vault.id).delete()
+        db.query(MemoryMetadataModel).filter(MemoryMetadataModel.source_kind == "vault").delete()
+        db.query(MemoryRelationshipModel).filter(MemoryRelationshipModel.origin == "vault").delete()
+    else:
+        db.query(VaultFindingModel).filter(VaultFindingModel.vault_id == vault.id).delete()
+
+    prior_by_path: dict[str, VaultNoteModel] = {
+        cast(str, row.vault_relpath): row
+        for row in db.query(VaultNoteModel).filter(VaultNoteModel.vault_id == vault.id).all()
+    }
+    carried_alias_keys = _alias_identity_set(db, vault.id)
+    resolutions = _resolve_renames(
+        vault.id,
+        projected,
+        prior_by_path,
+        carried_alias_keys=carried_alias_keys,
+    )
+    if rebuild_excluded_paths:
+        resolutions = tuple(
+            (
+                replace(
+                    resolution,
+                    item=replace(
+                        resolution.item,
+                        note=replace(resolution.item.note, status="excluded"),
+                    ),
+                    findings=resolution.findings
+                    + (
+                        _rename_finding(
+                            FindingCode.DEINDEXED_RETAINED,
+                            resolution.item.note.vault_relpath,
+                        ),
+                    ),
+                )
+                if resolution.item.note.vault_relpath in rebuild_excluded_paths
+                and resolution.item.note.status == "indexed"
+                else resolution
+            )
             for resolution in resolutions
-            if resolution.retained_former_path is not None
-        }
-        current_paths = {item.note.vault_relpath for item in projected}
-        deleted = 0
-        for path, row in prior_by_path.items():
-            if path not in current_paths and path not in retained_paths:
-                _delete_projection(db, row)
-                deleted += 1
+        )
+    projected = tuple(resolution.item for resolution in resolutions)
+    findings = _merge_findings(
+        findings,
+        tuple(finding for resolution in resolutions for finding in resolution.findings),
+    )
+    retained_paths = {
+        resolution.retained_former_path
+        for resolution in resolutions
+        if resolution.retained_former_path is not None
+    }
+    current_paths = {item.note.vault_relpath for item in projected}
+    deleted = 0
+    for path, row in prior_by_path.items():
+        if path not in current_paths and path not in retained_paths:
+            _delete_projection(db, row)
+            deleted += 1
 
-        relationship_service = MemoryRelationshipService()
-        for resolution in resolutions:
-            item = resolution.item
-            prior = prior_by_path.get(item.note.vault_relpath)
-            if prior is None or prior.note_uid == item.note_uid:
-                continue
-            stored_scope = cast(str, prior.scope)
-            stored_scope_id = cast(str, prior.scope_id)
-            stored_key = cast(str, prior.cao_key)
-            relationship_service.purge_for_key(
-                stored_scope,
-                None if stored_scope_id == "" else stored_scope_id,
-                stored_key,
-                origins=("vault",),
-                db=db,
-            )
-            _delete_metadata_for_identity(db, stored_scope, stored_scope_id, stored_key)
-            _delete_aliases_for_identity(db, vault.id, stored_scope, stored_scope_id, stored_key)
-            db.delete(prior)
-        db.flush()
+    relationship_service = MemoryRelationshipService()
+    for resolution in resolutions:
+        item = resolution.item
+        prior = prior_by_path.get(item.note.vault_relpath)
+        if prior is None or prior.note_uid == item.note_uid:
+            continue
+        stored_scope = cast(str, prior.scope)
+        stored_scope_id = cast(str, prior.scope_id)
+        stored_key = cast(str, prior.cao_key)
+        relationship_service.purge_for_key(
+            stored_scope,
+            None if stored_scope_id == "" else stored_scope_id,
+            stored_key,
+            origins=("vault",),
+            db=db,
+        )
+        _delete_metadata_for_identity(db, stored_scope, stored_scope_id, stored_key)
+        _delete_aliases_for_identity(db, vault.id, stored_scope, stored_scope_id, stored_key)
+        db.delete(prior)
+    db.flush()
 
-        for resolution in resolutions:
-            item = resolution.item
-            if resolution.alias_from is not None:
-                _record_rename_alias(db, vault.id, resolution.alias_from, plan.run_started_at)
-            _upsert_note(db, vault.id, item, plan.run_started_at)
-            if item.note.status == "indexed":
-                _upsert_metadata(db, item)
-            else:
-                _delete_metadata_for_item(db, item)
-        db.flush()
-        _refresh_alias_provenance(db, vault.id, projected, plan.run_started_at)
-        db.commit()
+    for resolution in resolutions:
+        item = resolution.item
+        if resolution.alias_from is not None:
+            _record_rename_alias(db, vault.id, resolution.alias_from, plan.run_started_at)
+        _upsert_note(db, vault.id, item, plan.run_started_at)
+        if item.note.status == "indexed":
+            _upsert_metadata(db, item)
+        else:
+            _delete_metadata_for_item(db, item)
+    db.flush()
+    _refresh_alias_provenance(db, vault.id, projected, plan.run_started_at)
     return deleted, findings, projected
 
 
 def _persist_findings(
+    db,
     vault_id: str,
     plan: ReconcilePlan,
     findings: tuple[tuple[str, str, str, str], ...],
 ) -> None:
-    with SessionLocal() as db:
-        db.query(VaultFindingModel).filter(VaultFindingModel.vault_id == vault_id).delete()
-        for code, path, severity, detail in findings:
-            db.add(
-                VaultFindingModel(
-                    id=_digest("finding", plan.run_id, code, path, severity),
-                    vault_id=vault_id,
-                    vault_relpath=path,
-                    code=code,
-                    severity=severity,
-                    detail=detail,
-                    reconcile_run_id=plan.run_id,
-                    created_at=plan.run_started_at,
-                )
+    db.query(VaultFindingModel).filter(VaultFindingModel.vault_id == vault_id).delete()
+    for code, path, severity, detail in findings:
+        db.add(
+            VaultFindingModel(
+                id=_digest("finding", plan.run_id, code, path, severity),
+                vault_id=vault_id,
+                vault_relpath=path,
+                code=code,
+                severity=severity,
+                detail=detail,
+                reconcile_run_id=plan.run_id,
+                created_at=plan.run_started_at,
             )
-        db.commit()
+        )
 
 
 def _delete_projection(db, row: VaultNoteModel) -> None:
@@ -570,15 +566,14 @@ def _resolve_renames(
                 )
             identity_changed = cast(str, existing.note_uid) != item.note_uid
             resolution_findings: tuple[tuple[str, str, str, str], ...] = ()
-            if existing.status == "excluded" and item.note.status == "indexed":
+            if existing.status == "excluded" and item.note.status != "excluded":
                 item = replace(item, note=replace(item.note, status="excluded"))
-                if identity_changed:
-                    resolution_findings = (
-                        _rename_finding(
-                            FindingCode.DEINDEXED_RETAINED,
-                            item.note.vault_relpath,
-                        ),
-                    )
+                resolution_findings = (
+                    _rename_finding(
+                        FindingCode.DEINDEXED_RETAINED,
+                        item.note.vault_relpath,
+                    ),
+                )
             resolutions.append(_RenameResolution(item, findings=resolution_findings))
             continue
         same_scope = tuple(
@@ -590,6 +585,8 @@ def _resolve_renames(
         matching = matching_by_path.get(item.note.vault_relpath, ())
         if has_authored_key:
             canonical = tuple(old for old in same_scope if old.note_uid == item.note_uid)
+            if len(canonical) == 1 and canonical[0].status == "excluded":
+                item = replace(item, note=replace(item.note, status="excluded"))
             resolutions.append(
                 _RenameResolution(
                     item,
@@ -611,7 +608,7 @@ def _resolve_renames(
                 memory_id=_digest("memory", old_note_uid),
             )
             rename_findings: tuple[tuple[str, str, str, str], ...] = ()
-            if old.status == "excluded" and renamed_item.note.status == "indexed":
+            if old.status == "excluded" and renamed_item.note.status != "excluded":
                 renamed_item = replace(
                     renamed_item,
                     note=replace(renamed_item.note, status="excluded"),
@@ -668,17 +665,21 @@ def _resolve_renames(
 
 
 def _record_rename_alias(db, vault_id: str, old: VaultNoteModel, created_at: datetime) -> None:
-    db.add(
-        VaultNoteAliasModel(
+    alias = db.get(
+        VaultNoteAliasModel,
+        {"vault_id": vault_id, "former_relpath": old.vault_relpath},
+    )
+    if alias is None:
+        alias = VaultNoteAliasModel(
             vault_id=vault_id,
             former_relpath=old.vault_relpath,
-            cao_key=old.cao_key,
-            scope=old.scope,
-            scope_id=None if old.scope_id == "" else old.scope_id,
-            content_sha256=old.content_sha256,
-            created_at=created_at,
         )
-    )
+        db.add(alias)
+    alias.cao_key = old.cao_key
+    alias.scope = old.scope
+    alias.scope_id = None if old.scope_id == "" else old.scope_id
+    alias.content_sha256 = old.content_sha256
+    alias.created_at = created_at
 
 
 def _refresh_alias_provenance(
@@ -850,10 +851,10 @@ def _candidate_set(
                 LinkCandidate(
                     candidate.key,
                     candidate.note.vault_relpath,
-                    (
-                        tuple(candidate.note.parsed.frontmatter.get("aliases", ()))
+                    _frontmatter_aliases(
+                        candidate.note.parsed.frontmatter.get("aliases")
                         if candidate.note.parsed
-                        else ()
+                        else None
                     ),
                     excluded=candidate.note.status != "indexed",
                 )
@@ -1008,6 +1009,8 @@ def _project_vault_edges(
 
 def _replace_vault_edges(
     projected: Iterable[_ProjectedNote],
+    *,
+    db=None,
 ) -> tuple[tuple[str, str, str, str], ...]:
     """Replace every vault-owned type group through the service boundary."""
     all_notes = tuple(projected)
@@ -1028,6 +1031,7 @@ def _replace_vault_edges(
                 type_,
                 [],
                 source_kind="vault",
+                db=db,
             )
             service.replace_set(
                 item.note.scope,
@@ -1037,6 +1041,7 @@ def _replace_vault_edges(
                 type_,
                 list(groups.get((item.note.scope, item.note.scope_id, item.key, type_), ())),
                 source_kind="vault",
+                db=db,
             )
     return findings
 
@@ -1099,3 +1104,14 @@ def _tags(value) -> str:
     if isinstance(value, list) and all(isinstance(tag, str) for tag in value):
         return ",".join(sorted(value))
     return ""
+
+
+def _frontmatter_aliases(value: object) -> tuple[str, ...]:
+    """Return only usable frontmatter aliases; YAML null means no aliases."""
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return (value,)
+    if isinstance(value, (list, tuple)):
+        return tuple(alias for alias in value if isinstance(alias, str))
+    return ()

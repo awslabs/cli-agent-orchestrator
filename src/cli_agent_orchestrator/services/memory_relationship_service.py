@@ -26,6 +26,7 @@ Fail-closed: every validation raises ``ValueError`` BEFORE any DB write.
 import json
 import logging
 import uuid
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, cast
@@ -487,6 +488,7 @@ class MemoryRelationshipService:
         edges: List[EdgeInput],
         *,
         source_kind: str = "native",
+        db: Any = None,
     ) -> ReplaceReport:
         """Producer-scoped replacement (principle 6, FR-2.5).
 
@@ -511,11 +513,12 @@ class MemoryRelationshipService:
         src = self._sanitize_key(source_key)
         sentinel = self._to_sentinel(scope_id)
         report = ReplaceReport()
+        owns_session = db is None
 
         # Validate + resolve the incoming set first (fail-closed); collect valid
         # targets, report the rest (FR-1.5-style) without aborting the whole op.
         valid: Dict[str, EdgeInput] = {}
-        with SessionLocal() as db:
+        with SessionLocal() if owns_session else nullcontext(db) as db:
             for edge in edges:
                 try:
                     tgt = self._sanitize_key(edge.target_key)
@@ -628,12 +631,14 @@ class MemoryRelationshipService:
                         )
                     )
                     report.added += 1
-            db.commit()
+            if owns_session:
+                db.commit()
         # Content-free summary audit for the bulk producer write (reviewer F2):
         # replace_set is the highest-volume path (compiler/lint every compile),
         # so it must leave a forensic trail. Counts + endpoints/origin/type only,
         # never a memory body/prompt (NFR-1.7).
-        self._audit_replace_set(scope, sentinel, src, origin, type, report)
+        if owns_session:
+            self._audit_replace_set(scope, sentinel, src, origin, type, report)
         return report
 
     def clear_source(
