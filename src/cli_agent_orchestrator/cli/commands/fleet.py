@@ -19,7 +19,13 @@ from cli_agent_orchestrator.utils.fleet import LIVE_STATES, FleetClient
 
 @click.group()
 def fleet():
-    """Inspect and tear down a CAO fleet's workers."""
+    """Inspect and tear down a CAO fleet's workers.
+
+    There is no verb here that builds a fleet. A fleet is deployed by its own
+    manifests — for EKS, `examples/cao-clusters/kubernetes/eks/deploy.sh` — and
+    these commands operate one that already exists. `shutdown` is not the inverse
+    of a create: it releases workers and leaves the fleet standing.
+    """
 
 
 @fleet.command()
@@ -54,7 +60,7 @@ def status(as_json):
 
 
 @fleet.command()
-@click.option("--yes", is_flag=True, help="Do not ask for confirmation")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt.")
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON (requires --yes)")
 def shutdown(yes, as_json):
     """Release every live worker in the fleet.

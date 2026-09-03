@@ -67,7 +67,9 @@ class FleetClient:
             raise click.ClickException(
                 f"No fleet configured. Set {ELASTIC_BROKER_URL_ENV} and "
                 f"{ELASTIC_BROKER_TOKEN_ENV} to point at your fleet's worker broker "
-                "(port-forward it first if you are outside the cluster)."
+                "(port-forward it first if you are outside the cluster). These "
+                "commands do not create a fleet: deploy one with its own manifests "
+                "first, e.g. examples/cao-clusters/kubernetes/eks/deploy.sh."
             )
         return cls(url, token)
 
