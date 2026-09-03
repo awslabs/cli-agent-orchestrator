@@ -33,6 +33,14 @@ spec:
         - podSelector:
             matchLabels:
               app.kubernetes.io/name: cao-fleet-panel
+        # `cao worker` runs outside the cluster, so it reaches a worker through
+        # the broker's allowlisted operator plane rather than by forwarding to a
+        # Service that lives for one task. Without this rule that plane comes up,
+        # authenticates, and then times out on every worker it tries — the failure
+        # reads as a dead worker rather than a policy denial.
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cao-worker-broker
       ports:
         - port: 9889
           protocol: TCP
@@ -76,10 +84,11 @@ spec:
 #
 # Deliberately NOT a copy of the agent egress rules. The broker runs no agent and
 # holds no credentials, so it needs neither vendor HTTPS nor the Pod Identity
-# endpoint — it needs DNS, the Kubernetes API server, and one fixed path to the
-# supervisor pod for its allowlisted worker gateway. That makes it the most
-# tightly bounded pod in the namespace despite being the only one that can
-# create another pod.
+# endpoint — it needs DNS, the Kubernetes API server, and port 9889 on the two
+# pod labels it proxies for: the supervisor, for the workers' allowlisted
+# gateway, and the workers themselves, for the operator plane `cao worker` calls.
+# That makes it the most tightly bounded pod in the namespace despite being the
+# only one that can create another pod.
 #
 # The API server rule is the subtle part. Copying the agents' `0.0.0.0/0` +
 # private-range-`except` rule onto the broker BLOCKS it: `kubernetes.default`
@@ -105,10 +114,19 @@ spec:
     # Narrow gateway upstream. Workers cannot reach the supervisor directly;
     # the broker authenticates their per-worker release token and forwards only
     # the explicit inbox and memory routes.
+    #
+    # The worker selector is the other direction and the other caller: `cao
+    # worker` from outside the cluster, forwarded to whichever worker it names.
+    # Both destinations answer cao-server on 9889, and neither can be enumerated
+    # by name — worker Services are minted per task — so the bound that holds is
+    # "these two labels, this one port".
     - to:
         - podSelector:
             matchLabels:
               app.kubernetes.io/name: cao-supervisor
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cao-elastic-worker
       ports:
         - port: 9889
           protocol: TCP
@@ -244,8 +262,8 @@ spec:
 # can forward those requests here.
 #
 # The panel still needs the full API for fleet probes. The broker runs no agent
-# and forwards only five fixed routes, so it is the narrow application-layer
-# boundary NetworkPolicy itself cannot express.
+# and forwards only the routes it names one by one, so it is the narrow
+# application-layer boundary NetworkPolicy itself cannot express.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

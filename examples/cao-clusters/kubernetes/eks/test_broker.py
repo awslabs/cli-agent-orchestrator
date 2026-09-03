@@ -65,6 +65,9 @@ STATE["create_pods"] = True
 # pod from the original by uid and a fake that reused one would silently skip
 # that branch.
 STATE["pod_seq"] = 0
+# Every read_namespaced_pod_log the broker makes, so the tail_lines cap can be
+# asserted on what reached the API server rather than on what was asked for.
+STATE["log_calls"] = []
 
 
 def _fake_pod(name, labels):
@@ -116,6 +119,10 @@ class FakeCore:
         wid = label_selector.split("=", 1)[1]
         pod = STATE["pods"].get(wid)
         return types.SimpleNamespace(items=[pod] if pod else [])
+
+    def read_namespaced_pod_log(self, name, ns, tail_lines=None, **kwargs):
+        STATE["log_calls"].append({"pod": name, "tail_lines": tail_lines})
+        return f"boot log of {name}\n"
 
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -649,6 +656,155 @@ with TestClient(broker.app) as c:
                or STATE["deployments"][f"cao-worker-{r.json()['worker_id']}"]
                .spec.template.spec.containers[0].image == os.environ["CAO_ELASTIC_WORKER_IMAGE"]),
           r.text[:200])
+
+    # --- 10. the operator plane: what `cao worker` can and cannot reach ----
+    #
+    # The allowlist is the whole security argument for this route, so the checks
+    # that matter are the refusals. A stub stands in for the worker's cao-server;
+    # the real one is unreachable offline, and what is being tested here is the
+    # broker's decision to forward, not the node's answer.
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    NODE_CALLS = []
+
+    class _NodeHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def _respond(self):
+            length = int(self.headers.get("content-length") or 0)
+            if length:
+                self.rfile.read(length)
+            NODE_CALLS.append({
+                "method": self.command,
+                "path": self.path,
+                "headers": {k.lower(): v for k, v in self.headers.items()},
+            })
+            body = json.dumps({"ok": True, "path": self.path}).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.send_header("x-node-hint", "kept")
+            self.end_headers()
+            self.wfile.write(body)
+
+        do_GET = _respond
+        do_POST = _respond
+
+        def log_message(self, *args):
+            pass
+
+    _node = HTTPServer(("127.0.0.1", 0), _NodeHandler)
+    threading.Thread(target=_node.serve_forever, daemon=True).start()
+    broker._worker_api_base = lambda worker_id: f"http://127.0.0.1:{_node.server_address[1]}"
+
+    # The reaper's 3s completion deadline would settle this worker mid-section and
+    # every proxied call would then correctly 409. Lift it for this section only.
+    _saved_completion = broker.COMPLETION_TIMEOUT
+    broker.COMPLETION_TIMEOUT = 3600
+    try:
+        r = c.post("/workers", json=worker_payload, headers=H)
+        pid = r.json()["worker_id"]
+
+        r = c.get(f"/workers/{pid}/api/sessions", headers=H)
+        check("allowlisted GET reaches the worker", r.status_code == 200, r.text[:200])
+        check("proxied path arrives unchanged at the worker",
+              NODE_CALLS[-1]["path"] == "/sessions", NODE_CALLS[-1]["path"])
+        # The one header that must not travel. It is the broker's credential for
+        # the broker's own API, and a worker is the pod running an agent.
+        check("broker token is not forwarded to the worker",
+              "x-cao-broker-token" not in NODE_CALLS[-1]["headers"],
+              json.dumps(sorted(NODE_CALLS[-1]["headers"])))
+        check("worker response headers survive the hop",
+              r.headers.get("x-node-hint") == "kept", json.dumps(dict(r.headers)))
+        # requests decompressed the body already, so both of these would describe
+        # bytes that no longer exist.
+        check("content-encoding is not passed through",
+              "content-encoding" not in {k.lower() for k in r.headers}, json.dumps(dict(r.headers)))
+
+        r = c.get(f"/workers/{pid}/api/sessions/my-session/terminals", headers=H)
+        check("a session's terminals are allowlisted", r.status_code == 200, r.text[:200])
+        r = c.get(f"/workers/{pid}/api/terminals/abc12345/output?mode=last", headers=H)
+        check("terminal output is allowlisted", r.status_code == 200, r.text[:200])
+        check("the query string is forwarded",
+              "mode=last" in NODE_CALLS[-1]["path"], NODE_CALLS[-1]["path"])
+        # Deliberately on the list: `cao worker send` is the verb this plane
+        # exists for, and the same token already deletes workers outright.
+        r = c.post(f"/workers/{pid}/api/terminals/abc12345/input?message=hi", headers=H)
+        check("sending input to a worker is allowlisted", r.status_code == 200, r.text[:200])
+
+        before = len(NODE_CALLS)
+        r = c.get(f"/workers/{pid}/api/settings", headers=H)
+        check("an unlisted path is refused", r.status_code == 404, r.text[:200])
+        r = c.get(f"/workers/{pid}/api/terminals/abc12345/websocket", headers=H)
+        check("the pty socket route is refused", r.status_code == 404, r.text[:200])
+        r = c.post(f"/workers/{pid}/api/sessions", headers=H)
+        check("a listed path on an unlisted method is refused",
+              r.status_code == 404, r.text[:200])
+        # Percent-encoded, because Starlette decodes it back to `..` and the
+        # segment pattern would otherwise match it as an ordinary terminal id.
+        r = c.get(f"/workers/{pid}/api/terminals/%2e%2e/output", headers=H)
+        check("an encoded dot segment is refused", r.status_code == 400, r.text[:200])
+        check("nothing refused ever reached the worker",
+              len(NODE_CALLS) == before, str(len(NODE_CALLS) - before))
+
+        r = c.get(f"/workers/{pid}/api/sessions")
+        check("unauthenticated proxy call is rejected", r.status_code == 401, r.text[:200])
+        r = c.get("/workers/not-a-worker-id/api/sessions", headers=H)
+        check("a malformed worker id is refused", r.status_code == 404, r.text[:200])
+
+        # --- 10b. logs -----------------------------------------------------
+        r = c.get(f"/workers/{pid}/logs", headers=H)
+        check("logs return the container output", r.status_code == 200
+              and "boot log of" in r.text, r.text[:200])
+        check("logs are served as text", r.headers["content-type"].startswith("text/plain"),
+              r.headers.get("content-type"))
+        r = c.get(f"/workers/{pid}/logs", params={"tail_lines": 999999}, headers=H)
+        check("tail_lines is capped at the broker's ceiling",
+              STATE["log_calls"][-1]["tail_lines"] == broker._LOG_TAIL_MAX,
+              str(STATE["log_calls"][-1]))
+        r = c.get(f"/workers/{pid}/logs")
+        check("unauthenticated log read is rejected", r.status_code == 401, r.text[:200])
+
+        # --- 10c. a settled lease answers with WHY, not with a timeout ------
+        broker._leases[pid]["state"] = "expired"
+        broker._leases[pid]["reason"] = "no completion within 900s"
+        r = c.get(f"/workers/{pid}/api/sessions", headers=H)
+        check("a settled worker is refused with its lease state",
+              r.status_code == 409 and "expired" in r.text, r.text[:200])
+        check("the refusal carries the reaper's reason",
+              "no completion within 900s" in r.text, r.text[:200])
+        r = c.get(f"/workers/{pid}/logs", headers=H)
+        check("logs are refused for a settled worker too",
+              r.status_code == 409, r.text[:200])
+        # An unknown worker_id is NOT refused: after a broker restart every
+        # surviving worker is unknown here and all of them are still reachable.
+        del broker._leases[pid]
+        r = c.get(f"/workers/{pid}/api/sessions", headers=H)
+        check("a worker with no lease row is still reachable",
+              r.status_code == 200, r.text[:200])
+    finally:
+        broker.COMPLETION_TIMEOUT = _saved_completion
+        _node.shutdown()
+
+    # --- 10d. the allowlist itself, without a transport ---------------------
+    check("health is readable", broker._worker_api_allowed("GET", "health"))
+    check("the sessions list is readable", broker._worker_api_allowed("GET", "sessions"))
+    check("a terminal is readable", broker._worker_api_allowed("GET", "terminals/abc12345"))
+    check("an inbox is readable",
+          broker._worker_api_allowed("GET", "terminals/abc12345/inbox/messages"))
+    check("input is writable", broker._worker_api_allowed("POST", "terminals/abc12345/input"))
+    for method, path in [
+        ("GET", "internal/memory/recall"),
+        ("GET", "settings"),
+        ("GET", "workflows"),
+        ("POST", "sessions"),
+        ("POST", "terminals/abc12345/inbox/messages"),
+        ("DELETE", "sessions/foo"),
+        ("GET", "sessions/foo/terminals/extra"),
+        ("GET", ""),
+    ]:
+        check(f"not proxied: {method} /{path}", not broker._worker_api_allowed(method, path))
 
 # --- 9. a missing model pin must stop the broker, not the first task -----
 import subprocess
