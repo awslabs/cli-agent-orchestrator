@@ -113,12 +113,6 @@ UPGRADE_PROMPT_PATTERN = r"Skip reminders for version|Upgrade now"
 USER_INPUT_BOX_START_PATTERN = r"╭─"
 USER_INPUT_BOX_END_PATTERN = r"╰─"
 
-# Prompt line with user input (v1.20.0+ format).
-# Matches ``💫 some text`` or ``✨ some text`` — a prompt emoji followed by non-whitespace
-# on the SAME line. Uses [^\S\n]+ (horizontal whitespace only) to avoid matching
-# across newlines (a bare ``💫`` followed by blank lines then status bar).
-PROMPT_WITH_INPUT_PATTERN = r"(?:\w+@[\w.-]+)?[✨💫][^\S\n]+\S"
-
 # Response/thinking bullet pattern: ``•`` (U+2022) at the start of a line.
 # Both thinking (internal monologue) and response (final answer) use this marker.
 # To distinguish them in extraction, check ANSI styling in raw output:
@@ -146,7 +140,7 @@ STATUS_BAR_PATTERN = r"\d+:\d+\s+.*(?:agent|shell)\s*\("
 # ---------------------------------------------------------------------------
 # Either of these confirms the new TUI is up at its prompt: the context-usage
 # footer, or the status bar's "agent (<model> ●)" segment (● = U+25CF).
-NEW_TUI_STATUS_PATTERN = r"context:\s*\d+(?:\.\d+)?%|agent\s*\([^)]*●"
+NEW_TUI_CONTEXT_PATTERN = re.compile(r"context:\s*\d+(?:\.\d+)?%")
 # Live working indicator: the new TUI animates a braille spinner
 # ("⠧ Thinking… 5s · 220 tokens", "⠹ Using handoff({...})") and a moon-phase
 # thinking glyph (🌑…🌘) that are cleared when the turn finishes. Any such
@@ -171,6 +165,52 @@ def _is_live_turn_spinner_line(line: str) -> bool:
     return bool(
         re.search(NEW_TUI_SPINNER_PATTERN, line) and not NEW_TUI_BOOT_CHROME_PATTERN.search(line)
     )
+
+
+def _has_new_tui_status(text: str) -> bool:
+    # Status detection is deliberately per-line. A wrapped status bar (for
+    # example in a narrow pane) will not match, avoiding a false status match
+    # from ``agent (`` and an unrelated bullet on later output lines.
+    return any(
+        NEW_TUI_CONTEXT_PATTERN.search(line) or _has_new_tui_agent_status(line)
+        for line in text.splitlines()
+    )
+
+
+def _has_new_tui_agent_status(line: str) -> bool:
+    """Match ``agent (<model> ●)`` without rescanning repeated agent prefixes."""
+    start = 0
+    while True:
+        agent = line.find("agent", start)
+        if agent == -1:
+            return False
+        cursor = agent + len("agent")
+        while cursor < len(line) and line[cursor].isspace():
+            cursor += 1
+        if cursor < len(line) and line[cursor] == "(":
+            close = line.find(")", cursor + 1)
+            bullet = line.find("●", cursor + 1)
+            if bullet != -1 and (close == -1 or bullet < close):
+                return True
+            if bullet == -1:
+                return False
+            start = close + 1
+        else:
+            start = agent + 1
+
+
+def _has_prompt_with_input(text: str) -> bool:
+    """Match an emoji prompt followed by horizontal whitespace and input text."""
+    for index, character in enumerate(text):
+        if character not in "✨💫":
+            continue
+        cursor = index + 1
+        whitespace_start = cursor
+        while cursor < len(text) and text[cursor] != "\n" and text[cursor].isspace():
+            cursor += 1
+        if cursor > whitespace_start and cursor < len(text) and not text[cursor].isspace():
+            return True
+    return False
 
 
 # A response/thinking bullet ("• …") at line start. Its presence means a turn
@@ -686,7 +726,7 @@ class KimiCliProvider(BaseProvider):
         # box, and a turn-in-flight is a braille spinner ("⠧ Thinking… Ns · N
         # tokens") that is cleared on completion. Gate on the new-TUI markers so
         # legacy (emoji-prompt) builds keep the path below unchanged.
-        if re.search(NEW_TUI_STATUS_PATTERN, clean_output):
+        if _has_new_tui_status(clean_output):
             # A "•" bullet appears only once a turn produces output (thinking or
             # response); the welcome banner / update nag have none. Latch it so a
             # long response that scrolls the bullets out of the rolling buffer
@@ -790,7 +830,7 @@ class KimiCliProvider(BaseProvider):
         #   - Detect prompt emoji followed by non-whitespace text
         if not self._has_received_input:
             # v1.20.0+: prompt line with text after the emoji
-            if re.search(PROMPT_WITH_INPUT_PATTERN, clean_output):
+            if _has_prompt_with_input(clean_output):
                 self._has_received_input = True
             # Pre-v1.20.0: input box detection
             elif not has_idle_prompt:
@@ -871,7 +911,7 @@ class KimiCliProvider(BaseProvider):
             return TerminalStatus.PROCESSING
 
         # Newest "Kimi Code" TUI: readiness is the status bar / context footer.
-        if re.search(NEW_TUI_STATUS_PATTERN, joined):
+        if _has_new_tui_status(joined):
             if any(_is_live_turn_spinner_line(ln) for ln in tail):
                 return TerminalStatus.PROCESSING
             if re.search(ERROR_PATTERN, joined, re.MULTILINE):
@@ -949,7 +989,7 @@ class KimiCliProvider(BaseProvider):
         # Strategy 2: Find the last prompt-with-input line — v1.20.0+
         prompt_input_idx = None
         for i, line in enumerate(clean_lines):
-            if re.search(PROMPT_WITH_INPUT_PATTERN, line):
+            if _has_prompt_with_input(line):
                 prompt_input_idx = i
 
         # Choose the best anchor: the LATEST marker wins. The newest "Kimi
@@ -983,7 +1023,7 @@ class KimiCliProvider(BaseProvider):
             if (
                 re.search(idle_prompt_eol, line)
                 or re.match(new_tui_input_rule, line)
-                or re.search(NEW_TUI_STATUS_PATTERN, line)
+                or _has_new_tui_status(line)
             ):
                 prompt_idx = i
                 break

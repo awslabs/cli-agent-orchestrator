@@ -19,6 +19,7 @@ from cli_agent_orchestrator.providers.codex import (
     _has_approval_modal_in_bottom,
     _has_approval_prompt_in_bottom,
     _has_startup_idle_composer,
+    _has_tui_footer,
     _toml_override,
     _toml_scalar,
 )
@@ -29,6 +30,13 @@ FIXTURES_DIR = Path(__file__).parent / "fixtures"
 def load_fixture(filename: str) -> str:
     with open(FIXTURES_DIR / filename, "r") as f:
         return f.read()
+
+
+def test_tui_footer_detector_preserves_supported_footer_formats():
+    assert _has_tui_footer("? for shortcuts") is True
+    assert _has_tui_footer("Context 100% left") is True
+    assert _has_tui_footer("gpt-5.6 · /workspace") is True
+    assert _has_tui_footer("ordinary assistant text") is False
 
 
 def read_developer_instructions_file(command: str) -> str:

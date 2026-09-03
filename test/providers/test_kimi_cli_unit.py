@@ -26,7 +26,10 @@ from cli_agent_orchestrator.providers.kimi_cli import (
     WELCOME_BANNER_PATTERN,
     KimiCliProvider,
     ProviderError,
+    _has_new_tui_status,
+    _has_prompt_with_input,
 )
+from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -34,6 +37,22 @@ FIXTURES_DIR = Path(__file__).parent / "fixtures"
 def _read_fixture(name: str) -> str:
     """Read a test fixture file."""
     return (FIXTURES_DIR / name).read_text()
+
+
+def test_new_tui_status_detector_preserves_realistic_status_format():
+    assert _has_new_tui_status("12:34  yolo  agent (Kimi-k2.6 ●)  context: 4.4%") is True
+    assert _has_new_tui_status("context: 4.4% (11.4k/262.1k)") is True
+    assert _has_new_tui_status("agent (Kimi-k2.6)") is False
+
+
+def test_split_across_lines_is_not_a_status_segment():
+    assert _has_new_tui_status("12:34 yolo agent (Kimi-k2.6\n●)") is False
+
+
+def test_prompt_input_detector_preserves_emoji_prompt_formats():
+    assert _has_prompt_with_input("user@host💫 write tests") is True
+    assert _has_prompt_with_input("💫 write tests") is True
+    assert _has_prompt_with_input("💫\nstatus") is False
 
 
 # =============================================================================
@@ -1154,6 +1173,7 @@ class TestKimiCodeNewTuiStatus:
         """A freshly-initialized terminal (no task yet) reads IDLE — this is the
         init readiness signal the legacy emoji detector missed."""
         buf = (_KIMI_FIXTURES / "kimi_code_tui_idle_raw.txt").read_text(encoding="utf-8")
+        assert _has_new_tui_status(strip_terminal_escapes(buf)) is True
         assert self._provider().get_status(buf) == TerminalStatus.IDLE
 
     def test_new_tui_processing_raw_capture(self):
