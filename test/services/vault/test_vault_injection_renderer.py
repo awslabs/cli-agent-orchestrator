@@ -31,7 +31,7 @@ def _injectable_renderer(tmp_path, monkeypatch):
     session_factory = sessionmaker(bind=engine)
     monkeypatch.setattr(reader, "SessionLocal", session_factory)
     monkeypatch.setattr(reconcile_module, "SessionLocal", session_factory)
-    monkeypatch.setattr(reconcile_module, "_replace_vault_edges", lambda _notes: None)
+    monkeypatch.setattr(reconcile_module, "_replace_vault_edges", lambda _notes, **_kwargs: None)
     monkeypatch.setattr(reconcile_module, "_clear_stale_vault_edges", lambda *_args: None)
     monkeypatch.setattr(reconcile_module, "_emit_audit_events", lambda *_args: None)
     monkeypatch.setattr(memory_service, "_is_memory_enabled", lambda: True)

@@ -27,7 +27,7 @@ def _vault_service(tmp_path, monkeypatch):
     Session = sessionmaker(bind=engine)
     monkeypatch.setattr(reconcile_module, "SessionLocal", Session)
     monkeypatch.setattr(reader, "SessionLocal", Session)
-    monkeypatch.setattr(reconcile_module, "_replace_vault_edges", lambda _notes: None)
+    monkeypatch.setattr(reconcile_module, "_replace_vault_edges", lambda _notes, **_kwargs: None)
     monkeypatch.setattr(reconcile_module, "_clear_stale_vault_edges", lambda *_args: None)
     monkeypatch.setattr(reconcile_module, "_emit_audit_events", lambda *_args: None)
     monkeypatch.setattr(memory_service, "_is_memory_enabled", lambda: True)

@@ -142,7 +142,7 @@ def test_delete_source_targets_native_memory_not_the_new_vault_note(
     Session = sessionmaker(bind=engine)
     monkeypatch.setattr(reconcile_module, "SessionLocal", Session)
     monkeypatch.setattr(reader, "SessionLocal", Session)
-    monkeypatch.setattr(reconcile_module, "_replace_vault_edges", lambda _notes: None)
+    monkeypatch.setattr(reconcile_module, "_replace_vault_edges", lambda _notes, **_kwargs: None)
     monkeypatch.setattr(reconcile_module, "_clear_stale_vault_edges", lambda *_args: None)
     monkeypatch.setattr(reconcile_module, "_emit_audit_events", lambda *_args: None)
     monkeypatch.setattr(settings_service, "get_vault_config", lambda: VaultConfig(enabled=False))

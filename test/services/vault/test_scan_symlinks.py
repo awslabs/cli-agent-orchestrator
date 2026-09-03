@@ -3,7 +3,6 @@ from test.services.vault.test_scan_exclusions import _vault
 
 import pytest
 
-from cli_agent_orchestrator.services.vault.config import FolderMapping
 from cli_agent_orchestrator.services.vault.findings import FindingCode
 from cli_agent_orchestrator.services.vault.scan import scan_vault
 

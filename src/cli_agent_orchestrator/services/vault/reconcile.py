@@ -564,7 +564,6 @@ def _resolve_renames(
                     note_uid=cast(str, existing.note_uid),
                     memory_id=_digest("memory", cast(str, existing.note_uid)),
                 )
-            identity_changed = cast(str, existing.note_uid) != item.note_uid
             resolution_findings: tuple[tuple[str, str, str, str], ...] = ()
             if existing.status == "excluded" and item.note.status != "excluded":
                 item = replace(item, note=replace(item.note, status="excluded"))

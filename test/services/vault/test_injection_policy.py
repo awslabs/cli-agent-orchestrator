@@ -49,7 +49,7 @@ def _indexed_non_injectable_binding(tmp_path, monkeypatch, *, mapping_folder="Pr
     Session = sessionmaker(bind=engine)
     monkeypatch.setattr(reader, "SessionLocal", Session)
     monkeypatch.setattr(reconcile_module, "SessionLocal", Session)
-    monkeypatch.setattr(reconcile_module, "_replace_vault_edges", lambda _notes: None)
+    monkeypatch.setattr(reconcile_module, "_replace_vault_edges", lambda _notes, **_kwargs: None)
     monkeypatch.setattr(reconcile_module, "_emit_audit_events", lambda *_args: None)
 
     fixture = build_vault_fixture(tmp_path)
@@ -386,7 +386,7 @@ def test_bm25_keeps_identity_free_vault_corpus_but_gates_curator_results(monkeyp
     monkeypatch.setattr(
         service,
         "_resolve_sources",
-        lambda *_args, **_kwargs: ([], ["project-binding"], 4096),
+        lambda *_args, **_kwargs: ([], ["project-binding"], 4096, None),
     )
     monkeypatch.setattr(
         service,
