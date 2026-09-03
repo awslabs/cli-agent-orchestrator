@@ -863,4 +863,40 @@ describe('round-5 review: a SETTLED preview cannot outlive its template (#692)',
     const posts = mock.mock.calls.filter(([u, o]: any[]) => String(u).endsWith('/agents/profiles') && o?.method === 'POST')
     expect(posts).toHaveLength(0)
   })
+
+  it("clearing the settled preview is not sticky: B's late schema re-arms the flow with B's render", async () => {
+    // Adversarial probe on the fix itself: the failure mode of over-clearing
+    // is a permanently disarmed Create. Once B's schema DOES resolve, the
+    // preview effect must issue B's render and re-enable Create with B's
+    // content -- never A's.
+    let releaseBSchema!: () => void
+    const bGate = new Promise<any>(res => { releaseBSchema = () => res(okJson(TEMPLATE_SCHEMA)) })
+    const mock = routedFetch({
+      'aws/stepfunction/schema': () => bGate,
+      '/agents/profiles/templates/preview': (_u: string, opts: any) =>
+        JSON.parse(opts.body).template === 'aws/sqs-monitor'
+          ? okJson({ template: 'aws/sqs-monitor', content: A_BODY })
+          : okJson({ template: 'aws/stepfunction', content: RENDERED }),
+    })
+    vi.stubGlobal('fetch', mock)
+    render(<ProfileCreateModal open={true} onClose={() => {}} onCreated={() => {}} />)
+    await act(async () => {})
+    await pickOption('Template', 'aws/sqs-monitor')
+    await act(async () => {})
+    await act(() => vi.advanceTimersByTimeAsync(PREVIEW_DEBOUNCE_MS + 10))
+    await act(async () => {})
+    expect(screen.getByTestId('template-preview')).toHaveTextContent('TEMPLATE-A-BODY')
+
+    await pickOption('Template', 'aws/stepfunction')
+    await act(async () => {})
+    expect(screen.queryByTestId('template-preview')).not.toBeInTheDocument()
+
+    // B's schema lands late: the flow must recover end-to-end
+    await act(async () => { releaseBSchema() })
+    await act(() => vi.advanceTimersByTimeAsync(PREVIEW_DEBOUNCE_MS + 10))
+    await act(async () => {})
+    expect(screen.getByTestId('template-preview')).toBeInTheDocument()
+    expect(screen.getByTestId('template-preview')).not.toHaveTextContent('TEMPLATE-A-BODY')
+    expect(screen.getByRole('button', { name: /create profile/i })).toBeEnabled()
+  })
 })
