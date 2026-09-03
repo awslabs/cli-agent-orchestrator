@@ -1,5 +1,6 @@
 """Unit tests for Codex provider."""
 
+import logging
 import os
 import re
 import shlex
@@ -704,6 +705,68 @@ class TestCodexProviderCodexProfile:
 
         assert "--yolo" in command
         assert "--profile" not in command
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_discarded_codex_profile_is_warned_not_silent(self, mock_load, caplog):
+        """#707: dropping an explicit containment setting must not be silent.
+
+        Naming a ``codexProfile`` is the only way to keep Codex's sandbox and
+        approval policy in effect under CAO. ``allowed_tools`` containing ``"*"``
+        discards it and launches --yolo, so an operator who set both gets no
+        sandbox. The launch still proceeds -- the point is that it says so.
+        """
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.codexProfile = "cao_reviewer"
+        mock_load.return_value = mock_profile
+
+        provider = CodexProvider("tid", "sess", "win", "agent", allowed_tools=["*"])
+        with caplog.at_level(logging.WARNING):
+            command = provider._build_codex_command()
+
+        assert "--yolo" in command
+        assert "--profile" not in command
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warnings, "discarding codexProfile logged nothing at WARNING"
+        text = warnings[0].getMessage()
+        assert "cao_reviewer" in text, "the discarded profile is not named"
+        assert "allowed_tools" in text and "*" in text, "the cause is not named"
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_no_warning_when_codex_profile_is_honored(self, mock_load, caplog):
+        """The warning must be specific to the discard, not to codexProfile itself."""
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.codexProfile = "cao_reviewer"
+        mock_load.return_value = mock_profile
+
+        provider = CodexProvider("tid", "sess", "win", "agent", allowed_tools=["fs_read"])
+        with caplog.at_level(logging.WARNING):
+            command = provider._build_codex_command()
+
+        assert "--profile cao_reviewer" in command
+        assert "--yolo" not in command
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_default_yolo_launch_records_that_sandbox_settings_do_not_apply(self, caplog):
+        """#707: operators relied on ~/.codex sandbox settings that --yolo makes inert.
+
+        Logged at INFO rather than WARNING because it is the documented default for
+        every codex worker, so warning on it would be noise; the point is that the
+        record names ``network_access`` where someone grepping for it will find it.
+        """
+        provider = CodexProvider("tid", "sess", "win", None)
+        with caplog.at_level(logging.INFO):
+            command = provider._build_codex_command()
+
+        assert "--yolo" in command
+        text = " ".join(r.getMessage() for r in caplog.records)
+        assert "network_access" in text, "the inert setting is not named"
+        assert "do NOT apply" in text or "not apply" in text
 
 
 class TestTomlScalar:

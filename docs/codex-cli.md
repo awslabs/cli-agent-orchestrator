@@ -128,6 +128,24 @@ The Codex provider automatically adds these flags for tmux compatibility:
 
 By default, CAO also passes `--yolo` (alias for `--dangerously-bypass-approvals-and-sandbox`) because CAO agents run in non-interactive tmux sessions where approval prompts block handoff/assign flows. Profiles can opt out via `codexProfile`; see [Custom Codex Profile](#custom-codex-profile). Any unrestricted allowed-tools configuration (`allowedTools: ["*"]`, `--allowed-tools '*'`, or `cao launch --yolo`) forces `--yolo` regardless of the profile setting.
 
+> **`--yolo` makes your Codex sandbox settings inert — do not rely on them as containment.**
+> Because `--yolo` bypasses the sandbox entirely, nothing in your `~/.codex/config.toml`
+> `[sandbox_*]` tables applies to a default CAO worker. That includes
+> `[sandbox_workspace_write].network_access = false`: setting it does not stop a worker reaching
+> the network, and it does not restrict Codex's built-in backend web tool, which runs server-side
+> rather than as a sandboxed shell command (reported in
+> [#707](https://github.com/awslabs/cli-agent-orchestrator/issues/707)). A worker that reads
+> untrusted web content can carry prompt-injected instructions into the working tree with no
+> human in the loop.
+>
+> To actually contain a Codex worker:
+>
+> - **`codexProfile`** drops `--yolo`, so your named `[profiles.<name>]` block governs sandbox and
+>   approvals. Note that `allowedTools: ["*"]` overrides it and forces `--yolo`; CAO logs a
+>   warning when that happens, so the discard is not silent.
+> - **`use_worktree=true`** puts writes in a throwaway git worktree behind review instead of the
+>   live tree. That bounds the damage; it does not stop the network access.
+
 ### Custom Codex Profile
 
 The `codexProfile` field on an agent profile names a `[profiles.<name>]` block in your `~/.codex/config.toml`. When set, CAO drops `--yolo` and passes `--profile <name>` instead, letting the user's named profile govern sandbox and approval behavior. Unrestricted allowed tools (`allowedTools: ["*"]`, `--allowed-tools '*'`, or `cao launch --yolo`) override this field and always force `--yolo`.

@@ -4,7 +4,12 @@ import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from cli_agent_orchestrator.clients.database import InboxModel, SessionLocal, TerminalModel
+from cli_agent_orchestrator.clients.database import (
+    IdempotencyKeyModel,
+    InboxModel,
+    SessionLocal,
+    TerminalModel,
+)
 from cli_agent_orchestrator.constants import (
     LOG_DIR,
     MEMORY_BASE_DIR,
@@ -65,6 +70,18 @@ def cleanup_old_data():
             )
             db.commit()
             logger.info(f"Deleted {deleted_messages} old inbox messages from database")
+
+        # Clean up old idempotency-key mappings (review on PR #634, issue
+        # #616): these are never swept elsewhere, so without this they grow
+        # unbounded with terminal-creation rate.
+        with SessionLocal() as db:
+            deleted_keys = (
+                db.query(IdempotencyKeyModel)
+                .filter(IdempotencyKeyModel.created_at < cutoff_date)
+                .delete()
+            )
+            db.commit()
+            logger.info(f"Deleted {deleted_keys} old idempotency keys from database")
 
         # Clean up old terminal log files
         terminal_logs_deleted = 0
