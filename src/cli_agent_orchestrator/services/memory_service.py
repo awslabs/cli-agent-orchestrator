@@ -13,7 +13,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal, Optional, Sequence, Set
+from typing import Any, Callable, Literal, Optional, Sequence, Set
 
 from cli_agent_orchestrator.constants import (
     MEMORY_BASE_DIR,
@@ -3355,8 +3355,8 @@ class MemoryService:
     def _deindex_vault_memory(self, key: str, binding: VaultBinding) -> ForgetResult:
         """Remove derived state for a vault note without modifying its file."""
         from cli_agent_orchestrator.clients.database import (
-            MemoryMetadataModel,
             VAULT_NOTE_SCOPE_ID_SENTINEL,
+            MemoryMetadataModel,
             VaultExclusionModel,
             VaultNoteModel,
         )
@@ -3366,7 +3366,7 @@ class MemoryService:
 
         scope_id = binding.scope_id
         stored_scope_id = scope_id if scope_id is not None else VAULT_NOTE_SCOPE_ID_SENTINEL
-        deferred_relationship_audits = []
+        deferred_relationship_audits: list[Callable[[], None]] = []
         with self._get_db_session() as db:
             with db.begin():
                 note = (
