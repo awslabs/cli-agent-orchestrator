@@ -66,9 +66,20 @@ Disabled behavior (mirrors the memory subsystem's idiom):
 - **Reads fail silent** — `list_outcomes()` returns `[]`; `GET /outcomes`
   and `POST /outcomes` return 404; the `report_outcome` MCP tool returns a
   `{"disabled": true}` payload the agent can surface and move on from.
-- **Errors fail closed** — an unreadable settings file leaves both learning
-  flags `false` (opt-in features fail closed; deliberately opposite to
-  `memory.enabled`, which fails open because it is opt-out).
+- **Errors fail closed, but say so** — an unreadable settings file leaves both
+  learning flags `false` (opt-in features fail closed; deliberately opposite to
+  `memory.enabled`, which fails open because it is opt-out). Failing closed is
+  not the same as *reporting* "disabled", though: `GET`/`POST /outcomes` answer
+  **503** when `settings.json` exists but cannot be read, and the MCP tools turn
+  that into a plain `error` with **no `disabled` key**. The distinction is
+  load-bearing — agents are told to skip a `disabled: true` payload silently, so
+  labelling a permissions fault "disabled" is how a broken data directory comes
+  to look like a deliberate opt-out. `GET /settings/memory` reports
+  `settings_readable` for the same reason.
+- **An unreachable server is not "disabled" either** — `report_outcome` and
+  `list_outcomes` reach cao-server over HTTP, so a down backplane returns
+  `{"success": false, "error": "Failed to connect to cao-server…"}`, never a
+  disabled payload.
 
 ## Phase 1 — outcome capture
 

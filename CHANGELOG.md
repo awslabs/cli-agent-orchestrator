@@ -4,6 +4,49 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Fixed
+
+- **enabling `CAO_MEMORY_API_URL` rejected memory keys that work without it.**
+  The `/internal/memory/store` and `/forget` routes validated the wire `key` as
+  the strict `MemoryKey` (`^[a-z0-9-]{1,60}$`), while the MCP tools have always
+  let `MemoryService._sanitize_key` normalise it — so `memory_store(key="Prefer
+  Pytest")` stored `preferpytest` in-process and 422'd through the gateway.
+
+- **an unreadable `settings.json` reported itself as "self-learning is
+  disabled".** `settings_service._load()` gated on `Path.exists()`, which returns
+  False on a `PermissionError` from the parent directory — silently, with no log
+  line — and swallowed every other read error, so a filesystem fault resolved to
+  a configuration message. Learning still fails closed, but `/outcomes` now
+  answers 503 when the file cannot be read, `GET /settings/memory` reports
+  `settings_readable`, and the tools surface it as a plain `error` rather than a
+  `disabled` payload that `skills/cao-learning` instructs agents to skip silently.
+
+- **`report_outcome` and `list_outcomes` opened SQLite in the agent's own
+  process**, so they failed for any agent that does not share a filesystem with
+  cao-server — and unlike the memory tools they have no `CAO_MEMORY_API_URL` path,
+  so configuration could not work around it. Both now call the existing
+  `POST`/`GET /outcomes` routes.
+
+- **the MCP server's terminal lookup did not carry the internal bearer token.**
+  `GET /terminals/{id}` is scope-gated, so with auth enabled it 401'd, the
+  terminal context resolved to `None`, and memory scope silently collapsed to
+  global. A transport or auth failure now propagates instead of being reported as
+  a missing terminal identity.
+
+- **built-in memory plugins created the server's database directory inside every
+  agent process.** They are discovered through `cao.plugins` entry points and that
+  discovery runs at MCP-server import, so their module-level `clients.database`
+  import executed its import-time `DB_DIR.mkdir()` in agents — and failed outright
+  wherever the data dir is unreadable. The import is now lazy.
+
+### Changed
+
+- `list_outcomes` clamps `limit` to 200 client-side; the service already clamped
+  silently, so `limit=500` keeps working rather than becoming a 422.
+
 ## [2.5.0] - 2026-08-28
 
 ### Added

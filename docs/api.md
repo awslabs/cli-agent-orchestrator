@@ -268,7 +268,15 @@ See [Workflows](workflows.md).
 - `/graph/{provider}*` projects and exports graph views.
 - `/outcomes` records (`POST`, write-scope) and lists (`GET`) workflow
   outcomes for the self-learning loop. Both return 404 while
-  `memory.learning_enabled` is false.
+  `memory.learning_enabled` is false, and **503 when `settings.json` exists but
+  cannot be read** — learning fails closed, so an unreadable file resolves to
+  "disabled" internally, and reporting that as 404 would tell the caller a
+  configuration story about a filesystem fault. These are the routes the
+  `report_outcome` / `list_outcomes` MCP tools call.
+- `/internal/memory/*` serves the memory tools on a node that does not own the
+  database (`CAO_MEMORY_API_URL`). Its `key` is validated leniently and then
+  normalised, matching what the tools have always done in-process — the strict
+  operator rule would reject keys that work without the gateway.
 
 See [Memory](memory.md), [Self-Learning](self-learning.md), and
 [Knowledge Graph Viewing](knowledge-graph-viewing.md).

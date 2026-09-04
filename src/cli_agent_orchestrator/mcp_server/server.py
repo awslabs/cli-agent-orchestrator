@@ -22,6 +22,7 @@ from cli_agent_orchestrator.constants import (
     WORKFLOW_POLL_INTERVAL_SECONDS,
     WORKFLOW_RUN_REQUEST_TIMEOUT,
 )
+from cli_agent_orchestrator.mcp_server import utils as mcp_utils
 from cli_agent_orchestrator.mcp_server.models import HandoffResult
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.models.workflow_runtime import ReturnAck, parse_decision
@@ -1242,19 +1243,35 @@ def _get_terminal_context_from_env() -> Optional[Dict[str, Any]]:
         return None
 
     try:
-        response = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=_mcp_timeout())
-        response.raise_for_status()
-        meta = response.json()
+        # Via mcp_utils, which attaches the internal Authorization header. The
+        # bare requests.get here did not, and GET /terminals/{id} IS scope-gated —
+        # so with auth enabled the call 401'd, this returned None, and every
+        # memory scope silently collapsed to global.
+        #
+        # A 404 (terminal genuinely not registered) is the only case that means
+        # "no context". Transport and auth failures PROPAGATE so the caller can
+        # say "cannot reach cao-server" rather than "could not resolve terminal
+        # context" — reporting a down server as a missing identity is the same
+        # class of misdirection as reporting an unreadable config as "disabled".
+        try:
+            meta = mcp_utils.get_json(f"/terminals/{terminal_id}", timeout=_mcp_timeout())
+        except requests.HTTPError as e:
+            if getattr(e.response, "status_code", None) == 404:
+                return None
+            raise
         ctx: Dict[str, Any] = {
             "terminal_id": meta["id"],
             "session_name": meta["session_name"],
             "provider": meta["provider"],
             "agent_profile": meta.get("agent_profile"),
         }
-        # Try to get working directory for project scope resolution
+        # Try to get working directory for project scope resolution. Same header
+        # reasoning as above — best-effort, so a failure degrades project scope
+        # rather than failing the call.
         try:
             wd_resp = requests.get(
                 f"{API_BASE_URL}/terminals/{terminal_id}/working-directory",
+                headers=mcp_utils._auth_headers() or None,
                 timeout=_mcp_timeout(),
             )
             if wd_resp.status_code == 200:
@@ -1262,6 +1279,11 @@ def _get_terminal_context_from_env() -> Optional[Dict[str, Any]]:
         except Exception:
             pass
         return ctx
+    except requests.RequestException:
+        # Let the caller distinguish "unreachable / unauthorized" from "no
+        # context"; the memory tools still degrade to None via their own
+        # handlers, while the outcome tools report the real cause.
+        raise
     except Exception as e:
         logger.warning(f"Failed to get terminal context for memory tools: {e}")
         return None
@@ -1514,6 +1536,35 @@ async def memory_forget(
         return {"success": False, "error": str(e)}
 
 
+def _outcome_tool_error(
+    exc: Exception, fallback: str, *, extra: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """Translate a failed outcome-API call into the tool's error payload.
+
+    Only a **404** becomes ``disabled: True`` — that is the route's own
+    feature-gate. A 503 (settings unreadable) and a transport failure must NOT:
+    ``skills/cao-learning`` instructs agents to skip a ``disabled: true`` payload
+    SILENTLY, so labelling an unreachable server or an unreadable config
+    "disabled" would hide both, exactly the way an unreadable settings.json used
+    to present itself as a deliberate opt-out.
+    """
+    extra = dict(extra or {})
+    if isinstance(exc, requests.ConnectionError):
+        return {
+            "success": False,
+            "error": "Failed to connect to cao-server. The server may not be running.",
+            **extra,
+        }
+    response = getattr(exc, "response", None)
+    if response is None:
+        return {"success": False, "error": f"{fallback}: {exc}", **extra}
+
+    detail = _extract_error_detail(response, fallback)
+    if response.status_code == 404:
+        return {"success": False, "disabled": True, "error": detail, **extra}
+    return {"success": False, "error": detail, **extra}
+
+
 @mcp.tool()
 async def report_outcome(
     task_label: str = Field(
@@ -1555,11 +1606,6 @@ async def report_outcome(
     Requires memory.learning_enabled=true (opt-in); otherwise returns a
     disabled payload without recording anything.
     """
-    from cli_agent_orchestrator.services.outcome_service import (
-        LearningDisabledError,
-        OutcomeService,
-    )
-
     try:
         terminal_context = _get_terminal_context_from_env()
         if not terminal_context:
@@ -1567,20 +1613,25 @@ async def report_outcome(
                 "success": False,
                 "error": "Could not resolve terminal context (CAO_TERMINAL_ID unset or unknown)",
             }
-        service = OutcomeService()
-        outcome = service.record_outcome(
-            session_name=terminal_context["session_name"],
-            task_label=task_label,
-            success=success,
-            workflow_name=workflow_name,
-            agent_profile=agent_profile or terminal_context.get("agent_profile"),
-            source_terminal_id=terminal_context["terminal_id"],
-            score=score,
-            friction_notes=friction_notes,
+        payload = mcp_utils.post_body_json(
+            "/outcomes",
+            {
+                "session_name": terminal_context["session_name"],
+                "task_label": task_label,
+                "success": success,
+                "workflow_name": workflow_name,
+                "agent_profile": agent_profile or terminal_context.get("agent_profile"),
+                "source_terminal_id": terminal_context["terminal_id"],
+                "score": score,
+                "friction_notes": friction_notes,
+            },
+            timeout=_mcp_timeout(),
         )
-        return {"success": True, "outcome_id": outcome["id"]}
-    except LearningDisabledError as e:
-        return {"success": False, "disabled": True, "error": str(e)}
+        # Only the id: the route returns the whole record, and echoing it would
+        # newly surface friction_notes back to the agent that wrote them.
+        return {"success": True, "outcome_id": payload["outcome"]["id"]}
+    except requests.RequestException as e:
+        return _outcome_tool_error(e, "Failed to record outcome")
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -1607,17 +1658,7 @@ async def list_outcomes(
     Requires memory.learning_enabled=true; returns an empty list with a
     disabled marker otherwise.
     """
-    from cli_agent_orchestrator.services.outcome_service import OutcomeService
-    from cli_agent_orchestrator.services.settings_service import is_learning_enabled
-
     try:
-        if not is_learning_enabled():
-            return {
-                "success": False,
-                "disabled": True,
-                "error": LEARNING_DISABLED_MESSAGE,
-                "outcomes": [],
-            }
         if session_name is None:
             # Fail closed: without an explicit session filter the caller's
             # own session is REQUIRED. Proceeding with None would run an
@@ -1635,13 +1676,20 @@ async def list_outcomes(
                     ),
                     "outcomes": [],
                 }
-        outcomes = OutcomeService().list_outcomes(
+        payload = mcp_utils.get_json(
+            "/outcomes",
             session_name=session_name,
             agent_profile=agent_profile,
             workflow_name=workflow_name,
-            limit=limit,
+            # Clamped, not passed through: OutcomeService clamps silently, so
+            # limit=500 works today, while the route's Query(le=200) would 422 it.
+            limit=min(max(1, int(limit)), 200),
+            timeout=_mcp_timeout(),
         )
+        outcomes = payload["outcomes"]
         return {"success": True, "outcomes": outcomes, "count": len(outcomes)}
+    except requests.RequestException as e:
+        return _outcome_tool_error(e, "Failed to list outcomes", extra={"outcomes": []})
     except Exception as e:
         return {"success": False, "error": str(e), "outcomes": []}
 

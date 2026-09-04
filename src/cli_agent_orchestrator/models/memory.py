@@ -29,6 +29,22 @@ MemoryKey = Annotated[
 ]
 
 
+# The /internal/memory/* routes NORMALIZE where the operator routes REJECT.
+#
+# Those routes serve the MCP memory tools via memory_gateway, and the tools have
+# always silently sanitized through MemoryService._sanitize_key: memory_store(
+# key="Prefer Pytest") stores "preferpytest" when running in-process. Validating
+# the wire key as the strict MemoryKey made the identical call 422 as soon as
+# CAO_MEMORY_API_URL was set, so turning the gateway on broke keys that work
+# without it. Control characters are still rejected here so a newline or NUL
+# cannot bypass a `$`-anchored regex further down.
+LenientMemoryKey = Annotated[
+    str,
+    StringConstraints(min_length=1, max_length=256),
+    AfterValidator(_reject_control_chars),
+]
+
+
 def _reject_all_dots(value: str) -> str:
     """Reject '.', '..', '...' so traversal tokens 422 at the boundary instead
     of relying on the get_wiki_path guard deeper down."""
