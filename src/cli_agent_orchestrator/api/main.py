@@ -1122,6 +1122,11 @@ class MemorySummary(BaseModel):
     tags: str
     created_at: datetime
     updated_at: datetime
+    source_kind: str = "native"
+    source_path: Optional[str] = None
+    indexed_at: Optional[datetime] = None
+    index_freshness: Optional[str] = None
+    content_truncated: bool = False
 
 
 class MemoryDetail(MemorySummary):
@@ -7292,7 +7297,48 @@ def _to_memory_summary(mem, base_dir: Path) -> MemorySummary:
         tags=mem.tags,
         created_at=mem.created_at,
         updated_at=mem.updated_at,
+        source_kind=getattr(mem, "source_kind", "native"),
+        source_path=getattr(mem, "source_path", None),
+        indexed_at=getattr(mem, "indexed_at", None),
+        index_freshness=getattr(mem, "index_freshness", None),
+        content_truncated=bool(getattr(mem, "content_truncated", False)),
     )
+
+
+@app.get("/memory/vault/status")
+async def vault_status_endpoint(
+    vault_id: Optional[str] = None,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Return the existing read-only, content-free vault status projection."""
+    from cli_agent_orchestrator.services.settings_service import get_vault_config
+    from cli_agent_orchestrator.services.vault.binding import VaultConfigUnavailableError
+    from cli_agent_orchestrator.services.vault.status import get_vault_status
+
+    try:
+        config = get_vault_config()
+    except (VaultConfigUnavailableError, ValueError):
+        return {"configured": False, "vaults": []}
+    if not config.enabled:
+        return {"configured": False, "vaults": []}
+
+    return {
+        "configured": True,
+        "vaults": [
+            {
+                "vault_id": item.vault_id,
+                "status_counts": dict(item.status_counts),
+                "finding_counts": dict(item.finding_counts),
+                "warnings": list(item.warnings),
+                "recall_counters": dict(item.recall_counters),
+                "process_local_unmapped_project_writes": item.process_local_unmapped_project_writes,
+                "process_local_unmapped_project_identities": item.process_local_unmapped_project_identities,
+                "process_local_non_writable_write_refusals": item.process_local_non_writable_write_refusals,
+                "process_local_secret_gate_write_refusals": item.process_local_secret_gate_write_refusals,
+            }
+            for item in get_vault_status(config, vault_id=vault_id)
+        ],
+    }
 
 
 @app.get("/memory", response_model=List[MemorySummary])
@@ -7658,12 +7704,17 @@ async def delete_memory_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to delete memory: {str(e)}",
         )
-    if not deleted:
+    if deleted.action == "absent":
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Memory '{key}' not found in scope '{scope.value}'",
         )
-    return {"success": True}
+    return {
+        "success": True,
+        "action": deleted.action,
+        "path": deleted.path,
+        "source_kind": deleted.source_kind,
+    }
 
 
 @app.delete("/memory")
@@ -7703,7 +7754,12 @@ async def clear_memories_endpoint(
         try:
             # session/agent results carry scope_id natively; project results
             # need the query param (their recalled scope_id is None).
-            if await svc.forget(key=mem.key, scope=scope.value, scope_id=mem.scope_id or scope_id):
+            result = await svc.forget(
+                key=mem.key,
+                scope=scope.value,
+                scope_id=mem.scope_id or scope_id,
+            )
+            if result.action in {"deleted", "deleted_and_deindexed"}:
                 deleted_count += 1
         except MemoryDisabledError:
             raise HTTPException(

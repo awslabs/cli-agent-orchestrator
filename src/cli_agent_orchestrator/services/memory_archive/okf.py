@@ -130,6 +130,10 @@ class OkfArchiveBackend(MemoryArchiveBackend):
         MemoryScope(scope)  # narrow ValueError on unknown scope
         if scope == MemoryScope.PROJECT.value and not scope_id:
             raise ValueError("project-scope export requires a scope_id (resolved project id)")
+        from cli_agent_orchestrator.services.vault.binding import VaultBinding, resolve
+
+        if isinstance(resolve(scope, scope_id), VaultBinding):
+            raise ValueError("vault-bound scopes cannot be exported as native OKF bundles")
 
         dest_real = Path(
             resolve_and_validate_path(
@@ -340,6 +344,12 @@ class OkfArchiveBackend(MemoryArchiveBackend):
                 self._reject(report, rel, f"matched credential pattern {hit!r}")
                 return
 
+        from cli_agent_orchestrator.services.vault.binding import VaultBinding, resolve
+
+        if isinstance(resolve(target_scope, scope_id), VaultBinding):
+            self._reject(report, rel, "vault-bound scopes cannot be imported as native OKF bundles")
+            return
+
         wiki_path = self._svc.get_wiki_path(target_scope, scope_id, key)
         exists = wiki_path.exists()
 
@@ -368,6 +378,7 @@ class OkfArchiveBackend(MemoryArchiveBackend):
                         scope=target_scope,
                         scope_id=scope_id,
                         terminal_context=terminal_context,
+                        target="native",
                     )
                 )
             memory = asyncio.run(

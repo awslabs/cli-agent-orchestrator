@@ -153,6 +153,20 @@ def test_read_token_admitted_on_diagnostics(client, auth_on):
     assert resp.status_code != 403
 
 
+def test_unscoped_token_forbidden_on_vault_status(client, auth_on):
+    """Vault operational status is read-scoped even though it is content-free."""
+    app.dependency_overrides[auth.get_current_scopes] = _override_scopes([])
+    resp = client.get("/memory/vault/status")
+    assert resp.status_code == 403
+
+
+def test_read_token_admitted_on_vault_status(client, auth_on):
+    """A read token reaches the status handler rather than being scope-rejected."""
+    app.dependency_overrides[auth.get_current_scopes] = _override_scopes([auth.SCOPE_READ])
+    resp = client.get("/memory/vault/status")
+    assert resp.status_code != 403
+
+
 # ---------------------------------------------------------------------------
 # PR 526 human review — BLOCKING: every payload-bearing run READ route must be
 # scope-gated, not just /diagnostics.

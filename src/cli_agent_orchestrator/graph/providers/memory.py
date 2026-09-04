@@ -8,13 +8,23 @@ ABC, no edits to memory_service/wiki_lint) and awaiting
 
 import asyncio
 import logging
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, cast
 
 from cli_agent_orchestrator.graph.cache import GraphViewCache, make_meta
 from cli_agent_orchestrator.graph.models import Edge, EdgeType, GraphView, Node
 from cli_agent_orchestrator.graph.providers.base import GraphProvider, register_provider
 from cli_agent_orchestrator.services import settings_service, wiki_lint
 from cli_agent_orchestrator.services.memory_service import MemoryService
+from cli_agent_orchestrator.services.vault import binding
+from cli_agent_orchestrator.services.vault.binding import (
+    ScopeBinding,
+    VaultBinding,
+    VaultConfigUnavailableError,
+)
+from cli_agent_orchestrator.services.vault.reader import (
+    NO_REQUESTER_IDENTITY,
+    resolve_candidates,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +35,13 @@ logger = logging.getLogger(__name__)
 # (ripgrep stale_claim ~20s + LLM ~8.5s ⇒ ~30s typical, up to ~148s under
 # load, past the frontend's 120s timeout). Keyed by (provider, scope, scope_id).
 _CACHE = GraphViewCache()
+_LINT_ENRICHMENTS = [
+    "orphan_page",
+    "contradiction",
+    "stale_claim",
+    "poison_frequency",
+    "graph_density",
+]
 
 
 @register_provider("memory")
@@ -45,9 +62,11 @@ class MemoryGraphProvider(GraphProvider):
         self,
         memory_service: Optional[MemoryService] = None,
         lint_enabled: Optional[Callable[[], bool]] = None,
+        binding_resolver: Optional[Callable[[str, Optional[str]], ScopeBinding]] = None,
     ) -> None:
         self._svc = memory_service or MemoryService()
         self._lint_enabled = lint_enabled or settings_service.is_memory_lint_enabled
+        self._binding_resolver = binding_resolver or binding.resolve
 
     async def project(self, **filters: Any) -> GraphView:
         """Return this scope's GraphView, served from cache when fresh.
@@ -61,12 +80,28 @@ class MemoryGraphProvider(GraphProvider):
         scope = str(filters.get("scope", "global"))
         raw_scope_id = filters.get("scope_id")
         scope_id: Optional[str] = None if raw_scope_id is None else str(raw_scope_id)
-
         lint_enabled = self._lint_enabled()
+        try:
+            resolved_binding = self._binding_resolver(scope, scope_id)
+        except VaultConfigUnavailableError as exc:
+            logger.warning("memory graph provider: vault binding unavailable: %s", exc)
+            return GraphView(
+                nodes=[],
+                edges=[],
+                meta={
+                    "provider": "memory",
+                    "scope": scope,
+                    "scope_id": scope_id,
+                    "boundary_cause": "vault_config_unavailable",
+                    "lint_enrichment": "unavailable_vault",
+                    "disabled_enrichments": _LINT_ENRICHMENTS,
+                },
+            )
+        scope_id = resolved_binding.scope_id
         key = ("memory", scope, scope_id, lint_enabled)
         view, cached, as_of = await _CACHE.get_or_build(
             key,
-            lambda: self._build(scope, scope_id, lint_enabled),
+            lambda: self._build(scope, scope_id, lint_enabled, resolved_binding),
         )
         # Re-wrap with fresh cache provenance without mutating the cached
         # instance's own meta (the same GraphView object is served to every hit).
@@ -76,52 +111,98 @@ class MemoryGraphProvider(GraphProvider):
             meta=make_meta(view.meta, cached=cached, as_of=as_of),
         )
 
-    async def _build(self, scope: str, scope_id: Optional[str], lint_enabled: bool) -> GraphView:
+    async def _build(
+        self,
+        scope: str,
+        scope_id: Optional[str],
+        lint_enabled: bool,
+        resolved_binding: ScopeBinding | None = None,
+    ) -> GraphView:
         """Project the scope's wiki into a GraphView (the uncached, ~148s path)."""
-        meta: dict[str, Any] = {"provider": "memory", "scope": scope, "scope_id": scope_id}
+        meta: dict[str, Any] = {
+            "provider": "memory",
+            "scope": scope,
+            "scope_id": scope_id,
+        }
         if not lint_enabled:
             meta.update(
                 {
                     "lint_enabled": False,
-                    "lint_enrichment": "disabled",
-                    "disabled_enrichments": [
-                        "orphan_page",
-                        "contradiction",
-                        "stale_claim",
-                        "poison_frequency",
-                        "graph_density",
-                    ],
+                    "lint_enrichment": "disabled_by_setting",
+                    "disabled_enrichments": _LINT_ENRICHMENTS,
+                }
+            )
+        try:
+            resolved_binding = resolved_binding or self._binding_resolver(scope, scope_id)
+            vault_bound = isinstance(resolved_binding, VaultBinding)
+        except VaultConfigUnavailableError as exc:
+            logger.warning("memory graph provider: vault binding unavailable: %s", exc)
+            meta.update(
+                {
+                    "boundary_cause": "vault_config_unavailable",
+                    "lint_enrichment": "unavailable_vault",
+                    "disabled_enrichments": _LINT_ENRICHMENTS,
+                }
+            )
+            return GraphView(nodes=[], edges=[], meta=meta)
+        if vault_bound:
+            meta.update(
+                {
+                    "lint_enrichment": "unavailable_vault",
+                    "disabled_enrichments": _LINT_ENRICHMENTS,
                 }
             )
 
-        # Resolve + parse the scope's index. A scope with no wiki on disk
-        # (or an unresolvable scope/scope_id) is an empty graph, not an error.
-        try:
-            index_path = self._svc.get_index_path(scope, scope_id)
-        except ValueError:
-            return GraphView(nodes=[], edges=[], meta=meta)
-        if not index_path.exists():
-            return GraphView(nodes=[], edges=[], meta=meta)
-        try:
-            entries = self._svc._parse_index(index_path)
-        except OSError:
-            return GraphView(nodes=[], edges=[], meta=meta)
-
-        # session/agent indexes are shared per container with scope_id
-        # encoded in each entry's path; project/global indexes are already
-        # per-container, so their entries carry no scope_id.
         keys: list[str] = []
-        seen: set[str] = set()
-        for entry in entries:
-            if entry["scope"] != scope:
-                continue
-            if scope in ("session", "agent") and entry["scope_id"] != scope_id:
-                continue
-            if entry["key"] not in seen:
-                seen.add(entry["key"])
-                keys.append(entry["key"])
+        nodes: dict[str, Node] = {}
+        if vault_bound:
+            # This is metadata-only: resolve_candidates enforces indexed status
+            # and policy eligibility without reading note bytes. Graph projection
+            # must never call load_candidate, the vault content read sink.
+            assert isinstance(resolved_binding, VaultBinding)
+            candidates = resolve_candidates(
+                resolved_binding,
+                scope=scope,
+                scope_id=scope_id,
+                require_injectable=False,
+                terminal_id=NO_REQUESTER_IDENTITY,
+                consumer="explicit_recall",
+            )
+            if candidates.exit_arm == "not_indexable":
+                meta["boundary_cause"] = candidates.exit_arm
+            if candidates.exit_arm == "curator_agent_scope_refused":
+                meta["agent_scope_omitted"] = True
+            for candidate in candidates:
+                key = cast(str, candidate.metadata.key)
+                keys.append(key)
+                nodes[key] = Node(id=key, kind="topic", label=key, attrs={"is_vault": True})
+        else:
+            # Resolve + parse the native scope's index. A scope with no wiki on
+            # disk (or an unresolvable scope/scope_id) is an empty graph.
+            try:
+                index_path = self._svc.get_index_path(scope, scope_id)
+            except ValueError:
+                return GraphView(nodes=[], edges=[], meta=meta)
+            if not index_path.exists():
+                return GraphView(nodes=[], edges=[], meta=meta)
+            try:
+                entries = self._svc._parse_index(index_path)
+            except OSError:
+                return GraphView(nodes=[], edges=[], meta=meta)
 
-        nodes: dict[str, Node] = {key: Node(id=key, kind="topic", label=key) for key in keys}
+            # session/agent indexes are shared per container with scope_id
+            # encoded in each entry's path; project/global indexes are already
+            # per-container, so their entries carry no scope_id.
+            seen: set[str] = set()
+            for entry in entries:
+                if entry["scope"] != scope:
+                    continue
+                if scope in ("session", "agent") and entry["scope_id"] != scope_id:
+                    continue
+                if entry["key"] not in seen:
+                    seen.add(entry["key"])
+                    keys.append(entry["key"])
+            nodes = {key: Node(id=key, kind="topic", label=key) for key in keys}
         edges: list[Edge] = []
 
         # Typed relationship edges from the STORE (issue #511, FR-4.3). The
@@ -138,7 +219,7 @@ class MemoryGraphProvider(GraphProvider):
         }
 
         issues = []
-        if lint_enabled:
+        if lint_enabled and not vault_bound:
             # Lint findings may run expensive detectors. A failure degrades to
             # a lint-free graph rather than a 500.
             try:
@@ -152,6 +233,8 @@ class MemoryGraphProvider(GraphProvider):
             except Exception as e:
                 logger.warning("memory graph provider: run_lint failed: %r", e, exc_info=True)
                 meta["lint_error"] = type(e).__name__
+                meta["lint_enrichment"] = "failed"
+                meta["disabled_enrichments"] = _LINT_ENRICHMENTS
 
         # ORDERING (human review, PR #524): the relationship read MUST come after
         # run_lint. run_lint persists its contradiction findings into this same

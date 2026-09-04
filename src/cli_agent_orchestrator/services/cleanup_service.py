@@ -51,7 +51,8 @@ def cleanup_old_data():
                 ):
                     retained_terminal_ids.add(terminal.id)
                     logger.warning(
-                        "Retaining stale Grok terminal %s while cleanup is deferred", terminal.id
+                        "Retaining stale Grok terminal %s while cleanup is deferred",
+                        terminal.id,
                     )
             terminal_query = db.query(TerminalModel).filter(TerminalModel.last_active < cutoff_date)
             if retained_terminal_ids:
@@ -147,8 +148,25 @@ async def cleanup_expired_memories() -> None:
 
         # Lazy-import to avoid circular imports at module level
         from cli_agent_orchestrator.services.memory_service import MemoryService
+        from cli_agent_orchestrator.services.vault.binding import (
+            ScopeBinding,
+            VaultBinding,
+            VaultConfigUnavailableError,
+            _load_vault_config,
+            resolve,
+        )
 
         memory_service = MemoryService(base_dir=MEMORY_BASE_DIR)
+        try:
+            vault_config = _load_vault_config()
+        except VaultConfigUnavailableError as exc:
+            logger.warning(
+                "vault configuration unavailable; expiring native copies only: %s",
+                exc,
+            )
+            vault_config = None
+        resolved_bindings: dict[tuple[str, str | None], ScopeBinding] = {}
+        refused_bindings: set[tuple[str, str | None]] = set()
 
         # Walk project dirs: {MEMORY_BASE_DIR}/{project_dir}/wiki/index.md
         # Glob and parse are sync I/O; offload to a thread so the event
@@ -172,6 +190,29 @@ async def cleanup_expired_memories() -> None:
                     # files resolve correctly. Fall back to the
                     # container's scope_id otherwise.
                     effective_scope_id = entry.get("scope_id") or scope_id
+                    binding_key = (entry["scope"], effective_scope_id)
+                    target = "native"
+                    if vault_config is not None:
+                        resolved_binding = resolved_bindings.get(binding_key)
+                        if resolved_binding is None:
+                            resolved_binding = resolve(
+                                entry["scope"],
+                                effective_scope_id,
+                                vault_config=vault_config,
+                            )
+                            resolved_bindings[binding_key] = resolved_binding
+
+                        if isinstance(resolved_binding, VaultBinding):
+                            if binding_key not in refused_bindings:
+                                logger.warning(
+                                    "vault-bound memory retention preserves vault note "
+                                    "scope=%s scope_id=%s",
+                                    entry["scope"],
+                                    effective_scope_id,
+                                )
+                                refused_bindings.add(binding_key)
+                        else:
+                            target = "binding"
                     # ``forget()`` is declared async but its body is
                     # sync FS work (unlink + flock + index rewrite).
                     # Offload to a thread so the event loop stays
@@ -182,6 +223,7 @@ async def cleanup_expired_memories() -> None:
                         entry["key"],
                         entry["scope"],
                         effective_scope_id,
+                        target,
                     )
                     expired_count += 1
                     logger.info(
@@ -200,7 +242,9 @@ async def cleanup_expired_memories() -> None:
         logger.error(f"Error during memory cleanup: {e}")
 
 
-def _forget_sync(memory_service, key: str, scope: str, scope_id: str | None) -> None:
+def _forget_sync(
+    memory_service, key: str, scope: str, scope_id: str | None, target: str = "binding"
+) -> None:
     """Run MemoryService.forget() synchronously in a worker thread.
 
     forget() is declared async but its body is sync; we invoke it
@@ -209,7 +253,7 @@ def _forget_sync(memory_service, key: str, scope: str, scope_id: str | None) -> 
     """
     import asyncio as _asyncio
 
-    _asyncio.run(memory_service.forget(key=key, scope=scope, scope_id=scope_id))
+    _asyncio.run(memory_service.forget(key=key, scope=scope, scope_id=scope_id, target=target))
 
 
 def _find_expired_entries(index_path: Path, now: datetime) -> list[dict]:

@@ -19,6 +19,9 @@ CAO's memory system gives agents persistent, cross-session storage. Agents store
   by default, `--apply` to mutate, with a full audit trail.
 - **Tiered retention / cleanup**, a daily audit log, and a memory Web UI.
 
+Vault-backed memory behavior, configuration, indexing, and retention limits are
+documented in [Obsidian Vault Knowledge Source](obsidian-vault.md).
+
 ## How It Works
 
 1. **Agent stores a memory** via `memory_store` MCP tool during a session
@@ -231,6 +234,11 @@ given, results follow scope precedence: `session` > `project` > `global`.
 
 Remove a memory by key.
 
+The result's `action` is authoritative. The legacy `deleted` boolean means CAO
+completed the forget operation, not necessarily that a vault file was removed.
+For a vault-backed memory, CAO de-indexes the note and retains its file; inspect
+the returned `path` for the retained vault location.
+
 ```
 memory_forget(
   key="testing-framework",
@@ -298,7 +306,7 @@ cao memory relationships reject <relationship-id>     # -> rejected (survives re
 Memories are linked by typed, provenance-tagged edges (`relates_to`,
 `contradiction`, `supersedes`) held in a durable store rather than inferred at
 read time. Each edge records its `origin` — `compiler`, `wiki_lint`, `human`,
-`legacy_related_keys`, or `external_import` — and a `status`.
+`legacy_related_keys`, `external_import`, or `vault` — and a `status`.
 
 Writes are **producer-scoped**: when the compiler or linter recomputes its edges
 for a source memory, it replaces only rows carrying its own origin and type, so a

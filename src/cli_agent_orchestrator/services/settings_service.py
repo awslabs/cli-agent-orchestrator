@@ -355,6 +355,9 @@ def get_memory_settings() -> Dict[str, Any]:
         saved = {}
     result = dict(defaults)
     result.update(saved)
+    # Vault config has cross-field safety invariants and is intentionally
+    # available only through get_vault_config().
+    result.pop("vault", None)
 
     # Env-var overlay: CAO_MEMORY_ENABLED beats settings.json
     env_enabled = os.environ.get("CAO_MEMORY_ENABLED")
@@ -395,6 +398,25 @@ def get_memory_settings() -> Dict[str, Any]:
 
     result["lint_enabled"] = is_memory_lint_enabled(settings=settings)
     return result
+
+
+def get_vault_config():
+    """Load the validated ``memory.vault`` object with a disable-only env gate."""
+    from cli_agent_orchestrator.services.vault.config import VaultConfig
+
+    settings = _load()
+    memory = settings.get("memory", {})
+    raw_vault = memory.get("vault", {}) if isinstance(memory, dict) else {}
+    if not isinstance(raw_vault, dict):
+        raise ValueError("memory.vault must be an object")
+    config = VaultConfig.model_validate(raw_vault)
+
+    # This operational override may only reduce exposure. In particular, an
+    # env value of true never enables a file-disabled or absent configuration.
+    raw_env = os.environ.get("CAO_MEMORY_VAULT_ENABLED")
+    if raw_env is not None and raw_env.strip().lower() in _BOOL_FALSE_VALUES:
+        config.enabled = False
+    return config
 
 
 def _coerce_optional_bool(value: Any, *, label: str) -> Optional[bool]:

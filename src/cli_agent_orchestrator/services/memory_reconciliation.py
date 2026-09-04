@@ -605,7 +605,11 @@ class MemoryReconciliationService:
         from cli_agent_orchestrator.clients.database import MemoryMetadataModel
 
         with self._get_db_session() as db:
-            rows = db.query(MemoryMetadataModel).all()
+            rows = (
+                db.query(MemoryMetadataModel)
+                .filter(MemoryMetadataModel.source_kind == "native")
+                .all()
+            )
             return [
                 _Row(
                     id=row.id,
@@ -947,6 +951,7 @@ class MemoryReconciliationService:
             query = db.query(MemoryMetadataModel).filter(
                 MemoryMetadataModel.key == topic.identity.key,
                 MemoryMetadataModel.scope == topic.identity.scope,
+                MemoryMetadataModel.source_kind == "native",
                 (
                     MemoryMetadataModel.scope_id == topic.identity.scope_id
                     if topic.identity.scope_id is not None

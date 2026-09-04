@@ -1,6 +1,6 @@
 //! The static run-policy table: what the TUI offers, and how (issue #321).
 //!
-//! One row per leaf command of the CAO Click tree — **76 of them** — each classified `InApp`,
+//! One row per leaf command of the CAO Click tree — **81 of them** — each classified `InApp`,
 //! `Handoff`, or `Hidden`. Three infallible lookups read that table and nothing else.
 //!
 //! # No I/O, and that is the security property (SR-1)
@@ -64,11 +64,18 @@ use std::vec::Vec;
 
 /// The number of leaf commands in the CAO Click tree.
 ///
-/// **76 as of this branch.** Two separate merges from `main` each brought four new leaf commands
-/// that this table did not know about, and both were caught by
-/// `test/test_command_catalog_matches_click.py` rather than by review — the second one in CI,
+/// **81 as of this branch.** Successive changes brought relationship, workflow, approval,
+/// agent-orchestration, and vault-maintenance leaves that this table did not know about. They were
+/// caught by `test/test_command_catalog_matches_click.py` rather than by review, several only in CI,
 /// because CI tests the PR MERGED against `main` while a local run only sees the branch. That is
-/// the guard doing exactly what it exists for, twice.
+/// the guard doing exactly what it exists for, three times.
+///
+/// The third was `cao workflow approve`, added to `main` by PR #650 (issue #583 Bolt 2, commit
+/// `8852d26`) while this branch was open. It is HIDE, per the same unclassified-command default:
+/// approving a plan identifier authorises later runs, which is not something the TUI's front door
+/// should offer. Note that this one arrived as a *single* leaf rather than a group of four, which
+/// is worth recording because it is the case a reviewer eyeballing a diff is least likely to
+/// notice — the count moves by one and every other number in the file stays plausible.
 ///
 /// The four `cao workflow *` leaves — `runs`, `wait`, `result`, `events` — arrived with PR #525
 /// (issue #505, commit `e2e6318`). The four `cao memory relationships *` leaves were added by
@@ -84,7 +91,7 @@ use std::vec::Vec;
 /// terminal's `cao-mcp-server` connection dies. All six are HIDE, per the same mandated default —
 /// none has been deliberately reviewed for IN-APP or HANDOFF yet, and `handoff` in particular
 /// blocks for up to an hour, which a reviewer will want to weigh before offering it in-pane. That
-/// moves the count from 69 to **76**, and the distribution from 24/18/27 to 24/18/34.
+/// moves the count from 75 to **81**, and the distribution from 24/18/33 to 24/18/39.
 ///
 /// The count below the four additions was **61, not the 60 the design records** — and the discrepancy is a prediction coming true
 /// rather than a defect. `business-logic-model.md` wrote that `cao tui` was "absent from the
@@ -93,7 +100,7 @@ use std::vec::Vec;
 /// must not offer itself — giving **33 IN-APP / 5 HANDOFF / 23 HIDE = 61**. Recorded here
 /// because a reader comparing the design's 60 against this 61 would otherwise suspect drift.
 /// (#321)
-const COMMAND_COUNT: usize = 76;
+const COMMAND_COUNT: usize = 81;
 
 /// What the TUI does with a command.
 ///
@@ -190,7 +197,7 @@ pub struct Command {
 ///
 /// `pub(crate)` since Bolt 3: `server-client`'s route-table tests walk it to assert that every
 /// IN-APP command has a route and that no HANDOFF or HIDE command does. Deriving that set any
-/// other way would mean re-listing 76 commands in a second place, which is a worse trade than
+/// other way would mean re-listing 81 commands in a second place, which is a worse trade than
 /// widening the visibility of a compile-time constant. Still crate-private — no consumer outside
 /// this crate exists, and the table is not a public API. (#321)
 pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
@@ -237,6 +244,11 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::MemoryRelationshipsReject,
     CommandId::MemoryRepair,
     CommandId::MemoryShow,
+    CommandId::MemoryVaultMigrate,
+    CommandId::MemoryVaultRebuild,
+    CommandId::MemoryVaultReconcile,
+    CommandId::MemoryVaultScan,
+    CommandId::MemoryVaultStatus,
     CommandId::ProfileCreate,
     CommandId::ProfileFind,
     CommandId::ProfileList,
@@ -272,7 +284,7 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::WorkflowValidate,
 ];
 
-/// One variant per leaf command — **all 69**.
+/// One variant per leaf command — **all 75**.
 ///
 /// Why an enum rather than a `String` key is the subject of this module's own docs: it is what
 /// makes an unclassified command a **compile error** instead of a runtime `None` (FR-4.2).
@@ -379,6 +391,16 @@ pub enum CommandId {
     MemoryRepair,
     /// `cao memory show`
     MemoryShow,
+    /// `cao memory vault migrate`
+    MemoryVaultMigrate,
+    /// `cao memory vault rebuild`
+    MemoryVaultRebuild,
+    /// `cao memory vault reconcile`
+    MemoryVaultReconcile,
+    /// `cao memory vault scan`
+    MemoryVaultScan,
+    /// `cao memory vault status`
+    MemoryVaultStatus,
 
     // `cao profile *`
     /// `cao profile create`
@@ -974,6 +996,66 @@ fn entry(id: CommandId) -> Command {
             params: &[Param { name: "key", required: true, kind: ParamKind::Text }, Param { name: "--scope", required: false, kind: ParamKind::Text }],
             handoff_reason: None,
         },
+        // ── `cao memory vault *` — all five HIDE ─────────────────────────────────────────
+        //
+        // These commands read and maintain local vault files. U11 deliberately ships no MCP
+        // tool for them: an agent must not be able to schedule vault reads without the operator
+        // choosing the CLI invocation. U11-B may add a read-only status HTTP endpoint, but no
+        // mutating route exists in this unit, so none belong in the TUI.
+        CommandId::MemoryVaultMigrate => Command {
+            id: CommandId::MemoryVaultMigrate,
+            parent: Some("memory vault"),
+            leaf_name: "migrate",
+            summary: "Migrate native memories into the managed vault folder.",
+            policy: Policy::Hidden,
+            params: &[
+                Param { name: "--scope", required: true, kind: ParamKind::Text },
+                Param { name: "--scope-id", required: false, kind: ParamKind::Text },
+                Param { name: "--apply", required: false, kind: ParamKind::Flag },
+                Param { name: "--delete-source", required: false, kind: ParamKind::Flag },
+                Param { name: "--confirm-delete-source", required: false, kind: ParamKind::Flag },
+            ],
+            handoff_reason: None,
+        },
+        CommandId::MemoryVaultRebuild => Command {
+            id: CommandId::MemoryVaultRebuild,
+            parent: Some("memory vault"),
+            leaf_name: "rebuild",
+            summary: "Delete and re-derive vault state.",
+            policy: Policy::Hidden,
+            params: &[Param { name: "--apply", required: false, kind: ParamKind::Flag }],
+            handoff_reason: None,
+        },
+        CommandId::MemoryVaultReconcile => Command {
+            id: CommandId::MemoryVaultReconcile,
+            parent: Some("memory vault"),
+            leaf_name: "reconcile",
+            summary: "Reconcile scanned vault notes into derived state.",
+            policy: Policy::Hidden,
+            params: &[
+                Param { name: "--apply", required: false, kind: ParamKind::Flag },
+                Param { name: "--format", required: false, kind: ParamKind::Text },
+            ],
+            handoff_reason: None,
+        },
+        CommandId::MemoryVaultScan => Command {
+            id: CommandId::MemoryVaultScan,
+            parent: Some("memory vault"),
+            leaf_name: "scan",
+            summary: "Scan configured vault notes without changing files or rows.",
+            policy: Policy::Hidden,
+            params: &[Param { name: "--dry-run", required: false, kind: ParamKind::Flag }],
+            handoff_reason: None,
+        },
+        CommandId::MemoryVaultStatus => Command {
+            id: CommandId::MemoryVaultStatus,
+            parent: Some("memory vault"),
+            leaf_name: "status",
+            summary: "Show vault projection status and configuration warnings.",
+            policy: Policy::Hidden,
+            params: &[Param { name: "--format", required: false, kind: ParamKind::Text }],
+            handoff_reason: None,
+        },
 
         CommandId::ProfileCreate => Command {
             id: CommandId::ProfileCreate,
@@ -1404,7 +1486,7 @@ mod tests {
         counts
     }
 
-    /// Test 1 — **the policy distribution is 24 IN-APP / 18 HANDOFF / 34 HIDE, totalling 76.**
+    /// Test 1 — **the policy distribution is 24 IN-APP / 18 HANDOFF / 39 HIDE, totalling 81.**
     ///
     /// Every number here is a **hard-coded literal**, and that is the entire design of the test.
     /// Deriving any of them from the table — `assert_eq!(in_app, TABLE.iter().filter(..).count())`
@@ -1437,35 +1519,39 @@ mod tests {
     /// merge then brought `cao workflow` {`runs`, `result`, `wait`, `events`} from PR #525 — caught
     /// in CI, which tests the PR merged against `main` and so saw four commands a local run could
     /// not. `runs`/`result` are ordinary journal reads (IN-APP); `wait`/`events` are unbounded
-    /// (HANDOFF). That gives **24/18/27 = 69**. Note what the shape of this failure was: every count here was internally
-    /// consistent and every test green, because nothing compared the table against the CLI. That
-    /// is what `test/test_command_catalog_matches_click.py` now does. (Review on PR #547.)
-    ///
+    /// (HANDOFF). That gave **24/18/27 = 69**. U11-A then added five local `memory vault`
+    /// maintenance commands, all HIDE because no TUI or MCP path may schedule vault reads,
+    /// yielding **24/18/32 = 74**. A third merge from `main` then brought a single leaf,
+    /// `cao workflow approve` (PR #650, issue #583 Bolt 2) — HIDE, because authorising a plan
+    /// identifier is not a front-door action — giving **24/18/33 = 75**.
     /// Then issue **#616** added six `cao agent *` leaves (assign/cancel/handoff/result/
     /// send-message/status), all HIDE per the same mandated default — none has been deliberately
-    /// reviewed for IN-APP or HANDOFF yet. That gives **24/18/34 = 76**.
+    /// reviewed for IN-APP or HANDOFF yet. That gives **24/18/39 = 81**. Note what the shape of
+    /// this failure was: every count here was internally consistent and every test green, because
+    /// nothing compared the table against the CLI. That is what
+    /// `test/test_command_catalog_matches_click.py` now does. (Review on PR #547.)
     #[test]
-    fn the_policy_distribution_is_twentyfour_eighteen_thirtyfour() {
+    fn the_policy_distribution_is_twentyfour_eighteen_thirtynine() {
         let (in_app, handoff, hidden) = distribution();
 
         assert_eq!(in_app, 24, "expected 24 IN-APP commands, found {in_app}");
         assert_eq!(handoff, 18, "expected 18 HANDOFF commands, found {handoff}");
-        assert_eq!(hidden, 34, "expected 34 HIDE commands, found {hidden}");
+        assert_eq!(hidden, 39, "expected 39 HIDE commands, found {hidden}");
         assert_eq!(
             in_app + handoff + hidden,
-            76,
-            "the three policy counts must account for all 76 leaf commands of the Click tree"
+            81,
+            "the three policy counts must account for all 81 leaf commands of the Click tree"
         );
 
-        // The three counts summing to 76 does not prove 76 *distinct* commands were counted: a
+        // The three counts summing to 81 does not prove 81 *distinct* commands were counted: a
         // duplicated entry in DISPLAY_ORDER would inflate one policy while a real command went
         // uncounted, and the arithmetic above would still close. DISPLAY_ORDER is generated, so
         // this is a live hazard rather than a theoretical one.
         let distinct: BTreeSet<CommandId> = DISPLAY_ORDER.iter().copied().collect();
         assert_eq!(
             distinct.len(),
-            76,
-            "DISPLAY_ORDER must list 76 DISTINCT commands; a duplicate would let one command go \
+            81,
+            "DISPLAY_ORDER must list 81 DISTINCT commands; a duplicate would let one command go \
              uncounted while the totals still summed correctly"
         );
     }
@@ -1575,6 +1661,11 @@ mod tests {
                     CommandId::MemoryRelationshipsReject => CommandId::MemoryRelationshipsReject,
                     CommandId::MemoryRepair => CommandId::MemoryRepair,
                     CommandId::MemoryShow => CommandId::MemoryShow,
+                    CommandId::MemoryVaultMigrate => CommandId::MemoryVaultMigrate,
+                    CommandId::MemoryVaultRebuild => CommandId::MemoryVaultRebuild,
+                    CommandId::MemoryVaultReconcile => CommandId::MemoryVaultReconcile,
+                    CommandId::MemoryVaultScan => CommandId::MemoryVaultScan,
+                    CommandId::MemoryVaultStatus => CommandId::MemoryVaultStatus,
                     CommandId::ProfileCreate => CommandId::ProfileCreate,
                     CommandId::ProfileFind => CommandId::ProfileFind,
                     CommandId::ProfileList => CommandId::ProfileList,
@@ -1656,6 +1747,11 @@ mod tests {
                 CommandId::MemoryRelationshipsReject,
                 CommandId::MemoryRepair,
                 CommandId::MemoryShow,
+                CommandId::MemoryVaultMigrate,
+                CommandId::MemoryVaultRebuild,
+                CommandId::MemoryVaultReconcile,
+                CommandId::MemoryVaultScan,
+                CommandId::MemoryVaultStatus,
                 CommandId::ProfileCreate,
                 CommandId::ProfileFind,
                 CommandId::ProfileList,

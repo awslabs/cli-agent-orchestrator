@@ -104,6 +104,25 @@ class Memory(BaseModel):
         ),
     )
     content: str = Field(default="", description="Memory content loaded from wiki file")
+    source_kind: str = Field(
+        default="native", description="Storage backend that supplied this memory"
+    )
+    source_path: Optional[str] = Field(
+        default=None,
+        description="Backend-relative source path; never an absolute vault path",
+    )
+    indexed_at: Optional[datetime] = Field(
+        default=None, description="When a vault projection was last reconciled"
+    )
+    index_freshness: Optional[str] = Field(
+        default=None, description="Vault stat comparison result: fresh or stale"
+    )
+    content_truncated: bool = Field(
+        default=False, description="True when recall body budget truncated content"
+    )
+    token_estimate: Optional[int] = Field(
+        default=None, description="Approximate recall token count"
+    )
     action: Optional[str] = Field(
         default=None,
         exclude=True,

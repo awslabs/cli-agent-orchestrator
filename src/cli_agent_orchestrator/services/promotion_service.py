@@ -137,6 +137,7 @@ class PromotionService:
                 .filter(
                     MemoryMetadataModel.scope == "agent",
                     MemoryMetadataModel.scope_id == agent_profile,
+                    MemoryMetadataModel.source_kind == "native",
                     MemoryMetadataModel.memory_type.in_(PROMOTABLE_TYPES),
                     MemoryMetadataModel.access_count >= min_access_count,
                 )

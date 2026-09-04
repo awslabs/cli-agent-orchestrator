@@ -59,7 +59,15 @@ def bound(monkeypatch, db_engine):
     return Session
 
 
-def _seed_memory(db_engine, key, scope="global", scope_id=None, body=None, body_dir=None):
+def _seed_memory(
+    db_engine,
+    key,
+    scope="global",
+    scope_id=None,
+    body=None,
+    body_dir=None,
+    source_kind="native",
+):
     """Seed a memory_metadata row.
 
     ``body`` is the memory's CONTENT. Memory bodies live in files, not in
@@ -94,6 +102,7 @@ def _seed_memory(db_engine, key, scope="global", scope_id=None, body=None, body_
                 memory_type="project",
                 scope=scope,
                 scope_id=scope_id,
+                source_kind=source_kind,
                 file_path=file_path,
                 tags="t",
             )
@@ -180,6 +189,44 @@ def test_s2b_unscoped_delete_would_nuke_human_edge(bound, db_engine):
     ), "unscoped delete removes EVERYTHING incl the human edge (the bug S2 guards)"
 
 
+def test_replace_set_persists_supplied_status_and_clear_source_is_producer_scoped(bound, db_engine):
+    """Vault reconciliation must retain declared status while retiring only its own old edges."""
+    for key in ("source", "target-a", "target-b", "target-c"):
+        _seed_memory(db_engine, key)
+    svc = _svc()
+    svc.replace_set(
+        "global",
+        None,
+        "source",
+        "vault",
+        "relates_to",
+        [EdgeInput("target-a", status="proposal")],
+    )
+    svc.create("global", None, "source", "target-b", "contradiction", "vault")
+    svc.create("global", None, "source", "target-b", "relates_to", "human")
+    rejected = svc.create("global", None, "source", "target-c", "relates_to", "vault")
+    svc.reject(rejected.id)
+
+    assert (
+        svc.get(svc.list_relationships("global", None, "source", status="proposal")[0].id).status
+        == "proposal"
+    )
+
+    svc.clear_source("global", None, "source", "vault")
+
+    remaining = svc.list_relationships("global", None, "source", include_non_active=True)
+    assert [(edge.origin, edge.type, edge.target_key) for edge in remaining] == [
+        ("human", "relates_to", "target-b"),
+        ("vault", "relates_to", "target-c"),
+    ]
+
+    svc.clear_source("global", None, "source", "vault", preserve_terminal=False)
+    remaining = svc.list_relationships("global", None, "source", include_non_active=True)
+    assert [(edge.origin, edge.type, edge.target_key) for edge in remaining] == [
+        ("human", "relates_to", "target-b")
+    ]
+
+
 # --------------------------------------------------------------------------- #
 # S4 — multi-edge coexistence
 # --------------------------------------------------------------------------- #
@@ -235,7 +282,10 @@ def test_superseded_targets_batched(bound, db_engine):
     svc.create("global", None, "new1", "old1", "supersedes", "human")
     svc.create("global", None, "new2", "old2", "supersedes", "human")
     hits = svc.superseded_targets("global", None, ["old1", "old2", "new1", "unrelated"])
-    assert hits == {"old1", "old2"}  # targets of active supersedes; sources/unrelated excluded
+    assert hits == {
+        "old1",
+        "old2",
+    }  # targets of active supersedes; sources/unrelated excluded
 
 
 def test_s7_null_confidence_not_zero(bound, db_engine):
@@ -458,7 +508,10 @@ def test_s6_legacy_related_keys_unconverted_still_expands(bound, db_engine, tmp_
 
     async def _setup():
         await svc.store(
-            content="# root\nalpha unique-token", key="root", memory_type="project", scope="global"
+            content="# root\nalpha unique-token",
+            key="root",
+            memory_type="project",
+            scope="global",
         )
         await svc.store(
             content="# legacyfriend\nbeta",
@@ -860,7 +913,15 @@ def test_validate_attributes_rejects_unserialisable_as_valueerror(bound, db_engi
     _seed_memory(db_engine, "b")
     svc = _svc()
     with pytest.raises(ValueError, match="JSON-serialisable"):
-        svc.create("global", None, "a", "b", "relates_to", "human", attributes={"bad": {1, 2, 3}})
+        svc.create(
+            "global",
+            None,
+            "a",
+            "b",
+            "relates_to",
+            "human",
+            attributes={"bad": {1, 2, 3}},
+        )
 
 
 def test_replace_set_soft_rejects_unserialisable_edge_not_whole_batch(bound, db_engine):
@@ -1089,7 +1150,7 @@ def test_forget_purges_relationships_and_slug_reuse_inherits_nothing(
     assert len(rel.list_relationships("global", None, "doomed")) == 1
     assert len(rel.list_relationships("global", None, "survivor")) == 1
 
-    assert asyncio.run(svc.forget("doomed", scope="global", scope_id=None)) is True
+    assert asyncio.run(svc.forget("doomed", scope="global", scope_id=None))
 
     # Both directions are gone...
     assert rel.list_relationships("global", None, "doomed") == []
@@ -1100,7 +1161,10 @@ def test_forget_purges_relationships_and_slug_reuse_inherits_nothing(
     # ...and a NEW memory reusing the slug inherits nothing.
     asyncio.run(
         svc.store(
-            content="# doomed\nreused slug", key="doomed", memory_type="project", scope="global"
+            content="# doomed\nreused slug",
+            key="doomed",
+            memory_type="project",
+            scope="global",
         )
     )
     assert (
@@ -1136,10 +1200,55 @@ def test_forget_purges_relationships_when_the_file_already_vanished(
     # Remove the file out-of-band so forget() takes the not-exists branch.
     svc.get_wiki_path("global", None, "ghost").unlink()
 
-    assert asyncio.run(svc.forget("ghost", scope="global", scope_id=None)) is False
+    assert not asyncio.run(svc.forget("ghost", scope="global", scope_id=None))
     assert (
         rel.list_relationships("global", None, "ghost") == []
     ), "the vanished-file path must purge relationships too"
+
+
+def test_forget_spares_vault_edges_and_metadata_while_purging_native_edges(
+    bound, db_engine, tmp_path, monkeypatch
+):
+    """The native forget predicate must not half-delete a vault projection."""
+    import asyncio
+
+    from cli_agent_orchestrator.clients import database as db_mod
+    from cli_agent_orchestrator.services import memory_service as ms_mod
+
+    scope = "project"
+    scope_id = "vault-bound"
+    for key, source_kind in (
+        ("shared", "native"),
+        ("shared", "vault"),
+        ("native-target", "native"),
+        ("vault-source", "vault"),
+    ):
+        _seed_memory(db_engine, key, scope, scope_id, source_kind=source_kind)
+    svc = ms_mod.MemoryService(base_dir=tmp_path, db_engine=db_engine)
+    monkeypatch.setattr(ms_mod, "MEMORY_BASE_DIR", tmp_path)
+    Session = sessionmaker(bind=db_engine)
+    monkeypatch.setattr(db_mod, "SessionLocal", Session)
+    rel = _svc()
+    rel.create(scope, scope_id, "shared", "native-target", "relates_to", "compiler")
+    rel.replace_set(
+        scope,
+        scope_id,
+        "vault-source",
+        "vault",
+        "relates_to",
+        [EdgeInput("shared")],
+        source_kind="vault",
+    )
+
+    assert not asyncio.run(svc.forget("shared", scope=scope, scope_id=scope_id))
+
+    with Session() as db:
+        assert (db.query(MemoryRelationshipModel).filter_by(origin="compiler").count()) == 0
+        assert db.query(MemoryRelationshipModel).filter_by(origin="vault").count() == 1
+        assert (
+            db.query(MemoryMetadataModel).filter_by(key="shared", source_kind="native").count()
+        ) == 0
+        assert (db.query(MemoryMetadataModel).filter_by(source_kind="vault").count()) == 2
 
 
 def test_stale_flag_is_live_after_the_source_is_edited(bound, db_engine):
