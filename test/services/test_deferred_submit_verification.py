@@ -37,6 +37,25 @@ class TestMessageVisibleInBox:
         with patch.object(ts, "get_output", return_value="❯ Analyze the\n  logs carefully"):
             assert ts._message_visible_in_box("t1", "Analyze the logs") is True
 
+    def test_prior_handoff_does_not_read_as_the_current_one(self):
+        # #727: every orchestrated handoff opens with the same banner, so a
+        # leading-slice probe collapses to that banner for ALL of them. A pane
+        # holding a completed earlier handoff and an empty composer must not
+        # read as the new handoff still sitting in the box — a bare Enter
+        # there submits a blank prompt and the task is lost. The flip side
+        # pins the same message genuinely present in the pane (only the Enter
+        # swallowed): the whole collapsed message must still match.
+        current = (
+            "[CAO Handoff] Supervisor terminal ID: a1b2c3d4. "
+            "This is a blocking handoff — complete the task and present "
+            "your deliverables.\n\nRefactor the config loader module"
+        )
+        stale = current.replace("Refactor the config loader module", "Fix the flaky e2e login test")
+        with patch.object(ts, "get_output", return_value=f"› {stale}\n❯ (empty prompt)"):
+            assert ts._message_visible_in_box("t1", current) is False
+        with patch.object(ts, "get_output", return_value=f"› {current}"):
+            assert ts._message_visible_in_box("t1", current) is True
+
 
 class TestRedeliverDroppedMessageHelper:
     """The shared one-attempt helper: a caller without a provider instance
