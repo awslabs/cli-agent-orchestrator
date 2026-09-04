@@ -2518,11 +2518,25 @@ class TestCodexProviderTrustPrompt:
         assert mock_backend.return_value.get_history.call_count == 1
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
-    async def test_bounds_default_to_their_documented_settings(self, mock_backend):
-        """idle_gap defaults to startup_prompt_handler_timeout and the outer cap
-        to provider_init_timeout — not both to the same setting."""
-        mock_backend.return_value.get_history.return_value = "OpenAI Codex (v0.98.0)\n› "
+    async def test_outer_cap_defaults_to_provider_init_timeout(self, mock_backend, mock_sleep):
+        """The outer cap must resolve to provider_init_timeout, not to the idle gap.
+
+        Asserting only that ``get_server_settings`` was *called* would pass with the
+        two settings swapped, which is the mistake this split exists to prevent. So
+        this discriminates by behaviour instead: the pane matches no prompt, banner
+        or login menu, so nothing can end the loop except the outer cap, and the
+        clock crosses the gap setting (7s) without reaching the init setting (99s).
+        A correctly wired handler is therefore still polling; if the cap had
+        resolved to 7s it would have broken before the first poll.
+
+        Counting reads rather than elapsed time is what makes this observable:
+        the cap's own error path reads the pane once more for its diagnostic
+        tail, so a correct cap leaves 2 reads (one in-loop, one diagnostic) and
+        a cap wrongly resolved to 7s leaves only the diagnostic one.
+        """
+        mock_backend.return_value.get_history.return_value = "unrecognized scrollback\n"
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         with patch(
@@ -2531,14 +2545,63 @@ class TestCodexProviderTrustPrompt:
                 "startup_prompt_handler_timeout": 7.0,
                 "provider_init_timeout": 99.0,
             },
-        ) as mock_settings:
+        ):
             with patch(
                 "cli_agent_orchestrator.providers.codex.time",
-                fake_clock(0.0, 0.0, 0.0),
+                fake_clock(0.0, 0.0, 50.0, 100.0),
             ):
                 await provider._handle_trust_prompt()
 
-        assert mock_settings.called
+        # t=50 is past the 7s gap but inside the 99s cap, so the in-loop poll
+        # happened; t=100 then ends it and the cap logs its pane tail. Swapping
+        # the two settings drops the in-loop poll, leaving 1.
+        assert mock_backend.return_value.get_history.call_count == 2
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_idle_gap_defaults_to_startup_prompt_handler_timeout(
+        self, mock_backend, mock_sleep
+    ):
+        """The idle gap must resolve to startup_prompt_handler_timeout.
+
+        Exercised the way ``initialize()`` actually calls it — outer cap passed
+        explicitly, gap left to default — so the cap cannot mask which setting the
+        gap read. Trust is answered on poll 1, then the pane goes quiet; 10s later
+        the 7s gap has elapsed and the handler returns. Had the gap defaulted to
+        ``provider_init_timeout`` (99s) it would still be polling.
+        """
+        trust = (
+            "  Since this folder is version controlled, you may wish to "
+            "allow Codex to work in this folder without asking for approval.\n"
+            "› 1. Yes, allow Codex to work in this folder without asking for approval\n"
+        )
+        mock_backend.return_value.get_history.side_effect = [
+            trust,
+            "unrecognized scrollback\n",
+            "unrecognized scrollback\n",
+            "unrecognized scrollback\n",
+        ]
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        with patch(
+            "cli_agent_orchestrator.providers.codex.get_server_settings",
+            return_value={
+                "startup_prompt_handler_timeout": 7.0,
+                "provider_init_timeout": 99.0,
+            },
+        ):
+            with patch(
+                "cli_agent_orchestrator.providers.codex.time",
+                # The trailing 700.0 crosses the explicit 600s cap so that a gap
+                # wrongly resolved to 99s ends the loop on the cap and fails this
+                # assertion, rather than exhausting the clock and raising
+                # StopIteration — a confusing error where a plain failure belongs.
+                fake_clock(0.0, 0.0, 0.0, 0.0, 10.0, 20.0, 700.0),
+            ):
+                await provider._handle_trust_prompt(outer_timeout=600.0)
+
+        assert mock_backend.return_value.get_history.call_count == 1
 
     def test_get_status_trust_prompt_is_waiting_user_answer(self):
         """Test that trust prompt reports WAITING_USER_ANSWER, not PROCESSING."""
