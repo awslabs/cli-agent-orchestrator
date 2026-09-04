@@ -174,8 +174,7 @@ def sessions(worker_id, as_json):
             # A worker holds one terminal, and a STATUS column that always read
             # N/A would be worse than the extra call.
             "terminals": [
-                client.terminal(worker_id, t["id"])
-                for t in client.terminals(worker_id, s["name"])
+                client.terminal(worker_id, t["id"]) for t in client.terminals(worker_id, s["name"])
             ],
         }
         for s in client.sessions(worker_id)
