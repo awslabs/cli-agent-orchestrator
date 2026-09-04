@@ -369,6 +369,17 @@ def _validate_resume_session_id(value: str) -> None:
         )
 
 
+class SetSessionEnvBody(BaseModel):
+    """JSON body for POST /sessions/{session_name}/env.
+
+    Same wire shape as the launch path: env values travel in the body — not
+    the query string — so secrets never land in cao-server's HTTP access log
+    (issue #248).
+    """
+
+    env_vars: Dict[str, str]
+
+
 def _validate_model_id(value: str) -> None:
     """Validate a ``model`` override at the request boundary (PR #501 review).
 
@@ -3102,6 +3113,58 @@ async def get_session(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get session: {str(e)}",
         )
+
+
+@app.post("/sessions/{session_name}/env")
+async def set_session_env_endpoint(
+    session_name: str,
+    body: SetSessionEnvBody,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Re-hydrate operator-forwarded env vars for an existing session.
+
+    The per-session env map (``cao launch --env``) lives only in cao-server
+    process memory and is wiped by a server restart — workers spawned in the
+    session AFTER the restart would silently lose vars like provider
+    credentials forwarded at launch. This endpoint lets an operator (or an
+    external launcher) re-register them without recreating the session.
+
+    Semantics: merge-on-top of whatever the server currently holds for the
+    session (per-key overwrite). Values are validated with the same rules the
+    launch CLI applies (POSIX names, blocked prefixes, byte cap) and rejected
+    loudly here rather than silently dropped at window creation. Already
+    running terminals are unaffected — their env was fixed into the tmux
+    window at creation; the map only feeds FUTURE windows.
+    """
+    from cli_agent_orchestrator.clients.tmux import TmuxClient
+    from cli_agent_orchestrator.services.session_env import get_session_env, set_session_env
+
+    try:
+        validate_tmux_name(session_name, "session_name")
+        for key, value in body.env_vars.items():
+            if (
+                not key
+                or not (key[0].isalpha() or key[0] == "_")
+                or not all(c.isalnum() or c == "_" for c in key)
+                or not key.isascii()
+            ):
+                raise ValueError(f"invalid env var name: {key!r}")
+            if TmuxClient._is_blocked_env_key(key):
+                raise ValueError(f"env var {key!r} has a blocked prefix")
+            if len(value.encode("utf-8")) >= TmuxClient._MAX_ENV_VALUE_BYTES:
+                raise ValueError(f"env var {key!r} value exceeds the byte cap")
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    if not get_backend().session_exists(session_name):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Session '{session_name}' not found",
+        )
+
+    merged = {**get_session_env(session_name), **body.env_vars}
+    set_session_env(session_name, merged)
+    return {"session_name": session_name, "env_keys": sorted(merged.keys())}
 
 
 @app.delete("/sessions/{session_name}")
