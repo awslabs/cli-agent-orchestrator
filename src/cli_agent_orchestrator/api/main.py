@@ -174,6 +174,7 @@ from cli_agent_orchestrator.services.worktree_service import WorktreeError
 from cli_agent_orchestrator.telemetry import init_telemetry, shutdown_telemetry
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
 from cli_agent_orchestrator.utils.logging import install_access_log_redaction, setup_logging
+from cli_agent_orchestrator.utils.paths import normalize_working_directory
 from cli_agent_orchestrator.utils.skills import (
     SkillNameError,
     load_skill_content,
@@ -1485,6 +1486,27 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def add_server_time_header(request: Request, call_next):
+    """Stamp handled responses with the server's wall clock as ``X-Server-Time``.
+
+    Browser clients render relative times ("2 minutes ago") from server
+    timestamps, and the two clocks are not the same clock: WSL2 hosts have been
+    observed hours adrift from the Windows browser next to them. One header on
+    a response lets a client measure the skew once and correct for it. It
+    rides the middleware stack, so an unhandled exception that never returns
+    through it (Starlette's own 500) goes out without the header; that is
+    harmless for an informational value and not worth a second code path.
+    Offset-aware ISO-8601 so a browser in a different timezone parses it
+    unambiguously (a naive string is read as browser-local time, which is the
+    skew this header exists to remove). Purely informational; clients that
+    ignore it are unaffected.
+    """
+    response = await call_next(request)
+    response.headers["X-Server-Time"] = datetime.now().astimezone().isoformat()
+    return response
+
+
 @app.exception_handler(RequestValidationError)
 async def _redact_env_vars_validation_error(
     request: Request, exc: RequestValidationError
@@ -2745,6 +2767,67 @@ async def get_agent_dirs_endpoint(
     }
 
 
+@app.get("/fs/dirs")
+async def list_directories(
+    path: Optional[str] = None,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """List the subdirectories of one server-side folder, for a folder picker.
+
+    Directory names only: never file names, sizes, or contents. Accepts the
+    same operator-typed spellings ``POST /sessions`` accepts for
+    ``working_directory`` (``~``, quoted, Windows drive paths translated to the
+    WSL mount) but never creates anything. Defaults to the server user's home.
+    Hidden folders are listed after the visible ones rather than dropped,
+    because provider homes (``~/.kiro``, ``~/.aws``) are exactly what an
+    operator browsing for a profile directory is after.
+
+    Read-scope gated when auth is enabled, like ``GET /settings/agent-dirs``.
+    Be clear about what that gate protects: this endpoint ENUMERATES child
+    directory names for any path the server user can read, with no root
+    confinement, which is a materially stronger disclosure than the
+    existence-and-creatability oracle a caller already has through
+    ``working_directory``. Under the default localhost-only posture that is
+    the operator reading their own filesystem; once auth is enabled it means a
+    read-scope token can walk the tree. Confining it to a configurable root is
+    the obvious hardening if that ever becomes the deployment shape.
+    """
+    try:
+        # ``normalize_working_directory`` returns None for a blank or
+        # quotes-only value, which must fall back to the documented home
+        # default -- ``Path("")`` would silently resolve to the server's CWD.
+        normalized = normalize_working_directory(path, create_missing=False) if path else None
+        resolved = Path(normalized) if normalized else Path.home()
+        resolved = resolved.resolve()
+        if not resolved.is_dir():
+            raise ValueError(f"Not a folder: {resolved}")
+        visible: List[str] = []
+        hidden: List[str] = []
+        for entry in sorted(resolved.iterdir(), key=lambda e: e.name.lower()):
+            try:
+                if not entry.is_dir():
+                    continue
+            except OSError:
+                continue  # unreadable entry (dangling symlink, EACCES): skip, not fail
+            (hidden if entry.name.startswith(".") else visible).append(entry.name)
+        parent = str(resolved.parent) if resolved.parent != resolved else None
+        return {"path": str(resolved), "parent": parent, "dirs": visible + hidden}
+    except PermissionError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No permission to read that folder",
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except OSError as e:
+        # ENOTDIR, EIO, a stale network mount: the per-entry loop already
+        # tolerates these, so the directory-level read should not 500 either.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Could not read that folder: {e}",
+        )
+
+
 class AgentDirsUpdate(BaseModel):
     agent_dirs: Optional[Dict[str, str]] = None
     extra_dirs: Optional[List[str]] = None
@@ -2967,6 +3050,14 @@ async def create_session(
                     "invalid initial_message_orchestration_type: "
                     f"{body.initial_message_orchestration_type!r}"
                 )
+        # Accept the spellings an operator actually types into a browser field
+        # (``~``, Explorer-quoted, Windows drive paths on WSL) and reject an
+        # unusable one as a clear 400 here, instead of a 500 deep in tmux.
+        # Deliberately LAST among the validations: this call can create the
+        # directory, and a request that some cheaper check was going to reject
+        # must not leave a tree behind (gutosantos82, #724 review).
+        working_directory = normalize_working_directory(working_directory)
+
         # Parse comma-separated allowed_tools string into list
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
 
@@ -3074,6 +3165,47 @@ async def list_sessions(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to list sessions: {str(e)}",
         )
+
+
+class SessionLabelUpdate(BaseModel):
+    label: str = Field(..., max_length=1024)
+
+
+@app.post("/sessions/{session_name}/label")
+async def set_session_label_endpoint(
+    session_name: str,
+    body: SessionLabelUpdate,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Set, or clear with an empty string, a friendly display name for a session.
+
+    Stored separately from the tmux session name so nothing that references
+    the real name (terminals, DB rows, the backend) is disturbed: a pure
+    display alias, surfaced as ``label`` on ``GET /sessions`` and
+    ``GET /sessions/{name}``. Trimmed and capped server-side; the response
+    carries the label as stored (``None`` once cleared).
+
+    The name is prefix-normalized exactly as ``POST /sessions`` normalizes it
+    at creation (``demo`` -> ``cao-demo``), so an operator who labels using
+    the name they created with reaches the same session the listing and the
+    teardown key off. Without that, the write would succeed and store an entry
+    that never surfaces and is never cleared (gutosantos82, #724 review).
+    """
+    from cli_agent_orchestrator.constants import SESSION_PREFIX
+
+    effective = (
+        session_name
+        if session_name.startswith(SESSION_PREFIX)
+        else f"{SESSION_PREFIX}{session_name}"
+    )
+    try:
+        validate_tmux_name(effective, "session_name")
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    from cli_agent_orchestrator.services.settings_service import set_session_label
+
+    labels = set_session_label(effective, body.label)
+    return {"session_name": effective, "label": labels.get(effective)}
 
 
 @app.get("/sessions/{session_name}")
@@ -3223,6 +3355,12 @@ async def create_terminal_in_session(
             resolved_provider = resolve_provider(agent_profile, fallback_provider="kiro_cli")
         else:
             resolved_provider = provider
+
+        # Same operator-typed spellings POST /sessions accepts (see there).
+        try:
+            working_directory = normalize_working_directory(working_directory)
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
         # Parse comma-separated allowed_tools string into list
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
