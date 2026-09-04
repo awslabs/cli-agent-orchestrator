@@ -610,6 +610,59 @@ def test_path_derived_pure_rename_preserves_identity_and_records_alias(tmp_path,
     assert [(row.key, row.file_path) for row in metadata] == [(original_key, "Mapped/New.md")]
 
 
+def test_recreated_former_path_cannot_steal_retained_rename_identity(tmp_path, monkeypatch):
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    mapped = tmp_path / "vault" / "Mapped"
+    old_path = mapped / "Old.md"
+    new_path = mapped / "New.md"
+    old_path.write_text("original content", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="former-path-before")
+    with Session() as db:
+        original = db.query(VaultNoteModel).one()
+        original_uid, original_key = original.note_uid, original.cao_key
+
+    old_path.rename(new_path)
+    reconcile(vault, apply=True, run_id="former-path-renamed")
+    old_path.write_text("new occupant", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="former-path-reused")
+
+    def snapshot():
+        with Session() as db:
+            notes = {
+                row.vault_relpath: (row.note_uid, row.cao_key, row.status)
+                for row in db.query(VaultNoteModel).all()
+            }
+            aliases = {
+                row.former_relpath: row.cao_key for row in db.query(VaultNoteAliasModel).all()
+            }
+            metadata = [
+                (row.key, row.file_path)
+                for row in db.query(MemoryMetadataModel).filter_by(source_kind="vault").all()
+            ]
+            findings = [
+                (row.code, row.vault_relpath)
+                for row in db.query(VaultFindingModel).filter_by(code="key_collision").all()
+            ]
+        return notes, aliases, metadata, findings
+
+    first = snapshot()
+    notes, aliases, metadata, findings = first
+    assert notes["Mapped/New.md"] == (original_uid, original_key, "indexed")
+    reused_uid, reused_key, reused_status = notes["Mapped/Old.md"]
+    assert reused_uid != original_uid
+    assert reused_key.startswith(f"{original_key}-collision-")
+    assert reused_status == "quarantined"
+    assert aliases["Mapped/Old.md"] == original_key
+    assert metadata == [(original_key, "Mapped/New.md")]
+    assert findings == [("key_collision", "Mapped/Old.md")]
+
+    reconcile(vault, apply=True, run_id="former-path-stable")
+    assert snapshot() == first
+
+
 def test_pure_rename_of_deindexed_note_keeps_it_excluded(tmp_path, monkeypatch):
     from cli_agent_orchestrator.services.vault import reconcile as module
 

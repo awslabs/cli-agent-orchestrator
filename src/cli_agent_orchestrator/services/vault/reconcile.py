@@ -199,6 +199,7 @@ def _preview_rename_findings(
     resolutions = _resolve_renames(
         vault_id, projected, prior_by_path, carried_alias_keys=carried_alias_keys
     )
+    resolutions = _quarantine_resolved_identity_collisions(resolutions, prior_by_path)
     resolutions = _retain_vault_exclusions(resolutions, exclusions)
     return (
         _merge_findings(
@@ -225,6 +226,7 @@ def _clear_stale_vault_edges(
     resolutions = _resolve_renames(
         vault_id, projected, prior_by_path, carried_alias_keys=carried_alias_keys
     )
+    resolutions = _quarantine_resolved_identity_collisions(resolutions, prior_by_path)
     resolutions = _retain_vault_exclusions(resolutions, exclusions)
     projected = tuple(resolution.item for resolution in resolutions)
     retained = {
@@ -327,6 +329,55 @@ def _quarantine_key_collisions(
     )
 
 
+def _quarantine_resolved_identity_collisions(
+    resolutions: tuple[_RenameResolution, ...],
+    prior_by_path: dict[str, VaultNoteModel],
+) -> tuple[_RenameResolution, ...]:
+    """Quarantine identities that collide only after rename absorption.
+
+    A retained rename identity belongs to the live row already stored at its
+    current path. If a newly recreated former path mints that same identity,
+    preserve the incumbent and quarantine the newcomer deterministically.
+    """
+    collisions = Counter(resolution.item.note_uid for resolution in resolutions)
+    incumbent_paths: dict[str, set[str]] = defaultdict(set)
+    for resolution in resolutions:
+        item = resolution.item
+        prior = prior_by_path.get(item.note.vault_relpath)
+        if prior is not None and prior.note_uid == item.note_uid:
+            incumbent_paths[item.note_uid].add(item.note.vault_relpath)
+
+    quarantined: list[_RenameResolution] = []
+    for resolution in resolutions:
+        item = resolution.item
+        if collisions[item.note_uid] == 1:
+            quarantined.append(resolution)
+            continue
+        incumbents = incumbent_paths[item.note_uid]
+        if len(incumbents) == 1 and item.note.vault_relpath in incumbents:
+            quarantined.append(resolution)
+            continue
+        collision_uid = item.note_uid
+        item = replace(
+            item,
+            key=f"{item.canonical_key}-collision-{_digest(item.note.vault_relpath)[:8]}",
+            note_uid=_digest("collision", collision_uid, item.note.vault_relpath),
+            memory_id=_digest("memory", "collision", collision_uid, item.note.vault_relpath),
+            note=replace(item.note, status="quarantined"),
+        )
+        quarantined.append(
+            replace(
+                resolution,
+                item=item,
+                retained_former_path=None,
+                alias_from=None,
+                findings=resolution.findings
+                + (_rename_finding(FindingCode.KEY_COLLISION, item.note.vault_relpath),),
+            )
+        )
+    return tuple(quarantined)
+
+
 def _apply_plan(
     db,
     vault: VaultSpec,
@@ -361,6 +412,7 @@ def _apply_plan(
         prior_by_path,
         carried_alias_keys=carried_alias_keys,
     )
+    resolutions = _quarantine_resolved_identity_collisions(resolutions, prior_by_path)
     resolutions = _retain_vault_exclusions(resolutions, exclusions)
     projected = tuple(resolution.item for resolution in resolutions)
     findings = _merge_findings(
@@ -460,7 +512,7 @@ def _delete_metadata_for_item(db, item: _ProjectedNote) -> None:
         else MemoryMetadataModel.scope_id == item.note.scope_id
     )
     db.query(MemoryMetadataModel).filter(
-        MemoryMetadataModel.key == item.canonical_key,
+        MemoryMetadataModel.key == item.key,
         MemoryMetadataModel.scope == item.note.scope,
         scope_filter,
         MemoryMetadataModel.source_kind == "vault",
