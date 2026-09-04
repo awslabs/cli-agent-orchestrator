@@ -1055,6 +1055,58 @@ class TestUsageIdentityIsolation:
         _run(svc.recall(query="body", scope="global", terminal_context=op))
         assert int(_row(db_engine, "null-scope", "global").access_count or 0) == 1
 
+    def test_project_row_in_global_container_keeps_null_scope_id(self, svc, db_engine, tmp_path):
+        """A legacy global-container project row must match its NULL DB identity."""
+        wiki_dir = tmp_path / "global" / "wiki"
+        project_dir = wiki_dir / "project"
+        project_dir.mkdir(parents=True)
+        wiki_path = project_dir / "legacy-project.md"
+        timestamp = "2026-09-04T00:00:00Z"
+        wiki_path.write_text(
+            "<!-- id: legacy-project | tags: legacy | scope: project | type: reference -->\n"
+            "# legacy-project\n\n"
+            f"## {timestamp}\n\n"
+            "legacy project body\n",
+            encoding="utf-8",
+        )
+        (wiki_dir / "index.md").write_text(
+            "# Memory Index\n\n"
+            "## project\n"
+            "- [legacy-project](project/legacy-project.md) — "
+            f"type:reference tags:legacy ~3tok updated:{timestamp}\n",
+            encoding="utf-8",
+        )
+        Session = sessionmaker(bind=db_engine)
+        with Session() as db:
+            db.add(
+                MemoryMetadataModel(
+                    id="legacy-project",
+                    key="legacy-project",
+                    memory_type="reference",
+                    scope="project",
+                    scope_id=None,
+                    source_kind="native",
+                    file_path=str(wiki_path),
+                    tags="legacy",
+                    access_count=0,
+                    created_at=datetime(2026, 9, 4, tzinfo=timezone.utc),
+                    updated_at=datetime(2026, 9, 4, tzinfo=timezone.utc),
+                )
+            )
+            db.commit()
+
+        results = _run(
+            svc.recall(
+                query="legacy project body",
+                scope="project",
+                terminal_context=None,
+                search_mode="metadata",
+            )
+        )
+
+        assert [(memory.key, memory.scope_id) for memory in results] == [("legacy-project", None)]
+        assert int(_row(db_engine, "legacy-project", "project").access_count or 0) == 1
+
 
 # ===========================================================================
 # sort_by="score" feeds genuine BM25 relevance (not a hard-coded 0.0)

@@ -35,6 +35,7 @@ from cli_agent_orchestrator.services.vault.reader import (
     VaultCandidate,
     VaultCandidateBatch,
     VaultInjectionPolicy,
+    _binding_policy_exit_arm,
     _resolve_injection_policy,
     increment_counter,
     load_candidate,
@@ -2575,7 +2576,11 @@ class MemoryService:
             for entry in entries:
                 entry = dict(entry)
                 if entry["scope"] == MemoryScope.PROJECT.value:
-                    entry["scope_id"] = project_dir.name
+                    entry["scope_id"] = (
+                        project_dir.name
+                        if project_dir.name not in {"global", "federated"}
+                        else None
+                    )
                 # Filter by scope
                 if scope and entry["scope"] != scope:
                     continue
@@ -3050,7 +3055,7 @@ class MemoryService:
             # The full indexed scope supplies IDF. Filters apply only to
             # returned candidates, never to the corpus population.
             if (
-                (not selection_policy.effective_require_injectable or candidate.binding.inject)
+                _binding_policy_exit_arm(candidate.binding, selection_policy) is None
                 and (memory_type is None or candidate.metadata.memory_type == memory_type)
                 and candidate.metadata.key not in exclude_keys
             ):
@@ -3350,49 +3355,71 @@ class MemoryService:
     def _deindex_vault_memory(self, key: str, binding: VaultBinding) -> ForgetResult:
         """Remove derived state for a vault note without modifying its file."""
         from cli_agent_orchestrator.clients.database import (
+            MemoryMetadataModel,
             VAULT_NOTE_SCOPE_ID_SENTINEL,
             VaultExclusionModel,
             VaultNoteModel,
         )
+        from cli_agent_orchestrator.services.memory_relationship_service import (
+            MemoryRelationshipService,
+        )
 
         scope_id = binding.scope_id
         stored_scope_id = scope_id if scope_id is not None else VAULT_NOTE_SCOPE_ID_SENTINEL
+        deferred_relationship_audits = []
         with self._get_db_session() as db:
-            note = (
-                db.query(VaultNoteModel)
-                .filter(
-                    VaultNoteModel.vault_id == binding.vault_id,
-                    VaultNoteModel.scope == binding.scope,
-                    VaultNoteModel.scope_id == stored_scope_id,
-                    VaultNoteModel.cao_key == key,
+            with db.begin():
+                note = (
+                    db.query(VaultNoteModel)
+                    .filter(
+                        VaultNoteModel.vault_id == binding.vault_id,
+                        VaultNoteModel.scope == binding.scope,
+                        VaultNoteModel.scope_id == stored_scope_id,
+                        VaultNoteModel.cao_key == key,
+                    )
+                    .one_or_none()
                 )
-                .one_or_none()
-            )
-            if note is None:
-                return ForgetResult("absent", "vault", None)
-            exclusion_identity = {
-                "vault_id": binding.vault_id,
-                "scope": binding.scope,
-                "scope_id": stored_scope_id,
-                "cao_key": key,
-            }
-            exclusion = db.get(VaultExclusionModel, exclusion_identity)
-            if exclusion is None:
-                exclusion = VaultExclusionModel(
-                    **exclusion_identity,
-                    last_known_relpath=note.vault_relpath,
-                    content_sha256=note.content_sha256,
+                if note is None:
+                    return ForgetResult("absent", "vault", None)
+                exclusion_identity = {
+                    "vault_id": binding.vault_id,
+                    "scope": binding.scope,
+                    "scope_id": stored_scope_id,
+                    "cao_key": key,
+                }
+                exclusion = db.get(VaultExclusionModel, exclusion_identity)
+                if exclusion is None:
+                    exclusion = VaultExclusionModel(
+                        **exclusion_identity,
+                        last_known_relpath=note.vault_relpath,
+                        content_sha256=note.content_sha256,
+                    )
+                    db.add(exclusion)
+                else:
+                    exclusion.last_known_relpath = note.vault_relpath
+                    exclusion.content_sha256 = note.content_sha256
+                note.status = "excluded"
+                path = note.vault_relpath
+                metadata = db.query(MemoryMetadataModel).filter(
+                    MemoryMetadataModel.key == key,
+                    MemoryMetadataModel.scope == binding.scope,
+                    MemoryMetadataModel.source_kind == "vault",
                 )
-                db.add(exclusion)
-            else:
-                exclusion.last_known_relpath = note.vault_relpath
-                exclusion.content_sha256 = note.content_sha256
-            note.status = "excluded"
-            path = note.vault_relpath
-            db.commit()
-
-        self._delete_metadata(key, binding.scope, scope_id, source_kind="vault")
-        self._purge_vault_relationships(key, binding.scope, scope_id)
+                if scope_id is None:
+                    metadata = metadata.filter(MemoryMetadataModel.scope_id.is_(None))
+                else:
+                    metadata = metadata.filter(MemoryMetadataModel.scope_id == scope_id)
+                metadata.delete()
+                MemoryRelationshipService().purge_for_key(
+                    binding.scope,
+                    scope_id,
+                    key,
+                    origins=("vault",),
+                    db=db,
+                    audit_sink=deferred_relationship_audits,
+                )
+        for emit_audit in deferred_relationship_audits:
+            emit_audit()
         # Vault notes may be user-authored, so deindexing never unlinks them.
         # Native peers are CAO-owned and must be removed to avoid leaving an
         # invisible same-key copy after a vault-bound forget.
@@ -3405,17 +3432,6 @@ class MemoryService:
                 (path, *native.paths),
             )
         return ForgetResult("deindexed", "vault", path, (path,))
-
-    def _purge_vault_relationships(self, key: str, scope: str, scope_id: Optional[str]) -> None:
-        """Remove only derived vault edges after a vault note is deindexed."""
-        try:
-            from cli_agent_orchestrator.services.memory_relationship_service import (
-                MemoryRelationshipService,
-            )
-
-            MemoryRelationshipService().purge_for_key(scope, scope_id, key, origins=("vault",))
-        except Exception as e:  # noqa: BLE001 -- deindexing remains best-effort for edges
-            logger.warning(f"Vault relationship purge failed (key={key}): {e}")
 
     def _purge_relationships(self, key: str, scope: str, scope_id: Optional[str]) -> None:
         """Hard-delete relationship rows for a FORGOTTEN memory. Best-effort.

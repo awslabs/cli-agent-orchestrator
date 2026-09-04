@@ -86,6 +86,39 @@ def test_forget_deindexes_vault_note_without_unlinking(tmp_path, monkeypatch) ->
         assert vault_metadata == []
 
 
+def test_forget_rolls_back_exclusion_when_relationship_purge_fails(tmp_path, monkeypatch) -> None:
+    from cli_agent_orchestrator.services.memory_relationship_service import (
+        MemoryRelationshipService,
+    )
+
+    service, _fixture, Session = _vault_service(tmp_path, monkeypatch)
+    asyncio.run(
+        service.store(
+            content="managed vault body",
+            scope="global",
+            memory_type="reference",
+            key="atomic-topic",
+        )
+    )
+
+    def fail_purge(*_args, **_kwargs):
+        raise RuntimeError("induced relationship failure")
+
+    monkeypatch.setattr(MemoryRelationshipService, "purge_for_key", fail_purge)
+
+    with pytest.raises(RuntimeError, match="induced relationship failure"):
+        asyncio.run(service.forget("atomic-topic", scope="global"))
+
+    with Session() as db:
+        note = db.query(VaultNoteModel).filter_by(cao_key="atomic-topic").one()
+        assert note.status == "indexed"
+        assert db.query(VaultExclusionModel).filter_by(cao_key="atomic-topic").count() == 0
+        assert (
+            db.query(MemoryMetadataModel).filter_by(source_kind="vault", key="atomic-topic").count()
+            == 1
+        )
+
+
 def test_memory_forget_reports_legacy_bool_and_authoritative_action(
     monkeypatch,
 ) -> None:

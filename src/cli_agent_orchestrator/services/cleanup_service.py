@@ -160,8 +160,11 @@ async def cleanup_expired_memories() -> None:
         try:
             vault_config = _load_vault_config()
         except VaultConfigUnavailableError as exc:
-            logger.warning("vault-bound memory retention refused: %s", exc)
-            return
+            logger.warning(
+                "vault configuration unavailable; expiring native copies only: %s",
+                exc,
+            )
+            vault_config = None
         resolved_bindings: dict[tuple[str, str | None], ScopeBinding] = {}
         refused_bindings: set[tuple[str, str | None]] = set()
 
@@ -188,26 +191,28 @@ async def cleanup_expired_memories() -> None:
                     # container's scope_id otherwise.
                     effective_scope_id = entry.get("scope_id") or scope_id
                     binding_key = (entry["scope"], effective_scope_id)
-                    resolved_binding = resolved_bindings.get(binding_key)
-                    if resolved_binding is None:
-                        resolved_binding = resolve(
-                            entry["scope"],
-                            effective_scope_id,
-                            vault_config=vault_config,
-                        )
-                        resolved_bindings[binding_key] = resolved_binding
-
-                    if isinstance(resolved_binding, VaultBinding):
-                        if binding_key not in refused_bindings:
-                            logger.warning(
-                                "vault-bound memory retention preserves vault note scope=%s scope_id=%s",
+                    target = "native"
+                    if vault_config is not None:
+                        resolved_binding = resolved_bindings.get(binding_key)
+                        if resolved_binding is None:
+                            resolved_binding = resolve(
                                 entry["scope"],
                                 effective_scope_id,
+                                vault_config=vault_config,
                             )
-                            refused_bindings.add(binding_key)
-                        target = "native"
-                    else:
-                        target = "binding"
+                            resolved_bindings[binding_key] = resolved_binding
+
+                        if isinstance(resolved_binding, VaultBinding):
+                            if binding_key not in refused_bindings:
+                                logger.warning(
+                                    "vault-bound memory retention preserves vault note "
+                                    "scope=%s scope_id=%s",
+                                    entry["scope"],
+                                    effective_scope_id,
+                                )
+                                refused_bindings.add(binding_key)
+                        else:
+                            target = "binding"
                     # ``forget()`` is declared async but its body is
                     # sync FS work (unlink + flock + index rewrite).
                     # Offload to a thread so the event loop stays

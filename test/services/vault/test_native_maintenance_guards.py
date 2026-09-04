@@ -170,7 +170,7 @@ def test_cleanup_expires_native_copy_and_preserves_vault_note(
     )
 
 
-def test_cleanup_refuses_when_vault_config_is_unavailable(
+def test_cleanup_expires_only_native_copy_when_vault_config_is_unavailable(
     tmp_path: Path, monkeypatch, caplog
 ) -> None:
     index = tmp_path / "project-id" / "wiki" / "index.md"
@@ -192,8 +192,10 @@ def test_cleanup_refuses_when_vault_config_is_unavailable(
 
     asyncio.run(cleanup_service.cleanup_expired_memories())
 
-    forget.assert_not_called()
+    forget.assert_called_once()
+    assert forget.call_args.args[1:] == ("old-note", "project", "project-id", "native")
     assert (
-        "vault-bound memory retention refused: vault configuration unavailable: "
+        "vault configuration unavailable; expiring native copies only: "
+        "vault configuration unavailable: "
         "vault root 'missing' does not exist" in caplog.messages
     )

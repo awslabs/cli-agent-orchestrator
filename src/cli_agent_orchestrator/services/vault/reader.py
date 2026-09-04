@@ -118,6 +118,23 @@ class VaultCandidateBatch(Sequence[VaultCandidate]):
         return bool(self.candidates)
 
 
+def _binding_policy_exit_arm(
+    binding: VaultBinding,
+    policy: VaultInjectionPolicy,
+) -> Optional[str]:
+    """Return the first authorization refusal for a vault binding."""
+    if not binding.index:
+        return "not_indexable"
+    # Curator recall is inserted verbatim into another terminal's context.
+    # Agent-scoped mappings are explicit-recall-only, matching the builder.
+    if policy.is_curator is not False and binding.scope == "agent":
+        return "curator_agent_scope_refused"
+    # Callers may tighten the policy but can never waive the curator's gate.
+    if policy.effective_require_injectable and not binding.inject:
+        return "not_injectable"
+    return None
+
+
 def resolve_candidates(
     binding: VaultBinding,
     *,
@@ -135,15 +152,9 @@ def resolve_candidates(
         consumer=consumer,
         terminal_id=terminal_id,
     )
-    if not binding.index:
-        return _resolution(policy, (), "not_indexable")
-    # Curator recall is inserted verbatim into another terminal's context.
-    # Agent-scoped mappings are explicit-recall-only, matching the builder.
-    if policy.is_curator is not False and binding.scope == "agent":
-        return _resolution(policy, (), "curator_agent_scope_refused")
-    # Callers may tighten the policy but can never waive the curator's gate.
-    if policy.effective_require_injectable and not binding.inject:
-        return _resolution(policy, (), "not_injectable")
+    refusal = _binding_policy_exit_arm(binding, policy)
+    if refusal is not None:
+        return _resolution(policy, (), refusal)
     # Direct-call contract guard. Production callers derive these values from
     # the binding, but a future direct caller must not cross scopes silently.
     if binding.scope != scope or binding.scope_id != scope_id:

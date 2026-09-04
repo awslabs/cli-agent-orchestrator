@@ -328,15 +328,22 @@ def test_bm25_keeps_identity_free_vault_corpus_but_gates_curator_results(monkeyp
     now = datetime.now(timezone.utc)
     candidates = (
         VaultCandidate(
-            binding=SimpleNamespace(inject=True),
+            binding=SimpleNamespace(index=True, inject=True, scope="project"),
             metadata=SimpleNamespace(key="allowed", memory_type="reference"),
             note=SimpleNamespace(),
             require_injectable=False,
             policy_arm="bm25_corpus",
         ),
         VaultCandidate(
-            binding=SimpleNamespace(inject=False),
+            binding=SimpleNamespace(index=True, inject=False, scope="project"),
             metadata=SimpleNamespace(key="hidden", memory_type="reference"),
+            note=SimpleNamespace(),
+            require_injectable=False,
+            policy_arm="bm25_corpus",
+        ),
+        VaultCandidate(
+            binding=SimpleNamespace(index=True, inject=True, scope="agent"),
+            metadata=SimpleNamespace(key="agent-only", memory_type="reference"),
             note=SimpleNamespace(),
             require_injectable=False,
             policy_arm="bm25_corpus",
@@ -362,6 +369,17 @@ def test_bm25_keeps_identity_free_vault_corpus_but_gates_curator_results(monkeyp
             scope_id="fixture-project",
             file_path="hidden.md",
             content="needle hidden",
+            created_at=now,
+            updated_at=now,
+        ),
+        "agent-only": Memory(
+            id="agent-only",
+            key="agent-only",
+            memory_type="reference",
+            scope="agent",
+            scope_id="memory_manager",
+            file_path="agent-only.md",
+            content="needle agent only",
             created_at=now,
             updated_at=now,
         ),
@@ -410,8 +428,10 @@ def test_bm25_keeps_identity_free_vault_corpus_but_gates_curator_results(monkeyp
     )
 
     assert corpus_policies == [memory_service._BM25_CORPUS_POLICY] * 2
-    assert corpora == [[["needle", "allowed"], ["needle", "hidden"]]] * 2
-    assert [memory.key for memory in ordinary] == ["allowed", "hidden"]
+    assert (
+        corpora == [[["needle", "allowed"], ["needle", "hidden"], ["needle", "agent", "only"]]] * 2
+    )
+    assert [memory.key for memory in ordinary] == ["allowed", "hidden", "agent-only"]
     assert [memory.key for memory in curator] == ["allowed"]
 
 
