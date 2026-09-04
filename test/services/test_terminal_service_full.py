@@ -3570,6 +3570,48 @@ class TestDeferredDeliveryNotCompletableBeforeDispatch:
         )
 
 
+class TestListSiblingsMasksPendingDelivery:
+    """#566: the masking WIRING in list_siblings, not ``reported_status`` alone.
+
+    The existing sibling tests use empty sibling lists, so deleting the
+    ``reported_status`` call left 130 tests passing (gutosantos82's mutation
+    check). ``list_siblings`` is one of the three outward surfaces, and it is the
+    one a supervisor reads to decide whether a sibling is finished -- an unmasked
+    IDLE there invites a caller to treat an undelivered worker as done.
+    """
+
+    @patch("cli_agent_orchestrator.services.terminal_service.list_siblings_by_group_prefix")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_pending_delivery_is_masked_for_siblings(self, mock_meta, mock_by_prefix):
+        from cli_agent_orchestrator.services import terminal_service
+        from cli_agent_orchestrator.services.terminal_service import list_siblings
+
+        mock_meta.return_value = {"group": ["root", "child"], "tmux_session": "cao-session"}
+        mock_by_prefix.return_value = [
+            {"id": "pend1234", "group": ["root", "child"], "metadata": None},
+            {"id": "free5678", "group": ["root", "child"], "metadata": None},
+        ]
+
+        fake_monitor = MagicMock()
+        fake_monitor.get_status.return_value = TerminalStatus.COMPLETED
+
+        with (
+            patch.object(terminal_service, "_pending_initial_delivery", {"pend1234"}),
+            patch.object(terminal_service, "status_monitor", fake_monitor),
+        ):
+            siblings = list_siblings("caller99")
+
+        by_id = {s["id"]: s["status"] for s in siblings}
+        assert by_id["pend1234"] == TerminalStatus.UNKNOWN.value, (
+            "list_siblings reported COMPLETED for a sibling whose initial message has "
+            "not been dispatched -- a supervisor would treat an undelivered worker as "
+            "finished"
+        )
+        assert (
+            by_id["free5678"] == TerminalStatus.COMPLETED.value
+        ), "masking leaked to a sibling with no pending delivery; it is per-terminal"
+
+
 class TestConfirmationRequiresPostDispatchEvidence:
     """Round-6 review (haofeif), P1: a cached pre-dispatch COMPLETED is not evidence.
 
@@ -3683,15 +3725,20 @@ class TestPendingMarkNeverLeaks:
         TERMINAL_ID = "1eak1eak"
         mock_meta.return_value = None
 
+        captured = {}
+
         class RefusingLoop:
             """Stands in for any create_task failure, not for a closed loop.
 
             Deliberately does NOT close the coroutine: a real loop doesn't either,
             and the production guard is what has to close it. Leaving that to the
-            fake would hide an un-awaited-coroutine warning in real use.
+            fake would hide an un-awaited-coroutine warning in real use. The
+            coroutine is captured so the assertion below can check production
+            closed it, rather than inferring that from a GC-timed warning.
             """
 
             def create_task(self, coro):
+                captured["coro"] = coro
                 raise RuntimeError("create_task refused")
 
         provider_instance = AsyncMock()
@@ -3707,6 +3754,16 @@ class TestPendingMarkNeverLeaks:
                     OrchestrationType.ASSIGN,
                     None,
                 )
+        # A closed coroutine has cr_frame is None; a never-started, never-closed one
+        # does not. Deterministic, unlike asserting on the un-awaited RuntimeWarning
+        # that pytest only surfaces as a non-failing PytestUnraisableExceptionWarning
+        # at GC -- which is why deleting production's coro.close() used to fail
+        # nothing (gutosantos82).
+        assert captured["coro"].cr_frame is None, (
+            "the orphaned coroutine was left open: create_task raised after _run() was "
+            "constructed, so nothing will ever await it and the interpreter warns "
+            "'coroutine was never awaited' when it is collected"
+        )
         assert not initial_delivery_pending(TERMINAL_ID), (
             "the pending mark leaked: create_task raised after the mark was set, so "
             "_run never ran and its finally never released it, leaving this "
