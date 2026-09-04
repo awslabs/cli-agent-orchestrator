@@ -1,6 +1,6 @@
 //! The static run-policy table: what the TUI offers, and how (issue #321).
 //!
-//! One row per leaf command of the CAO Click tree — **76 of them** — each classified `InApp`,
+//! One row per leaf command of the CAO Click tree — **85 of them** — each classified `InApp`,
 //! `Handoff`, or `Hidden`. Three infallible lookups read that table and nothing else.
 //!
 //! # No I/O, and that is the security property (SR-1)
@@ -64,7 +64,7 @@ use std::vec::Vec;
 
 /// The number of leaf commands in the CAO Click tree.
 ///
-/// **76 as of this branch.** Two separate merges from `main` each brought four new leaf commands
+/// **85 as of this branch.** Two separate merges from `main` each brought four new leaf commands
 /// that this table did not know about, and both were caught by
 /// `test/test_command_catalog_matches_click.py` rather than by review — the second one in CI,
 /// because CI tests the PR MERGED against `main` while a local run only sees the branch. That is
@@ -86,6 +86,17 @@ use std::vec::Vec;
 /// blocks for up to an hour, which a reviewer will want to weigh before offering it in-pane. That
 /// moves the count from 69 to **76**, and the distribution from 24/18/27 to 24/18/34.
 ///
+/// Nine more arrived with **CAO on EKS v2**: `cao fleet {status, shutdown}` and `cao worker
+/// {list, status, send, sessions, attach, logs, release}`. All nine are HIDE, and here the default
+/// is doing real work rather than deferring a decision. Every one of them talks to a **remote**
+/// cluster's worker broker over HTTP, addressed by two environment variables the TUI does not set
+/// and cannot see the value of; a pane that offered them would offer commands that fail with "No
+/// fleet configured" on every machine that has not exported them. `cao fleet shutdown` also
+/// deletes other people's running agent sessions, and `cao worker attach` is an interactive
+/// read/send loop with no terminal semantics — two more things a reviewer should weigh before any
+/// of this reaches navigation. That moves the count from 76 to **85**, and the distribution from
+/// 24/18/34 to 24/18/43.
+///
 /// The count below the four additions was **61, not the 60 the design records** — and the discrepancy is a prediction coming true
 /// rather than a defect. `business-logic-model.md` wrote that `cao tui` was "absent from the
 /// table … `skeleton-wheel-bundle` adds the subcommand"; Bolt 1 then added it. The affirmed
@@ -93,7 +104,7 @@ use std::vec::Vec;
 /// must not offer itself — giving **33 IN-APP / 5 HANDOFF / 23 HIDE = 61**. Recorded here
 /// because a reader comparing the design's 60 against this 61 would otherwise suspect drift.
 /// (#321)
-const COMMAND_COUNT: usize = 76;
+const COMMAND_COUNT: usize = 85;
 
 /// What the TUI does with a command.
 ///
@@ -190,7 +201,7 @@ pub struct Command {
 ///
 /// `pub(crate)` since Bolt 3: `server-client`'s route-table tests walk it to assert that every
 /// IN-APP command has a route and that no HANDOFF or HIDE command does. Deriving that set any
-/// other way would mean re-listing 76 commands in a second place, which is a worse trade than
+/// other way would mean re-listing 85 commands in a second place, which is a worse trade than
 /// widening the visibility of a compile-time constant. Still crate-private — no consumer outside
 /// this crate exists, and the table is not a public API. (#321)
 pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
@@ -216,6 +227,8 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::EnvList,
     CommandId::EnvSet,
     CommandId::EnvUnset,
+    CommandId::FleetShutdown,
+    CommandId::FleetStatus,
     CommandId::FlowAdd,
     CommandId::FlowDisable,
     CommandId::FlowEnable,
@@ -257,6 +270,13 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::SkillsList,
     CommandId::SkillsRemove,
     CommandId::TerminalRestore,
+    CommandId::WorkerAttach,
+    CommandId::WorkerList,
+    CommandId::WorkerLogs,
+    CommandId::WorkerRelease,
+    CommandId::WorkerSend,
+    CommandId::WorkerSessions,
+    CommandId::WorkerStatus,
     CommandId::WorkflowApprove,
     CommandId::WorkflowCancel,
     CommandId::WorkflowDelete,
@@ -272,7 +292,7 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::WorkflowValidate,
 ];
 
-/// One variant per leaf command — **all 69**.
+/// One variant per leaf command — **all 85**.
 ///
 /// Why an enum rather than a `String` key is the subject of this module's own docs: it is what
 /// makes an unclassified command a **compile error** instead of a runtime `None` (FR-4.2).
@@ -333,6 +353,12 @@ pub enum CommandId {
     EnvSet,
     /// `cao env unset`
     EnvUnset,
+
+    // `cao fleet *`
+    /// `cao fleet shutdown`
+    FleetShutdown,
+    /// `cao fleet status`
+    FleetStatus,
 
     // `cao flow *`
     /// `cao flow add`
@@ -429,6 +455,22 @@ pub enum CommandId {
     // `cao terminal *`
     /// `cao terminal restore`
     TerminalRestore,
+
+    // `cao worker *`
+    /// `cao worker attach`
+    WorkerAttach,
+    /// `cao worker list`
+    WorkerList,
+    /// `cao worker logs`
+    WorkerLogs,
+    /// `cao worker release`
+    WorkerRelease,
+    /// `cao worker send`
+    WorkerSend,
+    /// `cao worker sessions`
+    WorkerSessions,
+    /// `cao worker status`
+    WorkerStatus,
 
     // `cao workflow *`
     /// `cao workflow approve`
@@ -730,6 +772,38 @@ fn entry(id: CommandId) -> Command {
             params: &[Param { name: "key", required: true, kind: ParamKind::Text }],
             handoff_reason: None,
             // HIDE: no HTTP route exists; ADR-02 forbids subprocess execution
+        },
+
+        // ── `cao fleet *` — both HIDE (CAO on EKS v2) ─────────────────────────────────
+        //
+        // These do not talk to the cao-server on this machine. They talk to a REMOTE cluster's
+        // worker broker over HTTP, addressed by CAO_ELASTIC_BROKER_URL and
+        // CAO_ELASTIC_BROKER_TOKEN — two environment variables the TUI neither sets nor can read
+        // the value of. Offering them in-pane would offer commands that fail with "No cluster
+        // configured" on every machine that has not exported them, which is worse than not
+        // offering them at all. `shutdown` additionally deletes running agent sessions belonging
+        // to whoever is using that cluster. HIDE per project.md's mandated default, and both are
+        // a deliberate review away from anything else.
+        CommandId::FleetShutdown => Command {
+            id: CommandId::FleetShutdown,
+            parent: Some("fleet"),
+            leaf_name: "shutdown",
+            summary: "Release every live worker in the fleet.",
+            policy: Policy::Hidden,
+            params: &[
+                Param { name: "--yes", required: false, kind: ParamKind::Flag },
+                Param { name: "--json", required: false, kind: ParamKind::Flag },
+            ],
+            handoff_reason: None,
+        },
+        CommandId::FleetStatus => Command {
+            id: CommandId::FleetStatus,
+            parent: Some("fleet"),
+            leaf_name: "status",
+            summary: "Summarise the fleet: is the broker there, and what is it holding.",
+            policy: Policy::Hidden,
+            params: &[Param { name: "--json", required: false, kind: ParamKind::Flag }],
+            handoff_reason: None,
         },
 
         CommandId::FlowAdd => Command {
@@ -1175,6 +1249,94 @@ fn entry(id: CommandId) -> Command {
             // HIDE: human ruled out; recovery-by-terminal-ID tooling, not a launcher action
         },
 
+        // ── `cao worker *` — all seven HIDE (CAO on EKS v2) ─────────────────────────────
+        //
+        // The remote counterpart of `cao session`, and hidden for the same reason as
+        // `cao fleet *` above: a broker URL and token this process cannot see. `attach` is worth
+        // singling out — it is a prompt/read loop over two HTTP routes, NOT a pty, so a TUI pane
+        // that treated it as a terminal would misrepresent what the user is holding.
+        CommandId::WorkerAttach => Command {
+            id: CommandId::WorkerAttach,
+            parent: Some("worker"),
+            leaf_name: "attach",
+            summary: "Talk to a worker's agent turn by turn until you exit.",
+            policy: Policy::Hidden,
+            params: &[Param { name: "worker_id", required: true, kind: ParamKind::Text }],
+            handoff_reason: None,
+        },
+        CommandId::WorkerList => Command {
+            id: CommandId::WorkerList,
+            parent: Some("worker"),
+            leaf_name: "list",
+            summary: "List workers in the cluster.",
+            policy: Policy::Hidden,
+            params: &[
+                Param { name: "--all", required: false, kind: ParamKind::Flag },
+                Param { name: "--json", required: false, kind: ParamKind::Flag },
+            ],
+            handoff_reason: None,
+        },
+        CommandId::WorkerLogs => Command {
+            id: CommandId::WorkerLogs,
+            parent: Some("worker"),
+            leaf_name: "logs",
+            summary: "Print a worker's container log.",
+            policy: Policy::Hidden,
+            params: &[
+                Param { name: "worker_id", required: true, kind: ParamKind::Text },
+                Param { name: "--tail", required: false, kind: ParamKind::Text },
+                Param { name: "--follow", required: false, kind: ParamKind::Flag },
+            ],
+            handoff_reason: None,
+        },
+        CommandId::WorkerRelease => Command {
+            id: CommandId::WorkerRelease,
+            parent: Some("worker"),
+            leaf_name: "release",
+            summary: "Release one worker, deleting it and the session it was running.",
+            policy: Policy::Hidden,
+            params: &[Param { name: "worker_id", required: true, kind: ParamKind::Text }],
+            handoff_reason: None,
+        },
+        CommandId::WorkerSend => Command {
+            id: CommandId::WorkerSend,
+            parent: Some("worker"),
+            leaf_name: "send",
+            summary: "Send a message to a worker's agent and print its reply.",
+            policy: Policy::Hidden,
+            params: &[
+                Param { name: "worker_id", required: true, kind: ParamKind::Text },
+                Param { name: "message", required: true, kind: ParamKind::Text },
+                Param { name: "--async", required: false, kind: ParamKind::Flag },
+                Param { name: "--timeout", required: false, kind: ParamKind::Text },
+            ],
+            handoff_reason: None,
+        },
+        CommandId::WorkerSessions => Command {
+            id: CommandId::WorkerSessions,
+            parent: Some("worker"),
+            leaf_name: "sessions",
+            summary: "List the sessions and terminals inside a worker.",
+            policy: Policy::Hidden,
+            params: &[
+                Param { name: "worker_id", required: true, kind: ParamKind::Text },
+                Param { name: "--json", required: false, kind: ParamKind::Flag },
+            ],
+            handoff_reason: None,
+        },
+        CommandId::WorkerStatus => Command {
+            id: CommandId::WorkerStatus,
+            parent: Some("worker"),
+            leaf_name: "status",
+            summary: "Show a worker's lease and what its agent is doing.",
+            policy: Policy::Hidden,
+            params: &[
+                Param { name: "worker_id", required: true, kind: ParamKind::Text },
+                Param { name: "--json", required: false, kind: ParamKind::Flag },
+            ],
+            handoff_reason: None,
+        },
+
         CommandId::WorkflowApprove => Command {
             id: CommandId::WorkflowApprove,
             parent: Some("workflow"),
@@ -1404,7 +1566,7 @@ mod tests {
         counts
     }
 
-    /// Test 1 — **the policy distribution is 24 IN-APP / 18 HANDOFF / 34 HIDE, totalling 76.**
+    /// Test 1 — **the policy distribution is 24 IN-APP / 18 HANDOFF / 43 HIDE, totalling 85.**
     ///
     /// Every number here is a **hard-coded literal**, and that is the entire design of the test.
     /// Deriving any of them from the table — `assert_eq!(in_app, TABLE.iter().filter(..).count())`
@@ -1444,28 +1606,34 @@ mod tests {
     /// Then issue **#616** added six `cao agent *` leaves (assign/cancel/handoff/result/
     /// send-message/status), all HIDE per the same mandated default — none has been deliberately
     /// reviewed for IN-APP or HANDOFF yet. That gives **24/18/34 = 76**.
+    ///
+    /// Then **CAO on EKS v2** added nine: `cao fleet {status, shutdown}` and `cao worker {list,
+    /// status, send, sessions, attach, logs, release}`, all HIDE. Unlike every earlier addition,
+    /// these are HIDE for a reason beyond "not yet reviewed" — they address a remote cluster
+    /// through two environment variables this process cannot read, so an offered row would be a
+    /// row that fails on any machine without them. **24/18/43 = 85**.
     #[test]
-    fn the_policy_distribution_is_twentyfour_eighteen_thirtyfour() {
+    fn the_policy_distribution_is_twentyfour_eighteen_fortythree() {
         let (in_app, handoff, hidden) = distribution();
 
         assert_eq!(in_app, 24, "expected 24 IN-APP commands, found {in_app}");
         assert_eq!(handoff, 18, "expected 18 HANDOFF commands, found {handoff}");
-        assert_eq!(hidden, 34, "expected 34 HIDE commands, found {hidden}");
+        assert_eq!(hidden, 43, "expected 43 HIDE commands, found {hidden}");
         assert_eq!(
             in_app + handoff + hidden,
-            76,
-            "the three policy counts must account for all 76 leaf commands of the Click tree"
+            85,
+            "the three policy counts must account for all 85 leaf commands of the Click tree"
         );
 
-        // The three counts summing to 76 does not prove 76 *distinct* commands were counted: a
+        // The three counts summing to 85 does not prove 85 *distinct* commands were counted: a
         // duplicated entry in DISPLAY_ORDER would inflate one policy while a real command went
         // uncounted, and the arithmetic above would still close. DISPLAY_ORDER is generated, so
         // this is a live hazard rather than a theoretical one.
         let distinct: BTreeSet<CommandId> = DISPLAY_ORDER.iter().copied().collect();
         assert_eq!(
             distinct.len(),
-            76,
-            "DISPLAY_ORDER must list 76 DISTINCT commands; a duplicate would let one command go \
+            85,
+            "DISPLAY_ORDER must list 85 DISTINCT commands; a duplicate would let one command go \
              uncounted while the totals still summed correctly"
         );
     }
@@ -1554,6 +1722,8 @@ mod tests {
                     CommandId::EnvList => CommandId::EnvList,
                     CommandId::EnvSet => CommandId::EnvSet,
                     CommandId::EnvUnset => CommandId::EnvUnset,
+                    CommandId::FleetShutdown => CommandId::FleetShutdown,
+                    CommandId::FleetStatus => CommandId::FleetStatus,
                     CommandId::FlowAdd => CommandId::FlowAdd,
                     CommandId::FlowDisable => CommandId::FlowDisable,
                     CommandId::FlowEnable => CommandId::FlowEnable,
@@ -1595,6 +1765,13 @@ mod tests {
                     CommandId::SkillsList => CommandId::SkillsList,
                     CommandId::SkillsRemove => CommandId::SkillsRemove,
                     CommandId::TerminalRestore => CommandId::TerminalRestore,
+                    CommandId::WorkerAttach => CommandId::WorkerAttach,
+                    CommandId::WorkerList => CommandId::WorkerList,
+                    CommandId::WorkerLogs => CommandId::WorkerLogs,
+                    CommandId::WorkerRelease => CommandId::WorkerRelease,
+                    CommandId::WorkerSend => CommandId::WorkerSend,
+                    CommandId::WorkerSessions => CommandId::WorkerSessions,
+                    CommandId::WorkerStatus => CommandId::WorkerStatus,
                     CommandId::WorkflowApprove => CommandId::WorkflowApprove,
                     CommandId::WorkflowCancel => CommandId::WorkflowCancel,
                     CommandId::WorkflowDelete => CommandId::WorkflowDelete,
@@ -1635,6 +1812,8 @@ mod tests {
                 CommandId::EnvList,
                 CommandId::EnvSet,
                 CommandId::EnvUnset,
+                CommandId::FleetShutdown,
+                CommandId::FleetStatus,
                 CommandId::FlowAdd,
                 CommandId::FlowDisable,
                 CommandId::FlowEnable,
@@ -1676,6 +1855,13 @@ mod tests {
                 CommandId::SkillsList,
                 CommandId::SkillsRemove,
                 CommandId::TerminalRestore,
+                CommandId::WorkerAttach,
+                CommandId::WorkerList,
+                CommandId::WorkerLogs,
+                CommandId::WorkerRelease,
+                CommandId::WorkerSend,
+                CommandId::WorkerSessions,
+                CommandId::WorkerStatus,
                 CommandId::WorkflowApprove,
                 CommandId::WorkflowCancel,
                 CommandId::WorkflowDelete,

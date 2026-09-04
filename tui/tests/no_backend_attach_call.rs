@@ -333,6 +333,36 @@ fn attach_verb() -> String {
     format!("attach{}session", "-")
 }
 
+/// The abbreviated-verb needle - the argv fragment, not the bare word. Assembled for the same
+/// reason as [`attach_verb`].
+fn abbreviated_verb_needle() -> String {
+    format!("\"att{}\"", "ach")
+}
+
+/// Whether `catalog.rs`'s one use of that fragment is a CAO subcommand's name and nothing else.
+///
+/// **CAO on EKS v2** added a `cao worker attach` row, and the fragment above fired on it. That is
+/// a false positive of a specific kind worth exempting narrowly rather than loosening the needle:
+/// the string is a **leaf name in a data table**, the spelling of a CAO subcommand, and no tmux
+/// process is anywhere near it. Two conditions keep the exemption from widening into the defect
+/// the needle exists to catch - the fragment appears exactly **once**, as that row's `leaf_name`,
+/// and the row's policy is `Hidden`, so the TUI cannot offer it as navigation. A second
+/// occurrence anywhere in the file, or a policy that makes the row offerable, fails the test.
+fn catalog_attach_is_an_inert_leaf_name(code: &str) -> bool {
+    let needle = abbreviated_verb_needle();
+    if code.matches(needle.as_str()).count() != 1 {
+        return false;
+    }
+    let Some(rest) = code.split("CommandId::WorkerAttach => Command {").nth(1) else {
+        return false;
+    };
+    let row = match rest.find("\n        },") {
+        Some(end) => &rest[..end],
+        None => rest,
+    };
+    row.contains(&format!("leaf_name: {needle}")) && row.contains("policy: Policy::Hidden")
+}
+
 /// The `attach_session` methods, and process replacement, appear in **no** Rust source here.
 ///
 /// Three of the four needles have **zero** legitimate uses anywhere in this crate, so they are
@@ -392,11 +422,19 @@ fn no_rust_source_calls_either_backend_attach_session() {
     }
 
     let verb = attach_verb();
+    let abbreviated = abbreviated_verb_needle();
 
     for (path, source) in SOURCES {
         let code = code_only(source);
 
         for (needle, reason) in forbidden_needles() {
+            if needle == abbreviated
+                && *path == "src/catalog.rs"
+                && catalog_attach_is_an_inert_leaf_name(&code)
+            {
+                // Accounted for by the two conditions that function checks, not waved through.
+                continue;
+            }
             if needle == verb {
                 // Accounted for per-occurrence and per-region by the next test, for the budgeted
                 // files only. Every other needle, and every other file, is checked with no
