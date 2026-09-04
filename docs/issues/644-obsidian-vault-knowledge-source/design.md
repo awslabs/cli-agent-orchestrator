@@ -793,7 +793,9 @@ file**. It records the identity in `vault_exclusion`, drops the `memory_metadata
 row, reflects that authority as `vault_note.status = 'excluded'`, purges the note's
 `origin="vault"` edges, and reports the path the human may delete in Obsidian. The
 separate identity-keyed row is the durable intent; `vault_note.status` remains
-rebuildable projection state.
+rebuildable projection state. A path is diagnostic, never authority: a new key at
+the same path does not inherit the tombstone, and the forgotten key remains excluded
+if it later appears at another path.
 
 Revision 1 claimed `forget()` "keeps its meaning", which was wrong in a way that
 matters (F11): it returns `bool` (line 2658) across seven call sites, so there was no

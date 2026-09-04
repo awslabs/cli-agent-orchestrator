@@ -197,7 +197,6 @@ def _preview_rename_findings(
     resolutions = _resolve_renames(
         vault_id, projected, prior_by_path, carried_alias_keys=carried_alias_keys
     )
-    exclusions = _resolve_exclusion_transitions(resolutions, prior_by_path, exclusions)
     resolutions = _retain_vault_exclusions(resolutions, exclusions)
     return (
         _merge_findings(
@@ -224,7 +223,6 @@ def _clear_stale_vault_edges(
     resolutions = _resolve_renames(
         vault_id, projected, prior_by_path, carried_alias_keys=carried_alias_keys
     )
-    exclusions = _resolve_exclusion_transitions(resolutions, prior_by_path, exclusions)
     resolutions = _retain_vault_exclusions(resolutions, exclusions)
     projected = tuple(resolution.item for resolution in resolutions)
     retained = {
@@ -360,13 +358,6 @@ def _apply_plan(
         projected,
         prior_by_path,
         carried_alias_keys=carried_alias_keys,
-    )
-    exclusions = _resolve_exclusion_transitions(
-        resolutions,
-        prior_by_path,
-        exclusions,
-        db=db,
-        vault_id=vault.id,
     )
     resolutions = _retain_vault_exclusions(resolutions, exclusions)
     projected = tuple(resolution.item for resolution in resolutions)
@@ -527,77 +518,6 @@ def _vault_exclusion_set(db, vault_id: str) -> set[tuple[str, str, str]]:
         .filter(VaultExclusionModel.vault_id == vault_id)
         .all()
     }
-
-
-def _resolve_exclusion_transitions(
-    resolutions: tuple[_RenameResolution, ...],
-    prior_by_path: dict[str, VaultNoteModel],
-    exclusions: set[tuple[str, str, str]],
-    *,
-    db=None,
-    vault_id: str | None = None,
-) -> set[tuple[str, str, str]]:
-    """Move forget intent with a valid same-path identity transition."""
-    resolved = set(exclusions)
-    for resolution in resolutions:
-        item = resolution.item
-        prior = prior_by_path.get(item.note.vault_relpath)
-        if prior is None or item.note.status != "indexed":
-            continue
-        old_identity = (
-            cast(str, prior.scope),
-            cast(str, prior.scope_id),
-            cast(str, prior.cao_key),
-        )
-        new_identity = (
-            cast(str, item.note.scope),
-            item.note.scope_id or "",
-            item.key,
-        )
-        if old_identity not in resolved or old_identity == new_identity:
-            continue
-        resolved.remove(old_identity)
-        resolved.add(new_identity)
-        if db is None:
-            continue
-        old_row = db.get(
-            VaultExclusionModel,
-            {
-                "vault_id": vault_id,
-                "scope": old_identity[0],
-                "scope_id": old_identity[1],
-                "cao_key": old_identity[2],
-            },
-        )
-        new_row = db.get(
-            VaultExclusionModel,
-            {
-                "vault_id": vault_id,
-                "scope": new_identity[0],
-                "scope_id": new_identity[1],
-                "cao_key": new_identity[2],
-            },
-        )
-        if new_row is None:
-            db.add(
-                VaultExclusionModel(
-                    vault_id=vault_id,
-                    scope=new_identity[0],
-                    scope_id=new_identity[1],
-                    cao_key=new_identity[2],
-                    last_known_relpath=item.note.vault_relpath,
-                    content_sha256=item.note.content_sha256,
-                    created_at=(
-                        old_row.created_at if old_row is not None else datetime.now(timezone.utc)
-                    ),
-                )
-            )
-        else:
-            new_row.last_known_relpath = item.note.vault_relpath
-            new_row.content_sha256 = item.note.content_sha256
-        if old_row is not None:
-            db.delete(old_row)
-    return resolved
 
 
 def _retain_vault_exclusions(

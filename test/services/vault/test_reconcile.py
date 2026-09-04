@@ -462,12 +462,13 @@ def test_same_path_authored_key_a_to_b_migrates_without_old_edges(tmp_path, monk
     assert old_metadata_count == old_edge_count == 0
 
 
-def test_same_path_key_change_keeps_forgotten_note_excluded(tmp_path, monkeypatch):
+def test_same_path_replacement_does_not_steal_forgotten_identity(tmp_path, monkeypatch):
     from cli_agent_orchestrator.services.vault import reconcile as module
 
     Session = _session(tmp_path, monkeypatch, module)
     vault = _rename_vault(tmp_path)
-    source = tmp_path / "vault" / "Mapped" / "One.md"
+    mapped = tmp_path / "vault" / "Mapped"
+    source = mapped / "One.md"
     source.write_text("---\ncao:\n  key: old-key\n---\nbody", encoding="utf-8")
     reconcile(vault, apply=True, run_id="excluded-before")
     with Session() as db:
@@ -475,26 +476,36 @@ def test_same_path_key_change_keeps_forgotten_note_excluded(tmp_path, monkeypatc
         db.query(MemoryMetadataModel).filter_by(source_kind="vault", key="old-key").delete()
         db.commit()
 
-    source.write_text("---\ncao:\n  key: new-key\n---\nbody", encoding="utf-8")
-    reconcile(vault, apply=True, run_id="excluded-after")
+    source.unlink()
+    source.write_text("---\ncao:\n  key: new-key\n---\nreplacement", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="replacement")
 
     with Session() as db:
-        migrated = db.query(VaultNoteModel).filter_by(vault_relpath="Mapped/One.md").one()
-        vault_metadata_count = db.query(MemoryMetadataModel).filter_by(source_kind="vault").count()
+        replacement = db.query(VaultNoteModel).filter_by(vault_relpath="Mapped/One.md").one()
         exclusions = db.query(VaultExclusionModel).all()
-        retained = (
-            db.query(VaultFindingModel)
-            .filter_by(
-                code="deindexed_retained",
-                vault_relpath="Mapped/One.md",
-            )
-            .one()
+        metadata_keys = {
+            row.key for row in db.query(MemoryMetadataModel).filter_by(source_kind="vault").all()
+        }
+    assert (replacement.cao_key, replacement.status) == ("new-key", "indexed")
+    assert metadata_keys == {"new-key"}
+    assert [row.cao_key for row in exclusions] == ["old-key"]
+
+    (mapped / "Reintroduced.md").write_text(
+        "---\ncao:\n  key: old-key\n---\nforgotten body",
+        encoding="utf-8",
+    )
+    reconcile(vault, apply=True, run_id="reintroduced")
+
+    with Session() as db:
+        forgotten = db.query(VaultNoteModel).filter_by(cao_key="old-key").one()
+        old_metadata = (
+            db.query(MemoryMetadataModel).filter_by(source_kind="vault", key="old-key").count()
         )
-    assert migrated.cao_key == "new-key"
-    assert migrated.status == "excluded"
-    assert vault_metadata_count == 0
-    assert [row.cao_key for row in exclusions] == ["new-key"]
-    assert "deindexed_retained" in retained.detail
+    assert (forgotten.vault_relpath, forgotten.status, old_metadata) == (
+        "Mapped/Reintroduced.md",
+        "excluded",
+        0,
+    )
 
 
 def test_removing_authored_key_transitions_to_current_path_derived_key(tmp_path, monkeypatch):
