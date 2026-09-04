@@ -609,16 +609,37 @@ class TestSessionLabels:
         assert settings_service.get_session_labels() == {}
 
     def test_clearing_an_unknown_session_is_a_no_op(self, settings_file):
-        assert settings_service.set_session_label("cao-nope", "") == {}
+        with patch.object(settings_service, "_save") as save:
+            assert settings_service.set_session_label("cao-nope", "") == {}
+        save.assert_not_called()
         # ...including on disk: teardown clears unconditionally, and that must
         # not rewrite settings.json on every session delete.
         assert not settings_file.exists()
 
+    def test_teardown_clear_does_not_destroy_an_unparseable_settings_file(self, settings_file):
+        """#737: the loaders return {} for a file that exists but does not
+        parse, so any write over that state persists the empty fallback as the
+        new truth. ``delete_session`` clears a label unconditionally, which
+        would put that write on every teardown -- the no-op guard is what keeps
+        it off. Pinned here because the guard's value is not obvious from the
+        line itself, and #737's own fix should not be the only thing standing
+        between a corrupt file and this path."""
+        settings_file.write_text('{"terminal": {"backend": "tmux"},}')  # trailing comma
+        before = settings_file.read_text()
+
+        with patch.object(settings_service, "_save") as save:
+            assert settings_service.set_session_label("cao-gone", "") == {}
+        save.assert_not_called()
+        assert settings_file.read_text() == before
+
     def test_resetting_the_same_label_does_not_rewrite(self, settings_file):
+        """The no-op guard must actually skip the write, not merely produce the
+        same bytes: every settings write is a read-modify-write over the whole
+        file, so a needless one widens the window for losing a concurrent edit."""
         settings_service.set_session_label("cao-demo", "Run")
-        before = settings_file.stat().st_mtime_ns
-        settings_file.write_text(settings_file.read_text())  # any rewrite would be visible
-        settings_service.set_session_label("cao-demo", "Run")
+        with patch.object(settings_service, "_save") as save:
+            assert settings_service.set_session_label("cao-demo", "Run") == {"cao-demo": "Run"}
+        save.assert_not_called()
         assert json.loads(settings_file.read_text())["session_labels"] == {"cao-demo": "Run"}
 
     def test_label_is_capped(self, settings_file):

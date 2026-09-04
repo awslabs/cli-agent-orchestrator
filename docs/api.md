@@ -20,8 +20,9 @@ HTTP errors use standard status codes and generally return a JSON `detail`
 field. Authentication and network behavior depend on server configuration;
 see [Configuration](configuration.md) and [Security](../SECURITY.md).
 
-Every response carries an `X-Server-Time` header: the server's wall clock as
-an offset-aware ISO-8601 timestamp. A browser client that renders relative
+Handled responses carry an `X-Server-Time` header: the server's wall clock as
+an offset-aware ISO-8601 timestamp (an unhandled-exception 500 raised past the
+middleware stack does not). A browser client that renders relative
 times from server timestamps can measure its clock skew against it once and
 correct for it (WSL2 hosts have been observed hours adrift from the Windows
 browser next to them). It is informational; clients that ignore it are
@@ -151,9 +152,12 @@ See [Agent Profiles](agent-profile.md) and
   visible ones) for a folder picker, defaulting to the server user's home.
   It accepts the same operator-typed spellings `working_directory` accepts
   (see Sessions and terminals) but never creates anything, and it is
-  read-scope gated like `GET /settings/agent-dirs`. It discloses nothing a
-  caller could not already probe through `working_directory` on session
-  creation.
+  read-scope gated like `GET /settings/agent-dirs`. Note what it discloses:
+  child directory names for any path the server user can read, with no root
+  confinement. That is stronger than the existence check `working_directory`
+  already gives a caller, so under an auth-enabled deployment a read-scope
+  token can enumerate the filesystem; confine it to a root if that is your
+  deployment shape.
 
 ### Skills
 
@@ -189,8 +193,13 @@ See [Skills](skills.md) for discovery, installation, and catalog behavior.
   (Explorer's "Copy as path") are stripped, `~` is expanded, and on WSL a
   Windows drive path (`C:\x\y` or `C:/x/y`) is translated to the interop
   mount (`/mnt/c/x/y`) when that drive is mounted. A missing directory is
-  created; a relative path, a file, or an unmounted drive is rejected as a
-  `400` with a plain-language `detail` instead of a `500` from tmux.
+  created, bounded by a path-length and depth cap and performed only after the
+  request's cheaper validations pass, so a request that is rejected anyway
+  leaves nothing behind; a relative path, an existing non-directory, or an
+  unmounted drive is rejected as a `400` with a plain-language `detail`
+  instead of a `500` from tmux.
+- `POST /sessions/{session_name}/label` prefix-normalizes its name the same
+  way `POST /sessions` does, so `demo` and `cao-demo` address one session.
 - `POST /sessions/{session_name}/label` with `{"label": "..."}` sets a
   friendly display name for a session (trimmed, capped at 60 characters; an
   empty string clears it). It is a pure display alias stored in

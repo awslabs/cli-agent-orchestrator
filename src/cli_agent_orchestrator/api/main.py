@@ -1488,12 +1488,15 @@ app.add_middleware(
 
 @app.middleware("http")
 async def add_server_time_header(request: Request, call_next):
-    """Stamp every response with the server's wall clock as ``X-Server-Time``.
+    """Stamp handled responses with the server's wall clock as ``X-Server-Time``.
 
     Browser clients render relative times ("2 minutes ago") from server
     timestamps, and the two clocks are not the same clock: WSL2 hosts have been
     observed hours adrift from the Windows browser next to them. One header on
-    every response lets a client measure the skew once and correct for it.
+    a response lets a client measure the skew once and correct for it. It
+    rides the middleware stack, so an unhandled exception that never returns
+    through it (Starlette's own 500) goes out without the header; that is
+    harmless for an informational value and not worth a second code path.
     Offset-aware ISO-8601 so a browser in a different timezone parses it
     unambiguously (a naive string is read as browser-local time, which is the
     skew this header exists to remove). Purely informational; clients that
@@ -2779,17 +2782,22 @@ async def list_directories(
     because provider homes (``~/.kiro``, ``~/.aws``) are exactly what an
     operator browsing for a profile directory is after.
 
-    Read-scope gated when auth is enabled, like ``GET /settings/agent-dirs``:
-    the response discloses local filesystem layout. It discloses nothing a
-    caller could not already probe through ``working_directory`` on session
-    creation, and it is confined to the same localhost-only posture as the
-    rest of the API.
+    Read-scope gated when auth is enabled, like ``GET /settings/agent-dirs``.
+    Be clear about what that gate protects: this endpoint ENUMERATES child
+    directory names for any path the server user can read, with no root
+    confinement, which is a materially stronger disclosure than the
+    existence-and-creatability oracle a caller already has through
+    ``working_directory``. Under the default localhost-only posture that is
+    the operator reading their own filesystem; once auth is enabled it means a
+    read-scope token can walk the tree. Confining it to a configurable root is
+    the obvious hardening if that ever becomes the deployment shape.
     """
     try:
-        if path:
-            resolved = Path(normalize_working_directory(path, create_missing=False) or "")
-        else:
-            resolved = Path.home()
+        # ``normalize_working_directory`` returns None for a blank or
+        # quotes-only value, which must fall back to the documented home
+        # default -- ``Path("")`` would silently resolve to the server's CWD.
+        normalized = normalize_working_directory(path, create_missing=False) if path else None
+        resolved = Path(normalized) if normalized else Path.home()
         resolved = resolved.resolve()
         if not resolved.is_dir():
             raise ValueError(f"Not a folder: {resolved}")
@@ -2811,6 +2819,13 @@ async def list_directories(
         )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except OSError as e:
+        # ENOTDIR, EIO, a stale network mount: the per-entry loop already
+        # tolerates these, so the directory-level read should not 500 either.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Could not read that folder: {e}",
+        )
 
 
 class AgentDirsUpdate(BaseModel):
@@ -3003,10 +3018,6 @@ async def create_session(
     # values fail Pydantic body parsing and FastAPI returns 422 automatically,
     # before this function body ever runs.
     try:
-        # Accept the spellings an operator actually types into a browser field
-        # (``~``, Explorer-quoted, Windows drive paths on WSL) and reject an
-        # unusable one as a clear 400 here, instead of a 500 deep in tmux.
-        working_directory = normalize_working_directory(working_directory)
         if session_name is not None:
             # terminal_service.create_terminal prepends SESSION_PREFIX
             # ("cao-") if missing, so an API caller's 64-char valid name
@@ -3039,6 +3050,14 @@ async def create_session(
                     "invalid initial_message_orchestration_type: "
                     f"{body.initial_message_orchestration_type!r}"
                 )
+        # Accept the spellings an operator actually types into a browser field
+        # (``~``, Explorer-quoted, Windows drive paths on WSL) and reject an
+        # unusable one as a clear 400 here, instead of a 500 deep in tmux.
+        # Deliberately LAST among the validations: this call can create the
+        # directory, and a request that some cheaper check was going to reject
+        # must not leave a tree behind (gutosantos82, #724 review).
+        working_directory = normalize_working_directory(working_directory)
+
         # Parse comma-separated allowed_tools string into list
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
 
@@ -3165,15 +3184,28 @@ async def set_session_label_endpoint(
     display alias, surfaced as ``label`` on ``GET /sessions`` and
     ``GET /sessions/{name}``. Trimmed and capped server-side; the response
     carries the label as stored (``None`` once cleared).
+
+    The name is prefix-normalized exactly as ``POST /sessions`` normalizes it
+    at creation (``demo`` -> ``cao-demo``), so an operator who labels using
+    the name they created with reaches the same session the listing and the
+    teardown key off. Without that, the write would succeed and store an entry
+    that never surfaces and is never cleared (gutosantos82, #724 review).
     """
+    from cli_agent_orchestrator.constants import SESSION_PREFIX
+
+    effective = (
+        session_name
+        if session_name.startswith(SESSION_PREFIX)
+        else f"{SESSION_PREFIX}{session_name}"
+    )
     try:
-        validate_tmux_name(session_name, "session_name")
+        validate_tmux_name(effective, "session_name")
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     from cli_agent_orchestrator.services.settings_service import set_session_label
 
-    labels = set_session_label(session_name, body.label)
-    return {"session_name": session_name, "label": labels.get(session_name)}
+    labels = set_session_label(effective, body.label)
+    return {"session_name": effective, "label": labels.get(effective)}
 
 
 @app.get("/sessions/{session_name}")

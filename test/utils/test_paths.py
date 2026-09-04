@@ -1,8 +1,14 @@
 """Tests for the operator-supplied working-directory normalization."""
 
+import os
+
 import pytest
 
-from cli_agent_orchestrator.utils.paths import normalize_working_directory
+from cli_agent_orchestrator.utils.paths import (
+    WORKING_DIRECTORY_MAX_DEPTH,
+    WORKING_DIRECTORY_MAX_LEN,
+    normalize_working_directory,
+)
 
 
 @pytest.fixture
@@ -67,8 +73,39 @@ class TestNormalizeWorkingDirectory:
     def test_file_rejected(self, tmp_path, mnt):
         f = tmp_path / "afile.txt"
         f.write_text("x")
-        with pytest.raises(ValueError, match="is a file"):
+        with pytest.raises(ValueError, match="is not a folder"):
             normalize_working_directory(str(f), mnt_root=mnt)
+
+    def test_existing_non_directory_rejected(self, tmp_path, mnt):
+        """Not only regular files: a FIFO, socket or device node would
+        otherwise pass and fail later inside tmux with exactly the opaque
+        error this function exists to prevent."""
+        fifo = tmp_path / "afifo"
+        os.mkfifo(fifo)
+        with pytest.raises(ValueError, match="is not a folder"):
+            normalize_working_directory(str(fifo), mnt_root=mnt)
+
+    def test_creation_is_bounded_by_depth(self, tmp_path, mnt):
+        deep = tmp_path.joinpath(*[f"d{i}" for i in range(WORKING_DIRECTORY_MAX_DEPTH + 5)])
+        with pytest.raises(ValueError, match="nested too deeply"):
+            normalize_working_directory(str(deep), mnt_root=mnt)
+        assert not deep.exists()
+
+    def test_length_is_bounded_before_any_filesystem_call(self, tmp_path, mnt):
+        """Built from many legal-length components, so the limit under test is
+        ours and not the OS's per-component one. The check has to run before
+        exists(), which would itself raise ENAMETOOLONG and escape as a 500."""
+        long = tmp_path.joinpath(*["x" * 200 for _ in range(30)])
+        assert len(str(long)) > WORKING_DIRECTORY_MAX_LEN
+        with pytest.raises(ValueError, match="too long"):
+            normalize_working_directory(str(long), mnt_root=mnt)
+
+    def test_bounds_do_not_apply_to_an_existing_directory(self, tmp_path, mnt):
+        """The caps bound what we CREATE. A deep tree that already exists is
+        the operator's own layout and is none of our business."""
+        deep = tmp_path.joinpath(*[f"d{i}" for i in range(WORKING_DIRECTORY_MAX_DEPTH + 5)])
+        deep.mkdir(parents=True)
+        assert normalize_working_directory(str(deep), mnt_root=mnt) == str(deep)
 
     def test_uncreatable_directory_gives_clear_error(self, tmp_path, mnt):
         # A path whose parent is a FILE cannot be created; the OSError must

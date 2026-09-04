@@ -67,12 +67,30 @@ class TestFsDirs:
         f.write_text("x")
         resp = client.get("/fs/dirs", params={"path": str(f)})
         assert resp.status_code == 400
-        assert "is a file" in resp.json()["detail"]
+        assert "is not a folder" in resp.json()["detail"]
 
     def test_defaults_to_home(self, client):
         resp = client.get("/fs/dirs")
         assert resp.status_code == 200
         assert resp.json()["path"] == str(Path.home().resolve())
+
+    def test_blank_or_quoted_empty_path_falls_back_to_home_not_cwd(self, client):
+        """A quotes-only value normalizes to None; ``Path("")`` would silently
+        resolve to the server's CWD instead of the documented default."""
+        for blank in ('""', "   ", "''"):
+            resp = client.get("/fs/dirs", params={"path": blank})
+            assert resp.status_code == 200, blank
+            assert resp.json()["path"] == str(Path.home().resolve()), blank
+
+    def test_unreadable_folder_other_oserror_is_a_400_not_a_500(self, client, tmp_path):
+        """ENOTDIR/EIO/a stale mount: the per-entry loop already tolerates
+        these, so the directory-level read must not 500 either."""
+        with patch(
+            "cli_agent_orchestrator.api.main.Path.iterdir", side_effect=OSError("stale mount")
+        ):
+            resp = client.get("/fs/dirs", params={"path": str(tmp_path)})
+        assert resp.status_code == 400
+        assert "stale mount" in resp.json()["detail"]
 
     def test_root_has_no_parent(self, client):
         resp = client.get("/fs/dirs", params={"path": "/"})
@@ -103,6 +121,20 @@ class TestSessionLabelEndpoint:
         resp = client.post("/sessions/bad:name/label", json={"label": "x"})
         assert resp.status_code == 400
         assert settings_service.get_session_labels() == {}
+
+    def test_unprefixed_name_addresses_the_same_session(self, client, settings_file):
+        """``POST /sessions`` turns ``demo`` into ``cao-demo`` at creation, and
+        every read and the teardown key off that prefixed id. Labelling with
+        the name the operator created with must reach the same session, not
+        store an entry that never surfaces and is never cleared."""
+        resp = client.post("/sessions/demo/label", json={"label": "My Run"})
+        assert resp.status_code == 200
+        assert resp.json() == {"session_name": "cao-demo", "label": "My Run"}
+        assert settings_service.get_session_labels() == {"cao-demo": "My Run"}
+
+        # ...and the prefixed spelling is the same entry, not a second one.
+        client.post("/sessions/cao-demo/label", json={"label": "Renamed"})
+        assert settings_service.get_session_labels() == {"cao-demo": "Renamed"}
 
     def test_label_is_required(self, client, settings_file):
         resp = client.post("/sessions/cao-demo/label", json={})
@@ -161,6 +193,25 @@ class TestWorkingDirectoryNormalizationAtTheBoundary:
             )
         assert resp.status_code == 400
         assert "absolute" in resp.json()["detail"].lower()
+        svc.create_session.assert_not_called()
+
+    def test_a_rejected_request_creates_no_directory(self, client, tmp_path):
+        """The normalization can CREATE, so it runs after the cheap validations:
+        a request some other check will reject must leave nothing behind."""
+        target = tmp_path / "orphan" / "deep" / "tree"
+        with patch("cli_agent_orchestrator.api.main.session_service") as svc:
+            svc.create_session = AsyncMock()
+            resp = client.post(
+                "/sessions",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "working_directory": str(target),
+                    "session_name": "x" * 200,  # rejected by the name check
+                },
+            )
+        assert resp.status_code == 400
+        assert not target.exists(), "a rejected request left a directory tree behind"
         svc.create_session.assert_not_called()
 
     def test_create_session_creates_a_missing_folder(self, client, tmp_path):
