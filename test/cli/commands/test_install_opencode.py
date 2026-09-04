@@ -728,29 +728,31 @@ class TestAgentIdCollisionGuard:
     def test_non_colliding_punctuation_variants_both_install(
         self, runner: CliRunner, install_workspace: Dict[str, Any]
     ):
-        """Names differing only by allowlisted punctuation do NOT collide.
+        """Names differing only by punctuation do NOT collide.
 
-        ``to_opencode_agent_id`` rewrites separators and nothing else, so
-        ``foo.bar`` and ``foo-bar`` keep distinct ids and both install. This is the
-        guard's false-positive check: it must fire on a genuine id clash, not on
-        any two similar-looking names.
+        ``to_opencode_agent_id`` rewrites separators and nothing else, so ``foo_bar``
+        and ``foo-bar`` keep distinct ids and both install. This is the guard's
+        false-positive check: it must fire on a genuine id clash, not on any two
+        similar-looking names.
 
-        (This previously used ``"foo bar"`` versus ``"foo-bar"``. A space is no
-        longer a legal resolved name at all -- see
-        ``test_profile_name_with_a_space_is_rejected_before_any_id_is_derived`` --
-        so that pair could no longer reach the guard.)
+        Both names are valid under the profile schema's own ``name`` pattern
+        (``^[A-Za-z0-9_-]{1,64}$``), which is deliberate -- a test asserting that
+        two profiles install cleanly should not itself use a name the schema calls
+        invalid. (This previously used ``"foo bar"`` versus ``"foo-bar"``; a space
+        has never been a legal profile name, see
+        ``test_profile_name_with_a_space_is_rejected_before_any_id_is_derived``.)
         """
         store = install_workspace["local_store"]
-        _write_profile(store / "foo-dot.md", name="foo.bar")
+        _write_profile(store / "foo-under.md", name="foo_bar")
         _write_profile(store / "foo-dash.md", name="foo-bar")
 
-        r1 = runner.invoke(install, ["foo-dot", "--provider", "opencode_cli"])
+        r1 = runner.invoke(install, ["foo-under", "--provider", "opencode_cli"])
         r2 = runner.invoke(install, ["foo-dash", "--provider", "opencode_cli"])
 
         assert r1.exit_code == 0 and "Error:" not in r1.output, r1.output
         assert r2.exit_code == 0 and "Error:" not in r2.output, r2.output
         # Distinct ids => distinct files, both present.
-        assert (install_workspace["agents_dir"] / "foo.bar.md").exists()
+        assert (install_workspace["agents_dir"] / "foo_bar.md").exists()
         assert (install_workspace["agents_dir"] / "foo-bar.md").exists()
 
     def test_profile_name_with_a_space_is_rejected_before_any_id_is_derived(
@@ -758,12 +760,14 @@ class TestAgentIdCollisionGuard:
     ):
         """A resolved ``name:`` outside ``[A-Za-z0-9._-]`` fails the install.
 
-        Pins a behaviour the path-traversal hardening introduced on ``main``:
-        ``_write_context_file`` validates the resolved name with
-        ``validate_path_component`` before any provider sink runs, and that
-        allowlist rejects spaces as well as separators. The install fails cleanly
-        rather than writing a half-installed profile, and no agent file appears
-        under either the raw or a flattened spelling of the name.
+        A space has never been a legal profile name: the schema's ``name`` pattern
+        is ``^[A-Za-z0-9_-]{1,64}$``, described there as "filesystem-safe". What the
+        path-traversal hardening changed is that the rule is now ENFORCED at install
+        time -- ``_write_context_file`` runs ``validate_path_component`` on the
+        resolved name before any provider sink -- rather than being documented and
+        checked only by the validator endpoint. The install fails cleanly rather
+        than writing a half-installed profile, and no agent file appears under
+        either the raw or a flattened spelling of the name.
 
         This is what makes the collision guard's scope claim true -- the
         separator-collapse vector cannot be reached from here -- so it is pinned
