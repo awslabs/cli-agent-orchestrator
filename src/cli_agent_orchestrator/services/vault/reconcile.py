@@ -120,9 +120,6 @@ def reconcile(
         tuple(_project_note(vault, note, plan.run_started_at) for note in plan.notes)
     )
     findings = _group_findings(projected)
-    indexed = sum(note.note.status == "indexed" for note in projected)
-    quarantined = sum(note.note.status == "quarantined" for note in projected)
-    skipped = sum(note.note.status in {"skipped", "unsupported"} for note in projected)
     deleted = 0
 
     if apply:
@@ -160,11 +157,16 @@ def reconcile(
                 _persist_findings(db, vault.id, plan, findings)
         for emit_audit in deferred_relationship_audits:
             emit_audit()
-        _emit_audit_events(vault.id, plan.run_id, projected, indexed, quarantined, skipped)
     else:
         findings, projected = _preview_rename_findings(vault.id, projected, findings)
         _edge_groups, edge_findings = _project_vault_edges(projected)
         findings = _merge_findings(findings, edge_findings)
+
+    indexed = sum(note.note.status == "indexed" for note in projected)
+    quarantined = sum(note.note.status == "quarantined" for note in projected)
+    skipped = sum(note.note.status in {"skipped", "unsupported"} for note in projected)
+    if apply:
+        _emit_audit_events(vault.id, plan.run_id, projected, indexed, quarantined, skipped)
 
     return ReconcileReport(
         vault.id,

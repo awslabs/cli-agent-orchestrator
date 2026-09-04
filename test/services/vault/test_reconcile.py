@@ -795,6 +795,28 @@ def test_malformed_renamed_note_keeps_identity_excluded_without_suppressing_repl
     )
 
 
+def test_reconcile_report_and_audit_count_final_excluded_projection(tmp_path, monkeypatch):
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    source = tmp_path / "vault" / "Mapped" / "One.md"
+    source.write_text("---\ncao:\n  key: canonical\n---\nsafe", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="count-before")
+    with Session() as db:
+        _exclude_note(db, db.query(VaultNoteModel).filter_by(cao_key="canonical").one())
+        db.query(MemoryMetadataModel).filter_by(source_kind="vault", key="canonical").delete()
+        db.commit()
+
+    emitted = []
+    monkeypatch.setattr(module, "_emit_audit_events", lambda *args: emitted.append(args))
+    report = reconcile(vault, apply=True, run_id="count-after")
+
+    assert (report.indexed, report.quarantined, report.skipped) == (0, 0, 0)
+    assert len(emitted) == 1
+    assert emitted[0][3:] == (0, 0, 0)
+
+
 def test_reused_former_path_alias_cannot_replace_live_renamed_identity(tmp_path, monkeypatch):
     """C.md -> A.md -> D.md cannot replace B.md's retained A.md alias."""
     from cli_agent_orchestrator.services.vault import reconcile as module
