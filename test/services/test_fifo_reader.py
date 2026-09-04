@@ -287,11 +287,15 @@ class TestPipeLivenessWatchdog:
         monkeypatch.setattr("cli_agent_orchestrator.services.fifo_reader.FIFO_DIR", tmp_path)
         return FifoManager()
 
-    def _enroll(self, manager, terminal_id, pane_holder, rearm_calls, last_data_at):
+    def _enroll(
+        self, manager, terminal_id, pane_holder, rearm_calls, last_data_at, fifo_buffer=None
+    ):
         """Register a terminal with fake probe/rearm WITHOUT starting the reader
         thread or the real watchdog — we call _check_pipe_liveness by hand."""
+        fifo_buffer = fifo_buffer or pane_holder
         manager._pane_probe[terminal_id] = lambda: pane_holder["content"]
         manager._rearm[terminal_id] = lambda: rearm_calls.append(True)
+        manager._fifo_buffer_probe[terminal_id] = lambda: fifo_buffer["content"]
         manager._last_data_at[terminal_id] = last_data_at
 
     def test_stall_is_detected_and_pipe_rearmed(self, tmp_path, monkeypatch):
@@ -343,6 +347,7 @@ class TestPipeLivenessWatchdog:
             manager._last_data_at["term"] = time.monotonic()
             manager._check_pipe_liveness("term")
         assert rearm_calls == [], "a healthy, delivering pipe must never be re-armed"
+        assert manager._liveness["term"][0] == "line3"
 
     def test_rearm_replays_live_pane_into_pipeline(self, tmp_path, monkeypatch):
         """After re-arm the lost bytes are gone, but the pane's CURRENT content
@@ -493,6 +498,36 @@ class TestPipeLivenessWatchdog:
         manager._check_pipe_liveness("term")
         assert rearm_calls == [True], "must not spuriously re-arm again once healthy"
 
+    def test_same_interval_stall_does_not_rebaseline_past_fifo_buffer(self, tmp_path, monkeypatch):
+        """Issue #711: bytes arriving earlier in the interval are not proof that
+        the pane's later settled frame reached the FIFO. Keep the last healthy
+        baseline when the rolling buffer stops at the mid-burst frame."""
+        monkeypatch.setattr(fr, "PIPE_LIVENESS_STALL_CHECKS", 2)
+        manager = self._manager(tmp_path, monkeypatch)
+        pane = {"content": "prompt"}
+        fifo_buffer = {"content": "prompt"}
+        rearm_calls: list = []
+        self._enroll(
+            manager,
+            "term",
+            pane,
+            rearm_calls,
+            last_data_at=time.monotonic(),
+            fifo_buffer=fifo_buffer,
+        )
+
+        manager._check_pipe_liveness("term")  # baseline
+        fifo_buffer["content"] = "prompt\nmid-burst"
+        pane["content"] = "prompt\nmid-burst\nsettled frame"
+        manager._last_data_at["term"] = time.monotonic()
+
+        manager._check_pipe_liveness("term")
+        assert rearm_calls == []
+        assert manager._liveness["term"][0] == "prompt"
+
+        manager._check_pipe_liveness("term")
+        assert rearm_calls == [True]
+
     def test_stop_during_probe_does_not_resurrect_state(self, tmp_path, monkeypatch):
         """Regression for the round-2 review's stop-during-probe race:
         ``_check_pipe_liveness`` calls the injected ``probe()`` (a slow tmux
@@ -516,6 +551,7 @@ class TestPipeLivenessWatchdog:
 
         manager._pane_probe["term"] = slow_probe
         manager._rearm["term"] = lambda: None
+        manager._fifo_buffer_probe["term"] = lambda: "content"
         manager._liveness["term"] = ("previous content", 0.0, 0)
         manager._last_data_at["term"] = 0.0
 
@@ -544,6 +580,7 @@ class TestPipeLivenessWatchdog:
 
         manager._pane_probe["term"] = lambda: pane["content"]
         manager._rearm["term"] = failing_rearm
+        manager._fifo_buffer_probe["term"] = lambda: pane["content"]
         manager._last_data_at["term"] = time.monotonic()
 
         manager._check_pipe_liveness("term")  # baseline
@@ -577,6 +614,7 @@ class TestPipeLivenessWatchdog:
 
         manager._pane_probe["term"] = gone_probe
         manager._rearm["term"] = lambda: None
+        manager._fifo_buffer_probe["term"] = lambda: "l0"
         manager._last_data_at["term"] = time.monotonic()
 
         # Each call must return normally (NOT raise) — this is the storm fix: the
@@ -613,6 +651,7 @@ class TestPipeLivenessWatchdog:
 
         manager._pane_probe["term"] = flaky_probe
         manager._rearm["term"] = lambda: None
+        manager._fifo_buffer_probe["term"] = lambda: state["content"]
         manager._last_data_at["term"] = time.monotonic()
 
         # Two failures (below the cap of 3), then a success.
@@ -640,15 +679,18 @@ class TestPipeLivenessWatchdog:
                 "term-enroll",
                 pane_probe=lambda: "content",
                 rearm=lambda: None,
+                fifo_buffer_probe=lambda: "content",
             )
             assert "term-enroll" in manager._pane_probe
             assert "term-enroll" in manager._rearm
+            assert "term-enroll" in manager._fifo_buffer_probe
             assert manager._watchdog_thread is not None
             assert manager._watchdog_thread.is_alive()
 
             manager.stop_reader("term-enroll")
             assert "term-enroll" not in manager._pane_probe
             assert "term-enroll" not in manager._rearm
+            assert "term-enroll" not in manager._fifo_buffer_probe
             assert "term-enroll" not in manager._liveness
         finally:
             manager.stop_watchdog()
@@ -693,6 +735,7 @@ class TestColdStartStallDetection:
         that has never delivered anything since ``registered_at``."""
         manager._pane_probe[terminal_id] = lambda: pane_holder["content"]
         manager._rearm[terminal_id] = lambda: rearm_calls.append(True)
+        manager._fifo_buffer_probe[terminal_id] = lambda: pane_holder["content"]
         manager._last_data_at[terminal_id] = registered_at
         manager._registered_at[terminal_id] = registered_at
         manager._ever_delivered[terminal_id] = False
@@ -779,6 +822,7 @@ class TestColdStartStallDetection:
         rearm_calls: list = []
         manager._pane_probe["term"] = lambda: pane["content"]
         manager._rearm["term"] = lambda: rearm_calls.append(True)
+        manager._fifo_buffer_probe["term"] = lambda: pane["content"]
         manager._last_data_at["term"] = time.monotonic()
         # Deliberately NOT setting _ever_delivered / _registered_at.
 
@@ -814,7 +858,12 @@ class TestColdStartStallDetection:
         content stops changing."""
         manager = self._manager(tmp_path, monkeypatch)
         try:
-            manager.create_reader("term-e2e", pane_probe=lambda: "content", rearm=lambda: None)
+            manager.create_reader(
+                "term-e2e",
+                pane_probe=lambda: "content",
+                rearm=lambda: None,
+                fifo_buffer_probe=lambda: "content",
+            )
             with manager._lock:
                 assert manager._registered_at.get("term-e2e") is not None
                 assert manager._ever_delivered.get("term-e2e") is False
@@ -1045,8 +1094,10 @@ class TestConcurrencyRaces:
                 tid = f"term-{i % 8}"
                 manager._pane_probe[tid] = lambda: "content"
                 manager._rearm[tid] = lambda: None
+                manager._fifo_buffer_probe[tid] = lambda: "content"
                 manager._pane_probe.pop(tid, None)
                 manager._rearm.pop(tid, None)
+                manager._fifo_buffer_probe.pop(tid, None)
                 i += 1
 
         churners = [threading.Thread(target=churn) for _ in range(6)]
