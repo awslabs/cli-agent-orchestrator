@@ -792,6 +792,55 @@ class CodexProvider(BaseProvider):
     # the live frame rather than stale redraw history.
     supports_screen_detection = True
 
+    # Opt-in for the deferred-init direct status probe (capture-pane bypass,
+    # #659). The event-driven cache detects only at rising-edge/quiescence, so
+    # a repainting Working spinner can leave the cached status IDLE past the
+    # whole confirm window — the retry loop then re-delivers the task into the
+    # already-working pane and eventually tears the worker down. get_status()
+    # is line-oriented text analysis of exactly this rendered shape (the same
+    # frames the screen-detection route above feeds it in production), so a
+    # live capture-pane snapshot is a valid input; there is no dispatch
+    # bookkeeping that a fresh capture would bypass (the kiro_cli-style
+    # disqualifier documented on _worker_is_started_direct). The status alone
+    # is NOT the verdict, though — see direct_probe_confirms_dispatch below.
+    supports_direct_status_probe = True
+
+    def direct_probe_confirms_dispatch(self, post_dispatch_output: str) -> bool:
+        """Prove a codex turn actually started, from post-dispatch bytes alone.
+
+        Codex's startup chrome renders like its task activity: the
+        ``Starting MCP servers (4s - esc to interrupt)`` spinner IS
+        ``TUI_PROGRESS_PATTERN`` and any startup bullet is an assistant marker.
+        On a whole-frame ``get_status`` read that residue is indistinguishable
+        from a running turn, so the probe needs evidence tied to time rather
+        than to text.
+
+        ``post_dispatch_output`` supplies it: ``send_input`` empties the rolling
+        buffer immediately before sending the keystrokes, so a spinner that
+        stopped BEFORE the dispatch contributes no bytes here no matter where it
+        still sits on screen, while a live one repaints its elapsed counter and
+        necessarily does. The evidence is therefore the progress spinner alone.
+
+        A bullet is deliberately NOT accepted: the composer echoes the pasted
+        message as it renders, so a multi-line paste containing its own ``.``
+        bullet would emit one without any turn having started. The spinner's
+        ``(<n>s - esc to interrupt)`` shape cannot be produced that way.
+
+        False here is "unproven", never "idle" — see the base docstring. It is
+        also the honest answer on an event-inbox backend (herdr) that never
+        feeds a byte buffer: the probe then declines to vouch for the turn and
+        the caller falls back to its pre-existing behavior.
+        """
+        if not post_dispatch_output:
+            return False
+        return bool(
+            re.search(
+                TUI_PROGRESS_PATTERN,
+                strip_terminal_escapes(post_dispatch_output),
+                re.MULTILINE,
+            )
+        )
+
     def __init__(
         self,
         terminal_id: str,
