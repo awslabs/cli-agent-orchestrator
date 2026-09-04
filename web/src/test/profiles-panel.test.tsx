@@ -561,4 +561,43 @@ describe('round-6 review: post-edit detail reload vs navigation ownership (#692)
       vi.useRealTimers()
     }
   })
+
+  it('a FAILED post-save refresh still reloads the edited detail pane', async () => {
+    // The reload bump sits before the refresh await, so the early return on
+    // a failed refresh cannot strand the pane on pre-edit data either --
+    // the server document changed regardless of whether the catalog
+    // refetch succeeded.
+    let edited = false
+    const SOURCE = '---\nname: developer\ndescription: Writes code\n---\n\nBody.\n'
+    let catalogCall = 0
+    vi.stubGlobal('fetch', vi.fn(async (url: string, opts?: any) => {
+      const u = String(url)
+      if (u.includes('/agents/profiles/validate')) return okJson({ valid: true, messages: [] })
+      if (u.includes('/source')) return okJson({ name: 'developer', content: SOURCE })
+      if (u.endsWith('/agents/profiles/developer') && opts?.method === 'PUT') { edited = true; return okJson({ name: 'developer', warnings: [] }) }
+      if (/\/agents\/profiles\/[^/?]+$/.test(u)) return okJson({
+        name: 'developer', description: 'Writes code', provider: 'kiro_cli',
+        model: edited ? 'post-edit-model' : 'pre-edit-model', tags: [], capabilities: [],
+      })
+      if (u.includes('/agents/profiles')) {
+        catalogCall++
+        if (catalogCall > 1) return errJson(500, 'catalog exploded')
+        return okJson(CATALOG)
+      }
+      return okJson([])
+    }))
+    render(<ProfilesPanel />)
+    await act(async () => {})
+    fireEvent.click(screen.getByRole('option', { name: /developer/ }))
+    await act(async () => {})
+    expect(within(screen.getByTestId('profile-detail')).getByText('pre-edit-model')).toBeInTheDocument()
+
+    fireEvent.click(within(screen.getByTestId('profile-detail')).getByRole('button', { name: /edit/i }))
+    await act(async () => {})
+    fireEvent.change(screen.getByRole('textbox', { name: /profile source/i }), { target: { value: SOURCE.replace('Body.', 'New body.') } })
+    fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
+    await act(async () => {}) // PUT ok; refresh fails; continuation returns early
+    await act(async () => {})
+    expect(within(screen.getByTestId('profile-detail')).getByText('post-edit-model')).toBeInTheDocument()
+  })
 })
