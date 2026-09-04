@@ -119,6 +119,71 @@ class TestAnswerUserPrompt:
         ]
         mock_sleep.assert_called_once_with(0.05)
 
+    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    def test_worker_cannot_answer_another_terminals_prompt(self, mock_requests, monkeypatch):
+        from cli_agent_orchestrator.mcp_server.server import _send_user_prompt_answer
+
+        monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
+
+        result = _send_user_prompt_answer("deadbeef", "1")
+
+        assert result["success"] is False
+        assert "only answer its own terminal" in result["error"]
+        mock_requests.get.assert_not_called()
+        mock_requests.post.assert_not_called()
+
+    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    def test_worker_can_answer_its_own_prompt(self, mock_requests, monkeypatch):
+        from cli_agent_orchestrator.mcp_server.server import _send_user_prompt_answer
+
+        monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
+
+        status_response = MagicMock()
+        status_response.json.return_value = {"status": "waiting_user_answer"}
+        status_response.raise_for_status.return_value = None
+        input_response = MagicMock()
+        input_response.raise_for_status.return_value = None
+        mock_requests.get.return_value = status_response
+        mock_requests.post.return_value = input_response
+
+        result = _send_user_prompt_answer("abcd1234", "1")
+
+        assert result["success"] is True
+        mock_requests.post.assert_called_once_with(
+            f"{API_BASE_URL}/terminals/abcd1234/input",
+            params={
+                "message": "1",
+                "sender_id": "abcd1234",
+            },
+            timeout=_mcp_timeout(),
+        )
+
+    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    def test_supervisor_can_answer_any_terminals_prompt(self, mock_requests, monkeypatch):
+        from cli_agent_orchestrator.mcp_server.server import _send_user_prompt_answer
+
+        monkeypatch.delenv("CAO_TERMINAL_ID", raising=False)
+
+        status_response = MagicMock()
+        status_response.json.return_value = {"status": "waiting_user_answer"}
+        status_response.raise_for_status.return_value = None
+        input_response = MagicMock()
+        input_response.raise_for_status.return_value = None
+        mock_requests.get.return_value = status_response
+        mock_requests.post.return_value = input_response
+
+        result = _send_user_prompt_answer("deadbeef", "1")
+
+        assert result["success"] is True
+        mock_requests.post.assert_called_once_with(
+            f"{API_BASE_URL}/terminals/deadbeef/input",
+            params={
+                "message": "1",
+                "sender_id": "supervisor",
+            },
+            timeout=_mcp_timeout(),
+        )
+
     @patch("cli_agent_orchestrator.mcp_server.server.time.sleep")
     @patch("cli_agent_orchestrator.mcp_server.server.requests")
     def test_hermes_clarify_custom_answer_uses_other_then_text(self, mock_requests, mock_sleep):

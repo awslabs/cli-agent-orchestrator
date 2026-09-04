@@ -87,6 +87,23 @@ Returns:
 
 def _send_user_prompt_answer(terminal_id: str, answer: str) -> Dict[str, Any]:
     """Send an explicit answer to a terminal that is waiting on user input."""
+    # A worker may only answer its OWN terminal's approval prompt. The
+    # supervisor (CAO_TERMINAL_ID unset) is the role that legitimately answers
+    # other terminals' prompts, so only enforce ownership when the caller
+    # identifies as a worker. This keeps a prompt-injected or compromised
+    # worker from self-approving its own permission prompt or answering a
+    # sibling terminal's prompt.
+    caller_terminal_id = _current_terminal_id()
+    if caller_terminal_id and terminal_id != caller_terminal_id:
+        return {
+            "success": False,
+            "terminal_id": terminal_id,
+            "error": (
+                f"Worker terminal {caller_terminal_id} may only answer its own "
+                f"terminal's approval prompt, not terminal {terminal_id}'s. Only "
+                "the supervisor can answer another terminal's prompt."
+            ),
+        }
     if not answer.strip():
         return {
             "success": False,
