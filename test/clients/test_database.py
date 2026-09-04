@@ -1,6 +1,7 @@
 """Tests for the database client."""
 
 import tempfile
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -10,12 +11,14 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
+from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.clients.database import (
     Base,
     FlowModel,
     IdempotencyKeyModel,
     InboxModel,
     TerminalModel,
+    claim_pending_messages,
     create_flow,
     create_inbox_message,
     create_terminal,
@@ -1300,6 +1303,94 @@ class TestInboxOperations:
         update_message_status(1, MessageStatus.DELIVERED)
 
         mock_session.commit.assert_called_once()
+
+    def test_get_pending_messages_lets_two_independent_callers_both_see_the_same_row(
+        self, isolated_memory_db
+    ):
+        """Documents the race #406 reports: a plain read does not claim anything,
+        so two concurrent deliver_pending() callers both decide, independently,
+        that the same PENDING row is theirs to deliver.
+        """
+        with database.SessionLocal() as seed:
+            seed.add(
+                InboxModel(
+                    sender_id="s",
+                    receiver_id="term-1",
+                    message="m",
+                    status=MessageStatus.PENDING.value,
+                    created_at=datetime.now(),
+                )
+            )
+            seed.commit()
+
+        caller_a = get_pending_messages("term-1", limit=1)
+        caller_b = get_pending_messages("term-1", limit=1)
+
+        assert len(caller_a) == 1
+        assert [m.id for m in caller_a] == [m.id for m in caller_b]
+
+    def test_claim_pending_messages_only_one_caller_wins(self, isolated_memory_db):
+        """The atomic replacement for the race above: the second caller's
+        UPDATE ... WHERE status = 'pending' ... matches zero rows once the
+        first caller's UPDATE has already flipped it to DELIVERED."""
+        with database.SessionLocal() as seed:
+            seed.add(
+                InboxModel(
+                    sender_id="s",
+                    receiver_id="term-1",
+                    message="m",
+                    status=MessageStatus.PENDING.value,
+                    created_at=datetime.now(),
+                )
+            )
+            seed.commit()
+
+        caller_a = claim_pending_messages("term-1", limit=1)
+        caller_b = claim_pending_messages("term-1", limit=1)
+
+        assert len(caller_a) == 1
+        assert caller_a[0].status == MessageStatus.DELIVERED
+        assert caller_b == []
+
+    def test_claim_pending_messages_concurrent_threads_never_double_claim(self, isolated_memory_db):
+        """Real concurrent callers (two OS threads, barrier-synchronized so both
+        reach the UPDATE at the same time) against the on-disk SQLite file
+        isolated_memory_db sets up: every seeded message is claimed exactly
+        once across both threads combined, never twice and never zero times.
+        """
+        with database.SessionLocal() as seed:
+            seeded = [
+                InboxModel(
+                    sender_id="s",
+                    receiver_id="term-1",
+                    message="m",
+                    status=MessageStatus.PENDING.value,
+                    created_at=datetime.now(),
+                )
+                for _ in range(5)
+            ]
+            seed.add_all(seeded)
+            seed.commit()
+            seeded_ids = sorted(m.id for m in seeded)
+
+        barrier = threading.Barrier(2)
+        results: list[list] = []
+        lock = threading.Lock()
+
+        def worker():
+            barrier.wait()
+            claimed = claim_pending_messages("term-1", limit=5)
+            with lock:
+                results.append(claimed)
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        claimed_ids = sorted(m.id for batch in results for m in batch)
+        assert claimed_ids == seeded_ids
 
 
 class TestFlowOperations:

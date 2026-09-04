@@ -6,11 +6,13 @@ Consumer: terminal.{id}.status
 import asyncio
 import logging
 import threading
+from contextlib import contextmanager
 from itertools import groupby
-from typing import Dict
+from typing import Dict, Iterator, Optional, Tuple
 
 from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.clients.database import (
+    claim_pending_messages,
     get_pending_messages,
     list_pending_receiver_ids_by_provider,
     list_pending_receiver_ids_older_than,
@@ -32,31 +34,151 @@ from cli_agent_orchestrator.utils.event import terminal_id_from_topic
 
 logger = logging.getLogger(__name__)
 
+# terminal_id -> (lock, refcount). Same refcounted-per-key pattern as
+# session_lock.py's session_lifecycle_lock, kept separate rather than shared:
+# this guards a different critical section (message delivery, not session
+# create/teardown) and the two have no reason to block each other.
+_delivery_registry_guard = threading.Lock()
+_delivery_locks: Dict[str, Tuple[threading.Lock, int]] = {}
+
+# terminal_id -> status_monitor's transition generation at the moment of the
+# last dispatch not yet confirmed by a real status transition. The lock above
+# serializes deliver_pending calls but does not stop a queued caller from
+# proceeding once it is its turn: status_monitor.get_status() still returns
+# the cached IDLE/COMPLETED from before the first send, because
+# notify_input_sent() only arms the next PROCESSING detection, it does not
+# flip the cached status itself, and the real detection needs actual terminal
+# output to run. A second caller that only checks status would see the same
+# stale ready value and dispatch its own message into a terminal that has not
+# started working on the first one yet (reviewer-reproduced on #709: two IDLE
+# checks and two sends in one cycle). This marker closes that window: it is
+# set right after a successful send and cleared only once InboxService.run()
+# observes a status event whose generation is strictly newer than the one
+# recorded at dispatch time.
+#
+# The generation check matters because run()'s queue can already hold an
+# older, stale event at dispatch time (the immediate API, OpenCode poller and
+# reconcile paths all call deliver_pending() outside this consumer): clearing
+# on ANY event, rather than only a genuinely later one, would let that stale
+# event wipe the marker before the real post-dispatch transition arrives,
+# reopening the exact window the marker exists to close (#709 third review
+# round). A prior version also expired this marker on elapsed time alone, but
+# a provider is not contractually bound to emit any output within a fixed
+# window, so a slow or silent start left the cached status unchanged and let
+# the next caller (in particular the five-second OpenCode poller) dispatch a
+# second message into the same unconfirmed cycle (#709 fifth review round).
+# The marker now only ever clears on a genuine transition; a terminal whose
+# provider truly never produces another status event again holds its
+# remaining PENDING messages rather than risk another interleaved send, the
+# same terminal already received the first message that set the marker.
+_dispatch_active_guard = threading.Lock()
+_dispatch_active: Dict[str, int] = {}
+
+
+def _clear_dispatch_active(terminal_id: str, event_generation: int) -> None:
+    """Drop the busy marker, but only if this status event postdates the
+    dispatch it would confirm. An event generation at or below the one
+    recorded at dispatch time is one InboxService.run() had already queued
+    (or is a duplicate of one already accounted for) and proves nothing about
+    what happened after the send (#709)."""
+    with _dispatch_active_guard:
+        generation_at_dispatch = _dispatch_active.get(terminal_id)
+        if generation_at_dispatch is None:
+            return
+        if event_generation > generation_at_dispatch:
+            del _dispatch_active[terminal_id]
+
+
+def _is_dispatch_active(terminal_id: str) -> bool:
+    """True while a dispatch for this terminal has not yet been confirmed by
+    a later status event. Elapsed time alone never clears this: only a
+    genuinely newer transition (see _clear_dispatch_active) proves the cycle
+    advanced (#709 fifth review round)."""
+    with _dispatch_active_guard:
+        return terminal_id in _dispatch_active
+
+
+def _mark_dispatch_active(terminal_id: str, generation: Optional[int] = None) -> None:
+    """``generation`` defaults to a fresh read for callers (mainly tests) that
+    just want "busy as of right now"; deliver_pending always passes the
+    generation it read BEFORE calling send_input, so the marker exists for
+    the whole dispatch window and no status event confirming it can be
+    consumed before the marker does (#709 eighth review round: arming after
+    the send left a check-then-mark window between the post-dispatch read
+    and this call, wide enough for a fast completion event to be consumed by
+    InboxService.run() first, finding no marker to clear, and then this call
+    installing one for a generation that had already been confirmed and
+    would never be confirmed again)."""
+    if generation is None:
+        generation = status_monitor.get_status_generation(terminal_id)
+    with _dispatch_active_guard:
+        _dispatch_active[terminal_id] = generation
+
+
+def _abort_dispatch_active(terminal_id: str) -> None:
+    """Drop the marker unconditionally after a send that never reached the
+    terminal (#709 eighth review round). ``_mark_dispatch_active`` now runs
+    before ``send_input`` (see deliver_pending), so a failed or unresolved
+    send has already armed a marker that no real status event will ever
+    clear: nothing happened at the terminal, so there is nothing for
+    ``_clear_dispatch_active``'s generation check to confirm. Called from
+    both exception branches; safe to call when no marker is set."""
+    with _dispatch_active_guard:
+        _dispatch_active.pop(terminal_id, None)
+
+
+def _drop_dispatch_active_on_status_reset(terminal_id: str) -> None:
+    """status_monitor teardown hook: fires from clear_terminal/reset_buffer,
+    i.e. exactly when ``_status_generations`` is popped for this terminal and
+    its counter restarts from 0. A recorded dispatch generation snapshotted
+    before that restart is no longer comparable to anything the terminal can
+    publish afterward: every post-reset event carries a generation at or
+    below the old snapshot, so _clear_dispatch_active's strictly-greater
+    check could never fire and the marker would survive forever, silently
+    and permanently stranding that terminal's inbox (reviewer-reported
+    finding on #709). Drop it unconditionally rather than re-deriving
+    anything: a reset means whatever the marker was confirming no longer
+    applies. This also reaps the entry when the terminal is torn down via
+    clear_terminal, which nothing previously did, closing the same-cause
+    slow leak the reviewer flagged alongside the stranding bug."""
+    with _dispatch_active_guard:
+        _dispatch_active.pop(terminal_id, None)
+
+
+status_monitor.register_teardown_hook(_drop_dispatch_active_on_status_reset)
+
+
+@contextmanager
+def _terminal_delivery_lock(terminal_id: str) -> Iterator[None]:
+    """Serialize deliver_pending end to end for one terminal.
+
+    Claiming a row is atomic (#164, #406), but claim and delivery are two
+    separate steps: two concurrent callers can each claim a different PENDING
+    row for the same terminal and then both call terminal_service.send_input,
+    interleaving their paste/delay/Enter sequences at the tmux pane (#709).
+    Holding this lock across the whole read-check-claim-send-reset sequence
+    makes deliveries to one terminal fully sequential again; other terminals
+    are unaffected since each gets its own lock.
+    """
+    with _delivery_registry_guard:
+        if terminal_id not in _delivery_locks:
+            _delivery_locks[terminal_id] = (threading.Lock(), 0)
+        lock, count = _delivery_locks[terminal_id]
+        _delivery_locks[terminal_id] = (lock, count + 1)
+    try:
+        with lock:
+            yield
+    finally:
+        with _delivery_registry_guard:
+            lock, count = _delivery_locks[terminal_id]
+            if count <= 1:
+                del _delivery_locks[terminal_id]
+            else:
+                _delivery_locks[terminal_id] = (lock, count - 1)
+
 
 class InboxService:
     """Delivers one pending message per terminal per IDLE cycle."""
-
-    def __init__(self) -> None:
-        # deliver_pending is read(PENDING) → status check → mark DELIVERED → send,
-        # with no atomic claim at the DB layer, so two concurrent calls for the
-        # SAME terminal can both read the same oldest row before either marks it
-        # and deliver one task twice. Concurrent callers are real: the status-event
-        # consumer and the immediate POST path both dispatch to worker threads, and
-        # the OpenCode poller and the reconcile sweep add more. Serialize the whole
-        # read→mark→send sequence per terminal; as a side effect this also keeps
-        # two pastes from ever interleaving in one pane. The lock map is tiny
-        # (one Lock per terminal id ever delivered to in this process) and is not
-        # reaped — terminal ids are bounded by session lifecycle.
-        self._delivery_locks_guard = threading.Lock()
-        self._delivery_locks: Dict[str, threading.Lock] = {}
-
-    def _delivery_lock(self, terminal_id: str) -> threading.Lock:
-        with self._delivery_locks_guard:
-            lock = self._delivery_locks.get(terminal_id)
-            if lock is None:
-                lock = threading.Lock()
-                self._delivery_locks[terminal_id] = lock
-            return lock
 
     async def run(self, registry: PluginRegistry | None = None) -> None:
         queue = bus.subscribe("terminal.*.status")
@@ -66,8 +188,27 @@ class InboxService:
             try:
                 event = await queue.get()
                 status_value = event["data"]["status"]
+                # StatusMonitor is the only production publisher of this topic
+                # and always includes a generation; ApprovalBridge only
+                # subscribes to it. Default to 0 rather than raise so a
+                # differently-shaped event (e.g. from a test harness) can't
+                # take this consumer down: that never clears a real dispatch
+                # marker early, it just leaves this one event unable to
+                # confirm one (see _clear_dispatch_active).
+                event_generation = event["data"].get("generation", 0)
+                terminal_id = terminal_id_from_topic(event["topic"])
+                # A published status event means _apply_detection ran a genuine
+                # transition for this terminal (it dedupes no-op repeats), so a
+                # cached value a concurrent deliver_pending call saw BEFORE this
+                # transition is now stale. Clear the busy marker before deciding
+                # whether to deliver, so a real ready event right behind a
+                # dispatch is never starved by its own dispatch (#709), but only
+                # when the event is newer than the dispatch it would confirm: this
+                # queue can already hold an older event at dispatch time, and
+                # clearing on that one would reopen the same window from the other
+                # side (#709 third review round).
+                _clear_dispatch_active(terminal_id, event_generation)
                 if status_value in (TerminalStatus.IDLE.value, TerminalStatus.COMPLETED.value):
-                    terminal_id = terminal_id_from_topic(event["topic"])
                     # deliver_pending does blocking DB + tmux I/O. Offload it to a
                     # worker thread so this consumer keeps yielding to the event loop
                     # (StatusMonitor/LogWriter must not be starved — see the threading
@@ -96,83 +237,107 @@ class InboxService:
         so ``PostSendMessageEvent`` hooks fire with correct attribution.
 
         Safe to call from any thread: the whole read→mark→send sequence is
-        serialized per terminal (see __init__ for why that is load-bearing).
+        serialized per terminal (see _terminal_delivery_lock for why that is
+        load-bearing).
         """
-        with self._delivery_lock(terminal_id):
-            self._deliver_pending_locked(terminal_id, num_messages, registry)
-
-    def _deliver_pending_locked(
-        self,
-        terminal_id: str,
-        num_messages: int,
-        registry: PluginRegistry | None,
-    ) -> None:
-        limit = num_messages if num_messages > 0 else 100
-        messages = get_pending_messages(terminal_id, limit=limit)
-        if not messages:
-            return
-
-        status = status_monitor.get_status(terminal_id)
-        if status not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
-            # Not ready on the normal path. Eager delivery (#251) lets providers
-            # that accept input mid-turn receive messages while PROCESSING or
-            # WAITING_USER_ANSWER; only in that case do we need the provider.
-            eager_eligible = False
-            if EAGER_INBOX_DELIVERY and status in (
-                TerminalStatus.PROCESSING,
-                TerminalStatus.WAITING_USER_ANSWER,
-            ):
-                provider = provider_manager.get_provider(terminal_id)
-                eager_eligible = provider is not None and getattr(
-                    provider, "accepts_input_while_processing", False
-                )
-            if not eager_eligible:
+        with _terminal_delivery_lock(terminal_id):
+            if _is_dispatch_active(terminal_id):
+                # A prior dispatch for this terminal has not yet been confirmed
+                # by a real status transition (#709): the lock only serializes
+                # this call after that one, it does not prove the terminal has
+                # actually started working on the first message. Coalesce
+                # instead of consuming another row into the same stale ready
+                # window; the still-PENDING message is picked up by the next
+                # genuine status event or the reconcile sweep.
                 return
 
-        # Mark DELIVERED before sending (#164). send_input() types into the tmux
-        # pane; that output flows back through the FIFO/StatusMonitor pipeline and
-        # can re-emit an IDLE/COMPLETED status event, re-entering deliver_pending.
-        # If the messages were still PENDING then, they would be delivered twice.
-        # Marking them DELIVERED first closes that window; the except path resets
-        # them to FAILED.
-        for message in messages:
-            update_message_status(message.id, MessageStatus.DELIVERED)
+            limit = num_messages if num_messages > 0 else 100
+            messages = get_pending_messages(terminal_id, limit=limit)
+            if not messages:
+                return
 
-        # Deliver in contiguous runs of the same sender. With the default
-        # num_messages=1 this is a single run; when draining all pending messages
-        # (num_messages=0) a batch can span multiple senders, so each run is sent
-        # separately to keep PostSendMessageEvent attribution correct — otherwise
-        # every message would be attributed to messages[0].sender_id.
-        for sender_id, group in groupby(messages, key=lambda m: m.sender_id):
-            batch = list(group)
-            combined = "\n".join(m.message for m in batch)
-            try:
-                if registry is None:
-                    terminal_service.send_input(terminal_id, combined)
-                else:
-                    terminal_service.send_input(
-                        terminal_id,
-                        combined,
-                        registry=registry,
-                        sender_id=sender_id,
-                        orchestration_type=OrchestrationType.SEND_MESSAGE,
+            status = status_monitor.get_status(terminal_id)
+            if status not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
+                # Not ready on the normal path. Eager delivery (#251) lets providers
+                # that accept input mid-turn receive messages while PROCESSING or
+                # WAITING_USER_ANSWER; only in that case do we need the provider.
+                eager_eligible = False
+                if EAGER_INBOX_DELIVERY and status in (
+                    TerminalStatus.PROCESSING,
+                    TerminalStatus.WAITING_USER_ANSWER,
+                ):
+                    provider = provider_manager.get_provider(terminal_id)
+                    eager_eligible = provider is not None and getattr(
+                        provider, "accepts_input_while_processing", False
                     )
-                logger.info(f"Delivered {len(batch)} message(s) to terminal {terminal_id}")
-            except TerminalNotFoundError as e:
-                # Pane not resolvable yet (e.g. a herdr pane that isn't mapped
-                # for this window). Treat as transient: reset to PENDING so the
-                # reconcile sweep retries rather than marking FAILED. These were
-                # optimistically set to DELIVERED above. (#271 semantic.)
-                for message in batch:
-                    update_message_status(message.id, MessageStatus.PENDING)
-                logger.warning(
-                    f"Pane not resolvable for terminal {terminal_id}; leaving "
-                    f"{len(batch)} message(s) pending for retry: {e}"
-                )
-            except Exception as e:
-                for message in batch:
-                    logger.error(f"Failed to deliver message {message.id} to {terminal_id}: {e}")
-                    update_message_status(message.id, MessageStatus.FAILED)
+                if not eager_eligible:
+                    return
+
+            # Claim atomically (#164, #406): a concurrent deliver_pending call for this
+            # terminal can reach this point before this one commits, so only an atomic
+            # UPDATE, not a prior read, decides who delivers each message.
+            messages = claim_pending_messages(terminal_id, limit=limit)
+            if not messages:
+                return
+
+            # Deliver in contiguous runs of the same sender. With the default
+            # num_messages=1 this is a single run; when draining all pending messages
+            # (num_messages=0) a batch can span multiple senders, so each run is sent
+            # separately to keep PostSendMessageEvent attribution correct: otherwise
+            # every message would be attributed to messages[0].sender_id.
+            for sender_id, group in groupby(messages, key=lambda m: m.sender_id):
+                batch = list(group)
+                combined = "\n".join(m.message for m in batch)
+                # Mark busy BEFORE dispatch (#709 eighth review round), not after.
+                # Arming after send_input returns left a check-then-mark window: a
+                # fast completion event could be published and consumed by
+                # InboxService.run() while this call was still between its
+                # post-dispatch read and _mark_dispatch_active, find no marker to
+                # clear (none existed yet), and then this call would install one
+                # for a generation that event had already confirmed: nothing left
+                # to arrive would ever clear it, coalescing every later message to
+                # this terminal forever (reviewer-reproduced finding on #709).
+                # Arming here, before send_input is even called, closes the window:
+                # no status event caused by this dispatch can exist before the
+                # marker does, so _clear_dispatch_active's strictly-greater
+                # generation check is always checked against a marker that was
+                # already in place when the confirming event was published. If the
+                # send never reaches the terminal (see the except branches below),
+                # _abort_dispatch_active drops it again: nothing will ever confirm a
+                # dispatch that did not happen.
+                pre_dispatch_generation = status_monitor.get_status_generation(terminal_id)
+                _mark_dispatch_active(terminal_id, pre_dispatch_generation)
+                try:
+                    if registry is None:
+                        terminal_service.send_input(terminal_id, combined)
+                    else:
+                        terminal_service.send_input(
+                            terminal_id,
+                            combined,
+                            registry=registry,
+                            sender_id=sender_id,
+                            orchestration_type=OrchestrationType.SEND_MESSAGE,
+                        )
+                    logger.info(f"Delivered {len(batch)} message(s) to terminal {terminal_id}")
+                except TerminalNotFoundError as e:
+                    # Pane not resolvable yet (e.g. a herdr pane that isn't mapped
+                    # for this window). Treat as transient: reset to PENDING so the
+                    # reconcile sweep retries rather than marking FAILED. These were
+                    # optimistically set to DELIVERED above. (#271 semantic.)
+                    _abort_dispatch_active(terminal_id)
+                    for message in batch:
+                        update_message_status(message.id, MessageStatus.PENDING)
+                    logger.warning(
+                        f"Pane not resolvable for terminal {terminal_id}; leaving "
+                        f"{len(batch)} message(s) pending for retry: {e}"
+                    )
+                except Exception as e:
+                    _abort_dispatch_active(terminal_id)
+                    for message in batch:
+                        logger.error(
+                            f"Failed to deliver message {message.id} to {terminal_id}: {e}"
+                        )
+                        update_message_status(message.id, MessageStatus.FAILED)
 
     def poll_opencode_pending_messages(self, registry: PluginRegistry | None = None) -> None:
         """Poll OpenCode terminals for pending inbox messages.

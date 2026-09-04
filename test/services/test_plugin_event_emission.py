@@ -683,6 +683,7 @@ class TestMessagePluginEvents:
         registry.dispatch.assert_not_awaited()
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.claim_pending_messages")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
@@ -693,6 +694,7 @@ class TestMessagePluginEvents:
         mock_provider_manager,
         mock_status_monitor,
         mock_terminal_service,
+        mock_claim_pending_messages,
         mock_update_message_status,
     ):
         """Queued inbox delivery should forward sender context and hardcode send_message."""
@@ -702,8 +704,14 @@ class TestMessagePluginEvents:
         message.sender_id = "supervisor-1"
         message.message = "Please review this"
         mock_get_pending_messages.return_value = [message]
+        claimed = MagicMock()
+        claimed.id = 17
+        claimed.sender_id = "supervisor-1"
+        claimed.message = "Please review this"
+        mock_claim_pending_messages.return_value = [claimed]
         # Status is sourced from the event-driven StatusMonitor, not the provider.
         mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_status_monitor.get_status_generation.return_value = 0
 
         inbox_service.deliver_pending("abcd1234", registry=registry)
 
@@ -714,4 +722,6 @@ class TestMessagePluginEvents:
             sender_id="supervisor-1",
             orchestration_type=OrchestrationType.SEND_MESSAGE,
         )
-        mock_update_message_status.assert_called_once_with(17, MessageStatus.DELIVERED)
+        # claim_pending_messages() moves the message to DELIVERED atomically;
+        # update_message_status is only used for the PENDING/FAILED reset paths.
+        mock_update_message_status.assert_not_called()
