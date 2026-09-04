@@ -385,6 +385,116 @@ class TestSessionLifecycleTools:
         assert initial_message not in request_url
         assert initial_message not in str(request_params)
 
+    async def test_launch_session_forwards_env_vars(self) -> None:
+        """Forwarded env vars ride the JSON body (never the URL/params), the
+        same wire shape as ``cao launch --env``."""
+        env_vars = {"DEV_ACCOUNT": "123456789012", "BASE_URL": "http://localhost:8080"}
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data={"id": "term-env"}),
+        ) as mock_request:
+            result = await launch_session(
+                agent_profile="developer",
+                session_name="env-session",
+                env_vars=env_vars,
+            )
+
+        assert result == LaunchResult(
+            success=True,
+            message="Session 'env-session' launched successfully",
+            session_name="env-session",
+            terminal_id="term-env",
+        )
+        mock_request.assert_called_once_with(
+            "post",
+            "http://127.0.0.1:9889/sessions",
+            params={
+                "agent_profile": "developer",
+                "session_name": "env-session",
+            },
+            json={"env_vars": env_vars},
+        )
+        # A forwarded value must not leak into the URL or query params.
+        request_url = mock_request.call_args.args[1]
+        request_params = mock_request.call_args.kwargs["params"]
+        assert "env_vars" not in request_params
+        assert "123456789012" not in request_url
+        assert "123456789012" not in str(request_params)
+
+    async def test_launch_session_forwards_env_vars_with_initial_message(self) -> None:
+        """env_vars and initial_message coexist in the JSON body."""
+        env_vars = {"REGION": "us-west-2"}
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data={"id": "term-both"}),
+        ) as mock_request:
+            await launch_session(
+                agent_profile="developer",
+                session_name="both-session",
+                initial_message="do the thing",
+                env_vars=env_vars,
+            )
+
+        assert mock_request.call_args.kwargs["json"] == {
+            "initial_message": "do the thing",
+            "env_vars": env_vars,
+        }
+
+    async def test_launch_session_rejects_invalid_env_before_api_call(self) -> None:
+        """A forwarded env var breaking the forwarding rules fails at the MCP
+        boundary (mirroring ``cao launch --env``) with no HTTP request made."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+        ) as mock_request:
+            result = await launch_session(
+                agent_profile="developer",
+                session_name="bad-env",
+                env_vars={"CLAUDE_SESSION_ID": "abc"},  # blocked provider prefix
+            )
+
+        assert result.success is False
+        assert "blocked prefix" in result.message
+        assert result.terminal_id is None
+        mock_request.assert_not_called()
+
+    async def test_launch_session_rejects_non_utf8_env_without_crashing(self) -> None:
+        """A lone surrogate is a valid JSON/FastMCP str but is not UTF-8
+        encodable. It must return success=False (not raise a ToolError wrapping
+        UnicodeEncodeError) and make no HTTP request. Regression for the P2
+        review finding on PR #729."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+        ) as mock_request:
+            result = await launch_session(
+                agent_profile="developer",
+                session_name="bad-utf8",
+                env_vars={"X": "\ud800"},  # lone surrogate, not UTF-8 encodable
+            )
+
+        assert result.success is False
+        assert "not valid UTF-8" in result.message
+        assert result.terminal_id is None
+        mock_request.assert_not_called()
+
+    async def test_launch_session_rejects_nul_byte_env_without_crashing(self) -> None:
+        """A NUL byte in a value passes the length check but breaks Popen and
+        leaks the argv into logs. It must return success=False before any HTTP
+        request. Regression for the P1 review finding on PR #729."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+        ) as mock_request:
+            result = await launch_session(
+                agent_profile="developer",
+                session_name="bad-nul",
+                env_vars={"TOKEN": "secret\x00value"},
+            )
+
+        assert result.success is False
+        assert "NUL byte" in result.message
+        assert "secret" not in result.message  # value must not leak
+        assert result.terminal_id is None
+        mock_request.assert_not_called()
+
     async def test_launch_session_returns_invalid_model_error(self) -> None:
         """Request-boundary model errors are returned instead of ignored."""
         with patch(
