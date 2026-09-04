@@ -676,24 +676,33 @@ def _guard_opencode_agent_id_collision(source_name: str, profile_name: str) -> N
     """Fail loud if another installable profile shares this profile's agent id.
 
     The installed OpenCode id derives from a profile's *resolved name*
-    (frontmatter ``name:``) via :func:`to_opencode_agent_id`, and that
-    derivation is many-to-one, so TWO distinct profile files can land on the
-    same ``<id>.md`` / ``agent.<id>`` — whichever installs second silently
-    overwrites the first. Two independent ways this happens:
+    (frontmatter ``name:``) via :func:`to_opencode_agent_id`, and the opencode
+    sink writes ``OPENCODE_AGENTS_DIR/<id>.md`` and the ``agent.<id>`` section of
+    ``opencode.json`` unconditionally. So when two DIFFERENT profile files
+    resolve to the same id, whichever installs second silently overwrites the
+    first, and nothing tells the operator their profile is gone.
 
-    * the non-injective ``'/'`` -> ``'__'`` rewrite (name ``"a/b"`` and a
-      literal ``"a__b"`` both yield id ``a__b``); and
-    * two different files carrying the *identical* frontmatter ``name:`` (same
-      resolved string -> same id).
+    WHAT ACTUALLY COLLIDES. Two different files carrying the *identical*
+    frontmatter ``name:`` — same resolved string, same id. Nothing upstream of
+    this guard rejects that: ``name:`` need not match the file stem, so two
+    unrelated files can legitimately both say ``name: developer``.
+
+    NOT the ``'/'`` -> ``'__'`` collapse, which the original report was about.
+    That vector is dead on this path: :func:`_write_context_file` runs
+    ``validate_path_component`` on the resolved name earlier in the same
+    ``install_agent`` call, which rejects every path separator outright, so
+    ``"a/b"`` can no longer be installed at all and cannot collide with a literal
+    ``"a__b"``. For every name that *does* install, ``to_opencode_agent_id`` is
+    the identity, hence injective. The guard is kept for the same-``name:`` case
+    above, and remains correct if the separator rule is ever relaxed.
 
     Install runs one profile at a time, so this guard reconstructs the id-space
     the way installs actually populate it:
 
     * Discovery (:func:`list_agent_profiles`) keys profiles by file *stem*
-      (``source_name`` — never contains ``/``), which is the handle you pass to
-      ``cao install``.
+      (``source_name``), which is the handle you pass to ``cao install``.
     * The installed id, however, derives from the profile's *resolved name*
-      (frontmatter ``name:``, which MAY contain ``/``), not the stem.
+      (frontmatter ``name:``), not the stem — and the two need not agree.
 
     We resolve every OTHER installable profile's name and compare its id to the
     one being installed. Candidates are excluded by *stem* identity

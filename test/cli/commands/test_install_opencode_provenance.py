@@ -899,12 +899,27 @@ class TestContextFileModePreservation:
         mode = stat.S_IMODE(context_copy.stat().st_mode)
         assert mode == 0o644, oct(mode)
 
-    def test_brand_new_copy_uses_umask_default_not_hardcoded_0600(
+    def test_brand_new_copy_is_0600_and_a_permissive_umask_cannot_widen_it(
         self, runner: CliRunner, workspace: Dict[str, Any]
     ) -> None:
+        """A new context copy is 0o600 regardless of the ambient umask.
+
+        The context copy holds agent instruction content under
+        ``~/.aws/cli-agent-orchestrator/``, and the GHSA fix on ``main``
+        deliberately created it 0o600 rather than group/world readable. The temp
+        file is therefore created 0o600 outright instead of requesting 0o666 and
+        letting the umask subtract, which is what makes the result independent of
+        the umask rather than merely usually-correct.
+
+        umask 0o000 is the discriminating case: under a umask-derived mode this
+        would land 0o666, so this test fails if the hardening is ever traded back
+        for umask semantics. Reinstalls are a separate contract -- they preserve
+        whatever mode the target already has (see the test above), so CAO does not
+        silently re-tighten a mode an operator widened on purpose.
+        """
         _write_profile(workspace["local_store"] / "new-agent.md", name="new-agent")
 
-        old_umask = os.umask(0o022)
+        old_umask = os.umask(0o000)
         try:
             result = _install(runner, "new-agent")
         finally:
@@ -913,7 +928,10 @@ class TestContextFileModePreservation:
         assert result.exit_code == 0 and "Error:" not in result.output, result.output
         context_copy = workspace["context_dir"] / "new-agent.md"
         mode = stat.S_IMODE(context_copy.stat().st_mode)
-        assert mode == 0o644, oct(mode)
+        assert mode == 0o600, (
+            f"new context copy is {oct(mode)}, not 0o600: a permissive umask widened it, "
+            "so the mode is umask-derived rather than pinned"
+        )
 
 
 class TestReadOnlyContextDirErrorNamesRealTarget:

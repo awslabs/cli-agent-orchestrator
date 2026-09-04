@@ -700,22 +700,58 @@ class TestAgentIdCollisionGuard:
         assert r2.exit_code == 0 and "Error:" not in r2.output
         assert (install_workspace["agents_dir"] / "test-agent.md").exists()
 
-    def test_non_colliding_spaces_vs_dash_both_install(
+    def test_non_colliding_punctuation_variants_both_install(
         self, runner: CliRunner, install_workspace: Dict[str, Any]
     ):
-        """ "foo bar" and "foo-bar" do NOT collide (only '/' is rewritten)."""
+        """Names differing only by allowlisted punctuation do NOT collide.
+
+        ``to_opencode_agent_id`` rewrites separators and nothing else, so
+        ``foo.bar`` and ``foo-bar`` keep distinct ids and both install. This is the
+        guard's false-positive check: it must fire on a genuine id clash, not on
+        any two similar-looking names.
+
+        (This previously used ``"foo bar"`` versus ``"foo-bar"``. A space is no
+        longer a legal resolved name at all -- see
+        ``test_profile_name_with_a_space_is_rejected_before_any_id_is_derived`` --
+        so that pair could no longer reach the guard.)
+        """
         store = install_workspace["local_store"]
-        _write_profile(store / "foo-space.md", name="foo bar")
+        _write_profile(store / "foo-dot.md", name="foo.bar")
         _write_profile(store / "foo-dash.md", name="foo-bar")
 
-        r1 = runner.invoke(install, ["foo-space", "--provider", "opencode_cli"])
+        r1 = runner.invoke(install, ["foo-dot", "--provider", "opencode_cli"])
         r2 = runner.invoke(install, ["foo-dash", "--provider", "opencode_cli"])
 
-        assert r1.exit_code == 0 and "Error:" not in r1.output
-        assert r2.exit_code == 0 and "Error:" not in r2.output
+        assert r1.exit_code == 0 and "Error:" not in r1.output, r1.output
+        assert r2.exit_code == 0 and "Error:" not in r2.output, r2.output
         # Distinct ids => distinct files, both present.
-        assert (install_workspace["agents_dir"] / "foo bar.md").exists()
+        assert (install_workspace["agents_dir"] / "foo.bar.md").exists()
         assert (install_workspace["agents_dir"] / "foo-bar.md").exists()
+
+    def test_profile_name_with_a_space_is_rejected_before_any_id_is_derived(
+        self, runner: CliRunner, install_workspace: Dict[str, Any]
+    ):
+        """A resolved ``name:`` outside ``[A-Za-z0-9._-]`` fails the install.
+
+        Pins a behaviour the path-traversal hardening introduced on ``main``:
+        ``_write_context_file`` validates the resolved name with
+        ``validate_path_component`` before any provider sink runs, and that
+        allowlist rejects spaces as well as separators. The install fails cleanly
+        rather than writing a half-installed profile, and no agent file appears
+        under either the raw or a flattened spelling of the name.
+
+        This is what makes the collision guard's scope claim true -- the
+        separator-collapse vector cannot be reached from here -- so it is pinned
+        rather than left implicit.
+        """
+        _write_profile(install_workspace["local_store"] / "spacey.md", name="foo bar")
+
+        result = runner.invoke(install, ["spacey", "--provider", "opencode_cli"])
+
+        assert result.exit_code != 0 or "Error:" in result.output, result.output
+        agents_dir = install_workspace["agents_dir"]
+        assert not (agents_dir / "foo bar.md").exists()
+        assert not (agents_dir / "foo__bar.md").exists()
 
     def test_normal_single_profile_install_unaffected(
         self, runner: CliRunner, install_workspace: Dict[str, Any]
@@ -762,23 +798,49 @@ class TestAgentIdCollisionGuardInstalledProvenance:
         store = install_workspace_with_installed_dir["local_store"]
         _write_profile(store / "my-agent.md", name="resolved-agent", body="Resolved v1.")
 
-        first_agent_bytes = None
-        first_context_bytes = None
+        agent_seq = []
+        context_seq = []
         for _ in range(4):
             result = runner.invoke(install, ["my-agent", "--provider", "opencode_cli"])
-            assert result.exit_code == 0 and "Error:" not in result.output
+            assert result.exit_code == 0 and "Error:" not in result.output, result.output
 
-            agent_bytes = (
-                install_workspace_with_installed_dir["agents_dir"] / "resolved-agent.md"
-            ).read_bytes()
-            context_bytes = (
-                install_workspace_with_installed_dir["context_dir"] / "resolved-agent.md"
-            ).read_bytes()
-            if first_agent_bytes is None:
-                first_agent_bytes = agent_bytes
-                first_context_bytes = context_bytes
-            assert agent_bytes == first_agent_bytes
-            assert context_bytes == first_context_bytes
+            agent_seq.append(
+                (
+                    install_workspace_with_installed_dir["agents_dir"] / "resolved-agent.md"
+                ).read_bytes()
+            )
+            context_seq.append(
+                (
+                    install_workspace_with_installed_dir["context_dir"] / "resolved-agent.md"
+                ).read_bytes()
+            )
+
+        # The generated agent file is stable from the very first install.
+        assert len(set(agent_seq)) == 1, "agent file churns between reinstalls"
+
+        # The context copy CONVERGES after one install rather than being stable
+        # from the first, and that is a property of the install, not a slack
+        # assertion. Installing with an explicit --provider that differs from the
+        # profile's own materialises the choice into the local store
+        # (``write_profile`` with the resolved ``provider:`` added), which
+        # reserializes the frontmatter -- reordering keys and normalising trailing
+        # whitespace. The context copy is taken from that stored source, so cycle 1
+        # reads pre-stamp bytes and every later cycle reads post-stamp bytes.
+        # Asserting stability from cycle 2 onward still catches the failure that
+        # matters (a copy that keeps churning, e.g. a provenance marker appended
+        # afresh each time), while not demanding that the first install be a no-op
+        # on a store it is documented to update.
+        assert len(set(context_seq[1:])) == 1, (
+            "context copy never converges; it still differs after the provider stamp "
+            f"has settled: {context_seq[1:]!r}"
+        )
+        # Pin that the ONE permitted difference is the provider stamp and nothing
+        # else, so an unrelated change to cycle 1 does not hide here.
+        assert b"provider: opencode_cli" not in context_seq[0]
+        assert b"provider: opencode_cli" in context_seq[1]
+        # The provenance marker is present throughout and never duplicated.
+        for i, blob in enumerate(context_seq):
+            assert blob.count(b"x-cao-source-stem:") == 1, f"cycle {i}: {blob!r}"
 
     def test_different_local_profiles_with_same_agent_id_still_raise(
         self, runner: CliRunner, install_workspace_with_installed_dir: Dict[str, Any]

@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Fixed
+
+- refuse an OpenCode install that would silently overwrite another profile's agent
+  file, instead of letting the second install clobber the first (#493)
+
+### Changed
+
+- record the originating install handle in each shared context copy's frontmatter
+  (`x-cao-source-stem`), so a reinstall can tell its own prior copy apart from a
+  different profile that resolves to the same OpenCode agent id (#493)
+
+- write the shared context copy atomically, via a same-directory temporary file
+  and `os.replace`, so an interrupted install cannot leave a truncated copy; a new
+  copy is created `0o600` regardless of umask, and a reinstall preserves the
+  existing file's mode (#493)
+
 ## [2.5.0] - 2026-08-28
 
 ### Added
