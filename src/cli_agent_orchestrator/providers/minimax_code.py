@@ -26,6 +26,7 @@ from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 _PLUGIN_NAME = "cao-orchestrator"
 _PLUGIN_SERVER_NAME = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
+MINIMAX_CODE_MODEL_IDS = ("MiniMax-M3", "MiniMax-M2.7")
 _USER_LINE_PATTERN = re.compile(r"^\s*›[^\S\n]+(.*)$")
 _COMPLETION_LINE_PATTERN = re.compile(r"^\s*└\s+Completed in\s+\d", re.IGNORECASE)
 _COMPLETION_PATTERN = re.compile(r"(?:^|\n)\s*└\s+Completed in\s+\d", re.IGNORECASE)

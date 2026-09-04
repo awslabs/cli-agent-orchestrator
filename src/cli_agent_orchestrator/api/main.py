@@ -2702,6 +2702,8 @@ async def list_providers_endpoint() -> List[Dict]:
     """List available providers with installation status."""
     import shutil
 
+    from cli_agent_orchestrator.providers.minimax_code import MINIMAX_CODE_MODEL_IDS
+
     provider_binaries = {
         "kiro_cli": "kiro-cli",
         "claude_code": "claude",
@@ -2719,7 +2721,10 @@ async def list_providers_endpoint() -> List[Dict]:
     result = []
     for provider, binary in provider_binaries.items():
         installed = shutil.which(binary) is not None
-        result.append({"name": provider, "binary": binary, "installed": installed})
+        item = {"name": provider, "binary": binary, "installed": installed}
+        if provider == "mcode":
+            item["models"] = list(MINIMAX_CODE_MODEL_IDS)
+        result.append(item)
     return result
 
 
