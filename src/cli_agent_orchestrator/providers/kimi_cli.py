@@ -7,11 +7,15 @@ Key characteristics:
 - Command: ``kimi`` (installed via ``brew install kimi-cli`` or ``uv tool install kimi-cli``)
 - Idle prompt: ``💫`` (thinking mode, default) or ``✨`` (optionally prefixed with ``username@dirname``)
 - Processing: No idle prompt visible at bottom while the response is streaming
-- Response format: Bullet points prefixed with ``•`` (U+2022)
+- Response format: Bullet points prefixed with ``•`` (U+2022); Kimi Code
+  0.38+ renders response bullets as ``●`` (U+25CF) instead
 - Thinking output: Gray italic ``•`` bullets (ANSI color 38;5;244 + italic)
 - User input: Displayed in a bordered box using box-drawing characters (╭│╰)
 - Auto-approve: ``--yolo`` flag bypasses all tool action confirmations
-- Agent profiles: ``--agent-file FILE`` (YAML format, extends built-in 'default' agent)
+- Agent profiles: ``--agent-file FILE``. Legacy kimi-cli expects a YAML file
+  (extends built-in 'default' agent via ``system_prompt_path``); Kimi Code CLI
+  (MoonshotAI/kimi-code) expects a Markdown file with YAML frontmatter. The
+  installed variant is auto-detected from ``kimi --help``.
 - MCP config: ``--mcp-config TEXT`` (JSON configuration, repeatable flag)
 - Exit commands: ``/exit``, ``exit``, ``quit``, or Ctrl-D
 - Status bar: ``HH:MM [yolo] agent (model, thinking) ctrl-x: toggle mode context: X.X%``
@@ -33,6 +37,7 @@ import re
 import shlex
 import shutil
 import stat
+import subprocess
 import tempfile
 import threading
 import time
@@ -105,6 +110,18 @@ WELCOME_BANNER_PATTERN = r"Welcome to Kimi Code CLI!"
 # (persisted, so it does not recur until the next release).
 UPGRADE_PROMPT_PATTERN = r"Skip reminders for version|Upgrade now"
 
+# Kimi Code (MoonshotAI/kimi-code) workspace-trust dialog. When --mcp-config is
+# passed in a folder not previously trusted, kimi-code blocks BEFORE the REPL
+# asking whether to trust the workspace ("Project-level MCP servers are
+# disabled until you explicitly choose Trust"). CAO launches every instance in
+# a fresh per-instance temp dir, so with MCP servers configured the dialog
+# fires on EVERY launch and init times out unless answered. Answering "Trust
+# this folder" here is sound: the folder is CAO's own temp dir containing only
+# CAO-written files (agent.md / system.md), and the MCP config being enabled
+# is the one the operator's own profile declared. Approved by the operator
+# (Carlos, 2026-08-24) for the WaP fork.
+TRUST_PROMPT_PATTERN = r"Trust this folder"
+
 # User input box boundaries (pre-v1.20.0). Kimi displayed user messages in a bordered box:
 #   ╭──────────────────────────────╮
 #   │ user message text             │
@@ -124,7 +141,7 @@ PROMPT_WITH_INPUT_PATTERN = r"(?:\w+@[\w.-]+)?[✨💫][^\S\n]+\S"
 # To distinguish them in extraction, check ANSI styling in raw output:
 # - Thinking: gray italic (\x1b[38;5;244m• ... \x1b[3m\x1b[38;5;244m)
 # - Response: plain ``•`` without ANSI color prefix
-RESPONSE_BULLET_PATTERN = r"^•\s"
+RESPONSE_BULLET_PATTERN = r"^[•●]\s"
 
 # Thinking bullet detection in raw (ANSI-preserved) output.
 # Thinking lines use gray color (38;5;244) before the bullet character.
@@ -173,11 +190,13 @@ def _is_live_turn_spinner_line(line: str) -> bool:
     )
 
 
-# A response/thinking bullet ("• …") at line start. Its presence means a turn
+# A response/thinking bullet ("• …", or "● …" on Kimi Code 0.38+ — the
+# status bar's "agent (<model> ●)" is mid-line, so the line-start anchor
+# cannot false-match it) at line start. Its presence means a turn
 # has produced output — used to latch "input received" on the new TUI (the
 # welcome banner / update nag contain no "•", so this won't false-trigger at
 # init).
-ANY_BULLET_PATTERN = r"(?m)^\s*•"
+ANY_BULLET_PATTERN = r"(?m)^\s*[•●]"
 
 # Generic error patterns for detecting failure states in terminal output.
 ERROR_PATTERN = (
@@ -200,6 +219,10 @@ class KimiCliProvider(BaseProvider):
     # the config file causes race conditions and file corruption.
     _mcp_timeout_configured = False
 
+    # Class-level cache for the --agent-file format probe (one subprocess call
+    # per process, shared by concurrent provider instances).
+    _markdown_agent_file_cache: Optional[bool] = None
+
     # Class-level prompt regex shared between status detection
     # and ``extract_session_context``. Bounded quantifiers
     # (no unbounded ``*`` / ``+`` — defeats ReDoS on pathological pane bytes).
@@ -210,7 +233,7 @@ class KimiCliProvider(BaseProvider):
     _KIMI_PROMPT_RE = re.compile(r"(?:\w{1,32}@[\w.\-]{1,64})?[✨💫][^\S\n]{1,4}\S")
     # Response/thinking markers used to bound a user message line. Matches
     # the same ``• `` bullet the IDLE/PROCESSING path uses.
-    _KIMI_RESPONSE_MARKER_RE = re.compile(r"^•\s")
+    _KIMI_RESPONSE_MARKER_RE = re.compile(r"^[•●]\s")
 
     def __init__(
         self,
@@ -284,6 +307,29 @@ class KimiCliProvider(BaseProvider):
         except Exception:
             return None
 
+    @classmethod
+    def _agent_file_uses_markdown(cls) -> bool:
+        """Return True when the installed ``kimi`` binary is Kimi Code CLI.
+
+        Kimi Code CLI (MoonshotAI/kimi-code, successor of the wound-down
+        kimi-cli) expects ``--agent-file`` to be a Markdown agent definition
+        (YAML frontmatter + body as system prompt) and rejects the legacy YAML
+        format with "Missing frontmatter". Legacy kimi-cli expects the YAML
+        ``system_prompt_path`` format. Probed once per process from
+        ``kimi --help``: kimi-code's help describes ``--agent-file`` as loading
+        "from a Markdown file". Falls back to the legacy YAML format when the
+        probe fails, preserving pre-existing behavior.
+        """
+        if cls._markdown_agent_file_cache is None:
+            try:
+                result = subprocess.run(
+                    ["kimi", "--help"], capture_output=True, text=True, timeout=10
+                )
+                cls._markdown_agent_file_cache = "Markdown file" in (result.stdout + result.stderr)
+            except (OSError, subprocess.SubprocessError):
+                cls._markdown_agent_file_cache = False
+        return cls._markdown_agent_file_cache
+
     def _build_kimi_command(self) -> str:
         """Build Kimi CLI command with agent profile and MCP config if provided.
 
@@ -345,23 +391,46 @@ class KimiCliProvider(BaseProvider):
                     system_prompt = SECURITY_PROMPT + tool_constraint + system_prompt
 
                 if system_prompt:
-                    # Write the system prompt as a markdown file
-                    prompt_file = os.path.join(self._temp_dir, "system.md")
-                    with open(prompt_file, "w") as f:
-                        f.write(system_prompt)
+                    if self._agent_file_uses_markdown():
+                        # Kimi Code CLI: --agent-file is a Markdown agent
+                        # definition — YAML frontmatter (name/description)
+                        # with the body as the system prompt. json.dumps
+                        # yields valid YAML scalars, so no PyYAML dependency
+                        # is needed for quoting.
+                        # kimi-code validates the frontmatter name as
+                        # kebab-case (e.g. "code-reviewer"); CAO profile
+                        # names are snake_case, so normalize.
+                        raw_name = getattr(profile, "name", None) or "cao-agent"
+                        name = re.sub(r"[^a-z0-9]+", "-", str(raw_name).lower()).strip("-")
+                        name = name or "cao-agent"
+                        description = getattr(profile, "description", None) or "CAO-managed agent"
+                        header = (
+                            "---\n"
+                            f"name: {json.dumps(name)}\n"
+                            f"description: {json.dumps(description)}\n"
+                            "---\n\n"
+                        )
+                        agent_file = os.path.join(self._temp_dir, "agent.md")
+                        with open(agent_file, "w") as f:
+                            f.write(header + system_prompt)
+                    else:
+                        # Legacy kimi-cli: YAML agent file that extends the
+                        # default agent and points to a separate markdown
+                        # system prompt. Plain strings avoid a PyYAML
+                        # dependency.
+                        prompt_file = os.path.join(self._temp_dir, "system.md")
+                        with open(prompt_file, "w") as f:
+                            f.write(system_prompt)
 
-                    # Create the agent YAML that extends the default agent
-                    # and points to our custom system prompt file.
-                    # Written as plain string to avoid adding PyYAML dependency.
-                    agent_yaml = (
-                        "version: 1\n"
-                        "agent:\n"
-                        "  extend: default\n"
-                        "  system_prompt_path: ./system.md\n"
-                    )
-                    agent_file = os.path.join(self._temp_dir, "agent.yaml")
-                    with open(agent_file, "w") as f:
-                        f.write(agent_yaml)
+                        agent_yaml = (
+                            "version: 1\n"
+                            "agent:\n"
+                            "  extend: default\n"
+                            "  system_prompt_path: ./system.md\n"
+                        )
+                        agent_file = os.path.join(self._temp_dir, "agent.yaml")
+                        with open(agent_file, "w") as f:
+                            f.write(agent_yaml)
 
                     command_parts.extend(["--agent-file", agent_file])
 
@@ -395,7 +464,21 @@ class KimiCliProvider(BaseProvider):
                             env["CAO_TERMINAL_ID"] = self.terminal_id
                             mcp_config[server_name]["env"] = env
 
-                    command_parts.extend(["--mcp-config", json.dumps(mcp_config)])
+                    if self._agent_file_uses_markdown():
+                        # Kimi Code CLI has no --mcp-config flag; it reads
+                        # project-local MCP from <cwd>/.kimi-code/mcp.json
+                        # ({"mcpServers": {...}}). The provider already cd's
+                        # into its per-instance temp dir, so the file is
+                        # scoped to this terminal only. Enabling these
+                        # project-level servers is what triggers the
+                        # workspace-trust dialog answered in
+                        # _handle_startup_dialog.
+                        kimi_code_dir = os.path.join(self._temp_dir, ".kimi-code")
+                        os.makedirs(kimi_code_dir, exist_ok=True)
+                        with open(os.path.join(kimi_code_dir, "mcp.json"), "w") as f:
+                            json.dump({"mcpServers": mcp_config}, f, indent=2)
+                    else:
+                        command_parts.extend(["--mcp-config", json.dumps(mcp_config)])
 
             except Exception as e:
                 raise ProviderError(
@@ -527,6 +610,7 @@ class KimiCliProvider(BaseProvider):
         last_prompt_time = time.monotonic()
         any_prompt_handled = False
         upgrade_dismissed = False
+        trust_answered = False
         while True:
             now = time.monotonic()
             if now >= outer_deadline:
@@ -539,6 +623,34 @@ class KimiCliProvider(BaseProvider):
             )
             if output:
                 clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
+                # Answer the kimi-code workspace-trust dialog once (same
+                # linger-in-buffer consideration as the upgrade dialog below).
+                # See TRUST_PROMPT_PATTERN for why answering it is sound here.
+                if not trust_answered and re.search(TRUST_PROMPT_PATTERN, clean_output):
+                    from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+                    logger.info("Kimi Code workspace-trust dialog detected, trusting CAO temp dir")
+                    status_monitor.notify_input_sent(self.terminal_id)
+                    # Menu cursor defaults to "Don't trust"; Up selects
+                    # "Trust this folder", Enter confirms (validated manually
+                    # against kimi-code 0.38 in tmux).
+                    await asyncio.to_thread(
+                        get_backend().send_special_key,
+                        self.session_name,
+                        self.window_name,
+                        "Up",
+                    )
+                    await asyncio.to_thread(
+                        get_backend().send_special_key,
+                        self.session_name,
+                        self.window_name,
+                        "Enter",
+                    )
+                    trust_answered = True
+                    any_prompt_handled = True
+                    last_prompt_time = time.monotonic()  # reset idle timer
+                    await asyncio.sleep(1.0)
+                    continue
                 # Answer the upgrade dialog once; its text lingers in the buffer
                 # after dismissal, so the flag stops a re-answer on later polls.
                 if not upgrade_dismissed and re.search(UPGRADE_PROMPT_PATTERN, clean_output):
@@ -722,7 +834,7 @@ class KimiCliProvider(BaseProvider):
                 default=-1,
             )
             last_bullet = max(
-                (i for i, line in enumerate(lines) if re.match(r"\s*•", line)),
+                (i for i, line in enumerate(lines) if re.match(r"\s*[•●]", line)),
                 default=-1,
             )
             spinner_in_tail = last_spinner >= 0 and last_spinner >= len(lines) - 15
@@ -866,7 +978,7 @@ class KimiCliProvider(BaseProvider):
         if any(
             re.search(r"connecting to mcp servers|\(connecting\)", ln, re.IGNORECASE)
             for ln in rows
-            if not re.match(r"\s*•", ln)
+            if not re.match(r"\s*[•●]", ln)
         ):
             return TerminalStatus.PROCESSING
 

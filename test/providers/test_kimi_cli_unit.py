@@ -95,14 +95,15 @@ class TestKimiCliProviderInitialization:
             await provider.initialize()
 
     @pytest.mark.asyncio
+    @patch.object(KimiCliProvider, "_agent_file_uses_markdown", return_value=False)
     @patch("cli_agent_orchestrator.providers.kimi_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.kimi_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
     async def test_initialize_with_agent_profile(
-        self, mock_load, mock_tmux, mock_wait_shell, mock_wait_status
+        self, mock_load, mock_tmux, mock_wait_shell, mock_wait_status, _mock_md
     ):
-        """Test initialization with agent profile creates temp files."""
+        """Test initialization with agent profile creates temp files (legacy kimi-cli)."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
         mock_profile = MagicMock()
@@ -121,9 +122,161 @@ class TestKimiCliProviderInitialization:
         command = call_args[0][2]
         assert "--agent-file" in command
         assert "--yolo" in command
+        # Legacy format: YAML agent file + separate system.md
+        assert "agent.yaml" in command
+        assert os.path.exists(os.path.join(provider._temp_dir, "system.md"))
 
         # Cleanup temp files
         provider.cleanup()
+
+    @pytest.mark.asyncio
+    @patch.object(KimiCliProvider, "_agent_file_uses_markdown", return_value=True)
+    @patch("cli_agent_orchestrator.providers.kimi_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.kimi_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
+    @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
+    async def test_initialize_with_agent_profile_kimi_code_markdown(
+        self, mock_load, mock_tmux, mock_wait_shell, mock_wait_status, _mock_md
+    ):
+        """Kimi Code CLI expects --agent-file as Markdown with YAML frontmatter.
+
+        The legacy YAML format is rejected by kimi-code with
+        'Missing frontmatter', so the provider must emit
+        frontmatter + system prompt body instead.
+        """
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
+        mock_profile = MagicMock()
+        mock_profile.name = "dev_worker"
+        mock_profile.description = "Implements scoped code changes"
+        mock_profile.model = None
+        mock_profile.system_prompt = "You are a helpful assistant"
+        mock_profile.mcpServers = None
+        mock_profile.provider_init_timeout = None
+        mock_load.return_value = mock_profile
+
+        provider = KimiCliProvider("term-1", "session-1", "window-1", agent_profile="developer")
+        result = await provider.initialize()
+        assert result is True
+
+        call_args = mock_tmux.return_value.send_keys.call_args
+        command = call_args[0][2]
+        assert "--agent-file" in command
+        assert "agent.md" in command
+        assert "agent.yaml" not in command
+
+        agent_file = os.path.join(provider._temp_dir, "agent.md")
+        with open(agent_file) as f:
+            content = f.read()
+        assert content.startswith("---\n")
+        assert '"dev-worker"' in content
+        # snake_case CAO profile names must be normalized to kebab-case
+        # (kimi-code rejects e.g. "smoke_kimi": 'expected kebab-case').
+        assert '"Implements scoped code changes"' in content
+        assert content.rstrip().endswith("You are a helpful assistant")
+
+        # Cleanup temp files
+        provider.cleanup()
+
+    @pytest.mark.asyncio
+    @patch.object(KimiCliProvider, "_agent_file_uses_markdown", return_value=True)
+    @patch("cli_agent_orchestrator.providers.kimi_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.kimi_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
+    @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
+    async def test_initialize_with_mcp_servers_kimi_code_writes_project_file(
+        self, mock_load, mock_tmux, mock_wait_shell, mock_wait_status, _mock_md
+    ):
+        """Kimi Code CLI has no --mcp-config flag: MCP servers go to the
+        per-instance temp dir as .kimi-code/mcp.json ({"mcpServers": ...}),
+        with CAO_TERMINAL_ID injected into each server's env."""
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
+        mock_profile = MagicMock()
+        mock_profile.name = "dev_worker"
+        mock_profile.description = "desc"
+        mock_profile.model = None
+        mock_profile.system_prompt = "You are a helpful assistant"
+        mock_profile.mcpServers = {
+            "cao-mcp-server": {"command": "npx", "args": ["-y", "cao-mcp-server"]}
+        }
+        mock_profile.provider_init_timeout = None
+        mock_load.return_value = mock_profile
+
+        provider = KimiCliProvider("term-1", "session-1", "window-1", agent_profile="developer")
+        with patch(
+            "cli_agent_orchestrator.providers.kimi_cli.Path.home",
+            return_value=Path(tempfile.mkdtemp()),
+        ):
+            result = await provider.initialize()
+        assert result is True
+
+        command = mock_tmux.return_value.send_keys.call_args[0][2]
+        assert "--mcp-config" not in command
+
+        import json as _json
+
+        mcp_path = os.path.join(provider._temp_dir, ".kimi-code", "mcp.json")
+        with open(mcp_path) as f:
+            data = _json.load(f)
+        server = data["mcpServers"]["cao-mcp-server"]
+        assert server["env"]["CAO_TERMINAL_ID"] == "term-1"
+
+        provider.cleanup()
+
+    def test_get_status_new_tui_black_circle_bullet_completes(self):
+        """Kimi Code 0.38+ renders response bullets as ● (U+25CF), not •.
+
+        Without accepting ●, _has_received_input never latches on the new
+        TUI, the terminal reads IDLE forever after answering, and handoff
+        completion/extraction never fires (observed live: worker replied
+        '● SMOKE-OK' and stayed idle).
+        """
+        provider = KimiCliProvider("t-tui", "sess", "win")
+        screen = (
+            " ● SMOKE-OK\n"
+            " ╭──────────╮\n"
+            " │ >        │\n"
+            " ╰──────────╯\n"
+            " yolo  agent (kimi-k2.5 ●)  /tmp/x\n"
+            "                        context: 12% (29.5k/256k)\n"
+        )
+        assert provider.get_status(screen) == TerminalStatus.COMPLETED
+
+    def test_get_status_new_tui_status_bar_circle_alone_is_idle(self):
+        """The status bar's own ● ('agent (<model> ●)') is mid-line and must
+        NOT latch input — a freshly booted terminal stays IDLE."""
+        provider = KimiCliProvider("t-tui2", "sess", "win")
+        screen = (
+            " ╭──────────╮\n"
+            " │ >        │\n"
+            " ╰──────────╯\n"
+            " yolo  agent (kimi-k2.5 ●)  /tmp/x\n"
+            "                        context: 0% (0/256k)\n"
+        )
+        assert provider.get_status(screen) == TerminalStatus.IDLE
+
+    def test_agent_file_probe_detects_kimi_code_help(self):
+        """The probe keys off kimi-code's '--agent-file ... Markdown file' help text."""
+        KimiCliProvider._markdown_agent_file_cache = None
+        try:
+            fake = MagicMock()
+            fake.stdout = "--agent-file <path>  Load an agent definition from a Markdown file"
+            fake.stderr = ""
+            with patch(
+                "cli_agent_orchestrator.providers.kimi_cli.subprocess.run",
+                return_value=fake,
+            ):
+                assert KimiCliProvider._agent_file_uses_markdown() is True
+
+            KimiCliProvider._markdown_agent_file_cache = None
+            with patch(
+                "cli_agent_orchestrator.providers.kimi_cli.subprocess.run",
+                side_effect=OSError("kimi not found"),
+            ):
+                assert KimiCliProvider._agent_file_uses_markdown() is False
+        finally:
+            KimiCliProvider._markdown_agent_file_cache = None
 
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
     def test_initialize_with_invalid_profile(self, mock_load):
@@ -135,14 +288,15 @@ class TestKimiCliProviderInitialization:
             provider._build_kimi_command()
 
     @pytest.mark.asyncio
+    @patch.object(KimiCliProvider, "_agent_file_uses_markdown", return_value=False)
     @patch("cli_agent_orchestrator.providers.kimi_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.kimi_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
     async def test_initialize_with_mcp_servers(
-        self, mock_load, mock_tmux, mock_wait_shell, mock_wait_status
+        self, mock_load, mock_tmux, mock_wait_shell, mock_wait_status, _mock_md
     ):
-        """Test initialization with MCP servers in profile adds --mcp-config and modifies config.toml."""
+        """Test initialization with MCP servers in profile adds --mcp-config and modifies config.toml (legacy kimi-cli)."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
         mock_profile = MagicMock()
@@ -558,8 +712,9 @@ class TestKimiCliProviderBuildCommand:
         assert provider._temp_dir is not None
         provider.cleanup()
 
+    @patch.object(KimiCliProvider, "_agent_file_uses_markdown", return_value=False)
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
-    def test_build_command_with_system_prompt(self, mock_load):
+    def test_build_command_with_system_prompt(self, mock_load, _mock_md):
         """Test command with agent profile containing system prompt."""
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -579,8 +734,9 @@ class TestKimiCliProviderBuildCommand:
         # Cleanup
         provider.cleanup()
 
+    @patch.object(KimiCliProvider, "_agent_file_uses_markdown", return_value=False)
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
-    def test_build_command_with_mcp_config(self, mock_load, tmp_path):
+    def test_build_command_with_mcp_config(self, mock_load, _mock_md, tmp_path):
         """Test command with MCP server configuration including CAO_TERMINAL_ID injection."""
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -601,8 +757,9 @@ class TestKimiCliProviderBuildCommand:
         # No --config flag (modifies config.toml directly to avoid breaking OAuth)
         assert "--config" not in command
 
+    @patch.object(KimiCliProvider, "_agent_file_uses_markdown", return_value=False)
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
-    def test_build_command_resolves_bundled_mcp_command(self, mock_load, tmp_path):
+    def test_build_command_resolves_bundled_mcp_command(self, mock_load, _mock_md, tmp_path):
         """The bare cao-mcp-server command is resolved to a PATH-independent
         invocation in the emitted --mcp-config JSON (wiring guard: a refactor
         that drops the resolve_mcp_server_config call must fail this test)."""
@@ -626,8 +783,9 @@ class TestKimiCliProviderBuildCommand:
         assert "/venv/bin/cao-mcp-server" in command
         provider.cleanup()
 
+    @patch.object(KimiCliProvider, "_agent_file_uses_markdown", return_value=False)
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
-    def test_build_command_creates_agent_yaml(self, mock_load):
+    def test_build_command_creates_agent_yaml(self, mock_load, _mock_md):
         """Test that agent YAML and system prompt files are created correctly."""
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -656,8 +814,9 @@ class TestKimiCliProviderBuildCommand:
         # Cleanup
         provider.cleanup()
 
+    @patch.object(KimiCliProvider, "_agent_file_uses_markdown", return_value=False)
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
-    def test_build_command_with_pydantic_mcp_config(self, mock_load):
+    def test_build_command_with_pydantic_mcp_config(self, mock_load, _mock_md):
         """Test command with MCP servers as Pydantic model objects."""
         mock_server = MagicMock()
         mock_server.model_dump.return_value = {"command": "node", "args": ["server.js"]}
@@ -678,8 +837,9 @@ class TestKimiCliProviderBuildCommand:
         # CAO_TERMINAL_ID should be injected into MCP server env
         assert "CAO_TERMINAL_ID" in command
 
+    @patch.object(KimiCliProvider, "_agent_file_uses_markdown", return_value=False)
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
-    def test_build_command_mcp_preserves_existing_env(self, mock_load):
+    def test_build_command_mcp_preserves_existing_env(self, mock_load, _mock_md):
         """Test that CAO_TERMINAL_ID injection preserves existing env vars."""
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -706,8 +866,9 @@ class TestKimiCliProviderBuildCommand:
         assert config["test-server"]["env"]["MY_VAR"] == "my_value"
         assert config["test-server"]["env"]["CAO_TERMINAL_ID"] == "abc123"
 
+    @patch.object(KimiCliProvider, "_agent_file_uses_markdown", return_value=False)
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
-    def test_build_command_mcp_does_not_override_existing_terminal_id(self, mock_load):
+    def test_build_command_mcp_does_not_override_existing_terminal_id(self, mock_load, _mock_md):
         """Test that existing CAO_TERMINAL_ID in env is not overwritten."""
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -804,8 +965,9 @@ class TestKimiCliProviderBuildCommand:
         # Second instance should NOT have modified config (flag was already set)
         assert "tool_call_timeout_ms = 60000" in config_file.read_text()
 
+    @patch.object(KimiCliProvider, "_agent_file_uses_markdown", return_value=False)
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
-    def test_build_command_no_timeout_without_mcp(self, mock_load, tmp_path):
+    def test_build_command_no_timeout_without_mcp(self, mock_load, _mock_md, tmp_path):
         """Test that MCP tool timeout is NOT modified when no MCP servers are configured."""
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -829,8 +991,9 @@ class TestKimiCliProviderBuildCommand:
         assert "tool_call_timeout_ms = 60000" in config_file.read_text()
         provider.cleanup()
 
+    @patch.object(KimiCliProvider, "_agent_file_uses_markdown", return_value=False)
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
-    def test_mcp_timeout_config_missing(self, mock_load, tmp_path):
+    def test_mcp_timeout_config_missing(self, mock_load, _mock_md, tmp_path):
         """Test graceful handling when ~/.kimi/config.toml doesn't exist."""
         mock_profile = MagicMock()
         mock_profile.model = None
