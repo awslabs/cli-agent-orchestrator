@@ -441,30 +441,36 @@ class TestMissingMarkerPreExistingInstalls:
         assert legacy_copy.read_text() == first_context
         assert not (workspace["agents_dir"] / "shared.md").exists()
 
-    def test_legacy_slash_trap_still_raises_without_marker(
+    def test_legacy_slash_trap_is_now_refused_by_the_name_check_not_the_guard(
         self, runner: CliRunner, workspace: Dict[str, Any]
     ) -> None:
-        """The '/'->'__' collision still raises even with a marker-less sibling.
+        """The ``'/'``->``'__'`` trap is closed one layer earlier than this suite.
 
-        The colliding sibling is a local-store file (source 'local', never
-        'installed'), so the provenance fallback does not apply to it and the
-        normal collision path fires.
+        This test used to prove the collision guard caught a slash-named profile
+        colliding with a literal ``a__b``. It cannot reach the guard any more: the
+        resolved name is validated before any id is derived, so the install is
+        refused for containing a separator. Kept, rather than deleted, because the
+        *outcome* it protects is still the point -- the occupant is not overwritten
+        -- and pinning WHICH layer refuses is what stops the dead vector coming back
+        unnoticed if that validation is ever relaxed.
         """
         store = workspace["local_store"]
-        # Literal 'a__b' sibling installs first, alone.
+        # Literal 'a__b' sibling installs first, alone, and owns the id.
         _write_profile(store / "a__b.md", name="a__b")
         r1 = _install(runner, "a__b")
         assert r1.exit_code == 0 and "Error:" not in r1.output, r1.output
+        occupant = workspace["agents_dir"] / "a__b.md"
+        occupant_before = occupant.read_text()
 
-        # A slash-named profile ('a/b' -> id 'a__b') appears later and collides.
+        # A slash-named profile ('a/b' -> would be id 'a__b') appears later.
         _write_profile(store / "slash-named.md", name="a/b")
-        # This pre-creates the slash-name context parent because a separate
-        # _write_context_file defect still affects successful slash-name writes.
-        (workspace["context_dir"] / "a").mkdir(parents=True, exist_ok=True)
         r2 = _install(runner, "slash-named")
+
         assert r2.exit_code == 0  # failure result, not a crash
         assert "Error:" in r2.output, r2.output
-        assert "a__b" in r2.output
+        assert "path separator" in r2.output, r2.output
+        assert "cannot share an OpenCode agent id" not in r2.output
+        assert occupant.read_text() == occupant_before
 
 
 class TestNonOpenCodeContextWrites:

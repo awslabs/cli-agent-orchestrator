@@ -704,15 +704,26 @@ def _guard_opencode_agent_id_collision(source_name: str, profile_name: str) -> N
     * The installed id, however, derives from the profile's *resolved name*
       (frontmatter ``name:``), not the stem — and the two need not agree.
 
-    We resolve every OTHER installable profile's name and compare its id to the
-    one being installed. Candidates are excluded by *stem* identity
-    (``source_name``), so every remaining entry is a genuinely different file on
-    disk: any id match is a real collision — even when the two resolved names
-    are byte-for-byte identical. That same-resolved-name case must still be
-    caught, so the exclusion keys on stem (not resolved name) and the guard
-    raises :class:`OpenCodeAgentIdCollisionError` (a ``ValueError``) as soon as a
-    different file's id matches. The raised message names both profiles by stem
-    and resolved name so an operator can find and rename one.
+    We resolve every other INSTALLED profile's name and compare its id to the one
+    being installed. Two exclusions, for different reasons:
+
+    * by *stem* identity (``source_name``), so a profile never collides with
+      itself. Keying on stem rather than resolved name is what still catches a
+      genuinely different file whose ``name:`` is byte-for-byte identical — the
+      case a plain name-string dedup would swallow.
+    * by *occupancy*: only candidates that have actually been installed are
+      considered, because only an install writes ``<id>.md``, and only a written
+      file can be overwritten. A packaged built-in or an uninstalled local-store
+      profile that merely *would* produce this id owns nothing yet. Nothing is
+      missed by waiting — installing writes a provenance-stamped context copy, so
+      taking the id is exactly what makes a profile visible to this check — and
+      the pre-emptive alternative refused every install whose ``name:`` matched
+      one of CAO's six built-ins, including the ordinary case of customising a
+      built-in under your own filename.
+
+    The guard raises :class:`OpenCodeAgentIdCollisionError` (a ``ValueError``) as
+    soon as a surviving candidate's id matches, naming both profiles by stem and
+    resolved name so an operator can find and rename one.
 
     **Own-copy exception.** ``_write_context_file`` writes each
     opencode install's shared context copy to
@@ -722,10 +733,12 @@ def _guard_opencode_agent_id_collision(source_name: str, profile_name: str) -> N
     that copy as a separate ``source == "installed"`` candidate whose id
     necessarily equals the target id, so a naive guard would flag a profile
     against its OWN prior copy and permanently break reinstall/upgrade. We must
-    NOT fix this by blanket-excluding ``source == "installed"``: that reopens
-    the silent-overwrite bug (install A → ``cao profile remove A`` drops only
-    the local-store copy, leaving A's installed artifact → install a DIFFERENT
-    profile B with a colliding id → B clobbers A with no error). Instead each
+    NOT fix this by blanket-excluding ``source == "installed"`` — that is the one
+    source this guard cannot afford to skip, since it is the only one that owns an
+    id — and doing so reopens the silent-overwrite bug (install A → ``cao profile
+    remove A`` drops only the local-store copy, leaving A's installed artifact →
+    install a DIFFERENT profile B with a colliding id → B clobbers A with no
+    error). Instead each
     installed copy carries a provenance marker (``_CONTEXT_SOURCE_STEM_KEY``)
     recording the original install stem, and an installed candidate is skipped
     ONLY when that marker proves it is this very profile's prior copy. A missing
@@ -759,8 +772,28 @@ def _guard_opencode_agent_id_collision(source_name: str, profile_name: str) -> N
         # catching a *different* file that resolves to the same name.
         if not stem or stem == source_name:
             continue
+        # OCCUPANCY, not mere discoverability. Only a candidate that has actually
+        # been INSTALLED owns the agent id: installing is what writes
+        # OPENCODE_AGENTS_DIR/<id>.md, so that is the only thing a second install
+        # can overwrite. A packaged built-in or an uninstalled local-store profile
+        # that merely *would* produce this id occupies nothing, and refusing on it
+        # blocks installs that destroy no data.
+        #
+        # This is not a hole. Installing always writes a context copy carrying the
+        # provenance marker, so the moment a profile takes the id it becomes an
+        # "installed" candidate here and the next colliding install is caught. The
+        # guard therefore fires exactly when there is something to lose, one
+        # install later than the pre-emptive form -- and that form was untenable:
+        # CAO ships six built-in profiles, so it refused every install whose
+        # resolved name: matched code_supervisor, developer, memory_manager,
+        # retrospector, reviewer or workflow_scout. Copying a built-in, editing it
+        # and installing it under your own filename is an ordinary workflow, and
+        # ``test_legitimate_name_still_installs`` (added with the path-traversal
+        # fix) pins that ``name: developer`` must install.
+        if candidate_source != "installed":
+            continue
         if not candidate.get("loadable", True):
-            if candidate_source == "installed" and to_opencode_agent_id(stem) == target_id:
+            if to_opencode_agent_id(stem) == target_id:
                 _raise_unloadable_installed_collision(
                     target_id,
                     source_name,
@@ -772,7 +805,7 @@ def _guard_opencode_agent_id_collision(source_name: str, profile_name: str) -> N
             raw = _read_agent_profile_source(stem)
             resolved_name = parse_agent_profile_text(raw, stem).name
         except Exception as exc:
-            if candidate_source == "installed" and to_opencode_agent_id(stem) == target_id:
+            if to_opencode_agent_id(stem) == target_id:
                 _raise_unloadable_installed_collision(
                     target_id,
                     source_name,
@@ -782,27 +815,27 @@ def _guard_opencode_agent_id_collision(source_name: str, profile_name: str) -> N
             logger.debug("Skipping unreadable profile '%s' in collision check: %s", stem, exc)
             continue
 
-        # Own-copy exception: installed-dir candidates need provenance
-        # checks before we can determine if they're a collision. Check provenance
-        # BEFORE the id check so we skip self-copies early.
+        # Own-copy exception: an installed candidate needs its provenance checked
+        # before it can count as a collision. Checked BEFORE the id comparison so
+        # self-copies are skipped early.
         provenance_stem: Optional[str] = None
-        candidate_path: Optional[Path] = None
-        if candidate_source == "installed":
-            candidate_path = _installed_context_copy_path(stem)
-            try:
-                provenance_stem = _context_source_stem(raw)
-                # Marker present and matches: this is our own prior copy.
-                if provenance_stem == source_name:
-                    continue
-            except Exception as exc:
-                if to_opencode_agent_id(stem) == target_id:
-                    _raise_unloadable_installed_collision(
-                        target_id,
-                        source_name,
-                        profile_name,
-                        candidate_path,
-                    )
-                logger.debug("Could not read installed-profile provenance for '%s': %s", stem, exc)
+        # Not Optional any more: the occupancy filter above means every candidate
+        # reaching this point is an installed one, so it always has a copy path.
+        candidate_path: Path = _installed_context_copy_path(stem)
+        try:
+            provenance_stem = _context_source_stem(raw)
+            # Marker present and matches: this is our own prior copy.
+            if provenance_stem == source_name:
+                continue
+        except Exception as exc:
+            if to_opencode_agent_id(stem) == target_id:
+                _raise_unloadable_installed_collision(
+                    target_id,
+                    source_name,
+                    profile_name,
+                    candidate_path,
+                )
+            logger.debug("Could not read installed-profile provenance for '%s': %s", stem, exc)
 
         # Now check if this is an actual id collision.
         if to_opencode_agent_id(resolved_name) != target_id:
@@ -812,11 +845,11 @@ def _guard_opencode_agent_id_collision(source_name: str, profile_name: str) -> N
         # maps to the same agent id. Raising here (keyed on stem, not resolved
         # name) catches the same-resolved-name-different-file case that a plain
         # name-string dedup would swallow.
-        existing_profile = f"'{stem}.md'"
-        recovery = ""
-        if candidate_source == "installed" and candidate_path is not None:
-            existing_profile = _installed_profile_display(stem, provenance_stem, candidate_path)
-            recovery = f" {_installed_context_copy_remedy(candidate_path)}"
+        # Every candidate reaching here is an installed one (see the occupancy
+        # filter above), so the message always names the installed artifact and
+        # carries its recovery hint.
+        existing_profile = _installed_profile_display(stem, provenance_stem, candidate_path)
+        recovery = f" {_installed_context_copy_remedy(candidate_path)}"
 
         raise OpenCodeAgentIdCollisionError(
             f"OpenCode agent id '{target_id}' is produced by both the profile "

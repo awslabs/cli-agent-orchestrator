@@ -9,8 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- refuse an OpenCode install that would silently overwrite another profile's agent
-  file, instead of letting the second install clobber the first (#493)
+- refuse an OpenCode install that would silently overwrite an already-installed
+  profile's agent file, instead of letting the second install clobber the first
+  (#493). A profile that merely *could* produce the same agent id — a packaged
+  built-in, or a local-store profile that has not been installed — does not block
+  the install, since it owns no file yet; installing a profile whose `name:`
+  matches one of the built-ins therefore still works
 
 ### Changed
 

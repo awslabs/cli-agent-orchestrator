@@ -52,8 +52,16 @@ def install_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Dict[s
     monkeypatch.setattr(
         "cli_agent_orchestrator.utils.opencode_config.OPENCODE_CONFIG_FILE", opencode_config
     )
+    # ``cao_installed`` must point at this workspace's context dir, not be absent.
+    # Its real default IS ``AGENT_CONTEXT_DIR`` (see settings_service._DEFAULTS), so
+    # an empty dict is not a neutral stub -- it is a configuration production never
+    # has, in which discovery surfaces no ``source == "installed"`` profiles at all.
+    # The collision guard keys on exactly those (only an installed profile owns an
+    # agent id), so leaving this empty silently disables the guard and every
+    # collision test passes for the wrong reason.
     monkeypatch.setattr(
-        "cli_agent_orchestrator.services.settings_service.get_agent_dirs", lambda: {}
+        "cli_agent_orchestrator.services.settings_service.get_agent_dirs",
+        lambda: {"cao_installed": str(context_dir)},
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", lambda: []
@@ -611,29 +619,46 @@ class TestAgentIdCollisionGuard:
     ``agent.a__b`` config. The guard turns that into a clean CLI error.
     """
 
-    def test_real_collision_fails_and_names_both_profiles(
+    def test_slash_collapse_collision_is_unreachable_because_the_name_is_refused(
         self, runner: CliRunner, install_workspace: Dict[str, Any]
     ):
+        """The originally-reported ``'/'``->``'__'`` collision cannot happen here.
+
+        ``"a/b"`` and a literal ``"a__b"`` do both map to the id ``a__b``, but a
+        resolved name containing a separator no longer survives the install:
+        ``_write_context_file`` validates it earlier in the same ``install_agent``
+        call. So the install is refused for the *name*, not for a collision, and the
+        pre-existing ``a__b`` profile is never at risk.
+
+        Asserting the mechanism matters, because "install refused" alone would pass
+        for either reason and this is the claim the guard's scope now rests on: if
+        the separator rule is ever relaxed, this test fails and points at the guard
+        rather than letting the dead vector quietly come back to life.
+        """
         store = install_workspace["local_store"]
-        # A sibling profile that literally occupies the "a__b" id.
+        # A sibling profile that literally occupies the "a__b" id, installed first.
         _write_profile(store / "a__b.md", name="a__b")
-        # The profile we install has frontmatter name "a/b" -> id "a__b".
+        r1 = runner.invoke(install, ["a__b", "--provider", "opencode_cli"])
+        assert r1.exit_code == 0 and "Error:" not in r1.output, r1.output
+        occupant = install_workspace["agents_dir"] / "a__b.md"
+        assert occupant.exists()
+        occupant_before = occupant.read_text()
+
+        # The profile we install has frontmatter name "a/b" -> would be id "a__b".
         # File stem must be a legal source name; the '/' lives in frontmatter.
         _write_profile(store / "slash-named.md", name="a/b")
-        # profile.name "a/b" → context path context_dir/a/b.md; pre-create the
-        # intermediate dir so the context write (which runs before the provider
-        # branch) doesn't fail before the collision guard is reached.
-        (install_workspace["context_dir"] / "a").mkdir(parents=True, exist_ok=True)
 
         result = runner.invoke(install, ["slash-named", "--provider", "opencode_cli"])
 
         assert result.exit_code == 0  # install_agent returns a failure result, not a crash
         assert "Error:" in result.output
-        assert "a/b" in result.output and "a__b" in result.output
-        # The colliding profile must NOT have been written under the shared id.
-        # Only the pre-existing sibling (if installed) could own a__b.md; the
-        # slash-named install must be refused before writing.
-        assert not (install_workspace["agents_dir"] / "a__b.md").exists()
+        # Refused by the name validation, naming the offending value...
+        assert "path separator" in result.output, result.output
+        assert "a/b" in result.output
+        # ...and NOT by the collision guard, which never saw it.
+        assert "cannot share an OpenCode agent id" not in result.output
+        # The occupant is untouched.
+        assert occupant.read_text() == occupant_before
 
     def test_same_resolved_name_different_stem_fails_and_preserves_first(
         self, runner: CliRunner, install_workspace: Dict[str, Any]
@@ -842,20 +867,42 @@ class TestAgentIdCollisionGuardInstalledProvenance:
         for i, blob in enumerate(context_seq):
             assert blob.count(b"x-cao-source-stem:") == 1, f"cycle {i}: {blob!r}"
 
-    def test_different_local_profiles_with_same_agent_id_still_raise(
+    def test_an_uninstalled_local_twin_does_not_block_but_owning_the_id_does(
         self, runner: CliRunner, install_workspace_with_installed_dir: Dict[str, Any]
     ):
+        """The guard fires on OCCUPANCY, so it blocks one install later than before.
+
+        ``profile-a`` and ``profile-b`` both resolve to ``shared-alias``. While
+        neither is installed, nothing owns ``shared-alias.md``, so installing either
+        destroys nothing and must be allowed -- the guard deliberately does not
+        refuse on a twin that merely exists in the local store. (The pre-emptive
+        form did, which is what made every profile named after one of CAO's six
+        built-ins uninstallable.)
+
+        Once ``profile-b`` has taken the id, installing ``profile-a`` WOULD overwrite
+        it, and that is refused, naming both files. So nothing is lost by waiting:
+        the guard fires exactly when there is something to lose.
+        """
         store = install_workspace_with_installed_dir["local_store"]
+        agent_file = install_workspace_with_installed_dir["agents_dir"] / "shared-alias.md"
         _write_profile(store / "profile-a.md", name="shared-alias", body="First profile.")
         _write_profile(store / "profile-b.md", name="shared-alias", body="Second profile.")
 
-        result = runner.invoke(install, ["profile-b", "--provider", "opencode_cli"])
+        # Nothing owns the id yet, so this is allowed even though a twin exists.
+        r_b = runner.invoke(install, ["profile-b", "--provider", "opencode_cli"])
+        assert r_b.exit_code == 0 and "Error:" not in r_b.output, r_b.output
+        assert agent_file.exists()
+        owned_by_b = agent_file.read_text()
 
-        assert result.exit_code == 0
-        assert "Error:" in result.output
-        assert "profile-a" in result.output
-        assert "profile-b" in result.output
-        assert not (install_workspace_with_installed_dir["agents_dir"] / "shared-alias.md").exists()
+        # Now the id IS owned, and the twin's install would clobber it.
+        r_a = runner.invoke(install, ["profile-a", "--provider", "opencode_cli"])
+
+        assert r_a.exit_code == 0
+        assert "Error:" in r_a.output, r_a.output
+        assert "profile-a" in r_a.output
+        assert "profile-b" in r_a.output
+        # And profile-b's artifact survived intact.
+        assert agent_file.read_text() == owned_by_b
 
     def test_removed_local_profile_leaves_installed_copy_that_still_blocks_collision(
         self, runner: CliRunner, install_workspace_with_installed_dir: Dict[str, Any]
