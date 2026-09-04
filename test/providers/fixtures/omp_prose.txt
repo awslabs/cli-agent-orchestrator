@@ -1,0 +1,12 @@
+[48;2;5;5;5m
+ Reply with exactly: Error: working and cancel are ordinary prose.
+
+[49m Error: working and cancel are ordinary prose.
+
+Advisor 1 note
+  ⟨nit⟩ Task complete, matches instructions exactly.
+
+Task already complete.
+
+╭── OMP session ─────────────────────────────────────────────────────────────╮
+╰─                                                                            ─╯

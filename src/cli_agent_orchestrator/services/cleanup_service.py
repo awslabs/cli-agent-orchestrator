@@ -4,13 +4,20 @@ import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from cli_agent_orchestrator.clients.database import InboxModel, SessionLocal, TerminalModel
+from cli_agent_orchestrator.clients.database import (
+    IdempotencyKeyModel,
+    InboxModel,
+    SessionLocal,
+    TerminalModel,
+)
 from cli_agent_orchestrator.constants import (
     LOG_DIR,
     MEMORY_BASE_DIR,
     RETENTION_DAYS,
     TERMINAL_LOG_DIR,
 )
+from cli_agent_orchestrator.models.provider import ProviderType
+from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.memory_format import parse_index_entry
 from cli_agent_orchestrator.services.status_monitor import status_monitor
@@ -31,12 +38,28 @@ def cleanup_old_data():
             old_terminals = (
                 db.query(TerminalModel).filter(TerminalModel.last_active < cutoff_date).all()
             )
+            retained_terminal_ids: set[str] = set()
             for terminal in old_terminals:
                 fifo_manager.stop_reader(terminal.id)
                 status_monitor.clear_terminal(terminal.id)
-            deleted_terminals = (
-                db.query(TerminalModel).filter(TerminalModel.last_active < cutoff_date).delete()
-            )
+                # A stale Grok terminal can still own a private GROK_HOME. An
+                # explicit deferred cleanup is its retry handle, so retention
+                # housekeeping must not bulk-delete that row underneath it.
+                if (
+                    terminal.provider == ProviderType.GROK_CLI.value
+                    and provider_manager.cleanup_provider(terminal.id) is False
+                ):
+                    retained_terminal_ids.add(terminal.id)
+                    logger.warning(
+                        "Retaining stale Grok terminal %s while cleanup is deferred", terminal.id
+                    )
+            terminal_query = db.query(TerminalModel).filter(TerminalModel.last_active < cutoff_date)
+            if retained_terminal_ids:
+                deleted_terminals = terminal_query.filter(
+                    ~TerminalModel.id.in_(retained_terminal_ids)
+                ).delete()
+            else:
+                deleted_terminals = terminal_query.delete()
             db.commit()
             logger.info(f"Deleted {deleted_terminals} old terminals from database")
 
@@ -47,6 +70,18 @@ def cleanup_old_data():
             )
             db.commit()
             logger.info(f"Deleted {deleted_messages} old inbox messages from database")
+
+        # Clean up old idempotency-key mappings (review on PR #634, issue
+        # #616): these are never swept elsewhere, so without this they grow
+        # unbounded with terminal-creation rate.
+        with SessionLocal() as db:
+            deleted_keys = (
+                db.query(IdempotencyKeyModel)
+                .filter(IdempotencyKeyModel.created_at < cutoff_date)
+                .delete()
+            )
+            db.commit()
+            logger.info(f"Deleted {deleted_keys} old idempotency keys from database")
 
         # Clean up old terminal log files
         terminal_logs_deleted = 0

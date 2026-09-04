@@ -12,10 +12,23 @@ import struct
 import subprocess
 import termios
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, Any, Dict, List, Optional, Tuple, cast
+from typing import (
+    Annotated,
+    Any,
+    AsyncIterator,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Tuple,
+    cast,
+)
 
+import yaml
 from fastapi import (
     BackgroundTasks,
     Body,
@@ -33,7 +46,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from cli_agent_orchestrator.backends import TerminalBackendError, TerminalNotFoundError
@@ -60,12 +73,16 @@ from cli_agent_orchestrator.constants import (
     SERVER_HOST,
     SERVER_PORT,
     SERVER_VERSION,
+    TERMINAL_GROUP_ELEMENT_MAX_LEN,
+    TERMINAL_GROUP_MAX_ELEMENTS,
+    TERMINAL_METADATA_MAX_BYTES,
     TERMINALS_RUN_STEP_ROUTE,
     TRUSTED_FORWARDER_IPS,
     WORKFLOW_ENV_ALLOWLIST,
     WORKFLOW_ENV_VALUE_MAX_LEN,
     WS_ALLOWED_CLIENTS,
     add_local_cors_origins,
+    is_http_origin_allowed,
     is_ws_origin_allowed,
 )
 from cli_agent_orchestrator.ext_apps import mount_widget_static
@@ -84,8 +101,10 @@ from cli_agent_orchestrator.models.memory import (
     MemoryScopeId,
     MemoryType,
 )
-from cli_agent_orchestrator.models.terminal import Terminal, TerminalId
+from cli_agent_orchestrator.models.terminal import Terminal, TerminalId, TerminalLimitError
+from cli_agent_orchestrator.models.workflow import RecoveryPolicy
 from cli_agent_orchestrator.plugins import PluginRegistry
+from cli_agent_orchestrator.providers.base import OutputExtractionError
 from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroCapabilityError,
     KiroPhase0KASError,
@@ -95,6 +114,7 @@ from cli_agent_orchestrator.security.auth import (
     SCOPE_READ,
     SCOPE_WRITE,
     SCOPES_SUPPORTED,
+    _extract_bearer,
     extract_scopes_from_token,
     get_authorization_servers,
     get_current_scopes,
@@ -102,12 +122,20 @@ from cli_agent_orchestrator.security.auth import (
     require_any_scope,
 )
 from cli_agent_orchestrator.services import (
+    approval_gate,
+    approval_provenance,
+    approval_store,
     flow_service,
+    manifest_freeze,
     secret_gate,
     session_service,
     terminal_service,
 )
-from cli_agent_orchestrator.services.agent_step import StepExecutionError, run_agent_step
+from cli_agent_orchestrator.services.agent_step import (
+    StepExecutionError,
+    resolve_effective_working_directory,
+    run_agent_step,
+)
 from cli_agent_orchestrator.services.cleanup_service import (
     cleanup_expired_memories,
     cleanup_old_data,
@@ -127,7 +155,22 @@ from cli_agent_orchestrator.services.profile_search import (
 )
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
-from cli_agent_orchestrator.services.terminal_service import OutputMode, TerminalInputBlockedError
+from cli_agent_orchestrator.services.terminal_service import (
+    TERMINAL_RANGE_MAX_LENGTH,
+    IdempotencyKeyConflict,
+    OutputMode,
+    TerminalInputBlockedError,
+    _notify_elastic_terminal_ended,
+)
+from cli_agent_orchestrator.services.workflow_journal import (
+    _TERMINAL_RUN_STATES as _JOURNAL_TERMINAL_RUN_STATES,
+)
+from cli_agent_orchestrator.services.workflow_journal import (
+    EventRow,
+    GapMarker,
+    StepRow,
+)
+from cli_agent_orchestrator.services.worktree_service import WorktreeError
 from cli_agent_orchestrator.telemetry import init_telemetry, shutdown_telemetry
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
 from cli_agent_orchestrator.utils.logging import install_access_log_redaction, setup_logging
@@ -202,6 +245,20 @@ class TerminalOutputResponse(BaseModel):
     mode: str
 
 
+class TerminalOutputRange(BaseModel):
+    """Serialization view of an offset-ranged terminal-log read (U5 / #504, FR-4.3).
+
+    Echoes the request's ``offset`` and the EFFECTIVE ``length`` (the clamped
+    read window, so a caller can see it was capped) alongside the decoded
+    ``data``. Not persisted — a read adapter over the existing per-terminal log.
+    """
+
+    terminal_id: str
+    offset: int
+    length: int
+    data: str
+
+
 class CreateTerminalBody(BaseModel):
     """Optional JSON body for POST /sessions/{name}/terminals.
 
@@ -216,15 +273,100 @@ class CreateTerminalBody(BaseModel):
     initial_message_orchestration_type: Optional[str] = None
 
 
+def _check_group_size(group: Optional[List[str]]) -> Optional[List[str]]:
+    """Enforce structural caps on ``group`` (call-me-ram, PR #433 review).
+
+    ``group`` is written by the terminal's own agent via the ``update_group``
+    MCP tool with no operator review in the loop; an uncapped array lets a
+    worker grow the ``terminals.group`` TEXT column arbitrarily. Raises
+    ``ValueError`` (surfaces as 422 at every call site below) rather than
+    silently truncating — an over-cap request should fail loudly, not have
+    part of the caller's intended group silently dropped.
+    """
+    if not group:
+        return group
+    if len(group) > TERMINAL_GROUP_MAX_ELEMENTS:
+        raise ValueError(f"group has {len(group)} elements (max {TERMINAL_GROUP_MAX_ELEMENTS})")
+    for element in group:
+        if len(element) > TERMINAL_GROUP_ELEMENT_MAX_LEN:
+            raise ValueError(
+                f"group element {element!r} is {len(element)} chars "
+                f"(max {TERMINAL_GROUP_ELEMENT_MAX_LEN})"
+            )
+    return group
+
+
+def _check_metadata_size(metadata: Optional[Dict]) -> Optional[Dict]:
+    """Enforce a max-encoded-bytes cap on ``metadata`` (call-me-ram, PR #433 review).
+
+    ``metadata`` is a free-form dict the running agent writes about itself via
+    the ``update_metadata`` MCP tool; an unbounded ``Dict[str, Any]`` lets a
+    worker grow the ``terminals.metadata`` TEXT column arbitrarily, amplified
+    into every sibling's ``list_siblings`` response. Measured on the same
+    ``json.dumps`` encoding actually persisted (``WORKFLOW_MAX_SPEC_BYTES``
+    precedent), not e.g. a naive ``len(str(metadata))``.
+    """
+    if not metadata:
+        return metadata
+    encoded_len = len(json.dumps(metadata).encode("utf-8"))
+    if encoded_len > TERMINAL_METADATA_MAX_BYTES:
+        raise ValueError(
+            f"metadata is {encoded_len} bytes encoded (max {TERMINAL_METADATA_MAX_BYTES})"
+        )
+    return metadata
+
+
 class CreateSessionBody(CreateTerminalBody):
     """Optional JSON body for POST /sessions.
 
     Reuses the terminal-creation message payload and keeps operator-forwarded
     environment variables in the request body, preserving the existing
     ``{"env_vars": {...}}`` wire shape.
+
+    ``group``/``metadata`` are the #432 discovery fields (see
+    ``UpdateGroupBody``/``UpdateMetadataBody`` below for their dedicated PATCH
+    counterparts). They live here — rather than as separate top-level
+    ``Body(embed=True)`` params — so this endpoint keeps its single flat JSON
+    body wire shape (adding a second embedded body param would force FastAPI
+    to nest everything under a ``"body"`` key, breaking existing callers that
+    already POST ``{"env_vars": ..., "initial_message": ...}`` at the top
+    level, e.g. ``ops_mcp_server/server.py``'s ``_launch_session_impl``).
     """
 
     env_vars: Optional[Dict[str, str]] = None
+    group: Optional[List[str]] = None
+    metadata: Optional[Dict] = None
+
+    @field_validator("group")
+    @classmethod
+    def validate_group(cls, v: Optional[List[str]]) -> Optional[List[str]]:
+        return _check_group_size(v)
+
+    @field_validator("metadata")
+    @classmethod
+    def validate_metadata(cls, v: Optional[Dict]) -> Optional[Dict]:
+        return _check_metadata_size(v)
+
+
+RESUME_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{7,63}\Z")
+
+
+def _validate_resume_session_id(value: str) -> None:
+    """Validate a ``resume_session_id`` at the request boundary.
+
+    The id is interpolated into the provider's shell command
+    (``claude --resume <sid>``), so the charset is restricted to the shape
+    Claude Code actually emits (UUID-like) — no whitespace, quoting, or
+    shell metacharacters.
+
+    Raises:
+        ValueError: ``value`` does not match RESUME_SESSION_ID_RE.
+    """
+    if not RESUME_SESSION_ID_RE.match(value):
+        raise ValueError(
+            "invalid resume_session_id: expected 8-64 chars of [A-Za-z0-9._-] "
+            "starting with an alphanumeric"
+        )
 
 
 def _validate_model_id(value: str) -> None:
@@ -246,6 +388,42 @@ def _validate_model_id(value: str) -> None:
         raise ValueError(f"model exceeds the {MODEL_ID_MAX_LEN}-char cap")
     if not re.fullmatch(MODEL_ID_RE, value):
         raise ValueError(f"model {value!r} is invalid (must match {MODEL_ID_RE!r})")
+
+
+class UpdateGroupBody(BaseModel):
+    """Request body for ``PATCH /terminals/{id}/group`` (#432).
+
+    ``group`` is required (no default) so an omitted field is rejected with
+    422 rather than silently treated the same as an explicit ``null`` —
+    clearing the group is always an explicit choice (``null`` or ``[]``),
+    never an accident of a partial/empty body (Copilot review, PR #433).
+    """
+
+    group: Optional[List[str]]
+
+    @field_validator("group")
+    @classmethod
+    def validate_group(cls, v: Optional[List[str]]) -> Optional[List[str]]:
+        return _check_group_size(v)
+
+
+class UpdateMetadataBody(BaseModel):
+    """Request body for ``PATCH /terminals/{id}/metadata`` (#432).
+
+    Called by the running agent itself via the ``update_metadata`` MCP tool.
+
+    ``metadata`` is required (no default) for the same reason as
+    ``UpdateGroupBody.group`` above: an omitted field is rejected with 422
+    instead of being indistinguishable from an explicit clearing ``null``
+    (Copilot review, PR #433).
+    """
+
+    metadata: Optional[Dict]
+
+    @field_validator("metadata")
+    @classmethod
+    def validate_metadata(cls, v: Optional[Dict]) -> Optional[Dict]:
+        return _check_metadata_size(v)
 
 
 class RunStepRequest(BaseModel):
@@ -277,6 +455,14 @@ class RunStepRequest(BaseModel):
         default=None,
         description="Resolved allowed-tools list for a freshly created terminal (handoff inheritance)",
     )
+    use_worktree: bool = Field(
+        default=False,
+        description=(
+            "Issue #100 Phase 1: provision an isolated git worktree for a freshly "
+            "created terminal instead of sharing working_directory as given. "
+            "Requires the resolved directory to be inside a git repository."
+        ),
+    )
     env_vars: Optional[Dict[str, str]] = Field(
         default=None,
         description=(
@@ -292,6 +478,19 @@ class RunStepRequest(BaseModel):
             "(ignored when reusing a terminal), applied ahead of the agent "
             "profile's own static model field. Lets a caller pin a specific "
             "model for one worker without a dedicated agent profile."
+        ),
+    )
+    recovery: Optional[RecoveryPolicy] = Field(
+        default=None,
+        description=(
+            "What this step's author declares about re-running it (issue #583, "
+            "FR-5/FR-7), passed to the replay gate as the declared policy. "
+            "Absent means UNDECLARED, which is a distinct state and never "
+            "coerced to 'manual': the two differ at the gate's rule 2 and at its "
+            "catch-all. "
+            "Typed as the enum so an unknown value is REJECTED with 422 at the "
+            "boundary rather than silently downgraded to undeclared, which "
+            "would change the verdict (SR-6)."
         ),
     )
 
@@ -388,11 +587,28 @@ class RunStepRequest(BaseModel):
 
 
 class RunStepResponse(BaseModel):
-    """Response wrapping an ``AgentStepResult`` from ``run_agent_step``."""
+    """Response wrapping an ``AgentStepResult`` from ``run_agent_step``.
+
+    ``replayed`` is the one exception to that wrapping: a replayed response is
+    built from a STORED ``StepResultEnvelope``, and no ``run_agent_step`` call
+    happened at all (issue #583, FR-1).
+    """
 
     terminal_id: str
     last_message: str
     status: str
+    replayed: bool = Field(
+        default=False,
+        description=(
+            "True when this result was REPLAYED from the workflow journal "
+            "instead of executed (issue #583, FR-1). Defaulted to False, so "
+            "every existing response and consumer is unchanged. It is "
+            "load-bearing rather than cosmetic: a replayed response carries the "
+            "ORIGINAL terminal_id, which names a terminal that no longer "
+            "exists, and this flag is the only thing that stops a consumer "
+            "reading, writing to, or waiting on a dead id."
+        ),
+    )
 
 
 class WorkflowValidateRequest(BaseModel):
@@ -428,6 +644,33 @@ class WorkflowRunRequest(BaseModel):
     )
 
 
+class ResumeRunRequest(BaseModel):
+    """Request body for ``POST /workflows/runs/{run_id}/resume`` (issue #583, FR-7).
+
+    The route had no body before this unit; it stays OPTIONAL so every existing
+    caller — the CLI, the MCP tool, an operator with ``curl`` — keeps working
+    unchanged with no body at all.
+
+    ``decisions`` is typed ``Dict[str, str]`` and NOT ``Dict[str, RecoveryDecision]``
+    ON PURPOSE (SR-4/BR-10). Pydantic would reject an unknown value at the boundary
+    with a 422 and a schema-shaped message, while a mistyped decision must land on
+    **400** with a message naming the offending ``step_id``, produced by the ONE
+    validator all three surfaces share (``parse_decision``, reached through
+    ``workflow_journal.apply_decisions``). Validating here as well would put a second
+    implementation of the closed set on the path that must agree with it.
+    """
+
+    decisions: Optional[Dict[str, str]] = Field(
+        default=None,
+        description=(
+            "Per-step recovery decisions for a halted script run: "
+            "step_id -> 'rerun' (re-execute) | 'skip' (use the stored result). "
+            "Applied before the script is spawned; an unknown step id or value is a "
+            "400 and applies nothing at all."
+        ),
+    )
+
+
 class GraphExportRequest(BaseModel):
     """Request body for ``POST /graph/{provider}/export`` (U4, Issue #348)."""
 
@@ -453,6 +696,255 @@ class StepOutputResponse(BaseModel):
     validated: bool
     errors: List[str]
     state: str
+
+
+# ---------------------------------------------------------------------------
+# U3 (issue #504) — inspection + event-replay read models (serialization views,
+# NOT new persistence: domain-entities.md is explicit). ``EventRow``/``GapMarker``
+# are owned by U1 (workflow_journal) and reused here unchanged; ``RunRow`` /
+# ``StepRow`` shapes are read via the existing DAL helpers and never altered
+# (BR-2, additive-only). These models exist only to give the two read routes a
+# stable, documented JSON contract for the web surface (U8) and #505's clients.
+# ---------------------------------------------------------------------------
+class StepInspection(BaseModel):
+    """One step's durable projection inside a ``RunInspection`` (FR-5.1).
+
+    A UNION superset of the pre-U3 ``StepStatus`` step shape (``id`` / ``state``
+    / ``attempts``, which #505's status/result clients read) enriched with U1's
+    ``StepRow`` columns (``output_json``, ``error``, ``error_kind``,
+    ``terminal_id``, ``reprompted``, ``call_fingerprint``). ``id`` is the step
+    identifier (== ``StepRow.step_id``); it is kept as ``id`` (not renamed to
+    ``step_id``) so the existing endpoint's step contract is preserved
+    byte-for-byte and only ADDED to (BR-2). A pre-U1 row surfaces the additive
+    columns as ``None``.
+
+    ``output_json`` and ``error`` carry the step's FULL text and are NOT gated by
+    ``workflow_journal_capture_output`` — see the payload-posture note on
+    ``get_workflow_run_endpoint`` before adding a consumer or a log line.
+    """
+
+    id: str
+    state: str
+    attempts: int
+    output_json: Optional[str] = None
+    error: Optional[str] = None
+    error_kind: Optional[str] = None
+    terminal_id: Optional[str] = None
+    reprompted: Optional[int] = None
+    call_fingerprint: Optional[str] = None
+
+
+class RunInspection(BaseModel):
+    """Enriched run inspection (FR-5.1, domain-entities RunInspection).
+
+    A UNION superset of the existing ``get_run_status`` snapshot: it preserves
+    the snapshot fields #505 reads (``run_id``, ``state``, ``current_step_id``,
+    ``steps``) and ADDS the run metadata (``workflow_name``, ``started_at``,
+    ``finished_at``, ``tier``) plus richer per-step projections. Assembled from
+    ``get_run`` + ``get_steps`` with the journal fallback on a cache miss (BR-1),
+    so it is journal-authoritative (NFR-DUR-1) — never dependent on
+    ``run_registry`` holding an entry.
+    """
+
+    run_id: str
+    workflow_name: str
+    state: str
+    current_step_id: Optional[str] = None
+    started_at: str
+    finished_at: Optional[str] = None
+    tier: str
+    steps: List[StepInspection] = Field(default_factory=list)
+
+
+class EventTimelinePage(BaseModel):
+    """A batch page of a run's ordered event timeline (FR-5.2, BR-3/BR-4/BR-6).
+
+    ``events`` and ``gaps`` come verbatim from U1's ``read_events_with_gaps``
+    (seq-ordered, deterministic, dedupe-free; declared holes travel WITH the
+    events and are never renumbered away). ``next_after_seq`` is the max seq
+    returned — the reconnect/next-page cursor; ``None`` when the page is empty
+    (a caught-up follower, BR-6). This is the BATCH read; U4 (Bolt 3) will add
+    SSE live-follow over the SAME path and cursor — see the route seam comment.
+    """
+
+    events: List[EventRow] = Field(default_factory=list)
+    gaps: List[GapMarker] = Field(default_factory=list)
+    next_after_seq: Optional[int] = None
+
+
+# ---------------------------------------------------------------------------
+# U6 (issue #504) — run-comparison + diagnostic-bundle export views (FR-8, FR-9).
+# Read/export serialization shapes ONLY (domain-entities.md: "no new persistent
+# entity"); every field is assembled from U1's durable DAL (``get_run`` /
+# ``get_steps`` / ``read_events_with_gaps``) with NO ``run_registry`` dependency
+# (journal-authoritative, BR-6). ``EventRow`` / ``GapMarker`` are reused verbatim
+# from U1. No new persistence, no edit to any existing model.
+# ---------------------------------------------------------------------------
+class StepComparisonSide(BaseModel):
+    """One run's projection of an aligned step inside a ``RunComparison`` (FR-8.1).
+
+    The per-side metrics the comparison juxtaposes: ``attempts`` and ``state`` /
+    ``error_kind`` / ``reprompted`` carry the failure/retry behaviour;
+    ``duration_ms`` is the sum of the step's event ``elapsed_ms`` (durations are
+    derived, never persisted); ``provider`` / ``agent_profile`` are the config the
+    step ran under (last non-null among the step's events); ``validation`` is the
+    step's last non-null validation outcome. All optional fields degrade to
+    ``None`` where a swallowed/absent event left the datum unrecorded.
+    """
+
+    attempts: int
+    duration_ms: Optional[int] = None
+    provider: Optional[str] = None
+    agent_profile: Optional[str] = None
+    validation: Optional[str] = None
+    state: str
+    error_kind: Optional[str] = None
+    reprompted: Optional[int] = None
+
+
+class StepComparison(BaseModel):
+    """One aligned step across the two runs (FR-8.1, BR-1).
+
+    ``status`` is ``aligned`` when the step is present in BOTH runs, ``added``
+    when present only in the compare run (absent in the baseline), and
+    ``removed`` when present only in the baseline (absent in the compare run) —
+    a step present in one run and absent in the other is ALWAYS surfaced, never
+    silently dropped (BR-1). ``a`` is the baseline side, ``b`` the compare side;
+    the missing side is ``None`` on an added/removed row.
+    """
+
+    step_id: str
+    status: str
+    a: Optional[StepComparisonSide] = None
+    b: Optional[StepComparisonSide] = None
+
+
+class OutputDiff(BaseModel):
+    """A reference-level output/artifact difference for an aligned step (BR-2).
+
+    Output/artifact differences are compared at the ``output_ref`` REFERENCE
+    level, never by diffing payloads (payloads are not inlined). ``a_refs`` /
+    ``b_refs`` are the distinct ``output_ref`` references each run's events carry
+    for the step; an entry is emitted only when the two reference sets differ.
+    """
+
+    step_id: str
+    a_refs: List[str] = Field(default_factory=list)
+    b_refs: List[str] = Field(default_factory=list)
+
+
+class RunComparison(BaseModel):
+    """Compare two runs by aligned step (FR-8, domain-entities RunComparison).
+
+    ``baseline_run_id`` is the path run id; ``compare_run_id`` is the ``against``
+    query id. ``steps`` aligns by ``step_id`` (deterministically sorted);
+    ``output_diffs`` carries the reference-level output/artifact differences
+    (BR-2). Assembled from the durable journal for both runs — a comparison never
+    partially succeeds against a missing side (BR-8: unknown/deleted ``against``
+    -> 404, decided at the route).
+    """
+
+    baseline_run_id: str
+    compare_run_id: str
+    steps: List[StepComparison] = Field(default_factory=list)
+    output_diffs: List[OutputDiff] = Field(default_factory=list)
+
+
+class StepOutcome(BaseModel):
+    """A step's terminal outcome inside a ``DiagnosticBundle`` (FR-9.1).
+
+    Always-on execution metadata (NFR-SEC-1): ``state`` and the structured
+    ``error_kind`` are recorded regardless of the output-capture posture — this
+    row carries NO free-text output.
+    """
+
+    step_id: str
+    state: str
+    error_kind: Optional[str] = None
+
+
+class BundleEnvironment(BaseModel):
+    """Provider / agent / engine metadata for a run's bundle (FR-9.1).
+
+    Distinct non-null values observed across the run's durable events, sorted for
+    a deterministic export. Lists (not scalars) so a multi-step run whose steps
+    ran under different providers/agents/engines is represented losslessly.
+    """
+
+    providers: List[str] = Field(default_factory=list)
+    agent_profiles: List[str] = Field(default_factory=list)
+    engines: List[str] = Field(default_factory=list)
+
+
+class TerminalReference(BaseModel):
+    """A reference to a terminal-log offset range (BR-2, FR-4.2).
+
+    A REFERENCE only — ``terminal_id`` plus the byte-offset range the event
+    recorded; the complete terminal log is NEVER copied into the bundle. Resolving
+    a range to its bytes is U5's offset-ranged terminal-log read, called by a
+    consumer later, never inlined here.
+    """
+
+    terminal_id: str
+    offset_start: Optional[int] = None
+    offset_len: Optional[int] = None
+
+
+class BundleReferences(BaseModel):
+    """Terminal + artifact references for a bundle (BR-2, FR-1.3/FR-4.2).
+
+    References, not payloads: ``terminals`` are ``(terminal_id, offsets)``
+    references, ``artifacts`` are the distinct ``output_ref`` strings the events
+    carry. No terminal-log content and no artifact payload is inlined.
+    """
+
+    terminals: List[TerminalReference] = Field(default_factory=list)
+    artifacts: List[str] = Field(default_factory=list)
+
+
+class BundleExcerpt(BaseModel):
+    """A retention-safe, size-limited excerpt of a step's output (BR-5, BR-9).
+
+    Present ONLY when output capture is enabled (BR-9): each excerpt is the
+    step's output passed through U7's capture gate + the ``sanitize_output``
+    cap-and-mark SANITIZER (NFR-SEC-4/6). With capture disabled (the default), the
+    bundle carries NO excerpts — metadata + references only.
+
+    "Sanitizer", NOT "redactor": ``sanitize_output`` performs transport hygiene —
+    control-character stripping and size capping with a truncation marker. It does
+    NOT detect or remove secrets. A credential inside a step's output survives it
+    verbatim. The excerpt is retention-safe in SIZE, not in CONTENT.
+    """
+
+    step_id: str
+    excerpt: str
+
+
+class DiagnosticBundle(BaseModel):
+    """A run's troubleshooting export bundle (FR-9, domain-entities DiagnosticBundle).
+
+    Contains EVERY FR-9.1 section (BR-3): the spec identifier + content hash, the
+    SANITIZED inputs (BR-4 — size-capped and control-char-stripped, NOT
+    secret-redacted: a credential passed as a workflow input comes back verbatim),
+    the ordered event timeline with declared gaps, the
+    step outcomes + structured errors, provider/agent/engine environment metadata,
+    terminal + artifact references (BR-2), and retention-safe excerpts (BR-5,
+    capture-gated per BR-9). Reconstructable from the durable journal ALONE
+    (BR-6, FR-9.2) — no ``run_registry`` dependency — so it is usable after a
+    restart and by a support user who was not at the machine. ``capture_enabled``
+    declares the posture so a reader knows whether ``excerpts`` was gated off.
+    """
+
+    spec_id: str
+    spec_content_hash: str
+    inputs: str
+    events: List[EventRow] = Field(default_factory=list)
+    gaps: List[GapMarker] = Field(default_factory=list)
+    step_outcomes: List[StepOutcome] = Field(default_factory=list)
+    environment: BundleEnvironment
+    references: BundleReferences
+    excerpts: List[BundleExcerpt] = Field(default_factory=list)
+    capture_enabled: bool
 
 
 class SkillContentResponse(BaseModel):
@@ -530,6 +1022,94 @@ class PreviewTemplateResponse(BaseModel):
     content: str
 
 
+class ProfileValidationRequest(BaseModel):
+    """Request body for the non-mutating profile validate route."""
+
+    content: str = Field(
+        max_length=262_144,
+        description="Full profile markdown, including YAML frontmatter",
+    )
+
+
+class ProfileValidationMessage(BaseModel):
+    """One validation finding.
+
+    ``path`` is the dotted frontmatter location for JSON-Schema errors and is
+    absent for convention checks that are not tied to a single key.
+    """
+
+    severity: Literal["error", "warning"]
+    message: str
+    path: Optional[str] = None
+
+
+class ProfileValidationResponse(BaseModel):
+    """Outcome of validating a profile's frontmatter.
+
+    ``valid`` is False only when at least one error-severity finding is
+    present. Warnings are advisory and do not invalidate a profile, so a
+    client should block a save on errors alone.
+    """
+
+    valid: bool
+    messages: List[ProfileValidationMessage] = Field(default_factory=list)
+
+
+class ProfileCreateRequest(BaseModel):
+    """Request body for ``POST /agents/profiles``.
+
+    ``name`` is explicit rather than parsed out of ``content`` so the conflict
+    target is unambiguous even when the document is malformed. When the
+    frontmatter also declares a ``name`` the two must agree; see
+    ``_assert_frontmatter_name_matches``.
+    """
+
+    name: str = Field(description="Profile name, used as the local-store filename stem")
+    content: str = Field(
+        max_length=262_144,
+        description="Full profile markdown, including YAML frontmatter",
+    )
+
+
+class ProfileReplaceRequest(BaseModel):
+    """Request body for ``PUT /agents/profiles/{name}``.
+
+    No ``name`` field: the path parameter is authoritative. Frontmatter that
+    declares a different name is rejected rather than silently renaming.
+    """
+
+    content: str = Field(
+        max_length=262_144,
+        description="Full profile markdown, including YAML frontmatter",
+    )
+
+
+class ProfileWriteResponse(BaseModel):
+    """Outcome of a profile create or replace.
+
+    ``warnings`` carries advisory findings that did not block the write, so a
+    client can surface them after a successful save. Errors never reach here;
+    they reject the request with 400.
+    """
+
+    name: str
+    warnings: List[ProfileValidationMessage] = Field(default_factory=list)
+
+
+class ProfileSourceResponse(BaseModel):
+    """A profile's document exactly as stored, with placeholders intact.
+
+    Distinct from ``GET /agents/profiles/{name}``, which returns the *parsed and
+    resolved* profile. That response runs ``resolve_env_vars`` over the raw text
+    before parsing, so managed ``${VAR}`` placeholders come back as their
+    substituted values. Round-tripping that through a write would persist
+    resolved secrets into a plaintext profile, so an editor must read from here.
+    """
+
+    name: str
+    content: str
+
+
 class MemorySummary(BaseModel):
     """Memory list entry. Excludes file_path (absolute server filesystem path)."""
 
@@ -565,6 +1145,22 @@ class CreateFlowRequest(BaseModel):
         """Prevent path traversal — flow name becomes a filename."""
         if "/" in v or "\\" in v or ".." in v:
             raise ValueError("Flow name must not contain '/', '\\', or '..'")
+        return v
+
+    @field_validator("schedule", "agent_profile", "provider")
+    @classmethod
+    def validate_no_control_characters(cls, v: str) -> str:
+        """Prevent YAML frontmatter injection — a newline could otherwise
+        smuggle extra keys (e.g. script) into the serialized file."""
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in v):
+            raise ValueError("must not contain control characters")
+        return v
+
+    @field_validator("agent_profile", "provider")
+    @classmethod
+    def validate_not_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("must not be empty")
         return v
 
 
@@ -603,6 +1199,24 @@ def _seed_default_skills_at_startup() -> None:
         )
 
 
+def _sweep_workflow_runs_at_startup() -> None:
+    """Run the workflow run-journal retention sweep once at startup (NFR-SEC-3).
+
+    ``sweep_runs`` is already best-effort internally (enumeration failures return
+    0, a per-run delete failure is logged and the sweep continues), so this only
+    adds a defensive outer guard: a maintenance sweep must never prevent the
+    server from starting.
+    """
+    from cli_agent_orchestrator.services import workflow_retention
+
+    try:
+        pruned = workflow_retention.sweep_runs()
+        if pruned:
+            logger.info("workflow retention: pruned %d run(s) at startup", pruned)
+    except Exception as e:  # noqa: BLE001 — never block startup on a maintenance sweep
+        logger.warning("workflow retention sweep failed at startup: %s", e)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
@@ -629,6 +1243,12 @@ async def lifespan(app: FastAPI):
     # Run cleanup in background
     asyncio.create_task(asyncio.to_thread(cleanup_old_data))
     asyncio.create_task(cleanup_expired_memories())
+    # Workflow run-journal retention (#504, NFR-SEC-3). Without this the sweep
+    # had NO production caller and the advertised age/run-count retention never
+    # ran, so the event log grew without bound. Startup-time and best-effort,
+    # matching cleanup_old_data above: sweep_runs never raises (read failures
+    # degrade to a 0-run no-op) and bounds are read from settings.
+    asyncio.create_task(asyncio.to_thread(_sweep_workflow_runs_at_startup))
 
     # Start flow daemon as background task
     daemon_task = asyncio.create_task(flow_daemon())
@@ -795,6 +1415,58 @@ app = FastAPI(
     version=SERVER_VERSION,
     lifespan=lifespan,
 )
+
+# Methods whose request could change server state. The Origin check only
+# guards these — GET/HEAD/OPTIONS stay open (reads leak nothing stateful, and
+# OPTIONS preflights must reach CORSMiddleware unchanged).
+_STATE_CHANGING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+class OriginCheckMiddleware:
+    """Reject state-changing HTTP requests with a disallowed ``Origin``.
+
+    CSRF / CWE-352 guard for the default-unauthenticated surface. Browsers
+    attach an ``Origin`` header on every cross-site state-changing request
+    (fetch, XHR, and form POST alike — the simple-request paths CORS can't
+    preflight-block), while non-browser clients (curl, ``requests``, MCP, the
+    ``cao`` CLI) send none, so a present-but-untrusted ``Origin`` is exactly
+    the browser-only signal this rejects. Reads and OPTIONS preflights always
+    pass through. Registered FIRST so it runs inside ``TrustedHostMiddleware``:
+    Host is validated against ``ALLOWED_HOSTS`` on the same scope before the
+    same-origin branch below can trust it (see ``is_http_origin_allowed``).
+    """
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] == "http" and scope["method"] in _STATE_CHANGING_METHODS:
+            headers = {
+                name.decode("latin-1").lower(): value.decode("latin-1")
+                for name, value in scope.get("headers", [])
+            }
+            origin = headers.get("origin")
+            if origin and not is_http_origin_allowed(
+                origin, headers.get("host"), scope.get("scheme")
+            ):
+                logger.warning(
+                    "Rejected cross-origin %s request: disallowed Origin %r",
+                    scope["method"],
+                    origin,
+                )
+                response = JSONResponse(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    content={"detail": "Cross-origin request blocked"},
+                )
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+# Security: CSRF / Cross-Origin Request Forgery (CWE-352). See the middleware
+# docstring; the guard must sit INSIDE TrustedHostMiddleware's Host validation
+# (add_middleware stacks last-added outermost), hence it is registered first.
+app.add_middleware(OriginCheckMiddleware)
 
 # Security: DNS Rebinding Protection
 # Validate Host header to prevent DNS rebinding attacks (CVE mitigation)
@@ -1534,7 +2206,9 @@ mount_widget_static(app)
 
 
 @app.get("/agents/profiles")
-async def list_agent_profiles_endpoint() -> List[Dict]:
+async def list_agent_profiles_endpoint(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> List[Dict]:
     """List all available agent profiles from all configured directories."""
     try:
         from cli_agent_orchestrator.utils.agent_profiles import list_agent_profiles
@@ -1694,9 +2368,156 @@ async def preview_profile_template_endpoint(
     return PreviewTemplateResponse(template=request.template, content=content)
 
 
+@app.post("/agents/profiles/validate")
+async def validate_agent_profile_endpoint(
+    request: ProfileValidationRequest,
+) -> ProfileValidationResponse:
+    """Validate a profile's frontmatter against the profile schema. Writes nothing.
+
+    Distinct from ``/agents/profiles/templates/validate``, which checks a
+    *template config* against that template's own schema. This checks a
+    *finished profile* against ``agent_profile.schema.json`` plus CAO
+    conventions, and is the HTTP equivalent of ``cao profile validate``.
+
+    Deliberately NOT guarded by ``SCOPE_WRITE``, for the same reason as the
+    template validate route: this is a POST only because the profile content
+    travels in a JSON body rather than a query string, and it mutates no state.
+    """
+    from cli_agent_orchestrator.services.profile_validator import validate_profile_text
+
+    try:
+        findings = validate_profile_text(request.content)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    return ProfileValidationResponse(
+        valid=not any(f.severity == "error" for f in findings),
+        messages=[
+            ProfileValidationMessage(severity=f.severity, message=f.message, path=f.path)
+            for f in findings
+        ],
+    )
+
+
+@app.get("/agents/profiles/schema")
+async def get_agent_profile_schema_endpoint() -> Dict:
+    """Return the agent profile JSON-Schema.
+
+    Lets a client render create and edit forms from the server's own schema
+    definition instead of duplicating the field list. Declared above
+    ``GET /agents/profiles/{name}`` because FastAPI matches in declaration
+    order, and the path parameter would otherwise capture "schema" as a name.
+    """
+    from cli_agent_orchestrator.services.profile_validator import load_profile_schema
+
+    return load_profile_schema()
+
+
+def _profile_write_rejection(message: str, findings: Sequence[Any] = ()) -> HTTPException:
+    """Build the one 400 a profile write route may return.
+
+    Every 400 from the profile write and source routes carries this shape,
+    ``{"message", "errors"}``, so a client parses one thing rather than switching
+    on ``type(detail)``. ``errors`` is empty for a failure that is not
+    attributable to a field, but the key is always present so a caller can
+    iterate it unconditionally.
+
+    Deliberately covers the service-raised ``InvalidProfileNameError`` paths too,
+    not only schema findings. An unsafe name is a rejected input just like a
+    schema violation, and returning a bare string for one and a dict for the
+    other reintroduces exactly the type-switching this removes. The 404 and 409
+    mappings keep FastAPI's conventional bare-string ``detail``: the status code
+    already tells a client what happened and there are no findings to attach.
+    """
+    return HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail={
+            "message": message,
+            "errors": [
+                {"severity": f.severity, "message": f.message, "path": f.path} for f in findings
+            ],
+        },
+    )
+
+
+def _validate_profile_for_write(name: str, content: str) -> List[ProfileValidationMessage]:
+    """Validate a submitted profile document and enforce name identity.
+
+    Shared by ``POST /agents/profiles`` and ``PUT /agents/profiles/{name}`` so the
+    two cannot drift apart on either rule.
+
+    Runs the same validator the CLI and ``POST /agents/profiles/validate`` use, on
+    the exact document being persisted rather than on a client-side approximation
+    of it. Error-severity findings reject the write; warnings are returned so a
+    client can surface them after a successful save.
+
+    A profile has two identities: the storage key (its filename stem) and the
+    frontmatter ``name``. ``parse_agent_profile_text`` treats the stem only as a
+    fallback when frontmatter omits ``name``, so the two can diverge and nothing
+    reconciles them: ``name: foo`` in ``bar.md`` loads as ``foo`` while being
+    addressed as ``bar``. Requiring them to agree closes that without introducing
+    a rename operation, which has its own failure semantics.
+
+    Args:
+        name: The storage name, authoritative.
+        content: The full profile document.
+
+    Returns:
+        The warning-severity findings, if any.
+
+    Raises:
+        HTTPException: 400 if the document is unparseable, carries an
+            error-severity finding, or declares a conflicting ``name``. See
+            :func:`_profile_write_rejection` for the shared ``detail`` shape.
+    """
+    import frontmatter
+
+    from cli_agent_orchestrator.services.profile_validator import validate_frontmatter
+
+    def _reject(message: str, findings: Sequence[Any] = ()) -> None:
+        raise _profile_write_rejection(message, findings)
+
+    # Parsed once here, then handed to validate_frontmatter as metadata.
+    # validate_profile_text would parse it again: its docstring exists precisely
+    # to keep callers from duplicating the parse, and this function needs the
+    # metadata anyway for the name check below.
+    try:
+        parsed = frontmatter.loads(content)
+    except Exception as exc:
+        _reject(f"Profile could not be parsed and was not written: {exc}")
+
+    findings = validate_frontmatter(parsed.metadata)
+
+    errors = [f for f in findings if f.severity == "error"]
+    if errors:
+        _reject("Profile failed validation and was not written.", errors)
+
+    declared = parsed.metadata.get("name")
+    if isinstance(declared, str) and declared != name:
+        _reject(
+            f"Frontmatter name '{declared}' does not match the profile name "
+            f"'{name}'. They must agree; renaming a profile is not supported "
+            f"through this endpoint."
+        )
+
+    return [
+        ProfileValidationMessage(severity=f.severity, message=f.message, path=f.path)
+        for f in findings
+        if f.severity == "warning"
+    ]
+
+
 @app.get("/agents/profiles/{name}")
-async def get_agent_profile_endpoint(name: str) -> Dict:
-    """Return the full parsed content of a named agent profile."""
+async def get_agent_profile_endpoint(
+    name: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Return the full parsed content of a named agent profile.
+
+    Note this response is *resolved*: ``load_agent_profile`` applies
+    ``resolve_env_vars`` before parsing. Use ``GET /agents/profiles/{name}/source``
+    when the document is going to be edited and written back.
+    """
     try:
         profile = load_agent_profile(name)
         return profile.model_dump(exclude_none=True)
@@ -1732,6 +2553,150 @@ async def install_agent_profile_endpoint(
     return result
 
 
+@app.post("/agents/profiles", status_code=status.HTTP_201_CREATED)
+async def create_agent_profile_endpoint(
+    request: ProfileCreateRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> ProfileWriteResponse:
+    """Create a profile in the local store from a supplied document.
+
+    Named distinctly from ``POST /agents/profiles/install``, which installs from a
+    bare name or an https:// URL. This one takes the document itself in the body.
+
+    Validation runs on the exact submitted content before anything is persisted,
+    so an invalid profile never reaches disk. Conflict detection is delegated to
+    ``write_profile(overwrite=False)``, which checks for an existing file inside
+    the write lock; a pre-check here would sit outside that critical section and
+    let two concurrent creators both succeed.
+    """
+    from cli_agent_orchestrator.services.profile_store import (
+        InvalidProfileNameError,
+        ProfileExistsError,
+        write_profile,
+    )
+
+    warnings = _validate_profile_for_write(request.name, request.content)
+
+    try:
+        write_profile(request.name, request.content, overwrite=False)
+    except InvalidProfileNameError as exc:
+        raise _profile_write_rejection(str(exc))
+    except ProfileExistsError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+
+    return ProfileWriteResponse(name=request.name, warnings=warnings)
+
+
+@app.put("/agents/profiles/{name}")
+async def replace_agent_profile_endpoint(
+    name: str,
+    request: ProfileReplaceRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> ProfileWriteResponse:
+    """Replace an existing local-store profile. Never creates one.
+
+    Backed by ``replace_profile``, which requires the target to exist *inside* the
+    write lock. That is what makes a PUT naming a built-in or provider-managed
+    profile a 404 rather than a silent create: the local store is the only place
+    this resolves, so a built-in's name is simply not there. An upsert would
+    instead write a local file that shadows the built-in on load, manufacturing
+    exactly the condition ``duplicated_in`` exists to report.
+    """
+    from cli_agent_orchestrator.services.profile_store import (
+        InvalidProfileNameError,
+        ProfileNotFoundError,
+        replace_profile,
+    )
+
+    warnings = _validate_profile_for_write(name, request.content)
+
+    try:
+        replace_profile(name, request.content)
+    except InvalidProfileNameError as exc:
+        raise _profile_write_rejection(str(exc))
+    except ProfileNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+
+    return ProfileWriteResponse(name=name, warnings=warnings)
+
+
+@app.delete("/agents/profiles/{name}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_agent_profile_endpoint(
+    name: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> None:
+    """Delete a profile from the local store.
+
+    Write-or-admin, the same guard as POST and PUT, so one credential completes
+    the whole create/edit/delete cycle that issue #510 specifies. Scopes are a
+    flat set here, not a hierarchy: ``require_any_scope`` tests membership, so
+    admin-only would 403 a caller holding exactly ``cao:write`` and leave a
+    client that can create and edit a profile unable to remove it.
+
+    Most other ``DELETE`` routes on this service do require admin alone, but they
+    remove *running or generated* state: sessions, terminals, workflows, flows,
+    and bulk memory. A profile is an authored document, closer to
+    ``DELETE /memory/relationships/{id}``, which is also write-or-admin. Removing
+    one stops no in-flight work and destroys nothing that cannot be re-authored,
+    and the deletion is already gated behind a confirmation in the UI.
+
+    Built-in and provider-managed profiles are not deletable for the same reason
+    they are not replaceable: ``delete_profile`` resolves only inside the local
+    store, so their names raise ``ProfileNotFoundError``.
+    """
+    from cli_agent_orchestrator.services.profile_store import (
+        InvalidProfileNameError,
+        ProfileNotFoundError,
+        delete_profile,
+    )
+
+    try:
+        delete_profile(name)
+    except InvalidProfileNameError as exc:
+        raise _profile_write_rejection(str(exc))
+    except ProfileNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+
+
+@app.get("/agents/profiles/{name}/source")
+async def get_agent_profile_source_endpoint(
+    name: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> ProfileSourceResponse:
+    """Return a profile's document exactly as stored, unresolved.
+
+    The authoring counterpart to ``GET /agents/profiles/{name}``. That route calls
+    ``load_agent_profile``, which applies ``resolve_env_vars`` to the raw text
+    *before* parsing, so substitution reaches the Markdown body as well as the
+    frontmatter, and the substitution source is the managed CAO ``.env`` file.
+    Using that response to pre-fill an editor and then PUT it back would persist
+    resolved secret values into a plaintext profile. ``safe_substitute`` leaves
+    unset variables intact, which would make the damage selective and silent.
+
+    Reads across all configured stores, not only the local one, so a built-in can
+    be fetched as the starting point for a clone. Writing it back still requires
+    the local store, which is enforced by the write routes.
+
+    Scope-gated like the profile reads beside it. This route was gated on its own
+    when it was added here, on the #505 precedent that a *new* read route carries
+    the gate while already-shipped ungated siblings are left alone; #606 has since
+    gated those siblings too, so the asymmetry that reasoning managed no longer
+    exists. Gating matters at least as much here as on the parsed route because
+    this one returns the stored bytes verbatim from the local, provider, extra and
+    built-in stores, including documents that fail to parse, whereas the parsed
+    route can only return what the model accepts. Registered alongside them in
+    ``test/api/test_auth_read_gating.py::_GATED_ROUTES``.
+    """
+    from cli_agent_orchestrator.utils.agent_profiles import _read_agent_profile_source
+
+    try:
+        return ProfileSourceResponse(name=name, content=_read_agent_profile_source(name))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    except ValueError as exc:
+        raise _profile_write_rejection(str(exc))
+
+
 @app.get("/agents/providers")
 async def list_providers_endpoint() -> List[Dict]:
     """List available providers with installation status."""
@@ -1747,6 +2712,9 @@ async def list_providers_endpoint() -> List[Dict]:
         "opencode_cli": "opencode",
         "cursor_cli": "agent",
         "antigravity_cli": "agy",
+        "omp": "omp",
+        "grok_cli": "grok",
+        "mcode": "mcode",
     }
     result = []
     for provider, binary in provider_binaries.items():
@@ -1859,7 +2827,10 @@ async def set_skill_dirs_endpoint(
 
 
 @app.get("/skills/{name}", response_model=SkillContentResponse)
-async def get_skill_content(name: str) -> SkillContentResponse:
+async def get_skill_content(
+    name: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> SkillContentResponse:
     """Return the full Markdown body for an installed skill."""
     try:
         skill_name = validate_skill_name(name)
@@ -1899,6 +2870,9 @@ async def create_session(
     memory_manager: Optional[str] = None,
     engine: Optional[KiroEngine] = None,
     model: Optional[str] = None,
+    use_worktree: bool = False,
+    idempotency_key: Optional[str] = None,
+    resume_session_id: Optional[str] = None,
     body: Optional[CreateSessionBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
@@ -1926,9 +2900,40 @@ async def create_session(
 
     ``model`` is an optional per-launch override. It uses the same validation
     and provider handoff as the existing terminal-creation endpoint.
+
+    ``body.group``/``body.metadata`` are the #432 discovery fields, set on
+    the initial terminal at creation time (``group`` is also updatable later
+    via ``PATCH /terminals/{id}/group``, ``metadata`` via the
+    ``update_metadata`` MCP tool).
+
+    ``use_worktree`` (issue #100 Phase 1; review on PR #634): provision an
+    isolated git worktree for this terminal instead of sharing
+    ``working_directory`` as given, mirroring ``POST
+    /sessions/{name}/terminals``'s parameter of the same name. Previously only
+    that sibling endpoint threaded it through to
+    ``terminal_service.create_terminal`` -- a fresh (no existing session)
+    caller requesting a worktree had it silently dropped.
+
+    ``idempotency_key`` (review on PR #634, issue #616): a caller-supplied
+    token making a retry of this exact request safe. Supply the SAME key on
+    a retry (e.g. after the original response was lost) and this endpoint
+    returns the terminal the first, already-committed attempt created,
+    instead of creating a second one -- see
+    ``terminal_service.create_terminal``'s docstring for the mechanics.
+    Omitted (default): today's behavior, no retry protection.
+
+    The key is matched together with a fingerprint of the request, not on its
+    own, so presenting a key that a DIFFERENT request already claimed returns
+    **409 CONFLICT** rather than that other request's terminal. A key whose
+    terminal has since been torn down is stale, not conflicting, and simply
+    creates fresh.
     """
     initial_message = body.initial_message if body else None
     initial_message_orchestration_type = None
+    # Structural caps on group/metadata (call-me-ram, PR #433 review) are
+    # enforced by CreateSessionBody's own field_validators above — invalid
+    # values fail Pydantic body parsing and FastAPI returns 422 automatically,
+    # before this function body ever runs.
     try:
         if session_name is not None:
             # terminal_service.create_terminal prepends SESSION_PREFIX
@@ -1946,6 +2951,8 @@ async def create_session(
             validate_tmux_name(effective, "session_name")
         if model is not None:
             _validate_model_id(model)
+        if resume_session_id is not None:
+            _validate_resume_session_id(resume_session_id)
         if initial_message == "":
             raise ValueError("initial_message must not be empty")
         if body and body.initial_message_orchestration_type:
@@ -1975,12 +2982,41 @@ async def create_session(
             initial_message=initial_message,
             initial_message_orchestration_type=initial_message_orchestration_type,
             model=model,
+            use_worktree=use_worktree,
+            idempotency_key=idempotency_key,
+            resume_session_id=resume_session_id,
+            group=body.group if body else None,
+            metadata=body.metadata if body else None,
         )
 
         if memory_manager and str(memory_manager).lower() in ("true", "1", "yes"):
             registry = get_plugin_registry(request)
             sidecar_provider = provider or DEFAULT_PROVIDER
             sidecar_session = result.session_name
+            # The sidecar gets its OWN key, DERIVED from the caller's (review on
+            # PR #634, issue #616). This spawn is unconditional -- it runs after
+            # create_session whether the primary was created or resolved from an
+            # existing key -- and the returned Terminal cannot say which, so two
+            # identical keyed requests used to spawn two memory_manager workers
+            # for one primary: the exact no-duplicate-workers criterion the key
+            # exists to hold.
+            #
+            # Deriving a key rather than plumbing a created-vs-reused flag out
+            # through both create endpoints is the smaller correct fix, and it is
+            # strictly stronger: the sidecar create becomes idempotent in its own
+            # right, so the second request reuses the FIRST sidecar even in the
+            # races a boolean would miss (both requests seeing "created", or the
+            # first response being lost before the flag is read). The suffix
+            # keeps it out of the primary's namespace so it can never collide
+            # with the caller's own key.
+            #
+            # Sidecar args are all derived from the primary request or its
+            # result, so a genuine retry fingerprints identically and hits;
+            # anything else 409s inside the task and is logged below like any
+            # other sidecar failure, without failing the primary.
+            sidecar_idempotency_key = (
+                f"{idempotency_key}:memory-manager-sidecar" if idempotency_key else None
+            )
 
             async def _spawn_sidecar() -> None:
                 try:
@@ -1992,6 +3028,7 @@ async def create_session(
                         session_name=sidecar_session,
                         working_directory=working_directory,
                         registry=registry,
+                        idempotency_key=sidecar_idempotency_key,
                     )
                 except Exception as e:
                     logger.warning(f"Failed to spawn memory_manager sidecar: {e}")
@@ -2000,7 +3037,24 @@ async def create_session(
 
         return result
 
+    except IdempotencyKeyConflict as e:
+        # The key was already used for a DIFFERENT request (review on PR #634,
+        # issue #616). 409, matching Stripe/AWS IdempotentParameterMismatch,
+        # rather than silently serving the first call's terminal to a caller
+        # who asked for something else. IdempotencyKeyConflict subclasses
+        # Exception and NOT ValueError precisely so this arm cannot be
+        # shadowed by the 400 arm below -- which, note, sits FIRST here.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except TerminalLimitError as e:
+        # Node is at its tracked-terminal cap (CAO_MAX_TERMINALS) — a capacity
+        # rejection, not a bad request: the caller should retry on another node.
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
     except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except WorktreeError as e:
+        # use_worktree=true against a working_directory that isn't a git
+        # repo, or the 'git worktree add' itself failed -- a client-input
+        # problem, not a server crash. Mirrors POST /sessions/{name}/terminals.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:
         raise HTTPException(
@@ -2010,7 +3064,9 @@ async def create_session(
 
 
 @app.get("/sessions")
-async def list_sessions() -> List[Dict]:
+async def list_sessions(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> List[Dict]:
     try:
         return session_service.list_sessions()
     except Exception as e:
@@ -2021,7 +3077,10 @@ async def list_sessions() -> List[Dict]:
 
 
 @app.get("/sessions/{session_name}")
-async def get_session(session_name: str) -> Dict:
+async def get_session(
+    session_name: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
     # Validate before entering the try block so a malformed name surfaces
     # as 400 instead of being mapped to 404 by the not-found handler below.
     try:
@@ -2029,7 +3088,13 @@ async def get_session(session_name: str) -> Dict:
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     try:
-        return session_service.get_session(session_name)
+        # session_service.get_session() calls status_monitor.get_status() once per
+        # terminal in the session, which for a PROCESSING terminal can shell out to a
+        # real tmux capture-pane subprocess (the stale-PROCESSING fallback). A session
+        # with N processing terminals would otherwise fork N times inline on the event
+        # loop per request — and the web UI polls this endpoint. Run it off the loop,
+        # matching GET /terminals/{id}'s established pattern for the identical hazard.
+        return await asyncio.to_thread(session_service.get_session, session_name)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -2058,7 +3123,22 @@ async def delete_session(
         result = await asyncio.to_thread(
             session_service.delete_session, session_name, registry=get_plugin_registry(request)
         )
+        deleted = result.get("deleted") or []
+        errors = result.get("errors") or []
+        deferred = (isinstance(errors, list) and bool(errors)) or (
+            isinstance(deleted, (list, tuple)) and session_name not in deleted
+        )
+        if deferred:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"cleanup deferred for session '{session_name}'; "
+                    "retry delete after residual Grok processes exit"
+                ),
+            )
         return {"success": True, **result}
+    except HTTPException:
+        raise
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -2084,6 +3164,8 @@ async def create_terminal_in_session(
     caller_id: Optional[TerminalId] = None,
     defer_init: bool = False,
     model: Optional[str] = None,
+    use_worktree: bool = False,
+    idempotency_key: Optional[str] = None,
     body: Optional[CreateTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
@@ -2108,6 +3190,27 @@ async def create_terminal_in_session(
     supports it -- see ``terminal_service.create_terminal``'s own docstring).
     Lets a caller pin a specific model for one worker without needing a
     dedicated agent profile.
+
+    ``use_worktree`` (issue #100 Phase 1): provision an isolated git worktree
+    for this terminal instead of sharing ``working_directory`` as given. A
+    plain boolean routing flag, so it stays a query param alongside
+    ``defer_init`` rather than moving into the JSON body. Runs synchronously
+    before the deferred-init background task (if any) is scheduled, so it
+    applies the same way regardless of ``defer_init``.
+
+    ``idempotency_key`` (review on PR #634, issue #616): a caller-supplied
+    token making a retry of this exact request safe. Supply the SAME key on
+    a retry (e.g. after the original response was lost) and this endpoint
+    returns the terminal the first, already-committed attempt created,
+    instead of creating a second one -- see
+    ``terminal_service.create_terminal``'s docstring for the mechanics.
+    Omitted (default): today's behavior, no retry protection.
+
+    The key is matched together with a fingerprint of the request, not on its
+    own, so presenting a key that a DIFFERENT request already claimed returns
+    **409 CONFLICT** rather than that other request's terminal. A key whose
+    terminal has since been torn down is stale, not conflicting, and simply
+    creates fresh.
     """
     try:
         validate_tmux_name(session_name, "session_name")
@@ -2175,19 +3278,38 @@ async def create_terminal_in_session(
             initial_message_orchestration_type=orch_type,
             engine=engine,
             model=model,
+            use_worktree=use_worktree,
+            idempotency_key=idempotency_key,
         )
         return result
     except HTTPException:
         # Deliberate 4xx (e.g. the initial_message/defer_init guard, invalid
         # orchestration_type) — propagate as-is instead of masking as a 500.
         raise
+    except IdempotencyKeyConflict as e:
+        # The key was already used for a DIFFERENT request (review on PR #634,
+        # issue #616) — 409, not the 404 the generic ValueError arm below would
+        # give it. Unlike the Kiro arm, this one does not depend on preceding
+        # that arm: IdempotencyKeyConflict is not a ValueError, so no reorder
+        # of the ValueError family can shadow it.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except (KiroPhase0KASError, KiroCapabilityError) as e:
         # Both subclass ValueError, so they must precede the generic arm below —
         # a rejected engine is a bad request, not a missing resource. Matches
         # POST /sessions, which already returns 400 for the identical failure.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except TerminalLimitError as e:
+        # Node is at its tracked-terminal cap (CAO_MAX_TERMINALS) — a capacity
+        # rejection, not a bad request or a missing session: the caller should
+        # retry on another node.
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except WorktreeError as e:
+        # use_worktree=true against a working_directory that isn't a git repo,
+        # or the 'git worktree add' itself failed -- a client-input problem,
+        # not a server crash.
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -2197,7 +3319,20 @@ async def create_terminal_in_session(
 
 @app.get("/sessions/{session_name}/terminals")
 async def list_terminals_in_session(session_name: str) -> List[Dict]:
-    """List all terminals in a session."""
+    """List a session's terminals, oldest first.
+
+    The order is significant and part of this endpoint's contract: **index 0 is
+    the session's oldest surviving terminal**, which is normally its conductor.
+    `cao session status` and `cao session list` rely on it to label the
+    Conductor, and they reach it through this endpoint rather than the database,
+    so the guarantee has to be stated here too.
+
+    "Normally" is deliberate: if the conductor's own terminal is deleted while
+    the session lives on, index 0 becomes the oldest remaining worker. Treat it
+    as best-effort rather than as an identity. Clients needing a different order
+    (most-recently-active first, say) should sort client-side on `last_active`
+    rather than assume this one will change.
+    """
     try:
         validate_tmux_name(session_name, "session_name")
     except ValueError as e:
@@ -2214,7 +3349,10 @@ async def list_terminals_in_session(session_name: str) -> List[Dict]:
 
 
 @app.get("/terminals/{terminal_id}", response_model=Terminal)
-async def get_terminal(terminal_id: TerminalId) -> Terminal:
+async def get_terminal(
+    terminal_id: TerminalId,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Terminal:
     try:
         # get_terminal reads status_monitor.get_status(), which for a
         # PROCESSING terminal does a fresh detection that can shell out to
@@ -2234,8 +3372,145 @@ async def get_terminal(terminal_id: TerminalId) -> Terminal:
         )
 
 
+@app.patch("/terminals/{terminal_id}/group", response_model=Terminal)
+async def update_terminal_group_endpoint(
+    terminal_id: TerminalId,
+    body: UpdateGroupBody,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Terminal:
+    """Replace a terminal's group array (#432).
+
+    Lets a consumer whose own grouping can change after a terminal already
+    exists (e.g. harness-control folder/project reassignment,
+    harness-control#92) keep ``group`` from going stale. ``group`` is
+    required in the request body: an explicit ``null`` or ``[]`` clears it
+    (opting the terminal back out of discovery), while omitting the field
+    entirely is rejected with 422 rather than silently clearing it.
+    """
+    try:
+        updated = await asyncio.to_thread(terminal_service.update_group, terminal_id, body.group)
+        if not updated:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=f"Terminal '{terminal_id}' not found"
+            )
+        terminal = await asyncio.to_thread(terminal_service.get_terminal, terminal_id)
+        return Terminal(**terminal)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to update terminal group: {str(e)}",
+        )
+
+
+@app.patch("/terminals/{terminal_id}/metadata", response_model=Terminal)
+async def update_terminal_metadata_endpoint(
+    terminal_id: TerminalId,
+    body: UpdateMetadataBody,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Terminal:
+    """Replace a terminal's free-form metadata dict (#432).
+
+    Called by the running agent itself via the ``update_metadata`` MCP tool
+    (as well as by any other authorized API caller). Whole-dict replace, not
+    a merge -- concurrent calls are last-write-wins (tedswinyar, PR #433
+    review); an acceptable design for this field, but callers should re-send
+    the full intended dict rather than assuming a partial update accumulates.
+    """
+    try:
+        updated = await asyncio.to_thread(
+            terminal_service.update_metadata, terminal_id, body.metadata
+        )
+        if not updated:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=f"Terminal '{terminal_id}' not found"
+            )
+        terminal = await asyncio.to_thread(terminal_service.get_terminal, terminal_id)
+        return Terminal(**terminal)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to update terminal metadata: {str(e)}",
+        )
+
+
+@app.get("/terminals/{terminal_id}/siblings")
+async def list_terminal_siblings(
+    terminal_id: TerminalId,
+    depth: Optional[int] = Query(
+        default=None,
+        ge=1,
+        description=(
+            "How many leading elements of this terminal's own group to match "
+            "against. Omit for the widest scope this terminal is allowed to "
+            "see (its full own group). Server clamps to at most len(own "
+            "group) — can never exceed it. depth=0 is rejected (422) rather "
+            "than silently reinterpreted as an unscoped, all-terminals query."
+        ),
+    ),
+    cross_session: bool = Query(
+        default=False,
+        description=(
+            "Sibling discovery is session-scoped by default (issue #432 "
+            "design discussion, 2026-07-17/18): results are additionally "
+            "filtered to this terminal's own tmux session unless this is "
+            "explicitly set to true. Prevents two unrelated CAO sessions "
+            "that happen to reuse the same group prefix from silently "
+            "discovering each other."
+        ),
+    ),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> List[Dict]:
+    """List sibling terminals sharing a leading prefix of this terminal's own group (#432).
+
+    ``terminal_id`` in the URL IS the caller's resolved identity — the MCP
+    ``list_siblings`` tool passes its own ``CAO_TERMINAL_ID`` here, never a
+    client-supplied "who am I" claim (same mechanism ``send_message``/
+    ``handoff`` already use). This endpoint only ever compares against THAT
+    terminal's own persisted ``group``, so a caller can never request a scope
+    wider than its own group no matter what ``depth`` is passed. A terminal
+    with no ``group`` set finds no siblings — it participates in no
+    discovery — rather than erroring or matching everything.
+
+    Session-scoped by default: results are also filtered to this terminal's
+    own ``tmux_session`` unless ``cross_session=true`` is explicitly passed
+    (issue #432 design discussion). ``group`` is an organizational label,
+    not a security boundary — on a default install with auth disabled, a
+    worker already has local shell access, so nothing here provides tenant
+    isolation even with session scoping applied; see docs/api.md.
+
+    Each result includes a ``status`` (tedswinyar, PR #433 review): a live,
+    point-in-time snapshot, not a guarantee. A handoff terminal can still
+    complete and delete itself between this call returning and a caller's
+    follow-up message to it, so callers should still expect sends to an
+    apparently-live sibling to occasionally fail.
+    """
+    try:
+        # 404 if the terminal itself doesn't exist, distinct from "exists but
+        # has no group" (empty list result, not an error — #432).
+        await asyncio.to_thread(terminal_service.get_terminal, terminal_id)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+
+    try:
+        return await asyncio.to_thread(
+            terminal_service.list_siblings, terminal_id, depth=depth, cross_session=cross_session
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to list siblings: {str(e)}",
+        )
+
+
 @app.get("/terminals/{terminal_id}/memory-context")
-async def get_terminal_memory_context(terminal_id: TerminalId):
+async def get_terminal_memory_context(
+    terminal_id: TerminalId,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+):
     """Return the CAO memory context block for a terminal as plain text.
 
     Used by the Kiro AgentSpawn hook to inject memory into agent context.
@@ -2338,7 +3613,9 @@ async def send_terminal_key(
 
 @app.get("/terminals/{terminal_id}/output", response_model=TerminalOutputResponse)
 async def get_terminal_output(
-    terminal_id: TerminalId, mode: OutputMode = OutputMode.FULL
+    terminal_id: TerminalId,
+    mode: OutputMode = OutputMode.FULL,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> TerminalOutputResponse:
     try:
         # get_output does a blocking tmux capture-pane plus provider regex
@@ -2346,12 +3623,64 @@ async def get_terminal_output(
         # transcript can't stall the whole server.
         output = await asyncio.to_thread(terminal_service.get_output, terminal_id, mode)
         return TerminalOutputResponse(output=output, mode=mode)
+    except OutputExtractionError as e:
+        # Ordered before the ValueError arm it subclasses, same as run_step: the
+        # terminal and the route both resolved -- only the response marker was
+        # missing from the scrollback -- so this is a server-side extraction
+        # failure, not a bad terminal reference. Keep it a 500, not a 404
+        # (issue #570), and a plain-string detail like the run-step arm.
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get output: {str(e)}",
+        )
+
+
+@app.get("/terminals/{terminal_id}/output/range", response_model=TerminalOutputRange)
+async def get_terminal_output_range(
+    terminal_id: TerminalId,
+    offset: int = Query(ge=0, description="Byte offset into the append-only terminal log"),
+    length: int = Query(
+        ge=1,
+        le=TERMINAL_RANGE_MAX_LENGTH,
+        description=f"Bytes to read (capped at {TERMINAL_RANGE_MAX_LENGTH})",
+    ),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> TerminalOutputRange:
+    """Read an exact byte range from a terminal's on-disk log (U5 / #504, FR-4.3).
+
+    A SEPARATE read path from ``GET /terminals/{id}/output`` (the rolling
+    buffer/tail): this ranges over the append-only ``{id}.log`` so playback can
+    fetch the output produced around a selected event (FR-7.3). A valid terminal
+    that has not logged anything yet returns 200 with empty ``data`` so playback
+    degrades gracefully (BR-4), rather than 404.
+
+    Scope-gated: this route returns raw terminal log bytes, the same payload
+    class as the run read routes gated alongside it. Its only caller is this
+    repo's own web UI, so adding the gate breaks nothing. The sibling
+    ``GET /terminals/{id}/output`` — which returns the rolling transcript — is
+    gated with the same read tier, so both output read paths enforce
+    ``require_any_scope(READ, WRITE, ADMIN)`` when auth is enabled.
+    """
+    try:
+        # Reads a byte slice off disk — run it off the loop so a large range
+        # can't stall the server.
+        data = await asyncio.to_thread(
+            terminal_service.read_output_range, terminal_id, offset, length
+        )
+        return TerminalOutputRange(terminal_id=terminal_id, offset=offset, length=length, data=data)
+    except ValueError as e:
+        # Malformed id / negative offset — a caller error, not a missing log.
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except Exception as e:
+        # A genuine file I/O failure surfaced by read_output_range (BR-4): report
+        # it rather than masking a real fault as empty output.
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to read output range: {str(e)}",
         )
 
 
@@ -2374,6 +3703,17 @@ async def exit_terminal(
         )
 
 
+def _schedule_elastic_terminal_ended(
+    background_tasks: BackgroundTasks,
+    terminal_id: str,
+    *,
+    teardown: bool,
+    reuse_terminal_id: Optional[str],
+) -> None:
+    if teardown and reuse_terminal_id is None:
+        background_tasks.add_task(_notify_elastic_terminal_ended, terminal_id)
+
+
 @app.post(
     TERMINALS_RUN_STEP_ROUTE,
     response_model=RunStepResponse,
@@ -2390,6 +3730,7 @@ async def exit_terminal(
 )
 async def run_step(
     request: Request,
+    background_tasks: BackgroundTasks,
     body: RunStepRequest,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> RunStepResponse:
@@ -2423,37 +3764,77 @@ async def run_step(
     The plugin registry is threaded so teardown's ``post_kill_terminal`` hooks
     fire (parity with the DELETE endpoint).
     """
-    # BR-31: for a script-tier run-step call, record the created terminal into the
-    # shared ScriptRunRecord's step_states AT creation time, so U4's orphan sweep
+    # BR-31: for a script-tier run-step call, record the live terminal into the
+    # shared ScriptRunRecord's step_states as soon as it exists, so U4's orphan sweep
     # can tear it down if the subprocess dies mid-call. No-op for YAML/handoff
     # callers (no run/step env or no script record in the registry).
-    from cli_agent_orchestrator.services import workflow_service
+    from cli_agent_orchestrator.services import step_replay, workflow_service
     from cli_agent_orchestrator.services.script_runner import (
         make_step_terminal_recorder,
         record_step_completion,
+        record_step_replay,
+    )
+    from cli_agent_orchestrator.services.step_fingerprint import StepCallFields, compute
+    from cli_agent_orchestrator.services.workflow_errors import (
+        RecoveryDecisionRequired,
+        ReplayDivergenceError,
     )
     from cli_agent_orchestrator.services.workflow_service import StaleGenerationError
 
-    on_terminal_created = make_step_terminal_recorder(body.env_vars)
-    # BR-31 companion: the recorder above seeds a step RUNNING at terminal
-    # creation, but nothing transitions it — so a completed script run reports
+    # Issue #583, unit ``settlement-rewire``: the recorder now also publishes the
+    # step's call fingerprint (computed inside ``run_agent_step``, in the one window
+    # BR-5 permits) and writes the durable RUNNING row — on BOTH the create and the
+    # reuse path, which is why it is no longer named for terminal creation (BR-3/BR-4).
+    on_step_terminal_ready = make_step_terminal_recorder(body.env_vars)
+    # Its companion: the recorder above seeds a step RUNNING when its terminal
+    # appears, but nothing transitions it — so a completed script run would report
     # every step frozen at running/attempts=0/output=null. ``on_step_settled``
     # transitions the shared ScriptRunRecord's step RUNNING->COMPLETED on success
-    # (or ->FAILED on a StepExecutionError), matching the YAML tier. No-op for
-    # YAML/handoff callers (same guard as the recorder). Settling is best-effort:
-    # it must never turn a successful step into an HTTP error, so ``_settle_step``
-    # swallows + logs any bookkeeping failure.
-    on_step_settled = record_step_completion(
-        body.env_vars, provider=body.provider, agent=body.agent, prompt=body.prompt
-    )
+    # (or ->FAILED on a StepExecutionError), matching the YAML tier, and settles the
+    # durable row in ONE write carrying the result envelope, the redacted+bounded
+    # output and error. No-op for YAML/handoff callers (same guard as the recorder).
+    # Settling is best-effort: it must never turn a successful step into an HTTP
+    # error, so ``_settle_step`` swallows + logs any bookkeeping failure.
+    on_step_settled = record_step_completion(body.env_vars)
 
-    def _settle_step(terminal_id: Optional[str], error: Optional[str]) -> None:
+    def _settle_step(
+        terminal_id: Optional[str],
+        error: Optional[str],
+        last_message: Optional[str] = None,
+        response_status: Optional[str] = None,
+    ) -> None:
+        # ``last_message`` is the step's own text result and defaults to None because
+        # every FAILURE arm below has none to give: the step never produced one. Only
+        # the success arm passes it, and it is what the durable result envelope is
+        # built from — an envelope built without it would satisfy FR-4 guard 1's
+        # letter (a settled row DOES carry an envelope) while leaving every future
+        # replay serving an empty result.
         if on_step_settled is None:
             return
         try:
-            on_step_settled(terminal_id, error)
+            on_step_settled(terminal_id, error, last_message, response_status)
         except Exception:  # noqa: BLE001 — step bookkeeping is best-effort; never fail the step
             logger.warning("run_step: script step completion bookkeeping failed", exc_info=True)
+
+    # The THIRD sibling of the two callbacks above, called on the REPLAY arm only (PR #628
+    # review, Copilot F4). The replay branch returns before ``run_agent_step``, so neither
+    # callback above fires — correct, and the only way to create no terminal and write no
+    # durable row (BR-4) — but ``_finalize`` builds ``WorkflowRunResult.steps`` from
+    # ``ScriptRunRecord.step_states`` ALONE and ``resume_script_run`` rebuilds that map empty,
+    # so a fully replayed resume reported ``steps=[]`` while every journal row was intact.
+    # This records the step IN MEMORY, hydrated from its durable row; it writes nothing, so
+    # BR-4 is unchanged. Same guard as its siblings — None for every non-script-tier call.
+    on_step_replayed = record_step_replay(body.env_vars)
+
+    def _record_replayed_step() -> None:
+        if on_step_replayed is None:
+            return
+        try:
+            on_step_replayed()
+        except Exception:  # noqa: BLE001 — bookkeeping is best-effort; never fail the step
+            # A reporting loss (the step is absent from the run's step list), never a failed
+            # step: nothing ran, and there is a correct stored result to hand back regardless.
+            logger.warning("run_step: script step replay bookkeeping failed", exc_info=True)
 
     # The generation fence (ADR-9 anti-double-drive, DR-5): a script run-step call
     # carrying BOTH CAO_WORKFLOW_RUN_ID and CAO_WORKFLOW_GENERATION must be checked
@@ -2474,7 +3855,161 @@ async def run_step(
         except KeyError as e:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
+    # ---- issue #583, unit ``run-step-replay-branch``: the replay branch ----------
+    #
+    # THE BRANCH ENGAGES FOR SCRIPT-TIER CALLS ONLY (BR-2/SR-5): both
+    # CAO_WORKFLOW_RUN_ID and CAO_WORKFLOW_STEP_ID present AND a live
+    # ``ScriptRunRecord`` in the registry. That last term is not re-implemented
+    # here — ``make_step_terminal_recorder`` returns None on exactly that
+    # condition, so ``on_step_terminal_ready is not None`` IS the callbacks' own
+    # guard rather than a second copy of it that could drift from them. YAML and
+    # handoff callers therefore reach no gate call at all, which is a security
+    # property as much as a compatibility one: no other tier can be handed a
+    # script run's stored result.
+    replay_run_id = env_vars.get("CAO_WORKFLOW_RUN_ID")
+    replay_step_id = env_vars.get("CAO_WORKFLOW_STEP_ID")
+
+    # The three values the gate needs, or None for a non-script-tier call. They
+    # travel as ONE optional triple rather than three separate Optionals so the
+    # tier test exists in one place and the branch below cannot be reached with a
+    # half-populated context.
+    replay_context: Optional[Tuple[str, str, str]] = None
+
+    # BR-10/TD-1: the effective working directory is resolved HERE, and the
+    # resolved value is what both the fingerprint and ``run_agent_step`` receive.
+    # For every non-script-tier call this stays the posted value and
+    # ``run_agent_step`` resolves exactly as it always did — no behaviour change.
+    effective_working_directory = body.working_directory
+    if replay_run_id and replay_step_id and on_step_terminal_ready is not None:
+        effective_working_directory = await resolve_effective_working_directory(
+            body.working_directory, body.caller_id
+        )
+        # TD-2: the SAME ``compute`` over the SAME effective directory that
+        # ``settlement-rewire`` hashed and ``begin_step`` stored. That is what makes
+        # the gate's comparison meaningful. Computing from the POSTED
+        # ``working_directory`` instead would not match the stored value, so rule 6
+        # would fire and every ``caller_id``-inherited step would get a false
+        # ``DIVERGED`` — a bug, not a trade-off (BR-10).
+        replay_context = (
+            replay_run_id,
+            replay_step_id,
+            compute(
+                StepCallFields(
+                    provider=body.provider,
+                    agent=body.agent,
+                    prompt=body.prompt,
+                    model=body.model,
+                    # ``StepCallFields.engine`` is the enum's ``value`` by contract —
+                    # the CALLER normalises, mirroring ``run_agent_step``.
+                    engine=(
+                        body.engine.value if isinstance(body.engine, KiroEngine) else body.engine
+                    ),
+                    allowed_tools=(
+                        None if body.allowed_tools is None else tuple(body.allowed_tools)
+                    ),
+                    effective_working_directory=effective_working_directory,
+                    use_worktree=body.use_worktree,
+                    # DERIVED, never the raw id (``step-fingerprint`` BR-6). Always
+                    # False on this tier today, because ``env_vars`` with a
+                    # ``reuse_terminal_id`` is already a 422 — computed rather than
+                    # hardcoded so it stays correct if that ever changes.
+                    reused_terminal=body.reuse_terminal_id is not None,
+                    timeout=body.timeout,
+                )
+            ),
+        )
+
     try:
+        # The branch sits AFTER the generation fence and BEFORE ``run_agent_step``,
+        # and both directions are load-bearing (BR-1). After the fence: a
+        # stale-generation zombie must get the fence's 409 rather than a cached
+        # result. Before ``run_agent_step``: not entering it is the only way to
+        # create no terminal, fire no callback and write no durable row (BR-4).
+        #
+        # It sits INSIDE this ``try`` for one reason (BR-9/SR-8): a database failure
+        # inside ``decide`` must reach the EXISTING 500 arm below and must never fall
+        # through to execution. An unreadable journal degrading to "just run it"
+        # re-runs completed work under exactly the conditions FR-1 exists to prevent.
+        # ``decide``'s ``ValueError`` precondition (a non-``v2`` fingerprint) is
+        # unreachable from here because the fingerprint above came from ``compute``,
+        # which only ever emits ``v2:``.
+        #
+        # The two halting verdicts are raised as ``workflow-errors``' two exception
+        # types and mapped in two dedicated ``except`` arms rather than raised as
+        # ``HTTPException`` here: ``HTTPException`` IS an ``Exception``, so a 409
+        # raised in this block would be swallowed by the ``except Exception`` arm,
+        # returned as a 500, and — worse — would settle a step that never ran.
+        if replay_context is not None:
+            decide_run_id, decide_step_id, call_fingerprint = replay_context
+            decision = step_replay.decide(
+                decide_run_id, decide_step_id, call_fingerprint, body.recovery
+            )
+            if decision.verdict is step_replay.ReplayVerdict.REPLAY:
+                # FR-1. The envelope is returned VERBATIM (SR-3): it was redacted and
+                # then bounded by ``build_envelope`` before it reached SQLite, and a
+                # second redaction pass could match its own ``[REDACTED:<name>]``
+                # marker. Reading ``result_json`` raw would bypass that pipeline
+                # entirely; ``decision.envelope`` is the only sanctioned payload.
+                envelope = decision.envelope
+                if envelope is None:  # pragma: no cover — see comment
+                    # Unreachable: ``ReplayDecision.envelope`` is set iff the verdict
+                    # is REPLAY and ``decide`` is its only construction site
+                    # (``replay-gate`` BR-6). Raised rather than executed, because
+                    # falling through here would re-run a completed step.
+                    raise RuntimeError(
+                        f"step '{decide_step_id}': the replay gate returned REPLAY "
+                        f"with no result envelope"
+                    )
+                if envelope.terminal_id is None:  # pragma: no cover — see comment
+                    # Unreachable through the shipped writers: a REPLAY verdict
+                    # requires a current-scheme ``call_fingerprint`` on the row, only
+                    # ``begin_step`` writes that column, and its one caller sets
+                    # ``StepRunState.terminal_id`` in the same statement — so a row
+                    # that can replay always carries the id its envelope was built
+                    # with. Raised rather than substituting a fake id, because
+                    # ``RunStepResponse.terminal_id`` is a non-optional ``str`` and
+                    # inventing one would be worse than failing.
+                    raise RuntimeError(
+                        f"step '{decide_step_id}': the stored result envelope carries "
+                        f"no terminal id, so no replayed response can be built"
+                    )
+                # Make the replayed step visible in the run's step list before answering
+                # (F4). In memory only — no terminal, no journal write, so BR-4 holds. Before
+                # the return rather than after it for the obvious reason, and best-effort so a
+                # bookkeeping failure cannot turn a correct replay into an HTTP error.
+                _record_replayed_step()
+                # ``replayed=True`` is the mitigation for the dead id (SR-4): the
+                # terminal named here no longer exists, and the flag is the only
+                # thing that stops a consumer probing it.
+                return RunStepResponse(
+                    terminal_id=envelope.terminal_id,
+                    last_message=envelope.last_message,
+                    status=envelope.status,
+                    replayed=True,
+                )
+            if decision.verdict is step_replay.ReplayVerdict.DIVERGED:
+                # FR-3's surfacing. NO fingerprint travels with it, and none can be
+                # added later (SR-2): only a digest is persisted, and
+                # ``step-fingerprint``'s SR-2 forbids echoing a digest into a message,
+                # a log or an exception — a 409 body is the most exposed of the three.
+                raise ReplayDivergenceError(step_id=decide_step_id, reason=decision.reason)
+            if decision.verdict is step_replay.ReplayVerdict.DECISION_REQUIRED:
+                # FR-7's surfacing. ``rule`` is set iff the verdict is
+                # DECISION_REQUIRED (``replay-gate`` BR-6), and this is where it
+                # reaches a human: without it an operator cannot tell which of six
+                # conditions halted the run.
+                halt_rule = decision.rule
+                if halt_rule is None:  # pragma: no cover — see comment
+                    # Unreachable for the same reason as the envelope guard above.
+                    raise RuntimeError(
+                        f"step '{decide_step_id}': the replay gate returned "
+                        f"DECISION_REQUIRED with no halting rule"
+                    )
+                raise RecoveryDecisionRequired(
+                    step_id=decide_step_id, rule=halt_rule, reason=decision.reason
+                )
+            # EXECUTE falls through — the step runs normally.
+
         result = await run_agent_step(
             provider=body.provider,
             agent=body.agent,
@@ -2483,23 +4018,76 @@ async def run_step(
             reuse_terminal_id=body.reuse_terminal_id,
             teardown=body.teardown,
             timeout=body.timeout,
-            working_directory=body.working_directory,
+            # BR-10: the ALREADY-RESOLVED directory rides the existing parameter, so
+            # ``run_agent_step``'s own ``working_directory is None and caller_id is
+            # not None`` guard simply does not fire and the resolution never runs
+            # twice. Identical to ``body.working_directory`` for every
+            # non-script-tier call.
+            working_directory=effective_working_directory,
             caller_id=body.caller_id,
             allowed_tools=body.allowed_tools,
             engine=body.engine,
             registry=get_plugin_registry(request),
             env_vars=body.env_vars,
-            on_terminal_created=on_terminal_created,
+            on_step_terminal_ready=on_step_terminal_ready,
             model=body.model,
+            use_worktree=body.use_worktree,
         )
         # Success -> transition the script step RUNNING->COMPLETED (no-op for
         # non-script callers). Before building the response so a settle failure
-        # is logged, not raised.
-        _settle_step(result.terminal_id, None)
+        # is logged, not raised. ``last_message`` is passed here and nowhere else:
+        # this is the only arm where the step produced one.
+        response_status = (
+            result.status.value if hasattr(result.status, "value") else str(result.status)
+        )
+        _settle_step(result.terminal_id, None, result.last_message, response_status)
+        _schedule_elastic_terminal_ended(
+            background_tasks,
+            result.terminal_id,
+            teardown=body.teardown,
+            reuse_terminal_id=body.reuse_terminal_id,
+        )
         return RunStepResponse(
             terminal_id=result.terminal_id,
             last_message=result.last_message,
-            status=(result.status.value if hasattr(result.status, "value") else str(result.status)),
+            status=response_status,
+        )
+    except ReplayDivergenceError as e:
+        # FR-3's surfacing (BR-6/BR-7, TD-3/TD-4). 409 rather than 502/504 because
+        # neither is a worker outcome — NOTHING RAN. ``kind`` is authoritative and
+        # three 409s are now reachable from this route (the generation fence's,
+        # this, and "decision_required"), so all three must stay distinguishable.
+        #
+        # TWO ARMS, NEVER ONE, AND NEVER A SHARED HANDLER. ``workflow-errors``' TD-1
+        # gave these two exception types no common base SPECIFICALLY so one ``except``
+        # cannot collapse two remedies FR-3 and FR-6 exist to keep apart: a divergence
+        # is reconciled by a human looking at what changed in the script, a halt by a
+        # human authorising a rerun. Parametrising them into one arm would undo that.
+        #
+        # NO ``rule`` KEY HERE — ``replay-gate`` BR-6 sets ``rule`` only on
+        # DECISION_REQUIRED, because a divergence is always the same condition and a
+        # constant attribute is the inert-field trap this issue has removed three
+        # times. NO FINGERPRINT EITHER, not even truncated (SR-2).
+        #
+        # The step is NOT settled: it never ran, so there is no outcome to record.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"message": str(e), "kind": "diverged", "step_id": e.step_id},
+        )
+    except RecoveryDecisionRequired as e:
+        # FR-7's surfacing — the second of the two arms above. ``rule`` completes a
+        # chain three units long: unit 1 built ``HaltRule``, unit 7 put it on
+        # ``ReplayDecision`` so the condition could travel, unit 12 consumes it to
+        # resolve the halt — and this is where it reaches a HUMAN. Omitting it would
+        # leave an operator guessing which of six conditions halted their run.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": str(e),
+                "kind": "decision_required",
+                "step_id": e.step_id,
+                "rule": e.rule.value,
+            },
         )
     except StepExecutionError as e:
         # The step did not complete successfully. Distinguish a worker that
@@ -2515,7 +4103,26 @@ async def run_step(
             status_code=code,
             detail={"message": str(e), "kind": e.kind, "terminal_id": e.terminal_id},
         )
-    except TimeoutError as e:
+    except (TimeoutError, TerminalInputBlockedError) as e:
+        # TerminalInputBlockedError (PR #539) is kept a DISTINCT type from
+        # TimeoutError rather than collapsed into it, because
+        # _schedule_deferred_init's async path genuinely needs to tell
+        # "blocked on a recognized user prompt, worker still alive" (leave it
+        # running for answer_user_prompt) apart from "generic failure, worker
+        # dead" (tear down) -- see terminal_service.py's own
+        # _schedule_deferred_init. run_step never goes through that deferred
+        # path, though: run_agent_step calls terminal_service.send_input with
+        # no orchestration_type, so the WAITING_USER_ANSWER guard can never
+        # fire here -- the only producer reachable from run_step is
+        # send_input's ERROR-state guard (a terminal whose provider process
+        # has already exited, or flips to ERROR between the readiness wait
+        # and the send). Since run_step is the SYNCHRONOUS caller (handoff
+        # MCP client's step call, and the future run engine), there is no
+        # deferred worker to keep alive either way -- the call has simply
+        # failed to complete, so this maps to the same kind="timeout" / 504
+        # outcome as a plain TimeoutError. This preserves the pre-PR-#539 504
+        # status code for this exact failure instead of silently falling
+        # through to the generic kind-less 500 below.
         _settle_step(None, str(e))
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
@@ -2526,9 +4133,29 @@ async def run_step(
         # a bad request, not an unknown terminal.
         _settle_step(None, str(e))
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except OutputExtractionError as e:
+        # Also ordered before the ValueError arm it subclasses. The terminal and
+        # the route both resolved and the step ran -- only the response marker
+        # was missing -- so this is not a bad terminal reference. 500 per this
+        # endpoint's documented contract above ("any other failure -> 500",
+        # plain-string detail, no ``kind``), not 404 (issue #570).
+        _settle_step(None, str(e))
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+    except TerminalLimitError as e:
+        # The node is at its tracked-terminal cap (CAO_MAX_TERMINALS) — surfaced
+        # as 429 so a step scheduler can retry on a different node instead of
+        # reading a kind-less 500.
+        _settle_step(None, str(e))
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
     except ValueError as e:
         # Unknown terminal / bad input surfaced by the terminal layer.
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except WorktreeError as e:
+        # use_worktree=true against a working_directory that isn't a git repo,
+        # or the 'git worktree add' itself failed -- a client-input problem
+        # (bad/missing repo), not a server crash.
+        _settle_step(None, str(e))
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:
         _settle_step(None, str(e))
         raise HTTPException(
@@ -2547,7 +4174,10 @@ async def run_step(
 
 
 @app.post("/workflows/validate")
-async def validate_workflow_endpoint(body: WorkflowValidateRequest) -> Dict:
+async def validate_workflow_endpoint(
+    body: WorkflowValidateRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
     """Validate a workflow spec without running it (FR-1.3/A1a). Returns ValidationResult.
 
     Extension-based dispatch (U5, A1a, BR-23a): ``.yaml``/``.yml`` calls
@@ -2603,7 +4233,10 @@ async def validate_workflow_endpoint(body: WorkflowValidateRequest) -> Dict:
 
 
 @app.get("/workflows")
-async def list_workflows_endpoint(dir: Optional[str] = Query(default=None)) -> List[Dict]:
+async def list_workflows_endpoint(
+    dir: Optional[str] = Query(default=None),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> List[Dict]:
     """List indexed workflows, rebuilt from the spec files on disk (FR-2.1)."""
     from cli_agent_orchestrator.services import workflow_spec_service
 
@@ -2614,8 +4247,71 @@ async def list_workflows_endpoint(dir: Optional[str] = Query(default=None)) -> L
     return [row.model_dump() for row in rows]
 
 
+# --------------------------------------------------------------------------- #
+# ROUTE-ORDERING HAZARD (U4, issue #505, RO-1/RO-2). ``GET /workflows/runs`` MUST
+# be declared IMMEDIATELY BEFORE the ``GET /workflows/{name}`` catch-all below.
+# FastAPI matches routes in declaration order, and ``{name}`` is a SINGLE path
+# segment, so if the catch-all were declared first it would capture the literal
+# segment ``runs`` as ``name="runs"`` and this list route would be dead. Do NOT
+# "tidy" this route back below the catch-all. Only this bare single-segment
+# collection route collides; the deeper two-segment run routes
+# (``/workflows/runs/{run_id}`` and ``/workflows/runs/{run_id}/result``) can never
+# be shadowed by a single-segment ``{name}`` and are safe at any position. The
+# NFR-2a regression test (mirroring the #510 ``/agents/profiles/search`` precedent)
+# is the load-bearing guard against a future reorder.
+# --------------------------------------------------------------------------- #
+@app.get("/workflows/runs")
+async def list_workflow_runs_endpoint(
+    state: Optional[str] = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=500),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> List[Dict]:
+    """List journaled workflow runs newest-first as narrow summaries (U4, FR-3.3).
+
+    Journal-authoritative read: a thin mapper over U1's
+    ``workflow_journal.list_runs`` (RunSummaryRow projection, ORDER BY
+    ``started_at DESC, run_id DESC``). The state-legality check that the DAL
+    deliberately omits lives at this REST boundary (LR-1): an illegal ``state``
+    filter is a 400; a legal-but-unmatched value simply yields ``[]``. ``limit`` is
+    clamped to ``[1, 500]`` by FastAPI at the boundary (LR-2). An empty result is a
+    200 with ``[]`` (LR-3), never a 404. A ``sqlite3.Error`` from the DAL maps to
+    500 (LR-4) — a silently empty list would hide a broken database from a human
+    who explicitly asked to list runs.
+
+    No-id ``status`` floor (SR-1, FR-4.8): ``?limit=1`` returns the
+    most-recently-started run (any state), which U5/U6 consume to resolve
+    ``status`` with no explicit run id.
+    """
+    import sqlite3
+    from dataclasses import asdict
+
+    from cli_agent_orchestrator.models.workflow_runtime import RunState
+    from cli_agent_orchestrator.services import workflow_journal
+
+    if state is not None:
+        try:
+            RunState(state)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"illegal run state filter '{state}'",
+            )
+
+    try:
+        rows = workflow_journal.list_runs(state=state, limit=limit)
+    except sqlite3.Error as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"failed to list runs: {e}",
+        )
+    return [asdict(row) for row in rows]
+
+
 @app.get("/workflows/{name}")
-async def get_workflow_endpoint(name: str) -> Dict:
+async def get_workflow_endpoint(
+    name: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
     """Return the parsed/validated spec for a workflow name (FR-2.1, A1).
 
     Widened return: ``get_workflow`` may now resolve a ``.py`` name to a
@@ -2703,6 +4399,323 @@ async def record_step_output_endpoint(
 # WorkflowEngineError -> 500. Narrow exceptions in the service; mapped here.
 
 
+_EVENTS_ROUTE_PATH = "/workflows/runs/{run_id}/events"
+
+
+def _events_route_registered() -> bool:
+    """Whether THIS build actually serves the events route (CD-1).
+
+    The events route is owned by issue #504 and is absent from this branch, so
+    advertising it unconditionally put a link that 404s into EVERY accepted-run
+    response. Rather than hard-code either answer — which would need a follow-up
+    edit the moment the merge order changed — ask the running app what it serves.
+    The check is over the app's own route table (no I/O, no network) and it
+    self-heals: the link appears automatically once #504's route is registered,
+    with no code change at the rebase.
+    """
+    return any(getattr(r, "path", None) == _EVENTS_ROUTE_PATH for r in app.routes)
+
+
+def _run_links(run_id: str) -> Dict[str, str]:
+    """Build the 202 body's ``links`` map for a submitted run (U2, ADR-1, RR-2).
+
+    Each value is a **relative** URL (host/port/scheme-agnostic so they work behind
+    a proxy and in the test client, which joins them onto its own base URL).
+    ``cancel`` resolves to the existing cancel route; ``self``/``status`` both point
+    at the snapshot route.
+
+    ``events`` is CONDITIONAL (CD-1): it is present only when this build actually
+    serves the route (#504). A ``links`` map is a capability advertisement, and a
+    role that 404s is worse than an absent one — a client that feature-detects by
+    key presence does the right thing either way, whereas one that trusts an
+    advertised role gets a 404 on its first call. Clients must therefore treat
+    ``events`` as optional; the four unconditional roles are always present.
+    """
+    links = {
+        "self": f"/workflows/runs/{run_id}",
+        "status": f"/workflows/runs/{run_id}",
+        "result": f"/workflows/runs/{run_id}/result",
+        "cancel": f"/workflows/runs/{run_id}/cancel",
+    }
+    if _events_route_registered():
+        links["events"] = f"/workflows/runs/{run_id}/events"
+    return links
+
+
+# --- Background-drive task registry + admission bound (issue #505 review) ---
+#
+# STRONG REFERENCES (BG-1). ``asyncio`` keeps only a WEAK reference to a task, so a
+# bare ``asyncio.create_task(...)`` whose Task object is discarded can be garbage
+# collected while it is suspended on a future it alone roots — the drive simply
+# stops, and the journal row it was going to settle stays RUNNING forever. Those
+# rows are the durable record this feature exists to provide, so every drive task
+# is held in this module-level set until it completes and discards itself via a
+# done-callback.
+_background_drives: "set[asyncio.Task]" = set()
+
+# ADMISSION BOUND (AB-1). See WORKFLOW_MAX_CONCURRENT_BACKGROUND_DRIVES: the async
+# route has none of the blocking route's natural back-pressure, so the semaphore is
+# the only thing standing between N submits and N concurrent drives. Created lazily
+# because a module-level asyncio primitive binds to whatever loop is current at
+# import time, which is not necessarily the loop the app runs on (notably under
+# TestClient, which creates a fresh loop per client).
+_drive_semaphore: "Optional[asyncio.Semaphore]" = None
+
+
+def _get_drive_semaphore() -> asyncio.Semaphore:
+    """Return the process-wide background-drive admission semaphore (AB-1, lazy)."""
+    from cli_agent_orchestrator.constants import WORKFLOW_MAX_CONCURRENT_BACKGROUND_DRIVES
+
+    global _drive_semaphore
+    if _drive_semaphore is None:
+        _drive_semaphore = asyncio.Semaphore(WORKFLOW_MAX_CONCURRENT_BACKGROUND_DRIVES)
+    return _drive_semaphore
+
+
+def _schedule_background_drive(
+    record: Any, spec: Any, run_id: str, tier: str, inputs: Dict[str, Any]
+) -> "asyncio.Task":
+    """Schedule a background drive, holding a STRONG reference to its Task (BG-1).
+
+    The done-callback discards the reference on EVERY completion path (normal,
+    exception, cancellation), so the set cannot grow without bound. Returns the
+    Task so a caller/test can await or cancel it.
+    """
+    task = asyncio.create_task(
+        _run_in_background(record, spec, run_id, tier, inputs),
+        name=f"workflow-drive-{run_id}",
+    )
+    _background_drives.add(task)
+    task.add_done_callback(_background_drives.discard)
+    return task
+
+
+async def _run_in_background(
+    record: Any, spec: Any, run_id: str, tier: str, inputs: Dict[str, Any]
+) -> None:
+    """The fire-and-forget background drive for an async-submitted run (U2, C2).
+
+    Scheduled with ``asyncio.create_task`` AFTER the durable insert committed and
+    the 202 was returned — it holds no client socket. It invokes ONLY the dedicated
+    **prepared** engine entries (``start_run_prepared`` /
+    ``run_script_workflow_prepared``), never the blocking ``start_run`` /
+    ``run_script_workflow`` (which would re-admit and re-insert — the double-insert
+    / double-admission hazard, ADR-3 / DR-1). The prepared entries' own
+    write-through settles the terminal state.
+
+    BR-1: it NEVER re-raises into the event loop — every exception is terminal for
+    the task. BR-2: if an exception escaped BEFORE the engine settled the row, it
+    best-effort marks the run FAILED (its own ``try``/``except``) so a scheduling
+    bug can never orphan a run stuck in RUNNING. The ``ScriptRunRecord`` carries no
+    ``inputs`` field, so the resolved inputs are threaded in explicitly to build the
+    script spawn env via the single-homed public ``build_env`` seam.
+
+    BR-2a (issue #505 review): the backstop covers CANCELLATION too. ``CancelledError``
+    derives from ``BaseException``, NOT ``Exception``, so an ``except Exception``
+    backstop does not see it — on interpreter shutdown (or any task cancel) the
+    exception would propagate straight out and leave the journal row stuck in
+    RUNNING forever, exactly the outcome BR-2 exists to prevent. It is handled in its
+    OWN arm that writes the same FAILED backstop and then RE-RAISES, because
+    swallowing a cancellation would break cooperative-cancellation semantics for the
+    caller. The semaphore (AB-1) is acquired here rather than in the handler so a
+    queued run still holds its durable row and its already-returned 202.
+
+    BR-2b (PR #525 review): the backstop is STATE-GUARDED. Written unconditionally it
+    fired on any exception, including one raised AFTER the engine had already settled
+    the row — turning a true COMPLETED/CANCELLED into a false FAILED. The journal row
+    is the durable record of what actually happened, so a wrong terminal state is
+    worse than the orphaned-RUNNING hole BR-2 closes: an orphan is visibly stuck,
+    whereas a wrong terminal state is indistinguishable from a real one. The guard is
+    a conditional UPDATE in the DAL (``settle_run_state_if_running``), atomic rather
+    than a read-then-write here, so no concurrent settle can land between the check
+    and the write. The never-settled case still lands FAILED — BR-2's guarantee is
+    narrowed, not removed.
+    """
+    from cli_agent_orchestrator.models.workflow_runtime import RunState
+    from cli_agent_orchestrator.services import script_runner, workflow_journal, workflow_service
+
+    def _failed_backstop(why: str) -> None:
+        """Mark the run FAILED **only if still RUNNING**; itself guarded so it can never re-raise."""
+        try:
+            settled = workflow_journal.settle_run_state_if_running(
+                run_id, RunState.FAILED.value, workflow_service._now()
+            )
+            if not settled:
+                # BR-2b: the engine already settled this row. Logged explicitly —
+                # an unobservable no-op is indistinguishable from a broken guard
+                # when this is read back after an incident.
+                logger.info(
+                    "background workflow run '%s' already settled; FAILED backstop "
+                    "not written (%s)",
+                    run_id,
+                    why,
+                )
+        except Exception:  # noqa: BLE001 — the backstop is itself best-effort
+            logger.error(
+                "background workflow run '%s' FAILED-backstop journal write failed (%s)",
+                run_id,
+                why,
+                exc_info=True,
+            )
+
+    try:
+        async with _get_drive_semaphore():
+            if tier == "yaml":
+                await workflow_service.start_run_prepared(record)
+            else:
+                env = script_runner.build_env(run_id, "1", inputs)
+                await script_runner.run_script_workflow_prepared(record, spec.path, env)
+    except asyncio.CancelledError:
+        # BR-2a: cancellation is NOT an Exception subclass — settle the durable row
+        # before letting the cancellation continue to propagate.
+        logger.warning("background workflow run '%s' drive cancelled; marking FAILED", run_id)
+        _failed_backstop("cancelled")
+        raise
+    except Exception:  # noqa: BLE001 — BR-1: the task must never re-raise into the loop
+        logger.error("background workflow run '%s' drive failed", run_id, exc_info=True)
+        # BR-2: the engine's own write-through normally settles the terminal state;
+        # this only fires if the exception escaped before the engine settled the row.
+        _failed_backstop("drive raised")
+
+
+class PlanApprovalRequest(BaseModel):
+    """Body of the approve-a-plan request (issue #583 Bolt 2, unit ``approval-operation``).
+
+    ``plan_id`` IS A BODY FIELD AND NEVER A PATH SEGMENT, on purpose. It contains a ``:``
+    (``plan-v1:…``) and ``approval_store`` requires it be stored and compared VERBATIM, never parsed
+    and never normalised — a normalisation is how two distinct plans could come to share one
+    approval. A path segment invites percent-encoding, decoding and normalisation from every layer
+    between the client and this handler; a body field makes verbatimness a property of the transport
+    instead of a hope.
+
+    THERE IS NO ``approved_by`` FIELD, also on purpose. Accepting one would create free text that
+    nothing can verify and that any caller could set to any value — the appearance of accountability
+    with none of the substance. It is resolved server-side instead, which at least makes it a true
+    statement about which local account performed the call.
+    """
+
+    plan_id: str
+
+
+@app.post("/workflows/plans/approve")
+async def approve_workflow_plan_endpoint(
+    body: PlanApprovalRequest,
+    # SCOPE_ADMIN ONLY, AND DELIBERATELY NARROWER THAN EVERY SIBLING WORKFLOW ENDPOINT, which accept
+    # ``SCOPE_WRITE, SCOPE_ADMIN``. DO NOT "align" this with them — widening it silently defeats the
+    # control. Approving a plan is an AUTHORISATION act rather than ordinary data mutation, and the
+    # MCP surface deliberately ships no grant tool so an agent cannot approve the plan it just wrote
+    # (issue #583 Bolt 2 ``approval-operation`` Q1). But the MCP boundary reaches the backplane over
+    # HTTP — that is exactly what ``test_http_only_boundary.py`` enforces — so if this endpoint
+    # accepted ``cao:write`` and an agent's token were write-scoped, the agent could grant by calling
+    # here directly and the missing tool would be a speed bump rather than a control.
+    #
+    # Honest caveat, recorded rather than implied away: ``require_any_scope`` is default-off, so in a
+    # default install this changes nothing. ``SCOPE_WRITE, SCOPE_ADMIN`` is equally inert there; the
+    # two differ ONLY when auth is enabled, which is the one case the distinction was asked for.
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
+) -> Dict:
+    """Approve a plan identifier so its runs may start (issue #583 FR-8).
+
+    Idempotent: approving an already-approved plan changes nothing and SAYS SO, reporting the
+    ORIGINAL ``approved_at``/``approved_by``. ``approval_store.grant`` is ``INSERT OR IGNORE``
+    because an update path could transfer an existing approval to a changed plan, so a plain
+    "success" here would leave an operator unable to tell "I have just approved this" from "this was
+    approved last week by someone else and my grant did nothing".
+
+    Success is derived from a READ-BACK rather than from the absence of an exception, because
+    ``INSERT OR IGNORE`` succeeds silently whether or not it inserted. A missing row afterwards is
+    an error, never a cheerful success — this unit's worst failure mode is a command that appears to
+    work, leaving the operator to meet the same refusal on the next run with no explanation.
+    """
+    plan_id = body.plan_id
+    if not plan_id or not plan_id.strip():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="plan_id is required")
+
+    existing = await asyncio.to_thread(approval_store.get_approval, plan_id)
+    if existing is not None:
+        logger.info(
+            "workflow plan approval: %s was already approved at %s by %s (no change)",
+            plan_id,
+            existing.approved_at,
+            existing.approved_by,
+        )
+        return {
+            "plan_id": plan_id,
+            "approved": True,
+            "changed": False,
+            "approved_at": existing.approved_at,
+            "approved_by": existing.approved_by,
+        }
+
+    approved_by = approval_provenance.local_account()
+    try:
+        await asyncio.to_thread(approval_store.grant, plan_id, approved_by)
+        recorded = await asyncio.to_thread(approval_store.get_approval, plan_id)
+    except Exception as e:  # noqa: BLE001 — surfaced, never swallowed into a false success
+        logger.error("workflow plan approval: grant for %s failed: %s", plan_id, e)
+        raise HTTPException(status_code=500, detail=f"could not record approval: {e}")
+
+    if recorded is None:
+        # A database fault that ``approval_store`` converted to a quiet None. Correct for the GATE,
+        # which must fail closed; wrong to read here as "not approved yet, all fine".
+        logger.error("workflow plan approval: grant for %s did not persist", plan_id)
+        raise HTTPException(status_code=500, detail="approval did not persist")
+
+    logger.info("workflow plan approval: %s approved by %s", plan_id, recorded.approved_by)
+    return {
+        # Echoed VERBATIM. Returning a normalised form would teach a caller that some other
+        # spelling is equivalent, which is exactly the equivalence approval_store forbids.
+        "plan_id": plan_id,
+        "approved": True,
+        "changed": True,
+        "approved_at": recorded.approved_at,
+        "approved_by": recorded.approved_by,
+    }
+
+
+@app.get("/workflows/runs/{run_id}/plan")
+async def get_workflow_run_plan_endpoint(
+    run_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Report a run's plan identifier and whether it is approved (issue #583 FR-8).
+
+    READ-ONLY, and a NEW route rather than an extension of ``GET /workflows/runs/{run_id}``: adding
+    fields to a shipped response would change a surface every existing caller already parses, which
+    C-1 forbids.
+
+    This is what the read-only MCP tool consults, so an agent that meets an approval refusal can tell
+    the operator WHICH ``plan_id`` to approve. It cannot grant one — that is the CLI's, behind
+    ``cao:admin``.
+
+    ``plan_id`` is ``None`` for a YAML run (which never freezes a manifest) and for a script run whose
+    freeze failed. Both are reported as ``None`` rather than as "unapproved", because "this run has no
+    plan identifier" and "this plan is not approved" call for entirely different operator actions.
+    """
+    # Imported locally, matching the other run-row handlers in this module (see the resume endpoint).
+    from cli_agent_orchestrator.services import workflow_journal
+
+    row = await asyncio.to_thread(workflow_journal.get_run, run_id)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'")
+
+    # Reuses the gate's extractor rather than parsing the manifest a second way: two extractors
+    # disagreeing about what a run's plan_id is would be worse than either being wrong alone.
+    plan_id = approval_gate.plan_id_from_manifest(row.manifest_json)
+    if plan_id is None:
+        return {"run_id": run_id, "tier": row.tier, "plan_id": None, "approved": None}
+
+    approval = await asyncio.to_thread(approval_store.get_approval, plan_id)
+    return {
+        "run_id": run_id,
+        "tier": row.tier,
+        "plan_id": plan_id,
+        "approved": approval is not None,
+        "approved_at": approval.approved_at if approval else None,
+        "approved_by": approval.approved_by if approval else None,
+    }
+
+
 @app.post("/workflows/runs")
 async def start_workflow_run_endpoint(
     body: WorkflowRunRequest,
@@ -2773,6 +4786,8 @@ async def start_workflow_run_endpoint(
                 status_code=422,
                 detail={"findings": workflow_spec_service.render_findings(e.findings)},
             )
+        except approval_gate.PlanApprovalRequiredError as e:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
         except KeyError as e:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
         except ValueError as e:
@@ -2793,16 +4808,1406 @@ async def start_workflow_run_endpoint(
     return result.model_dump()
 
 
-@app.get("/workflows/runs/{run_id}")
-async def get_workflow_run_endpoint(run_id: str) -> Dict:
-    """Return a point-in-time status snapshot for a run (FR-5.5)."""
-    from cli_agent_orchestrator.services import workflow_service
+@app.post("/workflows/runs:submit", status_code=status.HTTP_202_ACCEPTED)
+async def submit_workflow_run_endpoint(
+    body: WorkflowRunRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Submit a workflow run asynchronously: durably record it, ack 202, drive in background.
 
+    THE SPINE (U2, FR-2.1..FR-2.6). Unlike the blocking ``POST /workflows/runs``
+    (untouched, byte-compatible), this route acks with **202** the instant the run
+    is durably journaled, then drives the run in a fire-and-forget background task.
+    It upholds two invariants on the write side: ``run-id-allocated-before-ack``
+    (INV-1 — the durable insert is awaited and complete before the 202) and
+    no-orphan-RUNNING-row (validate/lint/reserved-mode/insert are ordered so no 202
+    or RUNNING row exists for a rejected run).
+
+    The steps run STRICTLY in order — reordering breaks one of the two invariants:
+
+    0. Key-shape validation THEN the admission gate, both for a caller-supplied id
+       and both BEFORE spec resolve (OR-4). A malformed ``body.run_id`` returns 400
+       and a colliding one returns 409, in each case even when ``name_or_path``
+       names a nonexistent spec — so neither is masked by a 404. Validating the key
+       shape HERE (not only inside the engine entry) is load-bearing: the prepared
+       background entries are reached only AFTER the durable insert and the 202, so
+       an engine-side ``_validate_key_part`` failure would surface as a background
+       task error on an already-acked run instead of the blocking twin's 400.
+    1. Resolve the spec (same error mapping as the blocking route).
+    2. Mint or accept the run id (identical to the blocking route).
+    3. Validate + cap inputs BEFORE any create (OR-1, NFR-4) — no row yet.
+    4. Script tier: lint gate -> 422 (OR-2); reserved YAML mode -> 501 (OR-3) —
+       both BEFORE any insert, so a rejected run leaves NO durable row and NO 202.
+    5. The awaited HARD atomic durable insert (INV-1, TR-1) — a ``sqlite3.Error``
+       aborts with 500 and NO 202. This is the one deliberate deviation from the
+       engines' best-effort write. An ``IntegrityError`` is special-cased FIRST
+       (it is an ``Error`` subclass, so arm order is load-bearing) and maps to
+       409: it means a concurrent submit won the race for this run id, which is
+       the same collision step 0 reports as 409 when it can see it serially.
+    6. Register the tier-appropriate in-process record (the SAME record C2 drives).
+    7. Schedule the background drive through ``_schedule_background_drive`` — the
+       registry helper, NOT a bare ``asyncio.create_task`` (see BG-1 at step 7).
+    8. Return 202 ``{run_id, state:"running", links}``.
+    """
+    import sqlite3
+    import uuid
+
+    from cli_agent_orchestrator.constants import WORKFLOW_INPUTS_MAX_BYTES
+    from cli_agent_orchestrator.models.workflow import (
+        NotBuiltYetError,
+        ScriptSpec,
+        TierCollisionError,
+    )
+    from cli_agent_orchestrator.models.workflow_runtime import RunState, StepState
+    from cli_agent_orchestrator.services import (
+        script_runner,
+        workflow_journal,
+        workflow_service,
+        workflow_spec_service,
+    )
+
+    # --- Step 0: admission gate FIRST for a caller-supplied id (OR-4) ---
+    # BEFORE spec resolve, so a colliding id + nonexistent spec returns 409, not
+    # 404. A minted id has no step-0 gate (collision probability negligible; the
+    # atomic insert's IntegrityError is the backstop).
+    #
+    # TWO checks, in the SAME order the blocking twin runs them (workflow_service
+    # .start_run L795-796): FORMAT first (_validate_key_part -> 400), then
+    # UNIQUENESS (_check_run_id_available -> 409). Both are required here because
+    # the async path's prepared engine entry (``start_run_prepared``) is the
+    # drive-only tail of ``start_run`` — it deliberately re-runs NO admission, so
+    # it never validates the key. Without this line the twins split their contract:
+    # the same malformed id yields 400 on POST /workflows/runs and 202 here, and a
+    # durable journal row commits for a run that can never execute while the caller
+    # holds a run_id and a ``links`` block that will never resolve. (Nothing escapes
+    # onto disk either way — ``step_output_store`` re-validates both key parts at
+    # its own boundary, L129-130 — so this is a contract defect, not traversal.)
+    if body.run_id:
+        try:
+            workflow_service._validate_key_part(body.run_id, "run_id")
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+        try:
+            workflow_service._check_run_id_available(body.run_id)
+        except KeyError as e:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+
+    # --- Step 1: resolve the spec (mapping identical to the blocking route) ---
     try:
-        status_snapshot = workflow_service.get_run_status(run_id)
+        spec = workflow_spec_service.get_workflow(body.name_or_path)
+    except KeyError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"unknown workflow '{body.name_or_path}'",
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except TierCollisionError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    # --- Step 2: mint or accept the run id (identical to the blocking route) ---
+    run_id = body.run_id or f"run-{uuid.uuid4().hex[:16]}"
+
+    # --- Step 3: validate + cap inputs BEFORE any create (OR-1, NFR-4). No row
+    # yet — a validation failure never leaves an orphan RUNNING row. ---
+    try:
+        resolved = workflow_service._validate_inputs(spec, body.inputs)
+        payload = json.dumps(resolved, separators=(",", ":"))
+        if len(payload.encode("utf-8")) > WORKFLOW_INPUTS_MAX_BYTES:
+            raise ValueError(f"workflow inputs exceed {WORKFLOW_INPUTS_MAX_BYTES} bytes")
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    started_at = workflow_service._now()
+    record: Any
+    tier: str
+
+    # Steps 4-6 branch by tier via ONE ``isinstance`` check (mirrors the blocking
+    # route's tier split). Each arm: (4) its pre-insert gate, which raises BEFORE
+    # any insert so a rejected run leaves NO durable row and NO 202; (5) the awaited
+    # HARD durable insert; (6) the in-process record C2 will drive.
+    if isinstance(spec, ScriptSpec):
+        # Step 4 — script lint gate (OR-2): a lint fail -> 422 with a findings body,
+        # in the handler's validation phase (never deferred into the background
+        # task, where a 202 + RUNNING row would already exist).
+        lint_result = script_runner.lint_script(spec.source, spec.path)
+        if lint_result.status == "fail":
+            raise HTTPException(
+                status_code=422,
+                detail={"findings": workflow_spec_service.render_findings(lint_result.findings)},
+            )
+        spec_snapshot = json.dumps(
+            {"source": spec.source, "path": spec.path, "content_hash": spec.content_hash}
+        )
+        # Step 4b — approval gate (issue #583 Bolt 2, ``approval-gate``). Built ONCE here and handed
+        # to the INSERT below unchanged, so the manifest that is CHECKED is byte-identical to the one
+        # STORED. Gating BEFORE the INSERT means a refused start leaves no ``workflow_run`` row: every
+        # first run of a new plan is refused by design, so recording them would durably record runs
+        # that never happened. The blocking arm in ``script_runner`` gates identically at its Step 0b,
+        # because otherwise a run's approvability would depend on which route started it. No-ops
+        # entirely when enforcement is disabled, which is the default.
+        manifest_json = await asyncio.to_thread(
+            manifest_freeze.build_manifest_json,
+            source_hash=spec.content_hash,
+            inputs=resolved,
+        )
+        try:
+            approval_gate.ensure_plan_approved(tier="script", manifest_json=manifest_json)
+        except approval_gate.PlanApprovalRequiredError as e:
+            # 403, distinct from this endpoint's 409 (run_id collision) and 422 (lint / corrupt), so a
+            # caller can tell "needs approval" from "the run broke".
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+        # Step 5 — the script row is a single INSERT (no seed steps), already
+        # atomic on its own connection. This is the one deliberate deviation from
+        # the engines' best-effort write: awaited, and its failure aborts with 500.
+        try:
+            await asyncio.to_thread(
+                workflow_journal.insert_run,
+                run_id,
+                spec.name,
+                spec_snapshot,
+                payload,
+                RunState.RUNNING.value,
+                started_at,
+                "script",
+                "1",
+                # issue #583 Bolt 2, ``manifest-freeze``: the frozen manifest rides the SAME
+                # INSERT as the run row (ADR-583-4's no-two-writes lesson). This is the ASYNC
+                # script arm; the blocking arm freezes in ``script_runner`` the same way, and
+                # BOTH script entry points must freeze or a run's approvability would depend on
+                # which route started it. ``build_manifest_json`` is total and returns None on
+                # failure, which writes NULL and fails CLOSED at the approval gate.
+                # ``approval-gate`` (Bolt 2 unit 7) built this value at Step 4b and has already gated
+                # on it; reusing it rather than rebuilding is what makes checked-equals-stored true.
+                manifest_json,
+            )
+        except sqlite3.IntegrityError:
+            # TOCTOU (PR #525 review): step 0's uniqueness check and this insert are
+            # not one atomic operation, so two concurrent submits carrying the SAME
+            # caller-supplied run_id can both pass step 0. The loser's PRIMARY KEY
+            # violation is the same collision step 0 reports as 409 when it sees it
+            # serially, so it must answer 409 too — a 500 would tell the caller the
+            # server broke when in fact their run id was simply taken. Ordered BEFORE
+            # the generic arm: IntegrityError is a sqlite3.Error subclass.
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"run id '{run_id}' already exists",
+            )
+        except sqlite3.Error as e:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"failed to durably record run '{run_id}': {e}",
+            )
+        # Step 6 — the live script record.
+        record = script_runner.ScriptRunRecord(
+            run_id=run_id,
+            workflow_name=spec.name,
+            state=RunState.RUNNING,
+            cancelled=False,
+            current_step_id=None,
+            step_states={},
+            process=None,
+            generation="1",
+            started_at=started_at,
+            finished_at=None,
+            tier="script",
+        )
+        tier = "script"
+    else:
+        # Step 4 — reserved-mode guard (OR-3): the prepared YAML entry skips the
+        # blocking path's pre-drive reserved-mode rejection, so the handler runs it
+        # here and maps NotBuiltYetError -> 501 pre-journal.
+        if spec.mode != "sequential":
+            try:
+                workflow_service._dispatch_reserved_mode(spec)
+            except NotBuiltYetError as e:
+                raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail=str(e))
+        # Step 5 — the awaited HARD ATOMIC durable insert (INV-1, TR-1): the run row
+        # AND its seeded step rows commit in ONE transaction, so a failure leaves
+        # NEITHER (no phantom RUNNING row). Its failure aborts with 500 + NO 202.
+        try:
+            await asyncio.to_thread(
+                workflow_journal.insert_run_with_steps,
+                run_id,
+                spec.name,
+                spec.model_dump_json(),
+                payload,
+                RunState.RUNNING.value,
+                started_at,
+                [(step.id, StepState.PENDING.value) for step in spec.steps],
+                started_at,
+                "yaml",
+                "1",
+            )
+        except sqlite3.IntegrityError:
+            # Same TOCTOU → 409 mapping as the script arm above; ordered before the
+            # generic sqlite3.Error arm because IntegrityError subclasses it.
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"run id '{run_id}' already exists",
+            )
+        except sqlite3.Error as e:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"failed to durably record run '{run_id}': {e}",
+            )
+        # Step 6 — the live YAML record (step_states seeded from spec.steps).
+        record = workflow_service.RunRecord(
+            run_id=run_id,
+            workflow_name=spec.name,
+            spec=spec,
+            inputs=resolved,
+            state=RunState.RUNNING,
+            current_step_id=None,
+            cancelled=False,
+            step_states={
+                step.id: workflow_service.StepRunState(step_id=step.id) for step in spec.steps
+            },
+            started_at=started_at,
+        )
+        tier = "yaml"
+
+    workflow_service.run_registry[run_id] = record
+
+    # --- Step 7: schedule the fire-and-forget background drive (C2). ---
+    # Via the registry helper, NOT a bare create_task: the Task must be strongly
+    # referenced or it can be collected mid-drive (BG-1), and the drive itself is
+    # admission-bounded (AB-1) inside the task.
+    _schedule_background_drive(record, spec, run_id, tier, resolved)
+
+    # --- Step 8: ack 202. The insert (step 5) is awaited and durable before this,
+    # so the instant this returns, get_run(run_id) finds the row (INV-1). ---
+    return {"run_id": run_id, "state": RunState.RUNNING.value, "links": _run_links(run_id)}
+
+
+@app.get("/workflows/runs/{run_id}", response_model=RunInspection)
+async def get_workflow_run_endpoint(
+    run_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> RunInspection:
+    """Inspect a run: metadata, current state, and per-step projections (FR-5.1).
+
+    Supersedes the pre-U3 ``get_run_status`` snapshot handler that #505 shipped at
+    this same path (FR-5.5): that handler returned ``status_snapshot.model_dump()``,
+    and every field of it is reproduced verbatim below, so the #505 status/result
+    clients keep working byte-compatibly (BR-2, SEAM).
+
+    U3 (issue #504) ENRICHES this endpoint IN PLACE to the ``RunInspection``
+    shape — a UNION SUPERSET of the pre-U3 ``get_run_status`` snapshot, never a
+    replacement (BR-2, SEAM). The authoritative run state / current step / step
+    (id, state, attempts) still come from ``get_run_status`` UNCHANGED (so the
+    #505 status/result clients that read those fields keep working, live-first
+    and identical); U3 additionally overlays the durable run metadata
+    (``workflow_name``, ``started_at``, ``finished_at``, ``tier``) and the U1
+    per-step columns (``output_json``, ``error``, ``error_kind``,
+    ``terminal_id``, ``reprompted``, ``call_fingerprint``).
+
+    Journal-authoritative (NFR-DUR-1 / BR-1): ``get_run_status`` already falls
+    back to ``_rebuild_record_from_journal`` on a cache miss, and the metadata /
+    step enrichment reads the durable tables directly via ``get_run`` /
+    ``get_steps`` — so a run is fully inspectable after a restart with
+    ``run_registry`` cleared, and NO read path requires the registry to hold an
+    entry. A never-acked or corrupt-snapshot run degrades to 404 exactly as
+    ``get_run_status`` does today (BR-7).
+
+    SCOPE-GATED (PR #526 review, BLOCKING): the enrichment puts every step's full
+    ``output_json`` and ``error`` text in the response body, which makes this the
+    single most payload-bearing read route on the run surface — strictly more so
+    than ``/diagnostics``, whose excerpts are capture-gated while ``output_json``
+    here is not. It therefore carries the same read-or-better gate as
+    ``/diagnostics``, ``/events`` and ``/compare``: a FULL-route gate, not a
+    per-field split, because a field split would still return ``output_json`` to
+    an unscoped caller. Default-off is unchanged — with ``CAO_AUTH_ENABLED``
+    unset the dependency returns the full scope set and enforces nothing.
+    Consequence for #505: its CLI/MCP status/result clients read this route (plus
+    ``/events`` and ``/compare``) and must present a token carrying
+    ``cao:read``/``cao:write``/``cao:admin`` once auth is enabled.
+
+    PAYLOAD POSTURE CHANGED AT THIS PATH — read this before adding a caller
+    (PR #526 review round 3, FR-4). Before the #504/#505 integration this path was
+    answered by #505's ``RunStatus`` snapshot, which is documented payload-FREE:
+    "Carries no per-step output or prompt (B3-SD-3)" —
+    ``models/workflow_runtime.py``. The superseding ``RunInspection`` above is
+    payload-BEARING. The union-superset resolution that merged the two handlers
+    preserved every ``RunStatus`` field byte-compatibly, but it also widened what
+    this route DISCLOSES, and that widening is deliberate (it is the enriched
+    inspect feature FR-5.1 asks for) — not an oversight.
+
+    Two consequences a reader must not have to infer:
+
+    1. ``workflow_journal_capture_output`` does NOT govern these fields. That flag
+       gates only the event-log output digest and the ``/diagnostics`` excerpts.
+       ``_journal_step`` persists ``output_json`` and ``error`` on EVERY step
+       transition regardless of it, because the resume path and
+       ``{{steps.<id>.output.<field>}}`` templating read them back. So with capture
+       at its default OFF, this route still returns step output and error verbatim.
+    2. The ONLY protection is the scope dependency above, and it is INERT in the
+       default deployment: with ``CAO_AUTH_ENABLED`` unset, ``require_any_scope``
+       returns the full scope set and enforces nothing. A local CAO server therefore
+       serves step output and error text to any caller that can reach the port.
+
+    Deliberately documented rather than further gated: stripping the fields removes
+    the feature, and gating them behind the capture flag would break resume and
+    templating. If a stricter posture is wanted, it belongs in a change that also
+    covers #505's CLI/MCP consumers of this route.
+    """
+    from cli_agent_orchestrator.services import workflow_journal, workflow_service
+
+    # (1) Authoritative state/steps via the UNCHANGED existing seam. Raises
+    #     KeyError -> 404 on a never-acked / corrupt-snapshot run (BR-7). This is
+    #     the field set #505 reads; it is reused verbatim, never weakened.
+    try:
+        # OFF-LOOP too: on a registry cache miss this reads the journal itself
+        # (the cold-read fallback / _rebuild_record_from_journal), so it is a
+        # synchronous sqlite call on the same footing as the enrichment reads below.
+        status_snapshot = await asyncio.to_thread(workflow_service.get_run_status, run_id)
     except KeyError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'")
-    return status_snapshot.model_dump()
+
+    # (2) Durable enrichment sources (journal-authoritative, no registry needed).
+    #     OFF-LOOP: the journal DAL is synchronous sqlite, so every call runs in a
+    #     worker thread. This route is `async def`, so a bare call would block the
+    #     single event loop for the whole read — including the 250 ms SSE followers
+    #     (``_EVENTS_FOLLOW_POLL_INTERVAL_S``). Matches the SSE and DELETE arms,
+    #     which already wrap the same functions.
+    run_row = await asyncio.to_thread(workflow_journal.get_run, run_id)
+    step_rows = {
+        row.step_id: row for row in await asyncio.to_thread(workflow_journal.get_steps, run_id)
+    }
+
+    # (3) Per-step UNION: the authoritative (id, state, attempts) baseline from
+    #     the snapshot drives ordering and liveness; the durable StepRow columns
+    #     overlay where present. A step whose journal write was swallowed still
+    #     appears (from the snapshot) with None enrichment; a run whose snapshot
+    #     carries no steps (e.g. a cold script-tier read) falls back to the
+    #     durable rows so no step is silently dropped (UNION, not replace).
+    steps: List[StepInspection] = []
+    seen: set = set()
+    for st in status_snapshot.steps:
+        srow = step_rows.get(st.id)
+        steps.append(
+            StepInspection(
+                id=st.id,
+                state=st.state.value,
+                attempts=st.attempts,
+                output_json=srow.output_json if srow else None,
+                error=srow.error if srow else None,
+                error_kind=srow.error_kind if srow else None,
+                terminal_id=srow.terminal_id if srow else None,
+                reprompted=srow.reprompted if srow else None,
+                call_fingerprint=srow.call_fingerprint if srow else None,
+            )
+        )
+        seen.add(st.id)
+    for step_id, srow in step_rows.items():
+        if step_id in seen:
+            continue
+        steps.append(
+            StepInspection(
+                id=srow.step_id,
+                state=srow.state,
+                attempts=srow.attempts,
+                output_json=srow.output_json,
+                error=srow.error,
+                error_kind=srow.error_kind,
+                terminal_id=srow.terminal_id,
+                reprompted=srow.reprompted,
+                call_fingerprint=srow.call_fingerprint,
+            )
+        )
+
+    # (4) Run metadata: journal-first (authoritative). The only case where the
+    #     snapshot succeeds but the journal row is absent is a live record whose
+    #     insert_run write was swallowed — fall back to the live registry record
+    #     for its metadata so inspect still answers (a UNION fallback, not a
+    #     registry dependency: the normal post-restart path uses run_row).
+    if run_row is not None:
+        workflow_name = run_row.workflow_name
+        started_at = run_row.started_at
+        finished_at = run_row.finished_at
+        tier = run_row.tier
+    else:
+        record = workflow_service.run_registry.get(run_id)
+        workflow_name = getattr(record, "workflow_name", "")
+        started_at = getattr(record, "started_at", "") or ""
+        finished_at = getattr(record, "finished_at", None)
+        tier = getattr(record, "tier", "yaml")
+
+    return RunInspection(
+        run_id=status_snapshot.run_id,
+        workflow_name=workflow_name,
+        state=status_snapshot.state.value,
+        current_step_id=status_snapshot.current_step_id,
+        started_at=started_at,
+        finished_at=finished_at,
+        tier=tier,
+        steps=steps,
+    )
+
+
+# ---------------------------------------------------------------------------
+# U4 (issue #504, events-follow SSE surface, FR-6) — additive to the U3 batch
+# route below. #505's client follower (U10) consumes this SSE contract; the
+# batch path stays byte-behavior-identical for existing callers.
+# ---------------------------------------------------------------------------
+
+# Live-follow poll cadence. The durable ``workflow_run_event`` table is TAILED on
+# this interval (U2 publishes to no bus, so there is nothing to subscribe to);
+# journal-tailing trades minimal latency for zero coupling to U2's emission path
+# (BR-6, journal-authoritative). A future bus-push is an optimization layered on
+# later, tied to the open capture-seam decision — explicitly out of U4's scope.
+_EVENTS_FOLLOW_POLL_INTERVAL_S = 0.25
+
+# Run states at which the follow stream replays what remains and CLOSES (BR-5):
+# a run that has already ended must never leave a follower hanging on a
+# possibly-swallowed terminal event.
+#
+# IMPORTED, not redefined (PR #526 review): this set also gates whether the DAL
+# declares a trailing gap, so two independently-maintained copies could disagree
+# about whether a run has ended — the SSE arm would close a run the journal still
+# considered live, or vice versa. ``workflow_journal`` is the single Python source
+# of truth; this alias keeps the local references readable.
+_TERMINAL_RUN_STATES = _JOURNAL_TERMINAL_RUN_STATES
+
+
+def _event_sse_frame(event: EventRow) -> str:
+    """Serialize one durable ``EventRow`` as a named SSE frame (BR-1, ADR-3).
+
+    ``id: <seq>`` is the per-run seq — the sole ordering authority — so a native
+    ``EventSource`` sets ``Last-Event-ID`` to it automatically and a reconnect
+    resumes EXACTLY after the last delivered seq, dedupe-free (BR-3). ``data`` is
+    the full durable row as a JSON object, so every BR-1 minimum field (seq,
+    run_id, event_type, step_id where applicable, state, ts) is present alongside
+    the rest of #504's payload schema.
+    """
+    return f"event: {event.event_type}\ndata: {json.dumps(asdict(event))}\nid: {event.seq}\n\n"
+
+
+def _gap_sse_frame(gap: GapMarker) -> str:
+    """Serialize a declared sequence gap as a distinct ``event: gap`` frame (BR-4).
+
+    A gap is DATA the API declares, not something the client infers from
+    numbering: ``data`` carries ``{after_seq, before_seq, missing_count,
+    reason}``. It carries no ``id:`` — a gap is synthesized at read time and owns
+    no seq of its own; the surrounding event frames carry the reconnect cursor.
+    """
+    return f"event: gap\ndata: {json.dumps(asdict(gap))}\n\n"
+
+
+def _run_absent_sse_frame(run_id: str) -> str:
+    """Serialize the terminal 'this run does not exist' frame for the SSE arm.
+
+    Emitted when ``get_run`` returns ``None`` — an id that never existed, or one
+    removed by the DELETE endpoint or the retention sweep. Such a run can never
+    reach a terminal state, so without this the follower would poll forever
+    (an unbounded connection + poll cycle per typo'd id). Carries no ``id:``: it
+    is synthesized at read time and owns no seq, so a reconnect cursor is
+    unaffected.
+    """
+    return f"event: run_absent\ndata: {json.dumps({'run_id': run_id})}\n\n"
+
+
+def _gap_identity(gap: GapMarker) -> Tuple[Optional[int], int, str]:
+    """A declared gap's stable identity, for at-most-once emission per stream.
+
+    ``read_events_with_gaps`` re-synthesizes the SAME trailing marker on every
+    call while the run stays terminal, so the SSE follow loop — which reads twice
+    on the terminal-transition pass (the poll read, then the drain read) — would
+    otherwise declare one hole to the follower twice. Identity is the declared
+    span plus the reason, not object identity: the markers are distinct instances
+    built by separate reads.
+    """
+    return (gap.after_seq, gap.before_seq, gap.reason)
+
+
+def _merge_ordered_sse_frames(
+    events: List[EventRow],
+    gaps: List[GapMarker],
+    declared: Optional[set] = None,
+) -> List[str]:
+    """Interleave event + gap frames in seq/position order (business-logic-model).
+
+    An INTERIOR ``GapMarker`` is synthesized between two adjacent stored rows, so
+    its ``before_seq`` IS the seq of a delivered event; its frame is emitted
+    immediately BEFORE that event, placing the declared hole exactly where it
+    occurred in the stream (BR-4) rather than leaving the client to infer it from
+    numbering.
+
+    A gap's ``before_seq`` is NOT always a delivered event's seq, though: the
+    TRAILING marker ``read_events_with_gaps`` synthesizes for a terminal run whose
+    last append(s) were swallowed carries ``before_seq = high_water + 1``, a
+    sentinel one past the last ALLOCATED seq that by construction matches no
+    stored row (PR #526 review, BLOCKING). Matching gaps only against delivered
+    events therefore DROPPED the "run ended, the last N events are lost" fault on
+    the SSE arm entirely — the batch arm and the diagnostics bundle declared it,
+    the live surface silently did not. Any gap left unmatched after the event
+    drain is emitted as a standalone ``event: gap`` frame, in ``before_seq`` order,
+    at the position it belongs: past every event in this batch.
+
+    ``declared`` is an optional MUTABLE set of ``_gap_identity`` keys owned by the
+    caller's stream; a gap already in it is not re-emitted, and every emitted gap
+    is added to it. The follow loop passes one per connection so the trailing
+    marker is declared exactly once even though two reads synthesize it. Omitted
+    (the pure two-arg form) there is no cross-call state and every gap is emitted.
+    """
+    if declared is None:
+        declared = set()
+    gaps_by_before = {g.before_seq: g for g in gaps}
+    frames: List[str] = []
+    for event in events:
+        gap = gaps_by_before.get(event.seq)
+        if gap is not None and _gap_identity(gap) not in declared:
+            frames.append(_gap_sse_frame(gap))
+            declared.add(_gap_identity(gap))
+        frames.append(_event_sse_frame(event))
+    # Leftover drain: every gap whose before_seq bounded no delivered event —
+    # emitted in before_seq order after the event frames. Most often that is the
+    # trailing marker (before_seq = high_water + 1), but NOT always: a gap whose
+    # bounding event fell outside this page (e.g. a leading hole, or a batch the
+    # caller trimmed) is also unmatched, so its frame arrives here rather than at
+    # its true position (PR #526 review fix cycle 1 — an earlier version of this
+    # comment claimed a leftover gap is always past every event in the batch). The
+    # drain is deliberately generic: an unmatched declaration reaching the follower
+    # slightly out of position beats being swallowed, since the marker carries its
+    # own after_seq/before_seq range and the client renders what the server says.
+    for gap in sorted(gaps, key=lambda g: g.before_seq):
+        if _gap_identity(gap) not in declared:
+            frames.append(_gap_sse_frame(gap))
+            declared.add(_gap_identity(gap))
+    return frames
+
+
+async def _follow_run_events(run_id: str, after_seq: Optional[int]) -> AsyncIterator[str]:
+    """Async SSE generator: durable replay -> terminal guard -> live follow (FR-6).
+
+    Journal-authoritative (BR-6): every frame is sourced from the durable
+    ``workflow_run_event`` table via ``read_events_with_gaps`` and the run's
+    terminal state from ``get_run`` — NO ``run_registry`` / in-memory-ring
+    dependency, so a disconnected or late follower reconstructs entirely from the
+    cursor. Three phases:
+
+    1. **Durable replay** — read everything after ``after_seq`` and emit events +
+       declared gaps interleaved in seq/position order (BR-3/BR-4).
+    2. **Terminal-state guard (F-1, BR-5)** — after replay, check ``get_run``; if
+       the run already ended (completed/failed/cancelled), CLOSE rather than enter
+       live-follow. A run whose terminal event's append was swallowed must not
+       leave the follower waiting forever.
+    3. **Live-follow** — otherwise TAIL the durable table from the advancing
+       cursor on a short poll, emitting new events/gaps and re-checking
+       ``get_run`` for a terminal transition each pass; on a terminal transition
+       it drains any final rows and closes.
+
+    Cancel-safe: on client disconnect ``StreamingResponse`` throws
+    ``GeneratorExit`` into this generator, which exits the loop cleanly — the DAL
+    owns no long-lived resource (each poll opens and closes its own short-lived
+    connection), so there is nothing to leak. The blocking DAL reads run via
+    ``asyncio.to_thread`` so a slow DB op never blocks the event loop.
+    """
+    from cli_agent_orchestrator.services import workflow_journal
+
+    cursor = after_seq
+
+    # Every gap identity already declared on THIS connection. The trailing marker
+    # is re-synthesized by every read of a terminal run, and the terminal
+    # transition below reads twice (poll + drain), so without this the follower
+    # would be told about one hole twice. Scoped per connection: a reconnect
+    # legitimately re-declares, since the new stream has not seen it.
+    declared_gaps: set = set()
+
+    # Phase 1 — durable replay from the cursor.
+    events, gaps = await asyncio.to_thread(workflow_journal.read_events_with_gaps, run_id, cursor)
+    for frame in _merge_ordered_sse_frames(events, gaps, declared_gaps):
+        yield frame
+    if events:
+        cursor = events[-1].seq
+
+    # Phase 2 — terminal-state guard BEFORE live-follow (F-1, BR-5). The terminal
+    # event itself (run.completed / run.failed / run.cancelled) is the final frame
+    # already delivered in Phase 1 when its append succeeded; here we simply stop.
+    run = await asyncio.to_thread(workflow_journal.get_run, run_id)
+    if run is None:
+        # ABSENT run: an id that never existed (a typo from curl or an agent), or
+        # one the retention sweep / DELETE removed. There is no run that can ever
+        # go terminal, so entering live-follow would pin this connection and a
+        # poll cycle FOREVER. Declare the absence as a terminal frame and close,
+        # so a follower learns why the stream ended instead of hanging. (The
+        # batch arm answers the same case with an empty page; a stream cannot,
+        # having already committed to 200 + text/event-stream in the response
+        # header, so `event: run_absent` is the in-band equivalent.)
+        yield _run_absent_sse_frame(run_id)
+        return
+    if run.state in _TERMINAL_RUN_STATES:
+        # The run is terminal — but it may have BECOME terminal in the window
+        # between the Phase 1 read above and this state read. In that window
+        # Phase 1 saw a live run, so the terminal-only guard in
+        # read_events_with_gaps deliberately declared nothing, and any event
+        # appended in the window is not yet delivered. Returning bare here would
+        # close the stream on a run whose trailing hole was never declared (and
+        # drop those last events). One final drain read closes that window; on
+        # the common path (already terminal at connect) it is a no-op re-read
+        # whose gap is deduped by `declared_gaps`.
+        events, gaps = await asyncio.to_thread(
+            workflow_journal.read_events_with_gaps, run_id, cursor
+        )
+        for frame in _merge_ordered_sse_frames(events, gaps, declared_gaps):
+            yield frame
+        return
+
+    # Phase 3 — live-follow: tail the durable table until the run goes terminal
+    # (or the client disconnects, which raises GeneratorExit into this loop).
+    try:
+        while True:
+            await asyncio.sleep(_EVENTS_FOLLOW_POLL_INTERVAL_S)
+            events, gaps = await asyncio.to_thread(
+                workflow_journal.read_events_with_gaps, run_id, cursor
+            )
+            for frame in _merge_ordered_sse_frames(events, gaps, declared_gaps):
+                yield frame
+            if events:
+                cursor = events[-1].seq
+            run = await asyncio.to_thread(workflow_journal.get_run, run_id)
+            if run is None:
+                # The run VANISHED mid-follow (DELETE endpoint or retention
+                # sweep). Same reasoning as the Phase 2 absent guard: nothing
+                # can ever go terminal now, so close instead of polling forever.
+                yield _run_absent_sse_frame(run_id)
+                return
+            if run.state in _TERMINAL_RUN_STATES:
+                # Drain any events appended between this poll's read and the
+                # terminal projection landing, then close (BR-5). This read is
+                # ALSO the one that can first see a trailing gap: the poll read
+                # above may have run while the run was still live, when the
+                # terminal-only guard in read_events_with_gaps deliberately
+                # declares nothing. So a run that goes terminal mid-follow
+                # declares its trailing hole here, before the stream closes.
+                events, gaps = await asyncio.to_thread(
+                    workflow_journal.read_events_with_gaps, run_id, cursor
+                )
+                for frame in _merge_ordered_sse_frames(events, gaps, declared_gaps):
+                    yield frame
+                return
+    except GeneratorExit:
+        # Client disconnected; StreamingResponse closed the generator. No
+        # long-lived resource to release — just stop.
+        return
+
+
+@app.get("/workflows/runs/{run_id}/events", response_model=EventTimelinePage)
+async def get_workflow_run_events_endpoint(
+    run_id: str,
+    request: Request,
+    after_seq: Optional[int] = Query(
+        default=None,
+        ge=0,
+        description=(
+            "Replay cursor: return only events with seq strictly greater than "
+            "this value. Omitted -> from the start of the timeline. Takes "
+            "precedence over the Last-Event-ID header on the SSE stream (BR-3). "
+            "Must be >= 0: seqs start at 1, so 0 is the from-start cursor and a "
+            "negative value is meaningless. Bounded here (422) because an "
+            "unbounded negative cursor USED TO fabricate a phantom gap on a "
+            "healthy run; the reader also clamps defensively (BR-4)."
+        ),
+    ),
+    limit: Optional[int] = Query(
+        default=None,
+        ge=1,
+        description=(
+            "Reserved page-size hint. The durable read is already seq-ordered and "
+            "bounded per run; accepted for forward compatibility with paged / "
+            "live-follow reads (U4) and applied as a trailing cap when supplied. "
+            "Applies to the BATCH arm only."
+        ),
+    ),
+    stream: bool = Query(
+        default=False,
+        description=(
+            "Content-negotiation override: force the SSE live-follow arm even "
+            "when the Accept header is not text/event-stream. Equivalent to "
+            "sending Accept: text/event-stream."
+        ),
+    ),
+    last_event_id: Optional[str] = Header(
+        default=None,
+        alias="Last-Event-ID",
+        description=(
+            "Native EventSource reconnect cursor for the SSE arm. When set and "
+            "?after_seq= is not, the stream resumes strictly after this seq. "
+            "?after_seq= takes precedence when both are supplied (BR-3)."
+        ),
+    ),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Any:
+    """Read a run's ordered event timeline — BATCH page OR live SSE follow (FR-5.2/FR-6).
+
+    Content-negotiated on the SAME path (the U3-marked seam; U4 EXTENDS, does not
+    rewrite): ``Accept: text/event-stream`` (or ``?stream=true``) selects the SSE
+    live-follow arm; any other Accept returns the U3 batch ``EventTimelinePage``
+    JSON UNCHANGED. Existing batch callers (Accept ``*/*`` or ``application/json``,
+    no ``?stream=``) are byte-behavior-identical.
+
+    Both arms call U1's ``read_events_with_gaps(run_id, cursor)`` — events are
+    seq-ordered (seq is the sole ordering authority), deterministic and dedupe-free
+    (BR-3); declared sequence holes travel WITH the events as ``GapMarker``s rather
+    than being renumbered away (BR-4). Journal-authoritative (NFR-DUR-1): answered
+    entirely from the durable ``workflow_run_event`` table with no ``run_registry``
+    dependency, so a run's full timeline is replayable after a restart.
+
+    **Batch arm:** ``after_seq`` is the replay cursor (events with seq > after_seq);
+    omitted reads from the start; beyond the current max -> an empty page
+    (``next_after_seq=None``), a caught-up follower NOT an error (BR-6).
+    ``next_after_seq`` is the max seq returned, the reconnect cursor.
+
+    **SSE arm (FR-6):** durable replay from the resume cursor -> a terminal-state
+    guard that closes an already-ended run (F-1, BR-5) -> live-follow tailing the
+    durable table until the run goes terminal or the client disconnects. The resume
+    cursor is ``?after_seq=`` (preferred) or the ``Last-Event-ID`` header
+    (``?after_seq=`` wins when both are present, BR-3). Each event frame carries
+    ``id: <seq>`` so a native ``EventSource`` reconnect is exact and dedupe-free.
+
+    SCOPE-GATED (PR #526 review, BLOCKING): the timeline carries per-event
+    ``error_kind`` / ``reason`` / ``validation_result`` / ``output_ref`` and the
+    terminal-offset coordinates that address captured terminal output, so it is a
+    payload-bearing read like ``/diagnostics`` and takes the same read-or-better
+    gate. The gate applies to BOTH arms — batch and SSE — because the dependency
+    resolves before the arm is chosen. Default-off is unchanged. Consequence for
+    #505: its follower client must present a scoped token once auth is enabled.
+    """
+    from cli_agent_orchestrator.services import workflow_journal
+
+    # Content negotiation: SSE only when explicitly requested (Accept:
+    # text/event-stream or ?stream=true). A generic Accept (*/*, application/json)
+    # keeps the byte-identical batch path so existing callers are unaffected.
+    accept = request.headers.get("accept", "")
+    if stream or "text/event-stream" in accept.lower():
+        from fastapi.responses import StreamingResponse
+
+        # Resume cursor precedence: ?after_seq= wins; else the Last-Event-ID
+        # header (a native-EventSource reconnect). A malformed header is ignored
+        # (replay from the start) rather than 400-ing a reconnecting client.
+        effective_after_seq = after_seq
+        if effective_after_seq is None and last_event_id is not None:
+            try:
+                effective_after_seq = int(last_event_id)
+            except ValueError:
+                effective_after_seq = None
+        return StreamingResponse(
+            _follow_run_events(run_id, effective_after_seq),
+            media_type="text/event-stream",
+        )
+
+    # BATCH arm — byte-behavior-identical for existing callers. The DAL call runs
+    # OFF-LOOP (synchronous sqlite in an `async def`); the SSE arm above already
+    # wraps the same function, so leaving this one bare made the two arms of ONE
+    # route disagree on event-loop discipline.
+    events, gaps = await asyncio.to_thread(
+        workflow_journal.read_events_with_gaps, run_id, after_seq
+    )
+    if limit is not None and len(events) > limit:
+        events = events[:limit]
+        # Gaps beyond the trimmed window are dropped so a returned gap never
+        # points past the last delivered event (the cursor advances page-by-page).
+        last_seq = events[-1].seq if events else (after_seq or 0)
+        gaps = [g for g in gaps if g.before_seq <= last_seq]
+    next_after_seq = events[-1].seq if events else None
+    return EventTimelinePage(events=events, gaps=gaps, next_after_seq=next_after_seq)
+
+
+# ---------------------------------------------------------------------------
+# U6 (issue #504) — run comparison + diagnostic bundle (FR-8, FR-9). Two
+# read-only export routes over the DURABLE journal. Both register BEFORE the
+# ``/workflows/{name}`` catch-all (FR-6.5, BR-7) and are pinned by
+# ``test_workflow_route_ordering``. Both are answered from U1's DAL
+# (``get_run`` / ``get_steps`` / ``read_events_with_gaps``) with NO
+# ``run_registry`` dependency (journal-authoritative, BR-6 / FR-9.2), so both
+# reconstruct fully after a restart. No new persistence, no edit to any U1/U2/
+# U3/U5/U7 function — additive routes only.
+# ---------------------------------------------------------------------------
+def _events_by_step(events: List[EventRow]) -> Dict[str, List[EventRow]]:
+    """Group a run's seq-ordered events by ``step_id`` (run-level events dropped).
+
+    The events arrive seq-ordered from ``read_events_with_gaps`` (seq is the sole
+    ordering authority), so each per-step list stays seq-ordered — ``_last_non_null``
+    can rely on later-in-list meaning later-in-time.
+    """
+    grouped: Dict[str, List[EventRow]] = {}
+    for e in events:
+        if e.step_id is None:
+            continue
+        grouped.setdefault(e.step_id, []).append(e)
+    return grouped
+
+
+def _last_non_null(events: List[EventRow], attr: str) -> Optional[str]:
+    """Return the last non-null value of ``attr`` across a step's seq-ordered events.
+
+    "Last" = the value the step ran under at its final recorded transition (e.g. a
+    provider/agent that changed across a retry surfaces the last one). ``None`` when
+    no event recorded the field (e.g. a swallowed append).
+    """
+    value: Optional[str] = None
+    for e in events:
+        v = getattr(e, attr)
+        if v is not None:
+            value = v
+    return value
+
+
+def _step_duration_ms(events: List[EventRow]) -> Optional[int]:
+    """Sum a step's event ``elapsed_ms`` (durations are DERIVED, never persisted).
+
+    ``None`` when no event carried an ``elapsed_ms`` — distinguishing "took zero
+    measurable time" (sum 0) from "no duration recorded" (None).
+    """
+    total = 0
+    seen = False
+    for e in events:
+        if e.elapsed_ms is not None:
+            total += e.elapsed_ms
+            seen = True
+    return total if seen else None
+
+
+def _distinct_output_refs(events: List[EventRow]) -> List[str]:
+    """The distinct ``output_ref`` references a step's events carry (first-seen order).
+
+    Reference-level (BR-2): the ``output_ref`` STRINGS, never the payloads they
+    point at. Deterministic first-seen order so a diff is stable across reads.
+    """
+    refs: List[str] = []
+    for e in events:
+        if e.output_ref is not None and e.output_ref not in refs:
+            refs.append(e.output_ref)
+    return refs
+
+
+def _build_step_side(step_row: StepRow, step_events: List[EventRow]) -> StepComparisonSide:
+    """Assemble one run's per-step comparison side (FR-8.1).
+
+    ``attempts`` / ``state`` / ``error_kind`` / ``reprompted`` come from the durable
+    ``StepRow`` projection (the failure/retry behaviour); ``duration_ms`` /
+    ``provider`` / ``agent_profile`` / ``validation`` are derived from the step's
+    events. All datum-level ``None``s are honest gaps, never zeroed.
+    """
+    return StepComparisonSide(
+        attempts=step_row.attempts,
+        duration_ms=_step_duration_ms(step_events),
+        provider=_last_non_null(step_events, "provider"),
+        agent_profile=_last_non_null(step_events, "agent_profile"),
+        validation=_last_non_null(step_events, "validation_result"),
+        state=step_row.state,
+        error_kind=step_row.error_kind,
+        reprompted=step_row.reprompted,
+    )
+
+
+@app.get("/workflows/runs/{run_id}/compare", response_model=RunComparison)
+async def compare_workflow_runs_endpoint(
+    run_id: str,
+    against: str = Query(
+        ...,
+        description=(
+            "The run id to compare the path run against. Both runs are loaded "
+            "from the durable journal; an unknown/deleted id on either side is a "
+            "404, never a partial silent compare (BR-8)."
+        ),
+    ),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> RunComparison:
+    """Compare two runs by aligned step (FR-8.1, business-logic-model Algorithm 1).
+
+    Loads BOTH runs from the durable journal (``get_run`` / ``get_steps`` /
+    ``read_events_with_gaps``) — journal-authoritative, no ``run_registry``
+    dependency, so a comparison is answerable after a restart. Steps are aligned by
+    ``step_id`` (deterministically sorted). Per aligned step the response juxtaposes,
+    for the baseline (``a``) and compare (``b``) run: attempts, derived duration
+    (summed event ``elapsed_ms``), provider + agent config, validation outcome, and
+    the state/error_kind/reprompted failure-retry behaviour. A step present in only
+    one run is surfaced as ``added`` (only in the compare run) or ``removed`` (only
+    in the baseline), NEVER silently dropped (BR-1). Output/artifact differences are
+    reported at the ``output_ref`` REFERENCE level (BR-2), never by diffing payloads.
+
+    Unknown/deleted ``run_id`` (baseline) or ``against`` (compare) -> 404 for that
+    side (BR-8): the comparison never partially succeeds against a missing run.
+    Registered before the ``/workflows/{name}`` catch-all (FR-6.5) — a 2-segment
+    ``/workflows/runs/...`` path structurally unmatched by the single-segment
+    catch-all, pinned by ``test_workflow_route_ordering``.
+
+    SCOPE-GATED (PR #526 review, BLOCKING): the comparison exposes both runs'
+    per-step ``error_kind`` / validation outcomes and their ``output_ref``
+    references, so it is a payload-bearing read like ``/diagnostics`` and takes
+    the same read-or-better gate. Default-off is unchanged. Consequence for #505:
+    a scoped token is required once auth is enabled.
+    """
+    from cli_agent_orchestrator.services import workflow_journal
+
+    # Both sides loaded from the durable journal; a missing run on EITHER side is a
+    # 404, not a partial silent compare (BR-8). No run_registry lookup (BR-6).
+    #
+    # OFF-LOOP, PER CALL (six awaits). This route is the heaviest reader in the
+    # family — it reads two runs' full event sets — so a bare synchronous call
+    # stalls the event loop for the whole comparison. Deliberately NOT an
+    # `asyncio.gather` over the six: the two `get_run` calls are separated by their
+    # own 404 raises, and short-circuiting on the FIRST missing run is the existing
+    # BR-8 contract. Gathering would change which 404 fires and would read the
+    # second run's rows for a request that is already a 404.
+    baseline_run = await asyncio.to_thread(workflow_journal.get_run, run_id)
+    if baseline_run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'")
+    compare_run = await asyncio.to_thread(workflow_journal.get_run, against)
+    if compare_run is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"unknown run '{against}' (compare target)",
+        )
+
+    a_steps = {s.step_id: s for s in await asyncio.to_thread(workflow_journal.get_steps, run_id)}
+    b_steps = {s.step_id: s for s in await asyncio.to_thread(workflow_journal.get_steps, against)}
+    a_events, _a_gaps = await asyncio.to_thread(workflow_journal.read_events_with_gaps, run_id)
+    b_events, _b_gaps = await asyncio.to_thread(workflow_journal.read_events_with_gaps, against)
+    a_by_step = _events_by_step(a_events)
+    b_by_step = _events_by_step(b_events)
+
+    steps: List[StepComparison] = []
+    output_diffs: List[OutputDiff] = []
+    # Union of step ids from BOTH runs, sorted for a deterministic, stable export.
+    for step_id in sorted(set(a_steps) | set(b_steps)):
+        a_row = a_steps.get(step_id)
+        b_row = b_steps.get(step_id)
+        a_side = _build_step_side(a_row, a_by_step.get(step_id, [])) if a_row else None
+        b_side = _build_step_side(b_row, b_by_step.get(step_id, [])) if b_row else None
+        if a_row is not None and b_row is not None:
+            status_ = "aligned"
+        elif b_row is not None:
+            status_ = "added"  # present only in the compare run
+        else:
+            status_ = "removed"  # present only in the baseline run
+        steps.append(StepComparison(step_id=step_id, status=status_, a=a_side, b=b_side))
+
+        # Reference-level output diff (BR-2): compare the distinct output_ref sets,
+        # never the payloads. Emit a diff row only where the references differ.
+        a_refs = _distinct_output_refs(a_by_step.get(step_id, []))
+        b_refs = _distinct_output_refs(b_by_step.get(step_id, []))
+        if a_refs != b_refs:
+            output_diffs.append(OutputDiff(step_id=step_id, a_refs=a_refs, b_refs=b_refs))
+
+    return RunComparison(
+        baseline_run_id=run_id,
+        compare_run_id=against,
+        steps=steps,
+        output_diffs=output_diffs,
+    )
+
+
+@app.get("/workflows/runs/{run_id}/diagnostics", response_model=DiagnosticBundle)
+async def get_workflow_run_diagnostics_endpoint(
+    run_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> DiagnosticBundle:
+    """Export a run's troubleshooting bundle (FR-9, business-logic-model Algorithm 2).
+
+    Assembles EVERY FR-9.1 section (BR-3) from the DURABLE journal alone — no
+    ``run_registry`` dependency (BR-6 / FR-9.2), so the bundle is reconstructable
+    after a restart and usable by a support user who was not at the machine:
+
+    - ``spec_id`` = the run's workflow name; ``spec_content_hash`` = ``sha256`` of
+      the durable ``workflow_run.spec_snapshot`` (there is no existing standalone
+      spec-hash helper to reuse — ``workflow_spec_service`` hashes ``.py`` source
+      inline, not a reusable function — so ``hashlib.sha256`` is used directly).
+    - ``inputs`` = the run's ``inputs_json`` passed through U7's
+      ``workflow_retention.sanitize_output`` (NFR-SEC-6 / BR-4). Inputs are durable
+      run-row metadata (written at ``insert_run`` regardless of capture) so the
+      section is always present — the capture gate below applies only to
+      step-OUTPUT excerpts. NOTE: ``sanitize_output`` is size-limiting + control
+      character hygiene, NOT secret redaction — a credential passed as a workflow
+      input is returned verbatim here. That is why this route is scope-gated;
+      do not describe this section as redacted.
+    - ``events`` + ``gaps`` = the ordered event timeline with declared gaps
+      (``read_events_with_gaps``); ``step_outcomes`` = per-step state + structured
+      ``error_kind`` (always-on metadata, NFR-SEC-1, no free-text).
+    - ``environment`` = the distinct provider / agent_profile / engine observed
+      across the events (sorted).
+    - ``references`` = terminal (id + byte offsets) and artifact (``output_ref``)
+      REFERENCES only (BR-2 / FR-4.2) — no terminal-log content or artifact payload
+      is inlined (resolving a range is U5's read path, called by a consumer later).
+    - ``excerpts`` = retention-safe, size-limited step-output excerpts, present
+      ONLY when output capture is enabled (BR-9); each funnels through
+      ``sanitize_output`` (BR-5). With capture disabled (the default) the bundle is
+      metadata + references only, no output text.
+
+    Unknown ``run_id`` -> 404. Registered before the ``/workflows/{name}`` catch-all
+    (FR-6.5), pinned by ``test_workflow_route_ordering``.
+    """
+    import hashlib
+
+    from cli_agent_orchestrator.services import workflow_journal, workflow_retention
+
+    # Journal-authoritative (BR-6): the run row comes from get_run, NOT the live
+    # registry — a cleared registry (post-restart) does not affect this read.
+    # OFF-LOOP: synchronous sqlite in an `async def` (see the SSE/DELETE arms).
+    run_row = await asyncio.to_thread(workflow_journal.get_run, run_id)
+    if run_row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'")
+
+    # spec identifier + content hash of the DURABLE snapshot (FR-9.1).
+    spec_content_hash = hashlib.sha256(run_row.spec_snapshot.encode("utf-8")).hexdigest()
+
+    # Inputs — the SINGLE redaction path (NFR-SEC-6 / BR-4): funnel through U7's
+    # sanitize_output (the audit_log cap-and-mark idiom). Referenced as a module
+    # attribute so a spy on workflow_retention.sanitize_output proves the choke point.
+    inputs = workflow_retention.sanitize_output(run_row.inputs_json)
+
+    # OFF-LOOP: this bundle reads the run's ENTIRE event set plus every step row,
+    # so it is the second-heaviest reader after /compare.
+    events, gaps = await asyncio.to_thread(workflow_journal.read_events_with_gaps, run_id)
+    step_rows = await asyncio.to_thread(workflow_journal.get_steps, run_id)
+    step_outcomes = [
+        StepOutcome(step_id=s.step_id, state=s.state, error_kind=s.error_kind) for s in step_rows
+    ]
+
+    # Environment: distinct, sorted provider/agent/engine across the events.
+    environment = BundleEnvironment(
+        providers=sorted({e.provider for e in events if e.provider is not None}),
+        agent_profiles=sorted({e.agent_profile for e in events if e.agent_profile is not None}),
+        engines=sorted({e.engine for e in events if e.engine is not None}),
+    )
+
+    # References, not payloads (BR-2): terminal id + offsets, distinct artifact refs.
+    terminals: List[TerminalReference] = []
+    seen_terminals: set = set()
+    for e in events:
+        if e.terminal_id is None:
+            continue
+        key = (e.terminal_id, e.terminal_offset_start, e.terminal_offset_len)
+        if key in seen_terminals:
+            continue
+        seen_terminals.add(key)
+        terminals.append(
+            TerminalReference(
+                terminal_id=e.terminal_id,
+                offset_start=e.terminal_offset_start,
+                offset_len=e.terminal_offset_len,
+            )
+        )
+    artifacts: List[str] = []
+    for e in events:
+        if e.output_ref is not None and e.output_ref not in artifacts:
+            artifacts.append(e.output_ref)
+    references = BundleReferences(terminals=terminals, artifacts=artifacts)
+
+    # Excerpts — capture-gated (BR-9). With capture OFF (default), NO output text is
+    # emitted; with capture ON, each step's output funnels through sanitize_output
+    # (size-limited + redacted, BR-5 / NFR-SEC-4/6). Both the gate and the redactor
+    # are referenced as module attributes so a test can toggle/spy them.
+    capture_on = workflow_retention.capture_enabled()
+    excerpts: List[BundleExcerpt] = []
+    if capture_on:
+        for s in step_rows:
+            if s.output_json is not None:
+                excerpts.append(
+                    BundleExcerpt(
+                        step_id=s.step_id,
+                        excerpt=workflow_retention.sanitize_output(s.output_json),
+                    )
+                )
+
+    return DiagnosticBundle(
+        spec_id=run_row.workflow_name,
+        spec_content_hash=spec_content_hash,
+        inputs=inputs,
+        events=events,
+        gaps=gaps,
+        step_outcomes=step_outcomes,
+        environment=environment,
+        references=references,
+        excerpts=excerpts,
+        capture_enabled=capture_on,
+    )
+
+
+@app.delete("/workflows/runs/{run_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_workflow_run_endpoint(
+    run_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Response:
+    """Explicitly delete a run and all its retained diagnostic data (FR-11 / NFR-SEC-5).
+
+    Invokes U1's ``workflow_journal.delete_run`` cascade — the run row, its per-step
+    projection rows, its events, and its high-water seq row are removed in one
+    connection (U7 does NOT reimplement the cascade). The live ``run_registry`` cache
+    entry (a non-authoritative rebuild of the same run, and itself retained
+    diagnostic data for NFR-SEC-5) is evicted too, so a subsequent inspect does not
+    re-serve the just-deleted run from the cache. After this, inspect (U3) / events
+    (U3) / the step reads all return not-found/empty for the id.
+
+    A 2-segment path under ``/workflows/runs/...`` — structurally unmatched by the
+    single-segment ``/workflows/{name}`` catch-all regardless of registration order
+    (FR-6.5), and pinned by ``test_workflow_route_ordering``. Idempotent: deleting an
+    unknown run id is a well-defined no-op (``delete_run`` guarantees this, BR-3) and
+    still returns 204 — a delete is never an error that faults other reads. A run
+    that is still live (a known run in a non-terminal state) is REJECTED with 409:
+    deleting it would leave the drive loop running with no way to cancel it and its
+    later appends orphaned. Cancel first, then delete. The
+    blocking sqlite cascade runs off the event loop (``to_thread``) so a slow DB op
+    bounds its blast radius to this one request. ``run_id`` binds through
+    parameterized SQL in the DAL (no injection surface), matching the pass-through
+    posture of the sibling inspect/events/cancel/resume run routes.
+    """
+    from cli_agent_orchestrator.services import workflow_journal, workflow_service
+
+    # Refuse to delete a run that is still LIVE (409). Deleting one removes the
+    # run row and evicts the registry entry, but the drive loop keeps executing
+    # with nothing left to reach it: cancel can no longer find the run, and the
+    # loop's subsequent appends land as orphan event rows keyed off a run row
+    # that no longer exists — unreachable by every read path AND by the
+    # retention sweep, which both join through that row. So the delete would
+    # create an uncancellable zombie plus unreclaimable storage. Cancel first,
+    # then delete. Absent (None) stays a 204 no-op: idempotency is preserved
+    # (BR-3), and only a KNOWN non-terminal run is rejected.
+    run = await asyncio.to_thread(workflow_journal.get_run, run_id)
+    if run is not None and run.state not in _TERMINAL_RUN_STATES:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"run '{run_id}' is still {run.state}; cancel it before deleting "
+                "(deleting a live run orphans its events and leaves it uncancellable)"
+            ),
+        )
+
+    try:
+        await asyncio.to_thread(workflow_journal.delete_run, run_id)
+    except (
+        Exception
+    ) as e:  # noqa: BLE001 — surface a genuine DB failure; unknown id never lands here (BR-3)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"failed to delete run '{run_id}': {e}",
+        )
+    # Evict the non-authoritative live cache entry so the durable delete is
+    # immediately visible to the cache-first read path (a stale entry would let
+    # inspect re-serve the deleted run). Best-effort: absent id is a no-op.
+    workflow_service.run_registry.pop(run_id, None)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+def _json_or_none(output_json: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Parse a persisted step ``output_json`` blob, degrading a corrupt value to
+    ``None`` rather than failing the whole result (U4, RR-3).
+
+    Per-row corruption tolerance mirroring
+    ``workflow_service._rebuild_record_from_journal``'s ``_record_from_json``: a
+    single unparseable OR non-object ``output_json`` yields ``None`` for that one
+    step's output (``StepResult.output`` is an ``Optional[Dict]``), never a 500 for
+    the entire run result.
+    """
+    if output_json is None:
+        return None
+    try:
+        data = json.loads(output_json)
+    except (ValueError, TypeError):
+        logger.debug("result assembly: dropping unparseable step output_json")
+        return None
+    if not isinstance(data, dict):
+        logger.debug("result assembly: dropping non-object step output_json")
+        return None
+    return data
+
+
+def _durable_error_kind(steps: List[Any]) -> Optional[str]:
+    """Read the durable ``error_kind`` off the step projection, if present (U9, RP-1).
+
+    The column-first swap target (ADR-5): #504 persists a durable ``error_kind`` on
+    the ``workflow_run_step`` projection. Once that column lands and ``StepRow``
+    surfaces it, this returns the first non-null durable kind found on a step —
+    authoritative over any inference (RP-1). Until then, ``StepRow`` carries no
+    ``error_kind`` attribute, so ``getattr`` yields ``None`` for every row and this
+    helper is INERT (returns ``None``), leaving the inference floor in force (RP-2).
+
+    Reading via ``getattr(step, "error_kind", None)`` makes the rebase a clean swap
+    confined to this one helper (RP-5): when the column arrives no call site changes.
+    """
+    # TODO(#504-rebase): prefer durable step.error_kind once the column lands — the
+    # getattr below activates automatically the moment StepRow surfaces the field.
+    for s in steps:
+        durable = getattr(s, "error_kind", None)
+        if durable:
+            return str(durable)
+    return None
+
+
+def _resolve_error_kind(row: Any, steps: List[Any]) -> Optional[str]:
+    """Resolve the terminal ``kind`` for an assembled ``WorkflowRunResult`` (U4 seam).
+
+    U4 shipped the CALL SITE plus the ADR-5 inference FLOOR; U9 enriches this SAME
+    function with column-first precedence (kept a single module-level function so
+    the swap is confined, RP-5). Precedence:
+
+    1. Column-first (RP-1): a durable ``error_kind`` on the step projection wins
+       authoritatively — the inference is NOT consulted. INERT until #504's column
+       lands (``_durable_error_kind`` returns ``None`` for pre-migration rows).
+    2. Inference fallback (RP-2, pre-migration rows only) — the RR-4 floor:
+
+       - CANCELLED run                                 -> ``"cancelled"``
+       - FAILED run with a step error matching /timeout/i -> ``"timeout"``
+       - FAILED run otherwise                          -> ``"error"``
+       - COMPLETED / RUNNING / anything else           -> ``None``
+
+    The timeout branch is a conservative case-insensitive substring match, never a
+    parse, and no kind is ever fabricated for a completed/non-terminal run (RP-4).
+    """
+    from cli_agent_orchestrator.models.workflow_runtime import RunState
+
+    # Column-first (RP-1): authoritative when present; inert (None) pre-migration.
+    durable = _durable_error_kind(steps)
+    if durable is not None:
+        return durable
+
+    # Inference fallback (RP-2) — the ADR-5 floor for pre-migration rows.
+    try:
+        run_state = RunState(row.state)
+    except ValueError:
+        return None
+
+    if run_state == RunState.CANCELLED:
+        return "cancelled"
+    if run_state == RunState.FAILED:
+        for s in steps:
+            if s.error and re.search(r"timeout", s.error, re.IGNORECASE):
+                return "timeout"
+        return "error"
+    return None
+
+
+def _build_failure_envelope(
+    row: Any, step_results: List[Any], run_id: str, error_kind: Optional[str]
+) -> Optional[Dict[str, Any]]:
+    """Assemble the FR-7.1 failure envelope from journal state (U9, EF-1..EF-5).
+
+    A presentation value object — NOT a persisted entity (EF-5). Returned only for a
+    terminal-failed/cancelled run; a completed/non-terminal run yields ``None`` so a
+    successful run's result stays byte-identical (NFR-3 stable ``--json``). Assembled
+    purely from ``get_run`` + ``get_steps`` state, so it is answerable on the
+    detached / post-restart path with no live registry entry (JP-1, FR-6.2). Fields:
+
+    - ``failing_step`` — the first ``StepResult`` whose state is FAILED, else the
+      run's ``current_step_id`` at failure (EF-1).
+    - ``attempt`` — that step's ``attempts`` (EF-2).
+    - ``error_kind`` — the ``_resolve_error_kind`` result (already resolved).
+    - ``terminal_reference`` — the ``run_id`` (the durable handle, EF-3).
+    - ``next_command`` — a fixed literal hint keyed on the run id (EF-4, ST-1); the
+      shape does not drift, so ``--json`` consumers can parse it across releases.
+    """
+    from cli_agent_orchestrator.models.workflow_runtime import RunState, StepState
+
+    if row.state not in (RunState.FAILED.value, RunState.CANCELLED.value):
+        return None
+
+    failed = next((s for s in step_results if s.state == StepState.FAILED), None)
+    if failed is not None:
+        failing_step: Optional[str] = failed.id
+        attempt: Optional[int] = failed.attempts
+    else:
+        # No FAILED step (e.g. a cancelled run) — fall back to the live step at
+        # failure and read its attempt count when that row is present (EF-1/EF-2).
+        failing_step = row.current_step_id
+        match = next((s for s in step_results if s.id == failing_step), None)
+        attempt = match.attempts if match is not None else None
+
+    return {
+        "failing_step": failing_step,
+        "attempt": attempt,
+        "error_kind": error_kind,
+        "terminal_reference": run_id,
+        "next_command": f"cao workflow result {run_id}",
+    }
+
+
+@app.get("/workflows/runs/{run_id}/result")
+async def get_workflow_run_result_endpoint(
+    run_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Return the complete retained ``WorkflowRunResult`` for a run (U4, FR-7.2).
+
+    A two-segment path (safe at any declaration position, RO-2). Journal-authoritative
+    (FR-6.2, A-5): the result is assembled purely from ``get_run`` + ``get_steps``,
+    with NO dependency on a live ``run_registry`` entry — so a detached or
+    post-restart run's full retained result is still answerable (RR-2). An absent
+    run (``get_run`` is ``None``) is a 404 (RR-1). A single corrupt step
+    ``output_json`` degrades to ``output=None`` for that step, not a 500 for the
+    whole result (RR-3). ``kind`` is resolved through the single
+    ``_resolve_error_kind`` seam (RR-4).
+
+    U9 (FR-7.1): a terminal-FAILED/CANCELLED run additionally carries a
+    ``failure_envelope`` (failing step, attempt, error kind, terminal reference,
+    next-command hint), assembled from the same journal rows (JP-1). A
+    COMPLETED/non-terminal run omits the key, so a successful run's ``--json`` shape
+    stays byte-identical (NFR-3).
+
+    NOT returned (PR #525 review): a run-level ``output``. The journal has no column
+    for one, so the key was always null here; it is dropped rather than advertised.
+    Per-step outputs are unaffected and still populate ``steps[].output``. A caller
+    that needs a script run's run-level output must use the blocking
+    ``POST /workflows/runs``, whose live return path carries it.
+    """
+    from cli_agent_orchestrator.models.workflow_runtime import (
+        RunState,
+        StepResult,
+        StepState,
+        WorkflowRunResult,
+    )
+    from cli_agent_orchestrator.services import workflow_journal
+
+    row = workflow_journal.get_run(run_id)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'")
+
+    steps = workflow_journal.get_steps(run_id)
+    step_results = [
+        StepResult(
+            id=s.step_id,
+            state=StepState(s.state),
+            attempts=s.attempts,
+            output=_json_or_none(s.output_json),
+            error=s.error,
+        )
+        for s in steps
+    ]
+    error_kind = _resolve_error_kind(row, steps)
+    result = WorkflowRunResult(
+        run_id=row.run_id,
+        workflow_name=row.workflow_name,
+        state=RunState(row.state),
+        steps=step_results,
+        started_at=row.started_at,
+        finished_at=row.finished_at,
+        kind=error_kind,
+    )
+    body = result.model_dump()
+
+    # PR #525 review: DROP the run-level ``output`` key from this route's body.
+    # It was advertised in three places but STRUCTURALLY always None here: there is
+    # no run-level output column on ``workflow_run`` and ``RunRow`` has no such
+    # field, so a journal-assembled result has nothing to populate it from. (Only
+    # the LIVE script-tier return path fills it — ``script_runner._finalize`` — which
+    # the blocking route still returns, so the model field stays.) The pop is
+    # explicit because Pydantic's ``model_dump`` emits defaulted fields: simply not
+    # passing ``output=`` above leaves the key present as null, which is exactly the
+    # false advertisement being removed. Advertising a field that can never carry a
+    # value is worse than omitting it — a client feature-detecting on key presence
+    # wires up a code path that can never fire.
+    body.pop("output", None)
+
+    # U9 (FR-7.1): attach the failure envelope ONLY for a terminal-failed/cancelled
+    # run (a completed/non-terminal run keeps its byte-identical shape, NFR-3). The
+    # envelope is assembled from journal state alone (JP-1), so it is present on the
+    # detached / post-restart path with an empty registry.
+    envelope = _build_failure_envelope(row, step_results, run_id, error_kind)
+    if envelope is not None:
+        body["failure_envelope"] = envelope
+    return body
 
 
 @app.post("/workflows/runs/{run_id}/cancel")
@@ -2822,6 +6227,13 @@ async def cancel_workflow_run_endpoint(
     row CANCELLED directly rather than calling ``cancel_run`` (which would
     unconditionally raise ``KeyError`` here and mask every crash-remnant cancel
     as a 404).
+
+    U7 (issue #505, FR-9.1/FR-9.2) note: this is the route the 202 submit body's
+    ``links.cancel`` (built by ``_run_links``) points at — the SAME acknowledged
+    run id round-trips back here. It is the ONLY cancel handler; U7 adds no new
+    route (NR-1). The registry-miss journal-fallback arm above is what makes a
+    detached async-submitted run, or one whose registry entry was lost to a
+    restart, still cancellable from the journal alone (journal-is-authoritative).
     """
     from cli_agent_orchestrator.models.workflow_runtime import RunState
     from cli_agent_orchestrator.services import script_runner, workflow_journal, workflow_service
@@ -2873,6 +6285,7 @@ async def cancel_workflow_run_endpoint(
 @app.post("/workflows/runs/{run_id}/resume")
 async def resume_workflow_run_endpoint(
     run_id: str,
+    body: Optional[ResumeRunRequest] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
     """Resume a crashed/failed run from its durable journal (FR-6.2, N6, U5 A4).
@@ -2885,8 +6298,34 @@ async def resume_workflow_run_endpoint(
     script arm's typed-error catch order matches the boundary table: narrower
     ``ResumeNotAllowedError``/``ResumeCorruptError`` (both ``ValueError``
     subclasses) are caught BEFORE the bare ``ValueError`` arm.
+
+    ``recovery-decision-intake`` (issue #583, FR-7) adds the optional
+    ``decisions`` body field — the human's answer to a halted step. Three
+    properties of how it is wired here are requirements, not preferences:
+
+    * **Authorisation is INHERITED and not weakened** (SR-1). The scope
+      dependency below is untouched: a decision travels ON this request, so
+      supplying one already requires ``cao:write`` or ``cao:admin``. This unit
+      adds no second path in.
+    * **The decisions travel INTO the script arm's resume**, which applies them
+      after its own admission gates and before the spawn (SC-3/BR-7). They are
+      deliberately NOT applied here ahead of the call: this route cannot reject a
+      live run — ``resume_script_run``'s gate 2 does — so a decision written here
+      would be durable consent granted by a request that then returns 409.
+    * **A ``ValueError`` from that call still lands on 400** (SR-4), because the
+      call is inside the existing ``try`` and a bare ``ValueError`` is that arm. A
+      mistyped ``step_id`` is a client error; a 500 would tell the operator to
+      file a bug instead of fixing a typo.
+
+    Decisions are rejected for a non-script run rather than applied (INV-3, "a
+    decision never silently fails"): the replay gate that reads these states is
+    consulted by the script tier alone, and the YAML resume unconditionally resets
+    every non-completed step to ``PENDING`` and re-runs it — so a ``skip`` there
+    would re-execute the very step the operator asked to skip, silently.
     """
     from cli_agent_orchestrator.services import script_runner, workflow_journal, workflow_service
+
+    decisions = body.decisions if body is not None else None
 
     row = workflow_journal.get_run(run_id)
     if row is None:
@@ -2894,11 +6333,23 @@ async def resume_workflow_run_endpoint(
 
     if row.tier == "script":
         try:
-            result = await script_runner.resume_script_run(run_id)
+            if decisions:
+                result = await script_runner.resume_script_run(run_id, decisions=decisions)
+            else:
+                # Byte-identical to the pre-#583 call, so an ordinary resume cannot
+                # regress on a code path it never enters.
+                result = await script_runner.resume_script_run(run_id)
         except KeyError:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'"
             )
+        except approval_gate.PlanApprovalRequiredError as e:
+            # issue #583 Bolt 2, ``approval-gate``: 403, and it must be caught HERE rather than left
+            # to the arms below. ``PlanApprovalRequiredError`` is deliberately not a ``ValueError``
+            # precisely so the trailing 400 arm cannot claim it, and not a ``ResumeNotAllowedError``
+            # because 409 means "this run cannot be resumed" — a fact about the run — whereas this is
+            # a fact about the plan, and the operator's next action is completely different.
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
         except workflow_service.ResumeNotAllowedError as e:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
         except workflow_service.ResumeCorruptError as e:
@@ -2906,6 +6357,17 @@ async def resume_workflow_run_endpoint(
         except ValueError as e:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
         return result.model_dump()
+
+    if decisions:
+        # The YAML arm honours no decision, so it refuses one instead of accepting it
+        # and doing something else (see the docstring). Nothing is written on this path.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"run '{run_id}' is tier '{row.tier}'; recovery decisions apply to "
+                f"script-tier runs only"
+            ),
+        )
 
     try:
         result = await workflow_service.resume_from_last_completed(run_id)
@@ -3090,7 +6552,17 @@ async def delete_terminal(
             terminal_id,
             registry=get_plugin_registry(request),
         )
-        return {"success": success}
+        if not success:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"cleanup deferred for terminal '{terminal_id}'; "
+                    "retry delete after residual Grok processes exit"
+                ),
+            )
+        return {"success": True}
+    except HTTPException:
+        raise
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -3126,7 +6598,12 @@ async def create_inbox_message_endpoint(
     # Attempt immediate delivery if terminal is already IDLE.
     # If not, InboxService will deliver on next IDLE status event.
     try:
-        inbox_service.deliver_pending(receiver_id, registry=get_plugin_registry(request))
+        # deliver_pending reads status_monitor.get_status() (which can fork a tmux
+        # capture-pane via the stale-PROCESSING fallback) and, on delivery, paste-bombs
+        # the pane — blocking I/O either way, so keep it off the event loop.
+        await asyncio.to_thread(
+            inbox_service.deliver_pending, receiver_id, registry=get_plugin_registry(request)
+        )
     except Exception as e:
         logger.warning(f"Immediate delivery attempt failed for {receiver_id}: {e}")
 
@@ -3146,6 +6623,7 @@ async def get_inbox_messages_endpoint(
     status_param: Optional[str] = Query(
         default=None, alias="status", description="Filter by message status"
     ),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> List[Dict]:
     """Get inbox messages for a terminal.
 
@@ -3204,12 +6682,29 @@ async def get_inbox_messages_endpoint(
 async def terminal_ws(websocket: WebSocket, terminal_id: str):
     """WebSocket endpoint for live terminal streaming via tmux attach.
 
-    Security: This endpoint provides full PTY access with no bearer/token
-    authentication. It is intended for localhost-only use and is gated by two
-    checks before accept: the peer IP must be in ``WS_ALLOWED_CLIENTS`` and,
-    for browser callers, the ``Origin`` header must be in the trusted set
-    (CWE-1385 cross-site WebSocket hijacking guard). Do NOT expose the server
-    to untrusted networks (e.g. --host 0.0.0.0) without adding authentication.
+    Security: This endpoint provides full PTY access (keystroke injection =
+    RCE) and is gated by three checks before accept:
+
+    * the peer IP must be in ``WS_ALLOWED_CLIENTS`` (loopback by default);
+    * for browser callers, the ``Origin`` header must be same-origin with the
+      request ``Host`` or in the trusted set (CWE-1385 cross-site WebSocket
+      hijacking guard);
+    * when the HTTP auth layer is enabled (``AUTH0_DOMAIN`` /
+      ``CAO_AUTH_JWKS_URI`` set — see :func:`is_auth_enabled`), the handshake
+      must carry a valid bearer token granting at least the ``cao:read``
+      scope.
+
+    Token scheme: browsers cannot set request headers on a WebSocket
+    handshake, so the token is accepted from either ``Authorization: Bearer
+    <token>`` (native clients) or a ``?token=<token>`` query parameter (the
+    bundled web viewer). The token is verified exactly like the HTTP layer —
+    RS256 signature, issuer, audience and expiry via the JWKS cache — and a
+    missing/invalid token or one lacking ``cao:read`` closes the handshake
+    with code 4401 before accept. This closes the bypass where widening
+    ``CAO_WS_ALLOWED_CLIENTS`` / ``CAO_WS_ALLOWED_ORIGINS`` for containers,
+    devcontainers or Codespaces exposed full PTY control with no credential.
+    Do NOT expose the server to untrusted networks (e.g. --host 0.0.0.0)
+    without authentication.
     """
     # Reject connections from clients outside the configured allowlist.
     # Defaults to loopback; operators running cao-server inside a container can
@@ -3244,7 +6739,9 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
     # WebSocket scope first (CAO_ALLOWED_HOSTS="*" opts out of that; see
     # is_ws_origin_allowed).
     origin = websocket.headers.get("origin")
-    if not is_ws_origin_allowed(origin, websocket.headers.get("host")):
+    if not is_ws_origin_allowed(
+        origin, websocket.headers.get("host"), websocket.scope.get("scheme")
+    ):
         logger.warning(
             "Rejected WebSocket attach for terminal %r: disallowed Origin %r",
             terminal_id,
@@ -3252,6 +6749,42 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
         )
         await websocket.close(code=4403, reason="WebSocket Origin not allowed")
         return
+
+    # When the HTTP auth layer is enabled, the WS handshake must also prove
+    # identity: browsers cannot set request headers on a WebSocket handshake,
+    # so the token is accepted from the Authorization header or a ``?token=``
+    # query parameter. The token is verified with the same JWKS/issuer/
+    # audience/expiry logic as the HTTP layer and must grant at least
+    # ``SCOPE_READ``. Default-off (auth disabled): no token is required and
+    # behavior is byte-for-byte unchanged.
+    if is_auth_enabled():
+        token = _extract_bearer(websocket.headers.get("authorization"))
+        if not token:
+            token = websocket.query_params.get("token")
+        if not token:
+            logger.warning(
+                "Rejected WebSocket attach for terminal %r: auth enabled, missing bearer token",
+                terminal_id,
+            )
+            await websocket.close(code=4401, reason="Unauthorized")
+            return
+        try:
+            scopes = extract_scopes_from_token(token)
+        except Exception:
+            logger.warning(
+                "Rejected WebSocket attach for terminal %r: auth enabled, invalid bearer token",
+                terminal_id,
+            )
+            await websocket.close(code=4401, reason="Unauthorized")
+            return
+        if SCOPE_READ not in scopes:
+            logger.warning(
+                "Rejected WebSocket attach for terminal %r: token lacks %r scope",
+                terminal_id,
+                SCOPE_READ,
+            )
+            await websocket.close(code=4401, reason="Unauthorized")
+            return
 
     await websocket.accept()
 
@@ -3409,7 +6942,9 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
 
 
 @app.get("/flows", response_model=List[Flow])
-async def list_flows() -> List[Flow]:
+async def list_flows(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> List[Flow]:
     """List all flows."""
     try:
         return flow_service.list_flows()
@@ -3421,7 +6956,10 @@ async def list_flows() -> List[Flow]:
 
 
 @app.get("/flows/{name}", response_model=Flow)
-async def get_flow(name: str) -> Flow:
+async def get_flow(
+    name: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Flow:
     """Get a specific flow by name."""
     try:
         return flow_service.get_flow(name)
@@ -3450,16 +6988,18 @@ async def create_flow(
 
         file_path = flows_dir / f"{body.name}.flow.md"
 
-        # Build YAML frontmatter content
-        frontmatter_lines = [
-            "---",
-            f"name: {body.name}",
-            f'schedule: "{body.schedule}"',
-            f"agent_profile: {body.agent_profile}",
-            f"provider: {body.provider}",
-            "---",
-        ]
-        file_content = "\n".join(frontmatter_lines) + "\n" + body.prompt_template
+        # Serialize via yaml.safe_dump so a multi-line value becomes a quoted
+        # scalar rather than injecting a new frontmatter key.
+        frontmatter = yaml.safe_dump(
+            {
+                "name": body.name,
+                "schedule": body.schedule,
+                "agent_profile": body.agent_profile,
+                "provider": body.provider,
+            },
+            sort_keys=False,
+        )
+        file_content = "---\n" + frontmatter + "---\n" + body.prompt_template
 
         file_path.write_text(file_content)
 
@@ -3562,6 +7102,146 @@ def _get_memory_service():
     return MemoryService()
 
 
+def _memory_partial_write_response(error: Any) -> JSONResponse:
+    """Preserve the typed partial-write contract across the HTTP boundary."""
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={
+            "error_kind": error.error_kind,
+            "partial_write": {
+                "key": error.key,
+                "scope": error.scope,
+                "scope_id": error.scope_id,
+                "file_path": error.file_path,
+                "completed_phases": error.completed_phases,
+                "repair_command": error.repair_command,
+            },
+        },
+    )
+
+
+class InternalMemoryContext(BaseModel):
+    terminal_id: Optional[str] = None
+    session_name: Optional[str] = None
+    provider: Optional[str] = None
+    agent_profile: Optional[str] = None
+    cwd: Optional[str] = None
+
+
+class InternalMemoryStoreRequest(BaseModel):
+    content: str
+    scope: MemoryScope = MemoryScope.PROJECT
+    memory_type: MemoryType = MemoryType.PROJECT
+    key: Optional[MemoryKey] = None
+    tags: str = ""
+    terminal_context: Optional[InternalMemoryContext] = None
+
+
+class InternalMemoryRecallRequest(BaseModel):
+    query: Optional[str] = None
+    scope: Optional[MemoryScope] = None
+    memory_type: Optional[MemoryType] = None
+    limit: int = Field(default=10, ge=1, le=100)
+    terminal_context: Optional[InternalMemoryContext] = None
+    search_mode: str = "hybrid"
+    sort_by: str = "recency"
+    include_related: bool = False
+
+
+class InternalMemoryForgetRequest(BaseModel):
+    key: MemoryKey
+    scope: MemoryScope = MemoryScope.PROJECT
+    terminal_context: Optional[InternalMemoryContext] = None
+
+
+class InternalMemoryInjectionRequest(BaseModel):
+    terminal_context: InternalMemoryContext
+    budget_chars: int = Field(default=3000, ge=0, le=20000)
+
+
+@app.post("/internal/memory/store")
+async def internal_memory_store(
+    body: InternalMemoryStoreRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Any:
+    """Store memory on this node for a remote CAO worker."""
+    from cli_agent_orchestrator.services.memory_service import MemoryPartialWriteError
+
+    _require_memory_enabled()
+    try:
+        memory = await _get_memory_service().store(
+            content=body.content,
+            scope=body.scope.value,
+            memory_type=body.memory_type.value,
+            key=body.key,
+            tags=body.tags,
+            terminal_context=(
+                body.terminal_context.model_dump(exclude_none=True)
+                if body.terminal_context
+                else None
+            ),
+        )
+    except MemoryPartialWriteError as error:
+        return _memory_partial_write_response(error)
+    return {
+        "memory": memory.model_dump(mode="json"),
+        "action": memory.action,
+    }
+
+
+@app.post("/internal/memory/recall")
+async def internal_memory_recall(
+    body: InternalMemoryRecallRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Recall memory using context resolved by a remote worker node."""
+    _require_memory_enabled()
+    memories = await _get_memory_service().recall(
+        query=body.query,
+        scope=body.scope.value if body.scope else None,
+        memory_type=body.memory_type.value if body.memory_type else None,
+        limit=body.limit,
+        terminal_context=(
+            body.terminal_context.model_dump(exclude_none=True) if body.terminal_context else None
+        ),
+        search_mode=body.search_mode,
+        sort_by=body.sort_by,
+        include_related=body.include_related,
+    )
+    return {"memories": [memory.model_dump(mode="json") for memory in memories]}
+
+
+@app.post("/internal/memory/forget")
+async def internal_memory_forget(
+    body: InternalMemoryForgetRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Forget memory using context resolved by a remote worker node."""
+    _require_memory_enabled()
+    deleted = await _get_memory_service().forget(
+        key=body.key,
+        scope=body.scope.value,
+        terminal_context=(
+            body.terminal_context.model_dump(exclude_none=True) if body.terminal_context else None
+        ),
+    )
+    return {"deleted": deleted}
+
+
+@app.post("/internal/memory/context")
+async def internal_memory_context(
+    body: InternalMemoryInjectionRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, str]:
+    """Build the startup memory block for a terminal owned by another node."""
+    _require_memory_enabled()
+    context = _get_memory_service().get_memory_context(
+        body.terminal_context.model_dump(exclude_none=True),
+        budget_chars=body.budget_chars,
+    )
+    return {"context": context}
+
+
 def _require_memory_enabled() -> None:
     """Raise 404 when the memory subsystem is disabled.
 
@@ -3621,6 +7301,7 @@ async def list_memories_endpoint(
     memory_type: Optional[MemoryType] = Query(default=None, alias="type"),
     scope_id: Optional[MemoryScopeId] = None,
     limit: int = Query(default=50, ge=1, le=100),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> List[MemorySummary]:
     """List stored memories across all projects (mirrors `cao memory list --all`)."""
     _require_memory_enabled()
@@ -3911,6 +7592,7 @@ async def get_memory_endpoint(
     key: MemoryKey,
     scope: Optional[MemoryScope] = None,
     scope_id: Optional[MemoryScopeId] = None,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> MemoryDetail:
     """Show a memory by key (mirrors `cao memory show`; first match wins)."""
     _require_memory_enabled()

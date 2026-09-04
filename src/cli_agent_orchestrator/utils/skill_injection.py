@@ -17,6 +17,10 @@ from cli_agent_orchestrator.constants import (
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.atomic_file import locked_atomic_rewrite
+from cli_agent_orchestrator.utils.path_validation import (
+    flatten_path_separators,
+    validate_path_component,
+)
 from cli_agent_orchestrator.utils.skills import build_skill_catalog
 
 logger = logging.getLogger(__name__)
@@ -86,7 +90,11 @@ def refresh_agent_md_prompt(md_path: Path, profile: AgentProfile) -> bool:
 def refresh_installed_agent_for_profile(profile_name: str) -> List[Path]:
     """Refresh installed Copilot agents for one source profile."""
     profile = load_agent_profile(profile_name)
-    safe_name = profile.name.replace("/", "__")
+    # Flatten both separators (see install_service): this filename derives from
+    # the attacker-controlled resolved profile name, and a backslash is a
+    # separator on Windows. Defence in depth — install now rejects a
+    # separator-bearing name, so such a profile cannot have been installed.
+    safe_name = flatten_path_separators(profile.name)
     refreshed_paths: List[Path] = []
 
     copilot_path = COPILOT_AGENTS_DIR / f"{safe_name}.agent.md"
@@ -137,6 +145,17 @@ def _iter_installed_copilot_agents() -> Iterator[Path]:
 
 
 def _is_cao_managed_copilot_agent(name: str) -> bool:
-    """Return True when a corresponding CAO context file exists for this agent name."""
-    context_file = AGENT_CONTEXT_DIR / f"{name}.md"
+    """Return True when a corresponding CAO context file exists for this agent name.
+
+    ``name`` comes from the frontmatter of a file already sitting in the Copilot
+    agents directory, so it is not trusted. Validate it as a single path segment
+    before joining: an unsafe name simply is not CAO-managed (install would have
+    refused to write its context copy), so returning False is both correct and
+    keeps a traversal out of the join.
+    """
+    try:
+        safe_name = validate_path_component(name, description="agent name")
+    except ValueError:
+        return False
+    context_file = AGENT_CONTEXT_DIR / f"{safe_name}.md"
     return context_file.exists()

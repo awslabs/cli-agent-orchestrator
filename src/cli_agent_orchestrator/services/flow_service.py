@@ -274,17 +274,30 @@ async def execute_flow(name: str) -> bool:
 
         # Launch session
         session_name = f"cao-flow-{flow.name}"
+        terminals = list_terminals_by_session(session_name)
         if get_backend().session_exists(session_name):
-            terminals = list_terminals_by_session(session_name)
             # Only check the first (conductor) terminal for busy status.
             # Worker terminals spawned by the conductor may have stale status
             # after /exit and should not block flow recycling.
+            #
+            # Index 0 is the oldest surviving terminal -- normally the conductor
+            # -- per the ordering contract documented on
+            # ``list_terminals_by_session``; do not restate the rule here, and do
+            # not reorder that read. This is the consumer with real blast radius:
+            # if index 0 is a quiet WORKER rather than the conductor, the busy
+            # check passes and the kill_session below tears down a session whose
+            # conductor is mid-run. Two documented ways index 0 can be a worker
+            # (both pre-existing, both listed on that function): the conductor's
+            # own row was deleted, or a row was inserted during flow recycling,
+            # which does not hold ``session_lifecycle_lock``.
             conductor = terminals[0] if terminals else None
-            if conductor and _is_terminal_busy(conductor["id"]):
+            # Off the loop: get_status() can fork a tmux capture-pane for a
+            # PROCESSING terminal (status_monitor.py's stale-PROCESSING
+            # fallback), and execute_flow runs on the shared event loop.
+            if conductor and await asyncio.to_thread(_is_terminal_busy, conductor["id"]):
                 logger.info(f"Flow {name}: session {session_name} is busy, skipping")
                 return False
             for t in terminals:
-                provider_manager.cleanup_provider(t["id"])
                 # Tear down the event-driven pipeline for each recycled terminal:
                 # stop the FIFO reader thread (and unlink its *.fifo file) and clear
                 # the StatusMonitor buffers. Without this, repeated flow runs leak
@@ -298,6 +311,36 @@ async def execute_flow(name: str) -> bool:
                 except Exception as e:
                     logger.warning(f"Failed to clear status buffers for {t['id']}: {e}")
             get_backend().kill_session(session_name)
+            # A provider's private state must outlive the process that owns
+            # it.  Grok cleanup confirms any escaped updater has stopped
+            # before recursively deleting its private GROK_HOME.
+            cleanup_complete = True
+            for t in terminals:
+                # Do not bulk-delete DB rows if a Grok private home is still
+                # owned by a process we cannot safely inspect. Retained rows
+                # are the retry handle for a later terminal cleanup.
+                if provider_manager.cleanup_provider(t["id"]) is False:
+                    cleanup_complete = False
+            if not cleanup_complete:
+                logger.warning(
+                    "Flow %s recycling cleanup deferred; retaining terminal metadata for retry",
+                    name,
+                )
+                return False
+            delete_terminals_by_session(session_name)
+        elif terminals:
+            # A previous recycle can have killed the backend session but safely
+            # retained its terminal rows because a Grok-owned private home was
+            # still in use.  Do not create a same-named flow session until those
+            # rows have been retried: doing so would abandon their only cleanup
+            # handle and could collide with the deterministic GROK_HOME path.
+            cleanup_complete = True
+            for terminal_metadata in terminals:
+                if provider_manager.cleanup_provider(terminal_metadata["id"]) is False:
+                    cleanup_complete = False
+            if not cleanup_complete:
+                logger.warning("Flow %s has retained terminal cleanup; deferring next run", name)
+                return False
             delete_terminals_by_session(session_name)
         terminal = await create_terminal(
             session_name=session_name,

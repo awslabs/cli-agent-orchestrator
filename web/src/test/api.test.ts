@@ -18,6 +18,7 @@ describe('API wrapper', () => {
       status,
       statusText: status === 200 ? 'OK' : 'Error',
       json: () => Promise.resolve(data),
+      text: () => Promise.resolve(JSON.stringify(data)),
     })
   }
 
@@ -104,9 +105,17 @@ describe('API wrapper', () => {
   })
 
   it('deleteSession sends DELETE', async () => {
-    mockResponse({ success: true, deleted: [], errors: [] })
+    mockResponse({ success: true, deleted: ['s1'], errors: [] })
     await api.deleteSession('s1')
     expect(mockFetch).toHaveBeenCalledWith('/sessions/s1', expect.objectContaining({ method: 'DELETE' }))
+  })
+
+  it('deleteSession rejects deferred cleanup payloads', async () => {
+    mockResponse({ success: false, deleted: [], errors: [{ error: 'cleanup deferred; retry delete_session' }] })
+    await expect(api.deleteSession('s1')).rejects.toMatchObject({
+      status: 409,
+      message: 'cleanup deferred; retry delete_session',
+    })
   })
 
   it('sendInput sends POST with message', async () => {
@@ -238,6 +247,14 @@ describe('API wrapper', () => {
     mockResponse({ success: true })
     await api.deleteTerminal('t1')
     expect(mockFetch).toHaveBeenCalledWith('/terminals/t1', expect.objectContaining({ method: 'DELETE' }))
+  })
+
+  it('deleteTerminal rejects deferred cleanup payloads', async () => {
+    mockResponse({ success: false })
+    await expect(api.deleteTerminal('t1')).rejects.toMatchObject({
+      status: 409,
+      message: 'Terminal cleanup is pending; retry delete',
+    })
   })
 
   it('getMemoryStatus fetches /settings/memory', async () => {

@@ -20,6 +20,27 @@ from cli_agent_orchestrator.utils.opencode_config import (
 )
 
 
+class TestToOpencodeAgentId:
+    """The id becomes the ``<id>.md`` filename under OPENCODE_AGENTS_DIR, so no
+    path separator may survive it.
+
+    Security regression for GHSA-6m35-gcf5-xm75: only ``/`` was folded, leaving a
+    resolved profile name like ``..\\..\\evil`` able to traverse on Windows.
+    """
+
+    @pytest.mark.parametrize(
+        "hostile_name",
+        ["..\\..\\evil", "a\\b", "..\\../mixed", "C:\\Windows\\evil", "../../evil"],
+    )
+    def test_no_separator_survives(self, hostile_name):
+        produced = to_opencode_agent_id(hostile_name)
+        assert "/" not in produced
+        assert "\\" not in produced
+
+    def test_plain_name_is_unchanged(self):
+        assert to_opencode_agent_id("developer") == "developer"
+
+
 @pytest.fixture()
 def tmp_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Redirect OPENCODE_CONFIG_FILE to a temp directory for isolation."""

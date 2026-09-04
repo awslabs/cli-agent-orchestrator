@@ -16,6 +16,7 @@ from typing import Any, Dict, List
 
 from cli_agent_orchestrator.constants import OPENCODE_CONFIG_DIR, OPENCODE_CONFIG_FILE, SKILLS_DIR
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_cao_mcp_command
+from cli_agent_orchestrator.utils.path_validation import flatten_path_separators
 
 logger = logging.getLogger(__name__)
 
@@ -27,8 +28,14 @@ def to_opencode_agent_id(profile_name: str) -> str:
 
     OpenCode treats the filename stem of an agent ``.md`` file as its agent ID
     (used for ``--agent <id>`` and keyed by the same value under
-    ``agent.<id>`` in ``opencode.json``). Profile names may contain ``/`` —
-    illegal in filenames — so the conversion replaces every slash with ``__``.
+    ``agent.<id>`` in ``opencode.json``).
+
+    Since the id becomes the ``<id>.md`` filename, any path separator left in it
+    would traverse out of ``OPENCODE_AGENTS_DIR``, so both ``/`` and ``\\`` are
+    flattened to ``__`` (backslash included because it is a separator on
+    Windows). ``install_service`` now *rejects* a resolved profile ``name:``
+    containing a separator outright, so this flatten is defence in depth rather
+    than the primary guard — and a namespaced ``name:`` is no longer installable.
 
     The output is the single source of truth for:
 
@@ -36,19 +43,26 @@ def to_opencode_agent_id(profile_name: str) -> str:
     - the ``agent.<id>.tools`` key written to ``opencode.json``
     - the value passed to ``opencode --agent <id>`` at runtime
 
-    Idempotent: inputs that contain no ``/`` are returned unchanged.
+    Idempotent: inputs that contain no separator are returned unchanged.
 
-    The ``/`` → ``__`` collapse is not injective: distinct profile names can
-    map to the same id (e.g. ``"a/b"`` and a literal ``"a__b"`` both become
-    ``"a__b"``). Because the id is used as a dict key on disk (the ``<id>.md``
-    filename and the ``agent.<id>`` section of ``opencode.json``), such a
-    collision silently cross-wires two profiles. The opencode install path
-    guards against this via ``_guard_opencode_agent_id_collision`` in
-    ``services/install_service.py``, which fails loud rather than overwriting.
-    Note names that differ only by spaces or punctuation (``"foo bar"`` vs
-    ``"foo-bar"``) do NOT collide here — only ``/`` is rewritten.
+    THE ID SPACE IS STILL NOT INJECTIVE, for a reason that has nothing to do
+    with separators. Two DIFFERENT profile files carrying the same resolved
+    frontmatter ``name:`` produce the same id, and the id is a key on disk (the
+    ``<id>.md`` filename and the ``agent.<id>`` section of ``opencode.json``),
+    so whichever installs second silently overwrites the first. The opencode
+    install path guards against that via
+    ``_guard_opencode_agent_id_collision`` in ``services/install_service.py``,
+    which fails loud rather than overwriting.
+
+    The separator collapse itself is no longer a live collision source on the
+    install path: ``_write_context_file`` runs ``validate_path_component`` on the
+    resolved name earlier in the same ``install_agent`` call, which REJECTS any
+    name containing ``/`` or ``\\``, so a separator-bearing name never reaches
+    this function there and the flatten is the identity for everything that
+    does. It stays as defence in depth for any future caller that has not been
+    through that validation.
     """
-    return profile_name.replace("/", "__")
+    return flatten_path_separators(profile_name)
 
 
 class OpenCodeAgentIdCollisionError(ValueError):

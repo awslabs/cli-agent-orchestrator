@@ -1,0 +1,11 @@
+› run the deploy script
+• I'll run the deploy script now.
+
+• Called shell.exec({"command":"./scripts/deploy.sh"})
+
+╭─ Command Approval Required ──────────────────╮
+│                                              │
+│ ./scripts/deploy.sh                          │
+│                                              │
+│ [a] Accept  [d] Decline                      │
+╰──────────────────────────────────────────────╯

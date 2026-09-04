@@ -45,6 +45,10 @@ from cli_agent_orchestrator.utils.opencode_config import (
     upsert_mcp_server,
 )
 from cli_agent_orchestrator.utils.opencode_permissions import cao_tools_to_opencode_permission
+from cli_agent_orchestrator.utils.path_validation import (
+    flatten_path_separators,
+    validate_path_component,
+)
 from cli_agent_orchestrator.utils.skill_injection import compose_agent_prompt
 from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
 
@@ -499,17 +503,24 @@ def _create_context_temp_file(context_file: Path) -> Tuple[int, Path]:
     """Create a same-directory temp file for the context copy and return its
     open fd and path.
 
-    Requests mode 0o666 so the kernel applies the process umask atomically at
-    file-creation time, instead of this function reading the umask itself via
-    the ``os.umask(0)``/restore idiom — which briefly zeroes the umask
-    *process-wide* and can widen the mode of files concurrently created by
-    other threads (e.g. the API server's ``asyncio.to_thread`` workers).
+    Created 0o600, matching the mode the pre-atomic ``os.open`` sink asked for:
+    this holds agent instruction content under
+    ``~/.aws/cli-agent-orchestrator/`` and does not need to be group- or
+    world-readable. Naming the mode outright rather than requesting 0o666 and
+    letting the umask subtract also means the result does not depend on the
+    ambient umask, so a permissive umask cannot widen a new context copy. On a
+    reinstall the caller restores the existing target's mode via ``os.fchmod``
+    before the replace.
+
+    ``O_EXCL`` is what makes the name unguessable-and-unique rather than merely
+    unlikely to collide: the create fails rather than opening a file an attacker
+    pre-planted at the temp path.
     """
     last_exc: Optional[OSError] = None
     for _ in range(_TEMP_FILE_NAME_ATTEMPTS):
         candidate = context_file.parent / f".{context_file.name}.{secrets.token_hex(8)}.tmp"
         try:
-            fd = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
+            fd = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError as exc:
             last_exc = exc
             continue
@@ -534,27 +545,85 @@ def _write_context_file(agent_name: str, raw_content: str, source_name: str) -> 
     :func:`_guard_opencode_agent_id_collision`). The marker is inserted
     textually, preserving source formatting aside from that one marker line.
 
-    The target context path must be absent or a regular file. Symlinks,
+    SECURITY. The filename derives from the profile's RESOLVED frontmatter
+    ``name:``. That value is NOT covered by ``_PROFILE_NAME_RE`` -- that regex
+    validates the install *source handle* (the URL stem / bare-name argument),
+    not the resolved name -- and a profile can be installed straight from a URL,
+    so the field is attacker-controlled. Without a guard, a name like
+    ``../../foo`` or an absolute path steers this write outside
+    ``AGENT_CONTEXT_DIR`` and can overwrite a trusted ``.md`` instruction file.
+    Three layers, all in this function (see the barrier note below):
+
+    1. ``validate_path_component`` -- the shared segment validator, which rejects
+       empty, ``.``/``..``, NUL, every path separator, and anything outside
+       ``[A-Za-z0-9._-]``. The allowlist also makes Unicode normalization a
+       non-issue: a fullwidth solidus (U+FF0F) is rejected outright rather than
+       having to be caught before it folds to ``/`` under NFKC.
+    2. Lexical containment under the realpath of the base directory.
+    3. Refusal to write through a symlink at the final component -- enforced here
+       by the ``lstat`` type check plus ``os.replace`` (which replaces a symlink
+       rather than following it), where the pre-atomic writer used
+       ``O_NOFOLLOW`` on a direct open of the target. See the long comment at
+       that check for why the substitution is not a weakening.
+
+    ATOMICITY AND MODE. The target must be absent or a regular file; symlinks,
     directories, FIFOs, sockets, and devices are refused before writing (one
-    ``lstat`` serves both that check and the existing-mode read below, so
-    neither follows a symlink planted in the window between them). The
-    content is written to a same-directory temporary file and atomically
-    replaced into place so CAO never opens the target path itself and a
-    failed write does not leave a truncated context copy. The temp file's
-    mode is restored before the replace to the existing target's mode on a
-    reinstall (via ``os.fchmod``); a brand-new copy keeps the umask-derived
-    mode the kernel already applied when the temp file was created —
-    otherwise ``os.replace`` would carry an unrelated mode onto the target,
-    silently tightening or widening permissions on every install.
+    ``lstat`` serves both that check and the existing-mode read, so neither
+    follows a symlink planted in the window between them). Content goes to a
+    same-directory temporary file and is atomically replaced into place, so CAO
+    never opens the target path itself and a failed write cannot leave a
+    truncated context copy. A brand-new copy is created 0o600; on a reinstall the
+    existing target's mode is restored via ``os.fchmod`` before the replace,
+    since otherwise ``os.replace`` would carry an unrelated mode onto the target
+    and silently tighten or widen permissions on every install.
     """
     AGENT_CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
-    context_file = AGENT_CONTEXT_DIR / f"{agent_name}.md"
+    # BARRIER PLACEMENT: the validation and the containment check are inlined
+    # here, in the same function as the write sink, rather than factored into a
+    # helper. This mirrors the deliberate repetition in ``services/profile_store``
+    # -- CodeQL's py/path-injection dataflow only recognises a barrier that
+    # guards, in the same function as the sink, the very variable that reaches
+    # it. A helper that returns a validated path is more readable but invisible
+    # to the analysis, and this repo has a history of that alert reopening (see
+    # profile_store._PROFILE_NAME_RE). Load-bearing, not an oversight.
+    safe_name = validate_path_component(agent_name, description="profile name")
+    # Resolve only the BASE (so a symlinked context root is handled) and keep the
+    # final component UNRESOLVED. Resolving the whole candidate -- as
+    # ``safe_join_under_base`` does -- would follow a symlink planted at the
+    # target and silently write to wherever it resolves; leaving the final
+    # component lexical means such a symlink is refused by the lstat check
+    # below. That is why this does not simply call ``safe_join_under_base``.
+    base = os.path.realpath(AGENT_CONTEXT_DIR)
+    candidate = os.path.join(base, f"{safe_name}.md")
+    if candidate != base and not candidate.startswith(base + os.sep):
+        raise ValueError(
+            f"Refusing to write context copy: profile name {agent_name!r} resolves "
+            f"to a path outside the agent context directory ({candidate!r})."
+        )
+    context_file = Path(candidate)
+    # HOW THE SYMLINK REFUSAL IS ENFORCED HERE, having replaced O_NOFOLLOW.
+    # The pre-atomic writer opened the target directly, so it needed O_NOFOLLOW to
+    # stop the kernel writing THROUGH a symlink planted at the final component.
+    # This writer never opens the target at all: it writes a same-directory temp
+    # file and ``os.replace``s it into place, and ``os.replace`` replaces the
+    # symlink ITSELF rather than following it, so the write cannot land outside
+    # the directory even if the lstat below is raced. The lstat is what turns that
+    # into a clear refusal instead of silently clobbering an operator's symlink.
+    # Strictly stronger than the O_NOFOLLOW form on two counts: it also refuses
+    # directories/FIFOs/sockets/devices by type rather than by errno, and it holds
+    # on Windows, where os.O_NOFOLLOW does not exist and degraded to a no-op.
     try:
         st = os.lstat(context_file)
     except FileNotFoundError:
         st = None
     if st is not None and not stat.S_ISREG(st.st_mode):
         raise _non_regular_target_error(context_file)
+    # Reinstalls keep the target's current mode; a brand-new copy gets 0o600 from
+    # _create_context_temp_file. This file lives under
+    # ~/.aws/cli-agent-orchestrator/ and holds agent instruction content, so it is
+    # not group/world readable by default -- but silently RE-tightening a mode an
+    # operator widened on purpose would be its own surprise, so an existing mode
+    # is preserved rather than reasserted.
     existing_mode = stat.S_IMODE(st.st_mode) if st is not None else None
 
     content = _context_content_with_provenance(raw_content, source_name)
@@ -846,13 +915,45 @@ def install_agent(
                 for name, cfg in profile.mcpServers.items()
             }
 
+        # Record the provider we actually installed for into the LOCAL store
+        # copy, so later provider resolution on this node is deterministic.
+        #
+        # Without this, `cao install <p> --provider <x>` materialised the
+        # provider-specific config (below) but left no trace of <x> anywhere
+        # readable: resolve_provider() re-reads the profile, finds no
+        # frontmatter `provider:` key, and silently falls back to the caller's
+        # provider or DEFAULT_PROVIDER. Locally that is usually masked because
+        # the fallback is inherited from the calling terminal, but on the
+        # cross-node assign/handoff path `_assign_remote` deliberately omits
+        # the provider and lets the TARGET node resolve it — so the target
+        # would resolve DEFAULT_PROVIDER regardless of what was installed
+        # there, and remote placement fails on any node whose installed
+        # provider is not the default.
+        #
+        # Only the resolved `provider:` key is added; the body and every other
+        # frontmatter key are preserved verbatim, and raw (unresolved) content
+        # is stored so ${VARS} keep their placeholder form like the context
+        # file. Note this materialises a local-store copy of a built-in
+        # profile, which then shadows the packaged one on this node — that is
+        # intended (the install is a per-node fact), but it does mean later CAO
+        # upgrades will not change this profile's body on this node.
+        if profile.provider != provider:
+            stored = frontmatter.loads(raw_content)
+            stored["provider"] = provider
+            write_profile(agent_name, frontmatter.dumps(stored), overwrite=True)
+
         unresolved_vars = sorted(set(re.findall(r"\$\{(\w+)\}", resolved_content)))
 
         mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
         allowed_tools = resolve_allowed_tools(profile.allowedTools, profile.role, mcp_server_names)
 
         agent_file: Optional[Path] = None
-        safe_filename = profile.name.replace("/", "__")
+        # Defence in depth. The resolved profile name is attacker-controlled, but
+        # _write_context_file above has already REJECTED any name carrying a path
+        # separator, so nothing separator-bearing reaches these provider sinks in
+        # the normal flow. The flatten stays so each sink is independently safe if
+        # the order ever changes or a new caller appears.
+        safe_filename = flatten_path_separators(profile.name)
 
         # OpenCode collision guard must run BEFORE any destructive write. The
         # guard prevents opencode_cli/agents/<id>.md from being overwritten when

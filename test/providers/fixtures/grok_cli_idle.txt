@@ -1,0 +1,7 @@
+  Grok Build  1.0.0
+
+  ╭────────────────╮
+  │ ❯              │
+  ╰── Grok 4.5 (high) · always-approve ─╯
+
+  Shift+Tab:mode  │  Ctrl+x:shortcuts

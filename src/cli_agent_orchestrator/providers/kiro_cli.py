@@ -17,9 +17,11 @@ The provider detects the following terminal states:
 - ERROR: Agent encountered an error during processing
 """
 
+import asyncio
 import logging
 import re
 import shlex
+import time
 from typing import Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
@@ -134,6 +136,17 @@ TUI_PERMISSION_PATTERN = (
 # Matches the footer navigation chrome to avoid false positives on warning text in agent output.
 # Must be anchored to bottom screen region (see get_status WAITING check) to avoid stale matches.
 TUI_TRUST_ALL_TOOLS_FOOTER = r"esc to cancel · ↑↓ to navigate · ↵ to select"
+
+# Distinctive consent-dialog body text. TUI_TRUST_ALL_TOOLS_FOOTER above is
+# kiro's GENERIC list-selector chrome — an update/login/onboarding selector
+# renders it identically — so before answering we require this trust-specific
+# line, and require the ❯ cursor to sit on "No, exit" so Down lands on
+# "Yes, I accept" (not "Yes, and don't ask again"). Anything else fails closed.
+TUI_TRUST_ALL_TOOLS_BODY = r"Kiro is running in trust all tools mode"
+TUI_TRUST_ALL_TOOLS_CURSOR = r"❯\s*No, exit"
+
+# Bottom pane lines scanned for the consent dialog (mirrors codex's window).
+STARTUP_PROMPT_BOTTOM_LINES = 15
 
 # =============================================================================
 # Error Detection
@@ -297,46 +310,26 @@ class KiroCliProvider(BaseProvider):
         # tool invocation re-prompts, blocking assign/handoff flows.
         # --model: honor profile.model so workflows can pin a specific model.
         #
-        # UI mode selection:
-        # - Yolo (--trust-all-tools): kiro-cli 2.0.1 TUI blocks on an
-        #   interactive "Yes, I accept" consent dialog before the chat is
-        #   ready; only --legacy-ui/--classic/--no-interactive bypass it.
-        #   CAO drives kiro-cli headlessly, so we force --legacy-ui for yolo.
-        # - Non-yolo: use the default TUI (fall back to --legacy-ui on
-        #   timeout, preserving prior behavior for older kiro-cli versions).
-        yolo = bool(self._allowed_tools and "*" in self._allowed_tools)
+        # UI mode: always the default TUI. --legacy-ui is NOT an option — see
+        # build_kiro_command's docstring: it conflicts with --agent-engine=v2
+        # and otherwise silently selects the v1 engine, which exposes no MCP
+        # tools, so the agent could not assign/handoff/report_outcome at all.
         model = self._get_profile_model()
 
         # kiro-cli 2.11 introduced a "subagent requires approval" prompt that
         # blocks MCP tool calls that spawn subagents (e.g. cao-mcp-server's
-        # assign/handoff). Even for non-yolo profiles, CAO enforces tool
-        # scoping at its own layers (profile allowedTools + MCP allowlist),
-        # so passing --trust-all-tools is safe: it bypasses kiro's
-        # per-invocation UI prompt (there is no human at the terminal in
-        # headless orchestration to answer), while CAO still gates what
-        # tools can be called. Without this, a supervisor invoking assign()
-        # hangs indefinitely on the approval dialog.
-        if yolo:
-            logger.info(
-                "kiro_cli yolo mode: forcing --legacy-ui (kiro-cli 2.0.1 TUI "
-                "shows a non-bypassable trust-all-tools consent dialog)"
-            )
-            base_args = build_kiro_command(
-                self._engine,
-                self._agent_profile,
-                model=model,
-                yolo=True,
-                legacy_ui=True,
-            )
-        else:
-            # Current CAO policy always bypasses Kiro's interactive approval
-            # prompt; CAO still enforces the profile/MCP allowlist itself.
-            base_args = build_kiro_command(
-                self._engine,
-                self._agent_profile,
-                model=model,
-                yolo=True,
-            )
+        # assign/handoff). Current CAO policy always bypasses Kiro's
+        # interactive approval prompt regardless of the profile: CAO enforces
+        # tool scoping at its own layers (profile allowedTools + MCP
+        # allowlist), and there is no human at the terminal in headless
+        # orchestration to answer. Without this, a supervisor invoking
+        # assign() hangs indefinitely on the approval dialog.
+        base_args = build_kiro_command(
+            self._engine,
+            self._agent_profile,
+            model=model,
+            yolo=True,
+        )
         command = shlex.join(base_args)
         # Arm the StatusMonitor stickiness gate before launching the CLI so
         # the IDLE → PROCESSING → IDLE/COMPLETED transition is honored.
@@ -346,47 +339,124 @@ class KiroCliProvider(BaseProvider):
         # Step 3: Wait for Kiro CLI to fully initialize and show the agent prompt.
         # Accept both IDLE and COMPLETED — some CLI versions show a startup
         # message that get_status() interprets as a completed response.
-        if not await wait_until_status(
-            self.terminal_id,
-            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-            timeout=float(get_server_settings()["provider_init_timeout"]),
-        ):
-            if yolo:
-                # Yolo already launched with --legacy-ui; no further fallback.
-                raise TimeoutError("Kiro CLI initialization timed out with --legacy-ui (yolo mode)")
-            # Non-yolo TUI mode failed — fall back to --legacy-ui
-            logger.warning("Kiro CLI TUI initialization timed out, retrying with --legacy-ui")
-            # Exit the current session and start fresh with --legacy-ui
-            status_monitor.notify_input_sent(self.terminal_id)
-            get_backend().send_keys(self.session_name, self.window_name, "/exit")
-            init_timeout = get_server_settings()["provider_init_timeout"]
-            if not await wait_for_shell(self.terminal_id, timeout=init_timeout):
-                raise TimeoutError(
-                    f"Shell recovery timed out after {init_timeout}s (--legacy-ui fallback)"
-                )
-            # Clear the StatusMonitor buffer so the --legacy-ui attempt is detected
-            # against a clean buffer, not one still full of stale TUI marker bytes
-            # from the failed first attempt (which would otherwise time out too).
-            status_monitor.reset_buffer(self.terminal_id)
-            legacy_args = build_kiro_command(
-                self._engine,
-                self._agent_profile,
-                model=model,
-                yolo=True,
-                legacy_ui=True,
+        # _wait_ready_accepting_trust_dialog also auto-answers the trust
+        # consent dialog (see its docstring) if a wrapper version still shows
+        # one; --trust-tools='*' does not raise it, so that is now a safety net.
+        #
+        # There is no --legacy-ui retry. It used to exist for older wrappers
+        # whose TUI could not initialize headlessly, but it is no longer a
+        # usable fallback: on a v2 launch kiro-cli errors out on the flag
+        # combination, and a bare --legacy-ui retry would "succeed" into the v1
+        # engine with no MCP tools — turning a loud timeout into an agent that
+        # looks healthy and cannot orchestrate. Failing here is the honest
+        # outcome.
+        if not await self._wait_ready_accepting_trust_dialog():
+            raise TimeoutError(
+                "Kiro CLI initialization timed out waiting for the agent prompt "
+                f"(engine={self._engine.value}, profile={self._agent_profile!r})"
             )
-            legacy_command = shlex.join(legacy_args)
-            status_monitor.notify_input_sent(self.terminal_id)
-            get_backend().send_keys(self.session_name, self.window_name, legacy_command)
-            if not await wait_until_status(
-                self.terminal_id,
-                {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-                timeout=float(get_server_settings()["provider_init_timeout"]),
-            ):
-                raise TimeoutError("Kiro CLI initialization timed out with TUI and `--legacy-ui`")
 
         self._initialized = True
         return True
+
+    async def _wait_ready_accepting_trust_dialog(self) -> bool:
+        """Wait for the agent prompt, auto-answering the trust-all-tools dialog.
+
+        CAO always launches kiro-cli with ``--trust-all-tools`` (there is no
+        human at the terminal to answer per-tool permission prompts in headless
+        orchestration; CAO enforces tool scoping at its own profile/MCP layers).
+        Since kiro-cli 2.1, ``--trust-all-tools`` opens a one-time startup
+        consent dialog *before* the chat prompt is interactive:
+
+            ❯ No, exit
+              Yes, I accept
+              Yes, and don't ask again
+
+        The default TUI shows this dialog on kiro-cli 2.16.1 (verified), so the
+        earlier "force --legacy-ui to skip it" workaround no longer helps and
+        init just times out on the dialog. This helper is applied to the
+        ``--legacy-ui`` fallback path too, so if a kiro build shows the dialog
+        there as well it is handled without a version check. get_status()
+        classifies the dialog as WAITING_USER_ANSWER off generic selector
+        chrome, so before answering we VERIFY the dialog body and the ❯ cursor
+        line (fail closed on anything else), then select **"Yes, I accept"**
+        (Down, Enter) — the one-line-down option. We deliberately do NOT pick
+        "Yes, and don't ask again", which would persist a trust-all-tools
+        bypass into the user's kiro config; CAO's acceptance is scoped to this
+        ephemeral session only.
+
+        Returns:
+            True if the terminal reached IDLE or COMPLETED (dialog answered if
+            it was verified and shown), False if it timed out or a
+            WAITING_USER_ANSWER could not be verified as the consent dialog.
+        """
+        init_timeout = float(get_server_settings()["provider_init_timeout"])
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        start = time.monotonic()
+        ready = await wait_until_status(
+            self.terminal_id,
+            {
+                TerminalStatus.IDLE,
+                TerminalStatus.COMPLETED,
+                TerminalStatus.WAITING_USER_ANSWER,
+            },
+            timeout=init_timeout,
+        )
+        if not ready:
+            return False
+        # Ready-flap window: wait_until_status returned on WAITING_USER_ANSWER,
+        # but get_status is re-read here rather than trusted from the wait. If it
+        # has since flapped to IDLE/COMPLETED, treat the terminal as ready and do
+        # NOT send dialog keys (a blind Down+Enter into a live prompt would be a
+        # stray message). Low probability given the sticky latch, but explicit.
+        # Off the loop: get_status() can fork a tmux capture-pane for a PROCESSING
+        # terminal (status_monitor.py's stale-PROCESSING fallback).
+        current = await asyncio.to_thread(status_monitor.get_status, self.terminal_id)
+        if current != TerminalStatus.WAITING_USER_ANSWER:
+            return True
+
+        # WAITING_USER_ANSWER is classified from TUI_TRUST_ALL_TOOLS_FOOTER,
+        # which is kiro's GENERIC list-selector chrome. Verify the dialog BODY
+        # and the ❯ cursor position before answering — a blind Down+Enter on
+        # some other startup selector would pick an arbitrary option. Same
+        # fail-closed shape as codex's directory-trust check. On any mismatch,
+        # fall through to the normal timeout/fallback path.
+        backend = get_backend()
+        pane = strip_terminal_escapes(
+            re.sub(ANSI_CODE_PATTERN, "", backend.get_history(self.session_name, self.window_name))
+        )
+        bottom = "\n".join(pane.splitlines()[-STARTUP_PROMPT_BOTTOM_LINES:])
+        if not (
+            re.search(TUI_TRUST_ALL_TOOLS_BODY, bottom)
+            and re.search(TUI_TRUST_ALL_TOOLS_CURSOR, bottom)
+        ):
+            logger.warning(
+                "kiro_cli: WAITING_USER_ANSWER but the trust-all-tools consent "
+                "dialog (body + '❯ No, exit') was not verified; not answering"
+            )
+            return False
+
+        # Verified consent dialog: cursor on "No, exit", so Down lands on
+        # "Yes, I accept" (session-scoped — NOT "Yes, and don't ask again").
+        logger.info(
+            "kiro_cli: answering --trust-all-tools startup consent dialog "
+            "with 'Yes, I accept' (session-scoped)"
+        )
+        # Arm the PROCESSING latch before the keystrokes, like every other
+        # send_special_key path, so answering the dialog isn't blocked by the
+        # WAITING_USER_ANSWER we just observed.
+        status_monitor.notify_input_sent(self.terminal_id)
+        backend.send_special_key(self.session_name, self.window_name, "Down")
+        backend.send_special_key(self.session_name, self.window_name, "Enter")
+        # Bound the post-accept wait by the time already spent, so total startup
+        # stays within provider_init_timeout rather than up to 2x it.
+        remaining = max(0.0, init_timeout - (time.monotonic() - start))
+        return await wait_until_status(
+            self.terminal_id,
+            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
+            timeout=remaining,
+        )
 
     def get_status(self, output: str) -> TerminalStatus:
         """Get Kiro CLI status by analyzing terminal output.

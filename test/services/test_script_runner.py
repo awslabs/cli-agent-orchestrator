@@ -48,12 +48,13 @@ from cli_agent_orchestrator.services.script_runner import (
     _bump,
     _RingBuffer,
     _scan_sentinel,
-    _step_call_fingerprint,
+    build_env,
     cancel_script_run,
     make_step_terminal_recorder,
     record_step_completion,
     resume_script_run,
     run_script_workflow,
+    run_script_workflow_prepared,
 )
 from cli_agent_orchestrator.services.workflow_service import (
     ResumeCorruptError,
@@ -876,7 +877,7 @@ def test_terminal_recorder_records_into_step_states():
         {"CAO_WORKFLOW_RUN_ID": "run-rec", "CAO_WORKFLOW_STEP_ID": "s1"}
     )
     assert recorder is not None
-    recorder("term-created")
+    recorder("term-created", "v2:" + "0" * 64)
     assert record.step_states["s1"].terminal_id == "term-created"
     assert record.step_states["s1"].state == StepState.RUNNING
 
@@ -895,7 +896,7 @@ def test_terminal_recorder_updates_already_present_step_state():
         {"CAO_WORKFLOW_RUN_ID": "run-rec2", "CAO_WORKFLOW_STEP_ID": "s1"}
     )
     assert recorder is not None
-    recorder("term-new")
+    recorder("term-new", "v2:" + "0" * 64)
     assert record.step_states["s1"].terminal_id == "term-new"
     assert record.step_states["s1"].attempts == 2  # untouched, only terminal_id updates
 
@@ -944,26 +945,21 @@ def _kw(run_id: str, step_id: str) -> dict:
     return {"CAO_WORKFLOW_RUN_ID": run_id, "CAO_WORKFLOW_STEP_ID": step_id}
 
 
-def test_step_call_fingerprint_stable_and_field_separated():
-    """The fingerprint is deterministic and its fields cannot collide across the
-    boundary (``a|b`` must differ from ``ab|``)."""
-    fp1 = _step_call_fingerprint("kiro_cli", "dev", "go")
-    fp2 = _step_call_fingerprint("kiro_cli", "dev", "go")
-    assert fp1 == fp2 and len(fp1) == 64  # sha256 hexdigest
-    # A field-boundary shift must change the digest (NUL separation).
-    assert _step_call_fingerprint("a", "b", "c") != _step_call_fingerprint("ab", "", "c")
+# ``test_step_call_fingerprint_stable_and_field_separated`` lived here until issue #583's
+# ``step-fingerprint`` unit DELETED ``_step_call_fingerprint`` (BR-10/INV-7: two fingerprint
+# functions in one codebase is the defect FR-2 exists to prevent). Its two properties —
+# determinism and NUL field-boundary separation — are now asserted against the replacement in
+# ``test_step_fingerprint.py::TestReturnedForm``, and the journal round-trip it pinned is
+# preserved below in ``test_completion_transitions_running_to_completed``.
 
 
 def test_completion_guard_none_without_script_record():
     """Same BR-31 guard as the recorder: no run/step env or no live script
     record -> None (YAML/handoff callers untouched)."""
-    assert record_step_completion(None, provider="p", agent="a", prompt="x") is None
-    assert (
-        record_step_completion({"CAO_WORKFLOW_RUN_ID": "x"}, provider="p", agent="a", prompt="x")
-        is None
-    )
+    assert record_step_completion(None) is None
+    assert record_step_completion({"CAO_WORKFLOW_RUN_ID": "x"}) is None
     # run/step present but no record in the registry.
-    assert record_step_completion(_kw("ghost", "s1"), provider="p", agent="a", prompt="x") is None
+    assert record_step_completion(_kw("ghost", "s1")) is None
 
 
 def test_completion_transitions_running_to_completed(_patched_journal):
@@ -977,24 +973,27 @@ def test_completion_transitions_running_to_completed(_patched_journal):
     )
     workflow_service.run_registry["run-c"] = record
 
-    settle = record_step_completion(
-        _kw("run-c", "s1"), provider="kiro_cli", agent="dev", prompt="go"
-    )
+    settle = record_step_completion(_kw("run-c", "s1"))
     assert settle is not None
-    settle("term-1", None)
+    settle("term-1", None, "the answer")
 
     st = record.step_states["s1"]
     assert st.state == StepState.COMPLETED
     assert st.attempts == 1
     assert st.error is None
-    # The completed step is written through to the journal with a stable
-    # fingerprint AND its attempts persisted (so a resume's lookup_replay /
-    # rebuild sees the real state, not append_step's hardcoded attempts=0).
+    # The completed step is written through to the journal with its attempts
+    # persisted (so a resume's lookup_replay / rebuild sees the real state).
     row = workflow_journal.get_step("run-c", "s1")
     assert row is not None
     assert row.state == "completed"
     assert row.attempts == 1
-    assert row.call_fingerprint == _step_call_fingerprint("kiro_cli", "dev", "go")
+    # Issue #583's ``settlement-rewire``: one ``settle_step`` write, which carries the result
+    # envelope and NEVER the fingerprint (unit 6 BR-9 — ``begin_step`` owns that column). This
+    # test drives the settle callback directly with no preceding ``begin_step``, so the row is
+    # the documented no-begin RESCUE: settled, with absent provenance.
+    assert row.call_fingerprint is None
+    assert row.result_json is not None
+    assert json.loads(row.result_json)["last_message"] == "the answer"
 
 
 def test_completion_adopts_validated_structured_output(_patched_journal):
@@ -1009,8 +1008,8 @@ def test_completion_adopts_validated_structured_output(_patched_journal):
     # Worker emitted a valid output (no schema -> validated=True).
     record_step_output("run-out", "s1", {"answer": 42})
 
-    settle = record_step_completion(_kw("run-out", "s1"), provider="p", agent="a", prompt="go")
-    settle("term-1", None)
+    settle = record_step_completion(_kw("run-out", "s1"))
+    settle("term-1", None, "done")
 
     st = record.step_states["s1"]
     assert st.state == StepState.COMPLETED
@@ -1039,8 +1038,8 @@ def test_completion_unvalidated_output_settles_completed_unvalidated(_patched_jo
         {"type": "object", "properties": {"answer": {"type": "integer"}}, "required": ["answer"]},
     )
 
-    settle = record_step_completion(_kw("run-inv", "s1"), provider="p", agent="a", prompt="go")
-    settle("term-1", None)
+    settle = record_step_completion(_kw("run-inv", "s1"))
+    settle("term-1", None, "done")
 
     st = record.step_states["s1"]
     assert st.state == StepState.COMPLETED_UNVALIDATED
@@ -1056,8 +1055,8 @@ def test_completion_error_transitions_running_to_failed(_patched_journal):
     record.step_states["s1"] = StepRunState(step_id="s1", state=StepState.RUNNING)
     workflow_service.run_registry["run-f"] = record
 
-    settle = record_step_completion(_kw("run-f", "s1"), provider="p", agent="a", prompt="go")
-    settle("term-1", "terminal term-1 reached ERROR status")
+    settle = record_step_completion(_kw("run-f", "s1"))
+    settle("term-1", "terminal term-1 reached ERROR status", None)
 
     st = record.step_states["s1"]
     assert st.state == StepState.FAILED
@@ -1077,8 +1076,8 @@ def test_completion_creates_step_state_when_missing(_patched_journal):
     record = _make_record("run-m", process=None, generation="1")  # empty step_states
     workflow_service.run_registry["run-m"] = record
 
-    settle = record_step_completion(_kw("run-m", "s1"), provider="p", agent="a", prompt="go")
-    settle(None, None)
+    settle = record_step_completion(_kw("run-m", "s1"))
+    settle(None, None, "done")
 
     assert "s1" in record.step_states
     assert record.step_states["s1"].state == StepState.COMPLETED
@@ -1097,10 +1096,10 @@ def test_completion_journal_failure_never_raises(monkeypatch, _patched_journal):
     def _boom(*a, **k):
         raise RuntimeError("db gone")
 
-    monkeypatch.setattr(workflow_journal, "append_step", _boom)
+    monkeypatch.setattr(workflow_journal, "settle_step", _boom)
 
-    settle = record_step_completion(_kw("run-j", "s1"), provider="p", agent="a", prompt="go")
-    settle("term-1", None)  # must not raise
+    settle = record_step_completion(_kw("run-j", "s1"))
+    settle("term-1", None, "done")  # must not raise
     # In-memory transition still applied despite the journal write failing.
     assert record.step_states["s1"].state == StepState.COMPLETED
 
@@ -1161,3 +1160,94 @@ def _seed_script_run(run_id: str, *, state: str = "running", generation: str = "
         tier="script",
         generation=generation,
     )
+
+
+# ---------------------------------------------------------------------------
+# U2 (issue #505) — public build_env seam + run_script_workflow_prepared (ADR-3)
+# ---------------------------------------------------------------------------
+def test_build_env_public_alias_is_same_function():
+    """ADR-3 F-2: the public seam and the pre-U2 private name are the SAME function
+    (single-homed 6-key contract) — no behavior forked by the rename."""
+    assert build_env is script_runner._build_env
+    assert build_env is script_runner.build_env
+
+
+def test_public_build_env_exact_six_keys_and_resume_flag():
+    """T12: the public seam returns exactly the 6 keys; ``resume=True`` adds the
+    7th (guards the rename did not change behavior)."""
+    env = build_env("run-x", "1", {"a": 1})
+    assert set(env) == {
+        "CAO_WORKFLOW_RUN_ID",
+        "CAO_WORKFLOW_GENERATION",
+        "CAO_API_BASE_URL",
+        "CAO_WORKFLOW_INPUTS",
+        "PATH",
+        "HOME",
+    }
+    assert env["CAO_WORKFLOW_INPUTS"] == '{"a":1}'
+    assert "CAO_WORKFLOW_RESUME" not in env
+    resumed = build_env("run-x", "4", {"a": 1}, resume=True)
+    assert resumed["CAO_WORKFLOW_RESUME"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_run_script_workflow_prepared_drives_without_reinsert(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """DR-1/DR-2 + CR-2: the script prepared entry drives an already-journaled,
+    already-registered record via ``_drive_process`` WITHOUT re-linting or
+    re-inserting the run row. It must not call ``lint_script`` or ``insert_run``."""
+    from cli_agent_orchestrator.services import workflow_service
+
+    # C1 already journaled + registered the run before scheduling the drive — seed
+    # the real row FIRST, then wire the "must not be called again" guards.
+    _seed_script_run("run-prep-script")
+
+    def _fail_lint(*a, **k):
+        raise AssertionError("run_script_workflow_prepared must not lint")
+
+    def _fail_insert(*a, **k):
+        raise AssertionError("run_script_workflow_prepared must not insert_run")
+
+    monkeypatch.setattr(script_runner, "lint_script", _fail_lint)
+    monkeypatch.setattr(workflow_journal, "insert_run", _fail_insert)
+
+    proc = _FakeProcess(exit_rc=0, stdout=b'CAO_WORKFLOW_OUTPUT:{"ok": true}\n')
+    _install_fake_spawn(monkeypatch, proc)
+
+    record = _make_record("run-prep-script", process=None, generation="1")
+    workflow_service.run_registry["run-prep-script"] = record
+
+    env = build_env("run-prep-script", "1", {})
+    result = await run_script_workflow_prepared(record, "/tmp/wf.py", env)
+
+    assert result.state == RunState.COMPLETED
+    assert result.output == {"ok": True}
+    # DR-2: liveness mark cleared on exit.
+    assert "run-prep-script" not in workflow_service._active_drives
+
+
+@pytest.mark.asyncio
+async def test_run_script_workflow_prepared_marks_then_clears_active_drive(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The run is live in ``_active_drives`` while ``_drive_process`` runs and
+    absent after (finally discard) — the liveness truth crash-remnant logic uses."""
+    from cli_agent_orchestrator.services import workflow_service
+
+    observed = {"live": None}
+
+    async def _fake_drive(record, script_path, env):
+        observed["live"] = record.run_id in workflow_service._active_drives
+        return WorkflowRunResult(
+            run_id=record.run_id,
+            workflow_name="wf",
+            state=RunState.COMPLETED,
+            started_at=record.started_at,
+        )
+
+    monkeypatch.setattr(script_runner, "_drive_process", _fake_drive)
+    record = _make_record("run-prep-live", process=None, generation="1")
+    await run_script_workflow_prepared(record, "/tmp/wf.py", build_env("run-prep-live", "1", {}))
+    assert observed["live"] is True
+    assert "run-prep-live" not in workflow_service._active_drives

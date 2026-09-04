@@ -51,7 +51,10 @@ portable and make profile listings useful.
 
 ### Provider configuration
 
-- `mcpServers` (object): MCP server definitions.
+- `mcpServers` (object): MCP server definitions. Each entry defines either
+  `command` (with optional `args`, `env`, `timeout`) for a server CAO launches,
+  or `url` for a remote one, with `type` naming its transport (for example
+  `http` or `sse`). An entry defining neither is invalid.
 - `tools` (array), `toolAliases` (object), and `toolsSettings` (object):
   provider tool configuration.
 - `resources` (array), `hooks` (object), and `useLegacyMcpJson` (boolean):
@@ -64,15 +67,22 @@ portable and make profile listings useful.
 - `native_agent` (string): Claude Code native-agent name.
 - `codexProfile` (string): named Codex configuration profile.
 - `codexConfig` (object): inline Codex configuration overrides.
+- `claudeConfig` (object): inline Claude Code launch flags; `{"effort":
+  "<low|medium|high|xhigh>"}` maps to `--effort <level>` and
+  `{"fallback_model": "<model>"}` to `--fallback-model <model>`. The Claude
+  analog of `codexConfig`; the top-level `model` field still maps to `--model`.
 - `hermesProfile` (string): Hermes profile wrapper command.
+- `grokNativeWorkflows` (boolean): explicit Grok Build-native worker/workflow
+  opt-in; defaults to `false`.
 
 Provider support for pass-through fields differs. Use the focused guides for
 [Kiro CLI](kiro-cli.md), [Claude Code](claude-code.md),
 [Codex CLI](codex-cli.md), [Antigravity CLI](antigravity-cli.md),
 [Hermes](hermes.md), [Kimi CLI](kimi-cli.md),
-[GitHub Copilot CLI](copilot-cli.md), [OpenCode CLI](opencode-cli.md), and
-[Cursor CLI](cursor-cli.md) instead of relying on a duplicated compatibility
-catalog here.
+[MiniMax Code](minimax-code.md),
+[GitHub Copilot CLI](copilot-cli.md), [OpenCode CLI](opencode-cli.md),
+[Cursor CLI](cursor-cli.md), and [Grok Build CLI](grok-cli.md) instead of
+relying on a duplicated compatibility catalog here.
 
 ## Tool restrictions
 

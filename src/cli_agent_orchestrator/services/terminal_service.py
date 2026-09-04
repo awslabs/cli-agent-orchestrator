@@ -18,26 +18,42 @@ Terminal Workflow:
 """
 
 import asyncio
+import hashlib
 import logging
+import os
 import re
 import threading
 import time
 from datetime import datetime
 from enum import Enum
-from typing import Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import requests
+from pydantic import ValidationError
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
 )
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
+from cli_agent_orchestrator.clients.database import (
+    delete_idempotency_key,
+)
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
 from cli_agent_orchestrator.clients.database import (
+    delete_terminals_by_session,
+    get_idempotency_record,
     get_terminal_metadata,
+    list_all_terminals,
+    list_siblings_by_group_prefix,
     update_last_active,
+    update_terminal_group,
+    update_terminal_metadata,
     update_terminal_shell_command,
 )
 from cli_agent_orchestrator.constants import (
+    CALLBACK_TERMINAL_ID_ENV,
+    CALLBACK_URL_ENV,
     FIFO_DIR,
     PIPE_LIVENESS_TAIL_LINES,
     SESSION_PREFIX,
@@ -47,13 +63,19 @@ from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
 from cli_agent_orchestrator.models.provider import ProviderType
-from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
+from cli_agent_orchestrator.models.terminal import (
+    Terminal,
+    TerminalInputBlockedError,
+    TerminalLimitError,
+    TerminalStatus,
+)
 from cli_agent_orchestrator.plugins import (
     PluginRegistry,
     PostCreateTerminalEvent,
     PostKillTerminalEvent,
     PostSendMessageEvent,
 )
+from cli_agent_orchestrator.providers.base import OutputExtractionError
 from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroCapabilities,
     KiroPhase0KASError,
@@ -61,8 +83,16 @@ from cli_agent_orchestrator.providers.kiro_capabilities import (
     requested_kiro_capabilities,
 )
 from cli_agent_orchestrator.providers.manager import provider_manager
+from cli_agent_orchestrator.services import worktree_service
+from cli_agent_orchestrator.services.elastic_worker_gateway import (
+    elastic_worker_gateway_headers,
+)
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.herdr_inbox_registry import get_herdr_inbox_service
+from cli_agent_orchestrator.services.memory_gateway import (
+    memory_context_for_terminal,
+    remote_memory_url,
+)
 from cli_agent_orchestrator.services.memory_service import MemoryService
 from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_event
 from cli_agent_orchestrator.services.session_env import (
@@ -70,8 +100,12 @@ from cli_agent_orchestrator.services.session_env import (
     get_session_env,
     set_session_env,
 )
+from cli_agent_orchestrator.services.session_lock import session_lifecycle_lock
+from cli_agent_orchestrator.services.settings_service import get_max_terminals
 from cli_agent_orchestrator.services.status_monitor import status_monitor
+from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.path_validation import resolve_and_validate_path
 from cli_agent_orchestrator.utils.skills import build_skill_catalog
 from cli_agent_orchestrator.utils.terminal import (
     generate_session_name,
@@ -81,6 +115,58 @@ from cli_agent_orchestrator.utils.terminal import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class IdempotencyKeyConflict(Exception):
+    """An idempotency key was reused for a DIFFERENT request.
+
+    Review on PR #634, issue #616. Surfaced as HTTP 409 by both create
+    endpoints -- the same shape Stripe and AWS use
+    (``IdempotentParameterMismatch``) rather than silently serving the first
+    call's result to a caller who asked for something else.
+
+    Subclasses ``Exception`` and NOT ``ValueError``, deliberately. Every
+    ``ValueError`` out of ``create_terminal`` is already spoken for by the
+    endpoints: ``create_session`` maps it to 400 and
+    ``create_terminal_in_session`` maps it to 404, and in ``create_session``
+    that arm sits FIRST -- so a ``ValueError`` subclass would be swallowed
+    into a 400 before any 409 arm could see it, and a later reorder could
+    silently re-break it. As a plain ``Exception`` the only ordering
+    requirement is that its arm precede the catch-all 500, which no reorder
+    of the ``ValueError``-family arms can violate. This also matches the
+    dominant convention in this repo (``WorktreeError(Exception)``,
+    ``ProviderError(Exception)``).
+    """
+
+
+class TerminalRecordCorruptError(Exception):
+    """A stored terminal row exists but does not satisfy the ``Terminal`` model.
+
+    Review on PR #634. Raised in place of the bare pydantic
+    ``ValidationError`` so the failure cannot be mistaken for a client error:
+    ``ValidationError`` subclasses ``ValueError``, so letting it escape would
+    surface as 400 from ``create_session`` and 404 from
+    ``create_terminal_in_session`` -- both of which blame the caller for a
+    corrupt server-side row. As a plain ``Exception`` it reaches each
+    endpoint's catch-all and is reported as a 500, which is what a
+    server-data fault is, and needs no new ``except`` arm to do it.
+    """
+
+
+# Upper bound (bytes) on a single offset-ranged read of a terminal log
+# (U5 / #504, BR-2). ``read_output_range`` clamps its ``length`` to this so a
+# caller (playback fetching output around a selected event) can never trigger
+# an unbounded read of a large log file. 1 MiB is a defensible ceiling: it is
+# far larger than any realistic per-event output window (the rolling
+# STATE_BUFFER_MAX is only 8 KiB) yet bounds the worst-case allocation and
+# response size to a fixed, predictable amount regardless of on-disk log size.
+TERMINAL_RANGE_MAX_LENGTH = 1024 * 1024
+
+# Timeout (seconds) for the cross-node deferred-failure notification POST to a
+# remote supervisor's inbox. Runs on a worker thread, so a slow peer only
+# delays this one notification — but still bounded so a black-holed node can't
+# pin the thread.
+CROSS_NODE_NOTIFY_TIMEOUT = 10.0
 
 # Track terminals that have already received memory injection (first message only).
 _memory_injected_terminals: set = set()
@@ -93,28 +179,71 @@ _memory_injected_lock = threading.Lock()
 _deferred_init_tasks: set = set()
 
 
-class TerminalInputBlockedError(Exception):
-    """Raised when orchestrated input would answer an active interactive prompt."""
-
-
-def inject_memory_context(first_message: str, terminal_id: str) -> str:
+def inject_memory_context(
+    first_message: str, terminal_id: str, frozen_memory: str | None = None
+) -> str:
     """Prepend <cao-memory> context block to the first user message.
 
     Tracks which terminals have already been injected so that only the very
     first user message after init receives the memory block.
 
-    Calls MemoryService.get_memory_context_for_terminal() which returns
-    a formatted <cao-memory>...</cao-memory> block (or empty string if
-    no memories exist). Stateless — no file mutation, no backup/restore.
+    Calls the configured memory backend, which returns a formatted
+    <cao-memory>...</cao-memory> block (or empty string if no memories exist).
+    Stateless — no file mutation, no backup/restore.
+
+    ``frozen_memory`` is an OPTIONAL PRE-RESOLVED BLOCK (issue #583 FR-9). When it
+    is not None the block is injected verbatim and MemoryService is never
+    consulted, so a replayed workflow run sees the memory the ORIGINAL run
+    recorded rather than whatever the store holds today. When it is None this
+    function behaves exactly as it always has, which is what keeps every
+    non-workflow terminal in CAO unaffected — and this module deliberately knows
+    nothing about workflows: the parameter is named for its content, not its
+    origin.
     """
     with _memory_injected_lock:
         if terminal_id in _memory_injected_terminals:
             return first_message
         _memory_injected_terminals.add(terminal_id)
 
+    if frozen_memory is not None:
+        # "" is a SUPPLIED block, not an absent one: it means the original run
+        # resolved no memory, so prepend nothing — and, crucially, do NOT fall
+        # through to the live path. Deciding the arm on `is not None` while
+        # deciding the prepend on truthiness is deliberate; collapsing the two
+        # into one truthiness test is exactly how a run that legitimately froze
+        # an empty block would pick up memories written after it, which is the
+        # drift FR-9 exists to prevent.
+        if not frozen_memory:
+            return first_message
+        # The operator's kill switch binds this path too. Skipping MemoryService
+        # would otherwise skip its is_memory_enabled() check, and a workflow run
+        # would paste memory into the context of someone who turned memory off.
+        # The cost is that a replay under a disabled switch differs from the
+        # original run — acceptable because the manifest records that memory was
+        # frozen, so the difference is explainable, whereas a bypassed control
+        # would leave no trace at all. Imported lazily for the same
+        # settings -> memory circular-import reason memory_service documents.
+        from cli_agent_orchestrator.services.settings_service import is_memory_enabled
+
+        if not is_memory_enabled():
+            return first_message
+        # No try/except here on purpose: string concatenation cannot fail on I/O,
+        # so the only thing a guard could swallow is a programming error — and
+        # swallowing it would silently downgrade a replay to live memory, which
+        # is a wrong answer wearing a right answer's clothes.
+        return frozen_memory + "\n\n" + first_message
+
     try:
-        svc = MemoryService()
-        context = svc.get_curated_memory_context(terminal_id, task_description=first_message[:200])
+        if remote_memory_url():
+            context = memory_context_for_terminal(
+                terminal_id,
+                task_description=first_message[:200],
+            )
+        else:
+            context = MemoryService().get_curated_memory_context(
+                terminal_id,
+                task_description=first_message[:200],
+            )
         if context:
             return context + "\n\n" + first_message
     except Exception as e:
@@ -143,6 +272,9 @@ RUNTIME_SKILL_PROMPT_PROVIDERS = {
     ProviderType.CODEX.value,
     ProviderType.KIMI_CLI.value,
     ProviderType.ANTIGRAVITY_CLI.value,
+    ProviderType.OMP.value,
+    ProviderType.GROK_CLI.value,
+    ProviderType.MINIMAX_CODE.value,
 }
 
 # Providers whose tool restrictions are prompt-level text only (no native
@@ -151,7 +283,370 @@ SOFT_ENFORCEMENT_PROVIDERS = {
     ProviderType.KIMI_CLI.value,
     ProviderType.CODEX.value,
     ProviderType.ANTIGRAVITY_CLI.value,
+    ProviderType.OMP.value,
+    ProviderType.MINIMAX_CODE.value,
 }
+
+
+def _resolve_working_directory(working_directory: Optional[str]) -> str:
+    """Resolve launch cwd exactly as the tmux backend does before creation."""
+    return resolve_and_validate_path(
+        working_directory if working_directory is not None else os.getcwd(),
+        allow_create=False,
+        allow_file=False,
+        description="Working directory",
+    )
+
+
+def _roll_back_backend_create_locked(
+    session_name: str,
+    window_name: str,
+    *,
+    created_session: bool,
+) -> None:
+    """Undo the backend resource a create just made. CALLER MUST HOLD the
+    lifecycle lock for ``session_name``.
+
+    Used by ``create_terminal``'s locked critical section so a failure between
+    the backend create and the registry write cannot leave a live tmux
+    session/window with no row. Both branches matter and they are NOT the same
+    teardown:
+
+    * ``created_session=True`` -- this call created the whole session, so kill the
+      session and drop any forwarded env stashed for the name, so secrets don't
+      linger in memory or bleed into a future reuse of the name.
+    * ``created_session=False`` -- this call only added a WINDOW to a session that
+      already existed (``new_session=False``: every MCP spawn/assign-into-an-
+      existing-session call). Kill ONLY that window, so the pre-existing session
+      and its other terminals are left alone. Note this is not a guarantee that
+      the session survives: tmux drops a session when its last window dies, and
+      the peer window that made the session non-empty at the `session_exists`
+      check can be reaped by its own process exiting before this rollback runs --
+      the lifecycle lock serializes CAO's transitions, not a pane's exit. In that
+      race the session collapses and the peer's registry row is left pointing at
+      a dead session. Killing the whole session instead would be strictly worse
+      (it would destroy peers that ARE alive, which is the common case), so this
+      stays window-scoped; the residual race is the same one the outer `except`
+      path already carries and is tracked separately.
+
+    Best-effort and never raises: it runs while an exception is already in
+    flight, and that original failure is the one the caller must see.
+    """
+    if created_session:
+        # `finally`, not a following statement: the env mapping must be dropped
+        # however the kill turns out -- including when it raises a BaseException
+        # (KeyboardInterrupt/SystemExit), which `except Exception` does not catch.
+        # Sequencing these as two independent try blocks skipped the clear on
+        # exactly that path, leaving a forwarded secret in the process-global map
+        # keyed to a session name that is gone and may later be reused.
+        # `finally` still lets a BaseException propagate, which is what we want:
+        # a Ctrl-C must not be swallowed here.
+        try:
+            if not get_backend().kill_session(session_name):
+                # Falsy means the backend could not confirm the kill (or found
+                # nothing to kill). Either way the name may still be live, so say
+                # so -- a silent branch here is how an orphan goes unnoticed.
+                logger.warning(
+                    f"Rollback: kill_session({session_name}) did not confirm the kill; "
+                    "the session may still be live"
+                )
+        except Exception:
+            logger.exception(f"Rollback: failed to kill session {session_name}")
+        finally:
+            try:
+                clear_session_env(session_name)
+            except Exception:
+                logger.exception(f"Rollback: failed to clear session env for {session_name}")
+    else:
+        try:
+            if not get_backend().kill_window(session_name, window_name):
+                logger.warning(
+                    f"Rollback: kill_window({session_name}:{window_name}) did not confirm "
+                    "the kill; the window may still be live"
+                )
+        except Exception:
+            logger.exception(f"Rollback: failed to kill window {session_name}:{window_name}")
+
+
+def _roll_back_cancelled_create(
+    session_name: str,
+    terminal_id: str,
+    window_name: str,
+    *,
+    created_session: bool,
+) -> None:
+    """Undo a create whose awaiter was cancelled AFTER the worker succeeded.
+
+    Runs on a worker thread. Unlike the in-closure rollback this must
+    REACQUIRE the lifecycle lock: the worker released it when it returned, and
+    an unlocked late kill could destroy a NEW incarnation of the name that
+    another caller legitimately built in between — the same
+    never-observable-half-built argument the closure's docstring makes. Under
+    the lock, kill the session/window THIS call created, then drop the
+    committed row, so the cancelled create leaves both stores exactly as it
+    found them.
+
+    Best-effort like its sibling: the cancellation is already propagating and
+    is what the caller must see.
+    """
+    with session_lifecycle_lock(session_name):
+        _roll_back_backend_create_locked(session_name, window_name, created_session=created_session)
+        try:
+            db_delete_terminal(terminal_id)
+        except Exception:
+            logger.exception(
+                f"Rollback: failed to delete registry row {terminal_id} " "after a cancelled create"
+            )
+
+
+async def _finish_and_roll_back_cancelled_create(
+    create_worker: "asyncio.Task[Tuple[str, bool, bool]]",
+    session_name: str,
+    terminal_id: str,
+) -> None:
+    """Await the un-cancellable create worker, then compensate its outcome.
+
+    If the worker RAISED, its locked closure already rolled the backend
+    resource back and never wrote the row — nothing to do. If it RETURNED, it
+    built a session/window and committed a row that no caller will ever hear
+    about; roll both back under the lifecycle lock.
+    """
+    try:
+        window_name, session_created, _ = await create_worker
+    except BaseException:
+        return
+    await asyncio.to_thread(
+        _roll_back_cancelled_create,
+        session_name,
+        terminal_id,
+        window_name,
+        created_session=session_created,
+    )
+
+
+# ``allowed_tools=None`` and ``allowed_tools=[]`` are DIFFERENT requests --
+# ``None`` resolves the tool set from the agent profile while ``[]`` is an
+# explicit empty set that is not resolved (see the ``allowed_tools is None``
+# branch in ``create_terminal``) -- so they must not hash alike. These two
+# markers keep them apart by construction: an explicit list always starts with
+# ``_FP_TOOLS_SET``, so no list, not even one whose sole member is the unset
+# marker's own text, can produce the unset encoding.
+_FP_TOOLS_UNSET = "-"
+_FP_TOOLS_SET = "+"
+
+
+def _fingerprint_component(value: str) -> str:
+    """Length-prefix one fingerprint component so it cannot forge a boundary.
+
+    Review on PR #634. A separator alone is not enough when the
+    values are caller-controlled, and these are: ``allowed_tools`` arrives as a
+    query-param string split on ``","`` (``api/main.py``), and the scalar
+    fields are query params too, so a caller can embed the separator byte
+    itself via percent-encoding. Length-prefixing makes every component
+    self-delimiting, which kills the whole class in one place rather than
+    per-field: ``["a\x1fb"]`` can no longer serialise like ``["a", "b"]``, and
+    a ``NUL`` inside ``model`` can no longer forge the field boundary.
+    """
+    return f"{len(value)}:{value}"
+
+
+def _request_fingerprint(
+    provider: Optional[str],
+    agent_profile: Optional[str],
+    session_name: Optional[str],
+    working_directory: Optional[str],
+    caller_id: Optional[str],
+    model: Optional[str],
+    use_worktree: bool,
+    engine: Optional[KiroEngine | str],
+    allowed_tools: Optional[List[str]],
+    env_vars: Optional[Dict[str, str]],
+    resume_session_id: Optional[str],
+    initial_message: Optional[str],
+    initial_message_orchestration_type: Optional[OrchestrationType],
+) -> str:
+    """Fingerprint the create-terminal request an idempotency key stands for.
+
+    Review on PR #634, issue #616. Stored alongside the key so a later call
+    presenting the same key can be told apart: same fingerprint is a RETRY
+    (return the existing terminal), different fingerprint is a COLLISION
+    (raise ``IdempotencyKeyConflict``).
+
+    REQUESTED values, not resolved ones, and that is load-bearing. The key
+    check runs before ``create_terminal`` resolves the working directory,
+    provider fallback or Kiro engine, so resolved values do not exist yet;
+    computing them in order to compare would perform the very work the key
+    exists to skip. A genuine retry re-sends the same REQUEST, so
+    requested-vs-requested is the comparison that matches, and fingerprinting
+    resolved values would spuriously conflict a legitimate retry issued from
+    a different process cwd (whose ``working_directory=None`` resolves
+    differently) -- a false 409 on the exact case this feature serves.
+
+    ``caller_id`` is one of the fields, which is what makes a CROSS-CALLER
+    collision a mismatch rather than a silent hand-off of someone else's
+    worker: two supervisors reusing ``job-1`` fingerprint differently and the
+    second gets a loud 409. It is deliberately NOT additionally scoped in the
+    primary key -- see the accepted residuals in ``create_terminal``'s
+    docstring for the one case this cannot separate.
+
+    ``env_vars`` and ``resume_session_id`` are hashed for the same reason, and
+    ``env_vars`` has the sharpest precedent of any field here: ``RunStepRequest``
+    refuses ``env_vars`` together with ``reuse_terminal_id`` outright, because
+    "a silently dropped RUN_ID/GENERATION fence token is the quiet identity
+    failure NFR-SEC-4 exists to prevent". Unhashed, this function reproduced
+    exactly that -- a caller asking for one workflow run received a terminal
+    launched with ANOTHER run's fence tokens, silently.
+
+    ``allowed_tools`` AND ``engine`` ARE BOTH HASHED, and leaving either out
+    was a live privilege-escalation hole rather than a matter of taste
+    (review on PR #634). Both are persisted COLUMNS on
+    the ``terminals`` table (``database.py:43,46``), i.e. launch-time terminal
+    identity, and ``POST /sessions/{name}/terminals`` accepts either one in the
+    SAME call as ``idempotency_key``. Unhashed, a second call reusing a key
+    with a WIDER ``allowed_tools`` was handed the first call's narrow terminal
+    -- and in the other order, a caller asking for a narrow tool set received a
+    terminal holding ``execute_bash`` it never requested. ``allowed_tools`` is
+    baked in at launch, not re-evaluated per message, so that wrong policy is
+    PERMANENT for the terminal's life. Unhashed ``engine`` additionally let a
+    key hit skip the Kiro engine validation the same request would otherwise
+    have been rejected by (see ``create_terminal``'s docstring).
+
+    This is also the contract two other reuse paths in this repo already hold
+    us to: ``agent_step._validate_reused_terminal`` RAISES on an engine
+    mismatch, and ``api/main.py`` rejects ``env_vars`` with
+    ``reuse_terminal_id`` outright. ``step_fingerprint`` -- the other
+    fingerprint in this codebase -- hashes ``allowed_tools`` sorted (BR-4) and
+    says of ``engine`` that "it stays unconditionally hashed ... it is the
+    single easiest thing to get wrong here."
+
+    SERIALIZATION, following ``step_fingerprint``'s discipline:
+
+    - ``allowed_tools`` members are SORTED but NOT de-duplicated, because
+      ``["a","b"]`` and ``["b","a"]`` grant identical capability -- order
+      sensitivity would manufacture a false conflict for a caller who merely
+      reordered a comma list -- while ``["a","a"]`` differs from ``["a"]`` and
+      collapsing it would hide a real difference.
+    - EVERY component is LENGTH-PREFIXED by ``_fingerprint_component``, not
+      merely separated. The values are caller-controlled, so a separator alone
+      is forgeable; see that helper for the concrete collisions it prevents.
+    - ``None`` and ``[]`` hash DIFFERENTLY (``_FP_TOOLS_UNSET`` versus
+      ``_FP_TOOLS_SET``). They are genuinely different requests: ``None`` means
+      "resolve the tool policy from the agent profile" while ``[]`` is an
+      explicit empty set that is NOT resolved (see the ``allowed_tools is
+      None`` branch below), so collapsing them would let one caller be served
+      the other's privilege set. Note ``[]`` is NOT reachable over HTTP -- both
+      endpoints parse ``allowed_tools.split(",") if allowed_tools else None``,
+      so an empty query value arrives as ``None`` -- but it IS reachable from
+      the in-process callers (session, flow and step services), which is why
+      the distinction is kept rather than simplified away.
+    - ``env_vars`` is a MAPPING, so it sorts by key (declaration order is not
+      a difference) and length-prefixes key AND value, which no
+      single-axis scheme would do. Unlike ``allowed_tools``, ``None`` and
+      ``{}`` deliberately SHARE an encoding: every use in ``create_terminal``
+      collapses them already (``env_vars or {}``, ``if env_vars:``), so they
+      cannot yield materially different terminals. Same-shaped question as
+      ``allowed_tools``, opposite verified answer -- which is why the resolver
+      has to be read rather than the pattern matched.
+    - ``engine`` normalises through ``KiroEngine.value`` because the parameter
+      accepts the enum OR a plain string -- ``api/main.py`` forwards a query
+      string while ``parse_kiro_engine`` returns the member, and the same
+      logical request arriving by those two routes must produce ONE digest or
+      a legitimate retry 409s.
+
+    sha256 hexdigest rather than the joined text: the column stays a bounded
+    64 chars regardless of path length, and filesystem paths and profile names
+    are not left sitting in the database in cleartext. ``None`` normalises to
+    ``""`` for the scalar fields, and the field ORDER is fixed by this function
+    -- it is the only writer and the only reader, so the digest never has to be
+    stable across versions, only within one.
+    """
+    if allowed_tools is None:
+        tools = _FP_TOOLS_UNSET
+    else:
+        tools = _FP_TOOLS_SET + "".join(
+            _fingerprint_component(tool) for tool in sorted(allowed_tools)
+        )
+
+    # Normalised WITHOUT `parse_kiro_engine`, and the reason is purity rather
+    # than any particular status code: `parse_kiro_engine` VALIDATES, so calling
+    # it here would make digest computation a validation site. A fingerprint
+    # helper has one job -- map a request to a stable string -- and must not
+    # decide whether that request is acceptable; the engine is validated below,
+    # on the path that owns that decision. An invalid engine simply hashes as
+    # itself and mismatches, which is all this function needs to be correct.
+    # `KiroEngine` is a `str` Enum so joining a member happens to work, but
+    # `.value` is the documented contract (`step_fingerprint`: "a KiroEngine
+    # member's repr is not stable across versions") and an explicit branch
+    # cannot be broken by a later switch to a non-str Enum. `str()` runs only on
+    # the non-member path, so the unsafe `str(KiroEngine.V2) == "KiroEngine.V2"`
+    # form is unreachable.
+    if engine is None:
+        engine_value = ""
+    elif isinstance(engine, KiroEngine):
+        engine_value = engine.value
+    else:
+        engine_value = str(engine)
+
+    # `None` and `{}` share one encoding, and that is VERIFIED rather than
+    # assumed -- the opposite answer to `allowed_tools` above. Every use of
+    # `env_vars` in `create_terminal` collapses them (`env_vars or {}` when
+    # merging session env, and `if env_vars:` before persisting), so both mean
+    # "no extra environment" and no caller can be served a materially different
+    # terminal by the distinction. Sorted by key so declaration order cannot
+    # manufacture a false conflict, with key AND value each length-prefixed so
+    # no pair can forge a boundary.
+    env = "".join(
+        _fingerprint_component(key) + _fingerprint_component(value)
+        for key, value in sorted((env_vars or {}).items())
+    )
+
+    # The DELIVERED TASK is part of the request identity, and leaving it out was
+    # a silent-drop bug rather than a matter of taste (review on PR #634).
+    # `create_terminal` itself delivers `initial_message` -- it schedules the
+    # deferred init that sends it -- so a key hit returns EARLY, above that
+    # scheduling. Unhashed, seeding a key for task A and retrying the otherwise
+    # identical request with task B handed back A's terminal and discarded B
+    # entirely: no conflict, no delivery, no log line. Hashed, that second call
+    # is a 409, which is what both the endpoint's "exact request" contract and
+    # the CLI's own help text already promise.
+    #
+    # The orchestration type rides along because it selects HOW the message is
+    # delivered, so the same text under a different type is a different
+    # operation. `OrchestrationType` is normalised via `.value` for the reason
+    # `engine` is: the enum member's repr is not stable across versions.
+    #
+    # Note this does NOT change the handoff CLI path, where the message is sent
+    # AFTER creation by `_send_direct_input_handoff`/`_run_step_and_build_result`
+    # rather than passed here -- `initial_message` is None on both attempts, so
+    # a handoff retry still reuses its worker. That asymmetry is the honest one:
+    # these endpoints own delivery and can therefore conflict on it; the handoff
+    # path does not, and deduplicating ITS submission needs the durable run
+    # record tracked separately (#715), not this fingerprint.
+    if initial_message_orchestration_type is None:
+        orchestration_value = ""
+    elif isinstance(initial_message_orchestration_type, OrchestrationType):
+        orchestration_value = initial_message_orchestration_type.value
+    else:
+        orchestration_value = str(initial_message_orchestration_type)
+
+    parts = [
+        provider or "",
+        agent_profile or "",
+        session_name or "",
+        working_directory or "",
+        caller_id or "",
+        model or "",
+        "1" if use_worktree else "0",
+        engine_value,
+        tools,
+        env,
+        resume_session_id or "",
+        initial_message or "",
+        orchestration_value,
+    ]
+    return hashlib.sha256(
+        "\x00".join(_fingerprint_component(part) for part in parts).encode("utf-8")
+    ).hexdigest()
 
 
 async def create_terminal(
@@ -170,10 +665,17 @@ async def create_terminal(
     engine: Optional[KiroEngine | str] = None,
     kiro_capability_probe: Optional[Callable[[KiroEngine, set[str]], KiroCapabilities]] = None,
     model: Optional[str] = None,
+    resume_session_id: Optional[str] = None,
+    use_worktree: bool = False,
+    group: Optional[List[str]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    idempotency_key: Optional[str] = None,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
     This function orchestrates the complete terminal creation workflow:
+    0. If ``idempotency_key`` maps to a terminal from a prior call, return
+       IT instead -- no tmux window, no provider process, no new DB row
     1. Generate unique terminal ID and window name
     2. Create tmux session/window (new or existing)
     3. Save terminal metadata to database
@@ -207,14 +709,314 @@ async def create_terminal(
             (e.g. MCP handoff/assign's own `model` parameter) pin a specific
             model for one worker without needing a dedicated agent profile.
             None = behavior unchanged (profile.model, if any, still applies).
+        use_worktree: If True, provision an isolated ``git worktree`` (issue
+            #100) for this terminal instead of using ``working_directory`` as
+            given -- resolves the repo root from ``working_directory`` (or the
+            server's own cwd when unset), creates a fresh worktree on its own
+            branch there, and overrides ``working_directory`` to the new
+            worktree path before the tmux session/window is created. Requires
+            the resolved directory to actually be inside a git repository.
+        group: Ordered, general-to-specific grouping array for list_siblings
+            discovery (#432). None = this terminal opts out of discovery.
+        metadata: Free-form JSON describing what this terminal is doing.
+            Also updatable later by the running agent via the
+            ``update_metadata`` MCP tool.
+        idempotency_key: Review on PR #634, issue #616. When given and a PRIOR
+            call already created a terminal for the SAME KEY **and the same
+            request**, that terminal is returned as-is and nothing else in
+            this function runs -- no tmux window, no provider process, no new
+            DB row. This is what makes a retry after a lost response safe:
+            the caller that never saw the first response (e.g. a killed CLI
+            process) can call again with the SAME key and land on the terminal
+            the first, already-committed attempt produced, instead of creating
+            a second worker. Persisted atomically with the terminal row (see
+            ``database.create_terminal``); ``None`` (default) is the existing,
+            unprotected behavior every current caller keeps.
+
+            The key does NOT identify the request on its own -- it is matched
+            together with a fingerprint of ELEVEN fields (see
+            ``_request_fingerprint``). Presenting a key that a DIFFERENT
+            request already claimed raises ``IdempotencyKeyConflict``
+            (HTTP 409) rather than handing back a terminal that answers
+            someone else's question. A key whose terminal no longer exists is
+            treated as stale and simply creates fresh -- that is not a
+            conflict.
+
+            THE FIELD SET IS CLOSED BY ENUMERATION, not by however many review
+            rounds happened to run. Every caller-reachable parameter of BOTH
+            create endpoints -- ``POST /sessions`` (including everything
+            ``CreateSessionBody`` and its ``CreateTerminalBody`` base carry)
+            and ``POST /sessions/{name}/terminals`` -- is classified below,
+            hashed or excluded-with-a-reason. Adding a parameter to either
+            endpoint means classifying it here.
+
+            HASHED (11) -- these determine what the terminal IS, or what
+            privileges and context it launches with:
+            ``provider``, ``agent_profile``, ``session_name``,
+            ``working_directory``, ``caller_id``, ``model``, ``use_worktree``,
+            ``engine``, ``allowed_tools``, ``env_vars``,
+            ``resume_session_id``.
+
+            EXCLUDED, each for a checked reason:
+
+            - ``idempotency_key`` itself. It is the lookup key; hashing it
+              would make every key match only itself.
+            - ``group`` and ``metadata``. Discovery labels that are separately
+              mutable AFTER creation via ``PATCH /terminals/{id}/group`` and
+              the ``update_metadata`` MCP tool, so a create-time key is not
+              their integrity boundary -- a caller who cares about their value
+              cannot rely on creation to fix it anyway.
+            - ``initial_message`` and ``initial_message_orchestration_type``.
+              The delivered payload and its routing, not the terminal: neither
+              is persisted on the row, and a genuine retry re-sends the same
+              message. These create endpoints do not own the prompt.
+            - ``defer_init``. Excluded, and this one was decided against the
+              instinct that it looks like identity, because three things check
+              out against the code:
+              (a) On ``POST /sessions`` it is not caller-settable at all --
+              ``session_service.create_session`` derives it as
+              ``defer_init=initial_message is not None``. Hashing it would
+              therefore make two otherwise-identical requests conflict purely
+              because one supplied a message and the other did not, i.e. it
+              would partially hash ``initial_message`` through the back door,
+              contradicting the deliberate decision above not to hash the
+              prompt.
+              (b) It leaves NO permanent difference in the created terminal.
+              The only row column it touches is ``shell_command``, which the
+              deferred path sets to ``None`` up front and then writes after
+              ``provider.initialize()`` returns, converging on the same value
+              the synchronous path records immediately.
+              (c) On a key HIT the returned status is read live by
+              ``get_terminal``, not taken from this request, so ``defer_init``
+              cannot change what a hit returns. And the short-circuit never
+              waits for initialisation for ANY caller -- that is its purpose --
+              so there is no wait guarantee here for a differing
+              ``defer_init`` to violate. Hashing it would manufacture
+              conflicts while buying no guarantee.
+            - ``memory_manager``. Never reaches this function: the endpoint
+              uses it to spawn a SEPARATE sidecar terminal with
+              ``agent_profile="memory_manager"`` in a background task, so it
+              cannot alter the identity of the terminal this key maps to.
+              Excluded from the fingerprint, and no longer a duplication hole:
+              the spawn is gated only on the flag's truthiness and this
+              function still returns the same ``Terminal`` shape whether it
+              created one or matched a key, so the endpoint cannot tell a reuse
+              from a fresh create -- it therefore hands the sidecar its OWN key
+              derived from the caller's (``<key>:memory-manager-sidecar``),
+              making that create idempotent in its own right instead of relying
+              on a signal it cannot get. A keyed retry now resolves to the
+              first call's sidecar rather than spawning a second one.
+            - ``new_session``. Not a caller parameter on either endpoint --
+              each route passes its own fixed value -- so no caller can vary
+              it under a shared key.
+            - Framework and auth parameters (``request``,
+              ``background_tasks``, ``_scopes``) and the ``body`` wrapper
+              itself, which is expanded into its fields above.
+
+            ``engine`` being in that set also closes a validation BYPASS
+            (review on PR #634). The Kiro engine checks below run AFTER this
+            short-circuit, so a key hit used to return 200 for an ``engine``
+            the very same request would otherwise have been rejected with 400.
+            A first call carrying an invalid engine raises before any terminal
+            or key row is written, so a key hit implies the STORED engine was
+            valid -- and any later differing engine now mismatches the
+            fingerprint and is refused.
+
+            ACCEPTED MISATTRIBUTION, recorded rather than left silent. Two
+            cases, only one of which is this change's:
+
+            - USED key + invalid engine: was 200 (the bypass above), now 409
+              "this key was already used for a different request". So the
+              operator is told to change their KEY when their ENGINE is what
+              is wrong. Accepted rather than fixed, because reaching the real
+              validator means loading the agent profile and running the Kiro
+              capability probe -- a ``subprocess.run`` -- which is exactly the
+              work this short-circuit exists to skip; paying it on every retry
+              would trade away the property the feature is FOR in exchange for
+              a better message. The request is refused either way; only the
+              stated reason is imprecise.
+            - FRESH key + invalid engine: 404 on
+              ``POST /sessions/{name}/terminals`` (400 on ``POST /sessions``),
+              because the validator raises a BARE ``ValueError`` -- not a
+              ``KiroCapabilityError`` -- so it falls past that route's 400 arm
+              to its generic "not found" arm. That is PRE-EXISTING, is
+              unchanged by this change, and is deliberately not fixed here --
+              correcting it means reworking error mapping this change does not
+              own. Noted only so the 409 above is not mistaken for a
+              regression from a 400 that never existed.
+
+            This resolves an apparent tension with the commit directly beneath
+            this one, which stopped ``engine`` being forwarded to a non-Kiro
+            provider on the handoff reuse path. That change treats ``engine``
+            as provider-SPECIFIC; this one treats it as part of request
+            IDENTITY. Both hold: precisely because ``engine`` only means
+            something for one provider, two requests differing in it are
+            different requests, and the pair must not be conflated by a key.
+
+            Two accepted residuals, recorded so they are not mistaken for
+            bugs. Note neither is an exclusion from the field set above --
+            those are enumerated there with their reasons; these are limits of
+            what a fingerprint over those fields can distinguish:
+
+            1. Two callers that BOTH have ``caller_id=None`` and are otherwise
+               identical in all eleven fields are indistinguishable by
+               fingerprint, so the second reuses the first's terminal. At that
+               point the two requests are the same request by every property
+               the server can observe, and reuse is the defensible answer.
+               This is a REAL case rather than a hypothetical one, and
+               specifically on the fresh-session path: ``caller_id`` is a
+               caller parameter on ``POST /sessions/{name}/terminals`` ONLY --
+               ``POST /sessions`` does not expose it -- so every keyed
+               fresh-session create arrives with ``caller_id=None`` and this
+               residual is the norm there, not the exception.
+            2. The DELIVERED PROMPT is not hashed, so two same-shape requests
+               carrying different messages reuse one terminal. This is
+               deliberate and must not be "fixed" by adding the prompt -- a
+               genuine retry re-sends the same prompt, and these create
+               endpoints are not the prompt's owner.
+
+            KNOWN DIVERGENCE, stated so the next reader need not rediscover
+            it: even with eleven fields this remains a WEAKER contract than
+            the other reuse path in this repo.
+            ``agent_step._validate_reused_terminal`` RAISES on a provider or
+            engine mismatch against the PERSISTED row, and ``RunStepRequest``
+            rejects ``env_vars`` combined with ``reuse_terminal_id`` outright.
+            Here a mismatch is refused only insofar as it changes one of the
+            eleven hashed fields, and the comparison is
+            request-against-request rather than
+            request-against-persisted-metadata. The practical gap: a field
+            that is excluded above, or a difference between the request and
+            what the mapped terminal actually persisted, is not caught here.
 
     Returns:
         Terminal object with all metadata populated
 
     Raises:
         ValueError: If session already exists (new_session=True) or not found (new_session=False)
+        IdempotencyKeyConflict: If ``idempotency_key`` was already used for a
+            different request (surfaced as HTTP 409 by both create endpoints)
+        TerminalRecordCorruptError: If the terminal a key maps to has a stored
+            row that does not satisfy the ``Terminal`` model (HTTP 500)
+        TerminalLimitError: If the node's tracked-terminal cap (CAO_MAX_TERMINALS /
+            server.max_terminals; unset = unlimited) is already reached
         TimeoutError: If provider initialization times out
     """
+    # Idempotency resolution runs BEFORE the terminal cap check below, and the
+    # order is deliberate: a key HIT returns an already-existing terminal and
+    # allocates nothing, so charging it against the cap would 429 a legitimate
+    # retry on a full node -- the one case this feature exists to make safe.
+    # The cap still precedes every actual allocation (worktree, tmux window, DB
+    # row, provider process), which is all its own placement-guard needs.
+    request_fingerprint: Optional[str] = None
+    if idempotency_key:
+        request_fingerprint = _request_fingerprint(
+            provider,
+            agent_profile,
+            session_name,
+            working_directory,
+            caller_id,
+            model,
+            use_worktree,
+            engine,
+            allowed_tools,
+            env_vars,
+            resume_session_id,
+            initial_message,
+            initial_message_orchestration_type,
+        )
+        existing_record = get_idempotency_record(idempotency_key)
+        existing_terminal_id = existing_record.terminal_id if existing_record else None
+        if existing_terminal_id is not None:
+            # Only the LOOKUP is guarded. `Terminal(**row)` is deliberately
+            # OUTSIDE this try (review on PR #634): pydantic's ValidationError
+            # subclasses ValueError, so a single try around both would catch a
+            # row that EXISTS but does not validate and treat it as an absent
+            # one -- deleting a LIVE terminal's mapping below and creating a
+            # second worker for the same key, which is the exact duplication
+            # this feature exists to prevent, reported as "no longer exists".
+            # The `terminals` row and the `Terminal` model genuinely differ
+            # (no `working_directory` on the model, `metadata` vs
+            # `metadata_json`), so a future column rename reaches this arm; it
+            # must fail loudly rather than silently duplicate the job.
+            try:
+                row = get_terminal(existing_terminal_id)
+            except ValueError:
+                # The key's mapping outlived the terminal it pointed to (e.g.
+                # a completed-and-torn-down handoff, retried long after the
+                # fact) -- there is nothing left to recover, so fall through
+                # and create fresh rather than raising on an operator who
+                # simply reused a key from a job that already finished.
+                #
+                # The stale row must be deleted FIRST (review on PR #634):
+                # deleting a terminal does not cascade to idempotency_keys, so
+                # leaving this row in place would make the replacement
+                # terminal's own idempotency insert below collide on the same
+                # primary key and raise IntegrityError -- turning a graceful
+                # fallthrough into a guaranteed 500 on every such retry. The
+                # expected_terminal_id guard makes this a compare-and-delete:
+                # if a concurrent caller already replaced the mapping, this
+                # deletes nothing and this attempt's own insert below is the
+                # one that raises IntegrityError instead.
+                delete_idempotency_key(idempotency_key, existing_terminal_id)
+                logger.info(
+                    "idempotency_key %r maps to terminal %r, which no longer exists; "
+                    "creating a new terminal",
+                    idempotency_key,
+                    existing_terminal_id,
+                )
+            else:
+                # Reached ONLY once the mapped terminal is confirmed to still
+                # exist, and that ordering is the whole point: the stale-key
+                # branch above already fell through, so a key whose terminal is
+                # gone is never compared and never conflicts. Checking the
+                # fingerprint first would 409 the legitimate case this feature
+                # was built for -- an operator reusing a key from a job that
+                # already finished.
+                if existing_record is not None and (
+                    existing_record.request_fingerprint != request_fingerprint
+                ):
+                    # A different request under the same key is operator error,
+                    # not a retry, and returning the stored terminal here is not
+                    # a merely-wrong return value: _handoff_impl feeds it
+                    # straight into reuse_terminal_id, so this caller's prompt
+                    # would be delivered into the OTHER caller's running worker,
+                    # in that worker's session, under its tool restrictions --
+                    # and this caller's teardown would then delete it.
+                    raise IdempotencyKeyConflict(
+                        f"idempotency_key {idempotency_key!r} was already used for a "
+                        "different request; use a distinct key"
+                    )
+                # A genuine retry: same key, same request. Return the terminal
+                # the first call produced without doing any real work -- the
+                # property haofeif signed off on, unchanged by the check above.
+                try:
+                    return Terminal(**row)
+                except ValidationError as exc:
+                    # Re-raised as a non-ValueError so a corrupt STORED row is
+                    # reported as a 500 rather than being blamed on the caller
+                    # as a 400/404. See TerminalRecordCorruptError.
+                    raise TerminalRecordCorruptError(
+                        f"terminal {existing_terminal_id!r} is mapped by "
+                        f"idempotency_key {idempotency_key!r} but its stored row does "
+                        f"not satisfy the Terminal model: {exc}"
+                    ) from exc
+
+    # Per-node terminal cap (one-agent-per-pod k8s topology; worker pods set
+    # CAO_MAX_TERMINALS=1). Checked FIRST, before any resource (worktree, tmux
+    # window, DB row, provider process) is allocated, so a full node rejects
+    # cleanly with nothing to roll back. Best-effort under concurrency: two
+    # simultaneous creates can both pass the check (no cross-request lock),
+    # which is acceptable for the cap's placement-guard purpose.
+    max_terminals = get_max_terminals()
+    if max_terminals is not None:
+        tracked_count = len(list_all_terminals())
+        if tracked_count >= max_terminals:
+            raise TerminalLimitError(
+                f"Terminal limit reached: this node already has {tracked_count} tracked "
+                f"terminal(s) and CAO_MAX_TERMINALS/server.max_terminals is "
+                f"{max_terminals}. Delete a terminal or target a different node."
+            )
+
     terminal_id: Optional[str] = None
     session_created = False  # tracks whether THIS call created the tmux session
     # harness-control#186: tracks whether THIS call created a new WINDOW in an
@@ -225,6 +1027,11 @@ async def create_terminal(
     # new one, but had no equivalent for a window added to a session that
     # already existed — see the `except` block.
     window_created = False
+    # Reassigned to the resolved repo root once a worktree is actually created
+    # below (Step 1b), so the failure-cleanup path (the `except` block) knows
+    # whether there is a worktree to roll back too. Still None if Step 1b never
+    # ran (use_worktree=False) or itself failed before create_worktree returned.
+    worktree_repo_root: Optional[str] = None
     try:
         # Resolve profile policy and Kiro engine BEFORE allocating any backend
         # resource. A KAS request must probe then fail closed with no window,
@@ -290,51 +1097,42 @@ async def create_terminal(
 
         window_name = generate_window_name(agent_profile)
 
-        # Step 2: Create tmux session or window
-        if new_session:
+        # Step 1b: Provision an isolated git worktree (issue #100, Phase 1) before
+        # the tmux session/window below consumes `working_directory` -- the
+        # worktree's own path REPLACES whatever `working_directory` was given
+        # (explicit or caller-inherited), so the terminal always launches inside
+        # its own isolated checkout rather than the shared one it would
+        # otherwise have used.
+        if use_worktree:
+            # `find_repo_root`/`create_worktree` are synchronous `subprocess.run`
+            # calls (a full worktree checkout can take seconds to tens of
+            # seconds on a large repo); `create_terminal` is awaited directly on
+            # the shared event loop, so running them in-line here would freeze
+            # every other cao-server request (status monitor ticks, inbox
+            # delivery, unrelated terminal calls) for the duration. Offload to a
+            # thread, same posture as `delete_terminal`'s own blocking subprocess
+            # work (see its `run_in_executor` call site in api/main.py).
+            worktree_repo_root = await asyncio.to_thread(
+                worktree_service.find_repo_root, working_directory or os.getcwd()
+            )
+            working_directory = await asyncio.to_thread(
+                worktree_service.create_worktree, worktree_repo_root, terminal_id
+            )
+
+        # Resolve AFTER the worktree block, not before: when `use_worktree` is set
+        # the block above REPLACES `working_directory` with the new worktree path,
+        # so resolving earlier would both launch tmux in the pre-worktree directory
+        # (defeating the isolation #100 provides) and persist that stale path as the
+        # terminal's working_directory. This is the effective launch cwd either way.
+        resolved_working_directory = _resolve_working_directory(working_directory)
+
+        # Normalize the session name BEFORE anything keys off it: the lifecycle
+        # lock below is per session NAME, so it must be taken on the SAME string
+        # the tmux create and the registry row use, or a create and a teardown of
+        # what is really one session would take two different locks.
+        if new_session and not session_name.startswith(SESSION_PREFIX):
             # Ensure session name has the CAO prefix for identification
-            if not session_name.startswith(SESSION_PREFIX):
-                session_name = f"{SESSION_PREFIX}{session_name}"
-
-            # Prevent duplicate sessions
-            if get_backend().session_exists(session_name):
-                raise ValueError(f"Session '{session_name}' already exists")
-
-            # Wipe any stale mapping a prior aborted lifecycle for this name
-            # may have left behind, so a no-env relaunch can't inherit them.
-            clear_session_env(session_name)
-
-            # Create new tmux session with initial window
-            get_backend().create_session(
-                session_name,
-                window_name,
-                terminal_id,
-                working_directory,
-                extra_env=env_vars,
-            )
-            session_created = True  # only set after successful creation
-
-            # Persist forwarded env only after the tmux session actually
-            # exists; the failure path below clears it if a later step
-            # tears the session back down.
-            if env_vars:
-                set_session_env(session_name, env_vars)
-        else:
-            # Add window to existing session
-            if not get_backend().session_exists(session_name):
-                raise ValueError(f"Session '{session_name}' not found")
-            # Merge explicit per-step env_vars over the persisted session env
-            # (per-step wins on conflict): workflow routing ids like
-            # CAO_WORKFLOW_RUN_ID must reach the window even when it joins an
-            # existing session (issue #408).
-            window_name = get_backend().create_window(
-                session_name,
-                window_name,
-                terminal_id,
-                working_directory,
-                extra_env={**get_session_env(session_name), **(env_vars or {})},
-            )
-            window_created = True  # only set after successful creation
+            session_name = f"{SESSION_PREFIX}{session_name}"
 
         # Step 3: Build a runtime skill catalog only for providers that consume
         # it at launch time (see RUNTIME_SKILL_PROMPT_PROVIDERS).
@@ -354,22 +1152,202 @@ async def create_terminal(
                 f"Terminal {terminal_id}: provider '{provider}' cannot enforce tool "
                 f"restrictions (soft/prompt-level only) but profile '{agent_profile}' "
                 f"requests {allowed_tools}. Treat this worker as unrestricted; for "
-                f"enforced restrictions use claude_code, kiro_cli, or "
+                f"enforced restrictions use claude_code, grok_cli, kiro_cli, or "
                 f"copilot_cli."
             )
 
-        # Step 3c: Persist terminal metadata to database after restrictions
-        # are resolved so API reads and snapshots report the actual launch policy.
-        db_create_terminal(
-            terminal_id,
-            session_name,
-            window_name,
-            provider,
-            agent_profile,
-            allowed_tools,
-            caller_id=caller_id,
-            engine=resolved_engine.value if resolved_engine is not None else None,
-        )
+        # Step 3c: Create the tmux session/window and its registry row as ONE
+        # atomic step, under the per-session-name lifecycle lock (#498). This
+        # merges what used to be two separate steps -- the tmux create and the
+        # metadata persist -- precisely because they must become visible together.
+        #
+        # Note that everything above is already outside the lock by
+        # construction: profile load, Kiro engine resolution, tool-policy
+        # resolution and worktree provisioning are either pure reads or concern
+        # no session state, so the critical section stays down to the tmux +
+        # registry writes that actually have to be atomic against a concurrent
+        # teardown. That also lets the registry row be written exactly once, with
+        # its final allowed_tools and engine, inside the section.
+        #
+        # Why locked: without mutual exclusion a concurrent delete_session for
+        # the same name interleaves arbitrarily -- the teardown can decide the
+        # name is dead and then kill the session this call just created, or
+        # sweep between the tmux create and the row write, leaving one store
+        # holding state the other doesn't know about. Serializing per NAME (not
+        # globally) leaves creates of DIFFERENT sessions fully concurrent.
+        #
+        # Why on a worker thread: the lock is a threading primitive (the only
+        # kind reachable from both this coroutine and the synchronous teardown
+        # the API runs via to_thread -- see services/session_lock.py). Acquiring
+        # it directly here would block the EVENT LOOP for as long as a
+        # concurrent teardown of this name holds it (its tmux kill-verify poll
+        # and per-terminal FIFO joins are each seconds), freezing every other
+        # request. Off-loop, only this worker thread waits.
+        #
+        # Why the section ends here: provider.initialize() below can take tens
+        # of seconds, and a teardown of this name must never queue behind an
+        # agent launch. Everything inside is short, synchronous state mutation.
+        def _create_session_or_window_locked() -> Tuple[str, bool, bool]:
+            """Runs under the lifecycle lock on a worker thread.
+
+            Returns (window_name, session_created, window_created) -- the caller
+            needs all three: create_window may rename the window, and the
+            failure path keys its cleanup off which one this call created.
+
+            A failure after the backend create RETURNS rolls that resource back
+            HERE, still holding the lock, before re-raising: on return the tmux
+            session/window and its registry row both exist, and on such a raise
+            neither does. Without that the outer flags below would still be False
+            (they are only assigned from a successful RETURN), the `except`
+            cleanup would tear down nothing, and the failure would leave a live
+            tmux session with no registry row -- the exact divergence #498 exists
+            to eliminate. A "database is locked" OperationalError out of
+            db_create_terminal is an ordinary outcome under CAO's concurrent
+            writers, so this is a routine path, not a pathological one.
+
+            NOT covered (pre-existing, and deliberately not claimed): a failure
+            INSIDE the backend create itself, after it has already made the tmux
+            resource but before it returns. `TmuxClient.create_session` lands the
+            session at `server.new_session(...)` and only then reads
+            `session.windows[0].name` -- a fresh list-windows fetch that can raise
+            (IndexError, or its own `ValueError` when the name is None), with
+            `create_window` shaped the same way. That leaks a session/window this
+            closure never learns about, so the rollback below cannot fire. Same
+            gap existed pre-#498, which set its flag only after the create
+            returned. Closing it needs the guard to extend INTO the backend
+            create; tracked separately.
+
+            Why the rollback is INSIDE the lock rather than reported out to the
+            outer cleanup path: the lock's entire purpose is that, for one
+            session NAME, create and teardown are serialized so the name is
+            never observable half-built. Rolling back after release would reopen
+            that window -- between the release and the kill, another thread can
+            acquire the name and legitimately succeed (a new_session=False
+            create adding a window to what it sees as a live session, or a
+            teardown plus a fresh new_session=True create rebuilding the name) --
+            and the late kill would then destroy an incarnation this call does
+            not own, leaving ITS row pointing at nothing. Under the lock the
+            name goes free -> free with no observable intermediate state.
+            """
+            assert session_name is not None  # narrowed by the caller
+            with session_lifecycle_lock(session_name):
+                if new_session:
+                    # Prevent duplicate sessions
+                    if get_backend().session_exists(session_name):
+                        raise ValueError(f"Session '{session_name}' already exists")
+
+                    # Wipe any stale mapping a prior aborted lifecycle for this
+                    # name may have left behind, so a no-env relaunch can't
+                    # inherit them.
+                    clear_session_env(session_name)
+
+                    # Create new tmux session with initial window
+                    get_backend().create_session(
+                        session_name,
+                        window_name,
+                        terminal_id,
+                        resolved_working_directory,
+                        extra_env=env_vars,
+                    )
+                    created_window_name = window_name
+                    created_session, created_window = True, False
+                else:
+                    # Add window to existing session. Same lock, same reason: a
+                    # window added mid-teardown would otherwise survive the
+                    # session kill (or its row would be swept while the window
+                    # lives on).
+                    if not get_backend().session_exists(session_name):
+                        raise ValueError(f"Session '{session_name}' not found")
+                    # Merge explicit per-step env_vars over the persisted session
+                    # env (per-step wins on conflict): workflow routing ids like
+                    # CAO_WORKFLOW_RUN_ID must reach the window even when it
+                    # joins an existing session (issue #408).
+                    created_window_name = get_backend().create_window(
+                        session_name,
+                        window_name,
+                        terminal_id,
+                        resolved_working_directory,
+                        extra_env={**get_session_env(session_name), **(env_vars or {})},
+                    )
+                    created_session, created_window = False, True
+
+                # From here the backend resource EXISTS, so every remaining step
+                # is guarded: on failure the resource is rolled back under this
+                # same lock before the exception leaves the closure. See the
+                # docstring for why the rollback belongs here and not in the
+                # caller's `except`.
+                try:
+                    if created_session:
+                        # Drop rows a previous incarnation of this session name
+                        # left behind. Inside the lock, so it can never race the
+                        # row write of a concurrent create for the same name.
+                        delete_terminals_by_session(session_name)
+
+                        if env_vars:
+                            # Persist forwarded env only after the tmux session
+                            # actually exists; rolled back below if a later step
+                            # tears the session down again.
+                            set_session_env(session_name, env_vars)
+
+                    # Persist the registry row INSIDE the critical section so the
+                    # tmux session/window and its row become visible together. A
+                    # teardown that observes the new tmux state is then guaranteed
+                    # to also observe the row, instead of killing a session whose
+                    # row it cannot see and leaving it orphaned. The row carries
+                    # the launch policy already resolved above (allowed_tools,
+                    # engine), so API reads and snapshots report what was actually
+                    # launched.
+                    db_create_terminal(
+                        terminal_id,
+                        session_name,
+                        created_window_name,
+                        provider,
+                        agent_profile,
+                        allowed_tools,
+                        caller_id=caller_id,
+                        engine=resolved_engine.value if resolved_engine is not None else None,
+                        group=group,
+                        metadata=metadata,
+                        working_directory=resolved_working_directory,
+                        idempotency_key=idempotency_key,
+                        request_fingerprint=request_fingerprint,
+                    )
+                except BaseException:
+                    _roll_back_backend_create_locked(
+                        session_name,
+                        created_window_name,
+                        created_session=created_session,
+                    )
+                    raise
+                return created_window_name, created_session, created_window
+
+        # The worker is UN-CANCELLABLE once dispatched: cancelling this await
+        # detaches only the awaiter, while the thread proceeds to take the
+        # lifecycle lock, create the backend session/window, and commit the
+        # registry row — into the void. CancelledError is a BaseException, so
+        # the `except Exception` cleanup below never sees it, and the outer
+        # created-flags are still False so it would tear down nothing anyway:
+        # a live session + row with no FIFO, no provider, and no caller that
+        # knows the terminal exists — the exact divergence #498 eliminates.
+        # So shield the worker, and on cancellation hand its outcome to a
+        # compensator that rolls back whatever it built (under the lifecycle
+        # lock) before letting the cancellation continue.
+        create_worker = asyncio.ensure_future(asyncio.to_thread(_create_session_or_window_locked))
+        try:
+            window_name, session_created, window_created = await asyncio.shield(create_worker)
+        except asyncio.CancelledError:
+            if not create_worker.cancelled():
+                compensator = asyncio.ensure_future(
+                    _finish_and_roll_back_cancelled_create(create_worker, session_name, terminal_id)
+                )
+                try:
+                    await asyncio.shield(compensator)
+                except asyncio.CancelledError:
+                    # A repeat cancellation landed while the compensator ran;
+                    # the shielded task still completes on the loop. The
+                    # ORIGINAL cancellation is re-raised below either way.
+                    pass
+            raise
 
         # Step 4/5: Set up the FIFO event-driven output pipeline for pipe-pane
         # backends (tmux). Event-inbox backends (herdr) deliver via their own
@@ -423,6 +1401,7 @@ async def create_terminal(
             skill_prompt=skill_prompt,
             model=model or (profile.model if profile else None),
             engine=resolved_engine,
+            resume_session_id=resume_session_id,
         )
 
         # Deferred-init path: return fast so callers (e.g. MCP assign) do not
@@ -468,6 +1447,8 @@ async def create_terminal(
             allowed_tools=allowed_tools,
             engine=resolved_engine,
             shell_command=shell_command,
+            group=group,
+            metadata=metadata,
             status=initial_status,
             last_active=datetime.now(),
         )
@@ -510,22 +1491,11 @@ async def create_terminal(
                 status_monitor.clear_terminal(terminal_id)
         except Exception:
             pass  # Ignore cleanup errors
-        try:
-            if terminal_id is not None:
-                provider_manager.cleanup_provider(terminal_id)
-        except Exception:
-            pass  # Ignore cleanup errors
         # Roll back the DB terminal row so a failed create does not leave an
         # orphan record: the stale row would still be listed for the session
         # and report UNKNOWN status even though nothing is running. Idempotent
         # (DELETE ... WHERE id = ?), so it is a no-op when the failure happened
         # before the row was written. Runs regardless of session_created so a
-        # pre-existing session keeps its live terminals but loses the dead row.
-        try:
-            if terminal_id is not None:
-                db_delete_terminal(terminal_id)
-        except Exception:
-            pass  # Ignore cleanup errors
         if session_created and session_name:
             try:
                 get_backend().kill_session(session_name)
@@ -553,7 +1523,111 @@ async def create_terminal(
                 get_backend().kill_window(session_name, window_name)
             except Exception:
                 pass  # Ignore cleanup errors
+        # The process-owning tmux session/window must be stopped before a
+        # provider releases private on-disk state.  In particular Grok can
+        # have an updater still writing $GROK_HOME while its initialization
+        # fails; its cleanup verifies that no such process remains.
+        cleanup_complete = True
+        try:
+            if terminal_id is not None:
+                cleanup_complete = provider_manager.cleanup_provider(terminal_id) is not False
+        except Exception:
+            # Preserve the existing rollback contract for an unexpected
+            # provider-manager failure. Only an explicit False is a Grok
+            # cleanup deferral with enough information to retry safely.
+            cleanup_complete = True
+        # Do not erase the only retry handle before Grok has safely released
+        # its private home.  The original create error is still raised below;
+        # retaining this row makes the failed terminal discoverable and its
+        # deletion retryable rather than leaking credentials/config forever.
+        if cleanup_complete:
+            try:
+                if terminal_id is not None:
+                    db_delete_terminal(terminal_id)
+            except Exception:
+                pass  # Ignore cleanup errors
+        elif terminal_id is not None:
+            logger.warning(
+                "Create rollback deferred Grok cleanup for %s; retaining terminal metadata for retry",
+                terminal_id,
+            )
+        if worktree_repo_root is not None and terminal_id is not None:
+            # A worktree WAS created (Step 1b succeeded) before some later step
+            # failed -- roll it back too, same best-effort posture as everything
+            # else in this block. Without this, a provider-init timeout (or any
+            # later failure) on a worktree-backed terminal would leave an orphan
+            # worktree + branch behind with no CAO-side record pointing at it.
+            # Offloaded to a thread for the same reason Step 1b's create is:
+            # `git worktree remove` is a blocking subprocess call and this
+            # `except` block still runs on the shared event loop.
+            await asyncio.to_thread(
+                worktree_service.remove_worktree, worktree_repo_root, terminal_id
+            )
         raise
+
+
+def _notify_cross_node_caller(terminal_id: str, session_name: str, message: str) -> bool:
+    """Deliver a deferred-init failure to a CROSS-NODE supervisor, if one is recorded.
+
+    A worker created remotely (assign with ``target_host``) has no local
+    ``caller_id`` row — its supervisor's terminal lives on ANOTHER node. The
+    creating supervisor injected ``CAO_CALLBACK_URL`` / ``CAO_CALLBACK_TERMINAL_ID``
+    into the session env at creation time (persisted via ``set_session_env``),
+    so read them back and POST the failure through that callback endpoint.
+    Elastic workers use the authenticated broker gateway; ordinary remote
+    workers call the supervisor directly. Best-effort; returns True only when
+    the remote POST succeeded. Note the session-env store is process-local -
+    after a cao-server restart the route is gone and this degrades to the
+    log-only path.
+    """
+    try:
+        session_env = get_session_env(session_name)
+        callback_url = (session_env.get(CALLBACK_URL_ENV) or "").rstrip("/")
+        callback_terminal_id = session_env.get(CALLBACK_TERMINAL_ID_ENV)
+        if not callback_url or not callback_terminal_id:
+            return False
+        response = requests.post(
+            f"{callback_url}/terminals/{callback_terminal_id}/inbox/messages",
+            params={"sender_id": terminal_id, "message": message},
+            headers=elastic_worker_gateway_headers() or None,
+            timeout=CROSS_NODE_NOTIFY_TIMEOUT,
+        )
+        response.raise_for_status()
+        return True
+    except Exception as exc:  # noqa: BLE001 — notification is best-effort
+        logger.warning(
+            "Deferred-init failure notify: cross-node delivery for worker %s failed: %s",
+            terminal_id,
+            exc,
+        )
+        return False
+
+
+def _notify_elastic_terminal_ended(terminal_id: str) -> None:
+    """Tell the broker that a one-shot worker terminal ended without completion."""
+    worker_id = os.environ.get("CAO_ELASTIC_WORKER_ID", "").strip()
+    broker_url = os.environ.get("CAO_ELASTIC_BROKER_URL", "").strip().rstrip("/")
+    release_token = os.environ.get("CAO_ELASTIC_RELEASE_TOKEN", "").strip()
+    if not worker_id or not broker_url or not release_token:
+        return
+    try:
+        response = requests.post(
+            f"{broker_url}/workers/{worker_id}/terminal-ended",
+            json={"terminal_id": terminal_id},
+            headers={"X-CAO-Release-Token": release_token},
+            timeout=5.0,
+        )
+        # A completion or another teardown signal may already have released the
+        # lease. In that case this notification is redundant.
+        if response.status_code != 404:
+            response.raise_for_status()
+    except requests.RequestException as exc:
+        logger.warning(
+            "Could not report terminal %s ending for elastic worker %s: %s",
+            terminal_id,
+            worker_id,
+            exc,
+        )
 
 
 def _notify_caller_of_deferred_failure(
@@ -568,15 +1642,21 @@ def _notify_caller_of_deferred_failure(
     Runs in a worker thread (blocking DB + tmux I/O). The supervisor is the
     worker's ``caller_id``; we enqueue a PENDING inbox message to it so the
     failure surfaces as the supervisor's next input instead of leaving it to
-    wait forever on a callback that will never come. Every step is best-effort
-    and independently guarded — a failure to notify must not prevent teardown,
+    wait forever on a callback that will never come. When there is no LOCAL
+    caller row, the worker may have been created by a CROSS-NODE supervisor
+    (assign with ``target_host``) — in that case the failure is POSTed to the
+    supervisor node recorded in the session's callback env (see
+    ``_notify_cross_node_caller``). Every step is best-effort and
+    independently guarded — a failure to notify must not prevent teardown,
     and a failure to tear down must not crash the background task.
     """
     caller_id = None
+    session_name = None
     try:
         metadata = get_terminal_metadata(terminal_id)
         if metadata:
             caller_id = metadata.get("caller_id")
+            session_name = metadata.get("tmux_session")
     except Exception as exc:  # noqa: BLE001 — notification is best-effort
         logger.warning(
             "Deferred-init failure notify: could not read metadata for %s: %s",
@@ -595,6 +1675,8 @@ def _notify_caller_of_deferred_failure(
                 terminal_id,
                 exc,
             )
+    elif session_name and _notify_cross_node_caller(terminal_id, session_name, message):
+        pass  # delivered to the cross-node supervisor's inbox
     else:
         logger.warning(
             "Deferred-init failure for %s has no caller_id to notify; failure is " "log-only.",
@@ -613,6 +1695,10 @@ def _notify_caller_of_deferred_failure(
                 terminal_id,
                 exc,
             )
+        # This process is PID 1 in an elastic worker pod, so deleting its tmux
+        # terminal does not change the pod phase. Tell the broker explicitly or
+        # the failed lease remains Ready until its completion timeout.
+        _notify_elastic_terminal_ended(terminal_id)
 
 
 # --- deferred-init submit verification ----------------------------------------
@@ -676,7 +1762,14 @@ def _worker_is_started_direct(terminal_id: str, provider) -> bool:
 
 
 def _message_visible_in_box(terminal_id: str, message: str) -> bool:
-    """True when the delivered message is still sitting in the input box.
+    """True when the delivered message is still visible in the rendered pane.
+
+    Despite the name, this matches against ``get_output`` — the whole rendered
+    pane, which includes the transcript above the composer, not just the input
+    box. A prompt echoed in the transcript therefore also reads as "visible",
+    which is safe for the Enter-vs-full-resend decision (both actions are
+    recovery for a worker believed idle) but must not be read as proof the
+    text sits unsubmitted in the composer.
 
     Decides the resubmit action: if our text is there the paste landed and only
     the Enter was dropped (send a bare Enter); if it is absent the paste itself
@@ -695,6 +1788,96 @@ def _message_visible_in_box(terminal_id: str, message: str) -> bool:
     except Exception:
         return False
     return probe in re.sub(r"[^a-z0-9]", "", rendered.lower())
+
+
+def redeliver_dropped_message(
+    terminal_id: str,
+    message: str,
+    attempt: int,
+    provider=None,
+    *,
+    full_resend_requires_probe: bool = False,
+    registry: "PluginRegistry | None" = None,
+    sender_id: Optional[str] = None,
+    orchestration_type: Optional[OrchestrationType] = None,
+) -> bool:
+    """Re-deliver a message the TUI never accepted (blocking; to_thread it).
+
+    One attempt of the confirm-and-redeliver loop shared by the deferred-init
+    path (#479) and the synchronous step path (#562). First, when the provider
+    opts in via ``supports_direct_status_probe``, a live capture-pane check
+    catches a worker that IS already running but whose cached status lags
+    behind (#496) — returns True (started) without sending anything. A caller
+    that already holds the provider instance passes it; otherwise it is
+    resolved from the registry, best-effort (a resolution failure means no
+    probe, never a failed redelivery). Then the box check picks the
+    redelivery: if the delivered text is still visible in the rendered pane
+    only the Enter was swallowed (send a bare Enter); if it is absent the
+    paste itself was dropped (re-deliver in full). See
+    ``_message_visible_in_box`` for why guessing wrong must be avoided.
+
+    ``full_resend_requires_probe`` gates the full re-send on the provider
+    being probe-capable. Reason: ``_message_visible_in_box`` scans the whole
+    rendered pane, and under the pyte screen path status detection runs only
+    at rising-edge/quiescence — a whole turn can process inside one burst,
+    leaving the cached status IDLE throughout while the prompt scrolls off —
+    so for a provider without a direct status probe there is no way to
+    distinguish "paste dropped" from "worker already ran" — and re-pasting
+    the full message into a working worker silently runs the task twice.
+    When the gate is on and the provider is not probe-capable, the
+    bare-Enter branch (which cannot duplicate a task) is still taken
+    whenever the text is visible; otherwise nothing is sent and False is
+    returned, leaving the caller's own timeout to classify the outcome. The
+    deferred-init path keeps the default (off) because it loops on
+    ``wait_until_status`` for the PROCESSING edge before ever reaching here,
+    and that pre-existing behavior is unchanged by this helper's extraction.
+
+    Returns True when the worker was found already started and nothing was
+    sent; False when a redelivery was attempted (or deliberately skipped).
+    """
+    if provider is None:
+        try:
+            provider = provider_manager.get_provider(terminal_id)
+        except Exception:
+            provider = None
+    probe_capable = provider is not None and getattr(
+        provider, "supports_direct_status_probe", False
+    )
+    if probe_capable:
+        if _worker_is_started_direct(terminal_id, provider):
+            return True
+    if _message_visible_in_box(terminal_id, message):
+        logger.warning(
+            "Delivery to %s unsubmitted (Enter swallowed); " "re-submitting via Enter (attempt %d)",
+            terminal_id,
+            attempt,
+        )
+        send_special_key(terminal_id, "Enter")
+        return False
+    if full_resend_requires_probe and not probe_capable:
+        # No probe → cannot rule out a working worker whose prompt left the
+        # pane; a full re-send could silently duplicate the task. Skip the
+        # re-send and let the caller's own deadline classify the outcome.
+        logger.warning(
+            "Delivery to %s not accepted and provider is not probe-capable; "
+            "skipping full re-send to avoid a duplicate task (attempt %d)",
+            terminal_id,
+            attempt,
+        )
+        return False
+    logger.warning(
+        "Delivery to %s not accepted (paste dropped); " "re-delivering message (attempt %d)",
+        terminal_id,
+        attempt,
+    )
+    send_input(
+        terminal_id,
+        message,
+        registry=registry,
+        sender_id=sender_id,
+        orchestration_type=orchestration_type,
+    )
+    return False
 
 
 async def _confirm_worker_started_or_resubmit(
@@ -720,40 +1903,21 @@ async def _confirm_worker_started_or_resubmit(
         return True
 
     for attempt in range(1, _DEFERRED_SUBMIT_MAX_RESUBMITS + 1):
-        # The cached status_monitor status is event-driven (pyte screener at
-        # rising-edge/quiescence only) and can lag behind reality. Before
-        # re-delivering, do a direct capture-pane / visible-screen check via
-        # the provider to catch cases where the worker IS processing but the
-        # cached status hasn't caught up yet (e.g. OpenCode's ``esc interrupt``
-        # footer appearing between pyte detection edges). Only providers that
-        # opt in via ``supports_direct_status_probe = True`` take this path.
-        if provider is not None and getattr(provider, "supports_direct_status_probe", False):
-            if await asyncio.to_thread(_worker_is_started_direct, terminal_id, provider):
-                return True
-
-        if await asyncio.to_thread(_message_visible_in_box, terminal_id, message):
-            logger.warning(
-                "Deferred assign to %s unsubmitted (Enter swallowed); "
-                "re-submitting via Enter (attempt %d)",
-                terminal_id,
-                attempt,
-            )
-            await asyncio.to_thread(send_special_key, terminal_id, "Enter")
-        else:
-            logger.warning(
-                "Deferred assign to %s not accepted (paste dropped); "
-                "re-delivering message (attempt %d)",
-                terminal_id,
-                attempt,
-            )
-            await asyncio.to_thread(
-                send_input,
-                terminal_id,
-                message,
-                registry=registry,
-                sender_id=sender_id,
-                orchestration_type=orchestration_type,
-            )
+        # The redelivery decision (box check + #496's direct-probe guard for
+        # providers that opt in) lives in ``redeliver_dropped_message`` —
+        # shared with the synchronous step path (#562).
+        already_started = await asyncio.to_thread(
+            redeliver_dropped_message,
+            terminal_id,
+            message,
+            attempt,
+            provider,
+            registry=registry,
+            sender_id=sender_id,
+            orchestration_type=orchestration_type,
+        )
+        if already_started:
+            return True
         if await wait_until_status(
             terminal_id,
             _DEFERRED_STARTED_STATUSES,
@@ -796,14 +1960,28 @@ def _schedule_deferred_init(
                 update_terminal_shell_command(terminal_id, shell_command)
             if initial_message:
                 # For assign/handoff the sender is the CALLER (the supervisor),
-                # not this MCP server. But the deferred path is used only via
-                # /assign, and _assign_impl on the MCP-server side already
-                # embedded the callback instructions into initial_message.
+                # not this MCP server; _assign_impl on the MCP-server side already
+                # embedded the callback instructions into initial_message. The
+                # deferred path is also reached from POST /sessions?initial_message=
+                # (session_service.create_session), which has no supervisor and no
+                # orchestration_type requirement on its caller.
                 # We still pass sender_id=caller_id if present in DB metadata
                 # so plugin events see it.
                 metadata = await asyncio.to_thread(get_terminal_metadata, terminal_id)
                 if metadata:
                     caller_id = metadata.get("caller_id")
+                # Round-3 review fix (call-me-ram): a raw POST /sessions caller that
+                # supplies initial_message with no orchestration_type previously sailed
+                # straight past send_input's WAITING_USER_ANSWER guard entirely -- the
+                # guard only fires for OrchestrationType.ASSIGN/HANDOFF, so an unstated
+                # type meant no protection at all against pasting the initial task into
+                # a live choice prompt. Every call that reaches THIS function is by
+                # construction an unattended initial-task delivery (never an interactive
+                # human answer -- those go through answer_user_prompt's own separate
+                # /terminals/{id}/input call, which never routes through
+                # _schedule_deferred_init), so defaulting an unstated orchestration_type
+                # to ASSIGN here is always correct and cannot affect answer_user_prompt.
+                effective_orchestration_type = orchestration_type or OrchestrationType.ASSIGN
                 # send_input is blocking tmux I/O — off the loop so it can't
                 # freeze the server for concurrent requests.
                 await asyncio.to_thread(
@@ -812,7 +1990,7 @@ def _schedule_deferred_init(
                     initial_message,
                     registry=registry,
                     sender_id=caller_id,
-                    orchestration_type=orchestration_type,
+                    orchestration_type=effective_orchestration_type,
                 )
                 # Delivery can be silently dropped (Enter swallowed / paste lost)
                 # when the TUI isn't input-ready. Confirm the worker actually
@@ -823,7 +2001,10 @@ def _schedule_deferred_init(
                     initial_message,
                     registry,
                     caller_id,
-                    orchestration_type,
+                    # Same guard-eligible default as the initial send_input above --
+                    # a resubmit is still an unattended initial-task delivery, so it
+                    # must not silently drop back to the unguarded original type.
+                    effective_orchestration_type,
                     provider=provider_instance,
                 )
                 if not started:
@@ -861,8 +2042,10 @@ def _schedule_deferred_init(
                 _notify_caller_of_deferred_failure,
                 terminal_id,
                 f"Worker {terminal_id} is waiting on an interactive prompt; the "
-                f"assigned task has not been delivered yet. Use answer_user_prompt "
-                f"to unblock it, then it will receive the task.",
+                f"assigned task has not been delivered. Use answer_user_prompt to "
+                f"clear the prompt, then re-send the task yourself (e.g. via "
+                f"send_message) -- it is not automatically re-delivered once the "
+                f"prompt is answered.",
                 registry,
                 delete_worker=False,
             )
@@ -914,6 +2097,8 @@ def get_terminal(terminal_id: str) -> Dict:
             "caller_id": metadata.get("caller_id"),
             "allowed_tools": metadata.get("allowed_tools"),
             "engine": metadata.get("engine"),
+            "group": metadata.get("group"),
+            "metadata": metadata.get("metadata"),
             "status": status,
             "last_active": metadata["last_active"],
         }
@@ -921,6 +2106,82 @@ def get_terminal(terminal_id: str) -> Dict:
     except Exception as e:
         logger.error(f"Failed to get terminal {terminal_id}: {e}")
         raise
+
+
+def update_group(terminal_id: str, group: Optional[List[str]]) -> bool:
+    """Replace a terminal's group array.
+
+    Used by consumers whose own grouping can change after a terminal already
+    exists (e.g. harness-control folder/project reassignment) so ``group``
+    doesn't go stale (#432). ``None``/``[]`` opts the terminal back out of
+    discovery.
+
+    Returns:
+        False if the terminal does not exist, True otherwise.
+    """
+    return update_terminal_group(terminal_id, group)
+
+
+def update_metadata(terminal_id: str, metadata: Optional[Dict[str, Any]]) -> bool:
+    """Replace a terminal's free-form metadata dict.
+
+    Whole-dict replace, not a merge: concurrent calls are last-write-wins
+    (tedswinyar, PR #433 review). Acceptable for this field -- callers should
+    re-send the full intended dict each time rather than assuming a partial
+    update accumulates on top of a prior one.
+
+    Returns:
+        False if the terminal does not exist, True otherwise.
+    """
+    return update_terminal_metadata(terminal_id, metadata)
+
+
+def list_siblings(
+    caller_id: str, depth: Optional[int] = None, cross_session: bool = False
+) -> List[Dict[str, Any]]:
+    """Resolve ``caller_id``'s own group and return matching sibling terminals.
+
+    Depth is clamped server-side to ``[1, len(caller_group)]`` (#432): it can
+    never be widened past the caller's own group length, and an explicit 0 is
+    rejected by the API layer's query-param validation before this is ever
+    called (never silently reinterpreted as an unscoped, all-terminals
+    query). ``depth=None`` defaults to the caller's full own group length —
+    the widest scope the caller is allowed to see.
+
+    A caller with no group set finds no siblings (participates in no
+    discovery, per #432) rather than erroring.
+
+    Session-scoped by default (issue #432 design discussion): results are
+    additionally filtered to the caller's own ``tmux_session`` unless
+    ``cross_session=True`` is explicitly passed — see
+    ``list_siblings_by_group_prefix``'s own docstring for the full rationale.
+
+    Returns:
+        List of ``{id, group, metadata, status}`` dicts for every OTHER
+        terminal whose group shares the resolved prefix. ``status`` is a
+        live, point-in-time snapshot (tedswinyar, PR #433 review): a handoff
+        terminal that has COMPLETED can still delete itself between this
+        call returning and a caller's follow-up ``send_message`` to it, so a
+        discovered sibling is never a guarantee it's still reachable --
+        ``status`` lets a caller skip an obviously-finished sibling
+        proactively, but callers should still expect sends to occasionally
+        fail against a sibling that disappeared in that window.
+    """
+    caller_metadata = get_terminal_metadata(caller_id)
+    caller_group = caller_metadata.get("group") if caller_metadata else None
+    if not caller_group:
+        return []
+    caller_session = caller_metadata.get("tmux_session") if caller_metadata else None
+    max_depth = len(caller_group)
+    effective_depth = max_depth if depth is None else depth
+    effective_depth = max(1, min(effective_depth, max_depth))
+    prefix = caller_group[:effective_depth]
+    siblings = list_siblings_by_group_prefix(
+        caller_id, prefix, caller_session=caller_session, cross_session=cross_session
+    )
+    for sibling in siblings:
+        sibling["status"] = status_monitor.get_status(sibling["id"]).value
+    return siblings
 
 
 def get_working_directory(terminal_id: str) -> Optional[str]:
@@ -957,6 +2218,7 @@ def send_input(
     registry: PluginRegistry | None = None,
     sender_id: str | None = None,
     orchestration_type: OrchestrationType | None = None,
+    frozen_memory: str | None = None,
 ) -> bool:
     """Send input to terminal via tmux paste buffer.
 
@@ -964,6 +2226,12 @@ def send_input(
     of Enter keys sent after pasting is determined by the provider's
     ``paste_enter_count`` property (e.g., some TUIs need 2 Enters because
     bracketed paste triggers multi-line mode).
+
+    ``frozen_memory`` is forwarded UNCHANGED to :func:`inject_memory_context` and
+    is otherwise none of this function's business — not inspected, not validated,
+    not logged. It is last and defaulted so existing positional callers (notably
+    ``agent_step.run_agent_step``, which passes exactly two arguments) are
+    unaffected.
     """
     try:
         metadata = get_terminal_metadata(terminal_id)
@@ -1016,7 +2284,7 @@ def send_input(
         # plugins/webhooks see what the caller sent — not the
         # internal <cao-memory> block that we paste into the TUI.
         original_message = message
-        message = inject_memory_context(message, terminal_id)
+        message = inject_memory_context(message, terminal_id, frozen_memory)
 
         # Check how many Enter keys the provider needs after paste
         enter_count = provider.paste_enter_count if provider else 1
@@ -1026,7 +2294,10 @@ def send_input(
         # IDLE/COMPLETED). Without this, sticky ready-status would block
         # the genuine PROCESSING signal that arrives once the agent starts
         # working on the new message.
-        status_monitor.notify_input_sent(terminal_id)
+        if provider and provider.assume_processing_on_dispatch is True:
+            status_monitor.notify_input_sent(terminal_id, assume_processing=True)
+        else:
+            status_monitor.notify_input_sent(terminal_id)
 
         # Clear ONLY the rolling byte buffer BEFORE sending keys, so stale idle
         # prompts from BEFORE the input can't trigger a false COMPLETED
@@ -1040,7 +2311,19 @@ def send_input(
         # uses clear_rolling_buffer (byte-only), which preserves the sticky-latch
         # arm set by notify_input_sent above; reset_buffer would wipe the arm and
         # latch-block the IDLE→PROCESSING transition for the whole turn.
-        status_monitor.clear_rolling_buffer(terminal_id)
+        # Give stateful providers the same explicit generation boundary as the
+        # rolling byte buffer.  Grok uses this to distinguish a new,
+        # byte-identical completion from a retained completion screen.
+        status_monitor.clear_rolling_buffer(terminal_id, provider)
+
+        # Mark the provider before send_keys rather than after it.  send_keys
+        # includes the provider-specific submit delay, during which a fast CLI
+        # can already emit its first processing and completion frames.  Those
+        # frames must be parsed as belonging to this turn, not as a stale
+        # post-clear redraw.  StatusMonitor has already armed and cleared the
+        # same dispatch boundary above.
+        if provider:
+            provider.mark_input_received()
 
         get_backend().send_keys(
             metadata["tmux_session"],
@@ -1050,13 +2333,6 @@ def send_input(
             force_bracketed_paste=True,
             submit_delay=provider.paste_submit_delay if provider else 0.3,
         )
-
-        # Notify the provider that external input was received.
-        # This allows providers to adjust status
-        # detection — specifically to stop reporting IDLE for the post-init
-        # state and resume normal COMPLETED detection after a real task.
-        if provider:
-            provider.mark_input_received()
 
         update_last_active(terminal_id)
         logger.info(f"Sent input to terminal: {terminal_id}")
@@ -1239,7 +2515,11 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
                             terminal_id,
                             exc,
                         )
-                raise last_err  # type: ignore[misc]
+                # Re-raise as the narrower type: the terminal and provider both
+                # resolved, so this is a missing response marker, not a bad
+                # reference. Keeps the API boundary from reporting it as 404
+                # (issue #570).
+                raise OutputExtractionError(str(last_err)) from last_err
 
             # Escalating fetch: try progressively larger capture windows until
             # the response marker is found or we hit the cap.
@@ -1322,100 +2602,327 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
         raise
 
 
-def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) -> bool:
-    """Delete terminal and kill its tmux window."""
+def read_output_range(terminal_id: str, offset: int, length: int) -> str:
+    """Read a byte range from a terminal's append-only on-disk log (U5 / #504).
+
+    This is a SEPARATE read path from ``get_output``: that function returns the
+    bounded rolling buffer / tmux tail, whereas this reads an exact byte window
+    from ``TERMINAL_LOG_DIR / f"{terminal_id}.log"`` — the append-only,
+    monotonic file LogWriter maintains (BR-1). Playback (FR-4.3 / FR-7.3) uses
+    the ``terminal_offset_start`` / ``terminal_offset_len`` an event carries to
+    fetch exactly the output produced around that event, without copying the
+    log into the journal (BR-3).
+
+    Args:
+        terminal_id: The terminal whose log to read. Validated against the
+            workflow name/id charset before it is joined into the log path, so
+            a value containing ``/`` / ``..`` / a NUL can never escape
+            ``TERMINAL_LOG_DIR`` (path-traversal defense; reuses
+            ``_validate_key_part``).
+        offset: Byte offset to seek to. Must be ``>= 0``. An offset at or beyond
+            EOF is not an error — the read simply returns the available tail
+            (empty string when nothing follows the offset) so playback degrades
+            gracefully (BR-4).
+        length: Maximum number of bytes to read. Clamped to
+            ``TERMINAL_RANGE_MAX_LENGTH`` (BR-2) to bound the read.
+
+    Returns:
+        The decoded slice, ``bytes.decode("utf-8", errors="replace")`` so a
+        range that starts or ends mid-multibyte-sequence never raises (BR-5,
+        matching LogWriter's write encoding). Returns ``""`` for a valid
+        terminal whose log does not exist yet (nothing has been logged) — a
+        missing log is NOT a playback-breaking error (BR-4).
+
+    Raises:
+        ValueError: ``terminal_id`` fails id validation, or ``offset`` is
+            negative. Translated to a 400 at the request boundary.
+        OSError: A genuine file I/O failure (e.g. a permission error, or the
+            path exists but is unreadable). Surfaced to the caller, NOT
+            swallowed into an empty string — "nothing logged yet" (return "")
+            and "the read failed" (raise) are deliberately distinct outcomes
+            (BR-4 / construction error-handling guardrail).
+    """
+    # Path-traversal defense: reject any id that is not a plain key BEFORE it is
+    # joined into the log path. Reuses the workflow key/id validator so the
+    # charset rule is defined once (rejects "/", "..", ".", NUL, whitespace).
+    _validate_key_part(terminal_id, "terminal_id")
+
+    if offset < 0:
+        raise ValueError(f"offset must be >= 0, got {offset}")
+
+    # Clamp the read window (BR-2). A non-positive length reads nothing rather
+    # than raising — the route enforces length >= 1, so this is defense in depth.
+    capped_length = max(0, min(length, TERMINAL_RANGE_MAX_LENGTH))
+
+    log_path = TERMINAL_LOG_DIR / f"{terminal_id}.log"
+
     try:
-        # Unregister from herdr inbox service
-        svc = get_herdr_inbox_service()
-        if svc:
-            try:
-                svc.unregister_terminal(terminal_id)
-            except Exception as e:
-                logger.warning(f"Failed to unregister terminal {terminal_id} from herdr inbox: {e}")
+        with open(log_path, "rb") as f:
+            f.seek(offset)  # seeking past EOF is legal; the read below yields b""
+            data = f.read(capped_length)
+    except FileNotFoundError:
+        # Valid terminal that has not logged anything yet (or whose log has been
+        # cleaned up): an empty range, never an error (BR-4).
+        logger.debug(
+            "read_output_range: no log file for terminal %s (offset=%d, length=%d) — "
+            "returning empty range",
+            terminal_id,
+            offset,
+            capped_length,
+        )
+        return ""
+    except OSError as e:
+        # A genuine I/O failure (permission, etc.) is NOT the same as "nothing
+        # logged" — surface it rather than masking a real fault as empty output.
+        logger.error(
+            "read_output_range: I/O error reading log for terminal %s "
+            "(offset=%d, length=%d): %s",
+            terminal_id,
+            offset,
+            capped_length,
+            e,
+        )
+        raise
 
-        # Get metadata before deletion
-        metadata = get_terminal_metadata(terminal_id)
+    return data.decode("utf-8", errors="replace")
 
-        if metadata:
-            # Snapshot scrollback + metadata before killing (for debugging/restore)
-            try:
-                # Capture plain text full scrollback (no -e, no line cap)
-                scrollback = get_backend().get_history(
-                    metadata["tmux_session"],
-                    metadata["tmux_window"],
-                    strip_escapes=True,
-                    full_history=True,
-                )
-                scrollback_path = TERMINAL_LOG_DIR / f"{terminal_id}.scrollback"
-                scrollback_path.write_text(scrollback, encoding="utf-8")
 
-                import json as _json
+def capture_terminal_snapshot(terminal_id: str) -> Optional[Dict]:
+    """Persist a terminal's scrollback + metadata snapshot. NON-DESTRUCTIVE.
 
-                snapshot = {
-                    "terminal_id": terminal_id,
-                    "session_name": metadata["tmux_session"],
-                    "window_name": metadata["tmux_window"],
-                    "agent_profile": metadata.get("agent_profile"),
-                    "provider": metadata["provider"],
-                    "working_directory": get_backend().get_pane_working_directory(
-                        metadata["tmux_session"], metadata["tmux_window"]
-                    ),
-                    "allowed_tools": metadata.get("allowed_tools"),
-                    "caller_id": metadata.get("caller_id"),
-                }
-                snapshot_path = TERMINAL_LOG_DIR / f"{terminal_id}.snapshot.json"
-                snapshot_path.write_text(_json.dumps(snapshot, indent=2), encoding="utf-8")
-            except Exception as e:
-                logger.warning(f"Failed to snapshot terminal {terminal_id}: {e}")
+    The read-only first third of terminal teardown, split out so session
+    teardown can run it BEFORE the session kill while leaving every destructive
+    step until AFTER the kill is confirmed (#498). It has to precede the kill --
+    scrollback only exists while the pane does -- and because it only reads tmux
+    and writes two files under ``TERMINAL_LOG_DIR``, running it ahead of a kill
+    that then fails to confirm changes no terminal state at all.
 
-            # Stop pipe-pane logging
-            try:
-                get_backend().stop_pipe_pane(metadata["tmux_session"], metadata["tmux_window"])
-            except Exception as e:
-                logger.warning(f"Failed to stop pipe-pane for {terminal_id}: {e}")
+    Returns the terminal's metadata (both later thirds need it), or None when no
+    registry row exists -- i.e. there is nothing to tear down. The returned dict
+    carries one key that is NOT a registry column: ``live_working_directory``,
+    the pane's cwd read here while the pane still exists.
+    ``dismantle_terminal_runtime`` needs it for issue #100's worktree cleanup and
+    cannot read it itself -- on the session-teardown path the pane is already
+    gone by the time it runs -- so the single read is captured here and passed
+    along rather than repeated.
+    """
+    metadata = get_terminal_metadata(terminal_id)
+    if not metadata:
+        return None
 
-            # Stop FIFO reader and cleanup FIFO file. Must run BEFORE kill_window
-            # so the reader thread (which reopens the FIFO on EOF) unblocks and
-            # joins before the pane disappears.
-            try:
-                fifo_manager.stop_reader(terminal_id)
-            except Exception as e:
-                logger.warning(f"Failed to stop FIFO reader for {terminal_id}: {e}")
+    # Read the pane's live working directory BEFORE anything destroys the pane.
+    # Single read, reused for two purposes: the scrollback snapshot below, and
+    # issue #100 Phase 1's worktree cleanup (recognizing a worktree-backed
+    # terminal from its live cwd alone -- there is no separate CAO-side record
+    # of which terminals are worktree-backed). Best-effort: a read failure
+    # means the snapshot's working_directory field is None and no worktree
+    # cleanup runs later.
+    live_working_directory = None
+    try:
+        live_working_directory = get_backend().get_pane_working_directory(
+            metadata["tmux_session"], metadata["tmux_window"]
+        )
+    except Exception as e:
+        logger.warning(f"Failed to read working directory for {terminal_id}: {e}")
+    metadata["live_working_directory"] = live_working_directory
 
-            # Clear state detector buffers for this terminal
-            try:
-                status_monitor.clear_terminal(terminal_id)
-            except Exception as e:
-                logger.warning(f"Failed to clear state detector for {terminal_id}: {e}")
+    # Snapshot scrollback + metadata before killing (for debugging/restore)
+    try:
+        # Capture plain text full scrollback (no -e, no line cap)
+        scrollback = get_backend().get_history(
+            metadata["tmux_session"],
+            metadata["tmux_window"],
+            strip_escapes=True,
+            full_history=True,
+        )
+        scrollback_path = TERMINAL_LOG_DIR / f"{terminal_id}.scrollback"
+        scrollback_path.write_text(scrollback, encoding="utf-8")
 
+        import json as _json
+
+        snapshot = {
+            "terminal_id": terminal_id,
+            "session_name": metadata["tmux_session"],
+            "window_name": metadata["tmux_window"],
+            "agent_profile": metadata.get("agent_profile"),
+            "provider": metadata["provider"],
+            "working_directory": live_working_directory,
+            "allowed_tools": metadata.get("allowed_tools"),
+            "caller_id": metadata.get("caller_id"),
+        }
+        snapshot_path = TERMINAL_LOG_DIR / f"{terminal_id}.snapshot.json"
+        snapshot_path.write_text(_json.dumps(snapshot, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"Failed to snapshot terminal {terminal_id}: {e}")
+
+    return metadata
+
+
+def dismantle_terminal_runtime(
+    terminal_id: str,
+    metadata: Optional[Dict],
+    kill_window: bool = True,
+) -> bool:
+    """Tear down a terminal's runtime state, but NOT its registry row.
+
+    The destructive middle third: herdr inbox deregistration, pipe-pane stop,
+    FIFO reader stop, status-monitor clear, the tmux window kill, worktree
+    cleanup, provider cleanup, and the per-terminal bookkeeping registries. Every
+    step is individually guarded and idempotent, so re-running it on an
+    already-dismantled terminal is a no-op -- which is what makes a re-run after
+    a failed session teardown safe.
+
+    ``kill_window=False`` skips the two tmux-facing steps (pipe-pane stop and the
+    window kill). Session teardown passes False because it has already confirmed
+    the whole tmux SESSION gone, so the window no longer exists and both calls
+    would only produce spurious warnings.
+
+    Returns False when provider cleanup was DEFERRED (Grok's private-home owner
+    could not yet be inspected/stopped), meaning the caller must keep the
+    registry row so a later DELETE can retry; True when the runtime is fully
+    dismantled. Reporting True on a deferral would turn a temporary process race
+    into a permanent private-home leak.
+
+    Ordering note: stopping the FIFO reader before killing the window is
+    preferred but not load-bearing -- since issue #382 the reader loop uses a
+    non-blocking fd plus a ``select`` timeout and holds its own keepalive write
+    end, so it can never park waiting on the pane and always observes the stop
+    flag within one poll interval.
+    """
+    # Unregister from herdr inbox service
+    svc = get_herdr_inbox_service()
+    if svc:
+        try:
+            svc.unregister_terminal(terminal_id)
+        except Exception as e:
+            logger.warning(f"Failed to unregister terminal {terminal_id} from herdr inbox: {e}")
+
+    if metadata and kill_window:
+        # Stop pipe-pane logging. Before the FIFO steps below, so the pane stops
+        # writing to the FIFO before its reader (and the FIFO file) go away.
+        try:
+            get_backend().stop_pipe_pane(metadata["tmux_session"], metadata["tmux_window"])
+        except Exception as e:
+            logger.warning(f"Failed to stop pipe-pane for {terminal_id}: {e}")
+
+    # Deliberately OUTSIDE the `if metadata:` block below: both of these need
+    # only terminal_id. Gating them on metadata meant a failed snapshot (a
+    # `get_terminal_metadata` that raised, or "database is locked") skipped them,
+    # orphaning the FIFO reader thread and the status-detector buffers for a
+    # terminal whose row the by-id sweep then deleted anyway -- a reader with
+    # nothing left to read from and no record it exists.
+    try:
+        fifo_manager.stop_reader(terminal_id)
+    except Exception as e:
+        logger.warning(f"Failed to stop FIFO reader for {terminal_id}: {e}")
+
+    # Clear state detector buffers for this terminal
+    try:
+        status_monitor.clear_terminal(terminal_id)
+    except Exception as e:
+        logger.warning(f"Failed to clear state detector for {terminal_id}: {e}")
+
+    if metadata:
+        if kill_window:
             # Kill the tmux window (this terminates the agent process)
             try:
                 get_backend().kill_window(metadata["tmux_session"], metadata["tmux_window"])
             except Exception as e:
                 logger.warning(f"Failed to kill tmux window for {terminal_id}: {e}")
 
-        # Cleanup provider state and database record
-        provider_manager.cleanup_provider(terminal_id)
-        with _memory_injected_lock:
-            _memory_injected_terminals.discard(terminal_id)
-        # Drop any per-curator dispatch lock so the registry doesn't grow
-        # forever as memory_manager terminals come and go.
-        from cli_agent_orchestrator.services.memory_service import _curator_locks
+        # issue #100 Phase 1: if this terminal was worktree-backed (its live
+        # cwd matched the CAO-managed worktree path shape), remove the
+        # worktree + branch now that the process using it is gone.
+        # `remove_worktree` is itself best-effort/never-raises, matching
+        # every other step in this teardown.
+        #
+        # The parsed terminal_id MUST match the terminal actually being
+        # deleted here, not just "some" CAO worktree path. Without this
+        # guard: a worktree-backed terminal A (cwd
+        # .../.cao/worktrees/A) can spawn a non-worktree terminal B with
+        # working_directory explicitly set to A's cwd (handoff/assign
+        # both accept an explicit working_directory, and "here" -- the
+        # caller's own directory -- is a common choice). Deleting B --
+        # including handoff's automatic success teardown -- would then
+        # read B's pane cwd (== A's worktree path), parse terminal_id
+        # "A" out of it, and force-remove A's still-running worktree.
+        # Mismatched parses now fall through as a no-op leak (Phase 3
+        # territory) instead of destroying another terminal's checkout.
+        parsed = worktree_service.parse_worktree_path(metadata.get("live_working_directory"))
+        if parsed is not None:
+            worktree_repo_root, worktree_terminal_id = parsed
+            if worktree_terminal_id == terminal_id:
+                worktree_service.remove_worktree(worktree_repo_root, worktree_terminal_id)
 
-        _curator_locks.pop(terminal_id, None)
-        deleted = db_delete_terminal(terminal_id)
-        logger.info(f"Deleted terminal: {terminal_id}")
-        if deleted and metadata:
-            dispatch_plugin_event(
-                registry,
-                "post_kill_terminal",
-                PostKillTerminalEvent(
-                    session_id=metadata["tmux_session"],
-                    terminal_id=terminal_id,
-                    agent_name=metadata.get("agent_profile"),
-                ),
+    # Grok cleanup can be deferred when a private-home owner cannot yet be
+    # inspected/stopped.  Keep both the provider mapping and DB metadata so
+    # a subsequent DELETE can retry; reporting success here would turn a
+    # temporary process race into a permanent private-home leak.
+    if provider_manager.cleanup_provider(terminal_id) is False:
+        return False
+    with _memory_injected_lock:
+        _memory_injected_terminals.discard(terminal_id)
+    # Drop any per-curator dispatch lock so the registry doesn't grow
+    # forever as memory_manager terminals come and go.
+    from cli_agent_orchestrator.services.memory_service import _curator_locks
+
+    _curator_locks.pop(terminal_id, None)
+    return True
+
+
+def delete_terminal_row(
+    terminal_id: str,
+    metadata: Optional[Dict],
+    registry: PluginRegistry | None = None,
+) -> bool:
+    """Drop a terminal's registry row and emit ``post_kill_terminal``.
+
+    The final third of terminal teardown, split out so session teardown can
+    defer it past its kill-confirmation point (#498) -- deleting a row for a
+    session that turns out to still be alive is exactly how the registry and
+    tmux diverge. ``metadata`` is what ``capture_terminal_snapshot`` returned;
+    it is needed for the event payload because the row is gone by the time the
+    event is built.
+
+    ``registry=None`` drops the row WITHOUT emitting. Session teardown passes
+    None and emits the events itself once it has released the lifecycle lock, so
+    that no third-party plugin ever runs inside its critical section; the
+    single-terminal ``delete_terminal`` path holds no such lock and passes its
+    registry straight through.
+    """
+    deleted = db_delete_terminal(terminal_id)
+    logger.info(f"Deleted terminal: {terminal_id}")
+    if deleted and metadata:
+        dispatch_plugin_event(
+            registry,
+            "post_kill_terminal",
+            PostKillTerminalEvent(
+                session_id=metadata["tmux_session"],
+                terminal_id=terminal_id,
+                agent_name=metadata.get("agent_profile"),
+            ),
+        )
+    return deleted
+
+
+def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) -> bool:
+    """Delete terminal and kill its tmux window.
+
+    Single-terminal teardown: all three thirds back to back, in the order they
+    have always run. Session teardown does NOT use this -- it interleaves its own
+    tmux kill-confirmation between them (see ``services/session_service.py``).
+
+    Returns False when the teardown was deferred (see
+    ``dismantle_terminal_runtime``), leaving the row in place for a retry.
+    """
+    try:
+        metadata = capture_terminal_snapshot(terminal_id)
+        if not dismantle_terminal_runtime(terminal_id, metadata):
+            logger.warning(
+                "Terminal %s cleanup deferred; retaining metadata for a retry", terminal_id
             )
-        return deleted
+            return False
+        return delete_terminal_row(terminal_id, metadata, registry=registry)
 
     except Exception as e:
         logger.error(f"Failed to delete terminal {terminal_id}: {e}")

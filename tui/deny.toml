@@ -1,0 +1,166 @@
+# cargo-deny configuration for the `cao-tui` crate. Issue #321, unit `rust-ci`.
+#
+# This file is the HARD GATE over the Rust dependency graph (SR-1, SR-2, interview Q1):
+# `cargo deny check` covers all four checks — advisories, licenses, bans, sources — and a
+# non-zero exit fails CI. Before this file existed, nothing inspected the Rust graph at all:
+# `cargo` appeared in only `publish-to-pypi.yml` and never in `ci.yml`, so a new advisory, a
+# GPL transitive dependency, or an FFI crate could all land unnoticed. (#321)
+#
+# Config resolution is next to the MANIFEST, not the cwd: cargo-deny defaults to
+# `<cwd>/deny.toml`, but when invoked as `--manifest-path tui/Cargo.toml` from the repo root
+# it reads `tui/deny.toml`. Verified by planting a deliberately failing config here and
+# confirming the root-invoked run picked it up. That is why this file sits beside Cargo.toml
+# rather than at the repo root. (#321)
+#
+# cargo-deny REJECTS unknown keys (`error[unexpected-keys]`, which aborts config
+# deserialisation). That is a deliberate reason to trust this file over a hand-rolled gate:
+# unlike the coverage ratchet — which silently ignores keys it does not recognise — a typo
+# here fails loudly instead of quietly disabling a check. Verified by probing a bogus key. (#321)
+
+[graph]
+# Left at the defaults so the graph stays the full cross-platform resolution. Narrowing
+# `targets` would drop platform-specific crates from view entirely — the upstream template
+# warns that listing only some targets makes e.g. `nix` invisible — and this crate genuinely
+# resolves Windows-only crates (winapi, windows-sys) alongside the unix ones. A supply-chain
+# gate that cannot see the Windows half of its own graph is not a gate. (#321)
+all-features = false
+no-default-features = false
+
+[advisories]
+# The RustSec database covers the FULL graph here, including dev-dependencies — verified: a
+# `[licenses] include-dev` equivalent does not exist for this section (`include-dev` is
+# rejected as an unexpected key), and the check reports against every resolved crate.
+# That matters because this crate's entire pty and HTTP surface is dev-dependencies.
+#
+# `yanked = "deny"`: a yanked crate is a maintainer's own signal that a release is
+# defective. `Cargo.lock` is committed and CI runs `--locked`, so a yanked version would
+# otherwise stay pinned indefinitely with nothing to surface it. (#321)
+yanked = "deny"
+
+[licenses]
+# ---------------------------------------------------------------------------------------
+# `include-dev = true` IS LOAD-BEARING, AND ITS ABSENCE WOULD BE A SILENT HOLE.
+#
+# Measured: with the default (`include-dev = false`) the licenses check evaluates 10 of the
+# 39 resolved crates. Every dev-dependency — portable-pty, nix, filedescriptor, minreq and
+# their transitive graph — goes UNCHECKED, and an allow-list that omits their licenses still
+# reports "licenses ok". With `include-dev = true` all 39 are evaluated.
+#
+# For most crates that default is defensible. For THIS crate it is not: the pty harness and
+# the live-endpoint contract test are dev-dependencies by deliberate design (they are test
+# infrastructure kept out of the release binary for NFR-2's 10 MB ceiling), so the default
+# would leave the majority of this project's actual supply chain unexamined. (#321)
+# ---------------------------------------------------------------------------------------
+include-dev = true
+include-build = true
+# The exact set the real graph needs — enumerated from the graph, not guessed. Derived by
+# running the check with `allow = []` and reading back every license it rejected, then
+# confirming this list yields "licenses ok: 0 errors, 0 warnings, 39 notes".
+#
+# Deliberately a MINIMAL allow-list rather than a category rule (`allow-osi-fsf-free`): a new
+# transitive dependency arriving under an unlisted licence should stop and be looked at, which
+# is the whole point. Note what is NOT here — no GPL, no AGPL, no LGPL, mirroring the
+# `deny-licenses: GPL-3.0, AGPL-3.0` already set on `actions/dependency-review-action` in
+# ci.yml. An allow-list is the stronger form: it denies by default.
+#
+# Two crates carry OR expressions whose other branch is absent here on purpose —
+# serial2 (`BSD-2-Clause OR Apache-2.0`) and memchr (`Unlicense OR MIT`). Both are satisfied
+# via Apache-2.0/MIT respectively, so adding BSD-2-Clause or Unlicense would widen the
+# allow-list without licensing anything new. (#321)
+allow = [
+    "MIT",
+    "Apache-2.0",
+    # minreq, the dev-only HTTP client used by the live-endpoint contract test. OSI-approved
+    # and FSF Free/Libre (cargo-deny reports both), permissive, no copyleft obligation.
+    "ISC",
+    # unicode-ident is `(MIT OR Apache-2.0) AND Unicode-3.0` — an AND, so the Unicode term
+    # must be allowed explicitly; the MIT/Apache branch alone does not satisfy it.
+    "Unicode-3.0",
+    # foldhash, a PRODUCTION dependency reached via
+    # `ratatui -> ratatui-core -> {kasuari -> hashbrown, lru} -> foldhash`. It ships in the
+    # binary, so this is not a dev-only allowance. OSI-approved and FSF Free/Libre (cargo-deny
+    # reports both), permissive, no copyleft obligation — the same character as ISC above.
+    #
+    # Added at Bolt 4 when `results-pane` brought in ratatui and the graph went 39 -> 95 crates.
+    # `foldhash` was the ONLY new licence outside this list, and the gate failing is what
+    # surfaced it for an explicit operator decision rather than a silent widening. (#321)
+    "Zlib",
+]
+
+[bans]
+# ---------------------------------------------------------------------------------------
+# THE NO-FFI GATE (FR-5.2, SR-4, T-10) — the declarative half.
+#
+# T-10 forbids linking the TUI against the Python runtime: the boundary is subprocess for CLI
+# invocation and HTTP for server reads, never FFI or shared in-process state. The affirmed
+# rule requires this be enforced by a DETERMINISTIC CHECK ON THE DEPENDENCY GRAPH rather than
+# by code review, because code review does not see a crate arriving four levels down a
+# transitive chain.
+#
+# Verified this section sees dev-dependencies too, not just `[dependencies]`: banning
+# `portable-pty` (a dev-dependency) as a probe produced `error[banned]` with the inclusion
+# graph printing `└── (dev) cao-tui v0.1.0`. So an FFI crate could not slip in by being a
+# dev-dependency — which is exactly where it would arrive, since test-only tooling is the
+# most plausible accidental route to a Python binding.
+#
+# ci.yml's `rust` job carries a second, independent implementation of this same check on both
+# platforms. That is deliberate, not redundant: this section only runs inside the cargo-deny
+# job, which is a Docker action and therefore Linux-only. (#321)
+# ---------------------------------------------------------------------------------------
+deny = [
+    { crate = "pyo3" },
+    { crate = "pyo3-ffi" },
+    { crate = "cpython" },
+    { crate = "python3-sys" },
+]
+# A `*` version requirement accepts literally any future release of a dependency, including
+# a compromised one — no upper bound, no review. None exist today (every requirement in
+# Cargo.toml is a caret range), so this costs nothing now and refuses one later. (#321)
+wildcards = "deny"
+# ---------------------------------------------------------------------------------------
+# `multiple-versions` is "warn" DELIBERATELY — but `multiple-versions-include-dev` is what
+# makes it MEAN anything, and its absence would have made this a guard that cannot fire.
+#
+# Measured: with `multiple-versions-include-dev` at its default (false), setting
+# `multiple-versions = "deny"` detects NOTHING here — `bans ok: 0 errors, 0 warnings`. Every
+# duplicate in this graph is reached only through dev-dependencies, so the duplicate check is
+# vacuous on this crate without the second key. An earlier draft of this comment asserted that
+# "deny" would fail the build today; that was wrong, and probing it is what showed so. With
+# `multiple-versions-include-dev = true`, "deny" produces 4 errors and "warn" produces 4
+# warnings.
+#
+# FOUR crates resolve at two versions each (not three — thiserror-impl duplicates alongside
+# thiserror). All trace to `portable-pty`, a dev-dependency, so none is in the shipped binary:
+#
+#   bitflags       1.3.2   <- portable-pty                  | 2.13.1 <- nix <- portable-pty
+#   thiserror      1.0.69  <- filedescriptor <- portable-pty | 2.0.19 <- cao-tui (direct)
+#   thiserror-impl 1.0.69  <- thiserror 1.0.69               | 2.0.19 <- thiserror 2.0.19
+#   syn            2.0.119 <- thiserror-impl 1.x             | 3.0.3  <- serde_derive, thiserror-impl 2.x
+#
+# (Traced with `cargo tree -i <crate>@<version> --target all -e normal,build,dev`; the
+# 1.x-side queries print "nothing to print" without `--target all -e dev`, which is why the
+# provenance is stated per-version rather than per-crate.)
+#
+# "warn" rather than "deny" because the duplication is upstream's choice of `thiserror` major
+# inside portable-pty — this crate cannot fix it, and the only way to green a "deny" would be
+# `skip`/`skip-tree` entries, which would also suppress FUTURE duplicates in the same subtree.
+# A warning that names all four is more honest than a deny plus a blanket skip: duplicate
+# majors are a size/hygiene signal, not a vulnerability, and the advisories check covers each
+# version independently for actual CVEs. Revisit if a duplicate reaches `[dependencies]`. (#321)
+# ---------------------------------------------------------------------------------------
+multiple-versions = "warn"
+multiple-versions-include-dev = true
+
+[sources]
+# SR-2: crates.io is the ONLY permitted registry — the control against a dependency being
+# pulled from an attacker-controlled mirror. `unknown-registry` and `unknown-git` both
+# default to "warn", which would let a crate from an arbitrary registry or git remote through
+# with nothing but a log line; "deny" makes each a build failure.
+#
+# `allow-git = []` is explicit rather than omitted: a git dependency bypasses crates.io's
+# immutability guarantee entirely (a branch or tag can be force-pushed under the same ref),
+# so the empty list is the intended policy, not an oversight. (#321)
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

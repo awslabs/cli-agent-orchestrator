@@ -209,6 +209,20 @@ PIPE_LIVENESS_COLD_START_GRACE_S = _env_float("CAO_PIPE_LIVENESS_COLD_START_GRAC
 # After this many attempts, give up loudly and drop the terminal from the
 # watchdog, exactly like the rearm()-exception path already does.
 PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS = _env_int("CAO_PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS", 5)
+# Cap on consecutive liveness-PROBE failures per terminal (harness-control#845). The
+# probe (a tmux ``capture-pane``/``get_history``) raises — e.g. libtmux
+# ``ObjectDoesNotExist`` — when the session, window, or the whole tmux server is gone.
+# That exception path reaches NEITHER the rearm-failure NOR the cold-start counter above
+# (both sit downstream of a probe that RETURNED), so before this bound a terminal whose
+# session/server had died was re-probed every PIPE_LIVENESS_CHECK_INTERVAL_S forever, each
+# tick emitting a full-traceback ERROR — an unbounded, self-amplifying log/CPU storm across
+# every ghost terminal exactly when the box is already unhealthy (live incident: ~578k
+# error lines, a strong contributor to a near-simultaneous mass session teardown). After
+# this many consecutive probe failures, give up loudly ONCE and drop the terminal from the
+# watchdog, exactly like the rearm-exception and cold-start paths already do. The counter
+# resets on any successful probe, so a brief transient (a session momentarily unavailable
+# but not gone) never accumulates to a false drop.
+PIPE_LIVENESS_MAX_PROBE_FAILURES = _env_int("CAO_PIPE_LIVENESS_MAX_PROBE_FAILURES", 5)
 
 # pyte-rendered status detection. When enabled, the StatusMonitor feeds each
 # terminal's output through a pyte terminal emulator and runs detection against
@@ -355,6 +369,28 @@ API_BASE_URL = f"http://{SERVER_HOST}:{SERVER_PORT}"
 # Default timeout (seconds) for HTTP calls to the CAO API server.
 MCP_REQUEST_TIMEOUT = 30
 
+# Cross-node placement + callback routing (one-agent-per-pod topology).
+# Defined here — not in mcp_server/server.py — because BOTH the MCP client
+# (which injects/reads them for routing) and terminal_service (which reads the
+# persisted session env to notify a cross-node supervisor of a deferred-init
+# failure) need the names, and services must not import from mcp_server.
+#
+#   ADVERTISED_URL_ENV        set on a SUPERVISOR node: base URL at which peers
+#                             (worker pods) can reach this node's cao-server.
+#   ELASTIC_CALLBACK_URL_ENV  set on an elastic SUPERVISOR: narrow broker URL
+#                             workers use instead of the supervisor control API.
+#   CALLBACK_URL_ENV /        injected by the supervisor into a REMOTE worker
+#   CALLBACK_TERMINAL_ID_ENV  terminal's env at creation: the supervisor
+#                             node's advertised URL + supervisor terminal ID.
+ADVERTISED_URL_ENV = "CAO_ADVERTISED_URL"
+ELASTIC_CALLBACK_URL_ENV = "CAO_ELASTIC_CALLBACK_URL"
+CALLBACK_URL_ENV = "CAO_CALLBACK_URL"
+CALLBACK_TERMINAL_ID_ENV = "CAO_CALLBACK_TERMINAL_ID"
+ELASTIC_WORKER_ID_ENV = "CAO_ELASTIC_WORKER_ID"
+ELASTIC_RELEASE_TOKEN_ENV = "CAO_ELASTIC_RELEASE_TOKEN"
+ELASTIC_WORKER_ID_HEADER = "X-CAO-Worker-ID"
+ELASTIC_RELEASE_TOKEN_HEADER = "X-CAO-Release-Token"
+
 
 # Operators can extend network allowlists via the env vars handled below.
 # Same comma-separated pattern as ``CAO_PROFILE_ALLOWED_HOSTS`` in install_service.
@@ -459,23 +495,83 @@ WS_ALLOWED_CLIENTS = [
 WS_ALLOWED_ORIGINS = _split_env_list("CAO_WS_ALLOWED_ORIGINS")
 
 
-def _origin_authority(origin: str) -> "str | None":
-    """Return the ``host[:port]`` authority of an http/https ``Origin``.
+# ASGI reports ``ws``/``wss`` on a WebSocket scope, while a browser always
+# serializes the ``Origin`` header with the matching ``http``/``https`` scheme.
+# Fold the WebSocket forms onto the origin forms before comparing the two.
+_REQUEST_SCHEME_AS_ORIGIN_SCHEME = {
+    "http": "http",
+    "https": "https",
+    "ws": "http",
+    "wss": "https",
+}
+
+
+def _origin_scheme_and_authority(origin: str) -> "tuple[str, str] | None":
+    """Return ``(scheme, host[:port])`` for a plain http/https ``Origin``.
 
     ``None`` for anything that is not a plain http/https origin — an opaque
     ``"null"`` origin, a ``file://``/``data:`` scheme, or a malformed value —
     so those never satisfy the same-origin match below.
     """
-    parts = urlsplit(origin)
+    try:
+        parts = urlsplit(origin)
+    except ValueError:
+        # A malformed bracketed host (e.g. ``http://[``) makes ``urlsplit``
+        # raise instead of returning an unparsed result. Both callers sit on
+        # request paths that must fail closed with a 403, not propagate a 500
+        # from an unguarded parse error.
+        return None
     if parts.scheme not in ("http", "https") or not parts.netloc:
         return None
     # ``netloc`` may carry userinfo (user:pass@host); the authority a browser
     # actually reports in ``Origin`` never does, but strip it defensively so a
     # crafted value can't smuggle the trusted host into the userinfo segment.
-    return parts.netloc.rsplit("@", 1)[-1]
+    return parts.scheme, parts.netloc.rsplit("@", 1)[-1]
 
 
-def is_ws_origin_allowed(origin: "str | None", host: "str | None" = None) -> bool:
+def _is_same_origin(origin: str, host: str, scheme: "str | None") -> bool:
+    """Whether ``origin`` is same-origin with the request ``host``/``scheme``.
+
+    RFC 6454 defines an origin as the (scheme, host, port) triple, so the
+    authority match alone is not sufficient: ``http://h`` and ``https://h`` are
+    different origins.
+
+    The scheme comparison is deliberately one-directional. An ``http`` Origin on
+    an ``https`` request is rejected, which is unambiguous. An ``https`` Origin
+    on a request the server sees as plain ``http`` is still accepted, because
+    that is exactly the shape an HTTPS-terminating proxy produces when its
+    address is not in ``TRUSTED_FORWARDER_IPS``: uvicorn then ignores
+    ``X-Forwarded-Proto`` and reports ``scheme="http"`` for a request the browser
+    genuinely made over TLS. Rejecting that direction would break working
+    reverse-proxy and Codespaces deployments without closing a real hole, since
+    forging it means already controlling the victim's own origin over TLS.
+
+    That leniency has a corollary worth stating: the comparison only does
+    anything where ``scheme`` is trustworthy, meaning uvicorn terminates TLS
+    itself or the proxy is listed in ``TRUSTED_FORWARDER_IPS``. Behind an
+    untrusted proxy ``scheme`` is ``"http"`` on a request the browser made over
+    TLS, and the check is then inert in both directions: the ``http`` Origin is
+    accepted as well. Operators who want it enforced should set
+    ``CAO_FORWARDED_ALLOW_IPS`` to the proxy address.
+
+    ``scheme=None`` skips the comparison entirely, preserving the behaviour
+    callers had before the scheme was threaded through.
+    """
+    parsed = _origin_scheme_and_authority(origin)
+    if parsed is None:
+        return False
+    origin_scheme, authority = parsed
+    if authority != host:
+        return False
+    if scheme is None:
+        return True
+    request_scheme = _REQUEST_SCHEME_AS_ORIGIN_SCHEME.get(scheme.lower())
+    return not (request_scheme == "https" and origin_scheme == "http")
+
+
+def is_ws_origin_allowed(
+    origin: "str | None", host: "str | None" = None, scheme: "str | None" = None
+) -> bool:
     """Whether a WebSocket handshake ``Origin`` header may open a PTY socket.
 
     Rules, tightest-safe first:
@@ -506,6 +602,10 @@ def is_ws_origin_allowed(origin: "str | None", host: "str | None" = None) -> boo
       this branch too — the same explicit-opt-out tradeoff as
       ``CAO_WS_ALLOWED_CLIENTS="*"``. Keep ``ALLOWED_HOSTS`` scoped to the real
       serving hostname(s) rather than ``*`` whenever possible.
+
+      When ``scheme`` is supplied (the ASGI ``scope["scheme"]``, i.e. ``ws`` or
+      ``wss``), the match also requires the schemes to agree. See
+      ``_is_same_origin``.
     * Otherwise the ``Origin`` must appear in the explicit allowlists: the same
       ``CORS_ORIGINS`` list the HTTP API enforces plus any
       ``CAO_WS_ALLOWED_ORIGINS`` entries. Exact-string match mirrors how the
@@ -524,14 +624,61 @@ def is_ws_origin_allowed(origin: "str | None", host: "str | None" = None) -> boo
         return True
     if "*" in WS_ALLOWED_ORIGINS:
         return True
-    if host:
-        authority = _origin_authority(origin)
-        if authority is not None and authority == host:
-            return True
+    if host and _is_same_origin(origin, host, scheme):
+        return True
     # Membership only — an operator's ``CAO_CORS_ORIGINS="*"`` lands as the
     # literal string "*" in this list and matches ONLY a literal "*" Origin
     # (which no browser sends), so it never widens PTY trust. See docstring.
     return origin in CORS_ORIGINS or origin in WS_ALLOWED_ORIGINS
+
+
+def is_http_origin_allowed(
+    origin: "str | None", host: "str | None" = None, scheme: "str | None" = None
+) -> bool:
+    """Whether a state-changing HTTP request ``Origin`` header is trusted.
+
+    CSRF / CWE-352 guard for the default-unauthenticated HTTP surface, mirroring
+    ``is_ws_origin_allowed`` on the read/mutation HTTP split:
+
+    * A missing / empty ``Origin`` is allowed. Browsers always attach one on a
+      cross-site state-changing request (``fetch``, XHR, and form posts alike),
+      so its absence means a non-browser client (curl, ``requests``, MCP, the
+      ``cao`` CLI) — one with no ambient credentials a foreign page could use.
+    * A literal ``*`` in ``CORS_ORIGINS`` (i.e. ``CAO_CORS_ORIGINS="*"``) allows
+      every origin — the operator-visible wildcard that ``CORSMiddleware``
+      already honors for the read surface, so a ``"*"``-configured deployment
+      behaves consistently for writes too.
+    * **Same-origin**: the ``Origin`` authority equals the request ``Host``.
+      This is the request the bundled Web UI makes when served by cao-server
+      itself, and it is exactly what a cross-site attacker CANNOT forge —
+      script-set ``Host`` is forbidden and the real ``Host`` is the CAO server
+      the request was made to, not the attacker's page. Matching on the live
+      ``Host`` lets the imported-app deployment and dynamic reverse-proxy /
+      Codespaces hostnames work without pre-registering every origin.
+
+      Like the WebSocket branch, this trusts ``Host`` and is only as safe as
+      ``Host`` itself: ``TrustedHostMiddleware`` validates ``Host`` against
+      ``ALLOWED_HOSTS`` on the same scope BEFORE the HTTP origin check runs,
+      which keeps the match DNS-rebinding-safe in the default loopback config.
+      ``CAO_ALLOWED_HOSTS="*"`` opts out of that protection, matching the WS
+      guard's documented tradeoff.
+
+      When ``scheme`` is supplied (the ASGI ``scope["scheme"]``), the match also
+      requires the schemes to agree, so an ``https`` request no longer accepts a
+      plain-``http`` Origin as same-origin. See ``_is_same_origin`` for why the
+      comparison is one-directional.
+    * Otherwise the ``Origin`` must be in ``CORS_ORIGINS``. Exact-string match
+      mirrors how the browser serializes ``Origin`` and how ``CORSMiddleware``
+      compares it, so anything the CORS layer already trusts for reads is
+      trusted for writes too.
+    """
+    if not origin:
+        return True
+    if "*" in CORS_ORIGINS:
+        return True
+    if host and _is_same_origin(origin, host, scheme):
+        return True
+    return origin in CORS_ORIGINS
 
 
 # Trusted upstream IP allowlist for uvicorn's ``proxy_headers`` and
@@ -594,7 +741,7 @@ MEMORY_ARCHIVE_MAX_GZIP_RATIO = 100  # reject > 100x expansion
 # Built-in role defaults. A role is a named bundle of allowedTools.
 # Users can define custom roles in settings.json under "roles".
 # CAO vocabulary: execute_bash, fs_read, fs_write, fs_list, fs_*, web_fetch,
-# @builtin, @cao-mcp-server.
+# @builtin, @cao-mcp-server, discovery.
 # web_fetch is granted only to developer: supervisor/reviewer are intentionally
 # kept off the network (no WebFetch/WebSearch), shrinking their exfiltration surface.
 ROLE_TOOL_DEFAULTS = {
@@ -602,6 +749,18 @@ ROLE_TOOL_DEFAULTS = {
     "reviewer": ["@builtin", "fs_read", "fs_list", "@cao-mcp-server"],
     "developer": ["@builtin", "fs_*", "execute_bash", "web_fetch", "@cao-mcp-server"],
 }
+
+# Issue #432 design discussion (tedswinyar + klabulan, 2026-07-17/18): sibling
+# discovery (list_siblings/update_metadata) is a distinct capability from the
+# existing handoff/assign/send_message orchestration trio, and must be an
+# explicit, separate opt-in rather than bundled into @cao-mcp-server's
+# all-or-nothing MCP-server-level grant -- a profile should be able to keep
+# orchestration tools while declining peer-to-peer discovery. Deliberately
+# NOT in any built-in role's defaults above; a profile author adds it
+# explicitly (see docs/tool-restrictions.md and
+# docs/discovery-tool-coexistence.md for the full rationale and enforcement
+# mechanism).
+DISCOVERY_TOOL_MARKER = "discovery"
 
 # Security constraints prepended to system prompts for providers without
 # native tool restriction mechanisms (kimi_cli, codex).
@@ -626,11 +785,47 @@ WORKFLOW_MAX_SPEC_BYTES = 256 * 1024
 WORKFLOW_OUTPUT_SCHEMA_MAX_DEPTH = 8
 WORKFLOW_MAX_INPUTS = 64
 
+# SQLite busy-timeout for journal connections, in milliseconds (issue #583, NFR-4).
+# Journal writes are single-row upserts in one short transaction, so the realistic
+# contention window is milliseconds; 5000 gives ~3 orders of magnitude of headroom, which
+# makes "database is locked" mean a genuinely stuck writer rather than ordinary collision.
+# Per-connection (unlike WAL, which is per-database and deliberately out of scope,
+# ADR-583-10).
+WORKFLOW_JOURNAL_BUSY_TIMEOUT_MS = 5000
+
 # Max size (bytes) of the compact-JSON resolved inputs map delivered to a script
 # run via the CAO_WORKFLOW_INPUTS spawn-env key. Enforced at the run route, on
 # the RESOLVED map, BEFORE any journal write or registry registration (ADR-5) —
 # never inside _build_env. An oversized payload is rejected as ValueError -> 400.
 WORKFLOW_INPUTS_MAX_BYTES = 32768
+
+# Byte bound on the persisted step result text (issue #583, NFR-1 / TD-2). Applied to
+# ``last_message`` AFTER redaction (never before — SR-1), on the UTF-8 encoding rather
+# than the character count, because the bound is a storage limit. Matches
+# WORKFLOW_INPUTS_MAX_BYTES rather than inventing a fourth magnitude: being slightly
+# tight is VISIBLE (``truncated=True`` on the envelope) and cheap to revise from a named
+# constant, while being loose accumulates SILENTLY in a shared database that has no
+# eviction for this column.
+WORKFLOW_JOURNAL_RESULT_MAX_BYTES = 32768
+
+# Byte bound on the persisted execution manifest envelope (issue #583 Bolt 2, NFR-1 /
+# ADR-583-12). Applied to the compact-JSON encoding AFTER redaction (never before — a
+# secret straddling the bound would otherwise survive), on the UTF-8 byte length rather
+# than the character count, because the bound is a storage limit.
+#
+# 256 KiB MATCHES WORKFLOW_MAX_SPEC_BYTES RATHER THAN THE 32768 USED BY ITS TWO
+# NEIGHBOURS, AND THE ARITHMETIC IS THE REASON. The manifest CONTAINS the resolved
+# inputs map, which is separately allowed up to WORKFLOW_INPUTS_MAX_BYTES (32768). A
+# 32 KiB manifest bound would therefore be tighter than one of its own eleven fields:
+# any workflow using its full inputs allowance would truncate on EVERY run, and what
+# gets sacrificed is the frozen memory content — FR-9's entire payload. Truncation would
+# become the normal case, destroying the ``truncated`` flag's value as a signal.
+#
+# The cost is accepted deliberately: this is the loosest of the workflow bounds, in a
+# column with no eviction. Mitigating facts — it is one row per RUN rather than per step,
+# the flag makes truncation visible when it does fire, and this is a named constant that
+# is cheap to tighten if truncation is never observed in practice.
+WORKFLOW_MANIFEST_MAX_BYTES = 256 * 1024
 
 # Units (from units-generation) whose constructs are EXECUTABLE in the current
 # Bolt. Empty in Bolt 1: the run engine (N5) is not shipped, so every
@@ -694,6 +889,31 @@ WORKFLOW_STEP_TIMEOUT = 600.0
 # running near the 100-step ceiling can raise it via the env override if needed.
 WORKFLOW_RUN_REQUEST_TIMEOUT = (WORKFLOW_STEP_TIMEOUT + 120.0) * 12 + 180.0  # = 8820.0s (~2.45h)
 
+# Poll interval (seconds) for the async-run FOLLOWERS: ``cao workflow run`` (bare
+# follow-to-terminal + ``wait``) and the ``workflow_wait`` MCP tool (issue #505,
+# U5/U6). ADR-4 chose a poll loop over the snapshot route (Option A) rather than
+# consuming the events stream (that live follower is U10); the value itself was
+# delegated to functional design and pinned here (U5-FP-5). Named — not a magic
+# literal — so both the CLI follower and the MCP poll tool reference one constant.
+# Each poll's HTTP call uses the normal per-call timeout (MCP_REQUEST_TIMEOUT /
+# ``_mcp_timeout()``), NOT the long blocking WORKFLOW_RUN_REQUEST_TIMEOUT — the
+# long ceiling bounds only the OVERALL wait, never a single snapshot read.
+WORKFLOW_POLL_INTERVAL_SECONDS = 1.0
+
+# Admission ceiling on CONCURRENT background drives started by the async submit
+# route ``POST /workflows/runs:submit`` (issue #505 review, AB-1). The blocking
+# twin ``POST /workflows/runs`` is self-throttling — the caller holds the socket
+# for the whole run, so an overloaded server backs pressure up into its clients.
+# The async route deliberately REMOVES that property (that is the point of a 202),
+# so N submits would otherwise mean N concurrent drives, each spawning terminals.
+# The bound is applied INSIDE the background task (never at the handler), so a
+# submit over the ceiling still gets its durable row and its 202 and simply QUEUES
+# — admission stays decoupled from execution, and INV-1
+# (run-id-allocated-before-ack) is untouched. Sized to match the 12-step blocking
+# ceiling reasoning above rather than CPU count: each drive is dominated by
+# subprocess/agent wait, not local compute.
+WORKFLOW_MAX_CONCURRENT_BACKGROUND_DRIVES = 12
+
 # Script-linter rule inputs (Bolt 2, U1/C2, FR-1.3 / U1-BR-8). Import prefixes
 # whose first dotted segment marks a CAO-internal import — scripts reach CAO
 # over HTTP only (C-1). The ``cao_workflow`` shim (U6, ADR-6) is the sanctioned
@@ -738,6 +958,38 @@ WORKFLOW_ENV_VALUE_MAX_LEN = 256
 MODEL_ID_RE = r"^[A-Za-z0-9._:/-]+$"
 MODEL_ID_MAX_LEN = 128
 
+# Live-event follower (issue #505, U10). The CLI ``cao workflow events --follow``
+# and the MCP ``workflow_events`` open #504's events-follow SSE route
+# (``GET /workflows/runs/{id}/events`` with ``Accept: text/event-stream``) as thin
+# HTTP clients. A ``(connect, read)`` timeout tuple bounds the streamed GET — the
+# read leg must comfortably exceed #504's SSE heartbeat/poll cadence (250ms tail),
+# mirroring the AG-UI stream reader's 10s/60s split so a quiet run does not trip a
+# spurious read timeout between frames. The reconnect budget bounds how many times
+# a dropped connection is re-opened (resuming exactly via ``?after_seq=<last_seq>``,
+# RS-1/RS-3) before the follower gives up and does a final terminal status check —
+# so a flapping stream can never spin forever.
+WORKFLOW_EVENTS_CONNECT_TIMEOUT = 10.0
+WORKFLOW_EVENTS_READ_TIMEOUT = 60.0
+WORKFLOW_EVENTS_MAX_RECONNECTS = 5
+
+# Bound on frames the bounded MCP ``workflow_events`` follower drains before it
+# returns (an MCP tool call cannot stream indefinitely). The follower stops at a
+# terminal state OR this many events, whichever comes first (U10 MCP bound).
+WORKFLOW_EVENTS_MCP_MAX_EVENTS = 500
+
+# WALL-CLOCK bound (seconds) on the same bounded MCP ``workflow_events`` follower
+# (issue #505 review, TB-1). WORKFLOW_EVENTS_MCP_MAX_EVENTS above bounds the call in
+# EVENTS, which is not a bound at all for a stream that delivers no events: SSE
+# ``:keep-alive`` comment lines are skipped by ``parse_sse_frames`` (they yield no
+# frame, so they never count toward the event ceiling and never carry a terminal
+# event type) while still being traffic that resets the socket read timeout. So a
+# heartbeat-only stream satisfies neither existing bound and the tool would block
+# indefinitely. This is the independent time bound that makes "BOUNDED" true on
+# every stream shape. Set below the 60s read timeout so the deadline — not a socket
+# error — is what ends a quiet stream, giving the caller a clean partial result plus
+# ``timed_out: true`` to resume from.
+WORKFLOW_EVENTS_MCP_MAX_SECONDS = 45.0
+
 # Script-runner subprocess lifecycle (Bolt 3, U4/C1). Wall-clock bound + grace,
 # output ring-buffer cap, engine-owned scratch root for resume materialization.
 WORKFLOW_SCRIPT_TERM_GRACE = 5.0  # SIGTERM->SIGKILL grace (BR-10/11, NFR-REL-1)
@@ -747,3 +999,17 @@ WORKFLOW_SCRIPT_TERM_GRACE = 5.0  # SIGTERM->SIGKILL grace (BR-10/11, NFR-REL-1)
 WORKFLOW_SCRIPT_TIMEOUT = 8700.0
 WORKFLOW_SCRIPT_LOG_CAP = 256 * 1024  # per-stream tail cap, bytes (BR-24/25, Q7=A)
 WORKFLOW_SCRIPT_SCRATCH_DIR = CAO_HOME_DIR / "workflow-script-scratch"  # 0o700 (BR-30)
+
+# =============================================================================
+# Terminal group/metadata caps (#432 follow-up review, PR #433)
+# =============================================================================
+# ``group`` and (especially) ``metadata`` are written by the terminal's own
+# running agent via the ``update_metadata``/``update_group`` MCP tools, with
+# no operator review in the loop. Left unbounded, a worker could grow the
+# terminals.metadata/group TEXT columns arbitrarily, and that growth is
+# amplified into every sibling's ``list_siblings`` response (call-me-ram, PR
+# #433 review). Same shape as ``WORKFLOW_MAX_SPEC_BYTES``: a structural cap
+# enforced at the request boundary, fail-closed with 422.
+TERMINAL_METADATA_MAX_BYTES = 16 * 1024  # encoded (json.dumps) size cap
+TERMINAL_GROUP_MAX_ELEMENTS = 16
+TERMINAL_GROUP_ELEMENT_MAX_LEN = 128

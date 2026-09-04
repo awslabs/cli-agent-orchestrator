@@ -377,3 +377,23 @@ def test_discovers_tracked_markdown_and_excludes_vendored_and_fixture_trees(
     )
 
     assert discover_markdown_files(tmp_path) == [tmp_path / "README.md"]
+
+
+def test_discovery_excludes_blog_posts_that_link_by_site_route(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write(tmp_path / "README.md", "# Maintained\n")
+    _write(
+        tmp_path / "docusaurus" / "blog" / "2026-01-01-post" / "index.md",
+        "# Post\n\n[handoff](/docs/patterns/handoff)\n",
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.utils.markdown_links.subprocess.run",
+        lambda *args, **kwargs: type(
+            "Completed",
+            (),
+            {"stdout": "README.md\ndocusaurus/blog/2026-01-01-post/index.md\n"},
+        )(),
+    )
+
+    assert discover_markdown_files(tmp_path) == [tmp_path / "README.md"]
