@@ -1776,9 +1776,14 @@ def _message_visible_in_box(terminal_id: str, message: str) -> bool:
     was dropped (re-deliver the full message). Guessing wrong the other way must
     be avoided — a bare Enter into an EMPTY box would submit a blank prompt and
     the real task would be lost. Collapse to [a-z0-9] so wrapping / whitespace /
-    unicode punctuation in the rendered box can't defeat the match.
+    unicode punctuation in the rendered box can't defeat the match. The whole
+    collapsed message is the probe, not a leading slice: every orchestrated
+    handoff opens with the same banner, so a prefix cannot tell two handoffs
+    apart and a pane still holding a prior, completed handoff would read as the
+    current message (#727). A miss here costs a full re-delivery instead of a
+    bare Enter — never a blank submit — so erring toward "not shown" is safe.
     """
-    probe = re.sub(r"[^a-z0-9]", "", message.lower())[:24]
+    probe = re.sub(r"[^a-z0-9]", "", message.lower())
     if len(probe) < 8:
         # Too short to match reliably — treat as "not shown" so we re-deliver
         # in full rather than risk a blank submit.
