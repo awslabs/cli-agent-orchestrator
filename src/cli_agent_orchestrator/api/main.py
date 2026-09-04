@@ -671,6 +671,19 @@ class ResumeRunRequest(BaseModel):
     )
 
 
+class StepReplayRequest(BaseModel):
+    """Request body for ``POST /workflows/runs/{run_id}/steps/{step_id}:replay`` (#640)."""
+
+    prompt_override: Optional[str] = Field(
+        default=None,
+        description=(
+            "Replacement prompt TEMPLATE for this one replay; {{workflow.inputs.*}} and "
+            "{{steps.*.output.*}} references in it still resolve against the recorded "
+            "run. Omit to reuse the snapshotted step prompt."
+        ),
+    )
+
+
 class GraphExportRequest(BaseModel):
     """Request body for ``POST /graph/{provider}/export`` (U4, Issue #348)."""
 
@@ -6384,6 +6397,62 @@ async def resume_workflow_run_endpoint(
     except workflow_service.WorkflowEngineError as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
     return result.model_dump()
+
+
+@app.post("/workflows/runs/{run_id}/steps/{step_id}:replay")
+async def replay_workflow_step_endpoint(
+    run_id: str,
+    step_id: str,
+    body: Optional[StepReplayRequest] = None,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Re-execute ONE step of a recorded run and return its live result (issue #640).
+
+    Write-scoped because it creates a terminal and runs an agent — but READ-ONLY
+    with respect to the run it replays: the service writes no journal row and emits
+    no event for ``run_id``, so a completed or failed run can be re-probed step by
+    step, repeatedly, without disturbing what it recorded.
+
+    The step's prompt is resolved from the run's own journal (spec snapshot,
+    resolved inputs, predecessor outputs); an optional ``prompt_override`` replaces
+    the prompt TEMPLATE while keeping that resolution.
+
+    Error taxonomy mirrors the resume route: unknown run or unknown step -> 404, an
+    undeserializable spec snapshot -> 422, a script-tier run, an empty
+    ``prompt_override``, or a prompt that cannot be resolved from the recorded
+    predecessors -> 400. A step that FAILS is a 200 whose body carries ``error`` /
+    ``error_kind`` (a failed step is data, not a transport fault).
+
+    **The immutability guarantee has an audit consequence, accepted deliberately.**
+    Writing no journal row and emitting no event is what makes replay safe on a
+    recorded run — and it also means a replay execution is INVISIBLE to anything
+    treating the journal or event stream as the execution audit log, and is not
+    gated by plan approval (which gates run *starts*). That is consistent with CAO's
+    local single-operator model; the service logs each replay at INFO, which is the
+    trail. A deployment that needs replays audited should read those logs, not the
+    journal.
+    """
+    from cli_agent_orchestrator.services import workflow_service
+
+    try:
+        return await workflow_service.replay_single_step(
+            run_id,
+            step_id,
+            prompt_override=body.prompt_override if body is not None else None,
+        )
+    except KeyError as e:
+        # The service distinguishes "unknown run" from "unknown step" in the message;
+        # surface it rather than flattening both to the run-scoped default.
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e.args[0]) if e.args else f"unknown run '{run_id}'",
+        )
+    except workflow_service.ResumeCorruptError as e:
+        # 422 by literal code, matching the resume route's note on the ``status``
+        # alias drifting across Starlette versions in the CI matrix.
+        raise HTTPException(status_code=422, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 
 # ── graph layer (U4, Issue #348) ────────────────────────────────────────

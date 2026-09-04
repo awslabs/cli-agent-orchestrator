@@ -889,6 +889,16 @@ WORKFLOW_STEP_TIMEOUT = 600.0
 # running near the 100-step ceiling can raise it via the env override if needed.
 WORKFLOW_RUN_REQUEST_TIMEOUT = (WORKFLOW_STEP_TIMEOUT + 120.0) * 12 + 180.0  # = 8820.0s (~2.45h)
 
+# Client-side HTTP timeout (seconds) for the BLOCKING single-step replay call
+# ``POST /workflows/runs/{id}/steps/{step}:replay`` (``cao workflow step``, issue
+# #640). Also inline-blocking, but it runs at most ONE step, capped server-side at
+# ``WORKFLOW_STEP_TIMEOUT`` — so the multi-step ``WORKFLOW_RUN_REQUEST_TIMEOUT``
+# ceiling would hold an idle socket for ~2.45h before reporting a hung server, with
+# an author watching. Sized as the step ceiling plus the same +180s headroom
+# ``handoff`` uses for its single blocking step (mcp_server/server.py
+# ``client_timeout = timeout + 180.0``).
+WORKFLOW_STEP_REQUEST_TIMEOUT = WORKFLOW_STEP_TIMEOUT + 180.0  # = 780.0s (13min)
+
 # Poll interval (seconds) for the async-run FOLLOWERS: ``cao workflow run`` (bare
 # follow-to-terminal + ``wait``) and the ``workflow_wait`` MCP tool (issue #505,
 # U5/U6). ADR-4 chose a poll loop over the snapshot route (Option A) rather than

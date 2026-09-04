@@ -19,6 +19,8 @@ from cli_agent_orchestrator.constants import (
     MCP_REQUEST_TIMEOUT,
     WORKFLOW_POLL_INTERVAL_SECONDS,
     WORKFLOW_RUN_REQUEST_TIMEOUT,
+    WORKFLOW_STEP_REQUEST_TIMEOUT,
+    WORKFLOW_STEP_TIMEOUT,
 )
 
 
@@ -795,3 +797,169 @@ def test_list_json_passthrough_preserves_none(runner):
         result = runner.invoke(workflow, ["list", "--json"])
     assert result.exit_code == 0
     assert '"step_count": null' in result.output
+
+
+# ---------------------------------------------------------------------------
+# step — single-step re-execution against a recorded run (issue #640)
+# ---------------------------------------------------------------------------
+def _replay_body(**overrides):
+    """A ``:replay`` response body (the shape ``replay_single_step`` returns)."""
+    body = {
+        "run_id": "run1",
+        "step_id": "s2",
+        "provider": "claude_code",
+        "agent": "reviewer",
+        "prompt": "write about 42 for cats",
+        "terminal_id": "t1",
+        "last_message": "done",
+        "output": {"answer": "fresh"},
+        "validated": True,
+        "error": None,
+        "error_kind": None,
+    }
+    body.update(overrides)
+    return body
+
+
+def test_step_replays_one_step_and_renders_prompt_and_output(runner):
+    """Happy path: POSTs the :replay route, renders the resolved prompt + output, exits 0."""
+    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+        mock_req.post.return_value = _resp(200, _replay_body())
+        result = runner.invoke(workflow, ["step", "run1", "s2"])
+    assert result.exit_code == 0
+    args, kwargs = mock_req.post.call_args
+    assert args[0].endswith("/workflows/runs/run1/steps/s2:replay")
+    # No override sent when neither flag is given (the server reuses the snapshot).
+    assert kwargs["json"] == {}
+    # A step runs an agent inline server-side, so this is a BLOCKING client path —
+    # but it runs at most ONE step, so it takes the single-step ceiling, NOT the
+    # multi-step WORKFLOW_RUN_REQUEST_TIMEOUT (~2.45h of idle socket on a hung
+    # server). Bracketed on both sides so neither drift is silent.
+    assert kwargs["timeout"] == WORKFLOW_STEP_REQUEST_TIMEOUT
+    assert MCP_REQUEST_TIMEOUT < WORKFLOW_STEP_REQUEST_TIMEOUT < WORKFLOW_RUN_REQUEST_TIMEOUT
+    assert WORKFLOW_STEP_REQUEST_TIMEOUT == WORKFLOW_STEP_TIMEOUT + 180.0
+    assert "write about 42 for cats" in result.output
+    assert '"answer": "fresh"' in result.output
+
+
+def test_step_json_emits_body_verbatim(runner):
+    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+        mock_req.post.return_value = _resp(200, _replay_body())
+        result = runner.invoke(workflow, ["step", "run1", "s2", "--json"])
+    assert result.exit_code == 0
+    assert json.loads(result.output) == _replay_body()
+
+
+def test_step_prompt_override_is_sent(runner):
+    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+        mock_req.post.return_value = _resp(200, _replay_body(prompt="be terse"))
+        result = runner.invoke(workflow, ["step", "run1", "s2", "--prompt-override", "be terse"])
+    assert result.exit_code == 0
+    assert mock_req.post.call_args.kwargs["json"] == {"prompt_override": "be terse"}
+
+
+def test_step_prompt_file_is_read_and_sent(runner, tmp_path):
+    prompt_path = tmp_path / "p.md"
+    prompt_path.write_text("from a file\n", encoding="utf-8")
+    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+        mock_req.post.return_value = _resp(200, _replay_body(prompt="from a file\n"))
+        result = runner.invoke(workflow, ["step", "run1", "s2", "--prompt-file", str(prompt_path)])
+    assert result.exit_code == 0
+    assert mock_req.post.call_args.kwargs["json"] == {"prompt_override": "from a file\n"}
+
+
+def test_step_prompt_flags_are_mutually_exclusive(runner, tmp_path):
+    """Both prompt flags together is rejected BEFORE any request is issued."""
+    prompt_path = tmp_path / "p.md"
+    prompt_path.write_text("x", encoding="utf-8")
+    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+        result = runner.invoke(
+            workflow,
+            ["step", "run1", "s2", "--prompt-file", str(prompt_path), "--prompt-override", "y"],
+        )
+    assert result.exit_code != 0
+    assert "mutually exclusive" in result.output
+    assert mock_req.post.called is False
+
+
+def test_step_missing_prompt_file_is_a_clear_error(runner, tmp_path):
+    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+        result = runner.invoke(
+            workflow, ["step", "run1", "s2", "--prompt-file", str(tmp_path / "nope.md")]
+        )
+    assert result.exit_code != 0
+    assert "could not read --prompt-file" in result.output
+    assert mock_req.post.called is False
+
+
+def test_step_empty_prompt_override_is_rejected_before_any_request(runner):
+    """An empty override is not ``None``: without this it POSTed a blank prompt."""
+    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+        result = runner.invoke(workflow, ["step", "run1", "s2", "--prompt-override", ""])
+    assert result.exit_code != 0
+    assert "--prompt-override is empty" in result.output
+    assert mock_req.post.called is False
+
+
+def test_step_whitespace_only_prompt_file_is_rejected_and_names_the_file(runner, tmp_path):
+    """The common shape of the mistake: a "prompt file" holding only a newline."""
+    prompt_path = tmp_path / "blank.md"
+    prompt_path.write_text("\n  \n", encoding="utf-8")
+    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+        result = runner.invoke(workflow, ["step", "run1", "s2", "--prompt-file", str(prompt_path)])
+    assert result.exit_code != 0
+    assert "is empty" in result.output
+    assert str(prompt_path) in result.output  # names the file, not just the flag
+    assert mock_req.post.called is False
+
+
+def test_step_renders_a_run_with_no_structured_output(runner):
+    """A step that emitted nothing structured still succeeds — output is just absent.
+
+    Distinct from the failure path below: no ``error``, so exit 0, and the render says
+    so explicitly rather than printing an empty ``Output:`` heading.
+    """
+    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+        mock_req.post.return_value = _resp(
+            200, _replay_body(output=None, validated=None, last_message="all done")
+        )
+        result = runner.invoke(workflow, ["step", "run1", "s2"])
+    assert result.exit_code == 0
+    assert "(no structured output)" in result.output
+    assert "all done" in result.output
+
+
+def test_step_unknown_run_surfaces_the_server_detail(runner):
+    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+        mock_req.post.return_value = _resp(404, {"detail": "run 'run1' has no step 's9'"})
+        result = runner.invoke(workflow, ["step", "run1", "s9"])
+    assert result.exit_code != 0
+    assert "has no step 's9'" in result.output
+
+
+def test_step_unresolvable_prompt_400_surfaces_detail(runner):
+    detail = "cannot resolve the prompt for step 's2' of run 'run1': ... produced no output"
+    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+        mock_req.post.return_value = _resp(400, {"detail": detail})
+        result = runner.invoke(workflow, ["step", "run1", "s2"])
+    assert result.exit_code != 0
+    assert "produced no output" in result.output
+
+
+def test_step_failed_step_exits_1(runner):
+    """A failed step is a 200 whose body carries ``error`` — the exit code follows it."""
+    body = _replay_body(error="terminal reached ERROR", error_kind="error", output=None)
+    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+        mock_req.post.return_value = _resp(200, body)
+        result = runner.invoke(workflow, ["step", "run1", "s2"])
+    assert result.exit_code == 1
+    assert "terminal reached ERROR" in result.output
+
+
+def test_step_unreachable_server(runner):
+    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+        mock_req.exceptions = requests.exceptions
+        mock_req.post.side_effect = requests.exceptions.ConnectionError("refused")
+        result = runner.invoke(workflow, ["step", "run1", "s2"])
+    assert result.exit_code != 0
+    assert "could not reach cao-server" in result.output

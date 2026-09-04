@@ -6,12 +6,14 @@ thin HTTP client against the ``/workflows`` endpoints on the running cao-server
 ``workflow_spec_service`` or ``database`` directly (project Forbidden rule).
 
 The run-lifecycle verbs — ``run`` / ``runs`` / ``status`` / ``wait`` / ``result``
-/ ``resume`` / ``cancel`` — are thin HTTP clients over the ``/workflows/runs``
-engine endpoints (N5 + issue #505), mirroring the authoring-verb style. Bare
-``run`` submits asynchronously via ``POST /workflows/runs:submit`` and then FOLLOWS
-the run by polling ``GET /workflows/runs/{id}`` to a terminal state; ``--wait`` is
-the explicit blocking escape hatch over the retained ``POST /workflows/runs`` path
-and ``--detach`` submits without following. This module NEVER imports
+/ ``resume`` / ``step`` / ``cancel`` — are thin HTTP clients over the
+``/workflows/runs`` engine endpoints (N5 + issue #505 + issue #640), mirroring the
+authoring-verb style. Bare ``run`` submits asynchronously via
+``POST /workflows/runs:submit`` and then FOLLOWS the run by polling
+``GET /workflows/runs/{id}`` to a terminal state; ``--wait`` is the explicit
+blocking escape hatch over the retained ``POST /workflows/runs`` path and
+``--detach`` submits without following. ``step`` re-executes ONE step of an
+already-recorded run without re-running the workflow. This module NEVER imports
 ``workflow_service`` / ``script_runner`` / ``workflow_journal`` / ``database``
 directly (project Forbidden rule + issue #505 C-2, CI import guard) — every verb
 reaches its data over the REST surface only.
@@ -20,6 +22,7 @@ reaches its data over the REST surface only.
 import json as _json
 import sys
 import time
+from pathlib import Path
 
 import click
 import requests
@@ -32,6 +35,7 @@ from cli_agent_orchestrator.constants import (
     WORKFLOW_EVENTS_READ_TIMEOUT,
     WORKFLOW_POLL_INTERVAL_SECONDS,
     WORKFLOW_RUN_REQUEST_TIMEOUT,
+    WORKFLOW_STEP_REQUEST_TIMEOUT,
 )
 from cli_agent_orchestrator.utils.workflow_events import SseFrame, parse_sse_frames
 
@@ -800,6 +804,122 @@ def resume_cmd(run_id, decide, as_json):
             click.echo(f"  - {step['id']}: {step['state']} (attempts={step.get('attempts')})")
 
     if result.get("state") != "completed":
+        raise click.exceptions.Exit(1)
+
+
+def _render_step_replay(result):
+    """Human-render a single-step replay: identity, the resolved prompt, the output.
+
+    The resolved prompt is printed because it is the thing being iterated on — a
+    replay whose output looks wrong is usually a prompt that resolved differently
+    than the author expected, and that is invisible without showing it.
+    """
+    click.echo(f"Run:      {result.get('run_id')}")
+    click.echo(
+        f"Step:     {result.get('step_id')} ({result.get('provider')}/{result.get('agent')})"
+    )
+    click.echo(f"Terminal: {result.get('terminal_id') or '(none)'}")
+    click.echo("Prompt:")
+    click.echo(result.get("prompt") or "")
+    error = result.get("error")
+    if error:
+        click.echo(f"Error:    {error} (kind: {result.get('error_kind') or 'unknown'})", err=True)
+        return
+    output = result.get("output")
+    if output is None:
+        click.echo("Output:   (no structured output)")
+    else:
+        click.echo(f"Output (validated={result.get('validated')}):")
+        click.echo(_json.dumps(output, indent=2))
+    message = result.get("last_message")
+    if message:
+        click.echo("Message:")
+        click.echo(message)
+
+
+@workflow.command(name="step")
+@click.argument("run_id")
+@click.argument("step_id")
+@click.option(
+    "--prompt-file",
+    "prompt_file",
+    default=None,
+    help="Read the replacement prompt from this file (excludes --prompt-override).",
+)
+@click.option(
+    "--prompt-override",
+    "prompt_override",
+    default=None,
+    help="Replacement prompt text (excludes --prompt-file).",
+)
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit the result as JSON.")
+def step_cmd(run_id, step_id, prompt_file, prompt_override, as_json):
+    """Re-execute ONE step of a recorded run, without re-running the workflow.
+
+    Resolves the step's prompt from the RECORDED run (journaled inputs + predecessor
+    outputs), runs it live, and prints the resolved prompt and the output. The source
+    run is left untouched, so a step can be re-probed as many times as it takes to
+    get its prompt right. YAML-tier runs only.
+
+    ``--prompt-file`` / ``--prompt-override`` replace the prompt TEMPLATE for this one
+    execution; ``{{workflow.inputs.*}}`` / ``{{steps.*.output.*}}`` references in the
+    replacement still resolve against the recorded run.
+
+    Exit codes:
+      0  the step ran
+      1  the step failed, or the request errored
+    """
+    if prompt_file is not None and prompt_override is not None:
+        raise click.ClickException("--prompt-file and --prompt-override are mutually exclusive")
+    if prompt_file is not None:
+        try:
+            prompt_override = Path(prompt_file).read_text(encoding="utf-8")
+        except OSError as e:
+            raise click.ClickException(f"could not read --prompt-file '{prompt_file}': {e}")
+    # Caught here as well as server-side so an empty file costs no round trip and the
+    # message can name the flag the operator actually typed.
+    if prompt_override is not None and not prompt_override.strip():
+        source = (
+            f"--prompt-file '{prompt_file}'" if prompt_file is not None else "--prompt-override"
+        )
+        raise click.ClickException(
+            f"{source} is empty; omit it to re-run the step's recorded prompt "
+            f"(a blank prompt would run the step with no instructions)"
+        )
+
+    payload = {}
+    if prompt_override is not None:
+        payload["prompt_override"] = prompt_override
+
+    try:
+        # A single step still runs an agent inline on the server, so this is a
+        # BLOCKING path — never the flat MCP_REQUEST_TIMEOUT (which would report a
+        # still-running step as a failure). But it runs at most ONE step, capped
+        # server-side at WORKFLOW_STEP_TIMEOUT, so it uses the single-step ceiling
+        # rather than the multi-step WORKFLOW_RUN_REQUEST_TIMEOUT: a genuinely hung
+        # server surfaces in minutes, not hours.
+        response = requests.post(
+            f"{API_BASE_URL}/workflows/runs/{run_id}/steps/{step_id}:replay",
+            json=payload,
+            timeout=WORKFLOW_STEP_REQUEST_TIMEOUT,
+        )
+    except requests.exceptions.RequestException as e:
+        raise click.ClickException(f"could not reach cao-server: {e}")
+
+    if response.status_code == 404:
+        raise click.ClickException(_extract_detail(response, f"unknown run '{run_id}'"))
+    if response.status_code != 200:
+        raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
+
+    result = response.json()
+    if as_json:
+        click.echo(_json.dumps(result, indent=2))
+    else:
+        _render_step_replay(result)
+
+    # A failed step is a 200 with ``error`` set (the server reports it as data), so
+    # the exit code comes from the body, not the status line.
+    if result.get("error"):
         raise click.exceptions.Exit(1)
 
 
