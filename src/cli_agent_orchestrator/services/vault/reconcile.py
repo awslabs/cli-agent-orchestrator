@@ -323,15 +323,20 @@ def _apply_plan(
 ) -> tuple[int, tuple[tuple[str, str, str, str], ...], tuple[_ProjectedNote, ...]]:
     """Apply only vault-scoped deletes; native rows remain structurally untouched."""
     rebuild_excluded_paths: set[str] = set()
+    rebuild_excluded_identities: set[tuple[str, str, str]] = set()
     if rebuild:
-        rebuild_excluded_paths = {
-            cast(str, row.vault_relpath)
-            for row in db.query(VaultNoteModel)
+        excluded_notes = (
+            db.query(VaultNoteModel)
             .filter(
                 VaultNoteModel.vault_id == vault.id,
                 VaultNoteModel.status == "excluded",
             )
             .all()
+        )
+        rebuild_excluded_paths = {cast(str, row.vault_relpath) for row in excluded_notes}
+        rebuild_excluded_identities = {
+            (cast(str, row.scope), cast(str, row.scope_id), cast(str, row.cao_key))
+            for row in excluded_notes
         }
         # Every rebuild delete is scoped to its derived producer. Release
         # one permits one configured vault, so metadata has no vault id.
@@ -354,29 +359,11 @@ def _apply_plan(
         prior_by_path,
         carried_alias_keys=carried_alias_keys,
     )
-    if rebuild_excluded_paths:
-        resolutions = tuple(
-            (
-                replace(
-                    resolution,
-                    item=replace(
-                        resolution.item,
-                        note=replace(resolution.item.note, status="excluded"),
-                    ),
-                    findings=resolution.findings
-                    + (
-                        _rename_finding(
-                            FindingCode.DEINDEXED_RETAINED,
-                            resolution.item.note.vault_relpath,
-                        ),
-                    ),
-                )
-                if resolution.item.note.vault_relpath in rebuild_excluded_paths
-                and resolution.item.note.status == "indexed"
-                else resolution
-            )
-            for resolution in resolutions
-        )
+    resolutions = _retain_rebuild_exclusions(
+        resolutions,
+        rebuild_excluded_paths,
+        rebuild_excluded_identities,
+    )
     projected = tuple(resolution.item for resolution in resolutions)
     findings = _merge_findings(
         findings,
@@ -521,6 +508,38 @@ def _alias_identity_set(db, vault_id: str) -> set[tuple[str, str, str]]:
         .filter(VaultNoteAliasModel.vault_id == vault_id)
         .all()
     }
+
+
+def _retain_rebuild_exclusions(
+    resolutions: tuple[_RenameResolution, ...],
+    excluded_paths: set[str],
+    excluded_identities: set[tuple[str, str, str]],
+) -> tuple[_RenameResolution, ...]:
+    """Carry tombstones across a rebuild by authored identity or derived path."""
+    retained: list[_RenameResolution] = []
+    for resolution in resolutions:
+        item = resolution.item
+        has_authored_key = item.note.parsed is not None and "key" in item.note.parsed.cao
+        excluded = (
+            (
+                cast(str, item.note.scope),
+                item.note.scope_id or "",
+                item.canonical_key,
+            )
+            in excluded_identities
+            if has_authored_key
+            else item.note.vault_relpath in excluded_paths
+        )
+        if excluded and item.note.status == "indexed":
+            item = replace(item, note=replace(item.note, status="excluded"))
+            resolution = replace(
+                resolution,
+                item=item,
+                findings=resolution.findings
+                + (_rename_finding(FindingCode.DEINDEXED_RETAINED, item.note.vault_relpath),),
+            )
+        retained.append(resolution)
+    return tuple(retained)
 
 
 def _resolve_renames(
@@ -702,6 +721,8 @@ def _record_rename_alias(db, vault_id: str, old: VaultNoteModel, created_at: dat
         VaultNoteAliasModel,
         {"vault_id": vault_id, "former_relpath": old.vault_relpath},
     )
+    if alias is not None and _alias_has_live_different_identity_owner(db, vault_id, alias, old):
+        return
     if alias is None:
         alias = VaultNoteAliasModel(
             vault_id=vault_id,
@@ -713,6 +734,30 @@ def _record_rename_alias(db, vault_id: str, old: VaultNoteModel, created_at: dat
     alias.scope_id = None if old.scope_id == "" else old.scope_id
     alias.content_sha256 = old.content_sha256
     alias.created_at = created_at
+
+
+def _alias_has_live_different_identity_owner(
+    db, vault_id: str, alias: VaultNoteAliasModel, old: VaultNoteModel
+) -> bool:
+    """Do not replace a former-path alias still required by another live note."""
+    alias_scope_id = cast(Optional[str], alias.scope_id) or ""
+    same_identity = (
+        alias.cao_key == old.cao_key and alias.scope == old.scope and alias_scope_id == old.scope_id
+    )
+    if same_identity:
+        return False
+    return (
+        db.query(VaultNoteModel)
+        .filter(
+            VaultNoteModel.vault_id == vault_id,
+            VaultNoteModel.scope == alias.scope,
+            VaultNoteModel.scope_id == alias_scope_id,
+            VaultNoteModel.cao_key == alias.cao_key,
+            VaultNoteModel.vault_relpath != old.vault_relpath,
+        )
+        .first()
+        is not None
+    )
 
 
 def _refresh_alias_provenance(

@@ -625,6 +625,69 @@ def test_pure_rename_of_deindexed_note_keeps_it_excluded(tmp_path, monkeypatch):
     assert "deindexed_retained" in finding.detail
 
 
+def test_rebuild_keeps_authored_key_tombstone_after_rename(tmp_path, monkeypatch):
+    """A rebuild carries an exclusion by authored identity, not its former path."""
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    old_path = tmp_path / "vault" / "Mapped" / "Old.md"
+    old_path.write_text("---\ncao:\n  key: canonical\n---\nsafe", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="authored-rebuild-before")
+    with Session() as db:
+        db.query(VaultNoteModel).filter_by(cao_key="canonical").update({"status": "excluded"})
+        db.query(MemoryMetadataModel).filter_by(source_kind="vault", key="canonical").delete()
+        db.commit()
+
+    old_path.rename(old_path.with_name("New.md"))
+    reconcile(vault, apply=True, rebuild=True, run_id="authored-rebuild-after")
+
+    with Session() as db:
+        note = db.query(VaultNoteModel).filter_by(cao_key="canonical").one()
+        metadata = (
+            db.query(MemoryMetadataModel).filter_by(source_kind="vault", key="canonical").count()
+        )
+    assert (note.vault_relpath, note.status, metadata) == ("Mapped/New.md", "excluded", 0)
+
+
+def test_reused_former_path_alias_cannot_replace_live_renamed_identity(tmp_path, monkeypatch):
+    """C.md -> A.md -> D.md cannot replace B.md's retained A.md alias."""
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    mapped = tmp_path / "vault" / "Mapped"
+    original = mapped / "A.md"
+    original.write_text("B content", encoding="utf-8")
+    other = mapped / "C.md"
+    other.write_text("C content", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="alias-owner-before")
+    with Session() as db:
+        retained = db.query(VaultNoteModel).filter_by(vault_relpath="Mapped/A.md").one()
+        retained_uid, retained_key = retained.note_uid, retained.cao_key
+
+    original.rename(mapped / "B.md")
+    reconcile(vault, apply=True, run_id="alias-owner-b")
+    other.rename(mapped / "A.md")
+    reconcile(vault, apply=True, run_id="alias-owner-reused")
+    (mapped / "A.md").rename(mapped / "D.md")
+    reconcile(vault, apply=True, run_id="alias-owner-d")
+    reconcile(vault, apply=True, run_id="alias-owner-unchanged")
+
+    with Session() as db:
+        retained = db.get(VaultNoteModel, retained_uid)
+        alias = db.get(
+            VaultNoteAliasModel,
+            {"vault_id": vault.id, "former_relpath": "Mapped/A.md"},
+        )
+        metadata = (
+            db.query(MemoryMetadataModel).filter_by(source_kind="vault", key=retained_key).one()
+        )
+    assert (retained.cao_key, retained.vault_relpath) == (retained_key, "Mapped/B.md")
+    assert alias.cao_key == retained_key
+    assert (metadata.key, metadata.file_path) == (retained_key, "Mapped/B.md")
+
+
 def test_authored_key_rename_preserves_exclusion_through_quarantine(tmp_path, monkeypatch):
     """An explicitly forgotten authored identity cannot republish after a move."""
     from cli_agent_orchestrator.services.vault import reconcile as module
