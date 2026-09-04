@@ -1950,6 +1950,50 @@ def redeliver_dropped_message(
     return False
 
 
+async def _wait_for_post_dispatch_start(
+    terminal_id: str,
+    dispatch_generation: Optional[int],
+    timeout: float,
+    polling_interval: float = 0.5,
+) -> bool:
+    """Wait for a started status that is EVIDENCE OF THIS TURN, not a cached one.
+
+    Round-6 review (haofeif), P1. ``wait_until_status`` returns on the first poll
+    whose value is in the target set, and a status VALUE cannot say when it was
+    earned. Provider startup output can legitimately parse as COMPLETED, which
+    then latches (``_STICKY_READY_STATUSES``), and ``send_input`` only ARMS the
+    next transition without touching the cached value. So a pre-dispatch
+    COMPLETED satisfied confirmation instantly -- measured at 0.008s against an
+    exact head -- releasing the pending-delivery mask before the new task had
+    emitted anything. Two earlier release points failed for the same underlying
+    reason: they keyed on a status value rather than on its recency.
+
+    ``dispatch_generation`` is ``status_monitor.output_generation()`` sampled just
+    after the send. Requiring the current generation to EXCEED it means real
+    output has landed since dispatch, because that counter advances only in
+    ``notify_input_sent`` (already included in the sample) and ``_process_chunk``
+    (real output arrived). That is the causal evidence the mask needs.
+
+    ``dispatch_generation=None`` disables the recency requirement, which is
+    necessary for event-inbox backends (herdr): they start no FIFO reader, so the
+    generation never advances from output and gating on it could never succeed --
+    the worker would burn every resubmit and then be torn down. They need no gate
+    anyway, because ``get_status`` derives their status on demand at call time, so
+    there is no cached value to go stale.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        status = status_monitor.get_status(terminal_id)
+        if status in _DEFERRED_STARTED_STATUSES and (
+            dispatch_generation is None
+            or status_monitor.output_generation(terminal_id) > dispatch_generation
+        ):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(polling_interval)
+
+
 async def _confirm_worker_started_or_resubmit(
     terminal_id: str,
     message: str,
@@ -1957,18 +2001,19 @@ async def _confirm_worker_started_or_resubmit(
     sender_id: Optional[str],
     orchestration_type: Optional[OrchestrationType],
     provider=None,
+    dispatch_generation: Optional[int] = None,
 ) -> bool:
     """Confirm a deferred-init worker began processing; re-submit if not.
 
-    Returns True once the terminal reaches a started status, False if it is
-    still stuck at IDLE after all resubmit attempts. Blocking tmux/DB I/O runs
-    off the loop via to_thread so concurrent deferred inits aren't frozen.
+    Returns True once the terminal reaches a started status EARNED AFTER dispatch
+    (see ``_wait_for_post_dispatch_start``), False if it never does after all
+    resubmit attempts. Blocking tmux/DB I/O runs off the loop via to_thread so
+    concurrent deferred inits aren't frozen.
     """
-    if await wait_until_status(
+    if await _wait_for_post_dispatch_start(
         terminal_id,
-        _DEFERRED_STARTED_STATUSES,
+        dispatch_generation,
         timeout=_DEFERRED_SUBMIT_CONFIRM_TIMEOUT,
-        polling_interval=0.5,
     ):
         return True
 
@@ -1988,11 +2033,12 @@ async def _confirm_worker_started_or_resubmit(
         )
         if already_started:
             return True
-        if await wait_until_status(
+        # Same recency requirement as the first wait: a resubmit that lands on a
+        # still-cached pre-dispatch COMPLETED must not read as success either.
+        if await _wait_for_post_dispatch_start(
             terminal_id,
-            _DEFERRED_STARTED_STATUSES,
+            dispatch_generation,
             timeout=_DEFERRED_SUBMIT_CONFIRM_TIMEOUT,
-            polling_interval=0.5,
         ):
             return True
 
@@ -2098,6 +2144,22 @@ def _schedule_deferred_init(
                 # when the TUI isn't input-ready. Confirm the worker actually
                 # started and re-submit if not; if it never starts, surface the
                 # failure so the supervisor re-routes instead of waiting forever.
+                # Sample the turn/output generation NOW, after send_input has run
+                # notify_input_sent (which bumps it once). Confirmation then
+                # requires the generation to exceed this, i.e. real output arrived
+                # after the send -- so a COMPLETED cached during provider startup
+                # can no longer read as this task starting.
+                #
+                # None for event-inbox backends (herdr): they run no FIFO reader,
+                # so the generation never advances from output and the requirement
+                # could never be met -- every resubmit would burn and the worker
+                # would be torn down. Their status is derived on demand instead, so
+                # there is no stale cached value for the gate to protect against.
+                dispatch_generation = (
+                    None
+                    if get_backend().supports_event_inbox()
+                    else status_monitor.output_generation(terminal_id)
+                )
                 started = await _confirm_worker_started_or_resubmit(
                     terminal_id,
                     initial_message,
@@ -2108,6 +2170,7 @@ def _schedule_deferred_init(
                     # must not silently drop back to the unguarded original type.
                     effective_orchestration_type,
                     provider=provider_instance,
+                    dispatch_generation=dispatch_generation,
                 )
                 if not started:
                     logger.error(

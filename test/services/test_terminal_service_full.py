@@ -3570,6 +3570,91 @@ class TestDeferredDeliveryNotCompletableBeforeDispatch:
         )
 
 
+class TestConfirmationRequiresPostDispatchEvidence:
+    """Round-6 review (haofeif), P1: a cached pre-dispatch COMPLETED is not evidence.
+
+    Provider startup output can legitimately parse as COMPLETED, which then latches
+    (``_STICKY_READY_STATUSES``), and ``send_input`` only ARMS the next transition
+    without touching the cached value. Confirmation therefore used to succeed
+    instantly on a status earned BEFORE the send -- measured at 0.008s on an exact
+    head -- releasing the pending-delivery mask before the task emitted anything.
+
+    Every prior test in this area seeded IDLE and produced COMPLETED afterwards, so
+    none of them could see this. These seed the completion FIRST.
+    """
+
+    @pytest.mark.asyncio
+    async def test_pre_dispatch_completed_does_not_confirm_the_send(self):
+        """The reviewer's case: COMPLETED cached before dispatch, no new output."""
+        from cli_agent_orchestrator.services.terminal_service import (
+            _wait_for_post_dispatch_start,
+        )
+
+        fake_monitor = MagicMock()
+        # Status is COMPLETED throughout, and the generation NEVER advances --
+        # exactly the shape of a completion left over from provider startup.
+        fake_monitor.get_status.return_value = TerminalStatus.COMPLETED
+        fake_monitor.output_generation.return_value = 7
+
+        with patch("cli_agent_orchestrator.services.terminal_service.status_monitor", fake_monitor):
+            confirmed = await _wait_for_post_dispatch_start(
+                "abcd1234", dispatch_generation=7, timeout=0.25, polling_interval=0.05
+            )
+
+        assert confirmed is False, (
+            "confirmation accepted a COMPLETED cached before dispatch: the generation "
+            "never advanced, so no output arrived for this task, yet the send read as "
+            "started and the delivery mask would clear on the previous turn's result"
+        )
+
+    @pytest.mark.asyncio
+    async def test_post_dispatch_output_does_confirm(self):
+        """The discriminating half: same status, but the generation advanced."""
+        from cli_agent_orchestrator.services.terminal_service import (
+            _wait_for_post_dispatch_start,
+        )
+
+        fake_monitor = MagicMock()
+        fake_monitor.get_status.return_value = TerminalStatus.COMPLETED
+        fake_monitor.output_generation.return_value = 8  # real output landed
+
+        with patch("cli_agent_orchestrator.services.terminal_service.status_monitor", fake_monitor):
+            confirmed = await _wait_for_post_dispatch_start(
+                "abcd1234", dispatch_generation=7, timeout=0.25, polling_interval=0.05
+            )
+
+        assert confirmed is True, (
+            "a COMPLETED with an advanced generation IS this turn's completion and "
+            "must confirm -- otherwise a genuine fast turn burns every resubmit and "
+            "the worker is torn down"
+        )
+
+    @pytest.mark.asyncio
+    async def test_event_inbox_backends_are_not_gated_on_generation(self):
+        """herdr runs no FIFO reader, so the generation never advances from output.
+
+        Gating it would make confirmation unsatisfiable and tear down working
+        workers. ``dispatch_generation=None`` opts out, and their status is derived
+        on demand so there is no stale cached value to defend against.
+        """
+        from cli_agent_orchestrator.services.terminal_service import (
+            _wait_for_post_dispatch_start,
+        )
+
+        fake_monitor = MagicMock()
+        fake_monitor.get_status.return_value = TerminalStatus.COMPLETED
+        fake_monitor.output_generation.return_value = 0  # never advances for herdr
+
+        with patch("cli_agent_orchestrator.services.terminal_service.status_monitor", fake_monitor):
+            confirmed = await _wait_for_post_dispatch_start(
+                "abcd1234", dispatch_generation=None, timeout=0.25, polling_interval=0.05
+            )
+
+        assert (
+            confirmed is True
+        ), "an event-inbox backend was gated on a generation it can never advance"
+
+
 class TestPendingMarkNeverLeaks:
     """Only ``_run``'s finally releases the mark, so a ``create_task`` that raises
     would leave it set with nothing left to clear it.

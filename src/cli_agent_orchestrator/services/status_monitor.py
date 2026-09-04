@@ -558,6 +558,34 @@ class StatusMonitor:
             except RuntimeError:
                 pass  # loop already closed during shutdown — the timer is moot
 
+    def output_generation(self, terminal_id: str) -> int:
+        """Return the terminal's current turn/output generation.
+
+        Exposes the counter #712 already maintains (``_capture_generation``) so a
+        caller can ask "has anything happened since this point?" rather than only
+        "what is the status now?". It advances in exactly two places:
+        ``notify_input_sent`` (a new turn began) and ``_process_chunk`` (real
+        output arrived). So a generation strictly greater than one sampled just
+        after dispatch means the terminal has produced output since that dispatch.
+
+        This exists because a status VALUE cannot carry that information.
+        ``notify_input_sent`` deliberately leaves ``_last_status`` alone while
+        arming the revert, so a ready status cached BEFORE a send is
+        indistinguishable from one earned after it — the defect PR #566 hit when
+        a pre-dispatch COMPLETED satisfied delivery confirmation instantly.
+
+        Read-only and lock-guarded. Returns 0 for an unknown terminal, which is
+        below any real generation and so never reads as "something happened".
+
+        NOT meaningful for event-inbox backends (herdr): they start no FIFO
+        reader, so ``_process_chunk`` never runs and this never advances from
+        output. ``get_status`` derives their status on demand instead, which is
+        why they have no staleness problem to solve and callers must not gate on
+        this for them.
+        """
+        with self._lock:
+            return self._capture_generation.get(terminal_id, 0)
+
     def notify_input_sent(self, terminal_id: str, *, assume_processing: bool = False) -> None:
         """Arm the next PROCESSING transition.
 
