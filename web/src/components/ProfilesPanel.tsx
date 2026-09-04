@@ -277,13 +277,19 @@ export function ProfilesPanel() {
     // refresh is pending).
     const nav = navGen.begin()
     clearSearch()
+    // Advance the detail revision UNCONDITIONALLY, before the refresh and
+    // outside the navigation guard: the server document changed no matter
+    // who owns navigation now (round-6 P2 -- a search keystroke during the
+    // pending refresh used to suppress this, leaving a still-selected or
+    // re-selected row's pane on pre-edit provider/model/tags forever). The
+    // detail fetch is keyed on the profile NAME, which an in-place edit does
+    // not change, so the revision bump is what forces the remount.
+    setDetailReload(n => n + 1)
     if (!(await refreshCatalog())) return
+    // Only the FORCED selection yields to navigation performed while the
+    // refresh was pending (round-5 P2) -- later navigation wins.
     if (!nav.isCurrent()) return
     setSelected(name)
-    // The detail fetch is keyed on the profile NAME, which an in-place edit
-    // does not change -- without an explicit reload token the pane kept
-    // showing pre-edit provider/model/tags after a successful save.
-    setDetailReload(n => n + 1)
   }
 
   const handleDelete = async () => {

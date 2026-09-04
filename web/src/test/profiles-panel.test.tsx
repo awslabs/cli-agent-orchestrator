@@ -502,3 +502,63 @@ describe('round-5 review: settled-state and navigation ownership (#692)', () => 
     }
   })
 })
+
+describe('round-6 review: post-edit detail reload vs navigation ownership (#692)', () => {
+  it('newer navigation does not suppress the post-edit detail reload', async () => {
+    // The round-5 navigation guard protected the forced selection but sat
+    // ABOVE setDetailReload, so a search keystroke while the post-save
+    // refresh was pending invalidated the guard and skipped the reload --
+    // stranding a still-selected edited profile's pane on pre-edit
+    // provider/model/tags indefinitely (haofeif's round-6 P2). The detail
+    // revision now advances unconditionally: the server document changed no
+    // matter who owns navigation.
+    let releaseRefresh!: () => void
+    let edited = false
+    const SOURCE = '---\nname: developer\ndescription: Writes code\n---\n\nBody.\n'
+    let catalogCall = 0
+    vi.stubGlobal('fetch', vi.fn(async (url: string, opts?: any) => {
+      const u = String(url)
+      if (u.includes('/agents/profiles/validate')) return okJson({ valid: true, messages: [] })
+      if (u.includes('/agents/profiles/search')) return new Promise(() => {}) // user's search stays in flight
+      if (u.includes('/source')) return okJson({ name: 'developer', content: SOURCE })
+      if (u.endsWith('/agents/profiles/developer') && opts?.method === 'PUT') { edited = true; return okJson({ name: 'developer', warnings: [] }) }
+      if (/\/agents\/profiles\/[^/?]+$/.test(u)) return okJson({
+        name: 'developer', description: 'Writes code', provider: 'kiro_cli',
+        model: edited ? 'post-edit-model' : 'pre-edit-model', tags: [], capabilities: [],
+      })
+      if (u.includes('/agents/profiles')) {
+        catalogCall++
+        if (catalogCall > 1) return new Promise<any>(res => { releaseRefresh = () => res(okJson(CATALOG)) })
+        return okJson(CATALOG)
+      }
+      return okJson([])
+    }))
+    vi.useFakeTimers()
+    try {
+      render(<ProfilesPanel />)
+      await act(async () => {})
+      fireEvent.click(screen.getByRole('option', { name: /developer/ }))
+      await act(async () => {})
+      expect(within(screen.getByTestId('profile-detail')).getByText('pre-edit-model')).toBeInTheDocument()
+
+      // In-place edit through the real editor modal
+      fireEvent.click(within(screen.getByTestId('profile-detail')).getByRole('button', { name: /edit/i }))
+      await act(async () => {})
+      const editor = screen.getByRole('textbox', { name: /profile source/i })
+      fireEvent.change(editor, { target: { value: SOURCE.replace('Body.', 'New body.') } })
+      fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
+      await act(async () => {}) // PUT settles; post-save refresh now in flight, gated
+
+      // User navigates while the refresh is pending: this must NOT suppress
+      // the detail reload for the edited (still-selected) profile
+      fireEvent.change(screen.getByRole('searchbox', { name: /search profiles/i }), { target: { value: 'developer' } })
+      await act(async () => {})
+
+      await act(async () => { releaseRefresh() })
+      await act(async () => {})
+      expect(within(screen.getByTestId('profile-detail')).getByText('post-edit-model')).toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
