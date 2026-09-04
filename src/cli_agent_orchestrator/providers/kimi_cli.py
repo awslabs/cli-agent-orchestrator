@@ -153,6 +153,21 @@ NEW_TUI_STATUS_PATTERN = r"context:\s*\d+(?:\.\d+)?%|agent\s*\([^)]*●"
 # glyph means a turn-in-flight FRAME was rendered; freshness relative to the
 # last response bullet decides whether the turn is still going (see
 # get_status).
+# The newest "Kimi Code" TUI keeps a persistent EMPTY input box at the very
+# bottom of the screen (``╭─`` / ``│ > │`` / ``╰─``) plus footer chrome: a
+# mode/model/cwd line ("yolo  kimi-k2.5 thinking  …/path"), a key hint
+# ("shift+enter: newline") and the context meter. None of that is response
+# content; extraction must never anchor on the empty box nor return the footer.
+NEW_TUI_FOOTER_PATTERN = r"^\s*yolo\s{2,}|shift\+enter:\s*newline"
+
+# Newest-TUI thinking: rendered as a gray (truecolor 136;136;136) italic bullet
+# line, collapsed by default to one line plus a dim "... (N more lines,
+# ctrl+o to expand)" hint. The legacy detector keys on the 256-color gray
+# (38;5;244) and never matches these. Both belong to reasoning, not response.
+NEW_TUI_THINKING_RAW_PATTERN = r"\x1b\[38;2;136;136;136m(?:\x1b\[[0-9;]*m)*\s*[•●]"
+NEW_TUI_THINKING_COLLAPSE_PATTERN = r"^\s*\.\.\.\s*\(\d+ more lines?, ctrl\+o to expand\)"
+EMPTY_INPUT_BOX_LINE_PATTERN = r"^\s*│\s*>?\s*│?\s*$"
+
 NEW_TUI_SPINNER_PATTERN = r"[⠁-⣿]|[🌑🌒🌓🌔🌕🌖🌗🌘]"
 # Boot/MCP chrome also renders braille glyphs while the terminal is genuinely
 # idle at the welcome screen ("⠧ MCP Servers: 0/1 connected", "⠦ cao-mcp-server
@@ -944,6 +959,13 @@ class KimiCliProvider(BaseProvider):
                 welcome_idx = i
         for i in range(welcome_idx + 1, len(clean_lines)):
             if re.search(USER_INPUT_BOX_END_PATTERN, clean_lines[i]):
+                # The newest TUI keeps an EMPTY input box (``│ > │``) at the
+                # bottom of the screen at all times. Its ╰─ is always the last
+                # marker on screen; anchoring on it would slice the footer
+                # chrome instead of the response. Only boxes with actual
+                # message content are user-input anchors.
+                if self._is_empty_input_box(clean_lines, i):
+                    continue
                 box_end_idx = i
 
         # Strategy 2: Find the last prompt-with-input line — v1.20.0+
@@ -959,15 +981,31 @@ class KimiCliProvider(BaseProvider):
         # the real message and box-first priority would slice the response
         # from the boot screen. The response always follows the LAST user
         # input, whichever marker style rendered it.
+        anchored_on_prompt = False
         if box_end_idx is not None and prompt_input_idx is not None:
             response_start = max(box_end_idx, prompt_input_idx) + 1
+            anchored_on_prompt = prompt_input_idx >= box_end_idx
         elif box_end_idx is not None:
             response_start = box_end_idx + 1
         elif prompt_input_idx is not None:
             response_start = prompt_input_idx + 1
+            anchored_on_prompt = True
         else:
             # Neither marker found — long response scrolled everything out
             return self._extract_without_input_box(raw_lines, clean_lines)
+
+        # ✨-anchored (newest TUI): long user messages WRAP, and the wrapped
+        # continuation lines sit between the anchor and the first response
+        # bullet with no distinguishing style. Every assistant block starts
+        # with a bullet, so advance to the first bullet line — dropping the
+        # echoed tail of the user message. Box-anchored (legacy) extraction is
+        # left untouched; if no bullet exists in the window, keep the start
+        # (fallback safety).
+        if anchored_on_prompt:
+            for i in range(response_start, len(clean_lines)):
+                if re.match(r"^\s*[•●]", clean_lines[i]):
+                    response_start = i
+                    break
 
         # Find where the response ends: the next bare idle prompt
         # (legacy/v1.20 TUIs), or the newest-TUI footer chrome — the
@@ -984,6 +1022,12 @@ class KimiCliProvider(BaseProvider):
                 re.search(idle_prompt_eol, line)
                 or re.match(new_tui_input_rule, line)
                 or re.search(NEW_TUI_STATUS_PATTERN, line)
+                # A box START after the response begins is always a boundary:
+                # the next user message box (legacy TUI) or the trailing empty
+                # input box (newest TUI).
+                or re.search(USER_INPUT_BOX_START_PATTERN, line)
+                # Newest-TUI footer chrome (mode/model line, key hints).
+                or re.search(NEW_TUI_FOOTER_PATTERN, line)
             ):
                 prompt_idx = i
                 break
@@ -1015,8 +1059,23 @@ class KimiCliProvider(BaseProvider):
             if re.search(THINKING_BULLET_RAW_PATTERN, raw_line):
                 continue
 
+            # Skip newest-TUI thinking (gray truecolor italic bullet) and its
+            # collapsed-lines hint
+            if re.search(NEW_TUI_THINKING_RAW_PATTERN, raw_line) or re.match(
+                NEW_TUI_THINKING_COLLAPSE_PATTERN, clean_line
+            ):
+                continue
+
             # Skip status bar lines
             if re.search(STATUS_BAR_PATTERN, clean_line):
+                continue
+
+            # Skip newest-TUI chrome (footer, context meter, empty input box)
+            if (
+                re.search(NEW_TUI_FOOTER_PATTERN, clean_line)
+                or re.search(NEW_TUI_STATUS_PATTERN, clean_line)
+                or re.match(EMPTY_INPUT_BOX_LINE_PATTERN, clean_line)
+            ):
                 continue
 
             filtered_lines.append(clean_line.strip())
@@ -1028,6 +1087,29 @@ class KimiCliProvider(BaseProvider):
             return "\n".join(all_response_lines).strip()
 
         return "\n".join(filtered_lines).strip()
+
+    @staticmethod
+    def _is_empty_input_box(clean_lines: list, end_idx: int, max_height: int = 8) -> bool:
+        """Return True if the box closing at ``end_idx`` is an EMPTY input box.
+
+        The newest "Kimi Code" TUI renders a persistent input box at the bottom
+        of the screen whose interior is blank (``│ > │`` / ``│ │``). Walk up
+        from the closing ``╰─`` to the matching ``╭─``: if every interior line
+        is empty-input chrome, the box carries no user message and must not be
+        used as an extraction anchor. If no opening line is found within
+        ``max_height`` lines, err on the side of keeping the anchor (returns
+        False) — content boxes can be tall.
+        """
+        for j in range(end_idx - 1, max(-1, end_idx - 1 - max_height), -1):
+            line = clean_lines[j]
+            if re.search(USER_INPUT_BOX_START_PATTERN, line):
+                return True  # reached ╭─ with only empty interior in between
+            if not line.strip():
+                continue
+            if re.match(EMPTY_INPUT_BOX_LINE_PATTERN, line):
+                continue
+            return False  # real content inside the box
+        return False
 
     def _extract_without_input_box(self, raw_lines: list, clean_lines: list) -> str:
         """Fallback extraction when user input box has scrolled out of capture.
@@ -1067,12 +1149,28 @@ class KimiCliProvider(BaseProvider):
             if re.search(THINKING_BULLET_RAW_PATTERN, raw_line):
                 continue
 
+            # Skip newest-TUI thinking and its collapsed-lines hint
+            if re.search(NEW_TUI_THINKING_RAW_PATTERN, raw_line) or re.match(
+                NEW_TUI_THINKING_COLLAPSE_PATTERN, clean_line
+            ):
+                continue
+
             # Skip status bar
             if re.search(STATUS_BAR_PATTERN, clean_line):
                 continue
 
             # Skip welcome banner lines
             if re.search(WELCOME_BANNER_PATTERN, clean_line):
+                continue
+
+            # Skip newest-TUI chrome: footer, context meter, and the trailing
+            # empty input box (its borders and empty ``│ > │`` interior).
+            if (
+                re.search(NEW_TUI_FOOTER_PATTERN, clean_line)
+                or re.search(NEW_TUI_STATUS_PATTERN, clean_line)
+                or re.match(EMPTY_INPUT_BOX_LINE_PATTERN, clean_line)
+                or re.match(r"^\s*[╭╰]─", clean_line)
+            ):
                 continue
 
             filtered_lines.append(clean_line.strip())
