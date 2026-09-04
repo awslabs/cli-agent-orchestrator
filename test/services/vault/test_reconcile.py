@@ -650,6 +650,88 @@ def test_rebuild_keeps_authored_key_tombstone_after_rename(tmp_path, monkeypatch
     assert (note.vault_relpath, note.status, metadata) == ("Mapped/New.md", "excluded", 0)
 
 
+def test_rebuild_keeps_authored_tombstone_through_quarantine_and_restoration(tmp_path, monkeypatch):
+    """A rebuild cannot replace an authored exclusion with a transient quarantine."""
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    old_path = tmp_path / "vault" / "Mapped" / "Old.md"
+    new_path = old_path.with_name("New.md")
+    old_path.write_text("---\ncao:\n  key: canonical\n---\nsafe", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="authored-rebuild-quarantine-before")
+    with Session() as db:
+        db.query(VaultNoteModel).filter_by(cao_key="canonical").update({"status": "excluded"})
+        db.query(MemoryMetadataModel).filter_by(source_kind="vault", key="canonical").delete()
+        db.commit()
+
+    old_path.rename(new_path)
+    new_path.write_text(
+        "---\ncao:\n  key: canonical\n---\npassword: hunter2sixteen",
+        encoding="utf-8",
+    )
+    reconcile(vault, apply=True, rebuild=True, run_id="authored-rebuild-quarantine-middle")
+    with Session() as db:
+        middle = db.query(VaultNoteModel).filter_by(cao_key="canonical").one()
+        middle_metadata = (
+            db.query(MemoryMetadataModel).filter_by(source_kind="vault", key="canonical").count()
+        )
+    assert (middle.vault_relpath, middle.status, middle_metadata) == (
+        "Mapped/New.md",
+        "excluded",
+        0,
+    )
+
+    new_path.write_text("---\ncao:\n  key: canonical\n---\nsafe", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="authored-rebuild-quarantine-after")
+
+    with Session() as db:
+        restored = db.query(VaultNoteModel).filter_by(cao_key="canonical").one()
+        metadata = (
+            db.query(MemoryMetadataModel).filter_by(source_kind="vault", key="canonical").count()
+        )
+    assert (restored.vault_relpath, restored.status, metadata) == (
+        "Mapped/New.md",
+        "excluded",
+        0,
+    )
+
+
+def test_rebuild_does_not_apply_authored_tombstone_to_former_path_replacement(
+    tmp_path, monkeypatch
+):
+    """An authored tombstone follows its identity, not a different note at its old path."""
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    old_path = tmp_path / "vault" / "Mapped" / "Old.md"
+    new_path = old_path.with_name("New.md")
+    old_path.write_text("---\ncao:\n  key: canonical\n---\nsafe", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="authored-rebuild-replacement-before")
+    with Session() as db:
+        db.query(VaultNoteModel).filter_by(cao_key="canonical").update({"status": "excluded"})
+        db.query(MemoryMetadataModel).filter_by(source_kind="vault", key="canonical").delete()
+        db.commit()
+
+    old_path.rename(new_path)
+    old_path.write_text("different replacement", encoding="utf-8")
+    reconcile(vault, apply=True, rebuild=True, run_id="authored-rebuild-replacement-after")
+
+    with Session() as db:
+        notes = db.query(VaultNoteModel).order_by(VaultNoteModel.vault_relpath).all()
+        metadata_keys = {
+            row.key for row in db.query(MemoryMetadataModel).filter_by(source_kind="vault").all()
+        }
+    authored_note, replacement_note = notes
+    assert [(note.vault_relpath, note.cao_key, note.status) for note in notes] == [
+        ("Mapped/New.md", "canonical", "excluded"),
+        ("Mapped/Old.md", replacement_note.cao_key, "indexed"),
+    ]
+    assert authored_note.cao_key != replacement_note.cao_key
+    assert metadata_keys == {replacement_note.cao_key}
+
+
 def test_reused_former_path_alias_cannot_replace_live_renamed_identity(tmp_path, monkeypatch):
     """C.md -> A.md -> D.md cannot replace B.md's retained A.md alias."""
     from cli_agent_orchestrator.services.vault import reconcile as module

@@ -333,11 +333,10 @@ def _apply_plan(
             )
             .all()
         )
-        rebuild_excluded_paths = {cast(str, row.vault_relpath) for row in excluded_notes}
-        rebuild_excluded_identities = {
-            (cast(str, row.scope), cast(str, row.scope_id), cast(str, row.cao_key))
-            for row in excluded_notes
-        }
+        rebuild_excluded_paths, rebuild_excluded_identities = _snapshot_rebuild_exclusions(
+            excluded_notes,
+            projected,
+        )
         # Every rebuild delete is scoped to its derived producer. Release
         # one permits one configured vault, so metadata has no vault id.
         db.query(VaultNoteModel).filter(VaultNoteModel.vault_id == vault.id).delete()
@@ -519,18 +518,12 @@ def _retain_rebuild_exclusions(
     retained: list[_RenameResolution] = []
     for resolution in resolutions:
         item = resolution.item
-        has_authored_key = item.note.parsed is not None and "key" in item.note.parsed.cao
         excluded = (
-            (
-                cast(str, item.note.scope),
-                item.note.scope_id or "",
-                item.canonical_key,
-            )
-            in excluded_identities
-            if has_authored_key
-            else item.note.vault_relpath in excluded_paths
-        )
-        if excluded and item.note.status == "indexed":
+            cast(str, item.note.scope),
+            item.note.scope_id or "",
+            item.canonical_key,
+        ) in excluded_identities or item.note.vault_relpath in excluded_paths
+        if excluded and item.note.status != "excluded":
             item = replace(item, note=replace(item.note, status="excluded"))
             resolution = replace(
                 resolution,
@@ -540,6 +533,41 @@ def _retain_rebuild_exclusions(
             )
         retained.append(resolution)
     return tuple(retained)
+
+
+def _snapshot_rebuild_exclusions(
+    excluded_notes: Iterable[VaultNoteModel],
+    projected: tuple[_ProjectedNote, ...],
+) -> tuple[set[str], set[tuple[str, str, str]]]:
+    """Snapshot authored tombstones by identity and path-derived ones by path.
+
+    The current scan is the only source that can distinguish an authored key
+    from a path-derived key without adding mutable provenance to ``vault_note``.
+    Matching an authored identity before deleting prior rows prevents its old
+    path from suppressing a different replacement note.
+    """
+    authored_identities = {
+        (
+            item.note.scope,
+            item.note.scope_id or "",
+            item.canonical_key,
+        )
+        for item in projected
+        if item.note.parsed is not None and "key" in item.note.parsed.cao
+    }
+    excluded_paths: set[str] = set()
+    excluded_identities: set[tuple[str, str, str]] = set()
+    for row in excluded_notes:
+        identity = (
+            cast(str, row.scope),
+            cast(str, row.scope_id),
+            cast(str, row.cao_key),
+        )
+        if identity in authored_identities:
+            excluded_identities.add(identity)
+        else:
+            excluded_paths.add(cast(str, row.vault_relpath))
+    return excluded_paths, excluded_identities
 
 
 def _resolve_renames(
