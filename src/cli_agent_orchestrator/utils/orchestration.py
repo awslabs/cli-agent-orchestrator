@@ -26,6 +26,7 @@ import logging
 import os
 import re
 import time
+import uuid
 from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple
 
 import requests
@@ -862,6 +863,12 @@ def _extract_error_detail(response: requests.Response, fallback: str) -> str:
     return fallback
 
 
+# Server-side ready-wait (up to 120s) plus slack, added to the caller's step
+# timeout to get the HTTP read budget. Named because the pending-timeout message
+# has to quote the SAME number the budget uses -- two literals would drift.
+_CLIENT_TIMEOUT_HEADROOM = 180
+
+
 async def _run_step_and_build_result(
     payload: Dict[str, Any],
     agent_profile: str,
@@ -896,6 +903,12 @@ async def _run_step_and_build_result(
     is the name quoted back to the operator in the remote-cleanup hints below.
     """
     known_terminal_id: Optional[str] = payload.get("reuse_terminal_id")
+    # Read off the payload for the same reason ``reuse_terminal_id`` is: the
+    # caller owns it, and this helper only needs it to describe what it just
+    # POSTed. Present only on the default single-call path (issue #447) --
+    # absent on the early-terminal-id path, which already reported a real
+    # terminal_id to the caller and so needs no separate discovery key.
+    job_id: Optional[str] = payload.get("job_id")
     # Allow the full step time plus the server-side ready-wait (up to 120s)
     # plus headroom; the server enforces the per-step timeout internally.
     #
@@ -903,7 +916,7 @@ async def _run_step_and_build_result(
     # node would consume the FULL read budget (~timeout+180s) just failing
     # to connect. Local calls keep the plain timeout (localhost connect
     # cannot black-hole meaningfully) so their behavior is unchanged.
-    client_timeout = float(timeout) + 180.0
+    client_timeout = float(timeout) + _CLIENT_TIMEOUT_HEADROOM
     request_timeout: Any = (
         (REMOTE_CONNECT_TIMEOUT, client_timeout) if target_host else client_timeout
     )
@@ -916,6 +929,18 @@ async def _run_step_and_build_result(
         )
     except requests.Timeout:
         timeout_msg = f"Handoff timed out after {timeout} seconds"
+        if job_id:
+            # The transport died, but the step may still be running (or have
+            # already finished) server-side. The server persists the result in
+            # handoff_results under this job_id BEFORE the terminal is torn
+            # down, so the caller can still fetch it (issue #447 / PR #453
+            # review finding 3 -- naming the tool, not a bare
+            # "GET /handoff-results/{job_id}", because the supervisor LLM has
+            # no base URL and no token to build that request itself).
+            timeout_msg += (
+                f". The job may still be running server-side; retrieve the "
+                f"result with the get_handoff_result tool, job_id={job_id}"
+            )
         if target_host and not known_terminal_id:
             # Client-side timeout on a fresh remote create: the step may still
             # be running and its terminal id is unknown here, so it cannot be
@@ -928,6 +953,8 @@ async def _run_step_and_build_result(
             )
         return HandoffResult(
             success=False,
+            pending=bool(job_id) or None,
+            job_id=job_id,
             message=timeout_msg,
             output=None,
             terminal_id=known_terminal_id,
@@ -1174,6 +1201,15 @@ async def _handoff_impl(
             # and tool inheritance. Byte-for-byte the original single-seam
             # behavior (BR-8) -- this is what the MCP tool always takes.
             shaped_message = _shape_handoff_message(provider, message)
+            # Minted HERE, before the POST, so the key exists on the client even
+            # if the response never arrives (issue #447). The server records the
+            # result under it; client-side generation is what makes it available
+            # to the Timeout branch in ``_run_step_and_build_result``. This does
+            # NOT deduplicate execution -- a retry with the same job_id would
+            # still run a second step. Only the default single-call path needs
+            # it: the early-terminal-id path already hands back a real
+            # terminal_id, which is its own discovery handle.
+            job_id = uuid.uuid4().hex
             payload: Dict[str, Any] = {
                 "provider": provider,
                 "agent": agent_profile,
@@ -1181,6 +1217,7 @@ async def _handoff_impl(
                 "teardown": True,
                 "timeout": float(timeout),
                 "use_worktree": use_worktree,
+                "job_id": job_id,
             }
             if ctx.session_name:
                 payload["session_name"] = ctx.session_name

@@ -26,6 +26,7 @@ import logging
 import time
 from typing import Callable, Optional
 
+from cli_agent_orchestrator.clients.database import upsert_handoff_result
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine, parse_kiro_engine
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
@@ -439,6 +440,7 @@ async def run_agent_step(
     engine: Optional[KiroEngine | str] = None,
     model: Optional[str] = None,
     use_worktree: bool = False,
+    job_id: Optional[str] = None,
 ) -> AgentStepResult:
     """Run one agent step and return its result (success only).
 
@@ -448,7 +450,14 @@ async def run_agent_step(
       3. Send ``prompt`` (sync, bracketed-paste — the existing input path).
       4. Wait until COMPLETED (in-process status poll).
       5. Extract the last agent message (provider-specific extraction).
-      6. Tear the terminal down unless ``teardown=False`` or it was reused.
+      6. Persist the result durably (issue #447, if ``job_id`` given).
+      7. Tear the terminal down unless ``teardown=False`` or it was reused.
+
+    Step 6 runs BEFORE step 7 specifically so a crash during teardown cannot
+    lose an already-extracted result (PR #453 review: the prior placement in
+    the HTTP handler persisted AFTER this function had already torn the
+    terminal down, contradicting issue #447's "persist result, then tear
+    down" requirement).
 
     Args:
         provider: Provider type string (e.g. "kiro_cli", "claude_code").
@@ -542,6 +551,15 @@ async def run_agent_step(
             ``terminal_service.create_terminal``'s own docstring for the
             resolution/teardown mechanics. Ignored when reusing a terminal.
             Default False = behavior unchanged.
+        job_id: Optional durable-result key (issue #447). When given, the
+            extracted result is persisted via ``upsert_handoff_result`` BETWEEN
+            extraction and teardown — before the terminal that carries the only
+            other copy of the result is destroyed. The persistence write is
+            best-effort (a DB failure is logged, never raised) so it cannot turn
+            a successful step into a reported failure. Default None = behavior
+            unchanged (no persistence). Failure-path persistence (state="error")
+            remains the HTTP handler's responsibility, since only the handler
+            can distinguish which exception type occurred.
 
     Returns:
         ``AgentStepResult`` with status COMPLETED — ONLY on success.
@@ -779,6 +797,24 @@ async def run_agent_step(
         last_message=last_message,
         status=TerminalStatus.COMPLETED,
     )
+
+    # Persist BEFORE teardown (issue #447): the terminal about to be destroyed
+    # is the only other place this result lives, so a crash during teardown
+    # must not be able to lose it. Off the loop (sqlite I/O); best-effort — a
+    # write failure must not turn a successful step into a reported failure.
+    if job_id:
+        try:
+            await asyncio.to_thread(
+                upsert_handoff_result,
+                job_id,
+                "completed",
+                terminal_id=terminal_id,
+                last_message=last_message,
+            )
+        except Exception:  # noqa: BLE001 — persistence is best-effort; step already succeeded
+            logger.warning(
+                "run_agent_step: failed to persist completed result for job_id=%s", job_id
+            )
 
     if teardown and created_here:
         await _best_effort_teardown(terminal_id, registry)
