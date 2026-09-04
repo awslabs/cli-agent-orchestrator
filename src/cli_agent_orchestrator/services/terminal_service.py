@@ -298,6 +298,43 @@ def _resolve_working_directory(working_directory: Optional[str]) -> str:
     )
 
 
+def _write_terminal_snapshot(
+    terminal_id: str,
+    *,
+    session_name: str,
+    window_name: str,
+    agent_profile: Optional[str],
+    provider: str,
+    working_directory: Optional[str],
+    allowed_tools: Optional[list],
+    caller_id: Optional[str],
+) -> None:
+    """Write (or refresh) TERMINAL_LOG_DIR/<tid>.snapshot.json.
+
+    Called at terminal creation (early snapshot, so crashes still leave
+    restore metadata behind) and again at clean deletion (which refreshes
+    working_directory with the pane's live value). Best-effort: snapshot
+    failures never break the caller.
+    """
+    try:
+        import json as _json
+
+        snapshot = {
+            "terminal_id": terminal_id,
+            "session_name": session_name,
+            "window_name": window_name,
+            "agent_profile": agent_profile,
+            "provider": provider,
+            "working_directory": working_directory,
+            "allowed_tools": allowed_tools,
+            "caller_id": caller_id,
+        }
+        snapshot_path = TERMINAL_LOG_DIR / f"{terminal_id}.snapshot.json"
+        snapshot_path.write_text(_json.dumps(snapshot, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"Failed to write snapshot for {terminal_id}: {e}")
+
+
 def _roll_back_backend_create_locked(
     session_name: str,
     window_name: str,
@@ -1348,6 +1385,21 @@ async def create_terminal(
                     # ORIGINAL cancellation is re-raised below either way.
                     pass
             raise
+
+        # Step 3d: Early snapshot. Delete-time snapshotting only covers CLEAN
+        # deletions; a crash / tmux kill / reboot used to leave nothing behind.
+        # The snapshot's fields are static launch metadata, so write it now —
+        # the delete path refreshes it later with the live working directory.
+        _write_terminal_snapshot(
+            terminal_id,
+            session_name=session_name,
+            window_name=window_name,
+            agent_profile=agent_profile,
+            provider=provider,
+            working_directory=resolved_working_directory,
+            allowed_tools=allowed_tools,
+            caller_id=caller_id,
+        )
 
         # Step 4/5: Set up the FIFO event-driven output pipeline for pipe-pane
         # backends (tmux). Event-inbox backends (herdr) deliver via their own
@@ -2927,3 +2979,95 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
     except Exception as e:
         logger.error(f"Failed to delete terminal {terminal_id}: {e}")
         raise
+
+
+async def readopt_terminals_at_startup() -> Dict[str, int]:
+    """Re-adopt persisted terminals after a cao-server restart.
+
+    ``create_terminal`` is the only place the FIFO -> EventBus logging
+    pipeline is armed, so restarting cao-server used to leave live tmux
+    agents half-adopted: the pane keeps running, but its ``<tid>.log`` stops
+    growing and status detection observes nothing. For every persisted
+    terminal row:
+
+    - tmux window still alive: re-arm the pipeline — recreate the FIFO
+      reader (same probe/re-arm closures ``create_terminal`` uses) and
+      stop+start pipe-pane so the pane streams into the fresh FIFO (a bare
+      pipe_pane() would toggle a still-registered pipe OFF).
+    - window gone (reboot / tmux kill / crash): finalize — recover a
+      ``.scrollback`` from the ANSI-stripped ``<tid>.log`` if none exists
+      (crashes never ran the delete-path capture), then drop the DB row so
+      it does not linger as an orphan until retention cleanup.
+
+    Providers need no re-registration: ``provider_manager.get_provider``
+    rebuilds instances on demand from the DB row. Event-inbox backends
+    (herdr) deliver output via their own socket events, so there is nothing
+    to re-arm there.
+
+    Returns:
+        Counts: ``{"readopted": N, "finalized": M}``.
+    """
+    from cli_agent_orchestrator.utils.text import strip_terminal_escapes
+
+    counts = {"readopted": 0, "finalized": 0}
+    backend = get_backend()
+    if backend.supports_event_inbox():
+        return counts
+
+    for row in list_all_terminals():
+        terminal_id = row["id"]
+        session_name = row["tmux_session"]
+        window_name = row["tmux_window"]
+
+        alive = False
+        try:
+            if backend.session_exists(session_name):
+                # No dedicated window-exists query; a 1-line history read
+                # raises for a missing window and is cheap for a live one.
+                backend.get_history(session_name, window_name, tail_lines=1)
+                alive = True
+        except Exception:
+            alive = False
+
+        if alive:
+            try:
+                fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
+
+                def _probe_pane(s=session_name, w=window_name) -> str:
+                    return get_backend().get_history(s, w, tail_lines=PIPE_LIVENESS_TAIL_LINES)
+
+                def _rearm_pipe(s=session_name, w=window_name, p=str(fifo_path)) -> None:
+                    get_backend().stop_pipe_pane(s, w)
+                    get_backend().pipe_pane(s, w, p)
+
+                fifo_manager.create_reader(terminal_id, pane_probe=_probe_pane, rearm=_rearm_pipe)
+                # stop-then-start, NOT a bare pipe_pane(): after the old
+                # server died the pane may still report pane_pipe=1, and
+                # tmux's ``pipe-pane -o`` toggle would switch it OFF.
+                backend.stop_pipe_pane(session_name, window_name)
+                backend.pipe_pane(session_name, window_name, str(fifo_path))
+                # Nudge the agent's TUI so it repaints AFTER the fresh pipe
+                # attaches (same rationale as create_terminal's post-pipe
+                # Enter): pipe-pane only streams NEW output, so without a
+                # repaint the rolling status buffer stays empty and the
+                # re-adopted terminal reads UNKNOWN until it next speaks.
+                backend.send_special_key(session_name, window_name, "Enter")
+                counts["readopted"] += 1
+                logger.info(f"Re-adopted terminal {terminal_id} ({session_name}:{window_name})")
+            except Exception as e:
+                logger.warning(f"Failed to re-adopt terminal {terminal_id}: {e}")
+        else:
+            try:
+                scrollback_path = TERMINAL_LOG_DIR / f"{terminal_id}.scrollback"
+                if not scrollback_path.exists():
+                    log_path = TERMINAL_LOG_DIR / f"{terminal_id}.log"
+                    if log_path.exists():
+                        raw = log_path.read_text(encoding="utf-8", errors="replace")
+                        scrollback_path.write_text(strip_terminal_escapes(raw), encoding="utf-8")
+                db_delete_terminal(terminal_id)
+                counts["finalized"] += 1
+                logger.info(f"Finalized dead terminal {terminal_id} ({session_name}:{window_name})")
+            except Exception as e:
+                logger.warning(f"Failed to finalize terminal {terminal_id}: {e}")
+
+    return counts
