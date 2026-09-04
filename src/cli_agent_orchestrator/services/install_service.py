@@ -543,13 +543,15 @@ def install_agent(
             # OpenCode uses a shared opencode.json for MCP declarations. Keep
             # top-level MCP entries default-denied, then re-enable them only
             # for the installed agent. A reinstall without MCP removes stale
-            # per-agent grants.
+            # per-agent grants. With a known role the cao-mcp-server grant is
+            # per-tool (role allowlist), so a worker only carries the schemas
+            # it needs instead of all ~26 (token savings per delegated task).
             if profile.mcpServers:
                 mcp_names = list(profile.mcpServers.keys())
                 for mcp_name, mcp_cfg in profile.mcpServers.items():
                     opencode_mcp_cfg = translate_mcp_server_config(dict(mcp_cfg))
                     upsert_mcp_server(mcp_name, opencode_mcp_cfg)
-                upsert_agent_tools(agent_id, mcp_names)
+                upsert_agent_tools(agent_id, mcp_names, role=profile.role)
             else:
                 remove_agent_tools(agent_id)
 
