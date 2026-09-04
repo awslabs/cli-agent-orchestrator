@@ -12,6 +12,13 @@ logger = logging.getLogger(__name__)
 # Explorer address bar or "Copy as path".
 _WINDOWS_PATH = re.compile(r"^([A-Za-z]):[\\/](.*)$")
 
+# Bounds on a path we are willing to CREATE. Creating is a write primitive, so
+# it gets limits an operator typing a real project path will never reach:
+# Linux PATH_MAX, and a depth well past any plausible checkout. Without them a
+# single request can materialize an arbitrarily deep tree.
+WORKING_DIRECTORY_MAX_LEN = 4096
+WORKING_DIRECTORY_MAX_DEPTH = 64
+
 
 def normalized_path(path: "str | Path") -> str:
     """Canonical form for comparing configured directory paths (GH #280/#281).
@@ -51,7 +58,10 @@ def normalize_working_directory(
       operator is pointing at where they WANT the project to live, and
       bouncing them to a terminal to ``mkdir`` first defeats the purpose of
       a browser front door. Pass ``create_missing=False`` for read-only
-      callers that must not touch the filesystem.
+      callers that must not touch the filesystem. Creation is bounded by
+      ``WORKING_DIRECTORY_MAX_LEN``/``_MAX_DEPTH``; callers should also run
+      their cheap validations BEFORE calling with ``create_missing=True``, so
+      a request that is going to be rejected anyway leaves nothing behind.
 
     Returns ``None`` for ``None``/blank input so callers can pass the raw
     optional parameter straight through.
@@ -80,13 +90,29 @@ def normalize_working_directory(
         cleaned = str(translated)
 
     path = Path(cleaned).expanduser()
+    # Length is checked BEFORE any filesystem call: an over-long path makes
+    # exists()/is_dir() itself raise OSError(ENAMETOOLONG), which would escape
+    # as a 500 instead of the clear 400 every other rejection here produces.
+    if len(str(path)) > WORKING_DIRECTORY_MAX_LEN:
+        raise ValueError(
+            f"Working directory path is too long "
+            f"({len(str(path))} > {WORKING_DIRECTORY_MAX_LEN} characters)"
+        )
     if not path.is_absolute():
         raise ValueError(f"Working directory must be an absolute path, got {working_directory!r}")
-    if path.is_file():
-        raise ValueError(f"{str(path)!r} is a file, not a folder")
+    if path.exists() and not path.is_dir():
+        # Not just files: a FIFO, socket or device node would otherwise pass
+        # here and fail later inside tmux with exactly the opaque error this
+        # function exists to prevent.
+        raise ValueError(f"{str(path)!r} is not a folder")
     if not path.exists():
         if not create_missing:
             raise ValueError(f"Folder does not exist: {path}")
+        if len(path.parts) > WORKING_DIRECTORY_MAX_DEPTH:
+            raise ValueError(
+                f"Working directory is nested too deeply "
+                f"({len(path.parts)} > {WORKING_DIRECTORY_MAX_DEPTH} levels)"
+            )
         try:
             # exist_ok: a concurrent request may create the directory between
             # the exists() check above and this mkdir — that is success.

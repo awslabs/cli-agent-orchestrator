@@ -29,8 +29,10 @@ on WSL works as typed:
 | `~/proj` | `/home/me/proj` |
 | `/home/me/new-proj` (missing) | created, then used |
 
-A relative path, a file, or a Windows drive that is not mounted under `/mnt`
-is rejected with a `400` and a plain-language `detail`. The MCP `handoff`/
+A relative path, an existing non-directory (a file, FIFO, socket or device),
+or a Windows drive that is not mounted under `/mnt` is rejected with a `400`
+and a plain-language `detail`. Creation is bounded by a path-length and depth
+cap, and runs only after the request's cheaper validations pass. The MCP `handoff`/
 `assign` `working_directory` parameter is unchanged.
 
 ## Usage Example
