@@ -1,4 +1,4 @@
-"""Narrow worker-Job broker for the CAO elastic Kubernetes topology.
+"""Narrow worker broker for the CAO elastic Kubernetes topology.
 
 The broker is the only component in the fleet that can create a pod, and it is
 deliberately the smallest surface that can: a client names an agent profile and
@@ -18,6 +18,12 @@ The broker is also the workers' narrow gateway to supervisor-owned state.
 NetworkPolicy denies workers any direct route to the supervisor control API;
 the broker authenticates each worker's release token and forwards only inbox
 delivery and the four explicit memory operations.
+
+Finally it is the operator's way in. Worker Services are ClusterIP and last only
+as long as a task, so `cao worker` cannot port-forward to each one; instead it
+holds the broker token and the broker forwards an allowlisted set of read and
+send routes to the worker it names. See the operator plane at the end of this
+file for what is on that list and why.
 """
 
 from __future__ import annotations
@@ -31,12 +37,14 @@ import secrets
 import threading
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import requests
-from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, status
-from fastapi.responses import Response
-from kubernetes import client, config
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request, status
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import Response, StreamingResponse
+from kubernetes import client, config, watch
 from kubernetes.client.rest import ApiException
 from pydantic import BaseModel, Field
 
@@ -54,11 +62,15 @@ SUPERVISOR_API_URL = os.environ.get("CAO_SUPERVISOR_API_URL", "http://cao-superv
 )
 BROKER_PUBLIC_URL = os.environ.get("CAO_ELASTIC_BROKER_URL", "http://cao-worker-broker:9890")
 BROKER_TOKEN = os.environ["CAO_ELASTIC_BROKER_TOKEN"]
-WORKSPACE_ROOT = os.environ.get("CAO_ELASTIC_WORKSPACE_ROOT", "/home/cao/workspace/jobs")
+WORKSPACE_ROOT = os.environ.get("CAO_ELASTIC_WORKSPACE_ROOT", "/home/cao/workspace/workers")
 PROJECT_ID = os.environ.get("CAO_ELASTIC_PROJECT_ID", "cao-cluster")
 WORKER_SERVICE_ACCOUNT = os.environ.get("CAO_ELASTIC_WORKER_SERVICE_ACCOUNT", "cao-elastic-worker")
-# Outer bound enforced by Kubernetes itself, as a backstop for a broker that
-# dies before it can reap.
+# Outer bound on a worker's life, as a backstop for a broker that forgot it.
+# This used to be activeDeadlineSeconds on the worker's Job; a Deployment cannot
+# carry it at all (see the pod spec), so it is now enforced by
+# _sweep_orphan_workers, which deletes worker workloads this broker holds no live
+# lease for once they are older than this. Same number, same effect, one
+# REAPER_INTERVAL of slack.
 WORKER_TIMEOUT = int(os.environ.get("CAO_ELASTIC_WORKER_TIMEOUT", "3600"))
 READY_TIMEOUT = int(os.environ.get("CAO_ELASTIC_READY_TIMEOUT", "300"))
 # Does POST /workers block until the worker pod reports Ready?
@@ -72,7 +84,7 @@ READY_TIMEOUT = int(os.environ.get("CAO_ELASTIC_READY_TIMEOUT", "300"))
 # five-way fan-out reliably lost a worker to `connect timeout=10.0` on a pod that
 # `kubectl` showed as 1/1 Running.
 #
-# So the lease is now returned as soon as the Job and Service exist, and the
+# So the lease is now returned as soon as the Deployment and Service exist, and the
 # CALLER waits - on the thing it actually depends on, by polling the worker's
 # /health through the Service until it answers (see _wait_remote_ready in
 # mcp_server/server.py). One wait instead of two, on the correct predicate.
@@ -96,10 +108,12 @@ GATE_ON_READY = os.environ.get("CAO_ELASTIC_GATE_ON_READY", "0").strip().lower()
 COMPLETION_TIMEOUT = int(os.environ.get("CAO_ELASTIC_COMPLETION_TIMEOUT", "900"))
 REAPER_INTERVAL = int(os.environ.get("CAO_ELASTIC_REAPER_INTERVAL", "15"))
 # How long a finished lease stays queryable through GET /workers. This is the
-# audit trail for the false-success race, so it outlives the Job's own TTL.
+# audit trail for the false-success race, and since _release deletes the
+# Deployment immediately, this in-memory record is the ONLY place a settled
+# worker's verdict survives at all.
 LEASE_RETENTION = int(os.environ.get("CAO_ELASTIC_LEASE_RETENTION", "3600"))
 
-# Names the broker copies from its OWN environment into every worker Job. The
+# Names the broker copies from its OWN environment into every worker pod. The
 # Bedrock block lives in broker.yaml rather than here so that deploy.sh renders
 # the region in one place and no model id is baked into this image.
 WORKER_ENV_PASSTHROUGH = [
@@ -129,7 +143,7 @@ if _absent:
     )
 
 config.load_incluster_config()
-batch_api = client.BatchV1Api()
+apps_api = client.AppsV1Api()
 core_api = client.CoreV1Api()
 
 # worker_id -> lease lifecycle and placement observations
@@ -216,7 +230,14 @@ def _require_broker_token(value: Optional[str]) -> None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid token")
 
 
-def _job_name(worker_id: str) -> str:
+def _workload_name(worker_id: str) -> str:
+    """Name of the worker's Deployment, and of the Service in front of it.
+
+    The two share a name deliberately: the Service is what everything else
+    dials, so the string is also the worker's DNS label. It has not changed
+    since workers were Jobs, which is why moving to Deployments moved no host
+    name, no session name and no NetworkPolicy selector.
+    """
     return f"cao-worker-{worker_id}"
 
 
@@ -236,12 +257,27 @@ def _labels(worker_id: str) -> dict[str, str]:
     }
 
 
-def _worker_job(
+def _worker_deployment(
     worker_id: str,
     release_token: str,
     request: WorkerRequest,
-) -> client.V1Job:
-    name = _job_name(worker_id)
+) -> client.V1Deployment:
+    """One Deployment per worker, replicas=1.
+
+    A worker used to be a Job, and the reason it no longer is comes down to what
+    the pod actually does: `entrypoint.sh` ends in `exec cao-server`, so the
+    container never exits and the Job never completed. Its lifecycle was doing no
+    work - nothing read `.status.succeeded`, and the reaper watches Pods, not
+    Jobs. What a Job did contribute was a batch shape that made `cao worker` and
+    `cao fleet` awkward to explain and impossible to restart.
+
+    Not a StatefulSet, despite the per-pod identity looking like a fit: release is
+    out of order. `_release` deletes whichever single worker just finished, and a
+    StatefulSet only scales down from the highest ordinal, so releasing worker 3
+    of 10 would mean keeping or killing 4-9 with it. Identity is already solved by
+    the per-worker Service below, which is what callers dial.
+    """
+    name = _workload_name(worker_id)
     labels = _labels(worker_id)
     working_directory = _working_directory(worker_id)
     env = [
@@ -257,7 +293,7 @@ def _worker_job(
         client.V1EnvVar(name="CAO_MAX_TERMINALS", value="1"),
         client.V1EnvVar(name="CAO_HOME_DIR", value="/home/cao/.cao/state"),
         # The provider MUST be pinned, and here it always is: the store is a
-        # fresh emptyDir per Job, so the profile the task needs is installed
+        # fresh emptyDir per worker, so the profile the task needs is installed
         # with its provider at pod start and cannot drift.
         client.V1EnvVar(
             name="CAO_INSTALL_PROFILES",
@@ -349,7 +385,19 @@ def _worker_job(
         ),
     )
     pod_spec = client.V1PodSpec(
-        restart_policy="Never",
+        # A Deployment accepts no other value. It also means a worker whose
+        # cao-server dies comes back instead of staying dead - see the restart
+        # check in _reap_once, which releases the lease, because the pod that
+        # comes back has lost the agent and (on a replacement pod) its emptyDir.
+        restart_policy="Always",
+        # NO activeDeadlineSeconds here. It is the one Job property with no
+        # equivalent on a Deployment, and not merely in the sense of being
+        # ineffective: Kubernetes REFUSES the Deployment outright, with
+        # `spec.template.spec.activeDeadlineSeconds: Forbidden:
+        # activeDeadlineSeconds in ReplicaSet is not Supported` (422). Setting it
+        # does not weaken the cap, it stops every worker from being created. What
+        # the field bought is now _sweep_orphan_workers; see there for why age
+        # rather than existence is the trigger.
         # Pod Identity injects its own projected token volume via the webhook,
         # so the default SA mount stays off: nothing in a worker should be able
         # to talk to the API server.
@@ -408,10 +456,12 @@ def _worker_job(
         metadata=client.V1ObjectMeta(labels=labels),
         spec=pod_spec,
     )
-    return client.V1Job(
+    return client.V1Deployment(
         metadata=client.V1ObjectMeta(
             name=name,
             labels=labels,
+            # Read back by _require_release_token off the Deployment, so these
+            # must stay on the workload's own metadata and not on the template.
             annotations={
                 _RELEASE_TOKEN_ANNOTATION: release_token,
                 _CALLBACK_TERMINAL_ANNOTATION: request.callback_terminal_id,
@@ -421,47 +471,76 @@ def _worker_job(
                 _WORKING_DIRECTORY_ANNOTATION: working_directory,
             },
         ),
-        spec=client.V1JobSpec(
+        spec=client.V1DeploymentSpec(
+            replicas=1,
+            selector=client.V1LabelSelector(match_labels={"cao.aws/worker-id": worker_id}),
             template=template,
-            backoff_limit=0,
-            active_deadline_seconds=WORKER_TIMEOUT,
-            ttl_seconds_after_finished=300,
+            # Recreate, not the default RollingUpdate. Nothing updates a worker
+            # Deployment today, but if anything ever did, RollingUpdate would
+            # briefly run two pods that share one working directory on the RWX
+            # workspace volume, and the Service would balance across both.
+            strategy=client.V1DeploymentStrategy(type="Recreate"),
         ),
     )
 
 
-def _worker_service(worker_id: str, job: client.V1Job) -> client.V1Service:
-    """Per-worker ClusterIP, owned by the Job so it cannot outlive it.
+def _worker_service(worker_id: str, workload: client.V1Deployment) -> client.V1Service:
+    """Per-worker ClusterIP, owned by the Deployment so it cannot outlive it.
 
-    Without the ownerReference a Service leaks whenever the Job is removed by
-    anything other than _release - the Job's own TTL, the activeDeadline, a
-    `kubectl delete job`. Garbage collection then leaves a Service whose
-    selector matches nothing, and the next lease looks healthy while resolving
-    to a black hole.
+    Without the ownerReference a Service leaks whenever the Deployment is removed
+    by anything other than _release - a `kubectl delete deployment`, a namespace
+    cleanup that catches one and not the other. Garbage collection then leaves a
+    Service whose selector matches nothing, and the next lease looks healthy
+    while resolving to a black hole.
+
+    This Service is also what makes a Deployment enough: callers dial the name,
+    never the pod, so a worker keeps one stable address across a restart even
+    though its pod name changes.
     """
-    name = _job_name(worker_id)
-    if not (job.metadata and job.metadata.uid):
-        # Only reachable if this is called with an unsubmitted Job; the API
-        # server always assigns a uid on create. Refuse rather than fall back to
-        # an unowned Service, which would leak silently.
-        raise RuntimeError(f"cannot own worker Service {name}: Job has no uid (not created?)")
+    name = _workload_name(worker_id)
+    if not (workload.metadata and workload.metadata.uid):
+        # Only reachable if this is called with an unsubmitted Deployment; the
+        # API server always assigns a uid on create. Refuse rather than fall back
+        # to an unowned Service, which would leak silently.
+        raise RuntimeError(f"cannot own worker Service {name}: workload has no uid (not created?)")
     return client.V1Service(
         metadata=client.V1ObjectMeta(
             name=name,
             labels=_labels(worker_id),
             owner_references=[
                 client.V1OwnerReference(
-                    api_version="batch/v1",
-                    kind="Job",
-                    name=job.metadata.name,
-                    uid=job.metadata.uid,
+                    api_version="apps/v1",
+                    kind="Deployment",
+                    name=workload.metadata.name,
+                    uid=workload.metadata.uid,
                     controller=True,
                     block_owner_deletion=False,
                 )
             ],
         ),
         spec=client.V1ServiceSpec(
-            selector={"cao.aws/worker-id": worker_id},
+            # `cao.aws/worker-id` alone would select exactly the same single pod,
+            # so the app.kubernetes.io/name label looks redundant. It is not, and
+            # leaving it out costs the fleet panel every worker.
+            #
+            # The VPC CNI resolves a NetworkPolicy podSelector into concrete
+            # addresses in a PolicyEndpoint, and it includes a Service's ClusterIP
+            # only when that Service's selector carries the labels the policy
+            # selects on. networkpolicy.yaml selects workers by
+            # `app.kubernetes.io/name: cao-elastic-worker`, so a Service selecting
+            # only on worker-id never contributes its ClusterIP: the panel's
+            # PolicyEndpoint lists the worker's POD ip and not its SERVICE ip, and
+            # the panel — which reaches every node by Service DNS — gets a
+            # ConnectTimeout on a worker that is Running, Ready and directly
+            # reachable at its pod IP.
+            #
+            # That failure is invisible from the supervisor, whose own egress rule
+            # is `podSelector: {}`, and invisible in any test that only drives the
+            # supervisor node.
+            selector={
+                "app.kubernetes.io/name": "cao-elastic-worker",
+                "cao.aws/worker-id": worker_id,
+            },
             ports=[client.V1ServicePort(name="http", port=9889, target_port=9889)],
         ),
     )
@@ -502,7 +581,7 @@ def _wait_ready(worker_id: str) -> None:
 # --- fleet view -------------------------------------------------------------
 #
 # The panel renders whatever fleet.json lists and cannot discover an elastic
-# worker, because they are Jobs with generated names. The broker already owns that
+# worker, because one is created on demand with a generated id. The broker owns that
 # lifecycle, so it publishes each leased worker into the ConfigMap the panel
 # mounts and withdraws it on release.
 #
@@ -515,7 +594,7 @@ def _worker_machine(worker_id: str) -> dict[str, str]:
     """The panel's fleet entry for one worker."""
     return {
         "name": f"worker-{worker_id}",
-        "host": f"{_job_name(worker_id)}.{NAMESPACE}.svc.cluster.local",
+        "host": f"{_workload_name(worker_id)}.{NAMESPACE}.svc.cluster.local",
         "label": f"Worker {worker_id}",
         "role": "worker",
     }
@@ -579,13 +658,16 @@ def _update_fleet_config(worker_id: str, publish: bool) -> None:
 
 
 def _release(worker_id: str) -> None:
-    name = _job_name(worker_id)
+    name = _workload_name(worker_id)
     # First, so the panel stops probing a host that is about to disappear. This is
     # the one funnel for every removal path -- delete, complete, and every reaper
     # verdict via _release_and_settle -- so withdrawing here covers all of them.
     _update_fleet_config(worker_id, publish=False)
     try:
-        batch_api.delete_namespaced_job(
+        # Foreground, so this returns only once the ReplicaSet and the pod are
+        # gone too. Background would let the lease settle while a worker pod is
+        # still holding a node's worth of memory.
+        apps_api.delete_namespaced_deployment(
             name,
             NAMESPACE,
             propagation_policy="Foreground",
@@ -602,12 +684,18 @@ def _release(worker_id: str) -> None:
             raise
 
 
+# The two states in which a worker still exists. Everything else -- released,
+# completed, failed, terminated, expired -- is terminal, which is why _settle
+# refuses to move a lease twice and the operator plane refuses to dial one.
+_LIVE_LEASE_STATES = frozenset({"creating", "leased"})
+
+
 def _settle(worker_id: str, state: str, reason: Optional[str] = None) -> bool:
     with _leases_lock:
         lease = _leases.get(worker_id)
         if lease is None:
             return False
-        if lease["state"] not in {"creating", "leased"}:
+        if lease["state"] not in _LIVE_LEASE_STATES:
             return False
         lease["state"] = state
         lease["reason"] = reason
@@ -623,23 +711,97 @@ def _release_and_settle(worker_id: str, state: str, reason: Optional[str] = None
         log.warning("release of worker %s failed: %s", worker_id, exc)
 
 
+def _sweep_orphan_workers() -> None:
+    """Delete worker workloads this broker holds no live lease for.
+
+    This is what replaced `activeDeadlineSeconds`, and the replacement was forced
+    rather than chosen: a Deployment's pod template may not carry that field, so
+    the Kubernetes-side cap that used to hold when the broker was not reaping had
+    to move into the broker. Which sounds circular, and is not quite: what breaks
+    a lease is not the process dying, it is the process forgetting.
+
+    Leases live in this process's memory. A broker restart therefore forgets every
+    one of them, and the ordinary reaper walks `_leases` -- so a worker minted by
+    the previous incarnation can never be settled by the next one, no matter how
+    long it runs. Under Jobs those orphans died on the Kubernetes deadline about an
+    hour later. Nothing else would collect them: their Service is ClusterIP, their
+    pod is Ready, and the supervisor terminal holding the release token is gone
+    too.
+
+    **Age, not absence of a lease, is the trigger.** A broker that restarts while
+    five workers are mid-task must not kill five running tasks -- under Jobs it
+    did not, and a task that finishes can still reach `/complete`. So an orphan
+    gets the same WORKER_TIMEOUT it always had, measured from DEPLOYMENT creation,
+    and only then is it swept. Pod age is not equivalent: a node drain or eviction
+    replaces the pod and resets its creation timestamp, which could otherwise keep
+    a forgotten Deployment alive forever.
+
+    A worker with a LIVE lease is never touched here: the reaper owns those, with
+    reasons this function cannot supply. A worker whose lease has already settled
+    is fair game, because settling calls `_release` -- so if the workload is still
+    standing, that release failed, and this is the retry.
+    """
+    try:
+        workloads = apps_api.list_namespaced_deployment(
+            NAMESPACE,
+            label_selector="app.kubernetes.io/name=cao-elastic-worker",
+        ).items
+    except ApiException as exc:  # pragma: no cover - transient API errors
+        log.warning("orphan sweep could not list worker Deployments: %s", exc)
+        return
+
+    now = datetime.now(timezone.utc)
+    for workload in workloads:
+        meta = workload.metadata
+        worker_id = (meta.labels or {}).get("cao.aws/worker-id") if meta else None
+        if not worker_id:
+            continue
+        with _leases_lock:
+            lease = _leases.get(worker_id)
+            if lease is not None and lease["state"] in _LIVE_LEASE_STATES:
+                continue
+        created = meta.creation_timestamp if meta else None
+        if created is None:
+            continue
+        age = (now - created).total_seconds()
+        if age <= WORKER_TIMEOUT:
+            continue
+        log.warning(
+            "orphan sweep: worker %s has no live lease and is %ss old, deleting",
+            worker_id,
+            int(age),
+        )
+        try:
+            _release(worker_id)
+        except Exception as exc:  # pragma: no cover - sweep must not kill the reaper
+            log.warning("orphan sweep could not delete worker %s: %s", worker_id, exc)
+
+
 def _reap_once() -> None:
     """Release leases that will never be completed, and say why.
 
-    Three distinct failures land here, and none of them is visible to the caller:
+    Four distinct failures land here, and none of them is visible to the caller:
 
     - `terminated`: the one-shot terminal ended without `complete_assignment`,
-      or a pod that had already been observed disappeared/ended while leased.
-      The terminal-ended signal catches the TUI turn-detection race directly;
-      Pod phase cannot see a dead tmux window while cao-server remains running.
+      or a pod that had already been observed disappeared/ended while leased,
+      or the pod restarted or was replaced under the lease. The terminal-ended
+      signal catches the TUI turn-detection race directly; Pod phase cannot see a
+      dead tmux window while cao-server remains running.
     - `failed`: the pod never reported Ready within READY_TIMEOUT - unschedulable,
       ImagePullBackOff, a crash-looping entrypoint. This case used to be caught
       synchronously inside POST /workers, which is why the lease could be handed
       back only after a wait nobody wanted; see GATE_ON_READY. Moving it here
       keeps the deadline and gives up only exactness about when it is noticed.
     - `expired`: the pod is still Ready but /complete never arrived within
-      COMPLETION_TIMEOUT. Without this the Job squats a whole node's worth of
-      memory until activeDeadlineSeconds, an hour later.
+      COMPLETION_TIMEOUT. Without this the pod squats a whole node's worth of
+      memory until the orphan sweep collects it, an hour later.
+
+    The restart case is the one thing the Deployment made the reaper responsible
+    for. Under a Job, `restartPolicy: Never` and `backoffLimit: 0` meant a worker
+    that died stayed dead, and the existing "pod gone" and "pod Failed" branches
+    caught it. A Deployment brings it back, so without the check below the reaper
+    would see a Ready pod and keep the lease open for COMPLETION_TIMEOUT while the
+    agent that lease refers to no longer exists.
     """
     now = time.monotonic()
     with _leases_lock:
@@ -662,6 +824,7 @@ def _reap_once() -> None:
             age = now - lease["leased_at"]
             ever_ready = lease.get("ready_at") is not None
             pod_observed = lease.get("pod_observed_at") is not None
+            known_pod_uid = lease.get("pod_uid")
 
         selector = f"cao.aws/worker-id={worker_id}"
         try:
@@ -679,7 +842,7 @@ def _reap_once() -> None:
                     worker_id,
                     "failed",
                     f"worker pod was not created within {READY_TIMEOUT}s - check "
-                    "the Job controller, scheduling, and pod events",
+                    "the Deployment and its ReplicaSet, scheduling, and pod events",
                 )
                 log.warning(
                     "worker %s: no pod created after %ss, released",
@@ -693,8 +856,48 @@ def _reap_once() -> None:
                 lease = _leases.get(worker_id)
                 if lease is not None and lease["pod_observed_at"] is None:
                     lease["pod_observed_at"] = now
+                    # Remembered so a REPLACEMENT pod can be told from the
+                    # original. A replacement has a fresh emptyDir, so its
+                    # cao-server has no profile store, no session and no agent.
+                    lease["pod_uid"] = pods[0].metadata.uid
 
-        phase = pods[0].status.phase
+        # A ReplicaSet replacing the pod, or the kubelet restarting the container
+        # in place. Either way the tmux window and the agent inside it are gone,
+        # so the lease can never be completed and holding it open only delays the
+        # caller's error by COMPLETION_TIMEOUT.
+        #
+        # Identity rather than pods[0]: during a replacement the selector
+        # matches both the terminating pod and the new one, in no fixed order.
+        # Every check below must also read the LEASED pod, not whichever pod the
+        # list happened to put first — mid-rollout, pods[0] can be the fresh pod,
+        # zero restarts and phase Running, answering for an original that is
+        # dying, which would defer detection by a full reap cycle.
+        pod = pods[0]
+        if known_pod_uid is not None:
+            leased_pods = [p for p in pods if p.metadata and p.metadata.uid == known_pod_uid]
+            if not leased_pods:
+                _release_and_settle(
+                    worker_id,
+                    "terminated",
+                    f"worker pod was replaced after {int(age)}s - the new pod has "
+                    "an empty state volume, so the leased agent is gone",
+                )
+                log.warning("worker %s: pod replaced while leased, released", worker_id)
+                continue
+            pod = leased_pods[0]
+
+        restarts = sum((cs.restart_count or 0) for cs in (pod.status.container_statuses or []))
+        if restarts:
+            _release_and_settle(
+                worker_id,
+                "terminated",
+                f"worker container restarted {restarts}x after {int(age)}s - "
+                "cao-server came back without the agent it was hosting",
+            )
+            log.warning("worker %s: container restarted while leased, released", worker_id)
+            continue
+
+        phase = pod.status.phase
         if phase in {"Failed", "Succeeded"}:
             _release_and_settle(
                 worker_id,
@@ -712,7 +915,7 @@ def _reap_once() -> None:
         # keeps the deadline one-way: a worker that goes NotReady later is a
         # completion problem, and COMPLETION_TIMEOUT owns it.
         if not ever_ready:
-            if _pod_ready(pods[0]):
+            if _pod_ready(pod):
                 with _leases_lock:
                     lease = _leases.get(worker_id)
                     if lease is not None and lease["ready_at"] is None:
@@ -740,6 +943,10 @@ def _reap_once() -> None:
                 f"no completion within {COMPLETION_TIMEOUT}s",
             )
             log.warning("worker %s: lease expired after %ss, released", worker_id, int(age))
+
+    # Last, and outside the per-lease loop: this one walks the CLUSTER rather than
+    # the ledger, which is the only way to see a worker the ledger has forgotten.
+    _sweep_orphan_workers()
 
 
 def _reaper() -> None:  # pragma: no cover - background loop
@@ -772,17 +979,23 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="CAO Elastic Worker Broker", lifespan=lifespan)
 
 
-def _require_release_token(worker_id: str, value: Optional[str]) -> client.V1Job:
+def _require_release_token(worker_id: str, value: Optional[str]) -> client.V1Deployment:
+    """The worker's own Deployment is the record of what it was leased for.
+
+    Kept on the workload rather than in `_leases` on purpose: it survives a broker
+    restart, so a worker that calls /complete after the broker was rescheduled is
+    still recognised instead of being told its identity is invalid.
+    """
     try:
-        job = batch_api.read_namespaced_job(_job_name(worker_id), NAMESPACE)
+        workload = apps_api.read_namespaced_deployment(_workload_name(worker_id), NAMESPACE)
     except ApiException as exc:
         if exc.status == 404:
             raise HTTPException(status_code=404, detail="worker not found") from exc
         raise
-    expected = (job.metadata.annotations or {}).get(_RELEASE_TOKEN_ANNOTATION, "")
+    expected = (workload.metadata.annotations or {}).get(_RELEASE_TOKEN_ANNOTATION, "")
     if not value or not hmac.compare_digest(value, expected):
         raise HTTPException(status_code=401, detail="invalid release token")
-    return job
+    return workload
 
 
 def _require_worker_gateway(
@@ -791,8 +1004,8 @@ def _require_worker_gateway(
 ) -> WorkerAuthorization:
     if not worker_id or not re.fullmatch(r"[a-f0-9]{8}", worker_id):
         raise HTTPException(status_code=401, detail="invalid worker identity")
-    job = _require_release_token(worker_id, release_token)
-    annotations = job.metadata.annotations or {}
+    workload = _require_release_token(worker_id, release_token)
+    annotations = workload.metadata.annotations or {}
     try:
         return WorkerAuthorization(
             worker_id=worker_id,
@@ -873,7 +1086,7 @@ def _gateway_memory(
     bound_body = dict(body)
     # The worker controls its request body, including terminal_context. Replace
     # every identity-bearing field with the immutable lease claims persisted on
-    # the Job so session/agent scopes cannot be redirected laterally.
+    # the Deployment so session/agent scopes cannot be redirected laterally.
     bound_body["terminal_context"] = {
         "terminal_id": authorization.worker_id,
         "session_name": authorization.session_name,
@@ -955,7 +1168,7 @@ def create_worker(
     _require_broker_token(x_cao_broker_token)
     worker_id = secrets.token_hex(4)
     release_token = secrets.token_urlsafe(32)
-    name = _job_name(worker_id)
+    name = _workload_name(worker_id)
     with _leases_lock:
         _leases[worker_id] = {
             "state": "creating",
@@ -964,21 +1177,24 @@ def create_worker(
             "settled_at": None,
             "ready_at": None,
             "pod_observed_at": None,
+            # Set once, at the first sighting, and then compared on every sweep;
+            # see the replacement check in _reap_once.
+            "pod_uid": None,
             "agent_profile": request.agent_profile,
             "provider": request.provider,
             "callback_terminal_id": request.callback_terminal_id,
         }
     try:
-        # Job first, so the Service can be created owned by it. The pod does not
-        # need its own DNS name to boot - the readiness probe goes straight to
-        # the pod IP, and the supervisor only resolves the Service after this
-        # call returns a lease.
-        job = batch_api.create_namespaced_job(
+        # Deployment first, so the Service can be created owned by it. The pod
+        # does not need its own DNS name to boot - the readiness probe goes
+        # straight to the pod IP, and the supervisor only resolves the Service
+        # after this call returns a lease.
+        workload = apps_api.create_namespaced_deployment(
             NAMESPACE,
-            _worker_job(worker_id, release_token, request),
+            _worker_deployment(worker_id, release_token, request),
         )
-        core_api.create_namespaced_service(NAMESPACE, _worker_service(worker_id, job))
-        # The reaper ignores `creating` leases. Job-to-Pod creation is
+        core_api.create_namespaced_service(NAMESPACE, _worker_service(worker_id, workload))
+        # The reaper ignores `creating` leases. Deployment-to-Pod creation is
         # asynchronous, so `leased` still does not imply a Pod exists; the
         # separate pod_observed_at marker distinguishes "not created yet" from
         # "disappeared after creation".
@@ -1057,3 +1273,310 @@ def terminal_ended(
     if settled:
         background_tasks.add_task(_release, worker_id)
     return {"release_scheduled": settled}
+
+
+# ---------------------------------------------------------------------------
+# Operator plane: `cao worker` reaching a leased worker from outside the cluster.
+#
+# Everything above this line is the fleet talking to itself. This is for a human,
+# or the CLI acting for one, holding the broker token: one port-forward to the
+# broker reaches every worker. Port-forwarding each worker instead is not a
+# workflow - their Services are ClusterIP and exist only for the length of a
+# task, so the name to forward to does not exist until a lease is taken and is
+# gone before anyone types it.
+#
+# It is an allowlist of (method, path) and not a pass-through, for a reason worth
+# stating plainly: cao-server is an unauthenticated command-execution surface, so
+# forwarding arbitrary paths would publish the whole of it, on every worker, to
+# anyone holding one token. The list below is what `cao worker list/status/send`
+# and `cao worker sessions/attach` actually call, and nothing else.
+#
+# `POST /terminals/{id}/input` IS on it. That types into a live agent, which
+# sounds like the line not to cross, but the same token already creates and
+# deletes workers outright - being able to talk to a worker you can delete is not
+# an escalation, and `cao worker send` is the verb the whole plane exists for.
+#
+# Adding a route is a one-line change here. Deleting the allowlist is not a
+# simplification.
+_WORKER_API_PORT = 9889
+
+# One path segment. Deliberately narrow enough to exclude `/`, so segment counts
+# in the patterns below are load-bearing, and wide enough for a percent-encoded
+# session name - `cao session` quotes them with safe='' before they get here.
+_SEGMENT = r"[A-Za-z0-9._~%-]+"
+
+_WORKER_API_ALLOWLIST: dict[str, tuple[re.Pattern[str], ...]] = {
+    "GET": (
+        re.compile(r"health"),
+        re.compile(r"sessions"),
+        re.compile(rf"sessions/{_SEGMENT}/terminals"),
+        re.compile(rf"terminals/{_SEGMENT}"),
+        re.compile(rf"terminals/{_SEGMENT}/output"),
+        re.compile(rf"terminals/{_SEGMENT}/inbox/messages"),
+    ),
+    "POST": (re.compile(rf"terminals/{_SEGMENT}/input"),),
+}
+
+# Request headers forwarded to the worker. An allowlist, because the header that
+# must NOT travel is `x-cao-broker-token`: it is the broker's credential for the
+# broker's own API, a worker has no use for it, and a worker is the one pod here
+# running an agent that could be talked into repeating what it was handed.
+_FORWARD_REQUEST_HEADERS = frozenset(
+    {
+        "accept",
+        "accept-encoding",
+        "accept-language",
+        "cache-control",
+        "content-type",
+    }
+)
+
+# Response headers dropped on the way back. The hop-by-hop set describes the
+# broker<->worker connection rather than this one, and uvicorn writes its own
+# `date` and `server`.
+#
+# `content-length` and `content-encoding` are in here for a different reason, and
+# it is the one that bites: this proxy buffers, and `requests` has already
+# decompressed the body by the time it is read, so both headers now describe
+# bytes that no longer exist. Passing them through serves a gzip header over
+# plain text. The panel's streaming proxy keeps them precisely because it never
+# touches the bytes.
+_DROP_RESPONSE_HEADERS = frozenset(
+    {
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "date",
+        "server",
+        "content-length",
+        "content-encoding",
+    }
+)
+
+# Log tail ceiling. A whole worker boot log is a few hundred lines, and the point
+# of a cap is that `cao worker logs` cannot be turned into a way to pull an
+# arbitrary amount of an agent's transcript through the broker in one call.
+_LOG_TAIL_MAX = 2000
+
+
+def _worker_api_target(worker_id: str) -> tuple[str, str]:
+    """Where a worker answers: (url base, Host header). The pod's IP, not the Service.
+
+    The Service name is the obvious address and it does not work from here. On EKS
+    with the VPC CNI's NetworkPolicy agent, a pod's egress is matched against the
+    address the pod DIALLED, before kube-proxy rewrites it - so a rule written as
+    `to: podSelector: cao-elastic-worker` never matches traffic aimed at a worker's
+    ClusterIP, and the connection hangs until it times out. Proven on a live
+    cluster: from this pod, the worker's pod IP connects in 0.00s and its ClusterIP
+    times out, and adding that one ClusterIP to the policy as an ipBlock makes it
+    connect. The supervisor reaches workers by Service name only because its own
+    egress rule is `podSelector: {}` with no ports - an allow-all the agent does not
+    have to resolve.
+
+    The alternative was an ipBlock for the whole Service CIDR on 9889, which would
+    let the broker reach every ClusterIP in the cluster to buy back an address it
+    does not need. Dialling the pod directly stays inside the existing podSelector
+    rule, and the pod is looked up per request, so a ReplicaSet replacement is
+    picked up on the next call rather than cached into a 502.
+
+    The Host header still carries the Service name: it is what the worker lists in
+    CAO_ALLOWED_HOSTS, and a bare pod IP there would fail its DNS-rebinding check.
+    """
+    name = _workload_name(worker_id)
+    host = f"{name}.{NAMESPACE}.svc.cluster.local"
+    pod = _worker_pod(worker_id)
+    ip = pod.status.pod_ip if pod.status else None
+    if not ip:
+        raise HTTPException(
+            status_code=503,
+            detail=f"worker {worker_id} has no pod IP yet",
+        )
+    return f"http://{ip}:{_WORKER_API_PORT}", host
+
+
+def _require_leased_worker(worker_id: str) -> None:
+    """Refuse to dial a worker the ledger knows is gone, and say why it is gone.
+
+    Without this, a request to a released worker fails on DNS and surfaces as a
+    502 - which reads as a broken cluster rather than a finished task. The lease
+    ledger already knows better, and its `reason` is the useful half of the
+    answer.
+
+    An unrecognised worker_id is deliberately NOT refused. Leases live in this
+    process's memory while workloads live in the API server, so after a broker
+    restart every surviving worker is unknown here and every one of them is still
+    perfectly reachable.
+    """
+    if not re.fullmatch(r"[a-f0-9]{8}", worker_id):
+        raise HTTPException(status_code=404, detail="worker not found")
+    with _leases_lock:
+        lease = _leases.get(worker_id)
+        state = lease["state"] if lease else None
+        reason = lease["reason"] if lease else None
+    if state is not None and state not in _LIVE_LEASE_STATES:
+        detail = f"worker {worker_id} is no longer leased ({state})"
+        if reason:
+            detail = f"{detail}: {reason}"
+        raise HTTPException(status_code=409, detail=detail)
+
+
+def _worker_api_allowed(method: str, path: str) -> bool:
+    return any(
+        pattern.fullmatch(path)
+        for pattern in _WORKER_API_ALLOWLIST.get(method.upper(), ())
+    )
+
+
+def _forward_to_worker(
+    worker_id: str,
+    method: str,
+    path: str,
+    *,
+    query: str,
+    body: bytes,
+    headers: dict[str, str],
+) -> Response:
+    base, host = _worker_api_target(worker_id)
+    try:
+        upstream = requests.request(
+            method,
+            f"{base}/{path}",
+            params=query,
+            data=body or None,
+            headers={**headers, "host": host},
+            allow_redirects=False,
+            timeout=(5.0, 60.0),
+        )
+    except requests.RequestException as exc:
+        log.warning("worker %s api request failed for %s %s: %s", worker_id, method, path, exc)
+        raise HTTPException(
+            status_code=502,
+            detail=f"worker {worker_id} did not answer: {type(exc).__name__}",
+        ) from exc
+    return Response(
+        content=upstream.content,
+        status_code=upstream.status_code,
+        headers={
+            key: value
+            for key, value in upstream.headers.items()
+            if key.lower() not in _DROP_RESPONSE_HEADERS
+        },
+    )
+
+
+@app.api_route("/workers/{worker_id}/api/{path:path}", methods=["GET", "POST"])
+async def worker_api(
+    worker_id: str,
+    path: str,
+    request: Request,
+    x_cao_broker_token: Optional[str] = Header(default=None),
+) -> Response:
+    """Forward one allowlisted cao-server call to a leased worker.
+
+    Buffered rather than streamed, unlike the panel's node proxy: nothing on the
+    allowlist is a stream, and buffering is what lets the 502 above name the
+    worker that failed instead of tearing down a response already in flight.
+    """
+    _require_broker_token(x_cao_broker_token)
+    _require_leased_worker(worker_id)
+    if ".." in path.split("/"):
+        # requests leaves dot segments in the path and the worker's own server may
+        # resolve them, which would step outside the route just matched.
+        raise HTTPException(status_code=400, detail="invalid path")
+    if not _worker_api_allowed(request.method, path):
+        raise HTTPException(
+            status_code=404,
+            detail=f"'{request.method} /{path}' is not proxied to workers",
+        )
+    return await run_in_threadpool(
+        _forward_to_worker,
+        worker_id,
+        request.method,
+        path,
+        query=request.url.query,
+        body=await request.body(),
+        headers={
+            key: value
+            for key, value in request.headers.items()
+            if key.lower() in _FORWARD_REQUEST_HEADERS
+        },
+    )
+
+
+def _worker_pod(worker_id: str) -> client.V1Pod:
+    """The one pod behind a worker id, for callers that must name it or dial it."""
+    pods = core_api.list_namespaced_pod(
+        NAMESPACE,
+        label_selector=f"cao.aws/worker-id={worker_id}",
+    ).items
+    if not pods:
+        raise HTTPException(status_code=404, detail=f"worker {worker_id} has no pod")
+    # A Deployment can show two pods at once - the replacement and the pod being
+    # replaced - and the selector matches both in no fixed order. Prefer the one
+    # that is running; on a boot failure there is no such pod and the first one's
+    # log is exactly what the caller came for.
+    running = [pod for pod in pods if (pod.status.phase if pod.status else None) == "Running"]
+    return (running or pods)[0]
+
+
+def _worker_pod_name(worker_id: str) -> str:
+    return _worker_pod(worker_id).metadata.name
+
+
+@app.get("/workers/{worker_id}/logs")
+def worker_logs(
+    worker_id: str,
+    tail_lines: int = 200,
+    follow: bool = False,
+    x_cao_broker_token: Optional[str] = Header(default=None),
+) -> Response:
+    """The worker container's log, which is where a boot failure is legible.
+
+    `GET /workers` can say a lease `failed`; it cannot say the image pull was
+    denied, or that the profile install died on a bad provider pin. Answering that
+    needs `pods/log` `get` added to the broker Role - a real widening, and the
+    narrowest one that makes a failed worker diagnosable without putting kubectl
+    in the caller's hands. It is still not `pods/exec`: the broker can read what a
+    worker printed and never run anything inside it.
+    """
+    _require_broker_token(x_cao_broker_token)
+    _require_leased_worker(worker_id)
+    tail = max(1, min(tail_lines, _LOG_TAIL_MAX))
+    pod_name = _worker_pod_name(worker_id)
+    if not follow:
+        try:
+            body = core_api.read_namespaced_pod_log(pod_name, NAMESPACE, tail_lines=tail)
+        except ApiException as exc:
+            if exc.status == 404:
+                raise HTTPException(status_code=404, detail="worker pod not found") from exc
+            raise HTTPException(
+                status_code=502,
+                detail=f"could not read worker log: {exc.reason}",
+            ) from exc
+        return Response(content=body, media_type="text/plain; charset=utf-8")
+
+    def _stream():
+        # Watch, not read_namespaced_pod_log(follow=True, _preload_content=False):
+        # the client library sets `follow` for any function documenting it and
+        # yields whole lines, so a live log arrives line by line instead of
+        # stalling inside a fixed-size socket read.
+        watcher = watch.Watch()
+        try:
+            for line in watcher.stream(
+                core_api.read_namespaced_pod_log,
+                name=pod_name,
+                namespace=NAMESPACE,
+                tail_lines=tail,
+            ):
+                yield f"{line}\n"
+        except ApiException as exc:  # pragma: no cover - live cluster only
+            log.warning("log follow for worker %s ended: %s", worker_id, exc)
+        finally:
+            watcher.stop()
+
+    return StreamingResponse(_stream(), media_type="text/plain; charset=utf-8")

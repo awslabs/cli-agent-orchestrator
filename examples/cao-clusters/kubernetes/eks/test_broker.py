@@ -2,9 +2,9 @@
 
 Stubs the API server so the whole request path can run on a laptop. The point is
 to catch what only shows up at the first lease on a live cluster - a misspelled
-kwarg on a V1* model, a Job body the serializer mangles, a reaper that never
-releases. Every V1* object is pushed through the client's real serializer, which
-is what actually rejects a bad field name.
+kwarg on a V1* model, a Deployment body the serializer mangles, a reaper that
+never releases. Every V1* object is pushed through the client's real serializer,
+which is what actually rejects a bad field name.
 
 NOT part of the CAO test suite: broker.py lives outside the package and needs
 fastapi + the Kubernetes client, neither of which is a CAO dependency. Run it in
@@ -23,6 +23,7 @@ import os
 import sys
 import time
 import types
+from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock, patch
 
 os.environ.update({
@@ -46,7 +47,16 @@ from kubernetes import config as k8s_config
 
 k8s_config.load_incluster_config = lambda: None
 
-STATE = {"jobs": {}, "services": {}, "pods": {}, "deleted_jobs": [], "deleted_svcs": []}
+STATE = {
+    "deployments": {},
+    "services": {},
+    "pods": {},
+    # Extra pods the worker-id selector also matches, listed FIRST - the
+    # mid-rollout window where a replacement and the original answer together.
+    "extra_pods": {},
+    "deleted_deployments": [],
+    "deleted_svcs": [],
+}
 
 # What the fake API server hands back for the NEXT pod it creates. Readiness used
 # to be irrelevant to the fake (the broker waited for it, so a pod that was never
@@ -55,35 +65,68 @@ STATE = {"jobs": {}, "services": {}, "pods": {}, "deleted_jobs": [], "deleted_sv
 STATE["new_pods_ready"] = True
 STATE["new_pods_phase"] = "Running"
 STATE["create_pods"] = True
+# Every fake pod gets a distinct uid, because the reaper now tells a REPLACEMENT
+# pod from the original by uid and a fake that reused one would silently skip
+# that branch.
+STATE["pod_seq"] = 0
+# Every read_namespaced_pod_log the broker makes, so the tail_lines cap can be
+# asserted on what reached the API server rather than on what was asked for.
+STATE["log_calls"] = []
 
 
-class FakeBatch:
-    def create_namespaced_job(self, ns, body):
+def _fake_pod(name, labels):
+    STATE["pod_seq"] += 1
+    conditions = ([k8s.V1PodCondition(type="Ready", status="True")]
+                  if STATE["new_pods_ready"] else [])
+    return k8s.V1Pod(
+        metadata=k8s.V1ObjectMeta(
+            name=f"{name}-{STATE['pod_seq']:05d}",
+            uid=f"pod-uid-{STATE['pod_seq']}",
+            labels=dict(labels),
+            # The orphan sweep reads this, and a real pod always has it. Now, so
+            # every pod these tests create is age 0 and no sweep fires behind the
+            # lease-state sections; the sweep's own section backdates it.
+            creation_timestamp=datetime.now(timezone.utc),
+        ),
+        status=k8s.V1PodStatus(
+            phase=STATE["new_pods_phase"],
+            conditions=conditions,
+            # The operator plane dials this rather than the worker's Service name,
+            # so a pod without one is a 502 waiting to happen. Loopback, because
+            # section 10 points _WORKER_API_PORT at a stub server on 127.0.0.1 and
+            # then lets the real _worker_api_target build the URL.
+            pod_ip="127.0.0.1",
+        ),
+    )
+
+
+class FakeApps:
+    def create_namespaced_deployment(self, ns, body):
         body.metadata.uid = "uid-" + body.metadata.name
-        STATE["jobs"][body.metadata.name] = body
+        STATE["deployments"][body.metadata.name] = body
         wid = body.metadata.labels["cao.aws/worker-id"]
         if STATE["create_pods"]:
-            conditions = ([k8s.V1PodCondition(type="Ready", status="True")]
-                          if STATE["new_pods_ready"] else [])
-            pod = k8s.V1Pod(
-                metadata=k8s.V1ObjectMeta(name=body.metadata.name + "-abcde",
-                                          labels=dict(body.metadata.labels)),
-                status=k8s.V1PodStatus(
-                    phase=STATE["new_pods_phase"],
-                    conditions=conditions,
-                ),
-            )
-            STATE["pods"][wid] = pod
+            STATE["pods"][wid] = _fake_pod(body.metadata.name, body.metadata.labels)
         return body
 
-    def read_namespaced_job(self, name, ns):
-        if name not in STATE["jobs"]:
+    def read_namespaced_deployment(self, name, ns):
+        if name not in STATE["deployments"]:
             raise k8s.rest.ApiException(status=404)
-        return STATE["jobs"][name]
+        return STATE["deployments"][name]
 
-    def delete_namespaced_job(self, name, ns, propagation_policy=None):
-        STATE["deleted_jobs"].append(name)
-        STATE["jobs"].pop(name, None)
+    def list_namespaced_deployment(self, ns, label_selector=None):
+        key, value = label_selector.split("=", 1)
+        return types.SimpleNamespace(
+            items=[
+                workload
+                for workload in STATE["deployments"].values()
+                if (workload.metadata.labels or {}).get(key) == value
+            ]
+        )
+
+    def delete_namespaced_deployment(self, name, ns, propagation_policy=None):
+        STATE["deleted_deployments"].append(name)
+        STATE["deployments"].pop(name, None)
 
 
 class FakeCore:
@@ -96,15 +139,23 @@ class FakeCore:
         STATE["services"].pop(name, None)
 
     def list_namespaced_pod(self, ns, label_selector=None):
-        wid = label_selector.split("=", 1)[1]
-        pod = STATE["pods"].get(wid)
-        return types.SimpleNamespace(items=[pod] if pod else [])
+        # The reaper and the operator plane ask by worker id. The orphan sweep walks
+        # Deployments instead, because their creation timestamp survives a pod
+        # replacement and is the actual worker-lifetime bound.
+        key, value = label_selector.split("=", 1)
+        pod = STATE["pods"].get(value)
+        items = STATE["extra_pods"].get(value, []) + ([pod] if pod else [])
+        return types.SimpleNamespace(items=items)
+
+    def read_namespaced_pod_log(self, name, ns, tail_lines=None, **kwargs):
+        STATE["log_calls"].append({"pod": name, "tail_lines": tail_lines})
+        return f"boot log of {name}\n"
 
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import broker  # noqa: E402  (must follow the env setup above)
 
-broker.batch_api = FakeBatch()
+broker.apps_api = FakeApps()
 broker.core_api = FakeCore()
 
 from fastapi.testclient import TestClient
@@ -125,25 +176,55 @@ def worker_request():
     )
 
 
-# --- 1. the Job body survives the real serializer -------------------------
-job = broker._worker_job("deadbeef", "rt", worker_request())
-wire = k8s.ApiClient().sanitize_for_serialization(job)
+# --- 1. the Deployment body survives the real serializer ------------------
+workload = broker._worker_deployment("deadbeef", "rt", worker_request())
+wire = k8s.ApiClient().sanitize_for_serialization(workload)
 spec = wire["spec"]["template"]["spec"]
 env = {e["name"]: e.get("value") for e in spec["containers"][0]["env"]}
 
-check("job serializes to a dict", isinstance(wire, dict))
+check("deployment serializes to a dict", isinstance(wire, dict))
 annotations = wire["metadata"]["annotations"]
-check("job persists the authorized callback receiver",
+check("deployment persists the authorized callback receiver",
       annotations["cao.aws/callback-terminal-id"] == "abc12345")
-check("job persists the authorized memory session",
+check("deployment persists the authorized memory session",
       annotations["cao.aws/session-name"] == "cao-worker-deadbeef")
-check("job persists the authorized memory profile",
+check("deployment persists the authorized memory profile",
       annotations["cao.aws/agent-profile"] == "developer")
+# The annotations are read back off the workload by _require_release_token, so
+# putting them on the template instead would 401 every worker callback.
+check("lease claims are on the workload, not the pod template",
+      not (wire["spec"]["template"]["metadata"].get("annotations") or {}),
+      json.dumps(wire["spec"]["template"]["metadata"]))
+
+# --- 1b. the Deployment-shaped fields the Job did not have ----------------
+check("exactly one replica", wire["spec"]["replicas"] == 1, str(wire["spec"].get("replicas")))
+check("selector matches the worker id label",
+      wire["spec"]["selector"]["matchLabels"] == {"cao.aws/worker-id": "deadbeef"},
+      json.dumps(wire["spec"].get("selector")))
+# RollingUpdate would briefly run two pods sharing one working directory on the
+# RWX workspace volume, with the Service balancing across both.
+check("update strategy is Recreate", wire["spec"]["strategy"]["type"] == "Recreate",
+      json.dumps(wire["spec"].get("strategy")))
+check("restartPolicy is Always, the only value a Deployment accepts",
+      spec["restartPolicy"] == "Always", spec.get("restartPolicy"))
+# The one Job property with no home on a Deployment at all. Setting it does not
+# merely fail to work: the API server refuses the Deployment with
+# `activeDeadlineSeconds in ReplicaSet is not Supported` (422), so a worker
+# carrying it cannot be created. Found on a live cluster, because the fake
+# apps_api below accepts any body -- which is exactly why this assertion is
+# phrased as an absence and pinned here.
+check("no activeDeadlineSeconds on the pod (a ReplicaSet template forbids it)",
+      "activeDeadlineSeconds" not in spec,
+      str(spec.get("activeDeadlineSeconds")))
+check("no Job-only fields survive",
+      not any(k in wire["spec"] for k in ("backoffLimit", "ttlSecondsAfterFinished")),
+      json.dumps(sorted(wire["spec"])))
 check("default provider is claude_code", env["CAO_INSTALL_PROFILES"] == "developer:claude_code",
       env.get("CAO_INSTALL_PROFILES"))
-# A credential must never be a literal in the Job body - the broker's Role has no
-# `secrets`, and a value here would end up in etcd and in `kubectl get job -o yaml`.
-check("no provider credential inlined in the Job", "KIRO_API_KEY" not in env)
+# A credential must never be a literal in the workload body - the broker's Role has
+# no `secrets`, and a value here would end up in etcd and in
+# `kubectl get deployment -o yaml`.
+check("no provider credential inlined in the workload", "KIRO_API_KEY" not in env)
 
 # The optional flag is the load-bearing half: without it the Bedrock path, which
 # creates no such Secret, would hold every worker in CreateContainerConfigError.
@@ -195,21 +276,35 @@ check("readiness probe starts immediately", probe["initialDelaySeconds"] == 0,
 check("readiness probe polls every second", probe["periodSeconds"] == 1,
       str(probe.get("periodSeconds")))
 
-# --- 2. the Service is owned by the Job ----------------------------------
+# --- 2. the Service is owned by the Deployment ---------------------------
 try:
-    broker._worker_service("deadbeef", job)
-    check("unsubmitted Job is refused rather than left unowned", False, "no error raised")
+    broker._worker_service("deadbeef", workload)
+    check("unsubmitted workload is refused rather than left unowned", False, "no error raised")
 except RuntimeError as exc:
-    check("unsubmitted Job is refused rather than left unowned", "has no uid" in str(exc))
+    check("unsubmitted workload is refused rather than left unowned", "has no uid" in str(exc))
 
-job = broker.batch_api.create_namespaced_job("cao-cluster", job)  # assigns a uid
-svc = broker._worker_service("deadbeef", job)
+workload = broker.apps_api.create_namespaced_deployment("cao-cluster", workload)  # assigns a uid
+svc = broker._worker_service("deadbeef", workload)
 swire = k8s.ApiClient().sanitize_for_serialization(svc)
 owners = swire["metadata"].get("ownerReferences") or []
 check("service has an ownerReference", len(owners) == 1, json.dumps(swire["metadata"]))
-check("owner is the Job by uid",
-      owners and owners[0]["kind"] == "Job" and owners[0]["uid"] == "uid-cao-worker-deadbeef",
+check("owner is the Deployment by uid",
+      owners and owners[0]["kind"] == "Deployment"
+      and owners[0]["apiVersion"] == "apps/v1"
+      and owners[0]["uid"] == "uid-cao-worker-deadbeef",
       json.dumps(owners))
+
+# The selector needs BOTH labels, and the redundant-looking one is the load-bearing
+# one. worker-id alone selects the same single pod, but the VPC CNI includes a
+# Service's ClusterIP in a PolicyEndpoint only when the Service selects on the
+# labels the NetworkPolicy selects on. Drop the name label and the fleet panel gets
+# a ConnectTimeout on every worker while its pod IP stays reachable — which is why
+# this is asserted here rather than left to the manifest to imply.
+sel = swire["spec"]["selector"]
+check("service selects the worker by id", sel.get("cao.aws/worker-id") == "deadbeef",
+      json.dumps(sel))
+check("service also carries the label networkpolicy.yaml selects on",
+      sel.get("app.kubernetes.io/name") == "cao-elastic-worker", json.dumps(sel))
 
 # --- 3. the lease returns before readiness; the reaper owns the deadline --
 #
@@ -219,7 +314,7 @@ check("owner is the Job by uid",
 check("readiness gating is off by default", broker.GATE_ON_READY is False)
 
 # A reaper tick can overlap Kubernetes object creation. The lease must not be
-# considered active until both the Job and Service exist.
+# considered active until both the Deployment and Service exist.
 with broker._leases_lock:
     broker._leases["cafefeed"] = {
         "state": "creating",
@@ -228,6 +323,7 @@ with broker._leases_lock:
         "settled_at": None,
         "ready_at": None,
         "pod_observed_at": None,
+        "pod_uid": None,
         "agent_profile": "developer",
         "provider": "claude_code",
     }
@@ -240,8 +336,8 @@ check(
 with broker._leases_lock:
     del broker._leases["cafefeed"]
 
-# A Job exists before its controller creates a Pod. Empty Pod lists are normal
-# in that window and must not be called disappearance.
+# A Deployment exists before its ReplicaSet creates a Pod. Empty Pod lists are
+# normal in that window and must not be called disappearance.
 STATE["create_pods"] = False
 lease_waiting_for_pod = broker.create_worker(
     worker_request(), "test-token"
@@ -310,8 +406,8 @@ check("reaper fails a worker that never reported Ready",
 check("failed reason names never-Ready, not a completion timeout",
       "never reported Ready" in (broker._leases[w0]["reason"] or ""),
       str(broker._leases[w0]["reason"])[:200])
-check("failed worker's job is released", f"cao-worker-{w0}" in STATE["deleted_jobs"],
-      str(STATE["deleted_jobs"]))
+check("failed worker's deployment is released", f"cao-worker-{w0}" in STATE["deleted_deployments"],
+      str(STATE["deleted_deployments"]))
 
 # Once Ready has been SEEN, the readiness deadline is spent: a worker that goes
 # NotReady later is a completion problem, and must expire rather than fail.
@@ -353,6 +449,115 @@ finally:
     STATE["new_pods_ready"] = True
     STATE["new_pods_phase"] = "Running"
 
+# --- 3c. the ledger is a one-hour window, and its clock is settled_at -----
+#
+# `_release` deletes the Deployment immediately, so this in-memory row is the
+# ONLY place a settled worker's verdict survives - and the reaper drops it
+# LEASE_RETENTION seconds later. Nothing pinned that, and it is read wrong in two
+# directions worth catching:
+#
+#   * as unbounded. `cao worker list --all` looks like a full history, so an
+#     operator comes back after lunch for the `expired` reason and finds a table
+#     that no longer mentions the worker. Absence is not evidence of a clean run.
+#   * off the wrong clock. The AGE column is `now - leased_at`, and retention
+#     runs from `settled_at`. A row can show an age well past the hour and still
+#     be present, which makes a count cap the tempting (and wrong) explanation.
+check("settled leases are kept for an hour by default",
+      broker.LEASE_RETENTION == 3600, str(broker.LEASE_RETENTION))
+
+def _settled(worker_id, *, state, settled_ago, leased_ago=None):
+    """Put one synthetic settled lease in the ledger."""
+    now = time.monotonic()
+    with broker._leases_lock:
+        broker._leases[worker_id] = {
+            "state": state,
+            "reason": "released by caller",
+            "leased_at": now - (leased_ago if leased_ago is not None else settled_ago),
+            "settled_at": None if settled_ago is None else now - settled_ago,
+            "ready_at": now,
+            "pod_observed_at": now,
+            "pod_uid": None,
+            "agent_profile": "developer",
+            "provider": "claude_code",
+        }
+
+_settled("fade0001", state="completed", settled_ago=broker.LEASE_RETENTION - 5)
+_settled("fade0002", state="expired", settled_ago=broker.LEASE_RETENTION + 5)
+# Settled a second ago but leased long before the window: the row that proves
+# which of the two timestamps the prune reads.
+_settled("fade0003", state="released", settled_ago=1,
+         leased_ago=broker.LEASE_RETENTION * 2)
+# A lease still open, aged past the window. What saves it is that it has no
+# settle time yet, not its state: without that guard a running worker's lease
+# would be deleted out from under it, leaving the pod alive with nothing left
+# that knows it is owed a release.
+_settled("fade0004", state="leased", settled_ago=None,
+         leased_ago=broker.LEASE_RETENTION * 2)
+# The same row with a settle time it could not really have. `_settle` writes
+# state and settled_at together under one lock, so nothing reachable is both
+# open and settled - which makes the prune's `state != "leased"` clause pure
+# belt and braces. Pinned anyway, because the clause looks load-bearing and the
+# next reader should not be able to delete it and see a green suite.
+_settled("fade0007", state="leased", settled_ago=broker.LEASE_RETENTION + 5,
+         leased_ago=broker.LEASE_RETENTION * 2)
+
+broker._reap_once()
+
+check("a lease settled inside the window is still readable",
+      "fade0001" in broker._leases)
+check("a lease settled past the window is dropped",
+      "fade0002" not in broker._leases)
+check("retention runs from settled_at, not from leased_at",
+      "fade0003" in broker._leases)
+check("an open lease has no settle time, so no age can prune it",
+      "fade0004" in broker._leases, str(broker._leases.get("fade0004", {}).get("state")))
+check("an open lease survives even if it somehow carries a settle time",
+      "fade0007" in broker._leases)
+
+# A `creating` lease has no settle time at all, and `now - None` in that branch
+# would take the reaper thread down with it - after which nothing is reaped.
+_settled("fade0005", state="creating", settled_ago=None,
+         leased_ago=broker.LEASE_RETENTION * 2)
+broker._reap_once()
+check("a lease with no settled_at survives the prune rather than crashing it",
+      "fade0005" in broker._leases)
+
+# One tick can settle a lease and one tick can prune it, but never the same tick:
+# the prune reads settled_at from before this sweep, so a verdict is always
+# readable for a full retention window after it is written.
+_settled("fade0006", state="leased", settled_ago=None,
+         leased_ago=broker.COMPLETION_TIMEOUT + 1)
+broker._reap_once()
+check("a verdict written this tick is not pruned by the same tick",
+      "fade0006" in broker._leases,
+      str(broker._leases.get("fade0006", {}).get("state")))
+
+# And the coupling that makes that clause redundant deserves the pin more than
+# the clause does. `_settle` is the only writer of settled_at anywhere in the
+# broker, and it writes state in the same critical section, so "live" and
+# "settled" cannot both be true. That matters more than it reads: the prune
+# exempts the literal "leased" while every other test in the broker asks
+# _LIVE_LEASE_STATES, so a `creating` lease is live and NOT exempt by state. It
+# survives only because nothing gives it a settle time while it is coming up.
+_settled("fade0008", state="creating", settled_ago=None, leased_ago=1)
+_settled_ok = broker._settle("fade0008", "completed", "done")
+with broker._leases_lock:
+    _row = dict(broker._leases["fade0008"])
+check("_settle stamps settled_at and leaves the live set in one critical section",
+      _settled_ok
+      and _row["state"] not in broker._LIVE_LEASE_STATES
+      and _row["settled_at"] is not None,
+      f"{_row['state']} settled_at={_row['settled_at'] is not None}")
+check("a settled lease cannot be settled twice, so the first verdict is the one kept",
+      broker._settle("fade0008", "released", None) is False
+      and broker._leases["fade0008"]["reason"] == "done",
+      str(broker._leases["fade0008"]["reason"]))
+
+with broker._leases_lock:
+    for _wid in ("fade0001", "fade0003", "fade0004", "fade0005", "fade0006",
+                 "fade0007", "fade0008"):
+        broker._leases.pop(_wid, None)
+
 # --- 4. lease lifecycle over HTTP ---------------------------------------
 with TestClient(broker.app) as c:
     worker_payload = {
@@ -367,8 +572,8 @@ with TestClient(broker.app) as c:
     check("create returns a lease", r.status_code == 200, r.text[:300])
     lease = r.json()
     wid = lease["worker_id"]
-    check("job created first, then service",
-          f"cao-worker-{wid}" in STATE["jobs"] and f"cao-worker-{wid}" in STATE["services"])
+    check("deployment created first, then service",
+          f"cao-worker-{wid}" in STATE["deployments"] and f"cao-worker-{wid}" in STATE["services"])
     check("target_host is the per-worker service FQDN",
           lease["target_host"] == f"cao-worker-{wid}.cao-cluster.svc.cluster.local",
           lease["target_host"])
@@ -456,7 +661,7 @@ with TestClient(broker.app) as c:
             "session_name": f"cao-worker-{wid}",
             "provider": "claude_code",
             "agent_profile": "developer",
-            "cwd": f"/home/cao/workspace/jobs/{wid}",
+            "cwd": f"/home/cao/workspace/workers/{wid}",
         },
         str(post.call_args),
     )
@@ -470,8 +675,8 @@ with TestClient(broker.app) as c:
     r = c.post(f"/workers/{wid}/complete",
                headers={"X-CAO-Release-Token": lease["release_token"]})
     check("complete accepted with the right token", r.status_code == 200, r.text[:200])
-    check("completing releases the job", f"cao-worker-{wid}" in STATE["deleted_jobs"],
-          str(STATE["deleted_jobs"]))
+    check("completing releases the deployment", f"cao-worker-{wid}" in STATE["deleted_deployments"],
+          str(STATE["deleted_deployments"]))
     r = c.get("/workers", headers=H)
     check("ledger records completion",
           any(w["worker_id"] == wid and w["state"] == "completed" for w in r.json()), r.text[:300])
@@ -498,9 +703,9 @@ with TestClient(broker.app) as c:
         str(broker._leases[terminal_ended_id]["reason"]),
     )
     check(
-        "terminal-ended signal releases the worker Job",
-        f"cao-worker-{terminal_ended_id}" in STATE["deleted_jobs"],
-        str(STATE["deleted_jobs"]),
+        "terminal-ended signal releases the worker Deployment",
+        f"cao-worker-{terminal_ended_id}" in STATE["deleted_deployments"],
+        str(STATE["deleted_deployments"]),
     )
 
     # --- 6. pod terminal phase fallback, complete never arrives -----------
@@ -519,8 +724,8 @@ with TestClient(broker.app) as c:
           json.dumps(st))
     check("reaper reason names the truth, not a success",
           st["reason"] and "NOT necessarily done" in st["reason"], str(st.get("reason"))[:200])
-    check("reaper released the squatting job", f"cao-worker-{wid2}" in STATE["deleted_jobs"],
-          str(STATE["deleted_jobs"]))
+    check("reaper released the squatting deployment", f"cao-worker-{wid2}" in STATE["deleted_deployments"],
+          str(STATE["deleted_deployments"]))
 
     # --- 7. completion deadline on a still-healthy pod --------------------
     r = c.post("/workers", json=worker_payload, headers=H)
@@ -533,7 +738,92 @@ with TestClient(broker.app) as c:
         time.sleep(0.3)
     st = [w for w in c.get("/workers", headers=H).json() if w["worker_id"] == wid3][0]
     check("a healthy pod that never completes expires", st["state"] == "expired", json.dumps(st))
-    check("expired job is released", f"cao-worker-{wid3}" in STATE["deleted_jobs"])
+    check("expired deployment is released", f"cao-worker-{wid3}" in STATE["deleted_deployments"])
+
+    # --- 7b. the two failures the Deployment introduced -------------------
+    #
+    # Under a Job these could not happen: restartPolicy Never plus backoffLimit 0
+    # meant a dead worker stayed dead, and the "pod gone" / "pod Failed" branches
+    # above caught it. A Deployment brings the worker back, Ready and useless, so
+    # the reaper has to notice by identity rather than by phase.
+    r = c.post("/workers", json=worker_payload, headers=H)
+    restarted_id = r.json()["worker_id"]
+    STATE["pods"][restarted_id].status.container_statuses = [
+        k8s.V1ContainerStatus(
+            name="cao-node", image="x", image_id="x", ready=True, restart_count=1
+        )
+    ]
+    deadline = time.time() + 12
+    while time.time() < deadline:
+        st = [w for w in c.get("/workers", headers=H).json() if w["worker_id"] == restarted_id]
+        if st and st[0]["state"] != "leased":
+            break
+        time.sleep(0.3)
+    st = [w for w in c.get("/workers", headers=H).json() if w["worker_id"] == restarted_id][0]
+    check("a restarted container settles the lease as terminated",
+          st["state"] == "terminated", json.dumps(st))
+    check("restart reason says the agent is gone, not that the task finished",
+          st["reason"] and "restarted" in st["reason"], str(st.get("reason"))[:200])
+
+    r = c.post("/workers", json=worker_payload, headers=H)
+    replaced_id = r.json()["worker_id"]
+    # Wait for the reaper to record the ORIGINAL pod's uid before swapping it. A
+    # pod replaced before the broker ever saw the first one is indistinguishable
+    # from a slow start, and COMPLETION_TIMEOUT owns that case instead.
+    observed = time.time() + 6
+    while time.time() < observed and broker._leases[replaced_id].get("pod_uid") is None:
+        time.sleep(0.1)
+    check("reaper records the first pod's uid",
+          broker._leases[replaced_id].get("pod_uid") is not None)
+    # A ReplicaSet replacing the pod: same labels, same Service, new uid, and a
+    # brand new emptyDir with no profile store and no session in it.
+    STATE["pods"][replaced_id] = _fake_pod(f"cao-worker-{replaced_id}",
+                                           broker._labels(replaced_id))
+    deadline = time.time() + 12
+    while time.time() < deadline:
+        st = [w for w in c.get("/workers", headers=H).json() if w["worker_id"] == replaced_id]
+        if st and st[0]["state"] != "leased":
+            break
+        time.sleep(0.3)
+    st = [w for w in c.get("/workers", headers=H).json() if w["worker_id"] == replaced_id][0]
+    check("a replacement pod settles the lease as terminated",
+          st["state"] == "terminated", json.dumps(st))
+    check("replacement reason names the empty state volume",
+          st["reason"] and "empty state volume" in st["reason"], str(st.get("reason"))[:200])
+    check("replaced worker's deployment is released",
+          f"cao-worker-{replaced_id}" in STATE["deleted_deployments"],
+          str(STATE["deleted_deployments"]))
+
+    # A replacement MID-rollout: both pods answer the selector, the fresh one
+    # listed first. The reaper must judge the LEASED pod - a restarted original
+    # hiding behind its healthy-looking replacement is exactly the frame where
+    # reading pods[0] answers for the wrong pod.
+    r = c.post("/workers", json=worker_payload, headers=H)
+    rollover_id = r.json()["worker_id"]
+    observed = time.time() + 6
+    while time.time() < observed and broker._leases[rollover_id].get("pod_uid") is None:
+        time.sleep(0.1)
+    check("reaper records the rollover pod's uid",
+          broker._leases[rollover_id].get("pod_uid") is not None)
+    STATE["pods"][rollover_id].status.container_statuses = [
+        k8s.V1ContainerStatus(
+            name="cao-node", image="x", image_id="x", ready=True, restart_count=1
+        )
+    ]
+    STATE["extra_pods"][rollover_id] = [
+        _fake_pod(f"cao-worker-{rollover_id}", broker._labels(rollover_id))
+    ]
+    deadline = time.time() + 12
+    while time.time() < deadline:
+        st = [w for w in c.get("/workers", headers=H).json() if w["worker_id"] == rollover_id]
+        if st and st[0]["state"] != "leased":
+            break
+        time.sleep(0.3)
+    st = [w for w in c.get("/workers", headers=H).json() if w["worker_id"] == rollover_id][0]
+    check("the reaper judges the leased pod, not whichever the selector lists first",
+          st["state"] == "terminated" and "restarted" in (st["reason"] or ""),
+          json.dumps(st))
+    STATE["extra_pods"].clear()
 
     # --- 8. input validation still bounded -------------------------------
     r = c.post("/workers",
@@ -546,9 +836,182 @@ with TestClient(broker.app) as c:
     check("caller cannot inject an image",
           r.status_code in (200, 422)
           and (r.status_code == 422
-               or STATE["jobs"][f"cao-worker-{r.json()['worker_id']}"]
+               or STATE["deployments"][f"cao-worker-{r.json()['worker_id']}"]
                .spec.template.spec.containers[0].image == os.environ["CAO_ELASTIC_WORKER_IMAGE"]),
           r.text[:200])
+
+    # --- 10. the operator plane: what `cao worker` can and cannot reach ----
+    #
+    # The allowlist is the whole security argument for this route, so the checks
+    # that matter are the refusals. A stub stands in for the worker's cao-server;
+    # the real one is unreachable offline, and what is being tested here is the
+    # broker's decision to forward, not the node's answer.
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    NODE_CALLS = []
+
+    class _NodeHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def _respond(self):
+            length = int(self.headers.get("content-length") or 0)
+            if length:
+                self.rfile.read(length)
+            NODE_CALLS.append({
+                "method": self.command,
+                "path": self.path,
+                "headers": {k.lower(): v for k, v in self.headers.items()},
+            })
+            body = json.dumps({"ok": True, "path": self.path}).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.send_header("x-node-hint", "kept")
+            self.end_headers()
+            self.wfile.write(body)
+
+        do_GET = _respond
+        do_POST = _respond
+
+        def log_message(self, *args):
+            pass
+
+    _node = HTTPServer(("127.0.0.1", 0), _NodeHandler)
+    threading.Thread(target=_node.serve_forever, daemon=True).start()
+    # Only the port is stubbed. _worker_api_target itself runs for real, so the
+    # fake pod's IP is what gets dialled and the Service name it puts in the Host
+    # header is checked below on what the stub received - the two halves of the
+    # arrangement that makes a podSelector NetworkPolicy rule cover this hop.
+    _saved_port = broker._WORKER_API_PORT
+    broker._WORKER_API_PORT = _node.server_address[1]
+
+    # The reaper's 3s completion deadline would settle this worker mid-section and
+    # every proxied call would then correctly 409. Lift it for this section only.
+    _saved_completion = broker.COMPLETION_TIMEOUT
+    broker.COMPLETION_TIMEOUT = 3600
+    try:
+        r = c.post("/workers", json=worker_payload, headers=H)
+        pid = r.json()["worker_id"]
+
+        r = c.get(f"/workers/{pid}/api/sessions", headers=H)
+        check("allowlisted GET reaches the worker", r.status_code == 200, r.text[:200])
+        check("proxied path arrives unchanged at the worker",
+              NODE_CALLS[-1]["path"] == "/sessions", NODE_CALLS[-1]["path"])
+        # The request went to the pod's IP - the Service name does not resolve
+        # here, and on EKS it is not covered by the broker's egress rule - but the
+        # worker only trusts Host names it was given in CAO_ALLOWED_HOSTS.
+        check("the Host header carries the Service name, not the pod IP",
+              NODE_CALLS[-1]["headers"].get("host")
+              == f"cao-worker-{pid}.cao-cluster.svc.cluster.local",
+              str(NODE_CALLS[-1]["headers"].get("host")))
+        # The one header that must not travel. It is the broker's credential for
+        # the broker's own API, and a worker is the pod running an agent.
+        check("broker token is not forwarded to the worker",
+              "x-cao-broker-token" not in NODE_CALLS[-1]["headers"],
+              json.dumps(sorted(NODE_CALLS[-1]["headers"])))
+        check("worker response headers survive the hop",
+              r.headers.get("x-node-hint") == "kept", json.dumps(dict(r.headers)))
+        # requests decompressed the body already, so both of these would describe
+        # bytes that no longer exist.
+        check("content-encoding is not passed through",
+              "content-encoding" not in {k.lower() for k in r.headers}, json.dumps(dict(r.headers)))
+
+        r = c.get(f"/workers/{pid}/api/sessions/my-session/terminals", headers=H)
+        check("a session's terminals are allowlisted", r.status_code == 200, r.text[:200])
+        r = c.get(f"/workers/{pid}/api/terminals/abc12345/output?mode=last", headers=H)
+        check("terminal output is allowlisted", r.status_code == 200, r.text[:200])
+        check("the query string is forwarded",
+              "mode=last" in NODE_CALLS[-1]["path"], NODE_CALLS[-1]["path"])
+        # Deliberately on the list: `cao worker send` is the verb this plane
+        # exists for, and the same token already deletes workers outright.
+        r = c.post(f"/workers/{pid}/api/terminals/abc12345/input?message=hi", headers=H)
+        check("sending input to a worker is allowlisted", r.status_code == 200, r.text[:200])
+
+        before = len(NODE_CALLS)
+        r = c.get(f"/workers/{pid}/api/settings", headers=H)
+        check("an unlisted path is refused", r.status_code == 404, r.text[:200])
+        r = c.get(f"/workers/{pid}/api/terminals/abc12345/websocket", headers=H)
+        check("the pty socket route is refused", r.status_code == 404, r.text[:200])
+        r = c.post(f"/workers/{pid}/api/sessions", headers=H)
+        check("a listed path on an unlisted method is refused",
+              r.status_code == 404, r.text[:200])
+        # Percent-encoded, because Starlette decodes it back to `..` and the
+        # segment pattern would otherwise match it as an ordinary terminal id.
+        r = c.get(f"/workers/{pid}/api/terminals/%2e%2e/output", headers=H)
+        check("an encoded dot segment is refused", r.status_code == 400, r.text[:200])
+        check("nothing refused ever reached the worker",
+              len(NODE_CALLS) == before, str(len(NODE_CALLS) - before))
+
+        r = c.get(f"/workers/{pid}/api/sessions")
+        check("unauthenticated proxy call is rejected", r.status_code == 401, r.text[:200])
+        r = c.get("/workers/not-a-worker-id/api/sessions", headers=H)
+        check("a malformed worker id is refused", r.status_code == 404, r.text[:200])
+
+        # --- 10b. logs -----------------------------------------------------
+        r = c.get(f"/workers/{pid}/logs", headers=H)
+        check("logs return the container output", r.status_code == 200
+              and "boot log of" in r.text, r.text[:200])
+        check("logs are served as text", r.headers["content-type"].startswith("text/plain"),
+              r.headers.get("content-type"))
+        r = c.get(f"/workers/{pid}/logs", params={"tail_lines": 999999}, headers=H)
+        check("tail_lines is capped at the broker's ceiling",
+              STATE["log_calls"][-1]["tail_lines"] == broker._LOG_TAIL_MAX,
+              str(STATE["log_calls"][-1]))
+        r = c.get(f"/workers/{pid}/logs")
+        check("unauthenticated log read is rejected", r.status_code == 401, r.text[:200])
+
+        # --- 10c. a settled lease answers with WHY, not with a timeout ------
+        broker._leases[pid]["state"] = "expired"
+        broker._leases[pid]["reason"] = "no completion within 900s"
+        r = c.get(f"/workers/{pid}/api/sessions", headers=H)
+        check("a settled worker is refused with its lease state",
+              r.status_code == 409 and "expired" in r.text, r.text[:200])
+        check("the refusal carries the reaper's reason",
+              "no completion within 900s" in r.text, r.text[:200])
+        r = c.get(f"/workers/{pid}/logs", headers=H)
+        check("logs are refused for a settled worker too",
+              r.status_code == 409, r.text[:200])
+        # An unknown worker_id is NOT refused: after a broker restart every
+        # surviving worker is unknown here and all of them are still reachable.
+        del broker._leases[pid]
+        r = c.get(f"/workers/{pid}/api/sessions", headers=H)
+        check("a worker with no lease row is still reachable",
+              r.status_code == 200, r.text[:200])
+
+        # A pod that has not been assigned an IP cannot be dialled at all. Saying
+        # so beats a five-second connect timeout to nowhere.
+        _ip = STATE["pods"][pid].status.pod_ip
+        STATE["pods"][pid].status.pod_ip = None
+        try:
+            r = c.get(f"/workers/{pid}/api/sessions", headers=H)
+            check("a worker with no pod IP is refused, not dialled",
+                  r.status_code == 503 and "pod IP" in r.text, r.text[:200])
+        finally:
+            STATE["pods"][pid].status.pod_ip = _ip
+    finally:
+        broker.COMPLETION_TIMEOUT = _saved_completion
+        broker._WORKER_API_PORT = _saved_port
+        _node.shutdown()
+
+    # --- 10d. the allowlist itself, without a transport ---------------------
+    check("health is readable", broker._worker_api_allowed("GET", "health"))
+    check("the sessions list is readable", broker._worker_api_allowed("GET", "sessions"))
+    check("a terminal is readable", broker._worker_api_allowed("GET", "terminals/abc12345"))
+    check("an inbox is readable",
+          broker._worker_api_allowed("GET", "terminals/abc12345/inbox/messages"))
+    check("input is writable", broker._worker_api_allowed("POST", "terminals/abc12345/input"))
+    for method, path in [
+        ("GET", "internal/memory/recall"),
+        ("GET", "settings"),
+        ("GET", "workflows"),
+        ("POST", "sessions"),
+        ("POST", "terminals/abc12345/inbox/messages"),
+        ("DELETE", "sessions/foo"),
+        ("GET", "sessions/foo/terminals/extra"),
+        ("GET", ""),
+    ]:
+        check(f"not proxied: {method} /{path}", not broker._worker_api_allowed(method, path))
 
 # --- 9. a missing model pin must stop the broker, not the first task -----
 import subprocess
@@ -564,6 +1027,81 @@ _probe = subprocess.run(
 check("broker refuses to start with a passthrough var unset",
       _probe.returncode != 0 and "ANTHROPIC_DEFAULT_HAIKU_MODEL" in _probe.stderr,
       (_probe.stderr or _probe.stdout)[-300:])
+
+# --- 11. the orphan sweep, which replaced activeDeadlineSeconds -----------
+#
+# The case it exists for cannot be reached through the API: leases live in the
+# broker's memory, so an orphan is a worker whose lease this process never had.
+# That is what a broker restart leaves behind, and it is why the sweep queries
+# the cluster by app label instead of walking `_leases`.
+STATE["deleted_deployments"].clear()
+STATE["deleted_svcs"].clear()
+
+
+def _plant_worker(worker_id, age_seconds, pod_age_seconds=None):
+    """A worker workload with no lease, as a restarted broker would find it."""
+    name = f"cao-worker-{worker_id}"
+    STATE["deployments"][name] = types.SimpleNamespace(
+        metadata=types.SimpleNamespace(
+            name=name,
+            labels=broker._labels(worker_id),
+            creation_timestamp=datetime.now(timezone.utc) - timedelta(seconds=age_seconds),
+        )
+    )
+    pod = _fake_pod(name, broker._labels(worker_id))
+    pod.metadata.creation_timestamp = datetime.now(timezone.utc) - timedelta(
+        seconds=age_seconds if pod_age_seconds is None else pod_age_seconds
+    )
+    STATE["pods"][worker_id] = pod
+
+
+with patch.object(broker, "_update_fleet_config"):
+    # Old enough: this is the pod activeDeadlineSeconds used to kill.
+    _plant_worker("aaaaaaaa", broker.WORKER_TIMEOUT + 60)
+    # Not old enough. A broker that restarts mid-task must not kill the task -
+    # under Jobs it did not, and the worker could still call /complete.
+    _plant_worker("bbbbbbbb", broker.WORKER_TIMEOUT - 60)
+    # Old Deployment, brand-new replacement pod. Pod age must not reset the orphan
+    # deadline after a node drain, an eviction, or a ReplicaSet replacement.
+    _plant_worker("dddddddd", broker.WORKER_TIMEOUT + 60, pod_age_seconds=1)
+    broker._sweep_orphan_workers()
+
+check("orphan sweep deletes a leaseless worker past WORKER_TIMEOUT",
+      "cao-worker-aaaaaaaa" in STATE["deleted_deployments"],
+      json.dumps(STATE["deleted_deployments"]))
+check("orphan sweep takes the worker's Service with it",
+      "cao-worker-aaaaaaaa" in STATE["deleted_svcs"],
+      json.dumps(STATE["deleted_svcs"]))
+check("orphan sweep spares a leaseless worker inside WORKER_TIMEOUT",
+      "cao-worker-bbbbbbbb" not in STATE["deleted_deployments"],
+      json.dumps(STATE["deleted_deployments"]))
+check("a replacement pod does not reset an orphaned Deployment's timeout",
+      "cao-worker-dddddddd" in STATE["deleted_deployments"],
+      json.dumps(STATE["deleted_deployments"]))
+
+# The assertion that stops the sweep being a fleet-wide kill switch. A worker with
+# a LIVE lease belongs to the reaper, which can say WHY it released it; the sweep
+# can only delete. Age alone must never be enough.
+STATE["deleted_deployments"].clear()
+with patch.object(broker, "_update_fleet_config"):
+    _plant_worker("cccccccc", broker.WORKER_TIMEOUT * 10)
+    with broker._leases_lock:
+        broker._leases["cccccccc"] = {
+            "state": "leased",
+            "reason": None,
+            "leased_at": time.monotonic(),
+            "settled_at": None,
+            "ready_at": time.monotonic(),
+            "pod_observed_at": time.monotonic(),
+            "pod_uid": None,
+            "agent_profile": "developer",
+            "provider": "claude_code",
+            "release_token": "rt",
+        }
+    broker._sweep_orphan_workers()
+check("orphan sweep never touches a worker with a live lease, at any age",
+      "cao-worker-cccccccc" not in STATE["deleted_deployments"],
+      json.dumps(STATE["deleted_deployments"]))
 
 print()
 print("FAILURES:", FAILS if FAILS else "none")
