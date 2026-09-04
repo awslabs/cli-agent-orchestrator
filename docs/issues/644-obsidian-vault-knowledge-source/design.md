@@ -475,7 +475,7 @@ and both `skills/cao-memory/SKILL.md` copies.
 
 ## Derived state
 
-Three new tables, one widened constraint and one new column, all through the existing
+Four new tables, one widened constraint and one new column, all through the existing
 idempotent migration idiom invoked from `init_db()`.
 
 **`vault_note`** — one row per indexed or quarantined note.
@@ -493,6 +493,13 @@ idempotent migration idiom invoked from `init_db()`.
 | `status` TEXT NOT NULL | `indexed`, `quarantined`, `excluded`, `unsupported` |
 | `last_reconciled_at` DATETIME | The run's single captured timestamp |
 | Unique | `(vault_id, scope, scope_id, cao_key)` and `(vault_id, vault_relpath)` |
+
+**`vault_exclusion`** — one durable user-forget tombstone per
+`(vault_id, scope, scope_id, cao_key)`. `last_known_relpath` and `content_sha256`
+are diagnostic only. Reconcile applies this identity-keyed authority after resolving
+the live scan, so rebuilds, malformed frontmatter, quarantine, and path reuse cannot
+erase or misapply a forgotten authored identity. Existing `vault_note.status =
+'excluded'` rows are backfilled idempotently.
 
 **`vault_finding`** — `id`, `vault_id`, `vault_relpath`, `code`, `severity`
 (`info`/`warn`/`error`), bounded content-free `detail`, `reconcile_run_id`,
@@ -782,9 +789,11 @@ precedent in this test suite that assigns a two-parameter lambda over
 ### forget() de-indexes, and says so
 
 Settled by ruling R3. `forget()` on a vault-bound scope **does not delete a vault
-file**. It drops the `memory_metadata` row, sets `vault_note.status = 'excluded'`,
-purges the note's `origin="vault"` edges, and reports the path the human may delete in
-Obsidian.
+file**. It records the identity in `vault_exclusion`, drops the `memory_metadata`
+row, reflects that authority as `vault_note.status = 'excluded'`, purges the note's
+`origin="vault"` edges, and reports the path the human may delete in Obsidian. The
+separate identity-keyed row is the durable intent; `vault_note.status` remains
+rebuildable projection state.
 
 Revision 1 claimed `forget()` "keeps its meaning", which was wrong in a way that
 matters (F11): it returns `bool` (line 2658) across seven call sites, so there was no

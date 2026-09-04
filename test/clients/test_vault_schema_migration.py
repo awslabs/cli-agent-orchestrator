@@ -16,6 +16,7 @@ from cli_agent_orchestrator.clients import database as db_mod
 from cli_agent_orchestrator.clients.database import (
     VAULT_NOTE_SCOPE_ID_SENTINEL,
     MemoryMetadataModel,
+    VaultExclusionModel,
     VaultNoteModel,
 )
 
@@ -255,6 +256,64 @@ def test_vault_note_global_identity_uses_non_null_scope_id_sentinel(isolated_db)
                 )
             )
             session.commit()
+
+
+def test_vault_exclusion_migration_backfills_excluded_notes_idempotently(isolated_db):
+    db_path, engine = isolated_db
+    VaultNoteModel.__table__.create(engine)
+    with sessionmaker(bind=engine)() as session:
+        session.add(
+            VaultNoteModel(
+                note_uid="forgotten",
+                vault_id="primary",
+                scope="project",
+                scope_id="demo",
+                cao_key="private-plan",
+                vault_relpath="Projects/Private.md",
+                managed=False,
+                content_sha256="abc123",
+                status="excluded",
+            )
+        )
+        session.commit()
+
+    db_mod.init_db()
+    db_mod.init_db()
+
+    with sqlite3.connect(db_path) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(vault_exclusion)")}
+    with sessionmaker(bind=engine)() as session:
+        rows = session.query(VaultExclusionModel).all()
+
+    assert columns == {
+        "vault_id",
+        "scope",
+        "scope_id",
+        "cao_key",
+        "last_known_relpath",
+        "content_sha256",
+        "created_at",
+    }
+    assert [
+        (
+            row.vault_id,
+            row.scope,
+            row.scope_id,
+            row.cao_key,
+            row.last_known_relpath,
+            row.content_sha256,
+        )
+        for row in rows
+    ] == [
+        (
+            "primary",
+            "project",
+            "demo",
+            "private-plan",
+            "Projects/Private.md",
+            "abc123",
+        )
+    ]
 
 
 def test_source_kind_migration_failure_propagates(isolated_db):

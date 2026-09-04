@@ -11,6 +11,7 @@ from cli_agent_orchestrator.clients.database import (
     Base,
     MemoryMetadataModel,
     MemoryRelationshipModel,
+    VaultExclusionModel,
     VaultFindingModel,
     VaultNoteAliasModel,
     VaultNoteModel,
@@ -470,7 +471,7 @@ def test_same_path_key_change_keeps_forgotten_note_excluded(tmp_path, monkeypatc
     source.write_text("---\ncao:\n  key: old-key\n---\nbody", encoding="utf-8")
     reconcile(vault, apply=True, run_id="excluded-before")
     with Session() as db:
-        db.query(VaultNoteModel).filter_by(cao_key="old-key").update({"status": "excluded"})
+        _exclude_note(db, db.query(VaultNoteModel).filter_by(cao_key="old-key").one())
         db.query(MemoryMetadataModel).filter_by(source_kind="vault", key="old-key").delete()
         db.commit()
 
@@ -480,6 +481,7 @@ def test_same_path_key_change_keeps_forgotten_note_excluded(tmp_path, monkeypatc
     with Session() as db:
         migrated = db.query(VaultNoteModel).filter_by(vault_relpath="Mapped/One.md").one()
         vault_metadata_count = db.query(MemoryMetadataModel).filter_by(source_kind="vault").count()
+        exclusions = db.query(VaultExclusionModel).all()
         retained = (
             db.query(VaultFindingModel)
             .filter_by(
@@ -491,6 +493,7 @@ def test_same_path_key_change_keeps_forgotten_note_excluded(tmp_path, monkeypatc
     assert migrated.cao_key == "new-key"
     assert migrated.status == "excluded"
     assert vault_metadata_count == 0
+    assert [row.cao_key for row in exclusions] == ["new-key"]
     assert "deindexed_retained" in retained.detail
 
 
@@ -605,7 +608,7 @@ def test_pure_rename_of_deindexed_note_keeps_it_excluded(tmp_path, monkeypatch):
     old_path.write_text("same content", encoding="utf-8")
     reconcile(vault, apply=True, run_id="rename-excluded-before")
     with Session() as db:
-        db.query(VaultNoteModel).update({"status": "excluded"})
+        _exclude_note(db, db.query(VaultNoteModel).one())
         db.query(MemoryMetadataModel).filter_by(source_kind="vault").delete()
         db.commit()
 
@@ -635,7 +638,7 @@ def test_rebuild_keeps_authored_key_tombstone_after_rename(tmp_path, monkeypatch
     old_path.write_text("---\ncao:\n  key: canonical\n---\nsafe", encoding="utf-8")
     reconcile(vault, apply=True, run_id="authored-rebuild-before")
     with Session() as db:
-        db.query(VaultNoteModel).filter_by(cao_key="canonical").update({"status": "excluded"})
+        _exclude_note(db, db.query(VaultNoteModel).filter_by(cao_key="canonical").one())
         db.query(MemoryMetadataModel).filter_by(source_kind="vault", key="canonical").delete()
         db.commit()
 
@@ -661,7 +664,7 @@ def test_rebuild_keeps_authored_tombstone_through_quarantine_and_restoration(tmp
     old_path.write_text("---\ncao:\n  key: canonical\n---\nsafe", encoding="utf-8")
     reconcile(vault, apply=True, run_id="authored-rebuild-quarantine-before")
     with Session() as db:
-        db.query(VaultNoteModel).filter_by(cao_key="canonical").update({"status": "excluded"})
+        _exclude_note(db, db.query(VaultNoteModel).filter_by(cao_key="canonical").one())
         db.query(MemoryMetadataModel).filter_by(source_kind="vault", key="canonical").delete()
         db.commit()
 
@@ -710,7 +713,7 @@ def test_rebuild_does_not_apply_authored_tombstone_to_former_path_replacement(
     old_path.write_text("---\ncao:\n  key: canonical\n---\nsafe", encoding="utf-8")
     reconcile(vault, apply=True, run_id="authored-rebuild-replacement-before")
     with Session() as db:
-        db.query(VaultNoteModel).filter_by(cao_key="canonical").update({"status": "excluded"})
+        _exclude_note(db, db.query(VaultNoteModel).filter_by(cao_key="canonical").one())
         db.query(MemoryMetadataModel).filter_by(source_kind="vault", key="canonical").delete()
         db.commit()
 
@@ -730,6 +733,55 @@ def test_rebuild_does_not_apply_authored_tombstone_to_former_path_replacement(
     ]
     assert authored_note.cao_key != replacement_note.cao_key
     assert metadata_keys == {replacement_note.cao_key}
+
+
+def test_malformed_renamed_note_keeps_identity_excluded_without_suppressing_replacement(
+    tmp_path, monkeypatch
+):
+    """Invalid frontmatter cannot erase a forgotten identity or bind its old path."""
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    old_path = tmp_path / "vault" / "Mapped" / "Old.md"
+    new_path = old_path.with_name("New.md")
+    old_path.write_text("---\ncao:\n  key: canonical\n---\nsafe", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="malformed-rename-before")
+    with Session() as db:
+        _exclude_note(db, db.query(VaultNoteModel).filter_by(cao_key="canonical").one())
+        db.query(MemoryMetadataModel).filter_by(source_kind="vault", key="canonical").delete()
+        db.commit()
+
+    old_path.rename(new_path)
+    new_path.write_text("---\ncao: [\n---\nunparseable", encoding="utf-8")
+    old_path.write_text("different replacement", encoding="utf-8")
+    reconcile(vault, apply=True, rebuild=True, run_id="malformed-rename-middle")
+
+    with Session() as db:
+        replacement = db.query(VaultNoteModel).filter_by(vault_relpath="Mapped/Old.md").one()
+        exclusions = db.query(VaultExclusionModel).all()
+        metadata_keys = {
+            row.key for row in db.query(MemoryMetadataModel).filter_by(source_kind="vault").all()
+        }
+    assert replacement.status == "indexed"
+    assert metadata_keys == {replacement.cao_key}
+    assert [(row.cao_key, row.last_known_relpath) for row in exclusions] == [
+        ("canonical", "Mapped/Old.md")
+    ]
+
+    new_path.write_text("---\ncao:\n  key: canonical\n---\nsafe", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="malformed-rename-after")
+
+    with Session() as db:
+        restored = db.query(VaultNoteModel).filter_by(cao_key="canonical").one()
+        canonical_metadata = (
+            db.query(MemoryMetadataModel).filter_by(source_kind="vault", key="canonical").count()
+        )
+    assert (restored.vault_relpath, restored.status, canonical_metadata) == (
+        "Mapped/New.md",
+        "excluded",
+        0,
+    )
 
 
 def test_reused_former_path_alias_cannot_replace_live_renamed_identity(tmp_path, monkeypatch):
@@ -780,7 +832,7 @@ def test_authored_key_rename_preserves_exclusion_through_quarantine(tmp_path, mo
     old_path.write_text("---\ncao:\n  key: canonical\n---\nsafe", encoding="utf-8")
     reconcile(vault, apply=True, run_id="authored-tombstone-before")
     with Session() as db:
-        db.query(VaultNoteModel).filter_by(cao_key="canonical").update({"status": "excluded"})
+        _exclude_note(db, db.query(VaultNoteModel).filter_by(cao_key="canonical").one())
         db.query(MemoryMetadataModel).filter_by(source_kind="vault", key="canonical").delete()
         db.commit()
 
@@ -816,7 +868,7 @@ def test_authored_key_tombstone_survives_rename_into_quarantine_and_restoration(
     old_path.write_text("---\ncao:\n  key: canonical\n---\nsafe", encoding="utf-8")
     reconcile(vault, apply=True, run_id="quarantined-rename-before")
     with Session() as db:
-        db.query(VaultNoteModel).filter_by(cao_key="canonical").update({"status": "excluded"})
+        _exclude_note(db, db.query(VaultNoteModel).filter_by(cao_key="canonical").one())
         db.query(MemoryMetadataModel).filter_by(source_kind="vault", key="canonical").delete()
         db.commit()
 
@@ -826,7 +878,7 @@ def test_authored_key_tombstone_survives_rename_into_quarantine_and_restoration(
     with Session() as db:
         middle = db.query(VaultNoteModel).filter_by(vault_relpath="Mapped/New.md").one()
         middle_metadata = db.query(MemoryMetadataModel).filter_by(source_kind="vault").count()
-    assert (middle.status, middle_metadata) == ("excluded", 0)
+    assert (middle.status, middle_metadata) == ("quarantined", 0)
 
     new_path.write_text("---\ncao:\n  key: canonical\n---\nsafe", encoding="utf-8")
     reconcile(vault, apply=True, run_id="quarantined-rename-after")
@@ -1007,7 +1059,7 @@ def test_rebuild_preserves_deindexed_tombstones(tmp_path, monkeypatch):
     source.write_text("same content", encoding="utf-8")
     reconcile(vault, apply=True, run_id="rebuild-excluded-before")
     with Session() as db:
-        db.query(VaultNoteModel).update({"status": "excluded"})
+        _exclude_note(db, db.query(VaultNoteModel).one())
         db.query(MemoryMetadataModel).filter_by(source_kind="vault").delete()
         db.commit()
 
@@ -1318,6 +1370,20 @@ def _rename_vault(tmp_path) -> VaultSpec:
     (root / "Mapped").mkdir()
     (root / "CAO").mkdir()
     return _vault(tmp_path)
+
+
+def _exclude_note(db, note: VaultNoteModel) -> None:
+    note.status = "excluded"
+    db.add(
+        VaultExclusionModel(
+            vault_id=note.vault_id,
+            scope=note.scope,
+            scope_id=note.scope_id,
+            cao_key=note.cao_key,
+            last_known_relpath=note.vault_relpath,
+            content_sha256=note.content_sha256,
+        )
+    )
 
 
 def _session(tmp_path, monkeypatch, module):

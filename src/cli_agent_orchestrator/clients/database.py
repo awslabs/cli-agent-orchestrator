@@ -216,6 +216,25 @@ class VaultNoteModel(Base):
     )
 
 
+class VaultExclusionModel(Base):
+    """Authoritative user-forget intent for a vault memory identity."""
+
+    __tablename__ = "vault_exclusion"
+
+    vault_id = Column(String, primary_key=True)
+    scope = Column(String, primary_key=True)
+    scope_id = Column(
+        String,
+        primary_key=True,
+        default=VAULT_NOTE_SCOPE_ID_SENTINEL,
+        server_default=VAULT_NOTE_SCOPE_ID_SENTINEL,
+    )
+    cao_key = Column(String, primary_key=True)
+    last_known_relpath = Column(String, nullable=False)
+    content_sha256 = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+
+
 class VaultFindingModel(Base):
     """Content-free finding emitted while reconciling a vault."""
 
@@ -495,6 +514,9 @@ def init_db() -> None:
     # Appended LAST (issue #583 Bolt 2, ``approval-store``). Disjoint from every table above —
     # its own new table, no shared columns — so registry order is immaterial here too.
     _migrate_workflow_plan_approval()
+    # Appended LAST (PR #674). Disjoint from every table above except for the
+    # one-time backfill read from vault_note.
+    _migrate_vault_exclusions()
 
 
 def _restrict_db_file_permissions() -> None:
@@ -852,6 +874,52 @@ def _migrate_workflow_plan_approval() -> None:
             )
     except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug (B4-RD-4)
         logger.debug(f"workflow_plan_approval migration skipped: {e}")
+
+
+def _migrate_vault_exclusions() -> None:
+    """Create and backfill durable vault-forget identities.
+
+    ``vault_note.status`` is a rebuildable projection and cannot safely retain
+    user intent across path reuse, quarantine, or rebuild. Existing excluded
+    rows are therefore copied into the identity-keyed authoritative table.
+    Failure propagates because continuing without the backfill could republish
+    content that the user explicitly forgot.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS vault_exclusion ("
+                "vault_id VARCHAR NOT NULL, "
+                "scope VARCHAR NOT NULL, "
+                "scope_id VARCHAR NOT NULL DEFAULT '', "
+                "cao_key VARCHAR NOT NULL, "
+                "last_known_relpath VARCHAR NOT NULL, "
+                "content_sha256 VARCHAR, "
+                "created_at DATETIME NOT NULL, "
+                "PRIMARY KEY (vault_id, scope, scope_id, cao_key)"
+                ")"
+            )
+            note_table_exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'vault_note'"
+            ).fetchone()
+            if note_table_exists is None:
+                return
+            conn.execute(
+                "INSERT OR IGNORE INTO vault_exclusion ("
+                "vault_id, scope, scope_id, cao_key, last_known_relpath, "
+                "content_sha256, created_at"
+                ") "
+                "SELECT vault_id, scope, scope_id, cao_key, vault_relpath, "
+                "content_sha256, COALESCE(last_reconciled_at, CURRENT_TIMESTAMP) "
+                "FROM vault_note WHERE status = 'excluded'"
+            )
+    except Exception as e:
+        logger.error(f"Vault exclusion migration failed: {e}")
+        raise
 
 
 def _backfill_legacy_related_keys(conn: Any) -> None:

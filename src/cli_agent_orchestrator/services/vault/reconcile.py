@@ -12,6 +12,7 @@ from cli_agent_orchestrator.clients.database import (
     MemoryMetadataModel,
     MemoryRelationshipModel,
     SessionLocal,
+    VaultExclusionModel,
     VaultFindingModel,
     VaultNoteAliasModel,
     VaultNoteModel,
@@ -128,8 +129,15 @@ def reconcile(
         deferred_relationship_audits: list[Callable[[], None]] = []
         with SessionLocal() as db:
             with db.begin():
+                exclusions = _vault_exclusion_set(db, vault.id)
                 if not rebuild:
-                    _clear_stale_vault_edges(db, vault.id, projected, deferred_relationship_audits)
+                    _clear_stale_vault_edges(
+                        db,
+                        vault.id,
+                        projected,
+                        deferred_relationship_audits,
+                        exclusions,
+                    )
                 deleted, findings, projected = _apply_plan(
                     db,
                     vault,
@@ -138,6 +146,7 @@ def reconcile(
                     findings,
                     deferred_relationship_audits,
                     rebuild=rebuild,
+                    exclusions=exclusions,
                 )
                 findings = _merge_findings(
                     findings,
@@ -184,9 +193,12 @@ def _preview_rename_findings(
             for row in db.query(VaultNoteModel).filter(VaultNoteModel.vault_id == vault_id).all()
         }
         carried_alias_keys = _alias_identity_set(db, vault_id)
+        exclusions = _vault_exclusion_set(db, vault_id)
     resolutions = _resolve_renames(
         vault_id, projected, prior_by_path, carried_alias_keys=carried_alias_keys
     )
+    exclusions = _resolve_exclusion_transitions(resolutions, prior_by_path, exclusions)
+    resolutions = _retain_vault_exclusions(resolutions, exclusions)
     return (
         _merge_findings(
             findings,
@@ -201,6 +213,7 @@ def _clear_stale_vault_edges(
     vault_id: str,
     projected: tuple[_ProjectedNote, ...],
     audit_sink: list[Callable[[], None]],
+    exclusions: set[tuple[str, str, str]],
 ) -> None:
     """Retract removed or non-indexed sources through the relationship boundary."""
     prior_by_path: dict[str, VaultNoteModel] = {
@@ -211,6 +224,9 @@ def _clear_stale_vault_edges(
     resolutions = _resolve_renames(
         vault_id, projected, prior_by_path, carried_alias_keys=carried_alias_keys
     )
+    exclusions = _resolve_exclusion_transitions(resolutions, prior_by_path, exclusions)
+    resolutions = _retain_vault_exclusions(resolutions, exclusions)
+    projected = tuple(resolution.item for resolution in resolutions)
     retained = {
         resolution.retained_former_path
         for resolution in resolutions
@@ -320,23 +336,10 @@ def _apply_plan(
     audit_sink: list[Callable[[], None]],
     *,
     rebuild: bool,
+    exclusions: set[tuple[str, str, str]],
 ) -> tuple[int, tuple[tuple[str, str, str, str], ...], tuple[_ProjectedNote, ...]]:
     """Apply only vault-scoped deletes; native rows remain structurally untouched."""
-    rebuild_excluded_paths: set[str] = set()
-    rebuild_excluded_identities: set[tuple[str, str, str]] = set()
     if rebuild:
-        excluded_notes = (
-            db.query(VaultNoteModel)
-            .filter(
-                VaultNoteModel.vault_id == vault.id,
-                VaultNoteModel.status == "excluded",
-            )
-            .all()
-        )
-        rebuild_excluded_paths, rebuild_excluded_identities = _snapshot_rebuild_exclusions(
-            excluded_notes,
-            projected,
-        )
         # Every rebuild delete is scoped to its derived producer. Release
         # one permits one configured vault, so metadata has no vault id.
         db.query(VaultNoteModel).filter(VaultNoteModel.vault_id == vault.id).delete()
@@ -358,11 +361,14 @@ def _apply_plan(
         prior_by_path,
         carried_alias_keys=carried_alias_keys,
     )
-    resolutions = _retain_rebuild_exclusions(
+    exclusions = _resolve_exclusion_transitions(
         resolutions,
-        rebuild_excluded_paths,
-        rebuild_excluded_identities,
+        prior_by_path,
+        exclusions,
+        db=db,
+        vault_id=vault.id,
     )
+    resolutions = _retain_vault_exclusions(resolutions, exclusions)
     projected = tuple(resolution.item for resolution in resolutions)
     findings = _merge_findings(
         findings,
@@ -509,20 +515,104 @@ def _alias_identity_set(db, vault_id: str) -> set[tuple[str, str, str]]:
     }
 
 
-def _retain_rebuild_exclusions(
+def _vault_exclusion_set(db, vault_id: str) -> set[tuple[str, str, str]]:
+    """Load authoritative user-forget identities once for a reconciliation path."""
+    return {
+        (
+            cast(str, row.scope),
+            cast(str, row.scope_id),
+            cast(str, row.cao_key),
+        )
+        for row in db.query(VaultExclusionModel)
+        .filter(VaultExclusionModel.vault_id == vault_id)
+        .all()
+    }
+
+
+def _resolve_exclusion_transitions(
     resolutions: tuple[_RenameResolution, ...],
-    excluded_paths: set[str],
-    excluded_identities: set[tuple[str, str, str]],
+    prior_by_path: dict[str, VaultNoteModel],
+    exclusions: set[tuple[str, str, str]],
+    *,
+    db=None,
+    vault_id: str | None = None,
+) -> set[tuple[str, str, str]]:
+    """Move forget intent with a valid same-path identity transition."""
+    resolved = set(exclusions)
+    for resolution in resolutions:
+        item = resolution.item
+        prior = prior_by_path.get(item.note.vault_relpath)
+        if prior is None or item.note.status != "indexed":
+            continue
+        old_identity = (
+            cast(str, prior.scope),
+            cast(str, prior.scope_id),
+            cast(str, prior.cao_key),
+        )
+        new_identity = (
+            cast(str, item.note.scope),
+            item.note.scope_id or "",
+            item.key,
+        )
+        if old_identity not in resolved or old_identity == new_identity:
+            continue
+        resolved.remove(old_identity)
+        resolved.add(new_identity)
+        if db is None:
+            continue
+        old_row = db.get(
+            VaultExclusionModel,
+            {
+                "vault_id": vault_id,
+                "scope": old_identity[0],
+                "scope_id": old_identity[1],
+                "cao_key": old_identity[2],
+            },
+        )
+        new_row = db.get(
+            VaultExclusionModel,
+            {
+                "vault_id": vault_id,
+                "scope": new_identity[0],
+                "scope_id": new_identity[1],
+                "cao_key": new_identity[2],
+            },
+        )
+        if new_row is None:
+            db.add(
+                VaultExclusionModel(
+                    vault_id=vault_id,
+                    scope=new_identity[0],
+                    scope_id=new_identity[1],
+                    cao_key=new_identity[2],
+                    last_known_relpath=item.note.vault_relpath,
+                    content_sha256=item.note.content_sha256,
+                    created_at=(
+                        old_row.created_at if old_row is not None else datetime.now(timezone.utc)
+                    ),
+                )
+            )
+        else:
+            new_row.last_known_relpath = item.note.vault_relpath
+            new_row.content_sha256 = item.note.content_sha256
+        if old_row is not None:
+            db.delete(old_row)
+    return resolved
+
+
+def _retain_vault_exclusions(
+    resolutions: tuple[_RenameResolution, ...],
+    exclusions: set[tuple[str, str, str]],
 ) -> tuple[_RenameResolution, ...]:
-    """Carry tombstones across a rebuild by authored identity or derived path."""
+    """Apply durable forget intent after the live scan resolves note identity."""
     retained: list[_RenameResolution] = []
     for resolution in resolutions:
         item = resolution.item
         excluded = (
             cast(str, item.note.scope),
             item.note.scope_id or "",
-            item.canonical_key,
-        ) in excluded_identities or item.note.vault_relpath in excluded_paths
+            item.key,
+        ) in exclusions
         if excluded and item.note.status != "excluded":
             item = replace(item, note=replace(item.note, status="excluded"))
             resolution = replace(
@@ -533,41 +623,6 @@ def _retain_rebuild_exclusions(
             )
         retained.append(resolution)
     return tuple(retained)
-
-
-def _snapshot_rebuild_exclusions(
-    excluded_notes: Iterable[VaultNoteModel],
-    projected: tuple[_ProjectedNote, ...],
-) -> tuple[set[str], set[tuple[str, str, str]]]:
-    """Snapshot authored tombstones by identity and path-derived ones by path.
-
-    The current scan is the only source that can distinguish an authored key
-    from a path-derived key without adding mutable provenance to ``vault_note``.
-    Matching an authored identity before deleting prior rows prevents its old
-    path from suppressing a different replacement note.
-    """
-    authored_identities = {
-        (
-            item.note.scope,
-            item.note.scope_id or "",
-            item.canonical_key,
-        )
-        for item in projected
-        if item.note.parsed is not None and "key" in item.note.parsed.cao
-    }
-    excluded_paths: set[str] = set()
-    excluded_identities: set[tuple[str, str, str]] = set()
-    for row in excluded_notes:
-        identity = (
-            cast(str, row.scope),
-            cast(str, row.scope_id),
-            cast(str, row.cao_key),
-        )
-        if identity in authored_identities:
-            excluded_identities.add(identity)
-        else:
-            excluded_paths.add(cast(str, row.vault_relpath))
-    return excluded_paths, excluded_identities
 
 
 def _resolve_renames(
@@ -636,16 +691,7 @@ def _resolve_renames(
                     note_uid=cast(str, existing.note_uid),
                     memory_id=_digest("memory", cast(str, existing.note_uid)),
                 )
-            resolution_findings: tuple[tuple[str, str, str, str], ...] = ()
-            if existing.status == "excluded" and item.note.status != "excluded":
-                item = replace(item, note=replace(item.note, status="excluded"))
-                resolution_findings = (
-                    _rename_finding(
-                        FindingCode.DEINDEXED_RETAINED,
-                        item.note.vault_relpath,
-                    ),
-                )
-            resolutions.append(_RenameResolution(item, findings=resolution_findings))
+            resolutions.append(_RenameResolution(item))
             continue
         same_scope = tuple(
             old
@@ -656,8 +702,6 @@ def _resolve_renames(
         matching = matching_by_path.get(item.note.vault_relpath, ())
         if has_authored_key:
             canonical = tuple(old for old in same_scope if old.note_uid == item.note_uid)
-            if len(canonical) == 1 and canonical[0].status == "excluded":
-                item = replace(item, note=replace(item.note, status="excluded"))
             resolutions.append(
                 _RenameResolution(
                     item,
@@ -678,24 +722,11 @@ def _resolve_renames(
                 note_uid=old_note_uid,
                 memory_id=_digest("memory", old_note_uid),
             )
-            rename_findings: tuple[tuple[str, str, str, str], ...] = ()
-            if old.status == "excluded" and renamed_item.note.status != "excluded":
-                renamed_item = replace(
-                    renamed_item,
-                    note=replace(renamed_item.note, status="excluded"),
-                )
-                rename_findings = (
-                    _rename_finding(
-                        FindingCode.DEINDEXED_RETAINED,
-                        renamed_item.note.vault_relpath,
-                    ),
-                )
             resolutions.append(
                 _RenameResolution(
                     renamed_item,
                     retained_former_path=cast(str, old.vault_relpath),
                     alias_from=old,
-                    findings=rename_findings,
                 )
             )
         elif len(matching) > 1 or any(
@@ -716,14 +747,6 @@ def _resolve_renames(
                     item.note.vault_relpath,
                 ),
             )
-            if same_scope[0].status == "excluded" and item.note.status != "excluded":
-                item = replace(item, note=replace(item.note, status="excluded"))
-                rename_findings += (
-                    _rename_finding(
-                        FindingCode.DEINDEXED_RETAINED,
-                        item.note.vault_relpath,
-                    ),
-                )
             resolutions.append(
                 _RenameResolution(
                     item,

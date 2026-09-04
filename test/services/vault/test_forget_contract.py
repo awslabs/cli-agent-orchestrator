@@ -12,6 +12,7 @@ from sqlalchemy.orm import sessionmaker
 from cli_agent_orchestrator.clients.database import (
     Base,
     MemoryMetadataModel,
+    VaultExclusionModel,
     VaultNoteModel,
 )
 from cli_agent_orchestrator.services import memory_service, settings_service
@@ -71,6 +72,8 @@ def test_forget_deindexes_vault_note_without_unlinking(tmp_path, monkeypatch) ->
     with Session() as db:
         note = db.query(VaultNoteModel).filter_by(cao_key="managed-topic").one()
         assert note.status == "excluded"
+        exclusion = db.query(VaultExclusionModel).filter_by(cao_key="managed-topic").one()
+        assert exclusion.last_known_relpath == "CAO/managed-topic.md"
 
     reconcile_module.reconcile(fixture.vault, apply=True, run_id="after-forget")
 

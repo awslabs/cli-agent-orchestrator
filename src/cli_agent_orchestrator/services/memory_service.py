@@ -3351,6 +3351,7 @@ class MemoryService:
         """Remove derived state for a vault note without modifying its file."""
         from cli_agent_orchestrator.clients.database import (
             VAULT_NOTE_SCOPE_ID_SENTINEL,
+            VaultExclusionModel,
             VaultNoteModel,
         )
 
@@ -3369,6 +3370,23 @@ class MemoryService:
             )
             if note is None:
                 return ForgetResult("absent", "vault", None)
+            exclusion_identity = {
+                "vault_id": binding.vault_id,
+                "scope": binding.scope,
+                "scope_id": stored_scope_id,
+                "cao_key": key,
+            }
+            exclusion = db.get(VaultExclusionModel, exclusion_identity)
+            if exclusion is None:
+                exclusion = VaultExclusionModel(
+                    **exclusion_identity,
+                    last_known_relpath=note.vault_relpath,
+                    content_sha256=note.content_sha256,
+                )
+                db.add(exclusion)
+            else:
+                exclusion.last_known_relpath = note.vault_relpath
+                exclusion.content_sha256 = note.content_sha256
             note.status = "excluded"
             path = note.vault_relpath
             db.commit()
