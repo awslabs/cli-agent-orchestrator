@@ -120,7 +120,7 @@ def canonical_scope_id(scope: str, scope_id: Optional[str]) -> Optional[str]:
     """Return the durable identity used by every vault-facing scope boundary."""
     if scope != "project" or scope_id is None:
         return scope_id
-    return get_project_id_by_alias(scope_id) or scope_id
+    return get_project_id_by_alias(scope_id, fail_closed=True) or scope_id
 
 
 def _mapping_identity(mapping: "FolderMapping") -> tuple[str, Optional[str]]:

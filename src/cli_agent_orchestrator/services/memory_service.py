@@ -2684,45 +2684,52 @@ class MemoryService:
             # Fail closed instead of exposing a retained native replica.
             logger.warning("vault recall sources unavailable; returning no content: %s", exc)
             return [], [], 4096, None
-        from cli_agent_orchestrator.services.vault.binding import resolve
+        from cli_agent_orchestrator.services.vault.binding import (
+            VaultConfigUnavailableError,
+            resolve,
+        )
 
         native_dirs = self._get_search_dirs(scope, terminal_context, scan_all=scan_all)
-        if not config.enabled:
-            return native_dirs, [], config.max_recall_body_chars, config
-        if scope is not None:
-            scope_id = (
-                self.resolve_scope_id(scope, terminal_context)
-                if scope != MemoryScope.GLOBAL.value and terminal_context
-                else None
-            )
-            binding = resolve(scope, scope_id, vault_config=config)
-            return (
-                [] if isinstance(binding, VaultBinding) else native_dirs,
-                [binding] if isinstance(binding, VaultBinding) else [],
-                config.max_recall_body_chars,
-                config,
-            )
-        bindings: list[VaultBinding] = []
-        for vault in config.vaults:
-            for mapping in vault.mappings:
-                if not scan_all and mapping.scope not in {
-                    MemoryScope.GLOBAL.value,
-                    MemoryScope.PROJECT.value,
-                    MemoryScope.SESSION.value,
-                }:
-                    continue
-                if scan_all:
-                    binding_scope_id = mapping.scope_id
-                elif mapping.scope == MemoryScope.GLOBAL.value:
-                    binding_scope_id = None
-                elif terminal_context:
-                    binding_scope_id = self.resolve_scope_id(mapping.scope, terminal_context)
-                else:
-                    continue
-                binding = resolve(mapping.scope, binding_scope_id, vault_config=config)
-                if isinstance(binding, VaultBinding) and binding not in bindings:
-                    bindings.append(binding)
-        return native_dirs, bindings, config.max_recall_body_chars, config
+        try:
+            if not config.enabled:
+                return native_dirs, [], config.max_recall_body_chars, config
+            if scope is not None:
+                scope_id = (
+                    self.resolve_scope_id(scope, terminal_context)
+                    if scope != MemoryScope.GLOBAL.value and terminal_context
+                    else None
+                )
+                binding = resolve(scope, scope_id, vault_config=config)
+                return (
+                    [] if isinstance(binding, VaultBinding) else native_dirs,
+                    [binding] if isinstance(binding, VaultBinding) else [],
+                    config.max_recall_body_chars,
+                    config,
+                )
+            bindings: list[VaultBinding] = []
+            for vault in config.vaults:
+                for mapping in vault.mappings:
+                    if not scan_all and mapping.scope not in {
+                        MemoryScope.GLOBAL.value,
+                        MemoryScope.PROJECT.value,
+                        MemoryScope.SESSION.value,
+                    }:
+                        continue
+                    if scan_all:
+                        binding_scope_id = mapping.scope_id
+                    elif mapping.scope == MemoryScope.GLOBAL.value:
+                        binding_scope_id = None
+                    elif terminal_context:
+                        binding_scope_id = self.resolve_scope_id(mapping.scope, terminal_context)
+                    else:
+                        continue
+                    binding = resolve(mapping.scope, binding_scope_id, vault_config=config)
+                    if isinstance(binding, VaultBinding) and binding not in bindings:
+                        bindings.append(binding)
+            return native_dirs, bindings, config.max_recall_body_chars, config
+        except VaultConfigUnavailableError as exc:
+            logger.warning("vault recall sources unavailable; returning no content: %s", exc)
+            return [], [], 4096, None
 
     @staticmethod
     def _native_entry_is_vault_mapped(

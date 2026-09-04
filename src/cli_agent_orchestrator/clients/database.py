@@ -2088,8 +2088,16 @@ def record_project_alias(project_id: str, alias: str, kind: str) -> None:
         logger.debug(f"record_project_alias failed (non-fatal): {e}")
 
 
-def get_project_id_by_alias(alias: str) -> Optional[str]:
-    """Return the canonical ``project_id`` for an alias, or None if unknown."""
+class ProjectAliasLookupUnavailableError(RuntimeError):
+    """Raised when a required project-alias lookup cannot reach the database."""
+
+
+def get_project_id_by_alias(alias: str, *, fail_closed: bool = False) -> Optional[str]:
+    """Return the canonical ``project_id`` for an alias, or None if unknown.
+
+    Callers that enforce a vault boundary can request ``fail_closed`` so a
+    database outage cannot be mistaken for an unrecognized alias.
+    """
     if not alias:
         return None
     try:
@@ -2097,6 +2105,8 @@ def get_project_id_by_alias(alias: str) -> Optional[str]:
             row = db.query(ProjectAliasModel).filter(ProjectAliasModel.alias == alias).first()
             return cast(Optional[str], row.project_id) if row else None
     except Exception as e:
+        if fail_closed:
+            raise ProjectAliasLookupUnavailableError(str(e)) from e
         logger.debug(f"get_project_id_by_alias failed (non-fatal): {e}")
         return None
 

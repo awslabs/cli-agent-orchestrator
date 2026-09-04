@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.models.relationship import VALID_ORIGINS
 from cli_agent_orchestrator.services import settings_service
 from cli_agent_orchestrator.services.vault import binding
@@ -42,7 +43,7 @@ def test_resolve_canonicalises_project_alias_before_matching(tmp_path, monkeypat
     monkeypatch.setattr(
         binding,
         "get_project_id_by_alias",
-        lambda scope_id: "canonical-project" if scope_id == "old-project" else None,
+        lambda scope_id, **_kwargs: ("canonical-project" if scope_id == "old-project" else None),
     )
 
     resolved = binding.resolve("project", "old-project", vault_config=config)
@@ -61,7 +62,7 @@ def test_resolve_canonicalises_configured_project_alias_and_case_variant(
     monkeypatch.setattr(
         binding,
         "get_project_id_by_alias",
-        lambda scope_id: "canonical-project" if scope_id == "old-project" else None,
+        lambda scope_id, **_kwargs: ("canonical-project" if scope_id == "old-project" else None),
     )
 
     resolved = binding.resolve("project", "CANONICAL-PROJECT", vault_config=config)
@@ -69,6 +70,23 @@ def test_resolve_canonicalises_configured_project_alias_and_case_variant(
     assert isinstance(resolved, binding.VaultBinding)
     assert resolved.scope_id == "canonical-project"
     assert resolved.mapping.scope_id == "old-project"
+
+
+def test_resolve_refuses_native_fallback_when_project_alias_lookup_is_unavailable(
+    tmp_path, monkeypatch
+) -> None:
+    config = _config(tmp_path)
+
+    def unavailable_session_local():
+        raise RuntimeError("project alias database unavailable")
+
+    monkeypatch.setattr(database, "SessionLocal", unavailable_session_local)
+
+    with pytest.raises(
+        binding.VaultConfigUnavailableError,
+        match=r"^vault configuration unavailable: project alias database unavailable$",
+    ):
+        binding.resolve("project", "unknown-project", vault_config=config)
 
 
 def test_load_vault_config_refuses_when_configuration_is_unavailable(monkeypatch, caplog) -> None:
@@ -153,7 +171,9 @@ def test_collect_binding_warnings_are_complete_deterministic_and_content_free(
     monkeypatch.setattr(
         binding,
         "get_project_id_by_alias",
-        lambda scope_id: ("github-com-acme-widgets" if scope_id == "deadbeefcafe" else None),
+        lambda scope_id, **_kwargs: (
+            "github-com-acme-widgets" if scope_id == "deadbeefcafe" else None
+        ),
     )
     monkeypatch.setattr(
         binding,

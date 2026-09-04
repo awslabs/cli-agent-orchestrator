@@ -9,6 +9,7 @@ from threading import Lock
 from typing import Optional, Union, cast
 
 from cli_agent_orchestrator.clients.database import (
+    ProjectAliasLookupUnavailableError,
     get_project_id_by_alias,
     list_aliases_for_project,
 )
@@ -267,7 +268,10 @@ def _reset_unmapped_project_write_count() -> None:
 def _canonical_scope_id(scope: str, scope_id: Optional[str]) -> Optional[str]:
     if scope != "project" or scope_id is None:
         return scope_id
-    return get_project_id_by_alias(scope_id) or scope_id
+    try:
+        return get_project_id_by_alias(scope_id, fail_closed=True) or scope_id
+    except ProjectAliasLookupUnavailableError as exc:
+        raise VaultConfigUnavailableError(f"vault configuration unavailable: {exc}") from exc
 
 
 def _scope_ids_match(scope: str, left: Optional[str], right: Optional[str]) -> bool:

@@ -1473,6 +1473,49 @@ class TestVaultScopeAuthority:
         )
         assert service.get_memory_context(terminal_context) == ""
 
+    def test_alias_lookup_failure_fails_closed_for_recall_sources(self, tmp_path, monkeypatch):
+        from cli_agent_orchestrator.clients import database
+        from cli_agent_orchestrator.services import settings_service
+
+        vault_root = tmp_path / "vault"
+        vault_root.mkdir()
+        config = VaultConfig(
+            enabled=True,
+            vaults=[
+                VaultSpec(
+                    id="scope-test",
+                    root=str(vault_root),
+                    managed_folder="CAO",
+                    mappings=[
+                        FolderMapping(
+                            folder="Project",
+                            scope="project",
+                            scope_id="project-a",
+                        ),
+                        FolderMapping(folder="CAO", scope="global", writable=True),
+                    ],
+                )
+            ],
+        )
+        service = MemoryService(base_dir=tmp_path / "native")
+        terminal_context = _make_terminal_context(cwd=str(tmp_path / "project-a"))
+        service.resolve_scope_id = lambda scope, _context: (  # type: ignore[method-assign]
+            "project-a" if scope == "project" else None
+        )
+        monkeypatch.setattr(settings_service, "get_vault_config", lambda: config)
+        monkeypatch.setattr(
+            database,
+            "SessionLocal",
+            lambda: (_ for _ in ()).throw(RuntimeError("project alias database unavailable")),
+        )
+
+        native_dirs, vault_bindings, _max_body_chars, _config = service._resolve_sources(
+            "project", terminal_context, scan_all=False
+        )
+
+        assert native_dirs == []
+        assert vault_bindings == []
+
 
 # ===========================================================================
 # FEDERATED scope (issue #313) — machine-wide shared tier
