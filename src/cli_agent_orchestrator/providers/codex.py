@@ -126,7 +126,6 @@ UPDATE_DIALOG_PATTERN = r"Update available!\s+\S+\s+->\s+\S+"
 UPDATE_DIALOG_MENU_PATTERN = r"Skip until next version"
 UPDATE_DIALOG_FOOTER = TRUST_PROMPT_FOOTER
 STARTUP_PROMPT_BOTTOM_LINES = 15
-STARTUP_ACTIVITY_PATTERN = r"^\s*•[^\S\n]+\S"
 # Codex's runtime approval prompt as actually rendered by codex-cli 0.147.0,
 # verified against a live tmux capture (test/providers/fixtures/
 # codex_approval_modal_raw.txt):
@@ -678,7 +677,7 @@ def _has_startup_idle_composer(clean_output: str) -> bool:
     tail_lines = all_lines[-STARTUP_PROMPT_BOTTOM_LINES:]
     tail_output = "\n".join(tail_lines)
 
-    if re.search(STARTUP_ACTIVITY_PATTERN, tail_output, re.MULTILINE):
+    if re.search(TUI_PROGRESS_PATTERN, tail_output, re.MULTILINE):
         return False
     if re.search(WAITING_PROMPT_PATTERN, tail_output, re.IGNORECASE | re.MULTILINE):
         return False
@@ -1411,12 +1410,15 @@ class CodexProvider(BaseProvider):
             # - Fresh init: no assistant content either → IDLE.
             # - Long-running response: the › user marker has been evicted from
             #   the rolling state buffer by the time the response settles, but an
-            #   assistant bullet is still visible. Without this branch we'd
-            #   return IDLE forever and ``wait_for_status(completed)`` in the
-            #   e2e tests would time out.
+            #   assistant bullet is still visible. This is only a completion
+            #   after CAO has actually dispatched a task; startup notices use the
+            #   same bullet glyph.
             # Search above the TUI footer cutoff so the › suggestion-hint and
             # status-bar lines aren't confused with a model reply.
-            if _find_assistant_marker(clean_output[:cutoff_pos]) is not None:
+            if (
+                self._task_dispatched
+                and _find_assistant_marker(clean_output[:cutoff_pos]) is not None
+            ):
                 return TerminalStatus.COMPLETED
             return TerminalStatus.IDLE
 
