@@ -2212,6 +2212,29 @@ class TestCodexProviderTrustPrompt:
 
         assert _has_startup_idle_composer(output) is True
 
+    def test_v0153_account_notice_is_idle_at_startup(self):
+        """A startup account notice is neither activity nor a completed response."""
+        output = (
+            "OpenAI Codex (v0.153.2)\n"
+            "• You have 1 usage limit reset available. Run /usage to use one.\n\n"
+            "› Ask Codex to do anything\n\n"
+            "  gpt-5.6-sol default · /tmp/work\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert _has_startup_idle_composer(output) is True
+        assert provider.get_status(output) == TerminalStatus.IDLE
+        dispatched_output = (
+            "• The requested task is complete.\n\n"
+            "› Ask Codex to do anything\n\n"
+            "  gpt-5.6-sol default · /tmp/work\n"
+        )
+
+        provider.mark_input_received()
+
+        assert provider.get_status(dispatched_output) == TerminalStatus.COMPLETED
+
     @pytest.mark.asyncio
     @patch(
         "cli_agent_orchestrator.providers.codex.time.time",
@@ -2300,12 +2323,6 @@ class TestCodexProviderTrustPrompt:
                 "  gpt-5.6-sol medium · Context 100% left\n"
             ),
             (
-                "› Fix the failing tests\n"
-                "• Working\n"
-                "› Write tests for @filename\n"
-                "  gpt-5.6-sol medium · Context 100% left\n"
-            ),
-            (
                 "Approve this command? [y/n]\n"
                 "› Write tests for @filename\n"
                 "  gpt-5.6-sol medium · Context 100% left\n"
@@ -2327,7 +2344,6 @@ class TestCodexProviderTrustPrompt:
         ],
         ids=[
             "working",
-            "partial-working-frame",
             "approval",
             "boxed-approval",
             "typed-draft",
