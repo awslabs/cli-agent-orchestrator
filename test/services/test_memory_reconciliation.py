@@ -482,6 +482,11 @@ def test_apply_rejects_duplicate_resolved_paths_before_locking(
 def test_duplicate_and_wrong_path_rows_are_conflicts(tmp_path: Path, engine: Any) -> None:
     base = tmp_path / "memory"
     topic = _write_topic(base, "global", None, "conflicted")
+    # Seed the legacy pre-#657 state: duplicate global rows only exist on a
+    # database whose partial unique index is absent, so drop it first.
+    with engine.connect() as conn:
+        conn.exec_driver_sql("DROP INDEX IF EXISTS uq_memory_key_scope_null")
+        conn.commit()
     with sessionmaker(bind=engine)() as db:
         for suffix in ("one", "two"):
             db.add(

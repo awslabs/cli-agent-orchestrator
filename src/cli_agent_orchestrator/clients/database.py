@@ -12,12 +12,14 @@ from sqlalchemy import (
     Column,
     DateTime,
     Float,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
     create_engine,
     literal_column,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, declarative_base, sessionmaker
 
@@ -170,6 +172,18 @@ class MemoryMetadataModel(Base):
 
     __table_args__ = (
         UniqueConstraint("key", "scope", "scope_id", name="uq_memory_key_scope"),
+        # Same NULL-distinctness the sentinel comment below documents for
+        # ``memory_relationships``: ``uq_memory_key_scope`` never fires for
+        # global/federated rows because SQLite treats ``NULL != NULL`` in a
+        # UNIQUE index. This partial index covers exactly those rows
+        # (issue #657). Existing DBs get it from ``_migrate_memory_scope_null_uniqueness``.
+        Index(
+            "uq_memory_key_scope_null",
+            "key",
+            "scope",
+            unique=True,
+            sqlite_where=text("scope_id IS NULL"),
+        ),
         CheckConstraint(
             "related_keys IS NULL OR length(related_keys) < 1024",
             name="ck_related_keys_length",
@@ -414,6 +428,9 @@ def init_db() -> None:
     # Appended LAST (issue #583 Bolt 2, ``approval-store``). Disjoint from every table above —
     # its own new table, no shared columns — so registry order is immaterial here too.
     _migrate_workflow_plan_approval()
+    # Appended LAST (issue #657). Adds one partial index to memory_metadata;
+    # reads no other table, so registry order is immaterial here too.
+    _migrate_memory_scope_null_uniqueness()
 
 
 def _restrict_db_file_permissions() -> None:
@@ -683,6 +700,52 @@ def _migrate_workflow_plan_approval() -> None:
             )
     except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug (B4-RD-4)
         logger.debug(f"workflow_plan_approval migration skipped: {e}")
+
+
+def _migrate_memory_scope_null_uniqueness() -> None:
+    """Create the partial unique index backing ``uq_memory_key_scope`` for
+    NULL ``scope_id`` rows (issue #657). Appended LAST to the ``init_db()``
+    registry.
+
+    SQLite treats ``NULL != NULL`` in a UNIQUE index, so the table-level
+    ``uq_memory_key_scope`` constraint has never fired for global/federated
+    memories (``MemoryService.resolve_scope_id`` persists a real NULL for
+    both — ``memory_metadata`` deliberately keeps the column nullable; the
+    sentinel used by ``memory_relationships`` is wrong here). This index
+    covers exactly those rows; non-NULL scopes stay on the table constraint.
+
+    Idempotent, zero-arg, self-connecting — mirrors the existing migrators.
+    Fail-soft by design: on a database that already holds duplicate
+    NULL-scope rows (the state this bug allowed — external edits, merged
+    DBs), ``CREATE UNIQUE INDEX`` raises ``IntegrityError``, so duplicates
+    are pre-scanned and the index is skipped with a warning pointing at
+    ``cao memory repair`` rather than blocking startup. Re-running
+    ``init_db()`` after the repair creates it.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            duplicates = conn.execute(
+                "SELECT key, scope, COUNT(*) FROM memory_metadata "
+                "WHERE scope_id IS NULL GROUP BY key, scope HAVING COUNT(*) > 1"
+            ).fetchall()
+            if duplicates:
+                rendered = ", ".join(f"{scope}:{key}x{count}" for key, scope, count in duplicates)
+                logger.warning(
+                    "Skipping uq_memory_key_scope_null creation: duplicate global/federated "
+                    f"rows in memory_metadata ({rendered}). Run `cao memory repair` to "
+                    "reconcile them; the unique index is created on the next startup."
+                )
+                return
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_key_scope_null "
+                "ON memory_metadata (key, scope) WHERE scope_id IS NULL"
+            )
+    except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug
+        logger.debug(f"memory scope NULL uniqueness migration skipped: {e}")
 
 
 def _backfill_legacy_related_keys(conn: Any) -> None:
