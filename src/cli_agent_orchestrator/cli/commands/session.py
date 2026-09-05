@@ -248,7 +248,7 @@ def send(session_name, message, terminal_id, is_async, timeout):
     effective_timeout = timeout if timeout is not None else _DEFAULT_SEND_TIMEOUT
     interrupted = False
     try:
-        poll_until_done(target_id, effective_timeout)
+        poll_until_done(target_id, effective_timeout, require_observed_working=True)
     except KeyboardInterrupt:
         interrupted = True
 
