@@ -266,7 +266,11 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
             </div>
           </div>
         </div>
-        <div className="bg-gradient-to-br from-gray-800/80 to-gray-900/80 rounded-xl p-5 border border-gray-700/50">
+        <button
+          onClick={() => onNavigate('profiles')}
+          aria-label="Open Profiles tab"
+          className="bg-gradient-to-br from-gray-800/80 to-gray-900/80 rounded-xl p-5 border border-gray-700/50 text-left hover:border-blue-500/60 transition-colors cursor-pointer"
+        >
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 rounded-lg bg-blue-900/50 flex items-center justify-center">
               <Package size={20} className="text-blue-400" />
@@ -276,7 +280,7 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
               <div className="text-xs text-gray-400 uppercase tracking-wide">Profiles</div>
             </div>
           </div>
-        </div>
+        </button>
       </div>
 
       {/* Quick Actions */}

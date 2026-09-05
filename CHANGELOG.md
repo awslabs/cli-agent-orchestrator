@@ -4,10 +4,27 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Added
+
+- Profiles tab in the Web UI: browse, search, create (from template with live
+  preview, or from scratch via a schema-driven form), edit, clone, and delete
+  agent profiles over the profile management APIs, with validate-before-save
+  surfacing bounded findings and the truncation-marker contract (#510)
+
 ## [2.5.0] - 2026-08-28
 
 ### Added
 
+- MiniMax Code (`mcode`) provider with per-terminal authentication and profile
+  isolation, model and MCP configuration, multi-turn TUI orchestration,
+  supervisor/worker E2E coverage, and provider documentation (#624)
+- Oh My Pi (`omp`) provider with additive native configuration, profile MCP extension wiring, lifecycle detection, and supervisor/worker orchestration support (#559)
+- Add the official xAI Grok Build CLI as the `grok_cli` provider, including
+  isolated per-terminal MCP configuration, native hard tool restrictions,
+  multi-turn TUI support, orchestration e2e coverage, and provider docs.
 - async run submit, discovery, and live event following (#505) (#525)
 
 - rewrite the cao tui front door in Rust (#547)
