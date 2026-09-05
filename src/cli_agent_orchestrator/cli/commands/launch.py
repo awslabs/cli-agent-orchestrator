@@ -1,7 +1,6 @@
 """Launch command for CLI Agent Orchestrator CLI."""
 
 import os
-import time
 
 import click
 import requests
@@ -46,6 +45,53 @@ PROVIDERS_REQUIRING_WORKSPACE_ACCESS = {
 # ``utils.forwarded_env`` (shared with the ops-MCP ``launch_session`` tool so
 # the two client paths cannot drift) and are mirrored server-side in
 # ``TmuxClient._merge_extra_env``. See issue #248.
+
+# How long the CLI allows for server-side provider init: the pre-attach
+# readiness poll on the non-headless path, and the init allowance folded into
+# the headless wait (where init now runs inside ``poll_until_done``'s window
+# rather than in a separate poll before a client-side send).
+_READINESS_WAIT_TIMEOUT = 120
+
+# How long the agent gets to finish MESSAGE on the headless non-async path,
+# on top of ``_READINESS_WAIT_TIMEOUT``.
+_HEADLESS_TASK_TIMEOUT = 300
+
+
+def _is_waiting_on_user(terminal_id: str) -> bool:
+    """Return True when the terminal's live status is WAITING_USER_ANSWER.
+
+    Read separately because ``wait_until_terminal_status`` reports only whether
+    one of its target statuses was reached, not which one, and the pre-attach
+    poll accepts three.
+
+    Best-effort by design: this only decides which advisory line to print before
+    attaching, so a transport blip must not turn a successful launch into a
+    ``ClickException``. Hence the local except rather than letting it reach the
+    caller's ``RequestException`` handler, which reports "Failed to connect to
+    cao-server" — untrue here, since the poll above just talked to it.
+
+    An *unparseable* body is covered by the except:
+    ``requests.exceptions.JSONDecodeError`` subclasses ``RequestException`` (and
+    ``ValueError``) and has since requests 2.27, below this project's
+    ``requests>=2.32.0`` floor. A body that parses but isn't an object is not —
+    ``[].get`` raises ``AttributeError``, which is no kind of
+    ``RequestException`` — so the shape is checked rather than assumed. Without
+    that check a 200 carrying a JSON array, string or ``null`` escapes to the
+    caller's generic handler and aborts the launch with ``exit 1`` *after* the
+    session exists, leaving it orphaned in tmux: the precise failure this
+    function's local except is here to prevent.
+    """
+    try:
+        resp = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=5.0)
+        if resp.status_code == 200:
+            payload = resp.json()
+            if isinstance(payload, dict):
+                # bool(): ``payload.get`` is Any, so the comparison is too, and
+                # this function is annotated ``-> bool``.
+                return bool(payload.get("status") == TerminalStatus.WAITING_USER_ANSWER.value)
+    except requests.exceptions.RequestException:
+        pass
+    return False
 
 
 def _parse_env_pairs(pairs):
@@ -289,13 +335,45 @@ def launch(
         if resume_session_id:
             params["resume_session_id"] = resume_session_id
 
+        # Hand MESSAGE to the server rather than sending it ourselves.
+        # ``initial_message`` on ``POST /sessions`` puts the initial terminal on
+        # the existing deferred-init path (``session_service.create_session`` ->
+        # ``create_terminal(defer_init=True)``): the server responds as soon as
+        # the terminal record exists, then finishes provider init, delivers the
+        # message, and confirms/re-submits if the TUI swallowed it.
+        #
+        # The CLI used to create the session and then issue a SEPARATE
+        # ``POST /terminals/{id}/input``. Because ``POST /sessions`` ran the
+        # provider's full ``initialize()`` inline, a slow cold start outlived
+        # the client's read timeout: ``requests`` raised ``ReadTimeout``,
+        # ``launch`` reported "Failed to connect to cao-server", and that second
+        # request never happened — MESSAGE was silently dropped even though the
+        # session, the terminal and a healthy idle TUI all existed server-side,
+        # and nothing retried because from the server's point of view the launch
+        # had succeeded. Server-side delivery closes the window for every
+        # provider at once; ``cao launch`` was the last client still doing its
+        # own create-then-send (mcp_server and ops_mcp_server already pass
+        # ``initial_message``).
+        #
+        # Headless only: that is the path that used to send MESSAGE. A
+        # non-headless launch attaches instead and has never delivered MESSAGE,
+        # and deferring init there would make the pre-attach readiness poll
+        # below race the agent's first turn.
+        server_delivers_message = bool(message) and headless
+
         # Forwarded env vars travel in the JSON body so values (which may
         # contain secrets) don't end up in cao-server's HTTP access log.
-        # See issue #248.
-        request_timeout = get_server_settings()["mcp_request_timeout"]
-        post_kwargs: dict = {"params": params, "timeout": request_timeout}
+        # MESSAGE rides in the body for the same reason, plus URL-length. See
+        # issue #248 and ``CreateSessionBody``.
+        settings = get_server_settings()
+        post_kwargs: dict = {"params": params, "timeout": settings["mcp_request_timeout"]}
+        body: dict = {}
         if forwarded_env:
-            post_kwargs["json"] = {"env_vars": forwarded_env}
+            body["env_vars"] = forwarded_env
+        if server_delivers_message:
+            body["initial_message"] = message
+        if body:
+            post_kwargs["json"] = body
 
         response = requests.post(url, **post_kwargs)
         response.raise_for_status()
@@ -311,6 +389,21 @@ def launch(
         # silently drops keystrokes. See issue #220. The wait is advisory:
         # if it times out we still attach so the user can inspect the
         # half-initialized session rather than orphan it in tmux.
+        #
+        # WAITING_USER_ANSWER counts as settled here, not as a stall. A provider
+        # can finish initializing on a screen that legitimately needs the
+        # operator — Codex's first-run login menu is the case that forced this —
+        # and such a screen never becomes IDLE on its own, so waiting for IDLE
+        # burned the full ``_READINESS_WAIT_TIMEOUT`` and then blamed init for a
+        # pane that was simply waiting for a human. Safe because non-headless
+        # ``POST /sessions`` initializes synchronously (no ``initial_message``,
+        # see ``server_delivers_message`` above), so by the time this poll runs
+        # every provider's startup handler has already returned: a
+        # WAITING_USER_ANSWER here is a settled prompt, not a dialog caught
+        # mid-dismissal. If non-headless init is ever deferred, this poll would
+        # race the startup handler and attaching early would resize the pty
+        # mid-init — issue #220 again — so that change must gate attach on init
+        # completion rather than reuse this set.
         if not headless:
             # Align the CLI's backend singleton with the running server.
             # Without this, ``cao-server --terminal herdr`` + no config.json
@@ -318,45 +411,55 @@ def launch(
             sync_backend_from_server()
             ready = wait_until_terminal_status(
                 terminal["id"],
-                {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-                timeout=120,
+                {
+                    TerminalStatus.IDLE,
+                    TerminalStatus.COMPLETED,
+                    TerminalStatus.WAITING_USER_ANSWER,
+                },
+                timeout=_READINESS_WAIT_TIMEOUT,
             )
             if not ready:
                 click.echo(
                     click.style(
-                        f"  Warning: {terminal['id']} did not reach idle within 120s — "
-                        "attaching anyway; input may be unreliable until init completes.",
+                        f"  Warning: {terminal['id']} did not reach idle within "
+                        f"{_READINESS_WAIT_TIMEOUT}s — attaching anyway; input may be "
+                        "unreliable until init completes.",
+                        fg="yellow",
+                    )
+                )
+            elif _is_waiting_on_user(terminal["id"]):
+                click.echo(
+                    click.style(
+                        f"  {terminal['id']} is waiting for an answer in the pane "
+                        "(a first-run sign-in, for example) — complete it after "
+                        "attaching.",
                         fg="yellow",
                     )
                 )
             get_backend().attach_session(terminal["session_name"])
         elif message:
-            ready = wait_until_terminal_status(
-                terminal["id"],
-                {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-                timeout=120,
-            )
-            if not ready:
-                raise click.ClickException(
-                    f"Conductor {terminal['id']} did not become ready within 120s"
-                )
-            request_timeout = get_server_settings()["mcp_request_timeout"]
-            response = requests.post(
-                f"{API_BASE_URL}/terminals/{terminal['id']}/input",
-                params={"message": message},
-                timeout=request_timeout,
-            )
-            response.raise_for_status()
-            time.sleep(3)
+            # Nothing to send: the server took MESSAGE in the create body above
+            # and owns init, delivery and re-submission. There is also nothing
+            # left to wait for before delivery — waiting for IDLE here is what
+            # used to gate a send that no longer happens.
             if is_async:
-                click.echo(f"Message sent to {terminal['name']}. Running in background.")
+                click.echo(
+                    f"Message accepted for {terminal['name']}; the server delivers it "
+                    "once provider init completes. Running in background."
+                )
                 return
-            poll_until_done(terminal["id"], timeout=300)
-            request_timeout = get_server_settings()["mcp_request_timeout"]
+            # Provider init now happens inside this wait instead of in a
+            # separate readiness poll before the send, so the budget covers
+            # both. A deferred terminal reports UNKNOWN until init finishes,
+            # which ``poll_until_done`` deliberately does not count as "started"
+            # — it returns only once the agent has been observed working.
+            poll_until_done(
+                terminal["id"], timeout=_READINESS_WAIT_TIMEOUT + _HEADLESS_TASK_TIMEOUT
+            )
             output_resp = requests.get(
                 f"{API_BASE_URL}/terminals/{terminal['id']}/output",
                 params={"mode": "last"},
-                timeout=request_timeout,
+                timeout=settings["mcp_request_timeout"],
             )
             output_resp.raise_for_status()
             output = output_resp.json().get("output", "")

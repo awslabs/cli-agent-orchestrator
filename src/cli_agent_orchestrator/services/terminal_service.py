@@ -178,6 +178,76 @@ _memory_injected_lock = threading.Lock()
 # silently leaving a worker uninitialized. Tasks drop themselves on completion.
 _deferred_init_tasks: set = set()
 
+# Terminals whose deferred initial message has been ACCEPTED but not yet
+# dispatched to the pane. Written on the event loop by _schedule_deferred_init,
+# read from worker threads by the status-reporting helpers below, hence the lock
+# (mirrors _memory_injected_lock above).
+_pending_initial_delivery: set = set()
+_pending_initial_delivery_lock = threading.Lock()
+
+# Statuses a poller may read as "there is nothing left to wait for". While an
+# initial message is still pending these are exactly the readings that must not
+# escape: see reported_status().
+_COMPLETABLE_STATUSES = (TerminalStatus.IDLE, TerminalStatus.COMPLETED)
+
+
+def _mark_initial_delivery_pending(terminal_id: str) -> None:
+    """Record that an accepted initial message has not been dispatched yet."""
+    with _pending_initial_delivery_lock:
+        _pending_initial_delivery.add(terminal_id)
+
+
+def _clear_initial_delivery_pending(terminal_id: str) -> None:
+    """Release the pending mark. Idempotent — every exit path may call it."""
+    with _pending_initial_delivery_lock:
+        _pending_initial_delivery.discard(terminal_id)
+
+
+def initial_delivery_pending(terminal_id: str) -> bool:
+    """True while an accepted initial message has not reached the pane yet."""
+    with _pending_initial_delivery_lock:
+        return terminal_id in _pending_initial_delivery
+
+
+def reported_status(terminal_id: str, status: TerminalStatus) -> TerminalStatus:
+    """Mask a completable status while the initial message is still undispatched.
+
+    PR #566 review (haofeif), P1. A client that polls for completion decides
+    "done" from the terminal's status alone, and every such poller needs the same
+    thing: evidence that is causally DOWNSTREAM of the send it is waiting on.
+    Provider startup does not qualify. On the deferred path the pane can sit at a
+    perfectly genuine IDLE for seconds after ``initialize()`` returns while
+    ``_schedule_deferred_init`` resolves shell_baseline and metadata and
+    ``send_input`` runs ``inject_memory_context`` — all strictly BEFORE any
+    keystroke is dispatched. A poller sampling that window sees a stable IDLE and
+    concludes the agent finished a task it was never given: the synchronous
+    ``cao launch`` printed empty output and exited 0.
+
+    Reporting UNKNOWN closes that window at the source, for every client at once,
+    rather than asking each one to remember to wait for a separate handshake.
+    UNKNOWN is the honest reading — the terminal exists but is not tracking the
+    task yet — and pollers already treat it as neither progress nor completion
+    (``utils.terminal.poll_until_done``, ``services.agent_step``), so no number
+    of pre-dispatch samples can satisfy an idle gate.
+
+    Deliberately NOT masked:
+
+    - **WAITING_USER_ANSWER / PROCESSING / ERROR.** Masking WAITING_USER_ANSWER
+      would hide a pane genuinely parked on a prompt, which is the one state an
+      operator has to see to clear it (and which ``send_input``'s own guard turns
+      into a TerminalInputBlockedError that releases the pending mark anyway).
+      Letting it through is harmless here: it flips a poller's "has started" flag
+      early, but with IDLE masked no idle streak can accumulate to act on it.
+    - **The internal callers of ``status_monitor.get_status``.** send_input's
+      ERROR/WAITING_USER_ANSWER guards, inbox/flow/memory services and the
+      deferred path's own retry loop all need the RAW state; masking there would
+      change delivery decisions, not just reporting. This is a reporting-layer
+      concern only, applied where a status crosses the API boundary.
+    """
+    if status in _COMPLETABLE_STATUSES and initial_delivery_pending(terminal_id):
+        return TerminalStatus.UNKNOWN
+    return status
+
 
 def inject_memory_context(
     first_message: str, terminal_id: str, frozen_memory: str | None = None
@@ -1880,6 +1950,50 @@ def redeliver_dropped_message(
     return False
 
 
+async def _wait_for_post_dispatch_start(
+    terminal_id: str,
+    dispatch_generation: Optional[int],
+    timeout: float,
+    polling_interval: float = 0.5,
+) -> bool:
+    """Wait for a started status that is EVIDENCE OF THIS TURN, not a cached one.
+
+    Round-6 review (haofeif), P1. ``wait_until_status`` returns on the first poll
+    whose value is in the target set, and a status VALUE cannot say when it was
+    earned. Provider startup output can legitimately parse as COMPLETED, which
+    then latches (``_STICKY_READY_STATUSES``), and ``send_input`` only ARMS the
+    next transition without touching the cached value. So a pre-dispatch
+    COMPLETED satisfied confirmation instantly -- measured at 0.008s against an
+    exact head -- releasing the pending-delivery mask before the new task had
+    emitted anything. Two earlier release points failed for the same underlying
+    reason: they keyed on a status value rather than on its recency.
+
+    ``dispatch_generation`` is ``status_monitor.output_generation()`` sampled just
+    after the send. Requiring the current generation to EXCEED it means real
+    output has landed since dispatch, because that counter advances only in
+    ``notify_input_sent`` (already included in the sample) and ``_process_chunk``
+    (real output arrived). That is the causal evidence the mask needs.
+
+    ``dispatch_generation=None`` disables the recency requirement, which is
+    necessary for event-inbox backends (herdr): they start no FIFO reader, so the
+    generation never advances from output and gating on it could never succeed --
+    the worker would burn every resubmit and then be torn down. They need no gate
+    anyway, because ``get_status`` derives their status on demand at call time, so
+    there is no cached value to go stale.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        status = status_monitor.get_status(terminal_id)
+        if status in _DEFERRED_STARTED_STATUSES and (
+            dispatch_generation is None
+            or status_monitor.output_generation(terminal_id) > dispatch_generation
+        ):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(polling_interval)
+
+
 async def _confirm_worker_started_or_resubmit(
     terminal_id: str,
     message: str,
@@ -1887,18 +2001,19 @@ async def _confirm_worker_started_or_resubmit(
     sender_id: Optional[str],
     orchestration_type: Optional[OrchestrationType],
     provider=None,
+    dispatch_generation: Optional[int] = None,
 ) -> bool:
     """Confirm a deferred-init worker began processing; re-submit if not.
 
-    Returns True once the terminal reaches a started status, False if it is
-    still stuck at IDLE after all resubmit attempts. Blocking tmux/DB I/O runs
-    off the loop via to_thread so concurrent deferred inits aren't frozen.
+    Returns True once the terminal reaches a started status EARNED AFTER dispatch
+    (see ``_wait_for_post_dispatch_start``), False if it never does after all
+    resubmit attempts. Blocking tmux/DB I/O runs off the loop via to_thread so
+    concurrent deferred inits aren't frozen.
     """
-    if await wait_until_status(
+    if await _wait_for_post_dispatch_start(
         terminal_id,
-        _DEFERRED_STARTED_STATUSES,
+        dispatch_generation,
         timeout=_DEFERRED_SUBMIT_CONFIRM_TIMEOUT,
-        polling_interval=0.5,
     ):
         return True
 
@@ -1918,11 +2033,12 @@ async def _confirm_worker_started_or_resubmit(
         )
         if already_started:
             return True
-        if await wait_until_status(
+        # Same recency requirement as the first wait: a resubmit that lands on a
+        # still-cached pre-dispatch COMPLETED must not read as success either.
+        if await _wait_for_post_dispatch_start(
             terminal_id,
-            _DEFERRED_STARTED_STATUSES,
+            dispatch_generation,
             timeout=_DEFERRED_SUBMIT_CONFIRM_TIMEOUT,
-            polling_interval=0.5,
         ):
             return True
 
@@ -1992,10 +2108,58 @@ def _schedule_deferred_init(
                     sender_id=caller_id,
                     orchestration_type=effective_orchestration_type,
                 )
+                # The pending mark is deliberately NOT released here.
+                #
+                # Round-4 review (haofeif), P1. An earlier revision cleared it at
+                # this dispatch boundary, reasoning that a keystroke had been
+                # issued so a poller's evidence was now downstream of the send. It
+                # isn't. send_input only calls status_monitor.notify_input_sent(),
+                # which ARMS the next transition without changing the cached
+                # status, and no current provider enables
+                # assume_processing_on_dispatch. The status a poller reads right
+                # after this line is therefore still the pre-send IDLE, and stays
+                # that way until the agent's first output chunk is detected. The
+                # reviewer measured ~1.4s of it against a real worker; the
+                # regression test here reproduced 0.93s. Either way it is far
+                # longer than idle_stable_polls samples, so releasing at this line
+                # only moved the false-completion window from before the send to
+                # after it.
+                #
+                # _run's outer ``finally`` releases it instead, which is reached
+                # only after _confirm_worker_started_or_resubmit has observed a
+                # status in _DEFERRED_STARTED_STATUSES. That set includes
+                # COMPLETED, so holding the mark across the confirm window does
+                # NOT hide a genuine early completion (the concern that motivated
+                # releasing here): confirm returns as soon as the completion is
+                # visible, and the mark lifts with it.
+                #
+                # Cost of the change: when NO started status is ever observed the
+                # mark is now held for the confirm loop's whole budget
+                # (_DEFERRED_SUBMIT_CONFIRM_TIMEOUT x (1 + max resubmits) = ~32s)
+                # instead of being dropped at dispatch. That is inside `cao
+                # launch`'s 420s headless budget, and the worker is torn down at
+                # the end of it anyway, so UNKNOWN is the honest reading for a
+                # delivery we cannot confirm.
                 # Delivery can be silently dropped (Enter swallowed / paste lost)
                 # when the TUI isn't input-ready. Confirm the worker actually
                 # started and re-submit if not; if it never starts, surface the
                 # failure so the supervisor re-routes instead of waiting forever.
+                # Sample the turn/output generation NOW, after send_input has run
+                # notify_input_sent (which bumps it once). Confirmation then
+                # requires the generation to exceed this, i.e. real output arrived
+                # after the send -- so a COMPLETED cached during provider startup
+                # can no longer read as this task starting.
+                #
+                # None for event-inbox backends (herdr): they run no FIFO reader,
+                # so the generation never advances from output and the requirement
+                # could never be met -- every resubmit would burn and the worker
+                # would be torn down. Their status is derived on demand instead, so
+                # there is no stale cached value for the gate to protect against.
+                dispatch_generation = (
+                    None
+                    if get_backend().supports_event_inbox()
+                    else status_monitor.output_generation(terminal_id)
+                )
                 started = await _confirm_worker_started_or_resubmit(
                     terminal_id,
                     initial_message,
@@ -2006,6 +2170,7 @@ def _schedule_deferred_init(
                     # must not silently drop back to the unguarded original type.
                     effective_orchestration_type,
                     provider=provider_instance,
+                    dispatch_generation=dispatch_generation,
                 )
                 if not started:
                     logger.error(
@@ -2068,13 +2233,70 @@ def _schedule_deferred_init(
                 registry,
                 delete_worker=True,
             )
+        finally:
+            # The single release point for every path, and on the happy path the
+            # first moment a completion poller's evidence is genuinely downstream
+            # of the send: reached only once _confirm_worker_started_or_resubmit
+            # has seen PROCESSING, COMPLETED or WAITING_USER_ANSWER.
+            #
+            # It also covers every abnormal exit, so a terminal can never be left
+            # permanently masked: initialize() raising, send_input raising
+            # TerminalInputBlockedError (the pane is parked on a prompt — the
+            # terminal is then honestly WAITING_USER_ANSWER and the operator has
+            # to see it), the worker never starting after all resubmits, or the
+            # loop being torn down. Idempotent, so double-clearing is harmless.
+            _clear_initial_delivery_pending(terminal_id)
 
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         logger.error(f"Deferred init for {terminal_id}: no running event loop; init skipped")
         return
-    task = loop.create_task(_run())
+    # Mirrors _run's own ``if initial_message`` condition: defer_init is also used
+    # with no message at all (see the create_terminal call site), and there is
+    # nothing pending to mask on that path.
+    #
+    # Set here rather than inside _run so the mark is established by the time this
+    # function returns — the point at which the message has been accepted and the
+    # caller is free to start polling. That keeps the invariant independent of when
+    # the event loop first schedules _run instead of relying on it winning a race.
+    if initial_message:
+        _mark_initial_delivery_pending(terminal_id)
+    # Only _run's finally releases the mark, so a create_task that raises would
+    # leave it set with nothing left to clear it — create_terminal's own exception
+    # cleanup does not know about this mark. Cheap to close, so closed.
+    #
+    # Deliberately NOT claiming the obvious trigger: "the loop closed between the
+    # check above and this line" cannot happen. get_running_loop() only succeeds
+    # on the loop thread, so reaching here means we ARE the running loop, and
+    # loop.close() on a running loop raises "Cannot close a running event loop".
+    # What remains is the unglamorous set: _run() not being a coroutine
+    # (programming error), MemoryError, or a KeyboardInterrupt landing in the gap.
+    #
+    # Known and deliberately unguarded: after loop.stop(), create_task SUCCEEDS
+    # and the coroutine is never run, so the mark leaks with nothing raised for
+    # this to catch. That only arises while the loop is being torn down, and
+    # _pending_initial_delivery is module state that dies with the process, so
+    # there is nothing for it to leak into. Guarding it would mean a shutdown hook
+    # for state that cannot outlive shutdown.
+    # BaseException rather than Exception is deliberate, and matches the rollback
+    # guards at :415 and :796. KeyboardInterrupt is one of the two realistic
+    # triggers named above and is not an Exception subclass, so narrowing this
+    # would skip the case it exists for. The bare ``raise`` leaves shutdown
+    # semantics intact — this only cleans up on the way past.
+    coro = _run()
+    try:
+        task = loop.create_task(coro)
+    except BaseException:
+        # The coroutine object exists but was never handed to a task, so close it
+        # or the interpreter warns "coroutine was never awaited" when it is GC'd.
+        coro.close()
+        # Only clear what this call may have set: with no initial_message no mark
+        # was taken, and an unconditional discard would be reaching for state this
+        # call does not own.
+        if initial_message:
+            _clear_initial_delivery_pending(terminal_id)
+        raise
     _deferred_init_tasks.add(task)
     task.add_done_callback(_deferred_init_tasks.discard)
 
@@ -2086,7 +2308,7 @@ def get_terminal(terminal_id: str) -> Dict:
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
-        status = status_monitor.get_status(terminal_id).value
+        status = reported_status(terminal_id, status_monitor.get_status(terminal_id)).value
 
         return {
             "id": metadata["id"],
@@ -2180,7 +2402,9 @@ def list_siblings(
         caller_id, prefix, caller_session=caller_session, cross_session=cross_session
     )
     for sibling in siblings:
-        sibling["status"] = status_monitor.get_status(sibling["id"]).value
+        sibling["status"] = reported_status(
+            sibling["id"], status_monitor.get_status(sibling["id"])
+        ).value
     return siblings
 
 
