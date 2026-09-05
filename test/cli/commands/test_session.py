@@ -461,10 +461,21 @@ class TestSendSync:
         pre_send_status_resp = MagicMock(status_code=200)
         pre_send_status_resp.json.return_value = {"status": "idle"}
         poll_resp = MagicMock(status_code=200)
-        poll_resp.json.return_value = {"status": "completed"}
+        poll_resp.json.side_effect = [
+            {"status": "completed"},
+            {"status": "processing"},
+            {"status": "completed"},
+        ]
         output_resp = MagicMock(status_code=200)
         output_resp.json.return_value = {"output": "The answer is 42"}
-        mock_get.side_effect = [resolve_resp, pre_send_status_resp, poll_resp, output_resp]
+        mock_get.side_effect = [
+            resolve_resp,
+            pre_send_status_resp,
+            poll_resp,
+            poll_resp,
+            poll_resp,
+            output_resp,
+        ]
         mock_post.return_value = MagicMock(status_code=200)
         mock_time.time.return_value = 0
         mock_time.sleep = MagicMock()
@@ -531,10 +542,16 @@ class TestSendSync:
         pre_send_status_resp = MagicMock(status_code=200)
         pre_send_status_resp.json.return_value = {"status": "idle"}
         poll_resp = MagicMock(status_code=200)
-        poll_resp.json.return_value = {"status": "completed"}
+        poll_resp.json.side_effect = [{"status": "processing"}, {"status": "completed"}]
         output_resp = MagicMock(status_code=200)
         output_resp.json.return_value = {"output": "done"}
-        mock_get.side_effect = [resolve_resp, pre_send_status_resp, poll_resp, output_resp]
+        mock_get.side_effect = [
+            resolve_resp,
+            pre_send_status_resp,
+            poll_resp,
+            poll_resp,
+            output_resp,
+        ]
         mock_post.return_value = MagicMock(status_code=200)
         mock_time.time.return_value = 0
         mock_time.sleep = MagicMock()
@@ -575,10 +592,11 @@ class TestSendSync:
         pre_send_status_resp = MagicMock(status_code=200)
         pre_send_status_resp.json.return_value = {"status": "idle"}
         poll_resp = MagicMock(status_code=200)
-        poll_resp.json.return_value = {"status": "completed"}
+        poll_resp.json.side_effect = [{"status": "processing"}, {"status": "completed"}]
         mock_get.side_effect = [
             resolve_resp,
             pre_send_status_resp,
+            poll_resp,
             poll_resp,
             requests.exceptions.ConnectionError("refused"),
         ]
