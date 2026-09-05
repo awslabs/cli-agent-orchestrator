@@ -1404,6 +1404,10 @@ async def create_terminal(
             resume_session_id=resume_session_id,
         )
 
+        # harness-control#890: set when a synchronous init timed out but the live pane was kept
+        # (see the `except TimeoutError` below) -- drives the terminal's reported status to UNKNOWN.
+        init_timed_out = False
+
         # Deferred-init path: return fast so callers (e.g. MCP assign) do not
         # block on `provider.initialize()`. The remaining initialize + input
         # send runs as a background task, so two concurrent assigns can each
@@ -1421,14 +1425,39 @@ async def create_terminal(
                 registry,
             )
         else:
-            await provider_instance.initialize()
+            try:
+                await provider_instance.initialize()
 
-            # Persist shell_command baseline if the provider captured one
-            shell_command = provider_instance.shell_baseline
-            if not isinstance(shell_command, str):
+                # Persist shell_command baseline if the provider captured one
+                shell_command = provider_instance.shell_baseline
+                if not isinstance(shell_command, str):
+                    shell_command = None
+                if shell_command:
+                    update_terminal_shell_command(terminal_id, shell_command)
+            except TimeoutError as te:
+                # harness-control#890 (operator invariant, 2026-08-15): "no amount of CPU load may
+                # tear down a live process." A provider init TimeoutError is a PERFORMANCE signal,
+                # not death -- the tmux pane and the CLI process inside it are ALIVE, just too slow
+                # to reach IDLE within the (already load-scaled, see get_init_timeout) budget on a
+                # contended box. Routing this to the except-block below would kill_window /
+                # kill_session (the harness-control#186 orphan-cleanup path) -- i.e. destroy a live
+                # pane because CPU was busy, the exact self-sustaining recreate storm this issue
+                # closes. Instead we KEEP the live substrate (DB row, tmux window, FIFO reader,
+                # provider, status monitor -- all already wired up above) and report the terminal
+                # as UNKNOWN, identical to the deferred-init path: the StatusMonitor pushes its real
+                # status the moment the CLI finally settles, and clients poll GET /terminals/{id}.
+                # Only a genuine, non-timeout failure (crash, bad profile, backend error) still
+                # falls through to teardown. This extends fix14's "read-failure = UNKNOWN, never
+                # dead" to the init/settle path.
+                logger.warning(
+                    "Provider init for terminal %s did not settle within its (load-scaled) budget "
+                    "(%s) -- KEEPING the live pane and reporting UNKNOWN, not tearing it down "
+                    "(harness-control#890: CPU load is not liveness loss). It will report IDLE once "
+                    "it settles.",
+                    terminal_id, te,
+                )
+                init_timed_out = True
                 shell_command = None
-            if shell_command:
-                update_terminal_shell_command(terminal_id, shell_command)
 
         # Build and return the Terminal object. In the deferred-init path the
         # provider is still initializing on a background task, so the terminal
@@ -1436,7 +1465,11 @@ async def create_terminal(
         # can't mistake it for ready and send input early. Callers poll
         # GET /terminals/{id} for the live status once init completes. The
         # synchronous path has already reached IDLE by here.
-        initial_status = TerminalStatus.UNKNOWN if defer_init else TerminalStatus.IDLE
+        # harness-control#890: an init that TIMED OUT but was kept alive (see the
+        # `except TimeoutError` above) is likewise not-yet-ready -> UNKNOWN, not a fake IDLE.
+        initial_status = (
+            TerminalStatus.UNKNOWN if (defer_init or init_timed_out) else TerminalStatus.IDLE
+        )
         terminal = Terminal(
             id=terminal_id,
             name=window_name,
@@ -2046,6 +2079,28 @@ def _schedule_deferred_init(
                 f"clear the prompt, then re-send the task yourself (e.g. via "
                 f"send_message) -- it is not automatically re-delivered once the "
                 f"prompt is answered.",
+                registry,
+                delete_worker=False,
+            )
+        except TimeoutError as e:
+            # harness-control#890 (operator invariant): an init TimeoutError is a PERFORMANCE
+            # signal, not death -- the tmux pane and CLI process are alive, just too slow to settle
+            # under CPU load. Deleting the live worker here (as the generic handler below does) is
+            # exactly "CPU load tears down a live process." Keep it (delete_worker=False); the
+            # StatusMonitor reports its real status once it settles. Mirrors the synchronous
+            # create_terminal path's own `except TimeoutError` and fix14's read-failure=UNKNOWN.
+            logger.warning(
+                "Deferred init for terminal %s did not settle within its (load-scaled) budget: %r "
+                "-- KEEPING the live worker, not tearing it down (harness-control#890: CPU load is "
+                "not liveness loss). It will report IDLE once it settles.",
+                terminal_id,
+                e,
+            )
+            await asyncio.to_thread(
+                _notify_caller_of_deferred_failure,
+                terminal_id,
+                f"Worker {terminal_id} is initializing slowly under load and has not accepted the "
+                f"assigned task yet. It is still alive and will pick up the task once it settles.",
                 registry,
                 delete_worker=False,
             )
