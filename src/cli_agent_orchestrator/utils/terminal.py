@@ -244,14 +244,16 @@ def poll_until_done(
     timeout: float,
     polling_interval: float = 1.0,
     idle_stable_polls: int = 3,
+    require_observed_working: bool = False,
 ) -> None:
     """Poll terminal status until the agent is done, errored, or timeout.
 
     Two "done" signals, treated differently:
 
     - **COMPLETED** — a definitive response-done marker (Credits line / green
-      arrow). Returns immediately, exactly as before; a single reading is
-      trustworthy.
+      arrow). Returns immediately unless ``require_observed_working`` is set;
+      synchronous follow-up sends use that guard so a completion marker from
+      the prior turn cannot satisfy the new turn.
     - **IDLE** — returns only after (a) the agent has been observed actually
       working at least once (a PROCESSING/non-ready reading), AND (b) IDLE then
       persists for ``idle_stable_polls`` consecutive reads. kiro-cli 2.11
@@ -287,7 +289,9 @@ def poll_until_done(
             resp = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=5.0)
             resp.raise_for_status()
             status = resp.json().get("status")
-            if status == TerminalStatus.COMPLETED.value:
+            if status == TerminalStatus.COMPLETED.value and (
+                observed_working or not require_observed_working
+            ):
                 return
             if status == TerminalStatus.ERROR.value:
                 raise click.ClickException("Terminal reached ERROR status")
