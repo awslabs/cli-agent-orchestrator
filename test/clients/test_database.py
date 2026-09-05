@@ -1,5 +1,6 @@
 """Tests for the database client."""
 
+import sqlite3
 import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -10,11 +11,13 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
+from cli_agent_orchestrator.clients import database as db_mod
 from cli_agent_orchestrator.clients.database import (
     Base,
     FlowModel,
     IdempotencyKeyModel,
     InboxModel,
+    MemoryMetadataModel,
     TerminalModel,
     create_flow,
     create_inbox_message,
@@ -2004,6 +2007,103 @@ class TestProjectAliasMigration:
         with sqlite3.connect(str(db_file)) as conn:
             rows = conn.execute("SELECT alias, project_id FROM project_aliases").fetchall()
         assert rows == [("a1", "p1")], "current-schema table must be left intact"
+
+
+class TestMemoryScopeNullUniquenessMigration:
+    """Partial unique index for NULL scope_id rows (issue #657).
+
+    SQLite treats NULL != NULL in a UNIQUE index, so the table-level
+    uq_memory_key_scope never fired for global/federated memories; the
+    partial index covers exactly those rows. Real SQLite throughout — the
+    NULL-distinctness being asserted is engine behavior no mock can exercise.
+    """
+
+    def _mem(self, key, file_path, scope="global", scope_id=None):
+        return MemoryMetadataModel(
+            key=key,
+            memory_type="project",
+            scope=scope,
+            scope_id=scope_id,
+            file_path=file_path,
+            tags="",
+        )
+
+    def _legacy_db(self, tmp_path, monkeypatch, dupe_paths=()):
+        """A legacy pre-#657 database: fresh schema, partial index dropped,
+        optionally seeded with duplicate global rows the old constraint let
+        in. DATABASE_FILE is pointed at it."""
+        db_file = tmp_path / "legacy.db"
+        engine = create_engine(f"sqlite:///{db_file}")
+        Base.metadata.create_all(bind=engine)
+        engine.dispose()
+        with sqlite3.connect(str(db_file)) as conn:
+            conn.execute("DROP INDEX IF EXISTS uq_memory_key_scope_null")
+            for path in dupe_paths:
+                conn.execute(
+                    "INSERT INTO memory_metadata (id, key, memory_type, scope, scope_id, "
+                    "file_path, tags, access_count) "
+                    f"VALUES ('{path}', 'd', 'project', 'global', NULL, '{path}', '', 0)"
+                )
+            conn.commit()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.constants.DATABASE_FILE", db_file, raising=False
+        )
+        return db_file
+
+    def test_fresh_database_rejects_duplicate_global_rows(self):
+        """Two (key, global, NULL) rows must collide — the reporter's case.
+        The scoped sibling of the same key stays distinct: that is what
+        keeping scope_id nullable (not the sentinel) buys."""
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(bind=engine)
+        with sessionmaker(bind=engine)() as s:
+            s.add(self._mem("shared", "/a.md"))
+            s.commit()
+            s.add(self._mem("shared", "/b.md"))
+            with pytest.raises(IntegrityError):
+                s.commit()
+            s.rollback()
+            s.add(self._mem("shared", "/c.md", scope="session", scope_id="t1"))
+            s.commit()  # distinct (key, scope, scope_id) — accepted
+            rows = s.query(MemoryMetadataModel).order_by(MemoryMetadataModel.scope).all()
+        assert [r.scope for r in rows] == ["global", "session"]
+
+    def test_existing_database_gains_the_index(self, tmp_path, monkeypatch):
+        """A pre-index database gets uq_memory_key_scope_null on init."""
+        db_file = self._legacy_db(tmp_path, monkeypatch)
+        db_mod._migrate_memory_scope_null_uniqueness()
+
+        with sqlite3.connect(str(db_file)) as conn:
+            names = {r[1] for r in conn.execute("PRAGMA index_list('memory_metadata')")}
+        assert "uq_memory_key_scope_null" in names
+
+    def test_duplicate_seed_skips_index_then_recovers_after_repair(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """Fail-soft path (both seeded-duplicate cases from the issue): with
+        duplicates present the index is skipped with a warning naming them
+        and pointing at cao memory repair, and rows are kept; re-running
+        after the repair creates the index."""
+        db_file = self._legacy_db(tmp_path, monkeypatch, dupe_paths=("/1.md", "/2.md"))
+        with caplog.at_level("WARNING"):
+            db_mod._migrate_memory_scope_null_uniqueness()  # skips, warns
+
+        assert any("uq_memory_key_scope_null" in r.message for r in caplog.records)
+        assert any("cao memory repair" in r.message for r in caplog.records)
+        with sqlite3.connect(str(db_file)) as conn:
+            names = {r[1] for r in conn.execute("PRAGMA index_list('memory_metadata')")}
+            rows = conn.execute("SELECT COUNT(*) FROM memory_metadata").fetchone()[0]
+        assert "uq_memory_key_scope_null" not in names
+        assert rows == 2, "duplicates must be left for `cao memory repair`, never deleted here"
+
+        with sqlite3.connect(str(db_file)) as conn:  # the repair: keep one row
+            conn.execute("DELETE FROM memory_metadata WHERE file_path = '/2.md'")
+            conn.commit()
+        db_mod._migrate_memory_scope_null_uniqueness()  # creates
+
+        with sqlite3.connect(str(db_file)) as conn:
+            names = {r[1] for r in conn.execute("PRAGMA index_list('memory_metadata')")}
+        assert "uq_memory_key_scope_null" in names
 
 
 class TestListTerminalsInSessions:
