@@ -682,6 +682,37 @@ describe('round-7 review: navigation lock while a save owns the interaction (#69
     await act(async () => {})
     expect(screen.getByRole('tab', { name: /agents/i })).toHaveAttribute('aria-selected', 'true')
   })
+
+  it('the lock cannot leak when a successful save unmounts the editor modal', async () => {
+    // Adversarial probe on the lock itself: the editor modal is
+    // conditionally rendered, so a successful save unmounts it (onSaved ->
+    // onClose) potentially before setSaving(false) commits. A leaked
+    // counter would refuse navigation app-wide FOREVER. The effect cleanup
+    // must release on unmount.
+    const SOURCE = '---\nname: developer\ndescription: Writes code\n---\n\nBody.\n'
+    vi.stubGlobal('fetch', appFetch({
+      '/agents/profiles/validate': () => okJson({ valid: true, messages: [] }),
+      '/source': () => okJson({ name: 'developer', content: SOURCE }),
+      '/agents/profiles/developer': (u: string, opts: any) =>
+        opts?.method === 'PUT' ? okJson({ name: 'developer', warnings: [] })
+          : okJson({ name: 'developer', description: 'Writes code', provider: '', model: '', tags: [], capabilities: [] }),
+    }))
+    render(<App />)
+    fireEvent.click(screen.getByRole('tab', { name: /profiles/i }))
+    await act(async () => {})
+    fireEvent.click(screen.getByRole('option', { name: /developer/ }))
+    await act(async () => {})
+    fireEvent.click(within(screen.getByTestId('profile-detail')).getByRole('button', { name: /edit/i }))
+    await act(async () => {})
+    fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
+    await act(async () => {})
+    await act(async () => {}) // save succeeded; editor unmounted
+
+    // Navigation must work: the unmount path released the lock
+    fireEvent.keyDown(window, { key: '3', altKey: true })
+    await act(async () => {})
+    expect(screen.getByRole('tab', { name: /agents/i })).toHaveAttribute('aria-selected', 'true')
+  })
 })
 
 describe('round-7 review: P3 follow-ups fixed in the same pass (#692)', () => {
