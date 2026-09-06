@@ -77,6 +77,11 @@ export default function App() {
   // Default false (fail-closed): a dead backend hides the tab rather than showing a broken panel
   const [memoryEnabled, setMemoryEnabled] = useState(false)
   const { sessions, connected, fetchSessions } = useStore()
+  // Subscribed (not just read via getState) so the tab strip re-renders
+  // and visibly reflects the refusal while a save owns navigation --
+  // matching the modal's own disabled Close/Cancel/mode-tab affordances
+  // rather than silently ignoring clicks.
+  const navLocked = useStore(s => s.navLockCount > 0)
 
   const visibleTabs = TABS.filter(t => t.key !== 'memory' || memoryEnabled)
 
@@ -88,6 +93,17 @@ export default function App() {
     const interval = setInterval(fetchSessions, 10000)
     return () => clearInterval(interval)
   }, [])
+
+  // The nav lock stops IN-APP navigation from unmounting an in-flight
+  // save, but browser chrome (reload, tab close) bypasses it entirely --
+  // the same draft-loss path one level up. While the lock is held, ask
+  // the browser to confirm leaving.
+  useEffect(() => {
+    if (!navLocked) return
+    const handler = (e: BeforeUnloadEvent) => { e.preventDefault() }
+    window.addEventListener('beforeunload', handler)
+    return () => window.removeEventListener('beforeunload', handler)
+  }, [navLocked])
 
   // Keyboard shortcuts: Alt+1-N over the visible tabs
   useEffect(() => {
@@ -135,13 +151,16 @@ export default function App() {
                 key={t.key}
                 role="tab"
                 aria-selected={tab === t.key}
+                aria-disabled={navLocked && tab !== t.key}
                 onClick={() => requestTabChange(t.key)}
                 className={`px-4 py-2 rounded-lg text-sm font-medium transition-all duration-200 flex items-center gap-2 ${
                   tab === t.key
                     ? 'bg-gradient-to-r from-emerald-600 to-emerald-500 text-white shadow-lg shadow-emerald-500/20'
-                    : 'text-gray-400 hover:text-white hover:bg-gray-800/50'
+                    : navLocked
+                      ? 'text-gray-600 cursor-not-allowed'
+                      : 'text-gray-400 hover:text-white hover:bg-gray-800/50'
                 }`}
-                title={`Alt+${i + 1}`}
+                title={navLocked && tab !== t.key ? 'Finish or cancel the in-flight save first' : `Alt+${i + 1}`}
               >
                 {t.icon}
                 {t.label}

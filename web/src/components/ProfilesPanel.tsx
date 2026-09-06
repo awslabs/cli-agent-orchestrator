@@ -156,9 +156,10 @@ function ProfileDetail({
             the detail GET succeeded (#692 round-7 P3). Explicit null check
             so an intentionally EMPTY description stays empty instead of
             falling back to the stale row text. */}
-        {(detail !== null ? detail.description ?? '' : row.description) && (
-          <p className="text-sm text-gray-400">{detail !== null ? detail.description : row.description}</p>
-        )}
+        {(() => {
+          const description = detail !== null ? detail.description ?? '' : row.description
+          return description ? <p className="text-sm text-gray-400">{description}</p> : null
+        })()}
       </div>
 
       {duplicatedIn && duplicatedIn.length > 0 && (

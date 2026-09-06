@@ -713,6 +713,52 @@ describe('round-7 review: navigation lock while a save owns the interaction (#69
     await act(async () => {})
     expect(screen.getByRole('tab', { name: /agents/i })).toHaveAttribute('aria-selected', 'true')
   })
+
+  it('the refusal is visible, not silent: other tabs are aria-disabled while the lock is held', async () => {
+    // The modal's own Close/Cancel/mode-tabs render disabled during a save;
+    // the app tabs must reflect the same state instead of silently
+    // swallowing clicks (assistive tech gets no other signal).
+    vi.stubGlobal('fetch', appFetch({
+      '/agents/profiles/validate': () => new Promise(() => {}),
+    }))
+    await openScratchCreate()
+    expect(screen.getByRole('tab', { name: /agents/i })).toHaveAttribute('aria-disabled', 'false')
+    fireEvent.click(screen.getByRole('button', { name: /create profile/i }))
+    await act(async () => {})
+    expect(screen.getByRole('tab', { name: /agents/i })).toHaveAttribute('aria-disabled', 'true')
+    // The ACTIVE tab is not marked disabled -- it is not being refused
+    expect(screen.getByRole('tab', { name: /profiles/i })).toHaveAttribute('aria-disabled', 'false')
+  })
+
+  it('browser unload is guarded while a save is in flight, and released after', async () => {
+    // The nav lock stops in-app navigation; reload/close bypasses it -- the
+    // same draft-loss path one level up. beforeunload must be cancelable
+    // only while the lock is held.
+    let rejectPost!: () => void
+    vi.stubGlobal('fetch', appFetch({
+      '/agents/profiles/validate': () => okJson({ valid: true, messages: [] }),
+      '/agents/profiles': (u: string, opts: any) => {
+        if (u.endsWith('/agents/profiles') && opts?.method === 'POST') {
+          return new Promise<any>((_res, rej) => {
+            rejectPost = () => rej(Object.assign(new Error('boom'), { detail: 'boom' }))
+          })
+        }
+        return okJson(CATALOG)
+      },
+    }))
+    await openScratchCreate()
+    fireEvent.click(screen.getByRole('button', { name: /create profile/i }))
+    await act(async () => {}) // save in flight
+
+    const during = new Event('beforeunload', { cancelable: true })
+    window.dispatchEvent(during)
+    expect(during.defaultPrevented).toBe(true)
+
+    await act(async () => { rejectPost() }) // save settles (failure)
+    const after = new Event('beforeunload', { cancelable: true })
+    window.dispatchEvent(after)
+    expect(after.defaultPrevented).toBe(false)
+  })
 })
 
 describe('round-7 review: P3 follow-ups fixed in the same pass (#692)', () => {
