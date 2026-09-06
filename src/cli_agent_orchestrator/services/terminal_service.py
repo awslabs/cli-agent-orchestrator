@@ -1721,7 +1721,7 @@ _DEFERRED_STARTED_STATUSES = {
 }
 
 
-def _worker_is_started_direct(terminal_id: str, provider) -> bool:
+def _worker_is_started_direct(terminal_id: str, provider, post_dispatch_output: str) -> bool:
     """Direct visible-screen status check bypassing the event-driven status cache.
 
     The deferred-init retry loop polls ``status_monitor.get_status()`` which
@@ -1740,6 +1740,24 @@ def _worker_is_started_direct(terminal_id: str, provider) -> bool:
     providers (e.g. kiro_cli, antigravity_cli, cursor_cli) relies on
     dispatch bookkeeping and cannot distinguish IDLE from COMPLETED on a
     rendered capture-pane snapshot.
+
+    A started status is only half the verdict, and the weaker half: it is read
+    from a rendered frame, which ``get_status`` classifies as a whole, so
+    activity that PREDATES the submission (a provider's startup spinner or
+    bullet still on screen) reads as started for a pane whose task paste was
+    dropped. Accepting that would suppress the very redelivery this probe
+    gates, silently losing the task.
+
+    ``post_dispatch_output`` supplies the missing causality. It is the
+    StatusMonitor rolling buffer, which ``send_input`` empties immediately
+    before sending the keystrokes, so its contents arrived after the dispatch
+    by construction — evidence that cannot be forged by a shared message
+    prefix, evicted by a bounded capture tail, or confused with leftover
+    chrome. The provider judges it through ``direct_probe_confirms_dispatch``
+    (default: the status alone, for TUIs whose indicators are turn-scoped).
+
+    False means UNPROVEN rather than idle; the caller keeps the recoveries
+    that cannot duplicate work and withholds the one that can.
     """
     try:
         metadata = get_terminal_metadata(terminal_id)
@@ -1751,6 +1769,9 @@ def _worker_is_started_direct(terminal_id: str, provider) -> bool:
             return False
         output = get_backend().get_history(session_name, window_name, tail_lines=200)
         status = provider.get_status(output)
+        if status not in _DEFERRED_STARTED_STATUSES:
+            return False
+        return bool(provider.direct_probe_confirms_dispatch(post_dispatch_output))
     except Exception:
         logger.debug(
             "Direct status probe for %s failed (falling through to cached path)",
@@ -1758,7 +1779,6 @@ def _worker_is_started_direct(terminal_id: str, provider) -> bool:
             exc_info=True,
         )
         return False
-    return status in _DEFERRED_STARTED_STATUSES
 
 
 def _message_visible_in_box(terminal_id: str, message: str) -> bool:
@@ -1807,14 +1827,25 @@ def redeliver_dropped_message(
     path (#479) and the synchronous step path (#562). First, when the provider
     opts in via ``supports_direct_status_probe``, a live capture-pane check
     catches a worker that IS already running but whose cached status lags
-    behind (#496) — returns True (started) without sending anything. A caller
-    that already holds the provider instance passes it; otherwise it is
-    resolved from the registry, best-effort (a resolution failure means no
-    probe, never a failed redelivery). Then the box check picks the
-    redelivery: if the delivered text is still visible in the rendered pane
-    only the Enter was swallowed (send a bare Enter); if it is absent the
-    paste itself was dropped (re-deliver in full). See
-    ``_message_visible_in_box`` for why guessing wrong must be avoided.
+    behind (#496) — returns True (started) without sending anything. That
+    check is bound to THIS submission by the StatusMonitor rolling buffer,
+    which ``send_input`` empties at the dispatch boundary, so leftover chrome
+    from before the send can never vouch for it (see
+    ``_worker_is_started_direct``). A caller that already holds the provider
+    instance passes it; otherwise it is resolved from the registry,
+    best-effort (a resolution failure means no probe, never a failed
+    redelivery). Then the box check picks the redelivery: if the delivered
+    text is still visible in the rendered pane only the Enter was swallowed
+    (send a bare Enter); if it is absent the paste itself was dropped
+    (re-deliver in full). See ``_message_visible_in_box`` for why guessing
+    wrong must be avoided.
+
+    The full re-send is the one branch that can duplicate work, so it is also
+    withheld from a probe-capable provider whenever ANY output arrived after
+    the dispatch without proving the turn started: an accepted turn that has
+    out-scrolled its own echo presents exactly like a dropped paste to a
+    bounded capture, and absence of proof is not proof of a drop. A genuinely
+    dropped paste produces no post-dispatch output and so still re-sends.
 
     ``full_resend_requires_probe`` gates the full re-send on the provider
     being probe-capable. Reason: ``_message_visible_in_box`` scans the whole
@@ -1843,8 +1874,13 @@ def redeliver_dropped_message(
     probe_capable = provider is not None and getattr(
         provider, "supports_direct_status_probe", False
     )
+    post_dispatch_output = ""
     if probe_capable:
-        if _worker_is_started_direct(terminal_id, provider):
+        try:
+            post_dispatch_output = status_monitor.get_buffer(terminal_id)
+        except Exception:  # noqa: BLE001 — evidence is best-effort
+            post_dispatch_output = ""
+        if _worker_is_started_direct(terminal_id, provider, post_dispatch_output):
             return True
     if _message_visible_in_box(terminal_id, message):
         logger.warning(
@@ -1853,6 +1889,23 @@ def redeliver_dropped_message(
             attempt,
         )
         send_special_key(terminal_id, "Enter")
+        return False
+    if probe_capable and post_dispatch_output:
+        # The turn was not PROVEN started, but the terminal did emit output
+        # after the dispatch and our text is not on screen. Those are exactly
+        # the observations an ACCEPTED turn produces once its own echo has
+        # scrolled out of the captured tail, and re-pasting into it would run
+        # the task twice. Absence of proof is not proof of a dropped paste:
+        # withhold the full re-send (the only irreversible branch) and let the
+        # caller's deadline classify. A genuinely dropped paste emits nothing
+        # after the dispatch and so never reaches here.
+        logger.warning(
+            "Delivery to %s unconfirmed but the terminal emitted output after "
+            "dispatch; withholding a full re-send that could duplicate the task "
+            "(attempt %d)",
+            terminal_id,
+            attempt,
+        )
         return False
     if full_resend_requires_probe and not probe_capable:
         # No probe → cannot rule out a working worker whose prompt left the
@@ -1904,8 +1957,8 @@ async def _confirm_worker_started_or_resubmit(
 
     for attempt in range(1, _DEFERRED_SUBMIT_MAX_RESUBMITS + 1):
         # The redelivery decision (box check + #496's direct-probe guard for
-        # providers that opt in) lives in ``redeliver_dropped_message`` —
-        # shared with the synchronous step path (#562).
+        # providers that opt in, bound to post-dispatch output) lives in
+        # ``redeliver_dropped_message`` — shared with the step path (#562).
         already_started = await asyncio.to_thread(
             redeliver_dropped_message,
             terminal_id,
