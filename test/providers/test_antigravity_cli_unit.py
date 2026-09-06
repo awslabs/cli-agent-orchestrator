@@ -249,6 +249,20 @@ def test_screen_paste_echo_does_not_become_fresh_completed():
     assert p.get_status_from_screen(_completed_new_turn_screen()) == (TerminalStatus.COMPLETED)
 
 
+def test_raw_paste_echo_does_not_become_fresh_completed():
+    """The same #735 guard applies when pyte status is disabled."""
+    p = make_provider()
+    with patch("cli_agent_orchestrator.providers.antigravity_cli.get_backend") as mock_get_backend:
+        mock_get_backend.return_value.get_history.return_value = _prior_turn_pane()
+        p.mark_input_received()
+
+    raw_echo = "\n".join(_dispatched_pane_with_echo())
+    raw_done = "\n".join(_completed_new_turn_screen())
+
+    assert p.get_status(raw_echo) == TerminalStatus.PROCESSING
+    assert p.get_status(raw_done) == TerminalStatus.COMPLETED
+
+
 def test_screen_guard_inert_when_snapshot_capture_fails():
     """A transient capture failure at mark_input_received disables the guard
     (claude_code's #407 guard behaves the same) — the ready verdict stands."""

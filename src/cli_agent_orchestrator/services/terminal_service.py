@@ -2327,6 +2327,11 @@ def _dispatch_input_locked(
     it and manual prompt answers.
     """
     try:
+        if status_monitor.has_inflight_dispatch(terminal_id) is True:
+            raise TerminalInputBlockedError(
+                f"Terminal {terminal_id} already has an in-flight message dispatch. "
+                "Wait for it to finish or use the inbox queue."
+            )
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
@@ -2431,9 +2436,11 @@ def _dispatch_input_holding_slot(
         # the genuine PROCESSING signal that arrives once the agent starts
         # working on the new message.
         if provider and provider.assume_processing_on_dispatch is True:
-            dispatch_seq = status_monitor.notify_input_sent(terminal_id, assume_processing=True)
+            dispatch_seq = status_monitor.notify_input_sent(
+                terminal_id, assume_processing=True, owns_turn=True
+            )
         else:
-            dispatch_seq = status_monitor.notify_input_sent(terminal_id)
+            dispatch_seq = status_monitor.notify_input_sent(terminal_id, owns_turn=True)
 
         # Clear ONLY the rolling byte buffer BEFORE sending keys, so stale idle
         # prompts from BEFORE the input can't trigger a false COMPLETED
@@ -3003,6 +3010,8 @@ def dismantle_terminal_runtime(
     from cli_agent_orchestrator.services.memory_service import _curator_locks
 
     _curator_locks.pop(terminal_id, None)
+    with _dispatch_locks_guard:
+        _dispatch_locks.pop(terminal_id, None)
     return True
 
 

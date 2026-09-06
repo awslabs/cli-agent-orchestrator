@@ -142,6 +142,7 @@ class StatusMonitor:
         # dispatch 0 so any dispatch sequence >= 1 is never satisfied by it.
         self._dispatch_seq: Dict[str, int] = {}
         self._status_evidence_dispatch: Dict[str, int] = {}
+        self._active_dispatch: Dict[str, int] = {}
         # Per-terminal turn/output generation. Bumped under the lock by
         # notify_input_sent (a new turn began) and by _process_chunk (real output
         # arrived). A capture-pane verdict is only applied if the generation it was
@@ -637,7 +638,13 @@ class StatusMonitor:
             except RuntimeError:
                 pass  # loop already closed during shutdown — the timer is moot
 
-    def notify_input_sent(self, terminal_id: str, *, assume_processing: bool = False) -> int:
+    def notify_input_sent(
+        self,
+        terminal_id: str,
+        *,
+        assume_processing: bool = False,
+        owns_turn: bool = False,
+    ) -> int:
         """Arm the next PROCESSING transition and assign this dispatch a sequence.
 
         Call before any send_keys / paste that initiates a new processing
@@ -665,26 +672,42 @@ class StatusMonitor:
             self._capture_generation[terminal_id] = self._capture_generation.get(terminal_id, 0) + 1
             dispatch_seq = self._dispatch_seq.get(terminal_id, 0) + 1
             self._dispatch_seq[terminal_id] = dispatch_seq
+            if owns_turn:
+                self._active_dispatch[terminal_id] = dispatch_seq
         if assume_processing:
             self._apply_detection(terminal_id, TerminalStatus.PROCESSING)
         return dispatch_seq
 
-    def get_status_snapshot(self, terminal_id: str) -> Tuple[TerminalStatus, int]:
-        """Atomic (status, evidence dispatch) pair for a terminal.
-
-        Both values are read under ONE hold of the lock, so a status
-        transition between two separate sampling operations can never pair
-        a stale status with a newer evidence stamp (issue #735 review:
-        "status and evidence generation come from different snapshots").
-        The evidence dispatch is 0 when nothing has latched yet (or the
-        terminal was reset), so a dispatch-correlated caller's
-        ``evidence >= dispatch`` check can never pass against a terminal
-        with no observed evidence.
-        """
+    def has_inflight_dispatch(self, terminal_id: str) -> bool:
+        """Whether a top-level send still owns this terminal's turn boundary."""
         with self._lock:
+            active = self._active_dispatch.get(terminal_id)
+            if active is None:
+                return False
             status = self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
             evidence = self._status_evidence_dispatch.get(terminal_id, 0)
-            return status, evidence
+            return not (status in _STICKY_READY_STATUSES and evidence == active)
+
+    def get_status_snapshot(self, terminal_id: str) -> Tuple[TerminalStatus, int]:
+        """Return one dispatch-consistent, live ``(status, evidence)`` pair.
+
+        ``get_status`` is intentionally not a cache accessor: event-inbox
+        terminals derive their native status there and cached PROCESSING can
+        self-heal from the visible terminal.  Pin the dispatch around that
+        unlocked work and retry if a new input claimed the terminal while the
+        resolver was running; otherwise a live result from turn N could be
+        returned with turn N+1's evidence.
+        """
+        while True:
+            with self._lock:
+                dispatch = self._dispatch_seq.get(terminal_id, 0)
+
+            status = self.get_status(terminal_id)
+
+            with self._lock:
+                if self._dispatch_seq.get(terminal_id, 0) != dispatch:
+                    continue
+                return status, self._status_evidence_dispatch.get(terminal_id, 0)
 
     def get_status_generation(self, terminal_id: str) -> int:
         """Dispatch sequence of the evidence behind the latched status.
@@ -756,6 +779,7 @@ class StatusMonitor:
             self._pending_stale_capture.pop(terminal_id, None)
             self._capture_generation.pop(terminal_id, None)
             self._status_evidence_dispatch.pop(terminal_id, None)
+            self._active_dispatch.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
 
@@ -781,6 +805,7 @@ class StatusMonitor:
             self._pending_stale_capture.pop(terminal_id, None)
             self._capture_generation.pop(terminal_id, None)
             self._status_evidence_dispatch.pop(terminal_id, None)
+            self._active_dispatch.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
 

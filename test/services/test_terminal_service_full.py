@@ -2173,6 +2173,19 @@ class TestSendInput:
             assert send_input("test1234", "next message") is True
             mock_tmux.send_keys.assert_called_once()
 
+    def test_second_dispatch_after_paste_waits_for_the_first_turn(self):
+        """The short paste slot is not the whole turn boundary (#735)."""
+        with (
+            patch("cli_agent_orchestrator.services.terminal_service.status_monitor") as mock_sm,
+            patch("cli_agent_orchestrator.backends.registry._backend") as mock_tmux,
+        ):
+            mock_sm.has_inflight_dispatch.return_value = True
+
+            with pytest.raises(TerminalInputBlockedError, match="in-flight message dispatch"):
+                send_input("test1234", "second message")
+
+            mock_tmux.send_keys.assert_not_called()
+
     @patch("cli_agent_orchestrator.services.terminal_service.MemoryService")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
@@ -2215,7 +2228,7 @@ class TestSendInput:
         send_input("test1234", "hello worker")
 
         mock_provider.mark_input_received.assert_called_once()
-        mock_status_monitor.notify_input_sent.assert_called_once_with("test1234")
+        mock_status_monitor.notify_input_sent.assert_called_once_with("test1234", owns_turn=True)
         # The active provider receives the same explicit buffer-generation
         # boundary, so stateful detectors never compare post-dispatch output
         # with the discarded rolling buffer.
