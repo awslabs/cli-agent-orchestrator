@@ -31,6 +31,32 @@ def load_fixture(filename: str) -> str:
         return f.read()
 
 
+class TestCodexCurrentComposer:
+    @pytest.mark.parametrize(
+        ("screen", "expected"),
+        [
+            (
+                "› [CAO Handoff] repeat the exact task\n"
+                "• completed\n"
+                "›\n"
+                "  ? for shortcuts                     88% context left",
+                "",
+            ),
+            (
+                "› [CAO Handoff] repeat the exact task\n"
+                "  keep this sparse multiline draft\n"
+                "\n"
+                "  gpt-5.6-terra high · ~/work",
+                "› [CAO Handoff] repeat the exact task\n" "  keep this sparse multiline draft",
+            ),
+        ],
+    )
+    def test_extract_current_composer_uses_the_bottom_composer(self, screen, expected):
+        provider = CodexProvider("test1234", "test-session", "window-0", None)
+
+        assert provider.extract_current_composer(screen) == expected
+
+
 def read_developer_instructions_file(command: str) -> str:
     """Extracts the path from the command's ``$(cat <path>)`` developer_instructions
     fragment and returns that file's actual on-disk content -- the fragment keeps the

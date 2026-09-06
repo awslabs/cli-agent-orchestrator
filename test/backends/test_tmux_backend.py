@@ -147,12 +147,6 @@ class TestTmuxBackendDelegation:
         )
         assert result == "viewport text"
 
-    def test_get_cursor_position_delegates(self, backend, mock_client):
-        mock_client.get_cursor_position.return_value = (12, 7, 120)
-
-        assert backend.get_cursor_position("cao-test", "window-0") == (12, 7, 120)
-        mock_client.get_cursor_position.assert_called_once_with("cao-test", "window-0")
-
     def test_get_pane_working_directory_delegates(self, backend, mock_client):
         mock_client.get_pane_working_directory.return_value = "/home/user"
         result = backend.get_pane_working_directory("cao-test", "window-0")

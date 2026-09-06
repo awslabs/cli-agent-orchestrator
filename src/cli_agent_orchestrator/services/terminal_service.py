@@ -1763,10 +1763,13 @@ def _worker_is_started_direct(terminal_id: str, provider) -> bool:
     return status in _DEFERRED_STARTED_STATUSES
 
 
-def _capture_current_composer_region(terminal_id: str, probe_chars: int) -> Optional[str]:
+def _capture_current_composer_region(terminal_id: str) -> Optional[str]:
     try:
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
+            return None
+        provider = provider_manager.get_provider(terminal_id)
+        if provider is None:
             return None
         backend = get_backend()
         viewport = backend.get_history(
@@ -1775,19 +1778,7 @@ def _capture_current_composer_region(terminal_id: str, probe_chars: int) -> Opti
             strip_escapes=True,
             visible_only=True,
         )
-        cursor = backend.get_cursor_position(metadata["tmux_session"], metadata["tmux_window"])
-        if cursor is None:
-            return None
-        cursor_x, cursor_y, pane_width = cursor
-        if cursor_x < 0 or cursor_y < 0 or pane_width <= 0:
-            return None
-        lines = viewport.split("\n")
-        if cursor_y >= len(lines):
-            return None
-        rows = max(2, (2 * probe_chars + pane_width - 1) // pane_width + 1)
-        return "\n".join(
-            lines[max(0, cursor_y - rows + 1) : cursor_y] + [lines[cursor_y][:cursor_x]]
-        )
+        return provider.extract_current_composer(viewport)
     except Exception:
         logger.debug("Failed to capture current composer for %s", terminal_id, exc_info=True)
         return None
@@ -1800,18 +1791,17 @@ def _normalized_box_text(text: str) -> str:
 def _message_visible_in_box(terminal_id: str, message: str) -> bool:
     """True when the current editable composer contains the message text.
 
-    A bare Enter is safe only when the bounded trailing message probe is beside
-    the current cursor. The pane can retain historical deliveries and a rolling
-    output buffer can truncate a long composer, so this reads an escape-free
-    current viewport region rather than historical text. A miss takes the safer
-    full-redelivery path.
+    A bare Enter is safe only when the provider extracts the bounded trailing
+    message probe from its current composer. The pane can retain historical
+    deliveries, so cursor-adjacent or transcript text is not an input boundary.
+    A miss takes the safer full-redelivery path.
     """
     normalized_message = _normalized_box_text(message)
     probe = normalized_message[-_CURRENT_COMPOSER_PROBE_MAX_CHARS:]
     if len(probe) < 8:
         return False
 
-    composer = _capture_current_composer_region(terminal_id, len(probe))
+    composer = _capture_current_composer_region(terminal_id)
     if composer is None:
         return False
     return probe in _normalized_box_text(composer)
@@ -1838,14 +1828,15 @@ def redeliver_dropped_message(
     that already holds the provider instance passes it; otherwise it is
     resolved from the registry, best-effort (a resolution failure means no
     probe, never a failed redelivery). Then the box check picks the
-    redelivery: if the delivered text is still visible in the rendered pane
+    redelivery: if the delivered text is still visible in the current composer
     only the Enter was swallowed (send a bare Enter); if it is absent the
     paste itself was dropped (re-deliver in full). See
     ``_message_visible_in_box`` for why guessing wrong must be avoided.
 
     ``full_resend_requires_probe`` gates the full re-send on the provider
-    being probe-capable. Reason: ``_message_visible_in_box`` scans the whole
-    rendered pane, and under the pyte screen path status detection runs only
+    being probe-capable. Reason: the current-composer check cannot establish
+    that a prompt which has already scrolled away was processed, and under the
+    pyte screen path status detection runs only
     at rising-edge/quiescence — a whole turn can process inside one burst,
     leaving the cached status IDLE throughout while the prompt scrolls off —
     so for a provider without a direct status probe there is no way to

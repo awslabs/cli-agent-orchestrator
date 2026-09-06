@@ -125,11 +125,6 @@ class TmuxBackend(TerminalBackend):
             visible_only=visible_only,
         )
 
-    def get_cursor_position(
-        self, session_name: str, window_name: str
-    ) -> Optional[tuple[int, int, int]]:
-        return self._client.get_cursor_position(session_name, window_name)
-
     def get_pane_working_directory(self, session_name: str, window_name: str) -> Optional[str]:
         return self._client.get_pane_working_directory(session_name, window_name)
 

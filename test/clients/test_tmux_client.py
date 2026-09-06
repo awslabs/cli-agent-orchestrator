@@ -523,33 +523,6 @@ class TestGetHistory:
         mock_pane.cmd.assert_called_once_with("capture-pane", "-p", "-S", "-")
 
 
-class TestGetCursorPosition:
-    def test_get_cursor_position_returns_cursor_and_width(self, tmux):
-        mock_pane = MagicMock()
-        mock_pane.cmd.return_value.stdout = ["12 7 120"]
-        mock_window = MagicMock()
-        mock_window.panes = [mock_pane]
-        mock_session = MagicMock()
-        mock_session.windows.get.return_value = mock_window
-        tmux.server.sessions.get.return_value = mock_session
-
-        assert tmux.get_cursor_position("ses", "win") == (12, 7, 120)
-        mock_pane.cmd.assert_called_once_with(
-            "display-message", "-p", "#{cursor_x} #{cursor_y} #{pane_width}"
-        )
-
-    def test_get_cursor_position_returns_none_for_malformed_geometry(self, tmux):
-        mock_pane = MagicMock()
-        mock_pane.cmd.return_value.stdout = ["not geometry"]
-        mock_window = MagicMock()
-        mock_window.panes = [mock_pane]
-        mock_session = MagicMock()
-        mock_session.windows.get.return_value = mock_window
-        tmux.server.sessions.get.return_value = mock_session
-
-        assert tmux.get_cursor_position("ses", "win") is None
-
-
 # ── list_sessions ────────────────────────────────────────────────────
 
 

@@ -25,10 +25,11 @@ class TestMessageVisibleInBox:
     def test_false_when_current_viewport_does_not_add_message(self):
         assert not self._visible_in_current_composer("❯ (empty prompt)", "Analyze the logs")
 
-    def test_current_composer_capture_is_escape_free_and_cursor_bounded(self):
+    def test_current_composer_capture_delegates_plain_viewport_to_provider(self):
         backend = MagicMock()
         backend.get_history.return_value = "old history\n› Analyze the logs carefully"
-        backend.get_cursor_position.return_value = (28, 1, 80)
+        provider = MagicMock()
+        provider.extract_current_composer.return_value = "› Analyze the logs carefully"
         with (
             patch.object(
                 ts,
@@ -36,15 +37,16 @@ class TestMessageVisibleInBox:
                 return_value={"tmux_session": "session", "tmux_window": "window"},
             ),
             patch.object(ts, "get_backend", return_value=backend),
+            patch.object(ts, "provider_manager") as manager,
         ):
-            assert (
-                ts._capture_current_composer_region("t1", 24)
-                == "old history\n› Analyze the logs carefully"
-            )
+            manager.get_provider.return_value = provider
+            assert ts._capture_current_composer_region("t1") == "› Analyze the logs carefully"
         backend.get_history.assert_called_once_with(
             "session", "window", strip_escapes=True, visible_only=True
         )
-        backend.get_cursor_position.assert_called_once_with("session", "window")
+        provider.extract_current_composer.assert_called_once_with(
+            "old history\n› Analyze the logs carefully"
+        )
 
     def test_send_input_does_not_retain_a_viewport_before_paste(self):
         events = []
@@ -75,10 +77,11 @@ class TestMessageVisibleInBox:
     def test_false_when_output_fetch_raises(self):
         assert not self._visible_in_current_composer(None, "Analyze the logs")
 
-    def test_current_composer_capture_rejects_invalid_cursor_geometry(self):
+    def test_current_composer_capture_rejects_provider_without_composer_contract(self):
         backend = MagicMock()
         backend.get_history.return_value = "› Analyze the logs"
-        backend.get_cursor_position.return_value = (-1, 0, 80)
+        provider = MagicMock()
+        provider.extract_current_composer.return_value = None
         with (
             patch.object(
                 ts,
@@ -86,49 +89,17 @@ class TestMessageVisibleInBox:
                 return_value={"tmux_session": "session", "tmux_window": "window"},
             ),
             patch.object(ts, "get_backend", return_value=backend),
+            patch.object(ts, "provider_manager") as manager,
         ):
-            assert ts._capture_current_composer_region("t1", 16) is None
+            manager.get_provider.return_value = provider
+            assert ts._capture_current_composer_region("t1") is None
 
     def test_match_survives_wrapping_and_whitespace(self):
         assert self._visible_in_current_composer(
             "❯ Analyze the\n  logs carefully", "Analyze the logs"
         )
 
-    def test_prior_handoff_does_not_read_as_the_current_one(self):
-        current = (
-            "[CAO Handoff] Supervisor terminal ID: a1b2c3d4. "
-            "This is a blocking handoff — complete the task and present "
-            "your deliverables.\n\nRefactor the config loader module"
-        )
-        stale = current.replace("Refactor the config loader module", "Fix the flaky e2e login test")
-        assert not self._visible_in_current_composer("❯ (empty prompt)", current)
-        assert self._visible_in_current_composer(f"› {current}", current)
-
-    @pytest.mark.parametrize(
-        "stale",
-        [
-            "[CAO Handoff] repeat the exact task",
-            "[CAO Handoff] repeat the exact task plus a stale suffix",
-            "[CAO Handoff] triage 東京",
-        ],
-    )
-    def test_stale_historical_text_never_counts_as_current_composer(self, stale):
-        current = (
-            "[CAO Handoff] triage 大阪"
-            if "東京" in stale
-            else "[CAO Handoff] repeat the exact task"
-        )
-        assert not self._visible_in_current_composer("❯ (empty prompt)", current)
-
-    def test_identical_current_composer_counts_as_new(self):
-        message = "[CAO Handoff] repeat the exact task"
-        assert self._visible_in_current_composer(f"› {message}", message)
-
-    def test_current_composer_counts_when_a_stale_identical_prompt_scrolled_out(self):
-        message = "[CAO Handoff] repeat the exact task"
-        assert self._visible_in_current_composer(f"› {message}", message)
-
-    def test_escape_free_viewport_handles_ansi_wrapping_and_truncated_history(self):
+    def test_current_composer_tail_handles_wrapping_and_unicode(self):
         message = "Analyze the logs carefully and preserve the current composer message tail"
         tail = ts._normalized_box_text(message)[-ts._CURRENT_COMPOSER_PROBE_MAX_CHARS :]
         with patch.object(
