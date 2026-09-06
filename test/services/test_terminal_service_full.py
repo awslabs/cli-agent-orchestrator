@@ -2058,10 +2058,11 @@ class TestSendInput:
         mock_provider = mock_pm.get_provider.return_value
         mock_provider.paste_enter_count = 2
         mock_provider.paste_submit_delay = 0.3
+        mock_status_monitor.notify_input_sent.return_value = 7
 
         result = send_input("test1234", "test message")
 
-        assert result is True
+        assert result == 7
         mock_tmux.send_keys.assert_called_once_with(
             "cao-session",
             "developer-abcd",
@@ -2219,10 +2220,11 @@ class TestSendInput:
         mock_status_monitor.get_status.return_value = TerminalStatus.WAITING_USER_ANSWER
         mock_provider.paste_enter_count = 1
         mock_provider.paste_submit_delay = 0.3
+        mock_status_monitor.notify_input_sent.return_value = 3
 
         result = send_input("test1234", "1")
 
-        assert result is True
+        assert result == 3
         mock_tmux.send_keys.assert_called_once_with(
             "cao-session",
             "developer-abcd",

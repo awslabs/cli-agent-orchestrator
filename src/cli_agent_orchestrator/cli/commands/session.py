@@ -244,11 +244,21 @@ def send(session_name, message, terminal_id, is_async, timeout):
         click.echo(f"Message sent to terminal {target_id}")
         return
 
+    # Correlate the wait with THIS dispatch when the server reports the
+    # generation it assigned (issue #735): a completion marker on the current
+    # frame can belong to the previous turn, and this is the only way to
+    # accept a turn that finishes before polling begins.
+    dispatch_generation = response.json().get("input_generation")
     time.sleep(3)
     effective_timeout = timeout if timeout is not None else _DEFAULT_SEND_TIMEOUT
     interrupted = False
     try:
-        poll_until_done(target_id, effective_timeout, require_observed_working=True)
+        poll_until_done(
+            target_id,
+            effective_timeout,
+            dispatch_generation=dispatch_generation,
+            require_observed_working=dispatch_generation is None,
+        )
     except KeyboardInterrupt:
         interrupted = True
 
