@@ -2096,14 +2096,40 @@ class TestMemoryScopeNullUniquenessMigration:
         assert "uq_memory_key_scope_null" not in names
         assert rows == 2, "duplicates must be left for `cao memory repair`, never deleted here"
 
-        with sqlite3.connect(str(db_file)) as conn:  # the repair: keep one row
-            conn.execute("DELETE FROM memory_metadata WHERE file_path = '/2.md'")
-            conn.commit()
-        db_mod._migrate_memory_scope_null_uniqueness()  # creates
+        # The repair the warning advertises: the reconciliation service's
+        # dedupe path clears the stale sibling, then re-invokes the migrator.
+        # The seeded rows carry key='d', so the canonical topic is 'd.md'.
+        from cli_agent_orchestrator.services.memory_reconciliation import (
+            MemoryReconciliationService,
+        )
 
+        base_dir = tmp_path / "memory"
+        topic = base_dir / "global" / "wiki" / "global" / "d.md"
+        topic.parent.mkdir(parents=True, exist_ok=True)
+        topic.write_text(
+            "# d\n"
+            "<!-- id: 11111111-1111-1111-1111-111111111111 | scope: global | "
+            "type: reference | tags:  -->\n\n"
+            "## 2026-07-15T01:00:00Z\ndurable body\n",
+            encoding="utf-8",
+        )
+        with sqlite3.connect(str(db_file)) as conn:
+            conn.execute(
+                "UPDATE memory_metadata SET file_path = ? WHERE file_path = '/1.md'",
+                (str(topic),),
+            )
+            conn.commit()
+        engine = create_engine(f"sqlite:///{db_file}")
+        try:
+            report = MemoryReconciliationService(base_dir, engine).apply()
+            assert report.counts["dedupe_metadata"] == 1
+        finally:
+            engine.dispose()
         with sqlite3.connect(str(db_file)) as conn:
             names = {r[1] for r in conn.execute("PRAGMA index_list('memory_metadata')")}
-        assert "uq_memory_key_scope_null" in names
+            rows = conn.execute("SELECT COUNT(*) FROM memory_metadata").fetchone()[0]
+        assert rows == 1, "the canonical row survives the advertised repair"
+        assert "uq_memory_key_scope_null" in names, "repair re-attempts the index in-run"
 
 
 class TestListTerminalsInSessions:

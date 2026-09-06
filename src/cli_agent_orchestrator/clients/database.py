@@ -702,7 +702,7 @@ def _migrate_workflow_plan_approval() -> None:
         logger.debug(f"workflow_plan_approval migration skipped: {e}")
 
 
-def _migrate_memory_scope_null_uniqueness() -> None:
+def _migrate_memory_scope_null_uniqueness(engine: Any = None) -> None:
     """Create the partial unique index backing ``uq_memory_key_scope`` for
     NULL ``scope_id`` rows (issue #657). Appended LAST to the ``init_db()``
     registry.
@@ -714,20 +714,34 @@ def _migrate_memory_scope_null_uniqueness() -> None:
     sentinel used by ``memory_relationships`` is wrong here). This index
     covers exactly those rows; non-NULL scopes stay on the table constraint.
 
-    Idempotent, zero-arg, self-connecting — mirrors the existing migrators.
-    Fail-soft by design: on a database that already holds duplicate
-    NULL-scope rows (the state this bug allowed — external edits, merged
-    DBs), ``CREATE UNIQUE INDEX`` raises ``IntegrityError``, so duplicates
-    are pre-scanned and the index is skipped with a warning pointing at
-    ``cao memory repair`` rather than blocking startup. Re-running
-    ``init_db()`` after the repair creates it.
+    Idempotent, self-connecting — mirrors the existing migrators. ``engine``
+    lets a caller bound the attempt to an existing SQLAlchemy engine (the
+    memory-repair path passes its own); the default resolves the singleton
+    ``DATABASE_FILE`` exactly like the other migrators. Fail-soft by design:
+    on a database that still holds duplicate NULL-scope rows,
+    ``CREATE UNIQUE INDEX`` raises ``IntegrityError``, so duplicates are
+    pre-scanned and the index is skipped with a warning pointing at
+    ``cao memory repair`` rather than blocking startup. The repair now
+    re-invokes this migrator once its dedupe has cleared the duplicates, so
+    the index lands in the same repair run instead of at the next startup.
     """
     import sqlite3
 
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
+    target = str(DATABASE_FILE)
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        if engine is not None:
+            # Reuse the caller's engine connection pool so the attempt and the
+            # repairs share one database identity.
+            with engine.connect() as conn:
+                conn.exec_driver_sql(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_key_scope_null "
+                    "ON memory_metadata (key, scope) WHERE scope_id IS NULL"
+                )
+                conn.commit()
+            return
+        with sqlite3.connect(target) as conn:
             duplicates = conn.execute(
                 "SELECT key, scope, COUNT(*) FROM memory_metadata "
                 "WHERE scope_id IS NULL GROUP BY key, scope HAVING COUNT(*) > 1"
