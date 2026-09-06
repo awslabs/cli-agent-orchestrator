@@ -1164,6 +1164,110 @@ def test_rebuild_preserves_deindexed_tombstones(tmp_path, monkeypatch):
     assert "deindexed_retained" in finding.detail
 
 
+def test_rebuild_preserves_path_derived_tombstone_after_rename(tmp_path, monkeypatch):
+    """A rebuild migrates a forgotten rename-carried identity to the current path key."""
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    old_path = tmp_path / "vault" / "Mapped" / "Old.md"
+    new_path = old_path.with_name("New.md")
+    old_path.write_text("same content", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="rebuild-renamed-excluded-before")
+    with Session() as db:
+        original = db.query(VaultNoteModel).one()
+        original_key = original.cao_key
+        _exclude_note(db, original)
+        db.query(MemoryMetadataModel).filter_by(source_kind="vault").delete()
+        db.commit()
+
+    old_path.rename(new_path)
+    reconcile(vault, apply=True, run_id="rebuild-renamed-excluded-incremental")
+    with Session() as db:
+        renamed = db.query(VaultNoteModel).one()
+        assert (renamed.vault_relpath, renamed.cao_key, renamed.status) == (
+            "Mapped/New.md",
+            original_key,
+            "excluded",
+        )
+        assert db.query(VaultNoteAliasModel).count() == 1
+
+    reconcile(vault, apply=True, rebuild=True, run_id="rebuild-renamed-excluded-after")
+
+    with Session() as db:
+        rebuilt = db.query(VaultNoteModel).one()
+        rebuilt_key = rebuilt.cao_key
+        exclusions = db.query(VaultExclusionModel).all()
+        metadata_count = db.query(MemoryMetadataModel).filter_by(source_kind="vault").count()
+        retained = (
+            db.query(VaultFindingModel)
+            .filter_by(code="deindexed_retained", vault_relpath="Mapped/New.md")
+            .count()
+        )
+        alias_count = db.query(VaultNoteAliasModel).count()
+    assert rebuilt_key != original_key
+    assert (rebuilt.vault_relpath, rebuilt.status, metadata_count) == (
+        "Mapped/New.md",
+        "excluded",
+        0,
+    )
+    assert [(row.cao_key, row.last_known_relpath) for row in exclusions] == [
+        (rebuilt_key, "Mapped/New.md")
+    ]
+    assert retained == 1
+    assert alias_count == 0
+
+    reconcile(vault, apply=True, rebuild=True, run_id="rebuild-renamed-excluded-stable")
+    with Session() as db:
+        stable = db.query(VaultNoteModel).one()
+        stable_metadata = db.query(MemoryMetadataModel).filter_by(source_kind="vault").count()
+    assert (stable.cao_key, stable.status, stable_metadata) == (rebuilt_key, "excluded", 0)
+
+
+def test_rebuild_tombstone_migration_does_not_exclude_former_path_replacement(
+    tmp_path, monkeypatch
+):
+    """Content provenance keeps a replacement at the former path recallable."""
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    old_path = tmp_path / "vault" / "Mapped" / "Old.md"
+    new_path = old_path.with_name("New.md")
+    old_path.write_text("forgotten content", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="rebuild-replacement-before")
+    with Session() as db:
+        original = db.query(VaultNoteModel).one()
+        _exclude_note(db, original)
+        db.query(MemoryMetadataModel).filter_by(source_kind="vault").delete()
+        db.commit()
+
+    old_path.rename(new_path)
+    reconcile(vault, apply=True, run_id="rebuild-replacement-renamed")
+    old_path.write_text("different replacement", encoding="utf-8")
+    reconcile(vault, apply=True, rebuild=True, run_id="rebuild-replacement-after")
+
+    with Session() as db:
+        notes = {
+            row.vault_relpath: (row.cao_key, row.status) for row in db.query(VaultNoteModel).all()
+        }
+        metadata = {
+            row.file_path
+            for row in db.query(MemoryMetadataModel).filter_by(source_kind="vault").all()
+        }
+        exclusion = db.query(VaultExclusionModel).one()
+    renamed_key, renamed_status = notes["Mapped/New.md"]
+    replacement_key, replacement_status = notes["Mapped/Old.md"]
+    assert renamed_status == "excluded"
+    assert replacement_status == "indexed"
+    assert renamed_key != replacement_key
+    assert metadata == {"Mapped/Old.md"}
+    assert (exclusion.cao_key, exclusion.last_known_relpath) == (
+        renamed_key,
+        "Mapped/New.md",
+    )
+
+
 def test_authored_key_pure_rename_preserves_canonical_identity(tmp_path, monkeypatch):
     from cli_agent_orchestrator.services.vault import reconcile as module
 

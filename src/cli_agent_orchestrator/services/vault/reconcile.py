@@ -391,6 +391,19 @@ def _apply_plan(
 ) -> tuple[int, tuple[tuple[str, str, str, str], ...], tuple[_ProjectedNote, ...]]:
     """Apply only vault-scoped deletes; native rows remain structurally untouched."""
     if rebuild:
+        rebuild_prior_by_path = {
+            cast(str, row.vault_relpath): row
+            for row in db.query(VaultNoteModel).filter(VaultNoteModel.vault_id == vault.id).all()
+        }
+        rebuild_alias_keys = _alias_identity_set(db, vault.id)
+        exclusions = _carry_rebuild_exclusions(
+            db,
+            vault.id,
+            projected,
+            rebuild_prior_by_path,
+            rebuild_alias_keys,
+            exclusions,
+        )
         # Every rebuild delete is scoped to its derived producer. Release
         # one permits one configured vault, so metadata has no vault id.
         db.query(VaultNoteModel).filter(VaultNoteModel.vault_id == vault.id).delete()
@@ -572,6 +585,85 @@ def _vault_exclusion_set(db, vault_id: str) -> set[tuple[str, str, str]]:
         .filter(VaultExclusionModel.vault_id == vault_id)
         .all()
     }
+
+
+def _carry_rebuild_exclusions(
+    db,
+    vault_id: str,
+    projected: tuple[_ProjectedNote, ...],
+    prior_by_path: dict[str, VaultNoteModel],
+    carried_alias_keys: set[tuple[str, str, str]],
+    exclusions: set[tuple[str, str, str]],
+) -> set[tuple[str, str, str]]:
+    """Migrate a proven rename-carried tombstone before rebuild drops provenance.
+
+    Rebuild intentionally re-derives path-based keys and removes rename aliases.
+    A forgotten note that retained its former key through an ordinary rename must
+    therefore move its durable exclusion to the new path-derived key first.  The
+    old identity, live path, and content hash must all agree so a reused path or
+    unrelated note cannot inherit the tombstone.
+    """
+    projected_by_path = {item.note.vault_relpath: item for item in projected}
+    carried = set(exclusions)
+    for path, prior in prior_by_path.items():
+        old_identity = (
+            cast(str, prior.scope),
+            cast(str, prior.scope_id),
+            cast(str, prior.cao_key),
+        )
+        if old_identity not in exclusions or old_identity not in carried_alias_keys:
+            continue
+        item = projected_by_path.get(path)
+        if item is None or (item.note.parsed is not None and "key" in item.note.parsed.cao):
+            continue
+        exclusion = db.get(
+            VaultExclusionModel,
+            {
+                "vault_id": vault_id,
+                "scope": old_identity[0],
+                "scope_id": old_identity[1],
+                "cao_key": old_identity[2],
+            },
+        )
+        if (
+            exclusion is None
+            or exclusion.content_sha256 is None
+            or prior.content_sha256 != exclusion.content_sha256
+            or item.note.content_sha256 != exclusion.content_sha256
+        ):
+            continue
+        new_identity = (
+            item.note.scope,
+            item.note.scope_id or "",
+            item.canonical_key,
+        )
+        if new_identity == old_identity:
+            continue
+        replacement = db.get(
+            VaultExclusionModel,
+            {
+                "vault_id": vault_id,
+                "scope": new_identity[0],
+                "scope_id": new_identity[1],
+                "cao_key": new_identity[2],
+            },
+        )
+        if replacement is None:
+            replacement = VaultExclusionModel(
+                vault_id=vault_id,
+                scope=new_identity[0],
+                scope_id=new_identity[1],
+                cao_key=new_identity[2],
+                created_at=exclusion.created_at,
+            )
+            db.add(replacement)
+        replacement.last_known_relpath = item.note.vault_relpath
+        replacement.content_sha256 = item.note.content_sha256
+        db.delete(exclusion)
+        carried.discard(old_identity)
+        carried.add(new_identity)
+    db.flush()
+    return carried
 
 
 def _retain_vault_exclusions(
