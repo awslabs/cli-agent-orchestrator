@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -791,46 +793,50 @@ def test_dedupe_survives_mixed_naive_and_null_timestamps(tmp_path: Path, engine:
     assert "uq_memory_key_scope_null" in names
 
 
-def test_dedupe_tiebreak_picks_the_lowest_id_at_equal_normalized_time(
+def test_dedupe_tiebreak_picks_the_maximum_id_at_equal_normalized_time(
     tmp_path: Path, engine: Any
 ) -> None:
     """Equal normalized ``updated_at`` falls back to the ``id`` tie-break.
 
-    The reviewer's P2-2 contract names newest selection AND the equal-time
-    ``id`` tie-break; both rows anchor the canonical path, so the pick must
-    be deterministic — highest ``id`` per the ``max()`` key — never arbitrary.
+    Both duplicate rows anchor the canonical topic path with identical
+    timestamps, so survivor selection must actually compare both ids and
+    keep the documented maximum. Ids are seeded deterministically before
+    insert — mutating live primary keys after the fact races SQLite's
+    UNIQUE flush (review P2-2).
     """
     base = tmp_path / "memory"
     topic = _write_topic(base, "global", None, "shared")
-    _seed_duplicate_global_rows(
-        base,
-        engine,
-        "shared",
-        canonical_path=str(topic),
-        stale_paths=(str(topic.with_name("stale.md")),),
-    )
+    with engine.connect() as conn:
+        conn.exec_driver_sql("DROP INDEX IF EXISTS uq_memory_key_scope_null")
+        conn.commit()
     with sessionmaker(bind=engine)() as db:
-        db.execute(
-            MemoryMetadataModel.__table__.update().values(
-                updated_at=datetime(2026, 7, 1, 10, 0)
+        for row_id in (
+            "11111111-1111-1111-1111-111111111111",
+            "99999999-9999-9999-9999-999999999999",
+        ):
+            db.add(
+                MemoryMetadataModel(
+                    id=row_id,
+                    key="shared",
+                    memory_type="reference",
+                    scope="global",
+                    scope_id=None,
+                    file_path=str(topic),
+                    tags="",
+                )
             )
+        db.execute(
+            MemoryMetadataModel.__table__.update().values(updated_at=datetime(2026, 7, 1, 10, 0))
         )
-        rows = db.query(MemoryMetadataModel).all()
-        # Force the stale-path row to have the higher id so the tie-break,
-        # not insertion order, decides the survivor.
-        stale = next(row for row in rows if row.file_path != str(topic))
-        canonical = next(row for row in rows if row.file_path == str(topic))
-        if stale.id > canonical.id:
-            stale.id, canonical.id = canonical.id, stale.id
         db.commit()
-        expected_id = max(row.id for row in db.query(MemoryMetadataModel).all())
 
     report = MemoryReconciliationService(base, engine).apply()
 
     assert report.counts["dedupe_metadata"] == 1
     remaining = _rows(engine)
     assert len(remaining) == 1
-    assert remaining[0].id == expected_id, "equal-time tie-break keeps the highest id"
+    assert remaining[0].id == "99999999-9999-9999-9999-999999999999"
+    assert remaining[0].file_path == str(topic)
 
 
 def test_foreign_path_duplicate_clears_in_one_repair_run(tmp_path: Path, engine: Any) -> None:
@@ -864,6 +870,153 @@ def test_foreign_path_duplicate_clears_in_one_repair_run(tmp_path: Path, engine:
             for row in conn.exec_driver_sql("PRAGMA index_list('memory_metadata')").fetchall()
         }
     assert "uq_memory_key_scope_null" in names
+
+
+def test_replanned_topic_lock_blocks_concurrent_store(
+    tmp_path: Path, engine: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A replanned topic's lock is held from the initial acquisition (review P2-1).
+
+    Topic X's stale duplicate row sits on topic Y's canonical path, so Y
+    plans a row-state conflict and is repaired only by the second-pass
+    re-plan. That re-plan used to run without Y's topic lock, letting a
+    concurrent ``MemoryService.store()`` interleave: the Markdown stayed
+    new while SQLite and the index kept the pre-store projection. The
+    store must block against the replan and every surface must finish
+    describing the newest content.
+    """
+    base = tmp_path / "memory"
+    topic_x = _write_topic(base, "global", None, "x-shared")
+    topic_y = _write_topic(base, "global", None, "y-victim", body="original")
+    _seed_duplicate_global_rows(
+        base,
+        engine,
+        "x-shared",
+        canonical_path=str(topic_x),
+        stale_paths=(str(topic_y),),
+    )
+    with sessionmaker(bind=engine)() as db:
+        db.add(
+            MemoryMetadataModel(
+                id=str(uuid.uuid4()),
+                key="y-victim",
+                memory_type="reference",
+                scope="global",
+                scope_id=None,
+                file_path=str(topic_y),
+                tags="",
+            )
+        )
+        db.commit()
+
+    repair = MemoryReconciliationService(base, engine)
+    store = MemoryService(base, engine)
+    replan_started = threading.Event()
+    store_returned = threading.Event()
+    blocked_during_replan = threading.Event()
+
+    original_repair_metadata = repair._repair_metadata
+
+    def paused_repair_metadata(topic: Any, action: RepairAction) -> None:
+        if (
+            topic.identity is not None
+            and topic.identity.key == "y-victim"
+            and not replan_started.is_set()
+        ):
+            replan_started.set()
+            # Hold the replan open long enough for the concurrent store to
+            # reach the topic flock; it must still be blocked here.
+            time.sleep(1.5)
+            if not store_returned.is_set():
+                blocked_during_replan.set()
+        original_repair_metadata(topic, action)
+
+    monkeypatch.setattr(repair, "_repair_metadata", paused_repair_metadata)
+
+    def run_repair() -> None:
+        repair.apply()
+
+    def run_store() -> None:
+        replan_started.wait(timeout=10)
+        asyncio.run(
+            store.store(
+                content="concurrent new content",
+                scope="global",
+                memory_type="reference",
+                key="y-victim",
+            )
+        )
+        store_returned.set()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(run_repair), pool.submit(run_store)]
+        for future in futures:
+            future.result(timeout=30)
+
+    assert blocked_during_replan.is_set(), "store did not block on the replanned topic"
+
+    file_text = topic_y.read_text(encoding="utf-8")
+    assert "concurrent new content" in file_text
+    file_latest = (
+        max(line for line in file_text.splitlines() if line.startswith("## 20"))
+        .lstrip("# ")
+        .strip()
+    )
+    file_latest_at = datetime.strptime(file_latest, "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=timezone.utc
+    )
+
+    row = next(row for row in _rows(engine) if row.key == "y-victim")
+    row_updated_at = row.updated_at
+    assert row_updated_at is not None
+    assert row_updated_at.replace(tzinfo=timezone.utc) >= file_latest_at
+
+    index_text = (base / "global" / "wiki" / "index.md").read_text(encoding="utf-8")
+    y_lines = [line for line in index_text.splitlines() if "[y-victim]" in line]
+    assert len(y_lines) == 1
+    assert f"updated:{file_latest}" in y_lines[0]
+
+
+def test_unmapped_duplicate_scan_orders_across_scope_id_nullness(
+    tmp_path: Path, engine: Any
+) -> None:
+    """Identities differing only in ``scope_id`` nullness still sort (review P3).
+
+    The no-topic duplicate scan used dataclass ordering on
+    ``MemoryIdentity``, so two rows sharing key and scope with one NULL
+    and one string ``scope_id`` raised ``TypeError`` inside ``plan()``
+    instead of reporting.
+    """
+    base = tmp_path / "memory"
+    with sessionmaker(bind=engine)() as db:
+        db.add(
+            MemoryMetadataModel(
+                id="11111111-1111-1111-1111-111111111111",
+                key="shared",
+                memory_type="reference",
+                scope="global",
+                scope_id=None,
+                file_path=str(base / "global" / "wiki" / "global" / "gone-null.md"),
+                tags="",
+            )
+        )
+        db.add(
+            MemoryMetadataModel(
+                id="99999999-9999-9999-9999-999999999999",
+                key="shared",
+                memory_type="reference",
+                scope="global",
+                scope_id="legacy-nonnull",
+                file_path=str(base / "global" / "wiki" / "global" / "gone-str.md"),
+                tags="",
+            )
+        )
+        db.commit()
+
+    report = MemoryReconciliationService(base, engine).plan()
+
+    assert report.summary_text().startswith("memory_repair mode=dry-run")
+    assert report.counts["total"] == 0
 
 
 def test_unexpected_failure_does_not_rollback_other_records(

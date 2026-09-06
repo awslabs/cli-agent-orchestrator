@@ -922,7 +922,13 @@ class MemoryReconciliationService:
         # Surface every unmapped duplicate NULL-scope identity as an
         # actionable conflict: rows preserved, manual resolution named.
         mapped_identities = {topic.identity for topic in topics}
-        for identity, identity_rows in sorted(rows_by_identity.items()):
+        # Total key only: identities may differ solely in ``scope_id``
+        # nullness, and ``MemoryIdentity`` does not order across a
+        # None/string boundary.
+        for identity, identity_rows in sorted(
+            rows_by_identity.items(),
+            key=lambda item: (item[0].scope, item[0].scope_id or "", item[0].key),
+        ):
             if identity in mapped_identities or identity.scope_id is not None:
                 continue
             if len(identity_rows) <= 1:
@@ -1176,6 +1182,9 @@ class MemoryReconciliationService:
         groups: dict[Path, list[tuple[RepairRecord, _Candidate]]] = {}
         records_by_path: dict[Path, list[RepairRecord]] = {}
         resolved_paths: list[Optional[Path]] = []
+        # Findings whose records the second pass below can re-plan after
+        # another identity's dedupe frees the topic's path.
+        row_state_conflicts = {"database_path_conflict", "ambiguous_database_path"}
         for record in planned.records:
             if record.status != "skipped" and record.identity is not None:
                 resolved_path = Path(record.file_path).resolve()
@@ -1187,6 +1196,20 @@ class MemoryReconciliationService:
             path for path, matching_records in records_by_path.items() if len(matching_records) > 1
         }
         for record, planned_path in zip(planned.records, resolved_paths):
+            if (
+                record.status == "skipped"
+                and record.identity is not None
+                and record.finding is not None
+                and record.finding.kind in row_state_conflicts
+            ):
+                # This conflict may be re-planned and repaired in the second
+                # pass once another identity's dedupe frees its path, so its
+                # topic lock must be held from this initial ordered
+                # acquisition — never picked up lazily mid-run — keeping the
+                # single (index_path, file_path) lock order global.
+                candidate = self._candidate_from_record(record)
+                groups.setdefault(candidate.index_path, []).append((record, candidate))
+                continue
             if record.status == "skipped" or record.identity is None:
                 results.append(record)
                 continue
@@ -1317,8 +1340,9 @@ class MemoryReconciliationService:
             # just resolved. Re-plan those from a fresh snapshot and execute
             # the recovered plan here, so one repair run clears both the
             # duplicate and its dependent conflict instead of demanding a
-            # second identical run.
-            row_state_conflicts = {"database_path_conflict", "ambiguous_database_path"}
+            # second identical run. These topics joined the initial lock
+            # acquisition above, so the re-parse and every mutation below
+            # run under the topic's held lock.
             conflicted_indexes = [
                 index
                 for index, record in enumerate(results)
