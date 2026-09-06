@@ -1259,6 +1259,7 @@ class TestGetTerminal:
             "session_name": "test-session",
             "provider": "kiro_cli",
             "agent_profile": "developer",
+            "status_generation": 4,
         }
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.get_terminal.return_value = mock_terminal_dict
@@ -1269,6 +1270,7 @@ class TestGetTerminal:
         data = response.json()
         assert data["id"] == "abcd1234"
         assert data["provider"] == "kiro_cli"
+        assert data["status_generation"] == 4
         mock_svc.get_terminal.assert_called_once_with("abcd1234")
 
     def test_get_terminal_not_found(self, client):
@@ -1303,7 +1305,7 @@ class TestSendTerminalInput:
     def test_send_input_success(self, client):
         """POST /terminals/{id}/input sends message successfully."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
-            mock_svc.send_input.return_value = True
+            mock_svc.send_input.return_value = 7
 
             response = client.post(
                 "/terminals/abcd1234/input",
@@ -1313,6 +1315,7 @@ class TestSendTerminalInput:
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
+        assert data["input_generation"] == 7
         mock_svc.send_input.assert_called_once_with(
             "abcd1234",
             "hello world",
@@ -1324,7 +1327,7 @@ class TestSendTerminalInput:
     def test_send_input_with_orchestration_context(self, client):
         """POST /terminals/{id}/input forwards registry and orchestration metadata when provided."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
-            mock_svc.send_input.return_value = True
+            mock_svc.send_input.return_value = 9
 
             response = client.post(
                 "/terminals/abcd1234/input",
@@ -1336,6 +1339,7 @@ class TestSendTerminalInput:
             )
 
         assert response.status_code == 200
+        assert response.json()["input_generation"] == 9
         mock_svc.send_input.assert_called_once_with(
             "abcd1234",
             "hello world",

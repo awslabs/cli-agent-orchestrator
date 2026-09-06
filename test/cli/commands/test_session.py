@@ -462,9 +462,9 @@ class TestSendSync:
         pre_send_status_resp.json.return_value = {"status": "idle"}
         poll_resp = MagicMock(status_code=200)
         poll_resp.json.side_effect = [
-            {"status": "completed"},
-            {"status": "processing"},
-            {"status": "completed"},
+            {"status": "completed", "status_generation": 1},
+            {"status": "processing", "status_generation": 2},
+            {"status": "completed", "status_generation": 3},
         ]
         output_resp = MagicMock(status_code=200)
         output_resp.json.return_value = {"output": "The answer is 42"}
@@ -476,7 +476,9 @@ class TestSendSync:
             poll_resp,
             output_resp,
         ]
-        mock_post.return_value = MagicMock(status_code=200)
+        mock_post.return_value = MagicMock(
+            status_code=200, json=lambda: {"success": True, "input_generation": 2}
+        )
         mock_time.time.return_value = 0
         mock_time.sleep = MagicMock()
 
@@ -489,6 +491,93 @@ class TestSendSync:
     @patch("cli_agent_orchestrator.cli.commands.session.time")
     @patch("cli_agent_orchestrator.cli.commands.session.requests.post")
     @patch("cli_agent_orchestrator.cli.commands.session.requests.get")
+    def test_send_sync_fast_turn_completing_before_polling(
+        self, mock_get, mock_post, mock_time, runner
+    ):
+        """A turn that completes entirely during the pre-poll delay is accepted.
+
+        Regression (PR review): dispatch is assigned input_generation=5; the
+        turn finishes inside the 3s pre-poll sleep, so the FIRST poll already
+        reads completed whose evidence was latched at generation 6 (>= 5).
+        The completion must be accepted immediately — the observed-activity
+        gate would have rejected it and waited the full timeout.
+        """
+        resolve_resp = MagicMock(status_code=200, json=lambda: [{"id": "abc12345"}])
+        pre_send_status_resp = MagicMock(status_code=200)
+        pre_send_status_resp.json.return_value = {"status": "completed"}
+        poll_resp = MagicMock(status_code=200)
+        poll_resp.json.return_value = {
+            "status": "completed",
+            "status_generation": 6,
+        }
+        output_resp = MagicMock(status_code=200)
+        output_resp.json.return_value = {"output": "fast answer"}
+        mock_get.side_effect = [
+            resolve_resp,
+            pre_send_status_resp,
+            poll_resp,
+            output_resp,
+        ]
+        mock_post.return_value = MagicMock(
+            status_code=200, json=lambda: {"success": True, "input_generation": 5}
+        )
+        mock_time.time.return_value = 0
+        mock_time.sleep = MagicMock()
+
+        result = runner.invoke(session, ["send", "cao-test", "question"])
+
+        assert result.exit_code == 0
+        assert "fast answer" in result.output
+
+    @patch("cli_agent_orchestrator.cli.commands.session.time")
+    @patch("cli_agent_orchestrator.cli.commands.session.requests.post")
+    @patch("cli_agent_orchestrator.cli.commands.session.requests.get")
+    def test_send_sync_stale_completed_from_prior_turn_keeps_waiting(
+        self, mock_get, mock_post, mock_time, runner
+    ):
+        """A pre-dispatch completion marker must not satisfy the new turn.
+
+        Retained stale-prior-completion case: the terminal starts COMPLETED
+        from its previous turn (evidence generation 3); dispatch bumps to
+        input_generation=4. Polls keep reading the stale completed with
+        status_generation 3 < 4, so the wait must continue until genuine
+        post-dispatch evidence (generation 5) arrives.
+        """
+        resolve_resp = MagicMock(status_code=200, json=lambda: [{"id": "abc12345"}])
+        pre_send_status_resp = MagicMock(status_code=200)
+        pre_send_status_resp.json.return_value = {"status": "completed"}
+        poll_resp = MagicMock(status_code=200)
+        poll_resp.json.side_effect = [
+            {"status": "completed", "status_generation": 3},
+            {"status": "completed", "status_generation": 3},
+            {"status": "processing", "status_generation": 4},
+            {"status": "completed", "status_generation": 5},
+        ]
+        output_resp = MagicMock(status_code=200)
+        output_resp.json.return_value = {"output": "new turn answer"}
+        mock_get.side_effect = [
+            resolve_resp,
+            pre_send_status_resp,
+            poll_resp,
+            poll_resp,
+            poll_resp,
+            poll_resp,
+            output_resp,
+        ]
+        mock_post.return_value = MagicMock(
+            status_code=200, json=lambda: {"success": True, "input_generation": 4}
+        )
+        mock_time.time.return_value = 0
+        mock_time.sleep = MagicMock()
+
+        result = runner.invoke(session, ["send", "cao-test", "question"])
+
+        assert result.exit_code == 0
+        assert "new turn answer" in result.output
+
+    @patch("cli_agent_orchestrator.cli.commands.session.time")
+    @patch("cli_agent_orchestrator.cli.commands.session.requests.post")
+    @patch("cli_agent_orchestrator.cli.commands.session.requests.get")
     def test_send_sync_error_status(self, mock_get, mock_post, mock_time, runner):
         """Default (sync) mode detects error status and raises."""
         resolve_resp = MagicMock(status_code=200, json=lambda: [{"id": "abc12345"}])
@@ -497,7 +586,9 @@ class TestSendSync:
         poll_resp = MagicMock(status_code=200)
         poll_resp.json.return_value = {"status": "error"}
         mock_get.side_effect = [resolve_resp, pre_send_status_resp, poll_resp]
-        mock_post.return_value = MagicMock(status_code=200)
+        mock_post.return_value = MagicMock(
+            status_code=200, json=lambda: {"success": True, "input_generation": 1}
+        )
         mock_time.time.return_value = 0
         mock_time.sleep = MagicMock()
 
@@ -520,7 +611,7 @@ class TestSendSync:
         poll_resp = MagicMock(status_code=200)
         poll_resp.json.return_value = {"status": "processing"}
         mock_get.side_effect = [resolve_resp, pre_send_status_resp, poll_resp]
-        mock_post.return_value = MagicMock(status_code=200)
+        mock_post.return_value = MagicMock(status_code=200, json=lambda: {"success": True})
         mock_session_time.time.return_value = 0
         mock_session_time.sleep = MagicMock()
         mock_terminal_time.time.side_effect = [0, 31]
@@ -552,7 +643,7 @@ class TestSendSync:
             poll_resp,
             output_resp,
         ]
-        mock_post.return_value = MagicMock(status_code=200)
+        mock_post.return_value = MagicMock(status_code=200, json=lambda: {"success": True})
         mock_time.time.return_value = 0
         mock_time.sleep = MagicMock()
 
@@ -574,7 +665,7 @@ class TestSendSync:
             pre_send_status_resp,
             requests.exceptions.ConnectionError("refused"),
         ]
-        mock_post.return_value = MagicMock(status_code=200)
+        mock_post.return_value = MagicMock(status_code=200, json=lambda: {"success": True})
         mock_time.time.return_value = 0
         mock_time.sleep = MagicMock()
 
@@ -600,7 +691,7 @@ class TestSendSync:
             poll_resp,
             requests.exceptions.ConnectionError("refused"),
         ]
-        mock_post.return_value = MagicMock(status_code=200)
+        mock_post.return_value = MagicMock(status_code=200, json=lambda: {"success": True})
         mock_time.time.return_value = 0
         mock_time.sleep = MagicMock()
 
@@ -625,7 +716,7 @@ class TestSendSync:
         output_resp = MagicMock(status_code=200)
         output_resp.json.return_value = {"output": None}
         mock_get.side_effect = [resolve_resp, pre_send_status_resp, poll_resp, output_resp]
-        mock_post.return_value = MagicMock(status_code=200)
+        mock_post.return_value = MagicMock(status_code=200, json=lambda: {"success": True})
         mock_session_time.time.return_value = 0
         mock_session_time.sleep = MagicMock()
         mock_terminal_time.time.return_value = 0

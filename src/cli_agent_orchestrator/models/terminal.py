@@ -106,6 +106,15 @@ class Terminal(BaseModel):
     status: Optional[TerminalStatus] = Field(
         None, description="Current terminal status (live only)"
     )
+    status_generation: Optional[int] = Field(
+        None,
+        description=(
+            "Generation of the turn/output evidence behind `status`. Compare "
+            "with the `input_generation` returned by POST /terminals/{id}/input: "
+            "a completion is attributable to that dispatch only once "
+            "status_generation >= input_generation."
+        ),
+    )
     last_active: Optional[datetime] = Field(None, description="Last active timestamp")
 
 

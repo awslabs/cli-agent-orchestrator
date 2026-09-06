@@ -3562,7 +3562,7 @@ async def send_terminal_input(
         # off the event loop so a slow tmux call can't freeze every other
         # request — including /health and concurrent assign/handoff. Same
         # hazard class as issue #382 (only fixed for DELETE /sessions there).
-        success = await asyncio.to_thread(
+        dispatch_generation = await asyncio.to_thread(
             terminal_service.send_input,
             terminal_id,
             message,
@@ -3570,7 +3570,13 @@ async def send_terminal_input(
             sender_id=sender_id,
             orchestration_type=orchestration_type,
         )
-        return {"success": success}
+        # input_generation lets the caller correlate its completion wait with
+        # THIS dispatch: accept a completion once GET /terminals/{id}'s
+        # status_generation reaches this value (issue #735 — a completion
+        # marker on the current frame can otherwise belong to the previous
+        # turn, and an observed-activity gate alone rejects a turn that
+        # finishes before polling starts).
+        return {"success": True, "input_generation": dispatch_generation}
     except TerminalInputBlockedError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:

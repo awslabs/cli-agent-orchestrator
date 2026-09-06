@@ -1450,6 +1450,7 @@ async def create_terminal(
             group=group,
             metadata=metadata,
             status=initial_status,
+            status_generation=0,
             last_active=datetime.now(),
         )
 
@@ -2100,6 +2101,14 @@ def get_terminal(terminal_id: str) -> Dict:
             "group": metadata.get("group"),
             "metadata": metadata.get("metadata"),
             "status": status,
+            # Generation of the evidence behind ``status`` (see
+            # StatusMonitor.get_status_generation): callers correlating a wait
+            # with a specific dispatch (POST /terminals/{id}/input returns
+            # input_generation) accept a completion only once this reaches
+            # their dispatch generation — accepting a turn that finished
+            # before polling began while rejecting a completion marker left
+            # by an earlier turn.
+            "status_generation": status_monitor.get_status_generation(terminal_id),
             "last_active": metadata["last_active"],
         }
 
@@ -2219,13 +2228,21 @@ def send_input(
     sender_id: str | None = None,
     orchestration_type: OrchestrationType | None = None,
     frozen_memory: str | None = None,
-) -> bool:
+) -> int:
     """Send input to terminal via tmux paste buffer.
 
     Uses bracketed paste mode (-p) to bypass TUI hotkey handling. The number
     of Enter keys sent after pasting is determined by the provider's
     ``paste_enter_count`` property (e.g., some TUIs need 2 Enters because
     bracketed paste triggers multi-line mode).
+
+    Returns the dispatch generation: the monotonically increasing turn
+    generation (StatusMonitor.notify_input_sent) assigned atomically to THIS
+    dispatch. A caller correlating its wait with this send should accept a
+    completion only when the terminal's status evidence generation reaches
+    this value (see GET /terminals/{id}'s status_generation) — that accepts
+    a turn that finished before polling began while still rejecting a
+    completion marker left by an earlier turn.
 
     ``frozen_memory`` is forwarded UNCHANGED to :func:`inject_memory_context` and
     is otherwise none of this function's business — not inspected, not validated,
@@ -2295,9 +2312,11 @@ def send_input(
         # the genuine PROCESSING signal that arrives once the agent starts
         # working on the new message.
         if provider and provider.assume_processing_on_dispatch is True:
-            status_monitor.notify_input_sent(terminal_id, assume_processing=True)
+            dispatch_generation = status_monitor.notify_input_sent(
+                terminal_id, assume_processing=True
+            )
         else:
-            status_monitor.notify_input_sent(terminal_id)
+            dispatch_generation = status_monitor.notify_input_sent(terminal_id)
 
         # Clear ONLY the rolling byte buffer BEFORE sending keys, so stale idle
         # prompts from BEFORE the input can't trigger a false COMPLETED
@@ -2364,7 +2383,7 @@ def send_input(
                         traceparent=inject_traceparent(),
                     ),
                 )
-        return True
+        return dispatch_generation
 
     except Exception as e:
         logger.error(f"Failed to send input to terminal {terminal_id}: {e}")

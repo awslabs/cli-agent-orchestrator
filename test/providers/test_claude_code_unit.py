@@ -2489,6 +2489,73 @@ class TestClaudeCodeScreenDetection:
         ]
         assert self._p().get_status_from_screen(screen) == TerminalStatus.COMPLETED
 
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_snapshot_identical_completed_is_processing_after_dispatch(self, mock_backend):
+        """Issue #407 guard, ported to the screen path: right after a dispatch,
+        the composited viewport still shows the PREVIOUS turn's response box.
+        With no snapshot state (no dispatch yet), the same screen reads
+        COMPLETED; once mark_input_received captured it, an identical settled
+        frame must read PROCESSING so StatusMonitor's evidence generation only
+        advances on genuinely new content."""
+        sep = "─" * 60
+        prior_pane = (
+            "● Done — fib.py created and tests pass.\n"
+            "✻ Crunched for 12s\n" + sep + "\n❯ \n" + sep + "\n"
+        )
+        mock_backend.get_history.return_value = prior_pane
+        provider = self._p()
+        screen = list(prior_pane.splitlines())
+        assert provider.get_status_from_screen(screen) == TerminalStatus.COMPLETED
+
+        provider.mark_input_received()
+
+        assert provider.get_status_from_screen(screen) == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_new_response_after_dispatch_is_completed(self, mock_backend):
+        """Once the screen shows a DIFFERENT last response, the snapshot guard
+        releases and the fast turn's completion is reported — this is what
+        lets a turn finishing before polling began still latch post-dispatch
+        evidence."""
+        sep = "─" * 60
+        prior_pane = (
+            "● Done — fib.py created and tests pass.\n"
+            "✻ Crunched for 12s\n" + sep + "\n❯ \n" + sep + "\n"
+        )
+        mock_backend.get_history.return_value = prior_pane
+        provider = self._p()
+        before = list(prior_pane.splitlines())
+        provider.mark_input_received()
+        assert provider.get_status_from_screen(before) == TerminalStatus.PROCESSING
+
+        after = [
+            "● New answer for this turn.",
+            "✻ Crunched for 1s",
+            sep,
+            "❯ ",
+            sep,
+        ]
+        assert provider.get_status_from_screen(after) == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_byte_identical_repeat_answer_advances_via_marker_count(self, mock_backend):
+        """A new turn whose answer text happens to equal the previous turn's
+        still renders one MORE response marker, so the marker-count check
+        releases the guard even though the extracted text is unchanged."""
+        mock_backend.get_history.return_value = ""
+        provider = self._p()
+        provider.mark_input_received()
+        screen = [
+            "● Same answer.",  # byte-identical response text…
+            "✻ Crunched for 1s",
+            "─" * 60,
+            "❯ ",
+            "─" * 60,
+        ]
+        # The snapshot captured zero markers (fresh provider), so the count
+        # differs — guard releases.
+        assert provider.get_status_from_screen(screen) == TerminalStatus.COMPLETED
+
     def test_response_bullet_with_gerund_is_not_false_spinner(self):
         """A settled COMPLETED turn whose "*"/"·" response bullet ends in a
         gerund + ellipsis must NOT read as a live spinner. The loose

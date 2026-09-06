@@ -245,15 +245,22 @@ def poll_until_done(
     polling_interval: float = 1.0,
     idle_stable_polls: int = 3,
     require_observed_working: bool = False,
+    dispatch_generation: Optional[int] = None,
 ) -> None:
     """Poll terminal status until the agent is done, errored, or timeout.
 
     Two "done" signals, treated differently:
 
     - **COMPLETED** — a definitive response-done marker (Credits line / green
-      arrow). Returns immediately unless ``require_observed_working`` is set;
-      synchronous follow-up sends use that guard so a completion marker from
-      the prior turn cannot satisfy the new turn.
+      arrow). Returns immediately unless a turn-correlation guard is set:
+      ``dispatch_generation`` (from POST /terminals/{id}/input's
+      ``input_generation``) accepts the reading only once the status's
+      evidence generation (``status_generation`` on this endpoint's response)
+      reaches it, so a completion is attributable to that dispatch even when
+      the turn finished before polling began; ``require_observed_working``
+      (older servers without generation fields) accepts it only after this
+      loop itself observed PROCESSING/WAITING_USER_ANSWER, which cannot see a
+      turn that completes inside the pre-poll delay.
     - **IDLE** — returns only after (a) the agent has been observed actually
       working at least once (a PROCESSING/non-ready reading), AND (b) IDLE then
       persists for ``idle_stable_polls`` consecutive reads. kiro-cli 2.11
@@ -262,10 +269,9 @@ def poll_until_done(
       requiring COMPLETED only would hang here until timeout even though the
       agent is done. But IDLE is ambiguous: a terminal is *also* idle right
       after a send before it has begun processing. Gating the IDLE path on
-      "has started" prevents returning early with empty/partial output when the
-      agent simply hasn't picked up the task yet; the stable-window then guards
-      against a momentary idle flap mid-turn. The COMPLETED path is byte-for-byte
-      unchanged.
+      "has started" prevents returning early with empty/partial output when
+      the agent simply hasn't picked up the task yet; the stable-window then
+      guards against a momentary idle flap mid-turn.
 
     Raises click.ClickException on error, timeout, or request failure.
     """
@@ -288,11 +294,23 @@ def poll_until_done(
             # the outer timeout budget (matches wait_until_terminal_status).
             resp = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=5.0)
             resp.raise_for_status()
-            status = resp.json().get("status")
-            if status == TerminalStatus.COMPLETED.value and (
-                observed_working or not require_observed_working
-            ):
-                return
+            payload = resp.json()
+            status = payload.get("status")
+            if status == TerminalStatus.COMPLETED.value:
+                if dispatch_generation is not None:
+                    # Correlate with THIS dispatch: the completion is ours
+                    # only when the evidence behind the latched status was
+                    # sampled at or after the dispatch generation. Absent
+                    # status_generation (a mid-rollout server) falls back to
+                    # the observed-working gate.
+                    status_generation = payload.get("status_generation")
+                    if status_generation is None:
+                        if observed_working:
+                            return
+                    elif status_generation >= dispatch_generation:
+                        return
+                elif observed_working or not require_observed_working:
+                    return
             if status == TerminalStatus.ERROR.value:
                 raise click.ClickException("Terminal reached ERROR status")
             if status == TerminalStatus.IDLE.value:

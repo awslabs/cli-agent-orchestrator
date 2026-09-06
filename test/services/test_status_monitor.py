@@ -1056,6 +1056,139 @@ class TestStickyLatching:
         assert m.published == ["unknown"]
 
 
+class TestStatusEvidenceGeneration:
+    """Dispatch generation assignment + evidence-generation stamping (issue #735).
+
+    A dispatch-correlated caller (POST /terminals/{id}/input's
+    input_generation) accepts a completion only once the latched status's
+    evidence was sampled at or after its dispatch generation. That contract
+    needs exactly three properties pinned here:
+
+    1. notify_input_sent returns the generation assigned to that dispatch,
+       monotonically increasing per terminal.
+    2. A latch CHANGE stamps the evidence generation the change's evidence
+       was sampled under — so a completion that latched from post-dispatch
+       output outranks the dispatch.
+    3. A re-detection that leaves the latch unchanged does NOT refresh the
+       stamp — a paste echo re-affirming the prior turn's COMPLETED must stay
+       at its old evidence generation, or every stale marker would look
+       fresh.
+    """
+
+    def test_notify_input_sent_returns_monotonic_dispatch_generations(self):
+        m = _SequencedMonitor()
+        first = m.sm.notify_input_sent("t1")
+        second = m.sm.notify_input_sent("t1")
+        assert first >= 1
+        assert second == first + 1
+
+    def test_latch_change_stamps_evidence_generation(self):
+        m = _SequencedMonitor()
+        # Pre-dispatch: some earlier turn's completion latched from its own
+        # output chunk (generation 1).
+        m.feed(TerminalStatus.COMPLETED)
+        stamped = m.sm.get_status_generation("t1")
+        assert stamped == 1
+
+        # Dispatch bumps the generation; the first post-dispatch chunk bumps
+        # it again before the new completion is detected from that output.
+        dispatch = m.sm.notify_input_sent("t1")
+        assert dispatch == 2
+        m.feed(TerminalStatus.PROCESSING)
+        m.feed(TerminalStatus.COMPLETED)
+
+        evidence = m.sm.get_status_generation("t1")
+        assert evidence > dispatch
+        assert m.status() == TerminalStatus.COMPLETED
+
+    def test_unchanged_latch_does_not_refresh_evidence_generation(self):
+        m = _SequencedMonitor()
+        m.feed(TerminalStatus.COMPLETED)
+        stamped = m.sm.get_status_generation("t1")
+
+        # Dispatch, then the paste echo re-detects the SAME completed status
+        # from the still-composited prior frame — latch unchanged.
+        dispatch = m.sm.notify_input_sent("t1")
+        m.feed(TerminalStatus.COMPLETED)
+
+        assert m.status() == TerminalStatus.COMPLETED
+        assert m.sm.get_status_generation("t1") == stamped
+        assert stamped < dispatch
+
+    def test_no_evidence_reports_zero(self):
+        sm = StatusMonitor()
+        assert sm.get_status_generation("unknown-terminal") == 0
+
+    def test_fast_completion_outranks_dispatch_while_echo_does_not(self):
+        """The reviewer's exact-head race, composed against the REAL screen
+        detector (PR #741 rework): a turn whose entire activity interval fits
+        inside the pre-poll delay must latch post-dispatch evidence (so the
+        dispatch-correlated wait accepts it on the first read), while the
+        paste echo alone — same settled prior frame — must not.
+        """
+        sep = "─" * 60
+        prior_pane = (
+            "● Done — prior turn answer PREV1.\n"
+            "✻ Crunched for 12s\n" + sep + "\n❯ \n" + sep + "\n"
+        )
+        new_pane = (
+            "● Done — fresh turn answer FAST1.\n"
+            "✻ Crunched for 0s\n" + sep + "\n❯ \n" + sep + "\n"
+        )
+        paste_echo = "\rRun the probe and reply DONE\n"
+        repaint = "\x1b[H\x1b[2J" + new_pane
+
+        from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
+
+        provider = ClaudeCodeProvider("deadbeef", "cao-probe", "probe-0")
+        sm = StatusMonitor()
+
+        def feed_and_settle(chunk):
+            # No event loop in unit tests: rising-edge detection runs inline
+            # and _on_screen_quiescent drives the settle detection directly.
+            sm._process_chunk("deadbeef", chunk)
+            sm._on_screen_quiescent("deadbeef", provider)
+
+        with (
+            patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as pm,
+            patch("cli_agent_orchestrator.backends.registry._backend") as backend,
+        ):
+            pm.get_provider.return_value = provider
+            backend.get_history.return_value = prior_pane
+            backend.supports_event_inbox.return_value = False
+            backend.get_native_status.return_value = None
+
+            # Prior turn completes and settles.
+            feed_and_settle(prior_pane)
+            assert sm.get_status("deadbeef") == TerminalStatus.COMPLETED
+
+            # Dispatch, snapshot, paste echo — the screen still shows the
+            # prior frame's response.
+            dispatch = sm.notify_input_sent("deadbeef")
+            provider.mark_input_received()
+            sm.clear_rolling_buffer("deadbeef", provider)
+            feed_and_settle(paste_echo)
+
+            echo_gen = sm.get_status_generation("deadbeef")
+            echo_status = sm.get_status("deadbeef")
+            # The paste echo cannot satisfy the dispatch: either the #407
+            # screen guard forced PROCESSING (status changed, but the wait's
+            # COMPLETED rule is not satisfied), or the stale COMPLETED's
+            # evidence still predates the dispatch.
+            assert not (echo_status == TerminalStatus.COMPLETED and echo_gen >= dispatch), (
+                echo_status,
+                echo_gen,
+                dispatch,
+            )
+
+            # The whole fast turn lands before the first poll.
+            backend.get_history.return_value = new_pane
+            feed_and_settle(repaint)
+
+            assert sm.get_status("deadbeef") == TerminalStatus.COMPLETED
+            assert sm.get_status_generation("deadbeef") >= dispatch
+
+
 class TestQuiescenceTimerCancel:
     """The pyte quiescence timer is an asyncio.TimerHandle owned by the
     StatusMonitor's loop. clear_terminal/reset_buffer can run off that loop
