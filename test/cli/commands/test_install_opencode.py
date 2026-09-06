@@ -12,6 +12,7 @@ import pytest
 from click.testing import CliRunner
 
 from cli_agent_orchestrator.cli.commands.install import install
+from cli_agent_orchestrator.cli.commands.profile import profile as profile_cmd
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
@@ -51,14 +52,78 @@ def install_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Dict[s
     monkeypatch.setattr(
         "cli_agent_orchestrator.utils.opencode_config.OPENCODE_CONFIG_FILE", opencode_config
     )
+    # ``cao_installed`` must point at this workspace's context dir, not be absent.
+    # Its real default IS ``AGENT_CONTEXT_DIR`` (see settings_service._DEFAULTS), so
+    # an empty dict is not a neutral stub -- it is a configuration production never
+    # has, in which discovery surfaces no ``source == "installed"`` profiles at all.
+    # The collision guard keys on exactly those (only an installed profile owns an
+    # agent id), so leaving this empty silently disables the guard and every
+    # collision test passes for the wrong reason.
     monkeypatch.setattr(
-        "cli_agent_orchestrator.services.settings_service.get_agent_dirs", lambda: {}
+        "cli_agent_orchestrator.services.settings_service.get_agent_dirs",
+        lambda: {"cao_installed": str(context_dir)},
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", lambda: []
     )
     # Suppress ensure_skills_symlink filesystem side-effects in install unit tests.
     # The symlink helper's own behaviour is covered by test_opencode_config.py.
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.install_service.ensure_skills_symlink", lambda: None
+    )
+
+    return {
+        "local_store": local_store,
+        "context_dir": context_dir,
+        "agents_dir": opencode_agents,
+        "config_file": opencode_config,
+    }
+
+
+@pytest.fixture()
+def install_workspace_with_installed_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Dict[str, Any]:
+    """Redirect install paths while keeping the real default agent-dir discovery shape."""
+    local_store = tmp_path / "agent-store"
+    context_dir = tmp_path / "agent-context"
+    opencode_agents = tmp_path / "opencode_cli" / "agents"
+    opencode_config = tmp_path / "opencode_cli" / "opencode.json"
+
+    local_store.mkdir(parents=True)
+    context_dir.mkdir(parents=True)
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.profile_store.LOCAL_AGENT_STORE_DIR", local_store
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR", local_store
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.cli.commands.profile.LOCAL_AGENT_STORE_DIR", local_store
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.install_service.AGENT_CONTEXT_DIR", context_dir
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.install_service.OPENCODE_AGENTS_DIR", opencode_agents
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.utils.opencode_config.OPENCODE_CONFIG_FILE", opencode_config
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.settings_service.SETTINGS_FILE",
+        tmp_path / "settings.json",
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.settings_service._DEFAULTS",
+        {
+            "kiro_cli": str(tmp_path / "kiro" / "agents"),
+            "claude_code": str(local_store),
+            "codex": str(local_store),
+            "cao_installed": str(context_dir),
+        },
+    )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.install_service.ensure_skills_symlink", lambda: None
     )
@@ -538,6 +603,379 @@ class TestStaleMcpGrantsRemoved:
         assert "test-agent" not in data.get(
             "agent", {}
         ), "stale agent.<id>.tools entry must be removed on reinstall without MCP"
+
+
+# ---------------------------------------------------------------------------
+# Agent-id collision guard: '/' -> '__' derivation is not injective
+# ---------------------------------------------------------------------------
+
+
+class TestAgentIdCollisionGuard:
+    """Installing a profile whose id collides with another must fail loud.
+
+    The id derivation replaces '/' with '__', so a profile named ``a/b`` and a
+    literal profile named ``a__b`` both map to the ``a__b`` id — the second
+    install would silently overwrite the first's ``a__b.md`` file and
+    ``agent.a__b`` config. The guard turns that into a clean CLI error.
+    """
+
+    def test_slash_collapse_collision_is_unreachable_because_the_name_is_refused(
+        self, runner: CliRunner, install_workspace: Dict[str, Any]
+    ):
+        """The originally-reported ``'/'``->``'__'`` collision cannot happen here.
+
+        ``"a/b"`` and a literal ``"a__b"`` do both map to the id ``a__b``, but a
+        resolved name containing a separator no longer survives the install:
+        ``_write_context_file`` validates it earlier in the same ``install_agent``
+        call. So the install is refused for the *name*, not for a collision, and the
+        pre-existing ``a__b`` profile is never at risk.
+
+        Asserting the mechanism matters, because "install refused" alone would pass
+        for either reason and this is the claim the guard's scope now rests on: if
+        the separator rule is ever relaxed, this test fails and points at the guard
+        rather than letting the dead vector quietly come back to life.
+        """
+        store = install_workspace["local_store"]
+        # A sibling profile that literally occupies the "a__b" id, installed first.
+        _write_profile(store / "a__b.md", name="a__b")
+        r1 = runner.invoke(install, ["a__b", "--provider", "opencode_cli"])
+        assert r1.exit_code == 0 and "Error:" not in r1.output, r1.output
+        occupant = install_workspace["agents_dir"] / "a__b.md"
+        assert occupant.exists()
+        occupant_before = occupant.read_text()
+
+        # The profile we install has frontmatter name "a/b" -> would be id "a__b".
+        # File stem must be a legal source name; the '/' lives in frontmatter.
+        _write_profile(store / "slash-named.md", name="a/b")
+
+        result = runner.invoke(install, ["slash-named", "--provider", "opencode_cli"])
+
+        assert result.exit_code == 0  # install_agent returns a failure result, not a crash
+        assert "Error:" in result.output
+        # Refused by the name validation, naming the offending value...
+        assert "path separator" in result.output, result.output
+        assert "a/b" in result.output
+        # ...and NOT by the collision guard, which never saw it.
+        assert "cannot share an OpenCode agent id" not in result.output
+        # The occupant is untouched.
+        assert occupant.read_text() == occupant_before
+
+    def test_same_resolved_name_different_stem_fails_and_preserves_first(
+        self, runner: CliRunner, install_workspace: Dict[str, Any]
+    ):
+        """Two distinct files with the IDENTICAL frontmatter name collide.
+
+        Both ``profile-one.md`` and ``profile-two.md`` carry ``name: shared-alias``,
+        so both resolve to the id ``shared-alias`` — the same ``shared-alias.md``
+        file and ``agent.shared-alias`` config section. The second install must
+        fail (naming both files/name) rather than silently overwrite the first.
+        This is the same-resolved-name-different-stem gap: the id derivation is
+        many-to-one on the *name* even without any '/' rewrite.
+        """
+        store = install_workspace["local_store"]
+        # Install the first profile while it is the only one on disk.
+        _write_profile(store / "profile-one.md", name="shared-alias", body="First agent body.")
+        r1 = runner.invoke(install, ["profile-one", "--provider", "opencode_cli"])
+        assert r1.exit_code == 0 and "Error:" not in r1.output
+        agent_file = install_workspace["agents_dir"] / "shared-alias.md"
+        assert agent_file.exists()
+        first_contents = agent_file.read_text()
+        assert "First agent body." in first_contents
+
+        # Also capture the shared context file from the first install.
+        context_file = install_workspace["context_dir"] / "shared-alias.md"
+        assert context_file.exists()
+        first_context = context_file.read_text()
+
+        # A second, DIFFERENT file later appears with the same resolved name.
+        _write_profile(store / "profile-two.md", name="shared-alias", body="Second agent body.")
+
+        # Second install (different file, same resolved name) must be refused.
+        r2 = runner.invoke(install, ["profile-two", "--provider", "opencode_cli"])
+        assert r2.exit_code == 0  # returns a failure result, not a crash
+        assert "Error:" in r2.output
+        # The error must name both offending profiles and the shared name.
+        assert "profile-one" in r2.output
+        assert "profile-two" in r2.output
+        assert "shared-alias" in r2.output
+        # The first install's file must be intact — NOT overwritten by the second.
+        assert agent_file.read_text() == first_contents
+        assert "Second agent body." not in agent_file.read_text()
+        # Regression check: the shared context file must ALSO be
+        # preserved. Before the fix, the guard ran AFTER _write_context_file(),
+        # so the rejected second install would corrupt AGENT_CONTEXT_DIR/<id>.md
+        # even though opencode_cli/agents/<id>.md was protected.
+        assert context_file.read_text() == first_context
+        assert "Second agent body." not in context_file.read_text()
+
+    def test_reinstall_same_profile_stays_idempotent_despite_guard(
+        self, runner: CliRunner, install_workspace: Dict[str, Any]
+    ):
+        """Reinstalling the SAME profile (same stem) must not trip the guard.
+
+        The guard excludes candidates by stem, so a profile never collides with
+        itself even though discovery lists it with its own resolved name.
+        """
+        _write_profile(install_workspace["local_store"] / "test-agent.md", name="test-agent")
+
+        r1 = runner.invoke(install, ["test-agent", "--provider", "opencode_cli"])
+        r2 = runner.invoke(install, ["test-agent", "--provider", "opencode_cli"])
+
+        assert r1.exit_code == 0 and "Error:" not in r1.output
+        assert r2.exit_code == 0 and "Error:" not in r2.output
+        assert (install_workspace["agents_dir"] / "test-agent.md").exists()
+
+    def test_non_colliding_punctuation_variants_both_install(
+        self, runner: CliRunner, install_workspace: Dict[str, Any]
+    ):
+        """Names differing only by punctuation do NOT collide.
+
+        ``to_opencode_agent_id`` rewrites separators and nothing else, so ``foo_bar``
+        and ``foo-bar`` keep distinct ids and both install. This is the guard's
+        false-positive check: it must fire on a genuine id clash, not on any two
+        similar-looking names.
+
+        Both names are valid under the profile schema's own ``name`` pattern
+        (``^[A-Za-z0-9_-]{1,64}$``), which is deliberate -- a test asserting that
+        two profiles install cleanly should not itself use a name the schema calls
+        invalid. (This previously used ``"foo bar"`` versus ``"foo-bar"``; a space
+        has never been a legal profile name, see
+        ``test_profile_name_with_a_space_is_rejected_before_any_id_is_derived``.)
+        """
+        store = install_workspace["local_store"]
+        _write_profile(store / "foo-under.md", name="foo_bar")
+        _write_profile(store / "foo-dash.md", name="foo-bar")
+
+        r1 = runner.invoke(install, ["foo-under", "--provider", "opencode_cli"])
+        r2 = runner.invoke(install, ["foo-dash", "--provider", "opencode_cli"])
+
+        assert r1.exit_code == 0 and "Error:" not in r1.output, r1.output
+        assert r2.exit_code == 0 and "Error:" not in r2.output, r2.output
+        # Distinct ids => distinct files, both present.
+        assert (install_workspace["agents_dir"] / "foo_bar.md").exists()
+        assert (install_workspace["agents_dir"] / "foo-bar.md").exists()
+
+    def test_profile_name_with_a_space_is_rejected_before_any_id_is_derived(
+        self, runner: CliRunner, install_workspace: Dict[str, Any]
+    ):
+        """A resolved ``name:`` outside ``[A-Za-z0-9._-]`` fails the install.
+
+        A space has never been a legal profile name: the schema's ``name`` pattern
+        is ``^[A-Za-z0-9_-]{1,64}$``, described there as "filesystem-safe". What the
+        path-traversal hardening changed is that the rule is now ENFORCED at install
+        time -- ``_write_context_file`` runs ``validate_path_component`` on the
+        resolved name before any provider sink -- rather than being documented and
+        checked only by the validator endpoint. The install fails cleanly rather
+        than writing a half-installed profile, and no agent file appears under
+        either the raw or a flattened spelling of the name.
+
+        This is what makes the collision guard's scope claim true -- the
+        separator-collapse vector cannot be reached from here -- so it is pinned
+        rather than left implicit.
+        """
+        _write_profile(install_workspace["local_store"] / "spacey.md", name="foo bar")
+
+        result = runner.invoke(install, ["spacey", "--provider", "opencode_cli"])
+
+        assert result.exit_code != 0 or "Error:" in result.output, result.output
+        agents_dir = install_workspace["agents_dir"]
+        assert not (agents_dir / "foo bar.md").exists()
+        assert not (agents_dir / "foo__bar.md").exists()
+
+    def test_normal_single_profile_install_unaffected(
+        self, runner: CliRunner, install_workspace: Dict[str, Any]
+    ):
+        """The guard is a no-op for an ordinary, non-colliding profile."""
+        _write_profile(install_workspace["local_store"] / "solo-agent.md", name="solo-agent")
+
+        result = runner.invoke(install, ["solo-agent", "--provider", "opencode_cli"])
+
+        assert result.exit_code == 0
+        assert "Error:" not in result.output
+        assert (install_workspace["agents_dir"] / "solo-agent.md").exists()
+
+
+# ---------------------------------------------------------------------------
+# Provenance guard: installed copies with provenance markers
+# ---------------------------------------------------------------------------
+
+
+class TestAgentIdCollisionGuardInstalledProvenance:
+    """Collision checks must distinguish an installed self-copy from another profile."""
+
+    def test_stem_not_name_reinstall_succeeds_with_installed_copy_discovered(
+        self, runner: CliRunner, install_workspace_with_installed_dir: Dict[str, Any]
+    ):
+        store = install_workspace_with_installed_dir["local_store"]
+        _write_profile(store / "my-agent.md", name="resolved-agent", body="Resolved v1.")
+
+        r1 = runner.invoke(install, ["my-agent", "--provider", "opencode_cli"])
+        r2 = runner.invoke(install, ["my-agent", "--provider", "opencode_cli"])
+
+        assert r1.exit_code == 0 and "Error:" not in r1.output
+        assert r2.exit_code == 0 and "Error:" not in r2.output
+
+        context_file = install_workspace_with_installed_dir["context_dir"] / "resolved-agent.md"
+        post = frontmatter.loads(context_file.read_text())
+        assert post.metadata["x-cao-source-stem"] == "my-agent"
+        assert post.metadata["name"] == "resolved-agent"
+        assert post.content.strip() == "Resolved v1."
+
+    def test_multiple_stem_not_name_reinstall_cycles_remain_idempotent(
+        self, runner: CliRunner, install_workspace_with_installed_dir: Dict[str, Any]
+    ):
+        store = install_workspace_with_installed_dir["local_store"]
+        _write_profile(store / "my-agent.md", name="resolved-agent", body="Resolved v1.")
+
+        agent_seq = []
+        context_seq = []
+        for _ in range(4):
+            result = runner.invoke(install, ["my-agent", "--provider", "opencode_cli"])
+            assert result.exit_code == 0 and "Error:" not in result.output, result.output
+
+            agent_seq.append(
+                (
+                    install_workspace_with_installed_dir["agents_dir"] / "resolved-agent.md"
+                ).read_bytes()
+            )
+            context_seq.append(
+                (
+                    install_workspace_with_installed_dir["context_dir"] / "resolved-agent.md"
+                ).read_bytes()
+            )
+
+        # The generated agent file is stable from the very first install.
+        assert len(set(agent_seq)) == 1, "agent file churns between reinstalls"
+
+        # The context copy CONVERGES after one install rather than being stable
+        # from the first, and that is a property of the install, not a slack
+        # assertion. Installing with an explicit --provider that differs from the
+        # profile's own materialises the choice into the local store
+        # (``write_profile`` with the resolved ``provider:`` added), which
+        # reserializes the frontmatter -- reordering keys and normalising trailing
+        # whitespace. The context copy is taken from that stored source, so cycle 1
+        # reads pre-stamp bytes and every later cycle reads post-stamp bytes.
+        # Asserting stability from cycle 2 onward still catches the failure that
+        # matters (a copy that keeps churning, e.g. a provenance marker appended
+        # afresh each time), while not demanding that the first install be a no-op
+        # on a store it is documented to update.
+        assert len(set(context_seq[1:])) == 1, (
+            "context copy never converges; it still differs after the provider stamp "
+            f"has settled: {context_seq[1:]!r}"
+        )
+        # Pin that the ONE permitted difference is the provider stamp and nothing
+        # else, so an unrelated change to cycle 1 does not hide here.
+        assert b"provider: opencode_cli" not in context_seq[0]
+        assert b"provider: opencode_cli" in context_seq[1]
+        # The provenance marker is present throughout and never duplicated.
+        for i, blob in enumerate(context_seq):
+            assert blob.count(b"x-cao-source-stem:") == 1, f"cycle {i}: {blob!r}"
+
+    def test_an_uninstalled_local_twin_does_not_block_but_owning_the_id_does(
+        self, runner: CliRunner, install_workspace_with_installed_dir: Dict[str, Any]
+    ):
+        """The guard fires on OCCUPANCY, so it blocks one install later than before.
+
+        ``profile-a`` and ``profile-b`` both resolve to ``shared-alias``. While
+        neither is installed, nothing owns ``shared-alias.md``, so installing either
+        destroys nothing and must be allowed -- the guard deliberately does not
+        refuse on a twin that merely exists in the local store. (The pre-emptive
+        form did, which is what made every profile named after one of CAO's six
+        built-ins uninstallable.)
+
+        Once ``profile-b`` has taken the id, installing ``profile-a`` WOULD overwrite
+        it, and that is refused, naming both files. So nothing is lost by waiting:
+        the guard fires exactly when there is something to lose.
+        """
+        store = install_workspace_with_installed_dir["local_store"]
+        agent_file = install_workspace_with_installed_dir["agents_dir"] / "shared-alias.md"
+        _write_profile(store / "profile-a.md", name="shared-alias", body="First profile.")
+        _write_profile(store / "profile-b.md", name="shared-alias", body="Second profile.")
+
+        # Nothing owns the id yet, so this is allowed even though a twin exists.
+        r_b = runner.invoke(install, ["profile-b", "--provider", "opencode_cli"])
+        assert r_b.exit_code == 0 and "Error:" not in r_b.output, r_b.output
+        assert agent_file.exists()
+        owned_by_b = agent_file.read_text()
+
+        # Now the id IS owned, and the twin's install would clobber it.
+        r_a = runner.invoke(install, ["profile-a", "--provider", "opencode_cli"])
+
+        assert r_a.exit_code == 0
+        assert "Error:" in r_a.output, r_a.output
+        assert "profile-a" in r_a.output
+        assert "profile-b" in r_a.output
+        # And profile-b's artifact survived intact.
+        assert agent_file.read_text() == owned_by_b
+
+    def test_removed_local_profile_leaves_installed_copy_that_still_blocks_collision(
+        self, runner: CliRunner, install_workspace_with_installed_dir: Dict[str, Any]
+    ):
+        store = install_workspace_with_installed_dir["local_store"]
+        _write_profile(store / "profile-a.md", name="shared-alias", body="First profile.")
+
+        r1 = runner.invoke(install, ["profile-a", "--provider", "opencode_cli"])
+        assert r1.exit_code == 0 and "Error:" not in r1.output
+
+        agent_file = install_workspace_with_installed_dir["agents_dir"] / "shared-alias.md"
+        context_file = install_workspace_with_installed_dir["context_dir"] / "shared-alias.md"
+        first_agent = agent_file.read_text()
+        first_context = context_file.read_text()
+
+        removed = runner.invoke(profile_cmd, ["remove", "profile-a", "-y"])
+        assert removed.exit_code == 0, removed.output
+        assert not (store / "profile-a.md").exists()
+        assert context_file.exists()
+
+        _write_profile(store / "profile-b.md", name="shared-alias", body="Second profile.")
+        r2 = runner.invoke(install, ["profile-b", "--provider", "opencode_cli"])
+
+        assert r2.exit_code == 0
+        assert "Error:" in r2.output
+        assert "profile-a" in r2.output
+        assert "profile-b" in r2.output
+        assert agent_file.read_text() == first_agent
+        assert context_file.read_text() == first_context
+        assert "Second profile." not in agent_file.read_text()
+        assert "Second profile." not in context_file.read_text()
+
+    def test_legacy_installed_copy_without_marker_blocks_same_profile_reinstall(
+        self, runner: CliRunner, install_workspace_with_installed_dir: Dict[str, Any]
+    ):
+        store = install_workspace_with_installed_dir["local_store"]
+        _write_profile(store / "legacy-source.md", name="legacy-agent", body="Legacy profile.")
+        legacy_copy = install_workspace_with_installed_dir["context_dir"] / "legacy-agent.md"
+        _write_profile(legacy_copy, name="legacy-agent", body="Legacy profile.")
+        first_context = legacy_copy.read_text()
+
+        result = runner.invoke(install, ["legacy-source", "--provider", "opencode_cli"])
+
+        assert result.exit_code == 0
+        assert "Error:" in result.output, result.output
+        assert str(legacy_copy) in result.output
+        assert (
+            f"If '{legacy_copy}' is your own profile's context copy from an earlier "
+            "CAO version, delete it and reinstall."
+        ) in result.output
+        assert legacy_copy.read_text() == first_context
+
+    def test_legacy_installed_copy_without_marker_still_blocks_id_alias_collision(
+        self, runner: CliRunner, install_workspace_with_installed_dir: Dict[str, Any]
+    ):
+        store = install_workspace_with_installed_dir["local_store"]
+        legacy_copy = install_workspace_with_installed_dir["context_dir"] / "a__b.md"
+        _write_profile(legacy_copy, name="a__b", body="Legacy profile.")
+        first_context = legacy_copy.read_text()
+
+        _write_profile(store / "slash-named.md", name="a/b", body="Second profile.")
+        result = runner.invoke(install, ["slash-named", "--provider", "opencode_cli"])
+
+        assert result.exit_code == 0
+        assert "Error:" in result.output
+        assert "slash-named" in result.output
+        assert "a__b" in result.output
+        assert legacy_copy.read_text() == first_context
+        assert "Second profile." not in legacy_copy.read_text()
 
 
 # ---------------------------------------------------------------------------

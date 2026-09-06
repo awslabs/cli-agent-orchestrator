@@ -44,8 +44,36 @@ def to_opencode_agent_id(profile_name: str) -> str:
     - the value passed to ``opencode --agent <id>`` at runtime
 
     Idempotent: inputs that contain no separator are returned unchanged.
+
+    THE ID SPACE IS STILL NOT INJECTIVE, for a reason that has nothing to do
+    with separators. Two DIFFERENT profile files carrying the same resolved
+    frontmatter ``name:`` produce the same id, and the id is a key on disk (the
+    ``<id>.md`` filename and the ``agent.<id>`` section of ``opencode.json``),
+    so whichever installs second silently overwrites the first. The opencode
+    install path guards against that via
+    ``_guard_opencode_agent_id_collision`` in ``services/install_service.py``,
+    which fails loud rather than overwriting.
+
+    The separator collapse itself is no longer a live collision source on the
+    install path: ``_write_context_file`` runs ``validate_path_component`` on the
+    resolved name earlier in the same ``install_agent`` call, which REJECTS any
+    name containing ``/`` or ``\\``, so a separator-bearing name never reaches
+    this function there and the flatten is the identity for everything that
+    does. It stays as defence in depth for any future caller that has not been
+    through that validation.
     """
     return flatten_path_separators(profile_name)
+
+
+class OpenCodeAgentIdCollisionError(ValueError):
+    """Two distinct profile names collapse to the same OpenCode agent id.
+
+    Raised by the opencode install guard
+    (``_guard_opencode_agent_id_collision``). Subclasses ``ValueError`` so
+    existing ``except ValueError`` / broad handlers (e.g. ``install_agent``'s
+    ``except Exception``) surface it as a clean CLI error rather than a
+    traceback.
+    """
 
 
 def ensure_skills_symlink() -> None:
