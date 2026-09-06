@@ -14,47 +14,125 @@ from cli_agent_orchestrator.services import terminal_service as ts
 
 
 class TestMessageVisibleInBox:
-    def test_true_when_probe_present(self):
-        with patch.object(ts, "get_output", return_value="❯ Analyze the logs now"):
-            assert ts._message_visible_in_box("t1", "Analyze the logs") is True
+    @staticmethod
+    def _visible_after_dispatch(before, after, message):
+        with patch.object(ts, "_capture_plain_viewport", side_effect=[before, after]):
+            ts._remember_pre_dispatch_viewport("t1")
+            return ts._message_visible_in_box("t1", message)
 
-    def test_false_when_absent(self):
-        with patch.object(ts, "get_output", return_value="❯ (empty prompt)"):
-            assert ts._message_visible_in_box("t1", "Analyze the logs") is False
+    def test_true_when_current_composer_adds_message(self):
+        assert self._visible_after_dispatch(
+            "❯ (empty prompt)", "❯ Analyze the logs now", "Analyze the logs"
+        )
+
+    def test_false_when_current_viewport_does_not_add_message(self):
+        assert not self._visible_after_dispatch(
+            "❯ (empty prompt)", "❯ (empty prompt)", "Analyze the logs"
+        )
+
+    def test_viewport_capture_is_escape_free_and_history_free(self):
+        backend = MagicMock()
+        backend.get_history.return_value = "› Analyze the logs carefully"
+        with (
+            patch.object(
+                ts,
+                "get_terminal_metadata",
+                return_value={"tmux_session": "session", "tmux_window": "window"},
+            ),
+            patch.object(ts, "get_backend", return_value=backend),
+        ):
+            assert ts._capture_plain_viewport("t1") == "› Analyze the logs carefully"
+        backend.get_history.assert_called_once_with(
+            "session", "window", strip_escapes=True, visible_only=True
+        )
+
+    def test_send_input_snapshots_viewport_before_paste(self):
+        events = []
+        backend = MagicMock()
+        backend.send_keys.side_effect = lambda *args, **kwargs: events.append("paste")
+        with (
+            patch.object(
+                ts,
+                "get_terminal_metadata",
+                return_value={"tmux_session": "session", "tmux_window": "window"},
+            ),
+            patch.object(ts, "provider_manager") as manager,
+            patch.object(ts, "inject_memory_context", return_value="Analyze the logs"),
+            patch.object(ts.status_monitor, "notify_input_sent"),
+            patch.object(ts.status_monitor, "clear_rolling_buffer"),
+            patch.object(
+                ts,
+                "_remember_pre_dispatch_viewport",
+                side_effect=lambda _: events.append("snapshot"),
+            ),
+            patch.object(ts, "get_backend", return_value=backend),
+            patch.object(ts, "update_last_active"),
+        ):
+            manager.get_provider.return_value = None
+            assert ts.send_input("t1", "Analyze the logs")
+        assert events == ["snapshot", "paste"]
 
     def test_false_when_message_too_short(self):
-        # < 8 alnum chars → don't risk a blank submit; report not-shown.
-        with patch.object(ts, "get_output", return_value="go go go") as mock_out:
+        with patch.object(ts, "_capture_plain_viewport") as capture:
             assert ts._message_visible_in_box("t1", "go") is False
-            mock_out.assert_not_called()
+            capture.assert_not_called()
 
     def test_false_when_output_fetch_raises(self):
-        with patch.object(ts, "get_output", side_effect=Exception("boom")):
-            assert ts._message_visible_in_box("t1", "Analyze the logs") is False
+        assert not self._visible_after_dispatch("❯ (empty prompt)", None, "Analyze the logs")
 
     def test_match_survives_wrapping_and_whitespace(self):
-        # Rendered box wraps the text across lines / pads with spaces.
-        with patch.object(ts, "get_output", return_value="❯ Analyze the\n  logs carefully"):
-            assert ts._message_visible_in_box("t1", "Analyze the logs") is True
+        assert self._visible_after_dispatch(
+            "❯ (empty prompt)", "❯ Analyze the\n  logs carefully", "Analyze the logs"
+        )
 
     def test_prior_handoff_does_not_read_as_the_current_one(self):
-        # #727: every orchestrated handoff opens with the same banner, so a
-        # leading-slice probe collapses to that banner for ALL of them. A pane
-        # holding a completed earlier handoff and an empty composer must not
-        # read as the new handoff still sitting in the box — a bare Enter
-        # there submits a blank prompt and the task is lost. The flip side
-        # pins the same message genuinely present in the pane (only the Enter
-        # swallowed): the whole collapsed message must still match.
         current = (
             "[CAO Handoff] Supervisor terminal ID: a1b2c3d4. "
             "This is a blocking handoff — complete the task and present "
             "your deliverables.\n\nRefactor the config loader module"
         )
         stale = current.replace("Refactor the config loader module", "Fix the flaky e2e login test")
-        with patch.object(ts, "get_output", return_value=f"› {stale}\n❯ (empty prompt)"):
-            assert ts._message_visible_in_box("t1", current) is False
-        with patch.object(ts, "get_output", return_value=f"› {current}"):
-            assert ts._message_visible_in_box("t1", current) is True
+        assert not self._visible_after_dispatch(
+            f"› {stale}\n❯ (empty prompt)", f"› {stale}\n❯ (empty prompt)", current
+        )
+        assert self._visible_after_dispatch(
+            f"› {stale}\n❯ (empty prompt)", f"› {stale}\n› {current}", current
+        )
+
+    @pytest.mark.parametrize(
+        "stale",
+        [
+            "[CAO Handoff] repeat the exact task",
+            "[CAO Handoff] repeat the exact task plus a stale suffix",
+            "[CAO Handoff] triage 東京",
+        ],
+    )
+    def test_stale_historical_text_never_counts_as_current_composer(self, stale):
+        current = (
+            "[CAO Handoff] triage 大阪"
+            if "東京" in stale
+            else "[CAO Handoff] repeat the exact task"
+        )
+        assert not self._visible_after_dispatch(
+            f"› {stale}\n❯ (empty prompt)", f"› {stale}\n❯ (empty prompt)", current
+        )
+
+    def test_identical_current_composer_counts_as_new(self):
+        message = "[CAO Handoff] repeat the exact task"
+        assert self._visible_after_dispatch(
+            f"› {message}\n❯ (empty prompt)", f"› {message}\n› {message}", message
+        )
+
+    def test_escape_free_viewport_handles_ansi_wrapping_and_truncated_history(self):
+        message = "Analyze the logs carefully and preserve the current composer message tail"
+        tail = ts._normalized_box_text(message)[-ts._CURRENT_COMPOSER_PROBE_MAX_CHARS :]
+        with patch.object(
+            ts,
+            "_capture_plain_viewport",
+            side_effect=["❯ (empty prompt)", f"› {tail[:24]}\n{tail[24:]}"],
+        ):
+            ts._remember_pre_dispatch_viewport("t1")
+            assert ts._message_visible_in_box("t1", message)
 
 
 class TestRedeliverDroppedMessageHelper:

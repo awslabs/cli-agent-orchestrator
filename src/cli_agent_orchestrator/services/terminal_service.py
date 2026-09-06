@@ -172,6 +172,10 @@ CROSS_NODE_NOTIFY_TIMEOUT = 10.0
 _memory_injected_terminals: set = set()
 _memory_injected_lock = threading.Lock()
 
+_pre_dispatch_viewports: Dict[str, str] = {}
+_pre_dispatch_viewports_lock = threading.Lock()
+_CURRENT_COMPOSER_PROBE_MAX_CHARS = 64
+
 # Strong references to in-flight deferred-init background tasks. asyncio keeps
 # only a WEAK reference to tasks from loop.create_task, so without this a
 # deferred provider.initialize() + input-send task could be GC'd mid-run,
@@ -1761,38 +1765,59 @@ def _worker_is_started_direct(terminal_id: str, provider) -> bool:
     return status in _DEFERRED_STARTED_STATUSES
 
 
-def _message_visible_in_box(terminal_id: str, message: str) -> bool:
-    """True when the delivered message is still visible in the rendered pane.
-
-    Despite the name, this matches against ``get_output`` — the whole rendered
-    pane, which includes the transcript above the composer, not just the input
-    box. A prompt echoed in the transcript therefore also reads as "visible",
-    which is safe for the Enter-vs-full-resend decision (both actions are
-    recovery for a worker believed idle) but must not be read as proof the
-    text sits unsubmitted in the composer.
-
-    Decides the resubmit action: if our text is there the paste landed and only
-    the Enter was dropped (send a bare Enter); if it is absent the paste itself
-    was dropped (re-deliver the full message). Guessing wrong the other way must
-    be avoided — a bare Enter into an EMPTY box would submit a blank prompt and
-    the real task would be lost. Collapse to [a-z0-9] so wrapping / whitespace /
-    unicode punctuation in the rendered box can't defeat the match. The whole
-    collapsed message is the probe, not a leading slice: every orchestrated
-    handoff opens with the same banner, so a prefix cannot tell two handoffs
-    apart and a pane still holding a prior, completed handoff would read as the
-    current message (#727). A miss here costs a full re-delivery instead of a
-    bare Enter — never a blank submit — so erring toward "not shown" is safe.
-    """
-    probe = re.sub(r"[^a-z0-9]", "", message.lower())
-    if len(probe) < 8:
-        # Too short to match reliably — treat as "not shown" so we re-deliver
-        # in full rather than risk a blank submit.
-        return False
+def _capture_plain_viewport(terminal_id: str) -> Optional[str]:
     try:
-        rendered = get_output(terminal_id)
+        metadata = get_terminal_metadata(terminal_id)
+        if not metadata:
+            return None
+        return get_backend().get_history(
+            metadata["tmux_session"],
+            metadata["tmux_window"],
+            strip_escapes=True,
+            visible_only=True,
+        )
     except Exception:
+        logger.debug("Failed to capture viewport for %s", terminal_id, exc_info=True)
+        return None
+
+
+def _remember_pre_dispatch_viewport(terminal_id: str) -> None:
+    viewport = _capture_plain_viewport(terminal_id)
+    with _pre_dispatch_viewports_lock:
+        if viewport is None:
+            _pre_dispatch_viewports.pop(terminal_id, None)
+        else:
+            _pre_dispatch_viewports[terminal_id] = viewport
+
+
+def _normalized_box_text(text: str) -> str:
+    return "".join(character.casefold() for character in text if character.isalnum())
+
+
+def _message_visible_in_box(terminal_id: str, message: str) -> bool:
+    """True when the current dispatch introduced message text into the viewport.
+
+    A bare Enter is safe only when a current paste introduced its text after the
+    pre-dispatch viewport snapshot. The pane can retain historical deliveries,
+    and the rolling output buffer can retain ANSI escapes or truncate a long
+    composer, so compare escape-free viewport captures and only require the
+    bounded trailing message probe to be newly present. A miss takes the safer
+    full-redelivery path.
+    """
+    normalized_message = _normalized_box_text(message)
+    probe = normalized_message[-_CURRENT_COMPOSER_PROBE_MAX_CHARS:]
+    if len(probe) < 8:
         return False
-    return probe in re.sub(r"[^a-z0-9]", "", rendered.lower())
+
+    with _pre_dispatch_viewports_lock:
+        before = _pre_dispatch_viewports.get(terminal_id)
+    if before is None:
+        return False
+
+    after = _capture_plain_viewport(terminal_id)
+    if after is None:
+        return False
+    return _normalized_box_text(after).count(probe) > _normalized_box_text(before).count(probe)
 
 
 def redeliver_dropped_message(
@@ -2329,6 +2354,8 @@ def send_input(
         # same dispatch boundary above.
         if provider:
             provider.mark_input_received()
+
+        _remember_pre_dispatch_viewport(terminal_id)
 
         get_backend().send_keys(
             metadata["tmux_session"],
