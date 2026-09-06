@@ -2272,7 +2272,11 @@ class TestCodexProviderTrustPrompt:
         provider = CodexProvider("test1234", "test-session", "window-0")
         provider.mark_input_received()
 
-        assert provider.get_status(retained) == TerminalStatus.PROCESSING
+        # IDLE, not COMPLETED: the composer is visible, so the pane reads
+        # "not started" — exactly the signal the deferred-delivery retry
+        # loop needs to re-submit a dropped input. (PROCESSING would read
+        # as "task accepted" to that same consumer, issue #739 review.)
+        assert provider.get_status(retained) == TerminalStatus.IDLE
 
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
     def test_dispatch_does_not_complete_on_retained_prior_turn(self, mock_backend):
@@ -2290,7 +2294,7 @@ class TestCodexProviderTrustPrompt:
         provider = CodexProvider("test1234", "test-session", "window-0")
         provider.mark_input_received()
 
-        assert provider.get_status(retained) == TerminalStatus.PROCESSING
+        assert provider.get_status(retained) == TerminalStatus.IDLE
 
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
     def test_dispatched_evicted_marker_turn_completes_after_new_content(self, mock_backend):
@@ -2343,10 +2347,11 @@ class TestCodexProviderTrustPrompt:
         provider.mark_input_received()
         assert provider.get_status(first_turn) == TerminalStatus.COMPLETED
 
-        # Dispatch two: the pane still shows turn one's completion.
+        # Dispatch two: the pane still shows turn one's completion. IDLE, not
+        # COMPLETED (ownership gate), and composer-visible means "not started".
         mock_backend.return_value.get_history.return_value = first_turn
         provider.mark_input_received()
-        assert provider.get_status(first_turn) == TerminalStatus.PROCESSING
+        assert provider.get_status(first_turn) == TerminalStatus.IDLE
 
         second_turn = (
             "› second question\n"
@@ -2356,6 +2361,131 @@ class TestCodexProviderTrustPrompt:
             "  gpt-5.6-sol default · /tmp/work\n"
         )
         assert provider.get_status(second_turn) == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_draft_in_composer_does_not_disarm_ownership(self, mock_backend):
+        """A successful paste with swallowed Enter must not complete the turn.
+
+        Issue #739 follow-up review: the draft changes only the composer
+        line, which the TUI footer cutoff already excludes from transcript
+        parsing — so it must not change the dispatch baseline either. With
+        the retained notice still the only transcript content, the pane
+        reads IDLE ("not started"), letting the deferred-delivery retry
+        loop re-submit instead of accepting the task as started.
+        """
+        notice_pane = (
+            "OpenAI Codex (v0.153.2)\n"
+            "• You have 1 usage limit reset available. Run /usage to use one.\n\n"
+            "› Ask Codex to do anything\n\n"
+            "  gpt-5.6-sol default · /tmp/work\n"
+        )
+        draft_pane = (
+            "OpenAI Codex (v0.153.2)\n"
+            "• You have 1 usage limit reset available. Run /usage to use one.\n\n"
+            "› analyze the repo and list risks\n\n"
+            "  gpt-5.6-sol default · /tmp/work\n"
+        )
+        mock_backend.return_value.get_history.return_value = notice_pane
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider.mark_input_received()
+
+        assert provider.get_status(draft_pane) == TerminalStatus.IDLE
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_baseline_capture_failure_fails_closed(self, mock_backend):
+        """A transient get_history failure at dispatch must not disarm the gate.
+
+        The first post-dispatch observation becomes the baseline, so a
+        retained notice pane still cannot complete the dropped submission
+        (issue #739 follow-up review: baseline-read failure previously
+        restored the unsafe completion behavior).
+        """
+        notice_pane = (
+            "OpenAI Codex (v0.153.2)\n"
+            "• You have 1 usage limit reset available. Run /usage to use one.\n\n"
+            "› Ask Codex to do anything\n\n"
+            "  gpt-5.6-sol default · /tmp/work\n"
+        )
+        mock_backend.return_value.get_history.side_effect = RuntimeError("capture failed")
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider.mark_input_received()
+
+        # First observation arms the baseline lazily; the same pane — with or
+        # without a typed draft — stays not-started, and genuine new content
+        # still completes.
+        assert provider.get_status(notice_pane) == TerminalStatus.IDLE
+        assert provider.get_status(notice_pane) == TerminalStatus.IDLE
+        settled = (
+            "• The requested task is complete.\n\n"
+            "› Ask Codex to do anything\n\n"
+            "  gpt-5.6-sol default · /tmp/work\n"
+        )
+        assert provider.get_status(settled) == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_unchanged_approval_prompt_keeps_waiting_after_dispatch(self, mock_backend):
+        """A dropped prompt answer must not flip an approval menu to PROCESSING.
+
+        Issue #739 follow-up review: the ownership gate must not mask the
+        modal classifiers. The pane is unchanged from the pre-answer
+        baseline, but the numbered approval menu keeps its
+        WAITING_USER_ANSWER precedence so another answer_user_prompt call
+        is accepted.
+        """
+        approval_pane: str = (
+            "› Run this shell command now, do not explain first: mkdir -p /tmp/x\n"
+            "• Running mkdir -p /tmp/x\n"
+            "\n"
+            "  Would you like to run the following command?\n"
+            "\n"
+            "  Environment: local\n"
+            "\n"
+            "  $ mkdir -p /tmp/x\n"
+            "\n"
+            "› 1. Yes, proceed (y)\n"
+            "  2. Yes, and don't ask again for commands that start with `mkdir -p /tmp/x` (p)\n"
+            "  3. No, and tell Codex what to do differently (n)\n"
+            "\n"
+            "  Press enter to confirm or esc to cancel\n"
+        )
+        mock_backend.return_value.get_history.return_value = approval_pane
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider.mark_input_received()
+
+        assert provider.get_status(approval_pane) == TerminalStatus.WAITING_USER_ANSWER
+        assert (
+            provider.get_status_from_screen(approval_pane.splitlines())
+            == TerminalStatus.WAITING_USER_ANSWER
+        )
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_unchanged_login_menu_keeps_waiting_after_dispatch(self, mock_backend):
+        """Same precedence for the first-run login menu: a dropped answer must
+        keep the pane WAITING_USER_ANSWER, not PROCESSING."""
+        login_pane: str = (
+            "Welcome to Codex, OpenAI's command-line coding agent\n"
+            "Sign in with ChatGPT to use Codex as part of your paid plan\n"
+            "or connect an API key for usage-based billing\n"
+            "\n"
+            "> 1. Sign in with ChatGPT\n"
+            "  2. Sign in with Device Code\n"
+            "  3. Provide your own API key\n"
+            "\n"
+            "Press enter to continue\n"
+        )
+        mock_backend.return_value.get_history.return_value = login_pane
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider.mark_input_received()
+
+        assert provider.get_status(login_pane) == TerminalStatus.WAITING_USER_ANSWER
+        assert (
+            provider.get_status_from_screen(login_pane.splitlines())
+            == TerminalStatus.WAITING_USER_ANSWER
+        )
 
     def test_v0153_stale_spinner_above_newer_composer_is_ready(self):
         """Readiness comes from the bottom-most cell, not any cell in the region.

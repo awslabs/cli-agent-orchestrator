@@ -766,28 +766,50 @@ def _has_startup_idle_composer(
     return False
 
 
-# Transcript/notice content starts with one of these glyphs (assistant bullets,
-# user markers, composer hints). Hashing only these lines makes the dispatch
-# baseline source-independent: pane history and the pyte-composited viewport
-# of an unchanged pane reduce to the same rows.
-_CONTENT_GLYPH_RE = re.compile(r"^[^\S\n]*[•›»]")
+# Transcript content starts with one of these glyphs: assistant bullets (•)
+# and submitted user-cell markers (› text / » text). The composer line — an
+# empty "›", the placeholder hint, or a draft typed into it — is deliberately
+# NOT transcript: it sits inside the TUI footer region the parser already
+# excludes via the footer cutoff, and hashing it let a successful paste whose
+# Enter was swallowed disarm the dispatch gate so a retained notice completed
+# the dropped submission (issue #739 review). Applying the same cutoff on
+# both the baseline and the observation keeps the signature a property of
+# the pane's transcript, not of whatever the composer currently holds.
+_ASSISTANT_BULLET_RE = re.compile(r"^[^\S\n]*•")
+_USER_CELL_RE = re.compile(r"^[^\S\n]*(?:›|»)[^\S\n]*\S")
 
 
-def _normalized_screen_hash(clean_output: str) -> str:
-    """Fingerprint the pane's turn-bearing content, ignoring volatile chrome.
+def _footer_cutoff_position(clean_output: str) -> int:
+    """Character position where the TUI footer region starts, when detected.
+
+    Same rule ``get_status`` uses to keep the composer and status bar out of
+    transcript parsing, shared with the dispatch-baseline capture so both
+    sides of the ownership comparison exclude the same footer chrome.
+    """
+    all_lines = clean_output.splitlines()
+    if any(re.search(TUI_FOOTER_PATTERN, line) for line in all_lines[-IDLE_PROMPT_TAIL_LINES:]):
+        return _compute_tui_footer_cutoff(all_lines)
+    return len(clean_output)
+
+
+def _transcript_signature(clean_output: str, cutoff_pos: Optional[int] = None) -> str:
+    """Fingerprint the pane's turn-bearing transcript, ignoring volatile chrome.
 
     Codex repaints the status bar and footer hint on a timer, so a raw tail
     hash differs between two observations of an unchanged pane and the
     per-dispatch staleness guard would never fire. Keep only transcript
-    lines (bullets, user markers, composer hints), normalized of trailing
-    padding, and hash the last of them: retained notices, prior responses,
-    and the idle composer survive this, while repaint-only chrome does not
-    change it. Restricting to glyph lines also keeps the fingerprint stable
-    across observation sources — pane history and the pyte viewport of the
-    same unchanged pane reduce to the same rows.
+    lines above the TUI footer cutoff — assistant bullets and non-empty user
+    cells — and hash the last of them: retained notices, prior responses,
+    and a genuine new user turn all survive this, while repaint-only chrome
+    and composer drafts (typed but unsubmitted text, excluded with the whole
+    footer region) do not change it. Restricting to glyph lines also keeps
+    the fingerprint stable across observation sources — pane history and
+    the pyte viewport of the same unchanged pane reduce to the same rows.
     """
+    if cutoff_pos is not None:
+        clean_output = clean_output[:cutoff_pos]
     lines = [line.rstrip() for line in clean_output.splitlines()]
-    body = [line for line in lines if _CONTENT_GLYPH_RE.match(line)]
+    body = [line for line in lines if _ASSISTANT_BULLET_RE.match(line) or _USER_CELL_RE.match(line)]
     return hashlib.sha256("\n".join(body[-40:]).encode()).hexdigest()
 
 
@@ -901,14 +923,17 @@ class CodexProvider(BaseProvider):
         self._agent_profile = agent_profile
         # Explicit per-call override for profile.model, see _build_codex_command.
         self._model = model
-        # Per-dispatch screen ownership (issue #739 review): the tmux buffer is
-        # cleared at dispatch, but the pyte-composited screen (and pane history
+        # Per-dispatch transcript ownership (issue #739 review): the tmux buffer
+        # is cleared at dispatch, but the pyte-composited screen (and pane history
         # on the capture paths) is NOT — a startup notice or a prior turn's
         # completed-response bullet survives the boundary. An ever-dispatched
         # boolean cannot tell that retained content from this dispatch's
-        # output, so record what the pane looked like at dispatch and require
-        # the observed content to differ before COMPLETED is possible.
-        self._dispatch_screen_hash: Optional[str] = None
+        # output, so record the pane's transcript signature at dispatch and
+        # require it to differ before COMPLETED is possible. A failed pane
+        # read leaves the baseline unset: the FIRST post-dispatch observation
+        # then becomes the baseline (fail closed — retained content cannot
+        # complete), never an inert guard.
+        self._dispatch_transcript_baseline: Optional[str] = None
         self._dispatch_pending: bool = False
 
     @property
@@ -1345,28 +1370,59 @@ class CodexProvider(BaseProvider):
         return True
 
     def mark_input_received(self) -> None:
-        """Record the pane baseline this dispatch must own its output from.
+        """Record the transcript baseline this dispatch must own its output from.
 
         The rolling byte buffer is cleared by the caller, but the pyte screen
         and pane history are not: a startup notice or a previous turn's
         completed-response bullet survives the dispatch boundary. Snapshot
-        the normalized pane content now; ``get_status`` refuses COMPLETED
-        until the observed content differs from this baseline, so retained
-        content alone can never complete the new turn.
+        the pane's transcript content now; the COMPLETED decision points in
+        ``get_status`` refuse to complete on content whose signature matches
+        this baseline, so retained content alone can never complete the new
+        turn. A failed pane read leaves the baseline unset — the first
+        post-dispatch observation then becomes the baseline, so the guard
+        stays armed and still fails closed rather than going inert.
         """
         output = ""
         try:
             output = get_backend().get_history(self.session_name, self.window_name) or ""
         except Exception:
-            # The pane read is best-effort: on backends without a live pane
-            # (unit tests, herdr event-inbox) there is nothing to snapshot.
-            # With no baseline recorded the guard below stays inert, which is
-            # the pre-existing behaviour for those paths.
-            pass
+            # Fail closed: no baseline now, so the guard below arms lazily
+            # from the first observation and still refuses to complete on
+            # content the dispatch has never seen change.
+            self._dispatch_transcript_baseline = None
+            self._dispatch_pending = True
+            super().mark_input_received()
+            return
         clean = strip_terminal_escapes(re.sub(ANSI_CODE_PATTERN, "", output))
-        self._dispatch_screen_hash = _normalized_screen_hash(clean) if clean else None
+        self._dispatch_transcript_baseline = (
+            _transcript_signature(clean, _footer_cutoff_position(clean)) if clean else None
+        )
         self._dispatch_pending = True
         super().mark_input_received()
+
+    def _dispatch_owns_transcript(self, clean_output: str, cutoff_pos: int) -> bool:
+        """True when the observed transcript is not the dispatch baseline.
+
+        Kept armed while the pane's transcript content still matches what
+        ``mark_input_received`` snapshotted (or, after a failed capture,
+        matches the first post-dispatch observation): retained notices and
+        prior-turn completions then cannot satisfy a COMPLETED branch.
+        Cleared permanently on the first observation whose transcript
+        differs — genuine current-turn content has rendered, and the turn's
+        own evidence decides from there on.
+        """
+        if not self._dispatch_pending:
+            return True
+        observed = _transcript_signature(clean_output, cutoff_pos)
+        if self._dispatch_transcript_baseline is None:
+            # Baseline capture failed: this observation becomes the baseline
+            # (fail closed), and only content that changes from it completes.
+            self._dispatch_transcript_baseline = observed
+            return False
+        if observed != self._dispatch_transcript_baseline:
+            self._dispatch_pending = False
+            return True
+        return False
 
     def get_status(self, output: str) -> TerminalStatus:
         # Native status (herdr): trust the backend's agent state when available;
@@ -1398,19 +1454,6 @@ class CodexProvider(BaseProvider):
         # idle ``›`` prompt / structural checks below misfire on the raw stream.
         clean_output = strip_terminal_escapes(output)
         tail_output = "\n".join(clean_output.splitlines()[-25:])
-
-        # Per-dispatch ownership (issue #739 review): between mark_input_received
-        # and the first observation whose content differs from the dispatch
-        # baseline, retained screen content (a startup notice, a prior turn's
-        # completed response) must not satisfy any COMPLETED branch — the
-        # visible- and evicted-user-marker paths both live below this gate.
-        # A differing observation proves current-turn content has rendered, so
-        # the guard disarms and the turn's own evidence decides as before.
-        if self._dispatch_pending:
-            observed = _normalized_screen_hash(clean_output)
-            if self._dispatch_screen_hash is not None and observed == self._dispatch_screen_hash:
-                return TerminalStatus.PROCESSING
-            self._dispatch_pending = False
 
         # Search for user messages, excluding the Codex TUI footer when present.
         # The TUI footer (idle prompt hint like "› Summarize recent commits" +
@@ -1551,12 +1594,26 @@ class CodexProvider(BaseProvider):
             if re.search(TUI_PROGRESS_PATTERN, tail_output, re.MULTILINE):
                 return TerminalStatus.PROCESSING
 
+            # Per-dispatch transcript ownership (issue #739 review): while the
+            # pane's transcript still matches the dispatch baseline, retained
+            # content — a startup notice, a prior turn's completion — cannot
+            # satisfy either COMPLETED branch. Consulted HERE, after the modal
+            # and error classifiers, so an unchanged approval/login prompt
+            # keeps its WAITING_USER_ANSWER precedence instead of collapsing
+            # to PROCESSING. The pane reports IDLE instead: the composer is
+            # visible, so a dropped submit reads "not started" to the
+            # deferred-delivery retry rather than "already done".
+            dispatch_owns_content = self._dispatch_owns_transcript(clean_output, cutoff_pos)
+
             # Consider COMPLETED only if we see an assistant marker (skipping
             # MCP tool-call markers) after the last user message. Without the
             # tool-call filter, "• Called <server>.<tool>(...)" emitted before
             # the model has actually replied would trip COMPLETED prematurely.
             if last_user is not None:
-                if _find_assistant_marker(clean_output[last_user.start() :]) is not None:
+                if (
+                    dispatch_owns_content
+                    and _find_assistant_marker(clean_output[last_user.start() :]) is not None
+                ):
                     return TerminalStatus.COMPLETED
 
                 return TerminalStatus.IDLE
@@ -1572,7 +1629,8 @@ class CodexProvider(BaseProvider):
             # Search above the TUI footer cutoff so the › suggestion-hint and
             # status-bar lines aren't confused with a model reply.
             if (
-                self._task_dispatched
+                dispatch_owns_content
+                and self._task_dispatched
                 and _find_assistant_marker(clean_output[:cutoff_pos]) is not None
             ):
                 return TerminalStatus.COMPLETED
