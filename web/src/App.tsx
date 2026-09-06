@@ -62,6 +62,18 @@ function Snackbar() {
 
 export default function App() {
   const [tab, setTab] = useState<TabKey>('home')
+
+  // The ONLY way any surface changes tabs. Refuses while an in-flight
+  // interaction (an authoring modal's save) holds the navigation lock:
+  // switching tabs unmounts the panel and its modal, so a deferred
+  // validation/write rejection would land on an unmounted component and the
+  // unsaved draft would be unrecoverable (#692 review round 7). Reads the
+  // lock through getState() so the keydown listener never closes over a
+  // stale value.
+  const requestTabChange = (t: TabKey) => {
+    if (useStore.getState().navLockCount > 0) return
+    setTab(t)
+  }
   // Default false (fail-closed): a dead backend hides the tab rather than showing a broken panel
   const [memoryEnabled, setMemoryEnabled] = useState(false)
   const { sessions, connected, fetchSessions } = useStore()
@@ -82,7 +94,7 @@ export default function App() {
     const handler = (e: KeyboardEvent) => {
       if (e.altKey && e.key >= '1' && e.key <= String(visibleTabs.length)) {
         e.preventDefault()
-        setTab(visibleTabs[parseInt(e.key) - 1].key)
+        requestTabChange(visibleTabs[parseInt(e.key) - 1].key)
       }
     }
     window.addEventListener('keydown', handler)
@@ -123,7 +135,7 @@ export default function App() {
                 key={t.key}
                 role="tab"
                 aria-selected={tab === t.key}
-                onClick={() => setTab(t.key)}
+                onClick={() => requestTabChange(t.key)}
                 className={`px-4 py-2 rounded-lg text-sm font-medium transition-all duration-200 flex items-center gap-2 ${
                   tab === t.key
                     ? 'bg-gradient-to-r from-emerald-600 to-emerald-500 text-white shadow-lg shadow-emerald-500/20'
@@ -148,7 +160,7 @@ export default function App() {
       <main className="max-w-7xl mx-auto px-6 py-6">
         <ErrorBoundary>
           <Suspense fallback={<div className="text-gray-500 text-sm py-12 text-center">Loading...</div>}>
-            {tab === 'home' && <DashboardHome onNavigate={(t) => setTab(t as TabKey)} />}
+            {tab === 'home' && <DashboardHome onNavigate={(t) => requestTabChange(t as TabKey)} />}
             {tab === 'profiles' && <ProfilesPanel />}
             {tab === 'agents' && <AgentPanel />}
             {tab === 'flows' && <FlowsPanel />}

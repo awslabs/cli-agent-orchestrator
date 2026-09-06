@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { useStore } from '../store'
 import { api, ApiError, ProfileValidationMessage } from '../api'
 import { rewriteFrontmatterName } from './ProfileCreateModal'
 import { ValidationFindings } from './ValidationFindings'
@@ -35,6 +36,20 @@ export function ProfileEditorModal({ open, mode, name, onClose, onSaved }: Profi
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
+
+  // Hold the app-level navigation lock for exactly the lifetime of a save
+  // (covers the deferred pre-save validation too, since `saving` is set
+  // before it). Effect-based acquire/release is leak-proof: whether the save
+  // resolves, rejects, throws, or the modal unmounts mid-flight, the cleanup
+  // releases the lock (#692 review round 7: Alt+digit tab changes unmounted
+  // an in-flight save, discarding the draft and its failure feedback).
+  const acquireNavLock = useStore(s => s.acquireNavLock)
+  const releaseNavLock = useStore(s => s.releaseNavLock)
+  useEffect(() => {
+    if (!saving) return
+    acquireNavLock()
+    return () => releaseNavLock()
+  }, [saving])
   const [saveError, setSaveError] = useState<string | null>(null)
   const [findings, setFindings] = useState<ProfileValidationMessage[]>([])
   // Closes the double-submit window: state updates are async, a ref is not.

@@ -601,3 +601,85 @@ describe('round-6 review: post-edit detail reload vs navigation ownership (#692)
     expect(within(screen.getByTestId('profile-detail')).getByText('post-edit-model')).toBeInTheDocument()
   })
 })
+
+describe('round-7 review: navigation lock while a save owns the interaction (#692)', () => {
+  const appFetch = (overrides: Record<string, (url: string, opts?: any) => any>) =>
+    vi.fn(async (url: string, opts?: any) => {
+      const u = String(url)
+      for (const [needle, handler] of Object.entries(overrides)) {
+        if (u.includes(needle)) return handler(u, opts)
+      }
+      if (u.includes('/agents/profiles/schema')) return okJson({
+        type: 'object', required: ['name'], properties: { name: { type: 'string' } },
+      })
+      if (u.includes('/agents/profiles/templates')) return okJson([])
+      if (u.includes('/agents/providers')) return okJson([])
+      if (u.includes('/agents/profiles')) return okJson(CATALOG)
+      if (u.includes('/memory/status')) return okJson({ enabled: false })
+      return okJson([])
+    })
+
+  async function openScratchCreate() {
+    render(<App />)
+    fireEvent.click(screen.getByRole('tab', { name: /profiles/i }))
+    await act(async () => {})
+    fireEvent.click(screen.getByRole('button', { name: /new profile/i }))
+    await act(async () => {})
+    fireEvent.click(screen.getByRole('tab', { name: 'From scratch' }))
+    await act(async () => {})
+    fireEvent.change(screen.getByRole('textbox', { name: 'Profile name' }), { target: { value: 'fresh-agent' } })
+  }
+
+  it('Alt+digit and tab clicks are refused while deferred validation is in flight', async () => {
+    // The reviewer's exact P2: every save-time guard lived INSIDE the modal,
+    // but the app-level tab switch unmounted the whole panel around it. The
+    // navigation lock is held for the full save, including the pre-save
+    // validation window.
+    vi.stubGlobal('fetch', appFetch({
+      '/agents/profiles/validate': () => new Promise(() => {}), // never settles
+    }))
+    await openScratchCreate()
+    fireEvent.click(screen.getByRole('button', { name: /create profile/i }))
+    await act(async () => {}) // validation in flight; lock held
+
+    fireEvent.keyDown(window, { key: '3', altKey: true })
+    fireEvent.click(screen.getByRole('tab', { name: /agents/i }))
+    await act(async () => {})
+    expect(screen.getByRole('tab', { name: /profiles/i })).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByRole('textbox', { name: 'Profile name' })).toHaveValue('fresh-agent')
+  })
+
+  it('a write rejection lands in a still-mounted modal: draft and error survive Alt navigation, and the lock releases after', async () => {
+    let rejectPost!: () => void
+    vi.stubGlobal('fetch', appFetch({
+      '/agents/profiles/validate': () => okJson({ valid: true, messages: [] }),
+      '/agents/profiles': (u: string, opts: any) => {
+        if (u.endsWith('/agents/profiles') && opts?.method === 'POST') {
+          return new Promise<any>((_res, rej) => {
+            rejectPost = () => rej(Object.assign(new Error('write exploded'), { detail: 'write exploded' }))
+          })
+        }
+        return okJson(CATALOG)
+      },
+    }))
+    await openScratchCreate()
+    fireEvent.click(screen.getByRole('button', { name: /create profile/i }))
+    await act(async () => {}) // POST in flight; lock held
+
+    fireEvent.keyDown(window, { key: '3', altKey: true }) // must be refused
+    await act(async () => {})
+    expect(screen.getByRole('tab', { name: /profiles/i })).toHaveAttribute('aria-selected', 'true')
+
+    // The rejection lands in the STILL-MOUNTED modal
+    await act(async () => { rejectPost() })
+    // Scoped by text rather than role: the app shell renders its own
+    // role="alert" (connection banner), so the bare role query is ambiguous.
+    expect(screen.getByText(/write exploded/)).toBeInTheDocument()
+    expect(screen.getByRole('textbox', { name: 'Profile name' })).toHaveValue('fresh-agent')
+
+    // The failed save released the lock: navigation works again
+    fireEvent.keyDown(window, { key: '3', altKey: true })
+    await act(async () => {})
+    expect(screen.getByRole('tab', { name: /agents/i })).toHaveAttribute('aria-selected', 'true')
+  })
+})
