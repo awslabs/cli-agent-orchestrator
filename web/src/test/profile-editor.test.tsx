@@ -244,28 +244,28 @@ describe('Stage 4 — delete flow', () => {
     expect(screen.getByRole('option', { name: /builtin-agent/ })).toBeInTheDocument()
   })
 
-  it('removes the profile from active search results, not only the catalog', async () => {
-    // Regression: the visible list is `results ?? catalog`; refreshCatalog()
-    // alone leaves a stale search result showing the deleted profile.
-    // Real timers: the 300 ms debounce elapses inside findByRole's poll window.
+  it('deleting under an active search clears the search: the refreshed catalog is authoritative', async () => {
+    // Round-3 kept the stale ranked rows and filtered the deleted name out
+    // of them; round-7 superseded that -- the stale rows can also HIDE a
+    // fallback the deletion re-exposes, so the search is cleared instead
+    // and the refreshed catalog becomes the visible row set.
+    // Real timers: the 300 ms debounce elapses inside findByText's poll window.
     const SEARCH = [
       { name: 'local-agent', description: 'Mine', capabilities: [], tags: [], role: '', source: 'local', coverage: 1, score: 1.5 },
-      { name: 'builtin-agent', description: 'Shipped', capabilities: [], tags: [], role: '', source: 'built-in', coverage: 1, score: 1.1 },
     ]
-    let searched = false
+    let deleted = false
     vi.stubGlobal('fetch', vi.fn(async (url: string, opts?: any) => {
-      if (url.includes('/agents/profiles/search')) { searched = true; return okJson(SEARCH) }
+      if (url.includes('/agents/profiles/search')) return okJson(SEARCH)
       if (url.includes('/agents/profiles/validate')) return okJson({ valid: true, messages: [] })
-      if (opts?.method === 'DELETE') return noContent()
+      if (opts?.method === 'DELETE') { deleted = true; return noContent() }
       if (/\/agents\/profiles\/[^/?]+$/.test(url)) return okJson(DETAIL)
-      if (url.includes('/agents/profiles')) return okJson(CATALOG)
+      if (url.includes('/agents/profiles')) return okJson(deleted ? CATALOG.filter(r => r.name !== 'local-agent') : CATALOG)
       return okJson([])
     }))
     render(<ProfilesPanel />)
     fireEvent.change(await screen.findByRole('searchbox', { name: /search profiles/i }), { target: { value: 'agent' } })
     // Wait for the debounced search to land and render the ranked rows
-    await screen.findByText('2 matches', undefined, { timeout: 2000 })
-    expect(searched).toBe(true)
+    await screen.findByText('1 match', undefined, { timeout: 2000 })
 
     fireEvent.click(screen.getByRole('option', { name: /local-agent/ }))
     const detail = await screen.findByTestId('profile-detail')
@@ -274,9 +274,10 @@ describe('Stage 4 — delete flow', () => {
     fireEvent.change(within(modal).getByRole('textbox', { name: /confirmation text/i }), { target: { value: 'local-agent' } })
     fireEvent.click(within(modal).getByRole('button', { name: 'Delete' }))
     await act(async () => {})
+    await act(async () => {})
 
+    expect(screen.getByRole('searchbox', { name: /search profiles/i })).toHaveValue('')
     expect(screen.queryByRole('option', { name: /local-agent/ })).not.toBeInTheDocument()
-    expect(screen.getByRole('option', { name: /builtin-agent/ })).toBeInTheDocument()
   })
 
   it('cancelling the ConfirmModal issues no DELETE', async () => {

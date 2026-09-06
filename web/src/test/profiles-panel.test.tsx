@@ -683,3 +683,85 @@ describe('round-7 review: navigation lock while a save owns the interaction (#69
     expect(screen.getByRole('tab', { name: /agents/i })).toHaveAttribute('aria-selected', 'true')
   })
 })
+
+describe('round-7 review: P3 follow-ups fixed in the same pass (#692)', () => {
+  it('the detail description is authoritative after a save even when the catalog refresh fails', async () => {
+    // Reviewer's exact conjunction: PUT and detail GET succeed, catalog GET
+    // fails -- the pane previously kept rendering the stale ROW description
+    // from the failed-to-refresh catalog snapshot.
+    let edited = false
+    const SOURCE = '---\nname: developer\ndescription: Writes code\n---\n\nBody.\n'
+    let catalogCall = 0
+    vi.stubGlobal('fetch', vi.fn(async (url: string, opts?: any) => {
+      const u = String(url)
+      if (u.includes('/agents/profiles/validate')) return okJson({ valid: true, messages: [] })
+      if (u.includes('/source')) return okJson({ name: 'developer', content: SOURCE })
+      if (u.endsWith('/agents/profiles/developer') && opts?.method === 'PUT') { edited = true; return okJson({ name: 'developer', warnings: [] }) }
+      if (/\/agents\/profiles\/[^/?]+$/.test(u)) return okJson({
+        name: 'developer', description: edited ? 'post-edit description' : 'Writes code',
+        provider: 'kiro_cli', model: 'claude-sonnet-4', tags: [], capabilities: [],
+      })
+      if (u.includes('/agents/profiles')) {
+        catalogCall++
+        if (catalogCall > 1) return errJson(500, 'catalog exploded')
+        return okJson(CATALOG)
+      }
+      return okJson([])
+    }))
+    render(<ProfilesPanel />)
+    await act(async () => {})
+    fireEvent.click(screen.getByRole('option', { name: /developer/ }))
+    await act(async () => {})
+
+    fireEvent.click(within(screen.getByTestId('profile-detail')).getByRole('button', { name: /edit/i }))
+    await act(async () => {})
+    fireEvent.change(screen.getByRole('textbox', { name: /profile source/i }), { target: { value: SOURCE.replace('Body.', 'New body.') } })
+    fireEvent.click(screen.getByRole('button', { name: /save changes/i }))
+    await act(async () => {})
+    await act(async () => {})
+    // Detail refetched (post-edit) even though the catalog snapshot is stale
+    expect(within(screen.getByTestId('profile-detail')).getByText('post-edit description')).toBeInTheDocument()
+  })
+
+  it('deleting a searched local shadow exposes the fallback: the search is cleared', async () => {
+    // Reviewer's P3: the stale ranked rows never carry the re-exposed
+    // fallback, so while the query matched its name the fallback stayed
+    // invisible. The smallest fix he endorsed: clearSearch() after DELETE.
+    let deleted = false
+    const LOCAL = { name: 'shared-agent', description: 'Local override', source: 'local' }
+    const FALLBACK = { name: 'shared-agent', description: 'Built-in fallback', source: 'built-in' }
+    vi.stubGlobal('fetch', vi.fn(async (url: string, opts?: any) => {
+      const u = String(url)
+      if (opts?.method === 'DELETE') { deleted = true; return okJson({ deleted: true }) }
+      if (u.includes('/agents/profiles/search')) return okJson([
+        { ...LOCAL, capabilities: [], tags: [], role: '', coverage: 1, score: 1.0 },
+      ])
+      if (/\/agents\/profiles\/[^/?]+$/.test(u)) return okJson({ ...LOCAL, provider: '', model: '', tags: [], capabilities: [] })
+      if (u.includes('/agents/profiles')) return okJson(deleted ? [FALLBACK] : [LOCAL])
+      return okJson([])
+    }))
+    vi.useFakeTimers()
+    try {
+      render(<ProfilesPanel />)
+      await act(async () => {})
+      fireEvent.change(screen.getByRole('searchbox', { name: /search profiles/i }), { target: { value: 'shared' } })
+      await act(() => vi.advanceTimersByTimeAsync(SEARCH_DEBOUNCE_MS + 10))
+      fireEvent.click(screen.getByRole('option', { name: /shared-agent/ }))
+      await act(async () => {})
+
+      fireEvent.click(within(screen.getByTestId('profile-detail')).getByRole('button', { name: /delete/i }))
+      const modal = screen.getByText('Delete profile').closest('.fixed') as HTMLElement
+      fireEvent.change(within(modal).getByRole('textbox', { name: /confirmation text/i }), { target: { value: 'shared-agent' } })
+      fireEvent.click(within(modal).getByRole('button', { name: 'Delete' }))
+      await act(async () => {})
+      await act(async () => {})
+
+      // Search cleared; the refreshed catalog exposes the built-in fallback
+      expect(screen.getByRole('searchbox', { name: /search profiles/i })).toHaveValue('')
+      const row = screen.getByRole('option', { name: /shared-agent/ })
+      expect(within(row).getByText('built-in')).toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})

@@ -150,7 +150,15 @@ function ProfileDetail({
             </button>
           )}
         </div>
-        {row.description && <p className="text-sm text-gray-400">{row.description}</p>}
+        {/* Once the parsed detail loads it is authoritative: the ROW's
+            description comes from catalog/search snapshots, which can be
+            stale when the post-save catalog refresh failed while PUT and
+            the detail GET succeeded (#692 round-7 P3). Explicit null check
+            so an intentionally EMPTY description stays empty instead of
+            falling back to the stale row text. */}
+        {(detail !== null ? detail.description ?? '' : row.description) && (
+          <p className="text-sm text-gray-400">{detail !== null ? detail.description : row.description}</p>
+        )}
       </div>
 
       {duplicatedIn && duplicatedIn.length > 0 && (
@@ -307,7 +315,13 @@ export function ProfilesPanel() {
       // the name under its new winning source.
       const name = pendingDelete
       setCatalog(c => c.filter(r => r.name !== name))
-      setResults(r => (r ? r.filter(x => x.name !== name) : r))
+      // Clear the search instead of filtering the stale result rows:
+      // deleting a local shadow legitimately re-exposes a same-named
+      // fallback from another source, but the stale ranked rows never carry
+      // it, so under an active query matching that name the fallback stayed
+      // invisible (#692 round-7 P3). clearSearch also advances the search
+      // generation, so an in-flight search cannot re-land afterwards.
+      clearSearch()
       setPendingDelete(null)
       refreshCatalog()
     } catch (e: any) {
