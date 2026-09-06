@@ -737,6 +737,12 @@ class AntigravityCliProvider(BaseProvider):
         # IDLE / COMPLETED: ready footer present. Fresh spawn (no delivered
         # turn) is IDLE; a finished turn is COMPLETED.
         if re.search(IDLE_FOOTER_PATTERN, tail):
+            if (
+                self._snapshot_last_response is not None
+                and self._turns > 0
+                and self._snapshot_last_response == self._extract_last_exchange(clean)
+            ):
+                return TerminalStatus.PROCESSING
             return TerminalStatus.COMPLETED if self._turns > 0 else TerminalStatus.IDLE
 
         if re.search(ERROR_PATTERN, clean, re.MULTILINE):

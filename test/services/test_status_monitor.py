@@ -1169,6 +1169,33 @@ class TestStatusEvidenceGeneration:
         m.feed(TerminalStatus.COMPLETED)
         assert m.sm.get_status_snapshot("t1") == (TerminalStatus.COMPLETED, second)
 
+    def test_top_level_dispatch_stays_inflight_until_its_ready_evidence(self):
+        m = _SequencedMonitor()
+        dispatch = m.sm.notify_input_sent("t1", owns_turn=True)
+
+        assert m.sm.has_inflight_dispatch("t1") is True
+        m.feed(TerminalStatus.PROCESSING)
+        assert m.sm.has_inflight_dispatch("t1") is True
+        m.feed(TerminalStatus.COMPLETED)
+
+        assert m.sm.get_status_snapshot("t1") == (TerminalStatus.COMPLETED, dispatch)
+        assert m.sm.has_inflight_dispatch("t1") is False
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_snapshot_preserves_live_event_inbox_status(self, mock_pm, mock_get_backend):
+        """GET status must not bypass the native event-inbox resolver (#735)."""
+        sm = StatusMonitor()
+        provider = MagicMock()
+        provider.get_status.return_value = TerminalStatus.IDLE
+        mock_pm.get_provider.return_value = provider
+        mock_get_backend.return_value.supports_event_inbox.return_value = True
+
+        dispatch = sm.notify_input_sent("t1", owns_turn=True)
+
+        assert sm.get_status_snapshot("t1") == (TerminalStatus.IDLE, dispatch)
+        provider.get_status.assert_called_once_with("")
+
     def test_fast_completion_outranks_dispatch_while_echo_does_not(self):
         """The reviewer's exact-head race, composed against the REAL screen
         detector (PR #741 rework): a turn whose entire activity interval fits
