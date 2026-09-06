@@ -2251,15 +2251,180 @@ class TestCodexProviderTrustPrompt:
 
         assert _has_startup_idle_composer(output) is True
         assert provider.get_status(output) == TerminalStatus.IDLE
-        dispatched_output = (
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_dispatch_does_not_complete_on_retained_notice_pane(self, mock_backend):
+        """After dispatch, an unchanged retained pane is PROCESSING, not COMPLETED.
+
+        The rolling byte buffer is cleared at dispatch, but the pyte screen
+        and pane history are not (issue #739 review): a control-only redraw
+        of the startup notice pane must not satisfy the evicted-marker
+        completion branch before Codex has rendered the new user turn.
+        """
+        retained = (
+            "OpenAI Codex (v0.153.2)\n"
+            "• You have 1 usage limit reset available. Run /usage to use one.\n\n"
+            "› Ask Codex to do anything\n\n"
+            "  gpt-5.6-sol default · /tmp/work\n"
+        )
+        mock_backend.return_value.get_history.return_value = retained
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider.mark_input_received()
+
+        assert provider.get_status(retained) == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_dispatch_does_not_complete_on_retained_prior_turn(self, mock_backend):
+        """A prior turn's completion, retained across the dispatch boundary
+        (screen path or rolling buffer), must not complete the new dispatch."""
+        retained = (
+            "› first question\n"
+            "• First answer.\n"
+            "\n"
+            "› Ask Codex to do anything\n\n"
+            "  gpt-5.6-sol default · /tmp/work\n"
+        )
+        mock_backend.return_value.get_history.return_value = retained
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider.mark_input_received()
+
+        assert provider.get_status(retained) == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_dispatched_evicted_marker_turn_completes_after_new_content(self, mock_backend):
+        """Once current-turn content renders, the evicted-marker path completes.
+
+        The v0153 regression: the user marker rolled out of the buffer, the
+        assistant response is visible above the footer cutoff, and the pane
+        differs from the dispatch baseline, so the turn's own evidence
+        decides — COMPLETED, as before the ownership guard.
+        """
+        notice_pane = (
+            "OpenAI Codex (v0.153.2)\n"
+            "• You have 1 usage limit reset available. Run /usage to use one.\n\n"
+            "› Ask Codex to do anything\n\n"
+            "  gpt-5.6-sol default · /tmp/work\n"
+        )
+        settled_turn = (
             "• The requested task is complete.\n\n"
             "› Ask Codex to do anything\n\n"
             "  gpt-5.6-sol default · /tmp/work\n"
         )
+        mock_backend.return_value.get_history.return_value = notice_pane
 
+        provider = CodexProvider("test1234", "test-session", "window-0")
         provider.mark_input_received()
 
-        assert provider.get_status(dispatched_output) == TerminalStatus.COMPLETED
+        assert provider.get_status(settled_turn) == TerminalStatus.COMPLETED
+        # The guard stays disarmed once the turn has been observed; a redraw
+        # of the same settled pane does not return it to PROCESSING.
+        assert provider.get_status(settled_turn) == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_second_dispatch_after_completion_waits_for_new_content(self, mock_backend):
+        """Dispatch N+1 must not be completed by dispatch N's retained pane."""
+        idle_pane = (
+            "OpenAI Codex (v0.153.2)\n\n"
+            "› Ask Codex to do anything\n\n"
+            "  gpt-5.6-sol default · /tmp/work\n"
+        )
+        first_turn = (
+            "› first question\n"
+            "• First answer.\n"
+            "\n"
+            "› Ask Codex to do anything\n\n"
+            "  gpt-5.6-sol default · /tmp/work\n"
+        )
+        mock_backend.return_value.get_history.return_value = idle_pane
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider.mark_input_received()
+        assert provider.get_status(first_turn) == TerminalStatus.COMPLETED
+
+        # Dispatch two: the pane still shows turn one's completion.
+        mock_backend.return_value.get_history.return_value = first_turn
+        provider.mark_input_received()
+        assert provider.get_status(first_turn) == TerminalStatus.PROCESSING
+
+        second_turn = (
+            "› second question\n"
+            "• Second answer.\n"
+            "\n"
+            "› Ask Codex to do anything\n\n"
+            "  gpt-5.6-sol default · /tmp/work\n"
+        )
+        assert provider.get_status(second_turn) == TerminalStatus.COMPLETED
+
+    def test_v0153_stale_spinner_above_newer_composer_is_ready(self):
+        """Readiness comes from the bottom-most cell, not any cell in the region.
+
+        The timed spinner above belongs to an earlier turn; the current
+        composer below it is what the TUI is repainting (issue #739 review:
+        an old timed spinner above a newer notice/composer must not keep the
+        pane not-ready).
+        """
+        output = (
+            "› earlier question\n"
+            "• Working (12s • esc to interrupt)\n"
+            "\n"
+            "• You have 1 usage limit reset available. Run /usage to use one.\n\n"
+            "› Ask Codex to do anything\n\n"
+            "  gpt-5.6-sol default · /tmp/work\n"
+        )
+
+        assert _has_startup_idle_composer(output) is True
+
+    def test_v0153_partial_activity_cell_blocks_readiness_until_stable(self):
+        """An unterminated bullet is a possible mid-paint frame: not ready on
+        first sight, ready once the frame is identical across polls."""
+        output = (
+            "OpenAI Codex (v0.153.2)\n"
+            "• Starting MCP servers (0/3): cao-mcp-server\n"
+            "\n"
+            "› Ask Codex to do anything\n\n"
+            "  gpt-5.6-sol default · /tmp/work\n"
+        )
+
+        assert _has_startup_idle_composer(output) is False
+        assert _has_startup_idle_composer(output, allow_partial_activity_cell=True) is True
+
+    @pytest.mark.parametrize(
+        "notice",
+        [
+            "You have 1 usage limit reset available. Run /usage to use one.",
+            "Your plan renews on Sep 30. Visit /usage for details.",
+            "New: file uploads are available in this workspace.",
+        ],
+        ids=["usage-limit", "plan-renewal", "feature-note"],
+    )
+    def test_v0153_notice_sentence_variants_are_ready(self, notice):
+        """Sentence-terminated notices are printed lines, never activity —
+        ready on the first poll, no stabilization wait (issue #739 review)."""
+        output = (
+            "OpenAI Codex (v0.153.2)\n"
+            f"• {notice}\n"
+            "\n"
+            "› Ask Codex to do anything\n\n"
+            "  gpt-5.6-sol default · /tmp/work\n"
+        )
+
+        assert _has_startup_idle_composer(output) is True
+
+    def test_v0153_unterminated_notice_requires_stabilization(self):
+        """A bare non-sentence notice bullet is ambiguous with a mid-paint
+        frame, so readiness waits for a stable frame."""
+        output = (
+            "OpenAI Codex (v0.153.2)\n"
+            "• Trying the latest stable version\n"
+            "\n"
+            "› Ask Codex to do anything\n\n"
+            "  gpt-5.6-sol default · /tmp/work\n"
+        )
+
+        assert _has_startup_idle_composer(output) is False
+        assert _has_startup_idle_composer(output, allow_partial_activity_cell=True) is True
 
     @pytest.mark.asyncio
     @patch(
@@ -2349,6 +2514,12 @@ class TestCodexProviderTrustPrompt:
                 "  gpt-5.6-sol medium · Context 100% left\n"
             ),
             (
+                "› Fix the failing tests\n"
+                "• Working\n"
+                "› Write tests for @filename\n"
+                "  gpt-5.6-sol medium · Context 100% left\n"
+            ),
+            (
                 "Approve this command? [y/n]\n"
                 "› Write tests for @filename\n"
                 "  gpt-5.6-sol medium · Context 100% left\n"
@@ -2370,6 +2541,7 @@ class TestCodexProviderTrustPrompt:
         ],
         ids=[
             "working",
+            "partial-working-frame",
             "approval",
             "boxed-approval",
             "typed-draft",
