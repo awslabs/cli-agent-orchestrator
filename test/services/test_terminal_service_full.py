@@ -26,6 +26,7 @@ from cli_agent_orchestrator.services.terminal_service import (
     _request_fingerprint,
     create_terminal,
     delete_terminal,
+    dispatch_input,
     get_output,
     get_terminal,
     get_working_directory,
@@ -1971,12 +1972,13 @@ class TestGetTerminal:
             "agent_profile": "developer",
             "last_active": datetime.now(),
         }
-        mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_status_monitor.get_status_snapshot.return_value = (TerminalStatus.IDLE, 0)
 
         result = get_terminal("test1234")
 
         assert result["id"] == "test1234"
         assert result["status"] == TerminalStatus.IDLE.value
+        assert result["status_generation"] == 0
 
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_get_terminal_not_found(self, mock_get_metadata):
@@ -1998,7 +2000,7 @@ class TestGetTerminal:
             "agent_profile": "developer",
             "last_active": datetime.now(),
         }
-        mock_status_monitor.get_status.return_value = TerminalStatus.UNKNOWN
+        mock_status_monitor.get_status_snapshot.return_value = (TerminalStatus.UNKNOWN, 0)
 
         result = get_terminal("test1234")
 
@@ -2062,7 +2064,7 @@ class TestSendInput:
 
         result = send_input("test1234", "test message")
 
-        assert result == 7
+        assert result is True
         mock_tmux.send_keys.assert_called_once_with(
             "cao-session",
             "developer-abcd",
@@ -2072,6 +2074,104 @@ class TestSendInput:
             submit_delay=0.3,
         )
         mock_update.assert_called_once_with("test1234")
+
+    def test_dispatch_input_returns_success_and_generation(self):
+        """dispatch_input is the generation-returning form the API layer uses;
+        send_input keeps its Boolean contract (issue #735 review: breaking the
+        Boolean return broke the all-extras telemetry seam)."""
+        with (
+            patch("cli_agent_orchestrator.services.terminal_service.MemoryService") as mock_ms,
+            patch("cli_agent_orchestrator.services.terminal_service.status_monitor") as mock_sm,
+            patch("cli_agent_orchestrator.services.terminal_service.update_last_active"),
+            patch("cli_agent_orchestrator.services.terminal_service.provider_manager") as mock_pm,
+            patch("cli_agent_orchestrator.backends.registry._backend") as mock_tmux,
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata"
+            ) as mock_meta,
+        ):
+            mock_ms.return_value.get_curated_memory_context.return_value = ""
+            mock_meta.return_value = {
+                "tmux_session": "cao-session",
+                "tmux_window": "developer-abcd",
+            }
+            mock_provider = mock_pm.get_provider.return_value
+            mock_provider.paste_enter_count = 1
+            mock_provider.paste_submit_delay = 0.3
+            mock_sm.get_status.return_value = TerminalStatus.IDLE
+            mock_sm.notify_input_sent.return_value = 7
+
+            ok, generation = dispatch_input("test1234", "test message")
+
+            assert ok is True
+            assert generation == 7
+            mock_tmux.send_keys.assert_called_once()
+
+    def test_overlapping_dispatch_to_same_terminal_is_rejected(self):
+        """Issue #735 review (blocker 1): adjacent dispatches could consume
+        each other's completion/output. A second message dispatch that
+        arrives while another holds the per-terminal dispatch slot is
+        rejected with TerminalInputBlockedError instead of interleaving its
+        turn boundary over the in-flight dispatch."""
+        import threading
+
+        from cli_agent_orchestrator.services.terminal_service import (
+            _dispatch_locks,
+            _dispatch_locks_guard,
+        )
+
+        # Simulate an in-flight dispatch: another thread holds the slot.
+        with _dispatch_locks_guard:
+            lock = _dispatch_locks.setdefault("test1234", threading.Lock())
+        lock.acquire()
+        try:
+            with (
+                patch("cli_agent_orchestrator.services.terminal_service.MemoryService") as mock_ms,
+                patch("cli_agent_orchestrator.services.terminal_service.status_monitor") as mock_sm,
+                patch("cli_agent_orchestrator.services.terminal_service.update_last_active"),
+                patch(
+                    "cli_agent_orchestrator.services.terminal_service.provider_manager"
+                ) as mock_pm,
+                patch("cli_agent_orchestrator.backends.registry._backend") as mock_tmux,
+                patch(
+                    "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata"
+                ) as mock_meta,
+            ):
+                mock_ms.return_value.get_curated_memory_context.return_value = ""
+                mock_meta.return_value = {
+                    "tmux_session": "cao-session",
+                    "tmux_window": "developer-abcd",
+                }
+                mock_sm.get_status.return_value = TerminalStatus.IDLE
+
+                with pytest.raises(TerminalInputBlockedError):
+                    send_input("test1234", "second message")
+                mock_tmux.send_keys.assert_not_called()
+        finally:
+            lock.release()
+        # The slot is free again: the next dispatch goes through.
+        with (
+            patch("cli_agent_orchestrator.services.terminal_service.MemoryService") as mock_ms,
+            patch("cli_agent_orchestrator.services.terminal_service.status_monitor") as mock_sm,
+            patch("cli_agent_orchestrator.services.terminal_service.update_last_active"),
+            patch("cli_agent_orchestrator.services.terminal_service.provider_manager") as mock_pm,
+            patch("cli_agent_orchestrator.backends.registry._backend") as mock_tmux,
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata"
+            ) as mock_meta,
+        ):
+            mock_ms.return_value.get_curated_memory_context.return_value = ""
+            mock_meta.return_value = {
+                "tmux_session": "cao-session",
+                "tmux_window": "developer-abcd",
+            }
+            mock_provider = mock_pm.get_provider.return_value
+            mock_provider.paste_enter_count = 1
+            mock_provider.paste_submit_delay = 0.3
+            mock_sm.get_status.return_value = TerminalStatus.IDLE
+            mock_sm.notify_input_sent.return_value = 2
+
+            assert send_input("test1234", "next message") is True
+            mock_tmux.send_keys.assert_called_once()
 
     @patch("cli_agent_orchestrator.services.terminal_service.MemoryService")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
@@ -2224,7 +2324,7 @@ class TestSendInput:
 
         result = send_input("test1234", "1")
 
-        assert result == 3
+        assert result is True
         mock_tmux.send_keys.assert_called_once_with(
             "cao-session",
             "developer-abcd",

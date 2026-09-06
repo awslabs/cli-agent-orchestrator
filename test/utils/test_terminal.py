@@ -745,3 +745,57 @@ class TestPollUntilDone:
             g.side_effect = seq
             poll_until_done("abcd1234", timeout=60, polling_interval=0, dispatch_generation=4)
             assert g.call_count == 3
+
+    def test_dispatch_owned_idle_satisfies_stable_window(self):
+        """Issue #735 review (blocker 3): a fast turn that ends
+        PROCESSING → IDLE entirely inside the pre-poll delay settles into
+        post-dispatch IDLE. Its evidence dispatch reaches the dispatch
+        sequence, so the stable-IDLE window counts it — the
+        observed-activity gate alone would have waited until timeout."""
+        from cli_agent_orchestrator.utils.terminal import poll_until_done
+
+        seq = [
+            self._gen_resp("idle", 5),  # post-dispatch idle, never observed processing
+            self._gen_resp("idle", 5),
+            self._gen_resp("idle", 5),  # 3rd stable idle -> return
+        ]
+        with (
+            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
+        ):
+            g.side_effect = seq
+            poll_until_done(
+                "abcd1234",
+                timeout=60,
+                polling_interval=0,
+                idle_stable_polls=3,
+                dispatch_generation=5,
+            )
+            assert g.call_count == 3
+
+    def test_pre_dispatch_idle_never_counts(self):
+        """IDLE whose evidence predates the dispatch is the idle-before-
+        processing window, not a finished turn: it must never satisfy the
+        stable window (issue #735: pre-dispatch markers are not ours)."""
+        import click
+
+        from cli_agent_orchestrator.utils.terminal import poll_until_done
+
+        times = iter([0, 0.5, 1.0, 1.5, 100.0])
+        with (
+            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
+            patch(
+                "cli_agent_orchestrator.utils.terminal.time.time",
+                side_effect=lambda: next(times),
+            ),
+        ):
+            g.return_value = self._gen_resp("idle", 2)
+            with pytest.raises(click.ClickException, match="Timed out"):
+                poll_until_done(
+                    "abcd1234",
+                    timeout=10,
+                    polling_interval=0,
+                    idle_stable_polls=3,
+                    dispatch_generation=4,
+                )

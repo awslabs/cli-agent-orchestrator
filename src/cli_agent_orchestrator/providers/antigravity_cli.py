@@ -223,6 +223,14 @@ class AntigravityCliProvider(BaseProvider):
         # send_input(). This keeps the handoff/assign "wait for IDLE before
         # sending the task" contract working right after init.
         self._turns: int = 0
+        # Issue #407-style content snapshot (see claude_code): captured at
+        # mark_input_received so the READY verdict right after a dispatch can
+        # be told apart from the prior turn's retained response. Without it,
+        # the paste echo plus the unchanged ready footer reads as fresh
+        # COMPLETED before the new turn's work has rendered (issue #735
+        # review: "On Antigravity, paste echo plus the retained ready footer
+        # becomes fresh COMPLETED before work starts").
+        self._snapshot_last_response: Optional[str] = None
 
     @property
     def blocks_orchestrated_input_while_waiting_user_answer(self) -> bool:
@@ -788,6 +796,22 @@ class AntigravityCliProvider(BaseProvider):
             return TerminalStatus.PROCESSING
 
         if re.search(IDLE_FOOTER_PATTERN, bottom):
+            # Issue #407 paste-echo guard (ported from claude_code): right
+            # after a dispatch, the composited viewport still shows the
+            # PREVIOUS turn's response box above the retained ready footer,
+            # and the paste echo scrolls nothing new into the bottom window.
+            # Until the last response differs from the snapshot taken at
+            # mark_input_received, that READY belongs to the earlier turn:
+            # report PROCESSING so StatusMonitor's evidence stamp only
+            # advances on genuinely new content. The guard is inert once the
+            # content differs (the new turn's response rendered) or when no
+            # snapshot could be captured.
+            if (
+                self._snapshot_last_response is not None
+                and self._turns > 0
+                and self._snapshot_last_response == self._extract_last_exchange(joined)
+            ):
+                return TerminalStatus.PROCESSING
             return TerminalStatus.COMPLETED if self._turns > 0 else TerminalStatus.IDLE
 
         if re.search(ERROR_PATTERN, joined, re.MULTILINE):
@@ -922,6 +946,48 @@ class AntigravityCliProvider(BaseProvider):
         self._initialized = False
 
     def mark_input_received(self) -> None:
-        """Record that a turn was delivered (IDLE → COMPLETED on next status)."""
+        """Record that a turn was delivered (IDLE → COMPLETED on next status).
+
+        Also captures the #407-style content snapshot the ready-footer guard
+        in get_status_from_screen compares against: the last rendered
+        exchange (query line + response text). The frame right after this
+        dispatch still shows the PREVIOUS turn's exchange (the paste echo
+        sits in the input box below it), so a READY verdict on identical
+        content belongs to the earlier turn.
+        """
         super().mark_input_received()
         self._turns += 1
+        try:
+            output = get_backend().get_history(self.session_name, self.window_name) or ""
+            self._snapshot_last_response = self._extract_last_exchange(output)
+        except Exception:
+            # The pane read is best-effort: a transient capture failure must
+            # not break the dispatch itself. A None snapshot disables the
+            # guard (claude's #407 guard behaves the same on capture failure).
+            self._snapshot_last_response = None
+
+    def _extract_last_exchange(self, output: str) -> Optional[str]:
+        """Identity of the last COMPLETE exchange (query with a response).
+
+        A query line whose span to the next separator holds no content is the
+        dispatched message sitting unanswered in the input box (the paste
+        echo), not a turn — it is skipped, so right after a dispatch this
+        returns the PREVIOUS turn's exchange, which is exactly what the
+        staleness guard needs to compare against. Returns None when the pane
+        shows no complete exchange at all (fresh spawn, mid-init).
+        """
+        clean = strip_terminal_escapes(output)
+        lines = clean.split("\n")
+        last_exchange: Optional[str] = None
+        for i, line in enumerate(lines):
+            if not re.search(QUERY_PROMPT_PATTERN, line):
+                continue
+            body: list[str] = []
+            for j in range(i + 1, len(lines)):
+                if re.search(SEPARATOR_PATTERN, lines[j]):
+                    break
+                if lines[j].strip():
+                    body.append(lines[j].strip())
+            if body:
+                last_exchange = line.strip() + "\n" + "\n".join(body)
+        return last_exchange
