@@ -154,3 +154,129 @@ def test_repair_reports_ambiguous_duplicates_without_data_loss(tmp_path: Path) -
         count = conn.execute("SELECT COUNT(*) FROM memory_metadata").fetchone()[0]
     assert count == 2, "ambiguous duplicates must be retained without data loss"
     assert "uq_memory_key_scope_null" not in _index_names(db_file)
+
+
+def test_repair_reports_no_topic_duplicates_via_the_real_cli(tmp_path: Path) -> None:
+    """Duplicates with no surviving canonical topic fail actionably (P2-1).
+
+    Review finding: reconciliation only emitted records for discovered
+    filesystem topics, so NULL-scope duplicate identities absent from the
+    scan made the real CLI exit 0 with ``total=0`` while both rows stayed
+    and the migrator kept skipping the index. The repair must report every
+    such identity as a conflict, exit 1, and delete nothing.
+    """
+    home = _home(tmp_path)
+    db_file = _db_path(home)
+    _seed_legacy_schema(db_file)
+    # No topic files exist at all: both duplicate rows point at deleted paths.
+    _seed_duplicate_rows(db_file, "shared", ["/gone/a.md", "/gone/b.md"])
+    # A federated duplicate pair, equally unmapped, must not be invisible.
+    _seed_duplicate_rows(db_file, "fed", ["/fed/gone/a.md", "/fed/gone/b.md"], scope="federated")
+
+    dry = _run_repair(home)
+    assert dry.returncode == 1, "dry-run must already exit nonzero on the conflict"
+    assert "total=2" in dry.stdout, f"dry-run must see both identities: {dry.stdout}"
+    assert "federated:-:fed" in dry.stdout, "the federated duplicate is reported too"
+    assert "no canonical topic maps to it" in dry.stdout
+
+    result = _run_repair(home, "--apply")
+    assert result.returncode == 1, "apply must fail actionably, not report success"
+    assert "total=2" in result.stdout
+    assert "no canonical topic maps to it" in result.stdout
+    with sqlite3.connect(str(db_file)) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM memory_metadata").fetchone()[0]
+    assert count == 4, "no row may be deleted without a topic anchor"
+    assert "uq_memory_key_scope_null" not in _index_names(db_file)
+
+
+def test_repair_dedupes_mixed_timestamp_rows_without_crashing(tmp_path: Path) -> None:
+    """Mixed naive/NULL ``updated_at`` dedupes instead of TypeError (P2-2).
+
+    The apply-time survivor pick compared raw legacy timestamps with a
+    timezone-aware floor, so a NULL/naive mix crashed the record mid-repair.
+    The real CLI must complete the dedupe, keep the newest row, and land the
+    index in the same run.
+    """
+    home = _home(tmp_path)
+    db_file = _db_path(home)
+    _seed_legacy_schema(db_file)
+    topic = home / "memory" / "global" / "wiki" / "global" / "shared.md"
+    topic.write_text(_TOPIC_BODY, encoding="utf-8")
+    _seed_duplicate_rows(db_file, "shared", [str(topic), str(topic.with_name("stale.md"))])
+    with sqlite3.connect(str(db_file)) as conn:
+        conn.execute(
+            "UPDATE memory_metadata SET updated_at = '2026-07-01 10:00:00' " "WHERE file_path = ?",
+            (str(topic),),
+        )
+        conn.execute(
+            "UPDATE memory_metadata SET updated_at = NULL " "WHERE file_path = ?",
+            (str(topic.with_name("stale.md")),),
+        )
+        survivor_id = conn.execute(
+            "SELECT id FROM memory_metadata WHERE file_path = ?", (str(topic),)
+        ).fetchone()[0]
+        conn.commit()
+
+    result = _run_repair(home, "--apply")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "TypeError" not in result.stderr
+    with sqlite3.connect(str(db_file)) as conn:
+        rows = conn.execute("SELECT id, file_path FROM memory_metadata").fetchall()
+    assert rows == [(survivor_id, str(topic))], "newest (only dated) row survives"
+    assert "uq_memory_key_scope_null" in _index_names(db_file)
+
+
+def test_repair_surfaces_lock_failed_index_creation_and_recovers(tmp_path: Path) -> None:
+    """A competing write lock must not yield silent success (P2-3).
+
+    The migrator swallowed every exception at debug, so a concurrent SQLite
+    writer could make ``cao memory repair --apply`` exit 0 while the unique
+    index stayed absent. Under lock the CLI must fail naming the index; once
+    the lock is released a rerun must succeed and the index must exist.
+    """
+    import subprocess
+    import textwrap
+
+    home = _home(tmp_path)
+    db_file = _db_path(home)
+    _seed_legacy_schema(db_file)
+    topic = home / "memory" / "global" / "wiki" / "global" / "shared.md"
+    topic.write_text(_TOPIC_BODY, encoding="utf-8")
+    _seed_duplicate_rows(db_file, "shared", [str(topic), str(topic.with_name("stale.md"))])
+
+    # An external process holds a write lock for the whole repair window.
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent("""
+                import sqlite3, sys, time
+                conn = sqlite3.connect(sys.argv[1], timeout=30)
+                conn.execute("BEGIN EXCLUSIVE")
+                print("locked", flush=True)
+                time.sleep(30)
+                conn.rollback()
+                """),
+            str(db_file),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert holder.stdout is not None and holder.stdout.readline().strip() == "locked"
+        result = _run_repair(home, "--apply")
+        assert result.returncode != 0, "repair under lock must not report success"
+    finally:
+        holder.kill()
+        holder.wait(timeout=10)
+
+    # BEGIN EXCLUSIVE blocks readers too, so probe only after the release.
+    assert "uq_memory_key_scope_null" not in _index_names(db_file)
+
+    retry = _run_repair(home, "--apply")
+    assert retry.returncode == 0, retry.stdout + retry.stderr
+    assert "uq_memory_key_scope_null" in _index_names(db_file)
+    with sqlite3.connect(str(db_file)) as conn:
+        rows = conn.execute("SELECT COUNT(*) FROM memory_metadata").fetchone()[0]
+    assert rows == 1, "the retry completes the dedupe"

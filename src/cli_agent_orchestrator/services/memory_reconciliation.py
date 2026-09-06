@@ -268,6 +268,7 @@ class MemoryReconciliationService:
         self.base_dir = Path(base_dir or MEMORY_BASE_DIR)
         self._db_engine = db_engine
         self._db_session_factory: Any = None
+        self._strict_index = False
         if db_engine is not None:
             from sqlalchemy.orm import sessionmaker
 
@@ -914,6 +915,29 @@ class MemoryReconciliationService:
                 )
 
         all_records = records + parsed_records
+        # Rows whose NULL-scope identity has NO surviving canonical topic are
+        # invisible to topic-driven planning above, yet they are exactly the
+        # duplicate state that keeps uq_memory_key_scope_null off the database
+        # (review: repair used to exit 0 with total=0 while the rows stayed).
+        # Surface every unmapped duplicate NULL-scope identity as an
+        # actionable conflict: rows preserved, manual resolution named.
+        mapped_identities = {topic.identity for topic in topics}
+        for identity, identity_rows in sorted(rows_by_identity.items()):
+            if identity in mapped_identities or identity.scope_id is not None:
+                continue
+            if len(identity_rows) <= 1:
+                continue
+            all_records.append(
+                self._candidate_record(
+                    Path(identity_rows[0].file_path or "<unknown>"),
+                    RepairAction.CONFLICT,
+                    "duplicate_database_identity",
+                    "multiple SQLite rows hold this NULL-scope identity and no canonical "
+                    "topic maps to it; restore or move the canonical topic file, or "
+                    "remove the stray rows manually",
+                    identity,
+                )
+            )
         all_records.sort(
             key=lambda record: (
                 record.identity.scope if record.identity else "",
@@ -1077,9 +1101,14 @@ class MemoryReconciliationService:
             path_matches = [row for row in rows if self._resolved_row_path(row) == topic.file_path]
             if not path_matches:
                 raise RuntimeError("metadata duplicate lost its canonical anchor while lock held")
+            # Legacy rows can mix naive, timezone-aware and NULL ``updated_at``
+            # values (SQLite stores naive datetimes), and comparing a naive
+            # value with the tz-aware ``_MIN_DT`` floor raises ``TypeError``
+            # mid-repair. Normalize through the same ``_utc()`` path planning
+            # uses so the survivor pick is well-defined on legacy data.
             survivor = max(
                 path_matches,
-                key=lambda row: (row.updated_at or _MIN_DT, row.id),
+                key=lambda row: (_utc(row.updated_at) or _MIN_DT, row.id),
             )
             removed = 0
             for row in rows:
@@ -1280,6 +1309,71 @@ class MemoryReconciliationService:
                                 ),
                             )
                         )
+
+            # A dedupe above can free a dependent conflict: every plan in this
+            # run was derived from the pre-mutation row snapshot, so a topic
+            # whose canonical path was occupied by another identity's stale
+            # duplicate row planned a row-state conflict that the dedupe has
+            # just resolved. Re-plan those from a fresh snapshot and execute
+            # the recovered plan here, so one repair run clears both the
+            # duplicate and its dependent conflict instead of demanding a
+            # second identical run.
+            row_state_conflicts = {"database_path_conflict", "ambiguous_database_path"}
+            conflicted_indexes = [
+                index
+                for index, record in enumerate(results)
+                if record.status == "skipped"
+                and record.finding is not None
+                and record.finding.kind in row_state_conflicts
+                and record.identity is not None
+            ]
+            if conflicted_indexes:
+                fresh_maps: Optional[
+                    tuple[dict[MemoryIdentity, list[_Row]], dict[Path, list[_Row]]]
+                ] = None
+                try:
+                    fresh_maps = self._row_maps(self._load_rows())
+                except Exception:
+                    fresh_maps = None
+                if fresh_maps is not None:
+                    fresh_by_identity, fresh_by_path = fresh_maps
+                    for index in conflicted_indexes:
+                        record = results[index]
+                        try:
+                            parsed = self._parse_candidate(self._candidate_from_record(record))
+                        except Exception:
+                            continue
+                        if isinstance(parsed, RepairRecord):
+                            continue
+                        replanned = self._plan_topic(
+                            parsed,
+                            rows_by_identity=fresh_by_identity,
+                            rows_by_path=fresh_by_path,
+                        )
+                        if replanned.status == "skipped":
+                            results[index] = replanned
+                            continue
+                        try:
+                            if RepairAction.DEDUPE_METADATA in replanned.actions:
+                                self._dedupe_metadata(parsed)
+                            for metadata_action in (
+                                RepairAction.CREATE_METADATA,
+                                RepairAction.UPDATE_METADATA,
+                            ):
+                                if metadata_action in replanned.actions:
+                                    self._repair_metadata(parsed, metadata_action)
+                            if RepairAction.REBUILD_INDEX in replanned.actions:
+                                self._repair_index_batch([parsed])
+                            results[index] = replace(
+                                replanned,
+                                status=(
+                                    "unchanged"
+                                    if replanned.actions == (RepairAction.UNCHANGED,)
+                                    else "repaired"
+                                ),
+                            )
+                        except Exception as exc:
+                            results[index] = self._failed_record(replanned, exc)
         finally:
             for _, _, lock_fd in reversed(locked_all):
                 try:
@@ -1301,20 +1395,33 @@ class MemoryReconciliationService:
     def _ensure_null_scope_unique_index(self) -> None:
         """Create ``uq_memory_key_scope_null`` if duplicates allow it.
 
-        Fail-soft by design — the startup migrator re-attempts this — but
-        exceptions surface to the caller because this runs inside an explicit
-        ``cao memory repair --apply``, where a silently missing index is
-        exactly the dead remediation path issue #657's review called out.
+        Fail-soft for the startup path — the startup migrator re-attempts
+        this — but the explicit ``cao memory repair --apply`` invocation sets
+        ``_strict_index``, where exceptions surface to the caller because a
+        silently missing index is exactly the dead remediation path issue
+        #657's review called out.
         """
         from cli_agent_orchestrator.clients.database import (
             _migrate_memory_scope_null_uniqueness,
         )
 
-        _migrate_memory_scope_null_uniqueness(engine=self._db_engine)
+        _migrate_memory_scope_null_uniqueness(engine=self._db_engine, strict=self._strict_index)
 
     def reconcile(self, *, apply: bool = False) -> RepairReport:
-        """Plan by default; mutate only when explicitly requested."""
-        return self.apply() if apply else self.plan()
+        """Plan by default; mutate only when explicitly requested.
+
+        ``apply=True`` is the explicit ``cao memory repair --apply``
+        invocation, so the same-run index creation is strict — a failure
+        there must surface rather than be logged at debug. The startup path
+        calls ``apply()`` directly and keeps the fail-soft default.
+        """
+        if not apply:
+            return self.plan()
+        self._strict_index = True
+        try:
+            return self.apply()
+        finally:
+            self._strict_index = False
 
 
 def reconcile_memory_startup() -> Optional[RepairReport]:

@@ -702,7 +702,7 @@ def _migrate_workflow_plan_approval() -> None:
         logger.debug(f"workflow_plan_approval migration skipped: {e}")
 
 
-def _migrate_memory_scope_null_uniqueness(engine: Any = None) -> None:
+def _migrate_memory_scope_null_uniqueness(engine: Any = None, *, strict: bool = False) -> None:
     """Create the partial unique index backing ``uq_memory_key_scope`` for
     NULL ``scope_id`` rows (issue #657). Appended LAST to the ``init_db()``
     registry.
@@ -724,6 +724,11 @@ def _migrate_memory_scope_null_uniqueness(engine: Any = None) -> None:
     ``cao memory repair`` rather than blocking startup. The repair now
     re-invokes this migrator once its dedupe has cleared the duplicates, so
     the index lands in the same repair run instead of at the next startup.
+    ``strict=True`` (the explicit ``cao memory repair --apply`` path) makes
+    that re-invocation honest: DDL failure — e.g. a competing SQLite write
+    lock — propagates instead of being logged at debug, and the named index
+    is verified present before returning, so repair can no longer report
+    success while the index is absent; the startup default stays fail-soft.
     """
     import sqlite3
 
@@ -735,11 +740,41 @@ def _migrate_memory_scope_null_uniqueness(engine: Any = None) -> None:
             # Reuse the caller's engine connection pool so the attempt and the
             # repairs share one database identity.
             with engine.connect() as conn:
+                index_rows = conn.exec_driver_sql(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type = 'index' AND name = 'uq_memory_key_scope_null'"
+                ).fetchall()
+                if index_rows:
+                    return
+                duplicates = conn.exec_driver_sql(
+                    "SELECT key, scope, COUNT(*) FROM memory_metadata "
+                    "WHERE scope_id IS NULL GROUP BY key, scope HAVING COUNT(*) > 1"
+                ).fetchall()
+                if duplicates:
+                    rendered = ", ".join(
+                        f"{scope}:{key}x{count}" for key, scope, count in duplicates
+                    )
+                    logger.warning(
+                        "Skipping uq_memory_key_scope_null creation: duplicate global/federated "
+                        f"rows in memory_metadata ({rendered}). Run `cao memory repair` to "
+                        "reconcile them; the unique index is created on the next startup."
+                    )
+                    return
                 conn.exec_driver_sql(
                     "CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_key_scope_null "
                     "ON memory_metadata (key, scope) WHERE scope_id IS NULL"
                 )
                 conn.commit()
+                if strict:
+                    created = conn.exec_driver_sql(
+                        "SELECT name FROM sqlite_master "
+                        "WHERE type = 'index' AND name = 'uq_memory_key_scope_null'"
+                    ).fetchall()
+                    if not created:
+                        raise RuntimeError(
+                            "uq_memory_key_scope_null creation reported success but the "
+                            "index is absent from sqlite_master"
+                        )
             return
         with sqlite3.connect(target) as conn:
             duplicates = conn.execute(
@@ -758,7 +793,19 @@ def _migrate_memory_scope_null_uniqueness(engine: Any = None) -> None:
                 "CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_key_scope_null "
                 "ON memory_metadata (key, scope) WHERE scope_id IS NULL"
             )
+            if strict:
+                created = conn.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type = 'index' AND name = 'uq_memory_key_scope_null'"
+                ).fetchall()
+                if not created:
+                    raise RuntimeError(
+                        "uq_memory_key_scope_null creation reported success but the "
+                        "index is absent from sqlite_master"
+                    )
     except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug
+        if strict:
+            raise
         logger.debug(f"memory scope NULL uniqueness migration skipped: {e}")
 
 
