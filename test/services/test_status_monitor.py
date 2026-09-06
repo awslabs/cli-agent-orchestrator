@@ -1085,20 +1085,21 @@ class TestStatusEvidenceGeneration:
     def test_latch_change_stamps_evidence_generation(self):
         m = _SequencedMonitor()
         # Pre-dispatch: some earlier turn's completion latched from its own
-        # output chunk (generation 1).
+        # output — with no dispatch ever assigned, its evidence dispatch is 0.
         m.feed(TerminalStatus.COMPLETED)
         stamped = m.sm.get_status_generation("t1")
-        assert stamped == 1
+        assert stamped == 0
 
-        # Dispatch bumps the generation; the first post-dispatch chunk bumps
-        # it again before the new completion is detected from that output.
+        # The dispatch gets sequence 1; post-dispatch output then latches a
+        # new completion whose evidence belongs to dispatch 1.
         dispatch = m.sm.notify_input_sent("t1")
-        assert dispatch == 2
+        assert dispatch == 1
         m.feed(TerminalStatus.PROCESSING)
         m.feed(TerminalStatus.COMPLETED)
 
         evidence = m.sm.get_status_generation("t1")
-        assert evidence > dispatch
+        assert evidence > stamped
+        assert evidence >= dispatch
         assert m.status() == TerminalStatus.COMPLETED
 
     def test_unchanged_latch_does_not_refresh_evidence_generation(self):
@@ -1118,6 +1119,55 @@ class TestStatusEvidenceGeneration:
     def test_no_evidence_reports_zero(self):
         sm = StatusMonitor()
         assert sm.get_status_generation("unknown-terminal") == 0
+        assert sm.get_status_snapshot("unknown-terminal") == (TerminalStatus.UNKNOWN, 0)
+
+    def test_snapshot_pairs_status_and_evidence_atomically(self):
+        """get_status_snapshot returns both values from ONE lock hold.
+
+        Review blocker 2 (controlled interleaving): a thread that samples the
+        status and the evidence in two separate reads can pair a stale
+        completed with a newer processing evidence stamp. The snapshot API
+        reads both under the same lock, so every observed pair is one that
+        actually coexisted.
+        """
+        m = _SequencedMonitor()
+        m.feed(TerminalStatus.COMPLETED)
+        # Evidence of that pre-dispatch completion is dispatch 0 (no dispatch
+        # had been assigned when it latched).
+        status, evidence = m.sm.get_status_snapshot("t1")
+        assert status == TerminalStatus.COMPLETED
+        assert evidence == 0
+
+        dispatch = m.sm.notify_input_sent("t1")
+        m.feed(TerminalStatus.PROCESSING)
+        m.feed(TerminalStatus.COMPLETED)
+        status, evidence = m.sm.get_status_snapshot("t1")
+        assert status == TerminalStatus.COMPLETED
+        assert evidence >= dispatch
+
+    def test_interleaved_dispatches_own_their_own_evidence(self):
+        """Review blocker 1: adjacent dispatches cannot consume each other's
+        completion — output that latches between dispatch N and dispatch N+1
+        stamps evidence N, which dispatch N+1's wait must reject (N < N+1)."""
+        m = _SequencedMonitor()
+        first = m.sm.notify_input_sent("t1")
+        m.feed(TerminalStatus.PROCESSING)
+        m.feed(TerminalStatus.COMPLETED)
+        # Evidence stamped at dispatch 1: owned by the FIRST dispatch.
+        assert m.sm.get_status_snapshot("t1") == (TerminalStatus.COMPLETED, first)
+
+        # A second dispatch arrives while that completion is latched. The
+        # latch is unchanged until new output arrives, so the evidence stamp
+        # still reads first — the second dispatch's wait keeps waiting.
+        second = m.sm.notify_input_sent("t1")
+        assert second == first + 1
+        assert m.sm.get_status_snapshot("t1") == (TerminalStatus.COMPLETED, first)
+        assert first < second  # the stale completion cannot satisfy dispatch 2
+
+        # The second turn's own output re-latches with evidence second.
+        m.feed(TerminalStatus.PROCESSING)
+        m.feed(TerminalStatus.COMPLETED)
+        assert m.sm.get_status_snapshot("t1") == (TerminalStatus.COMPLETED, second)
 
     def test_fast_completion_outranks_dispatch_while_echo_does_not(self):
         """The reviewer's exact-head race, composed against the REAL screen

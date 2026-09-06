@@ -271,7 +271,13 @@ def poll_until_done(
       after a send before it has begun processing. Gating the IDLE path on
       "has started" prevents returning early with empty/partial output when
       the agent simply hasn't picked up the task yet; the stable-window then
-      guards against a momentary idle flap mid-turn.
+      guards against a momentary idle flap mid-turn. With
+      ``dispatch_generation`` set, IDLE whose evidence dispatch reaches the
+      dispatch counts as observed working: a fast turn that ends
+      PROCESSING → IDLE entirely inside the pre-poll delay settles into
+      post-dispatch IDLE, which the observed-activity gate alone would reject
+      until timeout (issue #735 review: "fast completion ending in IDLE still
+      times out").
 
     Raises click.ClickException on error, timeout, or request failure.
     """
@@ -296,14 +302,24 @@ def poll_until_done(
             resp.raise_for_status()
             payload = resp.json()
             status = payload.get("status")
+            status_generation = payload.get("status_generation")
+            # Dispatch-owned evidence (this turn's output is behind the
+            # latched status) counts as observed work for BOTH done signals:
+            # the COMPLETED branch below returns on it directly, and the IDLE
+            # branch needs it because a fast turn can end PROCESSING → IDLE
+            # entirely before this loop ever polls.
+            evidence_owned_by_dispatch = (
+                dispatch_generation is not None
+                and status_generation is not None
+                and status_generation >= dispatch_generation
+            )
             if status == TerminalStatus.COMPLETED.value:
                 if dispatch_generation is not None:
                     # Correlate with THIS dispatch: the completion is ours
                     # only when the evidence behind the latched status was
-                    # sampled at or after the dispatch generation. Absent
+                    # sampled at or after the dispatch. Absent
                     # status_generation (a mid-rollout server) falls back to
                     # the observed-working gate.
-                    status_generation = payload.get("status_generation")
                     if status_generation is None:
                         if observed_working:
                             return
@@ -318,7 +334,7 @@ def poll_until_done(
                 # agent actually start working — otherwise the idle-before-
                 # processing window right after a send would return early with
                 # empty output.
-                if observed_working:
+                if observed_working or evidence_owned_by_dispatch:
                     consecutive_idle += 1
                     if consecutive_idle >= idle_stable_polls:
                         return

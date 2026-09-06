@@ -183,6 +183,84 @@ def test_screen_resolves_stale_processing_footer_regression():
     assert p.get_status_from_screen(screen) == TerminalStatus.IDLE
 
 
+def _prior_turn_pane() -> str:
+    """A settled completed pane: one delivered turn, response rendered."""
+    return (
+        "> first question\n"
+        "  prior turn answer PREV1\n"
+        + ("─" * 80)
+        + "\n> \n"
+        + ("─" * 80)
+        + "\n? for shortcuts   Gemini 3.1 Pro (High)\n"
+    )
+
+
+def _dispatched_pane_with_echo() -> list[str]:
+    """The composited viewport right after a dispatch: the paste echo has been
+    accepted into the composer but the previous turn's exchange is unchanged
+    and the ready footer is still rendered (issue #735 review: "paste echo
+    plus the retained ready footer becomes fresh COMPLETED before work
+    starts")."""
+    return [
+        "> first question",
+        "  prior turn answer PREV1",
+        "─" * 80,
+        "> Run the probe and reply DONE",
+        "─" * 80,
+        "? for shortcuts   Gemini 3.1 Pro (High)",
+    ]
+
+
+def _completed_new_turn_screen() -> list[str]:
+    """The same pane after the new turn finishes: the new exchange is rendered
+    above the input box and the ready footer is back."""
+    return [
+        "> Run the probe and reply DONE",
+        "  fresh turn answer FAST1",
+        "─" * 80,
+        "> ",
+        "─" * 80,
+        "? for shortcuts   Gemini 3.1 Pro (High)",
+    ]
+
+
+def test_screen_paste_echo_does_not_become_fresh_completed():
+    """The #407 guard, ported to agy's screen path (PR #741 rework).
+
+    A dispatch snapshots the last rendered exchange. Until the screen's last
+    exchange differs from that snapshot, a ready-footer verdict is the prior
+    turn's, not the new turn's: PROCESSING. The dispatch-correlated wait
+    (status_generation >= input_generation) therefore cannot be satisfied by
+    the paste echo — StatusMonitor's evidence stamp only advances on the
+    genuinely new content.
+    """
+    p = make_provider()
+    with patch("cli_agent_orchestrator.providers.antigravity_cli.get_backend") as mock_get_backend:
+        mock_get_backend.return_value.get_history.return_value = _prior_turn_pane()
+        p.mark_input_received()
+
+    assert p._turns == 1
+    assert p._snapshot_last_response is not None
+
+    # Paste echo + retained prior exchange + ready footer: still the OLD turn.
+    assert p.get_status_from_screen(_dispatched_pane_with_echo()) == (TerminalStatus.PROCESSING)
+
+    # The new turn's response renders: the exchange differs from the snapshot.
+    assert p.get_status_from_screen(_completed_new_turn_screen()) == (TerminalStatus.COMPLETED)
+
+
+def test_screen_guard_inert_when_snapshot_capture_fails():
+    """A transient capture failure at mark_input_received disables the guard
+    (claude_code's #407 guard behaves the same) — the ready verdict stands."""
+    p = make_provider()
+    with patch("cli_agent_orchestrator.providers.antigravity_cli.get_backend") as mock_get_backend:
+        mock_get_backend.return_value.get_history.side_effect = RuntimeError("no pane")
+        p.mark_input_received()
+
+    assert p._snapshot_last_response is None
+    assert p.get_status_from_screen(_completed_new_turn_screen()) == (TerminalStatus.COMPLETED)
+
+
 # --------------------------------------------------------------------------- #
 # Response extraction
 # --------------------------------------------------------------------------- #
