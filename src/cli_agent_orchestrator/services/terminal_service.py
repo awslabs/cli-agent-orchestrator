@@ -172,8 +172,6 @@ CROSS_NODE_NOTIFY_TIMEOUT = 10.0
 _memory_injected_terminals: set = set()
 _memory_injected_lock = threading.Lock()
 
-_pre_dispatch_viewports: Dict[str, str] = {}
-_pre_dispatch_viewports_lock = threading.Lock()
 _CURRENT_COMPOSER_PROBE_MAX_CHARS = 64
 
 # Strong references to in-flight deferred-init background tasks. asyncio keeps
@@ -1765,29 +1763,34 @@ def _worker_is_started_direct(terminal_id: str, provider) -> bool:
     return status in _DEFERRED_STARTED_STATUSES
 
 
-def _capture_plain_viewport(terminal_id: str) -> Optional[str]:
+def _capture_current_composer_region(terminal_id: str, probe_chars: int) -> Optional[str]:
     try:
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
             return None
-        return get_backend().get_history(
+        backend = get_backend()
+        viewport = backend.get_history(
             metadata["tmux_session"],
             metadata["tmux_window"],
             strip_escapes=True,
             visible_only=True,
         )
+        cursor = backend.get_cursor_position(metadata["tmux_session"], metadata["tmux_window"])
+        if cursor is None:
+            return None
+        cursor_x, cursor_y, pane_width = cursor
+        if cursor_x < 0 or cursor_y < 0 or pane_width <= 0:
+            return None
+        lines = viewport.split("\n")
+        if cursor_y >= len(lines):
+            return None
+        rows = max(2, (2 * probe_chars + pane_width - 1) // pane_width + 1)
+        return "\n".join(
+            lines[max(0, cursor_y - rows + 1) : cursor_y] + [lines[cursor_y][:cursor_x]]
+        )
     except Exception:
-        logger.debug("Failed to capture viewport for %s", terminal_id, exc_info=True)
+        logger.debug("Failed to capture current composer for %s", terminal_id, exc_info=True)
         return None
-
-
-def _remember_pre_dispatch_viewport(terminal_id: str) -> None:
-    viewport = _capture_plain_viewport(terminal_id)
-    with _pre_dispatch_viewports_lock:
-        if viewport is None:
-            _pre_dispatch_viewports.pop(terminal_id, None)
-        else:
-            _pre_dispatch_viewports[terminal_id] = viewport
 
 
 def _normalized_box_text(text: str) -> str:
@@ -1795,13 +1798,12 @@ def _normalized_box_text(text: str) -> str:
 
 
 def _message_visible_in_box(terminal_id: str, message: str) -> bool:
-    """True when the current dispatch introduced message text into the viewport.
+    """True when the current editable composer contains the message text.
 
-    A bare Enter is safe only when a current paste introduced its text after the
-    pre-dispatch viewport snapshot. The pane can retain historical deliveries,
-    and the rolling output buffer can retain ANSI escapes or truncate a long
-    composer, so compare escape-free viewport captures and only require the
-    bounded trailing message probe to be newly present. A miss takes the safer
+    A bare Enter is safe only when the bounded trailing message probe is beside
+    the current cursor. The pane can retain historical deliveries and a rolling
+    output buffer can truncate a long composer, so this reads an escape-free
+    current viewport region rather than historical text. A miss takes the safer
     full-redelivery path.
     """
     normalized_message = _normalized_box_text(message)
@@ -1809,15 +1811,10 @@ def _message_visible_in_box(terminal_id: str, message: str) -> bool:
     if len(probe) < 8:
         return False
 
-    with _pre_dispatch_viewports_lock:
-        before = _pre_dispatch_viewports.get(terminal_id)
-    if before is None:
+    composer = _capture_current_composer_region(terminal_id, len(probe))
+    if composer is None:
         return False
-
-    after = _capture_plain_viewport(terminal_id)
-    if after is None:
-        return False
-    return _normalized_box_text(after).count(probe) > _normalized_box_text(before).count(probe)
+    return probe in _normalized_box_text(composer)
 
 
 def redeliver_dropped_message(
@@ -2354,8 +2351,6 @@ def send_input(
         # same dispatch boundary above.
         if provider:
             provider.mark_input_received()
-
-        _remember_pre_dispatch_viewport(terminal_id)
 
         get_backend().send_keys(
             metadata["tmux_session"],

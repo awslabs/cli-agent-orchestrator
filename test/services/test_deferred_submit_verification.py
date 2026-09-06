@@ -15,24 +15,20 @@ from cli_agent_orchestrator.services import terminal_service as ts
 
 class TestMessageVisibleInBox:
     @staticmethod
-    def _visible_after_dispatch(before, after, message):
-        with patch.object(ts, "_capture_plain_viewport", side_effect=[before, after]):
-            ts._remember_pre_dispatch_viewport("t1")
+    def _visible_in_current_composer(composer, message):
+        with patch.object(ts, "_capture_current_composer_region", return_value=composer):
             return ts._message_visible_in_box("t1", message)
 
     def test_true_when_current_composer_adds_message(self):
-        assert self._visible_after_dispatch(
-            "❯ (empty prompt)", "❯ Analyze the logs now", "Analyze the logs"
-        )
+        assert self._visible_in_current_composer("❯ Analyze the logs now", "Analyze the logs")
 
     def test_false_when_current_viewport_does_not_add_message(self):
-        assert not self._visible_after_dispatch(
-            "❯ (empty prompt)", "❯ (empty prompt)", "Analyze the logs"
-        )
+        assert not self._visible_in_current_composer("❯ (empty prompt)", "Analyze the logs")
 
-    def test_viewport_capture_is_escape_free_and_history_free(self):
+    def test_current_composer_capture_is_escape_free_and_cursor_bounded(self):
         backend = MagicMock()
-        backend.get_history.return_value = "› Analyze the logs carefully"
+        backend.get_history.return_value = "old history\n› Analyze the logs carefully"
+        backend.get_cursor_position.return_value = (28, 1, 80)
         with (
             patch.object(
                 ts,
@@ -41,12 +37,16 @@ class TestMessageVisibleInBox:
             ),
             patch.object(ts, "get_backend", return_value=backend),
         ):
-            assert ts._capture_plain_viewport("t1") == "› Analyze the logs carefully"
+            assert (
+                ts._capture_current_composer_region("t1", 24)
+                == "old history\n› Analyze the logs carefully"
+            )
         backend.get_history.assert_called_once_with(
             "session", "window", strip_escapes=True, visible_only=True
         )
+        backend.get_cursor_position.assert_called_once_with("session", "window")
 
-    def test_send_input_snapshots_viewport_before_paste(self):
+    def test_send_input_does_not_retain_a_viewport_before_paste(self):
         events = []
         backend = MagicMock()
         backend.send_keys.side_effect = lambda *args, **kwargs: events.append("paste")
@@ -60,29 +60,38 @@ class TestMessageVisibleInBox:
             patch.object(ts, "inject_memory_context", return_value="Analyze the logs"),
             patch.object(ts.status_monitor, "notify_input_sent"),
             patch.object(ts.status_monitor, "clear_rolling_buffer"),
-            patch.object(
-                ts,
-                "_remember_pre_dispatch_viewport",
-                side_effect=lambda _: events.append("snapshot"),
-            ),
             patch.object(ts, "get_backend", return_value=backend),
             patch.object(ts, "update_last_active"),
         ):
             manager.get_provider.return_value = None
             assert ts.send_input("t1", "Analyze the logs")
-        assert events == ["snapshot", "paste"]
+        assert events == ["paste"]
 
     def test_false_when_message_too_short(self):
-        with patch.object(ts, "_capture_plain_viewport") as capture:
+        with patch.object(ts, "_capture_current_composer_region") as capture:
             assert ts._message_visible_in_box("t1", "go") is False
             capture.assert_not_called()
 
     def test_false_when_output_fetch_raises(self):
-        assert not self._visible_after_dispatch("❯ (empty prompt)", None, "Analyze the logs")
+        assert not self._visible_in_current_composer(None, "Analyze the logs")
+
+    def test_current_composer_capture_rejects_invalid_cursor_geometry(self):
+        backend = MagicMock()
+        backend.get_history.return_value = "› Analyze the logs"
+        backend.get_cursor_position.return_value = (-1, 0, 80)
+        with (
+            patch.object(
+                ts,
+                "get_terminal_metadata",
+                return_value={"tmux_session": "session", "tmux_window": "window"},
+            ),
+            patch.object(ts, "get_backend", return_value=backend),
+        ):
+            assert ts._capture_current_composer_region("t1", 16) is None
 
     def test_match_survives_wrapping_and_whitespace(self):
-        assert self._visible_after_dispatch(
-            "❯ (empty prompt)", "❯ Analyze the\n  logs carefully", "Analyze the logs"
+        assert self._visible_in_current_composer(
+            "❯ Analyze the\n  logs carefully", "Analyze the logs"
         )
 
     def test_prior_handoff_does_not_read_as_the_current_one(self):
@@ -92,12 +101,8 @@ class TestMessageVisibleInBox:
             "your deliverables.\n\nRefactor the config loader module"
         )
         stale = current.replace("Refactor the config loader module", "Fix the flaky e2e login test")
-        assert not self._visible_after_dispatch(
-            f"› {stale}\n❯ (empty prompt)", f"› {stale}\n❯ (empty prompt)", current
-        )
-        assert self._visible_after_dispatch(
-            f"› {stale}\n❯ (empty prompt)", f"› {stale}\n› {current}", current
-        )
+        assert not self._visible_in_current_composer("❯ (empty prompt)", current)
+        assert self._visible_in_current_composer(f"› {current}", current)
 
     @pytest.mark.parametrize(
         "stale",
@@ -113,25 +118,22 @@ class TestMessageVisibleInBox:
             if "東京" in stale
             else "[CAO Handoff] repeat the exact task"
         )
-        assert not self._visible_after_dispatch(
-            f"› {stale}\n❯ (empty prompt)", f"› {stale}\n❯ (empty prompt)", current
-        )
+        assert not self._visible_in_current_composer("❯ (empty prompt)", current)
 
     def test_identical_current_composer_counts_as_new(self):
         message = "[CAO Handoff] repeat the exact task"
-        assert self._visible_after_dispatch(
-            f"› {message}\n❯ (empty prompt)", f"› {message}\n› {message}", message
-        )
+        assert self._visible_in_current_composer(f"› {message}", message)
+
+    def test_current_composer_counts_when_a_stale_identical_prompt_scrolled_out(self):
+        message = "[CAO Handoff] repeat the exact task"
+        assert self._visible_in_current_composer(f"› {message}", message)
 
     def test_escape_free_viewport_handles_ansi_wrapping_and_truncated_history(self):
         message = "Analyze the logs carefully and preserve the current composer message tail"
         tail = ts._normalized_box_text(message)[-ts._CURRENT_COMPOSER_PROBE_MAX_CHARS :]
         with patch.object(
-            ts,
-            "_capture_plain_viewport",
-            side_effect=["❯ (empty prompt)", f"› {tail[:24]}\n{tail[24:]}"],
+            ts, "_capture_current_composer_region", return_value=f"› {tail[:24]}\n{tail[24:]}"
         ):
-            ts._remember_pre_dispatch_viewport("t1")
             assert ts._message_visible_in_box("t1", message)
 
 

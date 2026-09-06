@@ -1225,6 +1225,31 @@ class TmuxClient:
             logger.error(f"Failed to get history from {session_name}:{window_name}: {e}")
             raise
 
+    def get_cursor_position(
+        self, session_name: str, window_name: str
+    ) -> Optional[tuple[int, int, int]]:
+        """Return the active pane cursor column, row, and width when readable."""
+        try:
+            session = self._find_session(session_name)
+            if not session:
+                return None
+            window = self._find_window(session, session_name, window_name)
+            if not window:
+                return None
+            pane = self._find_first_pane(window, session_name, window_name)
+            if not pane:
+                return None
+            result = pane.cmd("display-message", "-p", "#{cursor_x} #{cursor_y} #{pane_width}")
+            if not result.stdout:
+                return None
+            cursor_x, cursor_y, pane_width = (int(value) for value in result.stdout[0].split())
+            if cursor_x < 0 or cursor_y < 0 or pane_width <= 0:
+                return None
+            return cursor_x, cursor_y, pane_width
+        except Exception as e:
+            logger.error(f"Failed to get cursor position for {session_name}:{window_name}: {e}")
+            return None
+
     def list_sessions(self) -> List[Dict[str, str]]:
         """List all tmux sessions.
 

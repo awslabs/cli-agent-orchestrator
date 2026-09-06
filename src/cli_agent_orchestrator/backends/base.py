@@ -250,6 +250,16 @@ class TerminalBackend(ABC):
         """
         ...
 
+    def get_cursor_position(
+        self, session_name: str, window_name: str
+    ) -> Optional[tuple[int, int, int]]:
+        """Return the cursor column, row, and pane width when available.
+
+        Backends without rendered-pane cursor geometry return ``None``. Callers
+        must treat that as an unknown screen state rather than inferring one.
+        """
+        return None
+
     @abstractmethod
     def get_pane_working_directory(self, session_name: str, window_name: str) -> Optional[str]:
         """Get the current working directory of a pane.
