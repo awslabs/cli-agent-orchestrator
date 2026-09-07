@@ -243,6 +243,7 @@ async def inbox_reconciliation_daemon(registry: PluginRegistry) -> None:
 class TerminalOutputResponse(BaseModel):
     output: str
     mode: str
+    input_generation: Optional[int] = None
 
 
 class TerminalOutputRange(BaseModel):
@@ -3621,14 +3622,17 @@ async def send_terminal_key(
 async def get_terminal_output(
     terminal_id: TerminalId,
     mode: OutputMode = OutputMode.FULL,
+    input_generation: Optional[int] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> TerminalOutputResponse:
     try:
         # get_output does a blocking tmux capture-pane plus provider regex
         # extraction over the scrollback — run it off the loop so a large
         # transcript can't stall the whole server.
-        output = await asyncio.to_thread(terminal_service.get_output, terminal_id, mode)
-        return TerminalOutputResponse(output=output, mode=mode)
+        output = await asyncio.to_thread(
+            terminal_service.get_output, terminal_id, mode, input_generation
+        )
+        return TerminalOutputResponse(output=output, mode=mode, input_generation=input_generation)
     except OutputExtractionError as e:
         # Ordered before the ValueError arm it subclasses, same as run_step: the
         # terminal and the route both resolved -- only the response marker was

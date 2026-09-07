@@ -2098,7 +2098,7 @@ class TestSendInput:
             mock_provider.paste_enter_count = 1
             mock_provider.paste_submit_delay = 0.3
             mock_sm.get_status.return_value = TerminalStatus.IDLE
-            mock_sm.notify_input_sent.return_value = 7
+            mock_sm.claim_dispatch.return_value = 7
 
             ok, generation = dispatch_input("test1234", "test message")
 
@@ -2178,11 +2178,17 @@ class TestSendInput:
         with (
             patch("cli_agent_orchestrator.services.terminal_service.status_monitor") as mock_sm,
             patch("cli_agent_orchestrator.backends.registry._backend") as mock_tmux,
+            patch("cli_agent_orchestrator.services.terminal_service.provider_manager"),
         ):
-            mock_sm.has_inflight_dispatch.return_value = True
+            mock_sm.claim_dispatch.return_value = None
+            mock_meta = patch(
+                "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+                return_value={"tmux_session": "cao-session", "tmux_window": "developer-abcd"},
+            )
 
-            with pytest.raises(TerminalInputBlockedError, match="in-flight message dispatch"):
-                send_input("test1234", "second message")
+            with mock_meta:
+                with pytest.raises(TerminalInputBlockedError, match="in-flight message dispatch"):
+                    send_input("test1234", "second message")
 
             mock_tmux.send_keys.assert_not_called()
 
@@ -2228,7 +2234,9 @@ class TestSendInput:
         send_input("test1234", "hello worker")
 
         mock_provider.mark_input_received.assert_called_once()
-        mock_status_monitor.notify_input_sent.assert_called_once_with("test1234", owns_turn=True)
+        mock_status_monitor.claim_dispatch.assert_called_once_with(
+            "test1234", assume_processing=False
+        )
         # The active provider receives the same explicit buffer-generation
         # boundary, so stateful detectors never compare post-dispatch output
         # with the discarded rolling buffer.

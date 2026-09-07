@@ -660,22 +660,57 @@ class StatusMonitor:
         reflects its own turn.
         """
         with self._lock:
-            self._allow_processing_revert[terminal_id] = True
-            # A new turn is starting: whatever ready state a stale-PROCESSING capture saw
-            # before this input no longer describes the terminal. Left armed, that candidate
-            # could be "confirmed" by a single post-input read and latch ready against the
-            # new turn's genuine PROCESSING. The generation bump additionally invalidates
-            # any capture verdict already CONFIRMED but not yet applied — an in-flight
-            # get_status() that sampled the pane before this input must not stamp its
-            # stale verdict over the new turn (and consume the revert arm just set).
-            self._pending_stale_capture.pop(terminal_id, None)
-            self._capture_generation[terminal_id] = self._capture_generation.get(terminal_id, 0) + 1
-            dispatch_seq = self._dispatch_seq.get(terminal_id, 0) + 1
-            self._dispatch_seq[terminal_id] = dispatch_seq
-            if owns_turn:
-                self._active_dispatch[terminal_id] = dispatch_seq
+            dispatch_seq = self._start_dispatch_locked(terminal_id, owns_turn=owns_turn)
         if assume_processing:
             self._apply_detection(terminal_id, TerminalStatus.PROCESSING)
+        return dispatch_seq
+
+    def claim_dispatch(self, terminal_id: str, *, assume_processing: bool = False) -> int | None:
+        """Atomically install the one top-level dispatch allowed for a terminal."""
+        with self._lock:
+            if terminal_id in self._active_dispatch:
+                return None
+            dispatch_seq = self._start_dispatch_locked(terminal_id, owns_turn=True)
+        if assume_processing:
+            self._apply_detection(terminal_id, TerminalStatus.PROCESSING)
+        return dispatch_seq
+
+    def finish_dispatch(self, terminal_id: str, dispatch_seq: int) -> bool:
+        """Release the exact completed top-level dispatch after its output is retained."""
+        with self._lock:
+            if self._active_dispatch.get(terminal_id) != dispatch_seq:
+                return False
+            self._active_dispatch.pop(terminal_id, None)
+            return True
+
+    def owns_dispatch(self, terminal_id: str, dispatch_seq: int) -> bool:
+        """Whether this token is still the terminal's active top-level turn."""
+        with self._lock:
+            return self._active_dispatch.get(terminal_id) == dispatch_seq
+
+    def abort_dispatch(self, terminal_id: str, dispatch_seq: int) -> bool:
+        """Release the exact dispatch when submission fails before a turn can run."""
+        return self.finish_dispatch(terminal_id, dispatch_seq)
+
+    def continue_active_dispatch(
+        self, terminal_id: str, *, assume_processing: bool = False
+    ) -> None:
+        """Re-arm an existing turn after prompt-continuation input without renumbering it."""
+        with self._lock:
+            self._allow_processing_revert[terminal_id] = True
+            self._pending_stale_capture.pop(terminal_id, None)
+            self._capture_generation[terminal_id] = self._capture_generation.get(terminal_id, 0) + 1
+        if assume_processing:
+            self._apply_detection(terminal_id, TerminalStatus.PROCESSING)
+
+    def _start_dispatch_locked(self, terminal_id: str, *, owns_turn: bool) -> int:
+        self._allow_processing_revert[terminal_id] = True
+        self._pending_stale_capture.pop(terminal_id, None)
+        self._capture_generation[terminal_id] = self._capture_generation.get(terminal_id, 0) + 1
+        dispatch_seq = self._dispatch_seq.get(terminal_id, 0) + 1
+        self._dispatch_seq[terminal_id] = dispatch_seq
+        if owns_turn:
+            self._active_dispatch[terminal_id] = dispatch_seq
         return dispatch_seq
 
     def has_inflight_dispatch(self, terminal_id: str) -> bool:

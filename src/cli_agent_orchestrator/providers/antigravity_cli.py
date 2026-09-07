@@ -231,6 +231,8 @@ class AntigravityCliProvider(BaseProvider):
         # review: "On Antigravity, paste echo plus the retained ready footer
         # becomes fresh COMPLETED before work starts").
         self._snapshot_last_response: Optional[str] = None
+        self._snapshot_capture_succeeded = False
+        self._saw_processing_since_input = False
 
     @property
     def blocks_orchestrated_input_while_waiting_user_answer(self) -> bool:
@@ -732,16 +734,15 @@ class AntigravityCliProvider(BaseProvider):
             return TerminalStatus.WAITING_USER_ANSWER
 
         if processing:
+            if self._turns > 0:
+                self._saw_processing_since_input = True
             return TerminalStatus.PROCESSING
 
         # IDLE / COMPLETED: ready footer present. Fresh spawn (no delivered
         # turn) is IDLE; a finished turn is COMPLETED.
         if re.search(IDLE_FOOTER_PATTERN, tail):
-            if (
-                self._snapshot_last_response is not None
-                and self._turns > 0
-                and self._snapshot_last_response == self._extract_last_exchange(clean)
-            ):
+            current_response = self._extract_last_exchange(clean)
+            if self._ready_footer_is_stale(current_response):
                 return TerminalStatus.PROCESSING
             return TerminalStatus.COMPLETED if self._turns > 0 else TerminalStatus.IDLE
 
@@ -799,6 +800,8 @@ class AntigravityCliProvider(BaseProvider):
         if re.search(PROCESSING_FOOTER_PATTERN, bottom) or any(
             re.search(PROCESSING_SPINNER_PATTERN, line) for line in bottom_rows
         ):
+            if self._turns > 0:
+                self._saw_processing_since_input = True
             return TerminalStatus.PROCESSING
 
         if re.search(IDLE_FOOTER_PATTERN, bottom):
@@ -810,13 +813,9 @@ class AntigravityCliProvider(BaseProvider):
             # mark_input_received, that READY belongs to the earlier turn:
             # report PROCESSING so StatusMonitor's evidence stamp only
             # advances on genuinely new content. The guard is inert once the
-            # content differs (the new turn's response rendered) or when no
-            # snapshot could be captured.
-            if (
-                self._snapshot_last_response is not None
-                and self._turns > 0
-                and self._snapshot_last_response == self._extract_last_exchange(joined)
-            ):
+            # content differs (the new turn's response rendered); an
+            # unavailable snapshot instead waits for observed processing.
+            if self._ready_footer_is_stale(self._extract_last_exchange(joined)):
                 return TerminalStatus.PROCESSING
             return TerminalStatus.COMPLETED if self._turns > 0 else TerminalStatus.IDLE
 
@@ -963,14 +962,25 @@ class AntigravityCliProvider(BaseProvider):
         """
         super().mark_input_received()
         self._turns += 1
+        self._saw_processing_since_input = False
         try:
             output = get_backend().get_history(self.session_name, self.window_name) or ""
             self._snapshot_last_response = self._extract_last_exchange(output)
+            self._snapshot_capture_succeeded = True
         except Exception:
             # The pane read is best-effort: a transient capture failure must
-            # not break the dispatch itself. A None snapshot disables the
-            # guard (claude's #407 guard behaves the same on capture failure).
+            # not break dispatch, but it cannot make retained ready output
+            # trustworthy before a new complete exchange appears.
             self._snapshot_last_response = None
+            self._snapshot_capture_succeeded = False
+
+    def _ready_footer_is_stale(self, current_response: Optional[str]) -> bool:
+        """Whether a ready footer still describes the state before this input."""
+        if self._turns == 0:
+            return False
+        if not self._snapshot_capture_succeeded:
+            return not self._saw_processing_since_input
+        return self._snapshot_last_response == current_response
 
     def _extract_last_exchange(self, output: str) -> Optional[str]:
         """Identity of the last COMPLETE exchange (query with a response).

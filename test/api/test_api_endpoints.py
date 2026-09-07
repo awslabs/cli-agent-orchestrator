@@ -22,6 +22,7 @@ from cli_agent_orchestrator.models.terminal import Terminal
 from cli_agent_orchestrator.services.inbox_service import inbox_service
 from cli_agent_orchestrator.services.terminal_service import (
     IdempotencyKeyConflict,
+    OutputMode,
     TerminalRecordCorruptError,
 )
 from cli_agent_orchestrator.utils.skills import SkillNameError
@@ -1464,6 +1465,16 @@ class TestGetTerminalOutput:
         data = response.json()
         assert data["output"] == "Last response"
         assert data["mode"] == "last"
+
+    def test_get_output_dispatch_generation_returns_that_turn(self, client):
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.get_output.return_value = "First turn response"
+
+            response = client.get("/terminals/abcd1234/output?mode=last&input_generation=7")
+
+        assert response.status_code == 200
+        assert response.json()["input_generation"] == 7
+        mock_svc.get_output.assert_called_once_with("abcd1234", OutputMode.LAST, 7)
 
     def test_get_output_terminal_not_found(self, client):
         """GET /terminals/{id}/output returns 404 for nonexistent terminal."""
