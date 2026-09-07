@@ -22,7 +22,12 @@ mcpServers:
 The entry above uses You.com's keyless endpoint — no API key or account
 needed. The URL-server shape passes through to providers unchanged (see
 [Agent profiles](../../docs/agent-profile.md)); providers that support remote
-HTTP transports (for example Claude Code and Grok) connect to it at launch.
+HTTP transports (for example Claude Code, Grok, and MiniMax Code) connect to it
+at launch. The profile pins `provider: claude_code` for this reason — the
+default `kiro_cli` provider's support for remote `type: http` MCP servers is
+undocumented, so launching on defaults could silently produce an agent with no
+search tools. Swap the `provider` key (or pass `--provider` at launch) to run
+it on another HTTP-capable provider.
 
 The profile also keeps `cao-mcp-server` configured so the agent can still be
 targeted by supervisors via `handoff`/`assign` — it works both standalone and
@@ -60,15 +65,31 @@ mcpServers:
 and configure `YDC_API_KEY` bearer auth (get a key at
 [you.com/platform/api-keys](https://you.com/platform/api-keys)). How the
 bearer header is attached depends on the provider's MCP client; check your
-provider's remote-MCP auth options. Alternatively, run the skill-based setup
-from [youdotcom-oss/agent-skills](https://github.com/youdotcom-oss/agent-skills)
+provider's remote-MCP auth options. Keep the key in your provider's MCP
+client config or environment — do not paste it into the profile markdown,
+which is meant to be shared and committed. Alternatively, run the skill-based
+setup from [youdotcom-oss/agent-skills](https://github.com/youdotcom-oss/agent-skills)
 (`npx skills add youdotcom-oss/agent-skills`), which routes agents to the
-lightest You.com surface for the host.
+lightest You.com surface for the host. That command executes third-party
+code from the registry, so verify the publisher matches `youdotcom-oss`
+before running it.
+
+## Data flow
+
+Every search query and every `you-contents` URL fetch is sent to
+`api.you.com` — a third-party service. The keyless `profile=free` endpoint
+has no account boundary or audit trail. Do not include sensitive, secret, or
+repo-local content in research queries; assume anything the agent sends in a
+query leaves the machine.
 
 ## Notes
 
-- The profile uses `role: reviewer` (read-only) — research needs no write or
-  execution access. Widen `allowedTools` in the profile if you want the agent
-  to also edit files based on its findings.
+- The profile uses `role: reviewer`, whose native tool defaults are
+  read-only. Be aware that adding the `youcom` MCP server re-introduces
+  network egress (search + arbitrary URL fetch) that the reviewer role's
+  defaults deliberately exclude — the role label alone does not make this
+  agent network-sandboxed. The profile's security constraints are prompt-level
+  guidance, not an enforced boundary. Widen `allowedTools` in the profile if
+  you want the agent to also edit files based on its findings.
 - Search results and fetched page content are external data; the profile
   instructs the agent to treat them as untrusted evidence, not instructions.
