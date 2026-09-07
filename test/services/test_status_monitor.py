@@ -1181,6 +1181,29 @@ class TestStatusEvidenceGeneration:
         assert m.sm.get_status_snapshot("t1") == (TerminalStatus.COMPLETED, dispatch)
         assert m.sm.has_inflight_dispatch("t1") is False
 
+    def test_claim_dispatch_is_atomic_and_prompt_continuations_keep_its_token(self):
+        m = _SequencedMonitor()
+
+        dispatch = m.sm.claim_dispatch("t1")
+        assert dispatch == 1
+        assert m.sm.claim_dispatch("t1") is None
+
+        m.sm.continue_active_dispatch("t1")
+        m.feed(TerminalStatus.PROCESSING)
+        m.feed(TerminalStatus.COMPLETED)
+        assert m.sm.get_status_snapshot("t1") == (TerminalStatus.COMPLETED, dispatch)
+        assert m.sm.finish_dispatch("t1", dispatch) is True
+        assert m.sm.claim_dispatch("t1") == dispatch + 1
+
+    def test_abort_dispatch_releases_only_the_claimed_token(self):
+        m = _SequencedMonitor()
+
+        dispatch = m.sm.claim_dispatch("t1")
+        assert m.sm.abort_dispatch("t1", dispatch + 1) is False
+        assert m.sm.claim_dispatch("t1") is None
+        assert m.sm.abort_dispatch("t1", dispatch) is True
+        assert m.sm.claim_dispatch("t1") == dispatch + 1
+
     @patch("cli_agent_orchestrator.backends.registry.get_backend")
     @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
     def test_snapshot_preserves_live_event_inbox_status(self, mock_pm, mock_get_backend):

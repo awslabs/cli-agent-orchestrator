@@ -528,6 +528,10 @@ class TestSendSync:
 
         assert result.exit_code == 0
         assert "fast answer" in result.output
+        assert mock_get.call_args_list[-1].kwargs["params"] == {
+            "mode": "last",
+            "input_generation": 5,
+        }
 
     @patch("cli_agent_orchestrator.cli.commands.session.time")
     @patch("cli_agent_orchestrator.cli.commands.session.requests.post")

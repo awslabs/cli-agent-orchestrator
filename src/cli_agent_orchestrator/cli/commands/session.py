@@ -265,7 +265,14 @@ def send(session_name, message, terminal_id, is_async, timeout):
     try:
         output_resp = requests.get(
             f"{API_BASE_URL}/terminals/{target_id}/output",
-            params={"mode": "last"},
+            params={
+                "mode": "last",
+                **(
+                    {"input_generation": dispatch_generation}
+                    if dispatch_generation is not None
+                    else {}
+                ),
+            },
         )
         output_resp.raise_for_status()
         output = output_resp.json().get("output", "")

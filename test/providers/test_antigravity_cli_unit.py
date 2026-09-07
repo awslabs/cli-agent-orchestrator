@@ -74,6 +74,7 @@ def test_status_processing_fixture():
 def test_status_completed_after_turn():
     p = make_provider()
     p.mark_input_received()  # _turns -> 1
+    assert p.get_status("working\nesc to cancel") == TerminalStatus.PROCESSING
     assert p.get_status(load_fixture("agy_completed.txt")) == TerminalStatus.COMPLETED
 
 
@@ -133,6 +134,7 @@ def test_screen_status_idle_when_only_ready_footer():
 def test_screen_status_completed_after_turn():
     p = make_provider()
     p.mark_input_received()
+    assert p.get_status_from_screen(["working", "esc to cancel"]) == TerminalStatus.PROCESSING
     screen = ["> hi", "  done", "─" * 80, "? for shortcuts        Gemini 3.1 Pro (High)"]
     assert p.get_status_from_screen(screen) == TerminalStatus.COMPLETED
 
@@ -263,16 +265,30 @@ def test_raw_paste_echo_does_not_become_fresh_completed():
     assert p.get_status(raw_done) == TerminalStatus.COMPLETED
 
 
-def test_screen_guard_inert_when_snapshot_capture_fails():
-    """A transient capture failure at mark_input_received disables the guard
-    (claude_code's #407 guard behaves the same) — the ready verdict stands."""
+def test_screen_guard_waits_for_new_exchange_when_snapshot_capture_fails():
+    """A capture failure cannot make the retained ready footer trustworthy."""
     p = make_provider()
     with patch("cli_agent_orchestrator.providers.antigravity_cli.get_backend") as mock_get_backend:
         mock_get_backend.return_value.get_history.side_effect = RuntimeError("no pane")
         p.mark_input_received()
 
     assert p._snapshot_last_response is None
+    assert p._snapshot_capture_succeeded is False
+    assert p.get_status_from_screen(_dispatched_pane_with_echo()) == TerminalStatus.PROCESSING
+    assert p.get_status_from_screen(["working", "esc to cancel"]) == TerminalStatus.PROCESSING
     assert p.get_status_from_screen(_completed_new_turn_screen()) == (TerminalStatus.COMPLETED)
+
+
+def test_raw_guard_waits_for_processing_when_snapshot_capture_fails():
+    """The raw-status path must not trust the retained ready footer either."""
+    p = make_provider()
+    with patch("cli_agent_orchestrator.providers.antigravity_cli.get_backend") as mock_get_backend:
+        mock_get_backend.return_value.get_history.side_effect = RuntimeError("no pane")
+        p.mark_input_received()
+
+    assert p.get_status("\n".join(_dispatched_pane_with_echo())) == TerminalStatus.PROCESSING
+    assert p.get_status("working\nesc to cancel") == TerminalStatus.PROCESSING
+    assert p.get_status("\n".join(_completed_new_turn_screen())) == TerminalStatus.COMPLETED
 
 
 # --------------------------------------------------------------------------- #
