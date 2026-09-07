@@ -158,10 +158,6 @@ def test_widened_constraint_allows_backends_but_rejects_native_duplicates(isolat
         _insert(engine, key="shared", source_kind="native")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="#657: memory_metadata's nullable global scope_id makes SQLite UNIQUE non-total",
-)
 def test_global_native_duplicate_remains_rejected_after_widening(isolated_db):
     _, engine = isolated_db
     db_mod.init_db()
@@ -196,6 +192,31 @@ def test_global_native_duplicate_remains_rejected_after_widening(isolated_db):
                 )
             )
             session.commit()
+
+
+def test_global_native_and_vault_rows_remain_distinct_after_null_scope_fix(isolated_db):
+    _, engine = isolated_db
+    db_mod.init_db()
+
+    with sessionmaker(bind=engine)() as session:
+        for source_kind in ("native", "vault"):
+            session.add(
+                MemoryMetadataModel(
+                    id=str(uuid.uuid4()),
+                    key="global-shared",
+                    memory_type="project",
+                    scope="global",
+                    scope_id=None,
+                    source_kind=source_kind,
+                    file_path=f"/{source_kind}-global-shared.md",
+                    tags="",
+                )
+            )
+        session.commit()
+
+    with sessionmaker(bind=engine)() as session:
+        rows = session.query(MemoryMetadataModel).filter_by(key="global-shared").all()
+    assert {row.source_kind for row in rows} == {"native", "vault"}
 
 
 def test_rebuild_omits_related_keys_check_and_preserves_overlong_value(isolated_db):
