@@ -598,23 +598,37 @@ def _carry_rebuild_exclusions(
     """Migrate a proven rename-carried tombstone before rebuild drops provenance.
 
     Rebuild intentionally re-derives path-based keys and removes rename aliases.
-    A forgotten note that retained its former key through an ordinary rename must
-    therefore move its durable exclusion to the new path-derived key first.  The
-    old identity, live path, and content hash must all agree so a reused path or
-    unrelated note cannot inherit the tombstone.
+    A first-observed rename must pass the ordinary one-to-one content-hash
+    resolver.  Once an ordinary reconcile established alias-carried ownership,
+    the live identity remains authoritative through later content edits.  In
+    both cases the durable exclusion moves to the rebuilt path-derived key
+    before the identity rows are deleted.
     """
     projected_by_path = {item.note.vault_relpath: item for item in projected}
+    resolutions = _resolve_renames(
+        vault_id,
+        projected,
+        prior_by_path,
+        carried_alias_keys=carried_alias_keys,
+    )
+    resolutions = _quarantine_resolved_identity_collisions(resolutions, prior_by_path)
     carried = set(exclusions)
-    for path, prior in prior_by_path.items():
+    for resolution in resolutions:
+        item = resolution.item
+        rebuilt_item = projected_by_path[item.note.vault_relpath]
+        if rebuilt_item.note.parsed is not None and "key" in rebuilt_item.note.parsed.cao:
+            continue
+        prior = resolution.alias_from or prior_by_path.get(item.note.vault_relpath)
+        if prior is None:
+            continue
         old_identity = (
             cast(str, prior.scope),
             cast(str, prior.scope_id),
             cast(str, prior.cao_key),
         )
-        if old_identity not in exclusions or old_identity not in carried_alias_keys:
-            continue
-        item = projected_by_path.get(path)
-        if item is None or (item.note.parsed is not None and "key" in item.note.parsed.cao):
+        directly_resolved = resolution.alias_from is not None
+        established_alias = old_identity in carried_alias_keys
+        if old_identity not in exclusions or not (directly_resolved or established_alias):
             continue
         exclusion = db.get(
             VaultExclusionModel,
@@ -625,17 +639,12 @@ def _carry_rebuild_exclusions(
                 "cao_key": old_identity[2],
             },
         )
-        if (
-            exclusion is None
-            or exclusion.content_sha256 is None
-            or prior.content_sha256 != exclusion.content_sha256
-            or item.note.content_sha256 != exclusion.content_sha256
-        ):
+        if exclusion is None:
             continue
         new_identity = (
-            item.note.scope,
-            item.note.scope_id or "",
-            item.canonical_key,
+            rebuilt_item.note.scope,
+            rebuilt_item.note.scope_id or "",
+            rebuilt_item.canonical_key,
         )
         if new_identity == old_identity:
             continue
@@ -657,8 +666,8 @@ def _carry_rebuild_exclusions(
                 created_at=exclusion.created_at,
             )
             db.add(replacement)
-        replacement.last_known_relpath = item.note.vault_relpath
-        replacement.content_sha256 = item.note.content_sha256
+        replacement.last_known_relpath = rebuilt_item.note.vault_relpath
+        replacement.content_sha256 = rebuilt_item.note.content_sha256
         db.delete(exclusion)
         carried.discard(old_identity)
         carried.add(new_identity)

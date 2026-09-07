@@ -1164,6 +1164,111 @@ def test_rebuild_preserves_deindexed_tombstones(tmp_path, monkeypatch):
     assert "deindexed_retained" in finding.detail
 
 
+def test_rebuild_preserves_path_derived_tombstone_when_first_observing_rename(
+    tmp_path, monkeypatch
+):
+    """A rebuild resolves a forgotten pure rename before deleting prior identity rows."""
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    old_path = tmp_path / "vault" / "Mapped" / "Old.md"
+    new_path = old_path.with_name("New.md")
+    old_path.write_text("same content", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="direct-rebuild-rename-before")
+    with Session() as db:
+        original = db.query(VaultNoteModel).one()
+        original_key = original.cao_key
+        _exclude_note(db, original)
+        db.query(MemoryMetadataModel).filter_by(source_kind="vault").delete()
+        db.commit()
+
+    old_path.rename(new_path)
+    report = reconcile(
+        vault,
+        apply=True,
+        rebuild=True,
+        run_id="direct-rebuild-rename-after",
+    )
+
+    with Session() as db:
+        rebuilt = db.query(VaultNoteModel).one()
+        exclusion = db.query(VaultExclusionModel).one()
+        metadata_count = db.query(MemoryMetadataModel).filter_by(source_kind="vault").count()
+        retained = (
+            db.query(VaultFindingModel)
+            .filter_by(code="deindexed_retained", vault_relpath="Mapped/New.md")
+            .count()
+        )
+    assert rebuilt.cao_key != original_key
+    assert (rebuilt.vault_relpath, rebuilt.status, metadata_count) == (
+        "Mapped/New.md",
+        "excluded",
+        0,
+    )
+    assert (exclusion.cao_key, exclusion.last_known_relpath) == (
+        rebuilt.cao_key,
+        "Mapped/New.md",
+    )
+    assert (report.indexed, retained) == (0, 1)
+
+
+def test_rebuild_preserves_alias_carried_tombstone_after_content_edit(tmp_path, monkeypatch):
+    """An established rename identity stays forgotten when its current content changes."""
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    old_path = tmp_path / "vault" / "Mapped" / "Old.md"
+    new_path = old_path.with_name("New.md")
+    old_path.write_text("original content", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="edited-rebuild-rename-before")
+    with Session() as db:
+        original = db.query(VaultNoteModel).one()
+        original_key = original.cao_key
+        original_hash = original.content_sha256
+        _exclude_note(db, original)
+        db.query(MemoryMetadataModel).filter_by(source_kind="vault").delete()
+        db.commit()
+
+    old_path.rename(new_path)
+    reconcile(vault, apply=True, run_id="edited-rebuild-rename-carried")
+    with Session() as db:
+        carried = db.query(VaultNoteModel).one()
+        assert (carried.cao_key, carried.status) == (original_key, "excluded")
+        assert db.query(VaultNoteAliasModel).count() == 1
+
+    new_path.write_text("edited after identity-preserving rename", encoding="utf-8")
+    report = reconcile(
+        vault,
+        apply=True,
+        rebuild=True,
+        run_id="edited-rebuild-rename-after",
+    )
+
+    with Session() as db:
+        rebuilt = db.query(VaultNoteModel).one()
+        exclusion = db.query(VaultExclusionModel).one()
+        metadata_count = db.query(MemoryMetadataModel).filter_by(source_kind="vault").count()
+    assert rebuilt.cao_key != original_key
+    assert rebuilt.content_sha256 != original_hash
+    assert (rebuilt.vault_relpath, rebuilt.status, metadata_count) == (
+        "Mapped/New.md",
+        "excluded",
+        0,
+    )
+    assert (
+        exclusion.cao_key,
+        exclusion.last_known_relpath,
+        exclusion.content_sha256,
+    ) == (
+        rebuilt.cao_key,
+        "Mapped/New.md",
+        rebuilt.content_sha256,
+    )
+    assert report.indexed == 0
+
+
 def test_rebuild_preserves_path_derived_tombstone_after_rename(tmp_path, monkeypatch):
     """A rebuild migrates a forgotten rename-carried identity to the current path key."""
     from cli_agent_orchestrator.services.vault import reconcile as module
