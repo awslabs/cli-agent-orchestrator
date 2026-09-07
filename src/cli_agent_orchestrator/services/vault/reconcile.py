@@ -617,6 +617,21 @@ def _carry_rebuild_exclusions(
     # identity with the exact-hash rename, so ordinary collision preference
     # would incorrectly discard the rename proof.  The post-delete projection
     # resolves and quarantines its own live identities below.
+    direct_claimed_identities = {
+        (
+            cast(str, resolution.alias_from.scope),
+            cast(str, resolution.alias_from.scope_id),
+            cast(str, resolution.alias_from.cao_key),
+        )
+        for resolution in resolutions
+        if resolution.alias_from is not None
+        and resolution.alias_from.content_sha256 is not None
+        and resolution.alias_from.content_sha256 == resolution.item.note.content_sha256
+        and (
+            (parsed := projected_by_path[resolution.item.note.vault_relpath].note.parsed) is None
+            or "key" not in parsed.cao
+        )
+    }
     carried = set(exclusions)
     for resolution in resolutions:
         item = resolution.item
@@ -636,8 +651,10 @@ def _carry_rebuild_exclusions(
             and resolution.alias_from.content_sha256 is not None
             and resolution.alias_from.content_sha256 == item.note.content_sha256
         )
-        established_alias = old_identity in carried_alias_keys
-        if old_identity not in exclusions or not (directly_resolved or established_alias):
+        established_alias = (
+            old_identity in carried_alias_keys and old_identity not in direct_claimed_identities
+        )
+        if old_identity not in carried or not (directly_resolved or established_alias):
             continue
         exclusion = db.get(
             VaultExclusionModel,
