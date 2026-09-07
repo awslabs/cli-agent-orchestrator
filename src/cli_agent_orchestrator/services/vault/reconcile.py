@@ -626,7 +626,11 @@ def _carry_rebuild_exclusions(
             cast(str, prior.scope_id),
             cast(str, prior.cao_key),
         )
-        directly_resolved = resolution.alias_from is not None
+        directly_resolved = (
+            resolution.alias_from is not None
+            and resolution.alias_from.content_sha256 is not None
+            and resolution.alias_from.content_sha256 == item.note.content_sha256
+        )
         established_alias = old_identity in carried_alias_keys
         if old_identity not in exclusions or not (directly_resolved or established_alias):
             continue
@@ -731,12 +735,16 @@ def _resolve_renames(
             continue
         if item.note.parsed is not None and "key" in item.note.parsed.cao:
             continue
-        matching = tuple(
-            old
-            for old in disappeared
-            if old.scope == item.note.scope
-            and old.scope_id == (item.note.scope_id or "")
-            and old.content_sha256 == item.note.content_sha256
+        matching = (
+            tuple(
+                old
+                for old in disappeared
+                if old.scope == item.note.scope
+                and old.scope_id == (item.note.scope_id or "")
+                and old.content_sha256 == item.note.content_sha256
+            )
+            if item.note.content_sha256 is not None
+            else ()
         )
         matching_by_path[item.note.vault_relpath] = matching
         for old in matching:

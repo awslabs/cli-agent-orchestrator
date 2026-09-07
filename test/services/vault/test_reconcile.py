@@ -1213,6 +1213,68 @@ def test_rebuild_preserves_path_derived_tombstone_when_first_observing_rename(
     assert (report.indexed, retained) == (0, 1)
 
 
+def test_rebuild_does_not_carry_tombstone_between_hashless_notes(tmp_path, monkeypatch):
+    """Missing hashes are not proof that an unrelated new path is the same note."""
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    old_path = tmp_path / "vault" / "Mapped" / "Old.md"
+    new_path = old_path.with_name("New.md")
+    old_path.write_text("forgotten content", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="hashless-rebuild-before")
+    with Session() as db:
+        original = db.query(VaultNoteModel).one()
+        original_key = original.cao_key
+        _exclude_note(db, original)
+        db.query(MemoryMetadataModel).filter_by(source_kind="vault").delete()
+        db.commit()
+
+    old_path.write_text("x" * (vault.max_note_bytes + 1), encoding="utf-8")
+    reconcile(vault, apply=True, run_id="hashless-rebuild-forgotten-oversize")
+    with Session() as db:
+        forgotten = db.query(VaultNoteModel).one()
+        assert (forgotten.cao_key, forgotten.status, forgotten.content_sha256) == (
+            original_key,
+            "excluded",
+            None,
+        )
+
+    old_path.unlink()
+    new_path.write_text("y" * (vault.max_note_bytes + 1), encoding="utf-8")
+    reconcile(vault, apply=True, rebuild=True, run_id="hashless-rebuild-unrelated")
+
+    with Session() as db:
+        rebuilt = db.query(VaultNoteModel).one()
+        exclusion = db.query(VaultExclusionModel).one()
+        assert (rebuilt.vault_relpath, rebuilt.status, rebuilt.content_sha256) == (
+            "Mapped/New.md",
+            "skipped",
+            None,
+        )
+        assert (exclusion.cao_key, exclusion.last_known_relpath) == (
+            original_key,
+            "Mapped/Old.md",
+        )
+
+    new_path.write_text("unrelated readable content", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="hashless-rebuild-readable")
+
+    with Session() as db:
+        readable = db.query(VaultNoteModel).one()
+        metadata_count = db.query(MemoryMetadataModel).filter_by(source_kind="vault").count()
+        exclusion = db.query(VaultExclusionModel).one()
+    assert (readable.vault_relpath, readable.status, metadata_count) == (
+        "Mapped/New.md",
+        "indexed",
+        1,
+    )
+    assert (exclusion.cao_key, exclusion.last_known_relpath) == (
+        original_key,
+        "Mapped/Old.md",
+    )
+
+
 def test_rebuild_preserves_alias_carried_tombstone_after_content_edit(tmp_path, monkeypatch):
     """An established rename identity stays forgotten when its current content changes."""
     from cli_agent_orchestrator.services.vault import reconcile as module
