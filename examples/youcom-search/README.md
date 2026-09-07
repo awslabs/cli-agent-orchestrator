@@ -5,8 +5,10 @@ into a CAO terminal through the profile's `mcpServers` remote-URL mechanism —
 no code, no local dependencies, one config entry.
 
 The agent answers questions that depend on current web information using the
-`you-search` (web search) and `you-contents` (URL content extraction) MCP
-tools, and cites its sources.
+`you-search` MCP tool (current web search with snippets, and optional page
+content via its `livecrawl` option), and cites its sources. URL content
+extraction with the dedicated `you-contents` tool requires the authenticated
+endpoint (see below).
 
 ## How It Works
 
@@ -52,8 +54,12 @@ What changed in the latest Python release notes?
 
 ## Authenticated Endpoint (optional)
 
-The keyless `profile=free` endpoint provides basic search. For the full
-You.com MCP toolset, use the authenticated endpoint:
+The keyless `profile=free` endpoint is **search-only**: it exposes `you-search`
+(and `you-discover`) and does **not** include the `you-contents` URL-fetch
+tool, so the example's default configuration does not advertise arbitrary-URL
+extraction — page content is available through `you-search`'s `livecrawl`
+option. For the full You.com MCP toolset, including `you-contents`, use the
+authenticated endpoint:
 
 ```yaml
 mcpServers:
@@ -76,20 +82,22 @@ before running it.
 
 ## Data flow
 
-Every search query and every `you-contents` URL fetch is sent to
-`api.you.com` — a third-party service. The keyless `profile=free` endpoint
-has no account boundary or audit trail. Do not include sensitive, secret, or
-repo-local content in research queries; assume anything the agent sends in a
-query leaves the machine.
+Every search query (and any URL the `livecrawl` option fetches) is sent to
+`api.you.com` — a third-party service. On the authenticated endpoint, every
+`you-contents` URL fetch is sent there too. The keyless `profile=free`
+endpoint has no account boundary or audit trail. Do not include sensitive,
+secret, or repo-local content in research queries; assume anything the agent
+sends in a query leaves the machine.
 
 ## Notes
 
 - The profile uses `role: reviewer`, whose native tool defaults are
   read-only. Be aware that adding the `youcom` MCP server re-introduces
-  network egress (search + arbitrary URL fetch) that the reviewer role's
-  defaults deliberately exclude — the role label alone does not make this
-  agent network-sandboxed. The profile's security constraints are prompt-level
-  guidance, not an enforced boundary. Widen `allowedTools` in the profile if
-  you want the agent to also edit files based on its findings.
+  network egress (search queries and, on the authenticated endpoint,
+  arbitrary URL fetch) that the reviewer role's defaults deliberately
+  exclude — the role label alone does not make this agent network-sandboxed.
+  The profile's security constraints are prompt-level guidance, not an
+  enforced boundary. Widen `allowedTools` in the profile if you want the
+  agent to also edit files based on its findings.
 - Search results and fetched page content are external data; the profile
   instructs the agent to treat them as untrusted evidence, not instructions.
