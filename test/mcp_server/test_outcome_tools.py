@@ -266,3 +266,125 @@ class TestFailureTranslation:
         assert result["success"] is False
         assert "disabled" not in result, result
         assert "PermissionError" in result["error"]
+
+
+class TestOnlyTheGates404ReadsAsDisabled:
+    """A 404 is not by itself evidence that the feature is off.
+
+    ``/outcomes`` missing from an older cao-server, or a proxy that does not know
+    the path, answers an ordinary ``{"detail": "Not Found"}`` 404. Inferring
+    ``disabled: true`` from the status alone made that indistinguishable from the
+    gate — and ``skills/cao-learning`` tells agents to skip a disabled payload
+    SILENTLY, so the outcome vanished with no error anywhere. The gate therefore
+    marks its own 404 with ``LEARNING_DISABLED_CODE`` and the translation
+    requires it.
+    """
+
+    @staticmethod
+    def _patch_outcomes_404(monkeypatch, detail: str):
+        """404 only the ``/outcomes`` calls, leaving terminal-context lookups alive.
+
+        ``report_outcome`` resolves its identity through ``GET /terminals/{id}``
+        first. Failing every request would abort there — the tool would return
+        "could not resolve terminal context" and never reach the translation
+        under test — so the substitution is scoped by URL.
+        """
+        from cli_agent_orchestrator.mcp_server import utils as mcp_utils
+
+        class _Resp:
+            status_code = 404
+
+            def json(self):
+                return {"detail": detail}
+
+        for verb in ("get", "post"):
+            real = getattr(mcp_utils.requests, verb)
+
+            def fake(url, *a, _real=real, **kw):
+                if "/outcomes" in str(url):
+                    raise requests.HTTPError("404", response=_Resp())
+                return _real(url, *a, **kw)
+
+            monkeypatch.setattr(mcp_utils.requests, verb, fake)
+
+    @pytest.fixture
+    def _route_missing_404(self, monkeypatch):
+        """A generic 404 — no discriminator, i.e. "no such route here"."""
+        self._patch_outcomes_404(monkeypatch, "Not Found")
+
+    @pytest.fixture
+    def _gate_404(self, monkeypatch):
+        """The learning gate's own 404, carrying LEARNING_DISABLED_CODE."""
+        from cli_agent_orchestrator.services.outcome_service import LEARNING_DISABLED_MESSAGE
+
+        self._patch_outcomes_404(monkeypatch, LEARNING_DISABLED_MESSAGE)
+
+    def test_route_missing_404_is_an_explicit_failure(
+        self, mcp_over_testclient, isolated_db, _route_missing_404
+    ):
+        result = _run(_report())
+        assert result["success"] is False
+        assert "disabled" not in result, result
+        assert "Not Found" in result["error"]
+
+    def test_route_missing_404_does_not_disable_list_outcomes(
+        self, mcp_over_testclient, isolated_db, _route_missing_404
+    ):
+        result = _run(_list(session_name="sess-1"))
+        assert result["success"] is False
+        assert "disabled" not in result, result
+        assert result["outcomes"] == []
+
+    def test_gate_404_still_reads_as_disabled(self, mcp_over_testclient, isolated_db, _gate_404):
+        from cli_agent_orchestrator.services.outcome_service import LEARNING_DISABLED_CODE
+
+        result = _run(_report())
+        assert result["success"] is False
+        assert result["disabled"] is True
+        assert LEARNING_DISABLED_CODE in result["error"]
+
+    def test_gate_message_carries_the_discriminator(self):
+        """Pins the contract the translation matches on — the two must stay in step."""
+        from cli_agent_orchestrator.services.outcome_service import (
+            LEARNING_DISABLED_CODE,
+            LEARNING_DISABLED_MESSAGE,
+        )
+
+        assert LEARNING_DISABLED_CODE in LEARNING_DISABLED_MESSAGE
+
+
+class TestErrorDetailExtractionTolerance:
+    """A valid-JSON error body is not necessarily a JSON *object*.
+
+    A gateway between the agent and cao-server can answer with ``[]`` or a bare
+    string; both parse, neither has ``.get``. Assuming a mapping raised
+    ``AttributeError`` out of the error path, so a transport fault crashed the
+    tool instead of returning the typed ``success: False`` envelope.
+    """
+
+    @pytest.mark.parametrize(
+        "body",
+        [[], "gateway boom", 42, None],
+        ids=["list", "bare-string", "number", "null"],
+    )
+    def test_non_object_json_falls_back_instead_of_raising(self, body):
+        from cli_agent_orchestrator.utils.orchestration import _extract_error_detail
+
+        class _Resp:
+            status_code = 502
+
+            def json(self):
+                return body
+
+        assert _extract_error_detail(_Resp(), "fallback-text") == "fallback-text"
+
+    def test_object_without_detail_falls_back(self):
+        from cli_agent_orchestrator.utils.orchestration import _extract_error_detail
+
+        class _Resp:
+            status_code = 502
+
+            def json(self):
+                return {"message": "not the key we read"}
+
+        assert _extract_error_detail(_Resp(), "fallback-text") == "fallback-text"

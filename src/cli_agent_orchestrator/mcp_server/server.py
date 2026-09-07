@@ -34,7 +34,10 @@ from cli_agent_orchestrator.services.memory_service import (
     MemoryDisabledError,
     MemoryPartialWriteError,
 )
-from cli_agent_orchestrator.services.outcome_service import LEARNING_DISABLED_MESSAGE
+from cli_agent_orchestrator.services.outcome_service import (
+    LEARNING_DISABLED_CODE,
+    LEARNING_DISABLED_MESSAGE,
+)
 from cli_agent_orchestrator.services.profile_search import DEFAULT_LIMIT
 from cli_agent_orchestrator.utils.orchestration import (
     ENABLE_SENDER_ID_INJECTION,
@@ -1541,12 +1544,19 @@ def _outcome_tool_error(
 ) -> Dict[str, Any]:
     """Translate a failed outcome-API call into the tool's error payload.
 
-    Only a **404** becomes ``disabled: True`` — that is the route's own
-    feature-gate. A 503 (settings unreadable) and a transport failure must NOT:
-    ``skills/cao-learning`` instructs agents to skip a ``disabled: true`` payload
-    SILENTLY, so labelling an unreachable server or an unreadable config
-    "disabled" would hide both, exactly the way an unreadable settings.json used
-    to present itself as a deliberate opt-out.
+    ``disabled: True`` requires a 404 **and** the gate's own
+    ``LEARNING_DISABLED_CODE`` discriminator in the body. Status alone is not
+    enough: a missing ``/outcomes`` route during a mixed-version rollout, or a
+    proxy that does not know the path, returns an ordinary
+    ``{"detail": "Not Found"}`` 404 — and ``skills/cao-learning`` instructs
+    agents to skip a ``disabled: true`` payload SILENTLY, so inferring the
+    feature state from a generic 404 drops outcomes without a trace. That is the
+    same class of misreporting this module exists to remove, so an unmarked 404
+    stays an explicit failure with no ``disabled`` key.
+
+    A 503 (settings unreadable) and a transport failure are likewise never
+    "disabled", for the same reason: an unreadable settings.json used to present
+    itself as a deliberate opt-out.
     """
     extra = dict(extra or {})
     if isinstance(exc, requests.ConnectionError):
@@ -1560,7 +1570,7 @@ def _outcome_tool_error(
         return {"success": False, "error": f"{fallback}: {exc}", **extra}
 
     detail = _extract_error_detail(response, fallback)
-    if response.status_code == 404:
+    if response.status_code == 404 and LEARNING_DISABLED_CODE in detail:
         return {"success": False, "disabled": True, "error": detail, **extra}
     return {"success": False, "error": detail, **extra}
 
