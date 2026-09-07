@@ -394,7 +394,8 @@ markers = [
     "asyncio: marks tests that use asyncio",
     "integration: marks integration tests",
     "e2e: marks end-to-end tests",
-    "slow: marks tests as slow (deselect with '-m \"not slow\"')"
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "live_provider: marks tests that need a real cao-server + authenticated provider CLI (gated behind CAO_RUN_LIVE_PROVIDER_TESTS=1, skipped by default)"
 ]
 asyncio_mode = "strict"
 testpaths = ["test"]

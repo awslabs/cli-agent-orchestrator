@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -45,6 +47,8 @@ def _topic_path(base: Path, scope: str, scope_id: str | None, key: str) -> Path:
     if scope in {"session", "agent"}:
         assert scope_id is not None
         return base / "global" / "wiki" / scope / scope_id / f"{key}.md"
+    if scope == "federated":
+        return base / "federated" / "wiki" / scope / f"{key}.md"
     return base / "global" / "wiki" / scope / f"{key}.md"
 
 
@@ -482,6 +486,11 @@ def test_apply_rejects_duplicate_resolved_paths_before_locking(
 def test_duplicate_and_wrong_path_rows_are_conflicts(tmp_path: Path, engine: Any) -> None:
     base = tmp_path / "memory"
     topic = _write_topic(base, "global", None, "conflicted")
+    # Seed the legacy pre-#657 state: duplicate global rows only exist on a
+    # database whose partial unique index is absent, so drop it first.
+    with engine.connect() as conn:
+        conn.exec_driver_sql("DROP INDEX IF EXISTS uq_memory_key_scope_null")
+        conn.commit()
     with sessionmaker(bind=engine)() as db:
         for suffix in ("one", "two"):
             db.add(
@@ -501,7 +510,513 @@ def test_duplicate_and_wrong_path_rows_are_conflicts(tmp_path: Path, engine: Any
 
     assert report.records[0].actions == (RepairAction.CONFLICT,)
     assert report.records[0].finding.kind == "duplicate_database_identity"
+    assert "manually" in report.records[0].finding.message
     assert len(_rows(engine)) == 2
+
+
+def _seed_duplicate_global_rows(
+    base: Path,
+    engine: Any,
+    key: str,
+    *,
+    canonical_path: str,
+    stale_paths: tuple[str, ...],
+) -> None:
+    """Seed the legacy pre-#657 duplicate state on an index-less database."""
+    with engine.connect() as conn:
+        conn.exec_driver_sql("DROP INDEX IF EXISTS uq_memory_key_scope_null")
+        conn.commit()
+    with sessionmaker(bind=engine)() as db:
+        db.add(
+            MemoryMetadataModel(
+                id=str(uuid.uuid4()),
+                key=key,
+                memory_type="reference",
+                scope="global",
+                scope_id=None,
+                file_path=canonical_path,
+                tags="",
+            )
+        )
+        for path in stale_paths:
+            db.add(
+                MemoryMetadataModel(
+                    id=str(uuid.uuid4()),
+                    key=key,
+                    memory_type="reference",
+                    scope="global",
+                    scope_id=None,
+                    file_path=path,
+                    tags="",
+                )
+            )
+        db.commit()
+
+
+def test_duplicate_rows_dedupe_to_canonical_path_survivor(tmp_path: Path, engine: Any) -> None:
+    """The unambiguous legacy case: one row anchors the canonical topic path.
+
+    The repair the #657 migrator advertises must actually clear the state —
+    the stale sibling goes, the canonical row keeps its id, and the partial
+    unique index lands in the same repair run instead of at next startup.
+    """
+    base = tmp_path / "memory"
+    topic = _write_topic(base, "global", None, "shared")
+    _seed_duplicate_global_rows(
+        base,
+        engine,
+        "shared",
+        canonical_path=str(topic),
+        stale_paths=(str(topic.with_name("stale.md")),),
+    )
+    # Pin the ids the seeded rows actually got so the survivor assertion is
+    # about identity, not insertion order.
+    with sessionmaker(bind=engine)() as db:
+        rows = db.query(MemoryMetadataModel).order_by(MemoryMetadataModel.file_path).all()
+        survivor_id = next(row.id for row in rows if row.file_path == str(topic))
+
+    service = MemoryReconciliationService(base, engine)
+    dry = service.plan()
+    dedupe_records = [r for r in dry.records if RepairAction.DEDUPE_METADATA in r.actions]
+    assert len(dedupe_records) == 1
+    assert dry.applied is False
+    assert len(_rows(engine)) == 2, "dry-run must not touch rows"
+
+    report = service.apply()
+
+    assert report.counts["dedupe_metadata"] == 1
+    remaining = _rows(engine)
+    assert len(remaining) == 1
+    assert remaining[0].id == survivor_id
+    assert remaining[0].file_path == str(topic)
+    with engine.connect() as conn:
+        names = {
+            row[1]
+            for row in conn.exec_driver_sql("PRAGMA index_list('memory_metadata')").fetchall()
+        }
+    assert "uq_memory_key_scope_null" in names, "index must land in the repair run"
+
+
+def test_ambiguous_duplicate_rows_remain_a_manual_conflict(tmp_path: Path, engine: Any) -> None:
+    """Neither row anchors the canonical path: no silent winner, no data loss.
+
+    The reviewer's ambiguity requirement: rows are retained with explicit
+    manual-resolution guidance and no index is created over them.
+    """
+    base = tmp_path / "memory"
+    _write_topic(base, "global", None, "shared")
+    topic = base / "global" / "wiki" / "global" / "shared.md"
+    _seed_duplicate_global_rows(
+        base,
+        engine,
+        "shared",
+        canonical_path=str(topic.with_name("a.md")),
+        stale_paths=(str(topic.with_name("b.md")),),
+    )
+
+    service = MemoryReconciliationService(base, engine)
+    report = service.apply()
+
+    assert report.records[0].actions == (RepairAction.CONFLICT,)
+    assert report.records[0].finding.kind == "duplicate_database_identity"
+    assert "manually" in report.records[0].finding.message
+    assert len(_rows(engine)) == 2, "ambiguous duplicates must never be deleted"
+    with engine.connect() as conn:
+        names = {
+            row[1]
+            for row in conn.exec_driver_sql("PRAGMA index_list('memory_metadata')").fetchall()
+        }
+    assert "uq_memory_key_scope_null" not in names
+
+
+def test_duplicate_federated_rows_are_discovered_and_deduped(tmp_path: Path, engine: Any) -> None:
+    """Federated duplicates are covered by the same warning — and the repair.
+
+    The federated container was never scanned before, so its NULL-scope rows
+    could never even be reported, let alone repaired.
+    """
+    base = tmp_path / "memory"
+    topic = _write_topic(base, "federated", None, "shared")
+    with engine.connect() as conn:
+        conn.exec_driver_sql("DROP INDEX IF EXISTS uq_memory_key_scope_null")
+        conn.commit()
+    with sessionmaker(bind=engine)() as db:
+        db.add(
+            MemoryMetadataModel(
+                id=str(uuid.uuid4()),
+                key="shared",
+                memory_type="reference",
+                scope="federated",
+                scope_id=None,
+                file_path=str(topic),
+                tags="",
+            )
+        )
+        db.add(
+            MemoryMetadataModel(
+                id=str(uuid.uuid4()),
+                key="shared",
+                memory_type="reference",
+                scope="federated",
+                scope_id=None,
+                file_path=str(topic.with_name("stale.md")),
+                tags="",
+            )
+        )
+        db.commit()
+
+    service = MemoryReconciliationService(base, engine)
+    dry = service.plan()
+    assert any(
+        RepairAction.DEDUPE_METADATA in record.actions
+        for record in dry.records
+        if record.identity is not None and record.identity.scope == "federated"
+    ), "federated topics must be discovered by the scan"
+
+    report = service.apply()
+    remaining = _rows(engine)
+    assert len(remaining) == 1
+    assert remaining[0].scope == "federated"
+    assert remaining[0].file_path == str(topic)
+    with engine.connect() as conn:
+        names = {
+            row[1]
+            for row in conn.exec_driver_sql("PRAGMA index_list('memory_metadata')").fetchall()
+        }
+    assert "uq_memory_key_scope_null" in names
+    federated_index = base / "federated" / "wiki" / "index.md"
+    assert federated_index.exists(), "federated index entries are rebuilt"
+
+
+def test_unmapped_duplicate_rows_conflict_without_a_canonical_topic(
+    tmp_path: Path, engine: Any
+) -> None:
+    """Duplicates whose topic file is gone must still be reported (P2-1).
+
+    Planning is filesystem-first, so a NULL-scope identity with no surviving
+    canonical topic is invisible to it — repair used to exit 0 with total=0
+    while the duplicate rows stayed and the migrator kept skipping the index.
+    Every such identity must surface as an actionable conflict naming manual
+    resolution, with rows preserved.
+    """
+    base = tmp_path / "memory"
+    with engine.connect() as conn:
+        conn.exec_driver_sql("DROP INDEX IF EXISTS uq_memory_key_scope_null")
+        conn.commit()
+    with sessionmaker(bind=engine)() as db:
+        for scope, path in (
+            ("global", "/gone/global-a.md"),
+            ("global", "/gone/global-b.md"),
+            ("federated", "/gone/federated-a.md"),
+            ("federated", "/gone/federated-b.md"),
+        ):
+            db.add(
+                MemoryMetadataModel(
+                    id=str(uuid.uuid4()),
+                    key="orphan" if scope == "global" else "fed-orphan",
+                    memory_type="reference",
+                    scope=scope,
+                    scope_id=None,
+                    file_path=path,
+                    tags="",
+                )
+            )
+        db.commit()
+
+    service = MemoryReconciliationService(base, engine)
+    plan = service.plan()
+    conflicts = [
+        record
+        for record in plan.records
+        if record.finding is not None and record.finding.kind == "duplicate_database_identity"
+    ]
+    assert [record.identity.scope for record in conflicts] == ["federated", "global"]
+    for record in conflicts:
+        assert record.actions == (RepairAction.CONFLICT,)
+        assert "manually" in record.finding.message or "restore" in record.finding.message
+        assert "no canonical topic" in record.finding.message
+
+    report = service.apply()
+    assert report.counts["skipped"] == 2, "both conflicts survive apply untouched"
+    assert report.has_unresolved is True, "CLI maps this to exit 1"
+    assert len(_rows(engine)) == 4, "no row is ever deleted without a topic anchor"
+
+
+def test_dedupe_survives_mixed_naive_and_null_timestamps(tmp_path: Path, engine: Any) -> None:
+    """Mixed naive/aware/NULL ``updated_at`` must not crash dedupe (P2-2).
+
+    SQLite stores naive datetimes; legacy duplicate rows can mix naive,
+    aware and NULL values, and comparing any of them with the tz-aware
+    ``_MIN_DT`` floor used to raise ``TypeError`` mid-repair, leaving both
+    rows and the index absent. The survivor pick must normalize first, so
+    the newest row wins and the index lands in the same run.
+    """
+    base = tmp_path / "memory"
+    topic = _write_topic(base, "global", None, "shared")
+    _seed_duplicate_global_rows(
+        base,
+        engine,
+        "shared",
+        canonical_path=str(topic),
+        stale_paths=(str(topic.with_name("stale.md")),),
+    )
+    with sessionmaker(bind=engine)() as db:
+        db.execute(
+            MemoryMetadataModel.__table__.update()
+            .where(MemoryMetadataModel.file_path == str(topic))
+            .values(updated_at=datetime(2026, 7, 1, 10, 0))
+        )
+        db.execute(
+            MemoryMetadataModel.__table__.update()
+            .where(MemoryMetadataModel.file_path == str(topic.with_name("stale.md")))
+            .values(updated_at=None)
+        )
+        db.commit()
+        survivor_id = (
+            db.query(MemoryMetadataModel)
+            .filter(MemoryMetadataModel.file_path == str(topic))
+            .one()
+            .id
+        )
+
+    report = MemoryReconciliationService(base, engine).apply()
+
+    assert report.counts["dedupe_metadata"] == 1
+    remaining = _rows(engine)
+    assert len(remaining) == 1
+    assert remaining[0].id == survivor_id, "newest (only dated) row survives"
+    with engine.connect() as conn:
+        names = {
+            row[1]
+            for row in conn.exec_driver_sql("PRAGMA index_list('memory_metadata')").fetchall()
+        }
+    assert "uq_memory_key_scope_null" in names
+
+
+def test_dedupe_tiebreak_picks_the_maximum_id_at_equal_normalized_time(
+    tmp_path: Path, engine: Any
+) -> None:
+    """Equal normalized ``updated_at`` falls back to the ``id`` tie-break.
+
+    Both duplicate rows anchor the canonical topic path with identical
+    timestamps, so survivor selection must actually compare both ids and
+    keep the documented maximum. Ids are seeded deterministically before
+    insert — mutating live primary keys after the fact races SQLite's
+    UNIQUE flush (review P2-2).
+    """
+    base = tmp_path / "memory"
+    topic = _write_topic(base, "global", None, "shared")
+    with engine.connect() as conn:
+        conn.exec_driver_sql("DROP INDEX IF EXISTS uq_memory_key_scope_null")
+        conn.commit()
+    with sessionmaker(bind=engine)() as db:
+        for row_id in (
+            "11111111-1111-1111-1111-111111111111",
+            "99999999-9999-9999-9999-999999999999",
+        ):
+            db.add(
+                MemoryMetadataModel(
+                    id=row_id,
+                    key="shared",
+                    memory_type="reference",
+                    scope="global",
+                    scope_id=None,
+                    file_path=str(topic),
+                    tags="",
+                )
+            )
+        db.execute(
+            MemoryMetadataModel.__table__.update().values(updated_at=datetime(2026, 7, 1, 10, 0))
+        )
+        db.commit()
+
+    report = MemoryReconciliationService(base, engine).apply()
+
+    assert report.counts["dedupe_metadata"] == 1
+    remaining = _rows(engine)
+    assert len(remaining) == 1
+    assert remaining[0].id == "99999999-9999-9999-9999-999999999999"
+    assert remaining[0].file_path == str(topic)
+
+
+def test_foreign_path_duplicate_clears_in_one_repair_run(tmp_path: Path, engine: Any) -> None:
+    """A dedupe-freed path conflict must clear in the same run (review P3).
+
+    Topic X's stale duplicate row sits on topic Y's canonical path. The
+    pre-mutation snapshot plans Y as ``ambiguous_database_path`` while X
+    dedupes; without a re-plan, Y needs a second identical repair run. One
+    run must now clear both.
+    """
+    base = tmp_path / "memory"
+    topic_x = _write_topic(base, "global", None, "x-shared")
+    topic_y = _write_topic(base, "global", None, "y-victim")
+    _seed_duplicate_global_rows(
+        base,
+        engine,
+        "x-shared",
+        canonical_path=str(topic_x),
+        stale_paths=(str(topic_y),),
+    )
+
+    report = MemoryReconciliationService(base, engine).apply()
+
+    assert report.counts["skipped"] == 0, f"conflicts remained: {report.records}"
+    rows = {row.key: row for row in _rows(engine)}
+    assert set(rows) == {"x-shared", "y-victim"}, "both topics keep exactly one row"
+    assert rows["y-victim"].file_path == str(topic_y)
+    with engine.connect() as conn:
+        names = {
+            row[1]
+            for row in conn.exec_driver_sql("PRAGMA index_list('memory_metadata')").fetchall()
+        }
+    assert "uq_memory_key_scope_null" in names
+
+
+def test_replanned_topic_lock_blocks_concurrent_store(
+    tmp_path: Path, engine: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A replanned topic's lock is held from the initial acquisition (review P2-1).
+
+    Topic X's stale duplicate row sits on topic Y's canonical path, so Y
+    plans a row-state conflict and is repaired only by the second-pass
+    re-plan. That re-plan used to run without Y's topic lock, letting a
+    concurrent ``MemoryService.store()`` interleave: the Markdown stayed
+    new while SQLite and the index kept the pre-store projection. The
+    store must block against the replan and every surface must finish
+    describing the newest content.
+    """
+    base = tmp_path / "memory"
+    topic_x = _write_topic(base, "global", None, "x-shared")
+    topic_y = _write_topic(base, "global", None, "y-victim", body="original")
+    _seed_duplicate_global_rows(
+        base,
+        engine,
+        "x-shared",
+        canonical_path=str(topic_x),
+        stale_paths=(str(topic_y),),
+    )
+    with sessionmaker(bind=engine)() as db:
+        db.add(
+            MemoryMetadataModel(
+                id=str(uuid.uuid4()),
+                key="y-victim",
+                memory_type="reference",
+                scope="global",
+                scope_id=None,
+                file_path=str(topic_y),
+                tags="",
+            )
+        )
+        db.commit()
+
+    repair = MemoryReconciliationService(base, engine)
+    store = MemoryService(base, engine)
+    replan_started = threading.Event()
+    store_returned = threading.Event()
+    blocked_during_replan = threading.Event()
+
+    original_repair_metadata = repair._repair_metadata
+
+    def paused_repair_metadata(topic: Any, action: RepairAction) -> None:
+        if (
+            topic.identity is not None
+            and topic.identity.key == "y-victim"
+            and not replan_started.is_set()
+        ):
+            replan_started.set()
+            # Hold the replan open long enough for the concurrent store to
+            # reach the topic flock; it must still be blocked here.
+            time.sleep(1.5)
+            if not store_returned.is_set():
+                blocked_during_replan.set()
+        original_repair_metadata(topic, action)
+
+    monkeypatch.setattr(repair, "_repair_metadata", paused_repair_metadata)
+
+    def run_repair() -> None:
+        repair.apply()
+
+    def run_store() -> None:
+        replan_started.wait(timeout=10)
+        asyncio.run(
+            store.store(
+                content="concurrent new content",
+                scope="global",
+                memory_type="reference",
+                key="y-victim",
+            )
+        )
+        store_returned.set()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(run_repair), pool.submit(run_store)]
+        for future in futures:
+            future.result(timeout=30)
+
+    assert blocked_during_replan.is_set(), "store did not block on the replanned topic"
+
+    file_text = topic_y.read_text(encoding="utf-8")
+    assert "concurrent new content" in file_text
+    file_latest = (
+        max(line for line in file_text.splitlines() if line.startswith("## 20"))
+        .lstrip("# ")
+        .strip()
+    )
+    file_latest_at = datetime.strptime(file_latest, "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=timezone.utc
+    )
+
+    row = next(row for row in _rows(engine) if row.key == "y-victim")
+    row_updated_at = row.updated_at
+    assert row_updated_at is not None
+    assert row_updated_at.replace(tzinfo=timezone.utc) >= file_latest_at
+
+    index_text = (base / "global" / "wiki" / "index.md").read_text(encoding="utf-8")
+    y_lines = [line for line in index_text.splitlines() if "[y-victim]" in line]
+    assert len(y_lines) == 1
+    assert f"updated:{file_latest}" in y_lines[0]
+
+
+def test_unmapped_duplicate_scan_orders_across_scope_id_nullness(
+    tmp_path: Path, engine: Any
+) -> None:
+    """Identities differing only in ``scope_id`` nullness still sort (review P3).
+
+    The no-topic duplicate scan used dataclass ordering on
+    ``MemoryIdentity``, so two rows sharing key and scope with one NULL
+    and one string ``scope_id`` raised ``TypeError`` inside ``plan()``
+    instead of reporting.
+    """
+    base = tmp_path / "memory"
+    with sessionmaker(bind=engine)() as db:
+        db.add(
+            MemoryMetadataModel(
+                id="11111111-1111-1111-1111-111111111111",
+                key="shared",
+                memory_type="reference",
+                scope="global",
+                scope_id=None,
+                file_path=str(base / "global" / "wiki" / "global" / "gone-null.md"),
+                tags="",
+            )
+        )
+        db.add(
+            MemoryMetadataModel(
+                id="99999999-9999-9999-9999-999999999999",
+                key="shared",
+                memory_type="reference",
+                scope="global",
+                scope_id="legacy-nonnull",
+                file_path=str(base / "global" / "wiki" / "global" / "gone-str.md"),
+                tags="",
+            )
+        )
+        db.commit()
+
+    report = MemoryReconciliationService(base, engine).plan()
+
+    assert report.summary_text().startswith("memory_repair mode=dry-run")
+    assert report.counts["total"] == 0
 
 
 def test_unexpected_failure_does_not_rollback_other_records(
