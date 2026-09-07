@@ -6691,16 +6691,18 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
       hijacking guard);
     * when the HTTP auth layer is enabled (``AUTH0_DOMAIN`` /
       ``CAO_AUTH_JWKS_URI`` set — see :func:`is_auth_enabled`), the handshake
-      must carry a valid bearer token granting at least the ``cao:read``
-      scope.
+      must carry a valid bearer token granting ``cao:write`` or ``cao:admin``.
+      Keystroke injection is RCE; ``cao:read`` is not enough. HTTP
+      ``POST /terminals/{id}/input`` already requires write.
 
     Token scheme: browsers cannot set request headers on a WebSocket
     handshake, so the token is accepted from either ``Authorization: Bearer
     <token>`` (native clients) or a ``?token=<token>`` query parameter (the
     bundled web viewer). The token is verified exactly like the HTTP layer —
     RS256 signature, issuer, audience and expiry via the JWKS cache — and a
-    missing/invalid token or one lacking ``cao:read`` closes the handshake
-    with code 4401 before accept. This closes the bypass where widening
+    missing/invalid token or one lacking ``cao:write`` (or ``cao:admin``)
+    closes the handshake with code 4401 before accept. This closes the bypass
+    where widening
     ``CAO_WS_ALLOWED_CLIENTS`` / ``CAO_WS_ALLOWED_ORIGINS`` for containers,
     devcontainers or Codespaces exposed full PTY control with no credential.
     Do NOT expose the server to untrusted networks (e.g. --host 0.0.0.0)
@@ -6754,9 +6756,10 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
     # identity: browsers cannot set request headers on a WebSocket handshake,
     # so the token is accepted from the Authorization header or a ``?token=``
     # query parameter. The token is verified with the same JWKS/issuer/
-    # audience/expiry logic as the HTTP layer and must grant at least
-    # ``SCOPE_READ``. Default-off (auth disabled): no token is required and
-    # behavior is byte-for-byte unchanged.
+    # audience/expiry logic as the HTTP layer and must grant ``SCOPE_WRITE``
+    # or ``SCOPE_ADMIN``. ``SCOPE_READ`` is enough to watch HTTP output, not
+    # to type into the PTY. Default-off (auth disabled): no token is required
+    # and behavior is byte-for-byte unchanged.
     if is_auth_enabled():
         token = _extract_bearer(websocket.headers.get("authorization"))
         if not token:
@@ -6777,11 +6780,12 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
             )
             await websocket.close(code=4401, reason="Unauthorized")
             return
-        if SCOPE_READ not in scopes:
+        if SCOPE_WRITE not in scopes and SCOPE_ADMIN not in scopes:
             logger.warning(
-                "Rejected WebSocket attach for terminal %r: token lacks %r scope",
+                "Rejected WebSocket attach for terminal %r: token lacks %r/%r scope",
                 terminal_id,
-                SCOPE_READ,
+                SCOPE_WRITE,
+                SCOPE_ADMIN,
             )
             await websocket.close(code=4401, reason="Unauthorized")
             return
