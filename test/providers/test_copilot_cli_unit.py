@@ -45,6 +45,26 @@ class TestCopilotCliProviderCommand:
     )
     @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
     @patch.dict("os.environ", {}, clear=True)
+    def test_empty_allowlist_emits_deny_tool(self, mock_tmux, mock_build_mcp, mock_supports_flag):
+        """allowed_tools=[] must pass --deny-tool, not skip restrictions."""
+        mock_supports_flag.return_value = True
+        mock_build_mcp.return_value = '{"mcpServers":{"cao-mcp-server":{"command":"x"}}}'
+        mock_tmux.return_value.get_pane_working_directory.return_value = "/tmp/project"
+
+        provider = CopilotCliProvider(
+            "test1234", "test-session", "window-0", allowed_tools=[]
+        )
+        parts = shlex.split(provider._command())
+
+        assert "--deny-tool" in parts
+        assert "shell" in parts
+
+    @patch("cli_agent_orchestrator.providers.copilot_cli.CopilotCliProvider._supports_flag")
+    @patch(
+        "cli_agent_orchestrator.providers.copilot_cli.CopilotCliProvider._build_runtime_mcp_config"
+    )
+    @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
+    @patch.dict("os.environ", {}, clear=True)
     def test_command_does_not_use_model_env(self, mock_tmux, mock_build_mcp, mock_supports_flag):
         mock_supports_flag.return_value = True
         mock_build_mcp.return_value = '{"mcpServers":{"cao-mcp-server":{"command":"x"}}}'
