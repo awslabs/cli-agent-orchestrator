@@ -143,8 +143,10 @@ STARTUP_PARTIAL_ACTIVITY_PATTERN = r"^[^\S\n]*•[^\S\n]*\S[^\n]*$"
 # activity repaints carry no terminal punctuation ("• Working", "• Starting
 # MCP servers (2/3): cao-mcp-server"): the TUI redraws the whole cell once the
 # timer ticks, and a fragment with closing punctuation would be a completed
-# line, not a partial frame.
-STARTUP_STATIC_BULLET_PATTERN = r"^[^\S\n]*•[^\S\n]+\S.*[.!?…](?:\s*)$"
+# line, not a partial frame. A trailing ellipsis is NOT prose punctuation —
+# a live frame can pause on it mid-animation ("• Working…") — so it must
+# wait for the stabilization pass like any other partial frame.
+STARTUP_STATIC_BULLET_PATTERN = r"^[^\S\n]*•[^\S\n]+\S.*[.!?](?:\s*)$"
 # Codex's runtime approval prompt as actually rendered by codex-cli 0.147.0,
 # verified against a live tmux capture (test/providers/fixtures/
 # codex_approval_modal_raw.txt):
@@ -807,14 +809,35 @@ def _transcript_marker_cells(clean_output: str, cutoff_pos: Optional[int] = None
     composer line (an empty ``›``, the placeholder hint, or a draft typed
     into it) sits inside the footer region the parser already excludes, so
     a typed-but-unsubmitted draft cannot change the cells.
+
+    The same pane reaches this parser through differently produced text:
+    the pre-send baseline from a tmux capture-pane render (literal column
+    spacing, lines wrapped at the pane width) and status observations from
+    the raw stream, where cursor-forward runs collapse to single spaces and
+    lines never wrap. Cells are therefore canonicalized — horizontal
+    whitespace runs collapse to one space — and compared with truncation
+    tolerance (see ``_is_suffix``), so every view of an unchanged pane
+    parses to the same cells (issue #739 review).
+
+    When no TUI footer is detected the cutoff keeps the whole text, so a
+    partial repaint that has not drawn the status bar yet would leave the
+    composer hint as the bottom-most cell-looking line. A ``›``/``»`` line
+    that is the LAST content line of the pane is the composer in that
+    frame (a submitted user cell always has the composer or a response
+    below it), so it is dropped rather than read as a new cell that would
+    permanently disarm the ownership gate.
     """
-    if cutoff_pos is not None:
-        clean_output = clean_output[:cutoff_pos]
+    if cutoff_pos is None:
+        cutoff_pos = len(clean_output)
+    footer_detected = cutoff_pos < len(clean_output)
+    content_lines = [line for line in clean_output[:cutoff_pos].splitlines() if line.strip()]
+    if not footer_detected and content_lines and _USER_CELL_RE.match(content_lines[-1]):
+        content_lines.pop()
     cells = []
-    for line in clean_output.splitlines():
-        line = line.rstrip()
-        if _ASSISTANT_BULLET_RE.match(line) or _USER_CELL_RE.match(line):
-            cells.append(line)
+    for line in content_lines:
+        canonical = " ".join(line.split())
+        if _ASSISTANT_BULLET_RE.match(canonical) or _USER_CELL_RE.match(canonical):
+            cells.append(canonical)
     return cells
 
 
@@ -825,10 +848,20 @@ def _is_suffix(suffix: list, sequence: list) -> bool:
     cells than the pre-send baseline — genuine appended content — and is not
     a suffix. A zero-length observation is a tail of anything (a pane whose
     transcript cells scrolled out of this view is still unchanged content).
+    Cells compare equal when one is a prefix of the other: a capture-pane
+    render wraps a long cell at the pane width while the raw-stream view of
+    the same cell is unwrapped, so the wrapped fragment is a truncated view
+    of the same line, not new content. Codex never edits a printed line, so
+    a genuinely new cell cannot be a prefix of a retained one.
     """
     if len(suffix) > len(sequence):
         return False
-    return sequence[len(sequence) - len(suffix) :] == suffix
+    for observed, baseline in zip(suffix, sequence[len(sequence) - len(suffix) :], strict=True):
+        if not (
+            observed == baseline or observed.startswith(baseline) or baseline.startswith(observed)
+        ):
+            return False
+    return True
 
 
 def _find_assistant_marker(text: str) -> Optional[re.Match[str]]:
@@ -1252,6 +1285,14 @@ class CodexProvider(BaseProvider):
 
             clean_output = strip_terminal_escapes(re.sub(ANSI_CODE_PATTERN, "", output))
 
+            # Every observed poll updates the tail signature — including
+            # dialog frames — so the stabilization comparison below is always
+            # between two immediately adjacent observations, never a stale
+            # fragment from several polls back.
+            tail_signature = "\n".join(clean_output.splitlines()[-STARTUP_PROMPT_BOTTOM_LINES:])
+            adjacent_repeat = tail_signature == previous_tail_signature
+            previous_tail_signature = tail_signature
+
             if not trust_dismissed and re.search(TRUST_PROMPT_PATTERN, clean_output):
                 from cli_agent_orchestrator.services.status_monitor import status_monitor
 
@@ -1300,12 +1341,10 @@ class CodexProvider(BaseProvider):
             # still moving: once consecutive polls observe the identical tail,
             # the frame has settled and the pane is ready (see the signature
             # comment above).
-            tail_signature = "\n".join(clean_output.splitlines()[-STARTUP_PROMPT_BOTTOM_LINES:])
             has_idle = _has_startup_idle_composer(
                 clean_output,
-                allow_partial_activity_cell=(tail_signature == previous_tail_signature),
+                allow_partial_activity_cell=adjacent_repeat,
             )
-            previous_tail_signature = tail_signature
             has_dialog = (
                 re.search(TRUST_PROMPT_PATTERN, bottom_region)
                 or (
@@ -1402,10 +1441,11 @@ class CodexProvider(BaseProvider):
         The rolling byte buffer is cleared by the caller, but the pyte screen
         and pane history are not: a startup notice or a previous turn's
         completed-response bullet survives the dispatch boundary. Snapshot
-        the pane's marker cells from BOTH history bounds (viewport plus
-        scrollback) so the baseline contains every cell any observation view
-        can show; the COMPLETED decision points in ``get_status`` refuse to
-        complete while the observed cells are a tail of this baseline.
+        the pane's marker cells from the scrollback capture, falling back to
+        the visible-only viewport when the scrollback shows no cells, so the
+        baseline contains every retained cell. The COMPLETED decision points
+        in ``get_status`` refuse to complete while the observed cells are a
+        tail of this baseline.
 
         Capture happens here, strictly before send_keys: a baseline derived
         from a post-send observation would arm on a genuine fast
@@ -1434,7 +1474,10 @@ class CodexProvider(BaseProvider):
             visible = ""
 
         def _cells(raw: str) -> list:
-            clean = strip_terminal_escapes(re.sub(ANSI_CODE_PATTERN, "", raw))
+            # Same single cleaner and same footer-cutoff rule every status
+            # observation uses, so the baseline and the views reduce the
+            # same pane to the same cells (issue #739 review).
+            clean = strip_terminal_escapes(raw)
             return _transcript_marker_cells(clean, _footer_cutoff_position(clean))
 
         cells = _cells(history)
@@ -1460,6 +1503,12 @@ class CodexProvider(BaseProvider):
         observation whose cells are NOT a tail of the baseline — genuine
         current-turn content has rendered, and the turn's own evidence
         decides from there on.
+
+        Residual gap, accepted: a genuinely new cell that byte-equals (or is
+        a truncated view of) a retained baseline cell still reads unchanged,
+        so a terse reply identical to a prior turn's last cell stays IDLE
+        until the next differing frame. Content identity cannot distinguish
+        that case; it only ever delays completion, never falsely completes.
         """
         if not self._dispatch_pending:
             return True

@@ -2567,7 +2567,10 @@ class TestCodexProviderTrustPrompt:
 
         # The rolling buffer / pyte viewport observation holds only the last
         # ~40 rows of that pane — a differently bounded view of the same
-        # unchanged content.
+        # unchanged content. tmux captures viewport PLUS scrollback (``-S
+        # -200``), so a 220-turn history overruns even the full 200-row
+        # window; this fixture models that overrun, not the literal boundary
+        # exactly at 200.
         bounded_view = "\n".join(retained_lines[-40:])
 
         mock_backend.return_value.get_history.return_value = full_history
@@ -2605,7 +2608,106 @@ class TestCodexProviderTrustPrompt:
             provider = CodexProvider("test1234", "test-session", "window-0")
             provider.mark_input_received()
 
-        assert provider.get_status_from_screen(viewport_rows) == TerminalStatus.IDLE
+            assert provider.get_status_from_screen(viewport_rows) == TerminalStatus.IDLE
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_render_baseline_vs_raw_observation_is_not_newly_owned(self, mock_backend):
+        """One canonical representation for baseline and observation.
+
+        The pre-send baseline arrives as a tmux capture-pane render (literal
+        column spacing — double spaces where the TUI used cursor-forward
+        padding, long cells wrapped at the pane width), while status
+        observations arrive from the raw stream, where those cursor runs
+        collapse to single spaces and lines never wrap (issue #739 review:
+        exact per-cell equality between those two productions of one
+        unchanged pane disarmed the ownership gate and let a dropped
+        dispatch falsely COMPLETE). Cells canonicalize whitespace and
+        compare with wrap tolerance, so the raw view of the unchanged
+        retained turn reads unchanged.
+        """
+        rendered_history = (
+            "OpenAI Codex (v0.153.2)\n"
+            "• You have  1 usage limit reset available.  Run /usage to use one.\n"
+            "› run the deployment pipeline end to end and report every step plus the\n"
+            "  timing for each stage\n"
+            "• Pipeline finished.  All stages passed.\n"
+            "\n"
+            "› Ask Codex to do anything\n"
+            "\n"
+            "  gpt-5.6-sol default · /tmp/work\n"
+        )
+        raw_stream_view = (
+            "OpenAI Codex (v0.153.2)\n"
+            "• You have 1 usage limit reset available. Run /usage to use one.\n"
+            "› run the deployment pipeline end to end and report every step plus the timing for each stage\n"
+            "• Pipeline finished. All stages passed.\n"
+            "\n"
+            "› Ask Codex to do anything\n"
+            "\n"
+            "  gpt-5.6-sol default · /tmp/work\n"
+        )
+        mock_backend.return_value.get_history.return_value = rendered_history
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider.mark_input_received()
+
+        # The differently produced view of the SAME unchanged pane must not
+        # read as newly owned content: IDLE (dropped submit retries), not
+        # COMPLETED from the retained prior turn.
+        assert provider.get_status(raw_stream_view) == TerminalStatus.IDLE
+        # The render view of the same pane reads unchanged too.
+        assert provider.get_status(rendered_history) == TerminalStatus.IDLE
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_partial_repaint_without_footer_does_not_disarm_ownership(self, mock_backend):
+        """A post-clear partial repaint must not permanently disarm the gate.
+
+        The rolling buffer is cleared at dispatch, so an early poll can
+        catch the pane mid-repaint: the composer hint is drawn but the
+        status bar is not, so no TUI footer is detected and the cutoff
+        keeps the whole text (issue #739 review). The composer-looking
+        bottom line is dropped from the cells in that frame — a submitted
+        user cell always has the composer or a response below it — so the
+        unchanged notice pane keeps the gate armed and a later retained
+        notice still cannot complete the dropped dispatch.
+        """
+        notice_pane = (
+            "OpenAI Codex (v0.153.2)\n"
+            "• You have 1 usage limit reset available. Run /usage to use one.\n"
+            "\n"
+            "› Ask Codex to do anything\n"
+            "\n"
+            "  gpt-5.6-sol default · /tmp/work\n"
+        )
+        partial_repaint = (
+            "OpenAI Codex (v0.153.2)\n"
+            "• You have 1 usage limit reset available. Run /usage to use one.\n"
+            "\n"
+            "› Ask Codex to do anything\n"
+        )
+        mock_backend.return_value.get_history.return_value = notice_pane
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider.mark_input_received()
+
+        # Early poll: composer present, status bar not yet drawn.
+        assert provider.get_status(partial_repaint) == TerminalStatus.IDLE
+        # The gate must still be armed: the footer-restored unchanged pane
+        # is retained content, not this dispatch's completion.
+        assert provider.get_status(notice_pane) == TerminalStatus.IDLE
+
+        # Genuine current-turn content still completes.
+        settled = (
+            "OpenAI Codex (v0.153.2)\n"
+            "• You have 1 usage limit reset available. Run /usage to use one.\n"
+            "› analyze the repo and list risks\n"
+            "• The requested task is complete.\n"
+            "\n"
+            "› Ask Codex to do anything\n"
+            "\n"
+            "  gpt-5.6-sol default · /tmp/work\n"
+        )
+        assert provider.get_status(settled) == TerminalStatus.COMPLETED
 
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
     def test_unchanged_approval_prompt_keeps_waiting_after_dispatch(self, mock_backend):
@@ -2702,6 +2804,54 @@ class TestCodexProviderTrustPrompt:
 
         assert _has_startup_idle_composer(output) is False
         assert _has_startup_idle_composer(output, allow_partial_activity_cell=True) is True
+
+    def test_v0153_ellipsis_frame_waits_for_stabilization(self):
+        """A live frame paused on an ellipsis is not printed prose: readiness
+        waits for the stabilization pass rather than declaring the pane ready
+        mid-paint."""
+        output = (
+            "OpenAI Codex (v0.153.2)\n"
+            "• Working…\n"
+            "\n"
+            "› Ask Codex to do anything\n\n"
+            "  gpt-5.6-sol default · /tmp/work\n"
+        )
+
+        assert _has_startup_idle_composer(output) is False
+        assert _has_startup_idle_composer(output, allow_partial_activity_cell=True) is True
+
+    @pytest.mark.asyncio
+    @patch(
+        "cli_agent_orchestrator.providers.codex.time.time",
+        side_effect=[0.0, 0.0, 1.0, 20.0],
+    )
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.providers.codex.logger.error")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_handle_trust_prompt_stabilization_exits_on_adjacent_repeat(
+        self, mock_backend, mock_error, mock_sleep, _mock_time
+    ):
+        """The stabilization loop itself, not just its helper: two identical
+        partial-activity tails on consecutive polls must exit the startup loop
+        ready (a live spinner's tail never repeats, so it keeps waiting). A
+        broken signature update would time this loop out while every helper
+        test still passed (issue #739 review)."""
+        mock_backend.return_value.get_history.return_value = (
+            "OpenAI Codex (v0.153.2)\n"
+            "• Working\n"
+            "\n"
+            "› Ask Codex to do anything\n\n"
+            "  gpt-5.6-sol default · /tmp/work\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        await provider._handle_trust_prompt(timeout=20.0)
+
+        # Two polls: the first saw the partial frame moving, the second saw
+        # the identical tail and declared the pane settled.
+        assert mock_backend.return_value.get_history.call_count == 2
+        assert mock_sleep.await_count == 1
+        mock_error.assert_not_called()
 
     @pytest.mark.parametrize(
         "notice",
