@@ -84,6 +84,7 @@ class _RenameResolution:
     item: _ProjectedNote
     retained_former_path: Optional[str] = None
     alias_from: Optional[VaultNoteModel] = None
+    exact_hash_candidates: tuple[VaultNoteModel, ...] = ()
     findings: tuple[tuple[str, str, str, str], ...] = ()
 
 
@@ -617,20 +618,14 @@ def _carry_rebuild_exclusions(
     # identity with the exact-hash rename, so ordinary collision preference
     # would incorrectly discard the rename proof.  The post-delete projection
     # resolves and quarantines its own live identities below.
-    direct_claimed_identities = {
+    exact_hash_claimed_identities = {
         (
-            cast(str, resolution.alias_from.scope),
-            cast(str, resolution.alias_from.scope_id),
-            cast(str, resolution.alias_from.cao_key),
+            cast(str, candidate.scope),
+            cast(str, candidate.scope_id),
+            cast(str, candidate.cao_key),
         )
         for resolution in resolutions
-        if resolution.alias_from is not None
-        and resolution.alias_from.content_sha256 is not None
-        and resolution.alias_from.content_sha256 == resolution.item.note.content_sha256
-        and (
-            (parsed := projected_by_path[resolution.item.note.vault_relpath].note.parsed) is None
-            or "key" not in parsed.cao
-        )
+        for candidate in resolution.exact_hash_candidates
     }
     carried = set(exclusions)
     for resolution in resolutions:
@@ -652,7 +647,7 @@ def _carry_rebuild_exclusions(
             and resolution.alias_from.content_sha256 == item.note.content_sha256
         )
         established_alias = (
-            old_identity in carried_alias_keys and old_identity not in direct_claimed_identities
+            old_identity in carried_alias_keys and old_identity not in exact_hash_claimed_identities
         )
         if old_identity not in carried or not (directly_resolved or established_alias):
             continue
@@ -839,6 +834,7 @@ def _resolve_renames(
                     renamed_item,
                     retained_former_path=cast(str, old.vault_relpath),
                     alias_from=old,
+                    exact_hash_candidates=matching,
                 )
             )
         elif len(matching) > 1 or any(
@@ -847,6 +843,7 @@ def _resolve_renames(
             resolutions.append(
                 _RenameResolution(
                     item,
+                    exact_hash_candidates=matching,
                     findings=(
                         _rename_finding(FindingCode.RENAME_AMBIGUOUS, item.note.vault_relpath),
                     ),

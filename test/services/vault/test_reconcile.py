@@ -1425,6 +1425,53 @@ def test_rebuild_exact_hash_move_outranks_alias_path_replacement(tmp_path, monke
     ]
 
 
+def test_rebuild_ambiguous_hash_moves_do_not_exclude_alias_path_replacement(tmp_path, monkeypatch):
+    """Contested exact hashes block alias fallback to an unrelated replacement."""
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    old_path = tmp_path / "vault" / "Mapped" / "Old.md"
+    current_path = old_path.with_name("New.md")
+    old_path.write_text("forgotten content", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="ambiguous-alias-reuse-before")
+    with Session() as db:
+        original = db.query(VaultNoteModel).one()
+        original_key = original.cao_key
+        _exclude_note(db, original)
+        db.query(MemoryMetadataModel).filter_by(source_kind="vault").delete()
+        db.commit()
+
+    old_path.rename(current_path)
+    reconcile(vault, apply=True, run_id="ambiguous-alias-reuse-carried")
+    with Session() as db:
+        assert db.query(VaultNoteAliasModel).count() == 1
+        assert db.query(VaultNoteModel).one().status == "excluded"
+
+    current_path.rename(old_path.with_name("A.md"))
+    old_path.with_name("B.md").write_text("forgotten content", encoding="utf-8")
+    current_path.write_text("unrelated replacement", encoding="utf-8")
+    reconcile(vault, apply=True, rebuild=True, run_id="ambiguous-alias-reuse-rebuilt")
+
+    with Session() as db:
+        notes = {row.vault_relpath: row.status for row in db.query(VaultNoteModel).all()}
+        metadata = {
+            row.file_path
+            for row in db.query(MemoryMetadataModel).filter_by(source_kind="vault").all()
+        }
+        exclusion = db.query(VaultExclusionModel).one()
+    assert notes == {
+        "Mapped/A.md": "indexed",
+        "Mapped/B.md": "indexed",
+        "Mapped/New.md": "indexed",
+    }
+    assert metadata == {"Mapped/A.md", "Mapped/B.md", "Mapped/New.md"}
+    assert (exclusion.cao_key, exclusion.last_known_relpath) == (
+        original_key,
+        "Mapped/Old.md",
+    )
+
+
 def test_rebuild_preserves_path_derived_tombstone_after_rename(tmp_path, monkeypatch):
     """A rebuild migrates a forgotten rename-carried identity to the current path key."""
     from cli_agent_orchestrator.services.vault import reconcile as module
