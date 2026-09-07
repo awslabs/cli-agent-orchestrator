@@ -60,6 +60,11 @@ class TestResolveAllowedTools:
         result = resolve_allowed_tools(["*"], "supervisor")
         assert result == ["*"]
 
+    def test_unknown_role_raises(self):
+        """A typo must not grant ['*'] — that is more privilege than omitting role."""
+        with pytest.raises(ValueError, match="Unknown role 'Supervisor'"):
+            resolve_allowed_tools(None, "Supervisor")
+
 
 class TestGetDisallowedTools:
     """Tests for get_disallowed_tools."""
