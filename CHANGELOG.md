@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Profiles tab in the Web UI: browse, search, create (from template with live
+  preview, or from scratch via a schema-driven form), edit, clone, and delete
+  agent profiles over the profile management APIs, with validate-before-save
+  surfacing bounded findings and the truncation-marker contract (#510)
+
 ### Fixed
 
 - **enabling `CAO_MEMORY_API_URL` rejected memory keys that work without it.**
@@ -47,10 +54,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `list_outcomes` clamps `limit` to 200 client-side; the service already clamped
   silently, so `limit=500` keeps working rather than becoming a 422.
 
+
 ## [2.5.0] - 2026-08-28
 
 ### Added
 
+- MiniMax Code (`mcode`) provider with per-terminal authentication and profile
+  isolation, model and MCP configuration, multi-turn TUI orchestration,
+  supervisor/worker E2E coverage, and provider documentation (#624)
+- Oh My Pi (`omp`) provider with additive native configuration, profile MCP extension wiring, lifecycle detection, and supervisor/worker orchestration support (#559)
+- Add the official xAI Grok Build CLI as the `grok_cli` provider, including
+  isolated per-terminal MCP configuration, native hard tool restrictions,
+  multi-turn TUI support, orchestration e2e coverage, and provider docs.
 - async run submit, discovery, and live event following (#505) (#525)
 
 - rewrite the cao tui front door in Rust (#547)

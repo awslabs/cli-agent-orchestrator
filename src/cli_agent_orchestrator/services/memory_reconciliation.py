@@ -30,6 +30,10 @@ _SCOPE_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 _TIMESTAMP_RE = re.compile(r"^## (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)$", re.MULTILINE)
 _INDEX_ID_RE = re.compile(r"^- \[(?P<key>[^\]]+)\]\((?P<path>[^)]+)\)")
 
+# ``memory_metadata.updated_at`` is nullable; the dedupe survivor tiebreak
+# treats a missing timestamp as older than every real one.
+_MIN_DT = datetime.min.replace(tzinfo=timezone.utc)
+
 DEFAULTED_METADATA_FIELDS = (
     "source_provider",
     "source_terminal_id",
@@ -45,6 +49,7 @@ class RepairAction(str, Enum):
 
     CREATE_METADATA = "create_metadata"
     UPDATE_METADATA = "update_metadata"
+    DEDUPE_METADATA = "dedupe_metadata"
     REBUILD_INDEX = "rebuild_index"
     UNCHANGED = "unchanged"
     MALFORMED = "malformed"
@@ -100,6 +105,7 @@ class RepairReport:
             "failed": 0,
             "create_metadata": 0,
             "update_metadata": 0,
+            "dedupe_metadata": 0,
             "rebuild_index": 0,
             "malformed": 0,
             "conflict": 0,
@@ -235,6 +241,13 @@ def discover_canonical_scope_dirs(base_dir: Path) -> tuple[tuple[str, Optional[s
             for child in scope_children:
                 if child.is_dir():
                     discovered.add((scope, child.name, global_container))
+    # ``federated`` is a machine-wide sibling of ``global`` (see
+    # MemoryService._get_project_dir) and its NULL-``scope_id`` rows are
+    # covered by the same ``uq_memory_key_scope_null`` migration warning,
+    # so repair must be able to visit it too.
+    federated_container = base_dir / "federated"
+    if (federated_container / "wiki" / "federated").is_dir():
+        discovered.add(("federated", None, federated_container))
     if base_dir.is_dir():
         try:
             containers = tuple(base_dir.iterdir())
@@ -255,6 +268,7 @@ class MemoryReconciliationService:
         self.base_dir = Path(base_dir or MEMORY_BASE_DIR)
         self._db_engine = db_engine
         self._db_session_factory: Any = None
+        self._strict_index = False
         if db_engine is not None:
             from sqlalchemy.orm import sessionmaker
 
@@ -376,6 +390,18 @@ class MemoryReconciliationService:
         global_wiki = global_container / "wiki"
         global_index = global_wiki / "index.md"
         add_scope(global_wiki / "global", "global", None, global_index, "global")
+        # Federated is a machine-wide tier in its own top-level container
+        # (MemoryService._get_project_dir); its NULL-scope_id rows are covered
+        # by the same uq_memory_key_scope_null migration warning as global's,
+        # so repair must be able to reach them.
+        federated_container = self.base_dir / "federated"
+        add_scope(
+            federated_container / "wiki" / "federated",
+            "federated",
+            None,
+            federated_container / "wiki" / "index.md",
+            "federated",
+        )
 
         for scope in ("session", "agent"):
             scope_root = global_wiki / scope
@@ -630,6 +656,8 @@ class MemoryReconciliationService:
         """Derive an index identity without using the index as a discovery seed."""
         if scope == "global":
             return MemoryIdentity(key, scope)
+        if scope == "federated":
+            return MemoryIdentity(key, scope)
         if scope == "project" and project_scope_id is not None:
             return MemoryIdentity(key, scope, project_scope_id)
         if scope in {"session", "agent"}:
@@ -741,14 +769,32 @@ class MemoryReconciliationService:
             all_rows = list(rows)
             identity_rows = [row for row in all_rows if row.identity == topic.identity]
             path_rows = [row for row in all_rows if self._resolved_row_path(row) == topic.file_path]
+        dedupe_stale: list[_Row] = []
         if len(identity_rows) > 1:
-            return self._candidate_record(
-                topic.file_path,
-                RepairAction.CONFLICT,
-                "duplicate_database_identity",
-                "multiple SQLite rows match the canonical identity",
-                topic.identity,
-            )
+            # Legacy pre-#657 state: SQLite's NULL-distinctness let multiple
+            # NULL-scope_id rows share one identity. When at least one row
+            # anchors this canonical topic path (and no foreign identity sits
+            # on it) the others are demonstrably stale, so plan a deterministic
+            # dedupe keeping the path-anchored row — newest ``updated_at``
+            # first, ``id`` as the stable tiebreak when several point at the
+            # same path. Otherwise which row is canonical is a human decision.
+            path_matches = [
+                row for row in identity_rows if self._resolved_row_path(row) == topic.file_path
+            ]
+            if path_matches and not any(row.identity != topic.identity for row in path_rows):
+                survivor = max(path_matches, key=lambda row: (row.updated_at or _MIN_DT, row.id))
+                dedupe_stale = [row for row in identity_rows if row.id != survivor.id]
+                identity_rows = [survivor]
+            else:
+                return self._candidate_record(
+                    topic.file_path,
+                    RepairAction.CONFLICT,
+                    "duplicate_database_identity",
+                    "multiple SQLite rows match the canonical identity and none is "
+                    "uniquely anchored to the canonical topic path; align file_path "
+                    "or remove the stray rows manually",
+                    topic.identity,
+                )
         if any(row.identity != topic.identity for row in path_rows):
             return self._candidate_record(
                 topic.file_path,
@@ -759,6 +805,10 @@ class MemoryReconciliationService:
             )
         actions: list[RepairAction] = []
         defaulted: tuple[str, ...] = ()
+        if dedupe_stale:
+            # Ordered first: the stale siblings must be gone before the
+            # survivor's metadata is (re)written or the unique index exists.
+            actions.append(RepairAction.DEDUPE_METADATA)
         if not identity_rows:
             actions.append(RepairAction.CREATE_METADATA)
             defaulted = DEFAULTED_METADATA_FIELDS
@@ -789,6 +839,19 @@ class MemoryReconciliationService:
             actions=tuple(actions),
             status="unchanged" if actions == [RepairAction.UNCHANGED] else "planned",
             defaulted_fields=defaulted,
+            **(
+                {
+                    "finding": RepairFinding(
+                        kind="duplicate_database_identity",
+                        message=(
+                            f"{len(dedupe_stale)} stale duplicate row(s) will be removed, "
+                            "keeping the row anchored to the canonical topic path"
+                        ),
+                    )
+                }
+                if dedupe_stale
+                else {}
+            ),
         )
 
     def plan(self) -> RepairReport:
@@ -852,6 +915,35 @@ class MemoryReconciliationService:
                 )
 
         all_records = records + parsed_records
+        # Rows whose NULL-scope identity has NO surviving canonical topic are
+        # invisible to topic-driven planning above, yet they are exactly the
+        # duplicate state that keeps uq_memory_key_scope_null off the database
+        # (review: repair used to exit 0 with total=0 while the rows stayed).
+        # Surface every unmapped duplicate NULL-scope identity as an
+        # actionable conflict: rows preserved, manual resolution named.
+        mapped_identities = {topic.identity for topic in topics}
+        # Total key only: identities may differ solely in ``scope_id``
+        # nullness, and ``MemoryIdentity`` does not order across a
+        # None/string boundary.
+        for identity, identity_rows in sorted(
+            rows_by_identity.items(),
+            key=lambda item: (item[0].scope, item[0].scope_id or "", item[0].key),
+        ):
+            if identity in mapped_identities or identity.scope_id is not None:
+                continue
+            if len(identity_rows) <= 1:
+                continue
+            all_records.append(
+                self._candidate_record(
+                    Path(identity_rows[0].file_path or "<unknown>"),
+                    RepairAction.CONFLICT,
+                    "duplicate_database_identity",
+                    "multiple SQLite rows hold this NULL-scope identity and no canonical "
+                    "topic maps to it; restore or move the canonical topic file, or "
+                    "remove the stray rows manually",
+                    identity,
+                )
+            )
         all_records.sort(
             key=lambda record: (
                 record.identity.scope if record.identity else "",
@@ -988,6 +1080,50 @@ class MemoryReconciliationService:
                 row.token_estimate = topic.token_estimate
             db.commit()
 
+    def _dedupe_metadata(self, topic: _Topic) -> int:
+        """Remove stale duplicate rows for ``topic.identity`` (issue #657).
+
+        Re-derives the plan's survivor rule under the repair lock: among the
+        rows matching the identity, keep the one anchored to the canonical
+        topic path (newest ``updated_at``, ``id`` tiebreak when several point
+        at it) and remove the others. The survivor keeps its row id, so
+        canonical content is never rewritten. Returns the number removed.
+        """
+        from cli_agent_orchestrator.clients.database import MemoryMetadataModel
+
+        with self._get_db_session() as db:
+            query = db.query(MemoryMetadataModel).filter(
+                MemoryMetadataModel.key == topic.identity.key,
+                MemoryMetadataModel.scope == topic.identity.scope,
+                (
+                    MemoryMetadataModel.scope_id == topic.identity.scope_id
+                    if topic.identity.scope_id is not None
+                    else MemoryMetadataModel.scope_id.is_(None)
+                ),
+            )
+            rows = query.all()
+            if len(rows) <= 1:
+                return 0
+            path_matches = [row for row in rows if self._resolved_row_path(row) == topic.file_path]
+            if not path_matches:
+                raise RuntimeError("metadata duplicate lost its canonical anchor while lock held")
+            # Legacy rows can mix naive, timezone-aware and NULL ``updated_at``
+            # values (SQLite stores naive datetimes), and comparing a naive
+            # value with the tz-aware ``_MIN_DT`` floor raises ``TypeError``
+            # mid-repair. Normalize through the same ``_utc()`` path planning
+            # uses so the survivor pick is well-defined on legacy data.
+            survivor = max(
+                path_matches,
+                key=lambda row: (_utc(row.updated_at) or _MIN_DT, row.id),
+            )
+            removed = 0
+            for row in rows:
+                if row.id != survivor.id:
+                    db.delete(row)
+                    removed += 1
+            db.commit()
+            return removed
+
     def _candidate_from_record(self, record: RepairRecord) -> _Candidate:
         assert record.identity is not None
         path = Path(record.file_path)
@@ -995,6 +1131,9 @@ class MemoryReconciliationService:
         if identity.scope == "project":
             container = self.base_dir / str(identity.scope_id)
             prefix = "project"
+        elif identity.scope == "federated":
+            container = self.base_dir / "federated"
+            prefix = "federated"
         else:
             container = self.base_dir / "global"
             prefix = (
@@ -1043,6 +1182,9 @@ class MemoryReconciliationService:
         groups: dict[Path, list[tuple[RepairRecord, _Candidate]]] = {}
         records_by_path: dict[Path, list[RepairRecord]] = {}
         resolved_paths: list[Optional[Path]] = []
+        # Findings whose records the second pass below can re-plan after
+        # another identity's dedupe frees the topic's path.
+        row_state_conflicts = {"database_path_conflict", "ambiguous_database_path"}
         for record in planned.records:
             if record.status != "skipped" and record.identity is not None:
                 resolved_path = Path(record.file_path).resolve()
@@ -1054,6 +1196,20 @@ class MemoryReconciliationService:
             path for path, matching_records in records_by_path.items() if len(matching_records) > 1
         }
         for record, planned_path in zip(planned.records, resolved_paths):
+            if (
+                record.status == "skipped"
+                and record.identity is not None
+                and record.finding is not None
+                and record.finding.kind in row_state_conflicts
+            ):
+                # This conflict may be re-planned and repaired in the second
+                # pass once another identity's dedupe frees its path, so its
+                # topic lock must be held from this initial ordered
+                # acquisition — never picked up lazily mid-run — keeping the
+                # single (index_path, file_path) lock order global.
+                candidate = self._candidate_from_record(record)
+                groups.setdefault(candidate.index_path, []).append((record, candidate))
+                continue
             if record.status == "skipped" or record.identity is None:
                 results.append(record)
                 continue
@@ -1149,6 +1305,8 @@ class MemoryReconciliationService:
                 for current, parsed in current_items:
                     metadata_error: Optional[Exception] = None
                     try:
+                        if RepairAction.DEDUPE_METADATA in current.actions:
+                            self._dedupe_metadata(parsed)
                         for metadata_action in (
                             RepairAction.CREATE_METADATA,
                             RepairAction.UPDATE_METADATA,
@@ -1174,6 +1332,72 @@ class MemoryReconciliationService:
                                 ),
                             )
                         )
+
+            # A dedupe above can free a dependent conflict: every plan in this
+            # run was derived from the pre-mutation row snapshot, so a topic
+            # whose canonical path was occupied by another identity's stale
+            # duplicate row planned a row-state conflict that the dedupe has
+            # just resolved. Re-plan those from a fresh snapshot and execute
+            # the recovered plan here, so one repair run clears both the
+            # duplicate and its dependent conflict instead of demanding a
+            # second identical run. These topics joined the initial lock
+            # acquisition above, so the re-parse and every mutation below
+            # run under the topic's held lock.
+            conflicted_indexes = [
+                index
+                for index, record in enumerate(results)
+                if record.status == "skipped"
+                and record.finding is not None
+                and record.finding.kind in row_state_conflicts
+                and record.identity is not None
+            ]
+            if conflicted_indexes:
+                fresh_maps: Optional[
+                    tuple[dict[MemoryIdentity, list[_Row]], dict[Path, list[_Row]]]
+                ] = None
+                try:
+                    fresh_maps = self._row_maps(self._load_rows())
+                except Exception:
+                    fresh_maps = None
+                if fresh_maps is not None:
+                    fresh_by_identity, fresh_by_path = fresh_maps
+                    for index in conflicted_indexes:
+                        record = results[index]
+                        try:
+                            parsed = self._parse_candidate(self._candidate_from_record(record))
+                        except Exception:
+                            continue
+                        if isinstance(parsed, RepairRecord):
+                            continue
+                        replanned = self._plan_topic(
+                            parsed,
+                            rows_by_identity=fresh_by_identity,
+                            rows_by_path=fresh_by_path,
+                        )
+                        if replanned.status == "skipped":
+                            results[index] = replanned
+                            continue
+                        try:
+                            if RepairAction.DEDUPE_METADATA in replanned.actions:
+                                self._dedupe_metadata(parsed)
+                            for metadata_action in (
+                                RepairAction.CREATE_METADATA,
+                                RepairAction.UPDATE_METADATA,
+                            ):
+                                if metadata_action in replanned.actions:
+                                    self._repair_metadata(parsed, metadata_action)
+                            if RepairAction.REBUILD_INDEX in replanned.actions:
+                                self._repair_index_batch([parsed])
+                            results[index] = replace(
+                                replanned,
+                                status=(
+                                    "unchanged"
+                                    if replanned.actions == (RepairAction.UNCHANGED,)
+                                    else "repaired"
+                                ),
+                            )
+                        except Exception as exc:
+                            results[index] = self._failed_record(replanned, exc)
         finally:
             for _, _, lock_fd in reversed(locked_all):
                 try:
@@ -1185,11 +1409,43 @@ class MemoryReconciliationService:
         report = RepairReport(records=tuple(results), applied=True)
         if report.counts["failed"]:
             raise MemoryReconciliationError(report)
+        # The repair path is the remediation the uq_memory_key_scope_null
+        # migrator points at (issue #657): once the duplicates are gone, the
+        # index belongs on the database in this same run rather than at the
+        # next startup.
+        self._ensure_null_scope_unique_index()
         return report
 
+    def _ensure_null_scope_unique_index(self) -> None:
+        """Create ``uq_memory_key_scope_null`` if duplicates allow it.
+
+        Fail-soft for the startup path — the startup migrator re-attempts
+        this — but the explicit ``cao memory repair --apply`` invocation sets
+        ``_strict_index``, where exceptions surface to the caller because a
+        silently missing index is exactly the dead remediation path issue
+        #657's review called out.
+        """
+        from cli_agent_orchestrator.clients.database import (
+            _migrate_memory_scope_null_uniqueness,
+        )
+
+        _migrate_memory_scope_null_uniqueness(engine=self._db_engine, strict=self._strict_index)
+
     def reconcile(self, *, apply: bool = False) -> RepairReport:
-        """Plan by default; mutate only when explicitly requested."""
-        return self.apply() if apply else self.plan()
+        """Plan by default; mutate only when explicitly requested.
+
+        ``apply=True`` is the explicit ``cao memory repair --apply``
+        invocation, so the same-run index creation is strict — a failure
+        there must surface rather than be logged at debug. The startup path
+        calls ``apply()`` directly and keeps the fail-soft default.
+        """
+        if not apply:
+            return self.plan()
+        self._strict_index = True
+        try:
+            return self.apply()
+        finally:
+            self._strict_index = False
 
 
 def reconcile_memory_startup() -> Optional[RepairReport]:
