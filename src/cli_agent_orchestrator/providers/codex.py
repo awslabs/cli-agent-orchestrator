@@ -11,7 +11,7 @@ from typing import Any, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
-from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.models.terminal import TerminalCaptureUnavailableError, TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
@@ -995,6 +995,10 @@ class CodexProvider(BaseProvider):
         # IDLE.
         self._dispatch_marker_baseline: Optional[list] = None
         self._dispatch_pending: bool = False
+        # Monotonic timestamp of the last full-history ownership escalation
+        # (see _full_history_owns): resets at each dispatch so the first
+        # ambiguous poll of a new dispatch always earns its escalation read.
+        self._ownership_escalation_at: float = 0.0
 
     @property
     def blocks_orchestrated_input_while_waiting_user_answer(self) -> bool:
@@ -1450,21 +1454,18 @@ class CodexProvider(BaseProvider):
         Capture happens here, strictly before send_keys: a baseline derived
         from a post-send observation would arm on a genuine fast
         completion's own settled frame and latch the turn IDLE (issue #739
-        review). When the pre-send pane read raises, the dispatch refuses
-        instead of sending unowned: ProviderError reaches
-        terminal_service.send_input's callers before any key is typed, so
-        the message is retried rather than silently accepted. A read that
-        succeeds with no marker cells (fresh pane, login menu) is a VALID
-        empty baseline — nothing is retained, so any cell observed later is
-        new content this dispatch owns.
+        review). When the pre-send pane read keeps failing after a bounded
+        retry, the dispatch refuses instead of sending unowned:
+        TerminalCaptureUnavailableError (not a generic ProviderError) reaches
+        terminal_service.send_input's callers before any key is typed, and
+        its consumers retry — inbox delivery resets the message to PENDING
+        and deferred init re-attempts the delivery, leaving the initialized
+        worker alive (issue #739 review). A read that succeeds with no
+        marker cells (fresh pane, login menu) is a VALID empty baseline —
+        nothing is retained, so any cell observed later is new content this
+        dispatch owns.
         """
-        try:
-            history = get_backend().get_history(self.session_name, self.window_name) or ""
-        except Exception as e:
-            raise ProviderError(
-                f"Codex dispatch refused: pre-send transcript capture failed for "
-                f"{self.session_name}:{self.window_name}: {e}"
-            ) from e
+        history = self._capture_presend_pane()
         try:
             visible = (
                 get_backend().get_history(self.session_name, self.window_name, visible_only=True)
@@ -1488,7 +1489,32 @@ class CodexProvider(BaseProvider):
             cells = _cells(visible)
         self._dispatch_marker_baseline = cells
         self._dispatch_pending = True
+        self._ownership_escalation_at = 0.0
         super().mark_input_received()
+
+    def _capture_presend_pane(self, attempts: int = 3, delay: float = 0.4) -> str:
+        """Read the pre-dispatch pane, retrying a transient capture failure.
+
+        A single failed ``tmux capture-pane`` is infrastructure noise, not a
+        verdict on the pane (issue #739 review): retry it bounded inside the
+        dispatch so a transient blip does not refuse an otherwise valid
+        delivery. When every attempt fails, raise the distinct retryable
+        error rather than a generic ProviderError, so consumers can route
+        the refusal back to retry instead of terminally failing the
+        message or deleting a healthy worker.
+        """
+        last_error: Optional[Exception] = None
+        for attempt in range(attempts):
+            try:
+                return get_backend().get_history(self.session_name, self.window_name) or ""
+            except Exception as e:  # noqa: BLE001 - every backend failure is retried
+                last_error = e
+                if attempt + 1 < attempts:
+                    time.sleep(delay)
+        raise TerminalCaptureUnavailableError(
+            f"Codex dispatch refused: pre-send transcript capture failed for "
+            f"{self.session_name}:{self.window_name} after {attempts} attempts: {last_error}"
+        ) from last_error
 
     def _dispatch_owns_transcript(self, clean_output: str, cutoff_pos: int) -> bool:
         """True when the observed transcript is not the dispatch baseline.
@@ -1499,16 +1525,26 @@ class CodexProvider(BaseProvider):
         every observation view — the rolling buffer and the pyte viewport
         show only the tail of a long retained transcript, and a suffix match
         recognizes that tail as unchanged instead of reading the window
-        boundary difference as new content. Cleared permanently on the first
-        observation whose cells are NOT a tail of the baseline — genuine
-        current-turn content has rendered, and the turn's own evidence
-        decides from there on.
+        boundary difference as new content.
 
-        Residual gap, accepted: a genuinely new cell that byte-equals (or is
-        a truncated view of) a retained baseline cell still reads unchanged,
-        so a terse reply identical to a prior turn's last cell stays IDLE
-        until the next differing frame. Content identity cannot distinguish
-        that case; it only ever delays completion, never falsely completes.
+        Ownership mutates only on a structurally complete observation
+        (issue #739 review). A frame whose TUI footer has not rendered yet
+        cannot tell the composer from a submitted user cell, so it carries
+        no verdict at all: the gate stays armed and the settled frame
+        decides — an incomplete frame can delay a verdict, never disarm it.
+
+        A bounded observation that matches the baseline is still ambiguous
+        when the current turn is terse: a genuinely new cell that equals
+        (or is a truncated view of) the baseline's last cell reads as a
+        tail, and such a turn used to stay IDLE forever (issue #739
+        review). Resolve exactly that case against the full pane history —
+        the one view where an appended turn is always visible as growth
+        past the baseline regardless of cell text, because transcript
+        cells only accumulate. A full view that is not a tail of the
+        baseline is a post-dispatch occurrence; a tail, however much
+        scroll truncated its head, is unchanged retained content. See
+        ``_full_history_owns`` for the read's rate limit and fail-closed
+        behavior.
         """
         if not self._dispatch_pending:
             return True
@@ -1520,11 +1556,58 @@ class CodexProvider(BaseProvider):
             # no retained marker cells — and is handled by the suffix
             # comparison below, not by this refusal.
             return False
-        observed = _transcript_marker_cells(clean_output, cutoff_pos)
-        if _is_suffix(observed, baseline):
+        if cutoff_pos >= len(clean_output):
+            # No TUI footer in this frame: the pane is mid-repaint, and the
+            # bottom-most user-looking line is the composer, not evidence.
+            # An unbounded frame never mutates ownership (issue #739
+            # review) — the footer-restored frame carries the verdict.
             return False
-        self._dispatch_pending = False
-        return True
+        observed = _transcript_marker_cells(clean_output, cutoff_pos)
+        if not _is_suffix(observed, baseline):
+            self._dispatch_pending = False
+            return True
+        if self._full_history_owns(baseline):
+            self._dispatch_pending = False
+            return True
+        return False
+
+    # Budget for the full-history ownership escalation, in seconds.
+    # get_status() is a hot path (every wait_until_status poll, every UI
+    # refresh) and the escalation forks a capture-pane subprocess — the same
+    # reasoning that rate-limits STALE_PROCESSING_CAPTURE_INTERVAL_S in
+    # status_monitor.py. While the pane is genuinely unchanged this bounds
+    # the escalation to one read per interval; a differing observation never
+    # needs the escalation at all, and the first ambiguous poll of a
+    # dispatch always escalates (the timestamp resets at mark_input_received),
+    # so an equal-content completion is only ever delayed past a PRIOR
+    # ambiguous poll by at most one interval.
+    OWNERSHIP_ESCALATION_INTERVAL_S = 3.0
+
+    def _full_history_owns(self, baseline: list) -> bool:
+        """Resolve an ambiguous suffix match against the full pane history.
+
+        The bounded observation cannot distinguish a terse new turn from
+        retained content when the new cell's text equals the baseline's
+        tail, so compare the pane's full cell sequence instead: transcript
+        cells only accumulate, so any post-dispatch turn — however terse —
+        leaves the full view no longer a tail of the pre-send baseline
+        (issue #739 review). A read that fails, comes back empty, or is
+        rate-limited is NOT ownership: the gate stays armed, so this only
+        ever delays a verdict, never falsely completes.
+        """
+        now = time.monotonic()
+        if now - self._ownership_escalation_at < self.OWNERSHIP_ESCALATION_INTERVAL_S:
+            return False
+        self._ownership_escalation_at = now
+        try:
+            raw = get_backend().get_history(self.session_name, self.window_name) or ""
+        except Exception:
+            return False
+        if not raw:
+            return False
+        clean = strip_terminal_escapes(raw)
+        full_cells = _transcript_marker_cells(clean, _footer_cutoff_position(clean))
+        return not _is_suffix(full_cells, baseline)
 
     def get_status(self, output: str) -> TerminalStatus:
         # Native status (herdr): trust the backend's agent state when available;

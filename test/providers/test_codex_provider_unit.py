@@ -10,7 +10,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from cli_agent_orchestrator.models.inbox import OrchestrationType
-from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.models.terminal import (
+    TerminalCaptureUnavailableError,
+    TerminalStatus,
+)
 from cli_agent_orchestrator.providers.codex import (
     APPROVAL_PROMPT_FOOTER,
     CodexProvider,
@@ -2400,15 +2403,20 @@ class TestCodexProviderTrustPrompt:
         the first post-dispatch observation as the baseline, so a genuine
         fast completion latched IDLE — deferred delivery resent the finished
         task and synchronous dispatch timed out. A pre-send baseline that
-        cannot be obtained now raises ProviderError from
+        cannot be obtained after the bounded in-dispatch retry now raises
+        the distinct retryable TerminalCaptureUnavailableError from
         mark_input_received, which sits immediately before send_keys in
-        terminal_service.send_input: the message is never typed, callers
-        mark it for retry, and no baseline is ever derived post-send.
+        terminal_service.send_input: the message is never typed, consumers
+        route it back to retry (inbox resets PENDING, deferred init retries
+        without deleting the worker), and no baseline is ever derived
+        post-send.
         """
         mock_backend.return_value.get_history.side_effect = RuntimeError("capture failed")
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        with pytest.raises(ProviderError, match="pre-send transcript capture failed"):
+        with pytest.raises(
+            TerminalCaptureUnavailableError, match="pre-send transcript capture failed"
+        ):
             provider.mark_input_received()
         # Nothing was armed: the provider holds no dispatch state at all.
         assert provider._dispatch_pending is False
@@ -2494,7 +2502,7 @@ class TestCodexProviderTrustPrompt:
         mock_backend.return_value.get_history.side_effect = RuntimeError("capture failed")
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        with pytest.raises(ProviderError):
+        with pytest.raises(TerminalCaptureUnavailableError):
             provider.mark_input_received()
 
         # Caller retries the dispatch; capture succeeds now.
@@ -2535,7 +2543,7 @@ class TestCodexProviderTrustPrompt:
         def fresh_dispatch_then_observe(observation: str) -> TerminalStatus:
             mock_backend.return_value.get_history.side_effect = RuntimeError("boom")
             provider = CodexProvider("test1234", "test-session", "window-0")
-            with pytest.raises(ProviderError):
+            with pytest.raises(TerminalCaptureUnavailableError):
                 provider.mark_input_received()
             mock_backend.return_value.get_history.side_effect = None
             mock_backend.return_value.get_history.return_value = notice_pane
@@ -2708,6 +2716,229 @@ class TestCodexProviderTrustPrompt:
             "  gpt-5.6-sol default · /tmp/work\n"
         )
         assert provider.get_status(settled) == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_unrecognized_partial_footer_then_settled_notice_stays_not_completed(
+        self, mock_backend
+    ):
+        """Review 5131322289 P1, first mode: a partial repaint whose composer
+        line survives (footer row not yet recognized) must not permanently
+        disarm the ownership gate. The footerless frame now carries NO
+        verdict — ownership mutates only on a structurally complete,
+        footer-bounded observation — so the later, footer-restored UNCHANGED
+        notice pane still reads IDLE for the dropped task instead of
+        COMPLETED."""
+        notice_pane = (
+            "OpenAI Codex (v0.153.2)\n"
+            "• You have 1 usage limit reset available. Run /usage to use one.\n"
+            "\n"
+            "› Ask Codex to do anything\n"
+            "\n"
+            "  gpt-5.6-sol default · /tmp/work\n"
+        )
+        # Composer drawn, status-bar row present but not matching the footer
+        # pattern yet (partial repaint), so no TUI footer is detected.
+        partial_footer_repaint = (
+            "OpenAI Codex (v0.153.2)\n"
+            "• You have 1 usage limit reset available. Run /usage to use one.\n"
+            "\n"
+            "› Ask Codex to do anything\n"
+            "\n"
+            "  gpt-5.6\n"
+        )
+        mock_backend.return_value.get_history.return_value = notice_pane
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider.mark_input_received()
+
+        # Ambiguous footerless frame: no verdict, gate stays armed.
+        assert provider.get_status(partial_footer_repaint) == TerminalStatus.IDLE
+        assert provider._dispatch_pending is True
+        # The footer-restored UNCHANGED pane is retained content, not this
+        # dispatch's completion.
+        assert provider.get_status(notice_pane) == TerminalStatus.IDLE
+        assert provider._dispatch_pending is True
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_equal_content_evicted_marker_turn_completes_via_full_history(self, mock_backend):
+        """Review 5131322289 P1, second mode: a fast second turn whose user
+        marker is evicted from the observation window and whose assistant
+        cell equals the prior turn's last cell must COMPLETE, not stay IDLE
+        forever. The bounded observation is an exact suffix of the baseline,
+        so the gate escalates to the full pane history, where the appended
+        turn is visible as growth past the baseline (transcript cells only
+        accumulate)."""
+        prior_pane = (
+            "› first question\n"
+            "• Done.\n"
+            "\n"
+            "› Ask Codex to do anything\n"
+            "\n"
+            "  gpt-5.6-sol default · /tmp/work\n"
+        )
+        # Bounded observation: the user marker of the new turn already rolled
+        # out; the only new cell, "• Done.", byte-equals the prior turn's
+        # last cell, so the window view is an exact suffix of the baseline.
+        evicted_equal_view = (
+            "• Done.\n"
+            "\n"
+            "› Ask Codex to do anything\n"
+            "\n"
+            "  gpt-5.6-sol default · /tmp/work\n"
+        )
+        # Full history: the appended second turn is visible — the full cell
+        # sequence is longer than the baseline, not a tail of it.
+        full_second_turn = (
+            "› first question\n"
+            "• Done.\n"
+            "› second question\n"
+            "• Done.\n"
+            "\n"
+            "› Ask Codex to do anything\n"
+            "\n"
+            "  gpt-5.6-sol default · /tmp/work\n"
+        )
+        mock_backend.return_value.get_history.return_value = prior_pane
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider.mark_input_received()
+
+        # The pane history now holds the appended second turn.
+        mock_backend.return_value.get_history.return_value = full_second_turn
+        assert provider.get_status(evicted_equal_view) == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_prefix_content_evicted_marker_turn_completes_via_full_history(self, mock_backend):
+        """Review 5131322289 P1, second mode, prefix variant: the terse new
+        cell is a truncated view of the retained cell (capture-pane width
+        wrap), so the window comparison alone classifies it unchanged. The
+        full-history escalation still sees the appended turn as growth."""
+        prior_pane = (
+            "› first question\n"
+            "• The requested task is complete and all checks passed.\n"
+            "\n"
+            "› Ask Codex to do anything\n"
+            "\n"
+            "  gpt-5.6-sol default · /tmp/work\n"
+        )
+        # New turn's cell is a prefix of the retained one; user marker
+        # evicted from the bounded view.
+        evicted_prefix_view = (
+            "• The requested task is complete\n"
+            "\n"
+            "› Ask Codex to do anything\n"
+            "\n"
+            "  gpt-5.6-sol default · /tmp/work\n"
+        )
+        full_second_turn = (
+            "› first question\n"
+            "• The requested task is complete and all checks passed.\n"
+            "› second question\n"
+            "• The requested task is complete\n"
+            "\n"
+            "› Ask Codex to do anything\n"
+            "\n"
+            "  gpt-5.6-sol default · /tmp/work\n"
+        )
+        mock_backend.return_value.get_history.return_value = prior_pane
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider.mark_input_received()
+
+        mock_backend.return_value.get_history.return_value = full_second_turn
+        assert provider.get_status(evicted_prefix_view) == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_pyte_equal_content_evicted_marker_turn_completes_via_full_history(self, mock_backend):
+        """Review 5131322289 P1 through the pyte screen path: same
+        equal-content completion, driven through get_status_from_screen."""
+        prior_pane = (
+            "› first question\n"
+            "• Done.\n"
+            "\n"
+            "› Ask Codex to do anything\n"
+            "\n"
+            "  gpt-5.6-sol default · /tmp/work\n"
+        )
+        full_second_turn = (
+            "› first question\n"
+            "• Done.\n"
+            "› second question\n"
+            "• Done.\n"
+            "\n"
+            "› Ask Codex to do anything\n"
+            "\n"
+            "  gpt-5.6-sol default · /tmp/work\n"
+        )
+        mock_backend.return_value.get_history.return_value = prior_pane
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider.mark_input_received()
+
+        mock_backend.return_value.get_history.return_value = full_second_turn
+        screen_rows = [str(line) for line in full_second_turn.splitlines()]
+        assert provider.get_status_from_screen(screen_rows) == (TerminalStatus.COMPLETED)
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_unchanged_ambiguous_pane_does_not_escalate_unbounded(self, mock_backend):
+        """Review 5131322289 P1 rate bound: while the pane is genuinely
+        unchanged, repeated ambiguous polls escalate at most once per
+        interval — get_status stays cheap instead of forking a capture-pane
+        on every poll."""
+        prior_pane = (
+            "› first question\n"
+            "• Done.\n"
+            "\n"
+            "› Ask Codex to do anything\n"
+            "\n"
+            "  gpt-5.6-sol default · /tmp/work\n"
+        )
+        mock_backend.return_value.get_history.return_value = prior_pane
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider.mark_input_received()
+
+        # The bounded view equals the baseline: ambiguous, so escalation runs
+        # on the FIRST poll and is rate-limited on the next.
+        bounded_view = "\n".join(prior_pane.splitlines()[-4:])
+        assert provider.get_status(bounded_view) == TerminalStatus.IDLE
+        reads_after_first = mock_backend.return_value.get_history.call_count
+        assert provider.get_status(bounded_view) == TerminalStatus.IDLE
+        assert provider.get_status(bounded_view) == TerminalStatus.IDLE
+        # No unbounded forking: at most one escalation read per interval. The
+        # baseline capture itself performed reads before the first poll, so
+        # compare growth across the subsequent polls only.
+        assert mock_backend.return_value.get_history.call_count - reads_after_first <= 1
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_transient_capture_failure_retries_within_dispatch(self, mock_backend):
+        """Review 5131322289 P2: a single failed capture-pane read is retried
+        bounded INSIDE the dispatch — a transient blip must not refuse an
+        otherwise valid delivery."""
+        notice_pane = (
+            "OpenAI Codex (v0.153.2)\n"
+            "• You have 1 usage limit reset available. Run /usage to use one.\n"
+            "\n"
+            "› Ask Codex to do anything\n"
+            "\n"
+            "  gpt-5.6-sol default · /tmp/work\n"
+        )
+        calls = {"n": 0}
+
+        def flaky_capture(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("capture failed")
+            return notice_pane
+
+        mock_backend.return_value.get_history.side_effect = flaky_capture
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider.mark_input_received()  # no raise: the retry recovered it
+
+        assert provider._dispatch_pending is True
+        # The retained notice pane still cannot complete the dispatch.
+        assert provider.get_status(notice_pane) == TerminalStatus.IDLE
 
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
     def test_unchanged_approval_prompt_keeps_waiting_after_dispatch(self, mock_backend):
