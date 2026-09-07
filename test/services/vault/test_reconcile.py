@@ -1213,6 +1213,51 @@ def test_rebuild_preserves_path_derived_tombstone_when_first_observing_rename(
     assert (report.indexed, retained) == (0, 1)
 
 
+def test_rebuild_first_observed_rename_does_not_exclude_former_path_replacement(
+    tmp_path, monkeypatch
+):
+    """Exact content follows the rename when its former path is simultaneously reused."""
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    old_path = tmp_path / "vault" / "Mapped" / "Old.md"
+    new_path = old_path.with_name("New.md")
+    old_path.write_text("forgotten content", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="direct-rebuild-reuse-before")
+    with Session() as db:
+        original = db.query(VaultNoteModel).one()
+        original_key = original.cao_key
+        _exclude_note(db, original)
+        db.query(MemoryMetadataModel).filter_by(source_kind="vault").delete()
+        db.commit()
+
+    old_path.rename(new_path)
+    old_path.write_text("unrelated replacement", encoding="utf-8")
+    reconcile(vault, apply=True, rebuild=True, run_id="direct-rebuild-reuse-after")
+
+    with Session() as db:
+        notes = {
+            row.vault_relpath: (row.cao_key, row.status) for row in db.query(VaultNoteModel).all()
+        }
+        metadata = {
+            row.file_path
+            for row in db.query(MemoryMetadataModel).filter_by(source_kind="vault").all()
+        }
+        exclusion = db.query(VaultExclusionModel).one()
+    renamed_key, renamed_status = notes["Mapped/New.md"]
+    replacement_key, replacement_status = notes["Mapped/Old.md"]
+    assert renamed_key != original_key
+    assert renamed_status == "excluded"
+    assert replacement_status == "indexed"
+    assert renamed_key != replacement_key
+    assert metadata == {"Mapped/Old.md"}
+    assert (exclusion.cao_key, exclusion.last_known_relpath) == (
+        renamed_key,
+        "Mapped/New.md",
+    )
+
+
 def test_rebuild_does_not_carry_tombstone_between_hashless_notes(tmp_path, monkeypatch):
     """Missing hashes are not proof that an unrelated new path is the same note."""
     from cli_agent_orchestrator.services.vault import reconcile as module

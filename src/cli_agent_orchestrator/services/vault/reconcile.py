@@ -610,8 +610,13 @@ def _carry_rebuild_exclusions(
         projected,
         prior_by_path,
         carried_alias_keys=carried_alias_keys,
+        include_reused_path_candidates=True,
     )
-    resolutions = _quarantine_resolved_identity_collisions(resolutions, prior_by_path)
+    # These resolutions establish exclusion ownership only.  A simultaneous
+    # replacement at the former path temporarily shares its path-derived
+    # identity with the exact-hash rename, so ordinary collision preference
+    # would incorrectly discard the rename proof.  The post-delete projection
+    # resolves and quarantines its own live identities below.
     carried = set(exclusions)
     for resolution in resolutions:
         item = resolution.item
@@ -710,6 +715,7 @@ def _resolve_renames(
     prior_by_path: dict[str, VaultNoteModel],
     *,
     carried_alias_keys: set[tuple[str, str, str]] | None = None,
+    include_reused_path_candidates: bool = False,
 ) -> tuple[_RenameResolution, ...]:
     """Absorb only unambiguous pure renames; all other candidates remain new.
 
@@ -718,6 +724,7 @@ def _resolve_renames(
     content from silently changing identity.
     """
     carried_alias_keys = carried_alias_keys or set()
+    projected_by_path = {item.note.vault_relpath: item for item in projected}
     appeared_paths = {
         item.note.vault_relpath
         for item in projected
@@ -726,7 +733,12 @@ def _resolve_renames(
     disappeared = tuple(
         row
         for path, row in prior_by_path.items()
-        if path not in {item.note.vault_relpath for item in projected}
+        if path not in projected_by_path
+        or (
+            include_reused_path_candidates
+            and row.content_sha256 is not None
+            and projected_by_path[path].note.content_sha256 != row.content_sha256
+        )
     )
     matching_by_path: dict[str, tuple[VaultNoteModel, ...]] = {}
     claims_by_former_path: Counter[str] = Counter()
