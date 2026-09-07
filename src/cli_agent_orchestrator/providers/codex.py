@@ -1,7 +1,6 @@
 """Codex CLI provider implementation."""
 
 import asyncio
-import hashlib
 import logging
 import os
 import re
@@ -792,25 +791,44 @@ def _footer_cutoff_position(clean_output: str) -> int:
     return len(clean_output)
 
 
-def _transcript_signature(clean_output: str, cutoff_pos: Optional[int] = None) -> str:
-    """Fingerprint the pane's turn-bearing transcript, ignoring volatile chrome.
+def _transcript_marker_cells(clean_output: str, cutoff_pos: Optional[int] = None) -> list:
+    """Parsed transcript marker cells, oldest to newest.
 
-    Codex repaints the status bar and footer hint on a timer, so a raw tail
-    hash differs between two observations of an unchanged pane and the
-    per-dispatch staleness guard would never fire. Keep only transcript
-    lines above the TUI footer cutoff — assistant bullets and non-empty user
-    cells — and hash the last of them: retained notices, prior responses,
-    and a genuine new user turn all survive this, while repaint-only chrome
-    and composer drafts (typed but unsubmitted text, excluded with the whole
-    footer region) do not change it. Restricting to glyph lines also keeps
-    the fingerprint stable across observation sources — pane history and
-    the pyte viewport of the same unchanged pane reduce to the same rows.
+    Codex repaints the status bar and footer hint on a timer, so raw pane
+    text differs between two observations of an unchanged pane. Worse, the
+    tmux history window (``-S -200``) and the viewport/buffer views of the
+    SAME unchanged pane start at different lines once a transcript grows
+    past 200 rows, so even a cleaned-text hash of one view can mismatch a
+    differently bounded view of itself (issue #739 review). Reduce the pane
+    to exactly the turn-bearing marker cells — assistant bullets and
+    submitted user cells above the TUI footer cutoff — and compare parsed
+    cells by suffix (see ``_dispatch_owns_transcript``) so an observation
+    showing a tail of the baseline's cells still reads as unchanged. The
+    composer line (an empty ``›``, the placeholder hint, or a draft typed
+    into it) sits inside the footer region the parser already excludes, so
+    a typed-but-unsubmitted draft cannot change the cells.
     """
     if cutoff_pos is not None:
         clean_output = clean_output[:cutoff_pos]
-    lines = [line.rstrip() for line in clean_output.splitlines()]
-    body = [line for line in lines if _ASSISTANT_BULLET_RE.match(line) or _USER_CELL_RE.match(line)]
-    return hashlib.sha256("\n".join(body[-40:]).encode()).hexdigest()
+    cells = []
+    for line in clean_output.splitlines():
+        line = line.rstrip()
+        if _ASSISTANT_BULLET_RE.match(line) or _USER_CELL_RE.match(line):
+            cells.append(line)
+    return cells
+
+
+def _is_suffix(suffix: list, sequence: list) -> bool:
+    """True when ``suffix`` is a tail slice of ``sequence`` (or equal to it).
+
+    ``len(suffix) > len(sequence)`` means the observation shows MORE marker
+    cells than the pre-send baseline — genuine appended content — and is not
+    a suffix. A zero-length observation is a tail of anything (a pane whose
+    transcript cells scrolled out of this view is still unchanged content).
+    """
+    if len(suffix) > len(sequence):
+        return False
+    return sequence[len(sequence) - len(suffix) :] == suffix
 
 
 def _find_assistant_marker(text: str) -> Optional[re.Match[str]]:
@@ -928,12 +946,21 @@ class CodexProvider(BaseProvider):
         # on the capture paths) is NOT — a startup notice or a prior turn's
         # completed-response bullet survives the boundary. An ever-dispatched
         # boolean cannot tell that retained content from this dispatch's
-        # output, so record the pane's transcript signature at dispatch and
-        # require it to differ before COMPLETED is possible. A failed pane
-        # read leaves the baseline unset: the FIRST post-dispatch observation
-        # then becomes the baseline (fail closed — retained content cannot
-        # complete), never an inert guard.
-        self._dispatch_transcript_baseline: Optional[str] = None
+        # output, so record the pane's marker-cell baseline at dispatch and
+        # require it to differ before COMPLETED is possible. The baseline is a
+        # list of parsed marker cells (assistant bullets, submitted user cells),
+        # NOT a hash of raw pane text: history and viewport captures of the
+        # same unchanged pane cut at different line boundaries (issue #739
+        # review), so a raw-hash baseline of a long retained transcript could
+        # differ from a shorter observation of itself and read retained content
+        # as new. Marker cells are compared by suffix so an observation that
+        # shows a tail of the baseline's cells is still recognized as
+        # unchanged. Capture happens strictly BEFORE the send; when it cannot
+        # be obtained the dispatch refuses (see mark_input_received), so the
+        # baseline is never derived from a post-send observation — that would
+        # arm on a genuine fast completion's own settled frame and latch it
+        # IDLE.
+        self._dispatch_marker_baseline: Optional[list] = None
         self._dispatch_pending: bool = False
 
     @property
@@ -1370,59 +1397,85 @@ class CodexProvider(BaseProvider):
         return True
 
     def mark_input_received(self) -> None:
-        """Record the transcript baseline this dispatch must own its output from.
+        """Capture the canonical pre-send transcript baseline this dispatch owns.
 
         The rolling byte buffer is cleared by the caller, but the pyte screen
         and pane history are not: a startup notice or a previous turn's
         completed-response bullet survives the dispatch boundary. Snapshot
-        the pane's transcript content now; the COMPLETED decision points in
-        ``get_status`` refuse to complete on content whose signature matches
-        this baseline, so retained content alone can never complete the new
-        turn. A failed pane read leaves the baseline unset — the first
-        post-dispatch observation then becomes the baseline, so the guard
-        stays armed and still fails closed rather than going inert.
+        the pane's marker cells from BOTH history bounds (viewport plus
+        scrollback) so the baseline contains every cell any observation view
+        can show; the COMPLETED decision points in ``get_status`` refuse to
+        complete while the observed cells are a tail of this baseline.
+
+        Capture happens here, strictly before send_keys: a baseline derived
+        from a post-send observation would arm on a genuine fast
+        completion's own settled frame and latch the turn IDLE (issue #739
+        review). When the pre-send pane read raises, the dispatch refuses
+        instead of sending unowned: ProviderError reaches
+        terminal_service.send_input's callers before any key is typed, so
+        the message is retried rather than silently accepted. A read that
+        succeeds with no marker cells (fresh pane, login menu) is a VALID
+        empty baseline — nothing is retained, so any cell observed later is
+        new content this dispatch owns.
         """
-        output = ""
         try:
-            output = get_backend().get_history(self.session_name, self.window_name) or ""
+            history = get_backend().get_history(self.session_name, self.window_name) or ""
+        except Exception as e:
+            raise ProviderError(
+                f"Codex dispatch refused: pre-send transcript capture failed for "
+                f"{self.session_name}:{self.window_name}: {e}"
+            ) from e
+        try:
+            visible = (
+                get_backend().get_history(self.session_name, self.window_name, visible_only=True)
+                or ""
+            )
         except Exception:
-            # Fail closed: no baseline now, so the guard below arms lazily
-            # from the first observation and still refuses to complete on
-            # content the dispatch has never seen change.
-            self._dispatch_transcript_baseline = None
-            self._dispatch_pending = True
-            super().mark_input_received()
-            return
-        clean = strip_terminal_escapes(re.sub(ANSI_CODE_PATTERN, "", output))
-        self._dispatch_transcript_baseline = (
-            _transcript_signature(clean, _footer_cutoff_position(clean)) if clean else None
-        )
+            visible = ""
+
+        def _cells(raw: str) -> list:
+            clean = strip_terminal_escapes(re.sub(ANSI_CODE_PATTERN, "", raw))
+            return _transcript_marker_cells(clean, _footer_cutoff_position(clean))
+
+        cells = _cells(history)
+        if not cells and visible:
+            # History shows no marker cells but the viewport does (e.g. a
+            # cleared scrollback): the visible cells are the retained
+            # transcript the dispatch must own from.
+            cells = _cells(visible)
+        self._dispatch_marker_baseline = cells
         self._dispatch_pending = True
         super().mark_input_received()
 
     def _dispatch_owns_transcript(self, clean_output: str, cutoff_pos: int) -> bool:
         """True when the observed transcript is not the dispatch baseline.
 
-        Kept armed while the pane's transcript content still matches what
-        ``mark_input_received`` snapshotted (or, after a failed capture,
-        matches the first post-dispatch observation): retained notices and
-        prior-turn completions then cannot satisfy a COMPLETED branch.
-        Cleared permanently on the first observation whose transcript
-        differs — genuine current-turn content has rendered, and the turn's
-        own evidence decides from there on.
+        Kept armed while the observed marker cells are a suffix of (or equal
+        to) what ``mark_input_received`` captured: retained notices and
+        prior-turn completions then cannot satisfy a COMPLETED branch, in
+        every observation view — the rolling buffer and the pyte viewport
+        show only the tail of a long retained transcript, and a suffix match
+        recognizes that tail as unchanged instead of reading the window
+        boundary difference as new content. Cleared permanently on the first
+        observation whose cells are NOT a tail of the baseline — genuine
+        current-turn content has rendered, and the turn's own evidence
+        decides from there on.
         """
         if not self._dispatch_pending:
             return True
-        observed = _transcript_signature(clean_output, cutoff_pos)
-        if self._dispatch_transcript_baseline is None:
-            # Baseline capture failed: this observation becomes the baseline
-            # (fail closed), and only content that changes from it completes.
-            self._dispatch_transcript_baseline = observed
+        baseline = self._dispatch_marker_baseline
+        if baseline is None:
+            # Unreachable while capture always records a list (possibly
+            # empty); kept as a belt-and-braces refusal rather than an
+            # inert guard. An EMPTY list is a valid baseline — a pane with
+            # no retained marker cells — and is handled by the suffix
+            # comparison below, not by this refusal.
             return False
-        if observed != self._dispatch_transcript_baseline:
-            self._dispatch_pending = False
-            return True
-        return False
+        observed = _transcript_marker_cells(clean_output, cutoff_pos)
+        if _is_suffix(observed, baseline):
+            return False
+        self._dispatch_pending = False
+        return True
 
     def get_status(self, output: str) -> TerminalStatus:
         # Native status (herdr): trust the backend's agent state when available;
