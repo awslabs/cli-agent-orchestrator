@@ -56,3 +56,34 @@ def test_importing_a_memory_plugin_does_not_import_clients_database(module, tmp_
         f"agent process runs DB_DIR.mkdir(). Keep the import function-local.\n"
         f"stdout={result.stdout!r}"
     )
+
+
+@pytest.mark.parametrize("module", _PLUGIN_MODULES, ids=lambda m: m.rsplit(".", 1)[-1])
+def test_the_lazy_wrapper_delegates_to_clients_database(module, monkeypatch):
+    """The wrapper's own body must be exercised, not just patched over.
+
+    Every other plugin test monkeypatches ``<module>.get_terminal_metadata`` as a
+    seam, so the wrapper's two real lines — the function-local import and the
+    delegation — never execute in the suite. That left the laziness fix in an odd
+    state: the import site was pinned as absent at module scope (above) but
+    nothing proved the deferred import actually resolves and forwards. A typo in
+    the imported name would pass every test and fail only in production, on the
+    server-side path this indirection exists to serve.
+    """
+    import importlib
+
+    plugin = importlib.import_module(module)
+    calls = []
+
+    def fake_get_terminal_metadata(terminal_id: str):
+        calls.append(terminal_id)
+        return {"session_name": "s", "agent_name": "a"}
+
+    # Patch the SOURCE, so the wrapper's own import + call still run.
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+        fake_get_terminal_metadata,
+    )
+
+    assert plugin.get_terminal_metadata("term-1") == {"session_name": "s", "agent_name": "a"}
+    assert calls == ["term-1"], "wrapper did not forward to clients.database"

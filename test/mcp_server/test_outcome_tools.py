@@ -378,6 +378,20 @@ class TestErrorDetailExtractionTolerance:
 
         assert _extract_error_detail(_Resp(), "fallback-text") == "fallback-text"
 
+    def test_http_error_without_a_response_is_a_plain_error(self):
+        """An HTTPError can carry no ``response`` (e.g. raised by a wrapper).
+
+        ``getattr(exc, "response", None)`` then yields None and there is no status
+        to inspect — so it must fall through to the fallback text rather than
+        touching ``.status_code`` on None, and must never read as ``disabled``.
+        """
+        from cli_agent_orchestrator.mcp_server.server import _outcome_tool_error
+
+        result = _outcome_tool_error(requests.HTTPError("bare"), "fallback-text")
+        assert result["success"] is False
+        assert "disabled" not in result, result
+        assert "fallback-text" in result["error"]
+
     def test_object_without_detail_falls_back(self):
         from cli_agent_orchestrator.utils.orchestration import _extract_error_detail
 
