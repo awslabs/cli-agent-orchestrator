@@ -117,6 +117,24 @@ Chunks are **coalesced** before publishing (`_COALESCE_WINDOW = 50ms`). TUI prov
 
 Subscribes to `terminal.*.output`. Accumulates output into a rolling buffer (`state_buffer_max` server setting, 32KB by default, see `docs/configuration.md`) per terminal, detects status via the registered provider (returning `UNKNOWN` until a provider is registered for the terminal), and publishes `terminal.{id}.status` on change. Also the source of truth for current terminal status.
 
+Rendered-screen detection (`CAO_PYTE_STATUS`, on by default for providers that opt in via
+`supports_screen_detection`) runs on two edges: the rising edge, when output resumes after a quiet
+period, and quiescence, when no chunk has arrived for `PYTE_QUIESCENCE_DELAY_S` (0.2 s). Detection
+never runs mid-burst, which is what keeps half-drawn frames from flapping the status. A TUI that
+repaints a spinner every second never goes quiescent, though, so under edge-only detection a Codex
+worker read IDLE for its whole turn: the rising-edge frame still showed the previous ready state and
+nothing ran again until the turn ended. While a terminal is bursting and has not yet been seen
+PROCESSING, the monitor therefore probes the composited screen at most every
+`PYTE_MIDBURST_PROBE_S` (1.0 s, env `CAO_PYTE_MIDBURST_PROBE_S`) and applies **only** a PROCESSING
+verdict from such a frame; ready statuses still wait for quiescence, and the sticky-latch rules are
+unchanged.
+
+The probe asks `probe_processing_from_screen()`, a side-effect-free predicate, and only of providers
+that opt in with `supports_midburst_processing_probe` (Codex today). It deliberately does not call
+the full detector: discarding a non-PROCESSING verdict would not undo the turn bookkeeping some
+detectors commit while reaching it, and a half-drawn frame is exactly where that bookkeeping is
+wrong. Providers that do not opt in keep edge-only detection.
+
 Two buffer-reset primitives with different semantics:
 
 - **`reset_buffer(terminal_id)`** — clears the rolling byte buffer AND wipes `_last_status` and the `_allow_processing_revert` arm. Used by providers that relaunch a different CLI mode on the same `terminal_id` (e.g. Kiro's TUI → `--legacy-ui` fallback), where past status is deliberately forgotten.
