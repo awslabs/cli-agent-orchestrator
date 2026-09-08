@@ -346,6 +346,26 @@ class TestSessionLifecycleTools:
             json=None,
         )
 
+    async def test_launch_session_result_includes_provider_from_api_response(self) -> None:
+        """The Terminal model's provider field should be surfaced on LaunchResult."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data={"id": "term-789", "provider": "codex"}),
+        ):
+            result = await launch_session(
+                agent_profile="developer",
+                provider="codex",
+                session_name="provider-session",
+            )
+
+        assert result == LaunchResult(
+            success=True,
+            message="Session 'provider-session' launched successfully",
+            session_name="provider-session",
+            terminal_id="term-789",
+            provider="codex",
+        )
+
     async def test_launch_session_passes_model_and_initial_message(self) -> None:
         """The model stays in routing params and the first task stays in JSON."""
         initial_message = "Review the current change"
@@ -684,6 +704,169 @@ class TestSessionLifecycleTools:
             "message": "Get session info for 'cao-123' failed: boom",
         }
 
+    async def test_get_session_info_reads_the_canonical_name_only(self) -> None:
+        """A bare name (e.g. what launch_session's session_name echoed back)
+        must resolve, since sessions are actually stored as "cao-<name>".
+
+        It is read as ``cao-<name>`` directly, never as the literal name first:
+        an unprefixed name can never BE a CAO session (both creation paths
+        enforce the prefix), so a native tmux session answering that GET would
+        be the wrong session entirely.
+        """
+        payload = {"name": "cao-acc-agy", "terminals": [{"id": "term-1"}]}
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data=payload),
+        ) as mock_request:
+            result = await get_session_info("acc-agy")
+
+        assert result == payload
+        mock_request.assert_called_once_with(
+            "get", "http://127.0.0.1:9889/sessions/cao-acc-agy", params=None, json=None
+        )
+
+    async def test_get_session_info_does_not_retry_when_already_prefixed(self) -> None:
+        """A name already carrying the prefix must not be retried again on 404."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(status_code=404, json_data={"detail": "Session not found"}),
+        ) as mock_request:
+            result = await get_session_info("cao-missing")
+
+        assert result == {
+            "success": False,
+            "message": "Get session info for 'cao-missing' failed: Session not found",
+        }
+        mock_request.assert_called_once_with(
+            "get", "http://127.0.0.1:9889/sessions/cao-missing", params=None, json=None
+        )
+
+    async def test_get_session_info_surfaces_a_non_404_error_without_a_second_read(
+        self,
+    ) -> None:
+        """A non-404 error (e.g. 500) is reported from the one canonical read."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(status_code=500, json_data={"detail": "Internal error"}),
+        ) as mock_request:
+            result = await get_session_info("acc-agy")
+
+        assert result == {
+            "success": False,
+            "message": "Get session info for 'acc-agy' failed: Internal error",
+        }
+        mock_request.assert_called_once_with(
+            "get", "http://127.0.0.1:9889/sessions/cao-acc-agy", params=None, json=None
+        )
+
+    async def test_shutdown_session_canonicalizes_a_bare_name_before_deleting(
+        self,
+    ) -> None:
+        """A bare name is canonicalized, checked by GET, and deleted once.
+
+        The literal name is never probed, let alone deleted: it cannot be a CAO
+        session, and a native tmux session under it would answer the GET. The
+        delete cannot report a wrong target itself either -- the real endpoint
+        answers 200 for an absent session (it is idempotent), so a bare-name
+        DELETE would report success while ``cao-acc-agy`` stayed live. See
+        ``test_shutdown_session_canonical_name.py`` for the same contract proven
+        against the real route with a native session actually present.
+        """
+        payload = {"success": True, "deleted": ["cao-acc-agy"], "errors": []}
+        responses = [
+            _response(json_data={"session": {"id": "cao-acc-agy"}, "terminals": []}),
+            _response(json_data=payload),
+        ]
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            side_effect=responses,
+        ) as mock_request:
+            result = await shutdown_session("acc-agy")
+
+        assert result == payload
+        assert [call.args[:2] for call in mock_request.call_args_list] == [
+            ("get", "http://127.0.0.1:9889/sessions/cao-acc-agy"),
+            ("delete", "http://127.0.0.1:9889/sessions/cao-acc-agy"),
+        ]
+
+    async def test_shutdown_session_deletes_an_already_canonical_name_directly(
+        self,
+    ) -> None:
+        """A prefixed name resolves on the first read and is deleted as given."""
+        payload = {"success": True, "deleted": ["cao-acc-agy"], "errors": []}
+        responses = [
+            _response(json_data={"session": {"id": "cao-acc-agy"}, "terminals": []}),
+            _response(json_data=payload),
+        ]
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            side_effect=responses,
+        ) as mock_request:
+            result = await shutdown_session("cao-acc-agy")
+
+        assert result == payload
+        assert [call.args[:2] for call in mock_request.call_args_list] == [
+            ("get", "http://127.0.0.1:9889/sessions/cao-acc-agy"),
+            ("delete", "http://127.0.0.1:9889/sessions/cao-acc-agy"),
+        ]
+
+    async def test_shutdown_session_deletes_the_canonical_name_when_it_is_absent(
+        self,
+    ) -> None:
+        """The canonical name confirmed absent (404): delete it anyway, once.
+
+        Live-backend presence is not the cleanup identity. ``get_session``
+        requires the backend session, so a deferred cleanup -- whose retained
+        registry row is the retry handle -- 404s once the backend session is
+        gone; that row lives under ``cao-<name>``. Retargeting anything else
+        would answer 200 and clean up nothing. For a name that never existed,
+        the canonical delete is the same idempotent "already gone" success
+        rather than an invented client-side error.
+        """
+        payload = {"success": True, "deleted": ["cao-acc-agy"], "errors": []}
+        responses = [
+            _response(status_code=404, json_data={"detail": "Session 'cao-acc-agy' not found"}),
+            _response(json_data=payload),
+        ]
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            side_effect=responses,
+        ) as mock_request:
+            result = await shutdown_session("acc-agy")
+
+        assert result == payload
+        assert [call.args[:2] for call in mock_request.call_args_list] == [
+            ("get", "http://127.0.0.1:9889/sessions/cao-acc-agy"),
+            ("delete", "http://127.0.0.1:9889/sessions/cao-acc-agy"),
+        ]
+
+    async def test_shutdown_session_aborts_when_the_lookup_cannot_resolve(self) -> None:
+        """A non-404 lookup failure is unresolved, not absent: delete nothing.
+
+        Only a 404 is evidence of absence. A 500 (the real route returns one
+        when reading a terminal's status fails), a 403 or a transport error
+        leaves the cleanup target unknown, and deleting an unresolved alias
+        would answer 200 while the canonical session stayed live.
+        """
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(
+                status_code=500, json_data={"detail": "Failed to get session: boom"}
+            ),
+        ) as mock_request:
+            result = await shutdown_session("acc-agy")
+
+        assert result == {
+            "success": False,
+            "message": (
+                "Shutdown session 'acc-agy' aborted: lookup of session 'cao-acc-agy' "
+                "failed: Failed to get session: boom; no delete was issued"
+            ),
+        }
+        assert [call.args[:2] for call in mock_request.call_args_list] == [
+            ("get", "http://127.0.0.1:9889/sessions/cao-acc-agy"),
+        ]
+
     async def test_shutdown_session_returns_success_payload(self) -> None:
         """Shutdown should return the API success payload."""
         payload = {"success": True, "deleted_terminals": 2}
@@ -696,7 +879,11 @@ class TestSessionLifecycleTools:
         assert result == payload
 
     async def test_shutdown_session_returns_failure_for_not_found(self) -> None:
-        """Missing sessions should be surfaced as failures."""
+        """A DELETE that does 404 is surfaced as a failure.
+
+        The real endpoint is idempotent and does not answer 404, but a proxy or
+        a future revision could; the canonical name is what was targeted.
+        """
         with patch(
             "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
             return_value=_response(status_code=404, json_data={"detail": "Session not found"}),
@@ -705,21 +892,31 @@ class TestSessionLifecycleTools:
 
         assert result == {
             "success": False,
-            "message": "Shutdown session 'missing' failed: Session not found",
+            "message": "Shutdown session 'cao-missing' failed: Session not found",
         }
 
     async def test_shutdown_session_returns_failure_on_api_error(self) -> None:
-        """Shutdown transport errors should be converted into failures."""
+        """Shutdown transport errors should be converted into failures.
+
+        An unreachable API fails at the lookup, which is unresolved rather than
+        absent, so no DELETE is issued at all.
+        """
         with patch(
             "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
             side_effect=requests.ConnectionError("delete failed"),
-        ):
+        ) as mock_request:
             result = await shutdown_session("cao-123")
 
         assert result == {
             "success": False,
-            "message": "Shutdown session 'cao-123' failed: delete failed",
+            "message": (
+                "Shutdown session 'cao-123' aborted: lookup of session 'cao-123' "
+                "failed: delete failed; no delete was issued"
+            ),
         }
+        assert [call.args[:2] for call in mock_request.call_args_list] == [
+            ("get", "http://127.0.0.1:9889/sessions/cao-123"),
+        ]
 
 
 @pytest.mark.asyncio
