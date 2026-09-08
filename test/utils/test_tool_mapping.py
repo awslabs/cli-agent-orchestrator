@@ -36,6 +36,15 @@ class TestResolveAllowedTools:
         assert "fs_*" in result
         assert "web_fetch" in result
 
+    def test_workflow_scout_role_defaults(self):
+        """Shipped scout role: read + cao workflow list/get, not developer."""
+        result = resolve_allowed_tools(None, "workflow_scout")
+        assert result == ["@builtin", "fs_read", "execute_bash", "@cao-mcp-server"]
+        assert "fs_*" not in result
+        assert "fs_write" not in result
+        assert "web_fetch" not in result
+        assert "*" not in result
+
     def test_developer_default_when_no_role_no_tools(self):
         """No role + no allowedTools = developer defaults (secure default)."""
         result = resolve_allowed_tools(None, None)
