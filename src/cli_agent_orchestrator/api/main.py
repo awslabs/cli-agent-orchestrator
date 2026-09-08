@@ -4796,6 +4796,8 @@ async def start_workflow_run_endpoint(
                 status_code=422,
                 detail={"findings": workflow_spec_service.render_findings(e.findings)},
             )
+        except approval_gate.PlanApprovalUnavailableError as e:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
         except approval_gate.PlanApprovalRequiredError as e:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
         except KeyError as e:
@@ -4965,6 +4967,8 @@ async def submit_workflow_run_endpoint(
         )
         try:
             approval_gate.ensure_plan_approved(tier="script", manifest_json=manifest_json)
+        except approval_gate.PlanApprovalUnavailableError as e:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
         except approval_gate.PlanApprovalRequiredError as e:
             # 403, distinct from this endpoint's 409 (run_id collision) and 422 (lint / corrupt), so a
             # caller can tell "needs approval" from "the run broke".
@@ -6353,6 +6357,8 @@ async def resume_workflow_run_endpoint(
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'"
             )
+        except approval_gate.PlanApprovalUnavailableError as e:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
         except approval_gate.PlanApprovalRequiredError as e:
             # issue #583 Bolt 2, ``approval-gate``: 403, and it must be caught HERE rather than left
             # to the arms below. ``PlanApprovalRequiredError`` is deliberately not a ``ValueError``
