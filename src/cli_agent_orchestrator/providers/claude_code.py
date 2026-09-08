@@ -501,7 +501,9 @@ class ClaudeCodeProvider(BaseProvider):
         # Apply tool restrictions via --disallowedTools flags.
         # --dangerously-skip-permissions bypasses prompts but --disallowedTools
         # still prevents the agent from using the blocked tools entirely.
-        if self._allowed_tools and "*" not in self._allowed_tools:
+        # Treat a present-but-empty list as deny-all (same as Grok). A falsy
+        # check used to skip the flags entirely for allowed_tools=[].
+        if self._allowed_tools is not None and "*" not in self._allowed_tools:
             from cli_agent_orchestrator.utils.tool_mapping import get_disallowed_tools
 
             disallowed = get_disallowed_tools("claude_code", self._allowed_tools)
