@@ -333,6 +333,20 @@ class TestSoleTerminal:
 
         assert "cao worker logs w1" in exc.value.format_message()
 
+    def test_multiple_terminals_surface_the_topology_error(self, client):
+        with patch.object(client, "sessions", return_value=[{"name": "cao-worker-w1"}]):
+            with patch.object(
+                client,
+                "terminals",
+                return_value=[{"id": "t1"}, {"id": "t2"}],
+            ):
+                with pytest.raises(click.ClickException) as exc:
+                    client.sole_terminal("w1")
+
+        message = exc.value.format_message()
+        assert "2 terminals" in message
+        assert "refusing to choose one" in message
+
 
 class TestFollowLogs:
     def test_no_read_timeout_because_a_quiet_log_is_not_a_stalled_one(self, client):

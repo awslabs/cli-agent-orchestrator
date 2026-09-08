@@ -731,8 +731,10 @@ def _sweep_orphan_workers() -> None:
     **Age, not absence of a lease, is the trigger.** A broker that restarts while
     five workers are mid-task must not kill five running tasks -- under Jobs it
     did not, and a task that finishes can still reach `/complete`. So an orphan
-    gets the same WORKER_TIMEOUT it always had, measured from pod creation, and
-    only then is it swept.
+    gets the same WORKER_TIMEOUT it always had, measured from DEPLOYMENT creation,
+    and only then is it swept. Pod age is not equivalent: a node drain or eviction
+    replaces the pod and resets its creation timestamp, which could otherwise
+    keep a forgotten Deployment alive forever.
 
     A worker with a LIVE lease is never touched here: the reaper owns those, with
     reasons this function cannot supply. A worker whose lease has already settled
@@ -740,17 +742,17 @@ def _sweep_orphan_workers() -> None:
     standing, that release failed, and this is the retry.
     """
     try:
-        pods = core_api.list_namespaced_pod(
+        workloads = apps_api.list_namespaced_deployment(
             NAMESPACE,
             label_selector="app.kubernetes.io/name=cao-elastic-worker",
         ).items
     except ApiException as exc:  # pragma: no cover - transient API errors
-        log.warning("orphan sweep could not list worker pods: %s", exc)
+        log.warning("orphan sweep could not list worker Deployments: %s", exc)
         return
 
     now = datetime.now(timezone.utc)
-    for pod in pods:
-        meta = pod.metadata
+    for workload in workloads:
+        meta = workload.metadata
         worker_id = (meta.labels or {}).get("cao.aws/worker-id") if meta else None
         if not worker_id:
             continue

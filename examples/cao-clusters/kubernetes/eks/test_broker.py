@@ -111,6 +111,16 @@ class FakeApps:
             raise k8s.rest.ApiException(status=404)
         return STATE["deployments"][name]
 
+    def list_namespaced_deployment(self, ns, label_selector=None):
+        key, value = label_selector.split("=", 1)
+        return types.SimpleNamespace(
+            items=[
+                workload
+                for workload in STATE["deployments"].values()
+                if (workload.metadata.labels or {}).get(key) == value
+            ]
+        )
+
     def delete_namespaced_deployment(self, name, ns, propagation_policy=None):
         STATE["deleted_deployments"].append(name)
         STATE["deployments"].pop(name, None)
@@ -126,18 +136,10 @@ class FakeCore:
         STATE["services"].pop(name, None)
 
     def list_namespaced_pod(self, ns, label_selector=None):
-        # Two selectors reach here, and they mean different things. The reaper asks
-        # by worker id; the orphan sweep asks by app name, because the whole point
-        # of it is to find workers whose ids the broker no longer knows.
+        # The reaper and operator plane ask by worker id. The orphan sweep walks
+        # Deployments instead, because their creation timestamp survives a pod
+        # replacement and is the actual worker-lifetime bound.
         key, value = label_selector.split("=", 1)
-        if key == "app.kubernetes.io/name":
-            return types.SimpleNamespace(
-                items=[
-                    pod
-                    for pod in STATE["pods"].values()
-                    if (pod.metadata.labels or {}).get(key) == value
-                ]
-            )
         pod = STATE["pods"].get(value)
         return types.SimpleNamespace(items=[pod] if pod else [])
 
@@ -1001,15 +1003,19 @@ STATE["deleted_deployments"].clear()
 STATE["deleted_svcs"].clear()
 
 
-def _plant_worker(worker_id, age_seconds):
+def _plant_worker(worker_id, age_seconds, pod_age_seconds=None):
     """A worker workload with no lease, as a restarted broker would find it."""
     name = f"cao-worker-{worker_id}"
     STATE["deployments"][name] = types.SimpleNamespace(
-        metadata=types.SimpleNamespace(name=name)
+        metadata=types.SimpleNamespace(
+            name=name,
+            labels=broker._labels(worker_id),
+            creation_timestamp=datetime.now(timezone.utc) - timedelta(seconds=age_seconds),
+        )
     )
     pod = _fake_pod(name, broker._labels(worker_id))
     pod.metadata.creation_timestamp = datetime.now(timezone.utc) - timedelta(
-        seconds=age_seconds
+        seconds=age_seconds if pod_age_seconds is None else pod_age_seconds
     )
     STATE["pods"][worker_id] = pod
 
@@ -1020,6 +1026,9 @@ with patch.object(broker, "_update_fleet_config"):
     # Not old enough. A broker that restarts mid-task must not kill the task -
     # under Jobs it did not, and the worker could still call /complete.
     _plant_worker("bbbbbbbb", broker.WORKER_TIMEOUT - 60)
+    # Old Deployment, brand-new replacement pod. Pod age must not reset the
+    # orphan deadline after a node drain, eviction, or ReplicaSet replacement.
+    _plant_worker("dddddddd", broker.WORKER_TIMEOUT + 60, pod_age_seconds=1)
     broker._sweep_orphan_workers()
 
 check("orphan sweep deletes a leaseless worker past WORKER_TIMEOUT",
@@ -1030,6 +1039,9 @@ check("orphan sweep takes the worker's Service with it",
       json.dumps(STATE["deleted_svcs"]))
 check("orphan sweep spares a leaseless worker inside WORKER_TIMEOUT",
       "cao-worker-bbbbbbbb" not in STATE["deleted_deployments"],
+      json.dumps(STATE["deleted_deployments"]))
+check("replacement pod does not reset an orphaned Deployment's timeout",
+      "cao-worker-dddddddd" in STATE["deleted_deployments"],
       json.dumps(STATE["deleted_deployments"]))
 
 # The assertion that stops the sweep being a fleet-wide kill switch. A worker with

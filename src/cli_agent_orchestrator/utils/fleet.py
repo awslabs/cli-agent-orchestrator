@@ -28,7 +28,7 @@ One port-forward to the broker is therefore the whole setup:
 
 import json
 import os
-from typing import Any, Iterator, Optional
+from typing import Any, Iterator, Optional, cast
 from urllib.parse import quote
 
 import click
@@ -76,7 +76,7 @@ class FleetClient:
     # -- broker's own routes -------------------------------------------------
 
     def workers(self) -> list[dict[str, Any]]:
-        return self._request("GET", "/workers").json()
+        return cast(list[dict[str, Any]], self._request("GET", "/workers").json())
 
     def release(self, worker_id: str) -> bool:
         """Release one worker. True if it is now gone, including if it already was."""
@@ -87,9 +87,12 @@ class FleetClient:
         return True
 
     def logs(self, worker_id: str, *, tail_lines: int = 200) -> str:
-        return self._request(
-            "GET", f"/workers/{worker_id}/logs", params={"tail_lines": tail_lines}
-        ).text
+        return cast(
+            str,
+            self._request(
+                "GET", f"/workers/{worker_id}/logs", params={"tail_lines": tail_lines}
+            ).text,
+        )
 
     def follow_logs(self, worker_id: str, *, tail_lines: int = 200) -> Iterator[str]:
         """Stream a worker's log. No read timeout: a quiet log is not a stalled one."""
@@ -104,7 +107,7 @@ class FleetClient:
         except requests.RequestException as exc:
             raise click.ClickException(f"Failed to reach the fleet broker: {exc}") from exc
         self._check(response)
-        return response.iter_lines(decode_unicode=True)
+        return cast(Iterator[str], response.iter_lines(decode_unicode=True))
 
     # -- the worker's own cao-server, proxied --------------------------------
 
@@ -124,13 +127,16 @@ class FleetClient:
     # -- worker-scoped conveniences, matching `cao session`'s routes ---------
 
     def sessions(self, worker_id: str) -> list[dict[str, Any]]:
-        return self.node_get(worker_id, "sessions")
+        return cast(list[dict[str, Any]], self.node_get(worker_id, "sessions"))
 
     def terminals(self, worker_id: str, session_name: str) -> list[dict[str, Any]]:
-        return self.node_get(worker_id, f"sessions/{quote(session_name, safe='')}/terminals")
+        return cast(
+            list[dict[str, Any]],
+            self.node_get(worker_id, f"sessions/{quote(session_name, safe='')}/terminals"),
+        )
 
     def terminal(self, worker_id: str, terminal_id: str) -> dict[str, Any]:
-        return self.node_get(worker_id, f"terminals/{terminal_id}")
+        return cast(dict[str, Any], self.node_get(worker_id, f"terminals/{terminal_id}"))
 
     def terminal_status(self, worker_id: str, terminal_id: str) -> Optional[str]:
         return self.terminal(worker_id, terminal_id).get("status")
@@ -155,6 +161,11 @@ class FleetClient:
             raise click.ClickException(
                 f"Worker {worker_id} has no terminal yet. It may still be booting; "
                 f"`cao worker logs {worker_id}` shows how far it got."
+            )
+        if len(terminals) != 1:
+            raise click.ClickException(
+                f"Worker {worker_id} has {len(terminals)} terminals; expected exactly one. "
+                "The worker topology is inconsistent, so refusing to choose one."
             )
         return terminals[0]
 
