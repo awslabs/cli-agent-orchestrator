@@ -51,9 +51,7 @@ class TestCopilotCliProviderCommand:
         mock_build_mcp.return_value = '{"mcpServers":{"cao-mcp-server":{"command":"x"}}}'
         mock_tmux.return_value.get_pane_working_directory.return_value = "/tmp/project"
 
-        provider = CopilotCliProvider(
-            "test1234", "test-session", "window-0", allowed_tools=[]
-        )
+        provider = CopilotCliProvider("test1234", "test-session", "window-0", allowed_tools=[])
         parts = shlex.split(provider._command())
 
         assert "--deny-tool" in parts
