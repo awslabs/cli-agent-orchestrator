@@ -268,7 +268,15 @@ See [Workflows](workflows.md).
 - `/graph/{provider}*` projects and exports graph views.
 - `/outcomes` records (`POST`, write-scope) and lists (`GET`) workflow
   outcomes for the self-learning loop. Both return 404 while
-  `memory.learning_enabled` is false.
+  `memory.learning_enabled` is false, and **503 when `settings.json` exists but
+  cannot be read** — learning fails closed, so an unreadable file resolves to
+  "disabled" internally, and reporting that as 404 would tell the caller a
+  configuration story about a filesystem fault. These are the routes the
+  `report_outcome` / `list_outcomes` MCP tools call.
+- `/internal/memory/*` serves the memory tools on a node that does not own the
+  database (`CAO_MEMORY_API_URL`). Its `key` is validated leniently and then
+  normalised, matching what the tools have always done in-process — the strict
+  operator rule would reject keys that work without the gateway.
 
 See [Memory](memory.md), [Self-Learning](self-learning.md), and
 [Knowledge Graph Viewing](knowledge-graph-viewing.md).
@@ -288,8 +296,26 @@ Connect to:
 /terminals/{terminal_id}/ws
 ```
 
-The path must identify an existing terminal. This endpoint is unauthenticated
-and grants full read/write access to that terminal's PTY.
+The path must identify an existing terminal. An accepted connection grants
+full read/write access to that terminal's PTY, including command input.
+
+### Authentication
+
+Authentication is enabled when `CAO_AUTH_JWKS_URI` or `AUTH0_DOMAIN` is set.
+In that mode, the handshake requires a valid bearer token granting
+`cao:write` **or** `cao:admin`, matching `POST /terminals/{terminal_id}/input`.
+These are existing CAO scopes; `cao:read` alone does not permit interactive
+PTY access.
+
+Send the token in the `Authorization` bearer header, or in the `token` query
+parameter for clients that cannot set that header. An extracted header token
+takes precedence over the query parameter. Passing the Origin check does not
+supply a bearer token; the client must provide it. Keep token-bearing URLs out
+of logs and use TLS for remote connections.
+
+With neither authentication-enabling variable set, no token is required.
+The client-IP and Origin restrictions still apply in both modes. See the
+[authentication configuration](configuration.md#auth-auth--env-var-only).
 
 ### Client access boundary
 
@@ -298,9 +324,11 @@ By default, only loopback clients identified as `127.0.0.1`, `::1`, or
 IP addresses or hostnames to that allowlist. A literal `*` disables the
 client-IP restriction.
 
-Adding clients or using `*` gives those clients full PTY read/write access.
-Treat either change as a security-boundary change and do not expose the
-endpoint to untrusted networks. See the
+Adding clients or using `*` widens who can reach the PTY handshake; it does
+not bypass authentication when enabled. With authentication disabled,
+clients that also pass the Origin check receive full PTY read/write access.
+Treat either allowlist change as a security-boundary change and do not expose
+the endpoint to untrusted networks. See the
 [network configuration](configuration.md#network-network--env-var-only) for
 related server settings.
 
@@ -325,8 +353,18 @@ rows and 80 columns.
 
 ### Close outcomes
 
-- `4003`: the client is restricted, or terminal/backend target metadata is
-  invalid.
+Client-IP, Origin, and authentication refusals happen before the WebSocket
+upgrade. They reject the HTTP handshake with `403`, rather than delivering a
+WebSocket close frame. The handler uses these server-side refusal codes:
+
+- `4003`: the client is outside the allowed client-IP set.
+- `4403`: the browser Origin is not allowed.
+- `4401`: authentication is enabled and the token is missing, invalid, or
+  grants neither `cao:write` nor `cao:admin`.
+
+After the connection is accepted:
+
+- `4003`: terminal/backend target metadata is invalid.
 - `4004`: the terminal does not exist, or the backend cannot attach to it.
 - A normal viewer disconnect detaches that viewer and preserves the session.
 

@@ -1,5 +1,7 @@
 """Memory model for CAO memory system (Phase 1 — file-based, no SQLite)."""
 
+import os
+import re
 from datetime import datetime
 from enum import Enum
 from typing import Annotated, Optional
@@ -26,6 +28,47 @@ MemoryKey = Annotated[
     str,
     StringConstraints(pattern=r"^[a-z0-9-]{1,60}$"),
     AfterValidator(_reject_control_chars),
+]
+
+
+def _reject_keys_that_sanitize_to_empty(value: str) -> str:
+    """Reject a key with no slug characters at all (``"..."``, ``"###"``, ``"///"``).
+
+    Lenient does not mean "accept anything". These pass the length and
+    control-character checks, then reach ``MemoryService._sanitize_key``, which
+    strips everything outside ``[a-z0-9-]`` and raises ``ValueError`` on the empty
+    result. Neither internal handler catches that, so the client saw an HTTP 500
+    where the strict ``MemoryKey`` had returned a clean 422 — and gateway vs
+    in-process then disagreed about the same key, which is exactly the divergence
+    ``LenientMemoryKey`` exists to remove.
+
+    Rejecting at the boundary keeps the 422 and keeps the two paths identical:
+    a key that cannot survive sanitization is not a key either path accepts.
+    Mirrors ``_sanitize_key``'s charset deliberately; if that ever widens, widen
+    this with it.
+    """
+    _reject_control_chars(value)
+    if not re.sub(r"[^a-z0-9\-]", "", os.path.basename(value).lower()).strip("-"):
+        raise ValueError(
+            "key must contain at least one alphanumeric character "
+            "(it sanitizes to an empty slug)"
+        )
+    return value
+
+
+# The /internal/memory/* routes NORMALIZE where the operator routes REJECT.
+#
+# Those routes serve the MCP memory tools via memory_gateway, and the tools have
+# always silently sanitized through MemoryService._sanitize_key: memory_store(
+# key="Prefer Pytest") stores "preferpytest" when running in-process. Validating
+# the wire key as the strict MemoryKey made the identical call 422 as soon as
+# CAO_MEMORY_API_URL was set, so turning the gateway on broke keys that work
+# without it. Control characters are still rejected here (via the validator
+# below) so a newline or NUL cannot bypass a `$`-anchored regex further down.
+LenientMemoryKey = Annotated[
+    str,
+    StringConstraints(min_length=1, max_length=256),
+    AfterValidator(_reject_keys_that_sanitize_to_empty),
 ]
 
 

@@ -850,10 +850,21 @@ def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
 
 
 def _extract_error_detail(response: requests.Response, fallback: str) -> str:
-    """Extract a human-readable error detail from an API response."""
+    """Extract a human-readable error detail from an API response.
+
+    Valid JSON is not necessarily a JSON *object*: a gateway or proxy between the
+    agent and cao-server can answer a 502 with ``[]`` or a bare string, both of
+    which parse fine and have no ``.get``. Assuming a mapping here turned that
+    into an ``AttributeError`` raised out of the error path — so a transport
+    fault surfaced as a crash instead of the typed ``success: False`` envelope
+    every caller is written against. Check the type before subscripting.
+    """
     try:
         payload = response.json()
     except ValueError:
+        return fallback
+
+    if not isinstance(payload, dict):
         return fallback
 
     detail = payload.get("detail")
