@@ -4,7 +4,7 @@ import logging
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, cast
+from typing import Any, Dict, List, NamedTuple, Optional, cast
 
 from sqlalchemy import (
     Boolean,
@@ -12,6 +12,7 @@ from sqlalchemy import (
     Column,
     DateTime,
     Float,
+    Index,
     Integer,
     String,
     Text,
@@ -19,6 +20,7 @@ from sqlalchemy import (
     create_engine,
     literal_column,
     select,
+    text,
     update,
 )
 from sqlalchemy.orm import DeclarativeBase, declarative_base, sessionmaker
@@ -172,6 +174,18 @@ class MemoryMetadataModel(Base):
 
     __table_args__ = (
         UniqueConstraint("key", "scope", "scope_id", name="uq_memory_key_scope"),
+        # Same NULL-distinctness the sentinel comment below documents for
+        # ``memory_relationships``: ``uq_memory_key_scope`` never fires for
+        # global/federated rows because SQLite treats ``NULL != NULL`` in a
+        # UNIQUE index. This partial index covers exactly those rows
+        # (issue #657). Existing DBs get it from ``_migrate_memory_scope_null_uniqueness``.
+        Index(
+            "uq_memory_key_scope_null",
+            "key",
+            "scope",
+            unique=True,
+            sqlite_where=text("scope_id IS NULL"),
+        ),
         CheckConstraint(
             "related_keys IS NULL OR length(related_keys) < 1024",
             name="ck_related_keys_length",
@@ -327,6 +341,49 @@ class FlowModel(Base):
     enabled = Column(Boolean, default=True)
 
 
+class IdempotencyKeyModel(Base):
+    """Maps a caller-supplied idempotency key to the terminal it created.
+
+    Review on PR #634, issue #616: a caller that retries the same logical
+    create-terminal request (e.g. ``cao agent handoff`` killed after the
+    server committed a terminal but before the HTTP response reached the
+    client) supplies the SAME key on retry. ``create_terminal`` looks it up
+    BEFORE doing any real work (tmux window, provider process) and returns
+    the terminal that key already produced instead of creating a second one.
+
+    ``key`` is the primary key (not just unique) specifically so a second
+    ``INSERT`` for an already-claimed key raises ``IntegrityError`` at
+    ``commit()`` time rather than silently overwriting the first mapping --
+    the row is written once, by whichever caller's transaction commits
+    first (see ``create_terminal``'s own docs for what happens to the loser
+    of that rare race).
+    """
+
+    __tablename__ = "idempotency_keys"
+
+    key = Column(String, primary_key=True)
+    terminal_id = Column(String, nullable=False)
+    # sha256 hexdigest of the REQUESTED create fields (review on PR #634).
+    # Without it a key means only "some earlier call anywhere on this server
+    # used this string", not "this is a retry of THIS request" -- so a second
+    # caller reusing a common key (`retry`, `job-1`) was handed the first
+    # caller's terminal, and `_handoff_impl` then delivered its prompt into
+    # someone else's running worker. `terminal_service._request_fingerprint`
+    # owns the computation; see its docstring for why REQUESTED and not
+    # resolved values.
+    #
+    # `nullable=False` with NO default, deliberately: this column and this
+    # TABLE ship in the same create-table DDL (neither `idempotency_keys` nor
+    # `IdempotencyKeyModel` exists on main or in ANY released tag through
+    # v2.5.0), so no pre-existing database can hold a row without one and
+    # there is nothing to migrate. A blank fingerprint is therefore not a
+    # legacy row to tolerate -- it can only come from a scratch sqlite built
+    # from an earlier revision of this branch, whose fix is deleting the file.
+    # It is compared like any other value and simply mismatches, loudly.
+    request_fingerprint = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.now)
+
+
 def _ensure_db_dir() -> None:
     """Create the DB dir owner-only (0o700).
 
@@ -373,6 +430,9 @@ def init_db() -> None:
     # Appended LAST (issue #583 Bolt 2, ``approval-store``). Disjoint from every table above —
     # its own new table, no shared columns — so registry order is immaterial here too.
     _migrate_workflow_plan_approval()
+    # Appended LAST (issue #657). Adds one partial index to memory_metadata;
+    # reads no other table, so registry order is immaterial here too.
+    _migrate_memory_scope_null_uniqueness()
 
 
 def _restrict_db_file_permissions() -> None:
@@ -642,6 +702,113 @@ def _migrate_workflow_plan_approval() -> None:
             )
     except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug (B4-RD-4)
         logger.debug(f"workflow_plan_approval migration skipped: {e}")
+
+
+def _migrate_memory_scope_null_uniqueness(engine: Any = None, *, strict: bool = False) -> None:
+    """Create the partial unique index backing ``uq_memory_key_scope`` for
+    NULL ``scope_id`` rows (issue #657). Appended LAST to the ``init_db()``
+    registry.
+
+    SQLite treats ``NULL != NULL`` in a UNIQUE index, so the table-level
+    ``uq_memory_key_scope`` constraint has never fired for global/federated
+    memories (``MemoryService.resolve_scope_id`` persists a real NULL for
+    both — ``memory_metadata`` deliberately keeps the column nullable; the
+    sentinel used by ``memory_relationships`` is wrong here). This index
+    covers exactly those rows; non-NULL scopes stay on the table constraint.
+
+    Idempotent, self-connecting — mirrors the existing migrators. ``engine``
+    lets a caller bound the attempt to an existing SQLAlchemy engine (the
+    memory-repair path passes its own); the default resolves the singleton
+    ``DATABASE_FILE`` exactly like the other migrators. Fail-soft by design:
+    on a database that still holds duplicate NULL-scope rows,
+    ``CREATE UNIQUE INDEX`` raises ``IntegrityError``, so duplicates are
+    pre-scanned and the index is skipped with a warning pointing at
+    ``cao memory repair`` rather than blocking startup. The repair now
+    re-invokes this migrator once its dedupe has cleared the duplicates, so
+    the index lands in the same repair run instead of at the next startup.
+    ``strict=True`` (the explicit ``cao memory repair --apply`` path) makes
+    that re-invocation honest: DDL failure — e.g. a competing SQLite write
+    lock — propagates instead of being logged at debug, and the named index
+    is verified present before returning, so repair can no longer report
+    success while the index is absent; the startup default stays fail-soft.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    target = str(DATABASE_FILE)
+    try:
+        if engine is not None:
+            # Reuse the caller's engine connection pool so the attempt and the
+            # repairs share one database identity.
+            with engine.connect() as conn:
+                index_rows = conn.exec_driver_sql(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type = 'index' AND name = 'uq_memory_key_scope_null'"
+                ).fetchall()
+                if index_rows:
+                    return
+                duplicates = conn.exec_driver_sql(
+                    "SELECT key, scope, COUNT(*) FROM memory_metadata "
+                    "WHERE scope_id IS NULL GROUP BY key, scope HAVING COUNT(*) > 1"
+                ).fetchall()
+                if duplicates:
+                    rendered = ", ".join(
+                        f"{scope}:{key}x{count}" for key, scope, count in duplicates
+                    )
+                    logger.warning(
+                        "Skipping uq_memory_key_scope_null creation: duplicate global/federated "
+                        f"rows in memory_metadata ({rendered}). Run `cao memory repair` to "
+                        "reconcile them; the unique index is created on the next startup."
+                    )
+                    return
+                conn.exec_driver_sql(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_key_scope_null "
+                    "ON memory_metadata (key, scope) WHERE scope_id IS NULL"
+                )
+                conn.commit()
+                if strict:
+                    created = conn.exec_driver_sql(
+                        "SELECT name FROM sqlite_master "
+                        "WHERE type = 'index' AND name = 'uq_memory_key_scope_null'"
+                    ).fetchall()
+                    if not created:
+                        raise RuntimeError(
+                            "uq_memory_key_scope_null creation reported success but the "
+                            "index is absent from sqlite_master"
+                        )
+            return
+        with sqlite3.connect(target) as conn:
+            duplicates = conn.execute(
+                "SELECT key, scope, COUNT(*) FROM memory_metadata "
+                "WHERE scope_id IS NULL GROUP BY key, scope HAVING COUNT(*) > 1"
+            ).fetchall()
+            if duplicates:
+                rendered = ", ".join(f"{scope}:{key}x{count}" for key, scope, count in duplicates)
+                logger.warning(
+                    "Skipping uq_memory_key_scope_null creation: duplicate global/federated "
+                    f"rows in memory_metadata ({rendered}). Run `cao memory repair` to "
+                    "reconcile them; the unique index is created on the next startup."
+                )
+                return
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_key_scope_null "
+                "ON memory_metadata (key, scope) WHERE scope_id IS NULL"
+            )
+            if strict:
+                created = conn.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type = 'index' AND name = 'uq_memory_key_scope_null'"
+                ).fetchall()
+                if not created:
+                    raise RuntimeError(
+                        "uq_memory_key_scope_null creation reported success but the "
+                        "index is absent from sqlite_master"
+                    )
+    except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug
+        if strict:
+            raise
+        logger.debug(f"memory scope NULL uniqueness migration skipped: {e}")
 
 
 def _backfill_legacy_related_keys(conn: Any) -> None:
@@ -1211,8 +1378,28 @@ def create_terminal(
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
     working_directory: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
+    request_fingerprint: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Create terminal metadata record."""
+    """Create terminal metadata record.
+
+    ``idempotency_key``, when given, is persisted in the SAME ``SessionLocal``
+    session as the terminal row -- one ``commit()``, so SQLite's single-writer
+    transaction covers both inserts atomically (review on PR #634, issue
+    #616). This is what lets a retry with the same key find the terminal even
+    if the ORIGINAL caller never saw the HTTP response: the mapping is
+    durably committed server-side before any response is sent, regardless of
+    what happens to that response afterward.
+
+    ``key`` is this table's primary key, so a genuine collision (a second,
+    concurrent caller committing a DIFFERENT terminal for the SAME key before
+    either saw the other's mapping -- the narrow race this single-transaction
+    design does not fully close, only the sequential-retry gap it targets)
+    raises ``IntegrityError`` and rolls back BOTH inserts together; neither
+    row is left half-committed. The caller (``terminal_service.create_terminal``)
+    is responsible for translating that into cleanup of whatever tmux/provider
+    resources it had already allocated before this call.
+    """
     import json as _json
 
     with SessionLocal() as db:
@@ -1231,6 +1418,20 @@ def create_terminal(
             metadata_json=_json.dumps(metadata) if metadata else None,
         )
         db.add(terminal)
+        if idempotency_key:
+            # `or ""` keeps this insert in the SAME transaction as the terminal
+            # row (the property haofeif approved) without a nullable column: a
+            # caller that supplies a key but no fingerprint stores a blank one,
+            # which every later comparison simply mismatches. Failing loud beats
+            # a skip-on-blank branch that would silently hand back a terminal
+            # nobody verified.
+            db.add(
+                IdempotencyKeyModel(
+                    key=idempotency_key,
+                    terminal_id=terminal_id,
+                    request_fingerprint=request_fingerprint or "",
+                )
+            )
         db.commit()
         return {
             "id": terminal.id,
@@ -1252,6 +1453,73 @@ def create_terminal(
             "group": group if group else None,
             "metadata": metadata if metadata else None,
         }
+
+
+class IdempotencyRecord(NamedTuple):
+    """A key's stored mapping: which terminal, and for WHICH request."""
+
+    terminal_id: str
+    request_fingerprint: str
+
+
+def get_idempotency_record(key: str) -> Optional[IdempotencyRecord]:
+    """Return the full mapping for ``key``, or ``None`` if never used.
+
+    Review on PR #634, issue #616. A plain read, no locking: the caller
+    (``terminal_service.create_terminal``) uses this to decide whether to do
+    any real work at all, before generating a terminal id or touching tmux.
+
+    Returns the fingerprint together with the terminal id in ONE read, so the
+    caller can tell a genuine retry (same key, same request) from a key
+    COLLISION (same key, different request) rather than returning a terminal
+    that answers a question this caller never asked. This deliberately
+    REPLACES an earlier ``get_terminal_id_by_idempotency_key`` that returned
+    the id alone (review on PR #634): keeping a fingerprint-BLIND public
+    lookup beside this one would invite a future caller to reintroduce exactly
+    the bug class the fingerprint exists to close.
+    """
+    with SessionLocal() as db:
+        row = db.query(IdempotencyKeyModel).filter(IdempotencyKeyModel.key == key).first()
+        if row is None:
+            return None
+        return IdempotencyRecord(
+            terminal_id=cast(str, row.terminal_id),
+            request_fingerprint=cast(str, row.request_fingerprint),
+        )
+
+
+def delete_idempotency_key(key: str, expected_terminal_id: str) -> bool:
+    """Delete an idempotency-key mapping, but only if it still points to
+    ``expected_terminal_id``.
+
+    Review on PR #634, issue #616: ``create_terminal``'s fallthrough
+    for a mapping whose terminal no longer exists must clear this row FIRST.
+    ``delete_terminal`` does not cascade to ``idempotency_keys``, so leaving
+    a stale row in place would make the replacement terminal's own
+    idempotency insert collide on the same primary key and raise
+    ``IntegrityError``.
+
+    The ``expected_terminal_id`` guard is a compare-and-delete: if a
+    concurrent caller already replaced this mapping (it now points to
+    SOME OTHER terminal), this deletes nothing and this caller's own
+    create falls through to the normal atomic insert below, which then
+    correctly raises ``IntegrityError`` for the loser -- the same
+    already-accepted race behavior as two concurrent callers sharing a
+    brand-new key. Without this guard, an unconditional delete-by-key
+    could silently erase a concurrent winner's fresh, valid mapping
+    instead.
+    """
+    with SessionLocal() as db:
+        deleted = (
+            db.query(IdempotencyKeyModel)
+            .filter(
+                IdempotencyKeyModel.key == key,
+                IdempotencyKeyModel.terminal_id == expected_terminal_id,
+            )
+            .delete()
+        )
+        db.commit()
+        return deleted > 0
 
 
 def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:

@@ -232,9 +232,19 @@ Default-off. See [../src/cli_agent_orchestrator/ext_apps/apps.py](../src/cli_age
 | `CAO_WS_ALLOWED_CLIENTS` | `WS_ALLOWED_CLIENTS` (client IPs permitted to attach to the PTY WebSocket) | Running `cao-server` inside Docker (host browser arrives via a bridge IP). |
 | `CAO_WS_ALLOWED_ORIGINS` | `WS_ALLOWED_ORIGINS` (extra browser `Origin`s permitted to attach to the PTY WebSocket) | Serving the terminal viewer from a page whose origin **differs** from the cao-server host (a separate reverse-proxy hostname or dashboard). |
 
-> **Security note:** the WebSocket PTY endpoint is unauthenticated. Only add client IPs you actually trust to `CAO_WS_ALLOWED_CLIENTS` — anyone reaching the listener at one of those IPs gets full PTY access to running agent terminals.
+> **Security note:** an accepted WebSocket PTY connection grants full
+> read/write access to a running agent terminal. When authentication is enabled
+> by `CAO_AUTH_JWKS_URI` or `AUTH0_DOMAIN`, attachment requires a valid bearer
+> token granting `cao:write` or `cao:admin`. These are existing CAO scopes;
+> `cao:read` alone is not sufficient. With neither variable set, no token is
+> required. Only add client IPs you actually trust to `CAO_WS_ALLOWED_CLIENTS`,
+> and do not expose the endpoint to untrusted networks. Authentication does
+> not replace the client-IP or Origin checks, and widening either allowlist
+> does not bypass authentication. See the [Auth settings](#auth-auth--env-var-only)
+> and [PTY WebSocket contract](api.md#pty-websocket) for configuration, token
+> transports, and refusal outcomes.
 >
-> The endpoint also enforces an **Origin** check to block cross-site WebSocket hijacking (CWE-1385): a browser page that is not same-origin with the cao-server host (and not in `CAO_WS_ALLOWED_ORIGINS`) is refused. Same-origin viewers — including the bundled UI, imported-app deployments (`uvicorn cli_agent_orchestrator.api.main:app`), and dynamic reverse-proxy / Codespaces hostnames — work with no configuration, because the check accepts any `Origin` whose authority equals the request `Host` (itself validated by `TrustedHostMiddleware`). `CAO_WS_ALLOWED_ORIGINS` is only for *genuinely cross-origin* viewers; a literal `*` disables the Origin check. Note that `CAO_CORS_ORIGINS="*"` does **not** disable it — PTY access is more sensitive than ordinary CORS reads, so the escape hatch is the dedicated `CAO_WS_ALLOWED_ORIGINS="*"`.
+> The endpoint also enforces an **Origin** check to block cross-site WebSocket hijacking (CWE-1385): a browser page that is not same-origin with the cao-server host (and not in `CAO_WS_ALLOWED_ORIGINS`) is refused. Same-origin viewers — including the bundled UI, imported-app deployments (`uvicorn cli_agent_orchestrator.api.main:app`), and dynamic reverse-proxy / Codespaces hostnames — pass this Origin check without extra Origin configuration, because the check accepts any `Origin` whose authority equals the request `Host` (itself validated by `TrustedHostMiddleware`). Passing that check does not bypass the token requirement when authentication is enabled. `CAO_WS_ALLOWED_ORIGINS` is only for *genuinely cross-origin* viewers; a literal `*` disables the Origin check. Note that `CAO_CORS_ORIGINS="*"` does **not** disable it — PTY access is more sensitive than ordinary CORS reads, so the escape hatch is the dedicated `CAO_WS_ALLOWED_ORIGINS="*"`.
 
 ### Auth (`auth`) — env-var only
 

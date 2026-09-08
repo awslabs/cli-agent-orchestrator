@@ -4,7 +4,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, NamedTuple, Optional, Set
 
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
 from cli_agent_orchestrator.utils.paths import normalized_path
@@ -25,16 +25,83 @@ _BOOL_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _BOOL_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 
 
+class SettingsUnreadableError(RuntimeError):
+    """settings.json is PRESENT but could not be read or parsed.
+
+    Distinct from "absent", which legitimately means "use the built-in defaults".
+    Conflating the two is how a filesystem problem masquerades as a deliberate
+    opt-out: where reads under the CAO home directory are denied,
+    ``is_learning_enabled()`` answered False and agents reported "workflow
+    self-learning is disabled" — a configuration message for a permissions fault.
+
+    Callers that must fail closed still do; they just now know WHY.
+    """
+
+    def __init__(self, path: Path, cause: BaseException) -> None:
+        self.path = path
+        self.cause = cause
+        super().__init__(f"{path} could not be read: {type(cause).__name__}: {cause}")
+
+    def redacted_detail(self) -> str:
+        """Describe the failure WITHOUT the absolute path, for API responses.
+
+        Server filesystem paths are deliberately kept out of HTTP payloads (the
+        same reason ``MemorySummary`` excludes ``file_path``), so the path is
+        logged server-side and only the exception kind travels.
+        """
+        return (
+            f"CAO settings.json could not be read ({type(self.cause).__name__}); "
+            "configuration state is unknown — check permissions on the CAO home directory"
+        )
+
+
+def _load_or_raise() -> Dict[str, Any]:
+    """Load settings, distinguishing "absent" from "unreadable".
+
+    Deliberately calls ``read_text()`` rather than testing ``exists()`` first:
+    ``Path.exists()`` swallows ``PermissionError`` from the PARENT directory and
+    returns False, so an unreadable home directory would take the "no settings
+    file, use defaults" branch silently, without even a log line.
+    """
+    try:
+        raw = SETTINGS_FILE.read_text()
+    except FileNotFoundError:
+        return {}  # genuinely absent — defaults are the right answer
+    except OSError as e:  # PermissionError, IsADirectoryError, EIO, ...
+        raise SettingsUnreadableError(SETTINGS_FILE, e) from e
+
+    try:
+        data = json.loads(raw)
+    except ValueError as e:
+        raise SettingsUnreadableError(SETTINGS_FILE, e) from e
+    if not isinstance(data, dict):
+        raise SettingsUnreadableError(
+            SETTINGS_FILE, TypeError(f"expected a JSON object, got {type(data).__name__}")
+        )
+    return data
+
+
 def _load() -> Dict[str, Any]:
-    """Load settings from disk."""
-    if SETTINGS_FILE.exists():
-        try:
-            data = json.loads(SETTINGS_FILE.read_text())
-            if isinstance(data, dict):
-                return data
-        except Exception as e:
-            logger.warning(f"Failed to read settings: {e}")
-    return {}
+    """Load settings from disk, tolerating an unreadable file.
+
+    Lenient wrapper over :func:`_load_or_raise` so every existing caller keeps
+    its "unreadable behaves like absent" contract. Callers that need to tell the
+    two apart use :func:`_load_or_raise` or :func:`learning_status`.
+    """
+    try:
+        return _load_or_raise()
+    except SettingsUnreadableError as e:
+        logger.warning(f"Failed to read settings: {e}")
+        return {}
+
+
+def settings_readable() -> bool:
+    """True when settings.json is absent or readable; False when it cannot be read."""
+    try:
+        _load_or_raise()
+    except SettingsUnreadableError:
+        return False
+    return True
 
 
 def _save(data: Dict[str, Any]) -> None:
@@ -468,12 +535,55 @@ def is_learning_enabled() -> bool:
     learning regardless of this flag. Read errors default to False (opt-in
     features fail closed, mirroring the default).
     """
+    return learning_status().enabled
+
+
+class LearningStatus(NamedTuple):
+    """Whether learning is on, AND whether that answer is trustworthy.
+
+    ``unreadable`` is the honesty bit. ``enabled`` alone cannot distinguish
+    "the operator opted out" from "the settings file could not be read", and
+    those need different messages: the first is a configuration fact, the
+    second is a filesystem fault the operator has to go fix.
+    """
+
+    enabled: bool
+    unreadable: bool
+    detail: str
+
+
+def learning_status() -> LearningStatus:
+    """Resolve learning state, reporting whether settings.json was readable.
+
+    ``unreadable`` is True only when settings.json could not be read AND no
+    decisive ``CAO_MEMORY_LEARNING_ENABLED`` override is present: an
+    env-var-driven install is unaffected by an unreadable file, so reporting it
+    as broken would be its own kind of lie.
+
+    Still fails closed — ``enabled`` is False whenever the answer is unknown.
+    """
+    env_learning = os.environ.get("CAO_MEMORY_LEARNING_ENABLED")
+    env_decisive = env_learning is not None and env_learning.strip() != ""
+
+    try:
+        _load_or_raise()
+    except SettingsUnreadableError as e:
+        if not env_decisive:
+            # error, not warning: this is an operator-actionable fault, and the
+            # symptom it produces ("learning is disabled") does not look like one.
+            logger.error(f"Cannot determine learning state: {e}")
+            return LearningStatus(False, True, e.redacted_detail())
+        logger.warning(f"settings.json unreadable; using CAO_MEMORY_LEARNING_ENABLED: {e}")
+
     try:
         settings = get_memory_settings()
-        return bool(settings.get("enabled", True)) and bool(settings.get("learning_enabled", False))
+        enabled = bool(settings.get("enabled", True)) and bool(
+            settings.get("learning_enabled", False)
+        )
     except Exception as e:
         logger.warning(f"Failed to read memory.learning_enabled, defaulting to False: {e}")
-        return False
+        return LearningStatus(False, False, f"Failed to read learning settings: {e}")
+    return LearningStatus(enabled, False, "")
 
 
 def is_workflow_approval_required() -> bool:

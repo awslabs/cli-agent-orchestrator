@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from cli_agent_orchestrator.mcp_server import server
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.services import terminal_service
+from cli_agent_orchestrator.utils import orchestration
 
 
 def test_assign_elastic_provisions_then_assigns(monkeypatch):
@@ -23,6 +24,10 @@ def test_assign_elastic_provisions_then_assigns(monkeypatch):
     }
     with (
         patch.object(server, "_current_terminal_id", return_value="abc12345"),
+        # _assign_impl/_send_message_impl moved to utils/orchestration, so they
+        # resolve the caller through THAT module's name. server.py still has its
+        # own imported reference, so both need patching.
+        patch.object(orchestration, "_current_terminal_id", return_value="abc12345"),
         patch.object(server.requests, "post", return_value=response),
         patch.object(
             server,
@@ -100,6 +105,10 @@ def test_assign_elastic_deferred_failure_reports_terminal_ended(monkeypatch):
 
     with (
         patch.object(server, "_current_terminal_id", return_value="abc12345"),
+        # _assign_impl/_send_message_impl moved to utils/orchestration, so they
+        # resolve the caller through THAT module's name. server.py still has its
+        # own imported reference, so both need patching.
+        patch.object(orchestration, "_current_terminal_id", return_value="abc12345"),
         patch.object(server.requests, "get", return_value=Mock(status_code=200)),
         patch.object(server.requests, "post", side_effect=post),
         patch.object(terminal_service.asyncio, "to_thread", inline_to_thread),
@@ -164,6 +173,10 @@ def test_assign_elastic_omits_provider_so_the_broker_default_wins(monkeypatch):
     monkeypatch.setenv("CAO_ELASTIC_BROKER_TOKEN", "broker-token")
     with (
         patch.object(server, "_current_terminal_id", return_value="abc12345"),
+        # _assign_impl/_send_message_impl moved to utils/orchestration, so they
+        # resolve the caller through THAT module's name. server.py still has its
+        # own imported reference, so both need patching.
+        patch.object(orchestration, "_current_terminal_id", return_value="abc12345"),
         patch.object(server.requests, "post", return_value=_lease_response()) as post,
         patch.object(server, "_assign_impl", return_value={"success": True}),
     ):
@@ -180,6 +193,10 @@ def test_assign_elastic_forwards_an_explicit_provider(monkeypatch):
     monkeypatch.setenv("CAO_ELASTIC_BROKER_TOKEN", "broker-token")
     with (
         patch.object(server, "_current_terminal_id", return_value="abc12345"),
+        # _assign_impl/_send_message_impl moved to utils/orchestration, so they
+        # resolve the caller through THAT module's name. server.py still has its
+        # own imported reference, so both need patching.
+        patch.object(orchestration, "_current_terminal_id", return_value="abc12345"),
         patch.object(server.requests, "post", return_value=_lease_response()) as post,
         patch.object(server, "_assign_impl", return_value={"success": True}),
     ):
@@ -203,6 +220,10 @@ def test_assign_elastic_warns_the_worker_not_to_speak_first(monkeypatch):
     monkeypatch.setenv("CAO_ELASTIC_BROKER_TOKEN", "broker-token")
     with (
         patch.object(server, "_current_terminal_id", return_value="abc12345"),
+        # _assign_impl/_send_message_impl moved to utils/orchestration, so they
+        # resolve the caller through THAT module's name. server.py still has its
+        # own imported reference, so both need patching.
+        patch.object(orchestration, "_current_terminal_id", return_value="abc12345"),
         patch.object(server.requests, "post", return_value=_lease_response()),
         patch.object(server, "_assign_impl", return_value={"success": True}) as assign,
     ):
@@ -228,6 +249,10 @@ def test_assign_elastic_releases_when_assignment_fails(monkeypatch):
     delete_response = Mock(status_code=200)
     with (
         patch.object(server, "_current_terminal_id", return_value="abc12345"),
+        # _assign_impl/_send_message_impl moved to utils/orchestration, so they
+        # resolve the caller through THAT module's name. server.py still has its
+        # own imported reference, so both need patching.
+        patch.object(orchestration, "_current_terminal_id", return_value="abc12345"),
         patch.object(server.requests, "post", return_value=create_response),
         patch.object(server.requests, "delete", return_value=delete_response) as delete,
         patch.object(server, "_assign_impl", return_value={"success": False}),
@@ -280,7 +305,7 @@ def test_complete_assignment_keeps_worker_when_delivery_fails(monkeypatch):
 
 def test_wait_remote_ready_returns_on_the_first_healthy_answer():
     with patch.object(server.requests, "get", return_value=Mock(status_code=200)) as get:
-        server._wait_remote_ready("http://worker:9889", 5.0)
+        orchestration._wait_remote_ready("http://worker:9889", 5.0)
 
     assert get.call_count == 1
     assert get.call_args.args[0] == "http://worker:9889/health"
@@ -297,7 +322,7 @@ def test_wait_remote_ready_polls_through_a_converging_service():
         patch.object(server.requests, "get", side_effect=responses) as get,
         patch.object(server.time, "sleep") as sleep,
     ):
-        server._wait_remote_ready("http://worker:9889", 5.0)
+        orchestration._wait_remote_ready("http://worker:9889", 5.0)
 
     assert get.call_count == 3
     # Sub-second polling: the gap being waited out is a second or two, so a 5s
@@ -313,7 +338,7 @@ def test_wait_remote_ready_raises_something_diagnosable_on_timeout():
         patch.object(server.time, "sleep"),
     ):
         try:
-            server._wait_remote_ready("http://worker:9889", 0.0)
+            orchestration._wait_remote_ready("http://worker:9889", 0.0)
             raise AssertionError("expected a ValueError")
         except ValueError as exc:
             message = str(exc)
@@ -338,9 +363,9 @@ def test_assign_remote_does_not_wait_by_default(monkeypatch):
     monkeypatch.setenv(server.ADVERTISED_URL_ENV, "http://cao-supervisor:9889")
     with (
         patch.object(server.requests, "post", return_value=_remote_session_response()),
-        patch.object(server, "_wait_remote_ready") as wait,
+        patch.object(orchestration, "_wait_remote_ready") as wait,
     ):
-        result = server._assign_remote(
+        result = orchestration._assign_remote(
             agent_profile="developer",
             worker_message="Implement it",
             current_terminal_id="abc12345",
@@ -366,10 +391,10 @@ def test_assign_remote_waits_before_it_posts_the_task(monkeypatch):
             side_effect=lambda *a, **k: (calls.append("post"), _remote_session_response())[1],
         ),
         patch.object(
-            server, "_wait_remote_ready", side_effect=lambda *a: calls.append("wait")
+            orchestration, "_wait_remote_ready", side_effect=lambda *a: calls.append("wait")
         ) as wait,
     ):
-        server._assign_remote(
+        orchestration._assign_remote(
             agent_profile="developer",
             worker_message="Implement it",
             current_terminal_id="abc12345",
@@ -391,6 +416,10 @@ def test_assign_elastic_asks_the_assignment_to_wait_for_its_new_worker(monkeypat
     monkeypatch.delenv("CAO_ELASTIC_WORKER_READY_WAIT", raising=False)
     with (
         patch.object(server, "_current_terminal_id", return_value="abc12345"),
+        # _assign_impl/_send_message_impl moved to utils/orchestration, so they
+        # resolve the caller through THAT module's name. server.py still has its
+        # own imported reference, so both need patching.
+        patch.object(orchestration, "_current_terminal_id", return_value="abc12345"),
         patch.object(server.requests, "post", return_value=_lease_response()),
         patch.object(server, "_assign_impl", return_value={"success": True}) as assign,
     ):
@@ -434,6 +463,10 @@ def test_assign_elastic_calls_overlap_instead_of_serialising(monkeypatch):
 
     with (
         patch.object(server, "_current_terminal_id", return_value="abc12345"),
+        # _assign_impl/_send_message_impl moved to utils/orchestration, so they
+        # resolve the caller through THAT module's name. server.py still has its
+        # own imported reference, so both need patching.
+        patch.object(orchestration, "_current_terminal_id", return_value="abc12345"),
         patch.object(server.requests, "post", side_effect=slow_post),
         patch.object(server, "_assign_impl", side_effect=slow_assign),
     ):

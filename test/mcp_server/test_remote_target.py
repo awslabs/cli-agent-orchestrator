@@ -14,7 +14,8 @@ import pytest
 import requests
 
 from cli_agent_orchestrator.constants import API_BASE_URL
-from cli_agent_orchestrator.mcp_server.server import (
+from cli_agent_orchestrator.mcp_server.server import delete_terminal
+from cli_agent_orchestrator.utils.orchestration import (
     REMOTE_CONNECT_TIMEOUT,
     _assign_impl,
     _handoff_impl,
@@ -23,10 +24,14 @@ from cli_agent_orchestrator.mcp_server.server import (
     _resolve_target_base_url,
     _send_message_impl,
     _send_to_inbox,
-    delete_terminal,
 )
 
-_SRV = "cli_agent_orchestrator.mcp_server.server"
+# The cross-node implementation lives in utils/orchestration.py, not
+# mcp_server/server.py (issue #616 extracted the single shared seam behind both
+# the MCP tools and the `cao agent` CLI). Only the `delete_terminal` TOOL
+# wrapper is still server-local, and it delegates to the moved
+# `_delete_terminal_impl`, so patching this module covers it too.
+_SRV = "cli_agent_orchestrator.utils.orchestration"
 
 
 def _response(status_code=200, json_body=None):
@@ -257,7 +262,7 @@ class TestHandoffRemote:
     @patch(f"{_SRV}._resolve_handoff_provider")
     @patch(f"{_SRV}.requests")
     def test_omitted_target_host_posts_to_local_server(self, mock_requests, mock_ctx, _nudge):
-        from cli_agent_orchestrator.mcp_server.server import HandoffContext
+        from cli_agent_orchestrator.utils.orchestration import HandoffContext
 
         mock_ctx.return_value = HandoffContext(
             provider="mock_cli", session_name="cao-s", caller_id="a1b2c3d4", allowed_tools=None
@@ -442,7 +447,7 @@ class TestHandoffRemoteFailureCleanup:
     def test_local_failure_does_not_call_delete(self, mock_requests, mock_ctx, _nudge):
         """Local behavior unchanged: server-side cleanup guidance/deletes are
         a remote-only addition."""
-        from cli_agent_orchestrator.mcp_server.server import HandoffContext
+        from cli_agent_orchestrator.utils.orchestration import HandoffContext
 
         mock_ctx.return_value = HandoffContext(
             provider="mock_cli", session_name="cao-s", caller_id="a1b2c3d4", allowed_tools=None

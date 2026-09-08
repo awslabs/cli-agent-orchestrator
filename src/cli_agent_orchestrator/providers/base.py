@@ -199,6 +199,15 @@ class BaseProvider(ABC):
         """
         return self.get_status("\n".join(screen_lines))
 
+    def extract_current_composer(self, rendered_pane: str) -> Optional[str]:
+        """Return this provider's current editable composer, when it is known.
+
+        A rendered pane also contains transcript history, so callers must not
+        infer an input boundary from its cursor position alone. Providers opt
+        in only when they can identify their own live composer structure.
+        """
+        return None
+
     @property
     def paste_submit_delay(self) -> float:
         """Seconds to wait after a bracketed paste before sending the Enter key.

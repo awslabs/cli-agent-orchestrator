@@ -21,10 +21,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from cli_agent_orchestrator.mcp_server.server import HandoffContext
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.agent_step import run_agent_step
 from cli_agent_orchestrator.services.terminal_service import OutputMode
+from cli_agent_orchestrator.utils.orchestration import HandoffContext
 
 _STEP = "cli_agent_orchestrator.services.agent_step"
 
@@ -117,8 +117,8 @@ class TestEngineHandoffEquivalence:
         from fastapi.testclient import TestClient
 
         from cli_agent_orchestrator.api.main import app
-        from cli_agent_orchestrator.mcp_server.server import _handoff_impl
         from cli_agent_orchestrator.plugins import PluginRegistry
+        from cli_agent_orchestrator.utils.orchestration import _handoff_impl
 
         app.state.plugin_registry = PluginRegistry()
         test_client = TestClient(app, headers={"Host": "localhost"})
@@ -131,14 +131,14 @@ class TestEngineHandoffEquivalence:
                 return test_client.post("/terminals/run-step", json=json)
 
             with patch(
-                "cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value=""
+                "cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value=""
             ):
                 with patch(
-                    "cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider",
+                    "cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider",
                     return_value=HandoffContext("kiro_cli", None, None, None),
                 ):
                     with patch(
-                        "cli_agent_orchestrator.mcp_server.server.requests"
+                        "cli_agent_orchestrator.utils.orchestration.requests"
                     ) as mock_requests:
                         mock_requests.post.side_effect = fake_post
                         mock_requests.Timeout = Exception
@@ -172,8 +172,8 @@ class TestEngineHandoffEquivalence:
         from fastapi.testclient import TestClient
 
         from cli_agent_orchestrator.api.main import app
-        from cli_agent_orchestrator.mcp_server.server import _handoff_impl
         from cli_agent_orchestrator.plugins import PluginRegistry
+        from cli_agent_orchestrator.utils.orchestration import _handoff_impl
 
         app.state.plugin_registry = PluginRegistry()
         test_client = TestClient(app, headers={"Host": "localhost"})
@@ -188,14 +188,14 @@ class TestEngineHandoffEquivalence:
                 return test_client.post("/terminals/run-step", json=json)
 
             with patch(
-                "cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value=""
+                "cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value=""
             ):
                 with patch(
-                    "cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider",
+                    "cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider",
                     return_value=HandoffContext("kiro_cli", None, None, None),
                 ):
                     with patch(
-                        "cli_agent_orchestrator.mcp_server.server.requests"
+                        "cli_agent_orchestrator.utils.orchestration.requests"
                     ) as mock_requests:
                         mock_requests.post.side_effect = fake_post
                         mock_requests.Timeout = Exception

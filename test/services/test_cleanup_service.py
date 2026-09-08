@@ -52,10 +52,17 @@ class TestCleanupOldData:
         old_terminal_query = MagicMock()
         terminal_delete_query = MagicMock()
         inbox_query = MagicMock()
-        mock_db.query.side_effect = [old_terminal_query, terminal_delete_query, inbox_query]
+        idempotency_query = MagicMock()
+        mock_db.query.side_effect = [
+            old_terminal_query,
+            terminal_delete_query,
+            inbox_query,
+            idempotency_query,
+        ]
         old_terminal_query.filter.return_value.all.return_value = [old_terminal]
         terminal_delete_query.filter.return_value.filter.return_value.delete.return_value = 0
         inbox_query.filter.return_value.delete.return_value = 0
+        idempotency_query.filter.return_value.delete.return_value = 0
         mock_provider_manager.cleanup_provider.return_value = False
         mock_log_dir.exists.return_value = False
         mock_terminal_log_dir.exists.return_value = False
@@ -96,8 +103,9 @@ class TestCleanupOldData:
         # Verify cleanup was called:
         # Session 1: query.all() for terminal iteration + query.delete() for terminal deletion
         # Session 2: query.delete() for inbox deletion
+        # Session 3: query.delete() for idempotency-key deletion
         assert mock_db.query.call_count >= 2
-        assert mock_db.commit.call_count == 2
+        assert mock_db.commit.call_count == 3
 
     @patch("cli_agent_orchestrator.services.cleanup_service.SessionLocal")
     @patch("cli_agent_orchestrator.services.cleanup_service.RETENTION_DAYS", 7)

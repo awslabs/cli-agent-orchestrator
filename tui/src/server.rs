@@ -287,6 +287,18 @@ fn route(id: CommandId) -> Option<Route> {
         // below IS this route, reached through the guided launch flow rather than through `run`.
         CommandId::Launch => None,
 
+        // ── `cao agent *` — all six HIDE, no route (issue #616) ──────────────────────────
+        // New CLI orchestration commands (assign/handoff/send-message/status/result/cancel), a
+        // fallback for when a terminal's cao-mcp-server connection is unavailable. Unclassified
+        // pending deliberate TUI review (catalog.rs), so HIDE per project.md's mandated default —
+        // and a HIDE command is unreachable through `commands()`, so it needs no route regardless.
+        CommandId::AgentAssign => None,
+        CommandId::AgentCancel => None,
+        CommandId::AgentHandoff => None,
+        CommandId::AgentResult => None,
+        CommandId::AgentSendMessage => None,
+        CommandId::AgentStatus => None,
+
         // ── `cao config *`, `cao env *` ───────────────────────────────────────────────────
         // HIDE, and genuinely routeless: `cao env *` reads and writes the managed env store
         // in-process. These are the routeless commands BR-18's `NoRoute` variant was named for.
@@ -2665,7 +2677,7 @@ mod tests {
             .count();
         assert_eq!(
             in_app, 24,
-            "the settled distribution is 24 IN-APP / 18 HANDOFF / 27 HIDE = 69; if this moved, \
+            "the settled distribution is 24 IN-APP / 18 HANDOFF / 33 HIDE = 75; if this moved, \
              the 23-route figure above needs re-deriving rather than adjusting"
         );
     }

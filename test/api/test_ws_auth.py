@@ -3,7 +3,8 @@
 Covers the security fix that closes the auth bypass on
 ``/terminals/{terminal_id}/ws``: when the HTTP auth layer is enabled the
 handshake must carry a valid JWT (``Authorization: Bearer`` header or
-``?token=`` query parameter) granting at least ``cao:read``. Default-off —
+``?token=`` query parameter) granting ``cao:write`` or ``cao:admin``.
+Keystroke injection is RCE; ``cao:read`` is not enough. Default-off —
 auth disabled — the attach must behave exactly as before (no token needed).
 
 The tests drive ``terminal_ws`` directly with a mock ``WebSocket`` (the same
@@ -166,7 +167,7 @@ async def test_ws_auth_enabled_valid_bearer_header_attaches(monkeypatch, jwt_fac
     from cli_agent_orchestrator.api.main import terminal_ws
 
     _enable_auth(monkeypatch, jwt_factory)
-    ws = _make_ws(headers={"authorization": f"Bearer {jwt_factory.mint_viewer()}"})
+    ws = _make_ws(headers={"authorization": f"Bearer {jwt_factory.mint_operator()}"})
     with _admitted_patches():
         await terminal_ws(ws, "abcd1234")
 
@@ -182,7 +183,7 @@ async def test_ws_auth_enabled_valid_token_query_param_attaches(monkeypatch, jwt
     from cli_agent_orchestrator.api.main import terminal_ws
 
     _enable_auth(monkeypatch, jwt_factory)
-    ws = _make_ws(query_params={"token": jwt_factory.mint_viewer()})
+    ws = _make_ws(query_params={"token": jwt_factory.mint_operator()})
     with _admitted_patches():
         await terminal_ws(ws, "abcd1234")
 
@@ -191,13 +192,28 @@ async def test_ws_auth_enabled_valid_token_query_param_attaches(monkeypatch, jwt
 
 
 @pytest.mark.asyncio
-async def test_ws_auth_enabled_write_only_token_rejected(monkeypatch, jwt_factory):
-    """Auth on + a valid token WITHOUT ``cao:read`` → closed 4401 (attach
-    requires at least the read scope)."""
+async def test_ws_auth_enabled_write_only_token_attaches(monkeypatch, jwt_factory):
+    """Auth on + a valid token with ``cao:write`` (no read) → proceeds past
+    the gate. Matches HTTP ``POST /terminals/{id}/input``."""
     from cli_agent_orchestrator.api.main import terminal_ws
 
     _enable_auth(monkeypatch, jwt_factory)
     ws = _make_ws(headers={"authorization": f"Bearer {jwt_factory.mint(scopes='cao:write')}"})
+    with _admitted_patches():
+        await terminal_ws(ws, "abcd1234")
+
+    ws.accept.assert_awaited_once()
+    assert ws.close.call_args.kwargs.get("code") == 4004
+
+
+@pytest.mark.asyncio
+async def test_ws_auth_enabled_read_only_token_rejected(monkeypatch, jwt_factory):
+    """Auth on + a valid ``cao:read``-only token → closed 4401. The PTY is
+    write/RCE; read is not enough."""
+    from cli_agent_orchestrator.api.main import terminal_ws
+
+    _enable_auth(monkeypatch, jwt_factory)
+    ws = _make_ws(headers={"authorization": f"Bearer {jwt_factory.mint_viewer()}"})
     with _admitted_patches():
         await terminal_ws(ws, "abcd1234")
 

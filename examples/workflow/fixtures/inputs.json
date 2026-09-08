@@ -1,0 +1,5 @@
+{
+  "target": "myapp",
+  "concurrency": 3,
+  "strict": false
+}

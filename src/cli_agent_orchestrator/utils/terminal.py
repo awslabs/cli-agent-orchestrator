@@ -1,6 +1,7 @@
 """Session utilities for CLI Agent Orchestrator."""
 
 import asyncio
+import hashlib
 import logging
 import re
 import time
@@ -53,6 +54,24 @@ def generate_session_name() -> str:
     """Generate a unique session name with SESSION_PREFIX."""
     session_uuid = uuid.uuid4().hex[:8]
     return validate_tmux_name(f"{SESSION_PREFIX}{session_uuid}", "session_name")
+
+
+def generate_session_name_for_key(idempotency_key: str) -> str:
+    """Derive a STABLE session name from an idempotency key.
+
+    Review on PR #634, issue #616. ``generate_session_name`` mints a fresh
+    uuid4 per call, which is right for an ordinary create but wrong for a
+    KEYED one: the server fingerprints ``session_name``, so a retry that
+    generated a new name produced a different fingerprint for the same logical
+    request and 409'd against its own first attempt instead of reattaching.
+
+    Same shape as ``generate_session_name`` (prefix + 8 hex chars) and run
+    through the same validator, so nothing downstream can tell the two apart.
+    sha256 rather than ``hash()`` because the latter is salted per process and
+    would defeat the entire point across two separate CLI invocations.
+    """
+    digest = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()[:8]
+    return validate_tmux_name(f"{SESSION_PREFIX}{digest}", "session_name")
 
 
 def generate_terminal_id() -> str:

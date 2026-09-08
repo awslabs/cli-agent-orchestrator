@@ -14,6 +14,10 @@ from cli_agent_orchestrator.ops_mcp_server.models import (
     SendMessageResult,
     SessionListResult,
 )
+from cli_agent_orchestrator.utils.forwarded_env import (
+    ForwardedEnvError,
+    validate_forwarded_env,
+)
 from cli_agent_orchestrator.utils.terminal import generate_session_name
 
 JsonDict = Dict[str, Any]
@@ -101,9 +105,25 @@ async def _launch_session_impl(
     allowed_tools: Optional[List[str]] = None,
     model: Optional[str] = None,
     initial_message: Optional[str] = None,
+    env_vars: Optional[Dict[str, str]] = None,
 ) -> LaunchResult:
     """Create a new CAO session and return the session identifiers."""
     resolved_session_name = session_name or generate_session_name()
+
+    # Validate forwarded env at this boundary: the server silently drops a var
+    # that breaks the rules, so mirror `cao launch --env` and fail loudly here.
+    validated_env: Optional[Dict[str, str]] = None
+    if env_vars:
+        try:
+            validated_env = validate_forwarded_env(env_vars)
+        except ForwardedEnvError as exc:
+            return LaunchResult(
+                success=False,
+                message=f"Launch session failed: {exc}",
+                session_name=resolved_session_name,
+                terminal_id=None,
+            )
+
     params: Dict[str, Any] = {
         "agent_profile": agent_profile,
         "session_name": resolved_session_name,
@@ -119,7 +139,16 @@ async def _launch_session_impl(
     if serialized_allowed_tools:
         params["allowed_tools"] = serialized_allowed_tools
 
-    body = {"initial_message": initial_message} if initial_message is not None else None
+    # initial_message and env_vars both travel in the JSON body (never the URL,
+    # so a forwarded secret does not land in the server access log).
+    body: Optional[Dict[str, Any]] = None
+    if initial_message is not None or validated_env:
+        body = {}
+        if initial_message is not None:
+            body["initial_message"] = initial_message
+        if validated_env:
+            body["env_vars"] = validated_env
+
     session_data, error = _request_json(
         "post", "/sessions", params=params, json=body, operation="Launch session"
     )
@@ -303,6 +332,23 @@ async def launch_session(
             )
         ),
     ] = None,
+    env_vars: Annotated[
+        Optional[Dict[str, str]],
+        Field(
+            description=(
+                "Optional environment variables forwarded into the launched "
+                "session -- the supervisor terminal and every worker it later "
+                "spawns -- the same mechanism as `cao launch --env`. Delivered "
+                "in the JSON request body (never the URL, so a forwarded secret "
+                "stays out of the server access log). Keys must be POSIX "
+                "identifiers; the CLAUDE/CODEX_/__MISE_ prefixes are reserved "
+                "for provider env. Values must be UTF-8 with no NUL byte and "
+                "<2048 bytes each; at most 256 vars totalling <128 KiB are "
+                "accepted (tmux argv limits). Invalid input returns "
+                "success=False, it does not raise."
+            )
+        ),
+    ] = None,
 ) -> LaunchResult:
     """Create a new CAO session with the given provider and agent profile.
 
@@ -320,6 +366,8 @@ async def launch_session(
         allowed_tools: Optional list of tool restrictions
         model: Optional per-launch model override
         initial_message: Optional first task, carried in the JSON request body
+        env_vars: Optional env vars forwarded into the session, validated the
+            same way as ``cao launch --env`` and carried in the JSON body
 
     Returns:
         LaunchResult with success status, session_name, and terminal_id
@@ -332,6 +380,7 @@ async def launch_session(
         allowed_tools=allowed_tools,
         model=model,
         initial_message=initial_message,
+        env_vars=env_vars,
     )
 
 
