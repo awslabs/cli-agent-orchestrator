@@ -458,26 +458,27 @@ class TestConcurrentDeliverySerialization:
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
-    def test_marker_armed_before_send_is_cleared_by_an_event_consumed_during_dispatch(
+    def test_marker_armed_before_send_is_not_cleared_by_an_event_consumed_during_dispatch(
         self, mock_get, mock_monitor, mock_term, mock_claim
     ):
-        """Reviewer-reproduced eighth-round finding on #709 (haofeif): the
-        marker used to arm AFTER send_input returned, from a post-dispatch
-        generation read. That left a check-then-mark window: if
-        InboxService.run() consumed a fast completion event on another
-        thread before this call reached its own post-dispatch read, it found
-        no marker to clear (none existed yet), and this call then installed
-        one for a generation that event had already confirmed. Nothing left
-        to arrive would ever clear it, coalescing every later message to
-        this terminal forever.
+        """Reviewer-reproduced ninth-round finding on #709 (haofeif): the
+        marker used to be confirmable from the moment it was armed, using a
+        generation read BEFORE send_input was even called. An event about
+        output that predates this dispatch (queued before send_input started
+        preparing metadata/status/provider work, still ahead of the actual
+        backend dispatch boundary) could exceed that pre-dispatch snapshot
+        and clear the marker before the real send happened at all, letting a
+        second caller dispatch into the terminal while the first message was
+        still being typed.
 
-        The fix arms the marker before send_input is even called, so no
-        status event caused by this dispatch can be published before the
-        marker exists. Simulated here by having the mocked send_input itself
-        invoke the real clearing path, standing in for the event consumer
-        running concurrently while this call is still inside the blocking
-        send: the marker must already be armed by the time that happens, and
-        it must come out cleared once it does, not stranded.
+        The fix keeps the marker unconfirmable (boundary None) from the
+        moment it is armed until send_input returns: no event, however new
+        its generation, can confirm an attempt whose backend dispatch has
+        not happened yet. Simulated here by having the mocked send_input
+        itself invoke the real clearing path, standing in for the event
+        consumer running concurrently while this call is still inside the
+        blocking send: the marker must already be armed by the time that
+        happens, and it must stay armed once it does.
         """
         mock_get.return_value = [_make_message()]
         mock_claim.return_value = [_make_message(status=MessageStatus.DELIVERED)]
@@ -488,9 +489,10 @@ class TestConcurrentDeliverySerialization:
 
         def _send_input(*args, **kwargs):
             armed_before_send["value"] = inbox_service_module._is_dispatch_active("term-1")
-            # Stand-in for the real completion event (generation 1) landing
+            # Stand-in for a status event about pre-existing output landing
             # and being consumed by InboxService.run() on another thread
-            # while this call is still inside send_input.
+            # while this call is still inside send_input, before the real
+            # dispatch this call is making has happened.
             inbox_service_module._clear_dispatch_active("term-1", 1)
 
         mock_term.send_input.side_effect = _send_input
@@ -499,6 +501,33 @@ class TestConcurrentDeliverySerialization:
         svc.deliver_pending("term-1")
 
         assert armed_before_send["value"] is True
+        # Still active: the event landed before send_input returned, so the
+        # attempt was never confirmable and the event could not have been
+        # about this dispatch.
+        assert inbox_service_module._is_dispatch_active("term-1") is True
+
+    @patch("cli_agent_orchestrator.services.inbox_service.claim_pending_messages")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_marker_confirmed_after_send_is_cleared_by_a_later_event(
+        self, mock_get, mock_monitor, mock_term, mock_claim
+    ):
+        """Companion to the test above: once send_input returns, the attempt's
+        boundary becomes the generation read right then, and only an event
+        strictly newer than THAT can clear it (#709 ninth review round)."""
+        mock_get.return_value = [_make_message()]
+        mock_claim.return_value = [_make_message(status=MessageStatus.DELIVERED)]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_monitor.get_status_generation.return_value = 0
+
+        svc = InboxService()
+        svc.deliver_pending("term-1")
+
+        assert inbox_service_module._is_dispatch_active("term-1") is True
+        # Confirmed at generation 0 (the mocked post-send read); generation 1
+        # is strictly newer and clears it.
+        inbox_service_module._clear_dispatch_active("term-1", 1)
         assert inbox_service_module._is_dispatch_active("term-1") is False
 
     def test_marker_stranded_by_arm_after_send_is_the_bug_this_fix_closes(self):
@@ -523,14 +552,13 @@ class TestConcurrentDeliverySerialization:
         inbox_service_module._clear_dispatch_active("term-1", 1)
         assert inbox_service_module._is_dispatch_active("term-1") is True
 
-    def test_second_message_delivers_once_the_armed_before_dispatch_marker_clears(
+    def test_second_message_delivers_once_the_confirmed_dispatch_marker_clears(
         self, isolated_memory_db
     ):
-        """End-to-end companion to the mock-level test above: with the fix,
-        a genuine completion event landing during the first send's blocking
-        window clears the marker armed before that send, so a second pending
-        message delivers on the very next call instead of coalescing
-        forever."""
+        """End-to-end companion to the two tests above: a genuine completion
+        event landing after the first send confirms clears the marker, so a
+        second pending message delivers on the very next call instead of
+        coalescing forever."""
         with database.SessionLocal() as seed:
             seed.add_all(
                 [
@@ -552,15 +580,16 @@ class TestConcurrentDeliverySerialization:
         ):
             mock_monitor.get_status.return_value = TerminalStatus.IDLE
             mock_monitor.get_status_generation.return_value = 0
-
-            def _send_input(*args, **kwargs):
-                inbox_service_module._clear_dispatch_active("term-1", 1)
-
-            mock_term.send_input.side_effect = _send_input
             svc = InboxService()
 
             svc.deliver_pending("term-1")
             assert mock_term.send_input.call_count == 1
+            assert inbox_service_module._is_dispatch_active("term-1") is True
+
+            # A genuine status event landing after the send confirms: its
+            # generation (1) is strictly newer than the one read right after
+            # send_input returned (0).
+            inbox_service_module._clear_dispatch_active("term-1", 1)
             assert inbox_service_module._is_dispatch_active("term-1") is False
 
             svc.deliver_pending("term-1")
@@ -571,6 +600,53 @@ class TestConcurrentDeliverySerialization:
                 m.status for m in check.query(InboxModel).filter_by(receiver_id="term-1").all()
             )
         assert statuses == sorted([MessageStatus.DELIVERED.value, MessageStatus.DELIVERED.value])
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.claim_pending_messages")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_second_sender_groups_failure_does_not_strand_the_first_groups_marker(
+        self, mock_get, mock_monitor, mock_term_svc, mock_claim, mock_update
+    ):
+        """Reviewer-reproduced tenth-round finding on #709 (haofeif): with
+        num_messages > 1, distinct sender groups dispatch sequentially under
+        one terminal lock, each arming its own attempt. If group 1's send
+        succeeds and group 2's then fails, group 2's abort must remove only
+        its own token's entry, never the one still protecting group 1's
+        successful-but-unconfirmed dispatch."""
+
+        def _msg(id, sender_id, status):
+            return InboxMessage(
+                id=id,
+                sender_id=sender_id,
+                receiver_id="term-1",
+                message=f"m{id}",
+                status=status,
+                created_at=datetime.now(),
+            )
+
+        mock_get.return_value = [
+            _msg(1, "sender-1", MessageStatus.PENDING),
+            _msg(2, "sender-2", MessageStatus.PENDING),
+        ]
+        mock_claim.return_value = [
+            _msg(1, "sender-1", MessageStatus.DELIVERED),
+            _msg(2, "sender-2", MessageStatus.DELIVERED),
+        ]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_monitor.get_status_generation.return_value = 0
+        mock_term_svc.send_input.side_effect = [None, RuntimeError("tmux error")]
+
+        svc = InboxService()
+        svc.deliver_pending("term-1", num_messages=0)
+
+        # Group 2 (message id 2) was reset to FAILED; group 1 was never touched.
+        mock_update.assert_called_once_with(2, MessageStatus.FAILED)
+        # Group 1's dispatch reached the terminal and is still unconfirmed by
+        # a real status event, so it must still be protected even though
+        # group 2's own attempt was aborted right after it.
+        assert inbox_service_module._is_dispatch_active("term-1") is True
 
 
 class TestDispatchActiveTeardown:
