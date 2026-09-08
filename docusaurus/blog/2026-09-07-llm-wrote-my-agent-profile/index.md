@@ -5,21 +5,6 @@ tags: [tutorial]
 description: Machine-generated agent profiles fail in ways you can't see. A walkthrough of the Profiles web UI as the review gate they were missing.
 ---
 
-{/*
-DRAFT NOTES (delete before submitting):
-1. Target path: docusaurus/blog/YYYY-MM-DD-llm-wrote-my-agent-profile/index.md
-   -- rename directory to the actual publish date before the PR.
-2. DONE: version line filled (v2.5.1, releasing together with this post,
-   cut from the same main this was run against).
-3. Act-two output IS a real clean-room model run (2026-09-07); provenance
-   comment sits above the yaml block. Walkthrough + screenshots taken
-   against the live UI on 2026-09-07; validator message quoted verbatim.
-4. DONE: all 4 screenshots wired with alt text. No personal data visible.
-5. Verify locally: cd docusaurus && npm install && npm run build
-   (broken links and unlisted tags fail the build).
-6. Request editorial review from @haofeif on the PR.
-*/}
-
 I broke my own agent twice in one week. Once by hand, once with help from a
 very confident language model. This post is about both breaks, and about the
 Profiles tab in the CAO Web UI that turns machine-written profiles from
