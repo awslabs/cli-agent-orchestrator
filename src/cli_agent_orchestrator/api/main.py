@@ -7787,6 +7787,7 @@ async def create_outcome_endpoint(
 ) -> Dict:
     """Record a workflow outcome (self-learning signal)."""
     from cli_agent_orchestrator.services.outcome_service import (
+        LEARNING_DISABLED_MESSAGE,
         LearningDisabledError,
         OutcomeService,
     )
@@ -7804,9 +7805,14 @@ async def create_outcome_endpoint(
             friction_notes=body.friction_notes,
         )
     except LearningDisabledError:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Workflow self-learning is disabled"
-        )
+        # LEARNING_DISABLED_MESSAGE, not a hand-written string: it carries
+        # LEARNING_DISABLED_CODE, which is what the MCP layer matches on before
+        # reporting `disabled: true`. This is the race path — learning was enabled
+        # when _require_learning_enabled() ran and disabled by the time the write
+        # landed — so it is genuinely the feature gate and must read as such.
+        # A bare detail here would surface as a plain error instead, making the
+        # discriminator's coverage depend on which of two gates fired.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=LEARNING_DISABLED_MESSAGE)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     return {"success": True, "outcome": outcome}

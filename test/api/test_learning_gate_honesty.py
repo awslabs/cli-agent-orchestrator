@@ -75,6 +75,32 @@ class TestDisabledVersusUnreadable:
         assert str(fake) not in detail
         assert str(home) not in detail
 
+    def test_unreadable_is_503_root_safe(self, client, tmp_path):
+        """Same 503 contract, induced without chmod so ROOT CI executes it.
+
+        The chmod variant above is skipped as root, which meant this PR's central
+        behaviour had zero executed coverage in a root container — silently, since
+        a skip is not a failure. A directory where the settings file belongs is an
+        unreadable settings.json for every uid, so this path runs everywhere.
+        """
+        home = tmp_path / "cao-home"
+        home.mkdir()
+        as_dir = home / "settings.json"
+        as_dir.mkdir()
+        with (
+            patch("cli_agent_orchestrator.services.settings_service.SETTINGS_FILE", as_dir),
+            patch("cli_agent_orchestrator.services.settings_service.CAO_HOME_DIR", home),
+        ):
+            response = client.post("/outcomes", json=BODY)
+            get_response = client.get("/outcomes")
+
+        assert response.status_code == 503, response.text
+        assert get_response.status_code == 503
+        # Server filesystem paths must not travel in an HTTP payload.
+        detail = response.json()["detail"]
+        assert str(as_dir) not in detail
+        assert str(home) not in detail
+
     def test_enabled_still_works(self, client, settings_file):
         settings_file.write_text(json.dumps({"memory": {"learning_enabled": True}}))
         with patch(
@@ -93,6 +119,22 @@ class TestSettingsReadableSurface:
         assert body["learning_enabled"] is True
 
     @requires_unprivileged
+    def test_reports_unreadable_root_safe(self, client, tmp_path):
+        """``settings_readable: false`` without chmod, so root CI runs it too."""
+        home = tmp_path / "cao-home"
+        home.mkdir()
+        as_dir = home / "settings.json"
+        as_dir.mkdir()
+        with (
+            patch("cli_agent_orchestrator.services.settings_service.SETTINGS_FILE", as_dir),
+            patch("cli_agent_orchestrator.services.settings_service.CAO_HOME_DIR", home),
+        ):
+            body = client.get("/settings/memory").json()
+
+        assert body["settings_readable"] is False
+        # Fails CLOSED: unreadable must never resolve to enabled.
+        assert body["learning_enabled"] is False
+
     def test_reports_unreadable_while_still_failing_closed(self, client, tmp_path):
         home = tmp_path / "cao-home"
         home.mkdir()
