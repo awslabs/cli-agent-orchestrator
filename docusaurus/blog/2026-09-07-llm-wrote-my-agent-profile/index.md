@@ -125,3 +125,7 @@ There is a joke in there somewhere about building a review gate and then being r
 If an LLM writes your agent profiles, and it probably does, a better generator is not the missing piece. What was missing is a place where any author's output, yours or the machine's, gets checked before it runs. That now ships in the box: `Alt+2`.
 
 Try it, and if the validator catches your model inventing a field, I would genuinely love to hear which one it invented. There is a [discussion board](https://github.com/awslabs/cli-agent-orchestrator/discussions) for exactly that.
+
+## About the author
+
+Sujoy Datta Choudhury is a Software Development Engineer at Amazon Ads, where he works on real-time ad-serving systems, with over two decades of varied experience across FinTech and workflow orchestration. He contributed the Profiles surface to CLI Agent Orchestrator. His current interest is the reliability of LLM agents: how machine-generated configuration, plans, and code get verified before they run.
