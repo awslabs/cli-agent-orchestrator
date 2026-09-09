@@ -530,6 +530,40 @@ class TestConcurrentDeliverySerialization:
         inbox_service_module._clear_dispatch_active("term-1", 1)
         assert inbox_service_module._is_dispatch_active("term-1") is False
 
+    @patch("cli_agent_orchestrator.services.inbox_service.claim_pending_messages")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_completion_landing_during_send_input_resolves_the_marker_immediately(
+        self, mock_get, mock_monitor, mock_term, mock_claim
+    ):
+        """Reviewer-reproduced eleventh-round finding on #709 (haofeif): a
+        genuine completion can be detected and consumed by InboxService.run()
+        while send_input is still executing (it keeps working after
+        send_keys, e.g. updating last-active metadata), i.e. while the
+        marker's boundary is still None and the event cannot confirm it. The
+        tenth-round code then read a fresh post-call generation and used it
+        as the boundary, but that generation already reflects the completion
+        that just happened and will not repeat, so only a strictly newer
+        future event could ever clear it: none is coming, and the marker
+        strands forever, coalescing every later message to this terminal.
+
+        The fix compares the post-call generation against the one read at
+        arm time: if it already moved, the attempt resolves immediately
+        instead of arming a boundary nothing can ever exceed.
+        """
+        mock_get.return_value = [_make_message()]
+        mock_claim.return_value = [_make_message(status=MessageStatus.DELIVERED)]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        # arm() reads 0 (pre-dispatch); confirm() reads 1 (a real transition
+        # landed and was consumed elsewhere during send_input itself).
+        mock_monitor.get_status_generation.side_effect = [0, 1]
+
+        svc = InboxService()
+        svc.deliver_pending("term-1")
+
+        assert inbox_service_module._is_dispatch_active("term-1") is False
+
     def test_marker_stranded_by_arm_after_send_is_the_bug_this_fix_closes(self):
         """Same race as above, replayed against the OLD ordering directly
         (mark after send, using the post-dispatch generation) to show it is
