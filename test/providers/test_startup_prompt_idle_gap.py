@@ -8,7 +8,7 @@ total runtime is hard-capped by ``provider_init_timeout``.
 Covers: ClaudeCodeProvider, KimiCliProvider, AntigravityCliProvider.
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -308,6 +308,44 @@ class TestKimiCliIdleGap:
         # 's' sent to skip reminders at t=18 — the reset kept the loop alive to
         # cleanly detect readiness at t=35, past the old 20s window.
         mock_backend.send_keys.assert_called_once_with("sess", "win", "s", enter_count=0)
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.kimi_cli.get_server_settings", _settings)
+    @patch("cli_agent_orchestrator.providers.kimi_cli.asyncio.sleep")
+    @patch("cli_agent_orchestrator.providers.kimi_cli.time")
+    @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
+    async def test_kimi_code_trust_dialog_answered(self, mock_get_backend, mock_time, mock_sleep):
+        """kimi-code's workspace-trust dialog is answered once (Up + Enter).
+
+        With --mcp-config in a fresh CAO temp dir, kimi-code blocks before the
+        REPL on "Trust this folder" (cursor on "Don't trust"). The handler
+        selects the trust option; the reset idle timer keeps the loop alive to
+        detect readiness afterwards.
+        """
+        mock_backend = MagicMock()
+        mock_get_backend.return_value = mock_backend
+        mock_time.monotonic.side_effect = [
+            0.0,  # outer_deadline = 60
+            0.0,  # last_prompt_time = 0
+            5.0,  # iter1: trust dialog -> handled
+            5.0,  # last_prompt_time reset to 5
+            12.0,  # iter2: gap=7<20, ready -> return
+        ]
+        mock_backend.get_history.side_effect = [
+            "Project-level MCP servers are disabled until you explicitly choose Trust.\n"
+            "   Trust this folder\n \u276f Don't trust\n   Exit Kimi Code.",
+            "Welcome to Kimi!\n\U0001f4ab",
+        ]
+
+        p = self._make()
+        with patch.object(p, "get_status", return_value=TerminalStatus.IDLE):
+            await p._handle_startup_dialog()
+
+        assert mock_backend.send_special_key.call_args_list == [
+            call("sess", "win", "Up"),
+            call("sess", "win", "Enter"),
+        ]
+        mock_backend.send_keys.assert_not_called()
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.kimi_cli.get_server_settings", _settings)
