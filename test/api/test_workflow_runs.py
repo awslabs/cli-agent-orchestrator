@@ -1852,6 +1852,26 @@ def test_failure_envelope_assembled_for_failed_run_from_journal(client, read_sur
     assert env["next_command"] == "cao workflow result failrun"
 
 
+def test_retained_result_surfaces_durable_run_error_as_warning(client, monkeypatch):
+    """Issue #753: the detached result must retain a failed script's diagnostic."""
+    row = SimpleNamespace(
+        run_id="script-fail",
+        workflow_name="wf",
+        state=RunState.FAILED.value,
+        current_step_id=None,
+        started_at="2026-09-09T00:00:00Z",
+        finished_at="2026-09-09T00:00:01Z",
+        error="Traceback: script failed",
+    )
+    monkeypatch.setattr(workflow_journal, "get_run", lambda run_id: row)
+    monkeypatch.setattr(workflow_journal, "get_steps", lambda run_id: [])
+
+    body = client.get("/workflows/runs/script-fail/result").json()
+
+    assert body["state"] == "failed"
+    assert body["warnings"] == ["Traceback: script failed"]
+
+
 def test_failure_envelope_timeout_kind_and_hint(client, read_surface_db):
     """U9-T6 (EF-4): a timeout failure surfaces error_kind='timeout' and a stable
     next_command hint keyed on the run id."""
