@@ -165,6 +165,17 @@ Fires after a terminal has been shut down.
 
 Example use: remove the terminal from an external inventory or dashboard.
 
+## MCP tool surfaces
+
+Besides event hooks, a plugin can add MCP tools. Override `CaoPlugin.on_mcp_server(mcp)`; it is
+called once at MCP-server startup with the FastMCP instance, and anything registered on it with
+`@mcp.tool()` (or resources) becomes part of that server's surface. The hook runs for **both** CAO
+MCP servers: `cao-mcp-server`, which agents use inside a session, and `cao-ops-mcp-server`, which
+an external coordinator uses to manage the fleet, so a plugin's tools reach whichever side needs
+them. Registration is best-effort and isolated per plugin: an exception in one plugin's hook is
+logged and never prevents the server, or other plugins, from starting. The built-in `mcp_apps`
+plugin uses this hook for the MCP Apps surface.
+
 ## Authoring a plugin
 
 This document focuses on installing and using plugins. For a full plugin-authoring guide — scaffolding a plugin package, subclassing `CaoPlugin`, wiring up `@hook` methods, and testing — see the [`cao-plugin` skill](../skills/cao-plugin/SKILL.md).

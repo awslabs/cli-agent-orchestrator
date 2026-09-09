@@ -822,3 +822,18 @@ def test_main_runs_mcp_server() -> None:
         main()
 
     mock_run.assert_called_once_with()
+
+
+def test_plugin_mcp_surfaces_are_registered_on_ops_server() -> None:
+    """Entry-point plugins get on_mcp_server() called with the ops server's FastMCP
+    instance, so plugin tools reach external coordinators too."""
+    import importlib
+
+    import cli_agent_orchestrator.ops_mcp_server.server as ops_server
+
+    with patch(
+        "cli_agent_orchestrator.plugins.registry.register_mcp_server_surfaces"
+    ) as mock_register:
+        reloaded = importlib.reload(ops_server)
+        mock_register.assert_called_once_with(reloaded.mcp)
+    importlib.reload(ops_server)
