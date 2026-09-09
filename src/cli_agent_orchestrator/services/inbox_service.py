@@ -65,15 +65,22 @@ _delivery_locks: Dict[str, Tuple[threading.Lock, int]] = {}
 # real post-dispatch transition ever arrives (#709 ninth review round;
 # arming with an already-known pre-dispatch generation, as an earlier
 # version did, let exactly that event confirm a dispatch that had not
-# happened yet). Once send_input returns, the entry is resolved against the
-# generation read at arm time (before send_input was even called): if
-# nothing has moved, the boundary becomes the current generation and only a
-# genuinely later transition can confirm it; if the generation already
-# moved (a real transition landed during the call itself, including the
-# metadata write send_input does after send_keys), that transition already
-# is the confirmation and the entry is dropped immediately, since nothing
-# strictly newer than an event that already happened will ever arrive
-# (#709 eleventh review round).
+# happened yet). Once send_input returns, the entry is resolved against
+# status_monitor's own pre-write snapshot (recorded by notify_input_sent,
+# after send_input's prep and immediately before the backend write), not
+# against a snapshot taken at arm time before send_input was even called: a
+# transition observed during PREP (get_terminal_metadata,
+# inject_memory_context) predates the write and is not evidence of a
+# response to it, so comparing against an arm-time snapshot could mistake
+# leftover prep-window activity for confirmation (#709 twelfth review
+# round). If nothing has moved since the pre-write snapshot, the boundary
+# becomes the current generation and only a genuinely later transition can
+# confirm it; if the generation already moved since the pre-write snapshot
+# (a real transition landed at or after the write, including the metadata
+# write send_input does after send_keys), that transition already is the
+# confirmation and the entry is dropped immediately, since nothing strictly
+# newer than an event that already happened will ever arrive (#709 eleventh
+# review round).
 #
 # Attempts are tracked per-token, not as a single slot, because
 # ``deliver_pending`` dispatches multiple sender groups sequentially under
@@ -147,44 +154,62 @@ def _mark_dispatch_active(terminal_id: str, generation: Optional[int] = None) ->
         _dispatch_active.setdefault(terminal_id, []).append((token, generation))
 
 
-def _arm_dispatch_active(terminal_id: str) -> Tuple[int, int]:
+def _arm_dispatch_active(terminal_id: str) -> int:
     """Record a new dispatch attempt with no confirmable boundary yet, and
-    return its token together with the generation read right before this
-    call (before send_input is even called). The marker exists for the
-    whole dispatch window so no status event confirming it can be consumed
-    before the marker does (#709 eighth review round). The pre-dispatch
-    generation is not itself the boundary (see _confirm_dispatch_active):
-    it only lets that call tell whether a genuine transition already
-    landed during send_input. The token lets a later confirm/abort affect
-    only this attempt, never a sibling sender group's (#709 tenth review
-    round)."""
-    pre_dispatch_generation = status_monitor.get_status_generation(terminal_id)
+    return its token. The marker exists for the whole dispatch window so no
+    status event confirming it can be consumed before the marker does (#709
+    eighth review round). The token lets a later confirm/abort affect only
+    this attempt, never a sibling sender group's (#709 tenth review round).
+
+    The confirming boundary itself is not read here: a snapshot taken before
+    send_input is even called cannot tell a transition that happened during
+    send_input's own prep (get_terminal_metadata, inject_memory_context) from
+    one that happened at or after the actual backend write, and the two mean
+    opposite things (#709 twelfth review round). See _confirm_dispatch_active,
+    which sources the boundary from status_monitor.get_pre_write_generation
+    instead: a snapshot notify_input_sent takes itself, after send_input's
+    prep and immediately before the write."""
     with _dispatch_active_guard:
         token = _next_dispatch_token()
         _dispatch_active.setdefault(terminal_id, []).append((token, None))
-        return token, pre_dispatch_generation
+        return token
 
 
-def _confirm_dispatch_active(terminal_id: str, token: int, pre_dispatch_generation: int) -> None:
+def _confirm_dispatch_active(terminal_id: str, token: int) -> None:
     """Resolve ``token``'s attempt once send_input has returned, i.e. once
     input has actually crossed the backend dispatch boundary.
+
+    The comparison boundary is status_monitor.get_pre_write_generation(
+    terminal_id): the transition counter as notify_input_sent saw it, which
+    send_input calls after its own prep (get_terminal_metadata,
+    inject_memory_context) and immediately before the backend write
+    (send_keys). A transition during that prep is already folded into this
+    value and cannot be mistaken for a response to a write that had not
+    happened yet; only a transition at or after the actual write can exceed
+    it (#709 twelfth review round: a snapshot taken before send_input was
+    even called, as an earlier version did, could not tell the two apart).
 
     Reads the current generation inside the same critical section that
     decides the outcome, closing the snapshot-to-confirmation gap a
     separate pre-read would leave open. Two cases:
 
-    * The generation is unchanged since ``pre_dispatch_generation``: no
-      transition has been observed yet. Arm a boundary at the current
-      value, same as before, so only a strictly newer future event can
-      clear it.
-    * The generation has already advanced: a genuine transition landed and
-      was (or will be) consumed by InboxService.run() while this attempt's
-      boundary was still None and could not confirm it. That transition
-      already reflects what happened after this dispatch, so there is
-      nothing left for a future event to confirm; arming a boundary now
-      would need something strictly newer than an event that already
-      happened and will not repeat, stranding the marker forever (#709
-      eleventh review round). Resolve the attempt immediately instead.
+    * The generation is unchanged since the pre-write snapshot: no
+      transition has been observed since the write. Arm a boundary at the
+      current value, same as before, so only a strictly newer future event
+      can clear it.
+    * The generation has already advanced: a genuine post-write transition
+      landed and was (or will be) consumed by InboxService.run() while this
+      attempt's boundary was still None and could not confirm it. That
+      transition already reflects what happened after this dispatch, so
+      there is nothing left for a future event to confirm; arming a
+      boundary now would need something strictly newer than an event that
+      already happened and will not repeat, stranding the marker forever
+      (#709 eleventh review round). Resolve the attempt immediately instead.
+
+    If notify_input_sent was never observed for this terminal (defensive;
+    should not happen on the success path, since send_input always calls it
+    before send_keys), falls back to a fresh read as the boundary, the same
+    as the unchanged-generation case above.
 
     A no-op if ``token``'s entry was already removed by an abort (should
     not happen: confirm and abort are mutually exclusive outcomes of the
@@ -194,7 +219,8 @@ def _confirm_dispatch_active(terminal_id: str, token: int, pre_dispatch_generati
         if not attempts:
             return
         current_generation = status_monitor.get_status_generation(terminal_id)
-        if current_generation > pre_dispatch_generation:
+        pre_write_generation = status_monitor.get_pre_write_generation(terminal_id)
+        if pre_write_generation is not None and current_generation > pre_write_generation:
             remaining = [(t, b) for t, b in attempts if t != token]
         else:
             remaining = [(t, current_generation) if t == token else (t, b) for t, b in attempts]
@@ -400,18 +426,23 @@ class InboxService:
                 # group's own attempt so a later abort can never remove a
                 # sibling group's still-outstanding one (#709 tenth review
                 # round). _confirm_dispatch_active compares against the
-                # pre-dispatch generation rather than trusting a fresh
-                # post-call read as the boundary outright: a genuine
-                # completion can land while this attempt's boundary is still
-                # None (during the call itself, including the metadata write
-                # terminal_service.send_input does after send_keys), and a
-                # boundary set to that already-elapsed generation would need
-                # a strictly newer future event to clear it that will never
-                # arrive, stranding the marker (#709 eleventh review round).
+                # pre-write generation status_monitor recorded when send_input
+                # called notify_input_sent (after its own prep, immediately
+                # before the backend write), not against a snapshot taken here
+                # before send_input was even called: a genuine completion can
+                # land while this attempt's boundary is still None (during the
+                # call itself, including the metadata write terminal_service.
+                # send_input does after send_keys), and a boundary set to that
+                # already-elapsed generation would need a strictly newer
+                # future event to clear it that will never arrive, stranding
+                # the marker (#709 eleventh review round), while a
+                # transition observed during send_input's PREP, before the
+                # write, is not evidence of a response to this dispatch at all
+                # and must not confirm it either (#709 twelfth review round).
                 # If the send never reaches the terminal (see the except
                 # branches below), _abort_dispatch_active drops this attempt:
                 # nothing will ever confirm a dispatch that did not happen.
-                token, pre_dispatch_generation = _arm_dispatch_active(terminal_id)
+                token = _arm_dispatch_active(terminal_id)
                 try:
                     if registry is None:
                         terminal_service.send_input(terminal_id, combined)
@@ -423,7 +454,7 @@ class InboxService:
                             sender_id=sender_id,
                             orchestration_type=OrchestrationType.SEND_MESSAGE,
                         )
-                    _confirm_dispatch_active(terminal_id, token, pre_dispatch_generation)
+                    _confirm_dispatch_active(terminal_id, token)
                     logger.info(f"Delivered {len(batch)} message(s) to terminal {terminal_id}")
                 except TerminalNotFoundError as e:
                     # Pane not resolvable yet (e.g. a herdr pane that isn't mapped

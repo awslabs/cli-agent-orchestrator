@@ -109,6 +109,15 @@ class StatusMonitor:
         # tell a status event that predates a dispatch from one that follows
         # it (#709).
         self._status_generations: Dict[str, int] = {}
+        # Per-terminal snapshot of _status_generations taken at the START of
+        # notify_input_sent, i.e. after send_input's own prep (get_terminal_metadata,
+        # inject_memory_context) but before the backend write (send_keys). A
+        # transition observed during prep reflects output that predates this
+        # dispatch and is not evidence the terminal responded to it; comparing
+        # against a snapshot taken before send_input was even called cannot tell
+        # the two apart (#709 twelfth review round). InboxService confirms a
+        # dispatch against THIS snapshot, not the pre-call generation.
+        self._pre_write_generations: Dict[str, int] = {}
         # Per-terminal flag: when True, the next provider-detected PROCESSING
         # is honored and stickiness reset. Set by notify_input_sent() whenever
         # external input is sent to the terminal (paste-bombed by send_input
@@ -593,6 +602,13 @@ class StatusMonitor:
         IDLE/COMPLETED would block the genuine PROCESSING transition.
         """
         with self._lock:
+            # Snapshot the transition counter here, before the backend write:
+            # send_input's own prep (get_terminal_metadata, inject_memory_context)
+            # has already run by the time it calls this, so a transition observed
+            # during prep is already folded into this value rather than being
+            # mistaken for a response to the write that has not happened yet
+            # (#709 twelfth review round). See get_pre_write_generation.
+            self._pre_write_generations[terminal_id] = self._status_generations.get(terminal_id, 0)
             self._allow_processing_revert[terminal_id] = True
             # A new turn is starting: whatever ready state a stale-PROCESSING capture saw
             # before this input no longer describes the terminal. Left armed, that candidate
@@ -669,6 +685,7 @@ class StatusMonitor:
             self._last_status.pop(terminal_id, None)
             self._allow_processing_revert.pop(terminal_id, None)
             self._status_generations.pop(terminal_id, None)
+            self._pre_write_generations.pop(terminal_id, None)
             self._screens.pop(terminal_id, None)
             self._bursting.pop(terminal_id, None)
             self._last_stale_capture_check.pop(terminal_id, None)
@@ -693,6 +710,7 @@ class StatusMonitor:
             self._last_status.pop(terminal_id, None)
             self._allow_processing_revert.pop(terminal_id, None)
             self._status_generations.pop(terminal_id, None)
+            self._pre_write_generations.pop(terminal_id, None)
             # Drop the rendered screen too so the relaunched CLI mode is
             # detected against a fresh viewport, not the failed attempt's.
             self._screens.pop(terminal_id, None)
@@ -1025,6 +1043,17 @@ class StatusMonitor:
         """
         with self._lock:
             return self._status_generations.get(terminal_id, 0)
+
+    def get_pre_write_generation(self, terminal_id: str) -> Optional[int]:
+        """The transition counter as of the most recent notify_input_sent call
+        for this terminal, i.e. right before the backend write it precedes.
+        None if notify_input_sent has never been called for this terminal (or
+        its state was reset since): callers must not treat that the same as 0,
+        since 0 is itself a valid pre-write generation (#709 twelfth review
+        round).
+        """
+        with self._lock:
+            return self._pre_write_generations.get(terminal_id)
 
 
 # Module-level singleton

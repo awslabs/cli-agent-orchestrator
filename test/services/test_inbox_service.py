@@ -57,6 +57,7 @@ class TestDeliverPending:
         mock_claim.return_value = [_make_message(status=MessageStatus.DELIVERED)]
         mock_monitor.get_status.return_value = TerminalStatus.IDLE
         mock_monitor.get_status_generation.return_value = 0
+        mock_monitor.get_pre_write_generation.return_value = 0
 
         svc = InboxService()
         svc.deliver_pending("term-1")
@@ -77,6 +78,7 @@ class TestDeliverPending:
         mock_claim.return_value = [_make_message(status=MessageStatus.DELIVERED)]
         mock_monitor.get_status.return_value = TerminalStatus.COMPLETED
         mock_monitor.get_status_generation.return_value = 0
+        mock_monitor.get_pre_write_generation.return_value = 0
 
         svc = InboxService()
         svc.deliver_pending("term-1")
@@ -144,6 +146,7 @@ class TestDeliverPending:
         ]
         mock_monitor.get_status.return_value = TerminalStatus.IDLE
         mock_monitor.get_status_generation.return_value = 0
+        mock_monitor.get_pre_write_generation.return_value = 0
 
         svc = InboxService()
         svc.deliver_pending("term-1", num_messages=2)
@@ -168,6 +171,7 @@ class TestDeliverPending:
         ]
         mock_monitor.get_status.return_value = TerminalStatus.IDLE
         mock_monitor.get_status_generation.return_value = 0
+        mock_monitor.get_pre_write_generation.return_value = 0
 
         svc = InboxService()
         svc.deliver_pending("term-1", num_messages=0)
@@ -219,6 +223,7 @@ class TestDeliverPending:
         mock_get.return_value = [_make_message()]
         mock_monitor.get_status.return_value = TerminalStatus.IDLE
         mock_monitor.get_status_generation.return_value = 0
+        mock_monitor.get_pre_write_generation.return_value = 0
 
         order = []
 
@@ -321,6 +326,7 @@ class TestConcurrentDeliverySerialization:
         ):
             mock_monitor.get_status.return_value = TerminalStatus.IDLE
             mock_monitor.get_status_generation.return_value = 0
+            mock_monitor.get_pre_write_generation.return_value = 0
             mock_term.send_input.side_effect = fake_send_input
 
             threads = [threading.Thread(target=worker) for _ in range(2)]
@@ -370,6 +376,7 @@ class TestConcurrentDeliverySerialization:
         ):
             mock_monitor.get_status.return_value = TerminalStatus.IDLE
             mock_monitor.get_status_generation.return_value = 0
+            mock_monitor.get_pre_write_generation.return_value = 0
             svc = InboxService()
 
             svc.deliver_pending("term-1")
@@ -438,6 +445,7 @@ class TestConcurrentDeliverySerialization:
         ):
             mock_monitor.get_status.return_value = TerminalStatus.IDLE
             mock_monitor.get_status_generation.return_value = 0
+            mock_monitor.get_pre_write_generation.return_value = 0
             svc = InboxService()
 
             svc.deliver_pending("term-1")
@@ -484,6 +492,7 @@ class TestConcurrentDeliverySerialization:
         mock_claim.return_value = [_make_message(status=MessageStatus.DELIVERED)]
         mock_monitor.get_status.return_value = TerminalStatus.IDLE
         mock_monitor.get_status_generation.return_value = 0
+        mock_monitor.get_pre_write_generation.return_value = 0
 
         armed_before_send = {}
 
@@ -520,6 +529,7 @@ class TestConcurrentDeliverySerialization:
         mock_claim.return_value = [_make_message(status=MessageStatus.DELIVERED)]
         mock_monitor.get_status.return_value = TerminalStatus.IDLE
         mock_monitor.get_status_generation.return_value = 0
+        mock_monitor.get_pre_write_generation.return_value = 0
 
         svc = InboxService()
         svc.deliver_pending("term-1")
@@ -548,21 +558,122 @@ class TestConcurrentDeliverySerialization:
         future event could ever clear it: none is coming, and the marker
         strands forever, coalescing every later message to this terminal.
 
-        The fix compares the post-call generation against the one read at
-        arm time: if it already moved, the attempt resolves immediately
+        The fix compares the post-call generation against the pre-write
+        snapshot status_monitor took when send_input called notify_input_sent:
+        if it already moved past that, the attempt resolves immediately
         instead of arming a boundary nothing can ever exceed.
         """
         mock_get.return_value = [_make_message()]
         mock_claim.return_value = [_make_message(status=MessageStatus.DELIVERED)]
         mock_monitor.get_status.return_value = TerminalStatus.IDLE
-        # arm() reads 0 (pre-dispatch); confirm() reads 1 (a real transition
-        # landed and was consumed elsewhere during send_input itself).
-        mock_monitor.get_status_generation.side_effect = [0, 1]
+        # notify_input_sent's own pre-write snapshot reads 0; confirm()'s
+        # post-call read reads 1 (a real transition landed and was consumed
+        # elsewhere during send_input itself, at or after the write).
+        mock_monitor.get_pre_write_generation.return_value = 0
+        mock_monitor.get_status_generation.return_value = 1
 
         svc = InboxService()
         svc.deliver_pending("term-1")
 
         assert inbox_service_module._is_dispatch_active("term-1") is False
+
+    @patch("cli_agent_orchestrator.services.inbox_service.claim_pending_messages")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_prep_time_completion_does_not_resolve_the_marker(
+        self, mock_get, mock_monitor, mock_term, mock_claim
+    ):
+        """Reviewer-reproduced twelfth-round finding on #709 (haofeif): the
+        eleventh-round fix compared the post-call generation against a
+        snapshot taken before send_input was even called, so a transition
+        landing during send_input's own PREP (get_terminal_metadata,
+        inject_memory_context), before the backend write, looked
+        identical to one landing at or after the write. Prep-time activity
+        predates this dispatch and is not evidence of a response to it;
+        treating it as confirmation drops the marker immediately and lets a
+        second, sibling dispatch through before the terminal has actually
+        started on the first message.
+
+        The fix compares against status_monitor's own pre-write snapshot
+        (taken by notify_input_sent, which send_input calls after prep and
+        immediately before the write) instead of a snapshot taken at arm
+        time: a transition observed before that call is already folded into
+        the pre-write snapshot, so it cannot register as "newer" than it.
+        """
+        mock_get.return_value = [_make_message()]
+        mock_claim.return_value = [_make_message(status=MessageStatus.DELIVERED)]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        # A transition landed during send_input's prep, before notify_input_sent
+        # (and therefore before the write) ever ran: by the time notify_input_sent
+        # takes its snapshot, the counter already reads 1. Nothing moves after
+        # that: the post-call read is also 1.
+        mock_monitor.get_pre_write_generation.return_value = 1
+        mock_monitor.get_status_generation.return_value = 1
+
+        svc = InboxService()
+        svc.deliver_pending("term-1")
+
+        # Unchanged since the pre-write snapshot: the marker stays active,
+        # armed at boundary 1, rather than resolving immediately.
+        assert inbox_service_module._is_dispatch_active("term-1") is True
+        inbox_service_module._clear_dispatch_active("term-1", 1)
+        assert inbox_service_module._is_dispatch_active("term-1") is True
+        inbox_service_module._clear_dispatch_active("term-1", 2)
+        assert inbox_service_module._is_dispatch_active("term-1") is False
+
+    @patch("cli_agent_orchestrator.services.inbox_service.claim_pending_messages")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_prep_time_completion_against_the_real_status_monitor(
+        self, mock_get, mock_term, mock_claim
+    ):
+        """Same finding as the test above, but against the REAL StatusMonitor
+        singleton instead of a mock, so the ordering between "prep" and "the
+        write" is genuine rather than asserted by the mock setup: a fix
+        comparing the wrong two snapshots cannot pass this one by construction
+        of the mock. ``terminal_service.send_input`` is faked to reproduce
+        send_input's real internal order, prep then notify_input_sent then
+        the write, with a genuine status transition landing during prep,
+        before notify_input_sent's own snapshot.
+
+        Confirmed this fails on the pre-fix code: reverting only
+        inbox_service.py and status_monitor.py (keeping this test) makes the
+        pre-fix ``_arm_dispatch_active`` read its pre-dispatch generation
+        before ``terminal_service.send_input`` is even called, i.e. before
+        the fake's prep-time bump below runs, so it sees 0; the post-call
+        read then sees 1, ``1 > 0`` reads as "a genuine transition landed
+        during the call", and the marker is dropped immediately, exactly the
+        stranding bug this round reports.
+        """
+        mock_get.return_value = [_make_message()]
+        mock_claim.return_value = [_make_message(status=MessageStatus.DELIVERED)]
+        status_monitor.clear_terminal("term-1")
+        status_monitor._last_status["term-1"] = TerminalStatus.IDLE
+
+        def fake_send_input(terminal_id, message, **kwargs):
+            # Prep (get_terminal_metadata, inject_memory_context in the real
+            # send_input): a genuine, unrelated transition is detected and
+            # published here, BEFORE the backend write.
+            status_monitor._apply_detection(terminal_id, TerminalStatus.COMPLETED)
+            # send_input calls notify_input_sent immediately before the
+            # write; its snapshot is taken here, after the prep-time bump
+            # above already landed.
+            status_monitor.notify_input_sent(terminal_id)
+            # The write itself: nothing else moves the counter.
+            return True
+
+        mock_term.send_input.side_effect = fake_send_input
+
+        try:
+            svc = InboxService()
+            svc.deliver_pending("term-1")
+
+            # The prep-time transition must not be read as confirmation: the
+            # marker stays active, waiting for a real post-write event.
+            assert inbox_service_module._is_dispatch_active("term-1") is True
+        finally:
+            status_monitor.clear_terminal("term-1")
 
     def test_marker_stranded_by_arm_after_send_is_the_bug_this_fix_closes(self):
         """Same race as above, replayed against the OLD ordering directly
@@ -614,6 +725,7 @@ class TestConcurrentDeliverySerialization:
         ):
             mock_monitor.get_status.return_value = TerminalStatus.IDLE
             mock_monitor.get_status_generation.return_value = 0
+            mock_monitor.get_pre_write_generation.return_value = 0
             svc = InboxService()
 
             svc.deliver_pending("term-1")
@@ -670,6 +782,7 @@ class TestConcurrentDeliverySerialization:
         ]
         mock_monitor.get_status.return_value = TerminalStatus.IDLE
         mock_monitor.get_status_generation.return_value = 0
+        mock_monitor.get_pre_write_generation.return_value = 0
         mock_term_svc.send_input.side_effect = [None, RuntimeError("tmux error")]
 
         svc = InboxService()
@@ -769,6 +882,7 @@ class TestDispatchActiveTeardown:
             # back as generation 1, at or below the stale marker's 5.
             mock_monitor.get_status.return_value = TerminalStatus.IDLE
             mock_monitor.get_status_generation.return_value = 1
+            mock_monitor.get_pre_write_generation.return_value = 1
             svc = InboxService()
             svc.deliver_pending("term-reset-e2e")
 
@@ -802,6 +916,8 @@ class TestEagerInboxDelivery:
         mock_get.return_value = [_make_message()]
         mock_claim.return_value = [_make_message(status=MessageStatus.DELIVERED)]
         mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_monitor.get_status_generation.return_value = 0
+        mock_monitor.get_pre_write_generation.return_value = 0
         provider = MagicMock()
         provider.accepts_input_while_processing = False
         mock_pm.get_provider.return_value = provider
@@ -825,6 +941,8 @@ class TestEagerInboxDelivery:
         mock_get.return_value = [_make_message()]
         mock_claim.return_value = [_make_message(status=MessageStatus.DELIVERED)]
         mock_monitor.get_status.return_value = TerminalStatus.COMPLETED
+        mock_monitor.get_status_generation.return_value = 0
+        mock_monitor.get_pre_write_generation.return_value = 0
         provider = MagicMock()
         provider.accepts_input_while_processing = False
         mock_pm.get_provider.return_value = provider
@@ -848,6 +966,8 @@ class TestEagerInboxDelivery:
         mock_get.return_value = [_make_message()]
         mock_claim.return_value = [_make_message(status=MessageStatus.DELIVERED)]
         mock_monitor.get_status.return_value = TerminalStatus.PROCESSING
+        mock_monitor.get_status_generation.return_value = 0
+        mock_monitor.get_pre_write_generation.return_value = 0
         provider = MagicMock()
         provider.accepts_input_while_processing = True
         mock_pm.get_provider.return_value = provider
@@ -913,6 +1033,8 @@ class TestEagerInboxDelivery:
         mock_get.return_value = [_make_message()]
         mock_claim.return_value = [_make_message(status=MessageStatus.DELIVERED)]
         mock_monitor.get_status.return_value = TerminalStatus.WAITING_USER_ANSWER
+        mock_monitor.get_status_generation.return_value = 0
+        mock_monitor.get_pre_write_generation.return_value = 0
         provider = MagicMock()
         provider.accepts_input_while_processing = True
         mock_pm.get_provider.return_value = provider
