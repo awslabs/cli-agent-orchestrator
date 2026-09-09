@@ -36,7 +36,7 @@ the full prompt body it wrote was genuinely good. */}
 ```yaml
 ---
 name: strict-code-reviewer
-description: A strict code review agent that enforces high standards
+description: A strict code review agent that enforces high standards for code quality, security, and best practices
 model_id: us.anthropic.claude-sonnet-4-20250514
 tools:
   - think
@@ -45,8 +45,7 @@ tools:
   - execute_bash
   - list_directory
 system_prompt: |
-  You are a strict, senior code reviewer. Your job is to review code
-  changes with exacting standards. You do not approve code lightly.
+  You are a strict, senior code reviewer. Your job is to review code changes with exacting standards. You do not approve code lightly.
   [... forty more genuinely good lines ...]
 ---
 ```
