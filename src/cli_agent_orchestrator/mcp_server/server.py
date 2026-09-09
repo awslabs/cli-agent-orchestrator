@@ -364,6 +364,9 @@ if ENABLE_WORKING_DIRECTORY:
         Returns:
             HandoffResult with success status, message, and agent output
         """
+        denied = _tool_denied_reason("handoff")
+        if denied:
+            return HandoffResult(success=False, message=denied)
         return await _handoff_impl(
             agent_profile,
             message,
@@ -455,6 +458,9 @@ else:
         Returns:
             HandoffResult with success status, message, and agent output
         """
+        denied = _tool_denied_reason("handoff")
+        if denied:
+            return HandoffResult(success=False, message=denied)
         return await _handoff_impl(
             agent_profile,
             message,
@@ -578,6 +584,9 @@ if ENABLE_WORKING_DIRECTORY:
         ),
         target_host: Optional[str] = Field(default=None, description=_target_host_field_desc),
     ) -> Dict[str, Any]:
+        denied = _tool_denied_reason("assign")
+        if denied:
+            return {"success": False, "error": denied}
         return _assign_impl(
             agent_profile,
             message,
@@ -613,6 +622,9 @@ else:
         ),
         target_host: Optional[str] = Field(default=None, description=_target_host_field_desc),
     ) -> Dict[str, Any]:
+        denied = _tool_denied_reason("assign")
+        if denied:
+            return {"success": False, "error": denied}
         return _assign_impl(
             agent_profile,
             message,
@@ -1311,6 +1323,51 @@ def _caller_has_store_lesson_capability(caller_profile: Optional[str]) -> bool:
     except Exception as e:  # noqa: BLE001 — authz check fails closed
         logger.warning(f"store_lesson capability lookup failed for {caller_profile!r}: {e}")
         return False
+
+
+def _tool_denied_reason(tool_name: str) -> Optional[str]:
+    """Reason the calling terminal's profile bars ``tool_name``, or None to allow.
+
+    A profile's ``tools:`` allowlist is translated into provider-NATIVE tool
+    restrictions only (``utils/tool_mapping.py``), and those names never cover
+    CAO's own MCP tools. Without this check a profile declaring a narrow
+    allowlist still reaches ``assign`` and ``handoff``, which spawn a terminal
+    under a caller-chosen ``agent_profile`` and so mint a new identity with its
+    own memory scope (#671).
+
+    Identity comes from the terminal's registered record, never from tool
+    arguments, and the allowlist comes from the profile file's frontmatter, an
+    operator-owned artifact a worker cannot edit through MCP.
+
+    Three cases deliberately do NOT deny, because none of them is a declared
+    restriction: a profile with no ``tools:`` key (every profile CAO ships), an
+    allowlist containing ``"*"``, and a caller whose terminal context does not
+    resolve. A profile that IS named but cannot be read fails closed, matching
+    the ``store_lesson`` capability check above.
+    """
+    try:
+        context = _get_terminal_context_from_env()
+    except Exception:
+        # Transport or auth failure reaching cao-server. That is not an
+        # authorization decision, and the tool's own handling reports it.
+        return None
+
+    caller_profile = (context or {}).get("agent_profile")
+    if not caller_profile:
+        return None
+
+    try:
+        from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+
+        allowed = load_agent_profile(caller_profile).tools
+    except Exception as e:  # noqa: BLE001  (authz check fails closed)
+        logger.warning(f"tools allowlist lookup failed for {caller_profile!r}: {e}")
+        return f"profile '{caller_profile}' could not be loaded to authorize " f"'{tool_name}'"
+
+    if allowed is None or "*" in allowed or tool_name in allowed:
+        return None
+
+    return f"'{tool_name}' is not in the tools allowlist declared by profile " f"'{caller_profile}'"
 
 
 @mcp.tool()
