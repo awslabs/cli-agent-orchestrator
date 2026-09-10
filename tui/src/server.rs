@@ -1812,12 +1812,17 @@ mod tests {
         );
 
         // 3. And no value leaked under any other key name.
+        //
+        // The sentinel that matched is deliberately NOT interpolated into the panic
+        // message: these are credential-shaped values, and a panic message is a log
+        // line (rust/cleartext-logging). The raw query is printed instead, and it
+        // necessarily contains whichever sentinel leaked.
         for secret in ["hunter2", "us-east-1", "SECRET_TOKEN", "AWS_REGION"] {
             assert!(
                 !request.query.contains(secret),
-                "the env-var name/value {secret:?} must not appear anywhere in the query string, \
-                 under `env_vars` or any other key — a leak wearing a different parameter name \
-                 is the same leak. Raw query was {:?}",
+                "no env-var name or value may appear anywhere in the query string, under \
+                 `env_vars` or any other key — a leak wearing a different parameter name is \
+                 the same leak. The leaked sentinel is visible in the raw query: {:?}",
                 request.query
             );
         }
