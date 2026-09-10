@@ -62,6 +62,33 @@ class TestCreateSession:
         assert result == "my-window"
         tmux.server.new_session.assert_called_once()
 
+    def test_create_session_disables_exit_empty(self, tmux, tmp_path):
+        """harness-control#845: creating a session must set the server-wide
+        'exit-empty off' option (before new_session) so a transient empty moment
+        during a mass teardown can't take the whole tmux server down."""
+        mock_window = MagicMock()
+        mock_window.name = "my-window"
+        mock_session = MagicMock()
+        mock_session.windows = [mock_window]
+        tmux.server.new_session.return_value = mock_session
+
+        tmux.create_session("ses", "my-window", "tid1", str(tmp_path))
+
+        tmux.server.cmd.assert_any_call("set-option", "-s", "exit-empty", "off")
+
+    def test_exit_empty_failure_does_not_block_launch(self, tmux, tmp_path):
+        """Setting exit-empty is best-effort: a failure must NOT abort the launch."""
+        mock_window = MagicMock()
+        mock_window.name = "my-window"
+        mock_session = MagicMock()
+        mock_session.windows = [mock_window]
+        tmux.server.new_session.return_value = mock_session
+        tmux.server.cmd.side_effect = RuntimeError("tmux unavailable")
+
+        # Must still succeed despite the set-option failure.
+        result = tmux.create_session("ses", "my-window", "tid1", str(tmp_path))
+        assert result == "my-window"
+
     def test_create_session_window_name_none(self, tmux, tmp_path):
         mock_window = MagicMock()
         mock_window.name = None

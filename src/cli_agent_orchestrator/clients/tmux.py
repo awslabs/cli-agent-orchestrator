@@ -364,6 +364,31 @@ class TmuxClient:
     def __init__(self) -> None:
         self.server = libtmux.Server()
 
+    def _set_server_exit_empty_off(self) -> None:
+        """Keep the tmux server alive across a transient zero-session moment.
+
+        By default tmux terminates its whole server process the instant the last
+        session closes (``exit-empty on``). During a mass teardown — many sessions
+        ending near-simultaneously — that races CAO creating the next session
+        against the server vanishing: a momentary "no sessions" window tears the
+        entire server down, taking every other session's panes with it at once
+        (harness-control#845, the whole-server-death incident). ``exit-empty off``
+        keeps the server up through an empty moment.
+
+        This is the backend belt (HOME-independent, applies to whatever uid runs
+        cao-server); a HOME ``.tmux.conf`` set is the ops-side complement. Set on
+        every session-create rather than cached on the client: it is a cheap,
+        idempotent server option, and setting it each time means it survives even
+        if the tmux server is ever externally killed and recreated. ``server.cmd``
+        starts the server if it is not already running, so this also runs before
+        the very first session exists. Best-effort: a failure here must never block
+        a session launch.
+        """
+        try:
+            self.server.cmd("set-option", "-s", "exit-empty", "off")
+        except Exception:
+            logger.warning("failed to set tmux server option 'exit-empty off'", exc_info=True)
+
     # ── libtmux listing boundary ─────────────────────────────────────────
     #
     # Every read that makes libtmux shell out to `list-sessions` /
@@ -654,6 +679,11 @@ class TmuxClient:
     ) -> str:
         """Create detached tmux session with initial window and return window name."""
         try:
+            # Ensure the server won't die on a transient empty moment during a
+            # mass teardown (harness-control#845). Runs before new_session, and
+            # starts the server if it isn't up yet.
+            self._set_server_exit_empty_off()
+
             working_directory = self._resolve_and_validate_working_directory(working_directory)
 
             # Only pass essential env vars to avoid tmux "command too long"
