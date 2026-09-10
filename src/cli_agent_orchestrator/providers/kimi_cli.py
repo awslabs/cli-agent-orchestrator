@@ -117,7 +117,11 @@ USER_INPUT_BOX_END_PATTERN = r"╰─"
 # Matches ``💫 some text`` or ``✨ some text`` — a prompt emoji followed by non-whitespace
 # on the SAME line. Uses [^\S\n]+ (horizontal whitespace only) to avoid matching
 # across newlines (a bare ``💫`` followed by blank lines then status bar).
-PROMPT_WITH_INPUT_PATTERN = r"(?:\w+@[\w.-]+)?[✨💫][^\S\n]+\S"
+# An optional ``user@host`` prefix used to lead this pattern. It never changed
+# whether the pattern matched — every use is an unanchored search, so the emoji is
+# found with or without it — and its `\w+@` cost one rescan per word character on
+# input that never reaches an ``@`` (quadratic backtracking, CWE-1333).
+PROMPT_WITH_INPUT_PATTERN = r"[✨💫][^\S\n]+\S"
 
 # Response/thinking bullet pattern: ``•`` (U+2022) at the start of a line.
 # Both thinking (internal monologue) and response (final answer) use this marker.
@@ -146,7 +150,11 @@ STATUS_BAR_PATTERN = r"\d+:\d+\s+.*(?:agent|shell)\s*\("
 # ---------------------------------------------------------------------------
 # Either of these confirms the new TUI is up at its prompt: the context-usage
 # footer, or the status bar's "agent (<model> ●)" segment (● = U+25CF).
-NEW_TUI_STATUS_PATTERN = r"context:\s*\d+(?:\.\d+)?%|agent\s*\([^)]*●"
+# The gap between "(" and "●" holds a model name, so it is bounded and stops at
+# the first ●. An unbounded `[^)]*` made the unanchored search re-walk the whole
+# buffer from every "agent(" in it — quadratic backtracking (CWE-1333) on output
+# an agent can put on screen at will.
+NEW_TUI_STATUS_PATTERN = r"context:\s*\d+(?:\.\d+)?%|agent\s*\([^)●]{0,80}●"
 # Live working indicator: the new TUI animates a braille spinner
 # ("⠧ Thinking… 5s · 220 tokens", "⠹ Using handoff({...})") and a moon-phase
 # thinking glyph (🌑…🌘) that are cleared when the turn finishes. Any such
@@ -178,6 +186,12 @@ def _is_live_turn_spinner_line(line: str) -> bool:
 # welcome banner / update nag contain no "•", so this won't false-trigger at
 # init).
 ANY_BULLET_PATTERN = r"(?m)^\s*•"
+# Same bullet, tested against a single already-split line. Spelled out here rather
+# than inline as `re.match(r"\s*•", line)` so the ^ anchor and the horizontal-only
+# whitespace class are explicit: without them the leading-whitespace run reads as
+# rescannable from every position in it (CWE-1333). `re.match` already anchored in
+# practice, so this is precision, not a live fix.
+BULLET_LINE_PATTERN = re.compile(r"^[^\S\n]*•")
 
 # Generic error patterns for detecting failure states in terminal output.
 ERROR_PATTERN = (
@@ -722,7 +736,7 @@ class KimiCliProvider(BaseProvider):
                 default=-1,
             )
             last_bullet = max(
-                (i for i, line in enumerate(lines) if re.match(r"\s*•", line)),
+                (i for i, line in enumerate(lines) if BULLET_LINE_PATTERN.match(line)),
                 default=-1,
             )
             spinner_in_tail = last_spinner >= 0 and last_spinner >= len(lines) - 15
