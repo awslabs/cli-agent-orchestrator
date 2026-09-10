@@ -17,6 +17,7 @@ from cli_agent_orchestrator.cli.commands.memory import (
     show,
 )
 from cli_agent_orchestrator.models.memory import Memory
+from cli_agent_orchestrator.services.memory_service import ForgetResult
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -189,7 +190,7 @@ class TestMemoryDeleteWithConfirmation:
     def test_memory_delete_with_confirmation(self, mock_get_svc):
         """delete command should prompt for confirmation and delete."""
         mock_svc = MagicMock()
-        mock_svc.forget = AsyncMock(return_value=True)
+        mock_svc.forget = AsyncMock(return_value=ForgetResult("deleted", "native", "topic.md"))
         mock_get_svc.return_value = mock_svc
 
         runner = CliRunner()
@@ -206,7 +207,7 @@ class TestMemoryDeleteWithConfirmation:
     def test_memory_delete_prompts_user(self, mock_get_svc):
         """delete command without --yes should prompt for confirmation."""
         mock_svc = MagicMock()
-        mock_svc.forget = AsyncMock(return_value=True)
+        mock_svc.forget = AsyncMock(return_value=ForgetResult("deleted", "native", "topic.md"))
         mock_get_svc.return_value = mock_svc
 
         runner = CliRunner()
@@ -219,7 +220,7 @@ class TestMemoryDeleteWithConfirmation:
     def test_memory_delete_not_found(self, mock_get_svc):
         """delete command should error when key not found."""
         mock_svc = MagicMock()
-        mock_svc.forget = AsyncMock(return_value=False)
+        mock_svc.forget = AsyncMock(return_value=ForgetResult("absent", "native", None))
         mock_get_svc.return_value = mock_svc
 
         runner = CliRunner()
@@ -227,6 +228,21 @@ class TestMemoryDeleteWithConfirmation:
 
         assert result.exit_code != 0
         assert "not found" in result.output
+
+    @patch("cli_agent_orchestrator.cli.commands.memory._get_memory_service")
+    def test_memory_delete_reports_retained_vault_file_after_deindex(self, mock_get_svc):
+        mock_svc = MagicMock()
+        mock_svc.forget = AsyncMock(
+            return_value=ForgetResult("deindexed", "vault", "CAO/managed-topic.md")
+        )
+        mock_get_svc.return_value = mock_svc
+
+        result = CliRunner().invoke(delete, ["managed-topic", "--scope", "global", "--yes"])
+
+        assert result.exit_code == 0
+        assert "De-indexed 'managed-topic'" in result.output
+        assert "file is retained in your vault at CAO/managed-topic.md" in result.output
+        assert "Deleted memory" not in result.output
 
 
 class TestMemoryKeyValidation:

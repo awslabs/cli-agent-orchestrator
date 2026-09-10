@@ -21,6 +21,11 @@ from cli_agent_orchestrator.graph.providers import get_provider
 from cli_agent_orchestrator.graph.providers.memory import MemoryGraphProvider
 from cli_agent_orchestrator.services import settings_service, wiki_lint
 from cli_agent_orchestrator.services.memory_service import MemoryService
+from cli_agent_orchestrator.services.vault.binding import (
+    VaultBinding,
+    VaultConfigUnavailableError,
+)
+from cli_agent_orchestrator.services.vault.config import FolderMapping
 from cli_agent_orchestrator.services.wiki_lint import LintIssue
 
 BODY = "A reasonably long article body so contradiction pairing engages." + " filler" * 10
@@ -199,6 +204,31 @@ class TestMemoryProviderHappyPath:
     @pytest.mark.asyncio
     async def test_resolvable_from_registry(self):
         assert isinstance(get_provider("memory"), MemoryGraphProvider)
+
+    @pytest.mark.asyncio
+    async def test_graph_attributes_do_not_expose_paths(self, populated_scope, monkeypatch):
+        """Node and edge attrs are flags/provenance, never vault path data."""
+        _disable_llm(monkeypatch)
+        provider = MemoryGraphProvider(memory_service=populated_scope)
+
+        view = await provider.project(scope="global")
+
+        def values(value):
+            if isinstance(value, dict):
+                for child in value.values():
+                    yield from values(child)
+            elif isinstance(value, (list, tuple)):
+                for child in value:
+                    yield from values(child)
+            else:
+                yield value
+
+        for item in [*view.nodes, *view.edges]:
+            for value in values(item.attrs):
+                if isinstance(value, str):
+                    assert "/" not in value
+                    assert "\\" not in value
+                    assert not value.endswith(".md")
 
 
 class TestMemoryProviderEdgeCases:
@@ -488,7 +518,7 @@ class TestMemoryProviderEdgeCases:
             ("a", "b", EdgeType.RELATES_TO)
         ]
         assert view.meta["lint_enabled"] is False
-        assert view.meta["lint_enrichment"] == "disabled"
+        assert view.meta["lint_enrichment"] == "disabled_by_setting"
         assert set(view.meta["disabled_enrichments"]) == {
             "orphan_page",
             "contradiction",
@@ -499,3 +529,49 @@ class TestMemoryProviderEdgeCases:
         by_id = {n.id: n for n in view.nodes}
         assert "is_hub" not in by_id["a"].attrs
         assert all(e.type != EdgeType.CONTRADICTION for e in view.edges)
+
+    @pytest.mark.asyncio
+    async def test_unavailable_vault_binding_fails_closed(self, populated_scope, monkeypatch):
+        """Unknown vault ownership must not expose a retained native projection."""
+        run_lint = AsyncMock(return_value=[])
+        monkeypatch.setattr(wiki_lint, "run_lint", run_lint)
+
+        def unavailable_binding(*_args):
+            raise VaultConfigUnavailableError("invalid vault configuration")
+
+        provider = MemoryGraphProvider(
+            memory_service=populated_scope,
+            lint_enabled=lambda: True,
+            binding_resolver=unavailable_binding,
+        )
+
+        view = await provider.project(scope="global")
+
+        run_lint.assert_not_awaited()
+        assert view.nodes == []
+        assert view.edges == []
+        assert view.meta["boundary_cause"] == "vault_config_unavailable"
+
+    @pytest.mark.asyncio
+    async def test_index_disabled_vault_binding_has_empty_graph_with_boundary_cause(
+        self, populated_scope, tmp_path
+    ):
+        mapping = FolderMapping(folder="Mapped", scope="global", index=False)
+        resolved = VaultBinding(
+            scope="global",
+            scope_id=None,
+            vault_id="vault",
+            root=str(tmp_path),
+            mapping=mapping,
+        )
+        provider = MemoryGraphProvider(
+            memory_service=populated_scope,
+            lint_enabled=lambda: True,
+            binding_resolver=lambda *_args: resolved,
+        )
+
+        view = await provider.project(scope="global")
+
+        assert view.nodes == []
+        assert view.edges == []
+        assert view.meta["boundary_cause"] == "not_indexable"

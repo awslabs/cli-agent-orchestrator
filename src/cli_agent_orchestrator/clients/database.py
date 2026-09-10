@@ -145,6 +145,9 @@ class MemoryMetadataModel(Base):
     memory_type = Column(String, nullable=False)
     scope = Column(String, nullable=False)
     scope_id = Column(String, nullable=True)
+    # A NOT NULL discriminator keeps the widened unique constraint total:
+    # SQLite considers NULL values distinct inside UNIQUE indexes.
+    source_kind = Column(String, nullable=False, default="native", server_default="native")
     file_path = Column(String, nullable=False)
     tags = Column(String, nullable=False, default="")
     source_provider = Column(String, nullable=True)
@@ -171,16 +174,15 @@ class MemoryMetadataModel(Base):
     related_keys = Column(Text, nullable=True, default=None)
 
     __table_args__ = (
-        UniqueConstraint("key", "scope", "scope_id", name="uq_memory_key_scope"),
-        # Same NULL-distinctness the sentinel comment below documents for
-        # ``memory_relationships``: ``uq_memory_key_scope`` never fires for
-        # global/federated rows because SQLite treats ``NULL != NULL`` in a
-        # UNIQUE index. This partial index covers exactly those rows
-        # (issue #657). Existing DBs get it from ``_migrate_memory_scope_null_uniqueness``.
+        UniqueConstraint("key", "scope", "scope_id", "source_kind", name="uq_memory_key_scope"),
+        # SQLite treats NULL scope_id values as distinct in the table-level
+        # constraint. Keep PR #674's source_kind-aware identity while enforcing
+        # issue #657 uniqueness within each global/federated source tier.
         Index(
             "uq_memory_key_scope_null",
             "key",
             "scope",
+            "source_kind",
             unique=True,
             sqlite_where=text("scope_id IS NULL"),
         ),
@@ -189,6 +191,100 @@ class MemoryMetadataModel(Base):
             name="ck_related_keys_length",
         ),
     )
+
+
+# Vault-note identity needs a non-null scope id for global mappings: SQLite
+# considers NULL values distinct inside UNIQUE indexes. This is table-local;
+# memory_metadata keeps its historical nullable global scope_id convention.
+VAULT_NOTE_SCOPE_ID_SENTINEL = ""
+
+
+class VaultNoteModel(Base):
+    """Durable projection metadata for a note indexed from an Obsidian vault."""
+
+    __tablename__ = "vault_note"
+
+    note_uid = Column(String, primary_key=True)
+    vault_id = Column(String, nullable=False)
+    scope = Column(String, nullable=False)
+    scope_id = Column(
+        String,
+        nullable=False,
+        default=VAULT_NOTE_SCOPE_ID_SENTINEL,
+        server_default=VAULT_NOTE_SCOPE_ID_SENTINEL,
+    )
+    cao_key = Column(String, nullable=False)
+    vault_relpath = Column(String, nullable=False)
+    managed = Column(Boolean, nullable=False)
+    content_sha256 = Column(String, nullable=True)
+    frontmatter_sha256 = Column(String, nullable=True)
+    size_bytes = Column(Integer, nullable=True)
+    mtime_ns = Column(Integer, nullable=True)
+    status = Column(String, nullable=False)
+    last_reconciled_at = Column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("vault_id", "scope", "scope_id", "cao_key", name="uq_vault_note_key"),
+        UniqueConstraint("vault_id", "vault_relpath", name="uq_vault_note_path"),
+    )
+
+
+class VaultExclusionModel(Base):
+    """Authoritative user-forget intent for a vault memory identity."""
+
+    __tablename__ = "vault_exclusion"
+
+    vault_id = Column(String, primary_key=True)
+    scope = Column(String, primary_key=True)
+    scope_id = Column(
+        String,
+        primary_key=True,
+        default=VAULT_NOTE_SCOPE_ID_SENTINEL,
+        server_default=VAULT_NOTE_SCOPE_ID_SENTINEL,
+    )
+    cao_key = Column(String, primary_key=True)
+    last_known_relpath = Column(String, nullable=False)
+    content_sha256 = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+
+
+class VaultFindingModel(Base):
+    """Content-free finding emitted while reconciling a vault."""
+
+    __tablename__ = "vault_finding"
+
+    id = Column(String, primary_key=True)
+    vault_id = Column(String, nullable=False)
+    vault_relpath = Column(String, nullable=False)
+    code = Column(String, nullable=False)
+    severity = Column(String, nullable=False)
+    detail = Column(String, nullable=False)
+    reconcile_run_id = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+
+
+class VaultNoteAliasModel(Base):
+    """Former vault paths retained to make note renames observable."""
+
+    __tablename__ = "vault_note_alias"
+
+    vault_id = Column(String, primary_key=True)
+    former_relpath = Column(String, primary_key=True)
+    cao_key = Column(String, nullable=False)
+    scope = Column(String, nullable=True)
+    scope_id = Column(String, nullable=True)
+    content_sha256 = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+
+
+class VaultRecallCounterModel(Base):
+    """Durable, content-free operational counters for vault recall outcomes."""
+
+    __tablename__ = "vault_recall_counter"
+
+    vault_id = Column(String, primary_key=True)
+    counter_name = Column(String, primary_key=True)
+    value = Column(Integer, nullable=False, default=0, server_default="0")
 
 
 # Relationship-store sentinel: ``memory_relationships.scope_id`` is NOT NULL and
@@ -234,7 +330,7 @@ class MemoryRelationshipModel(Base):
     target_key = Column(String, nullable=False)
     # Closed taxonomy reusing the graph EdgeType values.
     type = Column(String, nullable=False)  # relates_to | contradiction | supersedes
-    # compiler | wiki_lint | human | legacy_related_keys | external_import(reserved)
+    # compiler | wiki_lint | human | legacy_related_keys | external_import(reserved) | vault
     origin = Column(String, nullable=False)
     # active | proposal | rejected | superseded | deleted (auditable soft-delete)
     status = Column(String, nullable=False, default="active")
@@ -410,10 +506,13 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _restrict_db_file_permissions()
     _migrate_terminals_schema()
-    _migrate_memory_indexes()
     _migrate_add_access_count()
     _migrate_add_last_compiled_at()
     _migrate_add_related_keys()
+    # Must run after additive legacy-column migrations and before the separate
+    # index migrator, which recreates the three secondary indexes after a rebuild.
+    _migrate_memory_source_kind()
+    _migrate_memory_indexes()
     _migrate_workflow_index()
     _migrate_workflow_run()
     _migrate_workflow_run_indexes()
@@ -428,8 +527,11 @@ def init_db() -> None:
     # Appended LAST (issue #583 Bolt 2, ``approval-store``). Disjoint from every table above —
     # its own new table, no shared columns — so registry order is immaterial here too.
     _migrate_workflow_plan_approval()
-    # Appended LAST (issue #657). Adds one partial index to memory_metadata;
-    # reads no other table, so registry order is immaterial here too.
+    # Appended LAST (PR #674). Disjoint from every table above except for the
+    # one-time backfill read from vault_note.
+    _migrate_vault_exclusions()
+    # Appended LAST (issue #657). Runs after the source_kind table rebuild so
+    # the partial index enforces the full PR #674 memory identity.
     _migrate_memory_scope_null_uniqueness()
 
 
@@ -510,6 +612,94 @@ def _migrate_memory_indexes() -> None:
             )
     except Exception as e:
         logger.debug(f"Memory index migration skipped: {e}")
+
+
+def _migrate_memory_source_kind() -> None:
+    """Widen memory identity with a non-null source discriminator.
+
+    SQLite cannot alter a UNIQUE constraint, so installed databases require a
+    transactional table rebuild.  The gate compares UNIQUE-index column lists,
+    not index names: SQLite discards names given to table-level constraints.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    expected_unique_columns = ("key", "scope", "scope_id", "source_kind")
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            table_exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'memory_metadata'"
+            ).fetchone()
+            if table_exists is None:
+                return
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(memory_metadata)")}
+            unique_indexes = [
+                row[1]
+                for row in conn.execute("PRAGMA index_list(memory_metadata)").fetchall()
+                if row[3] == "u"
+            ]
+            if any(
+                tuple(
+                    column[2]
+                    for column in conn.execute(
+                        f'PRAGMA index_info("{index_name.replace(chr(34), chr(34) * 2)}")'
+                    ).fetchall()
+                )
+                == expected_unique_columns
+                for index_name in unique_indexes
+            ):
+                if "source_kind" not in columns:
+                    raise RuntimeError(
+                        "memory_metadata unique index references missing source_kind"
+                    )
+                return
+
+            conn.execute("BEGIN")
+            conn.execute("""
+                CREATE TABLE memory_metadata_new (
+                    id VARCHAR NOT NULL PRIMARY KEY,
+                    key VARCHAR NOT NULL,
+                    memory_type VARCHAR NOT NULL,
+                    scope VARCHAR NOT NULL,
+                    scope_id VARCHAR,
+                    source_kind VARCHAR NOT NULL DEFAULT 'native',
+                    file_path VARCHAR NOT NULL,
+                    tags VARCHAR NOT NULL,
+                    source_provider VARCHAR,
+                    source_terminal_id VARCHAR,
+                    token_estimate INTEGER,
+                    created_at DATETIME,
+                    updated_at DATETIME,
+                    access_count INTEGER NOT NULL DEFAULT 0,
+                    last_accessed_at DATETIME,
+                    last_compiled_at DATETIME,
+                    related_keys TEXT,
+                    CONSTRAINT uq_memory_key_scope UNIQUE (key, scope, scope_id, source_kind)
+                )
+                """)
+            conn.execute("""
+                INSERT INTO memory_metadata_new (
+                    id, key, memory_type, scope, scope_id, source_kind, file_path, tags,
+                    source_provider, source_terminal_id, token_estimate, created_at, updated_at,
+                    access_count, last_accessed_at, last_compiled_at, related_keys
+                )
+                SELECT
+                    id, key, memory_type, scope, scope_id, 'native', file_path, tags,
+                    source_provider, source_terminal_id, token_estimate, created_at, updated_at,
+                    access_count, last_accessed_at, last_compiled_at, related_keys
+                FROM memory_metadata
+                """)
+            conn.execute("DROP TABLE memory_metadata")
+            conn.execute("ALTER TABLE memory_metadata_new RENAME TO memory_metadata")
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(memory_metadata)")}
+            if "source_kind" not in columns:
+                raise RuntimeError("memory_metadata rebuild did not add source_kind")
+            conn.commit()
+            logger.info("Migration: widened memory_metadata identity with source_kind")
+    except Exception as e:
+        logger.error(f"Memory source_kind migration failed: {e}")
+        raise
 
 
 def _migrate_add_access_count() -> None:
@@ -704,7 +894,7 @@ def _migrate_workflow_plan_approval() -> None:
 
 def _migrate_memory_scope_null_uniqueness(engine: Any = None, *, strict: bool = False) -> None:
     """Create the partial unique index backing ``uq_memory_key_scope`` for
-    NULL ``scope_id`` rows (issue #657). Appended LAST to the ``init_db()``
+    NULL ``scope_id`` rows within each ``source_kind`` (issue #657). Appended LAST to the ``init_db()``
     registry.
 
     SQLite treats ``NULL != NULL`` in a UNIQUE index, so the table-level
@@ -747,12 +937,13 @@ def _migrate_memory_scope_null_uniqueness(engine: Any = None, *, strict: bool = 
                 if index_rows:
                     return
                 duplicates = conn.exec_driver_sql(
-                    "SELECT key, scope, COUNT(*) FROM memory_metadata "
-                    "WHERE scope_id IS NULL GROUP BY key, scope HAVING COUNT(*) > 1"
+                    "SELECT key, scope, source_kind, COUNT(*) FROM memory_metadata "
+                    "WHERE scope_id IS NULL GROUP BY key, scope, source_kind HAVING COUNT(*) > 1"
                 ).fetchall()
                 if duplicates:
                     rendered = ", ".join(
-                        f"{scope}:{key}x{count}" for key, scope, count in duplicates
+                        f"{scope}:{key}[{source_kind}]x{count}"
+                        for key, scope, source_kind, count in duplicates
                     )
                     logger.warning(
                         "Skipping uq_memory_key_scope_null creation: duplicate global/federated "
@@ -762,7 +953,7 @@ def _migrate_memory_scope_null_uniqueness(engine: Any = None, *, strict: bool = 
                     return
                 conn.exec_driver_sql(
                     "CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_key_scope_null "
-                    "ON memory_metadata (key, scope) WHERE scope_id IS NULL"
+                    "ON memory_metadata (key, scope, source_kind) WHERE scope_id IS NULL"
                 )
                 conn.commit()
                 if strict:
@@ -778,11 +969,14 @@ def _migrate_memory_scope_null_uniqueness(engine: Any = None, *, strict: bool = 
             return
         with sqlite3.connect(target) as conn:
             duplicates = conn.execute(
-                "SELECT key, scope, COUNT(*) FROM memory_metadata "
-                "WHERE scope_id IS NULL GROUP BY key, scope HAVING COUNT(*) > 1"
+                "SELECT key, scope, source_kind, COUNT(*) FROM memory_metadata "
+                "WHERE scope_id IS NULL GROUP BY key, scope, source_kind HAVING COUNT(*) > 1"
             ).fetchall()
             if duplicates:
-                rendered = ", ".join(f"{scope}:{key}x{count}" for key, scope, count in duplicates)
+                rendered = ", ".join(
+                    f"{scope}:{key}[{source_kind}]x{count}"
+                    for key, scope, source_kind, count in duplicates
+                )
                 logger.warning(
                     "Skipping uq_memory_key_scope_null creation: duplicate global/federated "
                     f"rows in memory_metadata ({rendered}). Run `cao memory repair` to "
@@ -791,7 +985,7 @@ def _migrate_memory_scope_null_uniqueness(engine: Any = None, *, strict: bool = 
                 return
             conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_key_scope_null "
-                "ON memory_metadata (key, scope) WHERE scope_id IS NULL"
+                "ON memory_metadata (key, scope, source_kind) WHERE scope_id IS NULL"
             )
             if strict:
                 created = conn.execute(
@@ -807,6 +1001,52 @@ def _migrate_memory_scope_null_uniqueness(engine: Any = None, *, strict: bool = 
         if strict:
             raise
         logger.debug(f"memory scope NULL uniqueness migration skipped: {e}")
+
+
+def _migrate_vault_exclusions() -> None:
+    """Create and backfill durable vault-forget identities.
+
+    ``vault_note.status`` is a rebuildable projection and cannot safely retain
+    user intent across path reuse, quarantine, or rebuild. Existing excluded
+    rows are therefore copied into the identity-keyed authoritative table.
+    Failure propagates because continuing without the backfill could republish
+    content that the user explicitly forgot.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS vault_exclusion ("
+                "vault_id VARCHAR NOT NULL, "
+                "scope VARCHAR NOT NULL, "
+                "scope_id VARCHAR NOT NULL DEFAULT '', "
+                "cao_key VARCHAR NOT NULL, "
+                "last_known_relpath VARCHAR NOT NULL, "
+                "content_sha256 VARCHAR, "
+                "created_at DATETIME NOT NULL, "
+                "PRIMARY KEY (vault_id, scope, scope_id, cao_key)"
+                ")"
+            )
+            note_table_exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'vault_note'"
+            ).fetchone()
+            if note_table_exists is None:
+                return
+            conn.execute(
+                "INSERT OR IGNORE INTO vault_exclusion ("
+                "vault_id, scope, scope_id, cao_key, last_known_relpath, "
+                "content_sha256, created_at"
+                ") "
+                "SELECT vault_id, scope, scope_id, cao_key, vault_relpath, "
+                "content_sha256, COALESCE(last_reconciled_at, CURRENT_TIMESTAMP) "
+                "FROM vault_note WHERE status = 'excluded'"
+            )
+    except Exception as e:
+        logger.error(f"Vault exclusion migration failed: {e}")
+        raise
 
 
 def _backfill_legacy_related_keys(conn: Any) -> None:
@@ -2049,8 +2289,16 @@ def record_project_alias(project_id: str, alias: str, kind: str) -> None:
         logger.debug(f"record_project_alias failed (non-fatal): {e}")
 
 
-def get_project_id_by_alias(alias: str) -> Optional[str]:
-    """Return the canonical ``project_id`` for an alias, or None if unknown."""
+class ProjectAliasLookupUnavailableError(RuntimeError):
+    """Raised when a required project-alias lookup cannot reach the database."""
+
+
+def get_project_id_by_alias(alias: str, *, fail_closed: bool = False) -> Optional[str]:
+    """Return the canonical ``project_id`` for an alias, or None if unknown.
+
+    Callers that enforce a vault boundary can request ``fail_closed`` so a
+    database outage cannot be mistaken for an unrecognized alias.
+    """
     if not alias:
         return None
     try:
@@ -2058,6 +2306,8 @@ def get_project_id_by_alias(alias: str) -> Optional[str]:
             row = db.query(ProjectAliasModel).filter(ProjectAliasModel.alias == alias).first()
             return cast(Optional[str], row.project_id) if row else None
     except Exception as e:
+        if fail_closed:
+            raise ProjectAliasLookupUnavailableError(str(e)) from e
         logger.debug(f"get_project_id_by_alias failed (non-fatal): {e}")
         return None
 
