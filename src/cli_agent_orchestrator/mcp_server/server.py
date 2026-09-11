@@ -366,7 +366,7 @@ if ENABLE_WORKING_DIRECTORY:
         """
         denied = _tool_denied_reason("handoff")
         if denied:
-            return HandoffResult(success=False, message=denied)
+            return HandoffResult(success=False, message=denied, output=None, terminal_id=None)
         return await _handoff_impl(
             agent_profile,
             message,
@@ -460,7 +460,7 @@ else:
         """
         denied = _tool_denied_reason("handoff")
         if denied:
-            return HandoffResult(success=False, message=denied)
+            return HandoffResult(success=False, message=denied, output=None, terminal_id=None)
         return await _handoff_impl(
             agent_profile,
             message,
