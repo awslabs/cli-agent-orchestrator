@@ -364,6 +364,9 @@ if ENABLE_WORKING_DIRECTORY:
         Returns:
             HandoffResult with success status, message, and agent output
         """
+        denied = _tool_denied_reason("handoff")
+        if denied:
+            return HandoffResult(success=False, message=denied, output=None, terminal_id=None)
         return await _handoff_impl(
             agent_profile,
             message,
@@ -455,6 +458,9 @@ else:
         Returns:
             HandoffResult with success status, message, and agent output
         """
+        denied = _tool_denied_reason("handoff")
+        if denied:
+            return HandoffResult(success=False, message=denied, output=None, terminal_id=None)
         return await _handoff_impl(
             agent_profile,
             message,
@@ -578,6 +584,9 @@ if ENABLE_WORKING_DIRECTORY:
         ),
         target_host: Optional[str] = Field(default=None, description=_target_host_field_desc),
     ) -> Dict[str, Any]:
+        denied = _tool_denied_reason("assign")
+        if denied:
+            return {"success": False, "error": denied}
         return _assign_impl(
             agent_profile,
             message,
@@ -613,6 +622,9 @@ else:
         ),
         target_host: Optional[str] = Field(default=None, description=_target_host_field_desc),
     ) -> Dict[str, Any]:
+        denied = _tool_denied_reason("assign")
+        if denied:
+            return {"success": False, "error": denied}
         return _assign_impl(
             agent_profile,
             message,
@@ -1267,6 +1279,7 @@ def _get_terminal_context_from_env() -> Optional[Dict[str, Any]]:
             "session_name": meta["session_name"],
             "provider": meta["provider"],
             "agent_profile": meta.get("agent_profile"),
+            "allowed_tools": meta.get("allowed_tools"),
         }
         # Try to get working directory for project scope resolution. Same header
         # reasoning as above — best-effort, so a failure degrades project scope
@@ -1311,6 +1324,99 @@ def _caller_has_store_lesson_capability(caller_profile: Optional[str]) -> bool:
     except Exception as e:  # noqa: BLE001 — authz check fails closed
         logger.warning(f"store_lesson capability lookup failed for {caller_profile!r}: {e}")
         return False
+
+
+CAO_MCP_SERVER_SELECTOR = "@cao-mcp-server"
+
+
+def _caller_effective_allowed_tools(context: Dict[str, Any]) -> Optional[List[str]]:
+    """Effective CAO allowlist for the calling terminal, or None if unresolvable.
+
+    Mirrors ``create_terminal``: a recorded ``allowed_tools`` IS the effective
+    list, while ``None`` means "resolve from the agent profile" rather than
+    "unrestricted", so the profile goes through the same
+    ``resolve_allowed_tools`` the launch path uses.
+    """
+    recorded = context.get("allowed_tools")
+    if recorded is not None:
+        return list(recorded)
+
+    profile_name = context.get("agent_profile")
+    if not profile_name:
+        return None
+
+    from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+    from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
+
+    profile = load_agent_profile(profile_name)
+    mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
+    return resolve_allowed_tools(profile.allowedTools, profile.role, mcp_server_names)
+
+
+def _tool_denied_reason(tool_name: str) -> Optional[str]:
+    """Reason the calling terminal's allowlist bars ``tool_name``, or None to allow.
+
+    ``assign`` and ``handoff`` spawn a terminal under a caller-chosen
+    ``agent_profile``, so an agent reaching them can mint a new identity with
+    its own memory scope under any profile installed on the box (#671). The
+    provider-native restrictions built by ``utils/tool_mapping`` cannot cover
+    that: ``get_disallowed_tools`` skips every ``@``-prefixed entry because MCP
+    server references have no native tool names, so CAO's own MCP surface is
+    unreachable from that mechanism by construction.
+
+    The authorization model here is the one CAO already has, not a second one.
+    The effective list is the terminal's recorded ``allowed_tools``, or the
+    profile resolution that ``None`` stands for, and these operations are
+    granted by the documented ``@cao-mcp-server`` server selector or by ``*``.
+    Bare tool names are provider-native vocabulary and never name an MCP tool.
+
+    Fails closed. An unset ``CAO_TERMINAL_ID`` is the supported operator
+    context (``cao assign`` and ``cao handoff`` run with no caller identity)
+    and allows. Once the caller claims an identity every failure to resolve it
+    denies: a malformed ID, an unreachable or unauthorized cao-server, a
+    terminal that is not registered, an unreadable profile.
+
+    ``None`` from ``_get_terminal_context_from_env`` is NOT proof of an
+    operator context. That helper also returns ``None`` for a malformed
+    ``CAO_TERMINAL_ID`` (which ``_current_terminal_id`` itself calls a hard
+    error) and from its trailing ``except Exception``. So boundness is
+    established here from the environment rather than inferred from the
+    absence of an exception.
+    """
+    if not os.environ.get("CAO_TERMINAL_ID"):
+        return None
+
+    try:
+        context = _get_terminal_context_from_env()
+    except Exception as e:  # noqa: BLE001  (an unknown result must not dispatch)
+        logger.warning(f"authorization lookup failed for '{tool_name}': {e}")
+        return f"cannot authorize '{tool_name}': the calling terminal could not be resolved ({e})"
+
+    if context is None:
+        return (
+            f"cannot authorize '{tool_name}': CAO_TERMINAL_ID is set but the calling "
+            "terminal could not be resolved"
+        )
+
+    try:
+        allowed = _caller_effective_allowed_tools(context)
+    except Exception as e:  # noqa: BLE001  (an unknown result must not dispatch)
+        logger.warning(f"allowlist resolution failed for '{tool_name}': {e}")
+        return (
+            f"cannot authorize '{tool_name}': the caller's allowed tools could not "
+            f"be resolved ({e})"
+        )
+
+    if allowed is None:
+        return f"cannot authorize '{tool_name}': the caller's allowed tools could not be resolved"
+
+    if "*" in allowed or CAO_MCP_SERVER_SELECTOR in allowed:
+        return None
+
+    return (
+        f"'{tool_name}' is not permitted: the calling terminal's allowed tools do not "
+        f"include '{CAO_MCP_SERVER_SELECTOR}'"
+    )
 
 
 @mcp.tool()
