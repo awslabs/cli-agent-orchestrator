@@ -587,3 +587,74 @@ class TestWorkflowJournalSettingsWritePath:
         rather than being silently persisted as an unread setting."""
         with pytest.raises(ValueError, match="Unknown memory setting"):
             settings_service.set_memory_setting("workflow_journal_retention_dayz", 30)
+
+
+class TestSessionLabels:
+    """Per-session display aliases: trimmed, capped, cleared by a blank label."""
+
+    def test_empty_when_unset(self, settings_file):
+        assert settings_service.get_session_labels() == {}
+
+    def test_set_trims_and_persists(self, settings_file):
+        labels = settings_service.set_session_label("cao-demo", "  Nightly triage  ")
+        assert labels == {"cao-demo": "Nightly triage"}
+        assert settings_service.get_session_labels() == {"cao-demo": "Nightly triage"}
+        assert json.loads(settings_file.read_text())["session_labels"] == {
+            "cao-demo": "Nightly triage"
+        }
+
+    def test_blank_label_clears(self, settings_file):
+        settings_service.set_session_label("cao-demo", "x")
+        assert settings_service.set_session_label("cao-demo", "   ") == {}
+        assert settings_service.get_session_labels() == {}
+
+    def test_clearing_an_unknown_session_is_a_no_op(self, settings_file):
+        with patch.object(settings_service, "_save") as save:
+            assert settings_service.set_session_label("cao-nope", "") == {}
+        save.assert_not_called()
+        # ...including on disk: teardown clears unconditionally, and that must
+        # not rewrite settings.json on every session delete.
+        assert not settings_file.exists()
+
+    def test_teardown_clear_does_not_destroy_an_unparseable_settings_file(self, settings_file):
+        """#737: the loaders return {} for a file that exists but does not
+        parse, so any write over that state persists the empty fallback as the
+        new truth. ``delete_session`` clears a label unconditionally, which
+        would put that write on every teardown -- the no-op guard is what keeps
+        it off. Pinned here because the guard's value is not obvious from the
+        line itself, and #737's own fix should not be the only thing standing
+        between a corrupt file and this path."""
+        settings_file.write_text('{"terminal": {"backend": "tmux"},}')  # trailing comma
+        before = settings_file.read_text()
+
+        with patch.object(settings_service, "_save") as save:
+            assert settings_service.set_session_label("cao-gone", "") == {}
+        save.assert_not_called()
+        assert settings_file.read_text() == before
+
+    def test_resetting_the_same_label_does_not_rewrite(self, settings_file):
+        """The no-op guard must actually skip the write, not merely produce the
+        same bytes: every settings write is a read-modify-write over the whole
+        file, so a needless one widens the window for losing a concurrent edit."""
+        settings_service.set_session_label("cao-demo", "Run")
+        with patch.object(settings_service, "_save") as save:
+            assert settings_service.set_session_label("cao-demo", "Run") == {"cao-demo": "Run"}
+        save.assert_not_called()
+        assert json.loads(settings_file.read_text())["session_labels"] == {"cao-demo": "Run"}
+
+    def test_label_is_capped(self, settings_file):
+        long = "x" * (settings_service.SESSION_LABEL_MAX_LENGTH + 20)
+        labels = settings_service.set_session_label("cao-demo", long)
+        assert len(labels["cao-demo"]) == settings_service.SESSION_LABEL_MAX_LENGTH
+
+    def test_other_settings_survive(self, settings_file):
+        settings_file.write_text(json.dumps({"agent_dirs": {"kiro_cli": "/x"}}))
+        settings_service.set_session_label("cao-demo", "Run")
+        data = json.loads(settings_file.read_text())
+        assert data["agent_dirs"] == {"kiro_cli": "/x"}
+        assert data["session_labels"] == {"cao-demo": "Run"}
+
+    def test_corrupt_labels_value_is_treated_as_empty(self, settings_file):
+        settings_file.write_text(json.dumps({"session_labels": ["not", "a", "dict"]}))
+        assert settings_service.get_session_labels() == {}
+        assert settings_service.set_session_label("cao-demo", "Run") == {"cao-demo": "Run"}

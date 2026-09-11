@@ -16,6 +16,25 @@ export CAO_ENABLE_WORKING_DIRECTORY=true
 - **When enabled**: Tools expose `working_directory` parameter, allowing explicit directory specification
 - **Default directory**: Current working directory (`cwd`) of the supervisor agent
 
+## Operator-typed paths over HTTP
+
+`POST /sessions` and `POST /sessions/{session_name}/terminals` normalize
+`working_directory` before it reaches tmux, so a path pasted from a browser
+on WSL works as typed:
+
+| Typed | Used |
+|-------|------|
+| `"C:\Users\me\proj"` (Explorer "Copy as path") | `/mnt/c/Users/me/proj` |
+| `C:/Users/me/proj` | `/mnt/c/Users/me/proj` |
+| `~/proj` | `/home/me/proj` |
+| `/home/me/new-proj` (missing) | created, then used |
+
+A relative path, an existing non-directory (a file, FIFO, socket or device),
+or a Windows drive that is not mounted under `/mnt` is rejected with a `400`
+and a plain-language `detail`. Creation is bounded by a path-length and depth
+cap, and runs only after the request's cheaper validations pass. The MCP `handoff`/
+`assign` `working_directory` parameter is unchanged.
+
 ## Usage Example
 
 With `CAO_ENABLE_WORKING_DIRECTORY=true`:
