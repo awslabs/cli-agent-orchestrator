@@ -29,3 +29,19 @@ def mock_kiro_capability_probe(monkeypatch):
         "cli_agent_orchestrator.services.terminal_service.probe_kiro_capabilities",
         probe,
     )
+
+
+@pytest.fixture(autouse=True)
+def cleanup_test_snapshots():
+    """Remove early-snapshot files created by create_terminal during tests.
+
+    Mirrors the temp-file cleanup pattern in test_claude_code_unit.py: service
+    tests run create_terminal with mock ids (test1234, ...) and the early
+    snapshot writes to the real TERMINAL_LOG_DIR.
+    """
+    yield
+    from cli_agent_orchestrator.constants import TERMINAL_LOG_DIR
+
+    if TERMINAL_LOG_DIR.exists():
+        for f in TERMINAL_LOG_DIR.glob("test*.snapshot.json"):
+            f.unlink(missing_ok=True)
