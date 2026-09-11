@@ -6,7 +6,7 @@ import requests  # type: ignore[import-untyped]
 from fastmcp import FastMCP
 from pydantic import Field
 
-from cli_agent_orchestrator.constants import API_BASE_URL
+from cli_agent_orchestrator.constants import API_BASE_URL, SESSION_PREFIX
 from cli_agent_orchestrator.ops_mcp_server.models import (
     InstallResult,
     LaunchResult,
@@ -90,6 +90,128 @@ def _request_json(
         return None, f"{operation} failed: invalid JSON response ({exc})"
 
 
+def _canonical_session_name(session_name: str) -> str:
+    """The name a CAO session is ALWAYS stored under, per the naming contract.
+
+    Both creation paths enforce it: ``terminal_service.create_terminal``
+    prepends SESSION_PREFIX ("cao-") to a new session's name unless it already
+    starts with it, and ``POST /sessions`` validates that same effective
+    prefixed name at the boundary. So every CAO session name starts with
+    "cao-", and an UNPREFIXED name can never be a CAO session -- at most it is
+    a caller's alias for one (launch_session echoes back the bare
+    ``session_name`` it was given), or an unrelated native tmux session that
+    merely shares the name.
+
+    Canonicalization is therefore total, and it is the identity rule every
+    name-taking ops tool addresses. It is a pure function of the name --
+    deliberately NOT a question about what is live right now -- for two
+    reasons: the cleanup identity has to survive the backend session being gone
+    while its registry row remains, and a successful GET on an unprefixed name
+    is not evidence of CAO identity (``session_service.get_session`` reads the
+    backend directly, without the SESSION_PREFIX filter ``list_sessions``
+    applies, and the shipped tmux backend lists native sessions too).
+    """
+    if session_name.startswith(SESSION_PREFIX):
+        return session_name
+    return f"{SESSION_PREFIX}{session_name}"
+
+
+def _request_session_json(
+    method: str,
+    session_name: str,
+    *,
+    operation: str,
+) -> tuple[Optional[Any], Optional[str]]:
+    """Request ``/sessions/{name}`` against the CANONICAL name, once.
+
+    The read paths share the delete path's identity rule
+    (``_canonical_session_name``) rather than probing the literal name first: a
+    native tmux ``review`` and a CAO ``cao-review`` can legitimately coexist and
+    both answer GET, and preferring the literal made ``get_session_info("review")``
+    return the native session with none of CAO's terminals. An unprefixed name
+    can never BE a CAO session, so a successful GET on one proves nothing about
+    CAO identity and must never select the target.
+
+    This replaces an earlier 404-triggered retry of the prefixed name: with
+    canonicalization total, there is nothing left to retry.
+    """
+    return _request_json(
+        method,
+        f"/sessions/{_canonical_session_name(session_name)}",
+        operation=operation,
+    )
+
+
+def _lookup_session(candidate: str) -> tuple[bool, Optional[str]]:
+    """Probe ``GET /sessions/{candidate}`` for one of THREE outcomes.
+
+    Returns ``(found, error)``:
+
+    * ``(True, None)``   -- resolved: the GET answered below 400.
+    * ``(False, None)``  -- confirmed absent: the GET answered 404. Only a 404
+      is evidence of absence.
+    * ``(False, error)`` -- unresolved: a transport failure, 5xx, 403 or any
+      other non-404 status. The lookup did not answer the question, so the
+      caller must not treat it as absence. ``GET /sessions/{name}`` really does
+      return 500 when reading a terminal's live status fails
+      (``api/main.py``'s handler maps any non-ValueError to 500), and a 403
+      simply means this token lacks read scope while still holding admin.
+    """
+    try:
+        response = requests.request(
+            "get", f"{API_BASE_URL}/sessions/{candidate}", params=None, json=None
+        )
+    except requests.RequestException as exc:
+        return False, f"lookup of session '{candidate}' failed: {exc}"
+
+    if response.status_code < 400:
+        return True, None
+    if response.status_code == 404:
+        return False, None
+    return False, f"lookup of session '{candidate}' failed: {_response_detail(response)}"
+
+
+def _resolve_session_name(session_name: str) -> tuple[Optional[str], Optional[str]]:
+    """The name to mutate: the CANONICAL one, or ``(None, error)``.
+
+    The target comes from the naming contract (``_canonical_session_name``),
+    never from which name happens to answer a GET. Probing the literal name
+    first and taking any success was how ``shutdown_session("review")`` deleted
+    an unrelated NATIVE tmux ``review`` -- reporting success -- while
+    ``cao-review`` and its registry row stayed alive.
+
+    The read-only GET that remains is a safety check on that single canonical
+    name, not a selector, because ``DELETE /sessions/{name}`` cannot report the
+    problem itself: it is idempotent -- ``session_service.delete_session()``
+    puts an absent name straight into ``deleted`` -- so it answers 200 for a
+    name that never existed. Its three outcomes (``_lookup_session``):
+
+    * Resolved (below 400) or confirmed absent (404) -- return the canonical
+      name either way, so the single DELETE lands on the CAO session when it is
+      live, and is the endpoint's idempotent "already gone" success when it is
+      not. Confirmed absence is NOT a reason to retarget: after a deferred
+      cleanup (``dismantle_terminal_runtime`` returning False keeps the row,
+      answers 409 and reports the session in ``errors``) the backend session is
+      gone -- so ``get_session``, which requires it, 404s -- while the retained
+      registry row, the only handle the retry has, still lives under the
+      canonical name.
+    * Unresolved (transport error / 5xx / 403 / any non-404) -- return
+      ``(None, error)``. NOTHING is mutated. Collapsing this into "absent" is
+      how an unresolved name became a successful no-op DELETE: the canonical
+      session and its registry row survive while the caller is told cleanup
+      happened.
+    """
+    canonical_name = _canonical_session_name(session_name)
+
+    # The "found" half is deliberately discarded: presence does not choose the
+    # target here, it only distinguishes the two outcomes that share one.
+    _found, error = _lookup_session(canonical_name)
+    if error is not None:
+        return None, error
+
+    return canonical_name, None
+
+
 def _serialize_allowed_tools(allowed_tools: Optional[List[str]]) -> Optional[str]:
     """Serialize allowed tools for the session creation API."""
     if not allowed_tools:
@@ -169,6 +291,7 @@ async def _launch_session_impl(
         )
 
     terminal_id = str(session_data["id"])
+    launched_provider = session_data.get("provider")
     message = (
         f"Session '{resolved_session_name}' launched; initial message delivery is in progress"
         if initial_message is not None
@@ -179,6 +302,7 @@ async def _launch_session_impl(
         message=message,
         session_name=resolved_session_name,
         terminal_id=terminal_id,
+        provider=launched_provider,
     )
 
 
@@ -432,9 +556,9 @@ def _read_session_output_impl(
     if not resolved_terminal_id:
         if not session_name:
             return {"success": False, "message": "Provide either terminal_id or session_name"}
-        info, error = _request_json(
+        info, error = _request_session_json(
             "get",
-            f"/sessions/{session_name}",
+            session_name,
             operation=f"Resolve terminals for session '{session_name}'",
         )
         if error:
@@ -671,9 +795,9 @@ async def get_session_info(
     Returns:
         Dict with session fields, or {"success": False, "message": ...} on error
     """
-    data, error = _request_json(
+    data, error = _request_session_json(
         "get",
-        f"/sessions/{session_name}",
+        session_name,
         operation=f"Get session info for '{session_name}'",
     )
     if error:
@@ -691,16 +815,38 @@ async def shutdown_session(
 
     Exits all providers, kills the tmux session, and removes database records.
 
+    A bare name is canonicalized to the name CAO actually stores the session
+    under ("cao-<name>") before anything is deleted, so an unrelated NATIVE
+    tmux session sharing the bare name is never the target. When the canonical
+    lookup cannot answer -- transport failure, 5xx, 403, anything but a 404 --
+    no delete is issued at all and the lookup failure is reported instead of a
+    false cleanup success.
+
     Args:
         session_name: CAO session name to shut down
 
     Returns:
         Dict with success status and cleanup details, or failure dict on error
     """
+    # Resolve first, then delete exactly once against the canonical name: the
+    # DELETE route cannot report a bad target itself, because it never returns
+    # 404 for an absent session (see _resolve_session_name).
+    resolved_name, lookup_error = _resolve_session_name(session_name)
+    if lookup_error is not None or resolved_name is None:
+        # Unresolved, not absent: nothing has been mutated, and nothing will be.
+        # Deleting an unresolved alias would answer 200 and report a cleanup that
+        # never happened, so the coordinator sees the lookup problem instead.
+        return {
+            "success": False,
+            "message": (
+                f"Shutdown session '{session_name}' aborted: {lookup_error}; "
+                "no delete was issued"
+            ),
+        }
     data, error = _request_json(
         "delete",
-        f"/sessions/{session_name}",
-        operation=f"Shutdown session '{session_name}'",
+        f"/sessions/{resolved_name}",
+        operation=f"Shutdown session '{resolved_name}'",
     )
     if error:
         return {"success": False, "message": error}
