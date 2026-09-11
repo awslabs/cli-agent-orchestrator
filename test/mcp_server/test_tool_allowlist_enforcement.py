@@ -26,6 +26,7 @@ import requests
 
 from cli_agent_orchestrator.mcp_server import server
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
+from cli_agent_orchestrator.models.terminal import Terminal
 
 BOUND = {"CAO_TERMINAL_ID": "a1b2c3d4"}
 
@@ -228,3 +229,44 @@ class TestToolsRefuse:
                 result = await server.assign(agent_profile="developer", message="do work")
         assert result == {"success": True}
         impl.assert_called_once()
+
+
+class TestThroughTheRealContextHelper:
+    """The other classes stub ``_get_terminal_context_from_env``, so nothing there
+    exercises the terminal record actually carrying ``allowed_tools``. These drive
+    the real helper against the payload ``GET /terminals/{id}`` returns, which is a
+    ``Terminal`` (``response_model=Terminal``).
+    """
+
+    @staticmethod
+    def _payload(allowed_tools):
+        return Terminal(
+            id="a1b2c3d4",
+            name="w1",
+            provider="codex",
+            session_name="cao-session",
+            agent_profile="worker",
+            allowed_tools=allowed_tools,
+        ).model_dump(mode="json")
+
+    def test_recorded_policy_reaches_the_guard(self):
+        payload = self._payload(["fs_read", "@cao-mcp-server"])
+        with patch.dict(os.environ, BOUND):
+            with (
+                patch.object(server.mcp_utils, "get_json", return_value=payload),
+                patch("requests.get", side_effect=RuntimeError("skip working-dir probe")),
+            ):
+                ctx = server._get_terminal_context_from_env()
+                assert ctx["allowed_tools"] == ["fs_read", "@cao-mcp-server"]
+                assert server._tool_denied_reason("assign") is None
+
+    def test_narrow_recorded_policy_denies_through_the_real_helper(self):
+        payload = self._payload(["fs_read"])
+        with patch.dict(os.environ, BOUND):
+            with (
+                patch.object(server.mcp_utils, "get_json", return_value=payload),
+                patch("requests.get", side_effect=RuntimeError("skip working-dir probe")),
+            ):
+                reason = server._tool_denied_reason("assign")
+        assert reason is not None
+        assert "@cao-mcp-server" in reason
