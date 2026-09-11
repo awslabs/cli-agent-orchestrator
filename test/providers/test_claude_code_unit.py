@@ -1805,6 +1805,22 @@ class TestClaudeCodeProviderPermissionMode:
         assert "--dangerously-skip-permissions" in command
         assert "--permission-mode" not in command
 
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_empty_allowlist_emits_disallowed_tools(self, mock_load):
+        """allowed_tools=[] must deny natives, not skip --disallowedTools."""
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.permissionMode = None
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent", allowed_tools=[])
+        command = provider._build_claude_command()
+
+        assert "--disallowedTools" in command
+        assert "Bash" in command
+
 
 class TestClaudeCodeProviderYoloRootRegression:
     """Regression tests for yolo + root/non-root --dangerously-skip-permissions logic.

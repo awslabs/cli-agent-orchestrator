@@ -122,6 +122,9 @@ The current tools are grouped by purpose:
   `get_terminal_output`
 - Session lifecycle: `list_sessions`, `get_session_info`, `shutdown_session`
 
+Installed [plugins](plugins.md#mcp-tool-surfaces) can register additional tools on this
+server through `on_mcp_server`, the same hook `cao-mcp-server` honours.
+
 MCP tool discovery is authoritative for clients. The declarations in
 [`ops_mcp_server/server.py`](../src/cli_agent_orchestrator/ops_mcp_server/server.py)
 are the source of truth when the server surface changes.

@@ -42,7 +42,15 @@ def _print_table(workers):
 
 @click.group()
 def worker():
-    """Inspect and talk to workers in a CAO cluster."""
+    """Inspect and talk to workers in a CAO cluster.
+
+    These verbs are `cao session`'s, pointed at a worker in a fleet instead of a
+    session on this machine, and they name no scheduler: a worker is addressed the
+    same way whether the fleet runs it as a Kubernetes Deployment or as something
+    else. `cao fleet` is the fleet-wide view — is the broker there, what is it
+    holding, release all of it — and shares this group's two environment
+    variables.
+    """
 
 
 @worker.command("list")
@@ -81,10 +89,22 @@ def status(worker_id, as_json):
     lease = next((w for w in client.workers() if w.get("worker_id") == worker_id), None)
     terminal = None
     last_output = None
+    terminal_error = None
     if lease is None or lease.get("workload_present") is True:
-        terminal = client.sole_terminal(worker_id)
-        terminal = client.terminal(worker_id, terminal["id"])
-        last_output = client.terminal_output(worker_id, terminal["id"])
+        try:
+            terminal = client.sole_terminal(worker_id)
+            terminal = client.terminal(worker_id, terminal["id"])
+            last_output = client.terminal_output(worker_id, terminal["id"])
+        except click.ClickException as exc:
+            # A workload with no answering cao-server is the first minute of
+            # every worker's life — the pod may still be pulling its image or
+            # installing its profile. The inventory row is already in hand, so
+            # degrade to it rather than replacing the answer with a connection
+            # error. No inventory row AND no terminal is different: nothing was
+            # found, and the error is the answer.
+            if lease is None:
+                raise
+            terminal_error = exc.format_message()
 
     if as_json:
         click.echo(
@@ -93,6 +113,7 @@ def status(worker_id, as_json):
                     "worker_id": worker_id,
                     "lease": lease,
                     "terminal": terminal,
+                    "terminal_error": terminal_error,
                     "last_output": last_output,
                 },
                 indent=2,
@@ -114,6 +135,10 @@ def status(worker_id, as_json):
         click.echo(f"Agent:    {terminal.get('agent_profile', 'N/A')}")
         click.echo(f"Provider: {terminal.get('provider', 'N/A')}")
         click.echo(f"Status:   {terminal.get('status', 'N/A')}")
+    elif terminal_error:
+        click.echo(f"Terminal: not answering yet — {terminal_error}")
+        if "cao worker logs" not in terminal_error:
+            click.echo(f"          `cao worker logs {worker_id}` shows how far boot got.")
     if last_output:
         lines = last_output.splitlines()
         click.echo("\nLast response:")

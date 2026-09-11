@@ -79,7 +79,19 @@ TUI_FOOTER_PATTERN = r"(?:\?\s+for shortcuts|context left|\d+%\s+left|·\s+[~/])
 # Appears inline with --no-alt-screen when the agent is actively processing.
 # Must be checked before COMPLETED to avoid false positives (the • matches
 # ASSISTANT_PREFIX_PATTERN and the TUI footer › matches idle prompt).
-TUI_PROGRESS_PATTERN = r"•[^\n]*\((?:(?:\d+h\s+)?\d+m\s+)?\d+s\s*•\s*esc to interrupt\)"
+#
+# codex-cli 0.153.4 (live acceptance capture, 2026-09-08) alternates the
+# leading glyph between the solid bullet "•" (U+2022) and the hollow bullet
+# "◦" (U+25E6) as the spinner animates -- a frame landing on "◦Applying both
+# edits(52s • esc to interrupt)" previously failed to match (the pattern only
+# accepted "•"), and with --no-alt-screen the composer hint ("» Ask Codex to
+# do anything") plus the model/path footer can be rendered on that SAME line
+# as the spinner (e.g. "•Applying both edits(43s • esc to interrupt)»Ask
+# Codex to do anything gpt-6-astra ultra · ~/path"), with no space required
+# between the bullet and the following text either way. [^\n]* already
+# tolerates zero-or-more characters before the "(", so the only gap was the
+# glyph itself.
+TUI_PROGRESS_PATTERN = r"[•◦][^\n]*\((?:(?:\d+h\s+)?\d+m\s+)?\d+s\s*•\s*esc to interrupt\)"
 
 # Workspace trust/approval prompt shown when Codex opens a new directory.
 # Two known variants:

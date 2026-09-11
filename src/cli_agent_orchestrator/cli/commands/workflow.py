@@ -352,6 +352,10 @@ def _render_result(result):
     for step in result.get("steps", []):
         click.echo(f"  - {step['id']}: {step['state']} (attempts={step.get('attempts')})")
     _render_failure_envelope(result.get("failure_envelope"))
+    if result.get("state") == "failed" and result.get("warnings"):
+        click.echo("Diagnostics:")
+        for warning in result["warnings"]:
+            click.echo(f"  {warning}")
 
 
 def _render_failure_envelope(envelope):

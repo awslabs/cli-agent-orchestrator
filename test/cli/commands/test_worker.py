@@ -241,17 +241,52 @@ class TestStatus:
         assert payload["terminal"]["id"] == "t1"
         assert payload["last_output"] == "hi"
 
-    def test_a_booting_worker_reports_the_clients_hint(self, runner, broker):
-        broker.workers.return_value = [_lease("w1", "leased")]
+    def test_a_booting_worker_still_shows_its_inventory(self, runner, broker):
+        """The first minute of every worker's life must not read as an error."""
+        broker.workers.return_value = [_lease("w1", "creating", age_seconds=12)]
         broker.sole_terminal.side_effect = click.ClickException(
-            "Worker w1 has no terminal yet. It may still be booting; "
-            "`cao worker logs w1` shows how far it got."
+            "worker w1 did not answer: ConnectTimeout"
         )
 
         result = runner.invoke(worker, ["status", "w1"])
 
-        assert result.exit_code == 1
+        assert result.exit_code == 0
+        assert "Lease:    creating (12s)" in result.output
+        assert "not answering yet" in result.output
         assert "cao worker logs w1" in result.output
+
+    def test_the_booting_hint_is_not_printed_twice(self, runner, broker):
+        broker.sole_terminal.side_effect = click.ClickException(
+            "Worker w1 has no terminal yet. It may still be booting; "
+            "`cao worker logs w1` shows how far it got."
+        )
+        broker.workers.return_value = [_lease("w1", "leased")]
+
+        result = runner.invoke(worker, ["status", "w1"])
+
+        assert result.exit_code == 0
+        assert result.output.count("cao worker logs w1") == 1
+
+    def test_no_inventory_row_and_no_terminal_is_an_error(self, runner, broker):
+        broker.workers.return_value = []
+        broker.sole_terminal.side_effect = click.ClickException("worker zzzzzzzz has no pod")
+
+        result = runner.invoke(worker, ["status", "zzzzzzzz"])
+
+        assert result.exit_code == 1
+        assert "has no pod" in result.output
+
+    def test_json_degrades_the_same_way(self, runner, broker):
+        broker.workers.return_value = [_lease("w1", "creating")]
+        broker.sole_terminal.side_effect = click.ClickException(
+            "worker w1 did not answer: ConnectTimeout"
+        )
+
+        payload = json.loads(runner.invoke(worker, ["status", "w1", "--json"]).output)
+
+        assert payload["lease"]["state"] == "creating"
+        assert payload["terminal"] is None
+        assert "did not answer" in payload["terminal_error"]
 
 
 class TestSend:

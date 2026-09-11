@@ -30,6 +30,11 @@ def fleet():
     manifests — for EKS, `examples/cao-clusters/kubernetes/eks/deploy.sh` — and
     these commands operate one that already exists. `shutdown` is not the inverse
     of a create: it releases workers and leaves the fleet standing.
+
+    This group is the fleet as a whole. For one worker — talk to its agent, read
+    its log, release just it — see `cao worker`, which reads the same two
+    environment variables. It is a sibling rather than a subgroup because a
+    worker is addressed the same way whatever the fleet runs on.
     """
 
 

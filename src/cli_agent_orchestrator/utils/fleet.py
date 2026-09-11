@@ -68,6 +68,12 @@ class FleetClient:
         return cls(url, token)
 
     # -- broker's own routes -------------------------------------------------
+    #
+    # `requests` ships no stubs here (mypy.ini ignores its missing imports), so
+    # `.json()`, `.text` and `.iter_lines()` are all `Any`. The casts state the
+    # shape the broker's contract promises instead of letting `Any` widen a
+    # declared return type — `warn_return_any` is on, and a blanket per-module
+    # `disable_error_code` would hide the next genuine one.
 
     def workers(self) -> list[dict[str, Any]]:
         payload = self._request("GET", "/workers").json()
@@ -112,10 +118,11 @@ class FleetClient:
 
     def follow_logs(self, worker_id: str, *, tail_lines: int = 200) -> Iterator[str]:
         """Stream a worker's log. No read timeout: a quiet log is not a stalled one."""
+        params: dict[str, Any] = {"tail_lines": tail_lines, "follow": "true"}
         try:
             response = requests.get(
                 f"{self.url}/workers/{worker_id}/logs",
-                params={"tail_lines": tail_lines, "follow": "true"},
+                params=params,
                 headers=self._headers,
                 stream=True,
                 timeout=(_CONNECT_TIMEOUT, None),
@@ -141,6 +148,10 @@ class FleetClient:
         return f"/workers/{worker_id}/api/{path.lstrip('/')}"
 
     # -- worker-scoped conveniences, matching `cao session`'s routes ---------
+    #
+    # `node_get` is deliberately `-> Any`: it proxies arbitrary allowlisted JSON.
+    # Each caller below knows the one route it asked for, so it names that shape
+    # here rather than pushing `Any` out to the commands.
 
     def sessions(self, worker_id: str) -> list[dict[str, Any]]:
         return cast(list[dict[str, Any]], self.node_get(worker_id, "sessions"))
