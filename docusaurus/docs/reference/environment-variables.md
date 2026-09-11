@@ -41,6 +41,22 @@ These have schema entries but only the env var is actually honored at runtime.
 | `CAO_AUTH_ISSUER` | Issuer for RFC 9728 PRM endpoint | |
 | `CAO_AUTH_LOCAL_TOKEN` | Local bearer token for development/testing | |
 
+## Remote Fleets (Env-Var Only)
+
+These two are read directly by `utils/fleet.py` and have no schema entry, no
+`settings.json` key, and no default. They are the entire configuration of
+[`cao fleet` and `cao worker`](cli-commands.md#cao-fleet): without both, every
+subcommand exits with `No fleet configured.` rather than falling back to the
+`cao-server` on this machine.
+
+| Env Var | Purpose | Notes |
+|---------|---------|-------|
+| `CAO_ELASTIC_BROKER_URL` | Base URL of the fleet's worker broker | e.g. `http://127.0.0.1:9890` after a port-forward |
+| `CAO_ELASTIC_BROKER_TOKEN` | Shared secret sent as `X-CAO-Broker-Token` | Security-sensitive: it authorizes releasing workers and sending input to their agents, so treat it as a write credential |
+
+A supervisor pod in a CAO cluster already has both set, which is why
+`cao fleet status` needs no setup when run inside one.
+
 ## Server and Runtime
 
 | Env Var | Purpose | Default |

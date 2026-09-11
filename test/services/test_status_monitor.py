@@ -1241,3 +1241,221 @@ class TestProcessChunkBufferTruncation:
         sm_large._detect_status = lambda tid, buf: TerminalStatus.UNKNOWN
         sm_large._process_chunk("t1", payload)
         assert "MARKER" in sm_large.get_buffer("t1")
+
+
+class TestMidBurstProcessingProbe:
+    """A TUI that redraws its spinner every second never goes quiescent, so the
+    edge-only screen path saw IDLE for a whole busy turn (codex 0.153, live
+    2026-09-08). While bursting, an opted-in provider's non-mutating
+    ``probe_processing_from_screen()`` is asked at most every
+    PYTE_MIDBURST_PROBE_S, and only a True answer is applied."""
+
+    def _bursting_monitor(self, screen_lines=("• Working (3s • esc to interrupt)",)):
+        sm = StatusMonitor()
+        sm._loop = MagicMock()  # a loop exists -> edge-debounced path, not inline
+        sm._arm_quiesce_timer = lambda *a, **k: None
+        sm._cancel_quiesce_handle = lambda *a, **k: None
+        # A real pyte screen holding the frame, so a probe reads it through the
+        # same render path production uses rather than a stubbed accessor.
+        with sm._lock:
+            sm._feed_screen_locked("t1", "\r\n".join(screen_lines))
+        sm._last_status["t1"] = TerminalStatus.IDLE
+        sm._allow_processing_revert["t1"] = True
+        return sm
+
+    def _probing_provider(self, answers):
+        provider = MagicMock()
+        provider.supports_screen_detection = True
+        provider.supports_midburst_processing_probe = True
+        provider.probe_processing_from_screen.side_effect = list(answers)
+        return provider
+
+    def test_processing_seen_mid_burst_is_applied(self):
+        sm = self._bursting_monitor()
+        provider = self._probing_provider([True])
+        sm._detect_screen = lambda tid, prov: TerminalStatus.IDLE  # rising edge: old ready box
+
+        sm._schedule_screen_detection("t1", provider)
+        assert sm._last_status["t1"] == TerminalStatus.IDLE
+        sm._schedule_screen_detection("t1", provider)  # mid-burst probe: spinner visible
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+
+    def test_probe_is_rate_limited_and_never_applies_ready(self):
+        sm = self._bursting_monitor()
+        # False == "this half-drawn frame does not show work", e.g. a frame
+        # caught mid-repaint that still parses as the previous response box.
+        provider = self._probing_provider([False, False])
+        sm._detect_screen = lambda tid, prov: TerminalStatus.IDLE
+
+        sm._schedule_screen_detection("t1", provider)  # rising edge
+        sm._schedule_screen_detection("t1", provider)  # first mid-burst probe
+        sm._schedule_screen_detection("t1", provider)  # within the window: no probe
+        assert provider.probe_processing_from_screen.call_count == 1
+        assert sm._last_status["t1"] == TerminalStatus.IDLE
+
+    def test_no_probe_once_processing(self):
+        sm = self._bursting_monitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        provider = self._probing_provider([True])
+        sm._bursting["t1"] = True
+        sm._schedule_screen_detection("t1", provider)
+        assert provider.probe_processing_from_screen.call_count == 0
+
+    def test_provider_without_opt_in_is_never_probed(self):
+        """Fail closed, like supports_screen_detection and
+        supports_direct_status_probe: no flag, no mid-burst probe."""
+        sm = self._bursting_monitor()
+        provider = MagicMock()
+        provider.supports_screen_detection = True
+        provider.supports_midburst_processing_probe = False
+        detector_calls = []
+        sm._detect_screen = lambda tid, prov: detector_calls.append(tid) or TerminalStatus.IDLE
+
+        sm._bursting["t1"] = True
+        sm._schedule_screen_detection("t1", provider)
+        assert provider.probe_processing_from_screen.call_count == 0
+        assert detector_calls == []  # and the full detector is not run either
+        assert sm._last_status["t1"] == TerminalStatus.IDLE
+
+    def test_mid_burst_probe_leaves_a_stateful_provider_untouched(self):
+        """A discarded verdict does not undo what a detector did to reach it.
+
+        minimax_code opts into screen detection and commits turn bookkeeping
+        inside get_status (``_last_completion_identity`` /
+        ``_last_completion_buffer_epoch``, clearing ``_awaiting_turn``). Running
+        it against a mid-redraw frame — here turn A's retained response with its
+        user row momentarily erased, which changes the completion fingerprint —
+        makes that frame look like a NEW completion. Even with the COMPLETED
+        verdict thrown away, the bookkeeping would stick and the next settled
+        frame would report turn B complete on turn A's output. minimax does not
+        set supports_midburst_processing_probe, so the probe never asks it.
+        """
+        from pathlib import Path
+
+        from cli_agent_orchestrator.providers.minimax_code import MiniMaxCodeProvider
+
+        fixture = (
+            Path(__file__).resolve().parents[1]
+            / "providers"
+            / "fixtures"
+            / "minimax_code_completed.txt"
+        ).read_text(encoding="utf-8")
+        provider = MiniMaxCodeProvider(
+            terminal_id="t1", session_name="s", window_name="w", agent_profile=None
+        )
+        assert provider.get_status(fixture) == TerminalStatus.IDLE  # turn A settles
+        provider.notify_status_buffer_reset(1)
+        provider.mark_input_received()  # turn B armed
+        provider._last_dispatch_time = 0
+        assert provider._awaiting_turn is True
+
+        mid_redraw = [line for line in fixture.splitlines() if not line.startswith("› Explain")]
+        sm = self._bursting_monitor(screen_lines=mid_redraw)
+        before = dict(vars(provider))
+
+        sm._bursting["t1"] = True
+        sm._schedule_screen_detection("t1", provider)
+
+        assert vars(provider) == before
+        assert provider._awaiting_turn is True
+        # The settled frame still reads IDLE: turn B is still pending, which is
+        # the base behavior. (Feeding the same mid-redraw frame to the detector
+        # would have returned COMPLETED and cleared _awaiting_turn.)
+        assert provider.get_status_from_screen(fixture.splitlines()) == TerminalStatus.IDLE
+        assert provider._awaiting_turn is True
+
+    def test_codex_spinner_frame_probes_processing_without_mutating(self):
+        """The regression this fix exists for, through the real provider."""
+        from cli_agent_orchestrator.providers.codex import CodexProvider
+
+        provider = CodexProvider(
+            terminal_id="t1", session_name="s", window_name="w", agent_profile=None
+        )
+        assert provider.supports_midburst_processing_probe is True
+        working = [
+            "› Improve documentation in @filename",
+            "• Working (3s • esc to interrupt)",
+            "",
+            "  gpt-5.6-terra high · /tmp/project",
+        ]
+        before = dict(vars(provider))
+        assert provider.probe_processing_from_screen(working) is True
+        assert vars(provider) == before  # the predicate is an observation only
+
+        idle = [
+            "› Improve documentation in @filename",
+            "",
+            "  gpt-5.6-terra high · /tmp/project",
+        ]
+        assert provider.probe_processing_from_screen(idle) is False
+
+        sm = self._bursting_monitor(screen_lines=working)
+        sm._bursting["t1"] = True
+        sm._schedule_screen_detection("t1", provider)
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+
+    def test_erased_composer_is_not_work_evidence_and_the_real_spinner_still_lands(self):
+        """A partial redraw must not spend the dispatch arm.
+
+        `CodexProvider.get_status` answers PROCESSING for two different reasons:
+        a detected spinner, and a catch-all for a frame with no idle composer at
+        the bottom. The second is right for settled detection and wrong for a
+        mid-burst probe: erasing the composer while the previous response is
+        still on screen carries no evidence of new work. Taken as busy it
+        consumes the arm `notify_input_sent` set, the restored old completion
+        then latches, and the genuine spinner that follows is refused by the
+        sticky-ready rule — the terminal reads COMPLETED for the whole new turn.
+        """
+        from cli_agent_orchestrator.providers.codex import CodexProvider
+
+        provider = CodexProvider(
+            terminal_id="t1", session_name="s", window_name="w", agent_profile=None
+        )
+        old_response = [
+            "› Explain the result",
+            "• The integration is complete.",
+            "",
+            "  gpt-5.6-terra high · /tmp/project",
+        ]
+        erased_composer = ["• The integration is complete."]
+        real_spinner = [
+            "› Explain the result",
+            "• Working (3s • esc to interrupt)",
+            "",
+            "  gpt-5.6-terra high · /tmp/project",
+        ]
+
+        # The frame with no composer and no spinner is exactly the one the full
+        # detector calls PROCESSING through its fallback.
+        assert provider.get_status_from_screen(erased_composer) == TerminalStatus.PROCESSING
+        assert provider.probe_processing_from_screen(erased_composer) is False
+
+        sm = self._bursting_monitor(screen_lines=erased_composer)
+        sm._last_status["t1"] = TerminalStatus.COMPLETED  # previous turn
+        sm.notify_input_sent("t1")  # new turn dispatched: arm the transition
+        sm._bursting["t1"] = True
+
+        sm._schedule_screen_detection("t1", provider)  # probe the erased frame
+        assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+        assert sm._allow_processing_revert["t1"] is True  # the arm survives
+
+        # The old completion is redrawn and settles; still armed, still COMPLETED.
+        with sm._lock:
+            sm._screens.pop("t1", None)
+            sm._feed_screen_locked("t1", "\r\n".join(old_response))
+        # Quiescence with no event loop detects inline, the same call
+        # _on_screen_quiescent makes on its worker thread.
+        sm._loop = None
+        sm._on_screen_quiescent("t1", provider)
+        sm._loop = MagicMock()
+        assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+        assert sm._allow_processing_revert["t1"] is True
+
+        # The genuine spinner appears mid-burst and must be honoured.
+        with sm._lock:
+            sm._screens.pop("t1", None)
+            sm._feed_screen_locked("t1", "\r\n".join(real_spinner))
+            sm._midburst_probe_at.pop("t1", None)
+        sm._bursting["t1"] = True
+        sm._schedule_screen_detection("t1", provider)
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING

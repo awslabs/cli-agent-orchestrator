@@ -309,7 +309,7 @@ A number of other `CAO_*` variables (runtime/process-identity vars like `CAO_TER
 |---|---|---|---|
 | `CAO_HOME_DIR` | `~/.aws/cli-agent-orchestrator` | str (path) | Base directory for all CAO state. See [Data directory](#data-directory-cao_home_dir) above. |
 
-The pipe-pane liveness watchdog (issue #388, `services/fifo_reader.py`) adds six more of these ad-hoc vars, read directly via `_env_int`/`_env_float` in `constants.py` rather than through `ConfigService` — they have no `settings.json` mapping like the rows in the table above:
+Rendered-screen status detection adds `CAO_PYTE_STATUS` (default `true`) and `CAO_PYTE_MIDBURST_PROBE_S` (default `1.0`, the minimum interval between mid-burst PROCESSING probes; see [Event-Driven Architecture](event-driven-architecture.md#status-monitor-servicesstatus_monitorpy--publisher--consumer)), both read in `constants.py`. The pipe-pane liveness watchdog (issue #388, `services/fifo_reader.py`) adds six more of these ad-hoc vars, read directly via `_env_int`/`_env_float` in `constants.py` rather than through `ConfigService` — they have no `settings.json` mapping like the rows in the table above:
 
 | Env var | Default | Type | Purpose |
 |---|---|---|---|
@@ -319,6 +319,13 @@ The pipe-pane liveness watchdog (issue #388, `services/fifo_reader.py`) adds six
 | `CAO_PIPE_LIVENESS_MAX_REARM_FAILURES` | `5` | int | Consecutive failed re-arm attempts before the watchdog gives up on a terminal. |
 | `CAO_PIPE_LIVENESS_COLD_START_GRACE_S` | `3.0` | float | Grace period after a terminal is registered before a FIFO that has never delivered a single byte is treated as a cold-start stall (harness-control#93) instead of "still booting". |
 | `CAO_PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS` | `5` | int | Consecutive cold-start re-arm attempts (rearm() succeeded but the pipe still never delivered) before the watchdog gives up on a terminal — a separate failure class and counter from `CAO_PIPE_LIVENESS_MAX_REARM_FAILURES`, which only counts rearm() raising. |
+
+The `cao fleet` / `cao worker` commands ([control planes](control-planes.md#remote-fleets)) add two more, read directly in `utils/fleet.py`. They are the only configuration those commands take, and neither has a default: without both, every leaf exits with `No fleet configured.` rather than falling back to the local server.
+
+| Env var | Default | Type | Purpose |
+|---|---|---|---|
+| `CAO_ELASTIC_BROKER_URL` | *(none)* | str (URL) | Base URL of the fleet's worker broker, e.g. `http://127.0.0.1:9890` after a port-forward. |
+| `CAO_ELASTIC_BROKER_TOKEN` | *(none)* | str | Shared secret sent as `X-CAO-Broker-Token`. It authorizes releasing workers and sending input to their agents, so treat it as a write credential. |
 
 ## API Endpoints
 

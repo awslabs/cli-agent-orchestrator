@@ -12,6 +12,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from cli_agent_orchestrator.constants import (
     CAO_PYTE_STATUS,
+    PYTE_MIDBURST_PROBE_S,
     PYTE_QUIESCENCE_DELAY_S,
     PYTE_SCREEN_COLS,
     PYTE_SCREEN_ROWS,
@@ -125,6 +126,9 @@ class StatusMonitor:
         # IDLE/COMPLETED would freeze the terminal forever even when the
         # agent is genuinely processing new work.
         self._allow_processing_revert: Dict[str, bool] = {}
+        # Per-terminal monotonic timestamp of the last mid-burst PROCESSING probe
+        # (PYTE_MIDBURST_PROBE_S rate limit); absent until the first probe.
+        self._midburst_probe_at: Dict[str, float] = {}
         # Per-terminal monotonic timestamp of the last stale-PROCESSING capture-pane
         # attempt — the STALE_PROCESSING_CAPTURE_INTERVAL_S rate limit. Absence is None,
         # deliberately NOT 0.0: time.monotonic()'s reference point is arbitrary, so a 0.0
@@ -370,24 +374,34 @@ class StatusMonitor:
             self._screens[terminal_id] = scr
         scr[1].feed(chunk)
 
-    def _detect_screen(self, terminal_id: str, provider) -> TerminalStatus:
-        """Detect status from the terminal's composited pyte screen."""
-        fallback_buffer: Optional[str] = None
+    def _screen_lines(self, terminal_id: str) -> Tuple[Optional[List[str]], str]:
+        """Render the terminal's composited pyte screen under the lock.
+
+        Returns ``(lines, buffer)``. ``lines`` is None when the render itself
+        failed — distinct from an empty list (no screen yet, or a blank one), so
+        a caller can take the raw-buffer fallback only for a real failure.
+        """
         with self._lock:
             scr = self._screens.get(terminal_id)
             buffer = self._buffers.get(terminal_id, "")
             try:
-                lines: List[str] = list(scr[0].display) if scr is not None else []
+                return (list(scr[0].display) if scr is not None else []), buffer
             except Exception:
                 # pyte can transiently hold zero-length cell data while rendering
-                # complex TUI redraws. Fall back to raw-buffer detection instead of
-                # letting the quiescence callback tear down status monitoring.
+                # complex TUI redraws. Report the failure so status detection can
+                # fall back to the raw buffer instead of letting the quiescence
+                # callback tear down status monitoring.
                 logger.exception(
                     "Error rendering screen status for %s; falling back to raw buffer",
                     terminal_id,
                 )
-                fallback_buffer = buffer
-                lines = []
+                return None, buffer
+
+    def _detect_screen(self, terminal_id: str, provider) -> TerminalStatus:
+        """Detect status from the terminal's composited pyte screen."""
+        rendered, buffer = self._screen_lines(terminal_id)
+        fallback_buffer: Optional[str] = None if rendered is not None else buffer
+        lines: List[str] = rendered or []
         if fallback_buffer is not None:
             if provider is None:
                 return TerminalStatus.UNKNOWN
@@ -431,8 +445,59 @@ class StatusMonitor:
 
         if not was_bursting:
             self._apply_detection(terminal_id, self._detect_screen(terminal_id, provider))
+        else:
+            self._midburst_processing_probe(terminal_id, provider)
 
         self._arm_quiesce_timer(loop, terminal_id, self._on_screen_quiescent, provider)
+
+    def _midburst_processing_probe(self, terminal_id: str, provider) -> None:
+        """Catch a busy turn whose TUI never goes quiet.
+
+        A spinner redrawn every second keeps the terminal bursting for the whole
+        turn, so neither edge fires while the agent works and the rising-edge
+        frame (composited before the spinner drew) leaves a ready status latched.
+        While bursting and not yet PROCESSING, probe the rendered screen at most
+        every PYTE_MIDBURST_PROBE_S and apply ONLY a PROCESSING verdict: a
+        half-drawn frame can plausibly show a spinner, but it can also show a
+        stale ready box, so ready statuses still wait for quiescence.
+
+        The probe asks ``provider.probe_processing_from_screen()``, a pure
+        predicate, NOT the full detector: ignoring a detector's verdict does not
+        undo what the detector did to reach it. minimax_code's get_status()
+        commits ``_last_completion_identity``/``_last_completion_buffer_epoch``
+        and clears ``_awaiting_turn`` before returning COMPLETED, and grok_cli's
+        sets ``_turn_activity_seen`` — run against a mid-redraw frame whose
+        verdict is then dropped, that bookkeeping still lands, and a completion
+        waiter can finish the next turn on stale output. So the probe is
+        restricted to providers that opt in with
+        ``supports_midburst_processing_probe`` and promise a side-effect-free
+        predicate; everyone else keeps edge-only detection.
+        """
+        if provider is None or not getattr(provider, "supports_midburst_processing_probe", False):
+            return
+
+        now = time.monotonic()
+        with self._lock:
+            if self._last_status.get(terminal_id) == TerminalStatus.PROCESSING:
+                return
+            last_probe = self._midburst_probe_at.get(terminal_id)
+            if last_probe is not None and now - last_probe < PYTE_MIDBURST_PROBE_S:
+                return
+            self._midburst_probe_at[terminal_id] = now
+
+        lines, _ = self._screen_lines(terminal_id)
+        if not lines:
+            # Render failed or the screen is empty: no evidence, no verdict. The
+            # raw-buffer fallback _detect_screen uses is deliberately NOT taken
+            # here — it would run a full detector for a probe.
+            return
+        try:
+            busy = provider.probe_processing_from_screen(lines)
+        except Exception:
+            logger.exception("Error probing mid-burst status for %s", terminal_id)
+            return
+        if busy:
+            self._apply_detection(terminal_id, TerminalStatus.PROCESSING)
 
     def _on_screen_quiescent(self, terminal_id: str, provider) -> None:
         """Quiescence timer fired: output stopped, so the screen has settled.
@@ -686,6 +751,7 @@ class StatusMonitor:
             self._allow_processing_revert.pop(terminal_id, None)
             self._status_generations.pop(terminal_id, None)
             self._pre_write_generations.pop(terminal_id, None)
+            self._midburst_probe_at.pop(terminal_id, None)
             self._screens.pop(terminal_id, None)
             self._bursting.pop(terminal_id, None)
             self._last_stale_capture_check.pop(terminal_id, None)
@@ -711,6 +777,7 @@ class StatusMonitor:
             self._allow_processing_revert.pop(terminal_id, None)
             self._status_generations.pop(terminal_id, None)
             self._pre_write_generations.pop(terminal_id, None)
+            self._midburst_probe_at.pop(terminal_id, None)
             # Drop the rendered screen too so the relaunched CLI mode is
             # detected against a fresh viewport, not the failed attempt's.
             self._screens.pop(terminal_id, None)

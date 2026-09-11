@@ -1025,6 +1025,9 @@ def _migrate_workflow_run() -> None:
     This column is NOT indexed (ADR-583-12: re-approval compares a ``plan_id``
     read out of the envelope and no query filters on it). Writing and reading it
     belong to the ``manifest-freeze`` unit, not to this migrator.
+
+    Issue #753 additively appends nullable ``error`` for the redacted, bounded
+    script-level failure diagnostic. Existing and non-script rows remain NULL.
     """
     import sqlite3
 
@@ -1058,6 +1061,9 @@ def _migrate_workflow_run() -> None:
             if "manifest_json" not in columns:
                 conn.execute("ALTER TABLE workflow_run ADD COLUMN manifest_json TEXT DEFAULT NULL")
                 logger.info("Migration: added manifest_json column to workflow_run")
+            if "error" not in columns:
+                conn.execute("ALTER TABLE workflow_run ADD COLUMN error TEXT DEFAULT NULL")
+                logger.info("Migration: added error column to workflow_run")
     except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug (B4-RD-4)
         logger.debug(f"workflow_run migration skipped: {e}")
 

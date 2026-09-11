@@ -54,9 +54,15 @@ portable and make profile listings useful.
 - `mcpServers` (object): MCP server definitions. Each entry defines either
   `command` (with optional `args`, `env`, `timeout`) for a server CAO launches,
   or `url` for a remote one, with `type` naming its transport (for example
-  `http` or `sse`). An entry defining neither is invalid.
+  `http` or `sse`). An entry defining neither is invalid. For a worked example
+  of a remote-URL MCP server, see
+  [examples/youcom-search](../examples/youcom-search/README.md).
 - `tools` (array), `toolAliases` (object), and `toolsSettings` (object):
-  provider tool configuration.
+  provider tool configuration. `tools` is the provider's own tool catalog and
+  is passed through to it; it is not the CAO allowlist and does not restrict
+  what an agent may call. Use `allowedTools` or `role` for that, including for
+  CAO's own MCP tools, which are granted by the `@cao-mcp-server` selector.
+  See [Tool Restrictions](tool-restrictions.md).
 - `resources` (array), `hooks` (object), and `useLegacyMcpJson` (boolean):
   provider-native configuration passed through where supported.
 - `model` (string): provider model selection.

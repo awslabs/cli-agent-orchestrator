@@ -365,6 +365,8 @@ class LintFinding(BaseModel):
         "missing-recovery-policy",
         "unverifiable-recovery-policy",
         "unenforced-recovery-policy",
+        # issue #753 — literal script step ids rejected by the run-step route.
+        "invalid-step-id",
     ]
     severity: Literal["error", "warning"]
     line: int
