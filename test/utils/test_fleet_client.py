@@ -25,8 +25,6 @@ is the module's design claim -- four HTTP routes and one token -- so stubbing
 """
 
 import json
-import re
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import click
@@ -38,7 +36,7 @@ from cli_agent_orchestrator.constants import (
     ELASTIC_BROKER_TOKEN_HEADER,
     ELASTIC_BROKER_URL_ENV,
 )
-from cli_agent_orchestrator.utils.fleet import LIVE_STATES, FleetClient
+from cli_agent_orchestrator.utils.fleet import FleetClient
 
 
 @pytest.fixture(autouse=True)
@@ -164,6 +162,16 @@ class TestTransport:
         assert request.call_args.args[1].endswith("/workers/w1/logs")
         assert request.call_args.kwargs["params"] == {"tail_lines": 6}
 
+    def test_workers_rejects_a_lease_only_broker_response(self, client):
+        with patch(
+            "cli_agent_orchestrator.utils.fleet.requests.request",
+            return_value=_response(payload=[{"worker_id": "w1", "state": "leased"}]),
+        ):
+            with pytest.raises(click.ClickException) as exc:
+                client.workers()
+
+        assert "authoritative worker inventory" in exc.value.format_message()
+
 
 class TestRelease:
     def test_a_404_counts_as_released(self, client):
@@ -177,9 +185,22 @@ class TestRelease:
     def test_success_returns_true(self, client):
         with patch(
             "cli_agent_orchestrator.utils.fleet.requests.request",
-            return_value=_response(status=200, payload={"released": True}),
+            return_value=_response(
+                status=200,
+                payload={"released": True, "workload_present": False},
+            ),
         ):
             assert client.release("w1") is True
+
+    def test_success_without_absence_confirmation_fails_closed(self, client):
+        with patch(
+            "cli_agent_orchestrator.utils.fleet.requests.request",
+            return_value=_response(status=200, payload={"released": True}),
+        ):
+            with pytest.raises(click.ClickException) as exc:
+                client.release("w1")
+
+        assert "did not confirm" in exc.value.format_message()
 
     def test_any_other_error_still_raises(self, client):
         with patch(
@@ -378,38 +399,3 @@ class TestFollowLogs:
                 client.follow_logs("w1")
 
         assert "no such worker" in exc.value.format_message()
-
-
-class TestLiveStatesMatchTheBroker:
-    """A cross-boundary guard, in the spirit of the Click/Rust catalog check.
-
-    `LIVE_STATES` decides which rows `cao worker list` shows and which workers
-    `cao fleet shutdown` tries to release. The broker has its own copy in
-    `_LIVE_LEASE_STATES` and the docstring says they are kept in sync -- but
-    nothing kept them. Drift is silent in the direction that matters: add a
-    live state on the broker and `shutdown` quietly leaves those workers
-    running, holding a node's worth of memory, with no error anywhere.
-    """
-
-    BROKER = (
-        Path(__file__).resolve().parents[2]
-        / "examples"
-        / "cao-clusters"
-        / "kubernetes"
-        / "eks"
-        / "broker.py"
-    )
-
-    def test_the_broker_source_is_where_this_guard_thinks_it_is(self):
-        assert self.BROKER.is_file(), f"broker moved; update this guard: {self.BROKER}"
-
-    def test_the_two_sets_are_identical(self):
-        match = re.search(
-            r"^_LIVE_LEASE_STATES\s*=\s*frozenset\(\{([^}]*)\}\)",
-            self.BROKER.read_text(),
-            re.MULTILINE,
-        )
-        assert match, "could not find _LIVE_LEASE_STATES in the broker"
-        broker_states = set(re.findall(r'"([^"]+)"', match.group(1)))
-
-        assert broker_states == set(LIVE_STATES)

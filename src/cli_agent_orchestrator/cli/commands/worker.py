@@ -16,7 +16,7 @@ import time
 
 import click
 
-from cli_agent_orchestrator.utils.fleet import LIVE_STATES, FleetClient
+from cli_agent_orchestrator.utils.fleet import FleetClient
 from cli_agent_orchestrator.utils.terminal import poll_until_done
 
 # Default poll timeout for a sync send, matching `cao session send`. A worker is
@@ -25,7 +25,7 @@ _DEFAULT_SEND_TIMEOUT = 300
 
 
 def _rows(workers, *, live_only):
-    return [w for w in workers if not live_only or w.get("state") in LIVE_STATES]
+    return [w for w in workers if not live_only or w.get("workload_present") is True]
 
 
 def _print_table(workers):
@@ -81,7 +81,7 @@ def status(worker_id, as_json):
     lease = next((w for w in client.workers() if w.get("worker_id") == worker_id), None)
     terminal = None
     last_output = None
-    if lease is None or lease.get("state") in LIVE_STATES:
+    if lease is None or lease.get("workload_present") is True:
         terminal = client.sole_terminal(worker_id)
         terminal = client.terminal(worker_id, terminal["id"])
         last_output = client.terminal_output(worker_id, terminal["id"])

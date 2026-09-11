@@ -67,6 +67,9 @@ def _lease(worker_id, state, **extra):
         "agent_profile": "developer",
         "provider": "claude_code",
         "age_seconds": 30,
+        "workload_present": state in {"creating", "leased"},
+        "cleanup_pending": False,
+        "lease_tracked": True,
     }
     lease.update(extra)
     return lease
@@ -109,6 +112,21 @@ class TestList:
         assert "dead1" in result.output
         assert "no completion within 900s" in result.output
         assert "1128s" in result.output
+
+    def test_default_list_includes_a_settled_workload_awaiting_cleanup(self, runner, broker):
+        broker.workers.return_value = [
+            _lease(
+                "stuck1",
+                "completed",
+                workload_present=True,
+                cleanup_pending=True,
+            )
+        ]
+
+        result = runner.invoke(worker, ["list"])
+
+        assert result.exit_code == 0
+        assert "stuck1" in result.output
 
     def test_the_table_has_a_reason_column_header(self, runner, broker):
         broker.workers.return_value = [_lease("live1", "leased")]

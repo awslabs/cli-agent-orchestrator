@@ -28,6 +28,7 @@ file for what is on that list and why.
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import json
 import logging
@@ -44,7 +45,7 @@ import requests
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response, StreamingResponse
-from kubernetes import client, config, watch
+from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 from pydantic import BaseModel, Field
 
@@ -202,6 +203,9 @@ class WorkerStatus(BaseModel):
     agent_profile: Optional[str] = None
     provider: Optional[str] = None
     age_seconds: int
+    workload_present: bool
+    cleanup_pending: bool
+    lease_tracked: bool
 
 
 class TerminalEndedRequest(BaseModel):
@@ -664,9 +668,10 @@ def _release(worker_id: str) -> None:
     # verdict via _release_and_settle -- so withdrawing here covers all of them.
     _update_fleet_config(worker_id, publish=False)
     try:
-        # Foreground, so this returns only once the ReplicaSet and the pod are
-        # gone too. Background would let the lease settle while a worker pod is
-        # still holding a node's worth of memory.
+        # Foreground orders dependent deletion, but the Kubernetes delete call
+        # still returns before the Deployment necessarily disappears. The
+        # explicit absence check below is what makes a successful release mean
+        # the workload is actually gone.
         apps_api.delete_namespaced_deployment(
             name,
             NAMESPACE,
@@ -675,6 +680,17 @@ def _release(worker_id: str) -> None:
     except ApiException as exc:
         if exc.status != 404:
             raise
+    deadline = time.monotonic() + 15.0
+    while True:
+        try:
+            apps_api.read_namespaced_deployment(name, NAMESPACE)
+        except ApiException as exc:
+            if exc.status == 404:
+                break
+            raise
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"worker {worker_id} Deployment was not deleted within 15s")
+        time.sleep(0.1)
     # Belt and braces alongside the ownerReference: an explicit release should
     # not wait on garbage collection.
     try:
@@ -851,26 +867,22 @@ def _reap_once() -> None:
                 )
             continue
 
-        if not pod_observed:
-            with _leases_lock:
-                lease = _leases.get(worker_id)
-                if lease is not None and lease["pod_observed_at"] is None:
-                    lease["pod_observed_at"] = now
-                    # Remembered so a REPLACEMENT pod can be told from the
-                    # original. A replacement has a fresh emptyDir, so its
-                    # cao-server has no profile store, no session and no agent.
-                    lease["pod_uid"] = pods[0].metadata.uid
-
         # A ReplicaSet replacing the pod, or the kubelet restarting the container
         # in place. Either way the tmux window and the agent inside it are gone,
         # so the lease can never be completed and holding it open only delays the
         # caller's error by COMPLETION_TIMEOUT.
         #
-        # Membership rather than pods[0]: during a replacement the selector
+        # Identity rather than pods[0]: during a replacement the selector
         # matches both the terminating pod and the new one, in no fixed order.
+        pod = None
         if known_pod_uid is not None:
-            live_uids = {p.metadata.uid for p in pods if p.metadata and p.metadata.uid}
-            if known_pod_uid not in live_uids:
+            matching = [
+                candidate
+                for candidate in pods
+                if candidate.metadata is not None
+                and candidate.metadata.uid == known_pod_uid
+            ]
+            if not matching:
                 _release_and_settle(
                     worker_id,
                     "terminated",
@@ -879,9 +891,30 @@ def _reap_once() -> None:
                 )
                 log.warning("worker %s: pod replaced while leased, released", worker_id)
                 continue
+            pod = matching[0]
+        elif len(pods) != 1:
+            _release_and_settle(
+                worker_id,
+                "terminated",
+                f"worker has {len(pods)} candidate pods before its leased pod identity "
+                "was recorded; refusing to choose a replacement runtime",
+            )
+            log.warning("worker %s: ambiguous pod identity while leased, released", worker_id)
+            continue
+        else:
+            pod = pods[0]
+            pod_uid = pod.metadata.uid if pod.metadata else None
+            with _leases_lock:
+                lease = _leases.get(worker_id)
+                if lease is not None and lease["pod_observed_at"] is None:
+                    lease["pod_observed_at"] = now
+                    # Remembered so a REPLACEMENT pod can be told from the
+                    # original. A replacement has a fresh emptyDir, so its
+                    # cao-server has no profile store, no session and no agent.
+                    lease["pod_uid"] = pod_uid
 
         restarts = sum(
-            (cs.restart_count or 0) for cs in (pods[0].status.container_statuses or [])
+            (cs.restart_count or 0) for cs in (pod.status.container_statuses or [])
         )
         if restarts:
             _release_and_settle(
@@ -893,7 +926,7 @@ def _reap_once() -> None:
             log.warning("worker %s: container restarted while leased, released", worker_id)
             continue
 
-        phase = pods[0].status.phase
+        phase = pod.status.phase
         if phase in {"Failed", "Succeeded"}:
             _release_and_settle(
                 worker_id,
@@ -911,7 +944,7 @@ def _reap_once() -> None:
         # keeps the deadline one-way: a worker that goes NotReady later is a
         # completion problem, and COMPLETION_TIMEOUT owns it.
         if not ever_ready:
-            if _pod_ready(pods[0]):
+            if _pod_ready(pod):
                 with _leases_lock:
                     lease = _leases.get(worker_id)
                     if lease is not None and lease["ready_at"] is None:
@@ -1133,27 +1166,76 @@ def gateway_memory_context(
 def list_workers(
     x_cao_broker_token: Optional[str] = Header(default=None),
 ) -> list[WorkerStatus]:
-    """Lease ledger, including settled leases and why they settled.
+    """Authoritative workload inventory reconciled with the lease ledger.
 
-    This is the endpoint to read after a delegation that claimed success and
-    produced nothing: a `terminated` entry names the turn-detection race, where
-    the supervisor's own transcript shows only a clean success.
+    Workloads live in Kubernetes while leases live in this process. Returning
+    either source alone creates false empty fleets after a broker restart and
+    hides cleanup failures after a lease settles. A successful response means
+    the Deployment inventory was read; an API failure is reported as 503 rather
+    than as an empty fleet.
     """
     _require_broker_token(x_cao_broker_token)
-    now = time.monotonic()
+    try:
+        deployments = apps_api.list_namespaced_deployment(
+            NAMESPACE,
+            label_selector="app.kubernetes.io/name=cao-elastic-worker",
+        ).items
+    except ApiException as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"could not read worker inventory: {exc.reason}",
+        ) from exc
+
+    workloads: dict[str, client.V1Deployment] = {}
+    for workload in deployments:
+        metadata = workload.metadata
+        worker_id = (metadata.labels or {}).get("cao.aws/worker-id") if metadata else None
+        if worker_id:
+            workloads[worker_id] = workload
+
+    monotonic_now = time.monotonic()
+    wall_now = datetime.now(timezone.utc)
     with _leases_lock:
-        snapshot = [(wid, dict(lease)) for wid, lease in _leases.items()]
-    return [
-        WorkerStatus(
-            worker_id=wid,
-            state=lease["state"],
-            reason=lease["reason"],
-            agent_profile=lease["agent_profile"],
-            provider=lease["provider"],
-            age_seconds=int(now - lease["leased_at"]),
+        leases = {worker_id: dict(lease) for worker_id, lease in _leases.items()}
+
+    rows: list[WorkerStatus] = []
+    for worker_id in sorted(set(leases) | set(workloads)):
+        lease = leases.get(worker_id)
+        workload = workloads.get(worker_id)
+        workload_present = workload is not None
+        if lease is not None:
+            state = lease["state"]
+            reason = lease["reason"]
+            agent_profile = lease["agent_profile"]
+            provider = lease["provider"]
+            age_seconds = int(monotonic_now - lease["leased_at"])
+        else:
+            metadata = workload.metadata if workload else None
+            annotations = (metadata.annotations or {}) if metadata else {}
+            created = metadata.creation_timestamp if metadata else None
+            state = "untracked"
+            reason = "workload exists but this broker has no lease record"
+            agent_profile = annotations.get(_AGENT_PROFILE_ANNOTATION)
+            provider = annotations.get(_PROVIDER_ANNOTATION)
+            age_seconds = int((wall_now - created).total_seconds()) if created else 0
+        rows.append(
+            WorkerStatus(
+                worker_id=worker_id,
+                state=state,
+                reason=reason,
+                agent_profile=agent_profile,
+                provider=provider,
+                age_seconds=max(0, age_seconds),
+                workload_present=workload_present,
+                cleanup_pending=(
+                    workload_present
+                    and lease is not None
+                    and lease["state"] not in _LIVE_LEASE_STATES
+                ),
+                lease_tracked=lease is not None,
+            )
         )
-        for wid, lease in sorted(snapshot, key=lambda item: item[1]["leased_at"])
-    ]
+    return rows
 
 
 @app.post("/workers", response_model=WorkerLease)
@@ -1234,9 +1316,18 @@ def delete_worker(
     x_cao_broker_token: Optional[str] = Header(default=None),
 ) -> dict[str, bool]:
     _require_broker_token(x_cao_broker_token)
+    _require_worker_id(worker_id)
+    # Settle BEFORE deleting, like _release_and_settle does. The deletion below
+    # takes seconds, and in that window the reaper watches the same pod vanish;
+    # settling after would let it win the race and record a deliberate operator
+    # release as `terminated` - and _settle is first-writer-wins, so the wrong
+    # verdict would stick. Settling first cannot lose the workload either way:
+    # if _release then fails, /workers reports the survivor as cleanup_pending
+    # and this DELETE is the retry path. On a retry of an already-settled lease
+    # the _settle call is a no-op, preserving the original verdict.
     _settle(worker_id, "released", "released by caller")
     _release(worker_id)
-    return {"released": True}
+    return {"released": True, "workload_present": False}
 
 
 @app.post("/workers/{worker_id}/complete")
@@ -1358,6 +1449,7 @@ _DROP_RESPONSE_HEADERS = frozenset(
 # of a cap is that `cao worker logs` cannot be turned into a way to pull an
 # arbitrary amount of an agent's transcript through the broker in one call.
 _LOG_TAIL_MAX = 2000
+_LOG_FOLLOW_CONNECT_TIMEOUT = 5.0
 
 
 def _worker_api_target(worker_id: str) -> tuple[str, str]:
@@ -1395,21 +1487,14 @@ def _worker_api_target(worker_id: str) -> tuple[str, str]:
     return f"http://{ip}:{_WORKER_API_PORT}", host
 
 
-def _require_leased_worker(worker_id: str) -> None:
-    """Refuse to dial a worker the ledger knows is gone, and say why it is gone.
-
-    Without this, a request to a released worker fails on DNS and surfaces as a
-    502 - which reads as a broken cluster rather than a finished task. The lease
-    ledger already knows better, and its `reason` is the useful half of the
-    answer.
-
-    An unrecognised worker_id is deliberately NOT refused. Leases live in this
-    process's memory while workloads live in the API server, so after a broker
-    restart every surviving worker is unknown here and every one of them is still
-    perfectly reachable.
-    """
+def _require_worker_id(worker_id: str) -> None:
     if not re.fullmatch(r"[a-f0-9]{8}", worker_id):
         raise HTTPException(status_code=404, detail="worker not found")
+
+
+def _require_live_lease_for_write(worker_id: str) -> None:
+    """Refuse writes to a worker whose task has already settled."""
+    _require_worker_id(worker_id)
     with _leases_lock:
         lease = _leases.get(worker_id)
         state = lease["state"] if lease else None
@@ -1479,7 +1564,9 @@ async def worker_api(
     worker that failed instead of tearing down a response already in flight.
     """
     _require_broker_token(x_cao_broker_token)
-    _require_leased_worker(worker_id)
+    _require_worker_id(worker_id)
+    if request.method.upper() != "GET":
+        _require_live_lease_for_write(worker_id)
     if ".." in path.split("/"):
         # requests leaves dot segments in the path and the worker's own server may
         # resolve them, which would step outside the route just matched.
@@ -1505,23 +1592,140 @@ async def worker_api(
 
 
 def _worker_pod(worker_id: str) -> client.V1Pod:
-    """The one pod behind a worker id, for callers that must name it or dial it."""
+    """Resolve the exact pod instance that owns this worker lease.
+
+    Once the lease records a pod UID, a replacement is a different emptyDir and
+    therefore a different runtime. Operator calls must report that loss instead
+    of silently switching to the replacement. Discovery is allowed only before
+    an identity was recorded, and only when the selector has one unambiguous pod.
+    """
+    _require_worker_id(worker_id)
     pods = core_api.list_namespaced_pod(
         NAMESPACE,
         label_selector=f"cao.aws/worker-id={worker_id}",
     ).items
+
+    with _leases_lock:
+        lease = _leases.get(worker_id)
+        known_pod_uid = lease.get("pod_uid") if lease else None
+        lease_state = lease["state"] if lease else None
+        lease_reason = lease["reason"] if lease else None
+
     if not pods:
-        raise HTTPException(status_code=404, detail=f"worker {worker_id} has no pod")
-    # A Deployment can show two pods at once - the replacement and the pod being
-    # replaced - and the selector matches both in no fixed order. Prefer the one
-    # that is running; on a boot failure there is no such pod and the first one's
-    # log is exactly what the caller came for.
-    running = [pod for pod in pods if (pod.status.phase if pod.status else None) == "Running"]
-    return (running or pods)[0]
+        # A settled lease is the useful half of this answer: "no pod" reads as
+        # a broken cluster, while "expired: no completion within 900s" reads as
+        # what it is - a finished or abandoned task whose workload is gone.
+        detail = f"worker {worker_id} has no pod"
+        if lease_state is not None and lease_state not in _LIVE_LEASE_STATES:
+            detail = f"{detail}; its lease settled ({lease_state})"
+            if lease_reason:
+                detail = f"{detail}: {lease_reason}"
+        raise HTTPException(status_code=404, detail=detail)
+
+    if known_pod_uid is not None:
+        matching = [
+            pod
+            for pod in pods
+            if pod.metadata is not None and pod.metadata.uid == known_pod_uid
+        ]
+        if not matching:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"worker {worker_id}'s leased pod disappeared or was replaced; "
+                    "refusing to route to a different runtime"
+                ),
+            )
+        return matching[0]
+
+    if len(pods) != 1:
+        raise HTTPException(
+            status_code=409,
+            detail=f"worker {worker_id} has {len(pods)} candidate pods and no recorded identity",
+        )
+
+    pod = pods[0]
+    pod_uid = pod.metadata.uid if pod.metadata else None
+    if lease is not None and pod_uid:
+        with _leases_lock:
+            current = _leases.get(worker_id)
+            if current is not None and current.get("pod_uid") is None:
+                current["pod_uid"] = pod_uid
+                current["pod_observed_at"] = time.monotonic()
+    return pod
 
 
 def _worker_pod_name(worker_id: str) -> str:
     return _worker_pod(worker_id).metadata.name
+
+
+async def _close_log_upstream(upstream: Any) -> None:
+    """Tear down a follow's raw Kubernetes response without stalling the loop.
+
+    `shutdown()` (urllib3 >= 2.3) half-closes the socket, which is the portable
+    way to wake a readline blocked in another thread - `close()` alone is not
+    guaranteed to interrupt an in-flight read on every platform. It runs
+    synchronously and FIRST, deliberately: under a cancelled anyio scope the
+    next await checkpoint can raise immediately, and the socket must already be
+    shut down by then. `close()` then releases the connection from a worker
+    thread, keeping any close latency off the event loop; asyncio.to_thread
+    submits before its await point, so close still runs even if that await is
+    interrupted by a second cancellation.
+    """
+    shutdown = getattr(upstream, "shutdown", None)
+    if shutdown is not None:
+        try:
+            shutdown()
+        except (OSError, RuntimeError, ValueError):
+            pass
+    try:
+        await asyncio.to_thread(upstream.close)
+    except Exception as exc:
+        log.debug("closing log upstream failed: %s", exc)
+
+
+async def _follow_worker_log(
+    worker_id: str,
+    pod_name: str,
+    tail: int,
+):
+    """Yield log lines while retaining a closeable handle to the upstream read.
+
+    No read timeout on the upstream follow, deliberately: an agent can think or
+    run a tool for minutes without printing a line, and a read timeout would end
+    the follow there while the client - whose own contract is "a quiet log is
+    not a stalled one" - sees a clean EOF indistinguishable from the pod ending.
+    Disconnect handling does not need the timeout: StreamingResponse cancels
+    this generator, and `shutdown()` on the raw response half-closes the socket,
+    which unblocks a readline stuck in the executor thread.
+    """
+    upstream = None
+    try:
+        upstream = await asyncio.to_thread(
+            core_api.read_namespaced_pod_log,
+            pod_name,
+            NAMESPACE,
+            tail_lines=tail,
+            follow=True,
+            _preload_content=False,
+            _request_timeout=(_LOG_FOLLOW_CONNECT_TIMEOUT, None),
+        )
+        while True:
+            line = await asyncio.to_thread(upstream.readline)
+            if not line:
+                return
+            yield line
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # pragma: no cover - live cluster transport
+        log.warning("log follow for worker %s ended: %s", worker_id, exc)
+    finally:
+        if upstream is not None:
+            # StreamingResponse cancels this async generator on disconnect.
+            # Shutting down the raw HTTP response interrupts a blocked readline
+            # in the executor thread - this teardown is the only thing that ends
+            # a follow nobody is reading any more.
+            await _close_log_upstream(upstream)
 
 
 @app.get("/workers/{worker_id}/logs")
@@ -1541,7 +1745,7 @@ def worker_logs(
     worker printed and never run anything inside it.
     """
     _require_broker_token(x_cao_broker_token)
-    _require_leased_worker(worker_id)
+    _require_worker_id(worker_id)
     tail = max(1, min(tail_lines, _LOG_TAIL_MAX))
     pod_name = _worker_pod_name(worker_id)
     if not follow:
@@ -1556,23 +1760,7 @@ def worker_logs(
             ) from exc
         return Response(content=body, media_type="text/plain; charset=utf-8")
 
-    def _stream():
-        # Watch, not read_namespaced_pod_log(follow=True, _preload_content=False):
-        # the client library sets `follow` for any function documenting it and
-        # yields whole lines, so a live log arrives line by line instead of
-        # stalling inside a fixed-size socket read.
-        watcher = watch.Watch()
-        try:
-            for line in watcher.stream(
-                core_api.read_namespaced_pod_log,
-                name=pod_name,
-                namespace=NAMESPACE,
-                tail_lines=tail,
-            ):
-                yield f"{line}\n"
-        except ApiException as exc:  # pragma: no cover - live cluster only
-            log.warning("log follow for worker %s ended: %s", worker_id, exc)
-        finally:
-            watcher.stop()
-
-    return StreamingResponse(_stream(), media_type="text/plain; charset=utf-8")
+    return StreamingResponse(
+        _follow_worker_log(worker_id, pod_name, tail),
+        media_type="text/plain; charset=utf-8",
+    )

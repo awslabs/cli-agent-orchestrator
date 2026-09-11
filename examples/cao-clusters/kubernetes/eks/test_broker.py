@@ -51,8 +51,13 @@ STATE = {
     "deployments": {},
     "services": {},
     "pods": {},
+    # Replacement pods that match the same worker selector, listed first to
+    # reproduce the overlap where Kubernetes returns the fresh pod before the
+    # still-existing leased runtime.
+    "extra_pods": {},
     "deleted_deployments": [],
     "deleted_svcs": [],
+    "delete_failures": set(),
 }
 
 # What the fake API server hands back for the NEXT pod it creates. Readiness used
@@ -122,8 +127,13 @@ class FakeApps:
         )
 
     def delete_namespaced_deployment(self, name, ns, propagation_policy=None):
+        if name in STATE["delete_failures"]:
+            raise k8s.rest.ApiException(status=500, reason="injected deletion failure")
         STATE["deleted_deployments"].append(name)
         STATE["deployments"].pop(name, None)
+        worker_id = name.removeprefix("cao-worker-")
+        STATE["pods"].pop(worker_id, None)
+        STATE["extra_pods"].pop(worker_id, None)
 
 
 class FakeCore:
@@ -141,7 +151,10 @@ class FakeCore:
         # replacement and is the actual worker-lifetime bound.
         key, value = label_selector.split("=", 1)
         pod = STATE["pods"].get(value)
-        return types.SimpleNamespace(items=[pod] if pod else [])
+        items = list(STATE["extra_pods"].get(value, []))
+        if pod:
+            items.append(pod)
+        return types.SimpleNamespace(items=items)
 
     def read_namespaced_pod_log(self, name, ns, tail_lines=None, **kwargs):
         STATE["log_calls"].append({"pod": name, "tail_lines": tail_lines})
@@ -579,7 +592,29 @@ with TestClient(broker.app) as c:
     r = c.get("/workers", headers=H)
     check("ledger lists the open lease",
           r.status_code == 200 and any(w["worker_id"] == wid and w["state"] == "leased"
+                                       and w["workload_present"]
+                                       and w["lease_tracked"]
                                        for w in r.json()), r.text[:300])
+
+    # The Deployment inventory remains authoritative when the in-memory ledger
+    # is lost in a broker restart.
+    with broker._leases_lock:
+        forgotten = broker._leases.pop(wid)
+    r = c.get("/workers", headers=H)
+    check(
+        "a workload survives loss of its in-memory lease row",
+        r.status_code == 200
+        and any(
+            w["worker_id"] == wid
+            and w["state"] == "untracked"
+            and w["workload_present"]
+            and not w["lease_tracked"]
+            for w in r.json()
+        ),
+        r.text[:300],
+    )
+    with broker._leases_lock:
+        broker._leases[wid] = forgotten
 
     gateway_headers = {
         "X-CAO-Worker-ID": wid,
@@ -704,6 +739,61 @@ with TestClient(broker.app) as c:
         str(STATE["deleted_deployments"]),
     )
 
+    # A settled verdict and successful cleanup are separate facts. If Kubernetes
+    # rejects deletion, inventory must expose the survivor and DELETE must remain
+    # retryable after the failure is removed.
+    r = c.post("/workers", json=worker_payload, headers=H)
+    cleanup_id = r.json()["worker_id"]
+    cleanup_name = f"cao-worker-{cleanup_id}"
+    broker._settle(cleanup_id, "completed", None)
+    STATE["delete_failures"].add(cleanup_name)
+    try:
+        c.delete(f"/workers/{cleanup_id}", headers=H)
+        cleanup_failed = False
+    except k8s.rest.ApiException as exc:
+        cleanup_failed = exc.status == 500
+    check("an injected cleanup failure is reported", cleanup_failed)
+    r = c.get("/workers", headers=H)
+    check(
+        "a settled survivor remains visible and retryable",
+        any(
+            w["worker_id"] == cleanup_id
+            and w["state"] == "completed"
+            and w["workload_present"]
+            and w["cleanup_pending"]
+            for w in r.json()
+        ),
+        r.text[:300],
+    )
+    STATE["delete_failures"].remove(cleanup_name)
+    r = c.delete(f"/workers/{cleanup_id}", headers=H)
+    check(
+        "retrying cleanup removes the settled survivor",
+        r.status_code == 200 and r.json().get("workload_present") is False,
+        r.text[:200],
+    )
+    st = [w for w in c.get("/workers", headers=H).json() if w["worker_id"] == cleanup_id][0]
+    check(
+        "a cleanup retry preserves the original verdict",
+        st["state"] == "completed",
+        json.dumps(st),
+    )
+
+    # An operator's DELETE claims the verdict before the workload is deleted, so
+    # the reaper watching the same pod vanish cannot relabel a deliberate
+    # release as `terminated`.
+    r = c.post("/workers", json=worker_payload, headers=H)
+    released_id = r.json()["worker_id"]
+    r = c.delete(f"/workers/{released_id}", headers=H)
+    st = [w for w in c.get("/workers", headers=H).json() if w["worker_id"] == released_id][0]
+    check(
+        "an operator release is recorded as released, not terminated",
+        r.status_code == 200
+        and st["state"] == "released"
+        and st["reason"] == "released by caller",
+        json.dumps(st),
+    )
+
     # --- 6. pod terminal phase fallback, complete never arrives -----------
     r = c.post("/workers", json=worker_payload, headers=H)
     wid2 = r.json()["worker_id"]
@@ -789,6 +879,35 @@ with TestClient(broker.app) as c:
     check("replaced worker's deployment is released",
           f"cao-worker-{replaced_id}" in STATE["deleted_deployments"],
           str(STATE["deleted_deployments"]))
+
+    # Mid-replacement both pods can match, with the replacement listed first.
+    # The original has restarted, so judging the replacement would hide the
+    # failure and keep the lease open.
+    r = c.post("/workers", json=worker_payload, headers=H)
+    rollover_id = r.json()["worker_id"]
+    observed = time.time() + 6
+    while time.time() < observed and broker._leases[rollover_id].get("pod_uid") is None:
+        time.sleep(0.1)
+    STATE["pods"][rollover_id].status.container_statuses = [
+        k8s.V1ContainerStatus(
+            name="cao-node", image="x", image_id="x", ready=True, restart_count=1
+        )
+    ]
+    STATE["extra_pods"][rollover_id] = [
+        _fake_pod(f"cao-worker-{rollover_id}", broker._labels(rollover_id))
+    ]
+    deadline = time.time() + 12
+    while time.time() < deadline:
+        st = [w for w in c.get("/workers", headers=H).json() if w["worker_id"] == rollover_id]
+        if st and st[0]["state"] != "leased":
+            break
+        time.sleep(0.3)
+    st = [w for w in c.get("/workers", headers=H).json() if w["worker_id"] == rollover_id][0]
+    check(
+        "the reaper judges the recorded leased pod during replacement overlap",
+        st["state"] == "terminated" and "restarted" in (st["reason"] or ""),
+        json.dumps(st),
+    )
 
     # --- 8. input validation still bounded -------------------------------
     r = c.post("/workers",
@@ -926,17 +1045,54 @@ with TestClient(broker.app) as c:
         r = c.get(f"/workers/{pid}/logs")
         check("unauthenticated log read is rejected", r.status_code == 401, r.text[:200])
 
-        # --- 10c. a settled lease answers with WHY, not with a timeout ------
+        # The operator plane must use the recorded pod UID even when a fresh
+        # replacement is listed first.
+        original_pod = STATE["pods"][pid]
+        replacement_pod = _fake_pod(f"cao-worker-{pid}", broker._labels(pid))
+        STATE["extra_pods"][pid] = [replacement_pod]
+        check(
+            "operator routes resolve the recorded leased pod, not the first pod",
+            broker._worker_pod(pid).metadata.uid == original_pod.metadata.uid,
+        )
+        STATE["pods"][pid] = replacement_pod
+        STATE["extra_pods"].clear()
+        r = c.get(f"/workers/{pid}/api/sessions", headers=H)
+        check(
+            "a missing recorded pod is reported instead of routing to its replacement",
+            r.status_code == 409 and "different runtime" in r.text,
+            r.text[:200],
+        )
+        STATE["pods"][pid] = original_pod
+
+        # --- 10c. settled survivors stay readable but cannot be written -----
         broker._leases[pid]["state"] = "expired"
         broker._leases[pid]["reason"] = "no completion within 900s"
         r = c.get(f"/workers/{pid}/api/sessions", headers=H)
-        check("a settled worker is refused with its lease state",
-              r.status_code == 409 and "expired" in r.text, r.text[:200])
-        check("the refusal carries the reaper's reason",
-              "no completion within 900s" in r.text, r.text[:200])
+        check("a settled survivor remains readable for diagnosis",
+              r.status_code == 200, r.text[:200])
         r = c.get(f"/workers/{pid}/logs", headers=H)
-        check("logs are refused for a settled worker too",
-              r.status_code == 409, r.text[:200])
+        check("logs remain readable for a settled survivor",
+              r.status_code == 200, r.text[:200])
+        r = c.post(f"/workers/{pid}/api/terminals/abc12345/input?message=hi", headers=H)
+        check("writes to a settled survivor are refused with its verdict",
+              r.status_code == 409
+              and "expired" in r.text
+              and "no completion within 900s" in r.text,
+              r.text[:200])
+
+        # A settled worker whose pod is ALSO gone answers with the verdict, not
+        # with a bare "no pod" that reads as a broken cluster.
+        _gone = STATE["pods"].pop(pid)
+        try:
+            r = c.get(f"/workers/{pid}/api/sessions", headers=H)
+            check("a settled worker with no pod answers with its verdict",
+                  r.status_code == 404
+                  and "expired" in r.text
+                  and "no completion within 900s" in r.text,
+                  r.text[:200])
+        finally:
+            STATE["pods"][pid] = _gone
+
         # An unknown worker_id is NOT refused: after a broker restart every
         # surviving worker is unknown here and all of them are still reachable.
         del broker._leases[pid]
@@ -958,6 +1114,85 @@ with TestClient(broker.app) as c:
         broker.COMPLETION_TIMEOUT = _saved_completion
         broker._WORKER_API_PORT = _saved_port
         _node.shutdown()
+
+    # A disconnect cancels the async generator; shutdown() on the raw Kubernetes
+    # response is what interrupts its blocked readline, and close() - which on a
+    # real socket may not finish while a read is still in flight - must not be
+    # the thing the teardown depends on. The fake makes that ordering load-
+    # bearing: close() refuses to complete until shutdown() has run.
+    import asyncio
+
+    class _BlockingLogResponse:
+        def __init__(self):
+            self.interrupted = threading.Event()
+            self.shutdown_called = False
+            self.closed = threading.Event()
+
+        def readline(self):
+            self.interrupted.wait(5)
+            return b""
+
+        def shutdown(self):
+            self.shutdown_called = True
+            self.interrupted.set()
+
+        def close(self):
+            # Mimic a close() that blocks while a read is in flight: it can
+            # only finish once shutdown() has woken the reader.
+            self.interrupted.wait(5)
+            self.closed.set()
+
+    async def _disconnect_log_probe():
+        upstream = _BlockingLogResponse()
+        with patch.object(broker.core_api, "read_namespaced_pod_log", return_value=upstream):
+            stream = broker._follow_worker_log("feed0001", "pod", 20)
+            pending = asyncio.create_task(anext(stream))
+            await asyncio.sleep(0.05)
+            started = time.monotonic()
+            pending.cancel()
+            try:
+                await pending
+            except asyncio.CancelledError:
+                pass
+            elapsed = time.monotonic() - started
+            return upstream.shutdown_called and upstream.closed.is_set() and elapsed < 1.0
+
+    check(
+        "disconnecting a log follow shuts down the blocked upstream promptly",
+        asyncio.run(_disconnect_log_probe()),
+    )
+
+    # The upstream follow must carry NO read timeout: an agent can be quiet for
+    # minutes, and a read timeout would end the follow as a clean EOF that the
+    # CLI - whose own contract is "a quiet log is not a stalled one" - cannot
+    # tell apart from the pod ending.
+    class _EmptyLogResponse:
+        def readline(self):
+            return b""
+
+        def close(self):
+            pass
+
+    _follow_kwargs = {}
+
+    async def _quiet_follow_probe():
+        def _capture(*args, **kwargs):
+            _follow_kwargs.update(kwargs)
+            return _EmptyLogResponse()
+
+        with patch.object(broker.core_api, "read_namespaced_pod_log", side_effect=_capture):
+            stream = broker._follow_worker_log("feed0002", "pod", 20)
+            try:
+                await anext(stream)
+            except StopAsyncIteration:
+                pass
+
+    asyncio.run(_quiet_follow_probe())
+    check(
+        "a log follow carries no upstream read timeout",
+        _follow_kwargs.get("_request_timeout", ("missing", "missing"))[1] is None,
+        str(_follow_kwargs.get("_request_timeout")),
+    )
 
     # --- 10d. the allowlist itself, without a transport ---------------------
     check("health is readable", broker._worker_api_allowed("GET", "health"))

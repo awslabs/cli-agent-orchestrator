@@ -8,7 +8,7 @@ them, and against a stub in a test — with no kubernetes import anywhere in `sr
 
 The contract:
 
-    GET    /workers                     lease ledger: state, reason, age
+    GET    /workers                     reconciled workload and lease inventory
     DELETE /workers/{id}                release one worker
     GET    /workers/{id}/logs           the worker container's log
     GET|POST /workers/{id}/api/{path}   an allowlisted cao-server call, proxied
@@ -45,12 +45,6 @@ from cli_agent_orchestrator.constants import (
 _CONNECT_TIMEOUT = 5.0
 _READ_TIMEOUT = 60.0
 
-# States in which a worker still exists. The broker's own reaper settles a lease
-# into anything else — released, completed, failed, terminated, expired — and its
-# `reason` is the only record of why a delegation that claimed success produced
-# nothing. Kept in sync with `_LIVE_LEASE_STATES` in the broker.
-LIVE_STATES = frozenset({"creating", "leased"})
-
 
 class FleetClient:
     """One fleet, addressed through its broker."""
@@ -76,7 +70,19 @@ class FleetClient:
     # -- broker's own routes -------------------------------------------------
 
     def workers(self) -> list[dict[str, Any]]:
-        return cast(list[dict[str, Any]], self._request("GET", "/workers").json())
+        payload = self._request("GET", "/workers").json()
+        if not isinstance(payload, list) or any(
+            not isinstance(row, dict)
+            or "workload_present" not in row
+            or "cleanup_pending" not in row
+            or "lease_tracked" not in row
+            for row in payload
+        ):
+            raise click.ClickException(
+                "The fleet broker did not return an authoritative worker inventory. "
+                "Upgrade the broker before using fleet status or shutdown."
+            )
+        return cast(list[dict[str, Any]], payload)
 
     def release(self, worker_id: str) -> bool:
         """Release one worker. True if it is now gone, including if it already was."""
@@ -84,6 +90,16 @@ class FleetClient:
         if response.status_code == 404:
             return True
         self._check(response)
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise click.ClickException(
+                f"Broker did not confirm that worker {worker_id} was removed"
+            ) from exc
+        if not isinstance(payload, dict) or payload.get("workload_present") is not False:
+            raise click.ClickException(
+                f"Broker did not confirm that worker {worker_id} was removed"
+            )
         return True
 
     def logs(self, worker_id: str, *, tail_lines: int = 200) -> str:

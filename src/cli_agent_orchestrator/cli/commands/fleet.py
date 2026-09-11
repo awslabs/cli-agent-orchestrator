@@ -10,11 +10,16 @@ different verbs on different things, which is why the second one is spelled out.
 """
 
 import json
+import sys
 from collections import Counter
 
 import click
 
-from cli_agent_orchestrator.utils.fleet import LIVE_STATES, FleetClient
+from cli_agent_orchestrator.utils.fleet import FleetClient
+
+
+def _stdin_is_tty() -> bool:
+    return sys.stdin.isatty()
 
 
 @click.group()
@@ -40,12 +45,18 @@ def status(as_json):
     client = FleetClient.from_env()
     workers = client.workers()
     counts = Counter(w.get("state", "unknown") for w in workers)
-    live = [w for w in workers if w.get("state") in LIVE_STATES]
+    live = [w for w in workers if w.get("workload_present") is True]
+    cleanup_pending = [w for w in workers if w.get("cleanup_pending") is True]
 
     if as_json:
         click.echo(
             json.dumps(
-                {"broker": client.url, "live": len(live), "states": dict(counts)},
+                {
+                    "broker": client.url,
+                    "live": len(live),
+                    "cleanup_pending": len(cleanup_pending),
+                    "states": dict(counts),
+                },
                 indent=2,
             )
         )
@@ -53,6 +64,8 @@ def status(as_json):
 
     click.echo(f"Broker:  {client.url}")
     click.echo(f"Live:    {len(live)} worker(s)")
+    if cleanup_pending:
+        click.echo(f"Cleanup: {len(cleanup_pending)} worker(s) still present after settlement")
     if counts:
         click.echo("States:  " + ", ".join(f"{state}={n}" for state, n in sorted(counts.items())))
     else:
@@ -71,8 +84,8 @@ def shutdown(yes, as_json):
     deployed by the cluster's manifests and are removed the same way, so this
     command cannot leave you without the fleet you would use to make new workers.
 
-    Workers whose lease has already settled are skipped: the broker released them
-    when it settled them, so there is nothing left to delete.
+    A settled lease whose workload still exists is included. That means an earlier
+    cleanup failed, and shutdown is the operator's retry path.
 
     `--json` cannot ask for confirmation without corrupting its own output, so it
     requires `--yes` and the two together are the only unattended form. The exit
@@ -88,7 +101,7 @@ def shutdown(yes, as_json):
         )
 
     client = FleetClient.from_env()
-    live = [w for w in client.workers() if w.get("state") in LIVE_STATES]
+    live = [w for w in client.workers() if w.get("workload_present") is True]
     if not live:
         if as_json:
             click.echo(json.dumps({"released": [], "failed": []}, indent=2))
@@ -102,6 +115,11 @@ def shutdown(yes, as_json):
             click.echo(
                 f"  {w.get('worker_id')}  {w.get('agent_profile') or 'N/A'}"
                 f"  {w.get('age_seconds')}s"
+            )
+        if not _stdin_is_tty():
+            raise click.ClickException(
+                "Refusing to read shutdown confirmation from a pipe or redirected input. "
+                "Run this in a terminal, or pass --yes for an unattended shutdown."
             )
         click.confirm("Release them and lose their sessions?", abort=True)
 

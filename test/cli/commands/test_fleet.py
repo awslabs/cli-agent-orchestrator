@@ -53,6 +53,9 @@ def _lease(worker_id, state, **extra):
         "agent_profile": "developer",
         "provider": "claude_code",
         "age_seconds": 30,
+        "workload_present": state in {"creating", "leased"},
+        "cleanup_pending": False,
+        "lease_tracked": True,
     }
     lease.update(extra)
     return lease
@@ -112,8 +115,25 @@ class TestStatus:
         assert json.loads(result.output) == {
             "broker": "http://broker:9890",
             "live": 1,
+            "cleanup_pending": 0,
             "states": {"leased": 1, "completed": 1},
         }
+
+    def test_settled_survivor_counts_as_live_cleanup(self, runner, broker):
+        broker.workers.return_value = [
+            _lease(
+                "stuck",
+                "completed",
+                workload_present=True,
+                cleanup_pending=True,
+            )
+        ]
+
+        result = runner.invoke(fleet, ["status"])
+
+        assert result.exit_code == 0
+        assert "Live:    1 worker(s)" in result.output
+        assert "Cleanup: 1 worker(s) still present after settlement" in result.output
 
     def test_no_fleet_configured_is_reported_not_traced(self, runner):
         with patch(
@@ -151,7 +171,11 @@ class TestShutdown:
             _lease("aaaa1111", "leased", agent_profile="developer", age_seconds=42)
         ]
 
-        result = runner.invoke(fleet, ["shutdown"], input="y\n")
+        with patch(
+            "cli_agent_orchestrator.cli.commands.fleet._stdin_is_tty",
+            return_value=True,
+        ):
+            result = runner.invoke(fleet, ["shutdown"], input="y\n")
 
         assert result.exit_code == 0
         assert "About to release 1 worker(s):" in result.output
@@ -165,7 +189,11 @@ class TestShutdown:
     def test_declining_releases_nothing(self, runner, broker):
         broker.workers.return_value = [_lease("a", "leased"), _lease("b", "leased")]
 
-        result = runner.invoke(fleet, ["shutdown"], input="n\n")
+        with patch(
+            "cli_agent_orchestrator.cli.commands.fleet._stdin_is_tty",
+            return_value=True,
+        ):
+            result = runner.invoke(fleet, ["shutdown"], input="n\n")
 
         assert result.exit_code == 1
         assert "Aborted" in result.output
@@ -185,6 +213,15 @@ class TestShutdown:
         assert result.exit_code == 1
         broker.release.assert_not_called()
 
+    def test_piped_affirmative_is_not_treated_as_a_tty_confirmation(self, runner, broker):
+        broker.workers.return_value = [_lease("a", "leased")]
+
+        result = runner.invoke(fleet, ["shutdown"], input="y\n")
+
+        assert result.exit_code == 1
+        assert "pipe or redirected input" in result.output
+        broker.release.assert_not_called()
+
     def test_yes_skips_the_prompt(self, runner, broker):
         broker.workers.return_value = [_lease("a", "leased"), _lease("b", "creating")]
 
@@ -194,17 +231,22 @@ class TestShutdown:
         assert "About to release" not in result.output
         assert [c.args[0] for c in broker.release.call_args_list] == ["a", "b"]
 
-    def test_settled_leases_are_skipped_even_with_yes(self, runner, broker):
+    def test_only_workloads_that_still_exist_are_released(self, runner, broker):
         broker.workers.return_value = [
             _lease("live1", "leased"),
-            _lease("done1", "completed"),
+            _lease(
+                "stuck1",
+                "completed",
+                workload_present=True,
+                cleanup_pending=True,
+            ),
             _lease("gone1", "released"),
         ]
 
         result = runner.invoke(fleet, ["shutdown", "--yes"])
 
         assert result.exit_code == 0
-        assert [c.args[0] for c in broker.release.call_args_list] == ["live1"]
+        assert [c.args[0] for c in broker.release.call_args_list] == ["live1", "stuck1"]
 
     def test_json_alone_refuses_to_release_anything(self, runner, broker):
         """`--json` cannot prompt without corrupting its own output.
