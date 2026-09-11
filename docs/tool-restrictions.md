@@ -209,6 +209,27 @@ CAO defines a universal tool vocabulary (`execute_bash`, `fs_read`, `fs_write`, 
 
 **Providers that accept CAO vocabulary directly** — Kiro CLI accepts `allowedTools` in the agent JSON at install time, using the same vocabulary as CAO. No translation needed. Kimi CLI, MiniMax Code, and Codex use system prompt instructions to enforce restrictions. CAO passes the `allowedTools` list directly without translation — so no `TOOL_MAPPING` entry exists for them, and none is needed.
 
+#### MCP-side enforcement for `assign` and `handoff`
+
+Provider-native restrictions cannot reach CAO's own MCP tools. `TOOL_MAPPING` translates the CAO
+vocabulary into native tool names, and MCP server references have none, so `get_disallowed_tools`
+skips every `@`-prefixed entry. A profile without `@cao-mcp-server` therefore still reached
+`assign` and `handoff`, the two tools that launch an agent under a caller-chosen profile.
+
+Those two now check the caller themselves, at the MCP boundary:
+
+- The effective policy is the calling terminal's recorded `allowedTools`, or the profile
+  resolution it stands for when nothing was recorded. It is the same list `--allowed-tools`,
+  `role` defaults and `--yolo` already produce, not a second allowlist.
+- The grant is `@cao-mcp-server` or `*`. A bare tool name does not grant an MCP tool, because
+  bare names are provider-native vocabulary.
+- The check fails closed. Running with no `CAO_TERMINAL_ID` is the supported operator context
+  (`cao assign` and `cao handoff`) and is unrestricted, but once a caller presents an identity,
+  anything that stops it being resolved refuses the call rather than allowing it.
+
+`cao assign` and `cao handoff` on the command line are unaffected: the operator is not an agent
+and no profile allowlist applies to them.
+
 ## How Overrides Work
 
 When multiple controls are set, the highest priority wins:
@@ -358,7 +379,7 @@ Each agent is restricted based on its own profile, not its parent's permissions.
 
 1. **Claude Code tool mapping is nearly complete, with MCP tools the remaining gap.** The current mapping covers `Bash` (and its `Task`/`Agent`/`Monitor`/`BashOutput`/`KillShell` execution family), `Read`, `Edit`, `Write`, `Glob`, `Grep`, and — via `web_fetch` — [`WebFetch`](https://code.claude.com/docs/en/permissions#webfetch) and `WebSearch`. The subagent tool is intentionally **not** a separate category: it is folded into `execute_bash`, because a subagent spawns with its own full toolset and can run shell, so exposing it standalone would let a profile grant subagent access without `execute_bash` and re-open that escape. Claude Code **renamed this tool from `Task` to `Agent`**, so both names are denied — current builds expose only `Agent`, so denying just `Task` would be a silent no-op. Provider MCP tools remain unmapped (see limitation #2) — they cannot be blocked via `--disallowedTools`.
 
-2. **`@cao-mcp-server` is server-level, not per-tool control.** Grok restricted profiles translate it to an allow rule for the configured CAO MCP server; other providers generally treat it as an intent marker. No provider currently blocks individual MCP tools: once the server is available, its `handoff`, `assign`, `send_message`, and `answer_user_prompt` tools are all available. `answer_user_prompt` is exposed by the MCP server, but its structured prompt-navigation behavior is currently implemented for Hermes workers that report `waiting_user_answer`; other providers may only receive ordinary text input until they implement equivalent prompt states. Future versions may support `@cao-mcp-server:send_message` syntax for per-tool MCP control.
+2. **`@cao-mcp-server` is server-level, not per-tool control.** Grok restricted profiles translate it to an allow rule for the configured CAO MCP server; other providers generally treat it as an intent marker. No provider currently blocks individual MCP tools: once the server is available, its `handoff`, `assign`, `send_message`, and `answer_user_prompt` tools are all exposed. **CAO enforces the server-level grant on its own side for `assign` and `handoff`** (see [MCP-side enforcement](#mcp-side-enforcement-for-assign-and-handoff) above), so a profile without `@cao-mcp-server` cannot use them even where the provider still exposes them. `send_message` and `answer_user_prompt` are not gated this way. `answer_user_prompt` is exposed by the MCP server, but its structured prompt-navigation behavior is currently implemented for Hermes workers that report `waiting_user_answer`; other providers may only receive ordinary text input until they implement equivalent prompt states. Future versions may support `@cao-mcp-server:send_message` syntax for per-tool MCP control.
 
 3. **Soft enforcement is best-effort.** Kimi CLI, MiniMax Code, and Codex rely on prompt instructions to restrict tools. The agent may ignore these restrictions. Do not rely on soft enforcement for security-critical workloads.
 
