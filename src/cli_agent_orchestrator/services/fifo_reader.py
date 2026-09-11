@@ -52,6 +52,7 @@ _COALESCE_MAX_BYTES = 64 * 1024
 # fakes. terminal_service wires the real backend calls at create_reader time.
 PaneProbe = Callable[[], str]  # returns the live pane content (tmux capture-pane tail)
 RearmPipe = Callable[[], None]  # re-attaches pipe-pane (stop then start, NOT a bare toggle)
+FifoBufferProbe = Callable[[], str]  # returns the FIFO-fed StatusMonitor buffer tail
 
 
 class FifoManager:
@@ -129,6 +130,7 @@ class FifoManager:
         # register these; herdr and callers that pass none are never watched).
         self._pane_probe: Dict[str, PaneProbe] = {}
         self._rearm: Dict[str, RearmPipe] = {}
+        self._fifo_buffer_probe: Dict[str, FifoBufferProbe] = {}
         # Per-terminal watchdog bookkeeping: (last_pane_content, last_check_monotonic,
         # consecutive_diverging_checks). The full tail string (not a hash) is
         # stored so an accidental hash collision can never mask a real stall.
@@ -153,17 +155,18 @@ class FifoManager:
         terminal_id: str,
         pane_probe: Optional[PaneProbe] = None,
         rearm: Optional[RearmPipe] = None,
+        fifo_buffer_probe: Optional[FifoBufferProbe] = None,
     ) -> None:
         """Create FIFO and start reader thread.
 
-        ``pane_probe``/``rearm`` are optional and only supplied by pipe-pane
-        (tmux) callers. When both are given, the terminal is enrolled in the
-        liveness watchdog (issue #388). Callers that omit them (or backends
-        without pipe-pane) get exactly the old behavior — no watchdog.
+        ``pane_probe``/``rearm``/``fifo_buffer_probe`` are optional and only
+        supplied by pipe-pane (tmux) callers. When all are given, the terminal
+        is enrolled in the liveness watchdog (issue #388). Callers that omit
+        them (or backends without pipe-pane) get exactly the old behavior — no watchdog.
         """
         fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
 
-        enroll = pane_probe is not None and rearm is not None
+        enroll = pane_probe is not None and rearm is not None and fifo_buffer_probe is not None
 
         with self._lock:
             if terminal_id in self._readers:
@@ -187,9 +190,10 @@ class FifoManager:
             self._last_data_at[terminal_id] = now
             self._registered_at[terminal_id] = now
             self._ever_delivered[terminal_id] = False
-            if enroll:
+            if pane_probe is not None and rearm is not None and fifo_buffer_probe is not None:
                 self._pane_probe[terminal_id] = pane_probe
                 self._rearm[terminal_id] = rearm
+                self._fifo_buffer_probe[terminal_id] = fifo_buffer_probe
             thread.start()
 
         if enroll:
@@ -213,6 +217,7 @@ class FifoManager:
             # the watchdog stops probing a gone pane.
             self._pane_probe.pop(terminal_id, None)
             self._rearm.pop(terminal_id, None)
+            self._fifo_buffer_probe.pop(terminal_id, None)
             self._liveness.pop(terminal_id, None)
             self._last_data_at.pop(terminal_id, None)
             self._rearm_failures.pop(terminal_id, None)
@@ -465,7 +470,8 @@ class FifoManager:
         """
         probe = self._pane_probe.get(terminal_id)
         rearm = self._rearm.get(terminal_id)
-        if probe is None or rearm is None:
+        fifo_buffer_probe = self._fifo_buffer_probe.get(terminal_id)
+        if probe is None or rearm is None or fifo_buffer_probe is None:
             return
 
         # probe() is a slow tmux `capture-pane` call — deliberately made
@@ -492,6 +498,7 @@ class FifoManager:
                 if failures >= PIPE_LIVENESS_MAX_PROBE_FAILURES:
                     self._pane_probe.pop(terminal_id, None)
                     self._rearm.pop(terminal_id, None)
+                    self._fifo_buffer_probe.pop(terminal_id, None)
                     self._liveness.pop(terminal_id, None)
                     self._rearm_failures.pop(terminal_id, None)
                     self._registered_at.pop(terminal_id, None)
@@ -517,6 +524,7 @@ class FifoManager:
                     PIPE_LIVENESS_MAX_PROBE_FAILURES,
                 )
             return
+        fifo_buffer = fifo_buffer_probe()
         now = time.monotonic()
 
         do_rearm = False
@@ -573,6 +581,7 @@ class FifoManager:
                     cold_start_give_up = True
                     self._pane_probe.pop(terminal_id, None)
                     self._rearm.pop(terminal_id, None)
+                    self._fifo_buffer_probe.pop(terminal_id, None)
                     self._liveness.pop(terminal_id, None)
                     self._rearm_failures.pop(terminal_id, None)
                     self._registered_at.pop(terminal_id, None)
@@ -602,12 +611,13 @@ class FifoManager:
                 else:
                     baseline_content, last_check_at, strikes = prev
 
-                    # Did the reader deliver anything since the previous check?
-                    fifo_advanced = last_data_at >= last_check_at
+                    # Bytes arriving earlier in this interval only prove the pane
+                    # is healthy when the FIFO-fed buffer still reaches this frame.
+                    fifo_advanced = last_data_at >= last_check_at and fifo_buffer.endswith(content)
 
                     if fifo_advanced:
-                        # Healthy: the pipe is confirmed delivering. Re-baseline
-                        # to the current pane content and clear strikes.
+                        # Healthy: the FIFO reached the live pane frame. Re-baseline
+                        # to that content and clear strikes.
                         self._liveness[terminal_id] = (content, now, 0)
                     else:
                         # FIFO silent since the last check. Compare against the
@@ -717,6 +727,7 @@ class FifoManager:
                 if give_up:
                     self._pane_probe.pop(terminal_id, None)
                     self._rearm.pop(terminal_id, None)
+                    self._fifo_buffer_probe.pop(terminal_id, None)
                     self._liveness.pop(terminal_id, None)
                     self._rearm_failures.pop(terminal_id, None)
                     self._registered_at.pop(terminal_id, None)
