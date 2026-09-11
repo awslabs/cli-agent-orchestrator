@@ -675,6 +675,81 @@ class TestConcurrentDeliverySerialization:
         finally:
             status_monitor.clear_terminal("term-1")
 
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.claim_pending_messages")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_write_time_completion_against_the_real_status_monitor(
+        self, mock_get, mock_term, mock_claim, mock_update
+    ):
+        """Reviewer-reproduced thirteenth-round finding on #709 (haofeif): the
+        twelfth-round fix moved the pre-write snapshot into notify_input_sent,
+        but real work still runs between that snapshot and the actual pane
+        write: send_input's own clear_rolling_buffer and
+        provider.mark_input_received, then the backend's cancel-mode and
+        load-buffer calls (tmux.py), neither of which touches the pane. A
+        genuine, unrelated transition landing in that window is indistinguishable
+        from one landing during prep, but the twelfth-round fix only guarded
+        against the prep case.
+
+        Against the REAL StatusMonitor singleton (not mocked), so the ordering
+        is genuine rather than asserted by a mock: ``terminal_service.send_input``
+        is faked to reproduce the real internal order: prep, notify_input_sent,
+        then further pre-write steps culminating in the backend's own
+        mark_pre_write call immediately before the pane write, with a genuine
+        status transition landing in between, after notify_input_sent but
+        before mark_pre_write.
+
+        Confirmed this fails on the pre-fix code (status_monitor.py, terminal_
+        service.py, clients/tmux.py, and the two backend files all reverted to
+        their pre-thirteenth-round content, this test kept): the fake's call
+        to status_monitor.mark_pre_write raises AttributeError (the method does
+        not exist yet), deliver_pending's generic except branch catches it and
+        aborts the attempt, and the assertion below fails on
+        ``_is_dispatch_active("term-1") is False``: an aborted attempt looks
+        different from haofeif's report (a delivery failure, not a stray
+        second send), but it demonstrates the same root fact: nothing in the
+        pre-fix code can tell the difference between this stale transition and
+        a genuine post-write one. Confirmed directly against unmodified
+        production code (no test, no new method) with a standalone repro
+        driving only notify_input_sent, _apply_detection and
+        _confirm_dispatch_active: the marker resolves immediately on exactly
+        this transition, reproducing haofeif's reported outcome verbatim.
+        """
+        mock_get.return_value = [_make_message()]
+        mock_claim.return_value = [_make_message(status=MessageStatus.DELIVERED)]
+        status_monitor.clear_terminal("term-1")
+        status_monitor._last_status["term-1"] = TerminalStatus.IDLE
+
+        def fake_send_input(terminal_id, message, **kwargs):
+            # Prep (get_terminal_metadata, inject_memory_context): no bump.
+            # notify_input_sent's own snapshot, taken right after prep.
+            status_monitor.notify_input_sent(terminal_id)
+            # send_input's remaining pre-write steps (clear_rolling_buffer,
+            # provider.mark_input_received) and the backend's own pre-write
+            # work (cancel-mode, load-buffer) run here in production; a
+            # genuine, unrelated transition lands during that window, well
+            # before the pane is actually touched.
+            status_monitor._apply_detection(terminal_id, TerminalStatus.COMPLETED)
+            # The backend's pre_write_hook fires at the last point before the
+            # pane write (tmux.py: immediately before paste-buffer).
+            status_monitor.mark_pre_write(terminal_id)
+            # The write itself: nothing else moves the counter.
+            return True
+
+        mock_term.send_input.side_effect = fake_send_input
+
+        try:
+            svc = InboxService()
+            svc.deliver_pending("term-1")
+
+            # The transition predates the real write (mark_pre_write folded it
+            # in): the marker must stay active, waiting for a genuine
+            # post-write event, not resolve on this stale one.
+            assert inbox_service_module._is_dispatch_active("term-1") is True
+        finally:
+            status_monitor.clear_terminal("term-1")
+
     def test_marker_stranded_by_arm_after_send_is_the_bug_this_fix_closes(self):
         """Same race as above, replayed against the OLD ordering directly
         (mark after send, using the post-dispatch generation) to show it is

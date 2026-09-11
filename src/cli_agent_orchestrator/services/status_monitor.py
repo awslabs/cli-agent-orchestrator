@@ -672,7 +672,17 @@ class StatusMonitor:
             # has already run by the time it calls this, so a transition observed
             # during prep is already folded into this value rather than being
             # mistaken for a response to the write that has not happened yet
-            # (#709 twelfth review round). See get_pre_write_generation.
+            # (#709 twelfth review round). This is only a FALLBACK value now: real
+            # work still runs between this call and the actual pane write
+            # (clear_rolling_buffer, provider.mark_input_received, and the
+            # backend's own pre-write steps (TmuxClient.send_keys's cancel-mode
+            # and load-buffer, neither of which touches the pane), and a real,
+            # unrelated transition landing in that window is not evidence of a
+            # response to a write that has not happened yet either (#709
+            # thirteenth review round). A backend that supports the distinction
+            # overwrites this with a fresher reading via mark_pre_write, called
+            # through send_keys's pre_write_hook at the last point before the
+            # pane is actually touched. See get_pre_write_generation.
             self._pre_write_generations[terminal_id] = self._status_generations.get(terminal_id, 0)
             self._allow_processing_revert[terminal_id] = True
             # A new turn is starting: whatever ready state a stale-PROCESSING capture saw
@@ -1118,9 +1128,40 @@ class StatusMonitor:
         its state was reset since): callers must not treat that the same as 0,
         since 0 is itself a valid pre-write generation (#709 twelfth review
         round).
+
+        May be refined after notify_input_sent by a later mark_pre_write call
+        from the backend's own pre_write_hook, taken closer to the actual pane
+        write (#709 thirteenth review round). This accessor always returns
+        whichever snapshot is most recent.
         """
         with self._lock:
             return self._pre_write_generations.get(terminal_id)
+
+    def mark_pre_write(self, terminal_id: str) -> None:
+        """Re-snapshot the pre-write transition counter immediately before the
+        backend's actual write to the pane, overwriting notify_input_sent's
+        earlier (fallback) snapshot.
+
+        notify_input_sent takes its snapshot right after send_input's own prep
+        (get_terminal_metadata, inject_memory_context) but before send_input's
+        remaining pre-write steps (clear_rolling_buffer, provider.
+        mark_input_received) and the backend's own pre-write work
+        (TmuxClient.send_keys's cancel-mode and load-buffer calls, neither of
+        which touches the pane). A real, unrelated transition can still land
+        in that window and would be indistinguishable from a genuine response
+        to a write that has not happened yet (#709 thirteenth review round).
+
+        Backends that can tell "about to touch the pane" apart from their own
+        earlier prep call this via the ``pre_write_hook`` passed into
+        send_keys, at the last point before the pane is actually written
+        (TmuxClient: immediately before paste-buffer, after load-buffer
+        returns; HerdrBackend: immediately before pane send-text). Backends
+        that do not pass the hook leave notify_input_sent's snapshot as the
+        answer, strictly earlier, never later, than the true pre-write
+        point, so it never manufactures a false confirmation on its own.
+        """
+        with self._lock:
+            self._pre_write_generations[terminal_id] = self._status_generations.get(terminal_id, 0)
 
 
 # Module-level singleton

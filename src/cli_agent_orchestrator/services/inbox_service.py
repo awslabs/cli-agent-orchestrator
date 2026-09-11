@@ -66,21 +66,27 @@ _delivery_locks: Dict[str, Tuple[threading.Lock, int]] = {}
 # arming with an already-known pre-dispatch generation, as an earlier
 # version did, let exactly that event confirm a dispatch that had not
 # happened yet). Once send_input returns, the entry is resolved against
-# status_monitor's own pre-write snapshot (recorded by notify_input_sent,
-# after send_input's prep and immediately before the backend write), not
-# against a snapshot taken at arm time before send_input was even called: a
-# transition observed during PREP (get_terminal_metadata,
-# inject_memory_context) predates the write and is not evidence of a
-# response to it, so comparing against an arm-time snapshot could mistake
-# leftover prep-window activity for confirmation (#709 twelfth review
-# round). If nothing has moved since the pre-write snapshot, the boundary
-# becomes the current generation and only a genuinely later transition can
-# confirm it; if the generation already moved since the pre-write snapshot
-# (a real transition landed at or after the write, including the metadata
-# write send_input does after send_keys), that transition already is the
-# confirmation and the entry is dropped immediately, since nothing strictly
-# newer than an event that already happened will ever arrive (#709 eleventh
-# review round).
+# status_monitor's own pre-write snapshot, not against a snapshot taken at
+# arm time before send_input was even called: a transition observed during
+# PREP (get_terminal_metadata, inject_memory_context) predates the write and
+# is not evidence of a response to it, so comparing against an arm-time
+# snapshot could mistake leftover prep-window activity for confirmation
+# (#709 twelfth review round). That snapshot is itself refined twice: an
+# initial value from notify_input_sent, taken right after prep, then
+# overwritten by status_monitor.mark_pre_write via send_keys's
+# pre_write_hook at the last point before the pane is actually touched:
+# real work still runs between the two (clear_rolling_buffer, provider.
+# mark_input_received, and the backend's own pre-write steps), and a
+# transition landing there is equally not evidence of a response to a write
+# that has not happened yet (#709 thirteenth review round). If nothing has
+# moved since the final snapshot, the boundary becomes the current
+# generation and only a genuinely later transition can confirm it; if the
+# generation already moved since the final snapshot (a real transition
+# landed at or after the write, including the metadata write send_input
+# does after send_keys), that transition already is the confirmation and
+# the entry is dropped immediately, since nothing strictly newer than an
+# event that already happened will ever arrive (#709 eleventh review
+# round).
 #
 # Attempts are tracked per-token, not as a single slot, because
 # ``deliver_pending`` dispatches multiple sender groups sequentially under
@@ -180,14 +186,20 @@ def _confirm_dispatch_active(terminal_id: str, token: int) -> None:
     input has actually crossed the backend dispatch boundary.
 
     The comparison boundary is status_monitor.get_pre_write_generation(
-    terminal_id): the transition counter as notify_input_sent saw it, which
-    send_input calls after its own prep (get_terminal_metadata,
-    inject_memory_context) and immediately before the backend write
-    (send_keys). A transition during that prep is already folded into this
-    value and cannot be mistaken for a response to a write that had not
-    happened yet; only a transition at or after the actual write can exceed
-    it (#709 twelfth review round: a snapshot taken before send_input was
-    even called, as an earlier version did, could not tell the two apart).
+    terminal_id). notify_input_sent takes an initial snapshot after
+    send_input's own prep (get_terminal_metadata, inject_memory_context),
+    folding in any transition observed during prep so it cannot be mistaken
+    for a response to a write that had not happened yet (#709 twelfth review
+    round: a snapshot taken before send_input was even called, as an earlier
+    version did, could not tell the two apart). Real work still runs after
+    that snapshot and before the pane is actually written to (clear_
+    rolling_buffer, provider.mark_input_received, and the backend's own
+    pre-write steps), so send_keys's pre_write_hook re-snapshots via
+    status_monitor.mark_pre_write at the last point before the pane is
+    touched, overwriting notify_input_sent's earlier value with one that
+    also folds in a transition from that later window (#709 thirteenth
+    review round). Only a transition at or after the actual write can exceed
+    the final snapshot.
 
     Reads the current generation inside the same critical section that
     decides the outcome, closing the snapshot-to-confirmation gap a
@@ -426,10 +438,12 @@ class InboxService:
                 # group's own attempt so a later abort can never remove a
                 # sibling group's still-outstanding one (#709 tenth review
                 # round). _confirm_dispatch_active compares against the
-                # pre-write generation status_monitor recorded when send_input
-                # called notify_input_sent (after its own prep, immediately
-                # before the backend write), not against a snapshot taken here
-                # before send_input was even called: a genuine completion can
+                # pre-write generation status_monitor recorded, refined from
+                # notify_input_sent's own prep-time snapshot down to the
+                # backend's mark_pre_write call immediately before the pane
+                # is touched (#709 thirteenth review round), not against a
+                # snapshot taken here before send_input was even called: a
+                # genuine completion can
                 # land while this attempt's boundary is still None (during the
                 # call itself, including the metadata write terminal_service.
                 # send_input does after send_keys), and a boundary set to that
