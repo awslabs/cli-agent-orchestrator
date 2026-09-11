@@ -773,13 +773,15 @@ class ClaudeCodeProvider(BaseProvider):
                 from cli_agent_orchestrator.services.status_monitor import status_monitor
 
                 logger.info("Model upgrade nudge detected (%s), declining", title)
-                # Esc, NOT Enter: "1. Yes" is the pre-selected option, so Enter
-                # would accept the upgrade and restart the CLI. Esc is also
-                # preferred over Down+Enter because it does not depend on the
-                # option ordering staying "Yes" first.
+                # Choose the numbered "No" option directly. The dialog advertises
+                # Esc as cancel, but a live elastic-worker run showed Esc leaving
+                # this prompt standing while typing "2" dismissed it immediately.
+                # The prompt is a stable two-choice migration dialog whose own
+                # rendered contract names "1. Yes" and "2. No"; selecting the
+                # explicit negative choice also persists Claude's decision.
                 status_monitor.notify_input_sent(self.terminal_id)
                 await asyncio.to_thread(
-                    get_backend().send_special_key, self.session_name, self.window_name, "Escape"
+                    get_backend().send_keys, self.session_name, self.window_name, "2"
                 )
                 upgrade_declined.add(title)
                 any_prompt_handled = True
