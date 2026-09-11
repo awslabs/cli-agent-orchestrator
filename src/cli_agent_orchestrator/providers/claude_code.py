@@ -1306,6 +1306,26 @@ class ClaudeCodeProvider(BaseProvider):
             if re.search(
                 GET_STATUS_COMPLETION_PATTERN, joined
             ) or EXTRACTION_RESPONSE_PATTERN.search(joined):
+                # Issue #407 paste-echo guard, ported to the screen path: the
+                # composited viewport right after dispatch still shows the
+                # PREVIOUS turn's response box, and unlike the raw rolling
+                # buffer there is no byte diff to hide behind — the pyte
+                # screen is literally the same settled frame. Until the
+                # screen's last response differs from the snapshot taken at
+                # mark_input_received (or a new response marker appeared),
+                # that COMPLETED belongs to the earlier turn: report
+                # PROCESSING so StatusMonitor's evidence generation only
+                # advances on genuinely new content (a fast turn's first
+                # repaint rewrites the response text, and a turn whose output
+                # happens to be byte-identical still flips the marker count
+                # or falls through to the summary-pattern update).
+                if self._input_generation > 0 and self._snapshot_last_response is not None:
+                    screen_response = self._extract_last_response_text(joined)
+                    if screen_response == self._snapshot_last_response:
+                        clean = self._strip_effort_footer_lines(joined)
+                        current_count = len(list(re.finditer(r"[⏺●]\s+", clean)))
+                        if current_count == self._snapshot_response_count:
+                            return TerminalStatus.PROCESSING
                 return TerminalStatus.COMPLETED
             return TerminalStatus.IDLE
 

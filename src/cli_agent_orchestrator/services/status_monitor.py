@@ -129,6 +129,20 @@ class StatusMonitor:
         # still current, so a read that straddled a turn/output boundary can never
         # seed (or confirm) a candidate — see _fresh_capture_pane_status.
         self._pending_stale_capture: Dict[str, Tuple[TerminalStatus, float, int]] = {}
+        # Per-terminal immutable dispatch sequence (issue #735 review 2). A
+        # dispatch is a notify_input_sent call that starts a new turn; each
+        # gets a sequence number under the lock. Unlike _capture_generation
+        # (which advances on every output chunk and therefore proves only
+        # ordering), the dispatch sequence names the TURN the latched status's
+        # evidence belongs to: _status_evidence_dispatch is stamped with the
+        # dispatch sequence current when the evidence was sampled, so a
+        # caller holding dispatch sequence N can ask "is this status MY
+        # turn's?" (>= N) rather than "did any output happen after me?".
+        # Absent means nothing has latched yet; get_status_snapshot reports
+        # dispatch 0 so any dispatch sequence >= 1 is never satisfied by it.
+        self._dispatch_seq: Dict[str, int] = {}
+        self._status_evidence_dispatch: Dict[str, int] = {}
+        self._active_dispatch: Dict[str, int] = {}
         # Per-terminal turn/output generation. Bumped under the lock by
         # notify_input_sent (a new turn began) and by _process_chunk (real output
         # arrived). A capture-pane verdict is only applied if the generation it was
@@ -241,9 +255,24 @@ class StatusMonitor:
 
         self._schedule_screen_detection(terminal_id, provider)
 
-    def _apply_detection(self, terminal_id: str, detected: TerminalStatus) -> None:
+    def _apply_detection(
+        self,
+        terminal_id: str,
+        detected: TerminalStatus,
+        evidence_dispatch: Optional[int] = None,
+    ) -> None:
         """Apply the sticky-latch rules to a freshly detected status and publish
         on change. Shared by the raw and pyte detection paths.
+
+        ``evidence_dispatch`` is the dispatch sequence that was current
+        when the evidence behind ``detected`` was sampled (pinned by the
+        callers above, which sample the screen/buffer outside the lock). When
+        the latch actually changes, it is stamped as the evidence dispatch of
+        the new status so dispatch-correlated callers can distinguish "the
+        status I see reflects output from my turn" from "the status predates
+        my dispatch". ``None`` means "stamp the current dispatch sequence" —
+        used by callers that already hold fresh state (the herdr native path
+        derives status live per read).
 
         Stickiness: once a ready status is latched, refuse downgrades unless
         notify_input_sent() armed a revert. Two kinds of downgrade are blocked:
@@ -255,14 +284,21 @@ class StatusMonitor:
         paste into a busy agent).
         """
         with self._lock:
-            changed = self._apply_detection_locked(terminal_id, detected)
+            changed = self._apply_detection_locked(
+                terminal_id, detected, evidence_dispatch=evidence_dispatch
+            )
         if changed:
             # Publish outside the lock — subscribers must never be able to
             # re-enter StatusMonitor while the latch state is mid-update.
             bus.publish(f"terminal.{terminal_id}.status", {"status": detected.value})
             logger.info(f"Terminal {terminal_id} status changed: {detected.value}")
 
-    def _apply_detection_locked(self, terminal_id: str, detected: TerminalStatus) -> bool:
+    def _apply_detection_locked(
+        self,
+        terminal_id: str,
+        detected: TerminalStatus,
+        evidence_dispatch: Optional[int] = None,
+    ) -> bool:
         """Sticky-latch core of _apply_detection. Caller MUST hold self._lock.
 
         Split out so callers that need to validate a precondition and apply in
@@ -271,6 +307,14 @@ class StatusMonitor:
         notify_input_sent to slip through. Returns True when the status changed;
         the caller must then publish the change on the bus AFTER releasing the
         lock (see _apply_detection for why).
+
+        On a change, stamps ``_status_evidence_dispatch`` with the dispatch
+        sequence current when the evidence was sampled (callers that sample
+        the screen/buffer outside the lock pin it; None means read it now).
+        An unchanged latch leaves the previous stamp alone — a re-detection
+        of the same status from pre-dispatch evidence must not masquerade as
+        fresh (the paste-echo case _apply_detection's docstring above calls
+        out).
         """
         last = self._last_status.get(terminal_id)
 
@@ -310,6 +354,14 @@ class StatusMonitor:
             return False
 
         self._last_status[terminal_id] = detected
+        # Stamp only on a real transition: the evidence dispatch of the
+        # latched status is the dispatch sequence its evidence was sampled
+        # under, never "whenever the caller happened to re-detect it".
+        self._status_evidence_dispatch[terminal_id] = (
+            evidence_dispatch
+            if evidence_dispatch is not None
+            else self._dispatch_seq.get(terminal_id, 0)
+        )
         if detected == TerminalStatus.PROCESSING:
             self._allow_processing_revert[terminal_id] = False
         elif detected in _STICKY_READY_STATUSES and last not in _STICKY_READY_STATUSES:
@@ -392,10 +444,20 @@ class StatusMonitor:
             was_bursting = self._bursting.get(terminal_id, False)
             self._bursting[terminal_id] = True
             handle = self._quiesce_handle.pop(terminal_id, None)
+            # Pin the generation the rising-edge detection below will sample
+            # under: _detect_screen reads the screen/buffer unlocked, so a
+            # notify_input_sent can slip in before the verdict applies. The
+            # stamped evidence generation must describe the sampled evidence,
+            # not the post-hoc latch time (a paste echo latching nothing new).
+            pinned_dispatch = self._dispatch_seq.get(terminal_id, 0)
         self._cancel_quiesce_handle(handle)
 
         if not was_bursting:
-            self._apply_detection(terminal_id, self._detect_screen(terminal_id, provider))
+            self._apply_detection(
+                terminal_id,
+                self._detect_screen(terminal_id, provider),
+                evidence_dispatch=pinned_dispatch,
+            )
 
         self._arm_quiesce_timer(loop, terminal_id, self._on_screen_quiescent, provider)
 
@@ -408,14 +470,21 @@ class StatusMonitor:
         with self._lock:
             self._bursting[terminal_id] = False
             self._quiesce_handle.pop(terminal_id, None)
+            # Same pin rule as the rising-edge path: the screen re-read below
+            # runs unlocked, so record the generation being sampled now.
+            pinned_dispatch = self._dispatch_seq.get(terminal_id, 0)
 
         async def _detect_and_apply() -> None:
             detected = await asyncio.to_thread(self._detect_screen, terminal_id, provider)
-            self._apply_detection(terminal_id, detected)
+            self._apply_detection(terminal_id, detected, evidence_dispatch=pinned_dispatch)
 
         loop = self._loop or self._running_loop()
         if loop is None:
-            self._apply_detection(terminal_id, self._detect_screen(terminal_id, provider))
+            self._apply_detection(
+                terminal_id,
+                self._detect_screen(terminal_id, provider),
+                evidence_dispatch=pinned_dispatch,
+            )
         else:
             self._spawn_tracked(loop, _detect_and_apply())
 
@@ -448,6 +517,9 @@ class StatusMonitor:
             self._bursting[terminal_id] = True
             handle = self._quiesce_handle.pop(terminal_id, None)
             last_status = self._last_status.get(terminal_id)
+            # Pin the generation this detection will sample under — same rule
+            # as the screen path above.
+            pinned_dispatch = self._dispatch_seq.get(terminal_id, 0)
         self._cancel_quiesce_handle(handle)
 
         # While terminal is ready/armed, detect on every chunk so the
@@ -455,7 +527,7 @@ class StatusMonitor:
         # delivery by InboxService). Once PROCESSING is observed, debounce.
         if not was_bursting or last_status in _STICKY_READY_STATUSES or last_status is None:
             detected = self._detect_status(terminal_id, buffer)
-            self._apply_detection(terminal_id, detected)
+            self._apply_detection(terminal_id, detected, evidence_dispatch=pinned_dispatch)
 
         self._arm_quiesce_timer(loop, terminal_id, self._on_raw_quiescent)
 
@@ -505,14 +577,22 @@ class StatusMonitor:
             self._bursting[terminal_id] = False
             self._quiesce_handle.pop(terminal_id, None)
             buffer = self._buffers.get(terminal_id, "")
+            # Same pin rule as the screen path: _detect_status below runs
+            # unlocked against this buffer, so record the generation being
+            # sampled now.
+            pinned_dispatch = self._dispatch_seq.get(terminal_id, 0)
 
         async def _detect_and_apply() -> None:
             detected = await asyncio.to_thread(self._detect_status, terminal_id, buffer)
-            self._apply_detection(terminal_id, detected)
+            self._apply_detection(terminal_id, detected, evidence_dispatch=pinned_dispatch)
 
         loop = self._loop or self._running_loop()
         if loop is None:
-            self._apply_detection(terminal_id, self._detect_status(terminal_id, buffer))
+            self._apply_detection(
+                terminal_id,
+                self._detect_status(terminal_id, buffer),
+                evidence_dispatch=pinned_dispatch,
+            )
         else:
             self._spawn_tracked(loop, _detect_and_apply())
 
@@ -558,27 +638,131 @@ class StatusMonitor:
             except RuntimeError:
                 pass  # loop already closed during shutdown — the timer is moot
 
-    def notify_input_sent(self, terminal_id: str, *, assume_processing: bool = False) -> None:
-        """Arm the next PROCESSING transition.
+    def notify_input_sent(
+        self,
+        terminal_id: str,
+        *,
+        assume_processing: bool = False,
+        owns_turn: bool = False,
+    ) -> int:
+        """Arm the next PROCESSING transition and assign this dispatch a sequence.
 
         Call before any send_keys / paste that initiates a new processing
         cycle (terminal_service.send_input, provider.initialize warm-up
         and CLI-launch keystrokes). Without this, a previously-latched
         IDLE/COMPLETED would block the genuine PROCESSING transition.
+
+        Returns the dispatch sequence assigned to this dispatch — the value
+        any later status must OUT-RANK (see get_status_snapshot) for a
+        dispatch-correlated caller to accept its completion. The sequence
+        is bumped under the lock, so two concurrent dispatches get distinct
+        sequences and each caller can tell whether the status it reads
+        reflects its own turn.
         """
         with self._lock:
+            dispatch_seq = self._start_dispatch_locked(terminal_id, owns_turn=owns_turn)
+        if assume_processing:
+            self._apply_detection(terminal_id, TerminalStatus.PROCESSING)
+        return dispatch_seq
+
+    def claim_dispatch(self, terminal_id: str, *, assume_processing: bool = False) -> int | None:
+        """Atomically install the one top-level dispatch allowed for a terminal."""
+        with self._lock:
+            if terminal_id in self._active_dispatch:
+                return None
+            dispatch_seq = self._start_dispatch_locked(terminal_id, owns_turn=True)
+        if assume_processing:
+            self._apply_detection(terminal_id, TerminalStatus.PROCESSING)
+        return dispatch_seq
+
+    def finish_dispatch(self, terminal_id: str, dispatch_seq: int) -> bool:
+        """Release the exact completed top-level dispatch after its output is retained."""
+        with self._lock:
+            if self._active_dispatch.get(terminal_id) != dispatch_seq:
+                return False
+            self._active_dispatch.pop(terminal_id, None)
+            return True
+
+    def owns_dispatch(self, terminal_id: str, dispatch_seq: int) -> bool:
+        """Whether this token is still the terminal's active top-level turn."""
+        with self._lock:
+            return self._active_dispatch.get(terminal_id) == dispatch_seq
+
+    def abort_dispatch(self, terminal_id: str, dispatch_seq: int) -> bool:
+        """Release the exact dispatch when submission fails before a turn can run."""
+        return self.finish_dispatch(terminal_id, dispatch_seq)
+
+    def continue_active_dispatch(
+        self, terminal_id: str, *, assume_processing: bool = False
+    ) -> None:
+        """Re-arm an existing turn after prompt-continuation input without renumbering it."""
+        with self._lock:
             self._allow_processing_revert[terminal_id] = True
-            # A new turn is starting: whatever ready state a stale-PROCESSING capture saw
-            # before this input no longer describes the terminal. Left armed, that candidate
-            # could be "confirmed" by a single post-input read and latch ready against the
-            # new turn's genuine PROCESSING. The generation bump additionally invalidates
-            # any capture verdict already CONFIRMED but not yet applied — an in-flight
-            # get_status() that sampled the pane before this input must not stamp its
-            # stale verdict over the new turn (and consume the revert arm just set).
             self._pending_stale_capture.pop(terminal_id, None)
             self._capture_generation[terminal_id] = self._capture_generation.get(terminal_id, 0) + 1
         if assume_processing:
             self._apply_detection(terminal_id, TerminalStatus.PROCESSING)
+
+    def _start_dispatch_locked(self, terminal_id: str, *, owns_turn: bool) -> int:
+        self._allow_processing_revert[terminal_id] = True
+        self._pending_stale_capture.pop(terminal_id, None)
+        self._capture_generation[terminal_id] = self._capture_generation.get(terminal_id, 0) + 1
+        dispatch_seq = self._dispatch_seq.get(terminal_id, 0) + 1
+        self._dispatch_seq[terminal_id] = dispatch_seq
+        if owns_turn:
+            self._active_dispatch[terminal_id] = dispatch_seq
+        return dispatch_seq
+
+    def has_inflight_dispatch(self, terminal_id: str) -> bool:
+        """Whether a top-level send still owns this terminal's turn boundary."""
+        with self._lock:
+            active = self._active_dispatch.get(terminal_id)
+            if active is None:
+                return False
+            status = self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
+            evidence = self._status_evidence_dispatch.get(terminal_id, 0)
+            return not (status in _STICKY_READY_STATUSES and evidence == active)
+
+    def get_status_snapshot(self, terminal_id: str) -> Tuple[TerminalStatus, int]:
+        """Return one dispatch-consistent, live ``(status, evidence)`` pair.
+
+        ``get_status`` is intentionally not a cache accessor: event-inbox
+        terminals derive their native status there and cached PROCESSING can
+        self-heal from the visible terminal.  Pin the dispatch around that
+        unlocked work and retry if a new input claimed the terminal while the
+        resolver was running; otherwise a live result from turn N could be
+        returned with turn N+1's evidence.
+        """
+        while True:
+            with self._lock:
+                dispatch = self._dispatch_seq.get(terminal_id, 0)
+
+            status = self.get_status(terminal_id)
+
+            with self._lock:
+                if self._dispatch_seq.get(terminal_id, 0) != dispatch:
+                    continue
+                return status, self._status_evidence_dispatch.get(terminal_id, 0)
+
+    def get_status_generation(self, terminal_id: str) -> int:
+        """Dispatch sequence of the evidence behind the latched status.
+
+        Kept as a thin accessor for callers that need only the evidence
+        stamp; get_status_snapshot is the atomic form.
+        """
+        with self._lock:
+            return self._status_evidence_dispatch.get(terminal_id, 0)
+
+    def _record_unlatched_evidence(self, terminal_id: str) -> None:
+        """Stamp live-derived evidence at the current dispatch sequence.
+
+        The herdr native path in get_status derives status on demand and
+        returns it without latching, so there is no transition to stamp in
+        _apply_detection_locked. Its verdict describes the pane as read NOW,
+        so the current dispatch sequence is the honest evidence stamp.
+        """
+        with self._lock:
+            self._status_evidence_dispatch[terminal_id] = self._dispatch_seq.get(terminal_id, 0)
 
     def clear_rolling_buffer(self, terminal_id: str, provider=None) -> None:
         """Clear ONLY the rolling byte buffer for a terminal — preserves
@@ -629,6 +813,8 @@ class StatusMonitor:
             self._buffer_changed_at.pop(terminal_id, None)
             self._pending_stale_capture.pop(terminal_id, None)
             self._capture_generation.pop(terminal_id, None)
+            self._status_evidence_dispatch.pop(terminal_id, None)
+            self._active_dispatch.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
 
@@ -653,6 +839,8 @@ class StatusMonitor:
             self._buffer_changed_at.pop(terminal_id, None)
             self._pending_stale_capture.pop(terminal_id, None)
             self._capture_generation.pop(terminal_id, None)
+            self._status_evidence_dispatch.pop(terminal_id, None)
+            self._active_dispatch.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
 
@@ -683,7 +871,16 @@ class StatusMonitor:
                     # get_native_status()==None fallback still gets what we have.
                     # provider.get_status may shell out to the herdr CLI — call
                     # it outside the lock.
-                    return provider.get_status(buffer)
+                    derived = provider.get_status(buffer)
+                    # The native path does not latch; its verdict is live, so
+                    # record it as evidence at the CURRENT generation. The
+                    # provider-side _task_dispatched disambiguation (see
+                    # BaseProvider._resolve_native_status) already rejects a
+                    # pre-dispatch "idle", and a post-dispatch "done" is only
+                    # reported after the flush wait — this is exactly the
+                    # "output generation" a dispatch-correlated caller needs.
+                    self._record_unlatched_evidence(terminal_id)
+                    return derived
                 except Exception as e:
                     logger.error(f"Error deriving native status for {terminal_id}: {e}")
                     return TerminalStatus.UNKNOWN
@@ -696,6 +893,7 @@ class StatusMonitor:
             # timer from ever firing. Do a fresh detection from the current
             # buffer so poll-based callers (wait_until_status) catch the
             # PROCESSING→ready transition without waiting for stream silence.
+            pinned_dispatch = self._dispatch_seq.get(terminal_id, 0)
             if cached == TerminalStatus.PROCESSING:
                 buffer = self._buffers.get(terminal_id, "")
             else:
@@ -708,7 +906,7 @@ class StatusMonitor:
                 f"fresh={fresh.value}, buffer_len={len(buffer)}"
             )
             if fresh != TerminalStatus.PROCESSING and fresh != TerminalStatus.UNKNOWN:
-                self._apply_detection(terminal_id, fresh)
+                self._apply_detection(terminal_id, fresh, evidence_dispatch=pinned_dispatch)
                 return fresh
 
         if cached == TerminalStatus.PROCESSING:

@@ -1056,6 +1056,239 @@ class TestStickyLatching:
         assert m.published == ["unknown"]
 
 
+class TestStatusEvidenceGeneration:
+    """Dispatch generation assignment + evidence-generation stamping (issue #735).
+
+    A dispatch-correlated caller (POST /terminals/{id}/input's
+    input_generation) accepts a completion only once the latched status's
+    evidence was sampled at or after its dispatch generation. That contract
+    needs exactly three properties pinned here:
+
+    1. notify_input_sent returns the generation assigned to that dispatch,
+       monotonically increasing per terminal.
+    2. A latch CHANGE stamps the evidence generation the change's evidence
+       was sampled under — so a completion that latched from post-dispatch
+       output outranks the dispatch.
+    3. A re-detection that leaves the latch unchanged does NOT refresh the
+       stamp — a paste echo re-affirming the prior turn's COMPLETED must stay
+       at its old evidence generation, or every stale marker would look
+       fresh.
+    """
+
+    def test_notify_input_sent_returns_monotonic_dispatch_generations(self):
+        m = _SequencedMonitor()
+        first = m.sm.notify_input_sent("t1")
+        second = m.sm.notify_input_sent("t1")
+        assert first >= 1
+        assert second == first + 1
+
+    def test_latch_change_stamps_evidence_generation(self):
+        m = _SequencedMonitor()
+        # Pre-dispatch: some earlier turn's completion latched from its own
+        # output — with no dispatch ever assigned, its evidence dispatch is 0.
+        m.feed(TerminalStatus.COMPLETED)
+        stamped = m.sm.get_status_generation("t1")
+        assert stamped == 0
+
+        # The dispatch gets sequence 1; post-dispatch output then latches a
+        # new completion whose evidence belongs to dispatch 1.
+        dispatch = m.sm.notify_input_sent("t1")
+        assert dispatch == 1
+        m.feed(TerminalStatus.PROCESSING)
+        m.feed(TerminalStatus.COMPLETED)
+
+        evidence = m.sm.get_status_generation("t1")
+        assert evidence > stamped
+        assert evidence >= dispatch
+        assert m.status() == TerminalStatus.COMPLETED
+
+    def test_unchanged_latch_does_not_refresh_evidence_generation(self):
+        m = _SequencedMonitor()
+        m.feed(TerminalStatus.COMPLETED)
+        stamped = m.sm.get_status_generation("t1")
+
+        # Dispatch, then the paste echo re-detects the SAME completed status
+        # from the still-composited prior frame — latch unchanged.
+        dispatch = m.sm.notify_input_sent("t1")
+        m.feed(TerminalStatus.COMPLETED)
+
+        assert m.status() == TerminalStatus.COMPLETED
+        assert m.sm.get_status_generation("t1") == stamped
+        assert stamped < dispatch
+
+    def test_no_evidence_reports_zero(self):
+        sm = StatusMonitor()
+        assert sm.get_status_generation("unknown-terminal") == 0
+        assert sm.get_status_snapshot("unknown-terminal") == (TerminalStatus.UNKNOWN, 0)
+
+    def test_snapshot_pairs_status_and_evidence_atomically(self):
+        """get_status_snapshot returns both values from ONE lock hold.
+
+        Review blocker 2 (controlled interleaving): a thread that samples the
+        status and the evidence in two separate reads can pair a stale
+        completed with a newer processing evidence stamp. The snapshot API
+        reads both under the same lock, so every observed pair is one that
+        actually coexisted.
+        """
+        m = _SequencedMonitor()
+        m.feed(TerminalStatus.COMPLETED)
+        # Evidence of that pre-dispatch completion is dispatch 0 (no dispatch
+        # had been assigned when it latched).
+        status, evidence = m.sm.get_status_snapshot("t1")
+        assert status == TerminalStatus.COMPLETED
+        assert evidence == 0
+
+        dispatch = m.sm.notify_input_sent("t1")
+        m.feed(TerminalStatus.PROCESSING)
+        m.feed(TerminalStatus.COMPLETED)
+        status, evidence = m.sm.get_status_snapshot("t1")
+        assert status == TerminalStatus.COMPLETED
+        assert evidence >= dispatch
+
+    def test_interleaved_dispatches_own_their_own_evidence(self):
+        """Review blocker 1: adjacent dispatches cannot consume each other's
+        completion — output that latches between dispatch N and dispatch N+1
+        stamps evidence N, which dispatch N+1's wait must reject (N < N+1)."""
+        m = _SequencedMonitor()
+        first = m.sm.notify_input_sent("t1")
+        m.feed(TerminalStatus.PROCESSING)
+        m.feed(TerminalStatus.COMPLETED)
+        # Evidence stamped at dispatch 1: owned by the FIRST dispatch.
+        assert m.sm.get_status_snapshot("t1") == (TerminalStatus.COMPLETED, first)
+
+        # A second dispatch arrives while that completion is latched. The
+        # latch is unchanged until new output arrives, so the evidence stamp
+        # still reads first — the second dispatch's wait keeps waiting.
+        second = m.sm.notify_input_sent("t1")
+        assert second == first + 1
+        assert m.sm.get_status_snapshot("t1") == (TerminalStatus.COMPLETED, first)
+        assert first < second  # the stale completion cannot satisfy dispatch 2
+
+        # The second turn's own output re-latches with evidence second.
+        m.feed(TerminalStatus.PROCESSING)
+        m.feed(TerminalStatus.COMPLETED)
+        assert m.sm.get_status_snapshot("t1") == (TerminalStatus.COMPLETED, second)
+
+    def test_top_level_dispatch_stays_inflight_until_its_ready_evidence(self):
+        m = _SequencedMonitor()
+        dispatch = m.sm.notify_input_sent("t1", owns_turn=True)
+
+        assert m.sm.has_inflight_dispatch("t1") is True
+        m.feed(TerminalStatus.PROCESSING)
+        assert m.sm.has_inflight_dispatch("t1") is True
+        m.feed(TerminalStatus.COMPLETED)
+
+        assert m.sm.get_status_snapshot("t1") == (TerminalStatus.COMPLETED, dispatch)
+        assert m.sm.has_inflight_dispatch("t1") is False
+
+    def test_claim_dispatch_is_atomic_and_prompt_continuations_keep_its_token(self):
+        m = _SequencedMonitor()
+
+        dispatch = m.sm.claim_dispatch("t1")
+        assert dispatch == 1
+        assert m.sm.claim_dispatch("t1") is None
+
+        m.sm.continue_active_dispatch("t1")
+        m.feed(TerminalStatus.PROCESSING)
+        m.feed(TerminalStatus.COMPLETED)
+        assert m.sm.get_status_snapshot("t1") == (TerminalStatus.COMPLETED, dispatch)
+        assert m.sm.finish_dispatch("t1", dispatch) is True
+        assert m.sm.claim_dispatch("t1") == dispatch + 1
+
+    def test_abort_dispatch_releases_only_the_claimed_token(self):
+        m = _SequencedMonitor()
+
+        dispatch = m.sm.claim_dispatch("t1")
+        assert m.sm.abort_dispatch("t1", dispatch + 1) is False
+        assert m.sm.claim_dispatch("t1") is None
+        assert m.sm.abort_dispatch("t1", dispatch) is True
+        assert m.sm.claim_dispatch("t1") == dispatch + 1
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_snapshot_preserves_live_event_inbox_status(self, mock_pm, mock_get_backend):
+        """GET status must not bypass the native event-inbox resolver (#735)."""
+        sm = StatusMonitor()
+        provider = MagicMock()
+        provider.get_status.return_value = TerminalStatus.IDLE
+        mock_pm.get_provider.return_value = provider
+        mock_get_backend.return_value.supports_event_inbox.return_value = True
+
+        dispatch = sm.notify_input_sent("t1", owns_turn=True)
+
+        assert sm.get_status_snapshot("t1") == (TerminalStatus.IDLE, dispatch)
+        provider.get_status.assert_called_once_with("")
+
+    def test_fast_completion_outranks_dispatch_while_echo_does_not(self):
+        """The reviewer's exact-head race, composed against the REAL screen
+        detector (PR #741 rework): a turn whose entire activity interval fits
+        inside the pre-poll delay must latch post-dispatch evidence (so the
+        dispatch-correlated wait accepts it on the first read), while the
+        paste echo alone — same settled prior frame — must not.
+        """
+        sep = "─" * 60
+        prior_pane = (
+            "● Done — prior turn answer PREV1.\n"
+            "✻ Crunched for 12s\n" + sep + "\n❯ \n" + sep + "\n"
+        )
+        new_pane = (
+            "● Done — fresh turn answer FAST1.\n"
+            "✻ Crunched for 0s\n" + sep + "\n❯ \n" + sep + "\n"
+        )
+        paste_echo = "\rRun the probe and reply DONE\n"
+        repaint = "\x1b[H\x1b[2J" + new_pane
+
+        from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
+
+        provider = ClaudeCodeProvider("deadbeef", "cao-probe", "probe-0")
+        sm = StatusMonitor()
+
+        def feed_and_settle(chunk):
+            # No event loop in unit tests: rising-edge detection runs inline
+            # and _on_screen_quiescent drives the settle detection directly.
+            sm._process_chunk("deadbeef", chunk)
+            sm._on_screen_quiescent("deadbeef", provider)
+
+        with (
+            patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as pm,
+            patch("cli_agent_orchestrator.backends.registry._backend") as backend,
+        ):
+            pm.get_provider.return_value = provider
+            backend.get_history.return_value = prior_pane
+            backend.supports_event_inbox.return_value = False
+            backend.get_native_status.return_value = None
+
+            # Prior turn completes and settles.
+            feed_and_settle(prior_pane)
+            assert sm.get_status("deadbeef") == TerminalStatus.COMPLETED
+
+            # Dispatch, snapshot, paste echo — the screen still shows the
+            # prior frame's response.
+            dispatch = sm.notify_input_sent("deadbeef")
+            provider.mark_input_received()
+            sm.clear_rolling_buffer("deadbeef", provider)
+            feed_and_settle(paste_echo)
+
+            echo_gen = sm.get_status_generation("deadbeef")
+            echo_status = sm.get_status("deadbeef")
+            # The paste echo cannot satisfy the dispatch: either the #407
+            # screen guard forced PROCESSING (status changed, but the wait's
+            # COMPLETED rule is not satisfied), or the stale COMPLETED's
+            # evidence still predates the dispatch.
+            assert not (echo_status == TerminalStatus.COMPLETED and echo_gen >= dispatch), (
+                echo_status,
+                echo_gen,
+                dispatch,
+            )
+
+            # The whole fast turn lands before the first poll.
+            backend.get_history.return_value = new_pane
+            feed_and_settle(repaint)
+
+            assert sm.get_status("deadbeef") == TerminalStatus.COMPLETED
+            assert sm.get_status_generation("deadbeef") >= dispatch
+
+
 class TestQuiescenceTimerCancel:
     """The pyte quiescence timer is an asyncio.TimerHandle owned by the
     StatusMonitor's loop. clear_terminal/reset_buffer can run off that loop

@@ -663,3 +663,139 @@ class TestPollUntilDone:
             g.return_value = self._resp("error")
             with pytest.raises(click.ClickException):
                 poll_until_done("abcd1234", timeout=60, polling_interval=0)
+
+    def _gen_resp(self, status, generation):
+        m = MagicMock()
+        m.raise_for_status.return_value = None
+        m.json.return_value = {"status": status, "status_generation": generation}
+        return m
+
+    def test_dispatch_generation_accepts_immediate_completed(self):
+        """A turn that completed before polling began carries post-dispatch
+        evidence (status_generation >= dispatch generation), so its COMPLETED
+        is accepted on the first reading — no PROCESSING observation needed
+        (issue #735 rework: the observed-working gate rejected these)."""
+        from cli_agent_orchestrator.utils.terminal import poll_until_done
+
+        with (
+            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
+        ):
+            g.return_value = self._gen_resp("completed", 6)
+            poll_until_done("abcd1234", timeout=60, polling_interval=0, dispatch_generation=5)
+            assert g.call_count == 1
+
+    def test_dispatch_generation_rejects_stale_completed(self):
+        """COMPLETED whose evidence predates the dispatch (status_generation <
+        dispatch_generation) must keep waiting; the poll that finally carries
+        post-dispatch evidence returns."""
+        import click
+
+        from cli_agent_orchestrator.utils.terminal import poll_until_done
+
+        seq = [
+            self._gen_resp("completed", 3),  # prior turn's marker — rejected
+            self._gen_resp("completed", 3),  # still stale — rejected
+            self._gen_resp("processing", 4),
+            self._gen_resp("completed", 5),  # ours -> return
+        ]
+        with (
+            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
+        ):
+            g.side_effect = seq
+            poll_until_done("abcd1234", timeout=60, polling_interval=0, dispatch_generation=4)
+            assert g.call_count == 4
+
+    def test_dispatch_generation_stale_completed_times_out(self):
+        """A stale pre-dispatch COMPLETED that never advances must time out,
+        not return the previous turn's output."""
+        import click
+
+        from cli_agent_orchestrator.utils.terminal import poll_until_done
+
+        times = iter([0, 0.5, 1.0, 1.5, 100.0])
+        with (
+            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
+            patch(
+                "cli_agent_orchestrator.utils.terminal.time.time",
+                side_effect=lambda: next(times),
+            ),
+        ):
+            g.return_value = self._gen_resp("completed", 2)
+            with pytest.raises(click.ClickException, match="Timed out"):
+                poll_until_done("abcd1234", timeout=10, polling_interval=0, dispatch_generation=4)
+
+    def test_dispatch_generation_absent_field_falls_back_to_observed_working(self):
+        """A server mid-rollout that returns no status_generation keeps the
+        observed-working contract: COMPLETED before any PROCESSING reading
+        waits; after one it returns."""
+        from cli_agent_orchestrator.utils.terminal import poll_until_done
+
+        seq = [
+            self._resp("completed"),  # no generation field — stale-possible
+            self._resp("processing"),
+            self._resp("completed"),  # accepted via fallback gate
+        ]
+        with (
+            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
+        ):
+            g.side_effect = seq
+            poll_until_done("abcd1234", timeout=60, polling_interval=0, dispatch_generation=4)
+            assert g.call_count == 3
+
+    def test_dispatch_owned_idle_satisfies_stable_window(self):
+        """Issue #735 review (blocker 3): a fast turn that ends
+        PROCESSING → IDLE entirely inside the pre-poll delay settles into
+        post-dispatch IDLE. Its evidence dispatch reaches the dispatch
+        sequence, so the stable-IDLE window counts it — the
+        observed-activity gate alone would have waited until timeout."""
+        from cli_agent_orchestrator.utils.terminal import poll_until_done
+
+        seq = [
+            self._gen_resp("idle", 5),  # post-dispatch idle, never observed processing
+            self._gen_resp("idle", 5),
+            self._gen_resp("idle", 5),  # 3rd stable idle -> return
+        ]
+        with (
+            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
+        ):
+            g.side_effect = seq
+            poll_until_done(
+                "abcd1234",
+                timeout=60,
+                polling_interval=0,
+                idle_stable_polls=3,
+                dispatch_generation=5,
+            )
+            assert g.call_count == 3
+
+    def test_pre_dispatch_idle_never_counts(self):
+        """IDLE whose evidence predates the dispatch is the idle-before-
+        processing window, not a finished turn: it must never satisfy the
+        stable window (issue #735: pre-dispatch markers are not ours)."""
+        import click
+
+        from cli_agent_orchestrator.utils.terminal import poll_until_done
+
+        times = iter([0, 0.5, 1.0, 1.5, 100.0])
+        with (
+            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
+            patch(
+                "cli_agent_orchestrator.utils.terminal.time.time",
+                side_effect=lambda: next(times),
+            ),
+        ):
+            g.return_value = self._gen_resp("idle", 2)
+            with pytest.raises(click.ClickException, match="Timed out"):
+                poll_until_done(
+                    "abcd1234",
+                    timeout=10,
+                    polling_interval=0,
+                    idle_stable_polls=3,
+                    dispatch_generation=4,
+                )

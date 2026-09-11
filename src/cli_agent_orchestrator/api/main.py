@@ -244,6 +244,7 @@ async def inbox_reconciliation_daemon(registry: PluginRegistry) -> None:
 class TerminalOutputResponse(BaseModel):
     output: str
     mode: str
+    input_generation: Optional[int] = None
 
 
 class TerminalOutputRange(BaseModel):
@@ -3572,15 +3573,21 @@ async def send_terminal_input(
         # off the event loop so a slow tmux call can't freeze every other
         # request — including /health and concurrent assign/handoff. Same
         # hazard class as issue #382 (only fixed for DELETE /sessions there).
-        success = await asyncio.to_thread(
-            terminal_service.send_input,
+        _ok, dispatch_sequence = await asyncio.to_thread(
+            terminal_service.dispatch_input,
             terminal_id,
             message,
             registry=get_plugin_registry(request),
             sender_id=sender_id,
             orchestration_type=orchestration_type,
         )
-        return {"success": success}
+        # input_generation lets the caller correlate its completion wait with
+        # THIS dispatch: accept a completion once GET /terminals/{id}'s
+        # status_generation reaches this value (issue #735 — a completion
+        # marker on the current frame can otherwise belong to the previous
+        # turn, and an observed-activity gate alone rejects a turn that
+        # finishes before polling starts).
+        return {"success": True, "input_generation": dispatch_sequence}
     except TerminalInputBlockedError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
@@ -3625,14 +3632,17 @@ async def send_terminal_key(
 async def get_terminal_output(
     terminal_id: TerminalId,
     mode: OutputMode = OutputMode.FULL,
+    input_generation: Optional[int] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> TerminalOutputResponse:
     try:
         # get_output does a blocking tmux capture-pane plus provider regex
         # extraction over the scrollback — run it off the loop so a large
         # transcript can't stall the whole server.
-        output = await asyncio.to_thread(terminal_service.get_output, terminal_id, mode)
-        return TerminalOutputResponse(output=output, mode=mode)
+        output = await asyncio.to_thread(
+            terminal_service.get_output, terminal_id, mode, input_generation
+        )
+        return TerminalOutputResponse(output=output, mode=mode, input_generation=input_generation)
     except OutputExtractionError as e:
         # Ordered before the ValueError arm it subclasses, same as run_step: the
         # terminal and the route both resolved -- only the response marker was
