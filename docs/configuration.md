@@ -309,7 +309,7 @@ A number of other `CAO_*` variables (runtime/process-identity vars like `CAO_TER
 |---|---|---|---|
 | `CAO_HOME_DIR` | `~/.aws/cli-agent-orchestrator` | str (path) | Base directory for all CAO state. See [Data directory](#data-directory-cao_home_dir) above. |
 
-The pipe-pane liveness watchdog (issue #388, `services/fifo_reader.py`) adds six more of these ad-hoc vars, read directly via `_env_int`/`_env_float` in `constants.py` rather than through `ConfigService` — they have no `settings.json` mapping like the rows in the table above:
+Rendered-screen status detection adds `CAO_PYTE_STATUS` (default `true`) and `CAO_PYTE_MIDBURST_PROBE_S` (default `1.0`, the minimum interval between mid-burst PROCESSING probes; see [Event-Driven Architecture](event-driven-architecture.md#status-monitor-servicesstatus_monitorpy--publisher--consumer)), both read in `constants.py`. The pipe-pane liveness watchdog (issue #388, `services/fifo_reader.py`) adds six more of these ad-hoc vars, read directly via `_env_int`/`_env_float` in `constants.py` rather than through `ConfigService` — they have no `settings.json` mapping like the rows in the table above:
 
 | Env var | Default | Type | Purpose |
 |---|---|---|---|

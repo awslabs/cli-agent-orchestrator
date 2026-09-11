@@ -262,6 +262,16 @@ PYTE_SCREEN_ROWS = 200
 # per-chunk rendered detection produces (measured worse than the raw path).
 PYTE_QUIESCENCE_DELAY_S = 0.2
 
+# Mid-burst PROCESSING probe for rendered-screen detection (seconds). A TUI that
+# redraws a spinner every second (codex 0.153 while a command runs) never goes
+# quiescent, so edge-only detection sees the rising-edge frame (usually still
+# the previous ready state) and then nothing until the turn ends: the terminal
+# reads IDLE for its whole busy turn (observed live 2026-09-08). While a burst is
+# in progress and the terminal has not yet been seen PROCESSING, the screen is
+# probed at most this often; only a PROCESSING verdict is applied from such a
+# half-settled frame — ready statuses still wait for quiescence.
+PYTE_MIDBURST_PROBE_S = _env_positive_float("CAO_PYTE_MIDBURST_PROBE_S", 1.0)
+
 # Eager inbox delivery: when enabled, deliver queued messages to terminals in
 # PROCESSING state for providers that declare
 # accepts_input_while_processing=True. Eliminates latency between agent turns

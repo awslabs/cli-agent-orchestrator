@@ -813,6 +813,14 @@ class CodexProvider(BaseProvider):
     # the live frame rather than stale redraw history.
     supports_screen_detection = True
 
+    # Codex is the provider the mid-burst probe exists for: 0.153 redraws its
+    # spinner about once a second for the whole turn, so the screen never goes
+    # quiescent and the rising edge composites before the spinner draws. Opting
+    # in is safe because this detector is a pure function of the frame —
+    # get_status() reads patterns and returns, it commits no turn bookkeeping —
+    # so a probed frame the monitor discards leaves nothing behind.
+    supports_midburst_processing_probe = True
+
     def __init__(
         self,
         terminal_id: str,
@@ -1458,6 +1466,35 @@ class CodexProvider(BaseProvider):
         if not rows:
             return TerminalStatus.UNKNOWN
         return self.get_status("\n".join(rows))
+
+    def probe_processing_from_screen(self, screen_lines: list[str]) -> bool:
+        """Report whether a half-drawn Codex frame shows a working turn.
+
+        Positive evidence only: the progress row must actually be drawn. The
+        normal detector answers PROCESSING for two different reasons — a
+        detected spinner, and the catch-all at the end of get_status for a frame
+        that simply has no idle composer at the bottom. The second is right for
+        settled detection but wrong here, because a partial redraw that erases
+        the composer while the previous response is still on screen carries no
+        evidence of new work; taken as busy it consumes the monitor's dispatch
+        arm, after which the restored old completion latches and the genuine
+        spinner that follows is refused.
+
+        Requiring TUI_PROGRESS_PATTERN first, then keeping only a PROCESSING
+        verdict from the full detector, means the trust prompt, login menu,
+        approval dialog and error guards still get the final say on a frame that
+        does contain a spinner, without inheriting the no-composer fallback.
+
+        Pure: it matches patterns against the text it is handed and touches no
+        turn bookkeeping, so a verdict the monitor discards changes nothing.
+        """
+        rows = [line.rstrip() for line in screen_lines if line.strip()]
+        if not rows:
+            return False
+        frame = "\n".join(rows)
+        if not re.search(TUI_PROGRESS_PATTERN, frame, re.MULTILINE):
+            return False
+        return self.get_status(frame) == TerminalStatus.PROCESSING
 
     def extract_current_composer(self, rendered_pane: str) -> Optional[str]:
         """Return Codex's bottom composer without admitting transcript prompts."""
