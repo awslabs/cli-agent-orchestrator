@@ -389,6 +389,37 @@ check(
     broker._leases[observed_id]["state"],
 )
 
+# The reaper also takes an identity snapshot before its blocking LIST. Simulate
+# an operator claiming the original UID while that LIST is in flight, followed
+# by the stale LIST returning only a replacement. The reaper must re-read the
+# winning UID and settle the replacement instead of judging the stale candidate.
+reaper_race_lease = broker.create_worker(worker_request(), "test-token")
+reaper_race_id = reaper_race_lease.worker_id
+reaper_winner_uid = STATE["pods"][reaper_race_id].metadata.uid
+reaper_stale_candidate = _fake_pod(
+    f"cao-worker-{reaper_race_id}",
+    broker._labels(reaper_race_id),
+)
+
+def _list_after_operator_claim(*args, **kwargs):
+    with broker._leases_lock:
+        broker._leases[reaper_race_id]["pod_uid"] = reaper_winner_uid
+        broker._leases[reaper_race_id]["pod_observed_at"] = time.monotonic()
+    return types.SimpleNamespace(items=[reaper_stale_candidate])
+
+with patch.object(
+    broker.core_api,
+    "list_namespaced_pod",
+    side_effect=_list_after_operator_claim,
+):
+    broker._reap_once()
+check(
+    "reaper revalidates a pod identity claimed during its LIST",
+    broker._leases[reaper_race_id]["state"] == "terminated"
+    and "replaced" in (broker._leases[reaper_race_id]["reason"] or ""),
+    json.dumps(broker._leases[reaper_race_id], default=str),
+)
+
 STATE["new_pods_ready"] = False
 _t0 = time.monotonic()
 lease0 = broker.create_worker(worker_request(), "test-token")
@@ -1064,6 +1095,48 @@ with TestClient(broker.app) as c:
         )
         STATE["pods"][pid] = original_pod
 
+        # The first observer does not own the candidate merely because its LIST
+        # completed first. Simulate the reaper claiming another UID after the
+        # operator read `pod_uid=None` but before it records its own candidate.
+        # The losing operator must fail closed rather than route to that stale
+        # candidate.
+        class _ClaimRacingMetadata:
+            name = original_pod.metadata.name
+
+            @property
+            def uid(self):
+                with broker._leases_lock:
+                    broker._leases[pid]["pod_uid"] = "pod-uid-reaper-winner"
+                    broker._leases[pid]["pod_observed_at"] = time.monotonic()
+                return original_pod.metadata.uid
+
+        with broker._leases_lock:
+            broker._leases[pid]["pod_uid"] = None
+            broker._leases[pid]["pod_observed_at"] = None
+        racing_pod = types.SimpleNamespace(
+            metadata=_ClaimRacingMetadata(),
+            status=original_pod.status,
+        )
+        with patch.object(
+            broker.core_api,
+            "list_namespaced_pod",
+            return_value=types.SimpleNamespace(items=[racing_pod]),
+        ):
+            try:
+                broker._worker_pod(pid)
+                race_refused = False
+            except broker.HTTPException as exc:
+                race_refused = (
+                    exc.status_code == 409 and "claimed concurrently" in exc.detail
+                )
+        check(
+            "a losing operator pod-identity claim refuses its stale candidate",
+            race_refused,
+        )
+        with broker._leases_lock:
+            broker._leases[pid]["pod_uid"] = original_pod.metadata.uid
+            broker._leases[pid]["pod_observed_at"] = time.monotonic()
+
         # --- 10c. settled survivors stay readable but cannot be written -----
         broker._leases[pid]["state"] = "expired"
         broker._leases[pid]["reason"] = "no completion within 900s"
@@ -1122,11 +1195,32 @@ with TestClient(broker.app) as c:
     # bearing: close() refuses to complete until shutdown() has run.
     import asyncio
 
+    class _TimeoutSocket:
+        def __init__(self):
+            self.values = []
+
+        def settimeout(self, value):
+            self.values.append(value)
+
+    def _urllib3_v2_layout(sock):
+        # Mirror what urllib3 2.x actually exposes on a streaming response:
+        # `connection.sock` is None (the socket was handed to the http.client
+        # response), and the socket sits under `_fp.fp.raw._sock`. A fake that
+        # invented `connection.sock` here let a single-path extractor pass
+        # offline and fail on every real follow.
+        return {
+            "connection": types.SimpleNamespace(sock=None, timeout="header-timeout"),
+            "_fp": types.SimpleNamespace(
+                fp=types.SimpleNamespace(raw=types.SimpleNamespace(_sock=sock))
+            ),
+        }
+
     class _BlockingLogResponse:
         def __init__(self):
             self.interrupted = threading.Event()
             self.shutdown_called = False
             self.closed = threading.Event()
+            self.__dict__.update(_urllib3_v2_layout(_TimeoutSocket()))
 
         def readline(self):
             self.interrupted.wait(5)
@@ -1162,11 +1256,54 @@ with TestClient(broker.app) as c:
         asyncio.run(_disconnect_log_probe()),
     )
 
-    # The upstream follow must carry NO read timeout: an agent can be quiet for
-    # minutes, and a read timeout would end the follow as a clean EOF that the
-    # CLI - whose own contract is "a quiet log is not a stalled one" - cannot
-    # tell apart from the pod ending.
+    # Cancellation can land while urllib3 is still waiting for response
+    # headers. The executor call then continues without its asyncio waiter, so a
+    # response that arrives later must notice the abandoned ownership handoff
+    # and close itself.
+    async def _acquisition_disconnect_probe():
+        acquire_started = threading.Event()
+        release_headers = threading.Event()
+        upstream = _BlockingLogResponse()
+
+        def _acquire(*args, **kwargs):
+            acquire_started.set()
+            release_headers.wait(5)
+            return upstream
+
+        with patch.object(broker.core_api, "read_namespaced_pod_log", side_effect=_acquire):
+            stream = broker._follow_worker_log("feed0002", "pod", 20)
+            pending = asyncio.create_task(anext(stream))
+            while not acquire_started.is_set():
+                await asyncio.sleep(0.01)
+            started = time.monotonic()
+            pending.cancel()
+            try:
+                await pending
+            except asyncio.CancelledError:
+                pass
+            cancel_elapsed = time.monotonic() - started
+            release_headers.set()
+            deadline = time.monotonic() + 1.0
+            while not upstream.closed.is_set() and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            return (
+                cancel_elapsed < 1.0
+                and upstream.shutdown_called
+                and upstream.closed.is_set()
+            )
+
+    check(
+        "disconnect during log acquisition closes the late response",
+        asyncio.run(_acquisition_disconnect_probe()),
+    )
+
+    # Header acquisition is bounded, but the timeout must be removed from the
+    # established stream: an agent can be quiet for minutes and a body read
+    # timeout would look like a clean EOF to the CLI.
     class _EmptyLogResponse:
+        def __init__(self):
+            self.__dict__.update(_urllib3_v2_layout(_TimeoutSocket()))
+
         def readline(self):
             return b""
 
@@ -1174,14 +1311,15 @@ with TestClient(broker.app) as c:
             pass
 
     _follow_kwargs = {}
+    _quiet_upstream = _EmptyLogResponse()
 
     async def _quiet_follow_probe():
         def _capture(*args, **kwargs):
             _follow_kwargs.update(kwargs)
-            return _EmptyLogResponse()
+            return _quiet_upstream
 
         with patch.object(broker.core_api, "read_namespaced_pod_log", side_effect=_capture):
-            stream = broker._follow_worker_log("feed0002", "pod", 20)
+            stream = broker._follow_worker_log("feed0003", "pod", 20)
             try:
                 await anext(stream)
             except StopAsyncIteration:
@@ -1189,10 +1327,61 @@ with TestClient(broker.app) as c:
 
     asyncio.run(_quiet_follow_probe())
     check(
-        "a log follow carries no upstream read timeout",
-        _follow_kwargs.get("_request_timeout", ("missing", "missing"))[1] is None,
+        "log response-header acquisition has a finite timeout",
+        _follow_kwargs.get("_request_timeout", ("missing", "missing"))[1]
+        == broker._LOG_FOLLOW_HEADER_TIMEOUT,
         str(_follow_kwargs.get("_request_timeout")),
     )
+    check(
+        "an established quiet log follow has no socket read timeout",
+        _quiet_upstream.connection.timeout is None
+        and _quiet_upstream._fp.fp.raw._sock.values == [None],
+        str(_quiet_upstream._fp.fp.raw._sock.values),
+    )
+
+    # The extractor against REAL urllib3, not a fake of it. The fakes above
+    # model the 2.x layout, but only a live response proves the assumption:
+    # `connection.sock` is None on a streaming urllib3 2.x response, and a
+    # fake that fabricated it hid a bug that failed every real follow.
+    import http.server as _hs
+    import urllib3 as _u3
+
+    class _OneLineHandler(_hs.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"real line\n")
+            self.wfile.flush()
+
+        def log_message(self, *args):
+            pass
+
+    _log_srv = _hs.HTTPServer(("127.0.0.1", 0), _OneLineHandler)
+    threading.Thread(target=_log_srv.serve_forever, daemon=True).start()
+    try:
+        _real = _u3.PoolManager().request(
+            "GET",
+            f"http://127.0.0.1:{_log_srv.server_port}/",
+            preload_content=False,
+            timeout=_u3.Timeout(connect=5.0, read=15.0),
+        )
+        try:
+            broker._unbound_log_upstream_read(_real)
+            _real_sock = broker._socket_of_log_upstream(_real)
+            check(
+                "the timeout extractor works on a real urllib3 response",
+                _real_sock is not None and _real_sock.gettimeout() is None,
+                f"sock={_real_sock!r}",
+            )
+            check(
+                "a real established follow still delivers its line",
+                _real.readline() == b"real line\n",
+            )
+        finally:
+            _real.close()
+    finally:
+        _log_srv.shutdown()
 
     # --- 10d. the allowlist itself, without a transport ---------------------
     check("health is readable", broker._worker_api_allowed("GET", "health"))

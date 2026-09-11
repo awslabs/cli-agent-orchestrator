@@ -833,6 +833,16 @@ def _reap_once() -> None:
             del _leases[wid]
 
     for worker_id in open_ids:
+        selector = f"cao.aws/worker-id={worker_id}"
+        try:
+            pods = core_api.list_namespaced_pod(NAMESPACE, label_selector=selector).items
+        except ApiException as exc:  # pragma: no cover - transient API errors
+            log.warning("reaper could not list pods for %s: %s", worker_id, exc)
+            continue
+
+        # Read the lease AFTER the blocking LIST above, which can overlap an
+        # operator observation: a stale observer must follow the UID that won
+        # the first-claim race instead of judging its own candidate.
         with _leases_lock:
             lease = _leases.get(worker_id)
             if lease is None or lease["state"] != "leased":
@@ -841,13 +851,6 @@ def _reap_once() -> None:
             ever_ready = lease.get("ready_at") is not None
             pod_observed = lease.get("pod_observed_at") is not None
             known_pod_uid = lease.get("pod_uid")
-
-        selector = f"cao.aws/worker-id={worker_id}"
-        try:
-            pods = core_api.list_namespaced_pod(NAMESPACE, label_selector=selector).items
-        except ApiException as exc:  # pragma: no cover - transient API errors
-            log.warning("reaper could not list pods for %s: %s", worker_id, exc)
-            continue
 
         if not pods:
             if pod_observed:
@@ -906,12 +909,33 @@ def _reap_once() -> None:
             pod_uid = pod.metadata.uid if pod.metadata else None
             with _leases_lock:
                 lease = _leases.get(worker_id)
-                if lease is not None and lease["pod_observed_at"] is None:
+                if lease is None or lease["state"] != "leased":
+                    continue
+                winning_pod_uid = lease.get("pod_uid")
+                if winning_pod_uid is None:
                     lease["pod_observed_at"] = now
                     # Remembered so a REPLACEMENT pod can be told from the
                     # original. A replacement has a fresh emptyDir, so its
                     # cao-server has no profile store, no session and no agent.
                     lease["pod_uid"] = pod_uid
+                    winning_pod_uid = pod_uid
+            if winning_pod_uid != pod_uid:
+                matching = [
+                    candidate
+                    for candidate in pods
+                    if candidate.metadata is not None
+                    and candidate.metadata.uid == winning_pod_uid
+                ]
+                if not matching:
+                    _release_and_settle(
+                        worker_id,
+                        "terminated",
+                        f"worker pod was replaced after {int(age)}s - the new pod has "
+                        "an empty state volume, so the leased agent is gone",
+                    )
+                    log.warning("worker %s: pod replaced while leased, released", worker_id)
+                    continue
+                pod = matching[0]
 
         restarts = sum(
             (cs.restart_count or 0) for cs in (pod.status.container_statuses or [])
@@ -1450,6 +1474,12 @@ _DROP_RESPONSE_HEADERS = frozenset(
 # arbitrary amount of an agent's transcript through the broker in one call.
 _LOG_TAIL_MAX = 2000
 _LOG_FOLLOW_CONNECT_TIMEOUT = 5.0
+# urllib3 applies the read half of `_request_timeout` both while waiting for
+# response headers and while consuming the streaming body. Bound the former so
+# an abandoned acquisition cannot occupy an executor thread forever, then clear
+# the socket timeout once headers arrive so an established quiet follow remains
+# unlimited.
+_LOG_FOLLOW_HEADER_TIMEOUT = 15.0
 
 
 def _worker_api_target(worker_id: str) -> tuple[str, str]:
@@ -1649,9 +1679,30 @@ def _worker_pod(worker_id: str) -> client.V1Pod:
     if lease is not None and pod_uid:
         with _leases_lock:
             current = _leases.get(worker_id)
-            if current is not None and current.get("pod_uid") is None:
+            if current is None:
+                return pod
+            winning_pod_uid = current.get("pod_uid")
+            if winning_pod_uid is None:
                 current["pod_uid"] = pod_uid
                 current["pod_observed_at"] = time.monotonic()
+                winning_pod_uid = pod_uid
+        if winning_pod_uid != pod_uid:
+            matching = [
+                candidate
+                for candidate in pods
+                if candidate.metadata is not None
+                and candidate.metadata.uid == winning_pod_uid
+            ]
+            if not matching:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"worker {worker_id}'s pod identity was claimed concurrently "
+                        "by a runtime absent from this observation; refusing to route "
+                        "to a different runtime"
+                    ),
+                )
+            return matching[0]
     return pod
 
 
@@ -1684,6 +1735,110 @@ async def _close_log_upstream(upstream: Any) -> None:
         log.debug("closing log upstream failed: %s", exc)
 
 
+class _LogUpstreamHandoff:
+    """Transfer ownership of a blocking acquisition across cancellation.
+
+    Cancelling `asyncio.to_thread()` cannot stop work that has already entered
+    urllib3. This slot closes the race between that worker publishing a response
+    and the request task observing cancellation: exactly one side owns and
+    closes a response that arrives after the caller has gone away.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._abandoned = False
+        self._upstream: Any = None
+
+    def publish(self, upstream: Any) -> bool:
+        with self._lock:
+            if self._abandoned:
+                return False
+            self._upstream = upstream
+            return True
+
+    def claim(self, upstream: Any) -> None:
+        with self._lock:
+            if self._upstream is upstream:
+                self._upstream = None
+
+    def abandon(self) -> Any:
+        with self._lock:
+            self._abandoned = True
+            upstream = self._upstream
+            self._upstream = None
+            return upstream
+
+
+def _socket_of_log_upstream(upstream: Any) -> Any:
+    """The live socket under a streaming urllib3 response, across layouts.
+
+    urllib3 1.x keeps it at `connection.sock`. On 2.x that attribute is None
+    once the response is streaming: the socket has been handed to the
+    http.client response, whose BufferedReader wraps a SocketIO holding it.
+    Verified against urllib3 2.7 - `connection.sock` is None there, so a
+    single-path extractor would fail every real follow.
+    """
+    sock = getattr(getattr(upstream, "connection", None), "sock", None)
+    if sock is not None:
+        return sock
+    raw = getattr(getattr(getattr(upstream, "_fp", None), "fp", None), "raw", None)
+    return getattr(raw, "_sock", None)
+
+
+def _unbound_log_upstream_read(upstream: Any) -> None:
+    """Remove the header-acquisition timeout from an established raw stream."""
+    sock = _socket_of_log_upstream(upstream)
+    if sock is None:
+        # Fail loudly rather than keep the header timeout: a 15s body timeout
+        # would end every quiet follow with what looks like a clean EOF.
+        raise RuntimeError("Kubernetes log response did not expose its urllib3 socket")
+    connection = getattr(upstream, "connection", None)
+    if connection is not None:
+        connection.timeout = None
+    sock.settimeout(None)
+
+
+def _close_log_upstream_blocking(upstream: Any) -> None:
+    """Close an upstream entirely inside the acquisition worker thread."""
+    shutdown = getattr(upstream, "shutdown", None)
+    if shutdown is not None:
+        try:
+            shutdown()
+        except (OSError, RuntimeError, ValueError):
+            pass
+    try:
+        upstream.close()
+    except Exception as exc:
+        log.debug("closing late log upstream failed: %s", exc)
+
+
+def _acquire_log_upstream(
+    pod_name: str,
+    tail: int,
+    handoff: _LogUpstreamHandoff,
+) -> Any:
+    upstream = core_api.read_namespaced_pod_log(
+        pod_name,
+        NAMESPACE,
+        tail_lines=tail,
+        follow=True,
+        _preload_content=False,
+        _request_timeout=(
+            _LOG_FOLLOW_CONNECT_TIMEOUT,
+            _LOG_FOLLOW_HEADER_TIMEOUT,
+        ),
+    )
+    try:
+        _unbound_log_upstream_read(upstream)
+    except Exception:
+        _close_log_upstream_blocking(upstream)
+        raise
+    if not handoff.publish(upstream):
+        _close_log_upstream_blocking(upstream)
+        return None
+    return upstream
+
+
 async def _follow_worker_log(
     worker_id: str,
     pod_name: str,
@@ -1691,31 +1846,36 @@ async def _follow_worker_log(
 ):
     """Yield log lines while retaining a closeable handle to the upstream read.
 
-    No read timeout on the upstream follow, deliberately: an agent can think or
-    run a tool for minutes without printing a line, and a read timeout would end
-    the follow there while the client - whose own contract is "a quiet log is
-    not a stalled one" - sees a clean EOF indistinguishable from the pod ending.
-    Disconnect handling does not need the timeout: StreamingResponse cancels
-    this generator, and `shutdown()` on the raw response half-closes the socket,
-    which unblocks a readline stuck in the executor thread.
+    Response-header acquisition is bounded because cancellation cannot kill a
+    urllib3 call already running in an executor. Once acquired, the socket read
+    timeout is removed: an agent can think or run a tool for minutes without
+    printing a line, and ending the follow there would look like a clean EOF.
+
+    A handoff owns the acquisition/cancellation race. If the caller disconnects
+    before headers arrive, the eventual raw response is closed in the acquiring
+    thread instead of being discarded and retaining its connection.
     """
     upstream = None
+    handoff = _LogUpstreamHandoff()
     try:
         upstream = await asyncio.to_thread(
-            core_api.read_namespaced_pod_log,
+            _acquire_log_upstream,
             pod_name,
-            NAMESPACE,
-            tail_lines=tail,
-            follow=True,
-            _preload_content=False,
-            _request_timeout=(_LOG_FOLLOW_CONNECT_TIMEOUT, None),
+            tail,
+            handoff,
         )
+        if upstream is None:
+            return
+        handoff.claim(upstream)
         while True:
             line = await asyncio.to_thread(upstream.readline)
             if not line:
                 return
             yield line
     except asyncio.CancelledError:
+        late_upstream = handoff.abandon()
+        if late_upstream is not None and late_upstream is not upstream:
+            await _close_log_upstream(late_upstream)
         raise
     except Exception as exc:  # pragma: no cover - live cluster transport
         log.warning("log follow for worker %s ended: %s", worker_id, exc)
