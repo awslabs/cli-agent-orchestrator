@@ -58,7 +58,11 @@ portable and make profile listings useful.
   of a remote-URL MCP server, see
   [examples/youcom-search](../examples/youcom-search/README.md).
 - `tools` (array), `toolAliases` (object), and `toolsSettings` (object):
-  provider tool configuration.
+  provider tool configuration. `tools` is the provider's own tool catalog and
+  is passed through to it; it is not the CAO allowlist and does not restrict
+  what an agent may call. Use `allowedTools` or `role` for that, including for
+  CAO's own MCP tools, which are granted by the `@cao-mcp-server` selector.
+  See [Tool Restrictions](tool-restrictions.md).
 - `resources` (array), `hooks` (object), and `useLegacyMcpJson` (boolean):
   provider-native configuration passed through where supported.
 - `model` (string): provider model selection.
