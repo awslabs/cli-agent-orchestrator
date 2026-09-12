@@ -248,6 +248,122 @@ class TestTotalityProperty:
 SHIM_IMPORT = "from cao_workflow import run_step, step\n\n"
 
 
+class TestLiteralStepIdRule:
+    @pytest.mark.parametrize(
+        "call",
+        [
+            "step('p', 'a', 'x', step_id='t006:makefile', recovery='idempotent')",
+            "run_step('p', 'a', 'x', step_id='t006:makefile')",
+            "cao_workflow.step('p', 'a', 'x', step_id='t006:makefile', recovery='manual')",
+            "cao_workflow.run_step('p', 'a', 'x', step_id='t006:makefile')",
+        ],
+    )
+    def test_invalid_literal_step_id_is_a_blocking_error(self, call):
+        source = "import cao_workflow\n" + SHIM_IMPORT + call + "\n"
+        result = lint_script(source, "s.py")
+
+        findings = _findings_by_rule(result, "invalid-step-id")
+        assert result.status == "fail"
+        assert len(findings) == 1
+        assert findings[0].severity == "error"
+        assert findings[0].line == 4
+        assert "[A-Za-z0-9_-]" in findings[0].message
+        assert result.errors == [f"line 4: [invalid-step-id] {findings[0].message}"]
+
+    @pytest.mark.parametrize("step_id", ["a", "makefile_incremental", "step-64"])
+    def test_valid_literal_step_id_is_accepted(self, step_id):
+        source = SHIM_IMPORT + f"step('p', 'a', 'x', step_id='{step_id}', recovery='idempotent')\n"
+        result = lint_script(source, "s.py")
+
+        assert _findings_by_rule(result, "invalid-step-id") == []
+        assert result.status == "pass"
+
+    def test_computed_step_id_is_left_to_runtime_validation(self):
+        source = (
+            SHIM_IMPORT
+            + "step_id = make_step_id()\n"
+            + "step('p', 'a', 'x', step_id=step_id, recovery='idempotent')\n"
+        )
+        result = lint_script(source, "s.py")
+
+        assert _findings_by_rule(result, "invalid-step-id") == []
+        assert result.status == "pass"
+
+    def test_unrelated_run_step_method_is_not_blocked(self):
+        source = "runner.run_step('p', 'a', 'x', step_id='not:a:cao:id')\n"
+        result = lint_script(source, "s.py")
+
+        assert _findings_by_rule(result, "invalid-step-id") == []
+        assert result.status == "pass"
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            (
+                "from domain_workflow import run_step\n"
+                "run_step('p', 'a', 'x', step_id='not:a:cao:id')\n"
+            ),
+            (
+                "def step(*args, **kwargs):\n"
+                "    return None\n"
+                "step('p', 'a', 'x', step_id='not:a:cao:id', recovery='manual')\n"
+            ),
+        ],
+    )
+    def test_unrelated_bare_call_is_not_blocked(self, source):
+        result = lint_script(source, "s.py")
+
+        assert _findings_by_rule(result, "invalid-step-id") == []
+        assert result.status == "pass"
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            (
+                "from cao_workflow import step as cao_step\n"
+                "cao_step('p', 'a', 'x', step_id='t006:makefile', recovery='manual')\n"
+            ),
+            ("import cao_workflow as cw\n" "cw.run_step('p', 'a', 'x', step_id='t006:makefile')\n"),
+        ],
+    )
+    def test_cao_import_alias_is_checked(self, source):
+        result = lint_script(source, "s.py")
+
+        assert result.status == "fail"
+        assert len(_findings_by_rule(result, "invalid-step-id")) == 1
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            (
+                "from cao_workflow import step\n"
+                "def step(*args, **kwargs):\n"
+                "    return None\n"
+                "step('p', 'a', 'x', step_id='not:a:cao:id', recovery='manual')\n"
+            ),
+            (
+                "from cao_workflow import step as cao_step\n"
+                "cao_step = domain_step\n"
+                "cao_step('p', 'a', 'x', step_id='not:a:cao:id', recovery='manual')\n"
+            ),
+            (
+                "import cao_workflow as cw\n"
+                "import domain_workflow as cw\n"
+                "cw.run_step('p', 'a', 'x', step_id='not:a:cao:id')\n"
+            ),
+            (
+                "import cao_workflow as workflow, domain_workflow as workflow\n"
+                "workflow.run_step('p', 'a', 'x', step_id='not:a:cao:id')\n"
+            ),
+        ],
+    )
+    def test_shadowed_cao_import_is_left_to_runtime(self, source):
+        result = lint_script(source, "s.py")
+
+        assert _findings_by_rule(result, "invalid-step-id") == []
+        assert result.status == "pass"
+
+
 class TestMissingRecoveryPolicyRule:
     """BR-5 — the blocking ERROR. FR-5's rejection-at-validation."""
 
@@ -541,6 +657,7 @@ class TestRecoveryRuleIdSeverityAndModelAdmission:
             ("missing-recovery-policy", "error"),
             ("unverifiable-recovery-policy", "warning"),
             ("unenforced-recovery-policy", "warning"),
+            ("invalid-step-id", "error"),
         ],
     )
     def test_new_rule_id_is_admitted_by_lint_finding(self, rule_id, severity):

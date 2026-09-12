@@ -31,6 +31,32 @@ def load_fixture(filename: str) -> str:
         return f.read()
 
 
+class TestCodexCurrentComposer:
+    @pytest.mark.parametrize(
+        ("screen", "expected"),
+        [
+            (
+                "› [CAO Handoff] repeat the exact task\n"
+                "• completed\n"
+                "›\n"
+                "  ? for shortcuts                     88% context left",
+                "",
+            ),
+            (
+                "› [CAO Handoff] repeat the exact task\n"
+                "  keep this sparse multiline draft\n"
+                "\n"
+                "  gpt-5.6-terra high · ~/work",
+                "› [CAO Handoff] repeat the exact task\n" "  keep this sparse multiline draft",
+            ),
+        ],
+    )
+    def test_extract_current_composer_uses_the_bottom_composer(self, screen, expected):
+        provider = CodexProvider("test1234", "test-session", "window-0", None)
+
+        assert provider.extract_current_composer(screen) == expected
+
+
 def read_developer_instructions_file(command: str) -> str:
     """Extracts the path from the command's ``$(cat <path>)`` developer_instructions
     fragment and returns that file's actual on-disk content -- the fragment keeps the
@@ -1247,6 +1273,81 @@ class TestCodexRenderedScreenStatusDetection:
         provider = CodexProvider("test1234", "test-session", "window-0")
 
         assert provider.get_status_from_screen(screen_lines) == TerminalStatus.COMPLETED
+
+
+class TestCodexAcceptance20260908Spinner:
+    """Regression coverage from a live acceptance run (2026-09-08, codex-cli
+    0.153.4): the spinner read IDLE for the whole duration of a working turn
+    on 3 of 4 turns. Frames derived from that run's captured terminal logs
+    (caohome/logs/terminal/{aa9a3c70,45ab17ec,ed237bda}.log) and the clean
+    finished-turn pane capture (evidence/phaseC_pane.txt).
+    """
+
+    def test_hollow_bullet_spinner_merged_with_composer_is_processing(self):
+        """codex-cli 0.153.4 alternates the spinner glyph between the solid
+        bullet "•" (U+2022) and the hollow bullet "◦" (U+25E6), and with
+        --no-alt-screen the composer hint ("» Ask Codex to do anything") and
+        the model/path footer can land on the SAME rendered line as the
+        spinner, with no space after the bullet. TUI_PROGRESS_PATTERN only
+        matched "•" before this fix, so a frame landing on "◦" misclassified
+        as IDLE mid-turn."""
+        screen_lines = [
+            "› [CAO Handoff] Apply the two edits.",
+            "",
+            "◦Applying both edits(52s • esc to interrupt)»Ask Codex to do "
+            "anything gpt-6-astra ultra · ~/path",
+        ]
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status_from_screen(screen_lines) == TerminalStatus.PROCESSING
+        assert provider.get_status("\n".join(screen_lines)) == TerminalStatus.PROCESSING
+
+    def test_solid_bullet_spinner_merged_with_composer_is_processing(self):
+        """Same shape as above but with the solid bullet and no space after it,
+        exactly as captured mid-turn: "•Applying both edits(43s • esc to
+        interrupt)»Ask Codex to do anything gpt-6-astra ultra · ~/path"."""
+        screen_lines = [
+            "› [CAO Handoff] Apply the two edits.",
+            "",
+            "•Applying both edits(43s • esc to interrupt)»Ask Codex to do "
+            "anything gpt-6-astra ultra · ~/path",
+        ]
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status_from_screen(screen_lines) == TerminalStatus.PROCESSING
+        assert provider.get_status("\n".join(screen_lines)) == TerminalStatus.PROCESSING
+
+    def test_worked_for_boundary_with_empty_composer_is_completed(self):
+        """A finished turn's own "─ Worked for <duration> ──" boundary line,
+        followed by the empty composer, must read COMPLETED (evidence/
+        phaseC_pane.txt, trimmed to the boundary and footer)."""
+        screen_lines = [
+            "• Ran printf START > marker.txt; sleep 120; printf ' END' >> marker.txt; "
+            "cat marker.txt",
+            "  └ START END",
+            "─" * 40,
+            "• [C1-durability]",
+            "  START END",
+            "─ Worked for 2m 08s " + "─" * 40,
+            "» Ask Codex to do anything",
+            "  gpt-6-astra ultra · ~/path",
+        ]
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status_from_screen(screen_lines) == TerminalStatus.COMPLETED
+
+    def test_pre_task_idle_composer_is_idle(self):
+        """The pane before any task is dispatched -- fresh idle composer, no
+        spinner, no prior turn -- must read IDLE, not PROCESSING or COMPLETED."""
+        screen_lines = [
+            "OpenAI Codex (v0.153.4)",
+            "» Ask Codex to do anything",
+            "",
+            "  gpt-6-astra ultra · ~/path",
+        ]
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status_from_screen(screen_lines) == TerminalStatus.IDLE
 
 
 class TestCodexBulletFormatStatusDetection:

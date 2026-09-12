@@ -7,6 +7,7 @@ import click
 from cli_agent_orchestrator.cli.commands.agent import agent
 from cli_agent_orchestrator.cli.commands.config import config
 from cli_agent_orchestrator.cli.commands.env import env
+from cli_agent_orchestrator.cli.commands.fleet import fleet
 from cli_agent_orchestrator.cli.commands.info import info
 from cli_agent_orchestrator.cli.commands.init import init
 from cli_agent_orchestrator.cli.commands.install import install
@@ -21,6 +22,7 @@ from cli_agent_orchestrator.cli.commands.skills import skills
 from cli_agent_orchestrator.cli.commands.terminal import terminal
 from cli_agent_orchestrator.cli.commands.tui import tui
 from cli_agent_orchestrator.cli.commands.update import update
+from cli_agent_orchestrator.cli.commands.worker import worker
 from cli_agent_orchestrator.cli.commands.workflow import workflow
 
 try:
@@ -52,6 +54,10 @@ cli.add_command(memory)
 cli.add_command(skills)
 cli.add_command(session)
 cli.add_command(terminal)
+# Remote fleets. `cao fleet`/`cao worker` reach a cluster's worker broker over
+# HTTP; every other command here talks to the cao-server on this machine.
+cli.add_command(fleet)
+cli.add_command(worker)
 cli.add_command(workflow)
 cli.add_command(update)
 cli.add_command(tui)  # bundled Rust terminal UI (issue #321)

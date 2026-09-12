@@ -1805,6 +1805,22 @@ class TestClaudeCodeProviderPermissionMode:
         assert "--dangerously-skip-permissions" in command
         assert "--permission-mode" not in command
 
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_empty_allowlist_emits_disallowed_tools(self, mock_load):
+        """allowed_tools=[] must deny natives, not skip --disallowedTools."""
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.permissionMode = None
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent", allowed_tools=[])
+        command = provider._build_claude_command()
+
+        assert "--disallowedTools" in command
+        assert "Bash" in command
+
 
 class TestClaudeCodeProviderYoloRootRegression:
     """Regression tests for yolo + root/non-root --dangerously-skip-permissions logic.
@@ -2028,13 +2044,13 @@ class TestClaudeCodeProviderStartupPrompts:
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    async def test_handle_model_upgrade_nudge_declined_with_escape(self, mock_tmux):
-        """The Bedrock model-upgrade nudge is DECLINED, and with Esc specifically.
+    async def test_handle_model_upgrade_nudge_selects_no_directly(self, mock_tmux):
+        """The Bedrock model-upgrade nudge explicitly selects its No option.
 
-        Live-captured frame. "1. Yes" is pre-selected, so the Enter that clears
-        the trust/bypass dialogs would instead accept the upgrade: Claude Code
-        would rewrite the deployment's ANTHROPIC_*_MODEL pins and restart itself
-        mid-initialization.
+        Live-captured frame. "1. Yes" is pre-selected, so a bare Enter would
+        accept the upgrade and restart Claude Code. A live elastic-worker run
+        also showed Esc leaving the dialog standing; typing the advertised
+        numbered "2. No" choice dismissed it and let the original task proceed.
         """
         mock_tmux.get_history.side_effect = [
             _UPGRADE_NUDGE_FRAME,
@@ -2044,7 +2060,7 @@ class TestClaudeCodeProviderStartupPrompts:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         await provider._handle_startup_prompts(idle_gap=5.0)
 
-        mock_tmux.send_special_key.assert_called_once_with("test-session", "window-0", "Escape")
+        mock_tmux.send_keys.assert_called_once_with("test-session", "window-0", "2")
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.backends.registry._backend")
@@ -2070,10 +2086,10 @@ class TestClaudeCodeProviderStartupPrompts:
         await provider._handle_startup_prompts(idle_gap=5.0)
 
         # Twice, not once (missed tier) and not four times (re-answered scrollback).
-        assert mock_tmux.send_special_key.call_count == 2
+        assert mock_tmux.send_keys.call_count == 2
         assert all(
-            call.args == ("test-session", "window-0", "Escape")
-            for call in mock_tmux.send_special_key.call_args_list
+            call.args == ("test-session", "window-0", "2")
+            for call in mock_tmux.send_keys.call_args_list
         )
 
     def test_get_status_model_upgrade_nudge_not_waiting_user_answer(self):

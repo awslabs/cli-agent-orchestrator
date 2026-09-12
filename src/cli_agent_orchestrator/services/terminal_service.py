@@ -172,6 +172,8 @@ CROSS_NODE_NOTIFY_TIMEOUT = 10.0
 _memory_injected_terminals: set = set()
 _memory_injected_lock = threading.Lock()
 
+_CURRENT_COMPOSER_PROBE_MAX_CHARS = 64
+
 # Strong references to in-flight deferred-init background tasks. asyncio keeps
 # only a WEAK reference to tasks from loop.create_task, so without this a
 # deferred provider.initialize() + input-send task could be GC'd mid-run,
@@ -1761,33 +1763,48 @@ def _worker_is_started_direct(terminal_id: str, provider) -> bool:
     return status in _DEFERRED_STARTED_STATUSES
 
 
-def _message_visible_in_box(terminal_id: str, message: str) -> bool:
-    """True when the delivered message is still visible in the rendered pane.
-
-    Despite the name, this matches against ``get_output`` — the whole rendered
-    pane, which includes the transcript above the composer, not just the input
-    box. A prompt echoed in the transcript therefore also reads as "visible",
-    which is safe for the Enter-vs-full-resend decision (both actions are
-    recovery for a worker believed idle) but must not be read as proof the
-    text sits unsubmitted in the composer.
-
-    Decides the resubmit action: if our text is there the paste landed and only
-    the Enter was dropped (send a bare Enter); if it is absent the paste itself
-    was dropped (re-deliver the full message). Guessing wrong the other way must
-    be avoided — a bare Enter into an EMPTY box would submit a blank prompt and
-    the real task would be lost. Collapse to [a-z0-9] so wrapping / whitespace /
-    unicode punctuation in the rendered box can't defeat the match.
-    """
-    probe = re.sub(r"[^a-z0-9]", "", message.lower())[:24]
-    if len(probe) < 8:
-        # Too short to match reliably — treat as "not shown" so we re-deliver
-        # in full rather than risk a blank submit.
-        return False
+def _capture_current_composer_region(terminal_id: str) -> Optional[str]:
     try:
-        rendered = get_output(terminal_id)
+        metadata = get_terminal_metadata(terminal_id)
+        if not metadata:
+            return None
+        provider = provider_manager.get_provider(terminal_id)
+        if provider is None:
+            return None
+        backend = get_backend()
+        viewport = backend.get_history(
+            metadata["tmux_session"],
+            metadata["tmux_window"],
+            strip_escapes=True,
+            visible_only=True,
+        )
+        return provider.extract_current_composer(viewport)
     except Exception:
+        logger.debug("Failed to capture current composer for %s", terminal_id, exc_info=True)
+        return None
+
+
+def _normalized_box_text(text: str) -> str:
+    return "".join(character.casefold() for character in text if character.isalnum())
+
+
+def _message_visible_in_box(terminal_id: str, message: str) -> bool:
+    """True when the current editable composer contains the message text.
+
+    A bare Enter is safe only when the provider extracts the bounded trailing
+    message probe from its current composer. The pane can retain historical
+    deliveries, so cursor-adjacent or transcript text is not an input boundary.
+    A miss takes the safer full-redelivery path.
+    """
+    normalized_message = _normalized_box_text(message)
+    probe = normalized_message[-_CURRENT_COMPOSER_PROBE_MAX_CHARS:]
+    if len(probe) < 8:
         return False
-    return probe in re.sub(r"[^a-z0-9]", "", rendered.lower())
+
+    composer = _capture_current_composer_region(terminal_id)
+    if composer is None:
+        return False
+    return probe in _normalized_box_text(composer)
 
 
 def redeliver_dropped_message(
@@ -1811,14 +1828,15 @@ def redeliver_dropped_message(
     that already holds the provider instance passes it; otherwise it is
     resolved from the registry, best-effort (a resolution failure means no
     probe, never a failed redelivery). Then the box check picks the
-    redelivery: if the delivered text is still visible in the rendered pane
+    redelivery: if the delivered text is still visible in the current composer
     only the Enter was swallowed (send a bare Enter); if it is absent the
     paste itself was dropped (re-deliver in full). See
     ``_message_visible_in_box`` for why guessing wrong must be avoided.
 
     ``full_resend_requires_probe`` gates the full re-send on the provider
-    being probe-capable. Reason: ``_message_visible_in_box`` scans the whole
-    rendered pane, and under the pyte screen path status detection runs only
+    being probe-capable. Reason: the current-composer check cannot establish
+    that a prompt which has already scrolled away was processed, and under the
+    pyte screen path status detection runs only
     at rising-edge/quiescence — a whole turn can process inside one burst,
     leaving the cached status IDLE throughout while the prompt scrolls off —
     so for a provider without a direct status probe there is no way to

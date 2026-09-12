@@ -22,6 +22,7 @@ from cli_agent_orchestrator.constants import (
     WORKFLOW_POLL_INTERVAL_SECONDS,
     WORKFLOW_RUN_REQUEST_TIMEOUT,
 )
+from cli_agent_orchestrator.mcp_server import utils as mcp_utils
 from cli_agent_orchestrator.mcp_server.models import HandoffResult
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.models.workflow_runtime import ReturnAck, parse_decision
@@ -33,7 +34,10 @@ from cli_agent_orchestrator.services.memory_service import (
     MemoryDisabledError,
     MemoryPartialWriteError,
 )
-from cli_agent_orchestrator.services.outcome_service import LEARNING_DISABLED_MESSAGE
+from cli_agent_orchestrator.services.outcome_service import (
+    LEARNING_DISABLED_CODE,
+    LEARNING_DISABLED_MESSAGE,
+)
 from cli_agent_orchestrator.services.profile_search import DEFAULT_LIMIT
 from cli_agent_orchestrator.utils.orchestration import (
     ENABLE_SENDER_ID_INJECTION,
@@ -360,6 +364,9 @@ if ENABLE_WORKING_DIRECTORY:
         Returns:
             HandoffResult with success status, message, and agent output
         """
+        denied = _tool_denied_reason("handoff")
+        if denied:
+            return HandoffResult(success=False, message=denied, output=None, terminal_id=None)
         return await _handoff_impl(
             agent_profile,
             message,
@@ -451,6 +458,9 @@ else:
         Returns:
             HandoffResult with success status, message, and agent output
         """
+        denied = _tool_denied_reason("handoff")
+        if denied:
+            return HandoffResult(success=False, message=denied, output=None, terminal_id=None)
         return await _handoff_impl(
             agent_profile,
             message,
@@ -574,6 +584,9 @@ if ENABLE_WORKING_DIRECTORY:
         ),
         target_host: Optional[str] = Field(default=None, description=_target_host_field_desc),
     ) -> Dict[str, Any]:
+        denied = _tool_denied_reason("assign")
+        if denied:
+            return {"success": False, "error": denied}
         return _assign_impl(
             agent_profile,
             message,
@@ -609,6 +622,9 @@ else:
         ),
         target_host: Optional[str] = Field(default=None, description=_target_host_field_desc),
     ) -> Dict[str, Any]:
+        denied = _tool_denied_reason("assign")
+        if denied:
+            return {"success": False, "error": denied}
         return _assign_impl(
             agent_profile,
             message,
@@ -632,7 +648,7 @@ def _elastic_broker_config() -> Tuple[str, str]:
 
 
 # How long the elastic path waits for a freshly leased worker to answer through
-# its Service. The broker returns a lease as soon as the Job and Service objects
+# its Service. The broker returns a lease as soon as the workload and Service objects
 # exist, so this covers the worker's whole boot plus endpoint propagation - and it
 # is the ONE place that wait now happens, instead of once in the broker (on pod
 # readiness) and then implicitly again here (on a connect timeout, unretried).
@@ -679,11 +695,11 @@ async def assign_elastic(
     engine: Optional[str] = Field(default=None, description="Optional Kiro engine override"),
     model: Optional[str] = Field(default=None, description=_model_field_desc),
 ) -> Dict[str, Any]:
-    """Provision one Kubernetes Job and assign one task to it.
+    """Provision one elastic worker and assign one task to it.
 
     The worker must call ``complete_assignment`` exactly once after producing
     its final result. That tool durably delivers the callback before releasing
-    this worker's Job.
+    this worker.
 
     A successful return means the task was PLACED, not that it finished - the
     result arrives later through the supervisor's inbox. So a worker that dies
@@ -815,7 +831,7 @@ async def send_message(
 async def complete_assignment(
     message: str = Field(description="Final result to deliver to the assigning supervisor"),
 ) -> Dict[str, Any]:
-    """Deliver an elastic worker's final result, then release its Kubernetes Job."""
+    """Deliver an elastic worker's final result, then release the worker itself."""
     worker_id = os.environ.get("CAO_ELASTIC_WORKER_ID", "").strip()
     broker_url = os.environ.get("CAO_ELASTIC_BROKER_URL", "").strip().rstrip("/")
     release_token = os.environ.get("CAO_ELASTIC_RELEASE_TOKEN", "").strip()
@@ -1242,19 +1258,36 @@ def _get_terminal_context_from_env() -> Optional[Dict[str, Any]]:
         return None
 
     try:
-        response = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=_mcp_timeout())
-        response.raise_for_status()
-        meta = response.json()
+        # Via mcp_utils, which attaches the internal Authorization header. The
+        # bare requests.get here did not, and GET /terminals/{id} IS scope-gated —
+        # so with auth enabled the call 401'd, this returned None, and every
+        # memory scope silently collapsed to global.
+        #
+        # A 404 (terminal genuinely not registered) is the only case that means
+        # "no context". Transport and auth failures PROPAGATE so the caller can
+        # say "cannot reach cao-server" rather than "could not resolve terminal
+        # context" — reporting a down server as a missing identity is the same
+        # class of misdirection as reporting an unreadable config as "disabled".
+        try:
+            meta = mcp_utils.get_json(f"/terminals/{terminal_id}", timeout=_mcp_timeout())
+        except requests.HTTPError as e:
+            if getattr(e.response, "status_code", None) == 404:
+                return None
+            raise
         ctx: Dict[str, Any] = {
             "terminal_id": meta["id"],
             "session_name": meta["session_name"],
             "provider": meta["provider"],
             "agent_profile": meta.get("agent_profile"),
+            "allowed_tools": meta.get("allowed_tools"),
         }
-        # Try to get working directory for project scope resolution
+        # Try to get working directory for project scope resolution. Same header
+        # reasoning as above — best-effort, so a failure degrades project scope
+        # rather than failing the call.
         try:
             wd_resp = requests.get(
                 f"{API_BASE_URL}/terminals/{terminal_id}/working-directory",
+                headers=mcp_utils._auth_headers() or None,
                 timeout=_mcp_timeout(),
             )
             if wd_resp.status_code == 200:
@@ -1262,6 +1295,11 @@ def _get_terminal_context_from_env() -> Optional[Dict[str, Any]]:
         except Exception:
             pass
         return ctx
+    except requests.RequestException:
+        # Let the caller distinguish "unreachable / unauthorized" from "no
+        # context"; the memory tools still degrade to None via their own
+        # handlers, while the outcome tools report the real cause.
+        raise
     except Exception as e:
         logger.warning(f"Failed to get terminal context for memory tools: {e}")
         return None
@@ -1286,6 +1324,99 @@ def _caller_has_store_lesson_capability(caller_profile: Optional[str]) -> bool:
     except Exception as e:  # noqa: BLE001 — authz check fails closed
         logger.warning(f"store_lesson capability lookup failed for {caller_profile!r}: {e}")
         return False
+
+
+CAO_MCP_SERVER_SELECTOR = "@cao-mcp-server"
+
+
+def _caller_effective_allowed_tools(context: Dict[str, Any]) -> Optional[List[str]]:
+    """Effective CAO allowlist for the calling terminal, or None if unresolvable.
+
+    Mirrors ``create_terminal``: a recorded ``allowed_tools`` IS the effective
+    list, while ``None`` means "resolve from the agent profile" rather than
+    "unrestricted", so the profile goes through the same
+    ``resolve_allowed_tools`` the launch path uses.
+    """
+    recorded = context.get("allowed_tools")
+    if recorded is not None:
+        return list(recorded)
+
+    profile_name = context.get("agent_profile")
+    if not profile_name:
+        return None
+
+    from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+    from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
+
+    profile = load_agent_profile(profile_name)
+    mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
+    return resolve_allowed_tools(profile.allowedTools, profile.role, mcp_server_names)
+
+
+def _tool_denied_reason(tool_name: str) -> Optional[str]:
+    """Reason the calling terminal's allowlist bars ``tool_name``, or None to allow.
+
+    ``assign`` and ``handoff`` spawn a terminal under a caller-chosen
+    ``agent_profile``, so an agent reaching them can mint a new identity with
+    its own memory scope under any profile installed on the box (#671). The
+    provider-native restrictions built by ``utils/tool_mapping`` cannot cover
+    that: ``get_disallowed_tools`` skips every ``@``-prefixed entry because MCP
+    server references have no native tool names, so CAO's own MCP surface is
+    unreachable from that mechanism by construction.
+
+    The authorization model here is the one CAO already has, not a second one.
+    The effective list is the terminal's recorded ``allowed_tools``, or the
+    profile resolution that ``None`` stands for, and these operations are
+    granted by the documented ``@cao-mcp-server`` server selector or by ``*``.
+    Bare tool names are provider-native vocabulary and never name an MCP tool.
+
+    Fails closed. An unset ``CAO_TERMINAL_ID`` is the supported operator
+    context (``cao assign`` and ``cao handoff`` run with no caller identity)
+    and allows. Once the caller claims an identity every failure to resolve it
+    denies: a malformed ID, an unreachable or unauthorized cao-server, a
+    terminal that is not registered, an unreadable profile.
+
+    ``None`` from ``_get_terminal_context_from_env`` is NOT proof of an
+    operator context. That helper also returns ``None`` for a malformed
+    ``CAO_TERMINAL_ID`` (which ``_current_terminal_id`` itself calls a hard
+    error) and from its trailing ``except Exception``. So boundness is
+    established here from the environment rather than inferred from the
+    absence of an exception.
+    """
+    if not os.environ.get("CAO_TERMINAL_ID"):
+        return None
+
+    try:
+        context = _get_terminal_context_from_env()
+    except Exception as e:  # noqa: BLE001  (an unknown result must not dispatch)
+        logger.warning(f"authorization lookup failed for '{tool_name}': {e}")
+        return f"cannot authorize '{tool_name}': the calling terminal could not be resolved ({e})"
+
+    if context is None:
+        return (
+            f"cannot authorize '{tool_name}': CAO_TERMINAL_ID is set but the calling "
+            "terminal could not be resolved"
+        )
+
+    try:
+        allowed = _caller_effective_allowed_tools(context)
+    except Exception as e:  # noqa: BLE001  (an unknown result must not dispatch)
+        logger.warning(f"allowlist resolution failed for '{tool_name}': {e}")
+        return (
+            f"cannot authorize '{tool_name}': the caller's allowed tools could not "
+            f"be resolved ({e})"
+        )
+
+    if allowed is None:
+        return f"cannot authorize '{tool_name}': the caller's allowed tools could not be resolved"
+
+    if "*" in allowed or CAO_MCP_SERVER_SELECTOR in allowed:
+        return None
+
+    return (
+        f"'{tool_name}' is not permitted: the calling terminal's allowed tools do not "
+        f"include '{CAO_MCP_SERVER_SELECTOR}'"
+    )
 
 
 @mcp.tool()
@@ -1514,6 +1645,42 @@ async def memory_forget(
         return {"success": False, "error": str(e)}
 
 
+def _outcome_tool_error(
+    exc: Exception, fallback: str, *, extra: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """Translate a failed outcome-API call into the tool's error payload.
+
+    ``disabled: True`` requires a 404 **and** the gate's own
+    ``LEARNING_DISABLED_CODE`` discriminator in the body. Status alone is not
+    enough: a missing ``/outcomes`` route during a mixed-version rollout, or a
+    proxy that does not know the path, returns an ordinary
+    ``{"detail": "Not Found"}`` 404 — and ``skills/cao-learning`` instructs
+    agents to skip a ``disabled: true`` payload SILENTLY, so inferring the
+    feature state from a generic 404 drops outcomes without a trace. That is the
+    same class of misreporting this module exists to remove, so an unmarked 404
+    stays an explicit failure with no ``disabled`` key.
+
+    A 503 (settings unreadable) and a transport failure are likewise never
+    "disabled", for the same reason: an unreadable settings.json used to present
+    itself as a deliberate opt-out.
+    """
+    extra = dict(extra or {})
+    if isinstance(exc, requests.ConnectionError):
+        return {
+            "success": False,
+            "error": "Failed to connect to cao-server. The server may not be running.",
+            **extra,
+        }
+    response = getattr(exc, "response", None)
+    if response is None:
+        return {"success": False, "error": f"{fallback}: {exc}", **extra}
+
+    detail = _extract_error_detail(response, fallback)
+    if response.status_code == 404 and LEARNING_DISABLED_CODE in detail:
+        return {"success": False, "disabled": True, "error": detail, **extra}
+    return {"success": False, "error": detail, **extra}
+
+
 @mcp.tool()
 async def report_outcome(
     task_label: str = Field(
@@ -1555,11 +1722,6 @@ async def report_outcome(
     Requires memory.learning_enabled=true (opt-in); otherwise returns a
     disabled payload without recording anything.
     """
-    from cli_agent_orchestrator.services.outcome_service import (
-        LearningDisabledError,
-        OutcomeService,
-    )
-
     try:
         terminal_context = _get_terminal_context_from_env()
         if not terminal_context:
@@ -1567,20 +1729,25 @@ async def report_outcome(
                 "success": False,
                 "error": "Could not resolve terminal context (CAO_TERMINAL_ID unset or unknown)",
             }
-        service = OutcomeService()
-        outcome = service.record_outcome(
-            session_name=terminal_context["session_name"],
-            task_label=task_label,
-            success=success,
-            workflow_name=workflow_name,
-            agent_profile=agent_profile or terminal_context.get("agent_profile"),
-            source_terminal_id=terminal_context["terminal_id"],
-            score=score,
-            friction_notes=friction_notes,
+        payload = mcp_utils.post_body_json(
+            "/outcomes",
+            {
+                "session_name": terminal_context["session_name"],
+                "task_label": task_label,
+                "success": success,
+                "workflow_name": workflow_name,
+                "agent_profile": agent_profile or terminal_context.get("agent_profile"),
+                "source_terminal_id": terminal_context["terminal_id"],
+                "score": score,
+                "friction_notes": friction_notes,
+            },
+            timeout=_mcp_timeout(),
         )
-        return {"success": True, "outcome_id": outcome["id"]}
-    except LearningDisabledError as e:
-        return {"success": False, "disabled": True, "error": str(e)}
+        # Only the id: the route returns the whole record, and echoing it would
+        # newly surface friction_notes back to the agent that wrote them.
+        return {"success": True, "outcome_id": payload["outcome"]["id"]}
+    except requests.RequestException as e:
+        return _outcome_tool_error(e, "Failed to record outcome")
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -1607,17 +1774,7 @@ async def list_outcomes(
     Requires memory.learning_enabled=true; returns an empty list with a
     disabled marker otherwise.
     """
-    from cli_agent_orchestrator.services.outcome_service import OutcomeService
-    from cli_agent_orchestrator.services.settings_service import is_learning_enabled
-
     try:
-        if not is_learning_enabled():
-            return {
-                "success": False,
-                "disabled": True,
-                "error": LEARNING_DISABLED_MESSAGE,
-                "outcomes": [],
-            }
         if session_name is None:
             # Fail closed: without an explicit session filter the caller's
             # own session is REQUIRED. Proceeding with None would run an
@@ -1635,13 +1792,20 @@ async def list_outcomes(
                     ),
                     "outcomes": [],
                 }
-        outcomes = OutcomeService().list_outcomes(
+        payload = mcp_utils.get_json(
+            "/outcomes",
             session_name=session_name,
             agent_profile=agent_profile,
             workflow_name=workflow_name,
-            limit=limit,
+            # Clamped, not passed through: OutcomeService clamps silently, so
+            # limit=500 works today, while the route's Query(le=200) would 422 it.
+            limit=min(max(1, int(limit)), 200),
+            timeout=_mcp_timeout(),
         )
+        outcomes = payload["outcomes"]
         return {"success": True, "outcomes": outcomes, "count": len(outcomes)}
+    except requests.RequestException as e:
+        return _outcome_tool_error(e, "Failed to list outcomes", extra={"outcomes": []})
     except Exception as e:
         return {"success": False, "error": str(e), "outcomes": []}
 

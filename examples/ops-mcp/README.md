@@ -79,8 +79,8 @@ get_session_info       -> verify the session is actually gone
 
 Three details are load-bearing rather than incidental.
 
-**`launch_session` returns immediately.** It hands back `session_name` and
-`terminal_id` while provider startup and message delivery continue in the
+**`launch_session` returns immediately.** It hands back `session_name`,
+`terminal_id` and the resolved `provider` while provider startup and message delivery continue in the
 background, so the caller must poll. `--timeout` bounds each turn.
 
 **A ready status is not proof your turn ran.** This is the subtle one. `idle` can

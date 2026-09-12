@@ -96,6 +96,7 @@ from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.memory import (
+    LenientMemoryKey,
     MemoryKey,
     MemoryScope,
     MemoryScopeId,
@@ -2766,13 +2767,22 @@ class AgentDirsUpdate(BaseModel):
 
 @app.get("/settings/memory")
 async def get_memory_settings_endpoint() -> Dict:
-    """Return whether the memory subsystem is enabled (for UI feature discovery)."""
+    """Return whether the memory subsystem is enabled (for UI feature discovery).
+
+    ``settings_readable`` is additive: False means the two flags above are
+    defaults resolved WITHOUT settings.json, not a deliberate configuration.
+    """
     from cli_agent_orchestrator.services.settings_service import (
         is_learning_enabled,
         is_memory_enabled,
+        settings_readable,
     )
 
-    return {"enabled": is_memory_enabled(), "learning_enabled": is_learning_enabled()}
+    return {
+        "enabled": is_memory_enabled(),
+        "learning_enabled": is_learning_enabled(),
+        "settings_readable": settings_readable(),
+    }
 
 
 @app.post("/settings/agent-dirs")
@@ -4799,6 +4809,8 @@ async def start_workflow_run_endpoint(
                 status_code=422,
                 detail={"findings": workflow_spec_service.render_findings(e.findings)},
             )
+        except approval_gate.PlanApprovalUnavailableError as e:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
         except approval_gate.PlanApprovalRequiredError as e:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
         except KeyError as e:
@@ -4968,6 +4980,8 @@ async def submit_workflow_run_endpoint(
         )
         try:
             approval_gate.ensure_plan_approved(tier="script", manifest_json=manifest_json)
+        except approval_gate.PlanApprovalUnavailableError as e:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
         except approval_gate.PlanApprovalRequiredError as e:
             # 403, distinct from this endpoint's 409 (run_id collision) and 422 (lint / corrupt), so a
             # caller can tell "needs approval" from "the run broke".
@@ -6189,6 +6203,7 @@ async def get_workflow_run_result_endpoint(
         for s in steps
     ]
     error_kind = _resolve_error_kind(row, steps)
+    run_error = getattr(row, "error", None)
     result = WorkflowRunResult(
         run_id=row.run_id,
         workflow_name=row.workflow_name,
@@ -6197,6 +6212,7 @@ async def get_workflow_run_result_endpoint(
         started_at=row.started_at,
         finished_at=row.finished_at,
         kind=error_kind,
+        warnings=[run_error] if run_error else [],
     )
     body = result.model_dump()
 
@@ -6356,6 +6372,8 @@ async def resume_workflow_run_endpoint(
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'"
             )
+        except approval_gate.PlanApprovalUnavailableError as e:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
         except approval_gate.PlanApprovalRequiredError as e:
             # issue #583 Bolt 2, ``approval-gate``: 403, and it must be caught HERE rather than left
             # to the arms below. ``PlanApprovalRequiredError`` is deliberately not a ``ValueError``
@@ -6760,16 +6778,18 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
       hijacking guard);
     * when the HTTP auth layer is enabled (``AUTH0_DOMAIN`` /
       ``CAO_AUTH_JWKS_URI`` set — see :func:`is_auth_enabled`), the handshake
-      must carry a valid bearer token granting at least the ``cao:read``
-      scope.
+      must carry a valid bearer token granting ``cao:write`` or ``cao:admin``.
+      Keystroke injection is RCE; ``cao:read`` is not enough. HTTP
+      ``POST /terminals/{id}/input`` already requires write.
 
     Token scheme: browsers cannot set request headers on a WebSocket
     handshake, so the token is accepted from either ``Authorization: Bearer
     <token>`` (native clients) or a ``?token=<token>`` query parameter (the
     bundled web viewer). The token is verified exactly like the HTTP layer —
     RS256 signature, issuer, audience and expiry via the JWKS cache — and a
-    missing/invalid token or one lacking ``cao:read`` closes the handshake
-    with code 4401 before accept. This closes the bypass where widening
+    missing/invalid token or one lacking ``cao:write`` (or ``cao:admin``)
+    closes the handshake with code 4401 before accept. This closes the bypass
+    where widening
     ``CAO_WS_ALLOWED_CLIENTS`` / ``CAO_WS_ALLOWED_ORIGINS`` for containers,
     devcontainers or Codespaces exposed full PTY control with no credential.
     Do NOT expose the server to untrusted networks (e.g. --host 0.0.0.0)
@@ -6823,9 +6843,10 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
     # identity: browsers cannot set request headers on a WebSocket handshake,
     # so the token is accepted from the Authorization header or a ``?token=``
     # query parameter. The token is verified with the same JWKS/issuer/
-    # audience/expiry logic as the HTTP layer and must grant at least
-    # ``SCOPE_READ``. Default-off (auth disabled): no token is required and
-    # behavior is byte-for-byte unchanged.
+    # audience/expiry logic as the HTTP layer and must grant ``SCOPE_WRITE``
+    # or ``SCOPE_ADMIN``. ``SCOPE_READ`` is enough to watch HTTP output, not
+    # to type into the PTY. Default-off (auth disabled): no token is required
+    # and behavior is byte-for-byte unchanged.
     if is_auth_enabled():
         token = _extract_bearer(websocket.headers.get("authorization"))
         if not token:
@@ -6846,11 +6867,12 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
             )
             await websocket.close(code=4401, reason="Unauthorized")
             return
-        if SCOPE_READ not in scopes:
+        if SCOPE_WRITE not in scopes and SCOPE_ADMIN not in scopes:
             logger.warning(
-                "Rejected WebSocket attach for terminal %r: token lacks %r scope",
+                "Rejected WebSocket attach for terminal %r: token lacks %r/%r scope",
                 terminal_id,
-                SCOPE_READ,
+                SCOPE_WRITE,
+                SCOPE_ADMIN,
             )
             await websocket.close(code=4401, reason="Unauthorized")
             return
@@ -7201,7 +7223,15 @@ class InternalMemoryStoreRequest(BaseModel):
     content: str
     scope: MemoryScope = MemoryScope.PROJECT
     memory_type: MemoryType = MemoryType.PROJECT
-    key: Optional[MemoryKey] = None
+    # Lenient, not strict: these routes back the MCP memory tools, which have
+    # always let MemoryService._sanitize_key normalize the key. Strict validation
+    # here 422'd calls that succeed in-process, so enabling CAO_MEMORY_API_URL
+    # broke working callers. See LenientMemoryKey.
+    # Lenient, not strict: these routes back the MCP memory tools, which have
+    # always let MemoryService._sanitize_key normalize the key. Strict validation
+    # here 422'd calls that succeed in-process, so enabling CAO_MEMORY_API_URL
+    # broke working callers. See LenientMemoryKey.
+    key: Optional[LenientMemoryKey] = None
     tags: str = ""
     terminal_context: Optional[InternalMemoryContext] = None
 
@@ -7218,7 +7248,7 @@ class InternalMemoryRecallRequest(BaseModel):
 
 
 class InternalMemoryForgetRequest(BaseModel):
-    key: MemoryKey
+    key: LenientMemoryKey  # see InternalMemoryStoreRequest.key
     scope: MemoryScope = MemoryScope.PROJECT
     terminal_context: Optional[InternalMemoryContext] = None
 
@@ -7800,18 +7830,35 @@ class OutcomeCreateBody(BaseModel):
 
 
 def _require_learning_enabled() -> None:
-    """Raise 404 when workflow self-learning is disabled.
+    """Raise 404 when workflow self-learning is disabled, 503 when unknown.
 
     list_outcomes() silently returns [] when disabled, so the gate must be
     explicit rather than inferred from empty results (same reasoning as
     ``_require_memory_enabled``).
-    """
-    from cli_agent_orchestrator.services.settings_service import is_learning_enabled
 
-    if not is_learning_enabled():
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Workflow self-learning is disabled"
-        )
+    The 404/503 split is the point: an unreadable settings.json resolves to
+    "disabled" internally (learning fails closed, by design), but reporting THAT
+    as 404 tells the caller a configuration story about a filesystem fault. 503
+    says "I cannot tell", which is what an operator needs to hear.
+
+    ``_require_memory_enabled`` deliberately has no 503 branch — memory fails
+    OPEN, so an unreadable file there resolves to enabled and cannot mislead.
+    """
+    from cli_agent_orchestrator.services.outcome_service import LEARNING_DISABLED_MESSAGE
+    from cli_agent_orchestrator.services.settings_service import (
+        is_learning_enabled,
+        learning_status,
+    )
+
+    if is_learning_enabled():
+        return
+    # Disabled — but WHY? learning_status() is consulted only to explain the
+    # False, never to decide it, so is_learning_enabled() remains the single
+    # decision point every override and test seam already targets.
+    st = learning_status()
+    if st.unreadable:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=st.detail)
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=LEARNING_DISABLED_MESSAGE)
 
 
 @app.post("/outcomes")
@@ -7821,6 +7868,7 @@ async def create_outcome_endpoint(
 ) -> Dict:
     """Record a workflow outcome (self-learning signal)."""
     from cli_agent_orchestrator.services.outcome_service import (
+        LEARNING_DISABLED_MESSAGE,
         LearningDisabledError,
         OutcomeService,
     )
@@ -7838,9 +7886,14 @@ async def create_outcome_endpoint(
             friction_notes=body.friction_notes,
         )
     except LearningDisabledError:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Workflow self-learning is disabled"
-        )
+        # LEARNING_DISABLED_MESSAGE, not a hand-written string: it carries
+        # LEARNING_DISABLED_CODE, which is what the MCP layer matches on before
+        # reporting `disabled: true`. This is the race path — learning was enabled
+        # when _require_learning_enabled() ran and disabled by the time the write
+        # landed — so it is genuinely the feature gate and must read as such.
+        # A bare detail here would surface as a plain error instead, making the
+        # discriminator's coverage depend on which of two gates fired.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=LEARNING_DISABLED_MESSAGE)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     return {"success": True, "outcome": outcome}

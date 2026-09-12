@@ -687,6 +687,18 @@ def test_result_renders_failure_envelope_for_failed_run(runner):
     assert "cao workflow result run1" in out  # next command hint
 
 
+def test_result_renders_retained_run_diagnostic(runner):
+    """Issue #753: human output must show the stderr retained in warnings."""
+    body = _failed_result_body()
+    body["warnings"] = ["Traceback: script failed"]
+    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+        mock_req.get.return_value = _resp(200, body)
+        result = runner.invoke(workflow, ["result", "run1"])
+
+    assert result.exit_code == 0
+    assert "Traceback: script failed" in result.output
+
+
 def test_result_failed_json_verbatim_carries_envelope(runner):
     """U9-T8 (ST-1 / NFR-3): ``result --json`` for a failed run emits the server
     body verbatim — the failure envelope (and its stable next_command hint) is in

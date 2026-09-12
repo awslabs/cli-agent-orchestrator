@@ -97,6 +97,33 @@ ERROR_PATTERN = re.compile(
     r"Unknown model|Model .* (?:not found|unavailable))",
     re.IGNORECASE | re.MULTILINE,
 )
+# Footers grok 1.0.13 draws beneath a selectable picker.  Deliberately kept out
+# of ``WAITING_USER_PATTERN``: that branch is ordered only against completion
+# and ready evidence, and these shapes are also what the usage-limit picker
+# prints, so a picker an erase/redraw already replaced could report
+# WAITING_USER_ANSWER over a live turn.  ``get_status`` classifies them through
+# its own check, ordered against newer processing evidence too.
+PICKER_ANSWER_FOOTER_PATTERN = re.compile(r"(?:Tab:next answer|Enter:submit)", re.IGNORECASE)
+# Any footer that proves a picker was drawn in the frame -- the 1.0.13 shapes
+# plus the ``n/m:select`` footer ``WAITING_USER_PATTERN`` already knows.  Used
+# below only as the structural companion of the usage-limit refusal line.
+PICKER_FOOTER_PATTERN = re.compile(
+    r"(?:Tab:next answer|Enter:submit|\d+/\d+:select)", re.IGNORECASE
+)
+# Usage-limit refusal (grok 1.0.13).  It is not an ``Error:`` line; it is drawn
+# inside the picker box that offers "Upgrade tier" / "Buy more credits" /
+# "Try Again":
+#
+#     ┃  You hit your weekly limit.
+#     ┃  1 (○) Upgrade tier      Upgrade to a higher tier for more usage
+#     ┃  ↑/↓ navigate · y copy                                    Enter:submit
+#     Tab:next answer  │  Esc:scrollback  │  Shift+x:dismiss
+#
+# Requiring the box glyph on the refusal line keeps ordinary assistant prose
+# that quotes the sentence from matching; ``get_status`` additionally requires
+# a ``PICKER_FOOTER_PATTERN`` footer after the line, so only a drawn picker is
+# classified, and orders the whole structure against every newer status signal.
+USAGE_LIMIT_PATTERN = re.compile(r"┃[ \t]*You hit your weekly limit", re.IGNORECASE)
 
 _STATUS_TAIL_CHARS = 8192
 _COMPLETION_TO_READY_MAX_CHARS = 4096
@@ -709,9 +736,50 @@ class GrokCliProvider(BaseProvider):
         last_completion = completion_matches[-1].start() if completion_matches else -1
         last_error = max((match.start() for match in ERROR_PATTERN.finditer(tail)), default=-1)
 
+        # The usage-limit refusal counts only as part of a picker that is still
+        # drawn: the boxed refusal line must be followed by one of the picker's
+        # own footers in the same frame.
+        last_picker_footer = max(
+            (match.start() for match in PICKER_FOOTER_PATTERN.finditer(tail)), default=-1
+        )
+        last_limit_picker = max(
+            (
+                match.start()
+                for match in USAGE_LIMIT_PATTERN.finditer(tail)
+                if match.end() <= last_picker_footer
+            ),
+            default=-1,
+        )
+        last_picker_answer = max(
+            (match.start() for match in PICKER_ANSWER_FOOTER_PATTERN.finditer(tail)), default=-1
+        )
+
         # Pickers/login are bottom-of-screen blocking surfaces. Position guards
         # keep a dismissed prompt retained in scrollback from pinning status.
+        #
+        # The limit picker is checked ahead of WAITING and PROCESSING, but only
+        # while it is the newest evidence in the tail. Grok reads an append-only
+        # raw FIFO buffer and ``strip_terminal_escapes`` drops erase sequences
+        # without removing the text they erased, so a picker that ``ESC[2J``,
+        # ``ESC[H ESC[J`` or an ordinary redraw has already replaced still reads
+        # as a full picker here -- as does a transcript that quotes one. Only
+        # position tells the two apart, so this is ordered against
+        # last_processing as well as last_completion/last_ready. The real
+        # refusal still wins: the stale "Waiting for response…"/"Esc:cancel"
+        # marker belongs to the turn that hit the limit and therefore sits
+        # BEFORE the picker in the buffer.
+        if last_limit_picker > max(last_completion, last_ready, last_processing):
+            return TerminalStatus.ERROR
+
         if last_waiting > max(last_completion, last_ready):
+            return TerminalStatus.WAITING_USER_ANSWER
+
+        # The footer shapes 1.0.13 added, classified separately from the branch
+        # above so upstream's footers keep their existing ordering. A picker is
+        # only waiting on the user while nothing newer has been drawn over it,
+        # so these are ordered against last_processing for the same append-only
+        # reason as the limit picker.
+        if last_picker_answer > max(last_completion, last_ready, last_processing):
             return TerminalStatus.WAITING_USER_ANSWER
 
         if last_processing > last_completion:

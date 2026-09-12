@@ -226,7 +226,7 @@ def _wait_remote_ready(base_url: str, timeout: float) -> None:
 
     Exists because "the pod is Ready" and "the Service in front of the pod is
     routable" are different claims, and only the second one is what a caller
-    needs. A broker that leases a worker the moment its Job and Service objects
+    needs. A broker that leases a worker the moment its workload and Service objects
     exist is handing back an address that becomes usable shortly afterwards -
     endpoint published, kube-proxy rules programmed on this node - and the
     difference is a second or two that no readiness probe on the pod can observe.
@@ -850,10 +850,21 @@ def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
 
 
 def _extract_error_detail(response: requests.Response, fallback: str) -> str:
-    """Extract a human-readable error detail from an API response."""
+    """Extract a human-readable error detail from an API response.
+
+    Valid JSON is not necessarily a JSON *object*: a gateway or proxy between the
+    agent and cao-server can answer a 502 with ``[]`` or a bare string, both of
+    which parse fine and have no ``.get``. Assuming a mapping here turned that
+    into an ``AttributeError`` raised out of the error path — so a transport
+    fault surfaced as a crash instead of the typed ``success: False`` envelope
+    every caller is written against. Check the type before subscripting.
+    """
     try:
         payload = response.json()
     except ValueError:
+        return fallback
+
+    if not isinstance(payload, dict):
         return fallback
 
     detail = payload.get("detail")

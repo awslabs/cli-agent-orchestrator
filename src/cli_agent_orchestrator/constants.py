@@ -262,6 +262,16 @@ PYTE_SCREEN_ROWS = 200
 # per-chunk rendered detection produces (measured worse than the raw path).
 PYTE_QUIESCENCE_DELAY_S = 0.2
 
+# Mid-burst PROCESSING probe for rendered-screen detection (seconds). A TUI that
+# redraws a spinner every second (codex 0.153 while a command runs) never goes
+# quiescent, so edge-only detection sees the rising-edge frame (usually still
+# the previous ready state) and then nothing until the turn ends: the terminal
+# reads IDLE for its whole busy turn (observed live 2026-09-08). While a burst is
+# in progress and the terminal has not yet been seen PROCESSING, the screen is
+# probed at most this often; only a PROCESSING verdict is applied from such a
+# half-settled frame — ready statuses still wait for quiescence.
+PYTE_MIDBURST_PROBE_S = _env_positive_float("CAO_PYTE_MIDBURST_PROBE_S", 1.0)
+
 # Eager inbox delivery: when enabled, deliver queued messages to terminals in
 # PROCESSING state for providers that declare
 # accepts_input_while_processing=True. Eliminates latency between agent turns
@@ -390,6 +400,18 @@ ELASTIC_WORKER_ID_ENV = "CAO_ELASTIC_WORKER_ID"
 ELASTIC_RELEASE_TOKEN_ENV = "CAO_ELASTIC_RELEASE_TOKEN"
 ELASTIC_WORKER_ID_HEADER = "X-CAO-Worker-ID"
 ELASTIC_RELEASE_TOKEN_HEADER = "X-CAO-Release-Token"
+
+# The cluster's worker broker: where `cao fleet` and `cao worker` point, and
+# the token they authenticate with. Already set on a supervisor pod, which is why
+# these names are reused rather than invented — the same two values that let the
+# supervisor take a lease let an operator inspect and release one.
+#
+# The header is the broker's own, not a bearer token. It grants worker
+# create/list/release plus the broker's allowlisted per-worker routes; it is NOT a
+# credential for the node API behind them.
+ELASTIC_BROKER_URL_ENV = "CAO_ELASTIC_BROKER_URL"
+ELASTIC_BROKER_TOKEN_ENV = "CAO_ELASTIC_BROKER_TOKEN"
+ELASTIC_BROKER_TOKEN_HEADER = "X-CAO-Broker-Token"
 
 
 # Operators can extend network allowlists via the env vars handled below.

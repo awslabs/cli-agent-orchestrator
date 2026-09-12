@@ -173,7 +173,9 @@ class CopilotCliProvider(BaseProvider):
 
         # Apply tool restrictions via --deny-tool flags.
         # --deny-tool takes precedence over --allow-all.
-        if self._allowed_tools and "*" not in self._allowed_tools:
+        # A present-but-empty list is deny-all (same as Grok). A falsy check
+        # used to skip --deny-tool entirely for allowed_tools=[].
+        if self._allowed_tools is not None and "*" not in self._allowed_tools:
             from cli_agent_orchestrator.utils.tool_mapping import get_disallowed_tools
 
             disallowed = get_disallowed_tools("copilot_cli", self._allowed_tools)
