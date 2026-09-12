@@ -56,10 +56,12 @@ from cli_agent_orchestrator.models.workflow_runtime import (
     StepStatus,
     WorkflowRunResult,
 )
+from cli_agent_orchestrator.providers.base import OutputExtractionError
 from cli_agent_orchestrator.services import workflow_journal
 from cli_agent_orchestrator.services.agent_step import (
     StepCancelledError,
     StepExecutionError,
+    _best_effort_teardown,
     run_agent_step,
 )
 from cli_agent_orchestrator.services.step_output_store import (
@@ -1663,6 +1665,24 @@ async def replay_single_step(
     is reported in the returned payload (``error`` / ``error_kind``), never raised —
     the same posture as the drive loop, where a step failure is data rather than an
     exception.
+
+    Every raise above is a PREFLIGHT one: each is decided before the step runs, and
+    each keeps its own status code. Once execution starts the posture inverts, and
+    three failures are normalised into the payload rather than raised —
+    ``StepExecutionError`` (readiness/completion timeout, or the terminal reaching
+    ERROR), a ``TimeoutError`` from provider initialisation, and an
+    :class:`~cli_agent_orchestrator.providers.base.OutputExtractionError` from
+    extracting the output of a step that already completed. The last two used to
+    escape as 500 and 400 respectively, which reported a step that had RUN as a
+    malformed request. The list is closed on purpose: a failure that is not one of
+    those three is not known to be a step failure, and is left to propagate rather
+    than be dressed up as one.
+
+    A ``StepExecutionError`` also leaves its worker ALIVE — ``run_agent_step``
+    hands that terminal to its caller instead of deleting it — so this function
+    tears the terminal down before releasing the replay's private output slot.
+    Otherwise the request ends while its producer keeps running, and a late
+    ``workflow_return`` from that worker re-creates the slot that was just freed.
     """
     _validate_key_part(run_id, "run_id")
     _validate_key_part(step_id, "step_id")
@@ -1769,6 +1789,64 @@ async def replay_single_step(
             payload["error"] = str(e)
             payload["error_kind"] = e.kind
             payload["terminal_id"] = e.terminal_id
+            # THE WORKER IS STILL RUNNING AT THIS POINT. ``run_agent_step`` tears a
+            # terminal down on success, on cancellation and on extraction failure — but
+            # NOT here: at its readiness-timeout raise it says so outright ("We do NOT
+            # auto-delete here: leaving the terminal lets the caller decide"), and its
+            # completion wait re-raises ``StepExecutionError`` untorn while tearing down
+            # only ``StepCancelledError``. The DRIVE LOOP is the caller that wants that
+            # bargain: it pins ``exc.terminal_id`` onto the step state, and the run's
+            # registry entry, journal row and ``cao workflow cancel`` all still reach the
+            # worker afterwards. A replay has none of those — no run record, no cancel
+            # path, and a nonced store key private to this one call — so for a replay
+            # "left to the caller" means leaked. Observed: a completion timeout returned
+            # the failure payload while its worker kept running, and a later
+            # ``workflow_return`` from that worker was ACCEPTED and recreated the private
+            # store entry after the ``finally`` below had already released it.
+            #
+            # Tearing down inside this arm — rather than in the ``finally`` — is the
+            # ordering that closes it: the producer is dead before its slot is
+            # relinquished, so there is no window where a live worker can write to a
+            # released key. ``_best_effort_teardown`` never raises (it logs and swallows
+            # both halves of exit-then-delete), which is what keeps the ORIGINAL step
+            # failure the one the caller is told about even when cleanup itself fails.
+            #
+            # ``registry=None`` matches the ``run_agent_step`` call above, which passes no
+            # registry either: the in-process engine path dispatches no plugin hooks.
+            if e.terminal_id is not None:
+                await _best_effort_teardown(e.terminal_id, None)
+        except (TimeoutError, OutputExtractionError) as e:
+            # Two terminal-layer failures ``run_agent_step`` propagates verbatim instead
+            # of wrapping in ``StepExecutionError``, and both are the STEP failing rather
+            # than the REQUEST being bad. Provider initialization can raise
+            # ``TimeoutError`` (see that function's own ``Raises``: "ValueError /
+            # TimeoutError: propagated from terminal_service"), and completed-output
+            # extraction can raise ``OutputExtractionError``.
+            #
+            # Unnormalized, neither reached this payload: the timeout surfaced as an
+            # unhandled exception -> HTTP 500 "Internal Server Error", and
+            # ``OutputExtractionError`` — a ``ValueError`` subclass — fell into the
+            # route's ``except ValueError`` arm -> HTTP 400 "No message marker found",
+            # telling the caller its request was malformed about a step that had already
+            # RUN. It also broke the documented shape: ``cao workflow step ... --json``
+            # printed a plain error instead of the replay result carrying the resolved
+            # prompt and ``error``/``error_kind``. Catching the narrower type ahead of
+            # ``ValueError`` is the same move ``api/main.py`` already makes at its two
+            # ``get_output`` boundaries for issue #570.
+            #
+            # THE TUPLE IS DELIBERATELY NARROW. A bare ``except Exception`` here would
+            # report a programming error inside this function as a step failure, and the
+            # preflight raises live OUTSIDE this block on purpose so they keep their own
+            # codes: unknown run/step -> 404, corrupt snapshot -> 422, blank override or
+            # unresolvable template -> 400. Only failures of the EXECUTION are data.
+            #
+            # No teardown on this path, and that is not an omission. An
+            # ``OutputExtractionError`` can only arrive after ``run_agent_step``'s own
+            # extraction guard already tore the terminal down, and an initialization
+            # ``TimeoutError`` fails before there is a terminal id to tear down — neither
+            # leaves this call a handle, so there is nothing here to release.
+            payload["error"] = str(e)
+            payload["error_kind"] = "timeout" if isinstance(e, TimeoutError) else "error"
         else:
             payload["terminal_id"] = result.terminal_id
             payload["last_message"] = result.last_message

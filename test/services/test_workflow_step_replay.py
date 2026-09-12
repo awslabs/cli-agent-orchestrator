@@ -50,6 +50,7 @@ from cli_agent_orchestrator.models.workflow import (
     WorkflowStep,
 )
 from cli_agent_orchestrator.models.workflow_runtime import StepOutputRecord
+from cli_agent_orchestrator.providers.base import OutputExtractionError
 from cli_agent_orchestrator.services import workflow_journal
 from cli_agent_orchestrator.services import workflow_service as ws
 from cli_agent_orchestrator.services.agent_step import StepExecutionError
@@ -595,3 +596,168 @@ async def test_step_failure_is_reported_not_raised(monkeypatch):
     assert payload["error_kind"] == "timeout"
     assert payload["terminal_id"] == "t7"
     assert payload["output"] is None
+
+
+# ---------------------------------------------------------------------------
+# the replay-owned worker is stopped before its slot is released
+#
+# ``run_agent_step`` does NOT delete the terminal when it raises
+# ``StepExecutionError`` — it hands the live terminal to its caller. The drive loop
+# wants that (the run's registry entry, journal row and ``cao workflow cancel`` all
+# still reach the worker); a replay has none of those, so for a replay it means the
+# request ends and the worker does not.
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def _teardown_and_release_order(monkeypatch):
+    """Record teardown + slot-release calls in the order they actually happen."""
+    events: list[Any] = []
+
+    async def _record_teardown(terminal_id, registry):
+        events.append(("teardown", terminal_id, registry))
+
+    real_delete = ws.step_output_store.delete
+
+    def _record_delete(run_id, step_id):
+        events.append(("release", run_id, step_id))
+        return real_delete(run_id, step_id)
+
+    monkeypatch.setattr(ws, "_best_effort_teardown", _record_teardown)
+    monkeypatch.setattr(ws.step_output_store, "delete", _record_delete)
+    return events
+
+
+@pytest.mark.asyncio
+async def test_a_timed_out_replay_stops_its_worker(monkeypatch, _teardown_and_release_order):
+    """The failure payload is returned AND the replay-owned terminal is deleted."""
+    _seed_run()
+    monkeypatch.setattr(
+        ws,
+        "run_agent_step",
+        AsyncMock(side_effect=StepExecutionError("timed out", kind="timeout", terminal_id="t7")),
+    )
+
+    payload = await ws.replay_single_step(_RUN_ID, "s2")
+
+    assert payload["error_kind"] == "timeout"
+    assert payload["terminal_id"] == "t7"
+    assert ("teardown", "t7", None) in _teardown_and_release_order
+
+
+@pytest.mark.asyncio
+async def test_the_worker_is_dead_before_the_slot_is_released(
+    monkeypatch, _teardown_and_release_order
+):
+    """ORDER, not just presence: no window where a live worker can write a freed key.
+
+    Releasing first is what made a late ``workflow_return`` from the still-running
+    worker land in — and re-create — the private store entry.
+    """
+    _seed_run()
+    monkeypatch.setattr(
+        ws,
+        "run_agent_step",
+        AsyncMock(side_effect=StepExecutionError("timed out", kind="timeout", terminal_id="t7")),
+    )
+
+    await ws.replay_single_step(_RUN_ID, "s2")
+
+    kinds = [event[0] for event in _teardown_and_release_order]
+    assert kinds == ["teardown", "release"], kinds
+
+
+@pytest.mark.asyncio
+async def test_a_failure_with_no_terminal_tears_nothing_down(
+    monkeypatch, _teardown_and_release_order
+):
+    """``terminal_id=None`` means no worker was ever handed over — nothing to stop."""
+    _seed_run()
+    monkeypatch.setattr(
+        ws,
+        "run_agent_step",
+        AsyncMock(side_effect=StepExecutionError("never started", kind="error", terminal_id=None)),
+    )
+
+    payload = await ws.replay_single_step(_RUN_ID, "s2")
+
+    assert payload["error_kind"] == "error"
+    assert [event[0] for event in _teardown_and_release_order] == ["release"]
+
+
+@pytest.mark.asyncio
+async def test_a_successful_replay_tears_nothing_down(monkeypatch, _teardown_and_release_order):
+    """``run_agent_step`` already tore its own terminal down on the success path."""
+    _seed_run()
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(return_value=_ok()))
+
+    await ws.replay_single_step(_RUN_ID, "s2")
+
+    assert [event[0] for event in _teardown_and_release_order] == ["release"]
+
+
+# ---------------------------------------------------------------------------
+# known terminal-layer failures are normalised into the payload
+#
+# ``run_agent_step`` propagates these two verbatim rather than wrapping them, so
+# before this they escaped the HTTP-200 failure-as-data contract: the timeout as a
+# 500, and the extraction failure as a 400 about a step that had already RUN.
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_provider_init_timeout_is_reported_not_raised(monkeypatch):
+    _seed_run()
+    monkeypatch.setattr(
+        ws, "run_agent_step", AsyncMock(side_effect=TimeoutError("provider never came up"))
+    )
+
+    payload = await ws.replay_single_step(_RUN_ID, "s2")
+
+    assert "provider never came up" in payload["error"]
+    assert payload["error_kind"] == "timeout"
+    assert payload["output"] is None
+    # The resolved prompt is the half of the payload the CLI promises even on failure.
+    assert payload["prompt"] == "write about 42 for cats"
+
+
+@pytest.mark.asyncio
+async def test_output_extraction_failure_is_reported_not_raised(monkeypatch):
+    """A ``ValueError`` subclass — so it used to reach the route's 400 arm."""
+    _seed_run()
+    monkeypatch.setattr(
+        ws,
+        "run_agent_step",
+        AsyncMock(side_effect=OutputExtractionError("No message marker found")),
+    )
+
+    payload = await ws.replay_single_step(_RUN_ID, "s2")
+
+    assert "No message marker found" in payload["error"]
+    assert payload["error_kind"] == "error"
+    assert payload["prompt"] == "write about 42 for cats"
+
+
+@pytest.mark.asyncio
+async def test_normalisation_does_not_swallow_an_unrelated_error(monkeypatch):
+    """The closed list is the point: anything else still propagates.
+
+    A bare ``except Exception`` would have turned a programming error inside this
+    function into a reported step failure, which is worse than a 500.
+    """
+    _seed_run()
+    monkeypatch.setattr(
+        ws, "run_agent_step", AsyncMock(side_effect=RuntimeError("engine bug, not a step failure"))
+    )
+
+    with pytest.raises(RuntimeError, match="engine bug"):
+        await ws.replay_single_step(_RUN_ID, "s2")
+
+
+@pytest.mark.asyncio
+async def test_a_normalised_failure_still_releases_its_slot(monkeypatch):
+    """The ``finally`` covers the new arms too — no entry pinned for the process life."""
+    _seed_run()
+    monkeypatch.setattr(
+        ws, "run_agent_step", AsyncMock(side_effect=TimeoutError("provider never came up"))
+    )
+
+    await ws.replay_single_step(_RUN_ID, "s2")
+
+    assert ws.step_output_store._store == {}

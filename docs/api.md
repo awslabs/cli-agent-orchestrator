@@ -239,7 +239,11 @@ than calling these routes directly.
   still going. That also means replays are invisible to a journal-as-audit-log reader (they
   are logged at INFO instead). YAML tier only (script tier -> 400). A step that FAILS is a
   `200` whose body carries `error`/`error_kind`; unknown run or unknown step -> 404,
-  unusable spec snapshot -> 422, unresolvable or empty prompt -> 400.
+  unusable spec snapshot -> 422, unresolvable or empty prompt -> 400. The `200` covers
+  terminal-layer failures too, not only step timeouts: a provider that never initializes
+  and a completed step whose output cannot be extracted are both reported as data, since
+  neither says the request was bad. The 4xx/422 list is exactly the preflight checks —
+  every one of them is decided before the step runs.
 - `GET /workflows/runs/{run_id}/events` returns the run's ordered event timeline with
   any **declared** gaps. One content-negotiated path, two arms: send
   `Accept: text/event-stream` (or `?stream=true`) for a live SSE follow, otherwise a
