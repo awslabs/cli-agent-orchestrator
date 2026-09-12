@@ -91,7 +91,18 @@ TERMINAL_CLEANUP_NUDGE_THRESHOLD = 10
 # _create_terminal non-deferred in production (assign always uses
 # defer_init=True); this is the first caller of that path, so it gets its own
 # padded timeout rather than silently inheriting one sized for something else.
-_HANDOFF_CREATE_TIMEOUT_S = 150.0
+#
+# The ~45s estimate above is not the real worst case, though: several
+# providers apply their own unconditional ready-timeout FLOOR on top of the
+# configurable provider_init_timeout (default 60s) -- antigravity_cli.py's
+# initialize() uses max(180.0, init_timeout), minimax_code.py and kimi_cli.py
+# use max(120.0, init_timeout). At the old 150.0s value, a legitimately-slow
+# (but successful) antigravity init past ~150s got killed client-side here,
+# leaving an orphaned worker terminal with no terminal_id surfaced to the
+# operator to clean it up (no exception handling wraps this call). 240.0
+# clears the highest known floor (antigravity's 180.0) with real headroom;
+# revisit if a future provider's floor exceeds it.
+_HANDOFF_CREATE_TIMEOUT_S = 240.0
 _TERMINAL_ID_PATTERN = re.compile(r"^[a-f0-9]{8}$")
 
 
