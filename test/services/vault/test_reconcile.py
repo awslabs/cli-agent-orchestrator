@@ -2566,6 +2566,373 @@ def test_duplicate_authored_keys_quarantine_both_notes_with_one_finding_per_path
     assert (report.indexed, report.quarantined) == (0, 2)
 
 
+@pytest.mark.parametrize("moved_name", ["A-Moved.md", "Z-Moved.md"])
+def test_ordinary_reconcile_retains_contested_forgotten_rename_claim(
+    tmp_path, monkeypatch, moved_name
+):
+    """A rebuild quarantine remains closed when managed refresh reconciles unchanged notes."""
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    mapped = tmp_path / "vault" / "Mapped"
+    old_path = mapped / "Old.md"
+    moved_path = mapped / moved_name
+    claimant_path = mapped / "Claim.md"
+    old_path.write_text("forgotten content", encoding="utf-8")
+    reconcile(vault, apply=True, run_id=f"ordinary-claim-{moved_name}-before")
+    with Session() as db:
+        original = db.query(VaultNoteModel).one()
+        original_key = original.cao_key
+        _exclude_note(db, original)
+        db.query(MemoryMetadataModel).filter_by(source_kind="vault").delete()
+        db.commit()
+
+    old_path.rename(moved_path)
+    claimant_path.write_text(
+        f"---\ncao:\n  key: {original_key}\n---\nindependent claimant",
+        encoding="utf-8",
+    )
+    reconcile(vault, apply=True, rebuild=True, run_id=f"ordinary-claim-{moved_name}-rebuild")
+
+    snapshots = []
+    for suffix in ("ordinary", "repeated"):
+        report = reconcile(
+            vault,
+            apply=True,
+            run_id=f"ordinary-claim-{moved_name}-{suffix}",
+        )
+        with Session() as db:
+            snapshots.append(
+                (
+                    sorted(
+                        (row.vault_relpath, row.cao_key, row.status)
+                        for row in db.query(VaultNoteModel).all()
+                    ),
+                    db.query(MemoryMetadataModel).filter_by(source_kind="vault").count(),
+                    [
+                        (row.cao_key, row.last_known_relpath)
+                        for row in db.query(VaultExclusionModel).all()
+                    ],
+                    report.indexed,
+                    report.quarantined,
+                )
+            )
+
+    notes, metadata_count, exclusions, indexed, quarantined = snapshots[0]
+    assert snapshots[1] == snapshots[0]
+    assert {path for path, _key, status in notes if status == "quarantined"} == {
+        f"Mapped/{moved_name}",
+        "Mapped/Claim.md",
+    }
+    assert all(key != original_key for _path, key, _status in notes)
+    assert (metadata_count, exclusions, indexed, quarantined) == (
+        0,
+        [(original_key, "Mapped/Old.md")],
+        0,
+        2,
+    )
+
+
+@pytest.mark.parametrize("moved_name", ["A-Moved.md", "Z-Moved.md"])
+def test_contested_forgotten_claim_survives_claimant_removal_and_restoration(
+    tmp_path, monkeypatch, moved_name
+):
+    """Durable ownership survives a claimant removal and later restoration."""
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    mapped = tmp_path / "vault" / "Mapped"
+    old_path = mapped / "Old.md"
+    moved_path = mapped / moved_name
+    claimant_path = mapped / "Claim.md"
+    old_path.write_text("forgotten content", encoding="utf-8")
+    reconcile(vault, apply=True, run_id=f"claim-lifecycle-{moved_name}-before")
+    with Session() as db:
+        original = db.query(VaultNoteModel).one()
+        original_key = original.cao_key
+        _exclude_note(db, original)
+        db.query(MemoryMetadataModel).filter_by(source_kind="vault").delete()
+        db.commit()
+
+    claimant_text = f"---\ncao:\n  key: {original_key}\n---\nindependent claimant"
+    old_path.rename(moved_path)
+    claimant_path.write_text(claimant_text, encoding="utf-8")
+    reconcile(vault, apply=True, rebuild=True, run_id=f"claim-lifecycle-{moved_name}-rebuild")
+    reconcile(vault, apply=True, run_id=f"claim-lifecycle-{moved_name}-ordinary")
+
+    claimant_path.unlink()
+    reconcile(vault, apply=True, run_id=f"claim-lifecycle-{moved_name}-removed")
+    with Session() as db:
+        moved = db.query(VaultNoteModel).filter_by(vault_relpath=f"Mapped/{moved_name}").one()
+        assert moved.status == "excluded"
+        assert db.query(MemoryMetadataModel).filter_by(source_kind="vault").count() == 0
+
+    claimant_path.write_text(claimant_text, encoding="utf-8")
+    reconcile(vault, apply=True, run_id=f"claim-lifecycle-{moved_name}-restored")
+    with Session() as db:
+        assert db.query(VaultExclusionModel).filter_by(cao_key=original_key).count() == 1
+        assert db.query(MemoryMetadataModel).filter_by(source_kind="vault").count() == 0
+
+
+def test_ordinary_reconcile_quarantines_duplicate_hash_copies_of_forgotten_note(
+    tmp_path, monkeypatch
+):
+    """Ambiguous exact-hash descendants of a forgotten note are never recallable."""
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    mapped = tmp_path / "vault" / "Mapped"
+    old_path = mapped / "Old.md"
+    old_path.write_text("forgotten content", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="duplicate-forgotten-before")
+    with Session() as db:
+        original = db.query(VaultNoteModel).one()
+        _exclude_note(db, original)
+        db.query(MemoryMetadataModel).filter_by(source_kind="vault").delete()
+        db.commit()
+
+    old_path.unlink()
+    for name in ("CopyA.md", "CopyB.md"):
+        (mapped / name).write_text("forgotten content", encoding="utf-8")
+
+    report = reconcile(vault, apply=True, run_id="duplicate-forgotten-after")
+    with Session() as db:
+        notes = sorted((row.vault_relpath, row.status) for row in db.query(VaultNoteModel).all())
+        metadata_count = db.query(MemoryMetadataModel).filter_by(source_kind="vault").count()
+    assert notes == [
+        ("Mapped/CopyA.md", "quarantined"),
+        ("Mapped/CopyB.md", "quarantined"),
+    ]
+    assert (metadata_count, report.indexed, report.quarantined) == (0, 0, 2)
+
+
+@pytest.mark.parametrize("copy_names", [("A-Copy.md", "Z-Copy.md"), ("Z-Copy.md", "A-Copy.md")])
+def test_rebuild_then_ordinary_keeps_duplicate_forgotten_candidates_out_of_reader(
+    tmp_path, monkeypatch, copy_names
+):
+    """Reader returns the live positive control but never ambiguous forgotten copies."""
+    from cli_agent_orchestrator.services.vault import reader
+    from cli_agent_orchestrator.services.vault import reconcile as module
+    from cli_agent_orchestrator.services.vault.binding import VaultBinding
+
+    Session = _session(tmp_path, monkeypatch, module)
+    monkeypatch.setattr(reader, "SessionLocal", Session)
+    vault = _rename_vault(tmp_path)
+    mapped = tmp_path / "vault" / "Mapped"
+    old_path = mapped / "Old.md"
+    healthy_path = mapped / "Healthy.md"
+    old_path.write_text("forgotten content", encoding="utf-8")
+    healthy_path.write_text("healthy content", encoding="utf-8")
+    reconcile(vault, apply=True, run_id=f"reader-duplicates-{copy_names[0]}-before")
+    with Session() as db:
+        original = db.query(VaultNoteModel).filter_by(vault_relpath="Mapped/Old.md").one()
+        _exclude_note(db, original)
+        db.query(MemoryMetadataModel).filter_by(source_kind="vault", key=original.cao_key).delete()
+        db.commit()
+
+    old_path.unlink()
+    for name in copy_names:
+        (mapped / name).write_text("forgotten content", encoding="utf-8")
+    reconcile(vault, apply=True, rebuild=True, run_id=f"reader-duplicates-{copy_names[0]}-rebuild")
+    first = reconcile(vault, apply=True, run_id=f"reader-duplicates-{copy_names[0]}-ordinary")
+    second = reconcile(vault, apply=True, run_id=f"reader-duplicates-{copy_names[0]}-repeated")
+
+    binding = VaultBinding(
+        scope="project",
+        scope_id="project",
+        vault_id=vault.id,
+        root=vault.root,
+        mapping=vault.mappings[0],
+    )
+    candidates = reader.resolve_candidates(
+        binding,
+        scope="project",
+        scope_id="project",
+        require_injectable=False,
+        terminal_id=None,
+        consumer="explicit_recall",
+        policy=reader.VaultInjectionPolicy(False, "test", False),
+    )
+    assert (first.indexed, first.quarantined) == (second.indexed, second.quarantined) == (1, 2)
+    assert [candidate.metadata.key for candidate in candidates] == [derive_cao_key("Healthy.md")]
+
+
+def test_rebuild_long_collision_identity_fits_relationship_key_contract(tmp_path, monkeypatch):
+    """A replacement at a long forgotten path uses a distinct, <=60-char identity."""
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    mapped = tmp_path / "vault" / "Mapped"
+    old_path = mapped / f"{'a' * 50}.md"
+    moved_path = mapped / "Moved.md"
+    old_path.write_text("forgotten long-name content", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="long-collision-before")
+    with Session() as db:
+        original = db.query(VaultNoteModel).one()
+        _exclude_note(db, original)
+        db.query(MemoryMetadataModel).filter_by(source_kind="vault").delete()
+        db.commit()
+
+    old_path.rename(moved_path)
+    old_path.write_text("unrelated replacement", encoding="utf-8")
+    snapshots = []
+    for suffix in ("first", "second"):
+        report = reconcile(vault, apply=True, rebuild=True, run_id=f"long-collision-{suffix}")
+        with Session() as db:
+            notes = sorted(
+                (row.vault_relpath, row.cao_key, row.status)
+                for row in db.query(VaultNoteModel).all()
+            )
+            metadata = sorted(
+                (row.key, row.file_path)
+                for row in db.query(MemoryMetadataModel).filter_by(source_kind="vault").all()
+            )
+        snapshots.append((notes, metadata, report.indexed, report.quarantined))
+
+    notes, metadata, indexed, quarantined = snapshots[0]
+    assert snapshots[1] == snapshots[0]
+    assert all(len(key) <= 60 for _path, key, _status in notes)
+    assert len({key for _path, key, _status in notes}) == 2
+    replacement_key = next(
+        key
+        for path, key, _status in notes
+        if path == old_path.relative_to(tmp_path / "vault").as_posix()
+    )
+    assert metadata == [(replacement_key, old_path.relative_to(tmp_path / "vault").as_posix())]
+    assert (indexed, quarantined) == (1, 0)
+
+
+def test_ordinary_reconcile_keeps_alias_carried_identity_after_unrelated_forget(
+    tmp_path, monkeypatch
+):
+    """An unrelated tombstone cannot turn an edited carried rename into a candidate."""
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    mapped = tmp_path / "vault" / "Mapped"
+    old_path = mapped / "Old.md"
+    new_path = mapped / "New.md"
+    junk_path = mapped / "Junk.md"
+    old_path.write_text("body one", encoding="utf-8")
+    junk_path.write_text("unrelated forgotten text", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="alias-unrelated-before")
+    with Session() as db:
+        carried_key = (
+            db.query(VaultNoteModel).filter_by(vault_relpath="Mapped/Old.md").one().cao_key
+        )
+
+    old_path.rename(new_path)
+    reconcile(vault, apply=True, run_id="alias-unrelated-rename")
+    with Session() as db:
+        _exclude_note(
+            db,
+            db.query(VaultNoteModel).filter_by(vault_relpath="Mapped/Junk.md").one(),
+        )
+        db.commit()
+    junk_path.unlink()
+    reconcile(vault, apply=True, run_id="alias-unrelated-forget")
+
+    new_path.write_text("body two, edited", encoding="utf-8")
+    preview = reconcile(vault, apply=False, run_id="alias-unrelated-preview")
+    applied = reconcile(vault, apply=True, run_id="alias-unrelated-apply")
+    with Session() as db:
+        note = db.query(VaultNoteModel).filter_by(vault_relpath="Mapped/New.md").one()
+        metadata_keys = {
+            row.key for row in db.query(MemoryMetadataModel).filter_by(source_kind="vault").all()
+        }
+    assert (preview.indexed, preview.quarantined) == (applied.indexed, applied.quarantined)
+    assert (note.cao_key, note.status, metadata_keys) == (carried_key, "indexed", {carried_key})
+
+
+def test_ordinary_reconcile_does_not_apply_unrelated_forget_to_edited_copy(tmp_path, monkeypatch):
+    """An exclusion claim only affects paths and identities it actually implicates."""
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    mapped = tmp_path / "vault" / "Mapped"
+    forgotten_path = mapped / "Forget.md"
+    p_path = mapped / "P.md"
+    q_path = mapped / "Q.md"
+    forgotten_path.write_text("wholly unrelated forgotten text", encoding="utf-8")
+    p_path.write_text("p original body", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="unrelated-copy-before")
+    with Session() as db:
+        _exclude_note(
+            db,
+            db.query(VaultNoteModel).filter_by(vault_relpath="Mapped/Forget.md").one(),
+        )
+        db.commit()
+    forgotten_path.unlink()
+    reconcile(vault, apply=True, run_id="unrelated-copy-forget")
+
+    p_path.write_text("p edited body", encoding="utf-8")
+    q_path.write_text("p original body", encoding="utf-8")
+    report = reconcile(vault, apply=True, run_id="unrelated-copy-after")
+    with Session() as db:
+        statuses = {row.vault_relpath: row.status for row in db.query(VaultNoteModel).all()}
+    assert (statuses["Mapped/P.md"], statuses["Mapped/Q.md"], report.quarantined) == (
+        "indexed",
+        "indexed",
+        0,
+    )
+
+
+def test_rebuild_hyphen_boundary_collision_identity_is_sanitizer_stable(tmp_path, monkeypatch):
+    """A minted replacement identity must be a stable relationship endpoint."""
+    from cli_agent_orchestrator.services.memory_service import MemoryService
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    mapped = tmp_path / "vault" / "Mapped"
+    old_path = mapped / f"{'a' * 40}-{'b' * 10}.md"
+    moved_path = mapped / "Moved.md"
+    other_path = mapped / "Other.md"
+    old_path.write_text("forgotten long-name content", encoding="utf-8")
+    other_path.write_text("other", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="hyphen-collision-before")
+    with Session() as db:
+        _exclude_note(
+            db,
+            db.query(VaultNoteModel).filter_by(vault_relpath=f"Mapped/{old_path.name}").one(),
+        )
+        db.query(MemoryMetadataModel).filter_by(source_kind="vault").delete()
+        db.commit()
+
+    old_path.rename(moved_path)
+    old_path.write_text("replacement [[Other]]", encoding="utf-8")
+    snapshots = []
+    for suffix in ("first", "second"):
+        reconcile(vault, apply=True, rebuild=True, run_id=f"hyphen-collision-{suffix}")
+        with Session() as db:
+            notes = sorted(
+                (row.vault_relpath, row.cao_key, row.status)
+                for row in db.query(VaultNoteModel).all()
+            )
+            metadata = {
+                row.key
+                for row in db.query(MemoryMetadataModel).filter_by(source_kind="vault").all()
+            }
+            edges = {
+                (row.source_key, row.target_key)
+                for row in db.query(MemoryRelationshipModel).filter_by(origin="vault").all()
+            }
+        snapshots.append((notes, metadata, edges))
+
+    assert snapshots[1] == snapshots[0]
+    notes, metadata, edges = snapshots[0]
+    replacement_key = next(key for path, key, _status in notes if path == f"Mapped/{old_path.name}")
+    assert MemoryService._sanitize_key(replacement_key) == replacement_key
+    assert len(replacement_key) <= 60
+    assert all(endpoint in metadata for edge in edges for endpoint in edge)
+
+
 def test_incremental_upsert_never_updates_native_metadata(tmp_path, monkeypatch):
     from cli_agent_orchestrator.services.vault import reconcile as module
 

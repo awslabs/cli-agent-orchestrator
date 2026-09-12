@@ -26,7 +26,11 @@ from cli_agent_orchestrator.services.memory_relationship_service import (
 )
 from cli_agent_orchestrator.services.vault.config import VaultSpec
 from cli_agent_orchestrator.services.vault.findings import FindingCode, finding_severity
-from cli_agent_orchestrator.services.vault.identity import cao_key, derive_note_uid
+from cli_agent_orchestrator.services.vault.identity import (
+    cao_key,
+    collision_cao_key,
+    derive_note_uid,
+)
 from cli_agent_orchestrator.services.vault.links import (
     LinkCandidate,
     extract_wikilinks,
@@ -197,9 +201,16 @@ def _preview_rename_findings(
         }
         carried_alias_keys = _alias_identity_set(db, vault_id)
         exclusions = _vault_exclusion_set(db, vault_id)
+        claim_prior_by_path = _rebuild_claim_rows(db, vault_id, prior_by_path)
+        reused_path_candidates = _exclusion_reused_path_candidates(db, vault_id, projected)
     resolutions = _resolve_renames(
-        vault_id, projected, prior_by_path, carried_alias_keys=carried_alias_keys
+        vault_id,
+        projected,
+        claim_prior_by_path,
+        carried_alias_keys=carried_alias_keys,
+        reused_path_candidates=reused_path_candidates,
     )
+    resolutions = _restore_exclusion_claim_identities(vault_id, resolutions, exclusions)
     resolutions = _quarantine_resolved_identity_collisions(resolutions, prior_by_path)
     resolutions = _retain_vault_exclusions(resolutions, exclusions)
     return (
@@ -224,9 +235,16 @@ def _clear_stale_vault_edges(
         for row in db.query(VaultNoteModel).filter(VaultNoteModel.vault_id == vault_id).all()
     }
     carried_alias_keys = _alias_identity_set(db, vault_id)
+    claim_prior_by_path = _rebuild_claim_rows(db, vault_id, prior_by_path)
+    reused_path_candidates = _exclusion_reused_path_candidates(db, vault_id, projected)
     resolutions = _resolve_renames(
-        vault_id, projected, prior_by_path, carried_alias_keys=carried_alias_keys
+        vault_id,
+        projected,
+        claim_prior_by_path,
+        carried_alias_keys=carried_alias_keys,
+        reused_path_candidates=reused_path_candidates,
     )
+    resolutions = _restore_exclusion_claim_identities(vault_id, resolutions, exclusions)
     resolutions = _quarantine_resolved_identity_collisions(resolutions, prior_by_path)
     resolutions = _retain_vault_exclusions(resolutions, exclusions)
     projected = tuple(resolution.item for resolution in resolutions)
@@ -303,13 +321,22 @@ def _quarantine_key_collisions(
 ) -> tuple[_ProjectedNote, ...]:
     """Quarantine every note that shares a minted identity; never overwrite one."""
     collisions = Counter(item.note_uid for item in projected)
-    return tuple(
-        (
-            item
-            if collisions[item.note_uid] == 1
-            else replace(
+    reserved_keys = {item.key for item in projected}
+    quarantined: list[_ProjectedNote] = []
+    for item in projected:
+        if collisions[item.note_uid] == 1:
+            quarantined.append(item)
+            continue
+        key = collision_cao_key(
+            item.canonical_key,
+            item.note.vault_relpath,
+            reserved_keys=reserved_keys,
+        )
+        reserved_keys.add(key)
+        quarantined.append(
+            replace(
                 item,
-                key=f"{item.canonical_key}-collision-{_digest(item.note.vault_relpath)[:8]}",
+                key=key,
                 note_uid=_digest("collision", item.note_uid, item.note.vault_relpath),
                 memory_id=_digest("memory", "collision", item.note_uid, item.note.vault_relpath),
                 note=replace(
@@ -326,13 +353,14 @@ def _quarantine_key_collisions(
                 ),
             )
         )
-        for item in projected
-    )
+    return tuple(quarantined)
 
 
 def _quarantine_resolved_identity_collisions(
     resolutions: tuple[_RenameResolution, ...],
     prior_by_path: dict[str, VaultNoteModel],
+    *,
+    reserved_keys: set[str] | None = None,
 ) -> tuple[_RenameResolution, ...]:
     """Quarantine identities that collide only after rename absorption.
 
@@ -348,6 +376,7 @@ def _quarantine_resolved_identity_collisions(
         if prior is not None and prior.note_uid == item.note_uid:
             incumbent_paths[item.note_uid].add(item.note.vault_relpath)
 
+    reserved_keys = (reserved_keys or set()) | {resolution.item.key for resolution in resolutions}
     quarantined: list[_RenameResolution] = []
     for resolution in resolutions:
         item = resolution.item
@@ -359,9 +388,15 @@ def _quarantine_resolved_identity_collisions(
             quarantined.append(resolution)
             continue
         collision_uid = item.note_uid
+        key = collision_cao_key(
+            item.canonical_key,
+            item.note.vault_relpath,
+            reserved_keys=reserved_keys,
+        )
+        reserved_keys.add(key)
         item = replace(
             item,
-            key=f"{item.canonical_key}-collision-{_digest(item.note.vault_relpath)[:8]}",
+            key=key,
             note_uid=_digest("collision", collision_uid, item.note.vault_relpath),
             memory_id=_digest("memory", "collision", collision_uid, item.note.vault_relpath),
             note=replace(item.note, status="quarantined"),
@@ -397,15 +432,18 @@ def _apply_plan(
             for row in db.query(VaultNoteModel).filter(VaultNoteModel.vault_id == vault.id).all()
         }
         rebuild_alias_keys = _alias_identity_set(db, vault.id)
-        exclusions, projected, rebuild_findings, retained_rebuild_aliases = (
-            _carry_rebuild_exclusions(
-                db,
-                vault.id,
-                projected,
-                rebuild_prior_by_path,
-                rebuild_alias_keys,
-                exclusions,
-            )
+        (
+            exclusions,
+            projected,
+            rebuild_findings,
+            retained_rebuild_aliases,
+        ) = _carry_rebuild_exclusions(
+            db,
+            vault.id,
+            projected,
+            rebuild_prior_by_path,
+            rebuild_alias_keys,
+            exclusions,
         )
         findings = _merge_findings(findings, rebuild_findings)
         # Every rebuild delete is scoped to its derived producer. Release
@@ -432,12 +470,22 @@ def _apply_plan(
         for row in db.query(VaultNoteModel).filter(VaultNoteModel.vault_id == vault.id).all()
     }
     carried_alias_keys = _alias_identity_set(db, vault.id)
+    claim_prior_by_path = (
+        _rebuild_claim_rows(db, vault.id, prior_by_path) if not rebuild else prior_by_path
+    )
+    reused_path_candidates = (
+        set() if rebuild else _exclusion_reused_path_candidates(db, vault.id, projected)
+    )
     resolutions = _resolve_renames(
         vault.id,
         projected,
-        prior_by_path,
+        claim_prior_by_path,
         carried_alias_keys=carried_alias_keys,
+        include_reused_path_candidates=rebuild,
+        reused_path_candidates=reused_path_candidates,
     )
+    if not rebuild:
+        resolutions = _restore_exclusion_claim_identities(vault.id, resolutions, exclusions)
     resolutions = _quarantine_resolved_identity_collisions(resolutions, prior_by_path)
     resolutions = _retain_vault_exclusions(resolutions, exclusions)
     projected = tuple(resolution.item for resolution in resolutions)
@@ -600,6 +648,36 @@ def _vault_exclusion_set(db, vault_id: str) -> set[tuple[str, str, str]]:
     }
 
 
+def _exclusion_reused_path_candidates(
+    db, vault_id: str, projected: tuple[_ProjectedNote, ...]
+) -> set[str]:
+    """Return only live paths whose content or identity matches a durable claim."""
+    exclusions = tuple(
+        db.query(VaultExclusionModel).filter(VaultExclusionModel.vault_id == vault_id).all()
+    )
+    return {
+        item.note.vault_relpath
+        for item in projected
+        if any(
+            (
+                item.note.scope,
+                item.note.scope_id or "",
+                item.key,
+            )
+            == (
+                cast(str, exclusion.scope),
+                cast(str, exclusion.scope_id),
+                cast(str, exclusion.cao_key),
+            )
+            or (
+                item.note.content_sha256 is not None
+                and item.note.content_sha256 == cast(Optional[str], exclusion.content_sha256)
+            )
+            for exclusion in exclusions
+        )
+    }
+
+
 def _rebuild_claim_rows(
     db,
     vault_id: str,
@@ -668,6 +746,27 @@ def _carry_rebuild_exclusions(
     before the identity rows are deleted.
     """
     projected_by_path = {item.note.vault_relpath: item for item in projected}
+    # A replacement whose former-path identity was already reserved by a
+    # forgotten claimant keeps its synthetic projection identity on later
+    # rebuilds.  The durable tombstone may have migrated to the moved note,
+    # but changing the replacement back to its canonical key would make
+    # metadata and relationship endpoints churn between otherwise unchanged
+    # rebuilds.
+    for path, item in tuple(projected_by_path.items()):
+        prior = prior_by_path.get(path)
+        if (
+            prior is not None
+            and prior.status == "indexed"
+            and "-collision-" in cast(str, prior.cao_key)
+            and cast(str, prior.cao_key) != item.key
+        ):
+            prior_uid = cast(str, prior.note_uid)
+            projected_by_path[path] = replace(
+                item,
+                key=cast(str, prior.cao_key),
+                note_uid=prior_uid,
+                memory_id=_digest("memory", prior_uid),
+            )
     claim_prior_by_path = _rebuild_claim_rows(db, vault_id, prior_by_path)
     raw_claim_resolutions = _resolve_renames(
         vault_id,
@@ -696,6 +795,26 @@ def _carry_rebuild_exclusions(
         )
     }
     claim_resolutions = list(raw_claim_resolutions)
+    reserved_keys = {resolution.item.key for resolution in raw_claim_resolutions}
+    # A carried alias can become the final identity only after rename
+    # resolution. Reserve it before allocating a path-reuse synthetic key.
+    for resolution in raw_claim_resolutions:
+        item = resolution.item
+        if item.note.parsed is not None and "key" in item.note.parsed.cao:
+            continue
+        prior = resolution.alias_from or prior_by_path.get(item.note.vault_relpath)
+        if prior is None:
+            continue
+        prior_identity = (
+            cast(str, prior.scope),
+            cast(str, prior.scope_id),
+            cast(str, prior.cao_key),
+        )
+        if (
+            prior_identity in carried_alias_keys
+            and prior_identity not in exact_hash_claimed_identities
+        ):
+            reserved_keys.add(prior_identity[2])
     projection_override_indexes: set[int] = set()
     for index, resolution in enumerate(claim_resolutions):
         item = resolution.item
@@ -713,10 +832,13 @@ def _carry_rebuild_exclusions(
             or item.note.content_sha256 == exclusion_hash
         ):
             continue
-        replacement_key = (
-            f"{item.canonical_key}-collision-"
-            f"{_digest('path-reuse', item.note.vault_relpath)[:8]}"
+        replacement_key = collision_cao_key(
+            item.canonical_key,
+            "path-reuse",
+            item.note.vault_relpath,
+            reserved_keys=reserved_keys,
         )
+        reserved_keys.add(replacement_key)
         replacement_uid = derive_note_uid(
             vault_id,
             item.note.scope,
@@ -824,10 +946,12 @@ def _carry_rebuild_exclusions(
                 memory_id=_digest("memory", claimed_uid),
             )
             resolution = replace(resolution, item=item)
+        resolutions[index] = resolution
         conflicting_claims.append(resolution)
     conflicting_resolutions = _quarantine_resolved_identity_collisions(
         tuple(conflicting_claims),
         prior_by_path,
+        reserved_keys={resolution.item.key for resolution in resolutions},
     )
     for index, resolution in zip(
         conflicting_indexes,
@@ -1025,8 +1149,25 @@ def _retain_vault_exclusions(
             item.note.scope_id or "",
             item.key,
         ) in exclusions
+        exact_hash_excluded = any(
+            (
+                cast(str, candidate.scope),
+                cast(str, candidate.scope_id),
+                cast(str, candidate.cao_key),
+            )
+            in exclusions
+            for candidate in resolution.exact_hash_candidates
+        )
         if excluded and item.note.status != "excluded":
             item = replace(item, note=replace(item.note, status="excluded"))
+            resolution = replace(
+                resolution,
+                item=item,
+                findings=resolution.findings
+                + (_rename_finding(FindingCode.DEINDEXED_RETAINED, item.note.vault_relpath),),
+            )
+        elif exact_hash_excluded and item.note.status == "indexed":
+            item = replace(item, note=replace(item.note, status="quarantined"))
             resolution = replace(
                 resolution,
                 item=item,
@@ -1037,6 +1178,45 @@ def _retain_vault_exclusions(
     return tuple(retained)
 
 
+def _restore_exclusion_claim_identities(
+    vault_id: str,
+    resolutions: tuple[_RenameResolution, ...],
+    exclusions: set[tuple[str, str, str]],
+) -> tuple[_RenameResolution, ...]:
+    """Keep an unambiguous durable hash claimant in collision resolution."""
+    restored: list[_RenameResolution] = []
+    for resolution in resolutions:
+        candidates = tuple(
+            candidate
+            for candidate in resolution.exact_hash_candidates
+            if (
+                cast(str, candidate.scope),
+                cast(str, candidate.scope_id),
+                cast(str, candidate.cao_key),
+            )
+            in exclusions
+        )
+        if len(candidates) != 1:
+            restored.append(resolution)
+            continue
+        candidate = candidates[0]
+        key = cast(str, candidate.cao_key)
+        uid = cast(str, candidate.note_uid)
+        restored.append(
+            replace(
+                resolution,
+                item=replace(
+                    resolution.item,
+                    key=key,
+                    canonical_key=key,
+                    note_uid=uid,
+                    memory_id=_digest("memory", uid),
+                ),
+            )
+        )
+    return tuple(restored)
+
+
 def _resolve_renames(
     vault_id: str,
     projected: tuple[_ProjectedNote, ...],
@@ -1044,6 +1224,7 @@ def _resolve_renames(
     *,
     carried_alias_keys: set[tuple[str, str, str]] | None = None,
     include_reused_path_candidates: bool = False,
+    reused_path_candidates: set[str] | None = None,
 ) -> tuple[_RenameResolution, ...]:
     """Absorb only unambiguous pure renames; all other candidates remain new.
 
@@ -1052,13 +1233,14 @@ def _resolve_renames(
     content from silently changing identity.
     """
     carried_alias_keys = carried_alias_keys or set()
+    reused_path_candidates = reused_path_candidates or set()
     projected_by_path = {item.note.vault_relpath: item for item in projected}
     candidate_paths = {
         item.note.vault_relpath
         for item in projected
         if item.note.vault_relpath not in prior_by_path
         or (
-            include_reused_path_candidates
+            (include_reused_path_candidates or item.note.vault_relpath in reused_path_candidates)
             and (
                 prior_by_path[item.note.vault_relpath].status == "quarantined"
                 or item.note.content_sha256 != prior_by_path[item.note.vault_relpath].content_sha256
@@ -1070,7 +1252,7 @@ def _resolve_renames(
         for path, row in prior_by_path.items()
         if path not in projected_by_path
         or (
-            include_reused_path_candidates
+            (include_reused_path_candidates or path in reused_path_candidates)
             and row.content_sha256 is not None
             and projected_by_path[path].note.content_sha256 != row.content_sha256
         )

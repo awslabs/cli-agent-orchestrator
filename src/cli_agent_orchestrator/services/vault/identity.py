@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import re
 import unicodedata
+from collections.abc import Iterable
 from typing import Optional
 
 _KEY_RE = re.compile(r"^[a-z0-9-]{1,60}$")
@@ -52,6 +53,26 @@ def cao_key(authored_key: Optional[str], mapping_relative_path: str) -> str:
         if authored_key is not None
         else derive_cao_key(mapping_relative_path)
     )
+
+
+def collision_cao_key(
+    canonical_key: str,
+    *digest_parts: str,
+    reserved_keys: Iterable[str] = (),
+) -> str:
+    """Mint a distinct sanitizer-stable quarantine key without dropping its digest."""
+    reserved = set(reserved_keys)
+    digest = hashlib.sha256("\0".join(digest_parts).encode("utf-8")).hexdigest()
+    prefix = "-collision-"
+    for digest_length in range(8, 49, 8):
+        readable_length = 60 - len(prefix) - digest_length
+        readable = canonical_key[:readable_length].rstrip("-")
+        candidate = re.sub(r"-+", "-", f"{readable}{prefix}{digest[:digest_length]}").strip("-")
+        if not candidate.endswith(digest[:digest_length]):
+            continue
+        if candidate not in reserved:
+            return candidate
+    raise ValueError("unable to allocate a distinct collision cao.key")
 
 
 def derive_note_uid(vault_id: str, scope: str, scope_id: Optional[str], key: str) -> str:
