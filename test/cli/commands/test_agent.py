@@ -260,11 +260,17 @@ class TestHandoff:
         result = runner.invoke(agent, ["handoff", "developer", "do it", "--json"])
 
         assert result.exit_code == 0
+        # The full dump, which is the point of this test: every HandoffResult
+        # field appears, including the ones this success path leaves unset.
+        # ``pending``/``job_id`` (issue #447) are None here because they are
+        # only populated when a transport timeout leaves the step in flight.
         assert json.loads(result.output) == {
             "success": True,
             "message": "ok",
             "output": "done",
             "terminal_id": "w1",
+            "pending": None,
+            "job_id": None,
         }
 
 
