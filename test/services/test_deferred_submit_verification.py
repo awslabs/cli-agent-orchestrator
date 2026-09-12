@@ -218,7 +218,7 @@ class TestRedeliverDroppedMessageHelper:
 class TestConfirmWorkerStartedOrResubmit:
     async def test_started_on_first_confirm_no_resubmit(self):
         with (
-            patch.object(ts, "wait_until_status", new=AsyncMock(return_value=True)),
+            patch.object(ts, "_wait_for_post_dispatch_start", new=AsyncMock(return_value=True)),
             patch.object(ts, "send_special_key") as key,
             patch.object(ts, "send_input") as send,
         ):
@@ -233,7 +233,9 @@ class TestConfirmWorkerStartedOrResubmit:
         # First confirm fails, box shows our text (Enter swallowed) → bare Enter,
         # second confirm succeeds.
         with (
-            patch.object(ts, "wait_until_status", new=AsyncMock(side_effect=[False, True])),
+            patch.object(
+                ts, "_wait_for_post_dispatch_start", new=AsyncMock(side_effect=[False, True])
+            ),
             patch.object(ts, "_message_visible_in_box", return_value=True),
             patch.object(ts, "send_special_key") as key,
             patch.object(ts, "send_input") as send,
@@ -248,7 +250,9 @@ class TestConfirmWorkerStartedOrResubmit:
     async def test_full_redeliver_when_box_empty(self):
         # First confirm fails, box empty (paste dropped) → re-deliver full msg.
         with (
-            patch.object(ts, "wait_until_status", new=AsyncMock(side_effect=[False, True])),
+            patch.object(
+                ts, "_wait_for_post_dispatch_start", new=AsyncMock(side_effect=[False, True])
+            ),
             patch.object(ts, "_message_visible_in_box", return_value=False),
             patch.object(ts, "send_special_key") as key,
             patch.object(ts, "send_input") as send,
@@ -265,7 +269,7 @@ class TestConfirmWorkerStartedOrResubmit:
     async def test_returns_false_when_worker_never_starts(self):
         # Every confirm fails through all resubmit attempts.
         with (
-            patch.object(ts, "wait_until_status", new=AsyncMock(return_value=False)),
+            patch.object(ts, "_wait_for_post_dispatch_start", new=AsyncMock(return_value=False)),
             patch.object(ts, "_message_visible_in_box", return_value=True),
             patch.object(ts, "send_special_key"),
             patch.object(ts, "send_input"),
@@ -280,7 +284,7 @@ class TestConfirmWorkerStartedOrResubmit:
         # returns True without calling send_input or send_special_key.
         provider = MagicMock(supports_direct_status_probe=True)
         with (
-            patch.object(ts, "wait_until_status", new=AsyncMock(return_value=False)),
+            patch.object(ts, "_wait_for_post_dispatch_start", new=AsyncMock(return_value=False)),
             patch.object(ts, "_worker_is_started_direct", return_value=True),
             patch.object(ts, "send_special_key") as key,
             patch.object(ts, "send_input") as send,
@@ -301,7 +305,9 @@ class TestConfirmWorkerStartedOrResubmit:
         # Direct probe returns False → continues to existing resubmit logic.
         provider = MagicMock(supports_direct_status_probe=True)
         with (
-            patch.object(ts, "wait_until_status", new=AsyncMock(side_effect=[False, True])),
+            patch.object(
+                ts, "_wait_for_post_dispatch_start", new=AsyncMock(side_effect=[False, True])
+            ),
             patch.object(ts, "_worker_is_started_direct", return_value=False),
             patch.object(ts, "_message_visible_in_box", return_value=True),
             patch.object(ts, "send_special_key") as key,
@@ -324,7 +330,9 @@ class TestConfirmWorkerStartedOrResubmit:
         # invoked; falls through to existing resubmit logic.
         provider = MagicMock(supports_direct_status_probe=False)
         with (
-            patch.object(ts, "wait_until_status", new=AsyncMock(side_effect=[False, True])),
+            patch.object(
+                ts, "_wait_for_post_dispatch_start", new=AsyncMock(side_effect=[False, True])
+            ),
             patch.object(ts, "_worker_is_started_direct") as probe,
             patch.object(ts, "_message_visible_in_box", return_value=True),
             patch.object(ts, "send_special_key"),
@@ -344,7 +352,9 @@ class TestConfirmWorkerStartedOrResubmit:
     async def test_provider_none_skips_direct_probe(self):
         # The existing None-provider path still works unchanged.
         with (
-            patch.object(ts, "wait_until_status", new=AsyncMock(side_effect=[False, True])),
+            patch.object(
+                ts, "_wait_for_post_dispatch_start", new=AsyncMock(side_effect=[False, True])
+            ),
             patch.object(ts, "_worker_is_started_direct") as probe,
             patch.object(ts, "_message_visible_in_box", return_value=True),
             patch.object(ts, "send_special_key"),
