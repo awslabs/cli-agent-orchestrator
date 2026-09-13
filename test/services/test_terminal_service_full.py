@@ -3177,7 +3177,7 @@ class TestDeferredDeliveryNotCompletableBeforeDispatch:
         "cli_agent_orchestrator.services.terminal_service._confirm_worker_started_or_resubmit",
         new_callable=AsyncMock,
     )
-    @patch("cli_agent_orchestrator.services.terminal_service.send_input")
+    @patch("cli_agent_orchestrator.services.terminal_service.dispatch_input")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     async def test_poll_until_done_cannot_return_before_initial_send_is_issued(
@@ -3256,12 +3256,12 @@ class TestDeferredDeliveryNotCompletableBeforeDispatch:
         mock_status_monitor.get_status.side_effect = fake_get_status
 
         def fake_send_input(terminal_id, message, **kwargs):
-            # Stands in for send_input's pre-dispatch work — most of it
+            # Stands in for dispatch_input's pre-dispatch work — most of it
             # inject_memory_context — before any keystroke reaches the pane.
             _time.sleep(PRE_DISPATCH_SECONDS)
             dispatched_at["t"] = _time.monotonic()
             dispatched.set()
-            return True
+            return 0  # the dispatch boundary dispatch_input returns
 
         mock_send_input.side_effect = fake_send_input
         mock_confirm_started.return_value = True
@@ -3315,7 +3315,7 @@ class TestDeferredDeliveryNotCompletableBeforeDispatch:
     @patch("cli_agent_orchestrator.services.terminal_service._notify_caller_of_deferred_failure")
     @patch("cli_agent_orchestrator.services.terminal_service.update_terminal_shell_command")
     @patch("cli_agent_orchestrator.services.terminal_service.redeliver_dropped_message")
-    @patch("cli_agent_orchestrator.services.terminal_service.send_input")
+    @patch("cli_agent_orchestrator.services.terminal_service.dispatch_input")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     async def test_poll_cannot_complete_on_the_stale_post_dispatch_idle(
         self, mock_meta, mock_send_input, mock_redeliver, mock_update_shell, mock_notify
@@ -3393,7 +3393,7 @@ class TestDeferredDeliveryNotCompletableBeforeDispatch:
             _time.sleep(PRE_DISPATCH_SECONDS)
             dispatched_at["t"] = _time.monotonic()
             dispatched.set()
-            return True
+            return 0  # the dispatch boundary dispatch_input returns
 
         mock_send_input.side_effect = fake_send_input
         mock_redeliver.return_value = False
@@ -3837,3 +3837,134 @@ class TestReportedStatusMasking:
         with self._pending("aaaa1111"):
             assert reported_status("aaaa1111", TerminalStatus.IDLE) is TerminalStatus.UNKNOWN
             assert reported_status("bbbb2222", TerminalStatus.IDLE) is TerminalStatus.IDLE
+
+
+class TestDispatchBoundaryIsSampledBeforeKeys:
+    """Round-8 review (haofeif), P1: the boundary must be captured inside the send.
+
+    ``send_keys`` includes the provider's submit delay, and a fast worker can emit
+    and complete inside it. A baseline sampled by the CALLER after ``send_input``
+    returned therefore contained that output, so ``_wait_for_post_dispatch_start``
+    rejected a genuine completion, resubmitted, and could delete a worker that had
+    done the task. ``dispatch_input`` now returns the generation sampled between
+    arming the monitor and sending the first key.
+    """
+
+    def _metadata(self):
+        return {"tmux_session": "cao-session", "tmux_window": "developer-abcd"}
+
+    @patch("cli_agent_orchestrator.services.terminal_service.MemoryService")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_output_emitted_during_send_keys_is_not_inside_the_boundary(
+        self,
+        mock_get_metadata,
+        mock_tmux,
+        mock_pm,
+        mock_update,
+        mock_status_monitor,
+        mock_memory_service,
+    ):
+        from cli_agent_orchestrator.services.terminal_service import dispatch_input
+
+        mock_memory_service.return_value.get_curated_memory_context.return_value = ""
+        mock_get_metadata.return_value = self._metadata()
+        mock_provider = mock_pm.get_provider.return_value
+        mock_provider.paste_enter_count = 1
+        mock_provider.paste_submit_delay = 0.0
+        mock_provider.assume_processing_on_dispatch = False
+        mock_provider.blocks_orchestrated_input_while_waiting_user_answer = False
+        mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+
+        generation = {"n": 3}
+        mock_status_monitor.output_generation.side_effect = lambda terminal_id: generation["n"]
+
+        def worker_emits_and_completes_during_the_submit_delay(*args, **kwargs):
+            # The FIFO reader lands the worker's first (and last) chunk while
+            # send_keys is still blocking on the submit delay.
+            generation["n"] += 1
+
+        mock_tmux.send_keys.side_effect = worker_emits_and_completes_during_the_submit_delay
+
+        boundary = dispatch_input("test1234", "a task the worker finishes instantly")
+
+        assert boundary == 3, (
+            "the boundary must be the generation BEFORE any key was sent; a value of 4 "
+            "means it was sampled after send_keys and contains this task's own output"
+        )
+        # The old caller-side sample, taken after the send returned, would have
+        # been 4 -- equal to the current generation -- and would have rejected
+        # the completion.
+        assert mock_status_monitor.output_generation("test1234") == 4
+        # Ordering: armed and cleared BEFORE the sample, keys AFTER it.
+        mock_status_monitor.notify_input_sent.assert_called_once()
+        mock_status_monitor.clear_rolling_buffer.assert_called_once()
+        order = [name for name, _args, _kwargs in mock_status_monitor.mock_calls]
+        assert order.index("clear_rolling_buffer") < order.index("output_generation")
+
+    @pytest.mark.asyncio
+    async def test_fast_completion_during_send_confirms_with_the_inner_boundary(self):
+        """The reviewer's schedule, end to end through the confirmation gate."""
+        from cli_agent_orchestrator.services.terminal_service import (
+            _wait_for_post_dispatch_start,
+        )
+
+        fake_monitor = MagicMock()
+        # After the send: the worker emitted once (3 -> 4) and completed; nothing
+        # further will ever arrive.
+        fake_monitor.get_status.return_value = TerminalStatus.COMPLETED
+        fake_monitor.output_generation.return_value = 4
+        inner_boundary = 3  # what dispatch_input returned
+        post_send_sample = 4  # what the caller used to sample after send_input
+
+        with patch("cli_agent_orchestrator.services.terminal_service.status_monitor", fake_monitor):
+            with_inner = await _wait_for_post_dispatch_start(
+                "abcd1234", dispatch_generation=inner_boundary, timeout=0.25, polling_interval=0.05
+            )
+            with_post_send = await _wait_for_post_dispatch_start(
+                "abcd1234",
+                dispatch_generation=post_send_sample,
+                timeout=0.25,
+                polling_interval=0.05,
+            )
+
+        assert with_inner is True, (
+            "a worker that completed during the submit delay is a genuine completion and "
+            "must confirm; rejecting it burns every resubmit and deletes a worker that did "
+            "the task"
+        )
+        assert with_post_send is False, (
+            "documents the defect: a baseline sampled after the send contains the task's "
+            "own output and can never be exceeded by a worker that emits nothing more"
+        )
+
+    @patch("cli_agent_orchestrator.services.terminal_service.MemoryService")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_send_input_keeps_its_bool_contract(
+        self,
+        mock_get_metadata,
+        mock_tmux,
+        mock_pm,
+        mock_update,
+        mock_status_monitor,
+        mock_memory_service,
+    ):
+        """POST /terminals/{id}/input echoes this value as {"success": ...}."""
+        mock_memory_service.return_value.get_curated_memory_context.return_value = ""
+        mock_get_metadata.return_value = self._metadata()
+        # A first-ever dispatch has boundary 0; the wrapper must still say True.
+        mock_status_monitor.output_generation.return_value = 0
+        mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_pm.get_provider.return_value.blocks_orchestrated_input_while_waiting_user_answer = (
+            False
+        )
+
+        assert send_input("test1234", "hello") is True
+        mock_tmux.send_keys.assert_called_once()

@@ -1986,11 +1986,15 @@ async def _wait_for_post_dispatch_start(
     emitted anything. Two earlier release points failed for the same underlying
     reason: they keyed on a status value rather than on its recency.
 
-    ``dispatch_generation`` is ``status_monitor.output_generation()`` sampled just
-    after the send. Requiring the current generation to EXCEED it means real
-    output has landed since dispatch, because that counter advances only in
-    ``notify_input_sent`` (already included in the sample) and ``_process_chunk``
-    (real output arrived). That is the causal evidence the mask needs.
+    ``dispatch_generation`` is ``status_monitor.output_generation()`` sampled at
+    the dispatch boundary INSIDE ``dispatch_input`` -- armed, buffer cleared, no
+    key sent yet. Requiring the current generation to EXCEED it means real output
+    has landed since dispatch, because that counter advances in ``_process_chunk``
+    alone. Two things are deliberately NOT in it: the arm bump (so a redelivery's
+    own ``notify_input_sent`` cannot satisfy the gate on a still-cached
+    COMPLETED), and output emitted during ``send_keys``' submit delay (so a fast
+    worker that completes before the send returns is confirmed, not resubmitted
+    to and torn down). That is the causal evidence the mask needs.
 
     ``dispatch_generation=None`` disables the recency requirement, which is
     necessary for event-inbox backends (herdr): they start no FIFO reader, so the
@@ -2118,8 +2122,8 @@ def _schedule_deferred_init(
                 effective_orchestration_type = orchestration_type or OrchestrationType.ASSIGN
                 # send_input is blocking tmux I/O — off the loop so it can't
                 # freeze the server for concurrent requests.
-                await asyncio.to_thread(
-                    send_input,
+                dispatch_boundary = await asyncio.to_thread(
+                    dispatch_input,
                     terminal_id,
                     initial_message,
                     registry=registry,
@@ -2162,11 +2166,15 @@ def _schedule_deferred_init(
                 # when the TUI isn't input-ready. Confirm the worker actually
                 # started and re-submit if not; if it never starts, surface the
                 # failure so the supervisor re-routes instead of waiting forever.
-                # Sample the turn/output generation NOW, after send_input has run
-                # notify_input_sent (which bumps it once). Confirmation then
-                # requires the generation to exceed this, i.e. real output arrived
-                # after the send -- so a COMPLETED cached during provider startup
-                # can no longer read as this task starting.
+                # The output generation at the dispatch boundary, captured INSIDE
+                # dispatch_input between arming the monitor and sending the first
+                # key. Confirmation requires the generation to exceed it, i.e. real
+                # output arrived after the send -- so a COMPLETED cached during
+                # provider startup can no longer read as this task starting.
+                # It is not sampled here, after the send returned: send_keys'
+                # submit delay is long enough for a fast worker to emit and
+                # complete, and a baseline taken afterwards would contain that
+                # output and reject the genuine completion (reviewer-reproduced).
                 #
                 # None for event-inbox backends (herdr): they run no FIFO reader,
                 # so the generation never advances from output and the requirement
@@ -2174,9 +2182,7 @@ def _schedule_deferred_init(
                 # would be torn down. Their status is derived on demand instead, so
                 # there is no stale cached value for the gate to protect against.
                 dispatch_generation = (
-                    None
-                    if get_backend().supports_event_inbox()
-                    else status_monitor.output_generation(terminal_id)
+                    None if get_backend().supports_event_inbox() else dispatch_boundary
                 )
                 started = await _confirm_worker_started_or_resubmit(
                     terminal_id,
@@ -2464,6 +2470,46 @@ def send_input(
 ) -> bool:
     """Send input to terminal via tmux paste buffer.
 
+    Thin wrapper over :func:`dispatch_input` that keeps the ``bool`` contract.
+    The contract is load-bearing, not ceremony: ``POST /terminals/{id}/input``
+    returns this value on the wire as ``{"success": ...}``, so returning the
+    dispatch boundary here would change the API response -- and a first-ever
+    dispatch, whose boundary is 0, would read as ``"success": 0``. A caller that
+    must later prove the terminal produced output FOR THIS SEND (the deferred
+    initial-message path) calls ``dispatch_input`` directly and keeps the
+    boundary it returns.
+    """
+    dispatch_input(
+        terminal_id,
+        message,
+        registry=registry,
+        sender_id=sender_id,
+        orchestration_type=orchestration_type,
+        frozen_memory=frozen_memory,
+    )
+    return True
+
+
+def dispatch_input(
+    terminal_id: str,
+    message: str,
+    registry: PluginRegistry | None = None,
+    sender_id: str | None = None,
+    orchestration_type: OrchestrationType | None = None,
+    frozen_memory: str | None = None,
+) -> int:
+    """Send input to terminal via tmux paste buffer and return its dispatch boundary.
+
+    The return value is ``status_monitor.output_generation()`` sampled at the
+    dispatch boundary: after the monitor has been armed and the rolling buffer
+    cleared, and before any key reaches the pane. Any output generation strictly
+    greater than it is output the terminal produced after this send -- the
+    evidence ``_wait_for_post_dispatch_start`` needs. It has to be captured here
+    rather than by the caller after this function returns, because ``send_keys``
+    includes the provider's submit delay, during which a fast worker can already
+    emit and complete; sampled afterwards, those chunks would be inside the
+    baseline and a genuine completion would read as pre-dispatch.
+
     Uses bracketed paste mode (-p) to bypass TUI hotkey handling. The number
     of Enter keys sent after pasting is determined by the provider's
     ``paste_enter_count`` property (e.g., some TUIs need 2 Enters because
@@ -2558,6 +2604,22 @@ def send_input(
         # byte-identical completion from a retained completion screen.
         status_monitor.clear_rolling_buffer(terminal_id, provider)
 
+        # THE DISPATCH BOUNDARY. Sampled here -- armed, buffer cleared, no key
+        # sent yet -- and returned to the caller. Output that lands from this
+        # point on is output produced after this send; output that landed before
+        # it is already inside the value and can never count as evidence. This
+        # is the only place the sample is correct: one line later send_keys
+        # starts, and its submit delay is exactly the window in which a fast
+        # worker emits and completes (reviewer-reproduced on PR #566).
+        #
+        # Deliberately a separate lock acquisition AFTER the clear, not atomic
+        # with it. A chunk that lands between the two is pre-dispatch output (no
+        # key has been sent), and this ordering folds it INTO the baseline, so it
+        # cannot pass for evidence. Sampling under the clear's own lock would
+        # leave that chunk outside the baseline and count it -- the false
+        # confirmation this gate exists to prevent.
+        dispatch_boundary = status_monitor.output_generation(terminal_id)
+
         # Mark the provider before send_keys rather than after it.  send_keys
         # includes the provider-specific submit delay, during which a fast CLI
         # can already emit its first processing and completion frames.  Those
@@ -2606,7 +2668,7 @@ def send_input(
                         traceparent=inject_traceparent(),
                     ),
                 )
-        return True
+        return dispatch_boundary
 
     except Exception as e:
         logger.error(f"Failed to send input to terminal {terminal_id}: {e}")

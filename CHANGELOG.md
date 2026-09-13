@@ -16,6 +16,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`cao launch` could drop the initial task, or tear down a worker that had
+  already done it.** The initial message is now delivered by the server as
+  part of `POST /sessions` instead of a second request that raced provider
+  startup, and the terminal reads as not-yet-completable until that delivery
+  has been made and the worker has produced output for it. Confirmation gates
+  on an output-only generation sampled at the dispatch boundary, inside the
+  send, so neither a completion cached from provider startup nor a redelivery's
+  own keystrokes can pass for this task starting, and a worker fast enough to
+  finish before the send returns is confirmed rather than resubmitted to and
+  deleted (#566)
+
 - **enabling `CAO_MEMORY_API_URL` rejected memory keys that work without it.**
   The `/internal/memory/store` and `/forget` routes validated the wire `key` as
   the strict `MemoryKey` (`^[a-z0-9-]{1,60}$`), while the MCP tools have always
