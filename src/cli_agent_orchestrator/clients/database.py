@@ -12,12 +12,14 @@ from sqlalchemy import (
     Column,
     DateTime,
     Float,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
     create_engine,
     literal_column,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, declarative_base, sessionmaker
 
@@ -170,6 +172,18 @@ class MemoryMetadataModel(Base):
 
     __table_args__ = (
         UniqueConstraint("key", "scope", "scope_id", name="uq_memory_key_scope"),
+        # Same NULL-distinctness the sentinel comment below documents for
+        # ``memory_relationships``: ``uq_memory_key_scope`` never fires for
+        # global/federated rows because SQLite treats ``NULL != NULL`` in a
+        # UNIQUE index. This partial index covers exactly those rows
+        # (issue #657). Existing DBs get it from ``_migrate_memory_scope_null_uniqueness``.
+        Index(
+            "uq_memory_key_scope_null",
+            "key",
+            "scope",
+            unique=True,
+            sqlite_where=text("scope_id IS NULL"),
+        ),
         CheckConstraint(
             "related_keys IS NULL OR length(related_keys) < 1024",
             name="ck_related_keys_length",
@@ -414,6 +428,9 @@ def init_db() -> None:
     # Appended LAST (issue #583 Bolt 2, ``approval-store``). Disjoint from every table above —
     # its own new table, no shared columns — so registry order is immaterial here too.
     _migrate_workflow_plan_approval()
+    # Appended LAST (issue #657). Adds one partial index to memory_metadata;
+    # reads no other table, so registry order is immaterial here too.
+    _migrate_memory_scope_null_uniqueness()
 
 
 def _restrict_db_file_permissions() -> None:
@@ -685,6 +702,113 @@ def _migrate_workflow_plan_approval() -> None:
         logger.debug(f"workflow_plan_approval migration skipped: {e}")
 
 
+def _migrate_memory_scope_null_uniqueness(engine: Any = None, *, strict: bool = False) -> None:
+    """Create the partial unique index backing ``uq_memory_key_scope`` for
+    NULL ``scope_id`` rows (issue #657). Appended LAST to the ``init_db()``
+    registry.
+
+    SQLite treats ``NULL != NULL`` in a UNIQUE index, so the table-level
+    ``uq_memory_key_scope`` constraint has never fired for global/federated
+    memories (``MemoryService.resolve_scope_id`` persists a real NULL for
+    both — ``memory_metadata`` deliberately keeps the column nullable; the
+    sentinel used by ``memory_relationships`` is wrong here). This index
+    covers exactly those rows; non-NULL scopes stay on the table constraint.
+
+    Idempotent, self-connecting — mirrors the existing migrators. ``engine``
+    lets a caller bound the attempt to an existing SQLAlchemy engine (the
+    memory-repair path passes its own); the default resolves the singleton
+    ``DATABASE_FILE`` exactly like the other migrators. Fail-soft by design:
+    on a database that still holds duplicate NULL-scope rows,
+    ``CREATE UNIQUE INDEX`` raises ``IntegrityError``, so duplicates are
+    pre-scanned and the index is skipped with a warning pointing at
+    ``cao memory repair`` rather than blocking startup. The repair now
+    re-invokes this migrator once its dedupe has cleared the duplicates, so
+    the index lands in the same repair run instead of at the next startup.
+    ``strict=True`` (the explicit ``cao memory repair --apply`` path) makes
+    that re-invocation honest: DDL failure — e.g. a competing SQLite write
+    lock — propagates instead of being logged at debug, and the named index
+    is verified present before returning, so repair can no longer report
+    success while the index is absent; the startup default stays fail-soft.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    target = str(DATABASE_FILE)
+    try:
+        if engine is not None:
+            # Reuse the caller's engine connection pool so the attempt and the
+            # repairs share one database identity.
+            with engine.connect() as conn:
+                index_rows = conn.exec_driver_sql(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type = 'index' AND name = 'uq_memory_key_scope_null'"
+                ).fetchall()
+                if index_rows:
+                    return
+                duplicates = conn.exec_driver_sql(
+                    "SELECT key, scope, COUNT(*) FROM memory_metadata "
+                    "WHERE scope_id IS NULL GROUP BY key, scope HAVING COUNT(*) > 1"
+                ).fetchall()
+                if duplicates:
+                    rendered = ", ".join(
+                        f"{scope}:{key}x{count}" for key, scope, count in duplicates
+                    )
+                    logger.warning(
+                        "Skipping uq_memory_key_scope_null creation: duplicate global/federated "
+                        f"rows in memory_metadata ({rendered}). Run `cao memory repair` to "
+                        "reconcile them; the unique index is created on the next startup."
+                    )
+                    return
+                conn.exec_driver_sql(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_key_scope_null "
+                    "ON memory_metadata (key, scope) WHERE scope_id IS NULL"
+                )
+                conn.commit()
+                if strict:
+                    created = conn.exec_driver_sql(
+                        "SELECT name FROM sqlite_master "
+                        "WHERE type = 'index' AND name = 'uq_memory_key_scope_null'"
+                    ).fetchall()
+                    if not created:
+                        raise RuntimeError(
+                            "uq_memory_key_scope_null creation reported success but the "
+                            "index is absent from sqlite_master"
+                        )
+            return
+        with sqlite3.connect(target) as conn:
+            duplicates = conn.execute(
+                "SELECT key, scope, COUNT(*) FROM memory_metadata "
+                "WHERE scope_id IS NULL GROUP BY key, scope HAVING COUNT(*) > 1"
+            ).fetchall()
+            if duplicates:
+                rendered = ", ".join(f"{scope}:{key}x{count}" for key, scope, count in duplicates)
+                logger.warning(
+                    "Skipping uq_memory_key_scope_null creation: duplicate global/federated "
+                    f"rows in memory_metadata ({rendered}). Run `cao memory repair` to "
+                    "reconcile them; the unique index is created on the next startup."
+                )
+                return
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_key_scope_null "
+                "ON memory_metadata (key, scope) WHERE scope_id IS NULL"
+            )
+            if strict:
+                created = conn.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type = 'index' AND name = 'uq_memory_key_scope_null'"
+                ).fetchall()
+                if not created:
+                    raise RuntimeError(
+                        "uq_memory_key_scope_null creation reported success but the "
+                        "index is absent from sqlite_master"
+                    )
+    except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug
+        if strict:
+            raise
+        logger.debug(f"memory scope NULL uniqueness migration skipped: {e}")
+
+
 def _backfill_legacy_related_keys(conn: Any) -> None:
     """One-time, idempotent backfill of ``memory_metadata.related_keys`` into
     ``memory_relationships`` as ``type=relates_to, origin=legacy_related_keys,
@@ -899,6 +1023,9 @@ def _migrate_workflow_run() -> None:
     This column is NOT indexed (ADR-583-12: re-approval compares a ``plan_id``
     read out of the envelope and no query filters on it). Writing and reading it
     belong to the ``manifest-freeze`` unit, not to this migrator.
+
+    Issue #753 additively appends nullable ``error`` for the redacted, bounded
+    script-level failure diagnostic. Existing and non-script rows remain NULL.
     """
     import sqlite3
 
@@ -932,6 +1059,9 @@ def _migrate_workflow_run() -> None:
             if "manifest_json" not in columns:
                 conn.execute("ALTER TABLE workflow_run ADD COLUMN manifest_json TEXT DEFAULT NULL")
                 logger.info("Migration: added manifest_json column to workflow_run")
+            if "error" not in columns:
+                conn.execute("ALTER TABLE workflow_run ADD COLUMN error TEXT DEFAULT NULL")
+                logger.info("Migration: added error column to workflow_run")
     except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug (B4-RD-4)
         logger.debug(f"workflow_run migration skipped: {e}")
 

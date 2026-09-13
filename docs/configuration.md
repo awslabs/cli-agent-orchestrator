@@ -232,9 +232,19 @@ Default-off. See [../src/cli_agent_orchestrator/ext_apps/apps.py](../src/cli_age
 | `CAO_WS_ALLOWED_CLIENTS` | `WS_ALLOWED_CLIENTS` (client IPs permitted to attach to the PTY WebSocket) | Running `cao-server` inside Docker (host browser arrives via a bridge IP). |
 | `CAO_WS_ALLOWED_ORIGINS` | `WS_ALLOWED_ORIGINS` (extra browser `Origin`s permitted to attach to the PTY WebSocket) | Serving the terminal viewer from a page whose origin **differs** from the cao-server host (a separate reverse-proxy hostname or dashboard). |
 
-> **Security note:** the WebSocket PTY endpoint is unauthenticated. Only add client IPs you actually trust to `CAO_WS_ALLOWED_CLIENTS` — anyone reaching the listener at one of those IPs gets full PTY access to running agent terminals.
+> **Security note:** an accepted WebSocket PTY connection grants full
+> read/write access to a running agent terminal. When authentication is enabled
+> by `CAO_AUTH_JWKS_URI` or `AUTH0_DOMAIN`, attachment requires a valid bearer
+> token granting `cao:write` or `cao:admin`. These are existing CAO scopes;
+> `cao:read` alone is not sufficient. With neither variable set, no token is
+> required. Only add client IPs you actually trust to `CAO_WS_ALLOWED_CLIENTS`,
+> and do not expose the endpoint to untrusted networks. Authentication does
+> not replace the client-IP or Origin checks, and widening either allowlist
+> does not bypass authentication. See the [Auth settings](#auth-auth--env-var-only)
+> and [PTY WebSocket contract](api.md#pty-websocket) for configuration, token
+> transports, and refusal outcomes.
 >
-> The endpoint also enforces an **Origin** check to block cross-site WebSocket hijacking (CWE-1385): a browser page that is not same-origin with the cao-server host (and not in `CAO_WS_ALLOWED_ORIGINS`) is refused. Same-origin viewers — including the bundled UI, imported-app deployments (`uvicorn cli_agent_orchestrator.api.main:app`), and dynamic reverse-proxy / Codespaces hostnames — work with no configuration, because the check accepts any `Origin` whose authority equals the request `Host` (itself validated by `TrustedHostMiddleware`). `CAO_WS_ALLOWED_ORIGINS` is only for *genuinely cross-origin* viewers; a literal `*` disables the Origin check. Note that `CAO_CORS_ORIGINS="*"` does **not** disable it — PTY access is more sensitive than ordinary CORS reads, so the escape hatch is the dedicated `CAO_WS_ALLOWED_ORIGINS="*"`.
+> The endpoint also enforces an **Origin** check to block cross-site WebSocket hijacking (CWE-1385): a browser page that is not same-origin with the cao-server host (and not in `CAO_WS_ALLOWED_ORIGINS`) is refused. Same-origin viewers — including the bundled UI, imported-app deployments (`uvicorn cli_agent_orchestrator.api.main:app`), and dynamic reverse-proxy / Codespaces hostnames — pass this Origin check without extra Origin configuration, because the check accepts any `Origin` whose authority equals the request `Host` (itself validated by `TrustedHostMiddleware`). Passing that check does not bypass the token requirement when authentication is enabled. `CAO_WS_ALLOWED_ORIGINS` is only for *genuinely cross-origin* viewers; a literal `*` disables the Origin check. Note that `CAO_CORS_ORIGINS="*"` does **not** disable it — PTY access is more sensitive than ordinary CORS reads, so the escape hatch is the dedicated `CAO_WS_ALLOWED_ORIGINS="*"`.
 
 ### Auth (`auth`) — env-var only
 
@@ -299,7 +309,7 @@ A number of other `CAO_*` variables (runtime/process-identity vars like `CAO_TER
 |---|---|---|---|
 | `CAO_HOME_DIR` | `~/.aws/cli-agent-orchestrator` | str (path) | Base directory for all CAO state. See [Data directory](#data-directory-cao_home_dir) above. |
 
-The pipe-pane liveness watchdog (issue #388, `services/fifo_reader.py`) adds six more of these ad-hoc vars, read directly via `_env_int`/`_env_float` in `constants.py` rather than through `ConfigService` — they have no `settings.json` mapping like the rows in the table above:
+Rendered-screen status detection adds `CAO_PYTE_STATUS` (default `true`) and `CAO_PYTE_MIDBURST_PROBE_S` (default `1.0`, the minimum interval between mid-burst PROCESSING probes; see [Event-Driven Architecture](event-driven-architecture.md#status-monitor-servicesstatus_monitorpy--publisher--consumer)), both read in `constants.py`. The pipe-pane liveness watchdog (issue #388, `services/fifo_reader.py`) adds six more of these ad-hoc vars, read directly via `_env_int`/`_env_float` in `constants.py` rather than through `ConfigService` — they have no `settings.json` mapping like the rows in the table above:
 
 | Env var | Default | Type | Purpose |
 |---|---|---|---|
@@ -309,6 +319,13 @@ The pipe-pane liveness watchdog (issue #388, `services/fifo_reader.py`) adds six
 | `CAO_PIPE_LIVENESS_MAX_REARM_FAILURES` | `5` | int | Consecutive failed re-arm attempts before the watchdog gives up on a terminal. |
 | `CAO_PIPE_LIVENESS_COLD_START_GRACE_S` | `3.0` | float | Grace period after a terminal is registered before a FIFO that has never delivered a single byte is treated as a cold-start stall (harness-control#93) instead of "still booting". |
 | `CAO_PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS` | `5` | int | Consecutive cold-start re-arm attempts (rearm() succeeded but the pipe still never delivered) before the watchdog gives up on a terminal — a separate failure class and counter from `CAO_PIPE_LIVENESS_MAX_REARM_FAILURES`, which only counts rearm() raising. |
+
+The `cao fleet` / `cao worker` commands ([control planes](control-planes.md#remote-fleets)) add two more, read directly in `utils/fleet.py`. They are the only configuration those commands take, and neither has a default: without both, every leaf exits with `No fleet configured.` rather than falling back to the local server.
+
+| Env var | Default | Type | Purpose |
+|---|---|---|---|
+| `CAO_ELASTIC_BROKER_URL` | *(none)* | str (URL) | Base URL of the fleet's worker broker, e.g. `http://127.0.0.1:9890` after a port-forward. |
+| `CAO_ELASTIC_BROKER_TOKEN` | *(none)* | str | Shared secret sent as `X-CAO-Broker-Token`. It authorizes releasing workers and sending input to their agents, so treat it as a write credential. |
 
 ## API Endpoints
 

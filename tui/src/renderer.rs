@@ -40,8 +40,9 @@
 //! # The in-app gap, stated rather than half-wired (operator decision at the 3.5 plan gate)
 //!
 //! `ServerClient::run` needs `path_values`, `query` and `body`. **Measured from `route()` at this
-//! stage: of the 22 IN-APP commands, 9 have a placeholder-free route, 12 carry placeholders
-//! (`{name}`, `{run_id}`, `{key}`, `{terminal_id}`), and 1 (`profile find`) has no route at all.**
+//! stage, when the table held 22 IN-APP commands: 9 had a placeholder-free route, 12 carried
+//! placeholders (`{name}`, `{run_id}`, `{key}`, `{terminal_id}`), and 1 (`profile find`) had no
+//! route at all.**
 //! Nothing in the crate maps an arbitrary command's form fields to a route's path values, and no
 //! artifact specifies how.
 //!
@@ -53,6 +54,12 @@
 //!
 //! Note the plan recorded "15 carry placeholders". That was not re-derived from `route()`; the
 //! measured figure is 12 templated plus 1 routeless. See [`in_app_readiness`].
+//!
+//! **That gap has since largely closed, and the figures above are the pre-binding snapshot.**
+//! Path bindings landed, so of the 24 IN-APP commands the table holds now, 21 are runnable on an
+//! empty form, 2 are `NotWired` (`session send` / `session status`, both needing the session-name
+//! to terminal-id resolution) and 1 is routeless (`profile find`). Kept as written because the
+//! ruling it records is why `NotWired` exists at all; see `InAppReadiness` for the live counts.
 
 use std::io::{IsTerminal, Write};
 use std::time::Duration;
@@ -2351,7 +2358,7 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
         // rendered text into the pane in ONE write.
         //
         // This is the one place PR-1's incrementality is deliberately traded for readability, and
-        // it costs nothing measurable: zero of the 21 routed IN-APP commands uses
+        // it costs nothing measurable: zero of the 23 routed IN-APP commands uses
         // `StreamingResponse` (measured at 3.6), so there is no incremental arrival to lose. A
         // non-JSON body passes through unchanged. `PaneSink` remains the streaming path and is
         // still what `push_bytes` is exercised through elsewhere. (#321)
@@ -3147,9 +3154,11 @@ pub fn in_app_readiness(id: CommandId, flow: &GuidedFlow) -> InAppReadiness {
 /// PR-1 requires INCREMENTAL rendering: bytes appear as they arrive, so a slow command is never
 /// mistaken for a hang. Pretty-printing needs the WHOLE body, so it trades that away — and the
 /// trade is only defensible because it costs nothing for these routes. Measured at 3.6 by resolving
-/// all 57 route decorators and scanning each body: **zero of the 21 routed IN-APP commands uses
+/// the route decorators and scanning each body, and re-checked for the two routes added since
+/// (`workflow runs`, `workflow result`): **zero of the 23 routed IN-APP commands uses
 /// `StreamingResponse`.** They all return buffered JSON, so there is no incremental arrival to
-/// preserve.
+/// preserve. (`cao workflow events` is the one CAO read path that does stream, and it is HANDOFF
+/// with no route, so it never reaches this pane.)
 ///
 /// Non-JSON output is passed through UNCHANGED rather than mangled: if the body does not parse, the
 /// raw bytes go to the pane exactly as [`PaneSink`] would have sent them. A formatter that garbles
