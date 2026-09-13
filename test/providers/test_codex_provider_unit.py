@@ -26,6 +26,7 @@ from cli_agent_orchestrator.providers.codex import (
     _has_approval_modal_in_bottom,
     _has_approval_prompt_in_bottom,
     _has_startup_idle_composer,
+    _live_startup_block,
     _toml_override,
     _toml_scalar,
 )
@@ -5011,12 +5012,13 @@ class TestCodexInitConfiguredTimeouts:
     """Codex init timeouts must come from settings, not hard-coded literals."""
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.settings_service.get_server_settings")
     @patch("cli_agent_orchestrator.providers.codex.get_server_settings")
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
     async def test_initialize_passes_provider_init_timeout_as_the_outer_cap(
-        self, mock_backend, mock_wait_shell, mock_wait_status, mock_settings
+        self, mock_backend, mock_wait_shell, mock_wait_status, mock_settings, mock_base_settings
     ):
         """The handler's hard cap is ``provider_init_timeout``, not the idle gap.
 
@@ -5033,6 +5035,8 @@ class TestCodexInitConfiguredTimeouts:
             "provider_init_timeout": 60,
             "startup_prompt_handler_timeout": 45,
         }
+        # BaseProvider.get_init_timeout reads settings_service directly.
+        mock_base_settings.return_value = mock_settings.return_value
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
         mock_backend.return_value.get_history.return_value = "OpenAI Codex (v0.98.0)"
@@ -5045,12 +5049,13 @@ class TestCodexInitConfiguredTimeouts:
         mock_trust.assert_awaited_once_with(outer_timeout=60.0)
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.settings_service.get_server_settings")
     @patch("cli_agent_orchestrator.providers.codex.get_server_settings")
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
     async def test_init_timeout_error_reports_the_configured_bound(
-        self, mock_backend, mock_wait_shell, mock_wait_status, mock_settings
+        self, mock_backend, mock_wait_shell, mock_wait_status, mock_settings, mock_base_settings
     ):
         """The init-timeout message must name the timeout actually applied.
 
@@ -5062,6 +5067,8 @@ class TestCodexInitConfiguredTimeouts:
             "provider_init_timeout": 150,
             "startup_prompt_handler_timeout": 20,
         }
+        # BaseProvider.get_init_timeout reads settings_service directly.
+        mock_base_settings.return_value = mock_settings.return_value
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = False  # never reaches a ready status
         mock_backend.return_value.get_history.return_value = "OpenAI Codex (v0.98.0)"
@@ -5072,3 +5079,255 @@ class TestCodexInitConfiguredTimeouts:
                 await provider.initialize()
 
         assert mock_wait_status.await_args.kwargs["timeout"] == 150.0
+
+
+class TestLiveStartupBlock:
+    """``_live_startup_block`` names the block drawn LOWEST in the bottom window.
+
+    Round-3 review of #731 (haofeif), P1: the handler tested each dialog's text
+    on its own and so pressed keys into whichever modal was actually live. The
+    resolver makes that decision once, by position, before any key is sent.
+    """
+
+    _UPDATE = (
+        "✨ Update available! 0.142.5 -> 0.144.5\n"
+        "1. Update now (runs npm install -g @openai/codex)\n"
+        "2. Skip\n"
+        "3. Skip until next version\n"
+        "Press enter to continue\n"
+    )
+    _LOGIN = (
+        "  Sign in with ChatGPT to use Codex as part of your paid plan\n"
+        "> 1. Sign in with ChatGPT\n"
+        "  2. Sign in with Device Code\n"
+        "  3. Provide your own API key\n"
+        "\n"
+        "  Press enter to continue\n"
+    )
+    _TRUST_V1 = (
+        "  Since this folder is version controlled, you may wish to "
+        "allow Codex to work in this folder without asking for approval.\n"
+        "› 1. Yes, allow Codex to work in this folder without asking for approval\n"
+        "  2. No, ask me to approve edits and commands\n"
+    )
+    _TRUST_V2 = (
+        "  Do you trust the contents of this directory?\n"
+        "› 1. Yes, allow Codex to work in this folder without asking for approval\n"
+        "  2. No, ask me to approve edits and commands\n"
+        "\n"
+        "  Press enter to continue\n"
+    )
+
+    def test_nothing_recognised_is_none(self):
+        assert _live_startup_block("OpenAI Codex (v0.98.0)\n› ") is None
+
+    def test_each_block_alone_is_itself(self):
+        assert _live_startup_block(self._TRUST_V1) == "trust"
+        assert _live_startup_block(self._TRUST_V2) == "trust"
+        assert _live_startup_block(self._UPDATE) == "update"
+        assert _live_startup_block(self._LOGIN) == "login"
+
+    def test_stale_v1_trust_copy_above_a_live_update_dialog_is_update(self):
+        """The reviewer's first reproduction: bare Enter here selects 'Update now'."""
+        assert _live_startup_block(self._TRUST_V1 + "\n" + self._UPDATE) == "update"
+
+    def test_stale_v2_trust_copy_above_a_live_login_menu_is_login(self):
+        """The reviewer's second reproduction: the v2 header borrowed the menu's footer."""
+        stale_v2_header_only = "  Do you trust the contents of this directory?\n"
+        assert _live_startup_block(stale_v2_header_only + "\n" + self._LOGIN) == "login"
+
+    def test_live_trust_dialog_stacked_over_a_login_menu_is_trust(self):
+        assert _live_startup_block(self._LOGIN + "\n" + self._TRUST_V2) == "trust"
+
+    def test_the_shared_footer_belongs_to_the_lowest_block(self):
+        # A login header with no footer of its own does not become a block just
+        # because the trust dialog BELOW it renders one.
+        login_no_footer = "> 1. Sign in with ChatGPT\n  2. Sign in with Device Code\n"
+        assert _live_startup_block(login_no_footer + self._TRUST_V2) == "trust"
+        # ...and a v2 header with nothing under it is stale copy, not a dialog.
+        assert _live_startup_block("  Do you trust the contents of this directory?\n› ") is None
+
+    def test_a_footer_above_a_block_does_not_count_for_it(self):
+        """The discriminating half of footer attribution.
+
+        A login header (or an update header with its menu) drawn BELOW a trust
+        dialog, with the only footer on screen belonging to that dialog, is not
+        yet a dialog of its own: nothing has been drawn under it. Counting any
+        footer anywhere would make the half-rendered lower block win and return
+        the handler on a menu that has not finished appearing.
+        """
+        login_no_footer = "> 1. Sign in with ChatGPT\n  2. Sign in with Device Code\n"
+        assert _live_startup_block(self._TRUST_V2 + login_no_footer) == "trust"
+        update_no_footer = (
+            "✨ Update available! 0.142.5 -> 0.144.5\n"
+            "1. Update now (runs npm install -g @openai/codex)\n"
+            "3. Skip until next version\n"
+        )
+        assert _live_startup_block(self._TRUST_V2 + update_no_footer) == "trust"
+
+    def test_duplicate_trust_text_is_located_by_its_lowest_occurrence(self):
+        """Stale trust copy above a live menu, and a live trust dialog below it.
+
+        Only the LAST occurrence of a signature can be the block currently drawn.
+        Locating trust by its first occurrence would put it above the menu and
+        hand the frame to "login" -- returning the handler with a live dialog up.
+        """
+        frame = self._TRUST_V1 + "\n" + self._LOGIN + "\n" + self._TRUST_V2
+        assert _live_startup_block(frame) == "trust"
+        # And the mirror image: menu copy above, live menu below a stale dialog.
+        frame = self._LOGIN + "\n" + self._TRUST_V1 + "\n" + self._LOGIN
+        assert _live_startup_block(frame) == "login"
+
+    def test_update_header_without_its_menu_is_not_a_dialog(self):
+        assert (
+            _live_startup_block("✨ Update available! 0.1 -> 0.2\nPress enter to continue\n")
+            is None
+        )
+
+
+class TestStartupHandlerKeysOnlyTheLiveModal:
+    """Round-3 review of #731 (haofeif), P1 — reproduced on the exact head.
+
+    Stale trust copy in the bottom window used to be answered with a bare Enter
+    regardless of what was actually live below it. Both reproductions below sent
+    Enter on the unfixed head; the first never reached the safe '3' path.
+    """
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_stale_v1_copy_above_a_live_update_dialog_takes_the_skip_path(
+        self, mock_tmux, mock_sleep
+    ):
+        frame = (
+            "  Since this folder is version controlled, you may wish to "
+            "allow Codex to work in this folder without asking for approval.\n"
+            "› 1. Yes, allow Codex to work in this folder without asking for approval\n"
+            "  2. No, ask me to approve edits and commands\n"
+            "\n"
+            "✨ Update available! 0.142.5 -> 0.144.5\n"
+            "1. Update now (runs npm install -g @openai/codex)\n"
+            "2. Skip\n"
+            "3. Skip until next version\n"
+            "Press enter to continue\n"
+        )
+        mock_tmux.return_value.get_history.side_effect = [frame, "OpenAI Codex (v0.142.5)\n› "]
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        await provider._handle_trust_prompt(idle_gap=30.0, outer_timeout=30.0)
+
+        backend = mock_tmux.return_value
+        # '3' was sent BEFORE any Enter: a bare Enter first would have selected
+        # "1. Update now" and run a global npm install under every other worker.
+        assert backend.send_keys.call_args_list[0].args[2] == "3"
+        order = [name for name, _args, _kwargs in backend.mock_calls]
+        assert order.index("send_keys") < order.index("send_special_key")
+        # Exactly one Enter -- the one confirming '3'. A second would mean the stale
+        # trust copy was also "dismissed" as a dialog of its own.
+        assert backend.send_special_key.call_count == 1
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.logger.error")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_stale_v2_copy_above_a_live_login_menu_sends_nothing_and_settles(
+        self, mock_tmux, mock_error
+    ):
+        frame = (
+            "  Do you trust the contents of this directory?\n"
+            "\n"
+            "  Sign in with ChatGPT to use Codex as part of your paid plan\n"
+            "> 1. Sign in with ChatGPT\n"
+            "  2. Sign in with Device Code\n"
+            "  3. Provide your own API key\n"
+            "\n"
+            "  Press enter to continue\n"
+        )
+        mock_tmux.return_value.get_history.return_value = frame
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        started = time.monotonic()
+        await provider._handle_trust_prompt(idle_gap=20.0, outer_timeout=30.0)
+
+        assert time.monotonic() - started < 5.0, "settled login menu was not recognised"
+        # The v2 wording borrowed the menu's footer on the unfixed head and this
+        # Enter picked a sign-in method for the operator.
+        mock_tmux.return_value.send_special_key.assert_not_called()
+        mock_tmux.return_value.send_keys.assert_not_called()
+        mock_error.assert_not_called()
+
+
+class TestCodexInitHonoursProfileTimeout:
+    """Round-3 review of #731 (haofeif), P1: the per-profile override was ignored."""
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.settings_service.get_server_settings")
+    @patch("cli_agent_orchestrator.providers.codex.get_server_settings")
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_profile_override_reaches_all_three_waits(
+        self,
+        mock_backend,
+        mock_wait_shell,
+        mock_wait_status,
+        mock_load_profile,
+        mock_codex_settings,
+        mock_base_settings,
+    ):
+        settings = {"provider_init_timeout": 60, "startup_prompt_handler_timeout": 45}
+        mock_codex_settings.return_value = settings
+        mock_base_settings.return_value = settings
+        profile = MagicMock()
+        profile.provider_init_timeout = 180
+        profile.codexProfile = None
+        mock_load_profile.return_value = profile
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
+        mock_backend.return_value.get_history.return_value = "OpenAI Codex (v0.98.0)"
+
+        provider = CodexProvider("test1234", "test-session", "window-0", agent_profile="slow-box")
+        with (
+            patch.object(provider, "_handle_trust_prompt", new_callable=AsyncMock) as mock_trust,
+            patch.object(provider, "_build_codex_command", return_value="codex"),
+        ):
+            await provider.initialize()
+
+        # On the unfixed head every one of these received the server default, 60.
+        assert mock_wait_shell.await_args.kwargs["timeout"] == 180
+        mock_trust.assert_awaited_once_with(outer_timeout=180.0)
+        assert mock_wait_status.await_args.kwargs["timeout"] == 180.0
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.settings_service.get_server_settings")
+    @patch("cli_agent_orchestrator.providers.codex.get_server_settings")
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_unloadable_profile_falls_back_to_the_server_default(
+        self,
+        mock_backend,
+        mock_wait_shell,
+        mock_wait_status,
+        mock_load_profile,
+        mock_codex_settings,
+        mock_base_settings,
+    ):
+        """Timeout resolution is best-effort; the real, error-raising load comes later."""
+        settings = {"provider_init_timeout": 75, "startup_prompt_handler_timeout": 45}
+        mock_codex_settings.return_value = settings
+        mock_base_settings.return_value = settings
+        mock_load_profile.side_effect = FileNotFoundError("no such profile")
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
+        mock_backend.return_value.get_history.return_value = "OpenAI Codex (v0.98.0)"
+
+        provider = CodexProvider("test1234", "test-session", "window-0", agent_profile="gone")
+        with patch.object(provider, "_handle_trust_prompt", new_callable=AsyncMock):
+            # Resolution did not abort init; the real, error-raising load in
+            # _build_codex_command is what reports the broken profile.
+            with pytest.raises(ProviderError, match="gone"):
+                await provider.initialize()
+
+        assert mock_wait_shell.await_args.kwargs["timeout"] == 75
