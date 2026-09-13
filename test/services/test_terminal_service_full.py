@@ -16,7 +16,10 @@ from cli_agent_orchestrator.clients.database import (
 )
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.inbox import OrchestrationType
-from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.models.terminal import (
+    TerminalCaptureUnavailableError,
+    TerminalStatus,
+)
 from cli_agent_orchestrator.providers.base import OutputExtractionError
 from cli_agent_orchestrator.services.terminal_service import (
     IdempotencyKeyConflict,
@@ -3144,5 +3147,105 @@ class TestDeferredInitWaitingUserAnswerSurvival:
         await task
 
         mock_tmux.send_keys.assert_not_called()
+        mock_notify.assert_called_once()
+        assert mock_notify.call_args.kwargs["delete_worker"] is False
+
+
+class TestDeferredInitCaptureUnavailable:
+    """Issue #739 review (5131322289) P2: the provider's pre-send transcript
+    capture refuses the dispatch before any key is typed. The deferred-init
+    path must retry the delivery bounded, and when the refusal persists it
+    must leave the initialized worker ALIVE — a capture read that keeps
+    failing is transient infrastructure, not a dead terminal — while telling
+    the caller the task was not delivered.
+    """
+
+    @pytest.mark.asyncio
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service._confirm_worker_started_or_resubmit",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
+    @patch("cli_agent_orchestrator.services.terminal_service._notify_caller_of_deferred_failure")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.send_input")
+    async def test_transient_capture_refusal_retries_and_delivers(
+        self, mock_send, mock_pm, mock_status_monitor, mock_meta, mock_notify, mock_confirm
+    ):
+        """One capture refusal that clears on the retry: the task is
+        delivered, the confirm loop runs, and the caller is never told the
+        worker failed. (The confirm loop itself is stubbed to started — the
+        delivery retry is what this case owns.)"""
+        from cli_agent_orchestrator.services.terminal_service import (
+            _deferred_init_tasks,
+            _schedule_deferred_init,
+        )
+
+        mock_meta.return_value = {"caller_id": "super123"}
+        mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_pm.get_provider.return_value = None
+
+        calls = {"n": 0}
+
+        def send_then_succeed(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise TerminalCaptureUnavailableError("capture failed")
+            return True
+
+        mock_send.side_effect = send_then_succeed
+
+        provider_instance = AsyncMock()
+        provider_instance.initialize.return_value = True
+        provider_instance.shell_baseline = None
+
+        before_tasks = set(_deferred_init_tasks)
+        _schedule_deferred_init(
+            provider_instance, "worker99", "do the task", OrchestrationType.ASSIGN, None
+        )
+        (task,) = set(_deferred_init_tasks) - before_tasks
+        await task
+
+        # The delivery was retried and went through.
+        assert mock_send.call_count >= 2
+        mock_notify.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service._notify_caller_of_deferred_failure")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.send_input")
+    async def test_persistent_capture_refusal_leaves_worker_alive(
+        self, mock_send, mock_pm, mock_status_monitor, mock_meta, mock_notify
+    ):
+        """The refusal never clears: after the bounded retries the caller is
+        told the task was NOT delivered and the worker is left alive
+        (delete_worker=False) instead of deleted."""
+        from cli_agent_orchestrator.services.terminal_service import (
+            _deferred_init_tasks,
+            _schedule_deferred_init,
+        )
+
+        mock_meta.return_value = {"caller_id": "super123"}
+        mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_pm.get_provider.return_value = None
+        mock_send.side_effect = TerminalCaptureUnavailableError("capture failed")
+
+        provider_instance = AsyncMock()
+        provider_instance.initialize.return_value = True
+        provider_instance.shell_baseline = None
+
+        before_tasks = set(_deferred_init_tasks)
+        _schedule_deferred_init(
+            provider_instance, "worker99", "do the task", OrchestrationType.ASSIGN, None
+        )
+        (task,) = set(_deferred_init_tasks) - before_tasks
+        await task
+
+        # Bounded retries, then the distinct alive-preserving outcome.
+        assert mock_send.call_count == 3
         mock_notify.assert_called_once()
         assert mock_notify.call_args.kwargs["delete_worker"] is False

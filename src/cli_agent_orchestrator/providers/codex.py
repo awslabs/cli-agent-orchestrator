@@ -11,7 +11,7 @@ from typing import Any, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
-from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.models.terminal import TerminalCaptureUnavailableError, TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
@@ -147,7 +147,27 @@ UPDATE_DIALOG_PATTERN = r"Update available!\s+[\w.+-]+\s+->\s+[\w.+-]+"
 UPDATE_DIALOG_MENU_PATTERN = r"Skip until next version"
 UPDATE_DIALOG_FOOTER = TRUST_PROMPT_FOOTER
 STARTUP_PROMPT_BOTTOM_LINES = 15
-STARTUP_ACTIVITY_PATTERN = r"^\s*•[^\S\n]+\S"
+# Readiness activity is decided from the bottom-most TUI cell above the idle
+# composer, not from any match in the whole bottom region: with --no-alt-screen
+# a spinner or completed-turn bullet from an earlier turn can survive higher in
+# scrollback while the current composer renders below it (issue #739 review).
+# A live activity cell is the timed spinner ("• Working (2s • esc to
+# interrupt)"), which repaints the elapsed value every second. Before the first
+# timer tick, and on chunked redraws, that same cell renders as a bare
+# "• Working" fragment — evidence the TUI is still painting, so it vetoes
+# readiness too. A bullet that reads as a printed line (sentence punctuation,
+# or placeholder copy) is static text like an account notice, not activity.
+STARTUP_LIVE_ACTIVITY_PATTERN = TUI_PROGRESS_PATTERN
+STARTUP_PARTIAL_ACTIVITY_PATTERN = r"^[^\S\n]*•[^\S\n]*\S[^\n]*$"
+# Bullets that end like printed prose — notices, tips, and finished-turn
+# summaries — rather than a mid-paint frame of a live cell. Codex's partial
+# activity repaints carry no terminal punctuation ("• Working", "• Starting
+# MCP servers (2/3): cao-mcp-server"): the TUI redraws the whole cell once the
+# timer ticks, and a fragment with closing punctuation would be a completed
+# line, not a partial frame. A trailing ellipsis is NOT prose punctuation —
+# a live frame can pause on it mid-animation ("• Working…") — so it must
+# wait for the stabilization pass like any other partial frame.
+STARTUP_STATIC_BULLET_PATTERN = r"^[^\S\n]*•[^\S\n]+\S.*[.!?](?:\s*)$"
 # Codex's runtime approval prompt as actually rendered by codex-cli 0.147.0,
 # verified against a live tmux capture (test/providers/fixtures/
 # codex_approval_modal_raw.txt):
@@ -693,30 +713,176 @@ def _has_approval_prompt_in_bottom(clean_output: str) -> bool:
     return options >= APPROVAL_MENU_MIN_OPTIONS
 
 
-def _has_startup_idle_composer(clean_output: str) -> bool:
+def _classify_startup_activity_cell(line: str) -> str:
+    """Classify the bottom-most TUI cell above the composer, for readiness.
+
+    Returns ``"live"``, ``"partial"``, or ``"static"``. A timed spinner is
+    live activity. An unterminated bullet may be a mid-paint frame of one
+    (``• Working`` before the first timer tick), so it must settle before the
+    pane is called ready. A sentence-terminated bullet, or any line that is
+    not a bullet at all, is printed text — an account notice, a tip, a prior
+    turn — and never activity.
+    """
+    if re.search(STARTUP_LIVE_ACTIVITY_PATTERN, line):
+        return "live"
+    if re.match(STARTUP_PARTIAL_ACTIVITY_PATTERN, line) and not re.search(
+        STARTUP_STATIC_BULLET_PATTERN, line
+    ):
+        return "partial"
+    return "static"
+
+
+def _startup_cell_above_is_static(
+    tail_lines: list, anchor_index: int, allow_partial_cell: bool = False
+) -> bool:
+    """Decide readiness from the cell directly above the composer anchor.
+
+    Cells higher in the bottom region are history: with --no-alt-screen a
+    previous turn's spinner or completed-response bullet can survive in
+    scrollback while a newer composer renders below it, and a region-wide
+    veto let that stale spinner block a ready pane (issue #739 review). Only
+    the cell the current composer is actually repainting — the nearest
+    content above it — decides liveness. An unclassifiable bullet fragment
+    keeps the pane not-ready until a later poll shows the frame settled
+    (``allow_partial_cell``); that stability wait is owned by the caller's
+    poll loop, which can compare consecutive observations.
+    """
+    for index in range(anchor_index - 1, -1, -1):
+        line = tail_lines[index].rstrip()
+        if not line:
+            continue
+        kind = _classify_startup_activity_cell(line)
+        if kind == "partial":
+            return allow_partial_cell
+        return kind == "static"
+    return True
+
+
+def _has_startup_idle_composer(
+    clean_output: str, allow_partial_activity_cell: bool = False
+) -> bool:
     """Return True when the bottom of the pane shows Codex's idle composer."""
     all_lines = clean_output.splitlines()
     tail_lines = all_lines[-STARTUP_PROMPT_BOTTOM_LINES:]
     tail_output = "\n".join(tail_lines)
 
-    if re.search(STARTUP_ACTIVITY_PATTERN, tail_output, re.MULTILINE):
-        return False
     if re.search(WAITING_PROMPT_PATTERN, tail_output, re.IGNORECASE | re.MULTILINE):
         return False
     if re.search(STARTUP_BLOCKING_INPUT_PATTERN, tail_output, re.IGNORECASE):
         return False
 
     legacy_tail = all_lines[-IDLE_PROMPT_TAIL_LINES:]
-    if any(re.match(IDLE_PROMPT_STRICT_PATTERN, line) for line in legacy_tail):
-        return True
+    for legacy_index, line in enumerate(legacy_tail):
+        if re.match(IDLE_PROMPT_STRICT_PATTERN, line):
+            anchor = len(tail_lines) - len(legacy_tail) + legacy_index
+            return _startup_cell_above_is_static(tail_lines, anchor, allow_partial_activity_cell)
 
     # Codex 0.145 renders placeholder text inside the idle composer instead of
     # an empty prompt. Match only known placeholder copy and require its status
     # footer below it so typed drafts and ordinary output are not treated as ready.
     for index in range(len(tail_lines) - 1, -1, -1):
         if re.match(STARTUP_IDLE_PLACEHOLDER_PATTERN, tail_lines[index]):
-            return any(re.search(TUI_FOOTER_PATTERN, line) for line in tail_lines[index + 1 :])
+            if not any(re.search(TUI_FOOTER_PATTERN, line) for line in tail_lines[index + 1 :]):
+                return False
+            return _startup_cell_above_is_static(tail_lines, index, allow_partial_activity_cell)
     return False
+
+
+# Transcript content starts with one of these glyphs: assistant bullets (•)
+# and submitted user-cell markers (› text / » text). The composer line — an
+# empty "›", the placeholder hint, or a draft typed into it — is deliberately
+# NOT transcript: it sits inside the TUI footer region the parser already
+# excludes via the footer cutoff, and hashing it let a successful paste whose
+# Enter was swallowed disarm the dispatch gate so a retained notice completed
+# the dropped submission (issue #739 review). Applying the same cutoff on
+# both the baseline and the observation keeps the signature a property of
+# the pane's transcript, not of whatever the composer currently holds.
+_ASSISTANT_BULLET_RE = re.compile(r"^[^\S\n]*•")
+_USER_CELL_RE = re.compile(r"^[^\S\n]*(?:›|»)[^\S\n]*\S")
+
+
+def _footer_cutoff_position(clean_output: str) -> int:
+    """Character position where the TUI footer region starts, when detected.
+
+    Same rule ``get_status`` uses to keep the composer and status bar out of
+    transcript parsing, shared with the dispatch-baseline capture so both
+    sides of the ownership comparison exclude the same footer chrome.
+    """
+    all_lines = clean_output.splitlines()
+    if any(re.search(TUI_FOOTER_PATTERN, line) for line in all_lines[-IDLE_PROMPT_TAIL_LINES:]):
+        return _compute_tui_footer_cutoff(all_lines)
+    return len(clean_output)
+
+
+def _transcript_marker_cells(clean_output: str, cutoff_pos: Optional[int] = None) -> list:
+    """Parsed transcript marker cells, oldest to newest.
+
+    Codex repaints the status bar and footer hint on a timer, so raw pane
+    text differs between two observations of an unchanged pane. Worse, the
+    tmux history window (``-S -200``) and the viewport/buffer views of the
+    SAME unchanged pane start at different lines once a transcript grows
+    past 200 rows, so even a cleaned-text hash of one view can mismatch a
+    differently bounded view of itself (issue #739 review). Reduce the pane
+    to exactly the turn-bearing marker cells — assistant bullets and
+    submitted user cells above the TUI footer cutoff — and compare parsed
+    cells by suffix (see ``_dispatch_owns_transcript``) so an observation
+    showing a tail of the baseline's cells still reads as unchanged. The
+    composer line (an empty ``›``, the placeholder hint, or a draft typed
+    into it) sits inside the footer region the parser already excludes, so
+    a typed-but-unsubmitted draft cannot change the cells.
+
+    The same pane reaches this parser through differently produced text:
+    the pre-send baseline from a tmux capture-pane render (literal column
+    spacing, lines wrapped at the pane width) and status observations from
+    the raw stream, where cursor-forward runs collapse to single spaces and
+    lines never wrap. Cells are therefore canonicalized — horizontal
+    whitespace runs collapse to one space — and compared with truncation
+    tolerance (see ``_is_suffix``), so every view of an unchanged pane
+    parses to the same cells (issue #739 review).
+
+    When no TUI footer is detected the cutoff keeps the whole text, so a
+    partial repaint that has not drawn the status bar yet would leave the
+    composer hint as the bottom-most cell-looking line. A ``›``/``»`` line
+    that is the LAST content line of the pane is the composer in that
+    frame (a submitted user cell always has the composer or a response
+    below it), so it is dropped rather than read as a new cell that would
+    permanently disarm the ownership gate.
+    """
+    if cutoff_pos is None:
+        cutoff_pos = len(clean_output)
+    footer_detected = cutoff_pos < len(clean_output)
+    content_lines = [line for line in clean_output[:cutoff_pos].splitlines() if line.strip()]
+    if not footer_detected and content_lines and _USER_CELL_RE.match(content_lines[-1]):
+        content_lines.pop()
+    cells = []
+    for line in content_lines:
+        canonical = " ".join(line.split())
+        if _ASSISTANT_BULLET_RE.match(canonical) or _USER_CELL_RE.match(canonical):
+            cells.append(canonical)
+    return cells
+
+
+def _is_suffix(suffix: list, sequence: list) -> bool:
+    """True when ``suffix`` is a tail slice of ``sequence`` (or equal to it).
+
+    ``len(suffix) > len(sequence)`` means the observation shows MORE marker
+    cells than the pre-send baseline — genuine appended content — and is not
+    a suffix. A zero-length observation is a tail of anything (a pane whose
+    transcript cells scrolled out of this view is still unchanged content).
+    Cells compare equal when one is a prefix of the other: a capture-pane
+    render wraps a long cell at the pane width while the raw-stream view of
+    the same cell is unwrapped, so the wrapped fragment is a truncated view
+    of the same line, not new content. Codex never edits a printed line, so
+    a genuinely new cell cannot be a prefix of a retained one.
+    """
+    if len(suffix) > len(sequence):
+        return False
+    for observed, baseline in zip(suffix, sequence[len(sequence) - len(suffix) :], strict=True):
+        if not (
+            observed == baseline or observed.startswith(baseline) or baseline.startswith(observed)
+        ):
+            return False
+    return True
 
 
 def _find_assistant_marker(text: str) -> Optional[re.Match[str]]:
@@ -837,6 +1003,31 @@ class CodexProvider(BaseProvider):
         self._agent_profile = agent_profile
         # Explicit per-call override for profile.model, see _build_codex_command.
         self._model = model
+        # Per-dispatch transcript ownership (issue #739 review): the tmux buffer
+        # is cleared at dispatch, but the pyte-composited screen (and pane history
+        # on the capture paths) is NOT — a startup notice or a prior turn's
+        # completed-response bullet survives the boundary. An ever-dispatched
+        # boolean cannot tell that retained content from this dispatch's
+        # output, so record the pane's marker-cell baseline at dispatch and
+        # require it to differ before COMPLETED is possible. The baseline is a
+        # list of parsed marker cells (assistant bullets, submitted user cells),
+        # NOT a hash of raw pane text: history and viewport captures of the
+        # same unchanged pane cut at different line boundaries (issue #739
+        # review), so a raw-hash baseline of a long retained transcript could
+        # differ from a shorter observation of itself and read retained content
+        # as new. Marker cells are compared by suffix so an observation that
+        # shows a tail of the baseline's cells is still recognized as
+        # unchanged. Capture happens strictly BEFORE the send; when it cannot
+        # be obtained the dispatch refuses (see mark_input_received), so the
+        # baseline is never derived from a post-send observation — that would
+        # arm on a genuine fast completion's own settled frame and latch it
+        # IDLE.
+        self._dispatch_marker_baseline: Optional[list] = None
+        self._dispatch_pending: bool = False
+        # Monotonic timestamp of the last full-history ownership escalation
+        # (see _full_history_owns): resets at each dispatch so the first
+        # ambiguous poll of a new dispatch always earns its escalation read.
+        self._ownership_escalation_at: float = 0.0
 
     @property
     def blocks_orchestrated_input_while_waiting_user_answer(self) -> bool:
@@ -1113,6 +1304,12 @@ class CodexProvider(BaseProvider):
         start_time = time.time()
         trust_dismissed = False
         update_dismissed = False
+        # Readiness stabilization (issue #739 review): a partial activity cell
+        # ("• Working" before the first timer tick) is only evidence of a live
+        # repaint while it is still moving. Once a later poll shows the exact
+        # same frame, the TUI has settled and the pane is ready; a live
+        # spinner's elapsed value changes every second, so it never stabilizes.
+        previous_tail_signature = None
         while time.time() - start_time < timeout:
             output = get_backend().get_history(self.session_name, self.window_name)
             if not output:
@@ -1120,6 +1317,14 @@ class CodexProvider(BaseProvider):
                 continue
 
             clean_output = strip_terminal_escapes(re.sub(ANSI_CODE_PATTERN, "", output))
+
+            # Every observed poll updates the tail signature — including
+            # dialog frames — so the stabilization comparison below is always
+            # between two immediately adjacent observations, never a stale
+            # fragment from several polls back.
+            tail_signature = "\n".join(clean_output.splitlines()[-STARTUP_PROMPT_BOTTOM_LINES:])
+            adjacent_repeat = tail_signature == previous_tail_signature
+            previous_tail_signature = tail_signature
 
             if not trust_dismissed and re.search(TRUST_PROMPT_PATTERN, clean_output):
                 from cli_agent_orchestrator.services.status_monitor import status_monitor
@@ -1165,7 +1370,14 @@ class CodexProvider(BaseProvider):
             # Exit when the bottom region shows the idle composer prompt AND no
             # dialog is active. The welcome banner alone is insufficient — it
             # renders as normal startup chrome BEFORE a late update dialog appears.
-            has_idle = _has_startup_idle_composer(clean_output)
+            # A partial activity cell only keeps this loop waiting while it is
+            # still moving: once consecutive polls observe the identical tail,
+            # the frame has settled and the pane is ready (see the signature
+            # comment above).
+            has_idle = _has_startup_idle_composer(
+                clean_output,
+                allow_partial_activity_cell=adjacent_repeat,
+            )
             has_dialog = (
                 re.search(TRUST_PROMPT_PATTERN, bottom_region)
                 or (
@@ -1255,6 +1467,176 @@ class CodexProvider(BaseProvider):
 
         self._initialized = True
         return True
+
+    def mark_input_received(self) -> None:
+        """Capture the canonical pre-send transcript baseline this dispatch owns.
+
+        The rolling byte buffer is cleared by the caller, but the pyte screen
+        and pane history are not: a startup notice or a previous turn's
+        completed-response bullet survives the dispatch boundary. Snapshot
+        the pane's marker cells from the scrollback capture, falling back to
+        the visible-only viewport when the scrollback shows no cells, so the
+        baseline contains every retained cell. The COMPLETED decision points
+        in ``get_status`` refuse to complete while the observed cells are a
+        tail of this baseline.
+
+        Capture happens here, strictly before send_keys: a baseline derived
+        from a post-send observation would arm on a genuine fast
+        completion's own settled frame and latch the turn IDLE (issue #739
+        review). When the pre-send pane read keeps failing after a bounded
+        retry, the dispatch refuses instead of sending unowned:
+        TerminalCaptureUnavailableError (not a generic ProviderError) reaches
+        terminal_service.send_input's callers before any key is typed, and
+        its consumers retry — inbox delivery resets the message to PENDING
+        and deferred init re-attempts the delivery, leaving the initialized
+        worker alive (issue #739 review). A read that succeeds with no
+        marker cells (fresh pane, login menu) is a VALID empty baseline —
+        nothing is retained, so any cell observed later is new content this
+        dispatch owns.
+        """
+        history = self._capture_presend_pane()
+        try:
+            visible = (
+                get_backend().get_history(self.session_name, self.window_name, visible_only=True)
+                or ""
+            )
+        except Exception:
+            visible = ""
+
+        def _cells(raw: str) -> list:
+            # Same single cleaner and same footer-cutoff rule every status
+            # observation uses, so the baseline and the views reduce the
+            # same pane to the same cells (issue #739 review).
+            clean = strip_terminal_escapes(raw)
+            return _transcript_marker_cells(clean, _footer_cutoff_position(clean))
+
+        cells = _cells(history)
+        if not cells and visible:
+            # History shows no marker cells but the viewport does (e.g. a
+            # cleared scrollback): the visible cells are the retained
+            # transcript the dispatch must own from.
+            cells = _cells(visible)
+        self._dispatch_marker_baseline = cells
+        self._dispatch_pending = True
+        self._ownership_escalation_at = 0.0
+        super().mark_input_received()
+
+    def _capture_presend_pane(self, attempts: int = 3, delay: float = 0.4) -> str:
+        """Read the pre-dispatch pane, retrying a transient capture failure.
+
+        A single failed ``tmux capture-pane`` is infrastructure noise, not a
+        verdict on the pane (issue #739 review): retry it bounded inside the
+        dispatch so a transient blip does not refuse an otherwise valid
+        delivery. When every attempt fails, raise the distinct retryable
+        error rather than a generic ProviderError, so consumers can route
+        the refusal back to retry instead of terminally failing the
+        message or deleting a healthy worker.
+        """
+        last_error: Optional[Exception] = None
+        for attempt in range(attempts):
+            try:
+                return get_backend().get_history(self.session_name, self.window_name) or ""
+            except Exception as e:  # noqa: BLE001 - every backend failure is retried
+                last_error = e
+                if attempt + 1 < attempts:
+                    time.sleep(delay)
+        raise TerminalCaptureUnavailableError(
+            f"Codex dispatch refused: pre-send transcript capture failed for "
+            f"{self.session_name}:{self.window_name} after {attempts} attempts: {last_error}"
+        ) from last_error
+
+    def _dispatch_owns_transcript(self, clean_output: str, cutoff_pos: int) -> bool:
+        """True when the observed transcript is not the dispatch baseline.
+
+        Kept armed while the observed marker cells are a suffix of (or equal
+        to) what ``mark_input_received`` captured: retained notices and
+        prior-turn completions then cannot satisfy a COMPLETED branch, in
+        every observation view — the rolling buffer and the pyte viewport
+        show only the tail of a long retained transcript, and a suffix match
+        recognizes that tail as unchanged instead of reading the window
+        boundary difference as new content.
+
+        Ownership mutates only on a structurally complete observation
+        (issue #739 review). A frame whose TUI footer has not rendered yet
+        cannot tell the composer from a submitted user cell, so it carries
+        no verdict at all: the gate stays armed and the settled frame
+        decides — an incomplete frame can delay a verdict, never disarm it.
+
+        A bounded observation that matches the baseline is still ambiguous
+        when the current turn is terse: a genuinely new cell that equals
+        (or is a truncated view of) the baseline's last cell reads as a
+        tail, and such a turn used to stay IDLE forever (issue #739
+        review). Resolve exactly that case against the full pane history —
+        the one view where an appended turn is always visible as growth
+        past the baseline regardless of cell text, because transcript
+        cells only accumulate. A full view that is not a tail of the
+        baseline is a post-dispatch occurrence; a tail, however much
+        scroll truncated its head, is unchanged retained content. See
+        ``_full_history_owns`` for the read's rate limit and fail-closed
+        behavior.
+        """
+        if not self._dispatch_pending:
+            return True
+        baseline = self._dispatch_marker_baseline
+        if baseline is None:
+            # Unreachable while capture always records a list (possibly
+            # empty); kept as a belt-and-braces refusal rather than an
+            # inert guard. An EMPTY list is a valid baseline — a pane with
+            # no retained marker cells — and is handled by the suffix
+            # comparison below, not by this refusal.
+            return False
+        if cutoff_pos >= len(clean_output):
+            # No TUI footer in this frame: the pane is mid-repaint, and the
+            # bottom-most user-looking line is the composer, not evidence.
+            # An unbounded frame never mutates ownership (issue #739
+            # review) — the footer-restored frame carries the verdict.
+            return False
+        observed = _transcript_marker_cells(clean_output, cutoff_pos)
+        if not _is_suffix(observed, baseline):
+            self._dispatch_pending = False
+            return True
+        if self._full_history_owns(baseline):
+            self._dispatch_pending = False
+            return True
+        return False
+
+    # Budget for the full-history ownership escalation, in seconds.
+    # get_status() is a hot path (every wait_until_status poll, every UI
+    # refresh) and the escalation forks a capture-pane subprocess — the same
+    # reasoning that rate-limits STALE_PROCESSING_CAPTURE_INTERVAL_S in
+    # status_monitor.py. While the pane is genuinely unchanged this bounds
+    # the escalation to one read per interval; a differing observation never
+    # needs the escalation at all, and the first ambiguous poll of a
+    # dispatch always escalates (the timestamp resets at mark_input_received),
+    # so an equal-content completion is only ever delayed past a PRIOR
+    # ambiguous poll by at most one interval.
+    OWNERSHIP_ESCALATION_INTERVAL_S = 3.0
+
+    def _full_history_owns(self, baseline: list) -> bool:
+        """Resolve an ambiguous suffix match against the full pane history.
+
+        The bounded observation cannot distinguish a terse new turn from
+        retained content when the new cell's text equals the baseline's
+        tail, so compare the pane's full cell sequence instead: transcript
+        cells only accumulate, so any post-dispatch turn — however terse —
+        leaves the full view no longer a tail of the pre-send baseline
+        (issue #739 review). A read that fails, comes back empty, or is
+        rate-limited is NOT ownership: the gate stays armed, so this only
+        ever delays a verdict, never falsely completes.
+        """
+        now = time.monotonic()
+        if now - self._ownership_escalation_at < self.OWNERSHIP_ESCALATION_INTERVAL_S:
+            return False
+        self._ownership_escalation_at = now
+        try:
+            raw = get_backend().get_history(self.session_name, self.window_name) or ""
+        except Exception:
+            return False
+        if not raw:
+            return False
+        clean = strip_terminal_escapes(raw)
+        full_cells = _transcript_marker_cells(clean, _footer_cutoff_position(clean))
+        return not _is_suffix(full_cells, baseline)
 
     def get_status(self, output: str) -> TerminalStatus:
         # Native status (herdr): trust the backend's agent state when available;
@@ -1426,12 +1808,26 @@ class CodexProvider(BaseProvider):
             if re.search(TUI_PROGRESS_PATTERN, tail_output, re.MULTILINE):
                 return TerminalStatus.PROCESSING
 
+            # Per-dispatch transcript ownership (issue #739 review): while the
+            # pane's transcript still matches the dispatch baseline, retained
+            # content — a startup notice, a prior turn's completion — cannot
+            # satisfy either COMPLETED branch. Consulted HERE, after the modal
+            # and error classifiers, so an unchanged approval/login prompt
+            # keeps its WAITING_USER_ANSWER precedence instead of collapsing
+            # to PROCESSING. The pane reports IDLE instead: the composer is
+            # visible, so a dropped submit reads "not started" to the
+            # deferred-delivery retry rather than "already done".
+            dispatch_owns_content = self._dispatch_owns_transcript(clean_output, cutoff_pos)
+
             # Consider COMPLETED only if we see an assistant marker (skipping
             # MCP tool-call markers) after the last user message. Without the
             # tool-call filter, "• Called <server>.<tool>(...)" emitted before
             # the model has actually replied would trip COMPLETED prematurely.
             if last_user is not None:
-                if _find_assistant_marker(clean_output[last_user.start() :]) is not None:
+                if (
+                    dispatch_owns_content
+                    and _find_assistant_marker(clean_output[last_user.start() :]) is not None
+                ):
                     return TerminalStatus.COMPLETED
 
                 return TerminalStatus.IDLE
@@ -1440,12 +1836,17 @@ class CodexProvider(BaseProvider):
             # - Fresh init: no assistant content either → IDLE.
             # - Long-running response: the › user marker has been evicted from
             #   the rolling state buffer by the time the response settles, but an
-            #   assistant bullet is still visible. Without this branch we'd
-            #   return IDLE forever and ``wait_for_status(completed)`` in the
-            #   e2e tests would time out.
+            #   assistant bullet is still visible. This is a completion only when
+            #   a dispatch owns the observed content: never-dispatched startup
+            #   notices use the same bullet glyph, and after a dispatch the
+            #   ownership gate above has already refused retained content.
             # Search above the TUI footer cutoff so the › suggestion-hint and
             # status-bar lines aren't confused with a model reply.
-            if _find_assistant_marker(clean_output[:cutoff_pos]) is not None:
+            if (
+                dispatch_owns_content
+                and self._task_dispatched
+                and _find_assistant_marker(clean_output[:cutoff_pos]) is not None
+            ):
                 return TerminalStatus.COMPLETED
             return TerminalStatus.IDLE
 
