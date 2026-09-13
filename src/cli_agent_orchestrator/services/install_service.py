@@ -80,6 +80,8 @@ _PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 # own installed copy from a different profile that resolves to the same agent id.
 _CONTEXT_SOURCE_STEM_KEY = "x-cao-source-stem"
 _CONTEXT_SOURCE_STEM_RE = re.compile(rf"^\s*{re.escape(_CONTEXT_SOURCE_STEM_KEY)}\s*:")
+_TEMP_FILE_NAME_ATTEMPTS = 100
+_FRONTMATTER_DELIMITER_RE = re.compile(r"^-{3,}$")
 
 # Per-MCP-server tool-call timeout (milliseconds) injected into cao-mcp-server
 # entries in kiro agent profiles. kiro-cli's default MCP tool-call timeout
@@ -242,9 +244,6 @@ def _line_body_and_ending(line: str) -> Tuple[str, str]:
     if line.endswith("\r"):
         return line[:-1], "\r"
     return line, ""
-
-
-_FRONTMATTER_DELIMITER_RE = re.compile(r"^-{3,}$")
 
 
 def _is_frontmatter_delimiter(line_body: str, *, allow_bom: bool = False) -> bool:
@@ -441,11 +440,32 @@ def _context_source_stem(raw_content: str) -> Optional[str]:
     return None
 
 
+def _context_dir() -> Path:
+    """Resolve the shared context directory the way profile discovery does.
+
+    Discovery scans the ``cao_installed`` entry of ``agents.dirs`` (see
+    ``utils/agent_profiles.py``), and the opencode collision guard reads its
+    candidates from there. The writer has to deposit copies in the SAME place,
+    or an operator who overrides ``cao_installed`` gets copies discovery never
+    sees -- and a guard that is blind to exactly the files it protects.
+
+    ``settings_service.installed_context_dir_override`` owns the rule (the
+    setting counts only when it departs from its default); this falls back to
+    ``AGENT_CONTEXT_DIR`` so the constant stays authoritative when nothing is
+    configured, which is also what lets tests redirect the directory by
+    patching the constant alone.
+    """
+    from cli_agent_orchestrator.services.settings_service import (
+        installed_context_dir_override,
+    )
+
+    override = installed_context_dir_override()
+    return AGENT_CONTEXT_DIR if override is None else override
+
+
 def _installed_context_copy_path(stem: str) -> Path:
     """Return the installed context path for a discovered installed candidate."""
-    from cli_agent_orchestrator.services.settings_service import get_agent_dirs
-
-    installed_dir = Path(get_agent_dirs().get("cao_installed", str(AGENT_CONTEXT_DIR)))
+    installed_dir = _context_dir()
     flat = installed_dir / f"{stem}.md"
     if flat.exists():
         return flat
@@ -485,9 +505,6 @@ def _raise_unloadable_installed_collision(
         "was refused to avoid silently overwriting existing OpenCode artifacts. "
         f"{_installed_context_copy_remedy(candidate_path)}"
     )
-
-
-_TEMP_FILE_NAME_ATTEMPTS = 100
 
 
 def _non_regular_target_error(context_file: Path) -> ValueError:
@@ -577,7 +594,8 @@ def _write_context_file(agent_name: str, raw_content: str, source_name: str) -> 
     since otherwise ``os.replace`` would carry an unrelated mode onto the target
     and silently tighten or widen permissions on every install.
     """
-    AGENT_CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
+    context_dir = _context_dir()
+    context_dir.mkdir(parents=True, exist_ok=True)
     # BARRIER PLACEMENT: the validation and the containment check are inlined
     # here, in the same function as the write sink, rather than factored into a
     # helper. This mirrors the deliberate repetition in ``services/profile_store``
@@ -593,7 +611,7 @@ def _write_context_file(agent_name: str, raw_content: str, source_name: str) -> 
     # target and silently write to wherever it resolves; leaving the final
     # component lexical means such a symlink is refused by the lstat check
     # below. That is why this does not simply call ``safe_join_under_base``.
-    base = os.path.realpath(AGENT_CONTEXT_DIR)
+    base = os.path.realpath(context_dir)
     candidate = os.path.join(base, f"{safe_name}.md")
     if candidate != base and not candidate.startswith(base + os.sep):
         raise ValueError(

@@ -33,6 +33,7 @@ from cli_agent_orchestrator.services.install_service import (
     _CONTEXT_SOURCE_STEM_KEY,
     _context_content_with_provenance,
     _context_source_stem,
+    _line_body_and_ending,
 )
 
 
@@ -123,16 +124,6 @@ def _assert_non_regular_context_error(output: str, context_copy: Path) -> None:
     assert "non-regular filesystem entry" in output
     assert "Remove that path or replace it with a regular file, then reinstall." in output
     assert "Errno" not in output
-
-
-def _line_body_and_ending(line: str) -> tuple[str, str]:
-    if line.endswith("\r\n"):
-        return line[:-2], "\r\n"
-    if line.endswith("\n"):
-        return line[:-1], "\n"
-    if line.endswith("\r"):
-        return line[:-1], "\r"
-    return line, ""
 
 
 def _remove_marker_line(text: str) -> str:
@@ -960,3 +951,103 @@ class TestReadOnlyContextDirErrorNamesRealTarget:
         assert "Error:" in result.output, result.output
         assert str(context_dir / "ro-agent.md") in result.output
         assert ".tmp" not in result.output
+
+
+# ---------------------------------------------------------------------------
+# The writer and the guard must agree on WHERE the context copies live. Discovery
+# scans ``agents.dirs.cao_installed``; if the writer deposited copies at the
+# hard-coded ``AGENT_CONTEXT_DIR`` regardless, an operator who overrides the
+# setting would get copies discovery never sees -- and a guard blind to exactly
+# the files it protects.
+# ---------------------------------------------------------------------------
+
+
+class TestContextDirFollowsConfiguredInstalledDir:
+    def test_override_moves_the_copy_and_the_guard_follows(
+        self, runner: CliRunner, workspace: Dict[str, Any], tmp_path: Path, monkeypatch
+    ) -> None:
+        store = workspace["local_store"]
+        constant_dir = workspace["context_dir"]
+        override_dir = tmp_path / "configured-elsewhere"
+        assert override_dir != constant_dir
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_agent_dirs",
+            lambda: {"cao_installed": str(override_dir)},
+        )
+
+        _write_profile(store / "alpha.md", name="shared", body="Alpha body.")
+        rA = _install(runner, "alpha")
+        assert rA.exit_code == 0 and "Error:" not in rA.output, rA.output
+
+        # The copy landed where discovery will look, and nowhere else.
+        copy = override_dir / "shared.md"
+        assert copy.exists()
+        assert _context_source_stem(copy.read_text(encoding="utf-8")) == "alpha"
+        assert not (constant_dir / "shared.md").exists()
+        alpha_bytes = copy.read_bytes()
+
+        # A distinct profile resolving to the same id is refused, and the copy in
+        # the configured directory is what the refusal protected.
+        _write_profile(store / "beta.md", name="shared", body="Beta body.")
+        rB = _install(runner, "beta")
+        assert rB.exit_code == 0 and "Error:" in rB.output, rB.output
+        assert "alpha" in rB.output and "beta" in rB.output
+        assert copy.read_bytes() == alpha_bytes
+        assert not (constant_dir / "shared.md").exists()
+
+        # And the owner can still reinstall itself there.
+        rA2 = _install(runner, "alpha")
+        assert rA2.exit_code == 0 and "Error:" not in rA2.output, rA2.output
+
+    def test_default_mapping_keeps_the_constant_authoritative(
+        self, runner: CliRunner, workspace: Dict[str, Any], monkeypatch
+    ) -> None:
+        """An unconfigured ``cao_installed`` must resolve to ``AGENT_CONTEXT_DIR``.
+
+        The setting's default is the constant's value, so this is the production
+        no-override case. It also pins why patching the constant alone is enough
+        to redirect the writer: if the default mapping were taken literally the
+        writer would head for the real home directory.
+        """
+        from cli_agent_orchestrator.services import settings_service
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_agent_dirs",
+            lambda: {"cao_installed": settings_service._DEFAULTS["cao_installed"]},
+        )
+        _write_profile(workspace["local_store"] / "solo.md", name="solo")
+
+        r = _install(runner, "solo")
+        assert r.exit_code == 0 and "Error:" not in r.output, r.output
+        assert (workspace["context_dir"] / "solo.md").exists()
+        assert not Path(settings_service._DEFAULTS["cao_installed"]).joinpath("solo.md").exists()
+
+    @pytest.mark.parametrize("respell", ["trailing-slash", "dot-segment"])
+    def test_another_spelling_of_the_default_is_still_the_default(
+        self, runner: CliRunner, workspace: Dict[str, Any], monkeypatch, respell
+    ) -> None:
+        """Path comparison, not string comparison, decides "configured away".
+
+        An operator who writes the default location with a trailing slash or a
+        `/./` segment has not moved anything, and must not be split from the
+        constant-based consumers (and from discovery, which does not expand
+        such spellings) by a byte-for-byte comparison.
+        """
+        from cli_agent_orchestrator.services import settings_service
+
+        default = settings_service._DEFAULTS["cao_installed"]
+        if respell == "trailing-slash":
+            spelled = default + "/"
+        else:
+            spelled = str(Path(default).parent) + "/./" + Path(default).name
+        assert spelled != default
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_agent_dirs",
+            lambda: {"cao_installed": spelled},
+        )
+        _write_profile(workspace["local_store"] / "solo.md", name="solo")
+
+        r = _install(runner, "solo")
+        assert r.exit_code == 0 and "Error:" not in r.output, r.output
+        assert (workspace["context_dir"] / "solo.md").exists()
+        assert not Path(default).joinpath("solo.md").exists()

@@ -23,6 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the install, since it owns no file yet; installing a profile whose `name:`
   matches one of the built-ins therefore still works
 
+- the shared context copy is written to the configured installed-profile
+  directory (`agents.dirs.cao_installed`), the directory profile discovery, the
+  collision guard and the Copilot skill-injection probe read, instead of always
+  the default path; a `~`, trailing-slash or symlinked spelling of the default
+  still counts as the default, and with the default setting nothing moves (#493)
+
 - **enabling `CAO_MEMORY_API_URL` rejected memory keys that work without it.**
   The `/internal/memory/store` and `/forget` routes validated the wire `key` as
   the strict `MemoryKey` (`^[a-z0-9-]{1,60}$`), while the MCP tools have always

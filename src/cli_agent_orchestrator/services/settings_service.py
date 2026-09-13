@@ -133,6 +133,33 @@ def get_agent_dirs() -> Dict[str, str]:
     return result
 
 
+def installed_context_dir_override() -> Optional[Path]:
+    """Return ``agents.dirs.cao_installed`` when configured away from its default.
+
+    Returns None when the setting is absent or spells the default location.
+
+    The installed-profile context directory has two names for one default: the
+    ``AGENT_CONTEXT_DIR`` constant and this setting's default entry, both
+    ``CAO_HOME_DIR / "agent-context"``. Every consumer that has to find that
+    directory -- the install writer, the opencode collision guard, the Copilot
+    skill-injection probe -- calls this and falls back to its own imported
+    constant on None. So with an unconfigured setting the constant stays the
+    single source of truth (and a test that redirects the constant redirects
+    every consumer), while an operator who points the setting elsewhere moves
+    every consumer together instead of splitting them (PR #493).
+
+    Compared through ``normalized_path`` (realpath + expanduser), so a trailing
+    slash, a ``~`` or a symlinked spelling of the default is still the default
+    rather than an override to a directory nobody else looks in.
+    """
+    configured = get_agent_dirs().get("cao_installed")
+    if configured is None:
+        return None
+    if normalized_path(configured) == normalized_path(_DEFAULTS["cao_installed"]):
+        return None
+    return Path(configured).expanduser()
+
+
 def set_agent_dirs(dirs: Dict[str, str]) -> Dict[str, str]:
     """Update agent directories. Only updates providers that are specified.
 

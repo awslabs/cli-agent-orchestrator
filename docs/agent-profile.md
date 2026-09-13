@@ -147,6 +147,15 @@ cao install https://raw.githubusercontent.com/awslabs/cli-agent-orchestrator/mai
 Packaged examples are available in the
 [agent store](https://github.com/awslabs/cli-agent-orchestrator/tree/main/src/cli_agent_orchestrator/agent_store).
 
+Installing writes a copy of the profile to the shared context directory
+(`agents.dirs.cao_installed`, `~/.aws/cli-agent-orchestrator/agent-context` by
+default). CAO stamps that copy's frontmatter with `x-cao-source-stem`, the
+name the profile was installed under. The key is reserved: it is written by
+CAO, not authored, and a source profile that declares it is refused at install.
+It lets a reinstall recognise its own earlier copy, and lets the OpenCode
+install refuse a different profile whose `name:` would overwrite an installed
+one (see [OpenCode CLI](opencode-cli.md)).
+
 ### Profile discovery
 
 Search installed profiles by capability when the profile name is not known:
