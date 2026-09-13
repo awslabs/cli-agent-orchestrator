@@ -13,9 +13,13 @@ the right posture for a control someone deliberately switched on and the wrong o
 user of a feature that has no in-product way to grant approval until Bolt 3.
 
 THE GATE REPORTS; IT DOES NOT FORM AN OPINION ABOUT WHETHER AN APPROVAL EXISTS.
-``approval_store.is_approved`` is the sole authority, is already total, and already answers ``False``
-on a database error. A second opinion here would be the copy that drifts — and a drifted
-authorisation check is the kind that looks correct while permitting something.
+``approval_store`` is the sole authority. The gate consults it through ONE call —
+``approval_store.approval_state`` — and maps its three answers: APPROVED proceeds, ABSENT refuses as
+``PlanApprovalRequiredError`` (403), and UNKNOWN (the store faulted) refuses as
+``PlanApprovalUnavailableError`` (503, issue #696). A store fault stays fail-closed exactly as before
+— it never admits a run — but it is no longer collapsed into "not approved", because telling an
+operator whose database is unreadable to approve a plan names a remedy that cannot work. A second
+opinion here would be the copy that drifts, so the gate reads the store once and routes on that.
 
 IT SITS BEFORE THE FIRST IRREVERSIBLE ACT ON BOTH PATHS, and the two placements are not symmetric
 because what they protect is not the same thing:
@@ -72,6 +76,18 @@ class PlanApprovalRequiredError(Exception):
         self.plan_id = plan_id
 
 
+class PlanApprovalUnavailableError(Exception):
+    """Approval could not be checked because the store is unavailable.
+
+    Refuse the run with HTTP 503 so callers can distinguish a database fault from
+    a missing approval (403). Neither condition permits execution.
+    """
+
+    def __init__(self, message: str, plan_id: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.plan_id = plan_id
+
+
 def plan_id_from_manifest(manifest_json: Optional[str]) -> Optional[str]:
     """Extract ``plan_id`` from a frozen manifest, or ``None`` if it cannot be read.
 
@@ -98,7 +114,7 @@ def plan_id_from_manifest(manifest_json: Optional[str]) -> Optional[str]:
 
 
 def ensure_plan_approved(*, tier: str, manifest_json: Optional[str]) -> None:
-    """Raise :class:`PlanApprovalRequiredError` unless this run may proceed.
+    """Refuse missing approval or an unavailable approval store before execution.
 
     Returns ``None`` on every permitted path. Called from three places — the async start arm, the
     blocking start arm, and resume admission — as ONE function rather than three inline checks,
@@ -112,7 +128,7 @@ def ensure_plan_approved(*, tier: str, manifest_json: Optional[str]) -> None:
     if tier != SCRIPT_TIER:
         return
     if not is_workflow_approval_required():
-        # The default. is_approved is not called, so the disabled path cannot fail a run.
+        # The default. The approval store is not called on the disabled path.
         return
 
     plan_id = plan_id_from_manifest(manifest_json)
@@ -130,13 +146,25 @@ def ensure_plan_approved(*, tier: str, manifest_json: Optional[str]) -> None:
             "workflow.require_approval."
         )
 
-    if not approval_store.is_approved(plan_id):
-        # A control that refuses without saying which plan cannot be operated. plan_id is an opaque
-        # digest, so logging it adds nothing sensitive.
-        logger.warning("workflow approval gate: refusing unapproved plan_id %s", plan_id)
-        raise PlanApprovalRequiredError(
-            f"Plan '{plan_id}' has not been approved. Approve this plan identifier and run again. "
-            "Note that a plan_id is computed at run start, so the first run of a new or changed "
-            "plan is refused by design.",
+    state = approval_store.approval_state(plan_id)
+    if state == approval_store.APPROVED:
+        return
+
+    if state == approval_store.UNKNOWN:
+        logger.error("workflow approval store unavailable for plan_id %s", plan_id)
+        raise PlanApprovalUnavailableError(
+            f"Could not read the approval store for plan '{plan_id}'. "
+            "The run was refused. Restore database access and retry.",
             plan_id=plan_id,
         )
+
+    # state == ABSENT — a genuine absence of approval.
+    # A control that refuses without saying which plan cannot be operated. plan_id is an opaque
+    # digest, so logging it adds nothing sensitive.
+    logger.warning("workflow approval gate: refusing unapproved plan_id %s", plan_id)
+    raise PlanApprovalRequiredError(
+        f"Plan '{plan_id}' has not been approved. Approve this plan identifier and run again. "
+        "Note that a plan_id is computed at run start, so the first run of a new or changed "
+        "plan is refused by design.",
+        plan_id=plan_id,
+    )

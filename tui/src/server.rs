@@ -191,7 +191,7 @@ pub struct Route {
 /// silence `catalog.rs`'s own docs explain the enum exists to remove. [`TuiError::NoRoute`]
 /// stays a typed variant for the genuinely routeless (BR-18), not a fallback arm.
 ///
-/// # 21 routes for 22 IN-APP commands
+/// # 23 routes for 24 IN-APP commands
 ///
 /// `profile find` has **no** route and is served client-side by
 /// [`ServerClient::find_profiles`] (OQ-6 Q2). Every other IN-APP command maps to a route
@@ -298,6 +298,14 @@ fn route(id: CommandId) -> Option<Route> {
         CommandId::AgentResult => None,
         CommandId::AgentSendMessage => None,
         CommandId::AgentStatus => None,
+
+        // ── `cao fleet *` — both HIDE, and unroutable in principle (CAO on EKS v2) ──────
+        // Not "no route yet": these two do not address this cao-server at all. They address a
+        // remote cluster's worker broker, whose URL and token live in the operator's environment,
+        // so there is no path on `api/main.py` that could serve them. HIDE in catalog.rs, and a
+        // HIDE command is unreachable through `commands()` regardless.
+        CommandId::FleetShutdown => None,
+        CommandId::FleetStatus => None,
 
         // ── `cao config *`, `cao env *` ───────────────────────────────────────────────────
         // HIDE, and genuinely routeless: `cao env *` reads and writes the managed env store
@@ -484,7 +492,7 @@ fn route(id: CommandId) -> Option<Route> {
             }],
             &[],
         ),
-        // **`profile find` is the one IN-APP command with no route** — 21 routes for 22
+        // **`profile find` is the one IN-APP command with no route** — 23 routes for 24
         // commands. `search_profiles` is reachable only from the CLI (`profile.py:385`) and the
         // **stdio-only** MCP server (`mcp_server/server.py:2120`, `mcp.run()`), so it is not
         // HTTP-reachable at all. Served client-side by `find_profiles` over `GET
@@ -589,6 +597,20 @@ fn route(id: CommandId) -> Option<Route> {
         // ── `cao terminal *` ─────────────────────────────────────────────────────────────
         // HIDE: recovery-by-terminal-id tooling, not a launcher action.
         CommandId::TerminalRestore => None,
+
+        // ── `cao worker *` — all seven HIDE, all remote (CAO on EKS v2) ──────────────────
+        // Route names here would be a trap worth naming: `worker sessions` and `worker status`
+        // read `/sessions` and `/terminals/{id}` — the same paths this table serves for
+        // `cao session *` — but on a DIFFERENT cao-server, the one inside a worker pod, reached
+        // by proxy through a broker. Binding them to the local routes would report this machine's
+        // terminals as the remote worker's. See `utils/fleet.py`.
+        CommandId::WorkerAttach => None,
+        CommandId::WorkerList => None,
+        CommandId::WorkerLogs => None,
+        CommandId::WorkerRelease => None,
+        CommandId::WorkerSend => None,
+        CommandId::WorkerSessions => None,
+        CommandId::WorkerStatus => None,
 
         // ── `cao workflow *` ─────────────────────────────────────────────────────────────
         //
@@ -703,6 +725,12 @@ fn route(id: CommandId) -> Option<Route> {
         // path to a human authorisation act that nothing in the interface has reviewed.
         // (#583 Bolt 2, approval-operation)
         CommandId::WorkflowApprove => None,
+        // HIDE (issue #640), so it is unreachable through `commands()` and needs no route — the
+        // arm exists because this `match` is exhaustive, not because a route was withheld. A route
+        // does exist (`POST /workflows/runs/{run_id}/steps/{step_id}:replay`); it is unrouted here
+        // for the same reason every other HIDE row is, and `no HANDOFF or HIDE command may carry a
+        // route` is asserted below.
+        CommandId::WorkflowStep => None,
     }
 }
 
@@ -1812,12 +1840,17 @@ mod tests {
         );
 
         // 3. And no value leaked under any other key name.
+        //
+        // The sentinel that matched is deliberately NOT interpolated into the panic
+        // message: these are credential-shaped values, and a panic message is a log
+        // line (rust/cleartext-logging). The raw query is printed instead, and it
+        // necessarily contains whichever sentinel leaked.
         for secret in ["hunter2", "us-east-1", "SECRET_TOKEN", "AWS_REGION"] {
             assert!(
                 !request.query.contains(secret),
-                "the env-var name/value {secret:?} must not appear anywhere in the query string, \
-                 under `env_vars` or any other key — a leak wearing a different parameter name \
-                 is the same leak. Raw query was {:?}",
+                "no env-var name or value may appear anywhere in the query string, under \
+                 `env_vars` or any other key — a leak wearing a different parameter name is \
+                 the same leak. The leaked sentinel is visible in the raw query: {:?}",
                 request.query
             );
         }
@@ -2611,9 +2644,9 @@ mod tests {
 
     // ── The route table (BR-18, FR-3.1, OQ-6) ────────────────────────────────────────────
 
-    /// **21 routes for the 22 IN-APP commands, and `profile find` is the one without.**
+    /// **23 routes for the 24 IN-APP commands, and `profile find` is the one without.**
     ///
-    /// The distribution is settled ground truth — 22 IN-APP / 16 HANDOFF / 23 HIDE = 61 — and
+    /// The distribution is settled ground truth — 24 IN-APP / 18 HANDOFF / 44 HIDE = 86 — and
     /// every number below is a **hard-coded literal**. Deriving any of them from `route()` or
     /// from the catalog would compare production against itself, which is the vacuous shape this
     /// project has hit repeatedly.
@@ -2677,7 +2710,7 @@ mod tests {
             .count();
         assert_eq!(
             in_app, 24,
-            "the settled distribution is 24 IN-APP / 18 HANDOFF / 33 HIDE = 75; if this moved, \
+            "the settled distribution is 24 IN-APP / 18 HANDOFF / 44 HIDE = 86; if this moved, \
              the 23-route figure above needs re-deriving rather than adjusting"
         );
     }

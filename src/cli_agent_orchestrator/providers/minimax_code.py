@@ -28,21 +28,41 @@ _PLUGIN_NAME = "cao-orchestrator"
 _PLUGIN_SERVER_NAME = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
 _USER_LINE_PATTERN = re.compile(r"^\s*›[^\S\n]+(.*)$")
 _COMPLETION_LINE_PATTERN = re.compile(r"^\s*└\s+Completed in\s+\d", re.IGNORECASE)
-_COMPLETION_PATTERN = re.compile(r"(?:^|\n)\s*└\s+Completed in\s+\d", re.IGNORECASE)
-_ASSISTANT_LINE_PATTERN = re.compile(r"^(?P<indent>\s*)●\s+(?P<text>\S.*)$")
+# Line-start indent is matched with [^\S\n] (horizontal whitespace) rather than \s
+# so it cannot also consume the newlines that (?:^|\n) matches. With \s* the two
+# overlap, and a buffer of blank lines gives the engine one restart per newline
+# with a rescan behind it — quadratic backtracking on attacker-influenced agent
+# output (CWE-1333). The set of matches is unchanged: either form accepts a `└`
+# that is first on its line.
+_COMPLETION_PATTERN = re.compile(r"(?:^|\n)[^\S\n]*└\s+Completed in\s+\d", re.IGNORECASE)
+# Applied per line (via .match), so the horizontal-whitespace classes are exact
+# and the separator/body boundary is now unambiguous. `\s+` before the body
+# overlapped the following `.*` on every whitespace character outside ASCII, which
+# reads as re-guessable backtracking (CWE-1333); ^-anchoring means CPython never
+# actually walked it, but the narrower classes say what the line really looks like.
+_ASSISTANT_LINE_PATTERN = re.compile(r"^(?P<indent>[^\S\n]*)●[^\S\n]+(?P<text>\S.*)$")
 _READY_ASSISTANT_LINE_PATTERN = re.compile(r"^\s*●\s+Ready\s*$")
 _WAITING_PATTERN = re.compile(
     r"Approval needed|Run this command\?|Allow for this conversation|"
     r"Always allow this action|User prompt request",
     re.IGNORECASE,
 )
-_PROCESSING_PATTERN = re.compile(
-    r"[⠁-⣿◇◆]\s+(?:Loading|Running)(?:\s+\d+s)?[^\n]*(?:Enter queue|Esc stop)",
+# The spinner frame and its footer hint sit on ONE line with padding between
+# them ("◆ Running 12s ───── Enter queue · Esc stop"). Matching that as a single
+# pattern needs a `[^\n]*` gap, and because the pattern is unanchored the engine
+# re-walks the rest of the line from every spinner glyph on it — quadratic in the
+# line length (CWE-1333). Split into head + hint and check each at most once per
+# line instead; see _last_processing_start.
+_PROCESSING_HEAD_PATTERN = re.compile(
+    r"[⠁-⣿◇◆][^\S\n]+(?:Loading|Running)(?:[^\S\n]+\d+s)?",
     re.IGNORECASE,
 )
+_PROCESSING_HINT_PATTERN = re.compile(r"Enter queue|Esc stop", re.IGNORECASE)
 _READY_PATTERN = re.compile(r"●\s+Ready|Message\s+·\s+Enter send", re.IGNORECASE)
+# [^\S\n] rather than \s* after (?:^|\n) — see _COMPLETION_PATTERN.
 _ERROR_PATTERN = re.compile(
-    r"Sign in required|Authentication failed|Not authenticated|" r"(?:^|\n)\s*(?:Fatal|Error):",
+    r"Sign in required|Authentication failed|Not authenticated|"
+    r"(?:^|\n)[^\S\n]*(?:Fatal|Error):",
     re.IGNORECASE,
 )
 _EXTRACTION_SKIP_PATTERN = re.compile(r"^(?:├|└|Called\s|Message\s+·|/[^ ]+\s+\|)")
@@ -54,6 +74,24 @@ _ICON_PNG = base64.b64decode(
 
 def _last_match_start(pattern: re.Pattern[str], text: str) -> int:
     return max((match.start() for match in pattern.finditer(text)), default=-1)
+
+
+def _last_processing_start(text: str) -> int:
+    """Offset of the newest spinner frame that carries its footer hint, or -1.
+
+    Equivalent to matching head + gap + hint as one pattern, but linear: each
+    line costs one head scan plus one hint scan. Searching for the hint from the
+    FIRST head's end is enough — a hint that follows any later head on the line
+    also follows the first one.
+    """
+    result = -1
+    offset = 0
+    for line in text.split("\n"):
+        head = _PROCESSING_HEAD_PATTERN.search(line)
+        if head is not None and _PROCESSING_HINT_PATTERN.search(line, head.end()):
+            result = offset + head.start()
+        offset += len(line) + 1
+    return result
 
 
 class ProviderError(Exception):
@@ -461,7 +499,7 @@ class MiniMaxCodeProvider(BaseProvider):
         clean = strip_terminal_escapes(buffer)
 
         last_waiting = _last_match_start(_WAITING_PATTERN, clean)
-        last_processing = _last_match_start(_PROCESSING_PATTERN, clean)
+        last_processing = _last_processing_start(clean)
         last_completion = _last_match_start(_COMPLETION_PATTERN, clean)
         last_ready = _last_match_start(_READY_PATTERN, clean)
         last_error = _last_match_start(_ERROR_PATTERN, clean)
