@@ -2350,6 +2350,16 @@ def send_input(
             enter_count=enter_count,
             force_bracketed_paste=True,
             submit_delay=provider.paste_submit_delay if provider else 0.3,
+            # Re-snapshot the pre-write generation right before the backend
+            # actually touches the pane, not merely right after the prep
+            # above: clear_rolling_buffer and mark_input_received still run
+            # between notify_input_sent's own snapshot and this call, and the
+            # backend has pre-write work of its own (TmuxClient.send_keys's
+            # cancel-mode and load-buffer, neither of which touches the pane).
+            # A transition landing in that whole window is not evidence of a
+            # response to a write that has not happened yet (#709 thirteenth
+            # review round).
+            pre_write_hook=lambda: status_monitor.mark_pre_write(terminal_id),
         )
 
         update_last_active(terminal_id)

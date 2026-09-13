@@ -8,7 +8,7 @@ import asyncio
 import logging
 import threading
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from cli_agent_orchestrator.constants import (
     CAO_PYTE_STATUS,
@@ -101,6 +101,24 @@ class StatusMonitor:
         # stale screen redraw.
         self._buffer_epochs: Dict[str, int] = {}
         self._last_status: Dict[str, TerminalStatus] = {}
+        # Monotonic per-terminal count of genuine published status transitions
+        # (incremented in _apply_detection, alongside _last_status). A caller
+        # that captures this value at some point in time and later sees a
+        # STRICTLY GREATER value knows a real transition happened after that
+        # point; equal or lower means the observed transition is the same one
+        # or an older one already accounted for. InboxService uses this to
+        # tell a status event that predates a dispatch from one that follows
+        # it (#709).
+        self._status_generations: Dict[str, int] = {}
+        # Per-terminal snapshot of _status_generations taken at the START of
+        # notify_input_sent, i.e. after send_input's own prep (get_terminal_metadata,
+        # inject_memory_context) but before the backend write (send_keys). A
+        # transition observed during prep reflects output that predates this
+        # dispatch and is not evidence the terminal responded to it; comparing
+        # against a snapshot taken before send_input was even called cannot tell
+        # the two apart (#709 twelfth review round). InboxService confirms a
+        # dispatch against THIS snapshot, not the pre-call generation.
+        self._pre_write_generations: Dict[str, int] = {}
         # Per-terminal flag: when True, the next provider-detected PROCESSING
         # is honored and stickiness reset. Set by notify_input_sent() whenever
         # external input is sent to the terminal (paste-bombed by send_input
@@ -165,6 +183,16 @@ class StatusMonitor:
         # this a detection task can be garbage-collected mid-run and silently drop
         # a status transition. Tasks remove themselves on completion.
         self._detect_tasks: set = set()
+        # Callbacks invoked with a terminal_id whenever clear_terminal or
+        # reset_buffer resets that terminal's state, i.e. whenever
+        # _status_generations restarts. inbox_service registers one here to
+        # drop its own dispatch-active marker in the same reset (#709): that
+        # marker is keyed off a generation snapshot, and a restarted counter
+        # means every future event's generation can be at or below the
+        # snapshot, so a plain module import (rather than this hook) would
+        # need inbox_service to import status_monitor AND status_monitor to
+        # import inbox_service back.
+        self._teardown_hooks: List[Callable[[str], None]] = []
 
     async def run(self) -> None:
         """Subscribe to output events and detect status changes.
@@ -259,22 +287,27 @@ class StatusMonitor:
         paste into a busy agent).
         """
         with self._lock:
-            changed = self._apply_detection_locked(terminal_id, detected)
-        if changed:
+            generation = self._apply_detection_locked(terminal_id, detected)
+        if generation is not None:
             # Publish outside the lock — subscribers must never be able to
             # re-enter StatusMonitor while the latch state is mid-update.
-            bus.publish(f"terminal.{terminal_id}.status", {"status": detected.value})
+            bus.publish(
+                f"terminal.{terminal_id}.status",
+                {"status": detected.value, "generation": generation},
+            )
             logger.info(f"Terminal {terminal_id} status changed: {detected.value}")
 
-    def _apply_detection_locked(self, terminal_id: str, detected: TerminalStatus) -> bool:
+    def _apply_detection_locked(self, terminal_id: str, detected: TerminalStatus) -> Optional[int]:
         """Sticky-latch core of _apply_detection. Caller MUST hold self._lock.
 
         Split out so callers that need to validate a precondition and apply in
         ONE critical section (the stale-PROCESSING capture path revalidating its
         generation) can do so without a check-then-apply gap for
-        notify_input_sent to slip through. Returns True when the status changed;
-        the caller must then publish the change on the bus AFTER releasing the
-        lock (see _apply_detection for why).
+        notify_input_sent to slip through. Returns None when the status did not
+        change, otherwise the new status generation (incremented alongside
+        ``_last_status`` so InboxService's dispatch-coalescing sees a value tied
+        to this exact transition); the caller must then publish the change on
+        the bus AFTER releasing the lock (see _apply_detection for why).
         """
         last = self._last_status.get(terminal_id)
 
@@ -298,7 +331,7 @@ class StatusMonitor:
         # test_armed_unknown_then_ready_rerender_keeps_processing. The initial
         # UNKNOWN (last is None, nothing detected yet) is still allowed through.
         if detected == TerminalStatus.UNKNOWN and last is not None:
-            return False
+            return None
 
         armed = self._allow_processing_revert.get(terminal_id, False)
         if not armed:
@@ -306,12 +339,12 @@ class StatusMonitor:
                 TerminalStatus.PROCESSING,
                 TerminalStatus.UNKNOWN,
             ):
-                return False
+                return None
             if last == TerminalStatus.COMPLETED and detected == TerminalStatus.IDLE:
-                return False
+                return None
 
         if detected == last:
-            return False
+            return None
 
         self._last_status[terminal_id] = detected
         if detected == TerminalStatus.PROCESSING:
@@ -319,7 +352,9 @@ class StatusMonitor:
         elif detected in _STICKY_READY_STATUSES and last not in _STICKY_READY_STATUSES:
             self._allow_processing_revert[terminal_id] = False
 
-        return True
+        generation = self._status_generations.get(terminal_id, 0) + 1
+        self._status_generations[terminal_id] = generation
+        return generation
 
     # ----- pyte rendered-screen detection (edge-debounced) -------------------
 
@@ -632,6 +667,23 @@ class StatusMonitor:
         IDLE/COMPLETED would block the genuine PROCESSING transition.
         """
         with self._lock:
+            # Snapshot the transition counter here, before the backend write:
+            # send_input's own prep (get_terminal_metadata, inject_memory_context)
+            # has already run by the time it calls this, so a transition observed
+            # during prep is already folded into this value rather than being
+            # mistaken for a response to the write that has not happened yet
+            # (#709 twelfth review round). This is only a FALLBACK value now: real
+            # work still runs between this call and the actual pane write
+            # (clear_rolling_buffer, provider.mark_input_received, and the
+            # backend's own pre-write steps (TmuxClient.send_keys's cancel-mode
+            # and load-buffer, neither of which touches the pane), and a real,
+            # unrelated transition landing in that window is not evidence of a
+            # response to a write that has not happened yet either (#709
+            # thirteenth review round). A backend that supports the distinction
+            # overwrites this with a fresher reading via mark_pre_write, called
+            # through send_keys's pre_write_hook at the last point before the
+            # pane is actually touched. See get_pre_write_generation.
+            self._pre_write_generations[terminal_id] = self._status_generations.get(terminal_id, 0)
             self._allow_processing_revert[terminal_id] = True
             # A new turn is starting: whatever ready state a stale-PROCESSING capture saw
             # before this input no longer describes the terminal. Left armed, that candidate
@@ -681,6 +733,25 @@ class StatusMonitor:
             logger.error(f"Error detecting status for {terminal_id}: {e}")
             return TerminalStatus.UNKNOWN
 
+    def register_teardown_hook(self, hook: Callable[[str], None]) -> None:
+        """Register a callback run (outside ``self._lock``) with a terminal_id
+        whenever ``clear_terminal`` or ``reset_buffer`` resets that terminal's
+        ``_status_generations`` counter. Lets another service keep its own
+        per-terminal state consistent with that reset without a circular
+        import (#709)."""
+        self._teardown_hooks.append(hook)
+
+    def _run_teardown_hooks(self, terminal_id: str) -> None:
+        """Invoke every registered teardown hook for ``terminal_id``. Called
+        outside ``self._lock`` (a hook may take its own locks); a hook
+        exception is logged and never allowed to interrupt the reset it is
+        reacting to, since the reset itself already fully completed."""
+        for hook in self._teardown_hooks:
+            try:
+                hook(terminal_id)
+            except Exception as e:
+                logger.error(f"Error in status_monitor teardown hook for {terminal_id}: {e}")
+
     def clear_terminal(self, terminal_id: str) -> None:
         """Free buffer and status for a deleted terminal."""
         with self._lock:
@@ -688,6 +759,8 @@ class StatusMonitor:
             self._buffer_epochs.pop(terminal_id, None)
             self._last_status.pop(terminal_id, None)
             self._allow_processing_revert.pop(terminal_id, None)
+            self._status_generations.pop(terminal_id, None)
+            self._pre_write_generations.pop(terminal_id, None)
             self._midburst_probe_at.pop(terminal_id, None)
             self._screens.pop(terminal_id, None)
             self._bursting.pop(terminal_id, None)
@@ -697,6 +770,7 @@ class StatusMonitor:
             self._capture_generation.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
+        self._run_teardown_hooks(terminal_id)
 
     def reset_buffer(self, terminal_id: str) -> None:
         """Clear the rolling buffer + last-known status WITHOUT forgetting the
@@ -711,6 +785,8 @@ class StatusMonitor:
             self._buffers[terminal_id] = ""
             self._last_status.pop(terminal_id, None)
             self._allow_processing_revert.pop(terminal_id, None)
+            self._status_generations.pop(terminal_id, None)
+            self._pre_write_generations.pop(terminal_id, None)
             self._midburst_probe_at.pop(terminal_id, None)
             # Drop the rendered screen too so the relaunched CLI mode is
             # detected against a fresh viewport, not the failed attempt's.
@@ -722,6 +798,7 @@ class StatusMonitor:
             self._capture_generation.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
+        self._run_teardown_hooks(terminal_id)
 
     def get_status(self, terminal_id: str) -> TerminalStatus:
         """Get current terminal status — the single source of truth for both backends.
@@ -828,12 +905,17 @@ class StatusMonitor:
                                 and current_last_status == TerminalStatus.PROCESSING
                             )
                             if apply_ok:
-                                changed = self._apply_detection_locked(terminal_id, fresh_capture)
+                                status_generation = self._apply_detection_locked(
+                                    terminal_id, fresh_capture
+                                )
                         if apply_ok:
-                            if changed:
+                            if status_generation is not None:
                                 bus.publish(
                                     f"terminal.{terminal_id}.status",
-                                    {"status": fresh_capture.value},
+                                    {
+                                        "status": fresh_capture.value,
+                                        "generation": status_generation,
+                                    },
                                 )
                                 logger.info(
                                     f"Terminal {terminal_id} status changed: "
@@ -1027,6 +1109,59 @@ class StatusMonitor:
         """Get accumulated output buffer for a terminal."""
         with self._lock:
             return self._buffers.get(terminal_id, "")
+
+    def get_status_generation(self, terminal_id: str) -> int:
+        """Current value of the per-terminal transition counter.
+
+        Lets a caller record "no genuine transition has happened yet" (by
+        snapshotting this value) and later tell a status event that predates
+        that snapshot from one that follows it, without racing the event
+        queue itself (#709).
+        """
+        with self._lock:
+            return self._status_generations.get(terminal_id, 0)
+
+    def get_pre_write_generation(self, terminal_id: str) -> Optional[int]:
+        """The transition counter as of the most recent notify_input_sent call
+        for this terminal, i.e. right before the backend write it precedes.
+        None if notify_input_sent has never been called for this terminal (or
+        its state was reset since): callers must not treat that the same as 0,
+        since 0 is itself a valid pre-write generation (#709 twelfth review
+        round).
+
+        May be refined after notify_input_sent by a later mark_pre_write call
+        from the backend's own pre_write_hook, taken closer to the actual pane
+        write (#709 thirteenth review round). This accessor always returns
+        whichever snapshot is most recent.
+        """
+        with self._lock:
+            return self._pre_write_generations.get(terminal_id)
+
+    def mark_pre_write(self, terminal_id: str) -> None:
+        """Re-snapshot the pre-write transition counter immediately before the
+        backend's actual write to the pane, overwriting notify_input_sent's
+        earlier (fallback) snapshot.
+
+        notify_input_sent takes its snapshot right after send_input's own prep
+        (get_terminal_metadata, inject_memory_context) but before send_input's
+        remaining pre-write steps (clear_rolling_buffer, provider.
+        mark_input_received) and the backend's own pre-write work
+        (TmuxClient.send_keys's cancel-mode and load-buffer calls, neither of
+        which touches the pane). A real, unrelated transition can still land
+        in that window and would be indistinguishable from a genuine response
+        to a write that has not happened yet (#709 thirteenth review round).
+
+        Backends that can tell "about to touch the pane" apart from their own
+        earlier prep call this via the ``pre_write_hook`` passed into
+        send_keys, at the last point before the pane is actually written
+        (TmuxClient: immediately before paste-buffer, after load-buffer
+        returns; HerdrBackend: immediately before pane send-text). Backends
+        that do not pass the hook leave notify_input_sent's snapshot as the
+        answer, strictly earlier, never later, than the true pre-write
+        point, so it never manufactures a false confirmation on its own.
+        """
+        with self._lock:
+            self._pre_write_generations[terminal_id] = self._status_generations.get(terminal_id, 0)
 
 
 # Module-level singleton

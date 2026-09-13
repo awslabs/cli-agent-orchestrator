@@ -2,7 +2,7 @@
 
 import os
 from datetime import datetime
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -2069,8 +2069,16 @@ class TestSendInput:
             enter_count=2,
             force_bracketed_paste=True,
             submit_delay=0.3,
+            pre_write_hook=ANY,
         )
         mock_update.assert_called_once_with("test1234")
+
+        # The hook passed to send_keys is the wiring the round-13 review
+        # asked for: calling it must reach status_monitor.mark_pre_write
+        # with this exact terminal_id, not just exist as a kwarg.
+        pre_write_hook = mock_tmux.send_keys.call_args.kwargs["pre_write_hook"]
+        pre_write_hook()
+        mock_status_monitor.mark_pre_write.assert_called_once_with("test1234")
 
     @patch("cli_agent_orchestrator.services.terminal_service.MemoryService")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
@@ -2230,6 +2238,7 @@ class TestSendInput:
             enter_count=1,
             force_bracketed_paste=True,
             submit_delay=0.3,
+            pre_write_hook=ANY,
         )
         mock_update.assert_called_once_with("test1234")
 

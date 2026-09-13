@@ -816,6 +816,110 @@ class TestStaleProcessingCapturePane:
         assert sm._last_status["t1"] == TerminalStatus.ERROR
 
 
+class TestPreWriteGeneration:
+    """notify_input_sent's own snapshot of the transition counter, taken
+    after send_input's prep (get_terminal_metadata, inject_memory_context)
+    and immediately before the backend write. InboxService uses this
+    instead of a snapshot taken before send_input was even called, so a
+    prep-time transition cannot be mistaken for a response to a write that
+    has not happened yet (#709 twelfth review round)."""
+
+    def test_none_before_any_input_sent(self):
+        sm = StatusMonitor()
+        assert sm.get_pre_write_generation("t1") is None
+
+    def test_snapshots_the_counter_as_of_the_call(self):
+        sm = StatusMonitor()
+        sm._status_generations["t1"] = 3
+        sm.notify_input_sent("t1")
+        assert sm.get_pre_write_generation("t1") == 3
+
+        # A later transition does not retroactively move an already-taken
+        # snapshot.
+        sm._status_generations["t1"] = 4
+        assert sm.get_pre_write_generation("t1") == 3
+
+        # A second dispatch's own call re-snapshots at the new value.
+        sm.notify_input_sent("t1")
+        assert sm.get_pre_write_generation("t1") == 4
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_clear_terminal_drops_the_snapshot(self, mock_pm, mock_get_backend):
+        sm = StatusMonitor()
+        sm._status_generations["t1"] = 2
+        sm.notify_input_sent("t1")
+        assert sm.get_pre_write_generation("t1") == 2
+
+        sm.clear_terminal("t1")
+        assert sm.get_pre_write_generation("t1") is None
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_reset_buffer_drops_the_snapshot(self, mock_pm, mock_get_backend):
+        sm = StatusMonitor()
+        sm._status_generations["t1"] = 2
+        sm.notify_input_sent("t1")
+        assert sm.get_pre_write_generation("t1") == 2
+
+        sm.reset_buffer("t1")
+        assert sm.get_pre_write_generation("t1") is None
+
+
+class TestMarkPreWrite:
+    """mark_pre_write re-snapshots the transition counter at the last point
+    before the backend actually touches the pane, overwriting
+    notify_input_sent's earlier (fallback) snapshot: real work still runs
+    between notify_input_sent and the pane write (send_input's own
+    clear_rolling_buffer/mark_input_received, plus the backend's own
+    pre-write steps), so a transition observed in that window is not
+    evidence of a response to a write that has not happened yet (#709
+    thirteenth review round)."""
+
+    def test_overwrites_notify_input_sents_snapshot(self):
+        sm = StatusMonitor()
+        sm._status_generations["t1"] = 3
+        sm.notify_input_sent("t1")
+        assert sm.get_pre_write_generation("t1") == 3
+
+        # A transition lands after notify_input_sent's snapshot but before
+        # the backend's pre_write_hook fires (the window this fix closes).
+        sm._status_generations["t1"] = 4
+        sm.mark_pre_write("t1")
+        assert sm.get_pre_write_generation("t1") == 4
+
+    def test_can_be_called_without_a_prior_notify_input_sent(self):
+        """Defensive: a backend that calls the hook on every send_keys,
+        including a caller that never went through notify_input_sent, must
+        not raise."""
+        sm = StatusMonitor()
+        sm._status_generations["t1"] = 1
+        sm.mark_pre_write("t1")
+        assert sm.get_pre_write_generation("t1") == 1
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_clear_terminal_drops_the_mark_pre_write_snapshot(self, mock_pm, mock_get_backend):
+        sm = StatusMonitor()
+        sm._status_generations["t1"] = 2
+        sm.mark_pre_write("t1")
+        assert sm.get_pre_write_generation("t1") == 2
+
+        sm.clear_terminal("t1")
+        assert sm.get_pre_write_generation("t1") is None
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_reset_buffer_drops_the_mark_pre_write_snapshot(self, mock_pm, mock_get_backend):
+        sm = StatusMonitor()
+        sm._status_generations["t1"] = 2
+        sm.mark_pre_write("t1")
+        assert sm.get_pre_write_generation("t1") == 2
+
+        sm.reset_buffer("t1")
+        assert sm.get_pre_write_generation("t1") is None
+
+
 class TestScreenDetection:
     """Rendered-screen detection should fail soft and keep monitoring alive."""
 
