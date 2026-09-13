@@ -222,3 +222,23 @@ def test_run_list_path_does_not_resolve_to_the_catch_all():
             "GET /workflows/runs resolved to the /workflows/{name} catch-all; "
             "the list route is registered too late"
         )
+
+
+def test_step_replay_route_resolves_to_the_replay_endpoint():
+    # Issue #640: POST /workflows/runs/{run_id}/steps/{step_id}:replay carries a
+    # ``:verb`` suffix on the LAST path segment (the same shape as
+    # ``/workflows/runs:submit``). Pin the resolution: the ``{step_id}`` capture is
+    # greedy, so the suffix must be split off into the literal — ``step_id`` has to
+    # come back as "s2", never "s2:replay".
+    route = _resolve("POST", "/workflows/runs/run-abc123/steps/s2:replay")
+    assert route is not None
+    assert route.name == "replay_workflow_step_endpoint"
+    assert route.path == "/workflows/runs/{run_id}/steps/{step_id}:replay"
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/workflows/runs/run-abc123/steps/s2:replay",
+        "headers": [],
+    }
+    _, child_scope = route.matches(scope)
+    assert child_scope["path_params"] == {"run_id": "run-abc123", "step_id": "s2"}

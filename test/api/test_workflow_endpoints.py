@@ -287,3 +287,88 @@ class TestResumeEndpoint:
         resp = client.post("/workflows/runs/runX/resume")
         assert resp.status_code == 200
         assert resp.json()["state"] == "completed"
+
+
+class TestStepReplayEndpoint:
+    """The single-step replay route's boundary mapping (issue #640).
+
+    The service is exercised by ``test/services/test_workflow_step_replay.py``;
+    here we pin only the boundary contract — KeyError -> 404 (with the service's
+    own message, which distinguishes unknown-run from unknown-step),
+    ResumeCorruptError -> 422 (caught BEFORE the bare ValueError arm),
+    ValueError -> 400, and a successful replay returning the payload verbatim.
+    """
+
+    _PATH = "/workflows/runs/runX/steps/s2:replay"
+
+    def test_unknown_run_maps_to_404(self, client, monkeypatch):
+        from cli_agent_orchestrator.services import workflow_service as ws
+
+        async def _raise(run_id, step_id, prompt_override=None):
+            raise KeyError(f"unknown run '{run_id}'")
+
+        monkeypatch.setattr(ws, "replay_single_step", _raise)
+        resp = client.post(self._PATH)
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == "unknown run 'runX'"
+
+    def test_unknown_step_maps_to_404_naming_the_step(self, client, monkeypatch):
+        from cli_agent_orchestrator.services import workflow_service as ws
+
+        async def _raise(run_id, step_id, prompt_override=None):
+            raise KeyError(f"run '{run_id}' has no step '{step_id}'")
+
+        monkeypatch.setattr(ws, "replay_single_step", _raise)
+        resp = client.post(self._PATH)
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == "run 'runX' has no step 's2'"
+
+    def test_corrupt_snapshot_maps_to_422(self, client, monkeypatch):
+        from cli_agent_orchestrator.services import workflow_service as ws
+
+        async def _raise(run_id, step_id, prompt_override=None):
+            raise ws.ResumeCorruptError("no usable spec snapshot")
+
+        monkeypatch.setattr(ws, "replay_single_step", _raise)
+        resp = client.post(self._PATH)
+        assert resp.status_code == 422
+
+    def test_unresolvable_prompt_maps_to_400(self, client, monkeypatch):
+        from cli_agent_orchestrator.services import workflow_service as ws
+
+        async def _raise(run_id, step_id, prompt_override=None):
+            raise ValueError("cannot resolve the prompt")
+
+        monkeypatch.setattr(ws, "replay_single_step", _raise)
+        resp = client.post(self._PATH)
+        assert resp.status_code == 400
+
+    def test_success_returns_payload_and_forwards_the_override(self, client, monkeypatch):
+        from cli_agent_orchestrator.services import workflow_service as ws
+
+        seen = {}
+
+        async def _ok(run_id, step_id, prompt_override=None):
+            seen.update(run_id=run_id, step_id=step_id, prompt_override=prompt_override)
+            return {"run_id": run_id, "step_id": step_id, "prompt": "resolved", "error": None}
+
+        monkeypatch.setattr(ws, "replay_single_step", _ok)
+        resp = client.post(self._PATH, json={"prompt_override": "be terse"})
+        assert resp.status_code == 200
+        assert resp.json()["prompt"] == "resolved"
+        assert seen == {"run_id": "runX", "step_id": "s2", "prompt_override": "be terse"}
+
+    def test_body_is_optional(self, client, monkeypatch):
+        """A replay with no body reuses the snapshotted prompt (override None)."""
+        from cli_agent_orchestrator.services import workflow_service as ws
+
+        seen = {}
+
+        async def _ok(run_id, step_id, prompt_override=None):
+            seen["prompt_override"] = prompt_override
+            return {"run_id": run_id, "step_id": step_id, "error": None}
+
+        monkeypatch.setattr(ws, "replay_single_step", _ok)
+        resp = client.post(self._PATH)
+        assert resp.status_code == 200
+        assert seen == {"prompt_override": None}
