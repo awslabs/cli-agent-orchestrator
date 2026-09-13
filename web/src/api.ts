@@ -105,6 +105,77 @@ export interface AgentProfileInfo {
   duplicated_in?: string[]
 }
 
+/**
+ * One row from `GET /agents/profiles/search`. The backend contract
+ * (services/profile_search.py RESULT_FIELDS) is metadata-only: the profile
+ * prompt body is never returned. `score` = `coverage` + a BM25 tie-break
+ * fraction below 1, so descending score always agrees with the server's
+ * result order — the client must preserve that order, never re-sort.
+ */
+export interface ProfileSearchResult {
+  name: string
+  description: string
+  capabilities: string[]
+  tags: string[]
+  role: string
+  source: AgentProfileSource
+  coverage: number
+  score: number
+}
+
+/**
+ * Parsed profile from `GET /agents/profiles/{name}`. This response is
+ * *resolved* (env-var placeholders substituted) — fine for display, but an
+ * editor must load `GET /agents/profiles/{name}/source` instead so a save
+ * never persists resolved secrets. Only the fields the detail pane renders
+ * are declared; the endpoint returns the full model with nulls excluded.
+ */
+export interface AgentProfileDetail {
+  name: string
+  description: string
+  provider?: string
+  model?: string
+  role?: string
+  tags?: string[]
+  capabilities?: string[]
+}
+
+/** One scaffold template from `GET /agents/profiles/templates`. `name` is `category/name`. */
+export interface TemplateSummary {
+  name: string
+  description: string
+}
+
+/**
+ * One finding from the profile validator, shared by
+ * `POST /agents/profiles/validate` and the write routes' `warnings`.
+ */
+export interface ProfileValidationMessage {
+  severity: 'error' | 'warning'
+  message: string
+  path?: string | null
+}
+
+export interface ProfileValidationResponse {
+  valid: boolean
+  messages: ProfileValidationMessage[]
+}
+
+/**
+ * Outcome of a profile create or replace. `warnings` carries advisory
+ * findings that did not block the write; error findings reject with 400
+ * (detail shape `{message, errors}`) and never reach here.
+ */
+export interface ProfileWriteResponse {
+  name: string
+  warnings: ProfileValidationMessage[]
+}
+
+export interface TemplatePreview {
+  template: string
+  content: string
+}
+
 export interface AgentDirsSettings {
   agent_dirs: Record<string, string>
   extra_dirs: string[]
@@ -394,6 +465,62 @@ export interface RunSummaryRow {
 export const api = {
   // Agent Profiles & Providers
   listProfiles: () => fetchJSON<AgentProfileInfo[]>('/agents/profiles'),
+  // Server-ranked search. Result order is the relevance ranking — render as-is.
+  searchProfiles: (q: string, limit?: number) =>
+    fetchJSON<ProfileSearchResult[]>(`/agents/profiles/search?q=${encodeURIComponent(q)}${limit ? `&limit=${limit}` : ''}`),
+  getProfile: (name: string) => fetchJSON<AgentProfileDetail>(`/agents/profiles/${encodeURIComponent(name)}`),
+  // Profile authoring (issue #510).
+  getProfileSchema: () => fetchJSON<Record<string, any>>('/agents/profiles/schema'),
+  listProfileTemplates: () => fetchJSON<TemplateSummary[]>('/agents/profiles/templates'),
+  // The template identifier is `category/name` and travels as two path
+  // segments — the backend route is declared as
+  // `/templates/{category}/{name}/schema` — so the slash must NOT be encoded.
+  getTemplateSchema: (template: string) =>
+    fetchJSON<Record<string, any>>(`/agents/profiles/templates/${template.split('/').map(encodeURIComponent).join('/')}/schema`),
+  previewTemplate: (template: string, config: Record<string, unknown>) =>
+    fetchJSON<TemplatePreview>('/agents/profiles/templates/preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ template, config }),
+      // Authoring calls run the full validator server-side; the 10s
+      // default turns a slow round-trip into a phantom 'Validation failed'.
+      timeoutMs: 30000
+    }),
+  validateProfile: (content: string) =>
+    fetchJSON<ProfileValidationResponse>('/agents/profiles/validate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content }),
+      // Authoring calls run the full validator server-side; the 10s
+      // default turns a slow round-trip into a phantom 'Validation failed'.
+      timeoutMs: 30000
+    }),
+  createProfile: (name: string, content: string) =>
+    fetchJSON<ProfileWriteResponse>('/agents/profiles', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, content }),
+      // Authoring calls run the full validator server-side; the 10s
+      // default turns a slow round-trip into a phantom 'Validation failed'.
+      timeoutMs: 30000
+    }),
+  // The authoring read: returns the document exactly as stored, with env-var
+  // placeholders intact. An editor MUST read from here — the parsed
+  // GET /agents/profiles/{name} is resolved, and round-tripping it through a
+  // write would persist resolved secrets into a plaintext profile.
+  getProfileSource: (name: string) =>
+    fetchJSON<{ name: string; content: string }>(`/agents/profiles/${encodeURIComponent(name)}/source`),
+  replaceProfile: (name: string, content: string) =>
+    fetchJSON<ProfileWriteResponse>(`/agents/profiles/${encodeURIComponent(name)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content }),
+      // Authoring calls run the full validator server-side; the 10s
+      // default turns a slow round-trip into a phantom 'Validation failed'.
+      timeoutMs: 30000
+    }),
+  deleteProfile: (name: string) =>
+    fetchJSON<void>(`/agents/profiles/${encodeURIComponent(name)}`, { method: 'DELETE' }),
   listProviders: () => fetchJSON<ProviderInfo[]>('/agents/providers'),
 
   // Settings

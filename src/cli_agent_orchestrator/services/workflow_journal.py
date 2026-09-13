@@ -89,6 +89,7 @@ _REQUIRED_RUN_COLUMNS = frozenset(
         # ``test_workflow_journal_connection_posture.py::test_the_required_column_sets_match_what_the_migrators_produce``
         # exists to catch.
         "manifest_json",
+        "error",
     }
 )
 _REQUIRED_STEP_COLUMNS = frozenset(
@@ -129,6 +130,8 @@ class RunRow:
     # same shape ``StepRow``'s docstring describes for U1's nullable fields: a row written before this
     # (or by a YAML run, which never freezes) reads back observably identical to its previous shape.
     manifest_json: Optional[str] = None
+    # Issue #753: redacted, bounded script-level failure diagnostic.
+    error: Optional[str] = None
 
 
 @dataclass
@@ -546,11 +549,18 @@ def update_run_current_step(run_id: str, current_step_id: Optional[str]) -> None
         )
 
 
-def update_run_state(run_id: str, state: str, finished_at: Optional[str]) -> None:
-    """UPDATE ``workflow_run.state`` (+ ``finished_at``) on a run transition (E1).
+def update_run_state(
+    run_id: str,
+    state: str,
+    finished_at: Optional[str],
+    error: Optional[str] = None,
+) -> None:
+    """UPDATE run state, finish time, and optional run-level diagnostic (E1).
 
     ``finished_at`` is set on a terminal transition and cleared (``None``) when a
     resume re-opens a previously-settled run (business-logic-model §3).
+    ``error`` is cleared by every caller that omits it, preventing a resumed or
+    subsequently completed run from retaining a stale script failure.
 
     UNCONDITIONAL BY CONTRACT. Do NOT add a ``WHERE state = ...`` predicate here:
     the resume path calls this to write state BACK to ``running`` on an already
@@ -561,8 +571,8 @@ def update_run_state(run_id: str, state: str, finished_at: Optional[str]) -> Non
     """
     with _connect() as conn:
         conn.execute(
-            "UPDATE workflow_run SET state = ?, finished_at = ? WHERE run_id = ?",
-            (state, finished_at, run_id),
+            "UPDATE workflow_run SET state = ?, finished_at = ?, error = ? WHERE run_id = ?",
+            (state, finished_at, error, run_id),
         )
 
 
@@ -864,7 +874,7 @@ def get_run(run_id: str) -> Optional[RunRow]:
     with _connect() as conn:
         row = conn.execute(
             "SELECT run_id, workflow_name, spec_snapshot, inputs_json, state, "
-            "current_step_id, started_at, finished_at, tier, generation, manifest_json "
+            "current_step_id, started_at, finished_at, tier, generation, manifest_json, error "
             "FROM workflow_run WHERE run_id = ?",
             (run_id,),
         ).fetchone()
@@ -884,6 +894,7 @@ def get_run(run_id: str) -> Optional[RunRow]:
         # issue #583 Bolt 2, ``approval-gate``: NULL for every YAML run and for any run whose freeze
         # failed. Both read back as None, which the resume gate refuses when enforcement is on.
         manifest_json=row[10],
+        error=row[11],
     )
 
 

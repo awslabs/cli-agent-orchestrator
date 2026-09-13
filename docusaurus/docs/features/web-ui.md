@@ -39,6 +39,7 @@ Open http://localhost:5173. The Vite dev server proxies API requests to the back
 - **Terminal output** -- live-streaming scrollback from each agent
 - **WebSocket PTY** -- full interactive terminal access from the browser (`/terminals/{id}/ws`)
 - **Inbox monitoring** -- see pending and delivered messages per terminal
+- **Profile management** -- browse, search, create (from a template or from scratch), edit, clone, and delete agent profiles, with validation before every write
 - **Flow management** -- view scheduled flows, next run times, enable/disable
 - **Settings** -- configure agent directories, skill directories, memory, and backend from the UI
 - **Session control** -- launch, send messages, and shut down sessions from the browser

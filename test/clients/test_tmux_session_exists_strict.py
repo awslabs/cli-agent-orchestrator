@@ -472,11 +472,21 @@ class TestPortableServerDetection:
             assert ladder == (tmux_module._bound_unix_socket_paths_via_lsof,)
 
     @requires_lsof
-    def test_lsof_reports_the_bound_path_even_after_it_is_unlinked(self, tmux_socket):
+    def test_lsof_reports_the_bound_path_even_after_it_is_unlinked(
+        self, tmux_socket, unrelated_tmux_server
+    ):
         """The mechanism the mac path rests on, measured against real tmux.
 
         Same property ``/proc/net/unix`` has: bound while alive, STILL bound once
         the path is unlinked, gone once the server dies.
+
+        Takes ``unrelated_tmux_server`` so some OTHER named socket is bound for
+        the whole test. ``_bound_unix_socket_paths_via_lsof`` reports an empty
+        parse as ``None`` ("cannot tell"), deliberately, so that a host with
+        nothing bound cannot read as a confirmed absence. Where the socket under
+        test is the only named unix socket present, which is the ordinary case in
+        a container, the post-kill listing is empty and the detector answers
+        ``None``, so the final ``not in`` below raises instead of evaluating.
         """
         _start_session(tmux_socket, "cao-lsof")
         server_pid = _server_pid(tmux_socket)

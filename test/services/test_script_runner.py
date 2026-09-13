@@ -314,14 +314,15 @@ async def test_happy_completed_result_shape_and_sentinel(monkeypatch: pytest.Mon
 
 @pytest.mark.asyncio
 async def test_crash_nonzero_exit_failed_kind_error(monkeypatch: pytest.MonkeyPatch):
-    """Nonzero exit -> FAILED, kind=error, stderr tail surfaced, sweep fired."""
+    """Nonzero exit -> FAILED with a redacted durable diagnostic and a swept worker."""
     swept = {"run": None}
+    aws_key = "AKIAIOSFODNN7EXAMPLE"
 
     async def _fake_sweep(run_id):
         swept["run"] = run_id
 
     monkeypatch.setattr(script_runner, "_reconcile_orphans", _fake_sweep)
-    proc = _FakeProcess(exit_rc=1, stderr=b"Traceback: boom\n")
+    proc = _FakeProcess(exit_rc=1, stderr=f"Traceback: boom with {aws_key}\n".encode())
     _install_fake_spawn(monkeypatch, proc)
 
     result = await run_script_workflow(_FakeScriptSpec(), {}, "run-crash")
@@ -329,6 +330,10 @@ async def test_crash_nonzero_exit_failed_kind_error(monkeypatch: pytest.MonkeyPa
     assert result.kind == "error"
     assert any("boom" in w for w in result.warnings)  # stderr tail surfaced
     assert swept["run"] == "run-crash"
+    row = workflow_journal.get_run("run-crash")
+    assert row is not None
+    assert getattr(row, "error", None) == "Traceback: boom with [REDACTED:aws_access_key]"
+    assert aws_key not in getattr(row, "error", "")
 
 
 @pytest.mark.asyncio

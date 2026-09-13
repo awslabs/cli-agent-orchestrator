@@ -1,5 +1,6 @@
 """Unit tests for Codex provider."""
 
+import logging
 import os
 import re
 import shlex
@@ -28,6 +29,32 @@ FIXTURES_DIR = Path(__file__).parent / "fixtures"
 def load_fixture(filename: str) -> str:
     with open(FIXTURES_DIR / filename, "r") as f:
         return f.read()
+
+
+class TestCodexCurrentComposer:
+    @pytest.mark.parametrize(
+        ("screen", "expected"),
+        [
+            (
+                "› [CAO Handoff] repeat the exact task\n"
+                "• completed\n"
+                "›\n"
+                "  ? for shortcuts                     88% context left",
+                "",
+            ),
+            (
+                "› [CAO Handoff] repeat the exact task\n"
+                "  keep this sparse multiline draft\n"
+                "\n"
+                "  gpt-5.6-terra high · ~/work",
+                "› [CAO Handoff] repeat the exact task\n" "  keep this sparse multiline draft",
+            ),
+        ],
+    )
+    def test_extract_current_composer_uses_the_bottom_composer(self, screen, expected):
+        provider = CodexProvider("test1234", "test-session", "window-0", None)
+
+        assert provider.extract_current_composer(screen) == expected
 
 
 def read_developer_instructions_file(command: str) -> str:
@@ -705,6 +732,68 @@ class TestCodexProviderCodexProfile:
         assert "--yolo" in command
         assert "--profile" not in command
 
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_discarded_codex_profile_is_warned_not_silent(self, mock_load, caplog):
+        """#707: dropping an explicit containment setting must not be silent.
+
+        Naming a ``codexProfile`` is the only way to keep Codex's sandbox and
+        approval policy in effect under CAO. ``allowed_tools`` containing ``"*"``
+        discards it and launches --yolo, so an operator who set both gets no
+        sandbox. The launch still proceeds -- the point is that it says so.
+        """
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.codexProfile = "cao_reviewer"
+        mock_load.return_value = mock_profile
+
+        provider = CodexProvider("tid", "sess", "win", "agent", allowed_tools=["*"])
+        with caplog.at_level(logging.WARNING):
+            command = provider._build_codex_command()
+
+        assert "--yolo" in command
+        assert "--profile" not in command
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warnings, "discarding codexProfile logged nothing at WARNING"
+        text = warnings[0].getMessage()
+        assert "cao_reviewer" in text, "the discarded profile is not named"
+        assert "allowed_tools" in text and "*" in text, "the cause is not named"
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_no_warning_when_codex_profile_is_honored(self, mock_load, caplog):
+        """The warning must be specific to the discard, not to codexProfile itself."""
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.codexProfile = "cao_reviewer"
+        mock_load.return_value = mock_profile
+
+        provider = CodexProvider("tid", "sess", "win", "agent", allowed_tools=["fs_read"])
+        with caplog.at_level(logging.WARNING):
+            command = provider._build_codex_command()
+
+        assert "--profile cao_reviewer" in command
+        assert "--yolo" not in command
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_default_yolo_launch_records_that_sandbox_settings_do_not_apply(self, caplog):
+        """#707: operators relied on ~/.codex sandbox settings that --yolo makes inert.
+
+        Logged at INFO rather than WARNING because it is the documented default for
+        every codex worker, so warning on it would be noise; the point is that the
+        record names ``network_access`` where someone grepping for it will find it.
+        """
+        provider = CodexProvider("tid", "sess", "win", None)
+        with caplog.at_level(logging.INFO):
+            command = provider._build_codex_command()
+
+        assert "--yolo" in command
+        text = " ".join(r.getMessage() for r in caplog.records)
+        assert "network_access" in text, "the inert setting is not named"
+        assert "do NOT apply" in text or "not apply" in text
+
 
 class TestTomlScalar:
     """Tests for ``_toml_scalar`` TOML-literal serialization."""
@@ -1184,6 +1273,81 @@ class TestCodexRenderedScreenStatusDetection:
         provider = CodexProvider("test1234", "test-session", "window-0")
 
         assert provider.get_status_from_screen(screen_lines) == TerminalStatus.COMPLETED
+
+
+class TestCodexAcceptance20260908Spinner:
+    """Regression coverage from a live acceptance run (2026-09-08, codex-cli
+    0.153.4): the spinner read IDLE for the whole duration of a working turn
+    on 3 of 4 turns. Frames derived from that run's captured terminal logs
+    (caohome/logs/terminal/{aa9a3c70,45ab17ec,ed237bda}.log) and the clean
+    finished-turn pane capture (evidence/phaseC_pane.txt).
+    """
+
+    def test_hollow_bullet_spinner_merged_with_composer_is_processing(self):
+        """codex-cli 0.153.4 alternates the spinner glyph between the solid
+        bullet "•" (U+2022) and the hollow bullet "◦" (U+25E6), and with
+        --no-alt-screen the composer hint ("» Ask Codex to do anything") and
+        the model/path footer can land on the SAME rendered line as the
+        spinner, with no space after the bullet. TUI_PROGRESS_PATTERN only
+        matched "•" before this fix, so a frame landing on "◦" misclassified
+        as IDLE mid-turn."""
+        screen_lines = [
+            "› [CAO Handoff] Apply the two edits.",
+            "",
+            "◦Applying both edits(52s • esc to interrupt)»Ask Codex to do "
+            "anything gpt-6-astra ultra · ~/path",
+        ]
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status_from_screen(screen_lines) == TerminalStatus.PROCESSING
+        assert provider.get_status("\n".join(screen_lines)) == TerminalStatus.PROCESSING
+
+    def test_solid_bullet_spinner_merged_with_composer_is_processing(self):
+        """Same shape as above but with the solid bullet and no space after it,
+        exactly as captured mid-turn: "•Applying both edits(43s • esc to
+        interrupt)»Ask Codex to do anything gpt-6-astra ultra · ~/path"."""
+        screen_lines = [
+            "› [CAO Handoff] Apply the two edits.",
+            "",
+            "•Applying both edits(43s • esc to interrupt)»Ask Codex to do "
+            "anything gpt-6-astra ultra · ~/path",
+        ]
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status_from_screen(screen_lines) == TerminalStatus.PROCESSING
+        assert provider.get_status("\n".join(screen_lines)) == TerminalStatus.PROCESSING
+
+    def test_worked_for_boundary_with_empty_composer_is_completed(self):
+        """A finished turn's own "─ Worked for <duration> ──" boundary line,
+        followed by the empty composer, must read COMPLETED (evidence/
+        phaseC_pane.txt, trimmed to the boundary and footer)."""
+        screen_lines = [
+            "• Ran printf START > marker.txt; sleep 120; printf ' END' >> marker.txt; "
+            "cat marker.txt",
+            "  └ START END",
+            "─" * 40,
+            "• [C1-durability]",
+            "  START END",
+            "─ Worked for 2m 08s " + "─" * 40,
+            "» Ask Codex to do anything",
+            "  gpt-6-astra ultra · ~/path",
+        ]
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status_from_screen(screen_lines) == TerminalStatus.COMPLETED
+
+    def test_pre_task_idle_composer_is_idle(self):
+        """The pane before any task is dispatched -- fresh idle composer, no
+        spinner, no prior turn -- must read IDLE, not PROCESSING or COMPLETED."""
+        screen_lines = [
+            "OpenAI Codex (v0.153.4)",
+            "» Ask Codex to do anything",
+            "",
+            "  gpt-6-astra ultra · ~/path",
+        ]
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status_from_screen(screen_lines) == TerminalStatus.IDLE
 
 
 class TestCodexBulletFormatStatusDetection:
