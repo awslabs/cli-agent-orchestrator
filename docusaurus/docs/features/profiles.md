@@ -48,7 +48,7 @@ You are the Developer Agent. Write high-quality, maintainable code.
 
 | Field | Type | Scope | Description |
 |-------|------|-------|-------------|
-| `role` | string | All | `"supervisor"`, `"developer"`, `"reviewer"`, or custom role |
+| `role` | string | All | `"supervisor"`, `"developer"`, `"reviewer"`, `"workflow_scout"`, or custom role |
 | `provider` | string | All | Provider to run this agent on (e.g., `"claude_code"`, `"kiro_cli"`) |
 | `allowedTools` | array | All | CAO tool vocabulary allowlist; overrides role defaults |
 | `skills` | array | All | Restrict injected skill catalog (fnmatch globs); omit for full catalog |

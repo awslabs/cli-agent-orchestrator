@@ -119,7 +119,7 @@ Override via REST API, Web UI Settings page, `cao config set agents.dirs.<provid
 
 `agents.disabled_dirs` lists configured directories (defaults or extras) the user has toggled **off**: a disabled directory stays listed in Settings but is skipped when scanning for and loading agent profiles, so its profiles leave the active set without removing the path (GH #280/#281). Only paths that match a configured directory are accepted; entries are validated with the same path normalization the scanner uses (`~`, trailing slashes, and symlinks all match). Manage it via the Web UI Settings toggles, `cao config set agents.disabled_dirs '[...]'`, or `settings.json`.
 
-`agents.roles` defines custom [role](../CODEBASE.md) → `allowedTools` bundles, layered on top of the built-in `supervisor` / `reviewer` / `developer` roles.
+`agents.roles` defines custom [role](../CODEBASE.md) → `allowedTools` bundles, layered on top of the built-in `supervisor` / `reviewer` / `developer` / `workflow_scout` roles.
 
 ### Skills (`skills`)
 
