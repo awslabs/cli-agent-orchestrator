@@ -23,14 +23,14 @@
 
 ## CAO 是什么？
 
-CAO（读作 "kay-oh"）是一个轻量的本地编排器，位于你和常用 CLI 编程 Agent 之间。你不再只能一次运行一个 Agent，而是可以让 supervisor Agent 启动、发送消息并协调多个 worker Agent。每个 worker 都是真实的 CLI 工具（如 Claude Code、Kiro、Codex 等），运行在自己的 tmux 终端里。
+CAO（读作 "kay-oh"）是一个轻量的本地编排器，位于你和常用 CLI 编程 Agent 之间。你不再只能一次运行一个 Agent，而是可以让 supervisor Agent 启动、发送消息并协调多个 worker Agent。每个 worker 都是真实的 CLI 工具（如 Claude Code、Codex、Grok 等），运行在自己的 tmux 终端里。
 
 Agent 之间通过 MCP 暴露的原语通信，包括 **handoff**、**assign** 和 **send_message**。你可以通过 CLI、内置 Web UI，或 MCP 管理服务器来管理它们。由于每个 Agent 都是完整的 CLI 进程，CAO 能保留原工具的行为、鉴权方式和高级能力，例如 Claude Code sub-agents、Kiro CLI custom agents 等。这些是普通 API wrapper 难以完整保留的。
 
 ## 常见使用场景
 
 - **并行代码审查 / 实现**：supervisor 同时分派 N 个 reviewer 审查 N 个文件，然后汇总结果。
-- **跨 provider 工作流**：supervisor 使用一个 CLI（如 Kiro），worker 使用另一个 CLI（如 Claude Code），也可以按 profile 指定 provider。
+- **跨 provider 工作流**：supervisor 和 worker 可以使用不同 CLI，也可以按 profile 指定 provider。
 - **定时 Agent 任务**：通过 [Flows](docs/flows.md) 设置类似 cron 的触发器，例如「每天早上 9 点」运行。
 - **CI 中的无头 Agent 执行**：使用 `cao launch --headless --async` 无人值守地运行任务。
 - **带 HITL 的多 Agent swarm**：人可以 attach 到任意 tmux 会话，随时介入或调整方向。
@@ -136,7 +136,7 @@ CAO 驱动的是已有 CLI Agent 工具，它并不会替代这些工具。使�
 
 | Provider | 文档 | 鉴权 |
 |----------|------|------|
-| **Kiro CLI**（默认） | [Provider docs](docs/kiro-cli.md) · [Installation](https://kiro.dev/docs/kiro-cli) | AWS credentials |
+| **Codex CLI**（默认） | [Provider docs](docs/codex-cli.md) | OpenAI authentication |
 | **Claude Code** | [Provider docs](docs/claude-code.md) · [Installation](https://docs.anthropic.com/en/docs/claude-code/getting-started) | Anthropic API key |
 | **Codex CLI** | [Provider docs](docs/codex-cli.md) · [Installation](https://github.com/openai/codex) | OpenAI API key |
 | **Hermes Agent** | [Provider docs](docs/hermes.md) | Hermes auth；可选 `hermesProfile` wrapper；在选中的 Hermes profile 中配置 `cao-mcp-server` 以启用编排工具 |
@@ -193,7 +193,7 @@ cao launch --agents code_supervisor
 
 # 或指定 provider
 cao launch --agents code_supervisor --provider claude_code
-# 可选值：kiro_cli | claude_code | codex | antigravity_cli | hermes | kimi_cli | mcode | copilot_cli | opencode_cli | omp | cursor_cli
+# 可选值：codex | claude_code | grok_cli
 
 # 不限制访问、跳过确认（危险）
 cao launch --agents code_supervisor --yolo
@@ -305,7 +305,7 @@ provider: claude_code
 ---
 ```
 
-有效值包括：`kiro_cli`、`claude_code`、`codex`、`antigravity_cli`、`hermes`、`kimi_cli`、`mcode`、`copilot_cli`、`opencode_cli`、`omp`、`cursor_cli`。初始会话始终以 `cao launch --provider` 参数为准。详见 [`examples/cross-provider/`](examples/cross-provider/)。
+有效值包括：`codex`、`claude_code`、`grok_cli`。初始会话始终以 `cao launch --provider` 参数为准。详见 [`examples/cross-provider/`](examples/cross-provider/)。
 
 ### Tool Restrictions
 
