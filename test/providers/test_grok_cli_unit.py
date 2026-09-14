@@ -722,13 +722,24 @@ def test_profile_can_explicitly_enable_native_grok_workflows(tmp_path):
     provider.cleanup()
 
 
-def test_directory_trust_fixture_is_recognized():
-    output = (
-        "Do you trust the contents of this directory?\n"
-        "Grok Build may run or modify contents in this directory, posing security risks.\n"
-        "Yes, proceed  y\nNo, quit  n"
+def _raw_directory_trust_screen() -> str:
+    """Grok 1.0.30 startup cells from the failing terminal log, path scrubbed."""
+    return (
+        "\x1b[19;89HDo\x1b[19;92Hyou\x1b[19;96Htrust\x1b[19;102Hthe"
+        "\x1b[19;106Hcontents\x1b[19;115Hof\x1b[19;118Hthis\x1b[19;123Hdirectory?"
+        "\x1b[20;94H/workspace/project"
+        "\x1b[22;83HGrok\x1b[22;88HBuild\x1b[22;94Hmay\x1b[22;98Hrun"
+        "\x1b[22;102Hor\x1b[22;105Hmodify\x1b[22;112Hcontents\x1b[22;121Hin"
+        "\x1b[22;124Hthis\x1b[22;129Hdirectory,"
+        "\x1b[23;100Hposing\x1b[23;107Hsecurity\x1b[23;116Hrisks."
+        "\x1b[25;96H\x1b[1mYes, proceed\x1b[25;125H\x1b[22my"
+        "\x1b[26;96H\x1b[1mNo, quit\x1b[26;125H\x1b[22mn"
+        "\x1b[49;192H\x1b[1mGrok Build  \x1b[22m1.0.30\x1b[49;211H[stable]"
     )
-    assert DIRECTORY_TRUST_PATTERN.search(output)
+
+
+def test_directory_trust_fixture_is_recognized():
+    assert DIRECTORY_TRUST_PATTERN.search(strip_terminal_escapes(_raw_directory_trust_screen()))
 
 
 def test_build_command_model_precedence_rules_and_skill_prompt(tmp_path):
@@ -1278,19 +1289,17 @@ def test_home_process_rejects_non_grok_executable_with_matching_home(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_startup_trust_screen_fails_explicitly_without_auto_acceptance():
+async def test_startup_trust_screen_is_auto_accepted():
     provider = make_provider()
-    trust_screen = (
-        "Do you trust the contents of this directory?\n"
-        "Grok Build may run or modify contents in this directory, posing security risks.\n"
-        "Yes, proceed  y\nNo, quit  n"
-    )
+    trust_screen = _raw_directory_trust_screen()
+    backend = MagicMock()
     with (
         patch.object(status_monitor, "get_buffer", return_value=trust_screen),
-        patch.object(status_monitor, "get_status"),
+        patch.object(status_monitor, "get_status", return_value=TerminalStatus.IDLE),
+        patch("cli_agent_orchestrator.providers.grok_cli.get_backend", return_value=backend),
     ):
-        with pytest.raises(ProviderError, match="does not automatically trust"):
-            await provider._wait_for_startup_ready(timeout=1)
+        await provider._wait_for_startup_ready(timeout=2)
+    backend.send_special_key.assert_called_once_with("test-session", "test-window", "Enter")
 
 
 @pytest.mark.asyncio

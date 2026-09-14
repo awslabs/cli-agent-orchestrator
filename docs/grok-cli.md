@@ -166,12 +166,11 @@ A newly isolated home can show Grok's `Help improve Grok` telemetry choice.
 The banner is non-blocking and is ignored by CAO's status and response
 extraction logic.
 
-CAO never automatically accepts Grok's directory-trust screen. Accepting it
-would enable project-local MCP, LSP, and hook configuration under the terminal
-user's privileges; selecting No quits Grok. If that screen is detected, CAO
-fails startup with an actionable error. Review and remove project-local
-configuration such as `.mcp.json` or `.grok/` before launching the CAO
-terminal, or use standalone Grok when you intentionally want to trust it.
+CAO automatically accepts Grok Build 1.0.30's directory-trust screen so
+startup is unattended, matching the Codex and Claude Code providers. Review
+project-local configuration such as `.mcp.json` or `.grok/` before launching
+the CAO terminal, because trusted MCP, LSP, and hook configuration runs with
+the terminal user's privileges.
 
 ## Tool Restrictions
 
