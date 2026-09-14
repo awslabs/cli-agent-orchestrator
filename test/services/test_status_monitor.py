@@ -42,6 +42,16 @@ class TestGetStatusTmux:
 
         assert sm.get_status("missing") == TerminalStatus.UNKNOWN
 
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_explicit_hook_status_has_priority(self, mock_get_backend):
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+
+        sm.report_status("t1", TerminalStatus.COMPLETED)
+
+        assert sm.get_status("t1") == TerminalStatus.COMPLETED
+
 
 class TestGetStatusEventInbox:
     """Event-inbox backend (herdr): derive status on demand from the provider."""

@@ -86,6 +86,16 @@ When you launch with an agent profile (e.g., `--agents code_supervisor`), CAO:
 
 This enables Codex to operate with role-specific instructions (e.g., supervisor, developer, reviewer) just like other providers.
 
+### Lifecycle status hooks
+
+CAO exposes `POST /terminals/{terminal_id}/status` and the helper
+`scripts/cao-status-hook` for providers that emit lifecycle callbacks. A hook
+can report `processing`, `completed`, `idle`, `waiting_user_answer`, or `error`;
+the reported value is used immediately and takes precedence over output-derived
+status. Codex's current hook events are session and tool events, so CAO does
+not infer task completion from them. Use the helper only from an integration
+that can distinguish a task turn's start and end.
+
 ### MCP Server Integration
 
 If the agent profile includes `mcpServers`, CAO injects each MCP server into Codex via `-c mcp_servers.<name>.<field>=<value>` config overrides. This is per-session and does not modify the user's global `~/.codex/config.toml`.

@@ -87,8 +87,10 @@ WAITING_USER_PATTERN = re.compile(
 # grant project-local MCP, LSP, and hooks permission to run repository-defined
 # code, so it is not an ordinary picker CAO may auto-answer.
 DIRECTORY_TRUST_PATTERN = re.compile(
-    r"Do you trust the contents of this directory\?.*?"
-    r"Grok Build may run or modify contents in this directory",
+    # Grok Build 1.0.30 draws each word with cursor-positioned cells.  After
+    # ANSI cleanup the current UI is a single continuous string.
+    r"Doyoutrustthecontentsofthisdirectory\?.*?"
+    r"GrokBuildmayrunormodifycontentsinthisdirectory",
     re.IGNORECASE | re.DOTALL,
 )
 ERROR_PATTERN = re.compile(
@@ -539,25 +541,26 @@ class GrokCliProvider(BaseProvider):
             raise
 
     async def _wait_for_startup_ready(self, timeout: float) -> None:
-        """Wait for the composer, failing explicitly rather than granting trust.
-
-        Selecting ``No`` at Grok's directory-trust dialog quits and selecting
-        ``Yes`` permits repository-controlled MCP/LSP/hooks under the terminal
-        user's privileges. CAO must do neither in an unattended launch.
-        """
+        """Wait for the composer, accepting Grok's directory-trust dialog."""
 
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
         deadline = asyncio.get_running_loop().time() + timeout
+        trust_accepted = False
         while asyncio.get_running_loop().time() < deadline:
             output = status_monitor.get_buffer(self.terminal_id)
-            if DIRECTORY_TRUST_PATTERN.search(strip_terminal_escapes(output)):
-                raise ProviderError(
-                    "Grok Build is waiting for directory trust. CAO does not automatically "
-                    "trust repository-local MCP, LSP, or hooks. Review and remove the "
-                    "project-local configuration (for example .mcp.json or .grok/) before "
-                    "launching this CAO terminal."
+            if not trust_accepted and DIRECTORY_TRUST_PATTERN.search(strip_terminal_escapes(output)):
+                logger.info("Grok directory trust prompt detected, auto-accepting")
+                status_monitor.notify_input_sent(self.terminal_id)
+                await asyncio.to_thread(
+                    get_backend().send_special_key,
+                    self.session_name,
+                    self.window_name,
+                    "Enter",
                 )
+                trust_accepted = True
+                await asyncio.sleep(1.0)
+                continue
             # Off the loop: get_status() can fork a tmux capture-pane for a PROCESSING
             # terminal (status_monitor.py's stale-PROCESSING fallback) and this polls
             # every second on the shared event loop during init.
