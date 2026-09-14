@@ -683,6 +683,38 @@ def _send_direct_input_handoff(terminal_id: str, provider: str, message: str) ->
     _send_direct_input(terminal_id, handoff_message, OrchestrationType.HANDOFF)
 
 
+def _reuse_idle_worker(
+    *, session_name: str, agent_profile: str, provider: str, message: str
+) -> Optional[str]:
+    """Reuse an idle worker in the caller's session when its role matches.
+
+    Assign is intentionally opportunistic: a transient API failure or a race
+    with another assignment falls back to creating a fresh worker, preserving
+    the existing dispatch contract.
+    """
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}/sessions/{session_name}/terminals",
+            headers=_auth_headers() or None,
+            timeout=_mcp_timeout(),
+        )
+        response.raise_for_status()
+        terminals = response.json()
+        for terminal in terminals if isinstance(terminals, list) else []:
+            if (
+                terminal.get("agent_profile") == agent_profile
+                and terminal.get("provider") == provider
+                and terminal.get("status") in {"idle", "completed"}
+            ):
+                terminal_id = terminal.get("id")
+                if terminal_id:
+                    _send_direct_input(terminal_id, message, OrchestrationType.ASSIGN)
+                    return terminal_id
+    except Exception:
+        logger.debug("Unable to reuse idle worker; creating a new terminal", exc_info=True)
+    return None
+
+
 class HandoffContext(NamedTuple):
     """Supervisor-derived context for a handoff, resolved WITHOUT creating a terminal.
 
@@ -1554,6 +1586,31 @@ def _assign_impl(
                 callback_url=callback_url,
                 remote_session_name=remote_session_name,
             )
+
+        # Prefer an already-created idle worker with the same role/provider.
+        # This keeps a session's worker pool reusable and avoids needless CLI
+        # startup cost while retaining the create-on-demand behavior.
+        supervisor_meta = requests.get(
+            f"{API_BASE_URL}/terminals/{current_terminal_id}",
+            headers=_auth_headers() or None,
+            timeout=_mcp_timeout(),
+        ).json()
+        worker_provider = resolve_provider(
+            agent_profile, fallback_provider=supervisor_meta.get("provider", DEFAULT_PROVIDER)
+        )
+        reused_id = _reuse_idle_worker(
+            session_name=supervisor_meta.get("session_name", ""),
+            agent_profile=agent_profile,
+            provider=worker_provider,
+            message=worker_message,
+        ) if supervisor_meta.get("session_name") else None
+        if reused_id:
+            return {
+                "success": True,
+                "terminal_id": reused_id,
+                "message": f"Task assigned to existing idle {agent_profile} worker (terminal: {reused_id}).",
+                "reused": True,
+            }
 
         # Create terminal in DEFERRED-INIT mode: cao-server returns as soon
         # as the tmux window is up and the DB row is written; the actual
