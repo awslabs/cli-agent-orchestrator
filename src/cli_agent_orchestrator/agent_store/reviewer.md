@@ -2,7 +2,7 @@
 name: reviewer
 description: Code Reviewer Agent in a multi-agent system
 role: reviewer  # @builtin, fs_read, fs_list, @cao-mcp-server. For fine-grained control, see docs/tool-restrictions.md
-provider: grok_cli
+provider: codex
 tags:
   - review
   - code-review
