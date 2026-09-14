@@ -96,6 +96,7 @@ from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.memory import (
+    LenientMemoryKey,
     MemoryKey,
     MemoryScope,
     MemoryScopeId,
@@ -158,6 +159,7 @@ from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.services.terminal_service import (
     TERMINAL_RANGE_MAX_LENGTH,
+    IdempotencyKeyConflict,
     OutputMode,
     TerminalInputBlockedError,
     _notify_elastic_terminal_ended,
@@ -718,6 +720,19 @@ class ResumeRunRequest(BaseModel):
             "step_id -> 'rerun' (re-execute) | 'skip' (use the stored result). "
             "Applied before the script is spawned; an unknown step id or value is a "
             "400 and applies nothing at all."
+        ),
+    )
+
+
+class StepReplayRequest(BaseModel):
+    """Request body for ``POST /workflows/runs/{run_id}/steps/{step_id}:replay`` (#640)."""
+
+    prompt_override: Optional[str] = Field(
+        default=None,
+        description=(
+            "Replacement prompt TEMPLATE for this one replay; {{workflow.inputs.*}} and "
+            "{{steps.*.output.*}} references in it still resolve against the recorded "
+            "run. Omit to reuse the snapshotted step prompt."
         ),
     )
 
@@ -2829,13 +2844,22 @@ class AgentDirsUpdate(BaseModel):
 
 @app.get("/settings/memory")
 async def get_memory_settings_endpoint() -> Dict:
-    """Return whether the memory subsystem is enabled (for UI feature discovery)."""
+    """Return whether the memory subsystem is enabled (for UI feature discovery).
+
+    ``settings_readable`` is additive: False means the two flags above are
+    defaults resolved WITHOUT settings.json, not a deliberate configuration.
+    """
     from cli_agent_orchestrator.services.settings_service import (
         is_learning_enabled,
         is_memory_enabled,
+        settings_readable,
     )
 
-    return {"enabled": is_memory_enabled(), "learning_enabled": is_learning_enabled()}
+    return {
+        "enabled": is_memory_enabled(),
+        "learning_enabled": is_learning_enabled(),
+        "settings_readable": settings_readable(),
+    }
 
 
 @app.post("/settings/agent-dirs")
@@ -2946,6 +2970,8 @@ async def create_session(
     memory_manager: Optional[str] = None,
     engine: Optional[KiroEngine] = None,
     model: Optional[str] = None,
+    use_worktree: bool = False,
+    idempotency_key: Optional[str] = None,
     resume_session_id: Optional[str] = None,
     body: Optional[CreateSessionBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
@@ -2979,6 +3005,28 @@ async def create_session(
     the initial terminal at creation time (``group`` is also updatable later
     via ``PATCH /terminals/{id}/group``, ``metadata`` via the
     ``update_metadata`` MCP tool).
+
+    ``use_worktree`` (issue #100 Phase 1; review on PR #634): provision an
+    isolated git worktree for this terminal instead of sharing
+    ``working_directory`` as given, mirroring ``POST
+    /sessions/{name}/terminals``'s parameter of the same name. Previously only
+    that sibling endpoint threaded it through to
+    ``terminal_service.create_terminal`` -- a fresh (no existing session)
+    caller requesting a worktree had it silently dropped.
+
+    ``idempotency_key`` (review on PR #634, issue #616): a caller-supplied
+    token making a retry of this exact request safe. Supply the SAME key on
+    a retry (e.g. after the original response was lost) and this endpoint
+    returns the terminal the first, already-committed attempt created,
+    instead of creating a second one -- see
+    ``terminal_service.create_terminal``'s docstring for the mechanics.
+    Omitted (default): today's behavior, no retry protection.
+
+    The key is matched together with a fingerprint of the request, not on its
+    own, so presenting a key that a DIFFERENT request already claimed returns
+    **409 CONFLICT** rather than that other request's terminal. A key whose
+    terminal has since been torn down is stale, not conflicting, and simply
+    creates fresh.
     """
     initial_message = body.initial_message if body else None
     initial_message_orchestration_type = None
@@ -3034,6 +3082,8 @@ async def create_session(
             initial_message=initial_message,
             initial_message_orchestration_type=initial_message_orchestration_type,
             model=model,
+            use_worktree=use_worktree,
+            idempotency_key=idempotency_key,
             resume_session_id=resume_session_id,
             group=body.group if body else None,
             metadata=body.metadata if body else None,
@@ -3043,6 +3093,30 @@ async def create_session(
             registry = get_plugin_registry(request)
             sidecar_provider = provider or DEFAULT_PROVIDER
             sidecar_session = result.session_name
+            # The sidecar gets its OWN key, DERIVED from the caller's (review on
+            # PR #634, issue #616). This spawn is unconditional -- it runs after
+            # create_session whether the primary was created or resolved from an
+            # existing key -- and the returned Terminal cannot say which, so two
+            # identical keyed requests used to spawn two memory_manager workers
+            # for one primary: the exact no-duplicate-workers criterion the key
+            # exists to hold.
+            #
+            # Deriving a key rather than plumbing a created-vs-reused flag out
+            # through both create endpoints is the smaller correct fix, and it is
+            # strictly stronger: the sidecar create becomes idempotent in its own
+            # right, so the second request reuses the FIRST sidecar even in the
+            # races a boolean would miss (both requests seeing "created", or the
+            # first response being lost before the flag is read). The suffix
+            # keeps it out of the primary's namespace so it can never collide
+            # with the caller's own key.
+            #
+            # Sidecar args are all derived from the primary request or its
+            # result, so a genuine retry fingerprints identically and hits;
+            # anything else 409s inside the task and is logged below like any
+            # other sidecar failure, without failing the primary.
+            sidecar_idempotency_key = (
+                f"{idempotency_key}:memory-manager-sidecar" if idempotency_key else None
+            )
 
             async def _spawn_sidecar() -> None:
                 try:
@@ -3054,6 +3128,7 @@ async def create_session(
                         session_name=sidecar_session,
                         working_directory=working_directory,
                         registry=registry,
+                        idempotency_key=sidecar_idempotency_key,
                     )
                 except Exception as e:
                     logger.warning(f"Failed to spawn memory_manager sidecar: {e}")
@@ -3062,11 +3137,24 @@ async def create_session(
 
         return result
 
+    except IdempotencyKeyConflict as e:
+        # The key was already used for a DIFFERENT request (review on PR #634,
+        # issue #616). 409, matching Stripe/AWS IdempotentParameterMismatch,
+        # rather than silently serving the first call's terminal to a caller
+        # who asked for something else. IdempotencyKeyConflict subclasses
+        # Exception and NOT ValueError precisely so this arm cannot be
+        # shadowed by the 400 arm below -- which, note, sits FIRST here.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except TerminalLimitError as e:
         # Node is at its tracked-terminal cap (CAO_MAX_TERMINALS) — a capacity
         # rejection, not a bad request: the caller should retry on another node.
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
     except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except WorktreeError as e:
+        # use_worktree=true against a working_directory that isn't a git
+        # repo, or the 'git worktree add' itself failed -- a client-input
+        # problem, not a server crash. Mirrors POST /sessions/{name}/terminals.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:
         raise HTTPException(
@@ -3177,6 +3265,7 @@ async def create_terminal_in_session(
     defer_init: bool = False,
     model: Optional[str] = None,
     use_worktree: bool = False,
+    idempotency_key: Optional[str] = None,
     body: Optional[CreateTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
@@ -3208,6 +3297,20 @@ async def create_terminal_in_session(
     ``defer_init`` rather than moving into the JSON body. Runs synchronously
     before the deferred-init background task (if any) is scheduled, so it
     applies the same way regardless of ``defer_init``.
+
+    ``idempotency_key`` (review on PR #634, issue #616): a caller-supplied
+    token making a retry of this exact request safe. Supply the SAME key on
+    a retry (e.g. after the original response was lost) and this endpoint
+    returns the terminal the first, already-committed attempt created,
+    instead of creating a second one -- see
+    ``terminal_service.create_terminal``'s docstring for the mechanics.
+    Omitted (default): today's behavior, no retry protection.
+
+    The key is matched together with a fingerprint of the request, not on its
+    own, so presenting a key that a DIFFERENT request already claimed returns
+    **409 CONFLICT** rather than that other request's terminal. A key whose
+    terminal has since been torn down is stale, not conflicting, and simply
+    creates fresh.
     """
     try:
         validate_tmux_name(session_name, "session_name")
@@ -3276,12 +3379,20 @@ async def create_terminal_in_session(
             engine=engine,
             model=model,
             use_worktree=use_worktree,
+            idempotency_key=idempotency_key,
         )
         return result
     except HTTPException:
         # Deliberate 4xx (e.g. the initial_message/defer_init guard, invalid
         # orchestration_type) — propagate as-is instead of masking as a 500.
         raise
+    except IdempotencyKeyConflict as e:
+        # The key was already used for a DIFFERENT request (review on PR #634,
+        # issue #616) — 409, not the 404 the generic ValueError arm below would
+        # give it. Unlike the Kiro arm, this one does not depend on preceding
+        # that arm: IdempotencyKeyConflict is not a ValueError, so no reorder
+        # of the ValueError family can shadow it.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except (KiroPhase0KASError, KiroCapabilityError) as e:
         # Both subclass ValueError, so they must precede the generic arm below —
         # a rejected engine is a bad request, not a missing resource. Matches
@@ -5027,6 +5138,8 @@ async def start_workflow_run_endpoint(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail=_approval_refusal_detail(e),
             )
+        except approval_gate.PlanApprovalUnavailableError as e:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
         except approval_gate.PlanApprovalRequiredError as e:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN, detail=_approval_refusal_detail(e)
@@ -5206,6 +5319,8 @@ async def submit_workflow_run_endpoint(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail=_approval_refusal_detail(e),
             )
+        except approval_gate.PlanApprovalUnavailableError as e:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
         except approval_gate.PlanApprovalRequiredError as e:
             # 403, distinct from this endpoint's 409 (run_id collision) and 422 (lint / corrupt), so a
             # caller can tell "needs approval" from "the run broke".
@@ -6529,6 +6644,7 @@ async def get_workflow_run_result_endpoint(
         for s in steps
     ]
     error_kind = _resolve_error_kind(row, steps)
+    run_error = getattr(row, "error", None)
     result = WorkflowRunResult(
         run_id=row.run_id,
         workflow_name=row.workflow_name,
@@ -6537,6 +6653,7 @@ async def get_workflow_run_result_endpoint(
         started_at=row.started_at,
         finished_at=row.finished_at,
         kind=error_kind,
+        warnings=[run_error] if run_error else [],
     )
     body = result.model_dump()
 
@@ -6705,6 +6822,8 @@ async def resume_workflow_run_endpoint(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail=_approval_refusal_detail(e),
             )
+        except approval_gate.PlanApprovalUnavailableError as e:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
         except approval_gate.PlanApprovalRequiredError as e:
             # issue #583 Bolt 2, ``approval-gate``: 403, and it must be caught HERE rather than left
             # to the arms below. ``PlanApprovalRequiredError`` is deliberately not a ``ValueError``
@@ -6748,6 +6867,62 @@ async def resume_workflow_run_endpoint(
     except workflow_service.WorkflowEngineError as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
     return result.model_dump()
+
+
+@app.post("/workflows/runs/{run_id}/steps/{step_id}:replay")
+async def replay_workflow_step_endpoint(
+    run_id: str,
+    step_id: str,
+    body: Optional[StepReplayRequest] = None,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Re-execute ONE step of a recorded run and return its live result (issue #640).
+
+    Write-scoped because it creates a terminal and runs an agent — but READ-ONLY
+    with respect to the run it replays: the service writes no journal row and emits
+    no event for ``run_id``, so a completed or failed run can be re-probed step by
+    step, repeatedly, without disturbing what it recorded.
+
+    The step's prompt is resolved from the run's own journal (spec snapshot,
+    resolved inputs, predecessor outputs); an optional ``prompt_override`` replaces
+    the prompt TEMPLATE while keeping that resolution.
+
+    Error taxonomy mirrors the resume route: unknown run or unknown step -> 404, an
+    undeserializable spec snapshot -> 422, a script-tier run, an empty
+    ``prompt_override``, or a prompt that cannot be resolved from the recorded
+    predecessors -> 400. A step that FAILS is a 200 whose body carries ``error`` /
+    ``error_kind`` (a failed step is data, not a transport fault).
+
+    **The immutability guarantee has an audit consequence, accepted deliberately.**
+    Writing no journal row and emitting no event is what makes replay safe on a
+    recorded run — and it also means a replay execution is INVISIBLE to anything
+    treating the journal or event stream as the execution audit log, and is not
+    gated by plan approval (which gates run *starts*). That is consistent with CAO's
+    local single-operator model; the service logs each replay at INFO, which is the
+    trail. A deployment that needs replays audited should read those logs, not the
+    journal.
+    """
+    from cli_agent_orchestrator.services import workflow_service
+
+    try:
+        return await workflow_service.replay_single_step(
+            run_id,
+            step_id,
+            prompt_override=body.prompt_override if body is not None else None,
+        )
+    except KeyError as e:
+        # The service distinguishes "unknown run" from "unknown step" in the message;
+        # surface it rather than flattening both to the run-scoped default.
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e.args[0]) if e.args else f"unknown run '{run_id}'",
+        )
+    except workflow_service.ResumeCorruptError as e:
+        # 422 by literal code, matching the resume route's note on the ``status``
+        # alias drifting across Starlette versions in the CI matrix.
+        raise HTTPException(status_code=422, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 
 # ── graph layer (U4, Issue #348) ────────────────────────────────────────
@@ -7055,16 +7230,18 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
       hijacking guard);
     * when the HTTP auth layer is enabled (``AUTH0_DOMAIN`` /
       ``CAO_AUTH_JWKS_URI`` set — see :func:`is_auth_enabled`), the handshake
-      must carry a valid bearer token granting at least the ``cao:read``
-      scope.
+      must carry a valid bearer token granting ``cao:write`` or ``cao:admin``.
+      Keystroke injection is RCE; ``cao:read`` is not enough. HTTP
+      ``POST /terminals/{id}/input`` already requires write.
 
     Token scheme: browsers cannot set request headers on a WebSocket
     handshake, so the token is accepted from either ``Authorization: Bearer
     <token>`` (native clients) or a ``?token=<token>`` query parameter (the
     bundled web viewer). The token is verified exactly like the HTTP layer —
     RS256 signature, issuer, audience and expiry via the JWKS cache — and a
-    missing/invalid token or one lacking ``cao:read`` closes the handshake
-    with code 4401 before accept. This closes the bypass where widening
+    missing/invalid token or one lacking ``cao:write`` (or ``cao:admin``)
+    closes the handshake with code 4401 before accept. This closes the bypass
+    where widening
     ``CAO_WS_ALLOWED_CLIENTS`` / ``CAO_WS_ALLOWED_ORIGINS`` for containers,
     devcontainers or Codespaces exposed full PTY control with no credential.
     Do NOT expose the server to untrusted networks (e.g. --host 0.0.0.0)
@@ -7118,9 +7295,10 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
     # identity: browsers cannot set request headers on a WebSocket handshake,
     # so the token is accepted from the Authorization header or a ``?token=``
     # query parameter. The token is verified with the same JWKS/issuer/
-    # audience/expiry logic as the HTTP layer and must grant at least
-    # ``SCOPE_READ``. Default-off (auth disabled): no token is required and
-    # behavior is byte-for-byte unchanged.
+    # audience/expiry logic as the HTTP layer and must grant ``SCOPE_WRITE``
+    # or ``SCOPE_ADMIN``. ``SCOPE_READ`` is enough to watch HTTP output, not
+    # to type into the PTY. Default-off (auth disabled): no token is required
+    # and behavior is byte-for-byte unchanged.
     if is_auth_enabled():
         token = _extract_bearer(websocket.headers.get("authorization"))
         if not token:
@@ -7141,11 +7319,12 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
             )
             await websocket.close(code=4401, reason="Unauthorized")
             return
-        if SCOPE_READ not in scopes:
+        if SCOPE_WRITE not in scopes and SCOPE_ADMIN not in scopes:
             logger.warning(
-                "Rejected WebSocket attach for terminal %r: token lacks %r scope",
+                "Rejected WebSocket attach for terminal %r: token lacks %r/%r scope",
                 terminal_id,
-                SCOPE_READ,
+                SCOPE_WRITE,
+                SCOPE_ADMIN,
             )
             await websocket.close(code=4401, reason="Unauthorized")
             return
@@ -7496,7 +7675,15 @@ class InternalMemoryStoreRequest(BaseModel):
     content: str
     scope: MemoryScope = MemoryScope.PROJECT
     memory_type: MemoryType = MemoryType.PROJECT
-    key: Optional[MemoryKey] = None
+    # Lenient, not strict: these routes back the MCP memory tools, which have
+    # always let MemoryService._sanitize_key normalize the key. Strict validation
+    # here 422'd calls that succeed in-process, so enabling CAO_MEMORY_API_URL
+    # broke working callers. See LenientMemoryKey.
+    # Lenient, not strict: these routes back the MCP memory tools, which have
+    # always let MemoryService._sanitize_key normalize the key. Strict validation
+    # here 422'd calls that succeed in-process, so enabling CAO_MEMORY_API_URL
+    # broke working callers. See LenientMemoryKey.
+    key: Optional[LenientMemoryKey] = None
     tags: str = ""
     terminal_context: Optional[InternalMemoryContext] = None
 
@@ -7513,7 +7700,7 @@ class InternalMemoryRecallRequest(BaseModel):
 
 
 class InternalMemoryForgetRequest(BaseModel):
-    key: MemoryKey
+    key: LenientMemoryKey  # see InternalMemoryStoreRequest.key
     scope: MemoryScope = MemoryScope.PROJECT
     terminal_context: Optional[InternalMemoryContext] = None
 
@@ -8095,18 +8282,35 @@ class OutcomeCreateBody(BaseModel):
 
 
 def _require_learning_enabled() -> None:
-    """Raise 404 when workflow self-learning is disabled.
+    """Raise 404 when workflow self-learning is disabled, 503 when unknown.
 
     list_outcomes() silently returns [] when disabled, so the gate must be
     explicit rather than inferred from empty results (same reasoning as
     ``_require_memory_enabled``).
-    """
-    from cli_agent_orchestrator.services.settings_service import is_learning_enabled
 
-    if not is_learning_enabled():
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Workflow self-learning is disabled"
-        )
+    The 404/503 split is the point: an unreadable settings.json resolves to
+    "disabled" internally (learning fails closed, by design), but reporting THAT
+    as 404 tells the caller a configuration story about a filesystem fault. 503
+    says "I cannot tell", which is what an operator needs to hear.
+
+    ``_require_memory_enabled`` deliberately has no 503 branch — memory fails
+    OPEN, so an unreadable file there resolves to enabled and cannot mislead.
+    """
+    from cli_agent_orchestrator.services.outcome_service import LEARNING_DISABLED_MESSAGE
+    from cli_agent_orchestrator.services.settings_service import (
+        is_learning_enabled,
+        learning_status,
+    )
+
+    if is_learning_enabled():
+        return
+    # Disabled — but WHY? learning_status() is consulted only to explain the
+    # False, never to decide it, so is_learning_enabled() remains the single
+    # decision point every override and test seam already targets.
+    st = learning_status()
+    if st.unreadable:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=st.detail)
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=LEARNING_DISABLED_MESSAGE)
 
 
 @app.post("/outcomes")
@@ -8116,6 +8320,7 @@ async def create_outcome_endpoint(
 ) -> Dict:
     """Record a workflow outcome (self-learning signal)."""
     from cli_agent_orchestrator.services.outcome_service import (
+        LEARNING_DISABLED_MESSAGE,
         LearningDisabledError,
         OutcomeService,
     )
@@ -8133,9 +8338,14 @@ async def create_outcome_endpoint(
             friction_notes=body.friction_notes,
         )
     except LearningDisabledError:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Workflow self-learning is disabled"
-        )
+        # LEARNING_DISABLED_MESSAGE, not a hand-written string: it carries
+        # LEARNING_DISABLED_CODE, which is what the MCP layer matches on before
+        # reporting `disabled: true`. This is the race path — learning was enabled
+        # when _require_learning_enabled() ran and disabled by the time the write
+        # landed — so it is genuinely the feature gate and must read as such.
+        # A bare detail here would surface as a plain error instead, making the
+        # discriminator's coverage depend on which of two gates fired.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=LEARNING_DISABLED_MESSAGE)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     return {"success": True, "outcome": outcome}

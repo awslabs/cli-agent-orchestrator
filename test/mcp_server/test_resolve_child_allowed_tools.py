@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from cli_agent_orchestrator.mcp_server.server import _resolve_child_allowed_tools
+from cli_agent_orchestrator.utils.orchestration import _resolve_child_allowed_tools
 
 
 class TestResolveChildAllowedTools:

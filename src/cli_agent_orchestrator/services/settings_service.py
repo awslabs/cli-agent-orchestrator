@@ -25,70 +25,105 @@ _BOOL_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _BOOL_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 
 
-def _load_result_detail() -> Tuple[Dict[str, Any], bool, bool]:
-    """Load settings with distinct read/decode and parsed-content failures.
+class SettingsUnreadableError(RuntimeError):
+    """settings.json is PRESENT but could not be read or parsed.
 
-    Returns ``(data, ok, read_or_decode_failed)``. THE POINT OF THE STATUS VALUES is that :func:`_load` cannot
-    distinguish an ABSENT settings file from an UNREADABLE one, because both produce ``{}``, and
-    :func:`is_workflow_approval_required` needs them to resolve OPPOSITELY — an absent file is the
-    unconfigured case and the gate defaults ON, while unreadable or malformed settings must leave
-    the gate ON too, with a diagnostic source. The distinction keeps startup reporting truthful and
-    tells operators whether to repair a read/decode failure or parsed invalid configuration.
+    Distinct from "absent", which legitimately means "use the built-in defaults".
+    Conflating the two is how a filesystem problem masquerades as a deliberate
+    opt-out: where reads under the CAO home directory are denied,
+    ``is_learning_enabled()`` answered False and agents reported "workflow
+    self-learning is disabled" — a configuration message for a permissions fault.
 
-    Four states:
+    Callers that must fail closed still do; they just now know WHY.
+    """
 
-    * file absent -> ``({}, True, False)``  -- not a failure; nothing was configured
-    * file present but unreadable or undecodable -> ``({}, False, True)``
-    * file present and parsed but not a JSON object -> ``({}, False, False)``
-    * file present and readable -> ``(data, True, False)``
+    def __init__(self, path: Path, cause: BaseException) -> None:
+        self.path = path
+        self.cause = cause
+        super().__init__(f"{path} could not be read: {type(cause).__name__}: {cause}")
 
-    ONE read, not a ``stat``-then-read: an ``exists()`` probe followed by a read is both a second
-    syscall and a TOCTOU window in which the file can vanish. A file that disappears between the
-    call and the read therefore reports as absent rather than as a read failure, which is the
-    truthful answer.
+    def redacted_detail(self) -> str:
+        """Describe the failure WITHOUT the absolute path, for API responses.
 
-    Logging is deliberately IDENTICAL to the previous implementation so that :func:`_load`'s
-    observable behaviour is unchanged for its other callers: the two failure paths that logged a
-    ``warning`` still do, at the same level with the same message, and the not-a-JSON-object case
-    still logs nothing. The gate does its own ``error``-level logging, because for the gate the
-    condition is a lost security control rather than a missing preference.
+        Server filesystem paths are deliberately kept out of HTTP payloads (the
+        same reason ``MemorySummary`` excludes ``file_path``), so the path is
+        logged server-side and only the exception kind travels.
+        """
+        return (
+            f"CAO settings.json could not be read ({type(self.cause).__name__}); "
+            "configuration state is unknown — check permissions on the CAO home directory"
+        )
+
+
+def _load_or_raise() -> Dict[str, Any]:
+    """Load settings, distinguishing "absent" from "unreadable".
+
+    Deliberately calls ``read_text()`` rather than testing ``exists()`` first:
+    ``Path.exists()`` swallows ``PermissionError`` from the PARENT directory and
+    returns False, so an unreadable home directory would take the "no settings
+    file, use defaults" branch silently, without even a log line.
     """
     try:
         raw = SETTINGS_FILE.read_text()
     except FileNotFoundError:
-        return {}, True, False
-    except (OSError, ValueError) as e:
-        # ValueError covers UnicodeDecodeError, which read_text raises and which is NOT an OSError.
-        logger.warning(f"Failed to read settings: {e}")
-        return {}, False, True
+        return {}  # genuinely absent — defaults are the right answer
+    except (OSError, ValueError) as e:  # Includes UnicodeDecodeError from read_text().
+        raise SettingsUnreadableError(SETTINGS_FILE, e) from e
+
     try:
         data = json.loads(raw)
     except ValueError as e:
-        logger.warning(f"Failed to read settings: {e}")
-        return {}, False, True
+        raise SettingsUnreadableError(SETTINGS_FILE, e) from e
     if not isinstance(data, dict):
-        return {}, False, False
-    return data, True, False
+        raise SettingsUnreadableError(
+            SETTINGS_FILE, TypeError(f"expected a JSON object, got {type(data).__name__}")
+        )
+    return data
+
+
+def _load_result_detail() -> Tuple[Dict[str, Any], bool, bool]:
+    """Read once, distinguishing absent, unreadable, and parsed-invalid settings.
+
+    Approval stays enabled on either failure, but its diagnostic source distinguishes
+    read/decode failures from a parsed value that is not a JSON object. Use the same
+    strict loader as learning_status so both controls observe the same file semantics.
+    """
+    try:
+        return _load_or_raise(), True, False
+    except SettingsUnreadableError as e:
+        read_or_decode_failed = not isinstance(e.cause, TypeError)
+        if read_or_decode_failed:
+            logger.warning(f"Failed to read settings: {e}")
+        return {}, False, read_or_decode_failed
 
 
 def _load_result() -> Tuple[Dict[str, Any], bool]:
-    """Load settings, reporting whether the file could actually be read.
-
-    The two-item return shape is retained for existing callers. Approval posture needs the richer
-    distinction provided by :func:`_load_result_detail`.
-    """
+    """Retain the two-item settings result for callers that only need readability."""
     data, ok, _read_or_decode_failed = _load_result_detail()
     return data, ok
 
 
 def _load() -> Dict[str, Any]:
-    """Load settings from disk.
+    """Load settings from disk, tolerating an unreadable file.
 
-    TOTAL: never raises, and every failure resolves to an empty mapping. Delegates to
-    :func:`_load_result` and discards the success flag, so this function's signature, return type,
-    logging and observable behaviour are unchanged and none of its callers needed editing.
+    Lenient wrapper over :func:`_load_or_raise` so every existing caller keeps
+    its "unreadable behaves like absent" contract. Callers that need to tell the
+    two apart use :func:`_load_or_raise` or :func:`learning_status`.
     """
-    return _load_result()[0]
+    try:
+        return _load_or_raise()
+    except SettingsUnreadableError as e:
+        logger.warning(f"Failed to read settings: {e}")
+        return {}
+
+
+def settings_readable() -> bool:
+    """True when settings.json is absent or readable; False when it cannot be read."""
+    try:
+        _load_or_raise()
+    except SettingsUnreadableError:
+        return False
+    return True
 
 
 def _save(data: Dict[str, Any]) -> None:
@@ -352,8 +387,8 @@ def get_max_terminals() -> Optional[int]:
     Counts TRACKED terminals, meaning rows in the terminals table, not probed
     liveness: a terminal row is only removed by an explicit ``delete_terminal``,
     so a terminal whose process died without cleanup still occupies a slot. That
-    is harmless in the topology the cap exists for (a worker pod is a disposable
-    Job, so its rows die with it) but an operator who sets ``server.max_terminals``
+    is harmless in the topology the cap exists for (a worker pod is disposable and
+    its state is an emptyDir, so its rows die with it) but an operator who sets ``server.max_terminals``
     on a long-lived node may have to delete a stale row by hand. Deliberately not
     probed here: this check runs before anything is allocated precisely so it can
     stay cheap, and per-row liveness probing would put tmux calls in that path.
@@ -522,12 +557,55 @@ def is_learning_enabled() -> bool:
     learning regardless of this flag. Read errors default to False (opt-in
     features fail closed, mirroring the default).
     """
+    return learning_status().enabled
+
+
+class LearningStatus(NamedTuple):
+    """Whether learning is on, AND whether that answer is trustworthy.
+
+    ``unreadable`` is the honesty bit. ``enabled`` alone cannot distinguish
+    "the operator opted out" from "the settings file could not be read", and
+    those need different messages: the first is a configuration fact, the
+    second is a filesystem fault the operator has to go fix.
+    """
+
+    enabled: bool
+    unreadable: bool
+    detail: str
+
+
+def learning_status() -> LearningStatus:
+    """Resolve learning state, reporting whether settings.json was readable.
+
+    ``unreadable`` is True only when settings.json could not be read AND no
+    decisive ``CAO_MEMORY_LEARNING_ENABLED`` override is present: an
+    env-var-driven install is unaffected by an unreadable file, so reporting it
+    as broken would be its own kind of lie.
+
+    Still fails closed — ``enabled`` is False whenever the answer is unknown.
+    """
+    env_learning = os.environ.get("CAO_MEMORY_LEARNING_ENABLED")
+    env_decisive = env_learning is not None and env_learning.strip() != ""
+
+    try:
+        _load_or_raise()
+    except SettingsUnreadableError as e:
+        if not env_decisive:
+            # error, not warning: this is an operator-actionable fault, and the
+            # symptom it produces ("learning is disabled") does not look like one.
+            logger.error(f"Cannot determine learning state: {e}")
+            return LearningStatus(False, True, e.redacted_detail())
+        logger.warning(f"settings.json unreadable; using CAO_MEMORY_LEARNING_ENABLED: {e}")
+
     try:
         settings = get_memory_settings()
-        return bool(settings.get("enabled", True)) and bool(settings.get("learning_enabled", False))
+        enabled = bool(settings.get("enabled", True)) and bool(
+            settings.get("learning_enabled", False)
+        )
     except Exception as e:
         logger.warning(f"Failed to read memory.learning_enabled, defaulting to False: {e}")
-        return False
+        return LearningStatus(False, False, f"Failed to read learning settings: {e}")
+    return LearningStatus(enabled, False, "")
 
 
 #: Where a resolved approval posture came from. A CLOSED set: the startup line renders these

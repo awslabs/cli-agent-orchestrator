@@ -6,22 +6,26 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from cli_agent_orchestrator.constants import API_BASE_URL
-from cli_agent_orchestrator.mcp_server.server import _build_assign_description, _mcp_timeout
+from cli_agent_orchestrator.mcp_server.server import _build_assign_description
+from cli_agent_orchestrator.utils.orchestration import _mcp_timeout
 
 
 class TestCreateTerminalProviderResolution:
     """Tests for provider resolution used by dispatched worker terminals."""
 
     @patch(
-        "cli_agent_orchestrator.mcp_server.server._resolve_child_allowed_tools", return_value=None
+        "cli_agent_orchestrator.utils.orchestration._resolve_child_allowed_tools",
+        return_value=None,
     )
-    @patch("cli_agent_orchestrator.mcp_server.server.resolve_provider", return_value="claude_code")
-    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    @patch(
+        "cli_agent_orchestrator.utils.orchestration.resolve_provider", return_value="claude_code"
+    )
+    @patch("cli_agent_orchestrator.utils.orchestration.requests")
     def test_existing_session_respects_child_profile_provider(
         self, mock_requests, mock_resolve_provider, mock_allowed_tools
     ):
         """Worker profile provider should override the supervisor provider."""
-        from cli_agent_orchestrator.mcp_server.server import _create_terminal
+        from cli_agent_orchestrator.utils.orchestration import _create_terminal
 
         metadata_response = MagicMock()
         metadata_response.json.return_value = {
@@ -53,19 +57,21 @@ class TestCreateTerminalProviderResolution:
                 "working_directory": "/repo",
             },
             json=None,
+            headers=None,
             timeout=_mcp_timeout(),
         )
 
     @patch(
-        "cli_agent_orchestrator.mcp_server.server._resolve_child_allowed_tools", return_value=None
+        "cli_agent_orchestrator.utils.orchestration._resolve_child_allowed_tools",
+        return_value=None,
     )
-    @patch("cli_agent_orchestrator.mcp_server.server.resolve_provider", return_value="kiro_cli")
-    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    @patch("cli_agent_orchestrator.utils.orchestration.resolve_provider", return_value="kiro_cli")
+    @patch("cli_agent_orchestrator.utils.orchestration.requests")
     def test_existing_session_falls_back_to_supervisor_provider(
         self, mock_requests, mock_resolve_provider, mock_allowed_tools
     ):
         """Worker without a provider should inherit the supervisor provider."""
-        from cli_agent_orchestrator.mcp_server.server import _create_terminal
+        from cli_agent_orchestrator.utils.orchestration import _create_terminal
 
         metadata_response = MagicMock()
         metadata_response.json.return_value = {
@@ -97,20 +103,22 @@ class TestCreateTerminalProviderResolution:
                 "working_directory": "/repo",
             },
             json=None,
+            headers=None,
             timeout=_mcp_timeout(),
         )
 
     @patch(
-        "cli_agent_orchestrator.mcp_server.server._resolve_child_allowed_tools", return_value=None
+        "cli_agent_orchestrator.utils.orchestration._resolve_child_allowed_tools",
+        return_value=None,
     )
-    @patch("cli_agent_orchestrator.mcp_server.server.resolve_provider", return_value="mcode")
-    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    @patch("cli_agent_orchestrator.utils.orchestration.resolve_provider", return_value="mcode")
+    @patch("cli_agent_orchestrator.utils.orchestration.requests")
     def test_mcode_worker_omits_kiro_engine_and_forwards_model(
         self, mock_requests, mock_resolve_provider, mock_allowed_tools
     ):
         """MCode workers omit Kiro-only engine but receive a terminal-local model."""
-        from cli_agent_orchestrator.mcp_server.server import _create_terminal
         from cli_agent_orchestrator.models.inbox import OrchestrationType
+        from cli_agent_orchestrator.utils.orchestration import _create_terminal
 
         metadata_response = MagicMock()
         metadata_response.json.return_value = {
@@ -146,16 +154,16 @@ class TestCreateTerminalProviderResolution:
         assert kwargs["json"]["initial_message_orchestration_type"] == "assign"
 
     @patch(
-        "cli_agent_orchestrator.mcp_server.server._resolve_child_allowed_tools",
+        "cli_agent_orchestrator.utils.orchestration._resolve_child_allowed_tools",
         return_value=None,
     )
-    @patch("cli_agent_orchestrator.mcp_server.server.resolve_provider", return_value="kiro_cli")
-    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    @patch("cli_agent_orchestrator.utils.orchestration.resolve_provider", return_value="kiro_cli")
+    @patch("cli_agent_orchestrator.utils.orchestration.requests")
     def test_child_engine_is_explicit_not_inherited(
         self, mock_requests, _mock_resolve_provider, _mock_allowed_tools
     ):
         """A parent KAS value does not become an implicit child engine."""
-        from cli_agent_orchestrator.mcp_server.server import _create_terminal
+        from cli_agent_orchestrator.utils.orchestration import _create_terminal
 
         metadata_response = MagicMock()
         metadata_response.json.return_value = {
@@ -182,20 +190,20 @@ class TestCreateTerminalProviderResolution:
         assert mock_requests.post.call_args.kwargs["params"]["engine"] == "v2"
 
     @patch(
-        "cli_agent_orchestrator.mcp_server.server.generate_session_name",
+        "cli_agent_orchestrator.utils.orchestration.generate_session_name",
         return_value="cao-new-session",
     )
     @patch(
-        "cli_agent_orchestrator.mcp_server.server.resolve_provider",
+        "cli_agent_orchestrator.utils.orchestration.resolve_provider",
         return_value="codex",
     )
-    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    @patch("cli_agent_orchestrator.utils.orchestration.requests")
     def test_new_session_forwards_model_and_initial_message(
         self, mock_requests, mock_resolve_provider, mock_generate_session_name
     ):
         """The no-current-terminal branch no longer drops either launch field."""
-        from cli_agent_orchestrator.mcp_server.server import _create_terminal
         from cli_agent_orchestrator.models.inbox import OrchestrationType
+        from cli_agent_orchestrator.utils.orchestration import _create_terminal
 
         post_response = MagicMock()
         post_response.json.return_value = {"id": "worker-1", "provider": "codex"}
@@ -225,23 +233,24 @@ class TestCreateTerminalProviderResolution:
                 "initial_message": "Review the current change",
                 "initial_message_orchestration_type": "assign",
             },
+            headers=None,
             timeout=_mcp_timeout(),
         )
 
     @patch(
-        "cli_agent_orchestrator.mcp_server.server.generate_session_name",
+        "cli_agent_orchestrator.utils.orchestration.generate_session_name",
         return_value="cao-new-session",
     )
     @patch(
-        "cli_agent_orchestrator.mcp_server.server.resolve_provider",
+        "cli_agent_orchestrator.utils.orchestration.resolve_provider",
         return_value="codex",
     )
-    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    @patch("cli_agent_orchestrator.utils.orchestration.requests")
     def test_new_session_initial_message_is_forwarded_without_defer_flag(
         self, mock_requests, mock_resolve_provider, mock_generate_session_name
     ):
         """An initial message cannot be dropped when defer_init keeps its default."""
-        from cli_agent_orchestrator.mcp_server.server import _create_terminal
+        from cli_agent_orchestrator.utils.orchestration import _create_terminal
 
         post_response = MagicMock()
         post_response.json.return_value = {"id": "worker-1", "provider": "codex"}
@@ -262,19 +271,55 @@ class TestCreateTerminalProviderResolution:
                 "session_name": "cao-new-session",
             },
             json={"initial_message": "Review the current change"},
+            headers=None,
             timeout=_mcp_timeout(),
         )
 
-    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    @patch("cli_agent_orchestrator.utils.orchestration.requests")
     def test_defer_init_without_message_on_new_session_raises(self, mock_requests):
         """A bare defer flag still fails rather than changing semantics silently."""
-        from cli_agent_orchestrator.mcp_server.server import _create_terminal
+        from cli_agent_orchestrator.utils.orchestration import _create_terminal
 
         with patch.dict(os.environ, {"CAO_TERMINAL_ID": ""}):
             with pytest.raises(ValueError, match="defer_init requires initial_message"):
                 _create_terminal("reviewer", defer_init=True)
 
         mock_requests.post.assert_not_called()
+
+    @patch(
+        "cli_agent_orchestrator.utils.orchestration._resolve_child_allowed_tools",
+        return_value=None,
+    )
+    @patch(
+        "cli_agent_orchestrator.utils.orchestration.resolve_provider", return_value="claude_code"
+    )
+    @patch("cli_agent_orchestrator.utils.orchestration.get_local_bearer", return_value="tok")
+    @patch("cli_agent_orchestrator.utils.orchestration.requests")
+    def test_attaches_bearer_when_auth_enabled(
+        self, mock_requests, _bearer, mock_resolve_provider, mock_allowed_tools
+    ):
+        """Review on PR #634: both the metadata GET and the create POST carry
+        the local bearer when configured -- covers the assign/handoff path."""
+        from cli_agent_orchestrator.utils.orchestration import _create_terminal
+
+        metadata_response = MagicMock()
+        metadata_response.json.return_value = {
+            "provider": "claude_code",
+            "session_name": "cao-session",
+            "allowed_tools": None,
+        }
+        metadata_response.raise_for_status.return_value = None
+        post_response = MagicMock()
+        post_response.json.return_value = {"id": "worker-1", "provider": "claude_code"}
+        post_response.raise_for_status.return_value = None
+        mock_requests.get.return_value = metadata_response
+        mock_requests.post.return_value = post_response
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
+            _create_terminal("reviewer", "/repo")
+
+        assert mock_requests.get.call_args.kwargs["headers"] == {"Authorization": "Bearer tok"}
+        assert mock_requests.post.call_args.kwargs["headers"] == {"Authorization": "Bearer tok"}
 
 
 class TestCreateTerminalModelOverride:
@@ -284,14 +329,17 @@ class TestCreateTerminalModelOverride:
     how it wins over the profile's own static model field)."""
 
     @patch(
-        "cli_agent_orchestrator.mcp_server.server._resolve_child_allowed_tools", return_value=None
+        "cli_agent_orchestrator.utils.orchestration._resolve_child_allowed_tools",
+        return_value=None,
     )
-    @patch("cli_agent_orchestrator.mcp_server.server.resolve_provider", return_value="claude_code")
-    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    @patch(
+        "cli_agent_orchestrator.utils.orchestration.resolve_provider", return_value="claude_code"
+    )
+    @patch("cli_agent_orchestrator.utils.orchestration.requests")
     def test_model_is_forwarded_as_a_param(
         self, mock_requests, mock_resolve_provider, mock_allowed_tools
     ):
-        from cli_agent_orchestrator.mcp_server.server import _create_terminal
+        from cli_agent_orchestrator.utils.orchestration import _create_terminal
 
         metadata_response = MagicMock()
         metadata_response.json.return_value = {
@@ -313,16 +361,19 @@ class TestCreateTerminalModelOverride:
         assert kwargs["params"]["model"] == "fable-5"
 
     @patch(
-        "cli_agent_orchestrator.mcp_server.server._resolve_child_allowed_tools", return_value=None
+        "cli_agent_orchestrator.utils.orchestration._resolve_child_allowed_tools",
+        return_value=None,
     )
-    @patch("cli_agent_orchestrator.mcp_server.server.resolve_provider", return_value="claude_code")
-    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    @patch(
+        "cli_agent_orchestrator.utils.orchestration.resolve_provider", return_value="claude_code"
+    )
+    @patch("cli_agent_orchestrator.utils.orchestration.requests")
     def test_omitted_model_leaves_params_unchanged(
         self, mock_requests, mock_resolve_provider, mock_allowed_tools
     ):
         """No model given -> params dict is byte-for-byte the pre-fix shape
         (no 'model' key at all) -- existing callers see zero behavior change."""
-        from cli_agent_orchestrator.mcp_server.server import _create_terminal
+        from cli_agent_orchestrator.utils.orchestration import _create_terminal
 
         metadata_response = MagicMock()
         metadata_response.json.return_value = {
@@ -352,14 +403,17 @@ class TestCreateTerminalUseWorktree:
     natural way to distinguish 'absent' from 'false' anyway)."""
 
     @patch(
-        "cli_agent_orchestrator.mcp_server.server._resolve_child_allowed_tools", return_value=None
+        "cli_agent_orchestrator.utils.orchestration._resolve_child_allowed_tools",
+        return_value=None,
     )
-    @patch("cli_agent_orchestrator.mcp_server.server.resolve_provider", return_value="claude_code")
-    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    @patch(
+        "cli_agent_orchestrator.utils.orchestration.resolve_provider", return_value="claude_code"
+    )
+    @patch("cli_agent_orchestrator.utils.orchestration.requests")
     def test_use_worktree_true_is_included_in_params(
         self, mock_requests, mock_resolve_provider, mock_allowed_tools
     ):
-        from cli_agent_orchestrator.mcp_server.server import _create_terminal
+        from cli_agent_orchestrator.utils.orchestration import _create_terminal
 
         metadata_response = MagicMock()
         metadata_response.json.return_value = {
@@ -381,16 +435,19 @@ class TestCreateTerminalUseWorktree:
         assert kwargs["params"]["use_worktree"] == "true"
 
     @patch(
-        "cli_agent_orchestrator.mcp_server.server._resolve_child_allowed_tools", return_value=None
+        "cli_agent_orchestrator.utils.orchestration._resolve_child_allowed_tools",
+        return_value=None,
     )
-    @patch("cli_agent_orchestrator.mcp_server.server.resolve_provider", return_value="claude_code")
-    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    @patch(
+        "cli_agent_orchestrator.utils.orchestration.resolve_provider", return_value="claude_code"
+    )
+    @patch("cli_agent_orchestrator.utils.orchestration.requests")
     def test_use_worktree_false_is_omitted_from_params(
         self, mock_requests, mock_resolve_provider, mock_allowed_tools
     ):
         """Default False = today's exact behavior unchanged -- no new query
         param reaches the server for a caller that never mentions it."""
-        from cli_agent_orchestrator.mcp_server.server import _create_terminal
+        from cli_agent_orchestrator.utils.orchestration import _create_terminal
 
         metadata_response = MagicMock()
         metadata_response.json.return_value = {
@@ -411,6 +468,193 @@ class TestCreateTerminalUseWorktree:
         _, kwargs = mock_requests.post.call_args
         assert "use_worktree" not in kwargs["params"]
 
+    @patch(
+        "cli_agent_orchestrator.utils.orchestration.generate_session_name",
+        return_value="cao-new-session",
+    )
+    @patch(
+        "cli_agent_orchestrator.utils.orchestration.resolve_provider",
+        return_value="claude_code",
+    )
+    @patch("cli_agent_orchestrator.utils.orchestration.requests")
+    def test_use_worktree_true_reaches_new_session_params_too(
+        self, mock_requests, mock_resolve_provider, mock_generate_session_name
+    ):
+        """Regression (review on PR #634): a fresh-session caller (no
+        CAO_TERMINAL_ID -- e.g. `cao agent handoff --use-worktree` run outside
+        a CAO terminal) used to have use_worktree silently dropped, because
+        only the existing-session branch above forwarded it. POST /sessions
+        itself needed the same parameter its /sessions/{name}/terminals
+        sibling already had."""
+        from cli_agent_orchestrator.utils.orchestration import _create_terminal
+
+        post_response = MagicMock()
+        post_response.json.return_value = {"id": "worker-1", "provider": "claude_code"}
+        post_response.raise_for_status.return_value = None
+        mock_requests.post.return_value = post_response
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": ""}):
+            _create_terminal("reviewer", use_worktree=True)
+
+        _, kwargs = mock_requests.post.call_args
+        assert kwargs["params"]["use_worktree"] == "true"
+
+    @patch(
+        "cli_agent_orchestrator.utils.orchestration.generate_session_name",
+        return_value="cao-new-session",
+    )
+    @patch(
+        "cli_agent_orchestrator.utils.orchestration.resolve_provider",
+        return_value="claude_code",
+    )
+    @patch("cli_agent_orchestrator.utils.orchestration.requests")
+    def test_use_worktree_false_omitted_from_new_session_params(
+        self, mock_requests, mock_resolve_provider, mock_generate_session_name
+    ):
+        """Default False = today's exact behavior unchanged for the
+        new-session branch too."""
+        from cli_agent_orchestrator.utils.orchestration import _create_terminal
+
+        post_response = MagicMock()
+        post_response.json.return_value = {"id": "worker-1", "provider": "claude_code"}
+        post_response.raise_for_status.return_value = None
+        mock_requests.post.return_value = post_response
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": ""}):
+            _create_terminal("reviewer")
+
+        _, kwargs = mock_requests.post.call_args
+        assert "use_worktree" not in kwargs["params"]
+
+    @patch(
+        "cli_agent_orchestrator.utils.orchestration._resolve_child_allowed_tools",
+        return_value=None,
+    )
+    @patch(
+        "cli_agent_orchestrator.utils.orchestration.resolve_provider", return_value="claude_code"
+    )
+    @patch("cli_agent_orchestrator.utils.orchestration.requests")
+    def test_idempotency_key_reaches_existing_session_params(
+        self, mock_requests, mock_resolve_provider, mock_allowed_tools
+    ):
+        """Review on PR #634, issue #616."""
+        from cli_agent_orchestrator.utils.orchestration import _create_terminal
+
+        metadata_response = MagicMock()
+        metadata_response.json.return_value = {
+            "provider": "claude_code",
+            "session_name": "cao-session",
+            "allowed_tools": None,
+        }
+        metadata_response.raise_for_status.return_value = None
+        post_response = MagicMock()
+        post_response.json.return_value = {"id": "worker-1", "provider": "claude_code"}
+        post_response.raise_for_status.return_value = None
+        mock_requests.get.return_value = metadata_response
+        mock_requests.post.return_value = post_response
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
+            _create_terminal("reviewer", "/repo", idempotency_key="retry-1")
+
+        _, kwargs = mock_requests.post.call_args
+        assert kwargs["params"]["idempotency_key"] == "retry-1"
+
+    @patch(
+        "cli_agent_orchestrator.utils.orchestration.generate_session_name",
+        return_value="cao-new-session",
+    )
+    @patch(
+        "cli_agent_orchestrator.utils.orchestration.resolve_provider",
+        return_value="claude_code",
+    )
+    @patch("cli_agent_orchestrator.utils.orchestration.requests")
+    def test_idempotency_key_reaches_new_session_params(
+        self, mock_requests, mock_resolve_provider, mock_generate_session_name
+    ):
+        """Review on PR #634, issue #616."""
+        from cli_agent_orchestrator.utils.orchestration import _create_terminal
+
+        post_response = MagicMock()
+        post_response.json.return_value = {"id": "worker-1", "provider": "claude_code"}
+        post_response.raise_for_status.return_value = None
+        mock_requests.post.return_value = post_response
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": ""}):
+            _create_terminal("reviewer", idempotency_key="retry-1")
+
+        _, kwargs = mock_requests.post.call_args
+        assert kwargs["params"]["idempotency_key"] == "retry-1"
+
+    @patch(
+        "cli_agent_orchestrator.utils.orchestration.resolve_provider",
+        return_value="claude_code",
+    )
+    @patch("cli_agent_orchestrator.utils.orchestration.requests")
+    def test_two_keyed_fresh_session_retries_send_the_same_session_name(
+        self, mock_requests, mock_resolve_provider
+    ):
+        """A keyed retry outside a CAO terminal must reattach, not 409.
+
+        Review on PR #634. The test above pins ``generate_session_name`` to one
+        value and calls once, so it cannot see this: the server fingerprints
+        ``session_name``, and this branch used to mint a fresh uuid4 per
+        invocation, so two retries of the same command produced DIFFERENT
+        fingerprints and the retry conflicted with its own first attempt.
+
+        Deliberately does NOT patch the name generator -- pinning it is exactly
+        what hid the bug. Two real calls, and the session name they send must
+        match.
+        """
+        from cli_agent_orchestrator.utils.orchestration import _create_terminal
+
+        post_response = MagicMock()
+        post_response.json.return_value = {"id": "worker-1", "provider": "claude_code"}
+        post_response.raise_for_status.return_value = None
+        mock_requests.post.return_value = post_response
+
+        sent = []
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": ""}):
+            for _ in range(2):
+                _create_terminal("reviewer", idempotency_key="retry-1")
+                sent.append(mock_requests.post.call_args.kwargs["params"]["session_name"])
+
+        assert sent[0] == sent[1], "a keyed retry must re-send the same session_name"
+
+        # A DIFFERENT key must still get its own session, or one key would
+        # capture every fresh-session request on the node.
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": ""}):
+            _create_terminal("reviewer", idempotency_key="retry-2")
+        assert mock_requests.post.call_args.kwargs["params"]["session_name"] != sent[0]
+
+    @patch(
+        "cli_agent_orchestrator.utils.orchestration.resolve_provider",
+        return_value="claude_code",
+    )
+    @patch("cli_agent_orchestrator.utils.orchestration.requests")
+    def test_unkeyed_fresh_sessions_still_get_unique_names(
+        self, mock_requests, mock_resolve_provider
+    ):
+        """No key means the old uuid4 behaviour, unchanged.
+
+        Pinned because deriving the name from the key must not leak into the
+        default path: two unkeyed handoffs are unrelated requests and sharing a
+        session name would collide them.
+        """
+        from cli_agent_orchestrator.utils.orchestration import _create_terminal
+
+        post_response = MagicMock()
+        post_response.json.return_value = {"id": "worker-1", "provider": "claude_code"}
+        post_response.raise_for_status.return_value = None
+        mock_requests.post.return_value = post_response
+
+        sent = []
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": ""}):
+            for _ in range(2):
+                _create_terminal("reviewer")
+                sent.append(mock_requests.post.call_args.kwargs["params"]["session_name"])
+
+        assert sent[0] != sent[1]
+
     @patch("cli_agent_orchestrator.mcp_server.server._assign_impl")
     def test_assign_tool_forwards_use_worktree_to_impl(self, mock_impl):
         """The public `assign` MCP tool itself threads use_worktree through to
@@ -419,6 +663,13 @@ class TestCreateTerminalUseWorktree:
         _assign_impl's non-message/working_directory args (engine, model,
         use_worktree) are forwarded as keywords (see server.py's assign()),
         not positionally -- assert via kwargs rather than a positional index.
+
+        Patches ``mcp_server.server._assign_impl`` (NOT
+        ``utils.orchestration._assign_impl``): the `assign` tool wrapper still
+        lives in server.py and resolves the name from ITS OWN module globals
+        (populated by server.py's own `from utils.orchestration import
+        _assign_impl`), so that is the reference that must be replaced for
+        this call to observe the mock.
         """
         from cli_agent_orchestrator.mcp_server import server as server_module
 
@@ -444,13 +695,13 @@ class TestAssignSenderIdInjection:
     The tool-call itself returns as soon as the tmux window/DB row exist.
     """
 
-    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
-    @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
-    @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
+    @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.utils.orchestration.ENABLE_SENDER_ID_INJECTION", True)
+    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
     def test_assign_appends_sender_id_when_injection_enabled(self, mock_create, _nudge):
         """When injection is enabled, assign should pass a message with the
         sender ID suffix as ``initial_message`` to _create_terminal."""
-        from cli_agent_orchestrator.mcp_server.server import _assign_impl
+        from cli_agent_orchestrator.utils.orchestration import _assign_impl
 
         mock_create.return_value = ("worker-1", "claude_code")
 
@@ -470,12 +721,12 @@ class TestAssignSenderIdInjection:
 
         assert kwargs["initial_message_orchestration_type"] == OrchestrationType.ASSIGN
 
-    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
-    @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", False)
-    @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
+    @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.utils.orchestration.ENABLE_SENDER_ID_INJECTION", False)
+    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
     def test_assign_no_suffix_when_injection_disabled(self, mock_create, _nudge):
         """When injection is disabled, assign should pass the message unchanged."""
-        from cli_agent_orchestrator.mcp_server.server import _assign_impl
+        from cli_agent_orchestrator.utils.orchestration import _assign_impl
 
         mock_create.return_value = ("worker-2", "claude_code")
 
@@ -486,13 +737,13 @@ class TestAssignSenderIdInjection:
         _, kwargs = mock_create.call_args
         assert kwargs["initial_message"] == "Analyze the logs"
 
-    @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
-    @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
+    @patch("cli_agent_orchestrator.utils.orchestration.ENABLE_SENDER_ID_INJECTION", True)
+    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
     def test_assign_missing_terminal_id_errors_before_creating_terminal(self, mock_create):
         """When CAO_TERMINAL_ID is not set, assign must fail fast (issue #284) —
         never tell a worker to reply to terminal 'unknown', and never leave an
         orphan worker terminal behind."""
-        from cli_agent_orchestrator.mcp_server.server import _assign_impl
+        from cli_agent_orchestrator.utils.orchestration import _assign_impl
 
         with patch.dict(os.environ, {}, clear=True):
             result = _assign_impl("developer", "Build feature X")
@@ -502,15 +753,15 @@ class TestAssignSenderIdInjection:
         assert "CAO_TERMINAL_ID not set" in result["message"]
         mock_create.assert_not_called()
 
-    @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", False)
-    @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
+    @patch("cli_agent_orchestrator.utils.orchestration.ENABLE_SENDER_ID_INJECTION", False)
+    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
     def test_assign_missing_terminal_id_fails_fast_even_with_injection_off(self, mock_create):
         """PR #390 must-fix #2: the CAO_TERMINAL_ID fail-fast must be
         UNCONDITIONAL (not gated on sender-ID injection). With injection off and
         no terminal id, the deferred path would otherwise take the new-session
         branch, which can't deliver the task — assign would create a worker,
         drop the task, and still return success. Guard fires regardless."""
-        from cli_agent_orchestrator.mcp_server.server import _assign_impl
+        from cli_agent_orchestrator.utils.orchestration import _assign_impl
 
         with patch.dict(os.environ, {}, clear=True):
             result = _assign_impl("developer", "Build feature X")
@@ -520,12 +771,12 @@ class TestAssignSenderIdInjection:
         assert "CAO_TERMINAL_ID not set" in result["message"]
         mock_create.assert_not_called()
 
-    @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
-    @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
+    @patch("cli_agent_orchestrator.utils.orchestration.ENABLE_SENDER_ID_INJECTION", True)
+    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
     def test_assign_surfaces_terminal_id_when_create_fails(self, mock_create):
         """If _create_terminal fails, the returned dict should carry
         ``terminal_id=None`` and a failure message."""
-        from cli_agent_orchestrator.mcp_server.server import _assign_impl
+        from cli_agent_orchestrator.utils.orchestration import _assign_impl
 
         mock_create.side_effect = Exception("connection refused")
 
@@ -536,12 +787,12 @@ class TestAssignSenderIdInjection:
         assert result["terminal_id"] is None
         assert "Assignment failed" in result["message"]
 
-    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
-    @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
-    @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
+    @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.utils.orchestration.ENABLE_SENDER_ID_INJECTION", True)
+    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
     def test_assign_suffix_is_appended_not_prepended(self, mock_create, _nudge):
         """The sender ID should be a suffix, not a prefix."""
-        from cli_agent_orchestrator.mcp_server.server import _assign_impl
+        from cli_agent_orchestrator.utils.orchestration import _assign_impl
 
         mock_create.return_value = ("worker-4", "claude_code")
         original = "Do the task described in /path/to/task.md"
@@ -554,13 +805,13 @@ class TestAssignSenderIdInjection:
         assert sent_message.startswith(original)
         assert sent_message.index("[Assigned by terminal") > len(original)
 
-    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
-    @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
-    @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
+    @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.utils.orchestration.ENABLE_SENDER_ID_INJECTION", True)
+    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
     def test_assign_returns_fast_success_message(self, mock_create, _nudge):
         """Regression: assign() should tell the LLM the worker is initializing
         in the background, not claim the message has been delivered."""
-        from cli_agent_orchestrator.mcp_server.server import _assign_impl
+        from cli_agent_orchestrator.utils.orchestration import _assign_impl
 
         mock_create.return_value = ("worker-fast", "kiro_cli")
 
@@ -573,10 +824,10 @@ class TestAssignSenderIdInjection:
         # falsely conclude the worker has already received the task.
         assert "initializing" in result["message"].lower()
 
-    @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
-    @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
+    @patch("cli_agent_orchestrator.utils.orchestration.ENABLE_SENDER_ID_INJECTION", True)
+    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
     def test_assign_forwards_model_to_create_terminal(self, mock_create):
-        from cli_agent_orchestrator.mcp_server.server import _assign_impl
+        from cli_agent_orchestrator.utils.orchestration import _assign_impl
 
         mock_create.return_value = ("worker-1", "claude_code")
 
@@ -587,13 +838,13 @@ class TestAssignSenderIdInjection:
         _, kwargs = mock_create.call_args
         assert kwargs["model"] == "fable-5"
 
-    @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
-    @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
+    @patch("cli_agent_orchestrator.utils.orchestration.ENABLE_SENDER_ID_INJECTION", True)
+    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
     def test_assign_omitted_model_passes_none(self, mock_create):
         """No model given -> _create_terminal's own model=None default kicks
         in (profile.model, if any, still applies) -- existing callers see
         zero behavior change."""
-        from cli_agent_orchestrator.mcp_server.server import _assign_impl
+        from cli_agent_orchestrator.utils.orchestration import _assign_impl
 
         mock_create.return_value = ("worker-1", "claude_code")
 

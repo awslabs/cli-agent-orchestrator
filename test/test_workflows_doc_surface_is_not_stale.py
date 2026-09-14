@@ -45,6 +45,7 @@ _NUMBER_WORDS = {
     "fourteen": 14,
     "fifteen": 15,
     "sixteen": 16,
+    "sixteen": 16,
     "seventeen": 17,
     "eighteen": 18,
     "nineteen": 19,

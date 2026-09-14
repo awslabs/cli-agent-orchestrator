@@ -4,7 +4,7 @@
 way this goes wrong is a reliability failure. The readers are:
 
 * ``cli/commands/workflow.py::_extract_detail`` -- 28 call sites, all the workflow verbs.
-* ``mcp_server/server.py::_extract_error_detail`` -- 22 call sites, all 15 workflow tools.
+* ``utils/orchestration.py::_extract_error_detail`` -- shared by MCP and CLI orchestration.
 
 A THIRD copy exists at ``mcp_server/app_tools.py`` and is deliberately NOT covered here: it serves
 ``/sessions`` and ``/terminals/*`` only and cannot reach either object shape. Its own tests live in
@@ -31,7 +31,7 @@ from types import SimpleNamespace
 import pytest
 
 from cli_agent_orchestrator.cli.commands.workflow import _extract_detail
-from cli_agent_orchestrator.mcp_server.server import _extract_error_detail, _parse_run_step_error
+from cli_agent_orchestrator.utils.orchestration import _extract_error_detail, _parse_run_step_error
 
 READERS = {
     "cli": _extract_detail,

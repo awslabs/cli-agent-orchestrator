@@ -88,6 +88,15 @@ class StepOutputStore:
         """Return the record for ``(run_id, step_id)``, or None if absent."""
         return self._store.get((run_id, step_id))
 
+    def delete(self, run_id: str, step_id: str) -> None:
+        """Drop the record for ``(run_id, step_id)``; a no-op when absent.
+
+        A caller that re-runs a step under a REUSED key (the single-step replay,
+        issue #640) must clear the slot first, or a "this step emitted nothing"
+        read silently returns the PREVIOUS occupant's output.
+        """
+        self._store.pop((run_id, step_id), None)
+
     def __len__(self) -> int:
         return len(self._store)
 

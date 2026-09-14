@@ -67,7 +67,7 @@ handle = step(
     provider="claude_code",
     agent="reviewer",
     prompt="Summarize the input. Return the summary only.",
-    step_id="summarize:one",
+    step_id="summarize_one",
     recovery="idempotent",
 )
 emit_output({"summary": handle.output})

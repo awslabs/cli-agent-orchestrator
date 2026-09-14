@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { AlertTriangle, Loader2, X } from 'lucide-react'
 
 interface ConfirmModalProps {
@@ -10,6 +10,13 @@ interface ConfirmModalProps {
   cancelLabel?: string
   variant?: 'danger' | 'warning'
   loading?: boolean
+  /**
+   * Type-to-confirm gate. When set, an input is shown and the confirm button
+   * stays disabled until the user types this exact string (e.g. the name of
+   * the thing being deleted). Optional and additive: callers that omit it get
+   * the original confirm-on-click behavior.
+   */
+  confirmationText?: string
   onConfirm: () => void
   onCancel: () => void
 }
@@ -23,14 +30,20 @@ export function ConfirmModal({
   cancelLabel = 'Cancel',
   variant = 'danger',
   loading = false,
+  confirmationText,
   onConfirm,
   onCancel,
 }: ConfirmModalProps) {
   const cancelRef = useRef<HTMLButtonElement>(null)
+  const [typed, setTyped] = useState('')
 
   useEffect(() => {
-    if (open) cancelRef.current?.focus()
-  }, [open])
+    if (open) {
+      cancelRef.current?.focus()
+      // Reset per open so a previous confirmation never carries over.
+      setTyped('')
+    }
+  }, [open, confirmationText])
 
   useEffect(() => {
     if (!open) return
@@ -80,6 +93,25 @@ export function ConfirmModal({
           </div>
         )}
 
+        {/* Type-to-confirm gate */}
+        {confirmationText !== undefined && (
+          <div className="mx-6 mb-4">
+            <label htmlFor="confirm-typed" className="block text-xs text-gray-400 mb-1.5">
+              Type <span className="font-mono text-gray-200 select-all">{confirmationText}</span> to confirm:
+            </label>
+            <input
+              id="confirm-typed"
+              aria-label="Confirmation text"
+              type="text"
+              autoComplete="off"
+              spellCheck={false}
+              value={typed}
+              onChange={e => setTyped(e.target.value)}
+              className="w-full px-3 py-2 bg-gray-950 border border-gray-700 rounded-lg text-sm text-gray-200 font-mono placeholder-gray-600 focus:outline-none focus:border-red-600"
+            />
+          </div>
+        )}
+
         {/* Actions */}
         <div className="flex items-center justify-end gap-3 px-6 py-4 bg-gray-800/30 border-t border-gray-700/30">
           <button
@@ -92,7 +124,7 @@ export function ConfirmModal({
           </button>
           <button
             onClick={onConfirm}
-            disabled={loading}
+            disabled={loading || (confirmationText !== undefined && typed !== confirmationText)}
             className={`px-4 py-2 text-sm font-medium text-white rounded-lg transition-all focus:outline-none focus:ring-2 disabled:opacity-60 flex items-center gap-2 ${colors.btn}`}
           >
             {loading && <Loader2 size={14} className="animate-spin" />}

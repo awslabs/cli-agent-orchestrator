@@ -103,6 +103,52 @@ class TestCreateSession:
         assert call_kwargs["model"] == "gpt-5.1-codex"
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.session_service.dispatch_plugin_event")
+    @patch("cli_agent_orchestrator.services.session_service.create_terminal")
+    async def test_create_session_forwards_use_worktree(self, mock_create_terminal, mock_dispatch):
+        """Regression (review on PR #634): a fresh session used to drop
+        use_worktree silently -- nothing threaded it this far, unlike the
+        existing-session terminal-creation path."""
+        mock_terminal = MagicMock()
+        mock_terminal.session_name = "cao-test"
+        mock_create_terminal.return_value = mock_terminal
+
+        await create_session(provider="kiro_cli", agent_profile="my_agent", use_worktree=True)
+
+        assert mock_create_terminal.call_args.kwargs["use_worktree"] is True
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.session_service.dispatch_plugin_event")
+    @patch("cli_agent_orchestrator.services.session_service.create_terminal")
+    async def test_create_session_use_worktree_defaults_to_false(
+        self, mock_create_terminal, mock_dispatch
+    ):
+        mock_terminal = MagicMock()
+        mock_terminal.session_name = "cao-test"
+        mock_create_terminal.return_value = mock_terminal
+
+        await create_session(provider="kiro_cli", agent_profile="my_agent")
+
+        assert mock_create_terminal.call_args.kwargs["use_worktree"] is False
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.session_service.dispatch_plugin_event")
+    @patch("cli_agent_orchestrator.services.session_service.create_terminal")
+    async def test_create_session_forwards_idempotency_key(
+        self, mock_create_terminal, mock_dispatch
+    ):
+        """Review on PR #634, issue #616: forwarded as-is to create_terminal."""
+        mock_terminal = MagicMock()
+        mock_terminal.session_name = "cao-test"
+        mock_create_terminal.return_value = mock_terminal
+
+        await create_session(
+            provider="kiro_cli", agent_profile="my_agent", idempotency_key="retry-1"
+        )
+
+        assert mock_create_terminal.call_args.kwargs["idempotency_key"] == "retry-1"
+
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.session_service.create_terminal")
     async def test_create_session_rejects_orchestration_type_without_message(
         self, mock_create_terminal

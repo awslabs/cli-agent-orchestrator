@@ -35,6 +35,10 @@ _HISTORICAL = {
     # to the current count would destroy it, so the past-tense narrative keeps its own numbers.
     "24/18/27 = 69",
     "24/18/28 = 70",
+    "24/18/30 = 72",
+    "24/18/34 = 76",
+    "24/18/43 = 85",
+    "24/18/44 = 86",
     "33/5/22",
     "33 IN-APP / 5 HANDOFF / 23 HIDE = 61",
     "22/16/23",
@@ -148,6 +152,7 @@ def test_the_distribution_test_name_matches_its_assertions():
         "thirtyone": 31,
         "thirtytwo": 32,
         "thirtythree": 33,
+        "fortysix": 46,
         "five": 5,
         "sixteen": 16,
     }
