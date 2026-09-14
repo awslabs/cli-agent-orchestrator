@@ -821,10 +821,10 @@ class TestOpenCodeConstants:
 
         assert isinstance(OPENCODE_CONFIG_DIR, Path)
 
-    def test_opencode_cli_in_providers_list(self):
+    def test_user_facing_providers_are_restricted(self):
         from cli_agent_orchestrator.constants import PROVIDERS
 
-        assert "opencode_cli" in PROVIDERS
+        assert PROVIDERS == ["codex", "claude_code", "grok_cli"]
 
 
 class TestOpenCodeProviderType:
