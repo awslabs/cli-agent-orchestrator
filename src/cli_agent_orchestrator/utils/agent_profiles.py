@@ -193,9 +193,9 @@ def list_agent_profiles() -> List[Dict]:
     (from settings or defaults). Returns deduplicated list sorted by name.
     """
     from cli_agent_orchestrator.services.settings_service import (
-        get_agent_dirs,
         get_disabled_agent_dirs,
         get_extra_agent_dirs,
+        usable_agent_dirs,
     )
 
     profiles: Dict[str, Dict] = {}
@@ -221,8 +221,9 @@ def list_agent_profiles() -> List[Dict]:
         )
         scanned_paths.add(local_norm)
 
-    # 2. Provider-specific directories (from settings)
-    agent_dirs = get_agent_dirs()
+    # 2. Provider-specific directories (from settings; blank or relative values
+    #    fall back to their defaults so the working directory is never scanned)
+    agent_dirs = usable_agent_dirs()
     provider_source_labels = {
         "kiro_cli": "kiro",
         "claude_code": "claude_code",
@@ -306,9 +307,9 @@ def _read_agent_profile_source(agent_name: str) -> str:
     _validate_agent_name(agent_name)
 
     from cli_agent_orchestrator.services.settings_service import (
-        get_agent_dirs,
         get_disabled_agent_dirs,
         get_extra_agent_dirs,
+        usable_agent_dirs,
     )
 
     # Honour the disable toggle on the load path too, so disabling a directory
@@ -337,7 +338,7 @@ def _read_agent_profile_source(agent_name: str) -> str:
             return nested.read_text(encoding="utf-8")
         return None
 
-    for dir_path in get_agent_dirs().values():
+    for dir_path in usable_agent_dirs().values():
         if normalized_path(dir_path) in disabled:
             continue
         found = _lookup_in_directory(Path(dir_path))

@@ -152,12 +152,64 @@ def installed_context_dir_override() -> Optional[Path]:
     slash, a ``~`` or a symlinked spelling of the default is still the default
     rather than an override to a directory nobody else looks in.
     """
-    configured = get_agent_dirs().get("cao_installed")
+    configured = usable_agent_dirs().get("cao_installed")
     if configured is None:
         return None
     if normalized_path(configured) == normalized_path(_DEFAULTS["cao_installed"]):
         return None
     return Path(configured).expanduser()
+
+
+def usable_agent_dirs() -> Dict[str, str]:
+    """``get_agent_dirs()`` with every value that is not a directory replaced by its default.
+
+    ``get_agent_dirs`` returns what settings.json says, which is right for the
+    Settings UI. It is wrong for anything that walks the filesystem: a blank
+    value is ``Path("")``, i.e. ``Path(".")`` -- the server's working directory
+    -- and a relative one moves with whoever launched the process. Fed to
+    profile discovery, the lookup behind ``cao install <name>``, memory
+    promotion's profile lookup or the installed-context resolver, either would
+    turn the working directory into a
+    profile source and, for ``cao_installed``, the trusted write root, so a
+    profile named ``README`` or ``AGENTS`` lands on a repository file. Every
+    consumer that opens directories goes through this instead; each bad value is
+    logged once per call and falls back to the built-in default for its key, and
+    every surviving value is returned with ``~`` expanded.
+    """
+    result = dict(get_agent_dirs())
+    for key, value in list(result.items()):
+        if not isinstance(value, str) or not value.strip():
+            logger.warning(f"Ignoring blank agents.dirs.{key}; using its default directory")
+        elif not Path(value).expanduser().is_absolute():
+            logger.warning(
+                f"Ignoring relative agents.dirs.{key}={value!r}; using its default directory"
+            )
+        else:
+            # Returned expanded: a ``~`` spelling is a real directory to every
+            # consumer, not a literal path named "~" that discovery finds empty.
+            result[key] = str(Path(value).expanduser())
+            continue
+        if key in _DEFAULTS:
+            result[key] = _DEFAULTS[key]
+        else:
+            del result[key]
+    return result
+
+
+def installed_context_lookup_dirs(default: Path) -> List[Path]:
+    """Directories an existing installed context copy may live in, in probe order.
+
+    The configured override first, then ``default`` -- the constant the caller
+    imports -- when an override is active, because releases before the writer
+    honoured the setting deposited every copy at the default regardless. With no
+    override, just ``default``. Consumers that need to FIND a copy (the install
+    ownership guard, the Copilot skill-injection probe) iterate this; the writer
+    uses only the first entry.
+    """
+    override = installed_context_dir_override()
+    if override is None or normalized_path(override) == normalized_path(default):
+        return [default]
+    return [override, default]
 
 
 def set_agent_dirs(dirs: Dict[str, str]) -> Dict[str, str]:

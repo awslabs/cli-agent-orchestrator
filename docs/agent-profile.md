@@ -151,10 +151,19 @@ Installing writes a copy of the profile to the shared context directory
 (`agents.dirs.cao_installed`, `~/.aws/cli-agent-orchestrator/agent-context` by
 default). CAO stamps that copy's frontmatter with `x-cao-source-stem`, the
 name the profile was installed under. The key is reserved: it is written by
-CAO, not authored, and a source profile that declares it is refused at install.
-It lets a reinstall recognise its own earlier copy, and lets the OpenCode
-install refuse a different profile whose `name:` would overwrite an installed
-one (see [OpenCode CLI](opencode-cli.md)).
+CAO, not authored: a source profile that declares it has that line replaced by
+CAO's own at install, and the install is refused if the result does not read
+back as the marker CAO wrote (a quoted, folded or flow-mapping spelling that the
+YAML parser would resolve to a different value).
+It lets a reinstall recognise its own earlier copy, and lets `cao install`
+refuse -- for every provider -- a different profile whose `name:` would
+overwrite an installed one: the context copy is what the installed agent reads
+at runtime, and for OpenCode the agent file and `opencode.json` section share
+the same id (see [OpenCode CLI](opencode-cli.md)). The check reads the
+destination itself, so it also holds when the installed copy is shadowed in
+profile discovery by a same-named file in another directory. If
+`agents.dirs.cao_installed` is configured away from its default, copies written
+by earlier releases to the default directory still count.
 
 ### Profile discovery
 

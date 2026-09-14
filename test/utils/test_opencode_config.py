@@ -69,7 +69,7 @@ class TestOpenCodeAgentIdCollisionError:
     """The collision error type contract the install guard relies on."""
 
     def test_collision_is_valueerror_subclass(self):
-        # _guard_opencode_agent_id_collision raises this; install_agent()'s
+        # _guard_installed_copy_ownership raises this; install_agent()'s
         # broad `except Exception` turns it into a clean CLI "Error:" message.
         # (The end-to-end collision behaviour is covered in
         # test/cli/commands/test_install_opencode.py against the real CLI.)

@@ -51,7 +51,7 @@ def to_opencode_agent_id(profile_name: str) -> str:
     ``<id>.md`` filename and the ``agent.<id>`` section of ``opencode.json``),
     so whichever installs second silently overwrites the first. The opencode
     install path guards against that via
-    ``_guard_opencode_agent_id_collision`` in ``services/install_service.py``,
+    ``_guard_installed_copy_ownership`` in ``services/install_service.py``,
     which fails loud rather than overwriting.
 
     The separator collapse itself is no longer a live collision source on the
@@ -68,8 +68,10 @@ def to_opencode_agent_id(profile_name: str) -> str:
 class OpenCodeAgentIdCollisionError(ValueError):
     """Two distinct profile names collapse to the same OpenCode agent id.
 
-    Raised by the opencode install guard
-    (``_guard_opencode_agent_id_collision``). Subclasses ``ValueError`` so
+    Raised by the install ownership guard
+    (``install_service._guard_installed_copy_ownership``) when the provider is
+    OpenCode; other providers get its sibling
+    ``InstalledContextCopyCollisionError``. Subclasses ``ValueError`` so
     existing ``except ValueError`` / broad handlers (e.g. ``install_agent``'s
     ``except Exception``) surface it as a clean CLI error rather than a
     traceback.

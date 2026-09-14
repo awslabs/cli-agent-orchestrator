@@ -962,6 +962,16 @@ class TestAgentIdCollisionGuardInstalledProvenance:
     def test_legacy_installed_copy_without_marker_still_blocks_id_alias_collision(
         self, runner: CliRunner, install_workspace_with_installed_dir: Dict[str, Any]
     ):
+        """A slash-named profile is refused as an invalid name, occupant or not.
+
+        This used to assert the guard's collision message naming ``a__b``. It could
+        only do so because the guard compared flattened ids before any name check
+        ran; the name check now runs first (in the guard as well as the writer),
+        so ``a/b`` is refused for the separator -- the same layering
+        ``test_slash_collapse_collision_is_unreachable_because_the_name_is_refused``
+        and the provenance suite's legacy-slash test already pin. The outcome this
+        test protects is unchanged: the markerless legacy occupant is not touched.
+        """
         store = install_workspace_with_installed_dir["local_store"]
         legacy_copy = install_workspace_with_installed_dir["context_dir"] / "a__b.md"
         _write_profile(legacy_copy, name="a__b", body="Legacy profile.")
@@ -972,8 +982,8 @@ class TestAgentIdCollisionGuardInstalledProvenance:
 
         assert result.exit_code == 0
         assert "Error:" in result.output
-        assert "slash-named" in result.output
-        assert "a__b" in result.output
+        assert "path separator" in result.output, result.output
+        assert "cannot share an OpenCode agent id" not in result.output
         assert legacy_copy.read_text() == first_context
         assert "Second profile." not in legacy_copy.read_text()
 

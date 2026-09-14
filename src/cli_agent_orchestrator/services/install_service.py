@@ -74,7 +74,7 @@ class InstallResult(BaseModel):
 # CodeQL also recognises this regex as a path-injection sanitiser.
 _PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
-# Context-copy provenance marker — stamped into AGENT_CONTEXT_DIR/<name>.md
+# Context-copy provenance marker — stamped into <context dir>/<name>.md
 # frontmatter to record the original install source stem (the stem/name passed to
 # `cao install`). Used by the opencode collision guard to distinguish a profile's
 # own installed copy from a different profile that resolves to the same agent id.
@@ -463,9 +463,34 @@ def _context_dir() -> Path:
     return AGENT_CONTEXT_DIR if override is None else override
 
 
-def _installed_context_copy_path(stem: str) -> Path:
-    """Return the installed context path for a discovered installed candidate."""
-    installed_dir = _context_dir()
+def _context_lookup_dirs() -> List[Path]:
+    """Every directory an existing context copy may be sitting in.
+
+    The configured directory first, then -- only when an override is active --
+    the default it superseded. Releases before the override was honoured by the
+    writer deposited every copy at ``AGENT_CONTEXT_DIR`` even when
+    ``cao_installed`` pointed elsewhere, so an operator who upgrades with an
+    override already configured has ownership records in the legacy directory.
+    Probing it keeps those records in force: the guard still sees the owner of
+    an id, and the Copilot skill-injection probe still recognises the agents it
+    manages. New copies are written to ``_context_dir()`` only; the legacy copy
+    is left where it is.
+    """
+    from cli_agent_orchestrator.services.settings_service import (
+        installed_context_lookup_dirs,
+    )
+
+    return installed_context_lookup_dirs(AGENT_CONTEXT_DIR)
+
+
+def _installed_context_copy_path(stem: str, directory: Optional[Path] = None) -> Path:
+    """Return the installed context path for ``stem`` in ``directory``.
+
+    Prefers the flat ``<stem>.md`` the writer produces; falls back to the
+    directory-style ``<stem>/agent.md`` discovery also recognises, so an
+    operator-arranged copy in that shape still counts as occupying the id.
+    """
+    installed_dir = _context_dir() if directory is None else directory
     flat = installed_dir / f"{stem}.md"
     if flat.exists():
         return flat
@@ -483,27 +508,70 @@ def _installed_context_copy_remedy(path: Path) -> str:
     )
 
 
-def _installed_profile_display(
-    stem: str, provenance_stem: Optional[str], candidate_path: Path
-) -> str:
-    """Render an installed discovery candidate for collision errors."""
-    suffix = f" at '{candidate_path}'"
+class InstalledContextCopyCollisionError(ValueError):
+    """A different profile already owns the shared context copy this install would overwrite.
+
+    The provider-neutral counterpart of :class:`OpenCodeAgentIdCollisionError`:
+    raised by :func:`_guard_installed_copy_ownership` for every provider other
+    than OpenCode, whose installs additionally share the ``<id>.md`` agent file
+    and ``agent.<id>`` config section. Subclasses ``ValueError`` for the same
+    reason: ``install_agent``'s broad handler turns it into a clean CLI error.
+    """
+
+
+def _is_opencode(provider: str) -> bool:
+    return provider == ProviderType.OPENCODE_CLI.value
+
+
+def _collision_error_class(provider: str) -> type:
+    return (
+        OpenCodeAgentIdCollisionError
+        if _is_opencode(provider)
+        else InstalledContextCopyCollisionError
+    )
+
+
+def _installed_copy_display(provenance_stem: Optional[str], candidate_path: Path) -> str:
+    """Render the occupying context copy for collision errors."""
     if provenance_stem:
-        return f"'{provenance_stem}.md' (installed copy '{stem}.md'{suffix})"
-    return f"'{stem}.md' (installed copy without CAO source provenance{suffix})"
+        return f"'{provenance_stem}.md' (installed copy at '{candidate_path}')"
+    return f"an installed copy without CAO source provenance at '{candidate_path}'"
 
 
 def _raise_unloadable_installed_collision(
-    target_id: str, source_name: str, profile_name: str, candidate_path: Path
+    target_id: str, source_name: str, profile_name: str, candidate_path: Path, provider: str
 ) -> None:
-    """Block an installed target-slot candidate whose ownership is unknowable."""
-    raise OpenCodeAgentIdCollisionError(
-        f"OpenCode agent id '{target_id}' is already occupied by installed "
-        f"context copy '{candidate_path}', but CAO cannot read or validate that "
-        "file, so it cannot prove whether it belongs to the profile being "
-        f"installed ('{source_name}.md', name '{profile_name}'). The install "
-        "was refused to avoid silently overwriting existing OpenCode artifacts. "
+    """Block an install whose target slot is held by a copy of unknowable ownership."""
+    slot = (
+        f"OpenCode agent id '{target_id}'"
+        if _is_opencode(provider)
+        else f"Profile name '{target_id}'"
+    )
+    artifacts = "OpenCode artifacts" if _is_opencode(provider) else "installed artifacts"
+    raise _collision_error_class(provider)(
+        f"{slot} is already occupied by installed context copy '{candidate_path}', but "
+        "CAO cannot read or validate that file, so it cannot prove whether it belongs "
+        f"to the profile being installed ('{source_name}.md', name '{profile_name}'). "
+        f"The install was refused to avoid silently overwriting existing {artifacts}. "
         f"{_installed_context_copy_remedy(candidate_path)}"
+    )
+
+
+def _raise_unreadable_installed_copy(
+    target_id: str, source_name: str, candidate_path: Path, exc: OSError, provider: str
+) -> None:
+    """Block an install whose target slot holds a copy CAO could not read (an I/O fault)."""
+    slot = (
+        f"OpenCode agent id '{target_id}'"
+        if _is_opencode(provider)
+        else f"Profile name '{target_id}'"
+    )
+    raise _collision_error_class(provider)(
+        f"{slot} is already occupied by installed context copy '{candidate_path}', which "
+        f"could not be read ({exc.strerror or exc.__class__.__name__}), so CAO cannot tell "
+        f"whether it belongs to the profile being installed ('{source_name}.md'). The install "
+        "was refused rather than overwrite it. Fix the file's permissions (or the underlying "
+        "I/O problem) and reinstall; do not delete the copy, it is the ownership record."
     )
 
 
@@ -552,14 +620,14 @@ def _write_context_file(agent_name: str, raw_content: str, source_name: str) -> 
 
     ``agent_name`` is the *resolved* profile name (frontmatter ``name:``) and
     determines the filename — the context copy lives at
-    ``AGENT_CONTEXT_DIR/<resolved-name>.md``, NOT under the original install
+    ``<context dir>/<resolved-name>.md`` (see ``_context_dir``), NOT under the original install
     stem. ``source_name`` is the install *source handle* (the stem/name passed
     to ``cao install``), so it can be stamped into the copy's frontmatter under
     ``_CONTEXT_SOURCE_STEM_KEY``. The opencode collision guard later uses that
     marker to prove "this installed-dir
     artifact is a prior copy of the profile being reinstalled" versus "this is
     a different profile that resolves to the same agent id" (see
-    :func:`_guard_opencode_agent_id_collision`). The marker is inserted
+    :func:`_guard_installed_copy_ownership`). The marker is inserted
     textually, preserving source formatting aside from that one marker line.
 
     SECURITY. The filename derives from the profile's RESOLVED frontmatter
@@ -568,7 +636,7 @@ def _write_context_file(agent_name: str, raw_content: str, source_name: str) -> 
     not the resolved name -- and a profile can be installed straight from a URL,
     so the field is attacker-controlled. Without a guard, a name like
     ``../../foo`` or an absolute path steers this write outside
-    ``AGENT_CONTEXT_DIR`` and can overwrite a trusted ``.md`` instruction file.
+    the context directory and can overwrite a trusted ``.md`` instruction file.
     Three layers, all in this function (see the barrier note below):
 
     1. ``validate_path_component`` -- the shared segment validator, which rejects
@@ -595,6 +663,16 @@ def _write_context_file(agent_name: str, raw_content: str, source_name: str) -> 
     and silently tighten or widen permissions on every install.
     """
     context_dir = _context_dir()
+    if not context_dir.is_absolute():
+        # ``installed_context_dir_override`` already discards blank and relative
+        # settings; this is the sink's own refusal to ever treat the server's
+        # working directory as the trusted write root (a profile named README or
+        # AGENTS would otherwise land on a repository file).
+        raise ValueError(
+            f"Refusing to write context copy: the installed-profile directory "
+            f"{str(context_dir)!r} is not an absolute path. Set agents.dirs.cao_installed "
+            "to an absolute directory or remove it to use the default."
+        )
     context_dir.mkdir(parents=True, exist_ok=True)
     # BARRIER PLACEMENT: the validation and the containment check are inlined
     # here, in the same function as the write sink, rather than factored into a
@@ -690,195 +768,108 @@ def _build_provider_config(
     )
 
 
-def _guard_opencode_agent_id_collision(source_name: str, profile_name: str) -> None:
-    """Fail loud if another installable profile shares this profile's agent id.
+def _guard_installed_copy_ownership(source_name: str, profile_name: str, provider: str) -> None:
+    """Refuse an install that would overwrite a context copy owned by another profile.
 
-    The installed OpenCode id derives from a profile's *resolved name*
-    (frontmatter ``name:``) via :func:`to_opencode_agent_id`, and the opencode
-    sink writes ``OPENCODE_AGENTS_DIR/<id>.md`` and the ``agent.<id>`` section of
-    ``opencode.json`` unconditionally. So when two DIFFERENT profile files
-    resolve to the same id, whichever installs second silently overwrites the
-    first, and nothing tells the operator their profile is gone.
+    Every install writes the shared context copy ``<context dir>/<resolved
+    name>.md``; an OpenCode install additionally writes ``OPENCODE_AGENTS_DIR/<id>.md``
+    and the ``agent.<id>`` section of ``opencode.json``, where ``<id>`` is the
+    resolved name (``to_opencode_agent_id`` is the identity for every name that
+    passes validation). Two profile FILES can resolve to the same ``name:``, so
+    the second install would silently replace the first's artifacts -- and the
+    context copy is not bookkeeping: a Kiro agent's ``resources`` point at it
+    and it is what the installed agent reads at runtime. That is why this runs
+    for every provider, not only OpenCode (round-3 review of #493).
 
-    WHAT ACTUALLY COLLIDES. Two different files carrying the *identical*
-    frontmatter ``name:`` — same resolved string, same id. Nothing upstream of
-    this guard rejects that: ``name:`` need not match the file stem, so two
-    unrelated files can legitimately both say ``name: developer``.
+    **Occupancy is read from the destination itself**, not from profile
+    discovery. ``list_agent_profiles()`` keeps the first profile per stem, so an
+    installed copy is relegated to ``duplicated_in`` whenever the local store or
+    a provider directory holds a file of the same stem -- which is the ordinary
+    case of a profile installed under its own name -- and a disabled directory,
+    a ``~`` spelling or a discovery failure erased the evidence outright. The
+    files a second install overwrites are at known paths, so those paths are what
+    is probed: ``_context_lookup_dirs()`` (the configured directory, plus the
+    legacy default when an override is active) for ``<id>.md``.
 
-    NOT the ``'/'`` -> ``'__'`` collapse, which the original report was about.
-    That vector is dead on this path: :func:`_write_context_file` runs
-    ``validate_path_component`` on the resolved name earlier in the same
-    ``install_agent`` call, which rejects every path separator outright, so
-    ``"a/b"`` can no longer be installed at all and cannot collide with a literal
-    ``"a__b"``. For every name that *does* install, ``to_opencode_agent_id`` is
-    the identity, hence injective. The guard is kept for the same-``name:`` case
-    above, and remains correct if the separator rule is ever relaxed.
+    **Ownership is the provenance marker.** ``_write_context_file`` stamps each
+    copy with ``_CONTEXT_SOURCE_STEM_KEY`` naming the install stem it came from.
+    A copy whose marker names ``source_name`` is this very profile's earlier
+    copy: reinstall and upgrade proceed. A marker naming a different stem is a
+    collision. A missing marker (a copy written before the marker existed)
+    cannot prove either, so it blocks with a recovery message rather than being
+    assumed to be self -- legitimate upgrades change the body, so payload
+    equality is not an identity signal. The installed copy's own ``name:`` is
+    never parsed here: it may hold an unresolved ``${VAR}`` placeholder, and the
+    id it occupies is already the filename.
 
-    Install runs one profile at a time, so this guard reconstructs the id-space
-    the way installs actually populate it:
-
-    * Discovery (:func:`list_agent_profiles`) keys profiles by file *stem*
-      (``source_name``), which is the handle you pass to ``cao install``.
-    * The installed id, however, derives from the profile's *resolved name*
-      (frontmatter ``name:``), not the stem — and the two need not agree.
-
-    We resolve every other INSTALLED profile's name and compare its id to the one
-    being installed. Two exclusions, for different reasons:
-
-    * by *stem* identity (``source_name``), so a profile never collides with
-      itself. Keying on stem rather than resolved name is what still catches a
-      genuinely different file whose ``name:`` is byte-for-byte identical — the
-      case a plain name-string dedup would swallow.
-    * by *occupancy*: only candidates that have actually been installed are
-      considered, because only an install writes ``<id>.md``, and only a written
-      file can be overwritten. A packaged built-in or an uninstalled local-store
-      profile that merely *would* produce this id owns nothing yet. Nothing is
-      missed by waiting — installing writes a provenance-stamped context copy, so
-      taking the id is exactly what makes a profile visible to this check — and
-      the pre-emptive alternative refused every install whose ``name:`` matched
-      one of CAO's six built-ins, including the ordinary case of customising a
-      built-in under your own filename.
-
-    The guard raises :class:`OpenCodeAgentIdCollisionError` (a ``ValueError``) as
-    soon as a surviving candidate's id matches, naming both profiles by stem and
-    resolved name so an operator can find and rename one.
-
-    **Own-copy exception.** ``_write_context_file`` writes each
-    opencode install's shared context copy to
-    ``AGENT_CONTEXT_DIR/<resolved-name>.md`` — named by the *resolved* name, not
-    the install stem. When the install stem differs from ``name:`` (e.g.
-    ``cao install ./my-agent.md`` with ``name: developer``), discovery surfaces
-    that copy as a separate ``source == "installed"`` candidate whose id
-    necessarily equals the target id, so a naive guard would flag a profile
-    against its OWN prior copy and permanently break reinstall/upgrade. We must
-    NOT fix this by blanket-excluding ``source == "installed"`` — that is the one
-    source this guard cannot afford to skip, since it is the only one that owns an
-    id — and doing so reopens the silent-overwrite bug (install A → ``cao profile
-    remove A`` drops only the local-store copy, leaving A's installed artifact →
-    install a DIFFERENT profile B with a colliding id → B clobbers A with no
-    error). Instead each
-    installed copy carries a provenance marker (``_CONTEXT_SOURCE_STEM_KEY``)
-    recording the original install stem, and an installed candidate is skipped
-    ONLY when that marker proves it is this very profile's prior copy. A missing
-    marker (a copy written before this marker existed) cannot prove its original
-    source stem, and legitimate upgrades change the body, so payload equality is
-    not an identity signal. Markerless installed copies occupying the target id
-    therefore block with a recovery message instead of being treated as self.
-
-    Only collisions implicating the profile being installed block the install;
-    a pre-existing clash between two OTHER profiles is left alone. Discovery /
-    per-profile load failures are non-fatal except for installed candidates
-    occupying the target id slot: those block because CAO cannot establish
-    ownership. This guard is still a pre-write check; it does not add file
-    locking between the check and the write.
+    A non-regular entry at the probed path (symlink, directory, device) is left
+    to ``_write_context_file``, whose lstat check refuses it with the message
+    that names the real problem. Only a collision implicating the profile being
+    installed blocks; two OTHER profiles clashing is not this install's concern.
+    This remains a pre-write check with no locking between check and write.
     """
-    try:
-        from cli_agent_orchestrator.utils.agent_profiles import list_agent_profiles
+    # Validated here, in the same function as the paths built from it, so the
+    # probe below cannot be steered outside the context directory by a hostile
+    # ``name:`` (the writer repeats this check at its own sink for the same
+    # reason; see the BARRIER PLACEMENT note there). A separator-bearing name is
+    # therefore refused AS an invalid name, whether or not its flattened id
+    # happens to be occupied: it can never be installed, so "rename the other
+    # profile" would be the wrong remedy.
+    safe_name = validate_path_component(profile_name, description="profile name")
+    target_id = to_opencode_agent_id(safe_name)
 
-        candidates = list_agent_profiles()
-    except Exception as exc:  # pragma: no cover - defensive, discovery is best-effort
-        logger.debug("Skipping OpenCode agent-id collision check: %s", exc)
-        return
-
-    target_id = to_opencode_agent_id(profile_name)
-    for candidate in candidates:
-        stem = candidate.get("name")
-        candidate_source = candidate.get("source")
-        # Skip the profile being installed (by its stem/source handle).
-        # Excluding by STEM (not resolved name)
-        # is what keeps reinstalling the same profile idempotent while still
-        # catching a *different* file that resolves to the same name.
-        if not stem or stem == source_name:
+    for context_dir in _context_lookup_dirs():
+        candidate_path = _installed_context_copy_path(target_id, context_dir)
+        try:
+            entry = os.lstat(candidate_path)
+        except FileNotFoundError:
             continue
-        # OCCUPANCY, not mere discoverability. Only a candidate that has actually
-        # been INSTALLED owns the agent id: installing is what writes
-        # OPENCODE_AGENTS_DIR/<id>.md, so that is the only thing a second install
-        # can overwrite. A packaged built-in or an uninstalled local-store profile
-        # that merely *would* produce this id occupies nothing, and refusing on it
-        # blocks installs that destroy no data.
-        #
-        # This is not a hole. Installing always writes a context copy carrying the
-        # provenance marker, so the moment a profile takes the id it becomes an
-        # "installed" candidate here and the next colliding install is caught. The
-        # guard therefore fires exactly when there is something to lose, one
-        # install later than the pre-emptive form -- and that form was untenable:
-        # CAO ships six built-in profiles, so it refused every install whose
-        # resolved name: matched code_supervisor, developer, memory_manager,
-        # retrospector, reviewer or workflow_scout. Copying a built-in, editing it
-        # and installing it under your own filename is an ordinary workflow, and
-        # ``test_legitimate_name_still_installs`` (added with the path-traversal
-        # fix) pins that ``name: developer`` must install.
-        if candidate_source != "installed":
-            continue
-        if not candidate.get("loadable", True):
-            if to_opencode_agent_id(stem) == target_id:
-                _raise_unloadable_installed_collision(
-                    target_id,
-                    source_name,
-                    profile_name,
-                    _installed_context_copy_path(stem),
-                )
+        except OSError as exc:
+            _raise_unreadable_installed_copy(target_id, source_name, candidate_path, exc, provider)
+        if not stat.S_ISREG(entry.st_mode):
+            # The writer refuses this target itself, naming the real problem.
             continue
         try:
-            raw = _read_agent_profile_source(stem)
-            resolved_name = parse_agent_profile_text(raw, stem).name
-        except Exception as exc:
-            if to_opencode_agent_id(stem) == target_id:
-                _raise_unloadable_installed_collision(
-                    target_id,
-                    source_name,
-                    profile_name,
-                    _installed_context_copy_path(stem),
-                )
-            logger.debug("Skipping unreadable profile '%s' in collision check: %s", stem, exc)
-            continue
-
-        # Own-copy exception: an installed candidate needs its provenance checked
-        # before it can count as a collision. Checked BEFORE the id comparison so
-        # self-copies are skipped early.
-        provenance_stem: Optional[str] = None
-        # Not Optional any more: the occupancy filter above means every candidate
-        # reaching this point is an installed one, so it always has a copy path.
-        candidate_path: Path = _installed_context_copy_path(stem)
+            raw = candidate_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            # An I/O fault, not a bad file: the remedy is to fix access, not to
+            # delete the copy (which would discard the ownership record).
+            _raise_unreadable_installed_copy(target_id, source_name, candidate_path, exc, provider)
         try:
             provenance_stem = _context_source_stem(raw)
-            # Marker present and matches: this is our own prior copy.
-            if provenance_stem == source_name:
-                continue
         except Exception as exc:
-            if to_opencode_agent_id(stem) == target_id:
-                _raise_unloadable_installed_collision(
-                    target_id,
-                    source_name,
-                    profile_name,
-                    candidate_path,
-                )
-            logger.debug("Could not read installed-profile provenance for '%s': %s", stem, exc)
-
-        # Now check if this is an actual id collision.
-        if to_opencode_agent_id(resolved_name) != target_id:
+            logger.debug(
+                "Could not parse installed-profile provenance from '%s': %s", candidate_path, exc
+            )
+            _raise_unloadable_installed_collision(
+                target_id, source_name, profile_name, candidate_path, provider
+            )
+        if provenance_stem == source_name:
+            # Our own earlier copy (possibly in the legacy directory): a reinstall.
             continue
 
-        # A genuinely different file (stem != source_name) whose resolved name
-        # maps to the same agent id. Raising here (keyed on stem, not resolved
-        # name) catches the same-resolved-name-different-file case that a plain
-        # name-string dedup would swallow.
-        # Every candidate reaching here is an installed one (see the occupancy
-        # filter above), so the message always names the installed artifact and
-        # carries its recovery hint.
-        existing_profile = _installed_profile_display(stem, provenance_stem, candidate_path)
-        recovery = f" {_installed_context_copy_remedy(candidate_path)}"
-
-        raise OpenCodeAgentIdCollisionError(
-            f"OpenCode agent id '{target_id}' is produced by both the profile "
-            f"being installed ('{source_name}.md', name '{profile_name}') and "
-            f"the existing profile {existing_profile} (name '{resolved_name}'). Two "
-            "distinct profiles cannot share an OpenCode agent id: they install "
-            f"to the same '{target_id}.md' file and 'agent.{target_id}' config "
-            "section, so the second would silently overwrite the first. Rename "
-            "one of these profiles (their frontmatter 'name:', after '/' -> "
-            f"'__' rewriting, must differ).{recovery}"
-        )
+        existing = _installed_copy_display(provenance_stem, candidate_path)
+        recovery = "" if provenance_stem else f" {_installed_context_copy_remedy(candidate_path)}"
+        if _is_opencode(provider):
+            message = (
+                f"OpenCode agent id '{target_id}' is produced by both the profile "
+                f"being installed ('{source_name}.md', name '{profile_name}') and "
+                f"the existing profile {existing} (name '{target_id}'). Two "
+                "distinct profiles cannot share an OpenCode agent id: they install "
+                f"to the same '{target_id}.md' file and 'agent.{target_id}' config "
+                "section, so the second would silently overwrite the first. Rename "
+                "one of these profiles (their frontmatter 'name:' must differ)."
+            )
+        else:
+            message = (
+                f"Profile name '{target_id}' is already installed from the existing "
+                f"profile {existing}; installing '{source_name}.md' (name "
+                f"'{profile_name}') for {provider} would overwrite its shared context "
+                f"copy, which the installed agent reads at runtime. Two distinct "
+                "profiles cannot share a resolved name. Rename one of these profiles "
+                "(their frontmatter 'name:' must differ)."
+            )
+        raise _collision_error_class(provider)(message + recovery)
 
 
 def install_agent(
@@ -1009,22 +1000,19 @@ def install_agent(
 
         agent_file: Optional[Path] = None
         # Defence in depth. The resolved profile name is attacker-controlled, but
-        # _write_context_file above has already REJECTED any name carrying a path
-        # separator, so nothing separator-bearing reaches these provider sinks in
-        # the normal flow. The flatten stays so each sink is independently safe if
-        # the order ever changes or a new caller appears.
+        # the ownership guard and _write_context_file BELOW both reject any name
+        # carrying a path separator before any provider sink is reached, so
+        # nothing separator-bearing gets here in the normal flow. The flatten
+        # stays so each sink is independently safe if the order ever changes or
+        # a new caller appears.
         safe_filename = flatten_path_separators(profile.name)
 
-        # OpenCode collision guard must run BEFORE any destructive write. The
-        # guard prevents opencode_cli/agents/<id>.md from being overwritten when
-        # a second profile resolves to the same id, but that is only correct if
-        # AGENT_CONTEXT_DIR/<id>.md (the shared context file) is also protected.
-        # Running the guard here — before the context write — ensures a rejected
-        # install leaves ALL files (provider-specific AND shared) untouched. For
-        # non-opencode providers, the shared context file is written early (no
-        # guard needed); for opencode, it is written AFTER the guard passes.
-        if provider == ProviderType.OPENCODE_CLI.value:
-            _guard_opencode_agent_id_collision(agent_name, profile.name)
+        # The ownership guard runs BEFORE any destructive write, for every
+        # provider: the shared context copy is the first thing an install
+        # overwrites and the artifact every provider's agent reads, so a rejected
+        # install must leave it -- and, for OpenCode, the agent file and config
+        # section it also shares -- untouched.
+        _guard_installed_copy_ownership(agent_name, profile.name, provider)
         context_file = _write_context_file(profile.name, raw_content, agent_name)
 
         if provider == ProviderType.KIRO_CLI.value:
