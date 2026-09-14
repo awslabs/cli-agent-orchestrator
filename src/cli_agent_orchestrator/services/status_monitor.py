@@ -321,6 +321,21 @@ class StatusMonitor:
 
         return True
 
+    def report_status(self, terminal_id: str, status: TerminalStatus) -> None:
+        """Accept an explicit lifecycle status from a provider hook.
+
+        Hook reports are authoritative and therefore bypass output-derived
+        stickiness. They still use the normal event bus so inbox delivery and
+        UI subscribers react immediately.
+        """
+        with self._lock:
+            previous = self._last_status.get(terminal_id)
+            self._last_status[terminal_id] = status
+            self._allow_processing_revert[terminal_id] = status != TerminalStatus.PROCESSING
+        if previous != status:
+            bus.publish(f"terminal.{terminal_id}.status", {"status": status.value})
+            logger.info("Terminal %s status reported by hook: %s", terminal_id, status.value)
+
     # ----- pyte rendered-screen detection (edge-debounced) -------------------
 
     def _feed_screen_locked(self, terminal_id: str, chunk: str) -> None:

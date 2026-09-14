@@ -3592,6 +3592,23 @@ async def send_terminal_input(
         )
 
 
+@app.post("/terminals/{terminal_id}/status")
+async def report_terminal_status(
+    terminal_id: TerminalId,
+    reported_status: TerminalStatus,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Record an explicit lifecycle status emitted by a provider hook."""
+    try:
+        await asyncio.to_thread(status_monitor.report_status, terminal_id, reported_status)
+        return {"success": True, "status": reported_status.value}
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to report terminal status: {str(e)}",
+        )
+
+
 @app.post("/terminals/{terminal_id}/key")
 async def send_terminal_key(
     terminal_id: TerminalId,
