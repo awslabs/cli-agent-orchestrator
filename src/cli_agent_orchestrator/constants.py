@@ -55,12 +55,18 @@ SESSION_PREFIX = "cao-"
 # =============================================================================
 # Provider Configuration
 # =============================================================================
-# Available CLI providers - derived from the ProviderType enum for consistency
-PROVIDERS = [p.value for p in ProviderType]
+# Providers supported by this installation.  The provider implementations remain
+# importable internally, but the user-facing profile/launch surface is deliberately
+# limited to the three providers used by the standard supervisor workflow.
+PROVIDERS = [
+    ProviderType.CODEX.value,
+    ProviderType.CLAUDE_CODE.value,
+    ProviderType.GROK_CLI.value,
+]
 
 # Default provider used when --provider flag is not specified
-# Kiro CLI is the recommended provider for new projects
-DEFAULT_PROVIDER = ProviderType.KIRO_CLI.value
+# Codex is the default provider for new projects.
+DEFAULT_PROVIDER = ProviderType.CODEX.value
 
 # =============================================================================
 # Tmux Configuration
