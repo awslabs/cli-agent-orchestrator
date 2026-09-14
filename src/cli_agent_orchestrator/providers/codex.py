@@ -449,7 +449,9 @@ def _live_startup_block(bottom_region: str) -> Optional[str]:
     """Name the startup block currently drawn at the bottom of the pane, if any.
 
     Returns ``"trust"`` (workspace-trust dialog, either wording), ``"update"``
-    (update-available dialog), ``"login"`` (first-run sign-in menu) or ``None``.
+    (update-available dialog), ``"login"`` (first-run sign-in menu),
+    ``"transitional"`` (a recognised header is being drawn below the lowest
+    complete block, so the frame is mid-redraw and no key is safe) or ``None``.
     ``_handle_trust_prompt`` makes exactly one decision per frame from this and
     sends no key until it has.
 
@@ -513,7 +515,23 @@ def _live_startup_block(bottom_region: str) -> Optional[str]:
 
     if not candidates:
         return None
-    return max(candidates, key=lambda name: candidates[name])
+    live = max(candidates, key=lambda name: candidates[name])
+
+    # THE HALF-DRAWN BLOCK. A header that sits BELOW the winning block but is not
+    # yet followed by the lines that would make it a block of its own (the
+    # update menu, the shared footer) is a modal Codex is in the middle of
+    # drawing, not stale copy: stale copy is above the live block by the rule
+    # above. Naming the complete block above it "live" here would let the
+    # handler send that block's key into the modal that is appearing under it
+    # -- a bare Enter meant for an already-answered trust dialog landing on
+    # "1. Update now" or a sign-in method (round-4 review of #731). So the
+    # frame is reported as transitional: send nothing, keep every exit closed,
+    # and read again. The outer cap bounds how long that can go on.
+    live_position = candidates[live]
+    for name, position in (("trust", v2), ("update", update), ("login", login)):
+        if position is not None and name not in candidates and position > live_position:
+            return "transitional"
+    return live
 
 
 def _modal_line_content(line: str) -> Optional[str]:
@@ -1233,9 +1251,6 @@ class CodexProvider(BaseProvider):
             now = time.monotonic()
             if now >= outer_deadline:
                 break
-            if any_prompt_handled and now - last_prompt_time >= idle_gap:
-                # No new prompt within the idle gap — startup settled.
-                return
             output = await asyncio.to_thread(
                 get_backend().get_history, self.session_name, self.window_name
             )
@@ -1298,11 +1313,28 @@ class CodexProvider(BaseProvider):
 
             # A dismissed dialog can stay on screen for a frame after its key was
             # sent (rendering lag after Enter). While it does it is still the live
-            # block, and it still blocks both exits: returning with it up would let
-            # ``initialize()`` succeed on WAITING_USER_ANSWER, and a delivery
+            # block, and it still blocks every exit below -- the idle gap, the
+            # login menu and the idle composer alike: returning with it up would
+            # let ``initialize()`` succeed on WAITING_USER_ANSWER, and a delivery
             # landing in that window is refused with TerminalInputBlockedError and
             # dropped -- the failure this handler's idle-gap split exists to prevent.
-            has_dialog = live in ("trust", "update")
+            # A transitional frame (a header still being drawn under the lowest
+            # complete block) is held the same way: nothing is sent to it above,
+            # and nothing may return on it here.
+            has_dialog = live in ("trust", "update", "transitional")
+
+            # The idle gap is judged on THIS frame, after the block decision, not
+            # at the top of the loop before a read. Judged first, the mandatory
+            # one-second sleep after a dismissal is itself enough to expire a
+            # one-second gap (the smallest the settings validator accepts), so a
+            # follow-up dialog already rendered by then was never observed; and
+            # judged without ``has_dialog`` a dismissed block still on screen
+            # after the gap returned the handler onto it. Quiet means a fresh
+            # frame with no prompt on it, ``idle_gap`` seconds after the last one
+            # was answered.
+            if any_prompt_handled and not has_dialog and now - last_prompt_time >= idle_gap:
+                # No new prompt within the idle gap — startup settled.
+                return
 
             # First-run login menu: this handler must NOT answer it (picking a
             # sign-in method for the operator is not ours to do), but it is a
@@ -1510,14 +1542,22 @@ class CodexProvider(BaseProvider):
 
         # Check trust prompt early — the trust menu uses › which matches the idle prompt
         # pattern, and PROCESSING_PATTERN matches "running" in "You are running Codex in..."
-        if re.search(TRUST_PROMPT_PATTERN, clean_output):
+        # Bottom-anchored like every other startup dialog below. The v0.130+ trust
+        # dialog renders the v2 header OVER the v1 option text, so after it is
+        # dismissed "allow Codex to work in this folder" can survive above the
+        # composer on whatever the detector is handed; matched anywhere in it,
+        # that copy kept reporting WAITING_USER_ANSWER for a prompt that was no
+        # longer on screen, which initialize() accepts as success and the
+        # orchestrated-input guard then refuses to deliver into (round-4 review
+        # of #731). A live dialog is in view by definition.
+        bottom_region = "\n".join(clean_output.splitlines()[-15:])
+        if re.search(TRUST_PROMPT_PATTERN, bottom_region):
             return TerminalStatus.WAITING_USER_ANSWER
 
         # V2 trust dialog ("Do you trust the contents of this directory?" / "Press enter
         # to continue"). Only classify as WAITING when BOTH the question AND the footer
         # appear in the bottom region — avoids false positives if the question text
         # appears in scrollback from a previous model response.
-        bottom_region = "\n".join(clean_output.splitlines()[-15:])
         if re.search(TRUST_PROMPT_PATTERN_V2, bottom_region) and re.search(
             TRUST_PROMPT_FOOTER, bottom_region
         ):

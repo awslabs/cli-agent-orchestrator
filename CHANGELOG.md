@@ -24,8 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the handler to its cap; the handler now decides once per frame which startup
   block is actually live at the bottom of the pane and sends a key only to
   that block, so stale trust text left in scrollback can no longer answer a
-  live update dialog or sign-in menu; and a profile's own
-  `provider_init_timeout` now governs every Codex initialisation wait (#731)
+  live update dialog or sign-in menu; a frame in which a further dialog is
+  still being drawn under the live one is held rather than keyed; the idle gap
+  is judged on a freshly read frame with no dialog on it, not on the clock
+  alone; the v1 trust wording is bottom-anchored in status detection like the
+  other startup dialogs, so a dismissed trust prompt no longer reports
+  `WAITING_USER_ANSWER`; and a profile's own `provider_init_timeout` now
+  governs every Codex initialisation wait (#731)
 
 - **enabling `CAO_MEMORY_API_URL` rejected memory keys that work without it.**
   The `/internal/memory/store` and `/forget` routes validated the wire `key` as
