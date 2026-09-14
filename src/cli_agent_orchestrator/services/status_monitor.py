@@ -101,6 +101,9 @@ class StatusMonitor:
         # stale screen redraw.
         self._buffer_epochs: Dict[str, int] = {}
         self._last_status: Dict[str, TerminalStatus] = {}
+        # Explicit lifecycle reports from provider hooks. While present these
+        # take precedence over output-derived tmux detection.
+        self._reported_status: Dict[str, TerminalStatus] = {}
         # Per-terminal flag: when True, the next provider-detected PROCESSING
         # is honored and stickiness reset. Set by notify_input_sent() whenever
         # external input is sent to the terminal (paste-bombed by send_input
@@ -330,6 +333,7 @@ class StatusMonitor:
         """
         with self._lock:
             previous = self._last_status.get(terminal_id)
+            self._reported_status[terminal_id] = status
             self._last_status[terminal_id] = status
             self._allow_processing_revert[terminal_id] = status != TerminalStatus.PROCESSING
         if previous != status:
@@ -647,6 +651,7 @@ class StatusMonitor:
         IDLE/COMPLETED would block the genuine PROCESSING transition.
         """
         with self._lock:
+            self._reported_status.pop(terminal_id, None)
             self._allow_processing_revert[terminal_id] = True
             # A new turn is starting: whatever ready state a stale-PROCESSING capture saw
             # before this input no longer describes the terminal. Left armed, that candidate
@@ -750,6 +755,11 @@ class StatusMonitor:
         liveness) works on herdr without each having to special-case the backend.
         """
         from cli_agent_orchestrator.backends.registry import get_backend
+
+        with self._lock:
+            reported = self._reported_status.get(terminal_id)
+        if reported is not None:
+            return reported
 
         if get_backend().supports_event_inbox():
             try:
