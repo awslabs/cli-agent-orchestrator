@@ -17,7 +17,7 @@
 [![Python versions](https://img.shields.io/pypi/pyversions/cli-agent-orchestrator.svg)](https://pypi.org/project/cli-agent-orchestrator/)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/awslabs/cli-agent-orchestrator)
 
-**CLI Agent Orchestrator (CAO)** 是一个开源的多 Agent 编排框架，面向 Claude Code、Kiro CLI、Codex CLI、Antigravity CLI、Hermes Agent、Kimi CLI、MiniMax Code、GitHub Copilot CLI、OpenCode、Oh My Pi 和 Cursor CLI 等 AI 编程 CLI。CAO 会把每个 Agent 运行在隔离的 tmux 会话中，并通过 Model Context Protocol (MCP) 以 supervisor-worker 模式协调它们。一个 supervisor Agent 可以并行、串行，或以 swarm 方式把任务分派给多个专长不同的 Agent。
+**CLI Agent Orchestrator (CAO)** 是一个开源的多 Agent 编排框架，面向 Codex CLI、Claude Code 和 Grok CLI 等 AI 编程工具。CAO 会把每个 Agent 运行在隔离的终端中，并通过 Model Context Protocol (MCP) 以 supervisor-worker 模式协调它们。一个 supervisor Agent 可以并行或串行地把任务分派给多个专长不同的 Agent。
 
 📚 **[文档站点](https://awslabs.github.io/cli-agent-orchestrator/)** —— 指南、参考文档，以及两门交互式课程（英文）。
 
@@ -25,15 +25,15 @@
 
 CAO（读作 "kay-oh"）是一个轻量的本地编排器，位于你和常用 CLI 编程 Agent 之间。你不再只能一次运行一个 Agent，而是可以让 supervisor Agent 启动、发送消息并协调多个 worker Agent。每个 worker 都是真实的 CLI 工具（如 Claude Code、Codex、Grok 等），运行在自己的 tmux 终端里。
 
-Agent 之间通过 MCP 暴露的原语通信，包括 **handoff**、**assign** 和 **send_message**。你可以通过 CLI、内置 Web UI，或 MCP 管理服务器来管理它们。由于每个 Agent 都是完整的 CLI 进程，CAO 能保留原工具的行为、鉴权方式和高级能力，例如 Claude Code sub-agents、Kiro CLI custom agents 等。这些是普通 API wrapper 难以完整保留的。
+Agent 之间通过 MCP 暴露的原语通信，包括 **handoff**、**assign** 和 **send_message**。你可以通过 CLI、内置 Web UI，或 MCP 管理服务器来管理它们。由于每个 Agent 都是完整的 CLI 进程，CAO 能保留原工具的行为、鉴权方式和高级能力，这些是普通 API 封装难以完整保留的。
 
 ## 常见使用场景
 
 - **并行代码审查 / 实现**：supervisor 同时分派 N 个 reviewer 审查 N 个文件，然后汇总结果。
-- **跨 provider 工作流**：supervisor 和 worker 可以使用不同 CLI，也可以按 profile 指定 provider。
+- **跨 provider 工作流**：supervisor 和 worker 可以使用不同 CLI，也可以在 profile 中指定 provider。
 - **定时 Agent 任务**：通过 [Flows](docs/flows.md) 设置类似 cron 的触发器，例如「每天早上 9 点」运行。
 - **CI 中的无头 Agent 执行**：使用 `cao launch --headless --async` 无人值守地运行任务。
-- **带 HITL 的多 Agent swarm**：人可以 attach 到任意 tmux 会话，随时介入或调整方向。
+- **支持人工介入的多 Agent 协作**：人可以连接到任意终端，随时介入或调整方向。
 - **由 Agent 管理 Agent**：主 Agent 可以在自己的对话循环中使用 [`cao-ops-mcp`](#cao-ops-mcp-server) 创建和监控 CAO 会话。
 
 ## 分层多 Agent 系统
@@ -46,14 +46,14 @@ CAO 实现的是分层多 Agent 系统：一个 supervisor Agent 把任务委派
 
 - **分层 supervisor-worker 编排**：supervisor 负责协调与分派，worker 专注自己的任务域。整体上下文得以保留，worker 的上下文也不会被污染。
 - **通过 tmux 隔离会话**：每个 Agent 都运行在自己的 tmux 会话中。上下文清晰隔离，保留真实 PTY 访问能力，人也可以随时 `tmux attach` 进去调整。
-- **基于 MCP 的编排原语**：`handoff`（同步，等待完成）、`assign`（异步，fire-and-forget）和 `send_message`（Agent 间 inbox 投递）。Hermes worker 还会使用 `answer_user_prompt` 处理结构化审批和澄清提示；其他 provider 在实现等价 prompt 状态前，可能回退为普通文本投递。详见 [Multi-Agent Orchestration](#multi-agent-orchestration)。
+- **基于 MCP 的编排原语**：`handoff`（同步等待完成）、`assign`（异步派发）和 `send_message`（Agent 间消息投递）。详见 [Multi-Agent Orchestration](#multi-agent-orchestration)。
 - **跨 provider 混用**：同一个会话里可以让 worker 运行在不同 CLI 上。可以通过 Agent frontmatter 把某个 profile 固定到指定 provider。详见 [Cross-Provider Orchestration](#cross-provider-orchestration)。
 - **定时 flows**：用类似 cron 的方式调度无人值守的 Agent 运行。详见 [docs/flows.md](docs/flows.md)。
 - **Web UI、CLI 和 MCP 三种控制面**：可以从浏览器、`cao session` 命令，或 `cao-ops-mcp` server 管理会话。详见 [docs/control-planes.md](docs/control-planes.md)。
 - **按 Agent 限制工具权限**：通过 profile 中的 `role` 和 `allowedTools` 控制权限，并在可用时转换为各 provider 的原生限制。详见 [docs/tool-restrictions.md](docs/tool-restrictions.md)。
 - **持久化 Agent 记忆**：Agent 可以通过 `memory_store` 和 `memory_recall` MCP 工具跨会话保存和召回知识。CAO 会在会话启动时自动注入相关记忆作为上下文。详见 [docs/memory.md](docs/memory.md)。
 - **直接介入 worker**：不同于传统的「sub-agent」功能，你可以 attach 到正在运行的 worker，并在任务中途介入。
-- **保留完整 CLI 能力**：Agent 保留原 CLI 的能力，包括 Claude Code [sub-agents](https://docs.claude.com/en/docs/claude-code/sub-agents)、Kiro CLI custom agents、provider 原生鉴权等。
+- **保留完整 CLI 能力**：Agent 保留原 CLI 的能力，包括 Claude Code 的 [sub-agents](https://docs.claude.com/en/docs/claude-code/sub-agents) 和各 provider 的原生鉴权。
 - **用于 outbound events 的插件系统**：可以把 Agent 间消息转发到 Discord、Slack、Telegram 或任意 webhook 目标。详见 [Plugins](#plugins)。
 
 项目结构和架构细节请参考 [CODEBASE.md](CODEBASE.md)。
@@ -64,7 +64,7 @@ CAO 实现的是分层多 Agent 系统：一个 supervisor Agent 把任务委派
 
 - **curl** 和 **git**：用于下载安装脚本和克隆仓库。
 - **Python 3.10 或更高版本**：详见 [pyproject.toml](pyproject.toml)。
-- **tmux 3.3+**：用于 Agent 会话隔离。
+- **tmux 3.3+**：用于默认的 Agent 会话隔离。
 - **[uv](https://docs.astral.sh/uv/)**：快速的 Python 包安装器和虚拟环境管理器。
 
 ### 1. 安装 Python 3.10+
@@ -138,15 +138,7 @@ CAO 驱动的是已有 CLI Agent 工具，它并不会替代这些工具。使�
 |----------|------|------|
 | **Codex CLI**（默认） | [Provider docs](docs/codex-cli.md) | OpenAI authentication |
 | **Claude Code** | [Provider docs](docs/claude-code.md) · [Installation](https://docs.anthropic.com/en/docs/claude-code/getting-started) | Anthropic API key |
-| **Codex CLI** | [Provider docs](docs/codex-cli.md) · [Installation](https://github.com/openai/codex) | OpenAI API key |
-| **Hermes Agent** | [Provider docs](docs/hermes.md) | Hermes auth；可选 `hermesProfile` wrapper；在选中的 Hermes profile 中配置 `cao-mcp-server` 以启用编排工具 |
-| **Kimi CLI** | [Provider docs](docs/kimi-cli.md) · [Installation](https://platform.moonshot.cn/docs/kimi-cli) | Moonshot API key |
-| **MiniMax Code** | [Provider docs](docs/minimax-code.md) · [Installation](https://www.npmjs.com/package/@minimax-ai/code) | `mcode login` 或 BYOK 配置 |
-| **GitHub Copilot CLI** | [Provider docs](docs/copilot-cli.md) · [Installation](https://github.com/features/copilot/cli) | GitHub auth |
-| **OpenCode CLI**（实验性；多 Agent callback 暂时使用 inbox polling fallback，见 [#203](https://github.com/awslabs/cli-agent-orchestrator/issues/203)） | [Provider docs](docs/opencode-cli.md) · [Installation](https://opencode.ai) | Per-model API key |
-| **Oh My Pi** | [Provider docs](docs/omp-cli.md) · [Installation](https://github.com/can1357/oh-my-pi) | OMP authenticated model account |
-| **Cursor CLI** | [Provider docs](docs/cursor-cli.md) · [Installation](https://cursor.com/cli) | Cursor subscription / API key |
-| **Antigravity CLI** | [Provider docs](docs/antigravity-cli.md) · [Installation](https://antigravity.google) | Google account（与 Antigravity IDE 登录共用） |
+| **Grok CLI** | [Provider docs](docs/grok-cli.md) | xAI authentication |
 
 ## 快速开始
 
@@ -208,11 +200,11 @@ cao shutdown --all                      # 关闭所有 CAO 会话
 cao shutdown --session cao-my-session   # 关闭指定会话
 ```
 
-### 会话运行在 tmux 中
+### 会话运行在终端后端中
 
-所有 Agent 会话都运行在 tmux 中。你可以通过 `tmux attach -t <session-name>` 实时观察 Agent。完整 tmux 快捷键列表和交互式窗口选择器请参考 [docs/tmux.md](docs/tmux.md)。
+默认情况下，Agent 会话由 tmux 后端承载。你可以通过 `tmux attach -t <session-name>` 实时观察 Agent；后端也可以使用支持原生状态事件的 herdr。完整说明请参考 [docs/tmux.md](docs/tmux.md) 和 [docs/herdr.md](docs/herdr.md)。
 
-CAO 也实验性支持 [herdr](https://herdr.dev/) 作为替代后端。herdr 能感知 Agent 状态，因此可以用实时状态事件替代 tmux 输出轮询。配置方式见 [docs/herdr.md](docs/herdr.md)。
+CAO 也支持 [herdr](https://herdr.dev/) 作为替代后端。herdr 能感知 Agent 状态，因此可以用实时状态事件替代基于终端输出的状态识别。配置方式见 [docs/herdr.md](docs/herdr.md)。
 
 ## Web UI
 
@@ -305,7 +297,7 @@ provider: claude_code
 ---
 ```
 
-有效值包括：`codex`、`claude_code`、`grok_cli`。初始会话始终以 `cao launch --provider` 参数为准。详见 [`examples/cross-provider/`](examples/cross-provider/)。
+有效值包括：`codex`、`claude_code`、`grok_cli`。不指定时默认使用 Codex；初始会话也可以通过 `cao launch --provider` 显式指定。详见 [`examples/cross-provider/`](examples/cross-provider/)。
 
 ### Tool Restrictions
 
