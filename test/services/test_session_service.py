@@ -1230,6 +1230,7 @@ class TestGetSession:
             "id": "cao-gone",
             "name": "cao-gone",
             "status": "terminated",
+            "label": None,
         }
         assert result["terminals"][0]["status"] == "error"
         assert result["terminals"][0]["deferred_init_failure"] == failure

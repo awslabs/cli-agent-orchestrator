@@ -445,25 +445,41 @@ def set_session_label(session_name: str, label: str) -> Dict[str, str]:
     the real name (terminals, DB rows, the backend) is disturbed: a pure
     display alias. Whitespace is trimmed and the label is capped at
     ``SESSION_LABEL_MAX_LENGTH``. Returns the full label map after the update.
+
+    Setting a label over a settings.json that exists but cannot be read raises
+    :class:`SettingsUnreadableError` and leaves the file untouched. Clearing
+    one in that state is a warning and a no-op instead: session teardown clears
+    unconditionally, nothing can be written safely, and nothing has been lost.
     """
-    settings = _load()
-    labels = settings.get("session_labels", {})
-    if not isinstance(labels, dict):
-        labels = {}
     clean = label.strip()[:SESSION_LABEL_MAX_LENGTH]
-    if clean:
-        if labels.get(session_name) == clean:
-            return labels
-        labels[session_name] = clean
-    elif session_name in labels:
-        del labels[session_name]
-    else:
-        # Nothing to clear: do not rewrite settings.json for a no-op. Session
-        # teardown clears unconditionally, so this is the common case.
-        return labels
-    settings["session_labels"] = labels
-    _save(settings)
-    return labels
+
+    def update(settings: Dict[str, Any]) -> bool:
+        labels = settings.get("session_labels", {})
+        if not isinstance(labels, dict):
+            labels = {}
+        if clean:
+            if labels.get(session_name) == clean:
+                return False
+            labels[session_name] = clean
+        elif session_name in labels:
+            del labels[session_name]
+        else:
+            # Nothing to clear: do not rewrite settings.json for a no-op.
+            # Session teardown clears unconditionally, so this is the common
+            # case.
+            return False
+        settings["session_labels"] = labels
+        return True
+
+    try:
+        settings = _mutate(update)
+    except SettingsUnreadableError as e:
+        if clean:
+            raise
+        logger.warning(f"Not clearing label for {session_name}: {e}")
+        return {}
+    labels = settings.get("session_labels", {})
+    return labels if isinstance(labels, dict) else {}
 
 
 # Default server tuning values

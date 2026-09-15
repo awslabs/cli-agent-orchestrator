@@ -27,9 +27,11 @@ on WSL works as typed:
 | `"C:\Users\me\proj"` (Explorer "Copy as path") | `/mnt/c/Users/me/proj` |
 | `C:/Users/me/proj` | `/mnt/c/Users/me/proj` |
 | `~/proj` | `/home/me/proj` |
+| `/home/me/scratch/../proj` | `/home/me/proj` (`scratch` is never created) |
 | `/home/me/new-proj` (missing) | created, then used |
 
-A relative path, an existing non-directory (a file, FIFO, socket or device),
+A relative path, a `~user` for a user that does not exist, an existing
+non-directory (a file, FIFO, socket or device),
 or a Windows drive that is not mounted under `/mnt` is rejected with a `400`
 and a plain-language `detail`. Creation is bounded by a path-length and depth
 cap, and runs only after the request's cheaper validations pass. The MCP `handoff`/
