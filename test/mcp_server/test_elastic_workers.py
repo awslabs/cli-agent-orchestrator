@@ -18,7 +18,7 @@ def test_assign_elastic_provisions_then_assigns(monkeypatch):
     response.json.return_value = {
         "worker_id": "deadbeef",
         "target_host": "cao-worker-deadbeef.ns.svc.cluster.local",
-        "working_directory": "/home/cao/workspace/jobs/deadbeef",
+        "working_directory": "/home/cao/workspace/workers/deadbeef",
         "session_name": "cao-worker-deadbeef",
         "release_token": "release-token",
     }
@@ -58,7 +58,7 @@ def test_assign_elastic_deferred_failure_reports_terminal_ended(monkeypatch):
     lease.json.return_value = {
         "worker_id": "deadbeef",
         "target_host": "cao-worker-deadbeef.ns.svc.cluster.local",
-        "working_directory": "/home/cao/workspace/jobs/deadbeef",
+        "working_directory": "/home/cao/workspace/workers/deadbeef",
         "session_name": "cao-worker-deadbeef",
         "release_token": "release-token",
     }
@@ -155,7 +155,7 @@ def _lease_response():
     response.json.return_value = {
         "worker_id": "deadbeef",
         "target_host": "cao-worker-deadbeef.ns.svc.cluster.local",
-        "working_directory": "/home/cao/workspace/jobs/deadbeef",
+        "working_directory": "/home/cao/workspace/workers/deadbeef",
         "session_name": "cao-worker-deadbeef",
         "release_token": "release-token",
     }

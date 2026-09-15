@@ -23,7 +23,6 @@ import logging
 from pathlib import Path
 
 from cli_agent_orchestrator.backends.registry import get_backend
-from cli_agent_orchestrator.clients.database import get_terminal_metadata
 from cli_agent_orchestrator.plugins import PostCreateTerminalEvent, hook
 from cli_agent_orchestrator.plugins.base import CaoPlugin
 from cli_agent_orchestrator.services.memory_gateway import (
@@ -41,6 +40,25 @@ logger = logging.getLogger(__name__)
 BEGIN_MARKER = "<!-- cao-memory:begin -->"
 END_MARKER = "<!-- cao-memory:end -->"
 AGENTS_FILENAME = "AGENTS.md"
+
+
+def get_terminal_metadata(terminal_id: str):
+    """Lazy indirection onto ``clients.database.get_terminal_metadata``.
+
+    Deliberately a wrapper rather than a module-level import. These plugins are
+    discovered through the ``cao.plugins`` entry points, and that discovery also
+    runs in the AGENT's MCP process (``register_mcp_server_surfaces`` is called at
+    MCP server import). A module-level import therefore ran ``clients.database``'s
+    import-time ``_ensure_db_dir()`` -> ``DB_DIR.mkdir()`` inside every agent
+    process: a filesystem side effect on agent startup that also fails outright
+    wherever the data dir is unreadable. This handler only ever fires
+    server-side, so resolving the symbol on call costs nothing.
+    """
+    from cli_agent_orchestrator.clients.database import (
+        get_terminal_metadata as _get_terminal_metadata,
+    )
+
+    return _get_terminal_metadata(terminal_id)
 
 
 class CodexMemoryPlugin(CaoPlugin):

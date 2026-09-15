@@ -76,6 +76,30 @@ class TestReadSessionOutputImpl:
         assert result["terminal_id"] == "term-9"
         assert result["output"] == "abc"
 
+    def test_resolves_session_by_bare_name_against_the_canonical_name(self) -> None:
+        """A bare session_name (not yet "cao-"-prefixed) must still resolve,
+        since sessions are stored with SESSION_PREFIX applied.
+
+        The lookup addresses ``cao-<name>`` only. The literal name is never
+        read: it cannot be a CAO session (both creation paths enforce the
+        prefix), so an unrelated native tmux session answering that GET would
+        hand back the wrong session's terminals.
+        """
+        responses = [
+            _response(json_data={"name": "cao-acc-agy", "terminals": [{"id": "term-9"}]}),
+            _response(json_data={"output": "abc", "mode": "full"}),
+        ]
+        with patch(REQUEST, side_effect=responses) as mock_request:
+            result = _read_session_output_impl(None, "acc-agy", "full", None)
+
+        assert result["success"] is True
+        assert result["terminal_id"] == "term-9"
+        assert result["output"] == "abc"
+        assert mock_request.call_args_list[0].args[:2] == (
+            "get",
+            "http://127.0.0.1:9889/sessions/cao-acc-agy",
+        )
+
     def test_session_resolve_error_is_returned(self) -> None:
         """An API error while resolving a session is surfaced without an output read."""
         with patch(
