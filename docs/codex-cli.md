@@ -22,6 +22,13 @@ export OPENAI_API_KEY=your-key-here
 codex login
 ```
 
+> **Security note.** If Codex is launched under CAO without credentials, the
+> startup handler leaves the first-run sign-in menu on screen for an operator to
+> complete (it cannot be answered automatically). That live sign-in pane — OAuth
+> device code or API-key paste — is attachable through the Web UI and the PTY
+> WebSocket like any other CAO terminal, so enable control-plane authentication
+> before launching Codex workers that will need to sign in interactively.
+
 ### Using Codex Provider with CAO
 
 Create a terminal using the Codex provider:

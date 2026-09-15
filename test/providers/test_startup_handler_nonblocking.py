@@ -19,9 +19,9 @@ Two layers, parameterized across the four handlers:
    bug #494 reports: "mirrors ClaudeCodeProvider" docstrings that were never
    true because the body stayed fully sync).
 
-ClaudeCodeProvider._handle_startup_prompts is deliberately excluded from both
-layers: PR #451 (which converts it) is open/changes-requested, not merged, as
-of this test.
+ClaudeCodeProvider._handle_startup_prompts is not in the parametrized lists
+below. It was excluded when PR #451 (which converts it) was still open; #451 has
+since merged and the conversion is at head, so adding it here is a follow-up.
 
 ``CodexProvider._handle_trust_prompt`` and ``CodexProvider.initialize`` were
 added later (caom-7it), for the same reason and against the same property. Codex

@@ -435,25 +435,52 @@ def _toml_override(key: str, value: Any) -> str:
         raise TypeError(f"codexConfig key '{key}': {exc}") from exc
 
 
-def _has_update_dialog_in_bottom(clean_output: str) -> bool:
-    """Return True when Codex's update-available dialog is active in the bottom region."""
-    bottom = "\n".join(clean_output.splitlines()[-STARTUP_PROMPT_BOTTOM_LINES:])
-    return (
-        re.search(UPDATE_DIALOG_PATTERN, bottom) is not None
-        and re.search(UPDATE_DIALOG_MENU_PATTERN, bottom) is not None
-        and re.search(UPDATE_DIALOG_FOOTER, bottom) is not None
-    )
+def _composer_position(bottom_region: str) -> Optional[int]:
+    """Offset of the idle composer in ``bottom_region``, or None when none is drawn.
+
+    The composer has two signatures, the same two ``_has_startup_idle_composer``
+    accepts: a bare prompt line (``›`` with nothing after it -- a dialog's own
+    ``› 1. Yes, ...`` selector line does not qualify) or, from Codex 0.145, a
+    known placeholder line with the TUI status footer somewhere below it. The
+    LAST such line is the composer; earlier ones are history.
+    """
+    lines = bottom_region.split("\n")
+    offsets: List[int] = []
+    position = 0
+    for line in lines:
+        offsets.append(position)
+        position += len(line) + 1
+    composer: Optional[int] = None
+    for index, line in enumerate(lines):
+        if re.match(IDLE_PROMPT_STRICT_PATTERN, line):
+            composer = offsets[index]
+        elif re.match(STARTUP_IDLE_PLACEHOLDER_PATTERN, line) and any(
+            re.search(TUI_FOOTER_PATTERN, later) for later in lines[index + 1 :]
+        ):
+            composer = offsets[index]
+    return composer
 
 
 def _live_startup_block(bottom_region: str) -> Optional[str]:
-    """Name the startup block currently drawn at the bottom of the pane, if any.
+    """Name the startup state currently drawn lowest in the pane, if any.
 
-    Returns ``"trust"`` (workspace-trust dialog, either wording), ``"update"``
-    (update-available dialog), ``"login"`` (first-run sign-in menu),
-    ``"transitional"`` (a recognised header is being drawn below the lowest
-    complete block, so the frame is mid-redraw and no key is safe) or ``None``.
-    ``_handle_trust_prompt`` makes exactly one decision per frame from this and
-    sends no key until it has.
+    Returns ``"composer"`` (the idle composer), ``"trust"`` (workspace-trust
+    dialog, either wording), ``"update"`` (update-available dialog), ``"login"``
+    (first-run sign-in menu), ``"transitional"`` (a recognised header is being
+    drawn below everything else complete, so the frame is mid-redraw and no key
+    is safe) or ``None``. ``_handle_trust_prompt`` and ``get_status`` both take
+    exactly one decision per frame from this, so a frame cannot be "ready" to
+    one and "waiting" to the other.
+
+    THE COMPOSER IS A STATE, not a veto. Codex draws whatever is current LAST,
+    and that holds for the composer as much as for a modal: an idle composer
+    drawn below trust wording means the dialog has been answered and its text
+    is history (the v0.130+ dialog leaves its option line in view for a while),
+    and a header appearing below an idle composer means a modal is arriving and
+    the composer is the stale thing. Testing the modal patterns without the
+    composer in the ordering got both of those backwards -- status stayed
+    WAITING on a dismissed prompt, and startup was declared ready under a
+    modal mid-redraw (round-5 review of #731).
 
     THE RULE. Codex draws the active modal last, so of every recognised block
     whose signature sits in ``bottom_region`` the LOWEST one is on screen, and
@@ -472,7 +499,7 @@ def _live_startup_block(bottom_region: str) -> Optional[str]:
     (update, login, the v2 trust header) must be followed by a footer to count
     at all; the v1 wording carries its own numbered options and has never had
     one. The update dialog must additionally be followed by its numbered menu,
-    as ``_has_update_dialog_in_bottom`` always required.
+    as the update-dialog check has always required.
 
     Offsets are only comparable because every match comes from the same string.
     Callers pass the bottom window, never the whole capture: a live dialog is by
@@ -513,8 +540,19 @@ def _live_startup_block(bottom_region: str) -> Optional[str]:
     if login is not None and _footer_below(login):
         candidates["login"] = login
 
+    composer = _composer_position(bottom_region)
+    if composer is not None:
+        candidates["composer"] = composer
+
+    incomplete = [
+        position
+        for name, position in (("trust", v2), ("update", update), ("login", login))
+        if position is not None and name not in candidates
+    ]
     if not candidates:
-        return None
+        # A lone header with nothing complete anywhere is a modal being drawn,
+        # not nothing: report it so no exit fires on this frame.
+        return "transitional" if incomplete else None
     live = max(candidates, key=lambda name: candidates[name])
 
     # THE HALF-DRAWN BLOCK. A header that sits BELOW the winning block but is not
@@ -528,9 +566,8 @@ def _live_startup_block(bottom_region: str) -> Optional[str]:
     # frame is reported as transitional: send nothing, keep every exit closed,
     # and read again. The outer cap bounds how long that can go on.
     live_position = candidates[live]
-    for name, position in (("trust", v2), ("update", update), ("login", login)):
-        if position is not None and name not in candidates and position > live_position:
-            return "transitional"
+    if any(position > live_position for position in incomplete):
+        return "transitional"
     return live
 
 
@@ -1187,8 +1224,18 @@ class CodexProvider(BaseProvider):
         self,
         idle_gap: Optional[float] = None,
         outer_timeout: Optional[float] = None,
-    ) -> None:
+    ) -> str:
         """Dismiss startup prompts that block readiness.
+
+        Returns ``"settled"`` when startup reached a state the caller may build
+        on (idle composer, first-run login menu, or the idle gap elapsing on a
+        frame with no dialog), ``"blocked"`` when the outer cap was reached
+        with a trust/update dialog or a half-drawn modal still on screen (a
+        dismissal key was ignored or the redraw stalled), and ``"unresolved"``
+        when the cap was reached on a frame this handler does not recognise.
+        ``initialize()`` fails on ``"blocked"``: a dialog this handler exists to
+        dismiss must not be carried into readiness through the login-only
+        WAITING_USER_ANSWER success path.
 
         Args:
             idle_gap: Seconds with no new prompt before startup is considered
@@ -1196,7 +1243,9 @@ class CodexProvider(BaseProvider):
                 setting. Per that setting's contract this is an IDLE GAP, not a
                 total budget: it is reset every time a prompt is answered, and
                 it only starts counting once at least one prompt has been
-                handled. Mirrors ``kimi_cli``/``antigravity_cli``.
+                handled -- the semantics ``kimi_cli``/``antigravity_cli`` document
+                for the same setting (their handlers still judge the gap on the
+                clock before the poll; see the idle-gap note in the loop).
             outer_timeout: Hard cap on total time this handler may run.
                 Defaults to the ``provider_init_timeout`` setting, which is
                 what that setting documents itself as bounding.
@@ -1212,7 +1261,7 @@ class CodexProvider(BaseProvider):
 
         Every backend call here (get_history/send_keys/send_special_key) is a
         blocking subprocess exec, and this loop makes one per second for up to
-        ``timeout`` seconds. cao-server runs a SINGLE event loop, so leaving
+        ``outer_timeout`` seconds. cao-server runs a SINGLE event loop, so leaving
         them loop-side froze every other concurrent request — including every
         other terminal's own init — for the duration. They are offloaded to
         threads for the same reason claude_code's startup handler was in #451
@@ -1247,6 +1296,7 @@ class CodexProvider(BaseProvider):
         any_prompt_handled = False
         trust_dismissed = False
         update_dismissed = False
+        last_state: Optional[str] = None
         while True:
             now = time.monotonic()
             if now >= outer_deadline:
@@ -1270,6 +1320,7 @@ class CodexProvider(BaseProvider):
             # dismissed-but-still-rendered still blocks every exit, and stale copy
             # above the live block is invisible rather than merely tolerated.
             live = _live_startup_block(bottom_region)
+            last_state = live
 
             if live == "trust" and not trust_dismissed:
                 from cli_agent_orchestrator.services.status_monitor import status_monitor
@@ -1334,7 +1385,7 @@ class CodexProvider(BaseProvider):
             # was answered.
             if any_prompt_handled and not has_dialog and now - last_prompt_time >= idle_gap:
                 # No new prompt within the idle gap — startup settled.
-                return
+                return "settled"
 
             # First-run login menu: this handler must NOT answer it (picking a
             # sign-in method for the operator is not ours to do), but it is a
@@ -1350,13 +1401,17 @@ class CodexProvider(BaseProvider):
                     "Codex first-run login menu detected — startup is settled, leaving the "
                     "menu for the operator to answer"
                 )
-                return
+                return "settled"
             # Exit when the bottom region shows the idle composer prompt AND no
             # dialog is active. The welcome banner alone is insufficient — it
             # renders as normal startup chrome BEFORE a late update dialog appears.
-            if not has_dialog and _has_startup_idle_composer(clean_output):
+            # Readiness is the resolver's own answer -- the composer is the lowest
+            # thing drawn -- with ``_has_startup_idle_composer`` as the activity
+            # veto (a spinner or an approval prompt in the tail means the
+            # composer is not idle yet).
+            if live == "composer" and _has_startup_idle_composer(clean_output):
                 logger.info("Codex started — idle prompt visible, no blocking dialog")
-                return
+                return "settled"
 
             await asyncio.sleep(1.0)
 
@@ -1369,12 +1424,30 @@ class CodexProvider(BaseProvider):
                 pane_tail = "\n".join(output.splitlines()[-10:])
         except Exception:
             pass
+        blocked = last_state in ("trust", "update", "transitional")
         logger.error(
-            "Codex startup prompt handler hit its provider_init_timeout outer cap (%ss) — "
-            "no prompt or welcome banner detected. Pane tail:\n%s",
+            "Codex startup prompt handler hit its provider_init_timeout outer cap (%ss) — %s. "
+            "Pane tail:\n%s",
             outer_timeout,
+            (
+                f"a startup dialog is still on screen ({last_state})"
+                if blocked
+                else "no prompt or welcome banner detected"
+            ),
             pane_tail,
         )
+        return "blocked" if blocked else "unresolved"
+
+    async def _current_startup_state(self) -> Optional[str]:
+        """Resolve the startup state of the pane as it is right now."""
+        output = await asyncio.to_thread(
+            get_backend().get_history, self.session_name, self.window_name
+        )
+        if not output:
+            return None
+        clean_output = strip_terminal_escapes(re.sub(ANSI_CODE_PATTERN, "", output))
+        bottom_region = "\n".join(clean_output.splitlines()[-STARTUP_PROMPT_BOTTOM_LINES:])
+        return _live_startup_block(bottom_region)
 
     def _try_load_profile(self):
         """Best-effort profile load for timeout resolution only.
@@ -1449,7 +1522,17 @@ class CodexProvider(BaseProvider):
         # kimi_cli/antigravity_cli/claude_code — so an operator who lowers the
         # gap for one provider cannot silently truncate codex's whole handler
         # and leave a late dialog undismissed.
-        await self._handle_trust_prompt(outer_timeout=float(init_timeout))
+        outcome = await self._handle_trust_prompt(outer_timeout=float(init_timeout))
+        if outcome == "blocked":
+            # The handler's own hard cap failed: a trust/update dialog (or a
+            # modal mid-redraw) is still up. Letting the readiness wait below
+            # accept it as WAITING_USER_ANSWER -- a status meant for the login
+            # menu -- would report a successful initialisation that every
+            # assign/handoff is then refused into (round-5 review of #731).
+            raise TimeoutError(
+                f"Codex startup prompt could not be dismissed within {init_timeout}s: "
+                "a trust or update dialog is still on screen"
+            )
 
         # WAITING_USER_ANSWER is included here specifically for the first-run login/auth
         # menu (see LOGIN_MENU_PATTERN's own comment) — an account with no credentials
@@ -1477,6 +1560,16 @@ class CodexProvider(BaseProvider):
             # ``provider_init_timeout``, so an operator who changed it was told
             # a number the code never used.
             raise TimeoutError(f"Codex initialization timed out after {init_timeout}s")
+
+        # WAITING_USER_ANSWER satisfied the wait; only the login menu is entitled
+        # to. A trust/update dialog that appeared after the handler returned (or
+        # a modal mid-redraw) is a failed start, not a settled one.
+        startup_state = await self._current_startup_state()
+        if startup_state in ("trust", "update", "transitional"):
+            raise TimeoutError(
+                f"Codex initialization ended with a startup dialog on screen ({startup_state}); "
+                "it was not dismissed within the init window"
+            )
 
         self._initialized = True
         return True
@@ -1540,64 +1633,20 @@ class CodexProvider(BaseProvider):
             last_user and _find_assistant_marker(output_after_last_user) is not None
         )
 
-        # Check trust prompt early — the trust menu uses › which matches the idle prompt
-        # pattern, and PROCESSING_PATTERN matches "running" in "You are running Codex in..."
-        # Bottom-anchored like every other startup dialog below. The v0.130+ trust
-        # dialog renders the v2 header OVER the v1 option text, so after it is
-        # dismissed "allow Codex to work in this folder" can survive above the
-        # composer on whatever the detector is handed; matched anywhere in it,
-        # that copy kept reporting WAITING_USER_ANSWER for a prompt that was no
-        # longer on screen, which initialize() accepts as success and the
-        # orchestrated-input guard then refuses to deliver into (round-4 review
-        # of #731). A live dialog is in view by definition.
-        bottom_region = "\n".join(clean_output.splitlines()[-15:])
-        if re.search(TRUST_PROMPT_PATTERN, bottom_region):
+        # Startup states, resolved ONCE and positionally, by the same function the
+        # startup handler uses (``_live_startup_block``): trust wording (the menu
+        # uses › which matches the idle prompt pattern, and PROCESSING_PATTERN
+        # matches "running" in "You are running Codex in..."), the v2 dialog, the
+        # update dialog, the login menu, or a modal mid-redraw. Each is only
+        # WAITING when it is the LOWEST thing drawn; the idle composer takes part
+        # in that ordering, so the option line a dismissed v0.130+ trust dialog
+        # leaves above the composer is history, not a prompt (round-5 review of
+        # #731). Bottom-anchored: a live dialog is in view by definition.
+        bottom_region = "\n".join(clean_output.splitlines()[-STARTUP_PROMPT_BOTTOM_LINES:])
+        startup_state = _live_startup_block(bottom_region)
+        if startup_state in ("trust", "update", "login", "transitional"):
             return TerminalStatus.WAITING_USER_ANSWER
 
-        # V2 trust dialog ("Do you trust the contents of this directory?" / "Press enter
-        # to continue"). Only classify as WAITING when BOTH the question AND the footer
-        # appear in the bottom region — avoids false positives if the question text
-        # appears in scrollback from a previous model response.
-        if re.search(TRUST_PROMPT_PATTERN_V2, bottom_region) and re.search(
-            TRUST_PROMPT_FOOTER, bottom_region
-        ):
-            return TerminalStatus.WAITING_USER_ANSWER
-
-        # Update-available dialog. Bottom-anchored like trust-v2 to avoid false
-        # positives from scrollback. Never let this fall through to IDLE/COMPLETED
-        # where a queued message or blind Enter could select "Update now".
-        # Eager inbox delivery is not a vector: accepts_input_while_processing=False.
-        if _has_update_dialog_in_bottom(clean_output):
-            return TerminalStatus.WAITING_USER_ANSWER
-
-        # First-run login/auth menu (no credentials configured yet). Bottom-anchored like
-        # trust-v2, same reasoning. See LOGIN_MENU_PATTERN's own comment for why this can't
-        # be auto-dismissed the way trust/update dialogs are, and why classifying it here
-        # (rather than leaving it unrecognized) matters for initialize()'s own timeout.
-        if re.search(LOGIN_MENU_PATTERN, bottom_region) and re.search(
-            LOGIN_MENU_FOOTER, bottom_region
-        ):
-            return TerminalStatus.WAITING_USER_ANSWER
-
-        # Boxed command-approval modal ("Command Approval Required" / "[a] Accept"
-        # / "[d] Decline"). Reuses the copy that STARTUP_BLOCKING_INPUT_PATTERN
-        # already vetoes readiness on at startup — the same modal can appear at
-        # RUNTIME under any approval-prompting codexProfile, and only the startup
-        # path used to notice it.
-        #
-        # Bottom-anchored like trust-v2 and the update dialog, and placed BEFORE
-        # the idle/COMPLETED classification for the same reason: the TUI composer
-        # and status bar keep rendering while the modal is up, so the idle-prompt
-        # check below would otherwise report COMPLETED (or PROCESSING when the
-        # composer has scrolled off) for a pane that is hard-blocked on a
-        # keystroke. A COMPLETED there is the dangerous case — it tells the
-        # conductor the agent is free and invites more work into a dead pane.
-        #
-        # NOT gated on `not assistant_after_last_user` (unlike WAITING_PROMPT_PATTERN
-        # below): the modal is raised mid-turn, after the model has already emitted
-        # bullets, so that gate would suppress every real occurrence. Prose that
-        # merely quotes the copy is excluded structurally instead — see
-        # _has_approval_modal_in_bottom.
         if _has_approval_modal_in_bottom(clean_output):
             return TerminalStatus.WAITING_USER_ANSWER
 
