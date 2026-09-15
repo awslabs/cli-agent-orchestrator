@@ -154,6 +154,7 @@ from cli_agent_orchestrator.services.log_writer import log_writer
 from cli_agent_orchestrator.services.profile_search import (
     DEFAULT_LIMIT as PROFILE_SEARCH_DEFAULT_LIMIT,
 )
+from cli_agent_orchestrator.services.settings_service import SettingsUnreadableError
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.services.terminal_service import (
@@ -1497,6 +1498,11 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # X-Server-Time is not CORS-safelisted, so a browser on another origin
+    # (the Vite dev server, a configured deployment) cannot read it unless it
+    # is exposed here; without this the clock-skew correction it exists for
+    # silently never happens for exactly those clients.
+    expose_headers=["X-Server-Time"],
 )
 
 
@@ -1519,6 +1525,22 @@ async def add_server_time_header(request: Request, call_next):
     response = await call_next(request)
     response.headers["X-Server-Time"] = datetime.now().astimezone().isoformat()
     return response
+
+
+@app.exception_handler(SettingsUnreadableError)
+async def _settings_unreadable(request: Request, exc: SettingsUnreadableError) -> JSONResponse:
+    """A settings write was refused because settings.json is present but unreadable.
+
+    The writers fail closed rather than replace state they could not read
+    (#737), so the honest answer is a server-side fault the operator has to
+    fix on disk, not a client error. The path stays out of the body, as
+    everywhere else; it is in the server log.
+    """
+    logger.error(f"Refused a settings write: {exc}")
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={"detail": exc.redacted_detail()},
+    )
 
 
 @app.exception_handler(RequestValidationError)
@@ -3213,6 +3235,14 @@ async def set_session_label_endpoint(
     the name they created with reaches the same session the listing and the
     teardown key off. Without that, the write would succeed and store an entry
     that never surfaces and is never cleared (gutosantos82, #724 review).
+
+    Setting a label requires the session to exist (404 otherwise), so
+    settings.json never accumulates entries nothing will ever read or clear.
+    Clearing is allowed regardless: a session killed outside ``delete_session``
+    leaves its label behind, and this is the only way to remove it.
+
+    A settings.json that exists but cannot be read makes the set a 500 with
+    the file untouched, rather than the label-only file it used to become.
     """
     from cli_agent_orchestrator.constants import SESSION_PREFIX
 
@@ -3225,6 +3255,11 @@ async def set_session_label_endpoint(
         validate_tmux_name(effective, "session_name")
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    if body.label.strip() and not get_backend().session_exists(effective):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Session '{effective}' not found",
+        )
     from cli_agent_orchestrator.services.settings_service import set_session_label
 
     labels = set_session_label(effective, body.label)
@@ -3379,12 +3414,6 @@ async def create_terminal_in_session(
         else:
             resolved_provider = provider
 
-        # Same operator-typed spellings POST /sessions accepts (see there).
-        try:
-            working_directory = normalize_working_directory(working_directory)
-        except ValueError as e:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-
         # Parse comma-separated allowed_tools string into list
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
 
@@ -3424,6 +3453,15 @@ async def create_terminal_in_session(
                         f"{body.initial_message_orchestration_type!r}"
                     ),
                 )
+
+        # Same operator-typed spellings POST /sessions accepts (see there).
+        # Last among the validations for the same reason as there: this call
+        # can create the directory, and a request one of the checks above was
+        # going to reject must not leave a tree behind.
+        try:
+            working_directory = normalize_working_directory(working_directory)
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
         result = await terminal_service.create_terminal(
             provider=resolved_provider,

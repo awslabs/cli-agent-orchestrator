@@ -114,3 +114,20 @@ class TestNormalizeWorkingDirectory:
         blocker.write_text("x")
         with pytest.raises(ValueError, match="could not be created"):
             normalize_working_directory(str(blocker / "child"), mnt_root=mnt)
+
+    def test_unknown_user_tilde_is_a_clear_error(self, mnt):
+        """``expanduser`` raises RuntimeError for ``~nobody``; that has to
+        become the same ValueError family every other unusable spelling
+        produces, or the endpoints answer 500."""
+        with pytest.raises(ValueError, match="Cannot expand"):
+            normalize_working_directory("~definitely-not-a-user-here/proj", mnt_root=mnt)
+
+    def test_dot_dot_is_cancelled_before_creation(self, tmp_path, mnt):
+        """``a/../b`` cancels ``a`` on paper, but ``mkdir(parents=True)`` walks
+        the literal components and materializes ``a`` on the way to ``b``."""
+        result = normalize_working_directory(
+            str(tmp_path / "cancelled" / ".." / "kept"), mnt_root=mnt
+        )
+        assert result == str(tmp_path / "kept")
+        assert (tmp_path / "kept").is_dir()
+        assert not (tmp_path / "cancelled").exists(), "a cancelled component was created"

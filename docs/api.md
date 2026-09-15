@@ -25,7 +25,10 @@ an offset-aware ISO-8601 timestamp (an unhandled-exception 500 raised past the
 middleware stack does not). A browser client that renders relative
 times from server timestamps can measure its clock skew against it once and
 correct for it (WSL2 hosts have been observed hours adrift from the Windows
-browser next to them). It is informational; clients that ignore it are
+browser next to them). The header is listed in `Access-Control-Expose-Headers`,
+so a page on another allowed origin (the Vite dev server, a configured
+`CAO_CORS_ORIGINS` deployment) can read it; without that a browser hides
+non-safelisted headers from `fetch`. It is informational; clients that ignore it are
 unaffected.
 
 ## HTTP route families
@@ -141,6 +144,12 @@ See [AG-UI](agui.md) for enablement, event shapes, and privacy boundaries.
 - Template validation and preview require the selected template to include a
   `schema.json` file.
 - `/agents/providers` reports provider availability.
+- Every write to `settings.json` (`POST /settings/*`, the session label
+  endpoint) is a locked read-modify-write published atomically, and it refuses
+  to run over a `settings.json` that exists but cannot be read or parsed: the
+  response is a `500` whose `detail` names the problem (never the server
+  path), and the file is left untouched rather than replaced by the one
+  section being written.
 - `/settings/*` exposes supported agent-directory, skill-directory, and memory
   settings.
 
@@ -205,7 +214,10 @@ See [Skills](skills.md) for discovery, installation, and catalog behavior.
   empty string clears it). It is a pure display alias stored in
   `settings.json`, surfaced as `label` (or `null`) on `GET /sessions` and
   `GET /sessions/{session_name}`, and cleared when the session is deleted;
-  nothing that references the real tmux session name is affected.
+  nothing that references the real tmux session name is affected. Setting a
+  label for a session that does not exist is a `404`; clearing is accepted
+  regardless, since a session killed outside CAO leaves its label behind and
+  this is the only way to remove it.
 - `POST /sessions` accepts optional `group`/`metadata` at creation, opting a
   session's initial terminal into peer discovery (a mid-session worker uses
   `PATCH /terminals/{terminal_id}/group`/`metadata` instead — see below).

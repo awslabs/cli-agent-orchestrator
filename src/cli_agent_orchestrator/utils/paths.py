@@ -89,7 +89,18 @@ def normalize_working_directory(
         logger.info("Translated Windows path %r -> %s", working_directory, translated)
         cleaned = str(translated)
 
-    path = Path(cleaned).expanduser()
+    try:
+        path = Path(cleaned).expanduser()
+    except RuntimeError as e:
+        # ``~nobody/proj`` for a user that does not exist: no home to expand
+        # into. Same contract as every other unusable spelling, a clear 400.
+        raise ValueError(f"Cannot expand {cleaned!r}: {e}")
+    # Lexical normalization BEFORE any check or creation. ``a/../b`` cancels
+    # ``a`` on paper, but ``mkdir(parents=True)`` walks the literal components
+    # and would materialize ``a`` on its way to ``b``. Deliberately not
+    # ``resolve()``: symlinks are the callers' canonicalization concern, and
+    # following them needs the path to exist.
+    path = Path(os.path.normpath(path))
     # Length is checked BEFORE any filesystem call: an over-long path makes
     # exists()/is_dir() itself raise OSError(ENAMETOOLONG), which would escape
     # as a 500 instead of the clear 400 every other rejection here produces.
