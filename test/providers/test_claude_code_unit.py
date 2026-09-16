@@ -2251,9 +2251,7 @@ class TestClaudeCodeProviderSettings:
         mock_claude_dir.__truediv__ = MagicMock(return_value=mock_settings_path)
 
         # Both keys already set (and tui at some explicit value) -> genuine no-op.
-        existing = json.dumps(
-            {"skipDangerousModePermissionPrompt": True, "tui": "default"}
-        )
+        existing = json.dumps({"skipDangerousModePermissionPrompt": True, "tui": "default"})
         with patch("builtins.open", mock_open(read_data=existing)):
             ClaudeCodeProvider._ensure_startup_settings()
 
