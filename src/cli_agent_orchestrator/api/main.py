@@ -2307,6 +2307,7 @@ def _resolve_template_name(template: str) -> str:
 async def search_agent_profiles_endpoint(
     q: str = Query(description="Free-text capability keywords, e.g. 'monitor sqs'"),
     limit: int = Query(default=PROFILE_SEARCH_DEFAULT_LIMIT, ge=1, le=100),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> List[Dict]:
     """Rank installed agent profiles against ``q``.
 
@@ -2754,7 +2755,9 @@ async def get_agent_profile_source_endpoint(
 
 
 @app.get("/agents/providers")
-async def list_providers_endpoint() -> List[Dict]:
+async def list_providers_endpoint(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> List[Dict]:
     """List available providers with installation status."""
     import shutil
 
@@ -2808,7 +2811,9 @@ class AgentDirsUpdate(BaseModel):
 
 
 @app.get("/settings/memory")
-async def get_memory_settings_endpoint() -> Dict:
+async def get_memory_settings_endpoint(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
     """Return whether the memory subsystem is enabled (for UI feature discovery).
 
     ``settings_readable`` is additive: False means the two flags above are
@@ -2858,7 +2863,9 @@ async def set_agent_dirs_endpoint(
 
 
 @app.get("/settings/skill-dirs")
-async def get_skill_dirs_endpoint() -> Dict:
+async def get_skill_dirs_endpoint(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
     """Get the global skill store path and user-added extra skill directories."""
     from cli_agent_orchestrator.constants import SKILLS_DIR
     from cli_agent_orchestrator.services.settings_service import get_extra_skill_dirs
@@ -3632,7 +3639,10 @@ async def create_terminal_in_session(
 
 
 @app.get("/sessions/{session_name}/terminals")
-async def list_terminals_in_session(session_name: str) -> List[Dict]:
+async def list_terminals_in_session(
+    session_name: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> List[Dict]:
     """List a session's terminals, oldest first.
 
     The order is significant and part of this endpoint's contract: **index 0 is
@@ -3848,7 +3858,10 @@ async def get_terminal_memory_context(
 
 
 @app.get("/terminals/{terminal_id}/working-directory", response_model=WorkingDirectoryResponse)
-async def get_terminal_working_directory(terminal_id: TerminalId) -> WorkingDirectoryResponse:
+async def get_terminal_working_directory(
+    terminal_id: TerminalId,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> WorkingDirectoryResponse:
     """Get the current working directory of a terminal's pane."""
     try:
         working_directory = terminal_service.get_working_directory(terminal_id)

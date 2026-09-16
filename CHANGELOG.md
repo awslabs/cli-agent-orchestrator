@@ -48,6 +48,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   percent-encoded parameter names before deciding: the server accepts
   `?%61ccess_token=<JWT>` exactly like `?access_token=`, and uvicorn logs the
   raw bytes.
+- **Six read routes lacked the `cao:read` gate their siblings carry:**
+  `GET /agents/profiles/search`, `GET /agents/providers` (which provider
+  binaries exist on the host), `GET /sessions/{name}/terminals`,
+  `GET /terminals/{id}/working-directory`, `GET /settings/skill-dirs` and
+  `GET /settings/memory`. With authentication enabled they answered without a
+  token. No change with authentication off (the default). The read-gating
+  structural test now covers them; the only GETs left open are `/health`, the
+  OAuth discovery document, the static profile schema/template metadata and the
+  AG-UI stream, which carries its own credential.
 
 - **enabling `CAO_MEMORY_API_URL` rejected memory keys that work without it.**
   The `/internal/memory/store` and `/forget` routes validated the wire `key` as

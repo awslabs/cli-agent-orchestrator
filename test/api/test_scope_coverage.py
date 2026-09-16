@@ -97,26 +97,20 @@ _OPEN_READS = {
     # token at all, and CAO's liveness probe.
     "/.well-known/oauth-protected-resource",
     "/health",
-    # Agent profile and provider catalogs. Schema/search/template discovery plus
-    # which provider binaries are present. The profile *content* routes
-    # (`/agents/profiles`, `/agents/profiles/{name}`) are gated upstream and so
-    # are deliberately absent.
+    # Static profile schema/template metadata, identical on every install. The
+    # profile *content* routes (`/agents/profiles`, `/agents/profiles/{name}`,
+    # `/agents/profiles/search`) and `/agents/providers` (which provider
+    # binaries exist on this host) are gated and so are deliberately absent.
     "/agents/profiles/schema",
-    "/agents/profiles/search",
     "/agents/profiles/templates",
     "/agents/profiles/templates/{category}/{name}/schema",
-    "/agents/providers",
     # AG-UI event stream; carries its own auth story.
     "/agui/v1/stream",
-    # Settings reads.
-    "/settings/memory",
-    "/settings/skill-dirs",
-    # Live session and terminal state that remains ungated upstream. The rest of
-    # this surface — `/sessions`, `/terminals/{terminal_id}` and its inbox,
-    # memory-context and output reads — is now scope-gated, which is the
-    # direction that motivated gating `/plugins`.
-    "/sessions/{session_name}/terminals",
-    "/terminals/{terminal_id}/working-directory",
+    # Every settings read (`/settings/agent-dirs`, `/settings/skill-dirs`,
+    # `/settings/memory`) and every live session and terminal read — `/sessions`,
+    # `/sessions/{name}/terminals`, `/terminals/{terminal_id}` and its inbox,
+    # working-directory, memory-context and output reads — is scope-gated, which
+    # is the direction that motivated gating `/plugins`.
 }
 
 
