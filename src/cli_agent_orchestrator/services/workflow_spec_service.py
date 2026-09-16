@@ -24,6 +24,7 @@ The service raises only NARROW exceptions (``ValueError`` / ``FileNotFoundError`
 from __future__ import annotations
 
 import ast
+import errno
 import glob
 import hashlib
 import hmac
@@ -58,6 +59,10 @@ from cli_agent_orchestrator.models.workflow import (
 )
 from cli_agent_orchestrator.models.workflow import validate_only as _model_validate_only
 from cli_agent_orchestrator.services.script_lint import lint_script
+from cli_agent_orchestrator.utils.atomic_file import (
+    LockUnavailableError,
+    strict_target_lock,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +86,10 @@ class SpecPathRefusedError(ValueError):
     symlink refusals whose messages instead include an internally derived
     target path and must be redacted at the HTTP boundary.
     """
+
+
+class SafePublicationUnavailableError(OSError):
+    """The filesystem cannot provide atomic no-replace spec publication."""
 
 
 # Mode applied to a NEWLY created spec file (issue #583, Bolt 3, SR-3A2-6).
@@ -191,6 +200,41 @@ def _safe_spec_path(path: Union[str, Path], base_dir: Optional[str] = None) -> s
     return real_path
 
 
+_ASCII_CASEFOLD_TRANSLATION = str.maketrans(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"
+)
+
+
+def _workflow_lock_identity(canonical_target: str) -> str:
+    """Return the stable lock identity for a contained workflow target.
+
+    Identify the existing parent directory by its physical filesystem identity,
+    then append the ASCII-folded target basename. This makes case and Unicode
+    normalization aliases of the same parent select one lock without attempting
+    to reproduce filesystem-specific Unicode rules. It also keeps the lock
+    stable across atomic replacement of the target inode.
+
+    The caller must establish containment through :func:`_safe_spec_path`
+    before invoking this helper. The original target path remains unchanged for
+    every filesystem access. ASCII basename folding intentionally over-serializes
+    case-distinct workflow names on case-sensitive filesystems.
+    """
+    parent = os.path.dirname(canonical_target)
+    try:
+        parent_stat = os.stat(parent)
+    except OSError as exc:
+        raise LockUnavailableError(
+            "cannot identify workflow lock parent; refusing unlocked access"
+        ) from exc
+
+    basename = os.path.basename(canonical_target).translate(_ASCII_CASEFOLD_TRANSLATION)
+    basename_size = len(basename.encode("utf-8"))
+    return (
+        f"workflow-spec-v2\0dev:{parent_stat.st_dev}\0ino:{parent_stat.st_ino}"
+        f"\0name:{basename_size}:{basename}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Colocated resolve-contain-AND-access helpers (CodeQL py/path-injection)
 # ---------------------------------------------------------------------------
@@ -278,7 +322,11 @@ def _contained_spec_file(path: Union[str, Path], base_dir: Optional[str] = None)
 
 
 def _write_contained_spec_bytes(
-    path: Union[str, Path], data: bytes, base_dir: Optional[str] = None
+    path: Union[str, Path],
+    data: bytes,
+    base_dir: Optional[str] = None,
+    *,
+    create_only: bool = False,
 ) -> str:
     """Resolve + contain + atomically WRITE a spec file, guard colocated with the sinks.
 
@@ -329,9 +377,10 @@ def _write_contained_spec_bytes(
        projection rebuilt from the files (B2-BR-3), so a crash leaving an index
        row pointing at content that never reached disk inverts the
        file-is-canonical invariant.
-    7. **``os.replace``**, never in-place ``open(target, "w")`` (which truncates
-       and exposes an empty file) and never ``shutil.move`` (which copies across
-       filesystems, non-atomically).
+    7. **Atomic publication**: ``os.link`` for no-replace creates, or
+       ``os.replace`` for updates. Never in-place ``open(target, "w")`` (which
+       truncates and exposes an empty file), and never ``shutil.move`` (which
+       copies across filesystems, non-atomically).
     8. **Unlink the temp file on ANY failure**, or a chmod/disk-full error
        orphans it indefinitely.
 
@@ -342,10 +391,10 @@ def _write_contained_spec_bytes(
     expects back verbatim, and NFR-1's redaction obligation attaches to the
     manifest, not to user source.
 
-    Lost updates are NOT prevented (SR-3A2-7): ``os.replace`` stops a reader
-    seeing a partial file, but two writers that both read v1 and both write leave
-    the last one, silently. The mitigation is the caller's expected-source-hash
-    check, not a lock here.
+    This helper owns atomic publication, not the admission lock. Workflow
+    create/update hold :func:`strict_target_lock` from their existence/hash
+    checks through this call. Other direct callers must provide equivalent
+    serialization when their result depends on prior target state.
 
     Returns:
         The resolved, contained realpath ``str`` the bytes were written to — the
@@ -399,21 +448,65 @@ def _write_contained_spec_bytes(
         existing_mode = stat.S_IMODE(os.stat(real_path).st_mode)
 
     # (5) Temp file inside the validated base, with a name no index glob can match.
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{os.path.basename(real_path)}.", dir=safe_base)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{os.path.basename(real_path)}.", suffix=".tmp", dir=safe_base
+    )
+    published = False
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(data)
             handle.flush()
-            os.fsync(handle.fileno())  # (6) durable before the name points at it
-        os.chmod(tmp_name, existing_mode)
-        os.replace(tmp_name, real_path)  # (7) atomic for readers
+            os.chmod(tmp_name, existing_mode)
+            os.fsync(handle.fileno())  # (6) content + mode durable before publication
+        if create_only:
+            # Hard-link publication is atomic and fails with FileExistsError if
+            # the destination appeared. Never fall back to replace: that would
+            # turn a create race into a silent clobber.
+            try:
+                os.link(tmp_name, real_path)
+            except FileExistsError:
+                raise
+            except OSError as exc:
+                unsupported = {
+                    errno.ENOSYS,
+                    errno.EXDEV,
+                    errno.EPERM,
+                    getattr(errno, "ENOTSUP", errno.EOPNOTSUPP),
+                    errno.EOPNOTSUPP,
+                }
+                if exc.errno in unsupported:
+                    raise SafePublicationUnavailableError(
+                        "filesystem does not support atomic no-replace workflow publication"
+                    ) from exc
+                raise
+            published = True
+            os.unlink(tmp_name)
+        else:
+            os.replace(tmp_name, real_path)
+            published = True
+
+        # Persist the directory entry. If this fails after publication, report
+        # the error honestly but never unlink the committed final as "rollback".
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_fd = os.open(safe_base, directory_flags)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     except BaseException:
-        # (8) Never orphan the temp file.
+        # (8) Remove only this call's temp. A published final is never rollback
+        # material, including after a parent-directory fsync failure.
         try:
             os.unlink(tmp_name)
         except OSError:
             logger.debug("could not remove temp spec file after a failed write")
         raise
+    finally:
+        if not published:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
     return real_path
 
 
@@ -976,7 +1069,13 @@ def _validated_script_spec(name: str, source: str, target_path: str) -> ScriptSp
     )
 
 
-def _persist_spec(spec: ScriptSpec, target_path: str, safe_base: str) -> ScriptSpec:
+def _persist_spec(
+    spec: ScriptSpec,
+    target_path: str,
+    safe_base: str,
+    *,
+    create_only: bool = False,
+) -> ScriptSpec:
     """Write ``spec.source`` through the guarded writer, then index it.
 
     The bytes written are the bytes validated (BR-3A3-8, SR-3A3-7) — the same in-memory
@@ -991,7 +1090,10 @@ def _persist_spec(spec: ScriptSpec, target_path: str, safe_base: str) -> ScriptS
     because a cache write failed.
     """
     real_path = _write_contained_spec_bytes(
-        target_path, spec.source.encode("utf-8"), base_dir=safe_base
+        target_path,
+        spec.source.encode("utf-8"),
+        base_dir=safe_base,
+        create_only=create_only,
     )
     written = spec.model_copy(update={"path": real_path})
     try:
@@ -1028,12 +1130,10 @@ def create_workflow(name: str, source: str, scan_dir: Optional[str] = None) -> S
     4. lint + ``INPUTS`` validation;
     5. write, then index.
 
-    The existence check in step 2 is a ``stat`` and is therefore racy — a concurrent
-    writer could create the file between the check and the write. ``O_EXCL`` would make
-    it atomic and was deliberately declined at unit 2 to keep that finished primitive's
-    surface closed. This narrows a LIKELY mistake to a RARE one; it does not eliminate
-    it. Lost updates are a separate problem, mitigated by the caller's
-    expected-source-hash check, not here.
+    A strict permanent sidecar lock covers steps 2 through 5. Publication uses a
+    fully written, synced same-directory temp inode and an atomic hard link, so a
+    concurrent creator receives ``FileExistsError`` without either process ever
+    exposing or replacing a partial final file.
 
     Args:
         name: bare workflow name, no extension and no path separators.
@@ -1051,11 +1151,16 @@ def create_workflow(name: str, source: str, scan_dir: Optional[str] = None) -> S
         TierCollisionError: a same-stem sibling exists in the other tier.
     """
     safe_base, target_path = _validate_write_target(name, scan_dir)
-    if os.path.exists(target_path):
-        raise FileExistsError(f"workflow '{name}' already exists; use update to change it")
-    _check_tier_collision(name, safe_base)  # -> TierCollisionError (409)
-    spec = _validated_script_spec(name, source, target_path)
-    return _persist_spec(spec, target_path, safe_base)
+    # Resolve + contain before constructing the lock key. This keeps a refused
+    # path from creating even a lock sidecar outside the validated workflow
+    # target identity.
+    lock_target = _safe_spec_path(target_path, safe_base)
+    with strict_target_lock(Path(lock_target), lock_identity=_workflow_lock_identity(lock_target)):
+        if os.path.exists(target_path):
+            raise FileExistsError(f"workflow '{name}' already exists; use update to change it")
+        _check_tier_collision(name, safe_base)  # -> TierCollisionError (409)
+        spec = _validated_script_spec(name, source, target_path)
+        return _persist_spec(spec, target_path, safe_base, create_only=True)
 
 
 def _current_source_hash(target_path: str, safe_base: str) -> str:
@@ -1095,13 +1200,10 @@ def update_workflow(
     approval enforcement deliberately does not transfer: that gate could be tripped by
     a *transient* freeze failure, whereas here the hash either matches or it does not.
 
-    **What the check catches, and what it does not** (SR-3A4-6). It reliably catches
-    the realistic case: an agent read a spec, reasoned for a while, and submitted an
-    update against content that has since changed. It does NOT make concurrent writes
-    safe — there is a window between the comparison and the write in which another
-    writer could act, and closing it needs locking, which was considered and declined
-    (a lock adds a failure mode no other CAO path takes and still cannot constrain an
-    external editor). The comparison is placed as late as it can be without one.
+    The strict permanent sidecar lock covers existence, collision, current-byte
+    hashing, validation, and atomic replacement. Participating CAO writers therefore
+    cannot pass the same hash comparison and both publish. The advisory lock does not
+    constrain arbitrary external editors.
 
     Args:
         name: bare workflow name, no extension and no path separators.
@@ -1119,24 +1221,21 @@ def update_workflow(
         StaleSpecError: the spec changed on disk since ``expected_hash`` was read.
     """
     safe_base, target_path = _validate_write_target(name, scan_dir)
-    if not os.path.exists(target_path):
-        raise WorkflowNotFoundError(f"workflow '{name}' does not exist; use create to add it")
-    _check_tier_collision(name, safe_base)
+    lock_target = _safe_spec_path(target_path, safe_base)
+    with strict_target_lock(Path(lock_target), lock_identity=_workflow_lock_identity(lock_target)):
+        if not os.path.exists(target_path):
+            raise WorkflowNotFoundError(f"workflow '{name}' does not exist; use create to add it")
+        _check_tier_collision(name, safe_base)
 
-    # Placed AFTER existence and collision (each has a clearer error of its own) and
-    # BEFORE validation and the write (so a stale update is refused without paying for
-    # a lint pass, and the window to the write is as small as it can be) — BR-3A4-6.
-    actual_hash = _current_source_hash(target_path, safe_base)
-    # ``compare_digest`` rather than ``==``. NOT because a timing attack is a live
-    # threat here — the compared value hashes a file the caller can simply read, and an
-    # in-process call in a local tool is no practical oracle. It is used because ``==``
-    # on a digest is a recognised review flag, and this costs one import to remove the
-    # question a reader would otherwise have to answer from context (TS-3A4-1).
-    if not hmac.compare_digest(actual_hash, expected_hash):
-        raise StaleSpecError(name, expected_hash, actual_hash)
+        # The hash comparison and validation remain in this same lock through
+        # publication. A second same-hash updater therefore reads the winner's
+        # bytes and receives StaleSpecError instead of silently overwriting it.
+        actual_hash = _current_source_hash(target_path, safe_base)
+        if not hmac.compare_digest(actual_hash, expected_hash):
+            raise StaleSpecError(name, expected_hash, actual_hash)
 
-    spec = _validated_script_spec(name, source, target_path)
-    return _persist_spec(spec, target_path, safe_base)
+        spec = _validated_script_spec(name, source, target_path)
+        return _persist_spec(spec, target_path, safe_base)
 
 
 def get_workflow(

@@ -21,6 +21,7 @@ from types import SimpleNamespace
 import pytest
 from click.testing import CliRunner
 
+from cli_agent_orchestrator.cli.commands import workflow as workflow_module
 from cli_agent_orchestrator.cli.commands.workflow import workflow
 from cli_agent_orchestrator.mcp_server import server as mcp_server
 from cli_agent_orchestrator.models.workflow import ScriptSpec
@@ -53,7 +54,7 @@ def source_file(tmp_path):
 def test_create_posts_the_source_text_and_reports_the_hash(monkeypatch, source_file):
     captured = {}
 
-    def fake_post(url, json=None, timeout=None):
+    def fake_post(url, json=None, headers=None, timeout=None):
         captured["url"] = url
         captured["json"] = json
         return _resp(
@@ -132,7 +133,7 @@ def test_update_requires_expected_hash(monkeypatch, source_file):
 def test_update_passes_the_hash_through_verbatim(monkeypatch, source_file):
     captured = {}
 
-    def fake_put(url, json=None, timeout=None):
+    def fake_put(url, json=None, headers=None, timeout=None):
         captured["json"] = json
         return _resp(200, {"name": "wf", "path": "/x/wf.py", "content_hash": "sha256:new"})
 
@@ -146,6 +147,75 @@ def test_update_passes_the_hash_through_verbatim(monkeypatch, source_file):
     assert result.exit_code == 0, result.output
     assert captured["json"]["expected_hash"] == "sha256:old", "never recomputed, never normalised"
     assert "sha256:new" in result.output, "the NEW hash comes back, closing the loop"
+
+
+@pytest.mark.parametrize("verb", ("create", "update"))
+def test_write_verbs_forward_the_local_bearer(monkeypatch, source_file, verb):
+    """Removing ``headers=`` from either write client must fail this test."""
+    captured = {}
+
+    def capture(*args, **kwargs):
+        captured["headers"] = kwargs.get("headers")
+        return _resp(
+            201 if verb == "create" else 200,
+            {"name": "wf", "path": "/x/wf.py", "content_hash": "sha256:new"},
+        )
+
+    monkeypatch.setenv("AUTH0_DOMAIN", "auth.test")
+    monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", "test-token")
+    monkeypatch.setattr(workflow_module.requests, "post" if verb == "create" else "put", capture)
+    arguments = (
+        [verb, "wf", "--from-file", str(source_file)]
+        if verb == "create"
+        else [
+            verb,
+            "wf",
+            "--from-file",
+            str(source_file),
+            "--expected-hash",
+            "sha256:old",
+        ]
+    )
+
+    result = CliRunner().invoke(workflow, arguments)
+
+    assert result.exit_code == 0, result.output
+    assert captured["headers"] == {"Authorization": "Bearer test-token"}
+
+
+@pytest.mark.parametrize("verb", ("create", "update"))
+def test_write_verbs_omit_authorization_without_a_local_bearer(monkeypatch, source_file, verb):
+    """Auth-off/public servers receive no synthetic Authorization header."""
+    captured = {}
+
+    def capture(*args, **kwargs):
+        captured["headers"] = kwargs.get("headers")
+        return _resp(
+            201 if verb == "create" else 200,
+            {"name": "wf", "path": "/x/wf.py", "content_hash": "sha256:new"},
+        )
+
+    monkeypatch.delenv("AUTH0_DOMAIN", raising=False)
+    monkeypatch.delenv("CAO_AUTH_JWKS_URI", raising=False)
+    monkeypatch.delenv("CAO_AUTH_LOCAL_TOKEN", raising=False)
+    monkeypatch.setattr(workflow_module.requests, "post" if verb == "create" else "put", capture)
+    arguments = (
+        [verb, "wf", "--from-file", str(source_file)]
+        if verb == "create"
+        else [
+            verb,
+            "wf",
+            "--from-file",
+            str(source_file),
+            "--expected-hash",
+            "sha256:old",
+        ]
+    )
+
+    result = CliRunner().invoke(workflow, arguments)
+
+    assert result.exit_code == 0, result.output
+    assert captured["headers"] is None
 
 
 @pytest.mark.parametrize(
@@ -164,7 +234,9 @@ def test_each_refusal_carries_its_class_in_json_mode(
     monkeypatch.setattr(
         "cli_agent_orchestrator.cli.commands.workflow.requests."
         + ("post" if verb == "create" else "put"),
-        lambda url, json=None, timeout=None: _resp(status, {"detail": "the server's own words"}),
+        lambda url, json=None, headers=None, timeout=None: _resp(
+            status, {"detail": "the server's own words"}
+        ),
     )
 
     arguments = (
@@ -216,7 +288,7 @@ def test_the_source_is_never_echoed(monkeypatch, tmp_path):
     src.write_text(SECRET_ISH)
     monkeypatch.setattr(
         "cli_agent_orchestrator.cli.commands.workflow.requests.post",
-        lambda url, json=None, timeout=None: _resp(
+        lambda url, json=None, headers=None, timeout=None: _resp(
             201, {"name": "s", "path": "/x/s.py", "content_hash": "sha256:bb"}
         ),
     )

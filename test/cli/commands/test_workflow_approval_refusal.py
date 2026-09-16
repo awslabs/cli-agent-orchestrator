@@ -134,3 +134,62 @@ def test_an_ordinary_error_is_unaffected(runner, monkeypatch):
 
     assert "workflow inputs exceed 65536 bytes" in result.output
     assert "cao workflow approve" not in result.output
+
+
+def test_approve_forwards_the_local_bearer(runner, monkeypatch):
+    """Approval remains admin-only, with its configured bearer forwarded verbatim."""
+    captured = {}
+
+    def capture(*args, **kwargs):
+        captured["headers"] = kwargs.get("headers")
+        return SimpleNamespace(
+            status_code=200,
+            json=lambda: {
+                "plan_id": PLAN_ID,
+                "approved": True,
+                "changed": False,
+                "approved_at": "2026-09-16T00:00:00Z",
+                "approved_by": "tester",
+            },
+            text="",
+            headers={},
+        )
+
+    monkeypatch.setenv("AUTH0_DOMAIN", "auth.test")
+    monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", "test-token")
+    monkeypatch.setattr(wf.requests, "post", capture)
+
+    result = runner.invoke(wf.workflow, ["approve", PLAN_ID])
+
+    assert result.exit_code == 0, result.output
+    assert captured["headers"] == {"Authorization": "Bearer test-token"}
+
+
+def test_approve_omits_authorization_without_a_local_bearer(runner, monkeypatch):
+    """Auth-off/public servers receive no synthetic Authorization header."""
+    captured = {}
+
+    def capture(*args, **kwargs):
+        captured["headers"] = kwargs.get("headers")
+        return SimpleNamespace(
+            status_code=200,
+            json=lambda: {
+                "plan_id": PLAN_ID,
+                "approved": True,
+                "changed": False,
+                "approved_at": "2026-09-16T00:00:00Z",
+                "approved_by": "tester",
+            },
+            text="",
+            headers={},
+        )
+
+    monkeypatch.delenv("AUTH0_DOMAIN", raising=False)
+    monkeypatch.delenv("CAO_AUTH_JWKS_URI", raising=False)
+    monkeypatch.delenv("CAO_AUTH_LOCAL_TOKEN", raising=False)
+    monkeypatch.setattr(wf.requests, "post", capture)
+
+    result = runner.invoke(wf.workflow, ["approve", PLAN_ID])
+
+    assert result.exit_code == 0, result.output
+    assert captured["headers"] is None

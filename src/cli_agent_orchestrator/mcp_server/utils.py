@@ -12,22 +12,21 @@ from typing import Any, Dict, Optional
 import requests
 
 from cli_agent_orchestrator.constants import API_BASE_URL, MCP_REQUEST_TIMEOUT
-from cli_agent_orchestrator.security.auth import get_local_bearer
+from cli_agent_orchestrator.security.auth import get_client_bearer, get_local_bearer
 
 logger = logging.getLogger(__name__)
 
 
-def _auth_headers() -> Dict[str, str]:
+def _auth_headers(*, credential_only: bool = False) -> Dict[str, str]:
     """Return the ``Authorization`` header for the internal MCP->API hop, if any.
 
-    Mirrors ``app_tools._auth_headers``: attaches the operator-provisioned
-    ``CAO_AUTH_LOCAL_TOKEN`` when the auth layer is enabled, and returns an empty
-    mapping default-off so the no-auth posture is byte-for-byte unchanged. Reads
-    are not scope-gated today, but the header is attached for consistency so the
-    whole MCP->API hop behaves the same with auth on.
+    Default behavior preserves the legacy server-posture gate used by existing
+    internal helpers. ``credential_only=True`` selects the configured outbound
+    credential independently, for clients that may target a separately
+    configured authenticated server.
     """
 
-    token = get_local_bearer()
+    token = get_client_bearer() if credential_only else get_local_bearer()
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 

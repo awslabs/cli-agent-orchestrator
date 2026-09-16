@@ -11,10 +11,27 @@ import pytest
 import requests
 
 from cli_agent_orchestrator.mcp_server.utils import (
+    _auth_headers,
     get_json,
     get_terminal_record,
     post_body_json,
 )
+
+
+class TestAuthHeaders:
+    @patch("cli_agent_orchestrator.mcp_server.utils.get_client_bearer", return_value="remote")
+    @patch("cli_agent_orchestrator.mcp_server.utils.get_local_bearer", return_value="legacy")
+    def test_default_preserves_legacy_bearer_selection(self, legacy_bearer, client_bearer):
+        assert _auth_headers() == {"Authorization": "Bearer legacy"}
+        legacy_bearer.assert_called_once_with()
+        client_bearer.assert_not_called()
+
+    @patch("cli_agent_orchestrator.mcp_server.utils.get_client_bearer", return_value="remote")
+    @patch("cli_agent_orchestrator.mcp_server.utils.get_local_bearer", return_value="legacy")
+    def test_credential_only_ignores_server_auth_posture(self, legacy_bearer, client_bearer):
+        assert _auth_headers(credential_only=True) == {"Authorization": "Bearer remote"}
+        client_bearer.assert_called_once_with()
+        legacy_bearer.assert_not_called()
 
 
 class TestGetTerminalRecord:

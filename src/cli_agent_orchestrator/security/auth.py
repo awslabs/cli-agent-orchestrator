@@ -327,6 +327,17 @@ def get_scopes_for_local_token() -> List[str]:
 # --- internal MCP -> API service credential (H3) --------------------------
 
 
+def get_client_bearer() -> Optional[str]:
+    """Return the configured bearer for an outbound API client, if any.
+
+    Credential selection is independent of this process's server-auth posture:
+    a CLI or MCP client may call an authenticated remote server while its own
+    ``AUTH0_DOMAIN`` and ``CAO_AUTH_JWKS_URI`` settings are unset.
+    """
+
+    return os.getenv("CAO_AUTH_LOCAL_TOKEN", "").strip() or None
+
+
 def get_local_bearer() -> Optional[str]:
     """Return the bearer token for internal MCP->API (loopback) calls, or ``None``.
 
@@ -346,9 +357,7 @@ def get_local_bearer() -> Optional[str]:
     leak out.
     """
 
-    if not is_auth_enabled():
-        return None
-    return os.getenv("CAO_AUTH_LOCAL_TOKEN", "").strip() or None
+    return get_client_bearer() if is_auth_enabled() else None
 
 
 def local_auth_misconfig_error() -> Optional[str]:

@@ -4,7 +4,7 @@ import logging
 import re
 from importlib import resources
 from pathlib import Path
-from typing import Dict, List, Set
+from typing import Dict, List, Optional, Set
 
 import frontmatter
 
@@ -12,6 +12,11 @@ from cli_agent_orchestrator.constants import LOCAL_AGENT_STORE_DIR, PROVIDERS
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.utils.env import resolve_env_vars
 from cli_agent_orchestrator.utils.paths import normalized_path
+from cli_agent_orchestrator.utils.profile_value_resolution import (
+    ValueResolver,
+    _resolve_body_value,
+    _resolve_metadata_value,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -276,17 +281,39 @@ def list_agent_profiles() -> List[Dict]:
     return sorted(profiles.values(), key=lambda p: p["name"])
 
 
-def parse_agent_profile_text(resolved_text: str, profile_name: str) -> AgentProfile:
-    """Parse an AgentProfile from already-resolved markdown text."""
-    profile_data = frontmatter.loads(resolved_text)
+def parse_agent_profile_text(
+    profile_text: str,
+    profile_name: str,
+    *,
+    value_resolver: Optional[ValueResolver] = None,
+) -> AgentProfile:
+    """Parse an AgentProfile, optionally resolving values from raw profile text."""
+    profile_data = frontmatter.loads(profile_text)
     meta = profile_data.metadata
+    if value_resolver is not None:
+        meta = _resolve_metadata_value(meta, value_resolver)
     meta["system_prompt"] = profile_data.content.strip()
+    if value_resolver is not None:
+        meta["system_prompt"] = _resolve_body_value(
+            meta["system_prompt"],
+            value_resolver,
+        )
     # Fill in required fields if missing (Kiro profiles don't have frontmatter)
     if "name" not in meta:
         meta["name"] = profile_name
     if "description" not in meta:
         meta["description"] = ""
     return AgentProfile(**meta)
+
+
+def load_gated_agent_profile(agent_name: str, *, value_resolver: ValueResolver) -> AgentProfile:
+    """Load one raw profile source and apply gated value resolution exactly once."""
+    profile_text = _read_agent_profile_source(agent_name)
+    return parse_agent_profile_text(
+        profile_text,
+        agent_name,
+        value_resolver=value_resolver,
+    )
 
 
 def _read_agent_profile_source(agent_name: str) -> str:

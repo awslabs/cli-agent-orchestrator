@@ -33,6 +33,9 @@ later "improvement" is what would take them away:
 for identity and claims nothing about authentication: the value is stored in the same ``manifest_json``
 envelope it describes, so anyone able to write that column can simply write whatever value makes an
 approval match, without needing a collision. Integrity of the database file is the filesystem's job.
+The v2 digests are also UNSALTED: they keep raw bytes out of public documents, but do not make
+guessable input keys or low-entropy values confidential. Anyone holding a digest can test dictionary
+guesses. Authorization must not treat a digest as encryption or a keyed authenticator.
 
 WHAT THIS MODULE DOES NOT DO. It does not assemble the field values (``manifest-freeze``), does not
 carry or store the value (``manifest-envelope`` holds it opaquely inside the envelope;
@@ -91,6 +94,58 @@ _FRAME_SEP = ":"
 # for the same reason as the separator: changing it changes every stored value, so it is part of the
 # hash contract, not a tunable someone may legitimately revise.
 _NUMBER_PRECISION = 6
+
+PLAN_V2_SCHEME_PREFIX = "plan-v2:"
+PLAN_V2_COMPONENT_SET_VERSION = "2"
+PLAN_V2_COMPONENTS = (
+    "scheme",
+    "component_set_version",
+    "tier",
+    "artifact_hash",
+    "declaration",
+    "targets",
+    "inputs",
+    "limits",
+    "retry_policy",
+    "policy",
+    "memory",
+)
+"""The explicit, ordered ``plan-v2`` component contract.
+
+Unlike :class:`PlanFields`, this tuple is additive and does not alter the persisted
+``plan-v1`` encoding. Changing this tuple requires a component-set version bump.
+"""
+
+
+class PlanV2ComponentError(ValueError):
+    """A mandatory public component is absent or malformed.
+
+    Messages name only the component. They never include the rejected value because
+    component producers handle sensitive pre-redaction material.
+    """
+
+
+@dataclass(frozen=True)
+class InputDigest:
+    """One input's opaque key identity and pre-redaction value digest."""
+
+    key_digest: str
+    value_digest: str
+
+
+@dataclass(frozen=True)
+class PlanV2Components:
+    """The complete dynamic component set required by ``plan-v2``."""
+
+    tier: str
+    artifact_hash: str
+    declaration: str
+    targets: str
+    inputs: tuple[InputDigest, ...]
+    limits: str
+    retry_policy: str
+    policy: str
+    memory: str
 
 
 @dataclass(frozen=True)
@@ -188,6 +243,289 @@ def _frame(component: str) -> bytes:
     return f"{len(encoded)}{_FRAME_SEP}".encode("utf-8") + encoded
 
 
+def _frame_v2(payload: bytes) -> bytes:
+    """Length-frame exact bytes for the unreleased ``plan-v2`` contract."""
+    return f"{len(payload)}{_FRAME_SEP}".encode("utf-8") + payload
+
+
+def _v2_utf8(value: str, component: str) -> bytes:
+    try:
+        return value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise PlanV2ComponentError(f"{component} component is invalid") from None
+
+
+def canonical_key_bytes(key: str) -> bytes:
+    """Return the exact UTF-8 bytes used to identify one v2 mapping key."""
+    if not isinstance(key, str):
+        raise PlanV2ComponentError("mapping key is invalid")
+    return _v2_utf8(key, "mapping key")
+
+
+def canonical_component_bytes(value: Any) -> bytes:
+    """Encode a v2 value losslessly with explicit type tags and byte framing.
+
+    This encoder is intentionally separate from the released ``plan-v1``
+    ``_structure`` path. Unsupported values fail closed without rendering the
+    value in the exception.
+    """
+    if value is None:
+        return b"n"
+    if isinstance(value, bool):
+        return b"b1" if value else b"b0"
+    if isinstance(value, int):
+        return b"i" + _frame_v2(str(value).encode("ascii"))
+    if isinstance(value, float):
+        encoded = value.hex()
+        if encoded in {"nan", "inf", "-inf"}:
+            raise PlanV2ComponentError("floating-point value is invalid")
+        return b"f" + _frame_v2(encoded.encode("ascii"))
+    if isinstance(value, str):
+        return b"s" + _frame_v2(_v2_utf8(value, "string value"))
+    if isinstance(value, (bytes, bytearray)):
+        return b"y" + _frame_v2(bytes(value))
+    if isinstance(value, (list, tuple)):
+        return b"a" + _frame_v2(b"".join(canonical_component_bytes(item) for item in value))
+    if isinstance(value, dict):
+        items = []
+        for key in sorted(value, key=canonical_key_bytes):
+            key_bytes = canonical_key_bytes(key)
+            items.append(b"k" + _frame_v2(key_bytes) + canonical_component_bytes(value[key]))
+        return b"o" + _frame_v2(b"".join(items))
+    raise PlanV2ComponentError("value type is unsupported")
+
+
+def _decoded_frame(material: bytes, offset: int, limit: int) -> tuple[bytes, int]:
+    separator = material.find(b":", offset, limit)
+    if separator == -1 or separator == offset:
+        raise PlanV2ComponentError("encoded value component is invalid")
+    length_bytes = material[offset:separator]
+    if not all(48 <= byte <= 57 for byte in length_bytes):
+        raise PlanV2ComponentError("encoded value component is invalid")
+    try:
+        length = int(length_bytes.decode("ascii"))
+    except (UnicodeDecodeError, ValueError):
+        raise PlanV2ComponentError("encoded value component is invalid") from None
+    start = separator + 1
+    end = start + length
+    if end > limit:
+        raise PlanV2ComponentError("encoded value component is invalid")
+    return material[start:end], end
+
+
+def _decode_component_at(material: bytes, offset: int, limit: int) -> tuple[Any, int]:
+    if offset >= limit:
+        raise PlanV2ComponentError("encoded value component is invalid")
+    tag = material[offset : offset + 1]
+    offset += 1
+    if tag == b"n":
+        return None, offset
+    if tag == b"b":
+        if offset >= limit or material[offset : offset + 1] not in {b"0", b"1"}:
+            raise PlanV2ComponentError("encoded value component is invalid")
+        return material[offset : offset + 1] == b"1", offset + 1
+    if tag in {b"i", b"f", b"s", b"y"}:
+        payload, end = _decoded_frame(material, offset, limit)
+        try:
+            if tag == b"i":
+                return int(payload.decode("ascii")), end
+            if tag == b"f":
+                return float.fromhex(payload.decode("ascii")), end
+            if tag == b"s":
+                return payload.decode("utf-8"), end
+            return payload, end
+        except (UnicodeDecodeError, ValueError, OverflowError):
+            raise PlanV2ComponentError("encoded value component is invalid") from None
+    if tag in {b"a", b"o"}:
+        payload, end = _decoded_frame(material, offset, limit)
+        position = 0
+        if tag == b"a":
+            values = []
+            while position < len(payload):
+                value, position = _decode_component_at(payload, position, len(payload))
+                values.append(value)
+            return values, end
+        values_dict: dict[str, Any] = {}
+        previous_key: Optional[bytes] = None
+        while position < len(payload):
+            if payload[position : position + 1] != b"k":
+                raise PlanV2ComponentError("encoded value component is invalid")
+            key_bytes, position = _decoded_frame(payload, position + 1, len(payload))
+            try:
+                key = key_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                raise PlanV2ComponentError("encoded value component is invalid") from None
+            if previous_key is not None and key_bytes <= previous_key:
+                raise PlanV2ComponentError("encoded value component is invalid")
+            previous_key = key_bytes
+            value, position = _decode_component_at(payload, position, len(payload))
+            values_dict[key] = value
+        return values_dict, end
+    raise PlanV2ComponentError("encoded value component is invalid")
+
+
+def decode_component_bytes(material: bytes) -> Any:
+    """Strictly invert :func:`canonical_component_bytes`.
+
+    Tuple/list and bytearray/bytes share one canonical representation, so they
+    decode to ``list`` and ``bytes`` respectively. No JSON or partial-decoding
+    fallback exists. Re-encoding the result rejects every non-canonical frame,
+    numeric spelling, key order, and duplicate key.
+    """
+    if not isinstance(material, bytes):
+        raise PlanV2ComponentError("encoded value component is invalid")
+    try:
+        value, offset = _decode_component_at(material, 0, len(material))
+        if offset != len(material) or canonical_component_bytes(value) != material:
+            raise PlanV2ComponentError("encoded value component is invalid")
+        return value
+    except (PlanV2ComponentError, RecursionError, TypeError):
+        raise PlanV2ComponentError("encoded value component is invalid") from None
+
+
+def digest_bytes(material: bytes) -> str:
+    """Digest exact pre-redaction bytes for a public v2 component."""
+    if not isinstance(material, bytes):
+        raise TypeError("plan-v2 digest material must be bytes")
+    return hashlib.sha256(material).hexdigest()
+
+
+def digest_json(material: Any) -> str:
+    """Digest one losslessly encoded v2 value before public redaction."""
+    return digest_bytes(canonical_component_bytes(material))
+
+
+def digest_inputs(inputs: Any) -> tuple[InputDigest, ...]:
+    """Digest every input independently without publishing its key or value."""
+    if not isinstance(inputs, dict) or not all(isinstance(key, str) for key in inputs):
+        raise PlanV2ComponentError("inputs component is invalid")
+    return tuple(
+        sorted(
+            (
+                InputDigest(
+                    key_digest=digest_bytes(canonical_key_bytes(key)),
+                    value_digest=digest_json(inputs[key]),
+                )
+                for key in inputs
+            ),
+            key=lambda item: item.key_digest,
+        )
+    )
+
+
+def _valid_digest(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and value == value.lower()
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _validated_v2_values(fields: PlanV2Components) -> dict[str, Any]:
+    if fields.tier not in {"script", "yaml"}:
+        raise PlanV2ComponentError("tier component is invalid")
+    values: dict[str, Any] = {
+        "scheme": PLAN_V2_SCHEME_PREFIX[:-1],
+        "component_set_version": PLAN_V2_COMPONENT_SET_VERSION,
+        "tier": fields.tier,
+        "artifact_hash": fields.artifact_hash,
+        "declaration": fields.declaration,
+        "targets": fields.targets,
+        "inputs": [
+            {"key_digest": item.key_digest, "value_digest": item.value_digest}
+            for item in fields.inputs
+        ],
+        "limits": fields.limits,
+        "retry_policy": fields.retry_policy,
+        "policy": fields.policy,
+        "memory": fields.memory,
+    }
+    for name in (
+        "artifact_hash",
+        "declaration",
+        "targets",
+        "limits",
+        "retry_policy",
+        "policy",
+        "memory",
+    ):
+        if not _valid_digest(values[name]):
+            raise PlanV2ComponentError(f"{name} component is invalid")
+    if not isinstance(fields.inputs, tuple):
+        raise PlanV2ComponentError("inputs component is invalid")
+    previous = None
+    for item in fields.inputs:
+        if (
+            not isinstance(item, InputDigest)
+            or not _valid_digest(item.key_digest)
+            or not _valid_digest(item.value_digest)
+            or (previous is not None and item.key_digest <= previous)
+        ):
+            raise PlanV2ComponentError("inputs component is invalid")
+        previous = item.key_digest
+    if tuple(values) != PLAN_V2_COMPONENTS:
+        raise PlanV2ComponentError("component set is invalid")
+    return values
+
+
+def v2_component_document(fields: PlanV2Components) -> dict[str, Any]:
+    """Return the redaction-safe component document carried by public envelopes."""
+    return _validated_v2_values(fields)
+
+
+def compute_v2(fields: PlanV2Components) -> str:
+    """Compute the explicit versioned identity without changing ``plan-v1``."""
+    values = _validated_v2_values(fields)
+    framed = b"".join(
+        _frame_v2(canonical_key_bytes(name)) + _frame_v2(canonical_component_bytes(value))
+        for name, value in values.items()
+    )
+    return PLAN_V2_SCHEME_PREFIX + hashlib.sha256(framed).hexdigest()
+
+
+def verify_v2_components(document: Any, plan_id: Any) -> bool:
+    """Recompute a v2 identity from a public component document alone."""
+    try:
+        if (
+            not isinstance(document, dict)
+            or not isinstance(plan_id, str)
+            or set(document) != set(PLAN_V2_COMPONENTS)
+        ):
+            return False
+        raw_inputs = document["inputs"]
+        if not isinstance(raw_inputs, list):
+            return False
+        inputs = tuple(
+            InputDigest(
+                key_digest=item["key_digest"],
+                value_digest=item["value_digest"],
+            )
+            for item in raw_inputs
+            if isinstance(item, dict) and set(item) == {"key_digest", "value_digest"}
+        )
+        if len(inputs) != len(raw_inputs):
+            return False
+        fields = PlanV2Components(
+            tier=document["tier"],
+            artifact_hash=document["artifact_hash"],
+            declaration=document["declaration"],
+            targets=document["targets"],
+            inputs=inputs,
+            limits=document["limits"],
+            retry_policy=document["retry_policy"],
+            policy=document["policy"],
+            memory=document["memory"],
+        )
+        return (
+            document["scheme"] == PLAN_V2_SCHEME_PREFIX[:-1]
+            and document["component_set_version"] == PLAN_V2_COMPONENT_SET_VERSION
+            and compute_v2(fields) == plan_id
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
 def compute(fields: PlanFields) -> str:
     """Hash the nine components into ``"plan-v1:<64 lowercase hex>"``.
 
@@ -218,7 +556,7 @@ def compute(fields: PlanFields) -> str:
     return PLAN_SCHEME_PREFIX + hashlib.sha256(framed).hexdigest()
 
 
-def scheme_of(stored: Optional[str]) -> Literal["plan-v1", "unknown", "absent"]:
+def scheme_of(stored: Optional[str]) -> Literal["plan-v1", "plan-v2", "unknown", "absent"]:
     """Report what a stored value says about its own provenance. TOTAL — never raises.
 
     THREE ANSWERS, NOT TWO, and the middle one is why the prefix exists. Equality alone conflates "the
@@ -238,6 +576,8 @@ def scheme_of(stored: Optional[str]) -> Literal["plan-v1", "unknown", "absent"]:
     """
     if not stored:
         return "absent"
+    if stored.startswith(PLAN_V2_SCHEME_PREFIX):
+        return "plan-v2"
     if stored.startswith(PLAN_SCHEME_PREFIX):
         return "plan-v1"
     return "unknown"

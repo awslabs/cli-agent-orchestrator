@@ -152,6 +152,7 @@ def test_framing_is_injective_where_a_naive_join_would_collide():
 
 def test_scheme_of_reports_three_states():
     assert scheme_of(compute(_fields())) == "plan-v1"
+    assert scheme_of("plan-v2:" + "a" * 64) == "plan-v2"
     assert scheme_of("v2:" + "a" * 64) == "unknown"
     assert scheme_of(None) == "absent"
     assert scheme_of("") == "absent"
@@ -159,7 +160,7 @@ def test_scheme_of_reports_three_states():
 
 def test_scheme_of_never_raises():
     for value in (None, "", "plan-v1:", "garbage", "\x00", "plan-v2:abc", "a" * 10_000):
-        assert scheme_of(value) in {"plan-v1", "unknown", "absent"}
+        assert scheme_of(value) in {"plan-v1", "plan-v2", "unknown", "absent"}
 
 
 def test_absent_is_distinguishable_from_unknown():

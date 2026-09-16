@@ -2,8 +2,12 @@
 
 import logging
 import os
+import re
+import sqlite3
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, List, NamedTuple, Optional, cast
 
 from sqlalchemy import (
@@ -404,6 +408,263 @@ engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
+_REF_RUN_ID = re.compile(r"[A-Za-z0-9_-]{1,64}\Z", re.ASCII)
+_SAFE_LABEL = re.compile(r"[A-Za-z0-9_-]{1,64}\Z", re.ASCII)
+_V2_PLAN_ID = re.compile(r"plan-v2:[0-9a-f]{64}\Z", re.ASCII)
+_POLICY_HASH = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
+_RECORDED_AT = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z\Z",
+    re.ASCII,
+)
+
+
+class LaunchPolicyRefError(Exception):
+    """Base class for fixed, secret-safe launch-reference failures."""
+
+
+class LaunchPolicyRefStateError(LaunchPolicyRefError):
+    """The caller supplied invalid state or omitted a required transaction."""
+
+
+class LaunchPolicyRefConflictError(LaunchPolicyRefError):
+    """An immutable launch-reference binding already has different identity."""
+
+
+class LaunchPolicyRefStoreError(LaunchPolicyRefError):
+    """The borrowed launch-reference store could not complete a write."""
+
+
+class LaunchPolicyRefUnavailable(LaunchPolicyRefError):
+    """The immutable launch reference cannot be safely read."""
+
+
+@dataclass(frozen=True, slots=True)
+class LaunchPolicyRefRow:
+    """The minimum immutable policy identity needed by a future launch gate."""
+
+    plan_id: str
+    policy_hash: str
+
+
+def _is_exact_match(value: object, pattern: re.Pattern[str]) -> bool:
+    return type(value) is str and pattern.fullmatch(value) is not None
+
+
+def _validate_launch_policy_ref_binding(
+    *,
+    run_id: object,
+    target_key: object,
+    agent_profile: object,
+) -> None:
+    if not _is_exact_match(run_id, _REF_RUN_ID):
+        raise LaunchPolicyRefStateError("invalid_run_id")
+    if not _is_exact_match(target_key, _SAFE_LABEL) or not _is_exact_match(
+        agent_profile, _SAFE_LABEL
+    ):
+        raise LaunchPolicyRefStateError("invalid_binding_label")
+
+
+def _validate_launch_policy_ref_write(
+    *,
+    run_id: object,
+    target_key: object,
+    agent_profile: object,
+    plan_id: object,
+    policy_hash: object,
+    recorded_at: object,
+) -> None:
+    _validate_launch_policy_ref_binding(
+        run_id=run_id,
+        target_key=target_key,
+        agent_profile=agent_profile,
+    )
+    if not _is_exact_match(plan_id, _V2_PLAN_ID):
+        raise LaunchPolicyRefStateError("invalid_plan_id")
+    if not _is_exact_match(policy_hash, _POLICY_HASH):
+        raise LaunchPolicyRefStateError("invalid_policy_hash")
+    if not _is_exact_match(recorded_at, _RECORDED_AT):
+        raise LaunchPolicyRefStateError("invalid_recorded_at")
+
+
+def record_launch_policy_ref(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    target_key: str,
+    agent_profile: str,
+    plan_id: str,
+    policy_hash: str,
+    recorded_at: str,
+) -> None:
+    """Bind one launch slot to immutable plan and policy identities.
+
+    The caller owns the already-open transaction. This helper deliberately
+    issues no transaction control or DDL.
+    """
+    _validate_launch_policy_ref_write(
+        run_id=run_id,
+        target_key=target_key,
+        agent_profile=agent_profile,
+        plan_id=plan_id,
+        policy_hash=policy_hash,
+        recorded_at=recorded_at,
+    )
+    store_failed = False
+    try:
+        if not conn.in_transaction:
+            raise LaunchPolicyRefStateError("transaction_required")
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master " "WHERE type = 'table' AND name = 'launch_policy_ref'"
+        ).fetchone()
+        if table is None:
+            raise LaunchPolicyRefStateError("ref_table_missing")
+        current = conn.execute(
+            "SELECT plan_id, policy_hash FROM launch_policy_ref "
+            "WHERE run_id = ? AND target_key = ? AND agent_profile = ?",
+            (run_id, target_key, agent_profile),
+        ).fetchall()
+        if not current:
+            conn.execute(
+                "INSERT INTO launch_policy_ref "
+                "(run_id, target_key, agent_profile, plan_id, policy_hash, recorded_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    run_id,
+                    target_key,
+                    agent_profile,
+                    plan_id,
+                    policy_hash,
+                    recorded_at,
+                ),
+            )
+            return
+        if len(current) != 1 or current[0] != (plan_id, policy_hash):
+            raise LaunchPolicyRefConflictError("ref_conflict")
+    except LaunchPolicyRefError:
+        raise
+    except (sqlite3.Error, OSError):
+        store_failed = True
+    if store_failed:
+        raise LaunchPolicyRefStoreError("store_unavailable") from None
+
+
+def _verify_ref_store_readable(path: Path) -> None:
+    if os.name != "posix":
+        return
+    for candidate in (
+        path,
+        path.with_name(path.name + "-journal"),
+        path.with_name(path.name + "-wal"),
+        path.with_name(path.name + "-shm"),
+    ):
+        try:
+            mode = candidate.stat().st_mode
+        except FileNotFoundError:
+            continue
+        except OSError:
+            raise LaunchPolicyRefUnavailable("ref_store_permissions") from None
+        if mode & 0o077:
+            raise LaunchPolicyRefUnavailable("ref_store_permissions")
+
+
+def _ref_table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table_name,),
+        ).fetchone()
+        is not None
+    )
+
+
+def read_launch_policy_ref(
+    *,
+    run_id: str,
+    target_key: str,
+    agent_profile: str,
+) -> LaunchPolicyRefRow:
+    """Read and reconcile one immutable launch reference in a stable snapshot."""
+    from cli_agent_orchestrator import constants
+
+    _validate_launch_policy_ref_binding(
+        run_id=run_id,
+        target_key=target_key,
+        agent_profile=agent_profile,
+    )
+    path = Path(constants.DATABASE_FILE)
+    _verify_ref_store_readable(path)
+
+    conn: Optional[sqlite3.Connection] = None
+    began = False
+    result: Optional[LaunchPolicyRefRow] = None
+    pending: Optional[LaunchPolicyRefError] = None
+    try:
+        conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
+        conn.execute(f"PRAGMA busy_timeout = {constants.WORKFLOW_JOURNAL_BUSY_TIMEOUT_MS}")
+        conn.execute("BEGIN")
+        began = True
+        if not _ref_table_exists(conn, "launch_policy_ref"):
+            raise LaunchPolicyRefUnavailable("ref_table_missing")
+        if not _ref_table_exists(conn, "workflow_run_plan_snapshot"):
+            raise LaunchPolicyRefUnavailable("run_link_missing")
+
+        ref_rows = conn.execute(
+            "SELECT plan_id, policy_hash, recorded_at FROM launch_policy_ref "
+            "WHERE run_id = ? AND target_key = ? AND agent_profile = ?",
+            (run_id, target_key, agent_profile),
+        ).fetchall()
+        if not ref_rows:
+            raise LaunchPolicyRefUnavailable("ref_row_missing")
+        if len(ref_rows) != 1 or len(ref_rows[0]) != 3:
+            raise LaunchPolicyRefUnavailable("ref_row_malformed")
+        ref_plan_id, policy_hash, recorded_at = ref_rows[0]
+        if (
+            not _is_exact_match(ref_plan_id, _V2_PLAN_ID)
+            or not _is_exact_match(policy_hash, _POLICY_HASH)
+            or not _is_exact_match(recorded_at, _RECORDED_AT)
+        ):
+            raise LaunchPolicyRefUnavailable("ref_row_malformed")
+
+        link_rows = conn.execute(
+            "SELECT plan_id FROM workflow_run_plan_snapshot WHERE run_id = ?",
+            (run_id,),
+        ).fetchall()
+        if not link_rows:
+            raise LaunchPolicyRefUnavailable("run_link_missing")
+        if (
+            len(link_rows) != 1
+            or len(link_rows[0]) != 1
+            or not _is_exact_match(link_rows[0][0], _V2_PLAN_ID)
+        ):
+            raise LaunchPolicyRefUnavailable("ref_row_malformed")
+        if link_rows[0][0] != ref_plan_id:
+            raise LaunchPolicyRefUnavailable("ref_plan_mismatch")
+        result = LaunchPolicyRefRow(plan_id=ref_plan_id, policy_hash=policy_hash)
+    except LaunchPolicyRefError as exc:
+        pending = exc
+    except (sqlite3.Error, OSError):
+        pending = LaunchPolicyRefUnavailable("ref_storage_unavailable")
+    finally:
+        cleanup_failed = False
+        if conn is not None:
+            if began:
+                try:
+                    conn.execute("ROLLBACK")
+                except (sqlite3.Error, OSError):
+                    cleanup_failed = True
+            try:
+                conn.close()
+            except (sqlite3.Error, OSError):
+                cleanup_failed = True
+        if cleanup_failed and pending is None:
+            pending = LaunchPolicyRefUnavailable("ref_storage_unavailable")
+    if pending is not None:
+        raise pending from None
+    if result is None:
+        raise LaunchPolicyRefUnavailable("ref_storage_unavailable")
+    return result
+
+
 def init_db() -> None:
     """Initialize database tables and apply schema migrations."""
     _migrate_project_aliases_schema()
@@ -428,9 +689,15 @@ def init_db() -> None:
     # Appended LAST (issue #583 Bolt 2, ``approval-store``). Disjoint from every table above —
     # its own new table, no shared columns — so registry order is immaterial here too.
     _migrate_workflow_plan_approval()
+    # Appended LAST (PR #699 Phase A). Private snapshot operations never issue
+    # DDL, particularly not while borrowing a caller's write transaction.
+    _migrate_workflow_plan_snapshot()
     # Appended LAST (issue #657). Adds one partial index to memory_metadata;
     # reads no other table, so registry order is immaterial here too.
     _migrate_memory_scope_null_uniqueness()
+    # Appended LAST (PR #699 U5). This independent, immutable launch reference
+    # intentionally has no foreign key to a run: retention outlives run cleanup.
+    _migrate_launch_policy_ref()
 
 
 def _restrict_db_file_permissions() -> None:
@@ -700,6 +967,91 @@ def _migrate_workflow_plan_approval() -> None:
             )
     except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug (B4-RD-4)
         logger.debug(f"workflow_plan_approval migration skipped: {e}")
+
+
+def _migrate_workflow_plan_snapshot() -> None:
+    """Create the integrity-checked private plan snapshot schema.
+
+    This migration is deliberately separate from the private snapshot store.
+    Callers that will lend a SQLite transaction to ``freeze_and_attach`` must
+    run it before opening that transaction; attempting DDL through the borrowed
+    connection could commit caller work or deadlock against its write lock.
+
+    Startup's existing database chmod remains best-effort for compatibility;
+    this migrator itself is mode-agnostic. Private snapshot reads and writes
+    independently enforce their stricter fail-closed permission contract before
+    touching persisted executable material.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS workflow_plan_snapshot ("
+                "plan_id TEXT PRIMARY KEY, "
+                "component_set_version TEXT NOT NULL"
+                ")"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS workflow_plan_snapshot_component ("
+                "plan_id TEXT NOT NULL, "
+                "component_name TEXT NOT NULL, "
+                "content_digest TEXT NOT NULL, "
+                "content BLOB NOT NULL, "
+                "PRIMARY KEY (plan_id, component_name), "
+                "FOREIGN KEY (plan_id) REFERENCES workflow_plan_snapshot(plan_id) "
+                "ON DELETE CASCADE"
+                ")"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS workflow_run_plan_snapshot ("
+                "run_id TEXT PRIMARY KEY, "
+                "plan_id TEXT NOT NULL, "
+                "FOREIGN KEY (run_id) REFERENCES workflow_run(run_id) ON DELETE CASCADE, "
+                "FOREIGN KEY (plan_id) REFERENCES workflow_plan_snapshot(plan_id) "
+                "ON DELETE RESTRICT"
+                ")"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_workflow_run_plan_snapshot_plan "
+                "ON workflow_run_plan_snapshot(plan_id)"
+            )
+    except Exception as e:  # noqa: BLE001 — retryable; strict operations fail closed
+        logger.debug(f"workflow_plan_snapshot migration skipped: {e}")
+
+
+def _migrate_launch_policy_ref() -> None:
+    """Create the immutable launch-policy reference table and audit index."""
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        conn = sqlite3.connect(str(DATABASE_FILE))
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS launch_policy_ref ("
+            "run_id TEXT NOT NULL, "
+            "target_key TEXT NOT NULL, "
+            "agent_profile TEXT NOT NULL, "
+            "plan_id TEXT NOT NULL, "
+            "policy_hash TEXT NOT NULL, "
+            "recorded_at TEXT NOT NULL, "
+            "PRIMARY KEY (run_id, target_key, agent_profile)"
+            ")"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_launch_policy_ref_plan " "ON launch_policy_ref(plan_id)"
+        )
+        conn.commit()
+    except Exception:  # noqa: BLE001 - startup migration is fail-soft
+        logger.debug("launch_policy_ref migration skipped")
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001 - migration remains fail-soft
+                logger.debug("launch_policy_ref migration skipped")
 
 
 def _migrate_memory_scope_null_uniqueness(engine: Any = None, *, strict: bool = False) -> None:

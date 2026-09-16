@@ -38,11 +38,36 @@ from cli_agent_orchestrator.constants import (
     WORKFLOW_RUN_REQUEST_TIMEOUT,
     WORKFLOW_STEP_REQUEST_TIMEOUT,
 )
+from cli_agent_orchestrator.security.auth import get_client_bearer
 from cli_agent_orchestrator.utils.workflow_events import SseFrame, parse_sse_frames
 
 # Whole-run states that end the follow/poll loop (mirror ``RunState``'s terminal
 # members without importing the engine model — C-2 keeps this a thin HTTP client).
 _TERMINAL_RUN_STATES = frozenset({"completed", "failed", "cancelled"})
+
+
+def _auth_headers() -> dict[str, str]:
+    """Return the configured bearer header for the CLI-to-API hop, if any."""
+    token = get_client_bearer()
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+def _authentication_failure_detail(
+    response: requests.Response,
+    auth_headers: dict[str, str] | None,
+) -> str | None:
+    """Explain a 401 without exposing the configured credential."""
+    if response.status_code != 401:
+        return None
+    if auth_headers:
+        return (
+            "cao-server rejected the configured local authentication credential; "
+            "replace CAO_AUTH_LOCAL_TOKEN with a valid token"
+        )
+    return (
+        "cao-server requires authentication; configure CAO_AUTH_LOCAL_TOKEN "
+        "with a token for this server"
+    )
 
 
 def _render_lint_findings(findings: object) -> str:
@@ -197,7 +222,11 @@ def _emit_json_failure(envelope: dict) -> None:
 
 
 def _authoring_failure(
-    response: requests.Response, as_json: bool, fallback: str, operation: str
+    response: requests.Response,
+    as_json: bool,
+    fallback: str,
+    operation: str,
+    auth_headers: dict[str, str] | None,
 ) -> "click.ClickException":
     """Build the exception for a refused authoring call, honouring ``--json``.
 
@@ -206,7 +235,9 @@ def _authoring_failure(
     ``already_exists`` and ``stale_hash`` respectively. Lint failures arrive as 400 invalid-request
     responses; there is no live authoring 422 branch.
     """
-    detail = _extract_detail(response, fallback)
+    detail = _authentication_failure_detail(response, auth_headers) or _extract_detail(
+        response, fallback
+    )
     if not as_json:
         return click.ClickException(detail)
     error_class = _AUTHORING_ERROR_CLASSES.get(response.status_code, "error")
@@ -288,10 +319,12 @@ def create_cmd(name, from_file, as_json):
     except (OSError, ValueError) as e:
         raise click.ClickException(f"could not read {from_file}: {e}")
 
+    auth_headers = _auth_headers() or None
     try:
         response = requests.post(
             f"{API_BASE_URL}/workflows",
             json={"name": name, "source": source},
+            headers=auth_headers,
             timeout=MCP_REQUEST_TIMEOUT,
         )
     except requests.exceptions.RequestException as e:
@@ -301,7 +334,13 @@ def create_cmd(name, from_file, as_json):
         # The server's own message is surfaced verbatim rather than replaced by a generic phrase: the
         # over-cap refusal names the actual byte limit, and the YAML refusal names the restriction.
         # Substituting "invalid request" here would throw away the only actionable part.
-        raise _authoring_failure(response, as_json, f"status {response.status_code}", "create")
+        raise _authoring_failure(
+            response,
+            as_json,
+            f"status {response.status_code}",
+            "create",
+            auth_headers,
+        )
 
     _echo_spec_result(response.json(), as_json, "created")
 
@@ -345,17 +384,25 @@ def update_cmd(name, from_file, expected_hash, as_json):
     except (OSError, ValueError) as e:
         raise click.ClickException(f"could not read {from_file}: {e}")
 
+    auth_headers = _auth_headers() or None
     try:
         response = requests.put(
             f"{API_BASE_URL}/workflows/{name}",
             json={"source": source, "expected_hash": expected_hash},
+            headers=auth_headers,
             timeout=MCP_REQUEST_TIMEOUT,
         )
     except requests.exceptions.RequestException as e:
         raise _unreachable(e, as_json)
 
     if response.status_code != 200:
-        raise _authoring_failure(response, as_json, f"status {response.status_code}", "update")
+        raise _authoring_failure(
+            response,
+            as_json,
+            f"status {response.status_code}",
+            "update",
+            auth_headers,
+        )
 
     _echo_spec_result(response.json(), as_json, "updated")
 
@@ -517,12 +564,14 @@ def approve_cmd(plan_id, as_json):
       0  the plan is approved (whether this call approved it or found it already approved)
       1  the request was rejected or the server could not be reached
     """
+    auth_headers = _auth_headers() or None
     try:
         response = requests.post(
             f"{API_BASE_URL}/workflows/plans/approve",
             # plan_id rides the BODY, never the path: it contains a ':' and must reach the server
             # verbatim, because a normalisation is how two distinct plans could share one approval.
             json={"plan_id": plan_id},
+            headers=auth_headers,
             timeout=MCP_REQUEST_TIMEOUT,
         )
     except requests.exceptions.RequestException as e:
@@ -530,6 +579,9 @@ def approve_cmd(plan_id, as_json):
 
     if response.status_code == 400:
         raise click.ClickException(_extract_detail(response, "invalid request"))
+    authentication_detail = _authentication_failure_detail(response, auth_headers)
+    if authentication_detail:
+        raise click.ClickException(authentication_detail)
     if response.status_code == 403:
         raise click.ClickException(
             _extract_detail(response, "forbidden: approving a plan requires the cao:admin scope")

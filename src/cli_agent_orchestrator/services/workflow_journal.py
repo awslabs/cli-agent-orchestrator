@@ -1780,13 +1780,22 @@ def delete_run(run_id: str) -> None:
     would fault on a missing table rather than being the BR-12 no-op.
     """
     from cli_agent_orchestrator.clients.database import (
+        _migrate_workflow_plan_snapshot,
         _migrate_workflow_run,
         _migrate_workflow_run_step,
     )
 
     _migrate_workflow_run()
     _migrate_workflow_run_step()
+    _migrate_workflow_plan_snapshot()
     with _connect_event() as conn:
+        # ``plan-v2`` snapshots are plan-shared. Release only this run's
+        # reference; the helper garbage-collects raw bytes after the final run.
+        from cli_agent_orchestrator.services.private_plan_snapshot import (
+            release_run_reference,
+        )
+
+        release_run_reference(run_id, conn)
         # The event delete goes through the shared helper (DRY, one definition of
         # "clear a run's events"); the connection is threaded in so all four
         # statements stay in ONE transaction.

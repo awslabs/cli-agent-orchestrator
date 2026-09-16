@@ -163,6 +163,62 @@ async def test_every_tool_survives_a_non_json_body(name, monkeypatch):
     assert out["ok"] is False and "class" in out and out["error"]
 
 
+@pytest.mark.parametrize("name", _TOOLS)
+@pytest.mark.asyncio
+async def test_every_authoring_tool_forwards_the_configured_bearer(name, monkeypatch):
+    """Removing ``headers=`` from any named client must fail this test."""
+    seen = {}
+
+    def auth_headers(*, credential_only=False):
+        seen["credential_only"] = credential_only
+        return {"Authorization": "Bearer test-token"}
+
+    def capture(*args, **kwargs):
+        seen["headers"] = kwargs.get("headers")
+        return _resp(
+            201 if name == "workflow_create" else 200,
+            {"name": "wf", "status": "pass", "findings": []},
+        )
+
+    monkeypatch.setattr(S.mcp_utils, "_auth_headers", auth_headers)
+    for verb in ("get", "post", "put"):
+        monkeypatch.setattr(S.requests, verb, capture)
+
+    await _fn(name)(**_ARGS[name])
+
+    assert seen["credential_only"] is True
+    assert seen["headers"] == {"Authorization": "Bearer test-token"}
+
+
+@pytest.mark.parametrize("name", _TOOLS)
+@pytest.mark.asyncio
+async def test_every_authoring_tool_omits_authorization_without_a_configured_bearer(
+    name, monkeypatch
+):
+    """Auth-off/public servers receive no synthetic Authorization header."""
+    seen = {}
+
+    def auth_headers(*, credential_only=False):
+        seen["credential_only"] = credential_only
+        return {}
+
+    def capture(*args, **kwargs):
+        seen["headers"] = kwargs.get("headers")
+        return _resp(
+            201 if name == "workflow_create" else 200,
+            {"name": "wf", "status": "pass", "findings": []},
+        )
+
+    monkeypatch.setattr(S.mcp_utils, "_auth_headers", auth_headers)
+    for verb in ("get", "post", "put"):
+        monkeypatch.setattr(S.requests, verb, capture)
+
+    await _fn(name)(**_ARGS[name])
+
+    assert seen["credential_only"] is True
+    assert seen["headers"] is None
+
+
 # ---------------------------------------------------------------------------
 # Per-tool behaviour
 # ---------------------------------------------------------------------------
@@ -172,7 +228,7 @@ async def test_every_tool_survives_a_non_json_body(name, monkeypatch):
 async def test_create_sends_source_text_and_returns_the_hash(monkeypatch):
     seen = {}
 
-    def fake_post(url, json=None, timeout=None):
+    def fake_post(url, json=None, headers=None, timeout=None):
         seen["url"], seen["json"] = url, json
         return _resp(201, {"name": "wf", "path": "/x/wf.py", "content_hash": "sha256:aa"})
 
@@ -190,7 +246,7 @@ async def test_update_passes_the_hash_verbatim(monkeypatch):
     """SEC-4: transported, never obtained. The tool must not fetch the hash it is about to compare."""
     seen = {}
 
-    def fake_put(url, json=None, timeout=None):
+    def fake_put(url, json=None, headers=None, timeout=None):
         seen["json"] = json
         return _resp(200, {"name": "wf", "path": "/x/wf.py", "content_hash": "sha256:new"})
 
@@ -240,7 +296,7 @@ async def test_validate_sends_source_and_never_a_path(monkeypatch):
     """REL-6: a draft is checked without existing anywhere, and no path is ever sent."""
     seen = {}
 
-    def fake_post(url, json=None, timeout=None):
+    def fake_post(url, json=None, headers=None, timeout=None):
         seen["url"], seen["json"] = url, json
         return _resp(200, {"status": "pass", "findings": []})
 

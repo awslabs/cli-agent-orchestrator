@@ -155,6 +155,7 @@ from cli_agent_orchestrator.services.log_writer import log_writer
 from cli_agent_orchestrator.services.profile_search import (
     DEFAULT_LIMIT as PROFILE_SEARCH_DEFAULT_LIMIT,
 )
+from cli_agent_orchestrator.services.scope_admission import AgentAdmissionError
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.services.terminal_service import (
@@ -1601,6 +1602,19 @@ async def _redact_env_vars_validation_error(
             err = {k: v for k, v in err.items() if k not in ("input", "ctx")}
         errors.append(err)
     return JSONResponse(status_code=422, content={"detail": jsonable_encoder(errors)})
+
+
+@app.exception_handler(AgentAdmissionError)
+async def _render_agent_admission_error(request: Request, exc: AgentAdmissionError) -> JSONResponse:
+    """Render only the admission carrier's explicitly safe transport fields."""
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "code": exc.code,
+            "status_code": exc.status_code,
+            "retryable": exc.retryable,
+        },
+    )
 
 
 @app.get("/.well-known/oauth-protected-resource")
@@ -3149,6 +3163,8 @@ async def create_session(
         # Node is at its tracked-terminal cap (CAO_MAX_TERMINALS) — a capacity
         # rejection, not a bad request: the caller should retry on another node.
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
+    except AgentAdmissionError:
+        raise
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except WorktreeError as e:
@@ -3403,6 +3419,8 @@ async def create_terminal_in_session(
         # rejection, not a bad request or a missing session: the caller should
         # retry on another node.
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
+    except AgentAdmissionError:
+        raise
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except WorktreeError as e:

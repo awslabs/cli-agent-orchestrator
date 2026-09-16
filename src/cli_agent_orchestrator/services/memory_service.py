@@ -73,6 +73,20 @@ class MemoryPartialWriteError(RuntimeError):
         )
 
 
+class MemoryStrictReadError(RuntimeError):
+    """A deterministic freeze read failed instead of degrading silently.
+
+    The component is a fixed declaration key, never a path, memory value, or
+    dependency exception. Gated-run callers can therefore report the failure
+    without copying private memory or local filesystem details into another
+    sink.
+    """
+
+    def __init__(self, component: str) -> None:
+        self.component = component
+        super().__init__(f"strict memory read failed for component '{component}'")
+
+
 def _is_memory_enabled() -> bool:
     """Module-level guard for memory entry points.
 
@@ -1497,7 +1511,14 @@ class MemoryService:
         rendered = "\n".join(out).rstrip() + "\n"
         return rendered
 
-    def _related_keys_lookup(self, keys: list, scope: str, scope_id: Optional[str]) -> dict:
+    def _related_keys_lookup(
+        self,
+        keys: list,
+        scope: str,
+        scope_id: Optional[str],
+        *,
+        strict: bool = False,
+    ) -> dict:
         """Return ``{key: related_keys_raw}`` for the given keys in scope.
 
         Enriches recall/injection primaries (built from wiki files, which
@@ -1507,9 +1528,10 @@ class MemoryService:
         """
         if not keys:
             return {}
-        from cli_agent_orchestrator.clients.database import MemoryMetadataModel
 
         try:
+            from cli_agent_orchestrator.clients.database import MemoryMetadataModel
+
             with self._get_db_session() as db:
                 q = db.query(MemoryMetadataModel).filter(
                     MemoryMetadataModel.key.in_(list(set(keys))),
@@ -1521,11 +1543,18 @@ class MemoryService:
                     q = q.filter(MemoryMetadataModel.scope_id.is_(None))
                 return {r.key: r.related_keys for r in q.all()}
         except Exception as e:
+            if strict:
+                raise MemoryStrictReadError("related metadata") from None
             logger.debug(f"_related_keys_lookup failed: {e}")
             return {}
 
     def _load_related_memory(
-        self, key: str, scope: str, scope_id: Optional[str]
+        self,
+        key: str,
+        scope: str,
+        scope_id: Optional[str],
+        *,
+        strict: bool = False,
     ) -> "Optional[Memory]":
         """Load a single related Memory with the same guards as primary recall.
 
@@ -1538,12 +1567,18 @@ class MemoryService:
         try:
             sanitised = self._sanitize_key(key)
         except ValueError:
+            if strict:
+                raise MemoryStrictReadError("related article") from None
             return None
         if sanitised != key:
+            if strict:
+                raise MemoryStrictReadError("related article")
             return None
         try:
             wiki_path = self.get_wiki_path(scope, scope_id, sanitised)
         except ValueError:
+            if strict:
+                raise MemoryStrictReadError("related article") from None
             return None
         try:
             if not wiki_path.exists():
@@ -1561,6 +1596,8 @@ class MemoryService:
                 scope_dir = scope_dir / scope_id
             scope_dir_real = os.path.realpath(str(scope_dir))
             if not str(resolved).startswith(scope_dir_real + os.sep):
+                if strict:
+                    raise MemoryStrictReadError("related article")
                 return None
             file_content = resolved.read_text(encoding="utf-8")
             entry = {
@@ -1570,8 +1607,15 @@ class MemoryService:
                 "memory_type": "",
                 "tags": "",
             }
-            return self._parse_wiki_file(resolved, file_content, entry)
+            memory = self._parse_wiki_file(resolved, file_content, entry)
+            if memory is None and strict:
+                raise MemoryStrictReadError("related article")
+            return memory
+        except MemoryStrictReadError:
+            raise
         except Exception as e:
+            if strict:
+                raise MemoryStrictReadError("related article") from None
             logger.debug(f"_load_related_memory failed key={sanitised}: {e}")
             return None
 
@@ -2815,107 +2859,200 @@ class MemoryService:
             MemoryScope.PROJECT.value,
             MemoryScope.GLOBAL.value,
         ]
+        scope_selection = tuple(
+            (scope, self.resolve_scope_id(scope, terminal_context)) for scope in scopes_in_order
+        )
+        return self._get_memory_context_from_scope_selection(
+            scope_selection,
+            budget_chars=budget_chars,
+            strict=False,
+        )
+
+    def get_memory_context_strict(
+        self,
+        scope_selection: tuple[tuple[str, Optional[str]], ...],
+        *,
+        budget_chars: int = 3000,
+    ) -> str:
+        """Read exactly one pre-resolved selection or fail without degradation.
+
+        This is the gated-run freeze seam. It does not consult terminal state,
+        settings, project identity, a curator, or a provider. A missing index
+        or missing related article remains an ordinary empty/missing result;
+        an unexpected filesystem, parse, or metadata-query failure raises
+        :class:`MemoryStrictReadError`.
+        """
+        if not _is_memory_enabled():
+            raise MemoryStrictReadError("memory disabled")
+        expected_scopes = (
+            MemoryScope.SESSION.value,
+            MemoryScope.PROJECT.value,
+            MemoryScope.GLOBAL.value,
+        )
+        if (
+            not isinstance(scope_selection, tuple)
+            or tuple(scope for scope, _scope_id in scope_selection) != expected_scopes
+        ):
+            raise MemoryStrictReadError("scope selection")
+        return self._get_memory_context_from_scope_selection(
+            scope_selection,
+            budget_chars=budget_chars,
+            strict=True,
+        )
+
+    def _get_memory_context_from_scope_selection(
+        self,
+        scope_selection: tuple[tuple[str, Optional[str]], ...],
+        *,
+        budget_chars: int,
+        strict: bool,
+    ) -> str:
+        """Render a caller-resolved selection; legacy and strict policies share bytes."""
 
         scope_char_cap = min(
             MEMORY_SCOPE_BUDGET_CHARS,
-            max(0, budget_chars // len(scopes_in_order)),
+            max(0, budget_chars // len(scope_selection)),
         )
 
         lines: list[str] = []
         related_added_total = 0  # global per-build fanout cap
 
-        for scope_val in scopes_in_order:
-            scope_id = self.resolve_scope_id(scope_val, terminal_context)
-            project_dir = self._get_project_dir(scope_val, scope_id)
-            wiki_dir = project_dir / "wiki"
-            wiki_resolved = os.path.realpath(str(wiki_dir))
-            index_path = wiki_dir / "index.md"
-            if not index_path.exists():
-                continue
-
-            scope_entries = []
-            for e in self._parse_index(index_path):
-                if e["scope"] != scope_val:
+        try:
+            for scope_val, scope_id in scope_selection:
+                project_dir = self._get_project_dir(scope_val, scope_id)
+                wiki_dir = project_dir / "wiki"
+                wiki_resolved = os.path.realpath(str(wiki_dir))
+                index_path = wiki_dir / "index.md"
+                if not index_path.exists():
                     continue
-                # Session/agent entries embed scope_id in the wiki path and
-                # share index.md with global, so the scope_id must match the
-                # caller's. Project entries already live in a per-project
-                # directory and global has no scope_id by design.
-                if scope_val in (MemoryScope.SESSION.value, MemoryScope.AGENT.value):
-                    if e.get("scope_id") != scope_id:
-                        continue
-                scope_entries.append(e)
-            scope_entries.sort(key=lambda e: e.get("updated_at", ""), reverse=True)
 
-            scope_memories: list[Memory] = []
-            for entry in scope_entries:
-                if len(scope_memories) >= MEMORY_MAX_PER_SCOPE:
-                    break
-                wiki_file = wiki_dir / entry["relative_path"]
-                resolved_wiki = Path(os.path.realpath(str(wiki_file)))
-                # Guard against a crafted/corrupted index entry (e.g.
-                # ``../<other-project>/wiki/...``) escaping this scope's wiki
-                # directory and leaking another project's memory. Validate
-                # against the per-scope wiki dir, not the global memory base.
-                if not str(resolved_wiki).startswith(wiki_resolved + os.sep):
-                    logger.warning(
-                        f"Path traversal in index entry rejected: {entry.get('relative_path')}"
+                scope_entries = []
+                for e in self._parse_index(index_path):
+                    if e["scope"] != scope_val:
+                        continue
+                    # Session/agent entries embed scope_id in the wiki path and
+                    # share index.md with global, so the scope_id must match the
+                    # caller's. Project entries already live in a per-project
+                    # directory and global has no scope_id by design.
+                    if scope_val in (MemoryScope.SESSION.value, MemoryScope.AGENT.value):
+                        if e.get("scope_id") != scope_id:
+                            continue
+                    scope_entries.append(e)
+                if strict:
+                    scope_entries.sort(
+                        key=lambda e: (
+                            e.get("updated_at", ""),
+                            e.get("key", ""),
+                            e.get("relative_path", ""),
+                        ),
+                        reverse=True,
                     )
-                    continue
-                if not resolved_wiki.exists():
-                    continue
-                file_content = resolved_wiki.read_text(encoding="utf-8")
-                memory = self._parse_wiki_file(resolved_wiki, file_content, entry)
-                if memory:
-                    scope_memories.append(memory)
+                else:
+                    scope_entries.sort(
+                        key=lambda e: e.get("updated_at", ""),
+                        reverse=True,
+                    )
 
-            # One-level cross-reference expansion. Looks up ``related_keys``
-            # for primary entries via SQLite (source of truth, not the
-            # rendered ``## See Also`` markdown), expands within the same
-            # scope budget, dedups + cycle-blocks via ``visited``, and caps
-            # the total related articles added across this entire context
-            # build at ``RELATED_FANOUT_CAP``. Any lookup failure is silent.
-            try:
-                related_lookup = self._related_keys_lookup(
-                    [m.key for m in scope_memories], scope_val, scope_id
-                )
-            except Exception as e:  # noqa: BLE001 — non-blocking
-                logger.debug(f"related_keys lookup failed: {e}")
-                related_lookup = {}
-
-            visited: set = {m.key for m in scope_memories}
-            primary_snapshot = list(scope_memories)
-            for primary in primary_snapshot:
-                if related_added_total >= self.RELATED_FANOUT_CAP:
-                    logger.info("related_fanout_cap_reached added=%d", related_added_total)
-                    break
-                raw = related_lookup.get(primary.key)
-                for rk in self._parse_related_keys(raw, scope=scope_val):
-                    if related_added_total >= self.RELATED_FANOUT_CAP:
+                scope_memories: list[Memory] = []
+                for entry in scope_entries:
+                    if len(scope_memories) >= MEMORY_MAX_PER_SCOPE:
                         break
-                    if rk in visited:
+                    wiki_file = wiki_dir / entry["relative_path"]
+                    resolved_wiki = Path(os.path.realpath(str(wiki_file)))
+                    # Guard against a crafted/corrupted index entry (e.g.
+                    # ``../<other-project>/wiki/...``) escaping this scope's wiki
+                    # directory and leaking another project's memory. Validate
+                    # against the per-scope wiki dir, not the global memory base.
+                    if not str(resolved_wiki).startswith(wiki_resolved + os.sep):
+                        if strict:
+                            raise MemoryStrictReadError("memory index")
+                        logger.warning(
+                            "Path traversal in index entry rejected: "
+                            f"{entry.get('relative_path')}"
+                        )
                         continue
-                    visited.add(rk)
-                    related_mem = self._load_related_memory(rk, scope_val, scope_id)
-                    if related_mem is None:
+                    if not resolved_wiki.exists():
+                        if strict:
+                            raise MemoryStrictReadError("memory article")
                         continue
-                    related_mem.is_related = True  # transient render label
-                    scope_memories.append(related_mem)
-                    related_added_total += 1
+                    file_content = resolved_wiki.read_text(encoding="utf-8")
+                    memory = self._parse_wiki_file(resolved_wiki, file_content, entry)
+                    if memory:
+                        scope_memories.append(memory)
+                    elif strict:
+                        raise MemoryStrictReadError("memory article")
 
-            scope_used_chars = 0
-            for mem in scope_memories:
-                tag = " [related]" if getattr(mem, "is_related", False) else ""
-                line = f"- [{mem.scope}] {mem.key}{tag}: {mem.content}"
-                line_len = len(line) + 1
-                if scope_used_chars + line_len > scope_char_cap:
-                    if getattr(mem, "is_related", False):
-                        # Never truncate mid-list for a related extra; skip
-                        # it and try the next (possibly shorter) one.
-                        continue
-                    break
-                lines.append(line)
-                scope_used_chars += line_len
+                # One-level cross-reference expansion. Looks up ``related_keys``
+                # for primary entries via SQLite (source of truth, not the
+                # rendered ``## See Also`` markdown), expands within the same
+                # scope budget, dedups + cycle-blocks via ``visited``, and caps
+                # the total related articles added across this entire context
+                # build at ``RELATED_FANOUT_CAP``.
+                if strict:
+                    related_lookup = self._related_keys_lookup(
+                        [m.key for m in scope_memories],
+                        scope_val,
+                        scope_id,
+                        strict=True,
+                    )
+                else:
+                    related_lookup = self._related_keys_lookup(
+                        [m.key for m in scope_memories],
+                        scope_val,
+                        scope_id,
+                    )
+
+                visited: set = {m.key for m in scope_memories}
+                primary_snapshot = list(scope_memories)
+                for primary in primary_snapshot:
+                    if related_added_total >= self.RELATED_FANOUT_CAP:
+                        logger.info("related_fanout_cap_reached added=%d", related_added_total)
+                        break
+                    raw = related_lookup.get(primary.key)
+                    for rk in self._parse_related_keys(raw, scope=scope_val):
+                        if related_added_total >= self.RELATED_FANOUT_CAP:
+                            break
+                        if rk in visited:
+                            continue
+                        visited.add(rk)
+                        if strict:
+                            related_mem = self._load_related_memory(
+                                rk,
+                                scope_val,
+                                scope_id,
+                                strict=True,
+                            )
+                        else:
+                            related_mem = self._load_related_memory(
+                                rk,
+                                scope_val,
+                                scope_id,
+                            )
+                        if related_mem is None:
+                            continue
+                        related_mem.is_related = True  # transient render label
+                        scope_memories.append(related_mem)
+                        related_added_total += 1
+
+                scope_used_chars = 0
+                for mem in scope_memories:
+                    tag = " [related]" if getattr(mem, "is_related", False) else ""
+                    line = f"- [{mem.scope}] {mem.key}{tag}: {mem.content}"
+                    line_len = len(line) + 1
+                    if scope_used_chars + line_len > scope_char_cap:
+                        if getattr(mem, "is_related", False):
+                            # Never truncate mid-list for a related extra; skip
+                            # it and try the next (possibly shorter) one.
+                            continue
+                        break
+                    lines.append(line)
+                    scope_used_chars += line_len
+        except MemoryStrictReadError:
+            raise
+        except Exception:
+            if strict:
+                raise MemoryStrictReadError("scope material") from None
+            raise
 
         if not lines:
             return ""

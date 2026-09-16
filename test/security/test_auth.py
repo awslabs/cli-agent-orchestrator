@@ -406,6 +406,22 @@ def test_get_local_bearer_returns_token_when_configured(monkeypatch):
     assert auth.get_local_bearer() == "machine-token"
 
 
+def test_get_client_bearer_ignores_local_server_auth_posture(monkeypatch):
+    """A remote client credential must not depend on this process's server flags."""
+    monkeypatch.delenv("AUTH0_DOMAIN", raising=False)
+    monkeypatch.delenv("CAO_AUTH_JWKS_URI", raising=False)
+    monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", "  remote-machine-token  ")
+
+    assert auth.is_auth_enabled() is False
+    assert auth.get_local_bearer() is None
+    assert auth.get_client_bearer() == "remote-machine-token"
+
+
+def test_get_client_bearer_none_when_token_is_blank(monkeypatch):
+    monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", "   ")
+    assert auth.get_client_bearer() is None
+
+
 def test_local_auth_misconfig_error_none_when_disabled():
     """Default-off: the internal hop is fine, no misconfiguration error."""
     assert auth.local_auth_misconfig_error() is None

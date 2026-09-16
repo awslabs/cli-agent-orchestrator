@@ -49,6 +49,7 @@ shape defined here).
 
 import hashlib
 import json
+import math
 from dataclasses import dataclass, replace
 from typing import Any, Dict, Optional
 
@@ -58,6 +59,8 @@ from cli_agent_orchestrator.services.secret_gate import redact_json_leaves
 # Compact separators: the bound is on BYTES, so whitespace is storage spent for nothing.
 # Same form as ``step_result.serialise_envelope``.
 _JSON_SEPARATORS = (",", ":")
+_V2_PLAN_ID_PREFIX = "plan-v2:"
+_LOWER_HEX = frozenset("0123456789abcdef")
 
 
 @dataclass(frozen=True)
@@ -110,6 +113,101 @@ class ExecutionManifestEnvelope:
     truncated: bool
     redacted: bool
     notes: str = ""
+
+
+@dataclass(frozen=True)
+class ApprovedPlanV2:
+    """Immutable public approval bytes: opaque digests, never launch material."""
+
+    plan_id: str
+    components_json: str
+
+
+class PlanV2PublicEnvelopeEncodingError(ValueError):
+    """Approved public metadata is malformed; rejected values stay secret."""
+
+    def __init__(self) -> None:
+        super().__init__("plan-v2 public envelope is invalid")
+
+
+def _validate_v2_approved(approved: Any) -> None:
+    if not isinstance(approved, ApprovedPlanV2):
+        raise PlanV2PublicEnvelopeEncodingError()
+    plan_id = approved.plan_id
+    digest = plan_id.removeprefix(_V2_PLAN_ID_PREFIX) if isinstance(plan_id, str) else ""
+    if (
+        not isinstance(plan_id, str)
+        or not plan_id.startswith(_V2_PLAN_ID_PREFIX)
+        or len(digest) != 64
+        or any(character not in _LOWER_HEX for character in digest)
+        or not isinstance(approved.components_json, str)
+        or not approved.components_json.isascii()
+    ):
+        raise PlanV2PublicEnvelopeEncodingError()
+
+
+@dataclass(frozen=True)
+class PlanV2PublicEnvelope:
+    """Public approval plus a bounded, lossy prefix of diagnostic evidence.
+
+    ``evidence_dropped`` is the number of attempted appends omitted after the
+    first overflow. It is diagnostic and UNATTESTED: this envelope is not a
+    durable admission ledger. ``evidence_bytes`` caches the comma-joined UTF-8
+    payload length so size calculation does not reserialize the prefix.
+    Construction validates that cache by scanning the prefix, so a complete
+    append remains O(prefix length), not O(1).
+    """
+
+    approved: ApprovedPlanV2
+    evidence_json: tuple[str, ...] = ()
+    evidence_dropped: int = 0
+    evidence_bytes: int = 0
+
+    def __post_init__(self) -> None:
+        _validate_v2_approved(self.approved)
+        if (
+            not isinstance(self.evidence_json, tuple)
+            or not all(isinstance(item, str) for item in self.evidence_json)
+            or isinstance(self.evidence_dropped, bool)
+            or not isinstance(self.evidence_dropped, int)
+            or self.evidence_dropped < 0
+            or isinstance(self.evidence_bytes, bool)
+            or not isinstance(self.evidence_bytes, int)
+            or self.evidence_bytes < 0
+        ):
+            raise EvidenceEncodingError("metadata")
+        try:
+            expected = sum(len(item.encode("utf-8")) for item in self.evidence_json)
+        except UnicodeEncodeError:
+            raise EvidenceEncodingError("metadata") from None
+        expected += max(0, len(self.evidence_json) - 1)
+        if self.evidence_bytes != expected:
+            raise EvidenceEncodingError("metadata")
+
+    @property
+    def evidence_truncated(self) -> bool:
+        return self.evidence_dropped > 0
+
+
+class EvidenceEncodingError(ValueError):
+    """Evidence was not JSON-compatible; rejected values and keys stay secret."""
+
+    def __init__(self, location: str) -> None:
+        if location == "metadata":
+            super().__init__("plan-v2 evidence metadata is invalid")
+        else:
+            super().__init__(f"plan-v2 evidence is not JSON-compatible at {location}")
+
+
+# Backward-compatible spelling for the additive, unreleased v2 API.
+PlanV2EvidenceError = EvidenceEncodingError
+
+
+class PlanV2PublicEnvelopeTooLargeError(ValueError):
+    """The immutable public approval body cannot fit and must not be trimmed."""
+
+    def __init__(self) -> None:
+        super().__init__("plan-v2 public envelope exceeds size limit")
 
 
 # The six fields a caller may legitimately omit, in FR-8's order. Named once so ``_document`` and
@@ -355,3 +453,151 @@ def parse(manifest_json: Optional[str]) -> Optional[ExecutionManifestEnvelope]:
         )
     except Exception:  # noqa: BLE001 — totality is the contract; see the docstring
         return None
+
+
+def build_v2_public(components: Any) -> PlanV2PublicEnvelope:
+    """Build a public-verifiable v2 envelope from pre-redaction digests."""
+    from cli_agent_orchestrator.services import plan_identifier
+
+    document = plan_identifier.v2_component_document(components)
+    envelope = PlanV2PublicEnvelope(
+        approved=ApprovedPlanV2(
+            plan_id=plan_identifier.compute_v2(components),
+            components_json=json.dumps(document, separators=_JSON_SEPARATORS),
+        )
+    )
+    if v2_public_size_bytes(envelope) > WORKFLOW_MANIFEST_MAX_BYTES:
+        raise PlanV2PublicEnvelopeTooLargeError()
+    return envelope
+
+
+def _v2_public_document(envelope: PlanV2PublicEnvelope) -> Dict[str, Any]:
+    return {
+        "approved": {
+            "plan_id": envelope.approved.plan_id,
+            "components": json.loads(envelope.approved.components_json),
+        },
+        "evidence": [json.loads(item) for item in envelope.evidence_json],
+        "evidence_dropped": envelope.evidence_dropped,
+    }
+
+
+def approved_v2_bytes(envelope: PlanV2PublicEnvelope) -> bytes:
+    """Return the byte-identical authorization sub-document."""
+    plan_id = json.dumps(envelope.approved.plan_id, separators=_JSON_SEPARATORS).encode("utf-8")
+    return (
+        b'{"plan_id":'
+        + plan_id
+        + b',"components":'
+        + envelope.approved.components_json.encode("utf-8")
+        + b"}"
+    )
+
+
+def serialise_v2_public(envelope: PlanV2PublicEnvelope) -> str:
+    return json.dumps(_v2_public_document(envelope), separators=_JSON_SEPARATORS)
+
+
+def v2_public_size_bytes(envelope: PlanV2PublicEnvelope) -> int:
+    """Return the exact compact-JSON UTF-8 size using cached evidence length."""
+    approved_size = len(approved_v2_bytes(envelope))
+    # {"approved":<approved>,"evidence":[<payload>],"evidence_dropped":<n>}
+    return (
+        len(b'{"approved":')
+        + approved_size
+        + len(b',"evidence":[')
+        + envelope.evidence_bytes
+        + len(b'],"evidence_dropped":')
+        + len(str(envelope.evidence_dropped).encode("ascii"))
+        + len(b"}")
+    )
+
+
+def _validate_evidence_json(value: Any, location: str = "evidence") -> None:
+    if value is None or isinstance(value, (str, bool, int)):
+        return
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return
+        raise EvidenceEncodingError(location)
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            _validate_evidence_json(item, f"{location}[{index}]")
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise EvidenceEncodingError(f"{location}.object.key")
+            _validate_evidence_json(item, f"{location}.object.value")
+        return
+    raise EvidenceEncodingError(location)
+
+
+def append_v2_evidence(envelope: PlanV2PublicEnvelope, evidence: Any) -> PlanV2PublicEnvelope:
+    """Append redacted evidence without rewriting approved bytes.
+
+    Evidence that would exceed the public envelope ceiling is omitted. The
+    retained prefix is terminal after the first drop; every later append only
+    increments ``evidence_dropped``. This bounded record is diagnostic and
+    UNATTESTED, not a durable admission ledger. A caller must not fail an
+    otherwise authorized run when diagnostic evidence encoding fails; it should
+    catch :class:`EvidenceEncodingError` and record a drop at its integration
+    boundary. Executable material never passes through this lossy path.
+    """
+    if envelope.evidence_truncated:
+        return replace(envelope, evidence_dropped=envelope.evidence_dropped + 1)
+    try:
+        _validate_evidence_json(evidence)
+        cleaned = redact_json_leaves(evidence)
+        encoded = json.dumps(cleaned, separators=_JSON_SEPARATORS, allow_nan=False)
+    except EvidenceEncodingError:
+        raise
+    except (TypeError, ValueError, RecursionError):
+        raise EvidenceEncodingError("evidence.structure") from None
+    encoded_bytes = len(encoded.encode("utf-8"))
+    separator_bytes = 1 if envelope.evidence_json else 0
+    candidate = replace(
+        envelope,
+        evidence_json=envelope.evidence_json + (encoded,),
+        evidence_bytes=envelope.evidence_bytes + separator_bytes + encoded_bytes,
+    )
+    # Reserve decimal growth for a long-lived dropped counter so adding loss
+    # metadata cannot push an already accepted prefix over the ceiling.
+    reserved_counter = replace(candidate, evidence_dropped=10**20 - 1)
+    if v2_public_size_bytes(reserved_counter) <= WORKFLOW_MANIFEST_MAX_BYTES:
+        return candidate
+    return replace(envelope, evidence_dropped=1)
+
+
+def verify_v2_public(value: Any) -> bool:
+    """Verify a serialized or in-memory public envelope without private bytes."""
+    from cli_agent_orchestrator.services import plan_identifier
+
+    try:
+        if isinstance(value, str):
+            document = json.loads(value)
+        elif isinstance(value, PlanV2PublicEnvelope):
+            _validate_v2_approved(value.approved)
+            document = _v2_public_document(value)
+        elif isinstance(value, dict):
+            document = value
+        else:
+            return False
+        if not isinstance(document, dict):
+            return False
+        approved = document["approved"]
+        return (
+            isinstance(approved, dict)
+            and set(approved) == {"plan_id", "components"}
+            and plan_identifier.verify_v2_components(approved["components"], approved["plan_id"])
+        )
+    except (
+        AttributeError,
+        KeyError,
+        RecursionError,
+        TypeError,
+        UnicodeEncodeError,
+        ValueError,
+        json.JSONDecodeError,
+    ):
+        return False

@@ -28,6 +28,8 @@ from pathlib import Path
 
 import pytest
 
+import cli_agent_orchestrator.api.main as api_main
+
 REPO = Path(__file__).resolve().parents[1]
 SKILL_COPIES = (
     REPO / "skills" / "cao-workflow" / "SKILL.md",
@@ -36,12 +38,89 @@ SKILL_COPIES = (
 
 
 @pytest.fixture(params=SKILL_COPIES, ids=("repo_copy", "packaged_copy"))
-def skill(request) -> str:
-    return request.param.read_text()
+def skill(request: pytest.FixtureRequest) -> str:
+    return Path(request.param).read_text()
 
 
 def _python_blocks(text: str) -> list[str]:
     return re.findall(r"```python\n(.*?)```", text, re.DOTALL)
+
+
+def _observe_section(text: str) -> str:
+    headings = list(re.finditer(r"(?m)^### g\. OBSERVE(?:[ \t].*)?$", text))
+    assert len(headings) == 1, f"expected one exact OBSERVE section, found {len(headings)}"
+    start = headings[0].end()
+    next_heading = re.search(r"(?m)^#{1,6}[ \t]+", text[start:])
+    assert next_heading, "OBSERVE section must end at a following Markdown heading"
+    return text[start : start + next_heading.start()]
+
+
+def _table_cells(line: str) -> list[str]:
+    stripped = line.strip()
+    assert stripped.startswith("|") and stripped.endswith(
+        "|"
+    ), "classification table rows must start and end with a pipe"
+    return [cell.strip() for cell in re.split(r"(?<!\\)\|", stripped[1:-1])]
+
+
+def _classification_table_keys(text: str) -> set[str]:
+    """Parse and validate the sole Markdown table in the exact OBSERVE section."""
+    table_blocks: list[list[str]] = []
+    current: list[str] = []
+    for line in _observe_section(text).splitlines():
+        if line.strip().startswith("|"):
+            current.append(line)
+        elif current:
+            table_blocks.append(current)
+            current = []
+    if current:
+        table_blocks.append(current)
+    assert (
+        len(table_blocks) == 1
+    ), f"expected one unambiguous OBSERVE table, found {len(table_blocks)}"
+
+    rows = [_table_cells(line) for line in table_blocks[0]]
+    assert rows[0] == [
+        "`classification`",
+        "What it means",
+        "What to do",
+    ], f"unexpected classification table header: {rows[0]}"
+    assert len(rows) >= 3, "classification table needs a separator and data rows"
+    assert len(rows[1]) == 3 and all(
+        re.fullmatch(r":?-{3,}:?", cell) for cell in rows[1]
+    ), "classification table has an invalid Markdown separator"
+
+    keys = []
+    for cells in rows[2:]:
+        assert len(cells) == 3, f"classification table row has {len(cells)} cells, expected 3"
+        assert all(cells), "classification table data cells must all be non-empty"
+        first_cell = cells[0]
+        match = re.fullmatch(r"`([^`]+)`", first_cell)
+        assert match, f"classification table key is not one backticked value: {first_cell!r}"
+        keys.append(match.group(1))
+    assert keys, "classification table must contain data rows"
+    assert len(keys) == len(set(keys)), f"duplicate classification rows: {keys}"
+    return set(keys)
+
+
+def _api_classification_keys() -> set[str]:
+    values = [value for name, value in vars(api_main).items() if name.startswith("CLASSIFICATION_")]
+    assert values, "API must export its closed classification constants"
+    assert all(
+        isinstance(value, str) and value for value in values
+    ), "API classification constants must be non-empty strings"
+    assert len(values) == len(set(values)), "API classification constants must have unique values"
+    return set(values)
+
+
+def _assert_observe_classification_table(text: str) -> None:
+    assert _classification_table_keys(text) == _api_classification_keys()
+
+
+def _replace_in_observe(text: str, old: str, new: str) -> str:
+    section = _observe_section(text)
+    assert section.count(old) == 1
+    return text.replace(section, section.replace(old, new, 1), 1)
 
 
 # ---------------------------------------------------------------------------
@@ -184,9 +263,77 @@ def test_the_agent_is_told_python_is_the_format_and_never_to_ask(skill):
 
 
 def test_observe_names_the_classification_field(skill):
-    assert "failure_envelope.classification" in skill or "classification" in skill
-    lowered = skill.lower()
-    assert "transient" in lowered and "durable" in lowered
+    assert "failure_envelope.classification" in skill
+    _assert_observe_classification_table(skill)
+
+
+def test_observe_guard_tracks_the_full_api_classification_taxonomy(skill, monkeypatch):
+    monkeypatch.setattr(api_main, "CLASSIFICATION_FUTURE", "future", raising=False)
+
+    with pytest.raises(AssertionError):
+        _assert_observe_classification_table(skill)
+
+
+def test_observe_guard_ignores_out_of_section_decoy_table(skill):
+    decoy = (
+        "| `classification` | What it means | What to do |\n"
+        "| --- | --- | --- |\n"
+        "| `transient` | decoy | decoy |\n"
+        "| `artifact_defect` | decoy | decoy |\n"
+        "| `cancelled` | decoy | decoy |\n\n"
+    )
+    mutated = skill.replace("| `cancelled` |", "| `future` |", 1)
+
+    with pytest.raises(AssertionError):
+        _assert_observe_classification_table(decoy + mutated)
+
+
+def test_observe_guard_rejects_truncated_one_cell_rows(skill):
+    mutated = skill
+    for key in _api_classification_keys():
+        row = next(line for line in mutated.splitlines() if line.startswith(f"| `{key}` |"))
+        mutated = mutated.replace(row, f"| `{key}` |", 1)
+
+    with pytest.raises(AssertionError):
+        _assert_observe_classification_table(mutated)
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        (
+            "| `classification` | What it means | What to do |",
+            "| Classification | What it means | What to do |",
+        ),
+        ("| --- | --- | --- |", "| -- | --- | --- |"),
+        (
+            "| `transient` | a persisted timeout; the artifact may still be usable |",
+            "| transient | a persisted timeout; the artifact may still be usable |",
+        ),
+        (
+            "| `cancelled` | the run was deliberately cancelled |",
+            "| `transient` | the run was deliberately cancelled |",
+        ),
+    ],
+    ids=("header", "separator", "unbackticked-key", "duplicate-key"),
+)
+def test_observe_guard_rejects_malformed_table_contract(skill, old, new):
+    with pytest.raises(AssertionError):
+        _assert_observe_classification_table(_replace_in_observe(skill, old, new))
+
+
+def test_observe_guard_rejects_a_second_table_inside_the_section(skill):
+    second_table = (
+        "\n| `classification` | What it means | What to do |\n"
+        "| --- | --- | --- |\n"
+        "| `transient` | duplicate | duplicate |\n"
+    )
+    mutated = skill.replace(
+        "\n## Parameterized workflows", second_table + "\n## Parameterized workflows"
+    )
+
+    with pytest.raises(AssertionError):
+        _assert_observe_classification_table(mutated)
 
 
 # ---------------------------------------------------------------------------

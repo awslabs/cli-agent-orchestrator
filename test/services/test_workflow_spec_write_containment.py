@@ -13,6 +13,7 @@ exercised escapes would miss it entirely.
 
 from __future__ import annotations
 
+import errno
 import os
 import stat
 from pathlib import Path
@@ -25,6 +26,12 @@ from cli_agent_orchestrator.services import workflow_spec_service as svc
 
 def _write(base: Path, name: str, data: bytes = b"x = 1\n") -> str:
     return svc._write_contained_spec_bytes(str(base / name), data, base_dir=str(base))
+
+
+def _create_only(base: Path, name: str, data: bytes = b"x = 1\n") -> str:
+    return svc._write_contained_spec_bytes(
+        str(base / name), data, base_dir=str(base), create_only=True
+    )
 
 
 def _dir_entries(base: Path) -> list[str]:
@@ -55,6 +62,65 @@ def test_overwrites_an_existing_spec_atomically(tmp_path: Path) -> None:
     (tmp_path / "wf.py").write_bytes(b"old\n")
     _write(tmp_path, "wf.py", b"new\n")
     assert (tmp_path / "wf.py").read_bytes() == b"new\n"
+    assert _dir_entries(tmp_path) == ["wf.py"]
+
+
+def test_create_only_refuses_existing_destination_without_changing_it(tmp_path: Path) -> None:
+    target = tmp_path / "wf.py"
+    target.write_bytes(b"original\n")
+
+    with pytest.raises(FileExistsError):
+        _create_only(tmp_path, "wf.py", b"replacement\n")
+
+    assert target.read_bytes() == b"original\n"
+    assert _dir_entries(tmp_path) == ["wf.py"]
+
+
+def test_create_only_never_opens_final_path_for_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "wf.py"
+    real_fdopen = os.fdopen
+
+    def _checked_fdopen(fd: int, *args: object, **kwargs: object):
+        resolved = Path(f"/dev/fd/{fd}").resolve()
+        assert resolved != target
+        return real_fdopen(fd, *args, **kwargs)
+
+    monkeypatch.setattr(os, "fdopen", _checked_fdopen)
+    _create_only(tmp_path, "wf.py", b"complete\n")
+
+    assert target.read_bytes() == b"complete\n"
+
+
+def test_create_only_link_failure_leaves_no_target_or_temp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _unsupported(*args: object, **kwargs: object) -> None:
+        raise OSError(errno.EOPNOTSUPP, "hard links unsupported")
+
+    monkeypatch.setattr(os, "link", _unsupported)
+    with pytest.raises(svc.SafePublicationUnavailableError, match="no-replace"):
+        _create_only(tmp_path, "wf.py", b"complete\n")
+
+    assert _dir_entries(tmp_path) == []
+
+
+def test_directory_fsync_failure_reports_error_without_rolling_back_committed_create(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_fsync = os.fsync
+
+    def _fail_directory(fd: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError("directory fsync failed after publication")
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", _fail_directory)
+    with pytest.raises(OSError, match="directory fsync failed after publication"):
+        _create_only(tmp_path, "wf.py", b"committed\n")
+
+    assert (tmp_path / "wf.py").read_bytes() == b"committed\n"
     assert _dir_entries(tmp_path) == ["wf.py"]
 
 

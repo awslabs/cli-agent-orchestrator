@@ -2807,14 +2807,29 @@ _AUTHORING_CLASS_BY_STATUS = {
 }
 
 
-def _authoring_refusal(op: str, response: requests.Response) -> Dict[str, Any]:
+def _authoring_refusal(
+    op: str,
+    response: requests.Response,
+    auth_headers: Optional[Mapping[str, str]],
+) -> Dict[str, Any]:
     """Build the classed refusal envelope for an authoring tool.
 
     Lint failures reach authoring callers as 400 invalid-request responses because the service flattens
     them into ``ValueError``. The classifier deliberately does not sniff messages, so a hypothetical 422
     falls through to the generic ``error`` class rather than advertising a dead branch.
     """
-    detail = _extract_error_detail(response, f"status {response.status_code}")
+    if response.status_code == 401:
+        detail = (
+            "cao-server rejected the configured local authentication credential; "
+            "replace CAO_AUTH_LOCAL_TOKEN with a valid token"
+            if auth_headers
+            else (
+                "cao-server requires authentication; configure CAO_AUTH_LOCAL_TOKEN "
+                "with a token for this server"
+            )
+        )
+    else:
+        detail = _extract_error_detail(response, f"status {response.status_code}")
     klass = _AUTHORING_CLASS_BY_STATUS.get(op, {}).get(response.status_code, "error")
     return {"ok": False, "class": klass, "error": detail}
 
@@ -2884,17 +2899,19 @@ async def workflow_create(
     refusal = _workflow_name_refusal(name)
     if refusal:
         return refusal
+    auth_headers = mcp_utils._auth_headers(credential_only=True) or None
     try:
         response = requests.post(
             f"{API_BASE_URL}/workflows",
             json={"name": name, "source": source},
+            headers=auth_headers,
             timeout=_mcp_timeout(),
         )
     except requests.RequestException as e:
         return _unreachable_refusal(e)
 
     if response.status_code not in (200, 201):
-        return _authoring_refusal("create", response)
+        return _authoring_refusal("create", response, auth_headers)
 
     return _authoring_success(response)
 
@@ -2936,17 +2953,19 @@ async def workflow_update(
     if refusal:
         return refusal
     encoded_name = quote(name, safe="")
+    auth_headers = mcp_utils._auth_headers(credential_only=True) or None
     try:
         response = requests.put(
             f"{API_BASE_URL}/workflows/{encoded_name}",
             json={"source": source, "expected_hash": expected_hash},
+            headers=auth_headers,
             timeout=_mcp_timeout(),
         )
     except requests.RequestException as e:
         return _unreachable_refusal(e)
 
     if response.status_code != 200:
-        return _authoring_refusal("update", response)
+        return _authoring_refusal("update", response, auth_headers)
 
     return _authoring_success(response)
 
@@ -2974,13 +2993,18 @@ async def workflow_get(
     if refusal:
         return refusal
     encoded_name = quote(name, safe="")
+    auth_headers = mcp_utils._auth_headers(credential_only=True) or None
     try:
-        response = requests.get(f"{API_BASE_URL}/workflows/{encoded_name}", timeout=_mcp_timeout())
+        response = requests.get(
+            f"{API_BASE_URL}/workflows/{encoded_name}",
+            headers=auth_headers,
+            timeout=_mcp_timeout(),
+        )
     except requests.RequestException as e:
         return _unreachable_refusal(e)
 
     if response.status_code != 200:
-        return _authoring_refusal("get", response)
+        return _authoring_refusal("get", response, auth_headers)
 
     return _authoring_success(response)
 
@@ -3006,17 +3030,19 @@ async def workflow_validate(
 
     On refusal returns ``{ok: False, class, error}``. Never raises into the agent loop (EV-1).
     """
+    auth_headers = mcp_utils._auth_headers(credential_only=True) or None
     try:
         response = requests.post(
             f"{API_BASE_URL}/workflows/validate",
             json={"source": source},
+            headers=auth_headers,
             timeout=_mcp_timeout(),
         )
     except requests.RequestException as e:
         return _unreachable_refusal(e)
 
     if response.status_code != 200:
-        return _authoring_refusal("validate", response)
+        return _authoring_refusal("validate", response, auth_headers)
 
     return _authoring_success(response)
 

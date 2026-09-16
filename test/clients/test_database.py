@@ -4,7 +4,7 @@ import sqlite3
 import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -17,6 +17,11 @@ from cli_agent_orchestrator.clients.database import (
     FlowModel,
     IdempotencyKeyModel,
     InboxModel,
+    LaunchPolicyRefConflictError,
+    LaunchPolicyRefRow,
+    LaunchPolicyRefStateError,
+    LaunchPolicyRefStoreError,
+    LaunchPolicyRefUnavailable,
     MemoryMetadataModel,
     TerminalModel,
     create_flow,
@@ -39,6 +44,8 @@ from cli_agent_orchestrator.clients.database import (
     list_siblings_by_group_prefix,
     list_terminals_by_session,
     list_terminals_in_sessions,
+    read_launch_policy_ref,
+    record_launch_policy_ref,
     update_flow_enabled,
     update_flow_run_times,
     update_last_active,
@@ -1649,12 +1656,623 @@ class TestInitDb:
     """Tests for init_db function."""
 
     @patch("cli_agent_orchestrator.clients.database.Base")
+    @patch("cli_agent_orchestrator.clients.database._migrate_launch_policy_ref")
+    @patch("cli_agent_orchestrator.clients.database._migrate_memory_scope_null_uniqueness")
+    @patch("cli_agent_orchestrator.clients.database._migrate_workflow_plan_snapshot")
     @patch("cli_agent_orchestrator.clients.database._migrate_project_aliases_schema")
-    def test_init_db(self, mock_alias_migrate, mock_base):
+    def test_init_db(
+        self,
+        mock_alias_migrate,
+        mock_snapshot_migrate,
+        mock_memory_scope_migrate,
+        mock_launch_ref_migrate,
+        mock_base,
+    ):
         """Test database initialization."""
+        calls = MagicMock()
+        calls.attach_mock(mock_memory_scope_migrate, "memory_scope")
+        calls.attach_mock(mock_launch_ref_migrate, "launch_ref")
+
         init_db()
 
         mock_base.metadata.create_all.assert_called_once()
+        mock_snapshot_migrate.assert_called_once_with()
+        mock_launch_ref_migrate.assert_called_once_with()
+        assert calls.mock_calls[-2:] == [call.memory_scope(), call.launch_ref()]
+
+
+_REF_PLAN_ID = "plan-v2:" + "a" * 64
+_OTHER_REF_PLAN_ID = "plan-v2:" + "b" * 64
+_REF_POLICY_HASH = "c" * 64
+_OTHER_REF_POLICY_HASH = "d" * 64
+_REF_RECORDED_AT = "2026-09-17T12:34:56Z"
+
+
+@pytest.fixture
+def launch_ref_db(tmp_path, monkeypatch):
+    """Point every launch-reference operation at one test-owned database."""
+    from cli_agent_orchestrator import constants
+
+    db_file = tmp_path / "launch-policy-ref.db"
+    assert db_file.parent == tmp_path
+    monkeypatch.setattr(constants, "DATABASE_FILE", db_file)
+    assert constants.DATABASE_FILE == db_file
+    return db_file
+
+
+def _create_launch_ref_schema(db_file, *, primary_key=True):
+    db_mod._migrate_launch_policy_ref()
+    with sqlite3.connect(db_file) as conn:
+        conn.execute(
+            "CREATE TABLE workflow_run_plan_snapshot ("
+            "run_id TEXT PRIMARY KEY, plan_id TEXT NOT NULL)"
+        )
+        if not primary_key:
+            conn.execute("DROP TABLE launch_policy_ref")
+            conn.execute(
+                "CREATE TABLE launch_policy_ref ("
+                "run_id, target_key, agent_profile, plan_id, policy_hash, recorded_at)"
+            )
+    db_file.chmod(0o600)
+
+
+def _seed_launch_ref(
+    db_file,
+    *,
+    run_id="run-1",
+    target_key="target-1",
+    agent_profile="developer",
+    plan_id=_REF_PLAN_ID,
+    policy_hash=_REF_POLICY_HASH,
+    recorded_at=_REF_RECORDED_AT,
+):
+    with sqlite3.connect(db_file) as conn:
+        conn.execute(
+            "INSERT INTO workflow_run_plan_snapshot (run_id, plan_id) VALUES (?, ?)",
+            (run_id, plan_id),
+        )
+        conn.execute(
+            "INSERT INTO launch_policy_ref "
+            "(run_id, target_key, agent_profile, plan_id, policy_hash, recorded_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (run_id, target_key, agent_profile, plan_id, policy_hash, recorded_at),
+        )
+    db_file.chmod(0o600)
+
+
+class TestLaunchPolicyRefMigration:
+    def test_migration_is_idempotent_and_has_exact_schema(self, launch_ref_db):
+        db_mod._migrate_launch_policy_ref()
+        db_mod._migrate_launch_policy_ref()
+
+        with sqlite3.connect(launch_ref_db) as conn:
+            columns = conn.execute("PRAGMA table_info(launch_policy_ref)").fetchall()
+            indexes = conn.execute("PRAGMA index_list(launch_policy_ref)").fetchall()
+            index_columns = conn.execute("PRAGMA index_info(idx_launch_policy_ref_plan)").fetchall()
+
+        assert [(row[1], row[2], row[3], row[5]) for row in columns] == [
+            ("run_id", "TEXT", 1, 1),
+            ("target_key", "TEXT", 1, 2),
+            ("agent_profile", "TEXT", 1, 3),
+            ("plan_id", "TEXT", 1, 0),
+            ("policy_hash", "TEXT", 1, 0),
+            ("recorded_at", "TEXT", 1, 0),
+        ]
+        assert "idx_launch_policy_ref_plan" in {row[1] for row in indexes}
+        assert [row[2] for row in index_columns] == ["plan_id"]
+
+
+class TestRecordLaunchPolicyRef:
+    def test_requires_caller_transaction_without_creating_schema(self, launch_ref_db):
+        with sqlite3.connect(launch_ref_db) as conn:
+            with pytest.raises(LaunchPolicyRefStateError, match=r"^transaction_required$"):
+                record_launch_policy_ref(
+                    conn,
+                    run_id="run-1",
+                    target_key="target-1",
+                    agent_profile="developer",
+                    plan_id=_REF_PLAN_ID,
+                    policy_hash=_REF_POLICY_HASH,
+                    recorded_at=_REF_RECORDED_AT,
+                )
+            tables = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        assert tables == []
+
+    def test_insert_is_owned_by_caller_transaction_and_rollback(self, launch_ref_db):
+        db_mod._migrate_launch_policy_ref()
+        with sqlite3.connect(launch_ref_db) as conn:
+            statements = []
+            conn.set_trace_callback(statements.append)
+            conn.execute("BEGIN")
+            statements.clear()
+            record_launch_policy_ref(
+                conn,
+                run_id="run-1",
+                target_key="target-1",
+                agent_profile="developer",
+                plan_id=_REF_PLAN_ID,
+                policy_hash=_REF_POLICY_HASH,
+                recorded_at=_REF_RECORDED_AT,
+            )
+            helper_statements = list(statements)
+            conn.rollback()
+            assert conn.execute("SELECT COUNT(*) FROM launch_policy_ref").fetchone() == (0,)
+
+        assert not any(
+            statement.lstrip().upper().startswith(("BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT"))
+            for statement in helper_statements
+        )
+
+    def test_equal_record_is_noop_and_preserves_timestamp(self, launch_ref_db):
+        db_mod._migrate_launch_policy_ref()
+        with sqlite3.connect(launch_ref_db) as conn:
+            conn.execute("BEGIN")
+            kwargs = {
+                "run_id": "run-1",
+                "target_key": "target-1",
+                "agent_profile": "developer",
+                "plan_id": _REF_PLAN_ID,
+                "policy_hash": _REF_POLICY_HASH,
+                "recorded_at": _REF_RECORDED_AT,
+            }
+            record_launch_policy_ref(conn, **kwargs)
+            conn.commit()
+            statements = []
+            conn.set_trace_callback(statements.append)
+            conn.execute("BEGIN")
+            record_launch_policy_ref(conn, **{**kwargs, "recorded_at": "2026-02-31T00:00:00Z"})
+            conn.commit()
+            row = conn.execute("SELECT recorded_at FROM launch_policy_ref").fetchone()
+        assert row == (_REF_RECORDED_AT,)
+        assert not any(
+            statement.lstrip().upper().startswith(("INSERT", "UPDATE", "REPLACE"))
+            for statement in statements
+            if "launch_policy_ref" in statement
+        )
+
+    @pytest.mark.parametrize(
+        ("field", "value", "reason"),
+        [
+            ("run_id", "", "invalid_run_id"),
+            ("run_id", "é", "invalid_run_id"),
+            ("run_id", "a" * 65, "invalid_run_id"),
+            ("target_key", "bad label", "invalid_binding_label"),
+            ("agent_profile", 1, "invalid_binding_label"),
+            ("plan_id", "plan-v1:" + "a" * 64, "invalid_plan_id"),
+            ("policy_hash", "A" * 64, "invalid_policy_hash"),
+            ("recorded_at", "2026-09-17T12:34:56+00:00", "invalid_recorded_at"),
+        ],
+    )
+    def test_invalid_input_is_rejected_before_sql(self, launch_ref_db, field, value, reason):
+        kwargs = {
+            "run_id": "run-1",
+            "target_key": "target-1",
+            "agent_profile": "developer",
+            "plan_id": _REF_PLAN_ID,
+            "policy_hash": _REF_POLICY_HASH,
+            "recorded_at": _REF_RECORDED_AT,
+        }
+        kwargs[field] = value
+        with sqlite3.connect(launch_ref_db) as conn:
+            conn.execute("BEGIN")
+            with pytest.raises(LaunchPolicyRefStateError, match=rf"^{reason}$"):
+                record_launch_policy_ref(conn, **kwargs)
+            assert (
+                conn.execute(
+                    "SELECT name FROM sqlite_master WHERE name='launch_policy_ref'"
+                ).fetchall()
+                == []
+            )
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [("plan_id", _OTHER_REF_PLAN_ID), ("policy_hash", _OTHER_REF_POLICY_HASH)],
+    )
+    def test_disagreement_is_immutable_conflict(self, launch_ref_db, field, value):
+        db_mod._migrate_launch_policy_ref()
+        kwargs = {
+            "run_id": "run-1",
+            "target_key": "target-1",
+            "agent_profile": "developer",
+            "plan_id": _REF_PLAN_ID,
+            "policy_hash": _REF_POLICY_HASH,
+            "recorded_at": _REF_RECORDED_AT,
+        }
+        with sqlite3.connect(launch_ref_db) as conn:
+            conn.execute("BEGIN")
+            record_launch_policy_ref(conn, **kwargs)
+            with pytest.raises(LaunchPolicyRefConflictError, match=r"^ref_conflict$"):
+                record_launch_policy_ref(conn, **{**kwargs, field: value})
+            conn.rollback()
+
+    def test_missing_table_is_safe(self, launch_ref_db):
+        with sqlite3.connect(launch_ref_db) as conn:
+            conn.execute("BEGIN")
+            with pytest.raises(LaunchPolicyRefStateError, match=r"^ref_table_missing$"):
+                record_launch_policy_ref(
+                    conn,
+                    run_id="run-1",
+                    target_key="target-1",
+                    agent_profile="developer",
+                    plan_id=_REF_PLAN_ID,
+                    policy_hash=_REF_POLICY_HASH,
+                    recorded_at=_REF_RECORDED_AT,
+                )
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            sqlite3.OperationalError("secret SQL detail"),
+            OSError("secret filesystem detail"),
+        ],
+    )
+    def test_store_errors_drop_native_exception_context(self, failure):
+        import traceback
+
+        class BrokenConnection:
+            in_transaction = True
+
+            def execute(self, *_args):
+                raise failure
+
+        with pytest.raises(LaunchPolicyRefStoreError) as error:
+            record_launch_policy_ref(
+                BrokenConnection(),
+                run_id="run-1",
+                target_key="target-1",
+                agent_profile="developer",
+                plan_id=_REF_PLAN_ID,
+                policy_hash=_REF_POLICY_HASH,
+                recorded_at=_REF_RECORDED_AT,
+            )
+        assert str(error.value) == "store_unavailable"
+        assert repr(error.value) == "LaunchPolicyRefStoreError('store_unavailable')"
+        assert error.value.args == ("store_unavailable",)
+        assert error.value.__context__ is None
+        assert error.value.__cause__ is None
+        assert error.value.__suppress_context__
+        rendered = "".join(traceback.format_exception(error.value))
+        assert "secret" not in rendered
+        assert "SQL detail" not in rendered
+        assert "filesystem detail" not in rendered
+
+    @pytest.mark.parametrize(
+        ("run_id", "target_key", "agent_profile", "recorded_at"),
+        [
+            ("a", "b", "c", "2026-02-31T00:00:00Z"),
+            ("r" * 64, "t" * 64, "p" * 64, "2026-09-17T12:34:56.123456Z"),
+        ],
+    )
+    def test_valid_pattern_boundaries_are_accepted(
+        self, launch_ref_db, run_id, target_key, agent_profile, recorded_at
+    ):
+        db_mod._migrate_launch_policy_ref()
+        with sqlite3.connect(launch_ref_db) as conn:
+            conn.execute("BEGIN")
+            record_launch_policy_ref(
+                conn,
+                run_id=run_id,
+                target_key=target_key,
+                agent_profile=agent_profile,
+                plan_id=_REF_PLAN_ID,
+                policy_hash=_REF_POLICY_HASH,
+                recorded_at=recorded_at,
+            )
+            assert conn.execute(
+                "SELECT run_id, target_key, agent_profile, recorded_at " "FROM launch_policy_ref"
+            ).fetchone() == (run_id, target_key, agent_profile, recorded_at)
+            conn.rollback()
+
+
+class TestReadLaunchPolicyRef:
+    def test_round_trip_after_fresh_readonly_restart(self, launch_ref_db):
+        _create_launch_ref_schema(launch_ref_db)
+        _seed_launch_ref(launch_ref_db)
+
+        assert read_launch_policy_ref(
+            run_id="run-1", target_key="target-1", agent_profile="developer"
+        ) == LaunchPolicyRefRow(_REF_PLAN_ID, _REF_POLICY_HASH)
+
+    @pytest.mark.parametrize(
+        ("field", "value", "reason"),
+        [
+            ("run_id", None, "invalid_run_id"),
+            ("target_key", "bad label", "invalid_binding_label"),
+            ("agent_profile", "", "invalid_binding_label"),
+        ],
+    )
+    def test_invalid_arguments_refuse_before_connect(
+        self, launch_ref_db, monkeypatch, field, value, reason
+    ):
+        kwargs = {
+            "run_id": "run-1",
+            "target_key": "target-1",
+            "agent_profile": "developer",
+        }
+        kwargs[field] = value
+        monkeypatch.setattr(
+            db_mod.sqlite3,
+            "connect",
+            MagicMock(side_effect=AssertionError("must not connect")),
+        )
+        with pytest.raises(LaunchPolicyRefStateError, match=rf"^{reason}$"):
+            read_launch_policy_ref(**kwargs)
+
+    def test_missing_database_does_not_create_it(self, launch_ref_db):
+        with pytest.raises(LaunchPolicyRefUnavailable, match=r"^ref_storage_unavailable$"):
+            read_launch_policy_ref(run_id="run-1", target_key="target-1", agent_profile="developer")
+        assert not launch_ref_db.exists()
+
+    @pytest.mark.parametrize(
+        ("setup", "reason"),
+        [
+            ("empty", "ref_table_missing"),
+            ("no_link_table", "run_link_missing"),
+            ("no_ref_row", "ref_row_missing"),
+            ("no_link_row", "run_link_missing"),
+            ("mismatch", "ref_plan_mismatch"),
+        ],
+    )
+    def test_missing_or_mismatched_state_is_diagnostic(self, launch_ref_db, setup, reason):
+        if setup == "empty":
+            sqlite3.connect(launch_ref_db).close()
+        else:
+            db_mod._migrate_launch_policy_ref()
+            if setup != "no_link_table":
+                with sqlite3.connect(launch_ref_db) as conn:
+                    conn.execute(
+                        "CREATE TABLE workflow_run_plan_snapshot "
+                        "(run_id TEXT PRIMARY KEY, plan_id TEXT NOT NULL)"
+                    )
+                    if setup in {"no_link_row", "mismatch"}:
+                        conn.execute(
+                            "INSERT INTO launch_policy_ref VALUES (?, ?, ?, ?, ?, ?)",
+                            (
+                                "run-1",
+                                "target-1",
+                                "developer",
+                                _REF_PLAN_ID,
+                                _REF_POLICY_HASH,
+                                _REF_RECORDED_AT,
+                            ),
+                        )
+                    if setup == "mismatch":
+                        conn.execute(
+                            "INSERT INTO workflow_run_plan_snapshot VALUES (?, ?)",
+                            ("run-1", _OTHER_REF_PLAN_ID),
+                        )
+        launch_ref_db.chmod(0o600)
+        with pytest.raises(LaunchPolicyRefUnavailable, match=rf"^{reason}$"):
+            read_launch_policy_ref(run_id="run-1", target_key="target-1", agent_profile="developer")
+
+    @pytest.mark.parametrize(
+        "mutation",
+        ["bad_ref_type", "bad_ref_value", "duplicate_ref", "bad_link", "duplicate_link"],
+    )
+    def test_malformed_persisted_rows_refuse(self, launch_ref_db, mutation):
+        _create_launch_ref_schema(launch_ref_db, primary_key=False)
+        with sqlite3.connect(launch_ref_db) as conn:
+            ref_plan = _REF_PLAN_ID
+            policy_hash = _REF_POLICY_HASH
+            if mutation == "bad_ref_type":
+                policy_hash = sqlite3.Binary(b"secret")
+            if mutation == "bad_ref_value":
+                ref_plan = "plan-v1:" + "a" * 64
+            conn.execute(
+                "INSERT INTO launch_policy_ref VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    "run-1",
+                    "target-1",
+                    "developer",
+                    ref_plan,
+                    policy_hash,
+                    _REF_RECORDED_AT,
+                ),
+            )
+            if mutation == "duplicate_ref":
+                conn.execute(
+                    "INSERT INTO launch_policy_ref VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        "run-1",
+                        "target-1",
+                        "developer",
+                        _REF_PLAN_ID,
+                        _REF_POLICY_HASH,
+                        _REF_RECORDED_AT,
+                    ),
+                )
+            if mutation in {"bad_link", "duplicate_link"}:
+                conn.execute("DROP TABLE workflow_run_plan_snapshot")
+                conn.execute("CREATE TABLE workflow_run_plan_snapshot (run_id, plan_id)")
+            link_plan = sqlite3.Binary(b"secret") if mutation == "bad_link" else _REF_PLAN_ID
+            conn.execute(
+                "INSERT INTO workflow_run_plan_snapshot VALUES (?, ?)",
+                ("run-1", link_plan),
+            )
+            if mutation == "duplicate_link":
+                conn.execute(
+                    "INSERT INTO workflow_run_plan_snapshot VALUES (?, ?)",
+                    ("run-1", _REF_PLAN_ID),
+                )
+        launch_ref_db.chmod(0o600)
+        with pytest.raises(LaunchPolicyRefUnavailable, match=r"^ref_row_malformed$"):
+            read_launch_policy_ref(run_id="run-1", target_key="target-1", agent_profile="developer")
+
+    @pytest.mark.parametrize("suffix", ["", "-journal", "-wal", "-shm"])
+    def test_exposed_database_or_sidecar_refuses_without_chmod(self, launch_ref_db, suffix):
+        _create_launch_ref_schema(launch_ref_db)
+        _seed_launch_ref(launch_ref_db)
+        candidate = launch_ref_db.with_name(launch_ref_db.name + suffix)
+        if suffix:
+            candidate.write_bytes(b"")
+        candidate.chmod(0o604 if suffix else 0o644)
+
+        with pytest.raises(LaunchPolicyRefUnavailable, match=r"^ref_store_permissions$"):
+            read_launch_policy_ref(run_id="run-1", target_key="target-1", agent_profile="developer")
+        assert candidate.stat().st_mode & 0o777 == (0o604 if suffix else 0o644)
+
+    @pytest.mark.parametrize("mode", [0o400, 0o600])
+    def test_owner_only_database_reads_with_absent_sidecars(self, launch_ref_db, mode):
+        _create_launch_ref_schema(launch_ref_db)
+        _seed_launch_ref(launch_ref_db)
+        launch_ref_db.chmod(mode)
+
+        assert read_launch_policy_ref(
+            run_id="run-1", target_key="target-1", agent_profile="developer"
+        ) == LaunchPolicyRefRow(_REF_PLAN_ID, _REF_POLICY_HASH)
+
+    def test_missing_column_is_storage_unavailable(self, launch_ref_db):
+        with sqlite3.connect(launch_ref_db) as conn:
+            conn.execute(
+                "CREATE TABLE launch_policy_ref "
+                "(run_id, target_key, agent_profile, plan_id, recorded_at)"
+            )
+            conn.execute("CREATE TABLE workflow_run_plan_snapshot (run_id, plan_id)")
+        launch_ref_db.chmod(0o600)
+        with pytest.raises(LaunchPolicyRefUnavailable, match=r"^ref_storage_unavailable$"):
+            read_launch_policy_ref(run_id="run-1", target_key="target-1", agent_profile="developer")
+
+    def test_uncommitted_writer_is_not_visible(self, launch_ref_db):
+        _create_launch_ref_schema(launch_ref_db)
+        _seed_launch_ref(launch_ref_db)
+        writer = sqlite3.connect(launch_ref_db)
+        try:
+            writer.execute("BEGIN IMMEDIATE")
+            writer.execute(
+                "UPDATE launch_policy_ref SET plan_id = ? WHERE run_id = ?",
+                (_OTHER_REF_PLAN_ID, "run-1"),
+            )
+            assert read_launch_policy_ref(
+                run_id="run-1", target_key="target-1", agent_profile="developer"
+            ) == LaunchPolicyRefRow(_REF_PLAN_ID, _REF_POLICY_HASH)
+        finally:
+            writer.rollback()
+            writer.close()
+
+    def test_read_uses_busy_timeout_transaction_rollback_and_no_private_blob(
+        self, launch_ref_db, monkeypatch
+    ):
+        from cli_agent_orchestrator import constants
+
+        _create_launch_ref_schema(launch_ref_db)
+        _seed_launch_ref(launch_ref_db)
+        statements = []
+        original_connect = sqlite3.connect
+
+        class TrackingConnection(sqlite3.Connection):
+            def execute(self, sql, parameters=()):
+                statements.append(sql)
+                return super().execute(sql, parameters)
+
+            def commit(self):
+                raise AssertionError("reader must never commit")
+
+        def tracking_connect(*args, **kwargs):
+            kwargs["factory"] = TrackingConnection
+            return original_connect(*args, **kwargs)
+
+        monkeypatch.setattr(db_mod.sqlite3, "connect", tracking_connect)
+        result = read_launch_policy_ref(
+            run_id="run-1", target_key="target-1", agent_profile="developer"
+        )
+
+        assert result == LaunchPolicyRefRow(_REF_PLAN_ID, _REF_POLICY_HASH)
+        assert (
+            statements[0] == f"PRAGMA busy_timeout = {constants.WORKFLOW_JOURNAL_BUSY_TIMEOUT_MS}"
+        )
+        assert "BEGIN" in statements
+        assert "ROLLBACK" in statements
+        assert not any("COMMIT" in statement.upper() for statement in statements)
+        selected = " ".join(statements).lower()
+        assert "policy_hash, recorded_at" in selected
+        assert "content" not in selected
+
+    @pytest.mark.parametrize("failure_prefix", ["PRAGMA", "BEGIN"])
+    def test_setup_failure_closes_connection(self, launch_ref_db, monkeypatch, failure_prefix):
+        _create_launch_ref_schema(launch_ref_db)
+        _seed_launch_ref(launch_ref_db)
+        original_connect = sqlite3.connect
+        closed = []
+
+        class FailingConnection(sqlite3.Connection):
+            def execute(self, sql, parameters=()):
+                if sql.startswith(failure_prefix):
+                    raise sqlite3.OperationalError("secret setup detail")
+                return super().execute(sql, parameters)
+
+            def close(self):
+                closed.append(True)
+                return super().close()
+
+        def failing_connect(*args, **kwargs):
+            kwargs["factory"] = FailingConnection
+            return original_connect(*args, **kwargs)
+
+        monkeypatch.setattr(db_mod.sqlite3, "connect", failing_connect)
+        with pytest.raises(LaunchPolicyRefUnavailable, match=r"^ref_storage_unavailable$") as error:
+            read_launch_policy_ref(run_id="run-1", target_key="target-1", agent_profile="developer")
+        assert closed == [True]
+        assert "secret" not in repr(error.value)
+        assert error.value.__suppress_context__
+
+    def test_cleanup_failure_preserves_existing_mismatch_diagnostic(
+        self, launch_ref_db, monkeypatch
+    ):
+        _create_launch_ref_schema(launch_ref_db)
+        _seed_launch_ref(launch_ref_db)
+        with sqlite3.connect(launch_ref_db) as conn:
+            conn.execute(
+                "UPDATE workflow_run_plan_snapshot SET plan_id = ? WHERE run_id = ?",
+                (_OTHER_REF_PLAN_ID, "run-1"),
+            )
+        original_connect = sqlite3.connect
+        closed = []
+
+        class CleanupFailureConnection(sqlite3.Connection):
+            def execute(self, sql, parameters=()):
+                if sql == "ROLLBACK":
+                    raise sqlite3.OperationalError("secret cleanup detail")
+                return super().execute(sql, parameters)
+
+            def close(self):
+                closed.append(True)
+                return super().close()
+
+        def cleanup_failure_connect(*args, **kwargs):
+            kwargs["factory"] = CleanupFailureConnection
+            return original_connect(*args, **kwargs)
+
+        monkeypatch.setattr(db_mod.sqlite3, "connect", cleanup_failure_connect)
+        with pytest.raises(LaunchPolicyRefUnavailable, match=r"^ref_plan_mismatch$") as error:
+            read_launch_policy_ref(run_id="run-1", target_key="target-1", agent_profile="developer")
+        assert closed == [True]
+        assert "secret" not in repr(error.value)
+
+    def test_cleanup_failure_rejects_otherwise_successful_read(self, launch_ref_db, monkeypatch):
+        _create_launch_ref_schema(launch_ref_db)
+        _seed_launch_ref(launch_ref_db)
+        original_connect = sqlite3.connect
+        closed = []
+
+        class CleanupFailureConnection(sqlite3.Connection):
+            def execute(self, sql, parameters=()):
+                if sql == "ROLLBACK":
+                    raise sqlite3.OperationalError("secret cleanup detail")
+                return super().execute(sql, parameters)
+
+            def close(self):
+                closed.append(True)
+                return super().close()
+
+        def cleanup_failure_connect(*args, **kwargs):
+            kwargs["factory"] = CleanupFailureConnection
+            return original_connect(*args, **kwargs)
+
+        monkeypatch.setattr(db_mod.sqlite3, "connect", cleanup_failure_connect)
+        with pytest.raises(LaunchPolicyRefUnavailable, match=r"^ref_storage_unavailable$") as error:
+            read_launch_policy_ref(run_id="run-1", target_key="target-1", agent_profile="developer")
+        assert closed == [True]
+        assert "secret" not in repr(error.value)
 
 
 class TestTerminalsSchemaMigration:
