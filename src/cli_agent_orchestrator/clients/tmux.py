@@ -379,15 +379,55 @@ class TmuxClient:
         cao-server); a HOME ``.tmux.conf`` set is the ops-side complement. Set on
         every session-create rather than cached on the client: it is a cheap,
         idempotent server option, and setting it each time means it survives even
-        if the tmux server is ever externally killed and recreated. ``server.cmd``
-        starts the server if it is not already running, so this also runs before
-        the very first session exists. Best-effort: a failure here must never block
-        a session launch.
+        if the tmux server is ever externally killed and recreated.
+
+        ``server.cmd`` does NOT start a server for an arbitrary command — only
+        commands like ``new-session`` that create something do. On a clean
+        socket, ``set-option`` alone shells out to a tmux client that finds no
+        server, prints ``error connecting ...`` to stderr and returns status 1;
+        libtmux's ``tmux_cmd`` (0.51.x) captures that as a normal
+        :class:`libtmux.common.tmux_cmd` result rather than raising, so a bare
+        ``try/except`` around it never observes the failure. The option is then
+        never actually in force until *something else* starts the server —
+        typically the next ``new_session()`` call, which starts a fresh server
+        with the tmux-default ``exit-empty on``. That gap was reported and
+        reproduced against this exact code path (PR review, harness-control#845
+        follow-up): after the very first ``create_session()`` on a clean
+        socket, ``show-options -s exit-empty`` still read ``on``.
+
+        Two single ``server.cmd()`` calls (``start-server`` then
+        ``set-option``) do not close the gap either: with no sessions yet,
+        the server tmux just started evaluates ``exit-empty on`` and exits
+        again before the second, separate client process connects. The fix is
+        to start the server and set the option in the SAME tmux invocation —
+        ``start-server ; set-option ...`` — so the option is applied before
+        tmux's own empty-check can tear the just-started server back down.
+        ``;`` is passed as a literal argv token (no shell involved — libtmux's
+        ``tmux_cmd`` calls ``subprocess.Popen`` with the argument list
+        directly), which is exactly how tmux's own command-chaining syntax is
+        meant to be invoked from code. This is idempotent against an
+        already-running server (with or without existing sessions): tmux
+        treats ``start-server`` there as a no-op and simply applies the
+        ``set-option``.
+
+        Best-effort: a failure here must never block a session launch. Because
+        libtmux does not raise for this failure mode, the result's own
+        ``returncode`` is checked explicitly rather than relying on a caught
+        exception.
         """
         try:
-            self.server.cmd("set-option", "-s", "exit-empty", "off")
+            result = self.server.cmd(
+                "start-server", ";", "set-option", "-s", "exit-empty", "off"
+            )
         except Exception:
             logger.warning("failed to set tmux server option 'exit-empty off'", exc_info=True)
+            return
+
+        if result.returncode != 0:
+            logger.warning(
+                "failed to set tmux server option 'exit-empty off': %s",
+                "; ".join(result.stderr) or f"tmux exited {result.returncode}",
+            )
 
     # ── libtmux listing boundary ─────────────────────────────────────────
     #
