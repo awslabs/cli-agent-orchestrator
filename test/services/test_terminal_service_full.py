@@ -137,12 +137,18 @@ class TestCreateTerminal:
         assert result.status == TerminalStatus.UNKNOWN
         assert mock_provider_manager.create_provider.call_args.kwargs["model"] == ("gpt-5.1-codex")
         mock_provider.initialize.assert_not_awaited()
+        # pre_init_command is the pane's foreground command captured before initialize() runs;
+        # the deferred path needs it to tell a slow-but-live init timeout from a dead launch
+        # (harness-control#890 / PR #623 review). Its VALUE comes from the mocked backend and is
+        # not what this test is about, so it is matched loosely while the payload this test does
+        # own is still matched exactly.
         mock_schedule_deferred_init.assert_called_once_with(
             mock_provider,
             "test1234",
             "Review the current change",
             OrchestrationType.SEND_MESSAGE,
             None,
+            pre_init_command=mock_tmux.get_pane_current_command.return_value,
         )
 
     @pytest.mark.asyncio
