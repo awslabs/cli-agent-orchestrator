@@ -72,6 +72,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   OAuth discovery document, the static profile schema/template metadata and the
   AG-UI stream, which carries its own credential.
 
+- **`@builtin` in an `allowedTools` list enabled `bash`, `edit` and `write` on
+  OpenCode.** The OpenCode permission translator expanded the selector into the
+  four standard categories, while `utils/tool_mapping.py` treats every
+  `@`-prefixed entry as a non-grant for the providers it translates. The shipped
+  `reviewer` role lists `@builtin`, so an OpenCode reviewer was not read-only.
+  The selector now grants nothing on OpenCode either; run `cao install` again
+  for existing OpenCode agents, since the `permission:` block is written at
+  install time. A profile whose `allowedTools` listed **only** `@builtin`
+  previously got `read`/`grep`/`glob` (and the write and bash tools) on
+  OpenCode and now gets none of them: add `fs_read`, `fs_list` and the rest
+  explicitly, as the shipped roles already do.
+
 - **enabling `CAO_MEMORY_API_URL` rejected memory keys that work without it.**
   The `/internal/memory/store` and `/forget` routes validated the wire `key` as
   the strict `MemoryKey` (`^[a-z0-9-]{1,60}$`), while the MCP tools have always
