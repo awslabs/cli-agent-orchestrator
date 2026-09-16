@@ -138,7 +138,9 @@ class TestCreateSession:
         mock_session.windows = [mock_window]
         tmux.server.new_session.return_value = mock_session
         tmux.server.cmd.return_value = MagicMock(
-            returncode=1, stdout=[], stderr=["error connecting to /tmp/tmux-0/default (No such file or directory)"]
+            returncode=1,
+            stdout=[],
+            stderr=["error connecting to /tmp/tmux-0/default (No such file or directory)"],
         )
 
         result = tmux.create_session("ses", "my-window", "tid1", str(tmp_path))
@@ -1062,9 +1064,7 @@ class TestRealTmuxExitEmpty:
             capture_output=True,
             text=True,
         )
-        assert result.returncode == 0, (
-            f"'tmux show-options' failed unexpectedly: {result.stderr}"
-        )
+        assert result.returncode == 0, f"'tmux show-options' failed unexpectedly: {result.stderr}"
         return result.stdout.strip()
 
     def test_exit_empty_off_after_first_create_session_on_clean_server(self, tmp_path):
@@ -1076,8 +1076,9 @@ class TestRealTmuxExitEmpty:
         """
         self._require_tmux()
 
-        from cli_agent_orchestrator.clients.tmux import TmuxClient
         import libtmux
+
+        from cli_agent_orchestrator.clients.tmux import TmuxClient
 
         socket_name = f"cao-test-exit-empty-{uuid.uuid4().hex[:12]}"
         subprocess.run(["tmux", "-L", socket_name, "kill-server"], capture_output=True)
@@ -1109,8 +1110,9 @@ class TestRealTmuxExitEmpty:
         """
         self._require_tmux()
 
-        from cli_agent_orchestrator.clients.tmux import TmuxClient
         import libtmux
+
+        from cli_agent_orchestrator.clients.tmux import TmuxClient
 
         socket_name = f"cao-test-exit-empty-restart-{uuid.uuid4().hex[:12]}"
         subprocess.run(["tmux", "-L", socket_name, "kill-server"], capture_output=True)

@@ -416,9 +416,7 @@ class TmuxClient:
         exception.
         """
         try:
-            result = self.server.cmd(
-                "start-server", ";", "set-option", "-s", "exit-empty", "off"
-            )
+            result = self.server.cmd("start-server", ";", "set-option", "-s", "exit-empty", "off")
         except Exception:
             logger.warning("failed to set tmux server option 'exit-empty off'", exc_info=True)
             return
