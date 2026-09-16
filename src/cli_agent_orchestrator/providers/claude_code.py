@@ -541,7 +541,7 @@ class ClaudeCodeProvider(BaseProvider):
           permissions confirmation dialog on every launch with ``--dangerously-skip-permissions``
           unless this is persisted. CAO already uses the flag intentionally, so the confirmation
           is redundant and blocks initialization.
-        - ``tui: "default"`` (workain/harness-control#225): Claude Code shows a first-run
+        - ``tui: "default"`` (harness-control#225): Claude Code shows a first-run
           "Try the new fullscreen renderer?" onboarding upsell on a HOME dir whose stored
           onboarding-version state lags the installed CLI, unless the CLI's own ``/tui`` setting
           is already explicitly set. ``"default"`` keeps the classic renderer that this file's
@@ -551,6 +551,27 @@ class ClaudeCodeProvider(BaseProvider):
           effect of dialog suppression. Prevention beats reacting to a prompt shape that only
           exists at all because this setting was left unset (this replaces an earlier runtime
           detect-and-dismiss approach).
+
+          This key is global (unlike ``skipDangerousModePermissionPrompt``, which only changes
+          bypass-permissions launches): it affects every launch of the operator's own interactive
+          ``claude``, not only CAO-spawned sessions. The CLI's ``--settings`` flag can overlay a
+          key for one invocation only, which would scope this to CAO-launched sessions with no
+          global write at all -- tested live (CLI v2.1.197) against a disposable HOME reproducing
+          the documented trigger condition (``lastOnboardingVersion`` behind the installed CLI,
+          no ``tui`` key persisted): the dialog did not render either with or without a
+          ``--settings '{"tui": "default"}'`` overlay, so the overlay-vs-global-seed question
+          could not be settled this way. The installed CLI binary's own strings show the dialog's
+          copy sitting next to GrowthBook-style experiment-flag identifiers
+          (``tengu_fullscreen_upsell_dialog_shown``, ``fullscreenUpsellSeenCount``) using the same
+          naming convention as this account's other server-controlled feature flags
+          (``~/.claude.json``'s ``cachedGrowthBookFeatures``) -- consistent with the dialog being
+          gated by server-side experiment enrollment in addition to the local tui-unset condition
+          the docs describe, which would explain why neither run reproduced it. Absent a
+          reproduction, this keeps the seed-if-absent global write rather than moving ``tui`` to
+          a per-launch overlay: the absent-only guard already respects an operator's explicit
+          choice, and an unverified overlay is not a safe substitute for a prevention this PR
+          exists to make unconditional. Re-test when the CLI version above changes or when an
+          account with the dialog enabled is available.
 
         After the async conversion, N concurrent inits may run this read-modify-write in N
         threads (via ``asyncio.to_thread``). ``_SETTINGS_WRITE_LOCK`` serializes our own threads
