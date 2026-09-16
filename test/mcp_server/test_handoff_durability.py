@@ -8,13 +8,23 @@ Verifies:
 """
 
 import asyncio
-import uuid
 from unittest.mock import MagicMock, patch
 
 import requests
 
 from cli_agent_orchestrator.mcp_server.server import get_handoff_result
 from cli_agent_orchestrator.utils.orchestration import HandoffContext, _handoff_impl
+
+
+class FakeTimeout(Exception):
+    """Stand-in for ``requests.Timeout`` on the patched ``requests`` module.
+
+    Used in EVERY test here, including the ones that never time out. Assigning
+    the bare ``Exception`` to ``mock_requests.Timeout`` instead (PR #453 review
+    nit) turns production's ``except requests.Timeout:`` into a catch-all, so a
+    test could pass because some unrelated exception was swallowed into the
+    pending branch. A dedicated sentinel only matches what the test itself raised.
+    """
 
 
 def _ctx(provider="kiro_cli", session_name=None, caller_id=None, allowed_tools=None):
@@ -45,7 +55,7 @@ class TestHandoffJobId:
         mock_provider.return_value = _ctx()
         with patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests:
             mock_requests.post.return_value = _ok_response()
-            mock_requests.Timeout = Exception
+            mock_requests.Timeout = FakeTimeout
             asyncio.run(_handoff_impl("developer", "do task"))
 
         payload = mock_requests.post.call_args[1]["json"]
@@ -60,10 +70,6 @@ class TestHandoffJobId:
         """On requests.Timeout the HandoffResult must carry pending=True and
         a non-None job_id so the caller can poll the retrieval endpoint."""
         mock_provider.return_value = _ctx()
-
-        class FakeTimeout(Exception):
-            pass
-
         with patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests:
             mock_requests.post.side_effect = FakeTimeout("timed out")
             mock_requests.Timeout = FakeTimeout
@@ -86,7 +92,7 @@ class TestHandoffJobId:
         mock_provider.return_value = _ctx()
         with patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests:
             mock_requests.post.return_value = _ok_response()
-            mock_requests.Timeout = Exception
+            mock_requests.Timeout = FakeTimeout
             result = asyncio.run(_handoff_impl("developer", "do task"))
 
         assert result.success is True
@@ -98,10 +104,6 @@ class TestHandoffJobId:
         """Separate calls must generate distinct job_ids (no collision)."""
         mock_provider.return_value = _ctx()
         ids_seen = set()
-
-        class FakeTimeout(Exception):
-            pass
-
         for _ in range(5):
             with patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests:
                 mock_requests.post.side_effect = FakeTimeout("timed out")

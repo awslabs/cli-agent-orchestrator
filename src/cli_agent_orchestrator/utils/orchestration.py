@@ -864,8 +864,10 @@ def _extract_error_detail(response: requests.Response, fallback: str) -> str:
 
 
 # Server-side ready-wait (up to 120s) plus slack, added to the caller's step
-# timeout to get the HTTP read budget. Named because the pending-timeout message
-# has to quote the SAME number the budget uses -- two literals would drift.
+# timeout to get the HTTP read budget. Named rather than inlined because the
+# resulting budget (timeout + this) is what decides whether the pending/job_id
+# branch is reachable at all under a given provider's tools/call deadline -- see
+# the Timeout branch in _run_step_and_build_result. No message quotes 180.
 _CLIENT_TIMEOUT_HEADROOM = 180
 
 
@@ -933,10 +935,22 @@ async def _run_step_and_build_result(
             # The transport died, but the step may still be running (or have
             # already finished) server-side. The server persists the result in
             # handoff_results under this job_id BEFORE the terminal is torn
-            # down, so the caller can still fetch it (issue #447 / PR #453
-            # review finding 3 -- naming the tool, not a bare
-            # "GET /handoff-results/{job_id}", because the supervisor LLM has
-            # no base URL and no token to build that request itself).
+            # down, so it is retrievable (issue #447 / PR #453 review finding 3 --
+            # naming the tool, not a bare "GET /handoff-results/{job_id}",
+            # because the supervisor LLM has no base URL and no token to build
+            # that request itself).
+            #
+            # THIS BRANCH IS NOT FULL COVERAGE, and the row outliving the
+            # transport is not the same as this message reaching anyone. The HTTP
+            # read budget set above is timeout + _CLIENT_TIMEOUT_HEADROOM (default
+            # 600 + 180 = 780s), while several providers cap a single
+            # tools/call at ~600s (Codex, Kimi, MiniMax). For an MCP-supervisor
+            # caller on those providers the PROVIDER deadline usually fires
+            # first, so ``requests.Timeout`` is never raised here and this
+            # pending/job_id result is never returned -- the supervisor sees its
+            # own tool-call timeout with no job_id in hand. Closing that gap
+            # (surfacing the job_id before the call can be pre-empted) is
+            # tracked separately in #715; it is NOT fixed here.
             timeout_msg += (
                 f". The job may still be running server-side; retrieve the "
                 f"result with the get_handoff_result tool, job_id={job_id}"
@@ -953,7 +967,7 @@ async def _run_step_and_build_result(
             )
         return HandoffResult(
             success=False,
-            pending=bool(job_id) or None,
+            pending=True if job_id else None,
             job_id=job_id,
             message=timeout_msg,
             output=None,

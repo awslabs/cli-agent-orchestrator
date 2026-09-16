@@ -847,6 +847,14 @@ WORKFLOW_NAME_RE = r"^[A-Za-z0-9_-]{1,64}$"
 # over this single HTTP route (replacing its former six granular round-trips).
 TERMINALS_RUN_STEP_ROUTE = "/terminals/run-step"
 
+# Durable handoff-result retrieval endpoint (issue #447). Held as the FastAPI
+# path TEMPLATE so the route decorator and the MCP client's ``requests.get`` read
+# the SAME literal -- the client formats it (``.format(job_id=...)``) rather than
+# rebuilding the path. job_id is the sole retrieval capability for a row that can
+# carry worker output, so a silent typo on either side is a retrieval outage, not
+# a 404 the caller can act on.
+HANDOFF_RESULTS_ROUTE = "/handoff-results/{job_id}"
+
 # Default directory scanned for workflow spec YAML files when no --dir is given
 # (Bolt 2, N2). Spec files on disk are the single source of truth; the
 # ``workflow_index`` SQLite table is a derived, droppable projection (B2-BR-2).

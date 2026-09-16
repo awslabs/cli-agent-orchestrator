@@ -8,9 +8,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from cli_agent_orchestrator.constants import TERMINALS_RUN_STEP_ROUTE
-from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
+from cli_agent_orchestrator.constants import HANDOFF_RESULTS_ROUTE, TERMINALS_RUN_STEP_ROUTE
+from cli_agent_orchestrator.models.terminal import (
+    AgentStepResult,
+    TerminalLimitError,
+    TerminalStatus,
+)
+from cli_agent_orchestrator.providers.base import OutputExtractionError
+from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
 from cli_agent_orchestrator.services.agent_step import StepExecutionError
+from cli_agent_orchestrator.services.worktree_service import WorktreeError
 
 _RUN_STEP = "cli_agent_orchestrator.api.main.run_agent_step"
 _UPSERT = "cli_agent_orchestrator.api.main.upsert_handoff_result"
@@ -137,6 +144,36 @@ class TestRunStepDurabilityErrorBranches:
         assert calls[1][0][1] == "error"
         assert "unexpected boom" in calls[1][1]["error_message"]
 
+    # PR #453 review (blocking): these four arms settled the SCRIPT step but never
+    # transitioned the JOB, so a caller polling GET /handoff-results after a
+    # transport timeout read "running" until the retention sweep deleted the row.
+    # OutputExtractionError is the worst case -- the worker DID produce output.
+    # Parametrised rather than four near-identical bodies so a fifth arm is one
+    # table row, and asserted per-arm on the status code as well as the state so
+    # exception ORDERING (all but TerminalLimitError/WorktreeError are caught
+    # before the ValueError arm they subclass) stays pinned too.
+    @pytest.mark.parametrize(
+        ("exc", "expected_status", "fragment"),
+        [
+            (OutputExtractionError("no response marker in scrollback"), 500, "response marker"),
+            (KiroPhase0KASError(False), 400, "not available in Phase 0"),
+            (TerminalLimitError("node is at CAO_MAX_TERMINALS"), 429, "CAO_MAX_TERMINALS"),
+            (WorktreeError("not a git repository"), 400, "not a git repository"),
+        ],
+        ids=["output_extraction", "kiro_phase0_kas", "terminal_limit", "worktree"],
+    )
+    def test_settled_failure_arms_persist_error_state(self, client, exc, expected_status, fragment):
+        calls = []
+        with (
+            patch(_RUN_STEP, new=AsyncMock(side_effect=exc)),
+            patch(_UPSERT, side_effect=lambda *a, **kw: calls.append((a, kw))),
+        ):
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body(job_id="99aabbcc" * 4))
+
+        assert resp.status_code == expected_status
+        assert [c[0][1] for c in calls] == ["running", "error"]
+        assert fragment in calls[1][1]["error_message"]
+
 
 class TestJobIdValidation:
     """S-002: job_id field must reject non-hex and wrong-length values."""
@@ -197,7 +234,9 @@ class TestGetHandoffResult:
             "updated_at": "2025-01-01T00:01:00+00:00",
         }
         with patch(_GET, return_value=record):
-            resp = client.get("/handoff-results/cafe1234cafe1234cafe1234cafe1234")
+            resp = client.get(
+                HANDOFF_RESULTS_ROUTE.format(job_id="cafe1234cafe1234cafe1234cafe1234")
+            )
 
         assert resp.status_code == 200
         data = resp.json()
@@ -206,7 +245,7 @@ class TestGetHandoffResult:
 
     def test_returns_404_when_not_found(self, client):
         with patch(_GET, return_value=None):
-            resp = client.get("/handoff-results/unknown-job-id")
+            resp = client.get(HANDOFF_RESULTS_ROUTE.format(job_id="unknown-job-id"))
 
         assert resp.status_code == 404
 
@@ -221,7 +260,9 @@ class TestGetHandoffResult:
             "updated_at": "2025-01-01T00:00:30+00:00",
         }
         with patch(_GET, return_value=record):
-            resp = client.get("/handoff-results/aabbccddaabbccddaabbccddaabbccdd")
+            resp = client.get(
+                HANDOFF_RESULTS_ROUTE.format(job_id="aabbccddaabbccddaabbccddaabbccdd")
+            )
 
         assert resp.status_code == 200
         assert resp.json()["state"] == "running"

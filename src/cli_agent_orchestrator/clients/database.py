@@ -342,15 +342,27 @@ class FlowModel(Base):
 class HandoffResultModel(Base):
     """Durable record of a handoff step result (issue #447).
 
-    Written by the run-step handler BEFORE returning the HTTP response, so the
-    result survives an MCP-transport timeout.  The caller supplies a ``job_id``
-    (generated client-side so retries use the same key); the server upserts on
-    that key.
+    The caller generates a ``job_id`` and passes it to ``POST /terminals/run-step``;
+    the server upserts on that key. Client-side generation exists so the MCP client
+    holds the key BEFORE the request it might not get an answer to -- NOT for
+    deduplication: ``_handoff_impl`` mints a fresh ``uuid4().hex`` per call, so a
+    retry carries a different key and runs a second step.
 
     ``state``:
-      - ``"running"`` — step in progress (written at request start)
-      - ``"completed"`` — step finished successfully; ``last_message`` populated
-      - ``"error"`` — step failed; ``error_message`` populated
+      - ``"running"`` — step in progress (written by the run-step handler at
+        request start, after the generation fence)
+      - ``"completed"`` — step finished successfully; ``last_message`` populated.
+        Written inside ``run_agent_step``, between result extraction and terminal
+        teardown -- the terminal is the only other copy of the result, so the row
+        must exist before it is destroyed.
+      - ``"error"`` — step failed; ``error_message`` populated. Written by the
+        run-step handler's failure arms, which are the only place that can tell
+        which exception occurred.
+
+    ``created_at``/``updated_at`` carry ``DateTime(timezone=True)``, which is a
+    no-op on SQLite: the offset is dropped on write, so the stored values are
+    NAIVE UTC. The retention sweep must therefore compare against a UTC cutoff --
+    see ``cleanup_service.cleanup_old_data``.
     """
 
     __tablename__ = "handoff_results"
@@ -491,6 +503,14 @@ def _migrate_add_handoff_results() -> None:
     idempotent migration handles existing ones where the table does not
     exist yet.  SQLite supports ``CREATE TABLE IF NOT EXISTS``, so we
     delegate to raw SQL rather than a full schema rebuild.
+
+    The bare ``DATETIME`` columns here and the ORM model's
+    ``DateTime(timezone=True)`` are not a divergence in what gets STORED:
+    ``timezone=True`` is a no-op on SQLite, which keeps no offset either way, so
+    both paths hold naive UTC wall-clock (the writer's default is ``_utcnow``).
+    Registered LAST in ``init_db`` and order-independent: it touches its own new
+    table and no column of any other, so it neither depends on nor perturbs the
+    migrators above it.
     """
     import sqlite3
 
@@ -2144,14 +2164,24 @@ def upsert_handoff_result(
 ) -> None:
     """Create or update the durable record for a handoff step (issue #447).
 
-    Called at two points in the run-step handler:
-    1. Request start — ``state="running"`` (marks the job as in-progress so a
-       concurrent duplicate knows to wait rather than start a second worker).
-    2. Before sending the HTTP response — ``state="completed"`` or ``"error"``
-       (makes the result retrievable even if the transport closes before the
-       response arrives).
+    Called from three places, NOT two, and only one of them is the handler:
 
-    Idempotent: a second call for the same ``job_id`` updates the existing row.
+    1. ``api.main.run_step``, at request start — ``state="running"``.
+    2. ``services.agent_step.run_agent_step``, between result extraction and
+       terminal teardown — ``state="completed"``. NOT the handler after
+       ``run_agent_step`` returns: by then the terminal holding the only other
+       copy of the result is already gone.
+    3. ``api.main.run_step``'s failure arms — ``state="error"``. The handler owns
+       these because only it can distinguish the exception types.
+
+    Together, 2 and 3 make the result retrievable via
+    ``GET /handoff-results/{job_id}`` even if the transport closes before the
+    response arrives.
+
+    Idempotent per key: a second call for the same ``job_id`` updates the existing
+    row. That is last-write-wins bookkeeping, NOT execution deduplication -- there
+    is no mechanism by which a concurrent or retried call observes ``"running"``
+    and waits; a second call with the same key runs a second step.
     """
     now = _utcnow()
     with SessionLocal() as db:

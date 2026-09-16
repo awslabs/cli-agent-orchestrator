@@ -812,8 +812,11 @@ async def run_agent_step(
                 last_message=last_message,
             )
         except Exception:  # noqa: BLE001 — persistence is best-effort; step already succeeded
+            # Prefix only, never the whole id -- job_id is the sole retrieval
+            # capability for this row's worker output (PR #453 review finding 4).
             logger.warning(
-                "run_agent_step: failed to persist completed result for job_id=%s", job_id
+                "run_agent_step: failed to persist completed result for job_id_prefix=%s",
+                job_id[:8],
             )
 
     if teardown and created_here:

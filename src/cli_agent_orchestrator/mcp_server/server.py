@@ -15,6 +15,7 @@ from cli_agent_orchestrator.constants import (
     API_BASE_URL,
     DISCOVERY_TOOL_MARKER,
     ELASTIC_CALLBACK_URL_ENV,
+    HANDOFF_RESULTS_ROUTE,
     WORKFLOW_EVENTS_CONNECT_TIMEOUT,
     WORKFLOW_EVENTS_MCP_MAX_EVENTS,
     WORKFLOW_EVENTS_MCP_MAX_SECONDS,
@@ -1001,7 +1002,8 @@ def get_handoff_result(
         ``message`` when the job_id is unknown or the request failed.
     """
     try:
-        response = requests.get(f"{API_BASE_URL}/handoff-results/{job_id}", timeout=_mcp_timeout())
+        path = HANDOFF_RESULTS_ROUTE.format(job_id=job_id)
+        response = requests.get(f"{API_BASE_URL}{path}", timeout=_mcp_timeout())
         response.raise_for_status()
         data = response.json()
         return {

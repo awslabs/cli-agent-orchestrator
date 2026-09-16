@@ -3,12 +3,14 @@
 Uses an in-memory SQLite database so no file system state is required.
 """
 
+import sqlite3
 from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from cli_agent_orchestrator.clients import database as db_mod
 from cli_agent_orchestrator.clients.database import (
     Base,
     HandoffResultModel,
@@ -109,3 +111,105 @@ class TestDeleteOldHandoffResults:
         cutoff = _utcnow() - timedelta(days=30)
         deleted = delete_old_handoff_results(cutoff)
         assert deleted == 0
+
+
+class TestMigrateAddHandoffResults:
+    """PR #453 review finding 7: the migrator shipped untested.
+
+    The CRUD tests above sidestep it entirely -- they build their schema with
+    ``Base.metadata.create_all``, which is the FRESH-database path. Nothing
+    exercised the raw-SQL path that upgrades an operator's existing DB, so a typo
+    in the DDL, a non-idempotent re-run, or a missing ``init_db`` registration
+    would all have passed CI. Mirrors the coverage every other migrator ships
+    (see test_memory_relationships_migration.py): table shape, idempotent re-run,
+    registry placement.
+    """
+
+    @pytest.fixture
+    def legacy_db(self, tmp_path, monkeypatch):
+        """A sqlite file with SOME schema but no handoff_results -- an existing
+        install upgrading into this change."""
+        import cli_agent_orchestrator.constants as consts
+
+        db_path = tmp_path / "legacy.db"
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.execute("CREATE TABLE terminals (id TEXT PRIMARY KEY)")
+            conn.commit()
+        monkeypatch.setattr(consts, "DATABASE_FILE", db_path, raising=False)
+        return db_path
+
+    def test_creates_table_with_expected_shape(self, legacy_db):
+        with sqlite3.connect(str(legacy_db)) as conn:
+            assert (
+                conn.execute(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='handoff_results'"
+                ).fetchone()[0]
+                == 0
+            )
+
+        db_mod._migrate_add_handoff_results()
+
+        with sqlite3.connect(str(legacy_db)) as conn:
+            info = list(conn.execute("PRAGMA table_info(handoff_results)"))
+        cols = {r[1]: r for r in info}
+        assert set(cols) == {
+            "job_id",
+            "state",
+            "terminal_id",
+            "last_message",
+            "error_message",
+            "created_at",
+            "updated_at",
+        }
+        # job_id is the primary key -- it is the upsert key AND the retrieval
+        # capability, so a non-unique column here would let two jobs collide.
+        assert cols["job_id"][5] == 1
+        assert cols["state"][3] == 1, "state must be NOT NULL"
+        for c in ("terminal_id", "last_message", "error_message"):
+            assert cols[c][3] == 0, f"{c} must be nullable"
+
+    def test_idempotent_rerun_keeps_one_table_and_its_rows(self, legacy_db):
+        db_mod._migrate_add_handoff_results()
+        with sqlite3.connect(str(legacy_db)) as conn:
+            conn.execute(
+                "INSERT INTO handoff_results (job_id, state, last_message) VALUES (?, ?, ?)",
+                ("survivor", "completed", "worker output"),
+            )
+            conn.commit()
+
+        db_mod._migrate_add_handoff_results()  # re-run must not raise or reset
+
+        with sqlite3.connect(str(legacy_db)) as conn:
+            assert (
+                conn.execute(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='handoff_results'"
+                ).fetchone()[0]
+                == 1
+            )
+            # A re-run that dropped and recreated would silently destroy results.
+            assert (
+                conn.execute(
+                    "SELECT last_message FROM handoff_results WHERE job_id='survivor'"
+                ).fetchone()[0]
+                == "worker output"
+            )
+
+    def test_registered_in_init_db_and_order_independent(self):
+        """Registered, and safe wherever it sits: it names no table but its own, so
+        it cannot depend on or perturb any migrator around it."""
+        import ast
+        import inspect
+        import textwrap
+
+        assert "_migrate_add_handoff_results()" in inspect.getsource(db_mod.init_db)
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(db_mod._migrate_add_handoff_results)))
+        # Drop the docstring, which legitimately discusses create_all and the ORM.
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.Module)) and node.body:
+                if ast.get_docstring(node, clean=False) and isinstance(node.body[0], ast.Expr):
+                    node.body = node.body[1:] or [ast.Pass()]
+        code = ast.unparse(tree)
+        assert "handoff_results" in code
+        for other in ("memory_metadata", "memory_relationships", "workflow_run", "terminals"):
+            assert other not in code, f"migrator must not issue SQL against {other}"

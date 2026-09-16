@@ -104,9 +104,19 @@ def cleanup_old_data():
         logger.info(f"Deleted {server_logs_deleted} old server log files")
 
         # Clean up old handoff result records (issue #447).
-        # Same cutoff as terminals/messages: RETENTION_DAYS.
+        # Same RETENTION_DAYS window as terminals/messages, but a UTC cutoff, NOT
+        # ``cutoff_date`` (PR #453 review finding 1). The three tables above default
+        # their timestamp to naive-local ``datetime.now``, so the naive-local
+        # ``cutoff_date`` matches them. ``HandoffResultModel.created_at`` defaults to
+        # ``_utcnow()`` instead, and SQLite drops the offset -- what lands in the
+        # column is UTC wall-clock. Comparing that to a local cutoff deletes rows
+        # UTC-offset hours early (east of UTC) or late (west); measured ~10-19h early
+        # under TZ=+10. This is the most sensitive swept table (it holds full worker
+        # output), so it gets the clock its WRITER uses rather than the one its
+        # neighbours use.
+        handoff_cutoff = datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)
         try:
-            deleted_handoff = delete_old_handoff_results(cutoff_date)
+            deleted_handoff = delete_old_handoff_results(handoff_cutoff)
             logger.info(f"Deleted {deleted_handoff} old handoff result records")
         except Exception as e:
             logger.warning(f"Failed to clean up old handoff results: {e}")
