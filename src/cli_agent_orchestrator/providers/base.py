@@ -20,6 +20,7 @@ and output format to reliably detect status changes.
 """
 
 import logging
+import math
 import os
 import re
 import time
@@ -45,17 +46,37 @@ _DEFAULT_INIT_TIMEOUT_LOAD_MAX_FACTOR = 6.0
 
 
 def _env_float(name: str, default: float) -> float:
-    """Parse a float CAO_* env override, falling back to `default` on unset/blank/garbage.
+    """Parse a CAO_* env override as a FINITE, NON-NEGATIVE float, else fall back to `default`.
 
     Never raises: a misconfigured env var degrades to the default (and is logged once at DEBUG),
-    it never takes down the init path it is meant to make more forgiving."""
+    it never takes down the init path it is meant to make more forgiving.
+
+    ``float()`` alone is not enough, and the gap is not academic (PR #623 review): it happily
+    accepts ``"inf"``, ``"-inf"`` and ``"nan"``, each of which silently bypasses the fallback this
+    function promises and lands a value no caller can act on. ``CAO_INPUT_READY_TIMEOUT=inf``
+    makes the settle loop's ``time.monotonic() + timeout`` deadline infinite, so a pane that never
+    matches is waited on FOREVER; ``nan`` makes every ``<`` comparison against the deadline False,
+    so the same loop expires on its first iteration. A negative duration is the same class of
+    bug -- a deadline already in the past. Every value this helper resolves is a duration or a
+    scaling factor, so non-finite and negative are both rejected here rather than at each call
+    site, where the next reader of a new CAO_* knob would have to rediscover the hazard."""
     raw = os.environ.get(name)
     if raw is None or raw.strip() == "":
         return default
     try:
         val = float(raw)
     except ValueError:
-        logger.debug("Ignoring invalid %s=%r (expected float); using default %s", name, raw, default)
+        logger.debug(
+            "Ignoring invalid %s=%r (expected float); using default %s", name, raw, default
+        )
+        return default
+    if not math.isfinite(val) or val < 0:
+        logger.debug(
+            "Ignoring out-of-range %s=%r (expected a finite, non-negative float); using default %s",
+            name,
+            raw,
+            default,
+        )
         return default
     return val
 
@@ -69,8 +90,11 @@ def load_scaled_timeout(base_seconds: float) -> float:
     MORE aggressive than the pre-#890 fixed value. `CAO_INIT_TIMEOUT_LOAD_MAX_FACTOR` (default
     6.0) bounds the extension so a runaway load spike can't push a single init to an unbounded
     wait. Set the factor to 1.0 to disable load-awareness entirely. os.getloadavg() is unavailable
-    on some platforms (raises OSError/AttributeError) -- there we fall back to the base unchanged."""
-    max_factor = _env_float("CAO_INIT_TIMEOUT_LOAD_MAX_FACTOR", _DEFAULT_INIT_TIMEOUT_LOAD_MAX_FACTOR)
+    on some platforms (raises OSError/AttributeError) -- there we fall back to the base unchanged.
+    """
+    max_factor = _env_float(
+        "CAO_INIT_TIMEOUT_LOAD_MAX_FACTOR", _DEFAULT_INIT_TIMEOUT_LOAD_MAX_FACTOR
+    )
     if max_factor <= 1.0:
         return base_seconds
     try:
@@ -83,7 +107,11 @@ def load_scaled_timeout(base_seconds: float) -> float:
     if factor > 1.0:
         logger.debug(
             "load-aware timeout: base %.1fs -> %.1fs (load1=%.2f, cores=%d, factor=%.2f)",
-            base_seconds, base_seconds * factor, load1, cores, factor,
+            base_seconds,
+            base_seconds * factor,
+            load1,
+            cores,
+            factor,
         )
     return base_seconds * factor
 
@@ -99,6 +127,22 @@ class OutputExtractionError(ValueError):
     Subclasses ``ValueError`` so existing ``except ValueError`` callers keep
     working; the API boundary catches this narrower type first so an extraction
     failure is not reported as 404 Not Found (issue #570).
+    """
+
+
+class UnknownTerminalError(ValueError):
+    """A terminal id has no registry row: it never existed, or it has just been deleted.
+
+    Narrower than the other ``ValueError``s ``ProviderManager.get_provider`` can raise, which all
+    describe a terminal that DOES exist but whose provider could not be CONSTRUCTED -- an unknown
+    persisted provider type, a Kiro row with no ``agent_profile``, a ``resume_session_id`` on a
+    non-``claude_code`` provider. Those are real faults that must stay loud. Only this one means
+    "there is nothing left to act on", which is the ordinary race during terminal deletion.
+
+    Subclasses ``ValueError`` so every pre-existing ``except ValueError`` caller keeps working
+    unchanged; callers that need to tell the two apart (``StatusMonitor._process_chunk``) catch
+    this type instead. Raised in ``providers/manager.py``. (PR #623 review, Copilot on
+    ``status_monitor.py``.)
     """
 
 

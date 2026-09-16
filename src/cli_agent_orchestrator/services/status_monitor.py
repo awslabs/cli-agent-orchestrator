@@ -18,6 +18,7 @@ from cli_agent_orchestrator.constants import (
     PYTE_SCREEN_ROWS,
 )
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.providers.base import UnknownTerminalError
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.settings_service import get_server_settings
@@ -211,15 +212,22 @@ class StatusMonitor:
         """
         try:
             provider = provider_manager.get_provider(terminal_id)
-        except ValueError:
+        except UnknownTerminalError:
             # harness-control#890 (TOCTOU crash-harden): the terminal was deleted between this
             # output event being enqueued and now -- a normal race during session teardown / phantom
-            # reap, where `get_provider` finds no metadata row and raises "Terminal X not found in
-            # database". There is nothing left to detect or publish for a gone terminal, so drop the
-            # chunk quietly. Previously this propagated to the loop's generic handler and surfaced as
-            # a full `logger.exception` stack trace once per buffered chunk of every just-deleted
-            # terminal -- pure noise that looked like a fault. Any non-ValueError (e.g.
-            # KiroPhase0KASError) still propagates unchanged.
+            # reap, where `get_provider` finds no metadata row. There is nothing left to detect or
+            # publish for a gone terminal, so drop the chunk quietly. Previously this propagated to
+            # the loop's generic handler and surfaced as a full `logger.exception` stack trace once
+            # per buffered chunk of every just-deleted terminal -- pure noise that looked like a
+            # fault.
+            #
+            # Deliberately NOT a bare `except ValueError` (PR #623 review, Copilot): get_provider
+            # raises plain ValueError for real provider-CREATION faults too -- an unknown persisted
+            # provider type, a Kiro row with no agent_profile, resume_session_id on a non-claude_code
+            # provider. Swallowing those would silently drop the terminal's output and freeze its
+            # status at whatever it last was, with nothing logged above DEBUG to explain it. They
+            # propagate to the loop's generic handler exactly as they did before this change, as does
+            # any non-ValueError (e.g. KiroPhase0KASError).
             logger.debug(
                 "StatusMonitor: terminal %s vanished before status detection (TOCTOU); "
                 "dropping its output chunk",
