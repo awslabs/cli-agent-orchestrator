@@ -9,9 +9,11 @@
 
 ## Context
 
-The configuration is the security boundary. Everything the feature may read, everything it
-may write, which scope each note lands in, and whether a note may reach an agent's prompt
-are decided here. A weak validation story makes every other control theoretical.
+The configuration is the security boundary. The mapping folder, exclusions, and `index`
+setting define the notes the feature may currently read and index; `inject` routes eligible
+indexed content into automatic agent context, while explicit recall remains a separate
+access path. Everything the feature may write and which scope each note lands in are also
+decided here. A weak validation story makes every other control theoretical.
 
 CAO has one configuration file and one precedence chain, established by issue #357 in
 `services/config_service.py`: `CLI flag > CAO_* env var > config file > built-in default`,
@@ -403,6 +405,9 @@ in exchange for no security gain.
   subject to the mapping's `inject` and `secret_gate` settings — could be served by a
   native store subject to neither.
 - **Compliance review has a single artifact.** "What may CAO read, where may it write, and
-  what may reach an agent's prompt?" is answered by one JSON object, with
+  what may be routed into automatic agent context?" is answered by one JSON object, with
   `cao memory vault status` as the machine-checkable confirmation that the object is valid
-  and that only the intended mappings are injectable.
+  and that only the intended mappings are injectable. Automatic injection is not a
+  confidentiality guarantee: explicit recall and direct vault access remain separate paths,
+  and provider-bound automatic injection may redact credential-shaped substrings without
+  rewriting the source.

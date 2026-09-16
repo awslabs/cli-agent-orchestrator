@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 from typing import Mapping, Optional
 
 from cli_agent_orchestrator.services.vault.findings import FindingCode
@@ -11,6 +12,9 @@ from cli_agent_orchestrator.services.vault.findings import FindingCode
 MAX_BODY_WIKILINKS = 1000
 MAX_LINK_TARGET_CHARS = 256
 _WIKILINK = re.compile(r"(?P<embed>!)?\[\[(?P<target>[^\]\r\n]+)\]\]")
+_INLINE_MD_LINK = re.compile(
+    r"(?<![!\\])\[[^\]\\\r\n]{0,256}\]" r"\((?P<destination>[^\s()\\\r\n]{1,256})\)"
+)
 _FENCED_CODE = re.compile(r"```.*?```", re.DOTALL)
 _INLINE_CODE = re.compile(r"`[^`\r\n]*`")
 
@@ -37,20 +41,39 @@ class LinkExtraction:
 
     links: tuple[tuple[bool, str], ...]
     findings: tuple[FindingCode, ...] = ()
+    relative_paths: tuple[bool, ...] = ()
 
 
 def extract_wikilinks(text: str) -> LinkExtraction:
-    """Extract up to 1000 links outside fenced and inline code."""
+    """Extract up to 1000 supported body links outside fenced and inline code."""
     prose = _INLINE_CODE.sub("", _FENCED_CODE.sub("", text))
-    matches = tuple(
-        (bool(match.group("embed")), match.group("target")) for match in _WIKILINK.finditer(prose)
+    positioned = [
+        (match.start(), bool(match.group("embed")), match.group("target"), False)
+        for match in _WIKILINK.finditer(prose)
+    ]
+    positioned.extend(
+        (match.start(), False, destination, True)
+        for match in _INLINE_MD_LINK.finditer(prose)
+        if (destination := _relative_markdown_destination(match.group("destination"))) is not None
     )
+    ordered = sorted(positioned)
+    matches = tuple((embed, target) for _, embed, target, _ in ordered)
+    relative_paths = tuple(relative for _, _, _, relative in ordered)
     findings = (FindingCode.LINK_LIMIT_EXCEEDED,) if len(matches) > MAX_BODY_WIKILINKS else ()
-    return LinkExtraction(matches[:MAX_BODY_WIKILINKS], findings)
+    return LinkExtraction(
+        matches[:MAX_BODY_WIKILINKS],
+        findings,
+        relative_paths[:MAX_BODY_WIKILINKS],
+    )
 
 
 def resolve_wikilink(
-    raw_target: str, *, embed: bool, candidates: tuple[LinkCandidate, ...]
+    raw_target: str,
+    *,
+    embed: bool,
+    candidates: tuple[LinkCandidate, ...],
+    relative_path: bool = False,
+    source_relpath: Optional[str] = None,
 ) -> LinkOutcome:
     """Resolve only exact/path-qualified candidates; ambiguous links are never guessed."""
     target = raw_target.split("|", 1)[0]
@@ -61,7 +84,14 @@ def resolve_wikilink(
         return LinkOutcome("unsupported", finding_code=FindingCode.LINK_TARGET_INVALID)
     if fragment.startswith("^"):
         return LinkOutcome("unsupported", finding_code=FindingCode.BLOCK_REFERENCE_UNSUPPORTED)
-    matching = tuple(candidate for candidate in candidates if _matches(name, candidate))
+    if relative_path:
+        resolved_name = _source_relative_name(name, source_relpath)
+        if resolved_name is None:
+            return LinkOutcome("unsupported", finding_code=FindingCode.LINK_TARGET_INVALID)
+        name = resolved_name
+    matching = tuple(
+        candidate for candidate in candidates if _matches(name, candidate, exact_path=relative_path)
+    )
     if not matching:
         if embed and _is_non_markdown_attachment(name):
             return LinkOutcome("unsupported", finding_code=FindingCode.ATTACHMENT_IGNORED)
@@ -86,10 +116,41 @@ def resolve_wikilink(
     return LinkOutcome("resolved", available[0].key, finding, attributes or None)
 
 
-def _matches(name: str, candidate: LinkCandidate) -> bool:
+def _matches(name: str, candidate: LinkCandidate, *, exact_path: bool = False) -> bool:
     plain = candidate.relpath[:-3] if candidate.relpath.endswith(".md") else candidate.relpath
     basename = plain.rsplit("/", 1)[-1]
+    if exact_path:
+        return name == candidate.relpath
     return name in (plain, candidate.relpath, basename) or name in candidate.aliases
+
+
+def _relative_markdown_destination(destination: str) -> Optional[str]:
+    """Return a conservative relative Markdown note target, preserving its fragment."""
+    path = destination.partition("#")[0]
+    segments = path.split("/")
+    if (
+        not path.lower().endswith(".md")
+        or path.startswith("/")
+        or "?" in path
+        or ":" in segments[0]
+        or any(segment in {"", ".", ".."} for segment in segments)
+    ):
+        return None
+    return destination
+
+
+def _source_relative_name(name: str, source_relpath: Optional[str]) -> Optional[str]:
+    """Resolve an accepted inline path against its containing source directory."""
+    if source_relpath is None or "\\" in source_relpath or source_relpath.startswith("/"):
+        return None
+    source_parts = source_relpath.split("/")
+    if (
+        any(part in {"", ".", ".."} for part in source_parts)
+        or not source_relpath.lower().endswith(".md")
+        or _relative_markdown_destination(name) is None
+    ):
+        return None
+    return str(PurePosixPath(source_relpath).parent / name)
 
 
 def _is_non_markdown_attachment(name: str) -> bool:

@@ -2,33 +2,45 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import logging
 import os
+import secrets
 import stat
-import tempfile
-from collections.abc import Callable, Mapping
+from collections import Counter
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from threading import Lock
+from typing import Any, Literal, Optional
 
 import yaml
 
+from cli_agent_orchestrator.services.memory_append import (
+    MemoryAppendEntry,
+    append_section,
+)
+from cli_agent_orchestrator.services.memory_reconciliation import _first_symlink_component
 from cli_agent_orchestrator.services.secret_gate import scan_for_secrets
 from cli_agent_orchestrator.services.vault.binding import VaultBinding
+from cli_agent_orchestrator.services.vault.boundary import normalize_relpath
 from cli_agent_orchestrator.services.vault.config import VaultSpec
 from cli_agent_orchestrator.services.vault.parser import (
+    FrontmatterRegion,
     frontmatter_boundary,
     locate_top_level_cao_blocks,
     split_frontmatter,
 )
+from cli_agent_orchestrator.services.vault.vault_lock import vault_projection_lock
 from cli_agent_orchestrator.utils.atomic_file import _file_lock, _lock_path_for
-from cli_agent_orchestrator.utils.path_validation import (
-    safe_join_under_base,
-    validate_path_component,
-)
+from cli_agent_orchestrator.utils.path_validation import validate_path_component
 
 logger = logging.getLogger(__name__)
+_boundary_write_refusals: Counter[str] = Counter()
+_boundary_write_refusals_lock = Lock()
 
 
 class VaultWriteConflictError(RuntimeError):
@@ -39,6 +51,10 @@ class VaultSecretWriteError(ValueError):
     """Raised when a reject-mode vault mapping receives credential-shaped content."""
 
 
+class VaultWriteBoundaryError(ValueError):
+    """Raised when a managed write cannot stay on its configured lexical path."""
+
+
 @dataclass(frozen=True)
 class VaultWriteResult:
     """Content-free result of one managed vault-note write."""
@@ -46,6 +62,26 @@ class VaultWriteResult:
     path: str
     content_sha256: str
     ignored_frontmatter_keys: tuple[str, ...] = ()
+    first_section_at: Optional[datetime] = None
+    timestamp_clamped: bool = False
+
+
+def boundary_write_refusal_count(vault_id: Optional[str] = None) -> int:
+    """Return the process-local, content-free managed-boundary refusal count."""
+    with _boundary_write_refusals_lock:
+        if vault_id is None:
+            return sum(_boundary_write_refusals.values())
+        return _boundary_write_refusals[vault_id]
+
+
+@contextmanager
+def _count_boundary_refusal(vault_id: str) -> Iterator[None]:
+    try:
+        yield
+    except VaultWriteBoundaryError:
+        with _boundary_write_refusals_lock:
+            _boundary_write_refusals[vault_id] += 1
+        raise
 
 
 def write_managed_note(
@@ -53,94 +89,167 @@ def write_managed_note(
     vault: VaultSpec,
     binding: VaultBinding,
     key: str,
-    body: str,
+    body: Optional[str],
     cao: Mapping[str, Any],
     expected_content_sha256: Optional[str],
     refresh: Optional[Callable[[str], None]] = None,
     frontmatter: Optional[Mapping[str, Any]] = None,
+    mode: Literal["replace", "append"] = "replace",
+    entry: Optional[MemoryAppendEntry] = None,
 ) -> VaultWriteResult:
-    """Replace one CAO-owned note and refresh its projection after publication.
+    """Write one CAO-owned note and refresh its projection after publication.
 
-    ``body`` is the full body that the caller has rendered. ``frontmatter`` may
-    seed only the standard ``tags`` and ``created`` keys on a new note; an
-    existing user-owned value is preserved and reported as ignored. ``refresh``
-    runs after the durable publish so callers can perform the scoped
-    reconciliation without coupling the filesystem safety boundary to database
-    access.
+    Replace mode keeps the direct-writer contract. Append mode accepts only an
+    entry and renders against the body read through the held managed descriptor.
+    ``frontmatter`` may seed only the standard ``tags`` and ``created`` keys on
+    a new note; an existing user-owned value is preserved and reported as
+    ignored. ``refresh`` runs after the durable publish and note-flock release.
     """
     if vault.id != binding.vault_id:
         raise ValueError("vault binding does not belong to the requested vault")
     if not binding.writable:
         raise ValueError(f"vault mapping {binding.mapping.folder!r} is not writable")
+    if mode not in {"replace", "append"}:
+        raise ValueError(f"unsupported vault write mode: {mode!r}")
+    if mode == "replace" and (body is None or entry is not None):
+        raise ValueError("replace mode requires body and does not accept entry")
+    if mode == "append" and (body is not None or entry is None):
+        raise ValueError("append mode requires entry and does not accept body")
     seeded_frontmatter = _validated_seed_frontmatter(frontmatter)
 
-    managed_base, target = _managed_target(vault, key)
-    lock_path = _lock_path_for(Path(os.path.realpath(target)))
+    with vault_projection_lock(vault):
+        root_real, managed_folder, managed_base, target_name, target = _managed_target(vault, key)
+        lock_path = _lock_path_for(Path(target))
 
-    with _file_lock(lock_path, timeout=10.0):
-        existing = _read_contained_text(managed_base, target)
-        _check_expected_hash(target, existing, expected_content_sha256)
-        boundary = _existing_frontmatter_boundary(target, existing)
-        try:
-            rendered, ignored_frontmatter_keys = _merge_frontmatter(
-                existing,
-                body,
-                key=key,
-                cao=cao,
-                boundary=boundary,
-                seeded_frontmatter=seeded_frontmatter,
-            )
-        except ValueError as exc:
-            raise _conflict(target) from exc
-        rendered_cao = _render_cao(key, cao, boundary[1] if boundary is not None else "\n")
-        _check_indexable(rendered, vault)
-        _check_secret_gate(body, rendered_cao, binding)
-        mode = _target_mode(target)
-        _publish_managed_note(vault.root, managed_base, target, rendered, mode)
+        with _count_boundary_refusal(vault.id), _file_lock(lock_path, timeout=10.0):
+            symlink = _first_symlink_component(Path(managed_base), Path(root_real))
+            if symlink is not None:
+                raise VaultWriteBoundaryError(
+                    f"vault managed_folder contains a symlinked component: {str(symlink)!r}"
+                )
+            managed_fd = _open_managed_dir_fd(root_real, managed_folder)
+            try:
+                existing = _read_contained_text(managed_fd, target_name, target)
+                _check_expected_hash(target, existing, expected_content_sha256)
+                boundary = _existing_frontmatter_boundary(target, existing)
+                append_result = None
+                rendered_body = body
+                if mode == "append":
+                    assert entry is not None
+                    existing_body = boundary[0].body if boundary is not None else ""
+                    append_result = append_section(existing_body, entry)
+                    rendered_body = append_result.content
+                assert rendered_body is not None
+                try:
+                    rendered, ignored_frontmatter_keys = _merge_frontmatter(
+                        existing,
+                        rendered_body,
+                        key=key,
+                        cao=cao,
+                        boundary=boundary,
+                        seeded_frontmatter=seeded_frontmatter,
+                    )
+                except ValueError as exc:
+                    raise _conflict(target) from exc
+                rendered_cao = _render_cao(
+                    key,
+                    _merge_cao_fields(existing, cao, boundary),
+                    boundary[1] if boundary is not None else "\n",
+                )
+                _check_indexable(rendered, vault)
+                secret_body = entry.content if entry is not None else rendered_body
+                _check_secret_gate(secret_body, rendered_cao, binding)
+                target_mode = _target_mode(managed_fd, target_name)
+                _publish_managed_note(managed_fd, target_name, rendered, target_mode)
+            finally:
+                os.close(managed_fd)
 
-    result = VaultWriteResult(
-        path=target,
-        content_sha256=_sha256(rendered),
-        ignored_frontmatter_keys=ignored_frontmatter_keys,
-    )
-    if refresh is not None:
-        try:
-            refresh(target)
-        except Exception as exc:
-            # Import lazily: MemoryService imports this module for the vault arm.
-            from cli_agent_orchestrator.services.memory_service import (
-                MemoryPartialWriteError,
-            )
+        result = VaultWriteResult(
+            path=target,
+            content_sha256=_sha256(rendered),
+            ignored_frontmatter_keys=ignored_frontmatter_keys,
+            first_section_at=(
+                append_result.first_section_at if append_result is not None else None
+            ),
+            timestamp_clamped=(
+                append_result.timestamp_clamped if append_result is not None else False
+            ),
+        )
+        if refresh is not None:
+            try:
+                refresh(target)
+            except Exception as exc:
+                # Import lazily: MemoryService imports this module for the vault arm.
+                from cli_agent_orchestrator.services.memory_service import (
+                    MemoryPartialWriteError,
+                )
 
-            raise MemoryPartialWriteError(
-                key=key,
-                scope=binding.scope,
-                scope_id=binding.scope_id,
-                file_path=target,
-            ) from exc
-    return result
+                raise MemoryPartialWriteError(
+                    key=key,
+                    scope=binding.scope,
+                    scope_id=binding.scope_id,
+                    file_path=target,
+                ) from exc
+        return result
 
 
-def _managed_target(vault: VaultSpec, key: str) -> tuple[str, str]:
+def _managed_target(vault: VaultSpec, key: str) -> tuple[str, str, str, str, str]:
     validate_path_component(key, "vault key")
-    components = tuple(vault.managed_folder.split("/"))
-    managed_base = safe_join_under_base(
-        vault.root, *components, description="managed_folder component"
-    )
-    target = safe_join_under_base(vault.root, *components, f"{key}.md", description="vault key")
-    return managed_base, target
+    managed_folder = normalize_relpath(vault.managed_folder)
+    root_real = os.path.realpath(vault.root)
+    managed_base = os.path.join(root_real, *managed_folder.split("/"))
+    target_name = f"{key}.md"
+    target = os.path.join(managed_base, target_name)
+    return root_real, managed_folder, managed_base, target_name, target
 
 
-def _read_contained_text(managed_base: str, target: str) -> str:
-    if not os.path.exists(target):
+def _open_managed_dir_fd(root_real: str, managed_folder: str) -> int:
+    """Open every managed-folder component without following a symlink."""
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    current_fd = os.open(root_real, directory_flags)
+    try:
+        for component in normalize_relpath(managed_folder).split("/"):
+            try:
+                next_fd = os.open(component, directory_flags, dir_fd=current_fd)
+            except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                    raise VaultWriteBoundaryError(
+                        "vault managed_folder contains a symlinked or non-directory component"
+                    ) from exc
+                raise
+            os.close(current_fd)
+            current_fd = next_fd
+        return current_fd
+    except BaseException:
+        os.close(current_fd)
+        raise
+
+
+def _read_contained_text(managed_fd: int, target_name: str, target: str) -> str:
+    """Read the target through the same verified directory used to publish it."""
+    validate_path_component(target_name, "vault note filename")
+    try:
+        fd = os.open(
+            target_name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=managed_fd,
+        )
+    except FileNotFoundError:
         return ""
-    managed_base = os.path.realpath(managed_base)
-    target = os.path.realpath(target)
-    if not target.startswith(managed_base + os.sep):
-        raise ValueError("vault write target escapes managed_folder")
-    # F16: bare str plus the inline positive guard immediately above this sink.
-    with open(target, "r", encoding="utf-8", newline="") as handle:
-        return handle.read()
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise VaultWriteBoundaryError(
+                f"vault write target is a symlink or invalid entry: {target!r}"
+            ) from exc
+        raise
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise VaultWriteBoundaryError(f"vault write target is not a regular file: {target!r}")
+        with os.fdopen(fd, "r", encoding="utf-8", newline="", closefd=False) as handle:
+            return handle.read()
+    finally:
+        os.close(fd)
 
 
 def _check_expected_hash(
@@ -199,12 +308,39 @@ def _merge_frontmatter(
     ignored = tuple(key for key in seeded_frontmatter if key in existing_keys)
     seeds = {key: value for key, value in seeded_frontmatter.items() if key not in existing_keys}
     rendered_seeds = _render_seed_frontmatter(seeds, newline)
-    rendered_cao = _render_cao(key, cao, newline, indentation=indentation)
+    rendered_cao = _render_cao(
+        key,
+        _merge_cao_fields(existing, cao, boundary),
+        newline,
+        indentation=indentation,
+    )
 
     if retained and not retained.endswith(("\n", "\r")):
         retained += newline
     frontmatter = f"---{newline}{retained}{rendered_seeds}{rendered_cao}---{newline}"
     return prefix + frontmatter + (body if body else existing_body), ignored
+
+
+def _merge_cao_fields(
+    existing: str,
+    cao: Mapping[str, Any],
+    boundary: Optional[tuple[FrontmatterRegion, str]],
+) -> Mapping[str, Any]:
+    """Update caller-owned CAO fields while retaining authored links."""
+    merged = dict(cao)
+    if "links" in merged or boundary is None:
+        return merged
+    region, _newline = boundary
+    try:
+        loaded = yaml.safe_load(region.raw)
+    except yaml.YAMLError:
+        return merged
+    if not isinstance(loaded, Mapping):
+        return merged
+    existing_cao = loaded.get("cao")
+    if isinstance(existing_cao, Mapping) and "links" in existing_cao:
+        merged["links"] = existing_cao["links"]
+    return merged
 
 
 def _validated_seed_frontmatter(
@@ -315,60 +451,55 @@ def _umask_default_mode() -> int:
     return 0o666 & ~current
 
 
-def _target_mode(target: str) -> int:
+def _target_mode(managed_fd: int, target_name: str) -> int:
+    validate_path_component(target_name, "vault note filename")
     try:
-        return stat.S_IMODE(os.stat(target).st_mode)
+        metadata = os.stat(target_name, dir_fd=managed_fd, follow_symlinks=False)
     except FileNotFoundError:
         return _umask_default_mode()
+    if not stat.S_ISREG(metadata.st_mode):
+        raise VaultWriteBoundaryError("vault write target is not a regular file")
+    return stat.S_IMODE(metadata.st_mode)
 
 
-def _publish_managed_note(
-    vault_root: str, managed_base: str, target: str, content: str, mode: int
-) -> None:
-    """Stage under ``managed_folder`` and atomically replace the intended note."""
-    vault_root = os.path.realpath(vault_root)
-    managed_base = os.path.realpath(managed_base)
-    if not managed_base.startswith(vault_root + os.sep):
-        raise ValueError("vault write target escapes managed_folder")
-    if not os.path.isdir(managed_base):
-        raise FileNotFoundError(f"managed_folder does not exist: {managed_base!r}")
-
-    # F16: bare str and a single-positive guard immediately above this sink.
-    fd, temp_path = tempfile.mkstemp(prefix="_cao-", suffix=".tmp", dir=managed_base)
+def _publish_managed_note(managed_fd: int, target_name: str, content: str, mode: int) -> None:
+    """Atomically replace one entry relative to a held managed-directory descriptor."""
+    validate_path_component(target_name, "vault note filename")
+    temp_name = ""
+    fd = -1
+    for _attempt in range(128):
+        temp_name = f"_cao-{secrets.token_hex(12)}.tmp"
+        try:
+            fd = os.open(
+                temp_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                mode,
+                dir_fd=managed_fd,
+            )
+            break
+        except FileExistsError:
+            continue
+    if fd < 0:
+        raise FileExistsError("unable to reserve a unique managed-note temp entry")
     try:
-        os.close(fd)
-        temp_path = os.path.realpath(temp_path)
-        if not temp_path.startswith(managed_base + os.sep):
-            raise ValueError("vault write target escapes managed_folder")
-        # F16: bare str and a single-positive guard immediately above this sink.
-        with open(temp_path, "w", encoding="utf-8", newline="") as handle:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            fd = -1
             handle.write(content)
             handle.flush()
             os.fchmod(handle.fileno(), mode)
             os.fsync(handle.fileno())
-        target = os.path.realpath(target)
-        if not target.startswith(managed_base + os.sep):
-            raise ValueError("vault write target escapes managed_folder")
-        if not temp_path.startswith(managed_base + os.sep):
-            raise ValueError("vault write target escapes managed_folder")
-        # F16: both bare-string paths have single-positive guards immediately above.
-        os.replace(temp_path, target)
-        # Unlike the shared helper, this writer fsyncs the parent directory so
-        # a completed replace survives a crash as well as a process failure.
-        directory_fd = os.open(managed_base, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        os.replace(
+            temp_name,
+            target_name,
+            src_dir_fd=managed_fd,
+            dst_dir_fd=managed_fd,
+        )
+        os.fsync(managed_fd)
     finally:
-        # A crash or failed replace must not leave a scanner-invisible _cao temp.
+        if fd >= 0:
+            os.close(fd)
         try:
-            temp_path = os.path.realpath(temp_path)
-            if temp_path.startswith(managed_base + os.sep):
-                # F16: bare str and a single-positive guard immediately above this sink.
-                os.unlink(temp_path)
-            else:
-                logger.warning("vault_write_temp_cleanup_skipped_outside_managed_folder")
+            os.unlink(temp_name, dir_fd=managed_fd)
         except FileNotFoundError:
             pass
         except OSError:

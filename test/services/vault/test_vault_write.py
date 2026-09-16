@@ -16,10 +16,22 @@ from test.fixtures.vault_factory import build_vault_fixture
 import pytest
 import yaml
 
+from cli_agent_orchestrator.services.memory_append import (
+    MemoryAppendEntry,
+    append_section,
+)
 from cli_agent_orchestrator.services.memory_service import MemoryPartialWriteError
-from cli_agent_orchestrator.services.vault import writer
+from cli_agent_orchestrator.services.vault import vault_lock, writer
 from cli_agent_orchestrator.services.vault.binding import VaultBinding
 from cli_agent_orchestrator.services.vault.parser import parse_note, split_frontmatter
+from cli_agent_orchestrator.utils import atomic_file
+
+
+@pytest.fixture(autouse=True)
+def _isolate_writer_lock_files(tmp_path, monkeypatch) -> None:
+    lock_dir = tmp_path / "locks"
+    monkeypatch.setattr(atomic_file, "LOCK_DIR", lock_dir)
+    monkeypatch.setattr(vault_lock, "LOCK_DIR", lock_dir)
 
 
 def _binding(fixture) -> VaultBinding:
@@ -345,6 +357,94 @@ def test_write_creates_a_brand_new_managed_note(tmp_path) -> None:
     )
 
 
+def test_append_mode_creates_exactly_one_nonempty_iso_section(tmp_path) -> None:
+    fixture = build_vault_fixture(tmp_path)
+    occurred_at = datetime(2025, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+
+    result = _write(
+        fixture,
+        body=None,
+        mode="append",
+        entry=MemoryAppendEntry(
+            content="new body",
+            occurred_at=occurred_at,
+            now=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        ),
+    )
+
+    written = (fixture.root / "CAO" / "managed-note.md").read_text(encoding="utf-8")
+    assert written == (
+        "---\n"
+        "cao:\n"
+        "  type: reference\n"
+        "  key: managed-note\n"
+        "  managed: true\n"
+        "---\n"
+        "## 2025-01-02T03:04:05Z\n"
+        "new body\n"
+    )
+    assert written.count("## ") == 1
+    assert "\n\n## " not in written
+    assert result.first_section_at == occurred_at
+    assert result.timestamp_clamped is False
+
+
+def test_append_mode_keeps_explicit_cas_conflict_behavior(tmp_path) -> None:
+    fixture = build_vault_fixture(tmp_path)
+    target = fixture.root / "CAO" / "managed-note.md"
+    original = (
+        "---\ncao:\n  key: managed-note\n  managed: true\n---\n## 2025-01-01T00:00:00Z\nold\n"
+    )
+    target.write_text(original, encoding="utf-8")
+    expected = writer._sha256(original)
+    changed = original.replace("\nold\n", "\nhuman edit\n")
+    target.write_text(changed, encoding="utf-8")
+
+    with pytest.raises(writer.VaultWriteConflictError):
+        _write(
+            fixture,
+            body=None,
+            mode="append",
+            entry=MemoryAppendEntry(
+                content="must not publish",
+                occurred_at=None,
+                now=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            ),
+            expected_content_sha256=expected,
+        )
+
+    assert target.read_text(encoding="utf-8") == changed
+
+
+def test_shared_append_preserves_native_section_bytes_and_clamp_order() -> None:
+    existing = (
+        "# native-topic\n"
+        "<!-- id: 00000000-0000-0000-0000-000000000000 | "
+        "scope: global | type: reference | tags:  -->\n"
+        "\n## 2025-01-02T03:04:05Z\n"
+        "old body\n"
+    )
+    now = datetime(2026, 1, 1, 2, 3, 4, tzinfo=timezone.utc)
+    result = append_section(
+        existing,
+        MemoryAppendEntry(
+            content="imported body",
+            occurred_at=datetime(2025, 1, 1, tzinfo=timezone.utc),
+            now=now,
+        ),
+    )
+
+    assert result.content == (
+        existing.rstrip("\n") + "\n\n## 2026-01-01T02:03:04Z\n"
+        "_Originally recorded: 2025-01-01T00:00:00Z_\n"
+        "imported body\n"
+    )
+    assert result.entry_body == ("_Originally recorded: 2025-01-01T00:00:00Z_\nimported body")
+    assert result.timestamp_clamped is True
+    assert result.first_section_at == datetime(2025, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+    assert result.section_at == now
+
+
 def test_write_uses_complete_line_frontmatter_fence(tmp_path) -> None:
     fixture = build_vault_fixture(tmp_path)
     target = fixture.root / "CAO" / "managed-note.md"
@@ -562,8 +662,49 @@ def test_write_refuses_symlinked_managed_folder(tmp_path) -> None:
     with pytest.raises(ValueError) as caught:
         _write(fixture)
 
-    assert "escapes base directory" in str(caught.value)
+    assert "symlinked component" in str(caught.value)
     assert list(outside.iterdir()) == []
+
+
+def test_write_refuses_in_vault_symlinked_managed_folder_to_excluded_mapping(
+    tmp_path,
+) -> None:
+    fixture = build_vault_fixture(tmp_path)
+    refusals_before = writer.boundary_write_refusal_count(fixture.vault.id)
+    managed = fixture.root / "CAO"
+    excluded = fixture.root / "Private"
+    unmanaged = excluded / "unmanaged.md"
+    unmanaged.write_text("must remain unchanged", encoding="utf-8")
+    (managed / ".keep").unlink()
+    managed.rmdir()
+    managed.symlink_to(excluded, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        _write(fixture)
+
+    assert not (excluded / "managed-note.md").exists()
+    assert unmanaged.read_text(encoding="utf-8") == "must remain unchanged"
+    assert writer.boundary_write_refusal_count(fixture.vault.id) == refusals_before + 1
+
+
+def test_write_refuses_in_vault_symlinked_managed_folder_ancestor(tmp_path) -> None:
+    fixture = build_vault_fixture(tmp_path)
+    excluded = fixture.root / "Private"
+    redirected_managed = excluded / "CAO"
+    redirected_managed.mkdir()
+    unmanaged = redirected_managed / "unmanaged.md"
+    unmanaged.write_text("must remain unchanged", encoding="utf-8")
+    linked_ancestor = fixture.root / "managed-link"
+    linked_ancestor.symlink_to(excluded, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        _write(
+            fixture,
+            vault=fixture.vault.model_copy(update={"managed_folder": "managed-link/CAO"}),
+        )
+
+    assert not (redirected_managed / "managed-note.md").exists()
+    assert unmanaged.read_text(encoding="utf-8") == "must remain unchanged"
 
 
 def test_write_refuses_symlinked_managed_folder_ancestor(tmp_path) -> None:
@@ -579,7 +720,7 @@ def test_write_refuses_symlinked_managed_folder_ancestor(tmp_path) -> None:
             vault=fixture.vault.model_copy(update={"managed_folder": "managed-link/CAO"}),
         )
 
-    assert "escapes base directory" in str(caught.value)
+    assert "symlinked component" in str(caught.value)
     assert list(outside.iterdir()) == []
 
 
@@ -587,84 +728,97 @@ def test_read_sink_guard_raises_writer_containment_error(tmp_path) -> None:
     fixture = build_vault_fixture(tmp_path)
     outside = tmp_path / "outside.md"
     outside.write_text("outside", encoding="utf-8")
+    target = fixture.root / "CAO" / "managed-note.md"
+    target.symlink_to(outside)
+    managed_fd = os.open(fixture.root / "CAO", os.O_RDONLY | os.O_DIRECTORY)
 
-    with pytest.raises(ValueError, match="^vault write target escapes managed_folder$"):
-        writer._read_contained_text(str(fixture.root / "CAO"), str(outside))
+    try:
+        with pytest.raises(writer.VaultWriteBoundaryError, match="symlink"):
+            writer._read_contained_text(managed_fd, target.name, str(target))
+    finally:
+        os.close(managed_fd)
 
 
-def test_mkstemp_sink_guard_raises_writer_containment_error(tmp_path) -> None:
+def test_publish_rejects_target_name_escape(tmp_path) -> None:
     fixture = build_vault_fixture(tmp_path)
-    outside = tmp_path / "outside"
-    outside.mkdir()
+    managed_fd = os.open(fixture.root / "CAO", os.O_RDONLY | os.O_DIRECTORY)
 
-    with pytest.raises(ValueError, match="^vault write target escapes managed_folder$"):
-        writer._publish_managed_note(
-            str(fixture.root),
-            str(outside),
-            str(outside / "target.md"),
-            "content",
-            0o644,
-        )
+    try:
+        with pytest.raises(ValueError, match="must not contain a path separator"):
+            writer._publish_managed_note(managed_fd, "../outside.md", "content", 0o644)
+    finally:
+        os.close(managed_fd)
 
 
-def test_temp_open_sink_guard_raises_writer_containment_error(tmp_path, monkeypatch) -> None:
+def test_publish_temp_creation_is_exclusive_nofollow_and_descriptor_relative(
+    tmp_path, monkeypatch
+) -> None:
     fixture = build_vault_fixture(tmp_path)
-    outside = tmp_path / "outside.tmp"
-    outside.write_text("", encoding="utf-8")
+    managed_fd = os.open(fixture.root / "CAO", os.O_RDONLY | os.O_DIRECTORY)
+    observed: list[tuple[int, int | None]] = []
+    real_open = writer.os.open
 
-    def escaped_mkstemp(*_args, **_kwargs):
-        return os.open(outside, os.O_WRONLY), str(outside)
+    def inspect_open(path, flags, *args, **kwargs):
+        if str(path).startswith("_cao-"):
+            observed.append((flags, kwargs.get("dir_fd")))
+        return real_open(path, flags, *args, **kwargs)
 
-    def escaped_open(*_args, **_kwargs):
-        raise RuntimeError("escaped temp open reached")
+    monkeypatch.setattr(writer.os, "open", inspect_open)
 
-    monkeypatch.setattr(writer.tempfile, "mkstemp", escaped_mkstemp)
-    monkeypatch.setattr(writer, "open", escaped_open, raising=False)
+    try:
+        writer._publish_managed_note(managed_fd, "managed-note.md", "content", 0o644)
+    finally:
+        os.close(managed_fd)
 
-    with pytest.raises(ValueError, match="^vault write target escapes managed_folder$"):
-        writer._publish_managed_note(
-            str(fixture.root),
-            str(fixture.root / "CAO"),
-            str(fixture.root / "CAO" / "managed-note.md"),
-            "content",
-            0o644,
-        )
+    flags, dir_fd = observed[0]
+    assert flags & os.O_CREAT
+    assert flags & os.O_EXCL
+    assert flags & os.O_NOFOLLOW
+    assert dir_fd == managed_fd
 
 
-def test_replace_sink_guard_raises_writer_containment_error(tmp_path) -> None:
+def test_publish_replace_uses_the_same_managed_descriptor(tmp_path, monkeypatch) -> None:
     fixture = build_vault_fixture(tmp_path)
-    outside = tmp_path / "outside.md"
+    managed_fd = os.open(fixture.root / "CAO", os.O_RDONLY | os.O_DIRECTORY)
+    real_replace = writer.os.replace
+    observed = []
 
-    with pytest.raises(ValueError, match="^vault write target escapes managed_folder$"):
-        writer._publish_managed_note(
-            str(fixture.root),
-            str(fixture.root / "CAO"),
-            str(outside),
-            "content",
-            0o644,
-        )
+    def inspect_replace(source, destination, **kwargs):
+        observed.append((source, destination, kwargs))
+        return real_replace(source, destination, **kwargs)
+
+    monkeypatch.setattr(writer.os, "replace", inspect_replace)
+
+    try:
+        writer._publish_managed_note(managed_fd, "managed-note.md", "content", 0o644)
+    finally:
+        os.close(managed_fd)
+
+    assert observed[0][1] == "managed-note.md"
+    assert observed[0][2] == {"src_dir_fd": managed_fd, "dst_dir_fd": managed_fd}
 
 
-def test_cleanup_path_does_not_unlink_an_escaped_temp(tmp_path, monkeypatch) -> None:
+def test_write_component_swap_cannot_redirect_descriptor_publish(tmp_path, monkeypatch) -> None:
     fixture = build_vault_fixture(tmp_path)
-    outside = tmp_path / "outside.tmp"
-    outside.write_text("do not unlink", encoding="utf-8")
+    managed = fixture.root / "CAO"
+    held_directory = fixture.root / "original-managed"
+    excluded = fixture.root / "Private"
+    unmanaged = excluded / "unmanaged.md"
+    unmanaged.write_text("must remain unchanged", encoding="utf-8")
+    real_replace = writer.os.replace
 
-    def escaped_mkstemp(*_args, **_kwargs):
-        return os.open(outside, os.O_WRONLY), str(outside)
+    def swap_then_replace(source, destination, **kwargs):
+        managed.rename(held_directory)
+        managed.symlink_to(excluded, target_is_directory=True)
+        real_replace(source, destination, **kwargs)
 
-    monkeypatch.setattr(writer.tempfile, "mkstemp", escaped_mkstemp)
+    monkeypatch.setattr(writer.os, "replace", swap_then_replace)
 
-    with pytest.raises(ValueError, match="^vault write target escapes managed_folder$"):
-        writer._publish_managed_note(
-            str(fixture.root),
-            str(fixture.root / "CAO"),
-            str(fixture.root / "CAO" / "managed-note.md"),
-            "content",
-            0o644,
-        )
+    _write(fixture)
 
-    assert outside.read_text(encoding="utf-8") == "do not unlink"
+    assert not (excluded / "managed-note.md").exists()
+    assert unmanaged.read_text(encoding="utf-8") == "must remain unchanged"
+    assert (held_directory / "managed-note.md").read_text(encoding="utf-8").endswith("new body\n")
 
 
 def test_write_leaves_no_vault_debris_and_only_transient_reserved_temp(
@@ -675,14 +829,14 @@ def test_write_leaves_no_vault_debris_and_only_transient_reserved_temp(
     observed: set[Path] = set()
     real_replace = writer.os.replace
 
-    def inspect_then_replace(source: str, destination: str) -> None:
+    def inspect_then_replace(source: str, destination: str, **kwargs) -> None:
         current = {path.relative_to(fixture.root) for path in fixture.root.rglob("*")}
         observed.update(current - before)
         assert Path(destination).name == "managed-note.md"
         transient = {path for path in current - before if path.name.startswith("_cao-")}
         assert len(transient) == 1
         assert all(path.parent == Path("CAO") for path in transient)
-        real_replace(source, destination)
+        real_replace(source, destination, **kwargs)
 
     monkeypatch.setattr(writer.os, "replace", inspect_then_replace)
 
@@ -697,7 +851,7 @@ def test_write_leaves_no_vault_debris_and_only_transient_reserved_temp(
 def test_write_cleans_reserved_temp_when_publish_raises(tmp_path, monkeypatch) -> None:
     fixture = build_vault_fixture(tmp_path)
 
-    def fail_replace(_source: str, _destination: str) -> None:
+    def fail_replace(_source: str, _destination: str, **_kwargs) -> None:
         raise OSError("injected publish failure")
 
     monkeypatch.setattr(writer.os, "replace", fail_replace)
@@ -712,10 +866,10 @@ def test_write_cleans_reserved_temp_when_publish_raises(tmp_path, monkeypatch) -
 def test_write_cleanup_does_not_mask_publish_failure(tmp_path, monkeypatch) -> None:
     fixture = build_vault_fixture(tmp_path)
 
-    def fail_replace(_source: str, _destination: str) -> None:
+    def fail_replace(_source: str, _destination: str, **_kwargs) -> None:
         raise OSError("injected publish failure")
 
-    def fail_unlink(_path: str) -> None:
+    def fail_unlink(_path: str, **_kwargs) -> None:
         raise OSError("injected cleanup failure")
 
     monkeypatch.setattr(writer.os, "replace", fail_replace)

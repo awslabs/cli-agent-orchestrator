@@ -18,6 +18,7 @@ class FindingCode(str, Enum):
     ALIAS_AMBIGUOUS = "alias_ambiguous"
     LINK_AMBIGUOUS = "link_ambiguous"
     KEY_COLLISION = "key_collision"
+    KEY_PROVENANCE_UNKNOWN = "key_provenance_unknown"
     LINK_EXCLUDED = "link_excluded"
     LINK_DANGLING = "link_dangling"
     FRONTMATTER_MALFORMED = "frontmatter_malformed"
@@ -67,6 +68,7 @@ FINDING_SEVERITIES: Mapping[FindingCode, Severity] = MappingProxyType(
         FindingCode.ALIAS_AMBIGUOUS: "warn",
         FindingCode.LINK_AMBIGUOUS: "warn",
         FindingCode.KEY_COLLISION: "error",
+        FindingCode.KEY_PROVENANCE_UNKNOWN: "warn",
         FindingCode.LINK_EXCLUDED: "info",
         FindingCode.LINK_DANGLING: "info",
         FindingCode.FRONTMATTER_MALFORMED: "error",
@@ -135,6 +137,12 @@ SUPPORTED_BOUNDARY: tuple[BoundaryRule, ...] = (
     BoundaryRule("duplicate basenames", "refused", "no bare-link edge", FindingCode.LINK_AMBIGUOUS),
     BoundaryRule(
         "duplicate cao.key", "refused", "both notes quarantined", FindingCode.KEY_COLLISION
+    ),
+    BoundaryRule(
+        "ambiguous pre-provenance identity",
+        "degraded",
+        "durable identity preserved; warning emitted once",
+        FindingCode.KEY_PROVENANCE_UNKNOWN,
     ),
     BoundaryRule("link to excluded note", "refused", "no edge", FindingCode.LINK_EXCLUDED),
     BoundaryRule("link to nonexistent note", "refused", "no edge", FindingCode.LINK_DANGLING),

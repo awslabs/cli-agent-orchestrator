@@ -4,6 +4,7 @@ import asyncio
 import errno
 import os
 import sys
+from dataclasses import replace
 from datetime import datetime, timezone
 from test.fixtures.vault_factory import build_vault_fixture
 from types import SimpleNamespace
@@ -164,6 +165,180 @@ def test_reader_refuses_stale_projection_when_mapping_index_is_disabled(tmp_path
 
     assert resolution.exit_arm == "not_indexable"
     assert list(resolution) == []
+
+
+def test_production_binding_carries_managed_folder_and_exclude(tmp_path):
+    """A resolved binding snapshots every live vault boundary needed by readers."""
+    from cli_agent_orchestrator.services.vault.binding import resolve
+    from cli_agent_orchestrator.services.vault.config import VaultConfig
+
+    fixture = build_vault_fixture(tmp_path)
+    config = VaultConfig(enabled=True, vaults=[fixture.vault])
+
+    binding = resolve("project", "fixture-project", vault_config=config)
+
+    assert isinstance(binding, VaultBinding)
+    assert binding.managed_folder == "CAO"
+    assert binding.exclude == ("Private/**",)
+
+
+@pytest.mark.parametrize(
+    ("mapping_folder", "exclude"),
+    [
+        ("Projects/CAO Design/Notes", ()),
+        ("Projects/CAO Design", ("Projects/CAO Design/Design.md",)),
+        ("Projects/CAO", ()),
+    ],
+    ids=["narrowed-folder", "new-exclude", "component-prefix"],
+)
+def test_resolve_candidates_applies_current_folder_and_exclude_without_reconcile(
+    tmp_path, monkeypatch, mapping_folder, exclude
+):
+    """Current mapping authority removes stale rows without reattributing them."""
+    _reader, _Session, fixture, candidate = _indexed_reader_candidate(
+        tmp_path, monkeypatch, run_id=f"current-boundary-{mapping_folder}"
+    )
+    current_mapping = candidate.binding.mapping.model_copy(update={"folder": mapping_folder})
+    current_binding = VaultBinding(
+        scope=candidate.binding.scope,
+        scope_id=candidate.binding.scope_id,
+        vault_id=candidate.binding.vault_id,
+        root=candidate.binding.root,
+        mapping=current_mapping,
+        managed_folder=fixture.vault.managed_folder,
+        exclude=exclude,
+    )
+
+    resolution = resolve_candidates(
+        current_binding,
+        keys=["design"],
+        scope="project",
+        scope_id="fixture-project",
+        require_injectable=False,
+        terminal_id=None,
+        consumer="explicit_recall",
+    )
+
+    assert resolution == []
+    assert resolution.exit_arm == "config_boundary_filtered"
+
+
+def test_resolve_candidates_treats_percent_and_underscore_as_literal_folder_text(
+    tmp_path, monkeypatch
+):
+    """SQL wildcard characters cannot broaden current mapping authority."""
+    from cli_agent_orchestrator.services.vault import reader
+    from cli_agent_orchestrator.services.vault import reconcile as reconcile_module
+    from cli_agent_orchestrator.services.vault.binding import resolve
+    from cli_agent_orchestrator.services.vault.config import VaultConfig
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'state.db'}")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    monkeypatch.setattr(reconcile_module, "SessionLocal", Session)
+    monkeypatch.setattr(reader, "SessionLocal", Session)
+    monkeypatch.setattr(reconcile_module, "_replace_vault_edges", lambda _notes, **_kwargs: None)
+    monkeypatch.setattr(reconcile_module, "_emit_audit_events", lambda *_args: None)
+    fixture = build_vault_fixture(tmp_path)
+    literal_folder = fixture.root / "Projects" / "Percent%_Data"
+    literal_folder.mkdir(parents=True)
+    (literal_folder / "Exact.md").write_text("literal folder", encoding="utf-8")
+    mapping = FolderMapping(
+        folder="Projects/Percent%_Data",
+        scope="project",
+        scope_id="literal-project",
+    )
+    managed_mapping = next(
+        item for item in fixture.vault.mappings if item.folder == fixture.vault.managed_folder
+    )
+    vault = fixture.vault.model_copy(update={"mappings": [mapping, managed_mapping]})
+    config = VaultConfig(enabled=True, vaults=[vault])
+    reconcile(vault, apply=True, run_id="literal-folder")
+    binding = resolve("project", "literal-project", vault_config=config)
+    assert isinstance(binding, VaultBinding)
+
+    exact = resolve_candidates(
+        binding,
+        scope="project",
+        scope_id="literal-project",
+        require_injectable=False,
+        terminal_id=None,
+        consumer="explicit_recall",
+    )
+    wrong_binding = replace(
+        binding,
+        mapping=binding.mapping.model_copy(update={"folder": "Projects/PercentX_Data"}),
+    )
+    wrong = resolve_candidates(
+        wrong_binding,
+        scope="project",
+        scope_id="literal-project",
+        require_injectable=False,
+        terminal_id=None,
+        consumer="explicit_recall",
+    )
+
+    assert [candidate.note.vault_relpath for candidate in exact] == [
+        "Projects/Percent%_Data/Exact.md"
+    ]
+    assert wrong == []
+    assert wrong.exit_arm == "config_boundary_filtered"
+
+
+def test_public_recall_applies_live_exclude_without_reconcile(tmp_path, monkeypatch):
+    """Explicit recall reloads config and withholds a newly excluded stale row."""
+    from cli_agent_orchestrator.services import memory_service, settings_service
+    from cli_agent_orchestrator.services.memory_service import MemoryService
+    from cli_agent_orchestrator.services.vault import reader
+    from cli_agent_orchestrator.services.vault import reconcile as reconcile_module
+    from cli_agent_orchestrator.services.vault.config import VaultConfig
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'state.db'}")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    monkeypatch.setattr(reconcile_module, "SessionLocal", Session)
+    monkeypatch.setattr(reader, "SessionLocal", Session)
+    monkeypatch.setattr(reconcile_module, "_replace_vault_edges", lambda _notes, **_kwargs: None)
+    monkeypatch.setattr(reconcile_module, "_emit_audit_events", lambda *_args: None)
+    monkeypatch.setattr(memory_service, "_is_memory_enabled", lambda: True)
+    fixture = build_vault_fixture(tmp_path)
+    initial_config = VaultConfig(enabled=True, vaults=[fixture.vault])
+    current = [initial_config]
+    config_reads = []
+
+    def get_current_config():
+        config_reads.append(current[0])
+        return current[0]
+
+    monkeypatch.setattr(settings_service, "get_vault_config", get_current_config)
+    reconcile(fixture.vault, apply=True, run_id="public-live-config")
+    service = MemoryService(base_dir=tmp_path / "native")
+    service.resolve_scope_id = lambda scope, _context: (  # type: ignore[method-assign]
+        "fixture-project" if scope == "project" else None
+    )
+
+    before = asyncio.run(
+        service.recall(
+            query="Design",
+            scope="project",
+            terminal_context={"project_id": "fixture-project"},
+            search_mode="metadata",
+        )
+    )
+    excluded_vault = fixture.vault.model_copy(update={"exclude": ["Projects/CAO Design/Design.md"]})
+    current[0] = VaultConfig(enabled=True, vaults=[excluded_vault])
+    after = asyncio.run(
+        service.recall(
+            query="Design",
+            scope="project",
+            terminal_context={"project_id": "fixture-project"},
+            search_mode="metadata",
+        )
+    )
+
+    assert [(memory.key, memory.content) for memory in before] == [("design", "Design")]
+    assert after == []
+    assert config_reads == [initial_config, current[0]]
 
 
 @pytest.mark.parametrize("consumer", ["explicit_recall", "injected_context"])
@@ -423,31 +598,138 @@ def _indexed_reader_candidate(tmp_path, monkeypatch, *, run_id: str):
 
 
 @pytest.mark.parametrize(
-    ("file_path", "prepare"),
+    "target_relpath",
     [
-        ("../../etc/passwd", lambda _tmp_path, _fixture: None),
-        ("/etc/passwd", lambda _tmp_path, _fixture: None),
-        (
-            "Notes/link/N.md",
-            lambda tmp_path, fixture: (
-                (tmp_path / "outside").mkdir(),
-                (tmp_path / "outside" / "N.md").write_text("must not be read", encoding="utf-8"),
-                (fixture.root / "Notes").mkdir(),
-                os.symlink(tmp_path / "outside", fixture.root / "Notes" / "link"),
+        "Private/Secret.md",
+        "Reference/Glossary.md",
+        "Projects/CAO Design/Don't Panic.md",
+    ],
+    ids=["excluded-target", "unmapped-target", "non-injectable-target"],
+)
+def test_reader_refuses_post_index_in_vault_symlink_drift(tmp_path, monkeypatch, target_relpath):
+    """Bytes come from the indexed lexical entry or are not served."""
+    _reader, _Session, fixture, candidate = _indexed_reader_candidate(
+        tmp_path, monkeypatch, run_id=f"post-index-symlink-{target_relpath}"
+    )
+    indexed_path = fixture.root / candidate.note.vault_relpath
+    indexed_path.unlink()
+    os.symlink(fixture.root / target_relpath, indexed_path)
+    candidate = replace(
+        candidate,
+        binding=VaultBinding(
+            scope=candidate.binding.scope,
+            scope_id=candidate.binding.scope_id,
+            vault_id=candidate.binding.vault_id,
+            root=candidate.binding.root,
+            mapping=candidate.binding.mapping,
+            managed_folder=fixture.vault.managed_folder,
+            exclude=tuple(fixture.vault.exclude),
+        ),
+    )
+
+    assert load_candidate(candidate, max_body_chars=4096, require_injectable=False) is None
+
+
+def test_load_candidate_reasserts_index_path_and_current_mapping_boundary(tmp_path, monkeypatch):
+    """A stale caller cannot redirect or revive a candidate after resolution."""
+    _reader, _Session, fixture, candidate = _indexed_reader_candidate(
+        tmp_path, monkeypatch, run_id="load-boundary-reassertion"
+    )
+    original_binding = VaultBinding(
+        scope=candidate.binding.scope,
+        scope_id=candidate.binding.scope_id,
+        vault_id=candidate.binding.vault_id,
+        root=candidate.binding.root,
+        mapping=candidate.binding.mapping,
+        managed_folder=fixture.vault.managed_folder,
+        exclude=tuple(fixture.vault.exclude),
+    )
+    indexed_relpath = candidate.metadata.file_path
+    redirected = replace(candidate, binding=original_binding)
+    redirected.metadata.file_path = "Projects/CAO Design/Don't Panic.md"
+    narrowed = replace(
+        candidate,
+        binding=replace(
+            original_binding,
+            mapping=original_binding.mapping.model_copy(
+                update={"folder": "Projects/CAO Design/Notes"}
             ),
         ),
+    )
+    newly_excluded = replace(
+        candidate,
+        binding=replace(
+            original_binding,
+            exclude=("Projects/CAO Design/Design.md",),
+        ),
+    )
+    not_indexable = replace(
+        candidate,
+        binding=replace(
+            original_binding,
+            mapping=original_binding.mapping.model_copy(update={"index": False}),
+        ),
+    )
+    scope_remapped = replace(
+        candidate,
+        binding=replace(
+            original_binding,
+            scope="global",
+            scope_id=None,
+            mapping=original_binding.mapping.model_copy(
+                update={"scope": "global", "scope_id": None}
+            ),
+        ),
+    )
+
+    assert load_candidate(redirected, max_body_chars=4096, require_injectable=False) is None
+    candidate.metadata.file_path = indexed_relpath
+    assert load_candidate(narrowed, max_body_chars=4096, require_injectable=False) is None
+    assert load_candidate(newly_excluded, max_body_chars=4096, require_injectable=False) is None
+    assert load_candidate(not_indexable, max_body_chars=4096, require_injectable=False) is None
+    assert load_candidate(scope_remapped, max_body_chars=4096, require_injectable=False) is None
+
+
+@pytest.mark.parametrize(
+    "file_path",
+    [
+        "../../etc/passwd",
+        "/etc/passwd",
     ],
-    ids=["parent", "absolute", "symlink-outside"],
+    ids=["parent", "absolute"],
 )
-def test_reader_refuses_and_counts_every_escaped_metadata_path(
-    tmp_path, monkeypatch, caplog, file_path, prepare
+def test_reader_refuses_and_counts_mismatched_or_malformed_metadata_path(
+    tmp_path, monkeypatch, caplog, file_path
 ):
-    """Every poisoned path form is refused and visible in recall counters."""
+    """Malformed metadata cannot redirect the exact indexed entry."""
     _reader, Session, fixture, candidate = _indexed_reader_candidate(
         tmp_path, monkeypatch, run_id=f"reader-escape-{file_path!r}"
     )
-    prepare(tmp_path, fixture)
     candidate.metadata.file_path = file_path
+
+    assert load_candidate(candidate, max_body_chars=4096, require_injectable=False) is None
+    with Session() as db:
+        counter = (
+            db.query(VaultRecallCounterModel)
+            .filter_by(vault_id="fixture", counter_name="config_boundary_filtered")
+            .one()
+        )
+    assert counter.value == 1
+    assert any("arm=config_boundary_filtered" in record.getMessage() for record in caplog.records)
+
+
+def test_reader_refuses_and_counts_out_of_vault_symlink_at_indexed_path(
+    tmp_path, monkeypatch, caplog
+):
+    """A final symlink cannot redirect an otherwise valid indexed identity."""
+    _reader, Session, fixture, candidate = _indexed_reader_candidate(
+        tmp_path, monkeypatch, run_id="reader-symlink-outside"
+    )
+    indexed_path = fixture.root / candidate.note.vault_relpath
+    outside = tmp_path / "outside.md"
+    outside.write_text("must not be read", encoding="utf-8")
+    indexed_path.unlink()
+    os.symlink(outside, indexed_path)
 
     assert load_candidate(candidate, max_body_chars=4096, require_injectable=False) is None
     with Session() as db:
@@ -457,10 +739,10 @@ def test_reader_refuses_and_counts_every_escaped_metadata_path(
             .one()
         )
     assert counter.value == 1
-    assert any("arm=lexical" in record.getMessage() for record in caplog.records)
+    assert any("arm=eloop" in record.getMessage() for record in caplog.records)
 
 
-def test_reader_counts_an_intermediate_symlink_swap_after_resolution(tmp_path, monkeypatch):
+def test_reader_counts_an_intermediate_symlink_swap_during_lexical_walk(tmp_path, monkeypatch):
     """A platform-specific intermediate-link failure is reported as an escape."""
     from cli_agent_orchestrator.services.vault import reader
 
@@ -476,18 +758,22 @@ def test_reader_counts_an_intermediate_symlink_swap_after_resolution(tmp_path, m
     outside.mkdir()
     (outside / "N.md").write_text("must not be read", encoding="utf-8")
     candidate.metadata.file_path = str(inside.relative_to(fixture.root))
-    realpath = reader.os.path.realpath
+    candidate.note.vault_relpath = candidate.metadata.file_path
+    original_open = reader.os.open
+    swapped = False
 
-    def resolve_then_swap(path):
-        resolved = realpath(path)
-        if path.endswith(candidate.metadata.file_path):
+    def swap_before_component_open(path, flags, *, dir_fd=None):
+        nonlocal swapped
+        if path == "swap" and dir_fd is not None and not swapped:
             link.rename(tmp_path / "original-link")
             os.symlink(outside, link)
-        return resolved
+            swapped = True
+        return original_open(path, flags, dir_fd=dir_fd)
 
-    monkeypatch.setattr(reader.os.path, "realpath", resolve_then_swap)
+    monkeypatch.setattr(reader.os, "open", swap_before_component_open)
 
     assert load_candidate(candidate, max_body_chars=4096, require_injectable=False) is None
+    assert swapped is True
     with Session() as db:
         counter = (
             db.query(VaultRecallCounterModel)
@@ -497,7 +783,7 @@ def test_reader_counts_an_intermediate_symlink_swap_after_resolution(tmp_path, m
     assert counter.value == 1
 
 
-def test_reader_counts_a_final_symlink_swap_after_resolution(tmp_path, monkeypatch, caplog):
+def test_reader_counts_a_final_symlink_swap_during_lexical_walk(tmp_path, monkeypatch, caplog):
     """The final-file ELOOP conversion makes this race visible to status."""
     from cli_agent_orchestrator.services.vault import reader
 
@@ -509,21 +795,25 @@ def test_reader_counts_a_final_symlink_swap_after_resolution(tmp_path, monkeypat
     outside = tmp_path / "outside.md"
     outside.write_text("must not be read", encoding="utf-8")
     candidate.metadata.file_path = str(target.relative_to(fixture.root))
+    candidate.note.vault_relpath = candidate.metadata.file_path
     segments = candidate.metadata.file_path.split(os.sep)
     assert not os.path.isabs(candidate.metadata.file_path)
     assert all(segment not in {"", ".", ".."} for segment in segments)
-    realpath = reader.os.path.realpath
+    original_open = reader.os.open
+    swapped = False
 
-    def resolve_then_swap(path):
-        resolved = realpath(path)
-        if path.endswith(candidate.metadata.file_path):
+    def swap_before_file_open(path, flags, *, dir_fd=None):
+        nonlocal swapped
+        if path == target.name and dir_fd is not None and not swapped:
             target.unlink()
             os.symlink(outside, target)
-        return resolved
+            swapped = True
+        return original_open(path, flags, dir_fd=dir_fd)
 
-    monkeypatch.setattr(reader.os.path, "realpath", resolve_then_swap)
+    monkeypatch.setattr(reader.os, "open", swap_before_file_open)
 
     assert load_candidate(candidate, max_body_chars=4096, require_injectable=False) is None
+    assert swapped is True
     with Session() as db:
         counter = (
             db.query(VaultRecallCounterModel)
@@ -534,7 +824,7 @@ def test_reader_counts_a_final_symlink_swap_after_resolution(tmp_path, monkeypat
     assert any("arm=eloop" in record.getMessage() for record in caplog.records)
 
 
-def test_reader_counts_a_root_symlink_swap_after_resolution(tmp_path, monkeypatch, caplog):
+def test_reader_counts_a_root_symlink_swap_before_held_open(tmp_path, monkeypatch, caplog):
     """A root swap is counted when macOS reports it as ENOTDIR."""
     from cli_agent_orchestrator.services.vault import reader
 
@@ -546,19 +836,18 @@ def test_reader_counts_a_root_symlink_swap_after_resolution(tmp_path, monkeypatc
     assert all(segment not in {"", ".", ".."} for segment in segments)
     outside = tmp_path / "outside-root"
     outside.mkdir()
-    realpath = reader.os.path.realpath
+    original_open = reader.os.open
     root_swapped = False
 
-    def resolve_then_swap_root(path):
+    def swap_before_root_open(path, flags, *, dir_fd=None):
         nonlocal root_swapped
-        resolved = realpath(path)
-        if path.endswith(candidate.metadata.file_path):
+        if path == str(fixture.root) and dir_fd is None and not root_swapped:
             fixture.root.rename(tmp_path / "vault-before-root-swap")
             os.symlink(outside, fixture.root)
             root_swapped = True
-        return resolved
+        return original_open(path, flags, dir_fd=dir_fd)
 
-    monkeypatch.setattr(reader.os.path, "realpath", resolve_then_swap_root)
+    monkeypatch.setattr(reader.os, "open", swap_before_root_open)
 
     assert load_candidate(candidate, max_body_chars=4096, require_injectable=False) is None
     assert root_swapped is True

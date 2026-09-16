@@ -94,10 +94,12 @@ intentional.
 
 ### Automatic injection
 
-`inject: false` governs automatic injection into agent context only. It is not
-a confidentiality control: indexed content remains available through explicit
-recall and to anything that can read the vault or call the local API. An agent
-can pull content that CAO will not push into its context.
+`inject: false` governs whether eligible indexed content is routed into
+automatic agent context only. It is not a confidentiality control: the mapping
+folder, `exclude`, and `index` setting define what CAO can currently read and
+index, while explicit recall and anything that can read the vault or call the
+local API remain separate access paths. An agent can therefore pull content
+that CAO will not push into its automatic context.
 
 Curator injection bounds apply to CAO-mediated vault reads for the
 `memory_manager` identity. Agent-scoped mappings are returned only to a
@@ -136,7 +138,9 @@ remove or change the matching content before reconciling again.
 clipped with a visible `[Content truncated for recall]` marker, and the recall
 result records that it was truncated. This is deliberately lossy; inspect the
 note in the vault when the complete body matters. It is separate from the
-tighter context budget used for automatic injection.
+tighter context budget used for automatic injection. Explicit recall otherwise
+returns readable source content verbatim; credential-shaped redaction applies
+only to automatic provider-bound vault injection.
 
 Automatic injection always applies the injection policy; a caller on that path
 cannot waive it. Mappings with `inject: false` are omitted, as described above,
@@ -198,11 +202,14 @@ cao memory vault scan [--dry-run]
 cao memory vault reconcile [--apply] [--format table|json]
 cao memory vault rebuild --apply
 cao memory vault migrate --scope {global|project|agent} [--scope-id ID] [--apply] [--delete-source] [--confirm-delete-source]
+cao memory repair [--apply] [--receipt RECEIPT_ID]
 ```
 
 `status` reports the derived vault projection and configuration warnings. Its
 `process_local_unmapped_project_writes` field is explicitly process-local; a
 fresh CLI process cannot present it as a durable count.
+It also reports active and inconsistent migration-receipt counts. Receipt
+warnings name only the receipt identity and a content-free reason code.
 
 For each mapping with `index: false`, `status` also prints an `inert` line naming
 recall, injection, and writes as off, plus the number of residual projection
@@ -222,10 +229,62 @@ that projection.
 `rebuild` requires `--apply`. It deletes and re-derives vault-derived state;
 vault access counts reset by design.
 
-`migrate` moves one native memory scope into the managed folder. It is a
-dry-run unless `--apply` is present. `--delete-source` additionally requires
-both `--apply` and `--confirm-delete-source`; without both flags, the command
-refuses before migration.
+`migrate` copies one native memory scope into the managed folder and records a
+durable receipt. The retained native copy becomes dormant, and only typed
+relationships actually copied into `cao.links` are marked superseded. Migration
+is a dry-run unless `--apply` is present. `--delete-source` retains its separate
+destructive behavior and additionally requires both `--apply` and
+`--confirm-delete-source`; without both flags, the command refuses before
+migration.
+
+The receipt binds the exact retained native snapshot to the managed note
+identity. Its published hash is an immutable migration baseline used to prevent
+a rerun from overwriting later canonical edits; normal CAO appends and human
+edits do not rewrite that baseline or reactivate the native copy.
+
+### Receipt-scoped rollback
+
+Rollback is explicit and scoped to one receipt. It never deletes or rewrites
+the canonical vault note. First preserve that note and retire its vault
+authority, for example by moving it to an archive folder outside the mapping.
+If the retained native copy must serve again after rollback, also change the
+configuration so that the receipt's exact scope is no longer mapped: repoint or
+remove the mapping for that scope, or disable the vault. Archiving or excluding
+the note, or setting its mapping to `index: false`, does not release the scope
+binding and therefore keeps the native copy hidden. Then run:
+
+```text
+cao memory vault reconcile --apply
+cao memory repair --receipt RECEIPT_ID
+cao memory repair --apply --receipt RECEIPT_ID
+cao memory vault status
+```
+
+The first repair command is a dry-run. The apply command preflights the retained
+native snapshot and every edge recorded by that receipt, then restores all
+recorded prior statuses and marks the receipt rolled back in one transaction.
+Any missing or drifted source or edge causes zero changes and an unresolved
+exit; the receipt remains active. Repair without `--receipt` reports
+content-free receipt inconsistencies but never restores an edge, and there is
+no restore-all or `--undo` mode. Corpus repair may therefore report receipt
+drift while exiting 0 when all native repairs resolve; a scoped `--receipt`
+rollback that fails preflight remains unresolved and exits 1.
+
+Rollback does not clear a forget/exclusion decision, enable an `index: false`
+mapping, change configuration, or make an otherwise ineligible native memory
+visible. Native recall resumes only when no current vault mapping resolves the
+native identity's scope and no independent policy blocks it. A pre-migration
+`proposal` edge returns to `proposal`, never to a blanket `active` state. The
+archived note and all later human edits remain readable in Obsidian throughout.
+
+A rolled-back receipt also prevents that same vault, scope, and key from being
+silently migrated again. Both dry-run and apply report `receipt_not_active` and
+leave the native copy, vault content, receipt, and relationships unchanged. To
+place the content under vault management again, use a different identity
+(key, scope, or vault), or explicitly forget the native copy with
+`cao memory forget KEY --target native` once it is genuinely no longer needed and
+then store the content to the vault normally. There is no force or receipt-reset
+flag.
 
 Migration reports lossy source fields by name when present:
 

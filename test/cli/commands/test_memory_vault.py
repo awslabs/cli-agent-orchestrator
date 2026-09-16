@@ -50,6 +50,8 @@ def test_vault_status_labels_unmapped_writes_as_process_local(monkeypatch) -> No
                 0,
                 (),
                 (("Archive (project:alpha) inert: recall=off inject=off write=off", 3),),
+                (("active", 2), ("inconsistent", 1)),
+                6,
             ),
         ),
     )
@@ -69,6 +71,11 @@ def test_vault_status_labels_unmapped_writes_as_process_local(monkeypatch) -> No
         "mapping: Archive (project:alpha) inert: recall=off inject=off write=off; "
         "residual_rows=3" in result.output
     )
+    assert "migration_receipts: active=2, inconsistent=1" in result.output
+    assert (
+        "process_local_boundary_write_refusals: unavailable in a fresh CLI process" in result.output
+    )
+    assert "6" not in result.output
 
 
 def test_vault_scan_is_read_only_and_accepts_dry_run(monkeypatch) -> None:

@@ -38,6 +38,7 @@ def test_every_non_secret_finding_has_its_adr_severity():
         FindingCode.ALIAS_AMBIGUOUS: "warn",
         FindingCode.LINK_AMBIGUOUS: "warn",
         FindingCode.KEY_COLLISION: "error",
+        FindingCode.KEY_PROVENANCE_UNKNOWN: "warn",
         FindingCode.LINK_EXCLUDED: "info",
         FindingCode.LINK_DANGLING: "info",
         FindingCode.FRONTMATTER_MALFORMED: "error",

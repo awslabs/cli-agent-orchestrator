@@ -35,6 +35,8 @@ BYTE_EQUAL_COLUMNS = {
         "size_bytes",
         "mtime_ns",
         "status",
+        "key_source",
+        "key_source_reason",
     },
     "vault_finding": {"vault_id", "vault_relpath", "code", "severity", "detail"},
     "vault_note_alias": {

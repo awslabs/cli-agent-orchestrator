@@ -13,7 +13,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Literal, Optional, Sequence, Set
+from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, Sequence, Set, TypeVar, cast
 
 from cli_agent_orchestrator.constants import (
     MEMORY_BASE_DIR,
@@ -46,6 +46,9 @@ from cli_agent_orchestrator.utils.path_validation import (
     validate_path_component,
 )
 
+if TYPE_CHECKING:
+    from cli_agent_orchestrator.services.vault.config import VaultConfig, VaultSpec
+
 logger = logging.getLogger(__name__)
 
 VALID_SEARCH_MODES = ("metadata", "bm25", "hybrid")
@@ -54,6 +57,35 @@ VALID_SEARCH_MODES = ("metadata", "bm25", "hybrid")
 MEMORY_DISABLED_MESSAGE = (
     "memory subsystem is disabled. Set memory.enabled=true in settings.json " "to re-enable."
 )
+
+_VaultProjectionResult = TypeVar("_VaultProjectionResult")
+
+
+async def _offload_vault_projection(
+    vault: "VaultSpec",
+    fn: Callable[..., _VaultProjectionResult],
+    /,
+    *args: Any,
+    **kwargs: Any,
+) -> _VaultProjectionResult:
+    """Run one synchronous projection mutation without blocking the event loop.
+
+    An already-owning thread runs inline because lock re-entry is deliberately
+    thread-bound. Cancellation means outcome unknown: the worker continues to
+    atomic completion or failure and releases its lock. The lock timeout starts
+    only when that worker attempts acquisition; it does not bound executor
+    queueing, operation runtime, or guarantee freedom from pool starvation.
+    """
+    from cli_agent_orchestrator.services.vault.vault_lock import holds_projection_lock
+
+    if holds_projection_lock(vault):
+        return fn(*args, **kwargs)
+    try:
+        return await asyncio.to_thread(fn, *args, **kwargs)
+    except asyncio.CancelledError:
+        # Content-free by design: never log the memory key, body, or arguments.
+        logger.warning("vault_projection_offload_cancelled vault=%s", vault.id)
+        raise
 
 
 def _redact_injected_vault_content(memory: Memory) -> tuple[str, tuple[str, ...]]:
@@ -748,11 +780,9 @@ class MemoryService:
         rule in one place guarantees the dry-run report cannot drift from
         what a real ``store()`` would do.
         """
-        if occurred_at is None:
-            return False
-        return occurred_at > now or (
-            latest_section_at is not None and occurred_at < latest_section_at
-        )
+        from cli_agent_orchestrator.services.memory_append import occurred_at_would_clamp
+
+        return bool(occurred_at_would_clamp(occurred_at, latest_section_at, now))
 
     async def store(
         self,
@@ -860,12 +890,26 @@ class MemoryService:
         if vault_config.enabled:
             scope_binding = resolve(scope, scope_id, vault_config=vault_config)
             if isinstance(scope_binding, VaultBinding):
-                return self._store_vault_memory(
+                vault = next(
+                    (item for item in vault_config.vaults if item.id == scope_binding.vault_id),
+                    None,
+                )
+                if vault is None:
+                    raise ValueError(
+                        f"vault binding references unknown vault {scope_binding.vault_id!r}"
+                    )
+                # Cancellation after dispatch means outcome unknown. The
+                # thread-confined worker still commits or fails atomically and
+                # releases the lock before it exits.
+                return await _offload_vault_projection(
+                    vault,
+                    self._store_vault_memory,
                     content=content,
                     key=key,
                     memory_type=memory_type,
                     tags=tags,
                     terminal_context=terminal_context,
+                    occurred_at=occurred_at,
                     binding=scope_binding,
                     vault_config=vault_config,
                 )
@@ -883,18 +927,10 @@ class MemoryService:
             target_source_kind="native",
         )
         now = datetime.now(timezone.utc)
-        timestamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-        # Normalize occurred_at to UTC-aware for the ordering comparisons
-        # below. A future value is clamped for new topics AND merges (D5);
-        # the older-than-latest-section check needs the existing file and
-        # runs inside the topic lock.
-        if occurred_at is not None:
-            if occurred_at.tzinfo is None:
-                occurred_at = occurred_at.replace(tzinfo=timezone.utc)
-            else:
-                occurred_at = occurred_at.astimezone(timezone.utc)
-        timestamp_clamped = False
+        from cli_agent_orchestrator.services.memory_append import (
+            MemoryAppendEntry,
+            append_section,
+        )
 
         wiki_path = self.get_wiki_path(scope, scope_id, key)
         wiki_path.parent.mkdir(parents=True, exist_ok=True)
@@ -913,7 +949,6 @@ class MemoryService:
             is_update = wiki_path.exists()
             memory_id = str(uuid.uuid4())
             created_at = now
-            latest_section_at: Optional[datetime] = None
 
             if is_update:
                 # Read existing file to get original created_at and id from comment
@@ -922,12 +957,8 @@ class MemoryService:
                 id_match = re.search(r"<!-- id: ([a-f0-9\-]+)", existing_content)
                 if id_match:
                     memory_id = id_match.group(1)
-                # Extract original created_at (first section) and the latest
-                # section timestamp (last) for the occurred_at ordering rule.
-                # The regex is deliberately unanchored, matching
-                # _parse_wiki_file's existing behavior: a timestamp-shaped line
-                # inside an untrusted body can match. Import-time escaping
-                # (Unit 3) is the mitigation; deferred here, no behavior change.
+                # Extract original created_at (first section). Shared append
+                # rendering extracts the latest section under this same lock.
                 existing_ts = re.findall(
                     r"## (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)", existing_content
                 )
@@ -935,9 +966,6 @@ class MemoryService:
                     created_at = datetime.strptime(existing_ts[0], "%Y-%m-%dT%H:%M:%SZ").replace(
                         tzinfo=timezone.utc
                     )
-                    latest_section_at = datetime.strptime(
-                        existing_ts[-1], "%Y-%m-%dT%H:%M:%SZ"
-                    ).replace(tzinfo=timezone.utc)
                 # Rewrite the header line so updated memory_type/tags stay
                 # in sync with index.md (recall() reads the file header).
                 new_header = (
@@ -951,31 +979,22 @@ class MemoryService:
                     count=1,
                 )
 
-            # D5 ordering rule: an in-order, non-future occurred_at is used
-            # verbatim for the section heading; a future value (new topics
-            # AND merges) or a value older than the topic's latest section
-            # is clamped to now(), with provenance preserved as a first
-            # body line. occurred_at=None keeps the pre-#345 bytes exactly.
-            entry_body = content
-            if occurred_at is not None:
-                if self._occurred_at_would_clamp(occurred_at, latest_section_at, now):
-                    timestamp_clamped = True
-                    original_iso = occurred_at.strftime("%Y-%m-%dT%H:%M:%SZ")
-                    entry_body = f"_Originally recorded: {original_iso}_\n{content}"
-                else:
-                    timestamp = occurred_at.strftime("%Y-%m-%dT%H:%M:%SZ")
-                    if not is_update:
-                        created_at = occurred_at
-
-            if is_update:
-                # Append new timestamped entry
-                new_content = existing_content.rstrip("\n") + f"\n\n## {timestamp}\n{entry_body}\n"
-            else:
-                new_content = (
+            if not is_update:
+                existing_content = (
                     f"# {key}\n"
-                    f"<!-- id: {memory_id} | scope: {scope} | type: {memory_type} | tags: {tags} -->\n"
-                    f"\n## {timestamp}\n{entry_body}\n"
+                    f"<!-- id: {memory_id} | scope: {scope} | "
+                    f"type: {memory_type} | tags: {tags} -->\n"
                 )
+            appended = append_section(
+                existing_content,
+                MemoryAppendEntry(content=content, occurred_at=occurred_at, now=now),
+            )
+            new_content = appended.content
+            entry_body = appended.entry_body
+            timestamp = appended.section_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+            timestamp_clamped = appended.timestamp_clamped
+            if not is_update:
+                created_at = appended.first_section_at
 
             # Atomic write of the append version: write to tmp then os.replace.
             # This is always the immediate, durable result of store(). LLM
@@ -1112,6 +1131,7 @@ class MemoryService:
         memory_type: str,
         tags: str,
         terminal_context: Optional[dict],
+        occurred_at: Optional[datetime],
         binding: VaultBinding,
         vault_config,
     ) -> Memory:
@@ -1120,7 +1140,12 @@ class MemoryService:
             VAULT_NOTE_SCOPE_ID_SENTINEL,
             VaultNoteModel,
         )
+        from cli_agent_orchestrator.services.memory_append import MemoryAppendEntry
         from cli_agent_orchestrator.services.vault.reconcile import reconcile
+        from cli_agent_orchestrator.services.vault.vault_lock import (
+            VAULT_PROJECTION_LOCK_INTERACTIVE_TIMEOUT_S,
+            vault_projection_lock,
+        )
         from cli_agent_orchestrator.services.vault.writer import (
             VaultWriteConflictError,
             write_managed_note,
@@ -1138,57 +1163,74 @@ class MemoryService:
         vault = next((item for item in vault_config.vaults if item.id == binding.vault_id), None)
         if vault is None:
             raise ValueError(f"vault binding references unknown vault {binding.vault_id!r}")
-        if binding.scope == MemoryScope.AGENT.value:
-            from cli_agent_orchestrator.services.vault.reader import _resolve_injection_policy
+        with vault_projection_lock(
+            vault,
+            timeout=VAULT_PROJECTION_LOCK_INTERACTIVE_TIMEOUT_S,
+        ):
+            if binding.scope == MemoryScope.AGENT.value:
+                from cli_agent_orchestrator.services.vault.reader import (
+                    _resolve_injection_policy,
+                )
 
-            policy = _resolve_injection_policy(
-                False,
-                consumer="explicit_recall",
-                terminal_id=(terminal_context or {}).get("terminal_id"),
+                policy = _resolve_injection_policy(
+                    False,
+                    consumer="explicit_recall",
+                    terminal_id=(terminal_context or {}).get("terminal_id"),
+                )
+                if policy.is_curator is not False:
+                    raise PermissionError(
+                        "agent-scoped vault writes require a positively identified "
+                        "non-curator requester"
+                    )
+            self._assert_no_cross_tier_collision(
+                key,
+                binding.scope,
+                binding.scope_id,
+                target_source_kind="vault",
+                binding=binding,
+                vault=vault,
             )
-            if policy.is_curator is not False:
-                raise PermissionError(
-                    "agent-scoped vault writes require a positively identified non-curator requester"
-                )
-
-        self._assert_no_cross_tier_collision(
-            key,
-            binding.scope,
-            binding.scope_id,
-            target_source_kind="vault",
-        )
-        stored_scope_id = (
-            binding.scope_id if binding.scope_id is not None else VAULT_NOTE_SCOPE_ID_SENTINEL
-        )
-        with self._get_db_session() as db:
-            note = (
-                db.query(VaultNoteModel)
-                .filter(
-                    VaultNoteModel.vault_id == binding.vault_id,
-                    VaultNoteModel.scope == binding.scope,
-                    VaultNoteModel.scope_id == stored_scope_id,
-                    VaultNoteModel.cao_key == key,
-                )
-                .one_or_none()
+            stored_scope_id = (
+                binding.scope_id if binding.scope_id is not None else VAULT_NOTE_SCOPE_ID_SENTINEL
             )
-            managed_relpath = f"{vault.managed_folder}/{key}.md"
-            if note is not None and note.vault_relpath != managed_relpath:
-                raise VaultWriteConflictError(
-                    f"key {key!r} is already minted by {note.vault_relpath!r} in this mapping; "
-                    "choose another key or rename that note"
+            with self._get_db_session() as db:
+                note = (
+                    db.query(VaultNoteModel)
+                    .filter(
+                        VaultNoteModel.vault_id == binding.vault_id,
+                        VaultNoteModel.scope == binding.scope,
+                        VaultNoteModel.scope_id == stored_scope_id,
+                        VaultNoteModel.cao_key == key,
+                    )
+                    .one_or_none()
                 )
-            expected_content_sha256 = note.content_sha256 if note is not None else None
+                managed_relpath = f"{vault.managed_folder}/{key}.md"
+                if note is not None and note.vault_relpath != managed_relpath:
+                    raise VaultWriteConflictError(
+                        f"key {key!r} is already minted by {note.vault_relpath!r} in this mapping; "
+                        "choose another key or rename that note"
+                    )
+                expected_content_sha256 = note.content_sha256 if note is not None else None
 
-        write = write_managed_note(
-            vault=vault,
-            binding=binding,
-            key=key,
-            body=content,
-            cao={"type": memory_type},
-            frontmatter={"tags": tags} if tags else None,
-            expected_content_sha256=expected_content_sha256,
-            refresh=lambda _path: reconcile(vault, apply=True),
-        )
+            def refresh_projection(_path: str) -> None:
+                reconcile(vault, apply=True)
+
+            write = write_managed_note(
+                vault=vault,
+                binding=binding,
+                key=key,
+                body=None,
+                cao={"type": memory_type},
+                frontmatter={"tags": tags} if tags else None,
+                expected_content_sha256=expected_content_sha256,
+                refresh=refresh_projection,
+                mode="append",
+                entry=MemoryAppendEntry(
+                    content=content,
+                    occurred_at=occurred_at,
+                    now=datetime.now(timezone.utc),
+                ),
+            )
         now = datetime.now(timezone.utc)
         return Memory(
             id=str(uuid.uuid4()),
@@ -1200,12 +1242,13 @@ class MemoryService:
             tags=tags,
             source_provider=(terminal_context or {}).get("provider"),
             source_terminal_id=(terminal_context or {}).get("terminal_id"),
-            created_at=now,
+            created_at=write.first_section_at or now,
             updated_at=now,
             content=content,
             source_kind="vault",
             source_path=os.path.relpath(write.path, binding.root).replace(os.sep, "/"),
             action="updated" if expected_content_sha256 is not None else "created",
+            timestamp_clamped=write.timestamp_clamped,
         )
 
     def _assert_no_cross_tier_collision(
@@ -1215,6 +1258,8 @@ class MemoryService:
         scope_id: Optional[str],
         *,
         target_source_kind: Literal["native", "vault"],
+        binding: Optional[VaultBinding] = None,
+        vault: Any = None,
     ) -> None:
         """Refuse a write that would create same-key native and vault memories."""
         from cli_agent_orchestrator.clients.database import MemoryMetadataModel
@@ -1235,16 +1280,154 @@ class MemoryService:
                 )
                 .first()
             )
+        native_file_exists = (
+            target_source_kind == "vault" and self.get_wiki_path(scope, scope_id, key).exists()
+        )
+        if (
+            target_source_kind == "vault"
+            and (existing is not None or native_file_exists)
+            and binding is not None
+            and vault is not None
+            and self._migration_receipt_allows_vault_write(
+                key,
+                scope,
+                scope_id,
+                binding=binding,
+                vault=vault,
+            )
+        ):
+            return
         if existing is not None:
             raise ValueError(
                 f"memory key {key!r} already exists in the {other_source_kind} store "
                 f"for {scope!r}; resolve the cross-tier collision before writing"
             )
-        if target_source_kind == "vault" and self.get_wiki_path(scope, scope_id, key).exists():
+        if native_file_exists:
             raise ValueError(
                 f"memory key {key!r} already exists in the native store "
                 f"for {scope!r}; resolve the cross-tier collision before writing"
             )
+
+    def _migration_receipt_allows_vault_write(
+        self,
+        key: str,
+        scope: str,
+        scope_id: Optional[str],
+        *,
+        binding: VaultBinding,
+        vault: Any,
+    ) -> bool:
+        """Validate the exact source snapshot and target identity for one exemption."""
+        from cli_agent_orchestrator.clients.database import (
+            VAULT_NOTE_SCOPE_ID_SENTINEL,
+            VaultMigrationReceiptModel,
+        )
+        from cli_agent_orchestrator.services.vault.status import (
+            migration_receipt_write_guard_reason,
+        )
+
+        stored_scope_id = scope_id or VAULT_NOTE_SCOPE_ID_SENTINEL
+        if binding.vault_id != vault.id:
+            return False
+        with self._get_db_session() as db:
+            receipts = (
+                db.query(VaultMigrationReceiptModel)
+                .filter(
+                    VaultMigrationReceiptModel.scope == scope,
+                    VaultMigrationReceiptModel.scope_id == stored_scope_id,
+                    VaultMigrationReceiptModel.cao_key == key,
+                    VaultMigrationReceiptModel.status == "active",
+                )
+                .all()
+            )
+            return any(
+                migration_receipt_write_guard_reason(
+                    db,
+                    receipt,
+                    vault,
+                    memory_base_dir=Path(self.base_dir),
+                )
+                is None
+                for receipt in receipts
+            )
+
+    def _native_identity_is_migration_dormant(
+        self,
+        key: str,
+        scope: str,
+        scope_id: Optional[str],
+    ) -> bool:
+        """Return receipt dormancy plus current exclusion/index policy."""
+        from cli_agent_orchestrator.clients.database import (
+            VAULT_NOTE_SCOPE_ID_SENTINEL,
+            VaultExclusionModel,
+            VaultMigrationReceiptModel,
+        )
+        from cli_agent_orchestrator.services.settings_service import get_vault_config
+        from cli_agent_orchestrator.services.vault.boundary import (
+            is_excluded_relpath,
+            is_supported_relpath,
+        )
+
+        stored_scope_id = scope_id or VAULT_NOTE_SCOPE_ID_SENTINEL
+        with self._get_db_session() as db:
+            receipts = (
+                db.query(VaultMigrationReceiptModel.receipt_id)
+                .filter(
+                    VaultMigrationReceiptModel.scope == scope,
+                    VaultMigrationReceiptModel.scope_id == stored_scope_id,
+                    VaultMigrationReceiptModel.cao_key == key,
+                )
+                .all()
+            )
+            if not receipts:
+                return False
+            receipt_rows = (
+                db.query(VaultMigrationReceiptModel)
+                .filter(VaultMigrationReceiptModel.receipt_id.in_([item[0] for item in receipts]))
+                .all()
+            )
+            if any(receipt.status == "active" for receipt in receipt_rows):
+                return True
+            for receipt in receipt_rows:
+                exclusion = db.get(
+                    VaultExclusionModel,
+                    {
+                        "vault_id": receipt.vault_id,
+                        "scope": receipt.scope,
+                        "scope_id": receipt.scope_id,
+                        "cao_key": receipt.cao_key,
+                    },
+                )
+                if exclusion is not None:
+                    return True
+        try:
+            load_vault_config = cast(Callable[[], "VaultConfig"], get_vault_config)
+            config = load_vault_config()
+        except Exception:
+            return False
+        for receipt in receipt_rows:
+            vault = next((item for item in config.vaults if item.id == receipt.vault_id), None)
+            if vault is None:
+                continue
+            if not is_supported_relpath(receipt.managed_relpath):
+                return True
+            if is_excluded_relpath(receipt.managed_relpath, vault.exclude):
+                return True
+            for mapping in vault.mappings:
+                in_mapping = (
+                    receipt.managed_relpath == mapping.folder
+                    or receipt.managed_relpath.startswith(f"{mapping.folder}/")
+                )
+                mapping_scope_id = mapping.scope_id or VAULT_NOTE_SCOPE_ID_SENTINEL
+                if (
+                    in_mapping
+                    and mapping.scope == receipt.scope
+                    and mapping_scope_id == receipt.scope_id
+                    and not mapping.index
+                ):
+                    return True
+        return False
 
     # -------------------------------------------------------------------------
     # Deferred LLM compaction
@@ -3224,6 +3407,12 @@ class MemoryService:
 
     def _parse_wiki_file(self, wiki_file: Path, file_content: str, entry: dict) -> Optional[Memory]:
         """Parse a wiki topic file into a Memory object."""
+        if self._native_identity_is_migration_dormant(
+            entry["key"],
+            entry.get("scope", "global"),
+            entry.get("scope_id"),
+        ):
+            return None
         # Extract id from comment
         id_match = re.search(r"<!-- id: ([a-f0-9\-]+)", file_content)
         memory_id = id_match.group(1) if id_match else str(uuid.uuid4())
@@ -3308,9 +3497,25 @@ class MemoryService:
             from cli_agent_orchestrator.services.settings_service import get_vault_config
             from cli_agent_orchestrator.services.vault.binding import resolve
 
-            binding = resolve(scope, scope_id, vault_config=get_vault_config())
+            vault_config = get_vault_config()
+            binding = resolve(scope, scope_id, vault_config=vault_config)
             if isinstance(binding, VaultBinding):
-                return self._deindex_vault_memory(key, binding)
+                vault = next(
+                    (item for item in vault_config.vaults if item.id == binding.vault_id),
+                    None,
+                )
+                if vault is None:
+                    raise ValueError(f"vault binding references unknown vault {binding.vault_id!r}")
+                # Cancellation after dispatch means outcome unknown. The
+                # thread-confined worker still commits or fails atomically and
+                # releases the lock before it exits.
+                return await _offload_vault_projection(
+                    vault,
+                    self._deindex_vault_memory,
+                    key,
+                    binding,
+                    vault,
+                )
 
         return self._forget_native_memory(key, scope, scope_id)
 
@@ -3352,7 +3557,9 @@ class MemoryService:
 
         return ForgetResult("deleted", "native", str(wiki_path), (str(wiki_path),))
 
-    def _deindex_vault_memory(self, key: str, binding: VaultBinding) -> ForgetResult:
+    def _deindex_vault_memory(
+        self, key: str, binding: VaultBinding, vault: "VaultSpec"
+    ) -> ForgetResult:
         """Remove derived state for a vault note without modifying its file."""
         from cli_agent_orchestrator.clients.database import (
             VAULT_NOTE_SCOPE_ID_SENTINEL,
@@ -3363,67 +3570,109 @@ class MemoryService:
         from cli_agent_orchestrator.services.memory_relationship_service import (
             MemoryRelationshipService,
         )
+        from cli_agent_orchestrator.services.vault.vault_lock import (
+            VAULT_PROJECTION_LOCK_INTERACTIVE_TIMEOUT_S,
+            vault_projection_lock,
+        )
 
         scope_id = binding.scope_id
         stored_scope_id = scope_id if scope_id is not None else VAULT_NOTE_SCOPE_ID_SENTINEL
         deferred_relationship_audits: list[Callable[[], None]] = []
-        with self._get_db_session() as db:
-            with db.begin():
-                note = (
-                    db.query(VaultNoteModel)
-                    .filter(
-                        VaultNoteModel.vault_id == binding.vault_id,
-                        VaultNoteModel.scope == binding.scope,
-                        VaultNoteModel.scope_id == stored_scope_id,
-                        VaultNoteModel.cao_key == key,
-                    )
-                    .one_or_none()
-                )
-                if note is None:
-                    return ForgetResult("absent", "vault", None)
-                exclusion_identity = {
-                    "vault_id": binding.vault_id,
-                    "scope": binding.scope,
-                    "scope_id": stored_scope_id,
-                    "cao_key": key,
-                }
-                exclusion = db.get(VaultExclusionModel, exclusion_identity)
-                if exclusion is None:
-                    exclusion = VaultExclusionModel(
-                        **exclusion_identity,
-                        last_known_relpath=note.vault_relpath,
-                        content_sha256=note.content_sha256,
-                    )
-                    db.add(exclusion)
-                else:
-                    exclusion.last_known_relpath = note.vault_relpath
-                    exclusion.content_sha256 = note.content_sha256
-                note.status = "excluded"
-                path = note.vault_relpath
-                metadata = db.query(MemoryMetadataModel).filter(
-                    MemoryMetadataModel.key == key,
-                    MemoryMetadataModel.scope == binding.scope,
-                    MemoryMetadataModel.source_kind == "vault",
-                )
-                if scope_id is None:
-                    metadata = metadata.filter(MemoryMetadataModel.scope_id.is_(None))
-                else:
-                    metadata = metadata.filter(MemoryMetadataModel.scope_id == scope_id)
-                metadata.delete()
-                MemoryRelationshipService().purge_for_key(
-                    binding.scope,
-                    scope_id,
-                    key,
-                    origins=("vault",),
-                    db=db,
-                    audit_sink=deferred_relationship_audits,
-                )
-        for emit_audit in deferred_relationship_audits:
-            emit_audit()
-        # Vault notes may be user-authored, so deindexing never unlinks them.
-        # Native peers are CAO-owned and must be removed to avoid leaving an
-        # invisible same-key copy after a vault-bound forget.
-        native = self._forget_native_memory(key, binding.scope, scope_id)
+        committed = False
+        native: Optional[ForgetResult] = None
+        operation_error: Optional[Exception] = None
+        operation_traceback: Any = None
+        with vault_projection_lock(
+            vault,
+            timeout=VAULT_PROJECTION_LOCK_INTERACTIVE_TIMEOUT_S,
+        ):
+            try:
+                with self._get_db_session() as db:
+                    with db.begin():
+                        note = (
+                            db.query(VaultNoteModel)
+                            .filter(
+                                VaultNoteModel.vault_id == binding.vault_id,
+                                VaultNoteModel.scope == binding.scope,
+                                VaultNoteModel.scope_id == stored_scope_id,
+                                VaultNoteModel.cao_key == key,
+                            )
+                            .one_or_none()
+                        )
+                        if note is None:
+                            return ForgetResult("absent", "vault", None)
+                        exclusion_identity = {
+                            "vault_id": binding.vault_id,
+                            "scope": binding.scope,
+                            "scope_id": stored_scope_id,
+                            "cao_key": key,
+                        }
+                        exclusion = db.get(VaultExclusionModel, exclusion_identity)
+                        if exclusion is None:
+                            exclusion = VaultExclusionModel(
+                                **exclusion_identity,
+                                last_known_relpath=note.vault_relpath,
+                                content_sha256=note.content_sha256,
+                                key_source=note.key_source,
+                                key_source_reason=note.key_source_reason,
+                            )
+                            db.add(exclusion)
+                        else:
+                            exclusion.last_known_relpath = note.vault_relpath
+                            exclusion.content_sha256 = note.content_sha256
+                            exclusion.key_source = note.key_source
+                            exclusion.key_source_reason = note.key_source_reason
+                        note.status = "excluded"
+                        path = note.vault_relpath
+                        metadata = db.query(MemoryMetadataModel).filter(
+                            MemoryMetadataModel.key == key,
+                            MemoryMetadataModel.scope == binding.scope,
+                            MemoryMetadataModel.source_kind == "vault",
+                        )
+                        if scope_id is None:
+                            metadata = metadata.filter(MemoryMetadataModel.scope_id.is_(None))
+                        else:
+                            metadata = metadata.filter(MemoryMetadataModel.scope_id == scope_id)
+                        metadata.delete()
+                        MemoryRelationshipService().purge_for_key(
+                            binding.scope,
+                            scope_id,
+                            key,
+                            origins=("vault",),
+                            db=db,
+                            audit_sink=deferred_relationship_audits,
+                        )
+                    committed = True
+            except Exception as exc:
+                operation_error = exc
+                operation_traceback = exc.__traceback__
+            if operation_error is None:
+                # Vault notes may be user-authored, so deindexing never unlinks them.
+                # Native peers are CAO-owned and must be removed to avoid leaving an
+                # invisible same-key copy after a vault-bound forget.
+                try:
+                    native = self._forget_native_memory(key, binding.scope, scope_id)
+                except Exception as exc:
+                    operation_error = exc
+                    operation_traceback = exc.__traceback__
+
+        audit_error: Optional[Exception] = None
+        if committed:
+            for emit_audit in deferred_relationship_audits:
+                try:
+                    emit_audit()
+                except Exception as exc:
+                    # The real purge callback swallows Exception internally.
+                    # This is defensive for injected or future callbacks.
+                    if audit_error is None:
+                        audit_error = exc
+        if operation_error is not None:
+            if audit_error is not None:
+                logger.error("vault forget audit emission failed while preserving operation error")
+            raise operation_error.with_traceback(operation_traceback)
+        if audit_error is not None:
+            raise audit_error
+        assert native is not None
         if native.action == "deleted":
             return ForgetResult(
                 "deleted_and_deindexed",

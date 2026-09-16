@@ -222,6 +222,8 @@ class VaultNoteModel(Base):
     mtime_ns = Column(Integer, nullable=True)
     status = Column(String, nullable=False)
     last_reconciled_at = Column(DateTime(timezone=True), nullable=True)
+    key_source = Column(String, nullable=True)
+    key_source_reason = Column(String, nullable=True)
 
     __table_args__ = (
         UniqueConstraint("vault_id", "scope", "scope_id", "cao_key", name="uq_vault_note_key"),
@@ -245,6 +247,33 @@ class VaultExclusionModel(Base):
     cao_key = Column(String, primary_key=True)
     last_known_relpath = Column(String, nullable=False)
     content_sha256 = Column(String, nullable=True)
+    key_source = Column(String, nullable=True)
+    key_source_reason = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+
+
+class VaultMigrationReceiptModel(Base):
+    """Durable authority binding one native snapshot to its vault migration."""
+
+    __tablename__ = "vault_migration_receipt"
+
+    receipt_id = Column(String, primary_key=True)
+    scope = Column(String, nullable=False)
+    scope_id = Column(
+        String,
+        nullable=False,
+        default=VAULT_NOTE_SCOPE_ID_SENTINEL,
+        server_default=VAULT_NOTE_SCOPE_ID_SENTINEL,
+    )
+    cao_key = Column(String, nullable=False)
+    native_relpath = Column(String, nullable=False)
+    native_snapshot_sha256 = Column(String, nullable=False)
+    vault_id = Column(String, nullable=False)
+    managed_relpath = Column(String, nullable=False)
+    vault_note_uid = Column(String, nullable=False)
+    published_content_sha256 = Column(String, nullable=False)
+    superseded_edges = Column(Text, nullable=False, default="[]", server_default="[]")
+    status = Column(String, nullable=False, default="active", server_default="active")
     created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
 
 
@@ -527,9 +556,14 @@ def init_db() -> None:
     # Appended LAST (issue #583 Bolt 2, ``approval-store``). Disjoint from every table above —
     # its own new table, no shared columns — so registry order is immaterial here too.
     _migrate_workflow_plan_approval()
+    # Add the nullable columns before the exclusion backfill so a pre-existing
+    # excluded note can carry its provenance into the durable tombstone.
+    _migrate_vault_key_provenance()
     # Appended LAST (PR #674). Disjoint from every table above except for the
     # one-time backfill read from vault_note.
     _migrate_vault_exclusions()
+    # Appended LAST (PR #674 S5). One additive receipt table; no backfill.
+    _migrate_vault_migration_receipts()
     # Appended LAST (issue #657). Runs after the source_kind table rebuild so
     # the partial index enforces the full PR #674 memory identity.
     _migrate_memory_scope_null_uniqueness()
@@ -1026,6 +1060,8 @@ def _migrate_vault_exclusions() -> None:
                 "cao_key VARCHAR NOT NULL, "
                 "last_known_relpath VARCHAR NOT NULL, "
                 "content_sha256 VARCHAR, "
+                "key_source VARCHAR, "
+                "key_source_reason VARCHAR, "
                 "created_at DATETIME NOT NULL, "
                 "PRIMARY KEY (vault_id, scope, scope_id, cao_key)"
                 ")"
@@ -1038,14 +1074,67 @@ def _migrate_vault_exclusions() -> None:
             conn.execute(
                 "INSERT OR IGNORE INTO vault_exclusion ("
                 "vault_id, scope, scope_id, cao_key, last_known_relpath, "
-                "content_sha256, created_at"
+                "content_sha256, key_source, key_source_reason, created_at"
                 ") "
                 "SELECT vault_id, scope, scope_id, cao_key, vault_relpath, "
-                "content_sha256, COALESCE(last_reconciled_at, CURRENT_TIMESTAMP) "
+                "content_sha256, key_source, key_source_reason, "
+                "COALESCE(last_reconciled_at, CURRENT_TIMESTAMP) "
                 "FROM vault_note WHERE status = 'excluded'"
             )
     except Exception as e:
         logger.error(f"Vault exclusion migration failed: {e}")
+        raise
+
+
+def _migrate_vault_migration_receipts() -> None:
+    """Create the additive migration-receipt table on legacy databases."""
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            columns = conn.execute("PRAGMA table_info(vault_migration_receipt)").fetchall()
+            if columns:
+                return
+            conn.execute(
+                "CREATE TABLE vault_migration_receipt ("
+                "receipt_id VARCHAR NOT NULL PRIMARY KEY, "
+                "scope VARCHAR NOT NULL, "
+                "scope_id VARCHAR NOT NULL DEFAULT '', "
+                "cao_key VARCHAR NOT NULL, "
+                "native_relpath VARCHAR NOT NULL, "
+                "native_snapshot_sha256 VARCHAR NOT NULL, "
+                "vault_id VARCHAR NOT NULL, "
+                "managed_relpath VARCHAR NOT NULL, "
+                "vault_note_uid VARCHAR NOT NULL, "
+                "published_content_sha256 VARCHAR NOT NULL, "
+                "superseded_edges TEXT NOT NULL DEFAULT '[]', "
+                "status VARCHAR NOT NULL DEFAULT 'active', "
+                "created_at DATETIME NOT NULL"
+                ")"
+            )
+    except Exception as e:
+        logger.error(f"Vault migration receipt schema migration failed: {e}")
+        raise
+
+
+def _migrate_vault_key_provenance() -> None:
+    """Add nullable key provenance columns to legacy vault tables."""
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            for table in ("vault_note", "vault_exclusion"):
+                columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+                if "key_source" not in columns:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN key_source VARCHAR")
+                if "key_source_reason" not in columns:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN key_source_reason VARCHAR")
+    except Exception as e:
+        logger.error(f"Vault key provenance schema migration failed: {e}")
         raise
 
 

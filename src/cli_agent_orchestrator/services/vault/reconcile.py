@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import hashlib
 from collections import Counter, defaultdict
-from dataclasses import dataclass, replace
+from contextlib import nullcontext
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Optional, cast
 
@@ -37,16 +38,20 @@ from cli_agent_orchestrator.services.vault.links import (
     resolve_wikilink,
 )
 from cli_agent_orchestrator.services.vault.scan import ScanFinding, ScanNote, scan_vault
+from cli_agent_orchestrator.services.vault.vault_lock import vault_projection_lock
+
+_APPLY_PLAN_AUTHORITY = object()
 
 
 @dataclass(frozen=True)
 class ReconcilePlan:
-    """A stable, side-effect-free reconciliation decision."""
+    """A stable, side-effect-free preview decision."""
 
     vault_id: str
     notes: tuple[ScanNote, ...]
     run_id: str
     run_started_at: datetime
+    _apply_authority: object | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -74,6 +79,8 @@ class _ProjectedNote:
     canonical_key: str
     note_uid: str
     memory_id: str
+    key_source: Optional[str]
+    key_source_reason: Optional[str]
     managed: bool
     memory_type: str
     tags: str
@@ -98,12 +105,34 @@ def plan_reconcile(
     run_id: Optional[str] = None,
     run_started_at: Optional[datetime] = None,
 ) -> ReconcilePlan:
+    """Build a preview-only plan that is never authoritative for mutation."""
+    return _build_plan(
+        vault,
+        run_id=run_id,
+        run_started_at=run_started_at,
+        apply_authority=None,
+    )
+
+
+def _build_plan(
+    vault: VaultSpec,
+    *,
+    run_id: Optional[str],
+    run_started_at: Optional[datetime],
+    apply_authority: object | None,
+) -> ReconcilePlan:
     """Scan once and capture the only run-wide provenance values."""
     started = run_started_at or datetime.now(timezone.utc)
     stable_run_id = (
         run_id or hashlib.sha256(f"{vault.id}\0{started.isoformat()}".encode("utf-8")).hexdigest()
     )
-    return ReconcilePlan(vault.id, scan_vault(vault).notes, stable_run_id, started)
+    return ReconcilePlan(
+        vault.id,
+        scan_vault(vault).notes,
+        stable_run_id,
+        started,
+        apply_authority,
+    )
 
 
 def reconcile(
@@ -120,69 +149,77 @@ def reconcile(
     in a run. Multiple instances are folded into its content-free ``detail``
     count so the primary key derived from run/code/path cannot collide.
     """
-    plan = plan_reconcile(vault, run_id=run_id, run_started_at=run_started_at)
-    projected = _quarantine_key_collisions(
-        tuple(_project_note(vault, note, plan.run_started_at) for note in plan.notes)
-    )
-    findings = _group_findings(projected)
-    deleted = 0
+    deferred_relationship_audits: list[Callable[[], None]] = []
+    lock = vault_projection_lock(vault) if apply else nullcontext()
+    with lock:
+        plan = _build_plan(
+            vault,
+            run_id=run_id,
+            run_started_at=run_started_at,
+            apply_authority=_APPLY_PLAN_AUTHORITY if apply else None,
+        )
+        projected = _quarantine_key_collisions(
+            tuple(_project_note(vault, note, plan.run_started_at) for note in plan.notes)
+        )
+        findings = _group_findings(projected)
+        deleted = 0
 
-    if apply:
-        deferred_relationship_audits: list[Callable[[], None]] = []
-        with SessionLocal() as db:
-            with db.begin():
-                exclusions = _vault_exclusion_set(db, vault.id)
-                if not rebuild:
-                    _clear_stale_vault_edges(
+        if apply:
+            with SessionLocal() as db:
+                with db.begin():
+                    exclusions = _vault_exclusion_set(db, vault.id)
+                    if not rebuild:
+                        _clear_stale_vault_edges(
+                            db,
+                            vault.id,
+                            projected,
+                            deferred_relationship_audits,
+                            exclusions,
+                        )
+                    deleted, findings, projected = _apply_plan(
                         db,
-                        vault.id,
+                        vault,
+                        plan,
                         projected,
+                        findings,
                         deferred_relationship_audits,
-                        exclusions,
+                        rebuild=rebuild,
+                        exclusions=exclusions,
                     )
-                deleted, findings, projected = _apply_plan(
-                    db,
-                    vault,
-                    plan,
-                    projected,
-                    findings,
-                    deferred_relationship_audits,
-                    rebuild=rebuild,
-                    exclusions=exclusions,
-                )
-                findings = _merge_findings(
-                    findings,
-                    _replace_vault_edges(
-                        projected,
-                        db=db,
-                        audit_sink=deferred_relationship_audits,
+                    findings = _merge_findings(
+                        findings,
+                        _replace_vault_edges(
+                            projected,
+                            db=db,
+                            audit_sink=deferred_relationship_audits,
+                        )
+                        or (),
                     )
-                    or (),
-                )
-                _persist_findings(db, vault.id, plan, findings)
-        for emit_audit in deferred_relationship_audits:
-            emit_audit()
-    else:
-        findings, projected = _preview_rename_findings(vault.id, projected, findings)
-        _edge_groups, edge_findings = _project_vault_edges(projected)
-        findings = _merge_findings(findings, edge_findings)
+                    _persist_findings(db, vault.id, plan, findings)
+        else:
+            findings, projected = _preview_rename_findings(vault.id, projected, findings)
+            _edge_groups, edge_findings = _project_vault_edges(projected)
+            findings = _merge_findings(findings, edge_findings)
 
-    indexed = sum(note.note.status == "indexed" for note in projected)
-    quarantined = sum(note.note.status == "quarantined" for note in projected)
-    skipped = sum(note.note.status in {"skipped", "unsupported"} for note in projected)
+        indexed = sum(note.note.status == "indexed" for note in projected)
+        quarantined = sum(note.note.status == "quarantined" for note in projected)
+        skipped = sum(note.note.status in {"skipped", "unsupported"} for note in projected)
+        report = ReconcileReport(
+            vault.id,
+            plan.run_id,
+            indexed,
+            quarantined,
+            skipped,
+            len(findings),
+            deleted,
+            rebuild,
+        )
+
+    for emit_audit in deferred_relationship_audits:
+        emit_audit()
     if apply:
         _emit_audit_events(vault.id, plan.run_id, projected, indexed, quarantined, skipped)
-
-    return ReconcileReport(
-        vault.id,
-        plan.run_id,
-        indexed,
-        quarantined,
-        skipped,
-        len(findings),
-        deleted,
-        rebuild,
-    )
+    return report
 
 
 def _preview_rename_findings(
@@ -308,6 +345,8 @@ def _project_note(vault: VaultSpec, note: ScanNote, started: datetime) -> _Proje
         key,
         note_uid,
         _digest("memory", note_uid),
+        "authored" if authored is not None else "derived",
+        None,
         bool(cao.get("managed", False)),
         str(cao.get("type", MemoryType.REFERENCE.value)),
         _tags(frontmatter.get("tags")),
@@ -339,6 +378,8 @@ def _quarantine_key_collisions(
                 key=key,
                 note_uid=_digest("collision", item.note_uid, item.note.vault_relpath),
                 memory_id=_digest("memory", "collision", item.note_uid, item.note.vault_relpath),
+                key_source="collision",
+                key_source_reason="identity-collision",
                 note=replace(
                     item.note,
                     status="quarantined",
@@ -399,6 +440,8 @@ def _quarantine_resolved_identity_collisions(
             key=key,
             note_uid=_digest("collision", collision_uid, item.note.vault_relpath),
             memory_id=_digest("memory", "collision", collision_uid, item.note.vault_relpath),
+            key_source="collision",
+            key_source_reason="resolved-identity-collision",
             note=replace(item.note, status="quarantined"),
         )
         quarantined.append(
@@ -425,7 +468,9 @@ def _apply_plan(
     rebuild: bool,
     exclusions: set[tuple[str, str, str]],
 ) -> tuple[int, tuple[tuple[str, str, str, str], ...], tuple[_ProjectedNote, ...]]:
-    """Apply only vault-scoped deletes; native rows remain structurally untouched."""
+    """Apply an internally authorized plan created under the projection lock."""
+    if plan._apply_authority is not _APPLY_PLAN_AUTHORITY:
+        raise AssertionError("only an authoritative in-lock reconciliation plan may be applied")
     if rebuild:
         rebuild_prior_by_path = {
             cast(str, row.vault_relpath): row
@@ -719,6 +764,8 @@ def _rebuild_claim_rows(
             managed=False,
             content_sha256=exclusion_hash,
             status="excluded",
+            key_source=cast(Optional[str], exclusion.key_source),
+            key_source_reason=cast(Optional[str], exclusion.key_source_reason),
         )
     return claim_rows
 
@@ -746,6 +793,7 @@ def _carry_rebuild_exclusions(
     before the identity rows are deleted.
     """
     projected_by_path = {item.note.vault_relpath: item for item in projected}
+    provenance_findings: list[tuple[str, str, str, str]] = []
     # A replacement whose former-path identity was already reserved by a
     # forgotten claimant keeps its synthetic projection identity on later
     # rebuilds.  The durable tombstone may have migrated to the moved note,
@@ -754,18 +802,36 @@ def _carry_rebuild_exclusions(
     # rebuilds.
     for path, item in tuple(projected_by_path.items()):
         prior = prior_by_path.get(path)
+        has_authored_key = item.note.parsed is not None and "key" in item.note.parsed.cao
+        prior_source = cast(Optional[str], prior.key_source) if prior is not None else None
         if (
             prior is not None
             and prior.status == "indexed"
-            and "-collision-" in cast(str, prior.cao_key)
+            and not has_authored_key
             and cast(str, prior.cao_key) != item.key
+            and prior_source in {None, "collision", "unknown-legacy"}
         ):
             prior_uid = cast(str, prior.note_uid)
+            prior_reason: Optional[str]
+            if prior_source is None:
+                prior_source = "unknown-legacy"
+                prior_reason = "pre-provenance-upgrade"
+                provenance_findings.append(
+                    _key_provenance_finding(
+                        item.note.vault_relpath,
+                        cast(str, prior.cao_key),
+                        item.key,
+                    )
+                )
+            else:
+                prior_reason = cast(Optional[str], prior.key_source_reason)
             projected_by_path[path] = replace(
                 item,
                 key=cast(str, prior.cao_key),
                 note_uid=prior_uid,
                 memory_id=_digest("memory", prior_uid),
+                key_source=prior_source,
+                key_source_reason=prior_reason,
             )
     claim_prior_by_path = _rebuild_claim_rows(db, vault_id, prior_by_path)
     raw_claim_resolutions = _resolve_renames(
@@ -852,6 +918,8 @@ def _carry_rebuild_exclusions(
                 key=replacement_key,
                 note_uid=replacement_uid,
                 memory_id=_digest("memory", replacement_uid),
+                key_source="collision",
+                key_source_reason="path-reuse",
             ),
         )
         projection_override_indexes.add(index)
@@ -984,7 +1052,7 @@ def _carry_rebuild_exclusions(
         )
     resolved_claims = tuple(resolutions)
     rebuilt_by_path = dict(projected_by_path)
-    rebuild_findings: list[tuple[str, str, str, str]] = []
+    rebuild_findings: list[tuple[str, str, str, str]] = list(provenance_findings)
     conflicting_index_set = set(conflicting_indexes)
     for index, (claim, resolution) in enumerate(
         zip(claim_resolutions_tuple, resolved_claims, strict=True)
@@ -1010,6 +1078,8 @@ def _carry_rebuild_exclusions(
             str,
             Optional[str],
             datetime,
+            Optional[str],
+            Optional[str],
         ],
     ] = {}
     for resolution in resolved_claims:
@@ -1062,10 +1132,13 @@ def _carry_rebuild_exclusions(
             rebuilt_item.note.vault_relpath,
             rebuilt_item.note.content_sha256,
             cast(datetime, exclusion.created_at),
+            cast(Optional[str], exclusion.key_source),
+            cast(Optional[str], exclusion.key_source_reason),
         )
 
     destination_claims = Counter(
-        new_identity for new_identity, _path, _hash, _created_at in planned_migrations.values()
+        new_identity
+        for new_identity, _path, _hash, _created_at, _source, _reason in planned_migrations.values()
     )
     proposed_migrations = {
         old_identity: migration
@@ -1108,6 +1181,8 @@ def _carry_rebuild_exclusions(
         live_path,
         content_sha256,
         created_at,
+        key_source,
+        key_source_reason,
     ) in planned_migrations.items():
         replacement = db.get(
             VaultExclusionModel,
@@ -1129,6 +1204,8 @@ def _carry_rebuild_exclusions(
             db.add(replacement)
         replacement.last_known_relpath = live_path
         replacement.content_sha256 = content_sha256
+        replacement.key_source = key_source
+        replacement.key_source_reason = key_source_reason
     carried.difference_update(planned_migrations)
     carried.update(migration[0] for migration in planned_migrations.values())
     db.flush()
@@ -1302,6 +1379,8 @@ def _resolve_renames(
                     canonical_key=existing_key,
                     note_uid=cast(str, existing.note_uid),
                     memory_id=_digest("memory", cast(str, existing.note_uid)),
+                    key_source=cast(Optional[str], existing.key_source),
+                    key_source_reason=cast(Optional[str], existing.key_source_reason),
                 )
             resolutions.append(_RenameResolution(item))
             continue
@@ -1331,6 +1410,8 @@ def _resolve_renames(
                 key=old_key,
                 note_uid=old_note_uid,
                 memory_id=_digest("memory", old_note_uid),
+                key_source=cast(Optional[str], old.key_source),
+                key_source_reason=cast(Optional[str], old.key_source_reason),
             )
             resolutions.append(
                 _RenameResolution(
@@ -1456,6 +1537,20 @@ def _rename_finding(code: FindingCode, relpath: str) -> tuple[str, str, str, str
     )
 
 
+def _key_provenance_finding(
+    relpath: str,
+    prior_key: str,
+    projected_key: str,
+) -> tuple[str, str, str, str]:
+    code = FindingCode.KEY_PROVENANCE_UNKNOWN
+    return (
+        code.value,
+        relpath,
+        finding_severity(code, secret_gate="reject"),
+        f"prior_key={prior_key}; projected_key={projected_key}",
+    )
+
+
 def _merge_findings(
     findings: tuple[tuple[str, str, str, str], ...],
     additions: tuple[tuple[str, str, str, str], ...],
@@ -1496,6 +1591,8 @@ def _upsert_note(db, vault_id: str, item: _ProjectedNote, started: datetime) -> 
         "mtime_ns": item.note.mtime_ns,
         "status": item.note.status,
         "last_reconciled_at": started,
+        "key_source": item.key_source,
+        "key_source_reason": item.key_source_reason,
     }
     if row is None:
         db.add(VaultNoteModel(note_uid=item.note_uid, **values))
@@ -1562,8 +1659,14 @@ def _group_findings(
                     )
                 ].append(code.value)
             candidates = _candidate_set(all_notes, item)
-            for embed, raw in extracted.links:
-                outcome = resolve_wikilink(raw, embed=embed, candidates=candidates)
+            for index, (embed, raw) in enumerate(extracted.links):
+                outcome = resolve_wikilink(
+                    raw,
+                    embed=embed,
+                    candidates=candidates,
+                    relative_path=extracted.relative_paths[index],
+                    source_relpath=item.note.vault_relpath,
+                )
                 if outcome.finding_code is not None:
                     grouped[
                         (
@@ -1665,8 +1768,15 @@ def _project_vault_edges(
         canonical: dict[tuple[str, str], tuple[dict[str, Any], dict[str, object]]] = {}
         conflicts: set[tuple[str, str]] = set()
         if item.note.parsed is not None:
-            for embed, raw in extract_wikilinks(item.note.parsed.region.body).links:
-                outcome = resolve_wikilink(raw, embed=embed, candidates=candidates)
+            extracted = extract_wikilinks(item.note.parsed.region.body)
+            for index, (embed, raw) in enumerate(extracted.links):
+                outcome = resolve_wikilink(
+                    raw,
+                    embed=embed,
+                    candidates=candidates,
+                    relative_path=extracted.relative_paths[index],
+                    source_relpath=item.note.vault_relpath,
+                )
                 if outcome.outcome == "resolved" and outcome.target_key is not None:
                     body_edges.setdefault(
                         outcome.target_key,

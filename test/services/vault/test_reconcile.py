@@ -632,7 +632,13 @@ def test_recreated_former_path_cannot_steal_retained_rename_identity(tmp_path, m
     def snapshot():
         with Session() as db:
             notes = {
-                row.vault_relpath: (row.note_uid, row.cao_key, row.status)
+                row.vault_relpath: (
+                    row.note_uid,
+                    row.cao_key,
+                    row.status,
+                    row.key_source,
+                    row.key_source_reason,
+                )
                 for row in db.query(VaultNoteModel).all()
             }
             aliases = {
@@ -650,11 +656,21 @@ def test_recreated_former_path_cannot_steal_retained_rename_identity(tmp_path, m
 
     first = snapshot()
     notes, aliases, metadata, findings = first
-    assert notes["Mapped/New.md"] == (original_uid, original_key, "indexed")
-    reused_uid, reused_key, reused_status = notes["Mapped/Old.md"]
+    assert notes["Mapped/New.md"] == (
+        original_uid,
+        original_key,
+        "indexed",
+        "derived",
+        None,
+    )
+    reused_uid, reused_key, reused_status, reused_source, reused_reason = notes["Mapped/Old.md"]
     assert reused_uid != original_uid
     assert reused_key.startswith(f"{original_key}-collision-")
     assert reused_status == "quarantined"
+    assert (reused_source, reused_reason) == (
+        "collision",
+        "resolved-identity-collision",
+    )
     assert aliases["Mapped/Old.md"] == original_key
     assert metadata == [(original_key, "Mapped/New.md")]
     assert findings == [("key_collision", "Mapped/Old.md")]
@@ -2554,9 +2570,12 @@ def test_duplicate_authored_keys_quarantine_both_notes_with_one_finding_per_path
     with Session() as db:
         notes = db.query(VaultNoteModel).order_by(VaultNoteModel.vault_relpath).all()
         findings = db.query(VaultFindingModel).filter_by(code="key_collision").all()
-        assert [(note.vault_relpath, note.status) for note in notes] == [
-            ("Mapped/One.md", "quarantined"),
-            ("Mapped/Two.md", "quarantined"),
+        assert [
+            (note.vault_relpath, note.status, note.key_source, note.key_source_reason)
+            for note in notes
+        ] == [
+            ("Mapped/One.md", "quarantined", "collision", "identity-collision"),
+            ("Mapped/Two.md", "quarantined", "collision", "identity-collision"),
         ]
         assert {finding.vault_relpath for finding in findings} == {
             "Mapped/One.md",
@@ -2564,6 +2583,403 @@ def test_duplicate_authored_keys_quarantine_both_notes_with_one_finding_per_path
         }
         assert db.query(MemoryMetadataModel).filter_by(source_kind="vault").count() == 0
     assert (report.indexed, report.quarantined) == (0, 2)
+
+
+def test_rebuild_honors_authored_key_containing_collision_substring(tmp_path, monkeypatch):
+    """A legal authored spelling can never be mistaken for mint provenance."""
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    for case, original_key in (
+        ("collision-spelling", "merge-collision-notes"),
+        ("matched-control", "merge-conflict-notes"),
+    ):
+        case_root = tmp_path / case
+        case_root.mkdir()
+        Session = _session(case_root, monkeypatch, module)
+        vault = _rename_vault(case_root)
+        mapped = case_root / "vault" / "Mapped"
+        source = mapped / "Source.md"
+        target = mapped / "Target.md"
+        target.write_text(
+            f"---\ncao:\n  key: {original_key}\n---\ntarget",
+            encoding="utf-8",
+        )
+        source.write_text(
+            f"---\ncao:\n  links:\n    - to: {original_key}\n"
+            "      type: relates_to\n      status: active\n---\n",
+            encoding="utf-8",
+        )
+        reconcile(vault, apply=True, run_id=f"authored-{case}-before")
+
+        target.write_text(
+            "---\ncao:\n  key: merge-runbook\n---\ntarget",
+            encoding="utf-8",
+        )
+        source.write_text(
+            "---\ncao:\n  links:\n    - to: merge-runbook\n"
+            "      type: relates_to\n      status: active\n---\n",
+            encoding="utf-8",
+        )
+        reconcile(vault, apply=True, rebuild=True, run_id=f"authored-{case}-after")
+
+        with Session() as db:
+            renamed = db.query(VaultNoteModel).filter_by(vault_relpath="Mapped/Target.md").one()
+            metadata = db.query(MemoryMetadataModel).filter_by(file_path="Mapped/Target.md").one()
+            edges = db.query(MemoryRelationshipModel).filter_by(origin="vault").all()
+        assert (renamed.cao_key, renamed.status, renamed.key_source) == (
+            "merge-runbook",
+            "indexed",
+            "authored",
+        )
+        assert metadata.key == "merge-runbook"
+        assert [(edge.source_key, edge.target_key) for edge in edges] == [
+            (derive_cao_key("Source.md"), "merge-runbook")
+        ]
+
+
+def test_rebuild_ambiguous_legacy_null_claim_preserves_identity_and_reports_once(
+    tmp_path, monkeypatch
+):
+    """Only an unprovable pre-upgrade identity is frozen and reported."""
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    mapped = tmp_path / "vault" / "Mapped"
+    (mapped / "Other.md").write_text(
+        "---\ncao:\n  key: other\n---\nother",
+        encoding="utf-8",
+    )
+    legacy = mapped / "Legacy.md"
+    legacy.write_text(
+        "---\ncao:\n  links:\n    - to: other\n      type: relates_to\n"
+        "      status: active\n---\nlegacy",
+        encoding="utf-8",
+    )
+    reconcile(vault, apply=True, run_id="legacy-seed")
+    with Session() as db:
+        note = db.query(VaultNoteModel).filter_by(vault_relpath="Mapped/Legacy.md").one()
+        metadata = db.query(MemoryMetadataModel).filter_by(file_path="Mapped/Legacy.md").one()
+        old_uid = note.note_uid
+        old_memory_id = metadata.id
+        note.cao_key = "legacy-stable"
+        note.key_source = None
+        note.key_source_reason = None
+        metadata.key = "legacy-stable"
+        db.query(MemoryRelationshipModel).filter_by(origin="vault").update(
+            {"source_key": "legacy-stable"}
+        )
+        db.commit()
+
+    first = reconcile(vault, apply=True, rebuild=True, run_id="legacy-first")
+    with Session() as db:
+        note = db.query(VaultNoteModel).filter_by(vault_relpath="Mapped/Legacy.md").one()
+        metadata = db.query(MemoryMetadataModel).filter_by(file_path="Mapped/Legacy.md").one()
+        edge = db.query(MemoryRelationshipModel).filter_by(origin="vault").one()
+        findings = db.query(VaultFindingModel).filter_by(code="key_provenance_unknown").all()
+        first_state = (
+            note.cao_key,
+            note.note_uid,
+            note.status,
+            note.key_source,
+            note.key_source_reason,
+            metadata.id,
+            metadata.key,
+            edge.source_key,
+            edge.target_key,
+        )
+
+    second = reconcile(vault, apply=True, rebuild=True, run_id="legacy-second")
+    with Session() as db:
+        note = db.query(VaultNoteModel).filter_by(vault_relpath="Mapped/Legacy.md").one()
+        metadata = db.query(MemoryMetadataModel).filter_by(file_path="Mapped/Legacy.md").one()
+        edge = db.query(MemoryRelationshipModel).filter_by(origin="vault").one()
+        second_state = (
+            note.cao_key,
+            note.note_uid,
+            note.status,
+            note.key_source,
+            note.key_source_reason,
+            metadata.id,
+            metadata.key,
+            edge.source_key,
+            edge.target_key,
+        )
+        repeated = db.query(VaultFindingModel).filter_by(code="key_provenance_unknown").count()
+
+    assert (
+        first_state
+        == second_state
+        == (
+            "legacy-stable",
+            old_uid,
+            "indexed",
+            "unknown-legacy",
+            "pre-provenance-upgrade",
+            old_memory_id,
+            "legacy-stable",
+            "legacy-stable",
+            "other",
+        )
+    )
+    assert first.findings == 1
+    assert len(findings) == 1
+    assert "prior_key=legacy-stable" in findings[0].detail
+    assert repeated == 0
+    assert second.findings == 0
+
+    renamed_legacy = legacy.with_name("RenamedLegacy.md")
+    legacy.rename(renamed_legacy)
+    for suffix in ("rename", "ordinary"):
+        report = reconcile(vault, apply=True, run_id=f"legacy-{suffix}")
+        with Session() as db:
+            carried = (
+                db.query(VaultNoteModel).filter_by(vault_relpath="Mapped/RenamedLegacy.md").one()
+            )
+            metadata = (
+                db.query(MemoryMetadataModel).filter_by(file_path="Mapped/RenamedLegacy.md").one()
+            )
+            edge = db.query(MemoryRelationshipModel).filter_by(origin="vault").one()
+        assert (
+            carried.cao_key,
+            carried.note_uid,
+            carried.key_source,
+            carried.key_source_reason,
+            metadata.id,
+            metadata.key,
+            edge.source_key,
+            edge.target_key,
+        ) == (
+            "legacy-stable",
+            old_uid,
+            "unknown-legacy",
+            "pre-provenance-upgrade",
+            old_memory_id,
+            "legacy-stable",
+            "legacy-stable",
+            "other",
+        )
+        assert report.findings == 0
+
+    reconcile(vault, apply=True, rebuild=True, run_id="legacy-renamed-rebuild")
+    with Session() as db:
+        rebuilt = db.query(VaultNoteModel).filter_by(vault_relpath="Mapped/RenamedLegacy.md").one()
+        metadata = (
+            db.query(MemoryMetadataModel).filter_by(file_path="Mapped/RenamedLegacy.md").one()
+        )
+        edge = db.query(MemoryRelationshipModel).filter_by(origin="vault").one()
+    assert (
+        rebuilt.cao_key,
+        rebuilt.note_uid,
+        rebuilt.key_source,
+        rebuilt.key_source_reason,
+        metadata.id,
+        metadata.key,
+        edge.source_key,
+        edge.target_key,
+    ) == (
+        "legacy-stable",
+        old_uid,
+        "unknown-legacy",
+        "pre-provenance-upgrade",
+        old_memory_id,
+        "legacy-stable",
+        "legacy-stable",
+        "other",
+    )
+
+    renamed_legacy.write_text(
+        "---\ncao:\n  key: authored-resolution\n  links:\n    - to: other\n"
+        "      type: relates_to\n      status: active\n---\nlegacy",
+        encoding="utf-8",
+    )
+    reconcile(vault, apply=True, rebuild=True, run_id="legacy-authored")
+    with Session() as db:
+        resolved = db.query(VaultNoteModel).filter_by(vault_relpath="Mapped/RenamedLegacy.md").one()
+        metadata = (
+            db.query(MemoryMetadataModel).filter_by(file_path="Mapped/RenamedLegacy.md").one()
+        )
+        edge = db.query(MemoryRelationshipModel).filter_by(origin="vault").one()
+    assert (resolved.cao_key, resolved.status, resolved.key_source) == (
+        "authored-resolution",
+        "indexed",
+        "authored",
+    )
+    assert (metadata.key, edge.source_key, edge.target_key) == (
+        "authored-resolution",
+        "authored-resolution",
+        "other",
+    )
+
+
+@pytest.mark.parametrize(
+    ("case", "name", "body", "expected_source"),
+    [
+        ("derived", "Derived.md", "derived body", "derived"),
+        (
+            "authored",
+            "Authored.md",
+            "---\ncao:\n  key: authored-key\n---\nauthored body",
+            "authored",
+        ),
+        ("resolver", "Before.md", "rename body", "derived"),
+        ("excluded", "Excluded.md", "excluded body", "derived"),
+    ],
+)
+def test_rebuild_ordinary_legacy_null_note_is_preserved(
+    tmp_path, monkeypatch, case, name, body, expected_source
+):
+    """Ordinary NULL rows upgrade without identity or recall loss."""
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    path = tmp_path / "vault" / "Mapped" / name
+    path.write_text(body, encoding="utf-8")
+    reconcile(vault, apply=True, run_id=f"ordinary-{name}-seed")
+    with Session() as db:
+        prior = db.query(VaultNoteModel).one()
+        expected = (prior.cao_key, prior.note_uid)
+        prior.key_source = None
+        prior.key_source_reason = None
+        if case == "excluded":
+            _exclude_note(db, prior)
+            db.query(MemoryMetadataModel).filter_by(source_kind="vault").delete()
+        db.commit()
+
+    if case == "resolver":
+        renamed_path = path.with_name("After.md")
+        path.rename(renamed_path)
+
+    report = reconcile(vault, apply=True, rebuild=True, run_id=f"ordinary-{name}-rebuild")
+
+    with Session() as db:
+        note = db.query(VaultNoteModel).one()
+        metadata = db.query(MemoryMetadataModel).filter_by(source_kind="vault").one_or_none()
+        unknown = db.query(VaultFindingModel).filter_by(code="key_provenance_unknown").count()
+    if case != "resolver":
+        assert (note.cao_key, note.note_uid) == expected
+    else:
+        assert note.cao_key == derive_cao_key("After.md")
+    assert note.status == ("excluded" if case == "excluded" else "indexed")
+    assert note.key_source == expected_source
+    assert (metadata.key if metadata is not None else None) == (
+        None if case == "excluded" else note.cao_key
+    )
+    assert unknown == 0
+    assert report.findings == (1 if case == "excluded" else 0)
+
+
+def test_tombstone_provenance_survives_vault_note_deletion(tmp_path, monkeypatch):
+    """Direct forget mirrors provenance before projection deletion."""
+    from cli_agent_orchestrator.services.memory_service import MemoryService
+    from cli_agent_orchestrator.services.vault import reconcile as module
+    from cli_agent_orchestrator.services.vault.binding import VaultBinding
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    path = tmp_path / "vault" / "Mapped" / "Forget.md"
+    path.write_text("forget me", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="tombstone-seed")
+    with Session() as db:
+        note = db.query(VaultNoteModel).one()
+        key = note.cao_key
+        assert (note.key_source, note.key_source_reason) == ("derived", None)
+
+    service = MemoryService(base_dir=tmp_path / "native", db_engine=Session.kw["bind"])
+    binding = VaultBinding.from_spec(vault, vault.mappings[0], "project", "project")
+    result = service._deindex_vault_memory(key, binding, vault)
+    assert result.action == "deindexed"
+    with Session() as db:
+        note = db.query(VaultNoteModel).one()
+        exclusion = db.query(VaultExclusionModel).one()
+        assert (exclusion.cao_key, exclusion.key_source, exclusion.key_source_reason) == (
+            key,
+            "derived",
+            None,
+        )
+        db.delete(note)
+        db.commit()
+    with Session() as db:
+        exclusion = db.query(VaultExclusionModel).one()
+        assert (exclusion.cao_key, exclusion.key_source, exclusion.key_source_reason) == (
+            key,
+            "derived",
+            None,
+        )
+
+
+def test_rebuild_preserves_generated_collision_key_source(tmp_path, monkeypatch):
+    """A path-reuse mint survives both rename carry branches and rebuilds."""
+    from cli_agent_orchestrator.services.vault import reconcile as module
+
+    Session = _session(tmp_path, monkeypatch, module)
+    vault = _rename_vault(tmp_path)
+    mapped = tmp_path / "vault" / "Mapped"
+    old_path = mapped / "Original.md"
+    moved_path = mapped / "Moved.md"
+    (mapped / "Target.md").write_text(
+        "---\ncao:\n  key: stable-target\n---\ntarget",
+        encoding="utf-8",
+    )
+    old_path.write_text("forgotten owner", encoding="utf-8")
+    reconcile(vault, apply=True, run_id="generated-seed")
+    with Session() as db:
+        original = db.query(VaultNoteModel).filter_by(vault_relpath="Mapped/Original.md").one()
+        _exclude_note(db, original)
+        db.query(MemoryMetadataModel).filter_by(
+            source_kind="vault", file_path="Mapped/Original.md"
+        ).delete()
+        db.commit()
+
+    old_path.rename(moved_path)
+    old_path.write_text(
+        "---\ncao:\n  links:\n    - to: stable-target\n"
+        "      type: relates_to\n      status: active\n---\nreplacement",
+        encoding="utf-8",
+    )
+
+    def snapshot(relpath):
+        with Session() as db:
+            replacement = db.query(VaultNoteModel).filter_by(vault_relpath=relpath).one()
+            metadata = db.query(MemoryMetadataModel).filter_by(file_path=relpath).one()
+            endpoints = tuple(
+                sorted(
+                    (row.source_key, row.target_key)
+                    for row in db.query(MemoryRelationshipModel)
+                    .filter_by(origin="vault", source_key=replacement.cao_key)
+                    .all()
+                )
+            )
+            return (
+                replacement.cao_key,
+                replacement.note_uid,
+                replacement.status,
+                replacement.key_source,
+                replacement.key_source_reason,
+                metadata.id,
+                metadata.key,
+                endpoints,
+            )
+
+    reconcile(vault, apply=True, rebuild=True, run_id="generated-first")
+    states = [snapshot("Mapped/Original.md")]
+
+    renamed_path = old_path.with_name("Renamed.md")
+    old_path.rename(renamed_path)
+    reconcile(vault, apply=True, run_id="generated-rename")
+    states.append(snapshot("Mapped/Renamed.md"))
+
+    reconcile(vault, apply=True, run_id="generated-ordinary")
+    states.append(snapshot("Mapped/Renamed.md"))
+
+    for suffix in ("rebuilt", "repeated"):
+        reconcile(vault, apply=True, rebuild=True, run_id=f"generated-{suffix}")
+        states.append(snapshot("Mapped/Renamed.md"))
+
+    assert all(state == states[0] for state in states[1:])
+    assert states[0][2:5] == ("indexed", "collision", "path-reuse")
+    assert states[0][-1] == ((states[0][0], "stable-target"),)
 
 
 @pytest.mark.parametrize("moved_name", ["A-Moved.md", "Z-Moved.md"])

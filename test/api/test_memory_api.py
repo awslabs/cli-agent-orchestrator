@@ -9,12 +9,24 @@ import asyncio
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from test.fixtures.vault_factory import build_vault_fixture
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
+from cli_agent_orchestrator.clients.database import Base
 from cli_agent_orchestrator.models.memory import Memory
-from cli_agent_orchestrator.services.memory_service import ForgetResult, MemoryPartialWriteError
+from cli_agent_orchestrator.services import memory_service, settings_service
+from cli_agent_orchestrator.services.memory_service import (
+    ForgetResult,
+    MemoryPartialWriteError,
+    MemoryService,
+)
+from cli_agent_orchestrator.services.vault import reader
+from cli_agent_orchestrator.services.vault import reconcile as reconcile_module
+from cli_agent_orchestrator.services.vault.config import VaultConfig
 from cli_agent_orchestrator.services.vault.status import VaultStatus
 
 MEMORY_BASE = Path("/home/user/.aws/cli-agent-orchestrator/memory")
@@ -64,6 +76,38 @@ def _make_memory(
         updated_at=datetime(2026, 6, 10, 12, 0, 0, tzinfo=timezone.utc),
         content=content,
     )
+
+
+def _real_vault_service(tmp_path: Path, monkeypatch, keys: tuple[str, ...]):
+    """Index real vault notes and return their service and immutable byte snapshots."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'state.db'}")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine)
+    monkeypatch.setattr(reconcile_module, "SessionLocal", session_factory)
+    monkeypatch.setattr(reader, "SessionLocal", session_factory)
+    monkeypatch.setattr(reconcile_module, "_replace_vault_edges", lambda _notes, **_kwargs: None)
+    monkeypatch.setattr(reconcile_module, "_clear_stale_vault_edges", lambda *_args: None)
+    monkeypatch.setattr(reconcile_module, "_emit_audit_events", lambda *_args: None)
+    monkeypatch.setattr(memory_service, "_is_memory_enabled", lambda: True)
+
+    fixture = build_vault_fixture(tmp_path)
+    config = VaultConfig(enabled=True, vaults=[fixture.vault])
+    monkeypatch.setattr(settings_service, "get_vault_config", lambda: config)
+    service = MemoryService(base_dir=tmp_path / "native", db_engine=engine)
+    for key in keys:
+        stored = asyncio.run(
+            service.store(
+                content=f"body for {key}",
+                scope="global",
+                memory_type="reference",
+                key=key,
+            )
+        )
+        assert stored.source_kind == "vault"
+
+    reconcile_module.reconcile(fixture.vault, apply=True, run_id="api-clear-index")
+    note_paths = tuple(fixture.root / "CAO" / f"{key}.md" for key in keys)
+    return service, {path: path.read_bytes() for path in note_paths}
 
 
 @pytest.fixture
@@ -451,6 +495,37 @@ class TestClearMemories:
         assert response.status_code == 200
         assert response.json() == {"success": True, "deleted_count": 2}
         assert mock_service.forget.await_count == 2
+
+    def test_clear_counts_vault_deindexed_results(self, client, tmp_path, monkeypatch):
+        keys = ("api-alpha", "api-beta")
+        service, note_bytes = _real_vault_service(tmp_path, monkeypatch, keys)
+        before = asyncio.run(service.recall(scope="global", limit=1000))
+
+        with patch(FACTORY_TARGET, return_value=service):
+            response = client.delete("/memory?scope=global")
+
+        after = asyncio.run(service.recall(scope="global", limit=1000))
+        assert response.status_code == 200
+        assert {memory.key for memory in before} == set(keys)
+        assert response.json() == {"success": True, "deleted_count": 2}
+        assert after == []
+        assert all(path.read_bytes() == content for path, content in note_bytes.items())
+
+    def test_clear_counts_each_success_action_once(self, client, mock_service):
+        mock_service.recall.return_value = [_make_memory(key=f"m{index}") for index in range(5)]
+        mock_service.forget.side_effect = [
+            ForgetResult("deleted", "native", "global/m0.md"),
+            ForgetResult("deindexed", "vault", "CAO/m1.md"),
+            ForgetResult("deleted_and_deindexed", "both", "CAO/m2.md"),
+            ForgetResult("absent", "native", None),
+            RuntimeError("induced failure"),
+        ]
+
+        response = client.delete("/memory?scope=global")
+
+        assert response.status_code == 200
+        assert response.json() == {"success": True, "deleted_count": 3}
+        assert mock_service.forget.await_count == 5
 
     def test_clear_requires_scope(self, client, mock_service):
         assert client.delete("/memory").status_code == 422

@@ -77,24 +77,34 @@ def test_reviewed_vault_files_own_every_nonempty_read_sink_set():
     recall through its chokepoint, ``writer.py`` reads an existing managed note
     under its lock for conflict checks and frontmatter preservation, and
     ``migrate.py`` reads native memories under ``MEMORY_BASE_DIR`` only, never
-    a vault note.
+    a vault note. The sole reviewed exception is
+    ``vault_lock._open_registered_fd`` opening its CAO-owned hashed lock path
+    with caller-supplied write/create flags; it does not read vault-note bytes.
     """
     vault_root = SOURCE_ROOT / "services" / "vault"
     entitled = {"scan.py", "reader.py", "writer.py", "migrate.py"}
     sinks: list[str] = []
+    reviewed_lock_opens: list[str] = []
     violations: list[str] = []
 
     for path in vault_root.glob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        parents = {
+            child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)
+        }
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call) or not _is_read_sink(node):
                 continue
             location = f"{path.name}:{node.lineno}"
             sinks.append(location)
+            if path.name == "vault_lock.py" and _is_reviewed_lock_file_open(node, parents):
+                reviewed_lock_opens.append("vault_lock.py:_open_registered_fd")
+                continue
             if path.name not in entitled:
                 violations.append(location)
 
     assert sinks, "vault read-sink matcher must find reviewed reads"
+    assert reviewed_lock_opens == ["vault_lock.py:_open_registered_fd"]
     assert violations == []
 
 
@@ -378,6 +388,61 @@ def _is_read_sink(node: ast.Call) -> bool:
         and isinstance(mode.value, str)
         and any(flag in mode.value for flag in ("w", "a", "x", "+"))
     )
+
+
+def _is_reviewed_lock_file_open(
+    node: ast.Call,
+    parents: dict[ast.AST, ast.AST],
+) -> bool:
+    """Recognise only the reviewed CAO lock-file os.open wrapper."""
+    if not (
+        isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "os"
+        and node.func.attr == "open"
+        and len(node.args) == 3
+        and isinstance(node.args[0], ast.Call)
+        and isinstance(node.args[0].func, ast.Name)
+        and node.args[0].func.id == "str"
+        and node.args[0].args
+        and isinstance(node.args[0].args[0], ast.Name)
+        and node.args[0].args[0].id == "lock_path"
+        and isinstance(node.args[1], ast.Name)
+        and node.args[1].id == "flags"
+        and isinstance(node.args[2], ast.Constant)
+        and node.args[2].value == 0o600
+    ):
+        return False
+    parent: ast.AST = node
+    while parent in parents and not isinstance(
+        parent,
+        (ast.FunctionDef, ast.AsyncFunctionDef),
+    ):
+        parent = parents[parent]
+    return getattr(parent, "name", None) == "_open_registered_fd"
+
+
+def test_reviewed_lock_file_open_requires_exact_private_mode() -> None:
+    cases = (
+        ("os.open(str(lock_path), flags, 0o600)", True),
+        ("os.open(str(lock_path), flags, 0o777)", False),
+        ("os.open(str(lock_path), flags)", False),
+    )
+
+    for call, expected in cases:
+        tree = ast.parse(f"def _open_registered_fd():\n    {call}\n")
+        parents = {
+            child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)
+        }
+        node = next(
+            candidate
+            for candidate in ast.walk(tree)
+            if isinstance(candidate, ast.Call)
+            and isinstance(candidate.func, ast.Attribute)
+            and candidate.func.attr == "open"
+        )
+
+        assert _is_reviewed_lock_file_open(node, parents) is expected
 
 
 def _call_argument(node: ast.Call, keyword: str, index: int) -> ast.expr | None:

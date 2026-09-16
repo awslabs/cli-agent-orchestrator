@@ -5,6 +5,12 @@ from test.fixtures.vault_factory import build_vault_fixture
 
 import pytest
 
+from cli_agent_orchestrator.services.vault import boundary
+from cli_agent_orchestrator.services.vault.boundary import (
+    is_excluded_relpath,
+    normalize_relpath,
+    relpath_within_folder,
+)
 from cli_agent_orchestrator.services.vault.config import FolderMapping, VaultSpec
 from cli_agent_orchestrator.services.vault.findings import FindingCode
 from cli_agent_orchestrator.services.vault.scan import (
@@ -13,6 +19,68 @@ from cli_agent_orchestrator.services.vault.scan import (
     SCAN_NOTE_LIMIT_EXCEEDED,
     scan_vault,
 )
+
+
+def test_canonical_boundary_helpers_normalize_and_match_components() -> None:
+    assert normalize_relpath("Mapped\\Cafe\u0301\\Note.md") == "Mapped/Café/Note.md"
+    assert relpath_within_folder("Mapped_2/Note.md", "Mapped_2")
+    assert not relpath_within_folder("Mapped_20/Note.md", "Mapped_2")
+    assert is_excluded_relpath("MAPPED/PRIVATE/Note.md", ("mapped/private/**",))
+    assert is_excluded_relpath("Mapped/Café/Note.md", ("Mapped/Cafe\u0301/**",))
+    assert is_excluded_relpath("Mapped/Cafe\u0301/Note.md", ("Mapped/Café/**",))
+    assert is_excluded_relpath("Mapped/Private/Note.md", ("mapped\\private\\**",))
+    assert is_excluded_relpath("Mapped/.OBSIDIAN/State.md", ())
+    assert boundary.is_supported_relpath("Mapped/Café/Note.md")
+    assert not boundary.is_supported_relpath("Mapped/\\weird.md")
+
+
+@pytest.mark.parametrize("relpath", ("", "/absolute.md", ".", "..", "Mapped/../Note.md"))
+def test_canonical_boundary_rejects_non_relative_component_paths(relpath: str) -> None:
+    with pytest.raises(ValueError) as raised:
+        normalize_relpath(relpath)
+    assert str(raised.value) == "path must be a non-empty relative component path"
+    if relpath:
+        assert relpath not in str(raised.value)
+
+
+def test_scan_refuses_unsupported_file_and_indexes_healthy_sibling(tmp_path) -> None:
+    root = tmp_path / "vault"
+    root.mkdir()
+    (root / "CAO").mkdir()
+    mapped = root / "Mapped"
+    mapped.mkdir()
+    (mapped / "\\weird.md").write_text("refused", encoding="utf-8")
+    (mapped / "Healthy.md").write_text("healthy", encoding="utf-8")
+
+    by_path = {note.vault_relpath: note for note in scan_vault(_global_vault(root)).notes}
+
+    refused = by_path["Mapped/\\weird.md"]
+    assert refused.status == "skipped"
+    assert refused.text is None
+    assert len(refused.findings) == 1
+    assert refused.findings[0].code == FindingCode.PATH_ESCAPES_ROOT
+    assert refused.findings[0].detail == "path is not a supported relative component path"
+    assert refused.findings[0].severity == "warn"
+    assert by_path["Mapped/Healthy.md"].status == "indexed"
+
+
+def test_scan_prunes_unsupported_directory_and_indexes_healthy_sibling(tmp_path) -> None:
+    root = tmp_path / "vault"
+    root.mkdir()
+    (root / "CAO").mkdir()
+    mapped = root / "Mapped"
+    mapped.mkdir()
+    refused_dir = mapped / "\\refused"
+    refused_dir.mkdir()
+    (refused_dir / "Inner.md").write_text("must not be scanned", encoding="utf-8")
+    (mapped / "Healthy.md").write_text("healthy", encoding="utf-8")
+
+    by_path = {note.vault_relpath: note for note in scan_vault(_global_vault(root)).notes}
+
+    assert set(by_path) == {"Mapped/\\refused", "Mapped/Healthy.md"}
+    assert by_path["Mapped/\\refused"].status == "skipped"
+    assert by_path["Mapped/\\refused"].findings[0].code == FindingCode.PATH_ESCAPES_ROOT
+    assert by_path["Mapped/Healthy.md"].status == "indexed"
 
 
 def test_factory_refuses_nonempty_root_and_creates_realistic_names(tmp_path):
@@ -333,4 +401,13 @@ def _vault(root: Path, *, max_note_bytes: int = 4096) -> VaultSpec:
             ),
             FolderMapping(folder="CAO", scope="global", writable=True),
         ],
+    )
+
+
+def _global_vault(root: Path) -> VaultSpec:
+    return VaultSpec(
+        id="scan-global-test",
+        root=str(root),
+        managed_folder="Mapped",
+        mappings=[FolderMapping(folder="Mapped", scope="global", writable=True)],
     )

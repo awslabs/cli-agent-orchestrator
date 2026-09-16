@@ -702,6 +702,25 @@ def test_warn_mode_vault_secret_is_redacted_only_for_automatic_injection(tmp_pat
     assert secret_value in recalled.content
 
 
+def test_automatic_injection_applies_new_exclude_without_reconcile(tmp_path, monkeypatch):
+    """The live config boundary revokes an indexed note on the next injection."""
+    from test.services.vault.test_vault_injection_renderer import _injectable_renderer
+
+    from cli_agent_orchestrator.services import settings_service
+    from cli_agent_orchestrator.services.vault.config import VaultConfig
+
+    service, _Session, _vault_root, config = _injectable_renderer(tmp_path, monkeypatch)
+    assert "- [project] design: Design" in service.get_memory_context_for_terminal("worker")
+    vault = config.vaults[0].model_copy(update={"exclude": ["Projects/CAO Design/Design.md"]})
+    current_config = VaultConfig(enabled=True, vaults=[vault])
+    monkeypatch.setattr(settings_service, "get_vault_config", lambda: current_config)
+
+    block = service.get_memory_context_for_terminal("worker")
+
+    assert "design" not in block
+    assert "Design" not in block
+
+
 def test_post_reconcile_secret_drift_is_redacted_from_automatic_injection(tmp_path, monkeypatch):
     """Read-time redaction also covers credentials introduced after indexing."""
     from test.services.vault.test_vault_injection_renderer import (

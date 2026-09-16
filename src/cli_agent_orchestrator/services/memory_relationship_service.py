@@ -26,6 +26,7 @@ Fail-closed: every validation raises ``ValueError`` BEFORE any DB write.
 import json
 import logging
 import uuid
+from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -66,6 +67,15 @@ MAX_ATTRIBUTES_BYTES = 2048
 # The content-free audit event for relationship mutations (NFR-1.7). MUST be
 # registered in NOWAIT_AUDIT_EVENTS or audit_log drops it silently.
 AUDIT_EVENT = "relationship_mutation"
+EdgeIdentity = tuple[str, str, str, str, str, str]
+
+
+class EdgeSnapshotDriftError(ValueError):
+    """Content-free failure for an immutable edge snapshot mismatch."""
+
+    def __init__(self, reasons: dict[str, str]):
+        self.reasons = dict(reasons)
+        super().__init__(f"relationship edge snapshot drift: {self.reasons}")
 
 
 @dataclass
@@ -786,6 +796,155 @@ class MemoryRelationshipService:
             db.refresh(row)
             self._audit("patch", row)
             return self._to_dto(row)
+
+    def preflight_edge_identities(
+        self,
+        expect: Mapping[str, EdgeIdentity],
+        *,
+        require_status: Optional[str] = None,
+        db: Any = None,
+    ) -> dict[str, str]:
+        """Return content-free drift reasons for an exact immutable edge set."""
+        if require_status is not None:
+            self._validate_status(require_status)
+        owns_session = db is None
+        session = SessionLocal() if owns_session else db
+        try:
+            rows = (
+                session.query(MemoryRelationshipModel)
+                .filter(MemoryRelationshipModel.id.in_(tuple(expect)))
+                .all()
+                if expect
+                else []
+            )
+            by_id = {cast(str, row.id): row for row in rows}
+            reasons: dict[str, str] = {}
+            for edge_id, identity in expect.items():
+                row = by_id.get(edge_id)
+                if row is None:
+                    reasons[edge_id] = "edge_missing"
+                    continue
+                actual: EdgeIdentity = (
+                    cast(str, row.scope),
+                    cast(str, row.scope_id),
+                    cast(str, row.source_key),
+                    cast(str, row.target_key),
+                    cast(str, row.type),
+                    cast(str, row.origin),
+                )
+                if actual != identity:
+                    reasons[edge_id] = "edge_identity_drift"
+                elif require_status is not None and row.status != require_status:
+                    reasons[edge_id] = "edge_status_drift"
+            return reasons
+        finally:
+            if owns_session:
+                session.close()
+
+    def restore_statuses(
+        self,
+        restore: Mapping[str, str],
+        *,
+        expect: Mapping[str, EdgeIdentity],
+        require_status: str = "superseded",
+        db: Any = None,
+        audit_sink: Optional[List[Callable[[], None]]] = None,
+    ) -> int:
+        """Restore an exact receipt-owned edge set, atomically or not at all."""
+        if set(restore) != set(expect):
+            raise ValueError("restore and edge snapshot ids must match")
+        for status in restore.values():
+            self._validate_status(status)
+        self._validate_status(require_status)
+        owns_session = db is None
+        session = SessionLocal() if owns_session else db
+        deferred: List[Callable[[], None]] = []
+        try:
+            reasons = self.preflight_edge_identities(
+                expect,
+                require_status=require_status,
+                db=session,
+            )
+            if reasons:
+                raise EdgeSnapshotDriftError(reasons)
+            rows = (
+                session.query(MemoryRelationshipModel)
+                .filter(MemoryRelationshipModel.id.in_(tuple(restore)))
+                .all()
+                if restore
+                else []
+            )
+            for row in rows:
+                edge_id = cast(str, row.id)
+                row.status = restore[edge_id]
+                row.updated_at = _utcnow()
+                deferred.append(partial(self._audit, "migration_restore", row))
+            if owns_session:
+                session.commit()
+                for emit in deferred:
+                    emit()
+            elif audit_sink is not None:
+                audit_sink.extend(deferred)
+            return len(rows)
+        except Exception:
+            if owns_session:
+                session.rollback()
+            raise
+        finally:
+            if owns_session:
+                session.close()
+
+    def supersede_ids(
+        self,
+        ids: Sequence[str],
+        *,
+        expect: Mapping[str, EdgeIdentity],
+        db: Any = None,
+        audit_sink: Optional[List[Callable[[], None]]] = None,
+    ) -> dict[str, str]:
+        """Supersede exactly one captured migration prefix and return prior statuses."""
+        edge_ids = tuple(ids)
+        if len(edge_ids) > MAX_EDGES_PER_MUTATION:
+            raise ValueError(f"supersede_ids exceeds {MAX_EDGES_PER_MUTATION} edges")
+        if len(set(edge_ids)) != len(edge_ids):
+            raise ValueError("supersede_ids contains a duplicate edge id")
+        if set(edge_ids) != set(expect):
+            raise ValueError("supersede ids and edge snapshot ids must match")
+        owns_session = db is None
+        session = SessionLocal() if owns_session else db
+        deferred: List[Callable[[], None]] = []
+        try:
+            reasons = self.preflight_edge_identities(expect, db=session)
+            if reasons:
+                raise EdgeSnapshotDriftError(reasons)
+            rows = (
+                session.query(MemoryRelationshipModel)
+                .filter(MemoryRelationshipModel.id.in_(edge_ids))
+                .all()
+                if edge_ids
+                else []
+            )
+            prior_statuses = {cast(str, row.id): cast(str, row.status) for row in rows}
+            for status in prior_statuses.values():
+                self._validate_status(status)
+            for row in rows:
+                row.status = "superseded"
+                row.updated_at = _utcnow()
+                deferred.append(partial(self._audit, "migration_supersede", row))
+            if owns_session:
+                session.commit()
+                for emit in deferred:
+                    emit()
+            elif audit_sink is not None:
+                audit_sink.extend(deferred)
+            return prior_statuses
+        except Exception:
+            if owns_session:
+                session.rollback()
+            raise
+        finally:
+            if owns_session:
+                session.close()
 
     def promote(self, id: str) -> RelationshipDTO:
         """proposal -> active (FR-2.2)."""

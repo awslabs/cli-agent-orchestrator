@@ -117,6 +117,79 @@ def test_wikilink_extraction_preserves_embed_flag_and_raw_target():
     assert result.findings == ()
 
 
+def test_extract_relative_inline_markdown_md_link_ignores_label_fragment_and_code():
+    result = extract_wikilinks(
+        "See [a label that is not identity](Sub/Target.md#Section).\n"
+        "```markdown\n[Fenced](Hidden.md)\n```\n"
+        "and `[Inline](Also-Hidden.md)`."
+    )
+
+    assert result.links == ((False, "Sub/Target.md#Section"),)
+    assert result.relative_paths == (True,)
+    assert result.findings == ()
+
+
+@pytest.mark.parametrize(
+    "markdown",
+    [
+        "[absolute](/Target.md)",
+        "[parent escape](../Target.md)",
+        "[nested parent escape](Sub/../../Target.md)",
+        "[http](http://example.com/Target.md)",
+        "[https](https://example.com/Target.md)",
+        "[non-Markdown](Target.txt)",
+        "[scheme](custom:Target.md)",
+        r"\[escaped](Target.md)",
+        r"[escaped destination]\(Target.md)",
+        r"[escaped path](Sub/Target\.md)",
+    ],
+)
+def test_inline_markdown_extraction_refuses_unsupported_destinations(markdown):
+    assert extract_wikilinks(markdown).links == ()
+
+
+def test_relative_inline_resolution_requires_source_and_matches_exact_source_relative_path():
+    candidates = (
+        LinkCandidate(
+            "root-lookalike",
+            "Mapped/Sub/Target.md",
+            aliases=("Mapped/Nested/Sub/Target.md",),
+        ),
+        LinkCandidate("nested-target", "Mapped/Nested/Sub/Target.md"),
+    )
+
+    without_source = resolve_wikilink(
+        "Sub/Target.md",
+        embed=False,
+        candidates=candidates,
+        relative_path=True,
+    )
+    nested = resolve_wikilink(
+        "Sub/Target.md#Section",
+        embed=False,
+        candidates=candidates,
+        relative_path=True,
+        source_relpath="Mapped/Nested/Source.md",
+    )
+
+    assert without_source.outcome == "unsupported"
+    assert without_source.finding_code == FindingCode.LINK_TARGET_INVALID
+    assert nested.outcome == "resolved"
+    assert nested.target_key == "nested-target"
+    assert nested.attributes == {"fragment": "Section"}
+
+
+def test_qualified_wikilink_does_not_gain_relative_suffix_matching():
+    result = resolve_wikilink(
+        "Sub/Target",
+        embed=False,
+        candidates=(LinkCandidate("lookalike", "Mapped/Sub/Target.md"),),
+    )
+
+    assert result.outcome == "dangling"
+    assert result.finding_code == FindingCode.LINK_DANGLING
+
+
 def test_matching_dotted_note_title_is_not_an_attachment():
     result = resolve_wikilink(
         "Node.js Notes",

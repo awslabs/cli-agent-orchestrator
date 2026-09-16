@@ -99,6 +99,9 @@ def test_fresh_database_has_vault_schema_and_secondary_indexes(isolated_db):
     with sqlite3.connect(db_path) as conn:
         columns = {row[1]: row for row in conn.execute("PRAGMA table_info(memory_metadata)")}
         vault_note_columns = {row[1]: row for row in conn.execute("PRAGMA table_info(vault_note)")}
+        vault_exclusion_columns = {
+            row[1]: row for row in conn.execute("PRAGMA table_info(vault_exclusion)")
+        }
         tables = {
             row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
@@ -106,6 +109,10 @@ def test_fresh_database_has_vault_schema_and_secondary_indexes(isolated_db):
     assert columns["source_kind"][4] == "'native'"
     assert vault_note_columns["scope"][3] == 1
     assert vault_note_columns["scope_id"][3] == 1
+    assert vault_note_columns["key_source"][3] == 0
+    assert vault_note_columns["key_source_reason"][3] == 0
+    assert vault_exclusion_columns["key_source"][3] == 0
+    assert vault_exclusion_columns["key_source_reason"][3] == 0
     assert {"vault_note", "vault_finding", "vault_note_alias"} <= tables
     assert _secondary_indexes(db_path) == {
         "idx_memory_scope",
@@ -294,6 +301,8 @@ def test_vault_exclusion_migration_backfills_excluded_notes_idempotently(isolate
                 managed=False,
                 content_sha256="abc123",
                 status="excluded",
+                key_source="collision",
+                key_source_reason="path-reuse",
             )
         )
         session.commit()
@@ -313,6 +322,8 @@ def test_vault_exclusion_migration_backfills_excluded_notes_idempotently(isolate
         "cao_key",
         "last_known_relpath",
         "content_sha256",
+        "key_source",
+        "key_source_reason",
         "created_at",
     }
     assert [
@@ -323,6 +334,8 @@ def test_vault_exclusion_migration_backfills_excluded_notes_idempotently(isolate
             row.cao_key,
             row.last_known_relpath,
             row.content_sha256,
+            row.key_source,
+            row.key_source_reason,
         )
         for row in rows
     ] == [
@@ -333,8 +346,189 @@ def test_vault_exclusion_migration_backfills_excluded_notes_idempotently(isolate
             "private-plan",
             "Projects/Private.md",
             "abc123",
+            "collision",
+            "path-reuse",
         )
     ]
+
+
+def test_vault_exclusion_helper_fallback_ddl_has_nullable_provenance_columns(isolated_db):
+    db_path, _ = isolated_db
+
+    db_mod._migrate_vault_exclusions()
+
+    with sqlite3.connect(db_path) as conn:
+        columns = {row[1]: row for row in conn.execute("PRAGMA table_info(vault_exclusion)")}
+
+    assert set(columns) == {
+        "vault_id",
+        "scope",
+        "scope_id",
+        "cao_key",
+        "last_known_relpath",
+        "content_sha256",
+        "key_source",
+        "key_source_reason",
+        "created_at",
+    }
+    assert columns["key_source"][3] == 0
+    assert columns["key_source_reason"][3] == 0
+
+
+def test_fresh_database_has_exact_vault_migration_receipt_schema(isolated_db):
+    db_path, engine = isolated_db
+
+    db_mod.init_db()
+
+    with sqlite3.connect(db_path) as conn:
+        columns = {
+            row[1]: row for row in conn.execute("PRAGMA table_info(vault_migration_receipt)")
+        }
+        tables = {
+            row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+
+    assert "vault_migration_receipt" in tables
+    assert set(columns) == {
+        "receipt_id",
+        "scope",
+        "scope_id",
+        "cao_key",
+        "native_relpath",
+        "native_snapshot_sha256",
+        "vault_id",
+        "managed_relpath",
+        "vault_note_uid",
+        "published_content_sha256",
+        "superseded_edges",
+        "status",
+        "created_at",
+    }
+    assert columns["receipt_id"][5] == 1
+    assert columns["scope_id"][3] == 1
+    assert columns["scope_id"][4] == "''"
+    assert columns["status"][3] == 1
+
+    with sessionmaker(bind=engine)() as session:
+        session.add(
+            db_mod.VaultMigrationReceiptModel(
+                receipt_id="receipt",
+                scope="global",
+                scope_id=VAULT_NOTE_SCOPE_ID_SENTINEL,
+                cao_key="migrated",
+                native_relpath="global/wiki/global/migrated.md",
+                native_snapshot_sha256="a" * 64,
+                vault_id="primary",
+                managed_relpath="CAO/migrated.md",
+                vault_note_uid="note",
+                published_content_sha256="b" * 64,
+                superseded_edges="[]",
+                status="active",
+            )
+        )
+        session.commit()
+
+
+def test_legacy_database_adds_vault_migration_receipt_idempotently(isolated_db):
+    db_path, _ = isolated_db
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE unrelated_legacy_state (id TEXT PRIMARY KEY)")
+
+    db_mod.init_db()
+    db_mod.init_db()
+
+    with sqlite3.connect(db_path) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(vault_migration_receipt)")}
+        unrelated = conn.execute(
+            "SELECT sql FROM sqlite_master " "WHERE type='table' AND name='unrelated_legacy_state'"
+        ).fetchone()
+
+    assert columns == {
+        "receipt_id",
+        "scope",
+        "scope_id",
+        "cao_key",
+        "native_relpath",
+        "native_snapshot_sha256",
+        "vault_id",
+        "managed_relpath",
+        "vault_note_uid",
+        "published_content_sha256",
+        "superseded_edges",
+        "status",
+        "created_at",
+    }
+    assert unrelated is not None
+
+
+def test_legacy_vault_provenance_columns_are_nullable_lossless_and_idempotent(isolated_db):
+    db_path, _ = isolated_db
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("""
+            CREATE TABLE vault_note (
+                note_uid VARCHAR NOT NULL PRIMARY KEY,
+                vault_id VARCHAR NOT NULL,
+                scope VARCHAR NOT NULL,
+                scope_id VARCHAR NOT NULL DEFAULT '',
+                cao_key VARCHAR NOT NULL,
+                vault_relpath VARCHAR NOT NULL,
+                managed BOOLEAN NOT NULL,
+                content_sha256 VARCHAR,
+                frontmatter_sha256 VARCHAR,
+                size_bytes INTEGER,
+                mtime_ns INTEGER,
+                status VARCHAR NOT NULL,
+                last_reconciled_at DATETIME
+            )
+            """)
+        conn.execute("""
+            CREATE TABLE vault_exclusion (
+                vault_id VARCHAR NOT NULL,
+                scope VARCHAR NOT NULL,
+                scope_id VARCHAR NOT NULL DEFAULT '',
+                cao_key VARCHAR NOT NULL,
+                last_known_relpath VARCHAR NOT NULL,
+                content_sha256 VARCHAR,
+                created_at DATETIME NOT NULL,
+                key_source VARCHAR,
+                PRIMARY KEY (vault_id, scope, scope_id, cao_key)
+            )
+            """)
+        conn.execute(
+            "INSERT INTO vault_note "
+            "(note_uid, vault_id, scope, scope_id, cao_key, vault_relpath, managed, status) "
+            "VALUES ('legacy-note', 'vault', 'global', '', 'legacy', 'Mapped/Legacy.md', 0, "
+            "'indexed')"
+        )
+        conn.execute(
+            "INSERT INTO vault_exclusion "
+            "(vault_id, scope, scope_id, cao_key, last_known_relpath, created_at) "
+            "VALUES ('vault', 'global', '', 'forgotten', 'Mapped/Forgotten.md', "
+            "CURRENT_TIMESTAMP)"
+        )
+
+    db_mod.init_db()
+    db_mod.init_db()
+
+    with sqlite3.connect(db_path) as conn:
+        note_columns = {row[1]: row for row in conn.execute("PRAGMA table_info(vault_note)")}
+        exclusion_columns = {
+            row[1]: row for row in conn.execute("PRAGMA table_info(vault_exclusion)")
+        }
+        note = conn.execute(
+            "SELECT note_uid, cao_key, status, key_source, key_source_reason FROM vault_note"
+        ).fetchone()
+        exclusion = conn.execute(
+            "SELECT cao_key, last_known_relpath, key_source, key_source_reason "
+            "FROM vault_exclusion"
+        ).fetchone()
+
+    assert note_columns["key_source"][3:] == (0, None, 0)
+    assert note_columns["key_source_reason"][3:] == (0, None, 0)
+    assert exclusion_columns["key_source"][3:] == (0, None, 0)
+    assert exclusion_columns["key_source_reason"][3:] == (0, None, 0)
+    assert note == ("legacy-note", "legacy", "indexed", None, None)
+    assert exclusion == ("forgotten", "Mapped/Forgotten.md", None, None)
 
 
 def test_source_kind_migration_failure_propagates(isolated_db):

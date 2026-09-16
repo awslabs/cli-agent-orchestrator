@@ -8,7 +8,7 @@ import os
 import stat
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Iterable, Iterator, Literal, Optional, Sequence
+from typing import Iterable, Iterator, Literal, Optional, Sequence, cast
 
 from sqlalchemy import and_, func
 
@@ -22,6 +22,11 @@ from cli_agent_orchestrator.clients.database import (
 from cli_agent_orchestrator.models.memory import Memory
 from cli_agent_orchestrator.services.memory_format import normalize_memory_tags
 from cli_agent_orchestrator.services.vault.binding import VaultBinding
+from cli_agent_orchestrator.services.vault.boundary import (
+    is_excluded_relpath,
+    normalize_relpath,
+    relpath_within_folder,
+)
 from cli_agent_orchestrator.services.vault.config import MAX_FRONTMATTER_BYTES_LIMIT
 from cli_agent_orchestrator.services.vault.parser import split_frontmatter
 
@@ -188,9 +193,18 @@ def resolve_candidates(
             if not key_list:
                 return _resolution(policy, (), "empty_keys")
             query = query.filter(MemoryMetadataModel.key.in_(key_list))
-        rows = query.order_by(MemoryMetadataModel.updated_at.desc(), MemoryMetadataModel.key).all()
-        if not rows:
+        queried_rows = query.order_by(
+            MemoryMetadataModel.updated_at.desc(), MemoryMetadataModel.key
+        ).all()
+        if not queried_rows:
             return _resolution(policy, (), "no_rows")
+        rows = [
+            (cast(MemoryMetadataModel, metadata), cast(VaultNoteModel, note))
+            for metadata, note in queried_rows
+            if _binding_allows_relpath(binding, cast(str, note.vault_relpath))
+        ]
+        if not rows:
+            return _resolution(policy, (), "config_boundary_filtered")
         candidates = tuple(
             VaultCandidate(
                 binding=binding,
@@ -295,14 +309,25 @@ def load_candidate(
     confinement check. Stale notes are served with ``index_freshness="stale"``
     in ordinary recall; release one has no watcher or implicit reconcile.
     """
-    if require_injectable and not candidate.binding.inject:
+    binding = candidate.binding
+    if not binding.index or (require_injectable and not binding.inject):
         return None
-    relative_path = candidate.metadata.file_path
-    root = os.path.realpath(candidate.binding.root)
-    path = os.path.join(root, relative_path)
-    real_path = os.path.realpath(path)
+    if not _candidate_matches_binding_scope(candidate):
+        _record_config_boundary_filtered(candidate)
+        return None
     try:
-        fd, expected = _open_confined_fd(root, real_path)
+        metadata_relpath = normalize_relpath(cast(str, candidate.metadata.file_path))
+        note_relpath = normalize_relpath(cast(str, candidate.note.vault_relpath))
+    except (AttributeError, TypeError, ValueError):
+        _record_config_boundary_filtered(candidate)
+        return None
+    if metadata_relpath != note_relpath or not _binding_allows_relpath(binding, note_relpath):
+        _record_config_boundary_filtered(candidate)
+        return None
+    root = os.path.realpath(binding.root)
+    path = os.path.join(root, note_relpath)
+    try:
+        fd, expected = _open_confined_fd(root, path)
     except ValueError as exc:
         arm = "eloop" if str(exc) == "symlink escapes vault root" else "lexical"
         logger.warning("vault recall containment refusal arm=%s", arm)
@@ -427,19 +452,13 @@ def _stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
     )
 
 
-def _open_confined_fd(root: str, real_path: str) -> tuple[int, os.stat_result]:
-    """Traverse a guarded resolved path from a held root fd.
-
-    This intentionally changes read-time behavior: a symlinked-but-internal
-    component resolves before traversal and succeeds. Scan refuses such
-    components, so an indexed note cannot normally take that path. A component
-    swapped after resolution still fails closed via ``O_NOFOLLOW``.
-    """
-    if not real_path.startswith(root + os.sep):
+def _open_confined_fd(root: str, lexical_path: str) -> tuple[int, os.stat_result]:
+    """Traverse an indexed lexical path from a held root fd without following links."""
+    if not lexical_path.startswith(root + os.sep):
         raise ValueError("path escapes vault root")
     # CAO config accepts POSIX absolute roots only; U1 rejects Windows roots,
     # where ``realpath`` may preserve a trailing separator.
-    segments = real_path[len(root) + 1 :].split(os.sep)
+    segments = lexical_path[len(root) + 1 :].split(os.sep)
     directory_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY
     try:
         root_fd = os.open(root, directory_flags)
@@ -496,3 +515,33 @@ def _raise_if_symlink_error(error: OSError, segment: str, parent_fd: int | None)
 def _record_path_escape(candidate: VaultCandidate) -> None:
     """Make recall-side containment refusals visible without exposing paths."""
     increment_counter(candidate.binding.vault_id, "path_escapes_root", 1)
+
+
+def _binding_allows_relpath(binding: VaultBinding, relpath: str) -> bool:
+    """Apply current mapping authority without assigning a row to another mapping."""
+    try:
+        normalized = normalize_relpath(relpath)
+        return relpath_within_folder(
+            normalized, binding.mapping.folder
+        ) and not is_excluded_relpath(normalized, binding.exclude)
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+def _candidate_matches_binding_scope(candidate: VaultCandidate) -> bool:
+    """Require the indexed rows to retain the binding's current scope identity."""
+    binding = candidate.binding
+    metadata = candidate.metadata
+    note = candidate.note
+    return (
+        cast(str, metadata.scope) == binding.scope
+        and cast(Optional[str], metadata.scope_id) == binding.scope_id
+        and cast(str, note.scope) == binding.scope
+        and (cast(Optional[str], note.scope_id) or None) == binding.scope_id
+    )
+
+
+def _record_config_boundary_filtered(candidate: VaultCandidate) -> None:
+    """Expose a content-free read-side configuration refusal."""
+    logger.warning("vault recall configuration refusal arm=config_boundary_filtered")
+    increment_counter(candidate.binding.vault_id, "config_boundary_filtered", 1)

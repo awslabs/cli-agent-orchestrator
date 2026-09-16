@@ -16,6 +16,7 @@ from cli_agent_orchestrator.clients.database import (
 from cli_agent_orchestrator.services.vault.config import (
     FolderMapping,
     VaultConfig,
+    VaultSpec,
 )
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,27 @@ class VaultBinding:
     vault_id: str
     root: str
     mapping: FolderMapping
+    managed_folder: str = ""
+    exclude: tuple[str, ...] = ()
+
+    @classmethod
+    def from_spec(
+        cls,
+        vault: VaultSpec,
+        mapping: FolderMapping,
+        scope: str,
+        scope_id: Optional[str],
+    ) -> "VaultBinding":
+        """Snapshot the live vault and mapping policy needed by consumers."""
+        return cls(
+            scope=scope,
+            scope_id=scope_id,
+            vault_id=vault.id,
+            root=vault.root,
+            mapping=mapping,
+            managed_folder=vault.managed_folder,
+            exclude=tuple(vault.exclude),
+        )
 
     @property
     def index(self) -> bool:
@@ -100,12 +122,11 @@ def resolve(
                 canonical_mapping_scope_id,
                 canonical_scope_id,
             ):
-                return VaultBinding(
-                    scope=scope,
-                    scope_id=canonical_mapping_scope_id,
-                    vault_id=vault.id,
-                    root=vault.root,
-                    mapping=mapping,
+                return VaultBinding.from_spec(
+                    vault,
+                    mapping,
+                    scope,
+                    canonical_mapping_scope_id,
                 )
     return NativeBinding(scope=scope, scope_id=canonical_scope_id)
 

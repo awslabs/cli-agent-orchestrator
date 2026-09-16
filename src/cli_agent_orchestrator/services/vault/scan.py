@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fnmatch
 import hashlib
 import os
 import stat
@@ -14,8 +13,11 @@ from typing import Optional
 from cli_agent_orchestrator.services.memory_reconciliation import (
     _first_symlink_component,
 )
+from cli_agent_orchestrator.services.vault.boundary import (
+    is_excluded_relpath,
+    is_supported_relpath,
+)
 from cli_agent_orchestrator.services.vault.config import (
-    ALWAYS_EXCLUDED_PATTERNS,
     FolderMapping,
     VaultSpec,
 )
@@ -295,7 +297,27 @@ def _discover_candidates(
             for name in sorted(dirnames, key=lambda item: item.encode("utf-8")):
                 path = os.path.join(directory, name)
                 relpath = _relpath(path, root)
-                if _excluded(relpath, vault):
+                if not is_supported_relpath(relpath):
+                    notes.append(
+                        ScanNote(
+                            relpath,
+                            mapping.scope,
+                            mapping.scope_id,
+                            "skipped",
+                            findings=(
+                                ScanFinding(
+                                    FindingCode.PATH_ESCAPES_ROOT,
+                                    "path is not a supported relative component path",
+                                    finding_severity(
+                                        FindingCode.PATH_ESCAPES_ROOT,
+                                        secret_gate="reject",
+                                    ),
+                                ),
+                            ),
+                        )
+                    )
+                    continue
+                if is_excluded_relpath(relpath, vault.exclude):
                     continue
                 if _first_symlink_component(Path(path), root_path) is not None:
                     notes.append(
@@ -322,7 +344,29 @@ def _discover_candidates(
             for filename in sorted(filenames, key=lambda name: name.encode("utf-8")):
                 path = os.path.join(directory, filename)
                 relpath = _relpath(path, root)
-                if _excluded(relpath, vault) or not filename.lower().endswith(".md"):
+                if not is_supported_relpath(relpath):
+                    notes.append(
+                        ScanNote(
+                            relpath,
+                            mapping.scope,
+                            mapping.scope_id,
+                            "skipped",
+                            findings=(
+                                ScanFinding(
+                                    FindingCode.PATH_ESCAPES_ROOT,
+                                    "path is not a supported relative component path",
+                                    finding_severity(
+                                        FindingCode.PATH_ESCAPES_ROOT,
+                                        secret_gate="reject",
+                                    ),
+                                ),
+                            ),
+                        )
+                    )
+                    continue
+                if is_excluded_relpath(relpath, vault.exclude) or not filename.lower().endswith(
+                    ".md"
+                ):
                     continue
                 if _first_symlink_component(Path(path), root_path) is not None:
                     notes.append(
@@ -490,25 +534,6 @@ def _case_collision_paths(candidates: tuple[_Candidate, ...]) -> set[str]:
         key = unicodedata.normalize("NFC", candidate.relpath).casefold()
         groups.setdefault(key, []).append(candidate.relpath)
     return {path for group in groups.values() if len(group) > 1 for path in group}
-
-
-def _excluded(relpath: str, vault: VaultSpec) -> bool:
-    folded_path = relpath.casefold()
-    patterns = tuple(pattern.casefold() for pattern in (*ALWAYS_EXCLUDED_PATTERNS, *vault.exclude))
-    return any(_posix_glob_matches(folded_path, pattern) for pattern in patterns)
-
-
-def _posix_glob_matches(path: str, pattern: str) -> bool:
-    if pattern.endswith("/"):
-        directory = pattern.rstrip("/")
-        return any(component == directory for component in path.split("/"))
-    if "/" not in pattern and any(
-        fnmatch.fnmatchcase(component, pattern) for component in path.split("/")
-    ):
-        return True
-    return fnmatch.fnmatchcase(path, pattern) or (
-        pattern.startswith("**/") and fnmatch.fnmatchcase(path, pattern[3:])
-    )
 
 
 def _sync_conflict_name(filename: str) -> bool:

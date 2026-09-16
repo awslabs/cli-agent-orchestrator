@@ -7759,7 +7759,7 @@ async def clear_memories_endpoint(
                 scope=scope.value,
                 scope_id=mem.scope_id or scope_id,
             )
-            if result.action in {"deleted", "deleted_and_deindexed"}:
+            if result.action in {"deleted", "deindexed", "deleted_and_deindexed"}:
                 deleted_count += 1
         except MemoryDisabledError:
             raise HTTPException(

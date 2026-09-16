@@ -7,6 +7,8 @@ ABC, no edits to memory_service/wiki_lint) and awaiting
 """
 
 import asyncio
+import hashlib
+import json
 import logging
 from typing import Any, Callable, Optional, cast
 
@@ -17,6 +19,7 @@ from cli_agent_orchestrator.services import settings_service, wiki_lint
 from cli_agent_orchestrator.services.memory_service import MemoryService
 from cli_agent_orchestrator.services.vault import binding
 from cli_agent_orchestrator.services.vault.binding import (
+    NativeBinding,
     ScopeBinding,
     VaultBinding,
     VaultConfigUnavailableError,
@@ -42,6 +45,39 @@ _LINT_ENRICHMENTS = [
     "poison_frequency",
     "graph_density",
 ]
+
+
+def binding_fingerprint(resolved: ScopeBinding) -> str:
+    """Hash current binding metadata without loading note content."""
+    if isinstance(resolved, VaultBinding):
+        payload: dict[str, Any] = {
+            "kind": "vault",
+            "vault_id": resolved.vault_id,
+            "root": resolved.root,
+            "folder": resolved.mapping.folder,
+            "scope": resolved.scope,
+            "scope_id": resolved.scope_id,
+            "index": resolved.index,
+            "inject": resolved.inject,
+            "writable": resolved.writable,
+            "secret_gate": resolved.mapping.secret_gate,
+            "managed_folder": resolved.managed_folder,
+            "exclude": list(resolved.exclude),
+        }
+    else:
+        assert isinstance(resolved, NativeBinding)
+        payload = {
+            "kind": "native",
+            "scope": resolved.scope,
+            "scope_id": resolved.scope_id,
+        }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 @register_provider("memory")
@@ -98,7 +134,13 @@ class MemoryGraphProvider(GraphProvider):
                 },
             )
         scope_id = resolved_binding.scope_id
-        key = ("memory", scope, scope_id, lint_enabled)
+        key = (
+            "memory",
+            scope,
+            scope_id,
+            lint_enabled,
+            binding_fingerprint(resolved_binding),
+        )
         view, cached, as_of = await _CACHE.get_or_build(
             key,
             lambda: self._build(scope, scope_id, lint_enabled, resolved_binding),

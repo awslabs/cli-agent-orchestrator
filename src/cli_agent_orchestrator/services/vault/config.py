@@ -141,7 +141,12 @@ class FolderMapping(BaseModel):
     index: StrictBool = True
     inject: StrictBool = Field(
         default=False,
-        description="Controls automatic context injection only; it is not a confidentiality control.",
+        description=(
+            "Routes eligible indexed content to automatic agent-context injection only; "
+            "the mapping folder, exclude, and index settings define what CAO can "
+            "currently read and index, while explicit recall remains a separate "
+            "access path; it is not a confidentiality control."
+        ),
     )
     writable: StrictBool = False
     secret_gate: Literal["reject", "warn"] = "reject"

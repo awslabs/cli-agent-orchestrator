@@ -60,11 +60,18 @@ def memory():
     default=False,
     help="Apply metadata and index repairs. The default is a pure-read dry-run.",
 )
-def repair_cmd(do_apply):
+@click.option(
+    "--receipt",
+    "receipt_id",
+    default=None,
+    help="Plan or apply rollback for exactly one migration receipt.",
+)
+def repair_cmd(do_apply, receipt_id):
     """Reconcile surviving canonical topics into SQLite and index.md."""
     from cli_agent_orchestrator.services.memory_reconciliation import (
         MemoryReconciliationError,
         MemoryReconciliationService,
+        MigrationReceiptNotFoundError,
     )
 
     service = MemoryReconciliationService()
@@ -83,11 +90,16 @@ def repair_cmd(do_apply):
             click.echo(f"{record.status} {label} [{actions}]{detail}")
 
     try:
-        report = service.reconcile(apply=do_apply)
+        report = service.reconcile(apply=do_apply, receipt_id=receipt_id)
     except MemoryReconciliationError as exc:
         report = exc.report
         render_report(report)
         raise click.ClickException(str(exc))
+    except MigrationReceiptNotFoundError as exc:
+        raise click.ClickException(
+            "migration receipt not found; run `cao memory vault status` "
+            "and retry with a valid receipt id"
+        ) from exc
     except Exception as exc:
         raise click.ClickException(
             f"memory repair failed: {type(exc).__name__}; run `cao memory repair --apply`"
@@ -182,11 +194,19 @@ def vault_status(out_format):
         payload["process_local_secret_gate_write_refusals"] = (
             "process-local; unavailable in a fresh CLI process"
         )
+        payload["process_local_boundary_write_refusals"] = (
+            "process-local; unavailable in a fresh CLI process"
+        )
         if out_format == "json":
             click.echo(json.dumps(payload, indent=2, sort_keys=True))
             continue
         click.echo(f"vault_id: {payload['vault_id']}")
-        for name in ("status_counts", "finding_counts", "recall_counters"):
+        for name in (
+            "status_counts",
+            "finding_counts",
+            "recall_counters",
+            "migration_receipts",
+        ):
             counts = payload[name]
             click.echo(f"{name}: " + (", ".join(f"{key}={value}" for key, value in counts) or "-"))
         for label, residual_rows in payload["inert_mappings"]:
@@ -207,6 +227,10 @@ def vault_status(out_format):
         )
         click.echo(
             "process_local_secret_gate_write_refusals: "
+            "unavailable in a fresh CLI process (not durable status)"
+        )
+        click.echo(
+            "process_local_boundary_write_refusals: "
             "unavailable in a fresh CLI process (not durable status)"
         )
 
@@ -503,7 +527,7 @@ def clear(scope, yes):
                     scope_id=mem.scope_id,
                 )
             )
-            if result.action in {"deleted", "deleted_and_deindexed"}:
+            if result.action in {"deleted", "deindexed", "deleted_and_deindexed"}:
                 deleted_count += 1
         except Exception:
             click.echo(f"Warning: Failed to delete '{mem.key}'.", err=True)

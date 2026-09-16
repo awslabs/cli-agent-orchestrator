@@ -11,11 +11,17 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from cli_agent_orchestrator.clients.database import Base, MemoryMetadataModel, VaultNoteModel
-from cli_agent_orchestrator.services.memory_relationship_service import RelationshipDTO
+from cli_agent_orchestrator.services.memory_relationship_service import (
+    MemoryRelationshipService,
+    RelationshipDTO,
+)
 from cli_agent_orchestrator.services.memory_service import MemoryService
 from cli_agent_orchestrator.services.vault import migrate
+from cli_agent_orchestrator.services.vault import reconcile as reconcile_module
+from cli_agent_orchestrator.services.vault import vault_lock
 from cli_agent_orchestrator.services.vault.binding import VaultBinding
 from cli_agent_orchestrator.services.vault.parser import parse_note
+from cli_agent_orchestrator.utils import atomic_file
 
 
 class _Relationships:
@@ -32,6 +38,18 @@ class _Relationships:
 def svc(tmp_path, monkeypatch):
     engine = create_engine(f"sqlite:///{tmp_path / 'migration.db'}")
     Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    monkeypatch.setattr(reconcile_module, "SessionLocal", Session)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.memory_relationship_service.SessionLocal",
+        Session,
+    )
+    monkeypatch.setattr(reconcile_module, "_replace_vault_edges", lambda _notes, **_kwargs: None)
+    monkeypatch.setattr(reconcile_module, "_clear_stale_vault_edges", lambda *_args: None)
+    monkeypatch.setattr(reconcile_module, "_emit_audit_events", lambda *_args: None)
+    lock_dir = tmp_path / "locks"
+    monkeypatch.setattr(atomic_file, "LOCK_DIR", lock_dir)
+    monkeypatch.setattr(vault_lock, "LOCK_DIR", lock_dir)
     service = MemoryService(base_dir=tmp_path / "memory", db_engine=engine)
     monkeypatch.setattr(migrate, "MEMORY_BASE_DIR", service.base_dir)
     return service
@@ -65,7 +83,7 @@ def _migrate(svc, fixture, **kwargs):
         "scope": "global",
         "scope_id": None,
         "relationship_service": _Relationships(),
-        "refresh": lambda _path: None,
+        "refresh": lambda _path: reconcile_module.reconcile(fixture.vault, apply=True),
     }
     defaults.update(kwargs)
     return migrate.migrate_scope(svc, fixture.vault, _binding(fixture), **defaults)
@@ -202,26 +220,24 @@ def test_migration_reports_each_named_lossy_field(tmp_path, svc) -> None:
 def test_typed_relationships_are_written_to_cao_links_and_round_trip(tmp_path, svc) -> None:
     fixture = build_vault_fixture(tmp_path)
     _store(svc, "linked", tags="one,two")
-    relationships = _Relationships(
-        [
-            RelationshipDTO(
-                id="edge",
-                scope="global",
-                scope_id=None,
-                source_key="linked",
-                target_key="target",
-                type="relates_to",
-                origin="human",
-                status="active",
-                confidence=0.75,
-                rank=None,
-                attributes=None,
-                source_updated_at=None,
-                created_at=None,
-                updated_at=None,
-            )
-        ]
+    _store(svc, "target")
+    relationships = MemoryRelationshipService()
+    relationships.create(
+        "global",
+        None,
+        "linked",
+        "target",
+        "relates_to",
+        "human",
+        confidence=0.75,
     )
+    with svc._get_db_session() as db:
+        db.query(MemoryMetadataModel).filter_by(
+            key="target",
+            scope="global",
+            source_kind="native",
+        ).one().source_kind = "vault"
+        db.commit()
 
     report = _migrate(svc, fixture, apply=True, relationship_service=relationships)
 
@@ -232,7 +248,6 @@ def test_typed_relationships_are_written_to_cao_links_and_round_trip(tmp_path, s
         secret_gate="reject",
     )
     assert report.migrated == 1
-    assert relationships.calls
     assert parsed.cao["links"] == [
         {
             "to": "target",
@@ -248,26 +263,24 @@ def test_typed_relationships_are_written_to_cao_links_and_round_trip(tmp_path, s
 def test_cao_links_reemit_authored_origin_instead_of_vault_ownership(tmp_path, svc) -> None:
     fixture = build_vault_fixture(tmp_path)
     _store(svc, "linked")
-    relationships = _Relationships(
-        [
-            RelationshipDTO(
-                id="edge",
-                scope="global",
-                scope_id=None,
-                source_key="linked",
-                target_key="target",
-                type="relates_to",
-                origin="vault",
-                status="active",
-                confidence=None,
-                rank=None,
-                attributes={"authored_origin": "compiler"},
-                source_updated_at=None,
-                created_at=None,
-                updated_at=None,
-            )
-        ]
+    _store(svc, "target")
+    relationships = MemoryRelationshipService()
+    relationships.create(
+        "global",
+        None,
+        "linked",
+        "target",
+        "relates_to",
+        "human",
+        attributes={"authored_origin": "compiler"},
     )
+    with svc._get_db_session() as db:
+        db.query(MemoryMetadataModel).filter_by(
+            key="target",
+            scope="global",
+            source_kind="native",
+        ).one().source_kind = "vault"
+        db.commit()
 
     _migrate(svc, fixture, apply=True, relationship_service=relationships)
 
@@ -282,23 +295,7 @@ def test_cao_links_reemit_authored_origin_instead_of_vault_ownership(tmp_path, s
 def test_default_apply_keeps_native_row_when_vault_projection_is_refreshed(tmp_path, svc) -> None:
     fixture = build_vault_fixture(tmp_path)
     _store(svc, "coexists")
-
-    def refresh(_path):
-        with svc._get_db_session() as db:
-            db.add(
-                MemoryMetadataModel(
-                    id="vault-row",
-                    key="coexists",
-                    memory_type="reference",
-                    scope="global",
-                    scope_id=None,
-                    source_kind="vault",
-                    file_path="CAO/coexists.md",
-                )
-            )
-            db.commit()
-
-    report = _migrate(svc, fixture, apply=True, refresh=refresh)
+    report = _migrate(svc, fixture, apply=True)
 
     with svc._get_db_session() as db:
         rows = (
@@ -309,6 +306,21 @@ def test_default_apply_keeps_native_row_when_vault_projection_is_refreshed(tmp_p
         )
     assert report.migrated == 1
     assert [row.source_kind for row in rows] == ["native", "vault"]
+
+
+def test_dry_run_and_apply_report_the_same_already_migrated_skip(tmp_path, svc) -> None:
+    fixture = build_vault_fixture(tmp_path)
+    _store(svc, "coexists")
+    first = _migrate(svc, fixture, apply=True)
+    assert first.migrated == 1
+
+    dry_run = _migrate(svc, fixture)
+    applied = _migrate(svc, fixture, apply=True)
+
+    expected = {"coexists": "already_migrated"}
+    assert dry_run.skipped_vault_authoritative == expected
+    assert applied.skipped_vault_authoritative == expected
+    assert dry_run.migrated == applied.migrated == 0
 
 
 def test_secret_bearing_item_is_reported_while_later_items_migrate(tmp_path, svc) -> None:
