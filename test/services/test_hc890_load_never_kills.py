@@ -561,7 +561,17 @@ class TestEnvFloatRejectsUnusableValues:
     @pytest.mark.asyncio
     async def test_input_ready_settle_budget_stays_finite_with_inf_in_the_env(self):
         """End-to-end: the settle gate resolves a FINITE deadline even when the env says ``inf``,
-        so ``wait_until_input_ready`` cannot hang a never-matching pane forever."""
+        so ``wait_until_input_ready`` cannot hang a never-matching pane forever.
+
+        The outer ``asyncio.wait_for`` is part of the assertion, not scaffolding. Without the
+        guard in ``_env_float`` this coroutine does not merely return a wrong value --
+        ``deadline = time.monotonic() + inf`` is itself infinite, so the settle loop NEVER exits
+        and the test process hangs indefinitely (measured: 22 minutes at 0.1% CPU before it was
+        killed by hand). Bounding the wait turns that into an ordinary red test rather than a
+        stuck CI job.
+        """
+        import asyncio as _asyncio
+
         from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
 
         provider = ClaudeCodeProvider("t1", "sess", "win")
@@ -570,8 +580,8 @@ class TestEnvFloatRejectsUnusableValues:
             patch("cli_agent_orchestrator.backends.registry._backend") as mock_backend,
         ):
             mock_backend.get_history.return_value = "nothing that matches an input box"
-            # Would never return if the deadline were infinite.
-            assert await provider.wait_until_input_ready() is False
+            # The rejected `inf` falls back to the 5.0s default, so this settles well inside 60s.
+            assert await _asyncio.wait_for(provider.wait_until_input_ready(), timeout=60) is False
 
 
 class TestStatusMonitorDistinguishesProviderFaults:
