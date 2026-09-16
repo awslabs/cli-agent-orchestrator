@@ -37,6 +37,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   An unattributable peer is now refused with 4003 unless the explicit `*` opt-out
   is set.
 
+- **The terminal WebSocket's `?token=` query parameter reached uvicorn's logs
+  in clear.** Two gaps: the redaction filter only knew `access_token` and
+  `ticket`, and it was attached only to `uvicorn.access`, while uvicorn writes
+  the WebSocket handshake line (`"WebSocket /terminals/<id>/ws?token=…"
+  [accepted]`, and the `403` variant) on `uvicorn.error`, which a filter on a
+  sibling logger never sees. With authentication enabled every web-viewer
+  attach therefore wrote the `cao:write`-scoped JWT to stderr. `token` is now
+  redacted and the filter is attached to both loggers. The filter also decodes
+  percent-encoded parameter names before deciding: the server accepts
+  `?%61ccess_token=<JWT>` exactly like `?access_token=`, and uvicorn logs the
+  raw bytes.
+
 - **enabling `CAO_MEMORY_API_URL` rejected memory keys that work without it.**
   The `/internal/memory/store` and `/forget` routes validated the wire `key` as
   the strict `MemoryKey` (`^[a-z0-9-]{1,60}$`), while the MCP tools have always

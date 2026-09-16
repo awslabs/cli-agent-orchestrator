@@ -8486,9 +8486,11 @@ def main():
     # literal ``*`` is honoured and disables the check (matches the
     # existing CAO_WS_ALLOWED_CLIENTS="*" semantics).
     forwarded_ips = "*" if "*" in TRUSTED_FORWARDER_IPS else ",".join(TRUSTED_FORWARDER_IPS)
-    # Credential query params (``?access_token=``) are scrubbed from uvicorn's
-    # access log by ``install_access_log_redaction()``, installed in the app
-    # lifespan so both ``cao-server`` and ``uvicorn ...:app`` are covered.
+    # Credential query params (``?access_token=``, the WebSocket ``?token=``) are
+    # scrubbed from uvicorn's request logs -- ``uvicorn.access`` for HTTP and
+    # ``uvicorn.error`` for WebSocket handshakes -- by
+    # ``install_access_log_redaction()``, installed in the app lifespan so both
+    # ``cao-server`` and ``uvicorn ...:app`` are covered.
     uvicorn.run(
         app,
         host=host,

@@ -2,18 +2,33 @@ import logging
 import re
 import sys
 from datetime import datetime
+from urllib.parse import unquote
 
 from cli_agent_orchestrator.constants import LOG_DIR
 from cli_agent_orchestrator.services.config_service import ConfigService
 
 # Query parameters that carry bearer credentials. `access_token` is the AG-UI
 # SSE pattern (browser EventSource cannot set an Authorization header);
+# `token` is the terminal WebSocket's equivalent (browser WebSocket cannot set
+# one either, and uvicorn logs the upgrade request's path+query the same way);
 # `ticket` is reserved for the planned short-lived-ticket handshake.
-_CREDENTIAL_PARAMS = ("access_token", "ticket")
+_CREDENTIAL_PARAMS = frozenset({"access_token", "token", "ticket"})
 REDACTED = "[REDACTED]"
-_CREDENTIAL_RE = re.compile(
-    r"\b(" + "|".join(_CREDENTIAL_PARAMS) + r")=([^&\s\"']+)",
-)
+# Every ``name=value`` pair as the server would parse it. The NAME is matched as
+# a whole token (so ``access_token`` is one name, never ``token`` inside it) and
+# is percent-decoded before the credential check: Starlette decodes query names,
+# so ``?%61ccess_token=<JWT>`` authenticates exactly like ``?access_token=`` --
+# and uvicorn logs the raw, still-encoded bytes, which a literal-name pattern
+# would walk past (found by the #706 review).
+_QUERY_PAIR_RE = re.compile(r"(?<![\w%.\-])([A-Za-z0-9_%.\-]+)=([^&\s\"']+)")
+
+
+def _redact_pair(match: "re.Match[str]") -> str:
+    name = match.group(1)
+    if unquote(name).lower() in _CREDENTIAL_PARAMS:
+        return f"{name}={REDACTED}"
+    return match.group(0)
+
 
 # Route families where a PATH SEGMENT is itself the credential, not a query
 # parameter carrying one -- so ``_CREDENTIAL_RE`` above cannot reach it.
@@ -27,7 +42,7 @@ _CAPABILITY_PATH_RE = re.compile(r"(/handoff-results/)[^\s/?\"']+")
 
 def _scrub(text: str) -> str:
     """Redact both credential query params and capability-bearing path segments."""
-    text = _CREDENTIAL_RE.sub(rf"\1={REDACTED}", text)
+    text = _QUERY_PAIR_RE.sub(_redact_pair, text)
     return _CAPABILITY_PATH_RE.sub(rf"\g<1>{REDACTED}", text)
 
 
@@ -36,7 +51,9 @@ class RedactQueryTokenFilter(logging.Filter):
 
     Attached to ``uvicorn.access`` so ``GET /agui/v1/stream?access_token=<JWT>``
     lines never persist the token (uvicorn logs the raw path+query, and a JWT in
-    an access log is replayable until ``exp``), and so
+    an access log is replayable until ``exp``), to ``uvicorn.error`` so the
+    ``"WebSocket /terminals/<id>/ws?token=<JWT>" [accepted]`` handshake line
+    uvicorn emits there does not either, and so
     ``GET /handoff-results/<job_id>`` never persists the id that retrieves that
     job's worker output. Mutates the record in place and always returns True —
     this filter redacts, it never drops.
@@ -50,11 +67,21 @@ class RedactQueryTokenFilter(logging.Filter):
         return True
 
 
+#: Loggers uvicorn writes request lines to. HTTP requests go to ``uvicorn.access``;
+#: WebSocket handshakes (``'%s - "WebSocket %s" [accepted]'`` and the ``403`` /
+#: ``rejected`` variants) go to ``uvicorn.error`` from every websocket
+#: implementation, because ``h11_impl`` hands the upgrade off before its
+#: access-log call. A ``logging.Filter`` sees only records emitted on the logger
+#: it is attached to, never a sibling's, so both need the filter.
+_UVICORN_REQUEST_LOGGERS = ("uvicorn.access", "uvicorn.error")
+
+
 def install_access_log_redaction() -> None:
-    """Attach the credential filter to uvicorn's access logger (idempotent)."""
-    access_logger = logging.getLogger("uvicorn.access")
-    if not any(isinstance(f, RedactQueryTokenFilter) for f in access_logger.filters):
-        access_logger.addFilter(RedactQueryTokenFilter())
+    """Attach the credential filter to every uvicorn request logger (idempotent)."""
+    for name in _UVICORN_REQUEST_LOGGERS:
+        logger_ = logging.getLogger(name)
+        if not any(isinstance(f, RedactQueryTokenFilter) for f in logger_.filters):
+            logger_.addFilter(RedactQueryTokenFilter())
 
 
 def setup_logging() -> None:
