@@ -142,6 +142,33 @@ def _no_llm_compile_in_tests(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _pinned_load_baseline(monkeypatch):
+    """Pin the CPU-load baseline so timeout assertions cannot depend on the host's load.
+
+    ``BaseProvider.get_init_timeout`` (and ``ClaudeCodeProvider.wait_until_input_ready``) scale
+    their budget by ``load_scaled_timeout``, whose factor is ``loadavg1 / cpu_count`` -- so on a
+    busy runner every exact-timeout assertion in the suite silently starts asserting a LARGER
+    number than it wrote down. That is not hypothetical (PR #623 review, Copilot): with the fixture
+    absent, 15 tests across ``test/providers/test_base_provider.py`` and
+    ``test/providers/test_provider_init_timeout.py`` fail on a 4-core box at loadavg 8 and pass on
+    an idle one -- the worst kind of CI flake, because it correlates with load rather than with the
+    change under test.
+
+    Pinning the baseline here rather than in those two files keeps any FUTURE timeout assertion
+    deterministic too, without its author having to know load scaling exists. Tests that are about
+    scaling patch ``os.getloadavg`` themselves; a ``with patch(...)`` inside the test overrides this
+    one for its duration and restores it afterwards. The two env knobs are cleared for the same
+    reason ``_hermetic_cao_env`` clears its own: a developer's shell must not change the result.
+    """
+    from cli_agent_orchestrator.providers import base as _provider_base
+
+    monkeypatch.delenv("CAO_INIT_TIMEOUT_LOAD_MAX_FACTOR", raising=False)
+    monkeypatch.delenv("CAO_INPUT_READY_TIMEOUT", raising=False)
+    # An idle box: factor = max(1.0, 0.0 / cpu_count) = 1.0, i.e. no scaling.
+    monkeypatch.setattr(_provider_base.os, "getloadavg", lambda: (0.0, 0.0, 0.0))
+
+
+@pytest.fixture(autouse=True)
 def _reset_backend_registry():
     """Prevent leaked backend singletons from crossing test boundaries (fixes #522)."""
     from cli_agent_orchestrator.backends import registry

@@ -137,12 +137,18 @@ class TestCreateTerminal:
         assert result.status == TerminalStatus.UNKNOWN
         assert mock_provider_manager.create_provider.call_args.kwargs["model"] == ("gpt-5.1-codex")
         mock_provider.initialize.assert_not_awaited()
+        # pre_init_command is the pane's foreground command captured before initialize() runs;
+        # the deferred path needs it to tell a slow-but-live init timeout from a dead launch
+        # (harness-control#890 / PR #623 review). Its VALUE comes from the mocked backend and is
+        # not what this test is about, so it is matched loosely while the payload this test does
+        # own is still matched exactly.
         mock_schedule_deferred_init.assert_called_once_with(
             mock_provider,
             "test1234",
             "Review the current change",
             OrchestrationType.SEND_MESSAGE,
             None,
+            pre_init_command=mock_tmux.get_pane_current_command.return_value,
         )
 
     @pytest.mark.asyncio
@@ -1689,12 +1695,21 @@ class TestCreateTerminalWorktree:
         """The worktree WAS created before provider.initialize() failed later --
         the failure-cleanup path must roll it back too, or a provider-init
         timeout on a worktree-backed terminal leaves an orphan worktree/branch
-        with no CAO-side record pointing at it."""
+        with no CAO-side record pointing at it.
+
+        harness-control#890 keeps a timing-out terminal ALIVE when its CLI is verifiably still
+        running -- and a kept terminal must keep its worktree, which is the case the sibling test
+        below pins. This test is the other half: the pane's foreground command never leaves the
+        pre-init shell, so no CLI ever launched, the timeout is a genuinely failed launch, and the
+        rollback asserted here is the correct outcome. The shell command is stated explicitly
+        rather than left to a bare MagicMock so that precondition is visible instead of
+        accidental."""
         mock_gen_id.return_value = "test1234"
         mock_gen_session.return_value = "cao-session"
         mock_gen_window.return_value = "developer-abcd"
         mock_tmux.session_exists.return_value = True
         mock_tmux.create_window.return_value = "developer-abcd"
+        mock_tmux.get_pane_current_command.return_value = "zsh"
         mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
         mock_provider = AsyncMock()
         mock_provider.initialize.side_effect = TimeoutError("provider init timed out")
@@ -1716,6 +1731,69 @@ class TestCreateTerminalWorktree:
             )
 
         mock_worktree_service.remove_worktree.assert_called_once_with("/repo", "test1234")
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.worktree_service")
+    async def test_use_worktree_survives_a_slow_but_live_init_timeout(
+        self,
+        mock_worktree_service,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+        tmp_path,
+    ):
+        """The counterpart the PR #623 review asked for: "worktree + timeout = kept alive with
+        worktree intact".
+
+        Same injected TimeoutError as the sibling above, but the pane's foreground command HAS
+        moved off the shell -- the CLI launched and is still running, it is merely slow. The
+        terminal is kept (UNKNOWN, not a fake IDLE) and the worktree must NOT be removed: the live
+        pane is still sitting in it and will use it the moment it settles. Removing it here would
+        pull the working tree out from under a running agent."""
+        mock_gen_id.return_value = "test1234"
+        mock_gen_session.return_value = "cao-session"
+        mock_gen_window.return_value = "developer-abcd"
+        mock_tmux.session_exists.return_value = True
+        mock_tmux.create_window.return_value = "developer-abcd"
+        mock_tmux.get_pane_current_command.side_effect = ["zsh"] + ["kiro-cli"] * 8
+        mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
+        mock_provider = AsyncMock()
+        mock_provider.initialize.side_effect = TimeoutError("provider init timed out")
+        mock_provider_manager.create_provider.return_value = mock_provider
+        mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+        worktree_dir = tmp_path / "worktrees" / "test1234"
+        worktree_dir.mkdir(parents=True)
+        mock_worktree_service.find_repo_root.return_value = "/repo"
+        mock_worktree_service.create_worktree.return_value = str(worktree_dir)
+
+        result = await create_terminal(
+            "kiro_cli",
+            "developer",
+            session_name="cao-existing",
+            use_worktree=True,
+        )
+
+        assert result.status == TerminalStatus.UNKNOWN
+        mock_worktree_service.remove_worktree.assert_not_called()
+        mock_tmux.kill_window.assert_not_called()
+        mock_tmux.kill_session.assert_not_called()
 
 
 class TestCreateTerminalEnvVars:
