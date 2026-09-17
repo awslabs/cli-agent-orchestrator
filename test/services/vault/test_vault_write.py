@@ -650,6 +650,19 @@ def test_write_rejects_every_key_path_escape_before_writing(tmp_path, key, messa
     assert not (tmp_path / "escape.md").exists()
 
 
+def test_managed_target_preserves_ordinary_key_path_bytes(tmp_path) -> None:
+    fixture = build_vault_fixture(tmp_path)
+
+    root_real, managed_folder, managed_base, target_name, target = writer._managed_target(
+        fixture.vault, "ordinary-key"
+    )
+
+    assert root_real == os.path.realpath(fixture.vault.root)
+    assert managed_folder == "CAO"
+    assert os.fsencode(target_name) == b"ordinary-key.md"
+    assert os.fsencode(target) == os.fsencode(os.path.join(managed_base, target_name))
+
+
 def test_write_refuses_symlinked_managed_folder(tmp_path) -> None:
     fixture = build_vault_fixture(tmp_path)
     managed = fixture.root / "CAO"
@@ -664,6 +677,20 @@ def test_write_refuses_symlinked_managed_folder(tmp_path) -> None:
 
     assert "symlinked component" in str(caught.value)
     assert list(outside.iterdir()) == []
+
+
+def test_write_refuses_symlinked_note_inside_managed_folder(tmp_path) -> None:
+    fixture = build_vault_fixture(tmp_path)
+    target = fixture.root / "CAO" / "managed-note.md"
+    outside = tmp_path / "outside.md"
+    outside.write_text("must remain unchanged", encoding="utf-8")
+    target.symlink_to(outside)
+
+    with pytest.raises(writer.VaultWriteBoundaryError, match="symlink"):
+        _write(fixture)
+
+    assert target.is_symlink()
+    assert outside.read_text(encoding="utf-8") == "must remain unchanged"
 
 
 def test_write_refuses_in_vault_symlinked_managed_folder_to_excluded_mapping(
@@ -986,83 +1013,73 @@ def test_write_preserves_existing_mode_and_uses_umask_for_new_note(tmp_path) -> 
     assert stat.S_IMODE(target.stat().st_mode) == 0o644
 
 
-def test_writer_path_sinks_have_adjacent_inline_target_name_barriers() -> None:
-    """Keep CodeQL's recognized fullmatch barrier adjacent to each flagged sink."""
+def test_managed_target_has_query_recognized_normalization_and_containment_contract() -> None:
+    """Keep the query-recognized normalized candidate flowing to descriptor sinks."""
     tree = ast.parse(
         Path(writer.__file__).read_text(encoding="utf-8"),
         filename=str(writer.__file__),
     )
-    expected_sinks = {
-        "_read_contained_text": "open",
-        "_target_mode": "stat",
-        "_publish_managed_note": "replace",
-    }
-
     functions = {
         node.name: node
         for node in tree.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
+    managed_target = functions["_managed_target"]
+    assignments = {
+        target.id: node.value
+        for node in managed_target.body
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
 
-    def is_barrier(statement: ast.stmt) -> bool:
-        if not isinstance(statement, ast.If) or not isinstance(statement.test, ast.UnaryOp):
-            return False
-        if not isinstance(statement.test.op, ast.Not):
-            return False
-        call = statement.test.operand
-        return (
-            isinstance(call, ast.Call)
-            and isinstance(call.func, ast.Attribute)
-            and call.func.attr == "fullmatch"
-            and isinstance(call.func.value, ast.Name)
-            and call.func.value.id == "_VAULT_NOTE_FILENAME_RE"
-            and len(call.args) == 1
-            and isinstance(call.args[0], ast.Name)
-            and call.args[0].id == "target_name"
-            and any(isinstance(body_node, ast.Raise) for body_node in statement.body)
+    candidate = assignments["candidate"]
+    assert isinstance(candidate, ast.Call)
+    assert ast.unparse(candidate.func) == "os.path.normpath"
+    assert len(candidate.args) == 1
+    joined = candidate.args[0]
+    assert isinstance(joined, ast.Call)
+    assert ast.unparse(joined.func) == "os.path.join"
+    assert [ast.unparse(argument) for argument in joined.args] == [
+        "managed_base",
+        "f'{key}.md'",
+    ]
+
+    containment = next(node for node in managed_target.body if isinstance(node, ast.If))
+    assert ast.unparse(containment.test) == ("not candidate.startswith(managed_base + os.sep)")
+    raised = next(node for node in containment.body if isinstance(node, ast.Raise))
+    assert isinstance(raised.exc, ast.Call)
+    assert ast.unparse(raised.exc.func) == "ValueError"
+
+    target_name = assignments["target_name"]
+    assert isinstance(target_name, ast.Call)
+    assert ast.unparse(target_name.func) == "os.path.basename"
+    assert [ast.unparse(argument) for argument in target_name.args] == ["candidate"]
+
+    returned = next(node for node in managed_target.body if isinstance(node, ast.Return))
+    assert isinstance(returned.value, ast.Tuple)
+    assert [ast.unparse(item) for item in returned.value.elts] == [
+        "root_real",
+        "managed_folder",
+        "managed_base",
+        "target_name",
+        "candidate",
+    ]
+
+    write_calls = {
+        node.func.id: node
+        for node in ast.walk(functions["write_managed_note"])
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    for sink in ("_read_contained_text", "_target_mode", "_publish_managed_note"):
+        assert any(
+            isinstance(argument, ast.Name) and argument.id == "target_name"
+            for argument in write_calls[sink].args
         )
-
-    def contains_sink(statement: ast.stmt, sink_name: str) -> bool:
-        sink_arg_index = 1 if sink_name == "replace" else 0
-        for node in ast.walk(statement):
-            if not (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "os"
-                and node.func.attr == sink_name
-                and len(node.args) > sink_arg_index
-            ):
-                continue
-            sink_arg = node.args[sink_arg_index]
-            if isinstance(sink_arg, ast.Name) and sink_arg.id == "target_name":
-                return True
-        return False
-
-    def has_adjacent_barrier(node: ast.AST, sink_name: str) -> bool:
-        for _field, value in ast.iter_fields(node):
-            if isinstance(value, list):
-                statements = [item for item in value if isinstance(item, ast.stmt)]
-                if len(statements) == len(value):
-                    for index, statement in enumerate(statements):
-                        if (
-                            contains_sink(statement, sink_name)
-                            and index > 0
-                            and is_barrier(statements[index - 1])
-                        ):
-                            return True
-                for item in value:
-                    if isinstance(item, ast.AST) and has_adjacent_barrier(item, sink_name):
-                        return True
-            elif isinstance(value, ast.AST) and has_adjacent_barrier(value, sink_name):
-                return True
-        return False
-
-    for function_name, sink_name in expected_sinks.items():
-        assert has_adjacent_barrier(functions[function_name], sink_name), (
-            f"{function_name} must guard target_name with an adjacent inline fullmatch "
-            f"before os.{sink_name}"
-        )
+    assert not any(
+        isinstance(node, ast.Name) and node.id == "_VAULT_NOTE_FILENAME_RE"
+        for node in ast.walk(tree)
+    )
 
 
 def test_vault_writer_owns_nonempty_vault_write_sink_set() -> None:
