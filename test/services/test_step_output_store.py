@@ -54,6 +54,15 @@ class TestRecordStepOutput:
         with pytest.raises(ValueError):
             record_step_output("run", "bad/step", {"x": 1})
 
+    @pytest.mark.parametrize(
+        ("run_id", "step_id"),
+        [("run\n", "step"), ("run", "step\n")],
+        ids=["run_id", "step_id"],
+    )
+    def test_trailing_newline_key_part_raises_valueerror(self, run_id: str, step_id: str):
+        with pytest.raises(ValueError, match="invalid"):
+            record_step_output(run_id, step_id, {"x": 1})
+
 
 class TestStoreCapEviction:
     def test_cap_evicts_oldest_and_never_raises(self):

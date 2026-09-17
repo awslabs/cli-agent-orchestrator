@@ -4,7 +4,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, NamedTuple, Optional, Set
+from typing import Any, Dict, List, NamedTuple, Optional, Set, Tuple
 
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
 from cli_agent_orchestrator.utils.paths import normalized_path
@@ -67,7 +67,7 @@ def _load_or_raise() -> Dict[str, Any]:
         raw = SETTINGS_FILE.read_text()
     except FileNotFoundError:
         return {}  # genuinely absent — defaults are the right answer
-    except OSError as e:  # PermissionError, IsADirectoryError, EIO, ...
+    except (OSError, ValueError) as e:  # Includes UnicodeDecodeError from read_text().
         raise SettingsUnreadableError(SETTINGS_FILE, e) from e
 
     try:
@@ -79,6 +79,28 @@ def _load_or_raise() -> Dict[str, Any]:
             SETTINGS_FILE, TypeError(f"expected a JSON object, got {type(data).__name__}")
         )
     return data
+
+
+def _load_result_detail() -> Tuple[Dict[str, Any], bool, bool]:
+    """Read once, distinguishing absent, unreadable, and parsed-invalid settings.
+
+    Approval stays enabled on either failure, but its diagnostic source distinguishes
+    read/decode failures from a parsed value that is not a JSON object. Use the same
+    strict loader as learning_status so both controls observe the same file semantics.
+    """
+    try:
+        return _load_or_raise(), True, False
+    except SettingsUnreadableError as e:
+        read_or_decode_failed = not isinstance(e.cause, TypeError)
+        if read_or_decode_failed:
+            logger.warning(f"Failed to read settings: {e}")
+        return {}, False, read_or_decode_failed
+
+
+def _load_result() -> Tuple[Dict[str, Any], bool]:
+    """Retain the two-item settings result for callers that only need readability."""
+    data, ok, _read_or_decode_failed = _load_result_detail()
+    return data, ok
 
 
 def _load() -> Dict[str, Any]:
@@ -586,13 +608,38 @@ def learning_status() -> LearningStatus:
     return LearningStatus(enabled, False, "")
 
 
-def is_workflow_approval_required() -> bool:
-    """Return True when an unapproved script-tier workflow run must be refused (issue #583 FR-8).
+#: Where a resolved approval posture came from. A CLOSED set: the startup line renders these
+#: verbatim, so adding a member means updating that call site too.
+GATE_SOURCE_ENV = "env"
+GATE_SOURCE_FILE = "settings.json"
+GATE_SOURCE_DEFAULT = "default"
+GATE_SOURCE_READ_FAILURE = "read-failure-fallback"
+GATE_SOURCE_INVALID_SETTINGS = "invalid-settings-fallback"
 
-    Default is **False**: enforcement is opt-in. A ``plan_id`` does not exist until run start, so a
-    plan that has never run cannot have been approved and its first run is refused by design. Making
-    that the default would break every existing script-tier caller one Bolt before the authoring
-    sequence that presents a plan and takes approval BEFORE running.
+
+class WorkflowApprovalPosture(NamedTuple):
+    """A resolved approval-gate posture and the mechanism that decided it.
+
+    ``source`` lets the startup line distinguish an explicit settings-file opt-out from a malformed
+    file that leaves enforcement enabled and needs repair.
+    """
+
+    required: bool
+    source: str
+
+
+def resolve_workflow_approval_posture() -> WorkflowApprovalPosture:
+    """Resolve whether the approval gate is required, and what decided it (issue #583 FR-8).
+
+    DEFAULT IS **TRUE** SINCE ISSUE #583 BOLT 3 (``approval-enforcement-default``). Bolt 2 shipped
+    this opt-in for a specific reason that no longer holds: an always-on gate turned a TRANSIENT
+    freeze failure into a refused HEALTHY run, because ``manifest_freeze.build_manifest_json`` is
+    total and writes NULL on failure, and NULL fails closed. Bolt 3 makes the two causes
+    distinguishable — a missing plan identifier now raises
+    :class:`~cli_agent_orchestrator.services.approval_gate.PlanIdentityUnavailableError` and
+    transports as 503, while a genuinely unapproved plan stays 403 — and ships the authoring
+    sequence that takes approval BEFORE running. With both in place, leaving FR-8's guarantee
+    opt-in would mean it never applies in a default installation.
 
     PRECEDENCE IS DELIBERATELY ASYMMETRIC, AND THIS IS NOT AN OVERSIGHT. Every sibling setting here
     resolves ``CAO_* env var > settings.json > default`` — see :func:`is_memory_enabled`. This one
@@ -606,30 +653,73 @@ def is_workflow_approval_required() -> bool:
     operator's settings file still read as configured on — which would make the weakest
     configuration mechanism in the system the one that decides whether runs are authorised. The
     asymmetry is monotonic in the safe direction: nothing that merely influences an environment can
-    weaken the gate, while enabling it for a single test or trial stays a one-liner.
+    weaken the gate. Flipping the default does NOT reopen this; it only changes what the variable is
+    useful for, from switching a control on to re-asserting one that is already on.
 
-    Read failure resolves to the default (disabled) with a warning, which is the ONE place this
-    mechanism is deliberately not fail-closed. Treating an unreadable settings file as "gate on"
-    would refuse every script run in the installation on the strength of a JSON typo. Resolving to
-    disabled makes the unreadable case behave like the unconfigured case, and the asymmetry above
-    bounds the residual: an operator who enabled the gate via the environment is unaffected by a
-    corrupt file.
+    Read/decode failures and malformed configuration FAIL CLOSED: both preserve required enforcement
+    and log an error naming the repair path. :data:`GATE_SOURCE_READ_FAILURE` is reserved for a file
+    that could not be read or decoded; :data:`GATE_SOURCE_INVALID_SETTINGS` names content that parsed
+    but cannot configure this setting. A valid explicit JSON boolean ``false`` is the only settings
+    file opt-out.
+
+    An ABSENT settings file is NOT a read failure. It is the unconfigured case and resolves to the
+    default, which is now enabled. :func:`_load_result` is what makes the two distinguishable.
     """
     env = os.environ.get("CAO_WORKFLOW_REQUIRE_APPROVAL")
     if env is not None and env.strip().lower() in ("1", "true", "yes"):
         # Enable-only: a falsy env value is NOT consulted, so it cannot override an enabling
         # settings.json below. Returning early on truthy is what makes the precedence asymmetric.
-        return True
-    try:
-        workflow_settings = _load().get("workflow", {})
-        if not isinstance(workflow_settings, dict):
-            return False
-        return bool(workflow_settings.get("require_approval", False))
-    except Exception as e:
-        logger.warning(
-            "Failed to read workflow.require_approval, defaulting to False (gate disabled): %s", e
+        return WorkflowApprovalPosture(True, GATE_SOURCE_ENV)
+
+    data, ok, read_or_decode_failed = _load_result_detail()
+    if not ok:
+        if read_or_decode_failed:
+            logger.error(
+                "Failed to read or decode workflow approval settings from %s; the approval gate "
+                "remains REQUIRED. Repair settings.json and restart or reload the server; "
+                "CAO_WORKFLOW_REQUIRE_APPROVAL=1 may explicitly affirm enabled enforcement.",
+                SETTINGS_FILE,
+            )
+            return WorkflowApprovalPosture(True, GATE_SOURCE_READ_FAILURE)
+        logger.error(
+            "Invalid settings.json content in %s; the approval gate remains REQUIRED. Repair "
+            "settings.json and restart or reload the server; only an explicit JSON boolean "
+            "workflow.require_approval=false disables enforcement.",
+            SETTINGS_FILE,
         )
-        return False
+        return WorkflowApprovalPosture(True, GATE_SOURCE_INVALID_SETTINGS)
+
+    workflow_settings = data.get("workflow", {})
+    if not isinstance(workflow_settings, dict):
+        logger.error(
+            "The 'workflow' key in %s is not an object; the approval gate remains REQUIRED. "
+            "Repair settings.json and restart or reload the server.",
+            SETTINGS_FILE,
+        )
+        return WorkflowApprovalPosture(True, GATE_SOURCE_INVALID_SETTINGS)
+
+    if "require_approval" in workflow_settings:
+        required = workflow_settings["require_approval"]
+        if isinstance(required, bool):
+            return WorkflowApprovalPosture(required, GATE_SOURCE_FILE)
+        logger.error(
+            "workflow.require_approval in %s must be a JSON boolean; the approval gate remains "
+            "REQUIRED. Repair settings.json and restart or reload the server.",
+            SETTINGS_FILE,
+        )
+        return WorkflowApprovalPosture(True, GATE_SOURCE_INVALID_SETTINGS)
+    return WorkflowApprovalPosture(True, GATE_SOURCE_DEFAULT)
+
+
+def is_workflow_approval_required() -> bool:
+    """Return True when an unapproved script-tier workflow run must be refused (issue #583 FR-8).
+
+    Thin delegation to :func:`resolve_workflow_approval_posture`, which carries the full reasoning.
+    The signature is unchanged from Bolt 2 so that every existing caller — and every test asserting
+    this exact shape — is untouched; callers that need to know WHY the gate is on or off ask the
+    resolver instead.
+    """
+    return resolve_workflow_approval_posture().required
 
 
 def is_instruction_promotion_enabled() -> bool:

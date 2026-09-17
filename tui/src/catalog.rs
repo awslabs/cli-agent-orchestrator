@@ -1,6 +1,6 @@
 //! The static run-policy table: what the TUI offers, and how (issue #321).
 //!
-//! One row per leaf command of the CAO Click tree — **86 of them** — each classified `InApp`,
+//! One row per leaf command of the CAO Click tree — **88 of them** — each classified `InApp`,
 //! `Handoff`, or `Hidden`. Three infallible lookups read that table and nothing else.
 //!
 //! # No I/O, and that is the security property (SR-1)
@@ -64,14 +64,15 @@ use std::vec::Vec;
 
 /// The number of leaf commands in the CAO Click tree.
 ///
-/// **86 as of this branch.** Two separate merges from `main` each brought four new leaf commands
+/// **88 as of this branch.** Two separate merges from `main` each brought four new leaf commands
 /// that this table did not know about, and both were caught by
 /// `test/test_command_catalog_matches_click.py` rather than by review — the second one in CI,
 /// because CI tests the PR MERGED against `main` while a local run only sees the branch. That is
 /// the guard doing exactly what it exists for, twice.
 ///
-/// `cao workflow step` (issue #640) is another command this guard caught before review did. It is
-/// HIDE, and it is the single reason this branch reads **86** where `main` reads 85.
+/// `cao workflow step` (issue #640) is another command this guard caught before review did. It
+/// brought `main` to 86 leaves. PR #699 adds `workflow create` and `workflow update`, bringing the
+/// combined tree to 88. All three are HIDE.
 ///
 /// The four `cao workflow *` leaves — `runs`, `wait`, `result`, `events` — arrived with PR #525
 /// (issue #505, commit `e2e6318`). The four `cao memory relationships *` leaves were added by
@@ -87,7 +88,7 @@ use std::vec::Vec;
 /// terminal's `cao-mcp-server` connection dies. All six are HIDE, per the same mandated default —
 /// none has been deliberately reviewed for IN-APP or HANDOFF yet, and `handoff` in particular
 /// blocks for up to an hour, which a reviewer will want to weigh before offering it in-pane. That
-/// moves the count to **76** on `main`, and the distribution to 24/18/34. (`main`'s own note said
+/// moved the count to **76** on `main`, and the distribution to 24/18/34. (`main`'s own note said
 /// "from 69 to 76"; the step from 69 is two hops, not one — `cao workflow approve` had already
 /// taken 24/18/27 = 69 to 24/18/28 = 70 before the six `agent` leaves landed. Re-derived here
 /// rather than carried forward, per this module's own rule about fixing an instance without
@@ -101,8 +102,9 @@ use std::vec::Vec;
 /// fleet configured" on every machine that has not exported them. `cao fleet shutdown` also
 /// deletes other people's running agent sessions, and `cao worker attach` is an interactive
 /// read/send loop with no terminal semantics — two more things a reviewer should weigh before any
-/// of this reaches navigation. That moves the count from 76 to **85**, and the distribution from
-/// 24/18/34 to 24/18/43. With `cao workflow step` on top, this branch is 24/18/44 = **86**.
+/// of this reaches navigation. That moved the count from 76 to **85**, and the distribution from
+/// 24/18/34 to 24/18/43. `cao workflow step` then brought `main` to **24/18/44 = 86**.
+/// With PR #699's `workflow create` and `workflow update`, the combined tree is **24/18/46 = 88**.
 ///
 /// The count below the four additions was **61, not the 60 the design records** — and the discrepancy is a prediction coming true
 /// rather than a defect. `business-logic-model.md` wrote that `cao tui` was "absent from the
@@ -111,7 +113,7 @@ use std::vec::Vec;
 /// must not offer itself — giving **33 IN-APP / 5 HANDOFF / 23 HIDE = 61**. Recorded here
 /// because a reader comparing the design's 60 against this 61 would otherwise suspect drift.
 /// (#321)
-const COMMAND_COUNT: usize = 86;
+const COMMAND_COUNT: usize = 88;
 
 /// What the TUI does with a command.
 ///
@@ -208,7 +210,7 @@ pub struct Command {
 ///
 /// `pub(crate)` since Bolt 3: `server-client`'s route-table tests walk it to assert that every
 /// IN-APP command has a route and that no HANDOFF or HIDE command does. Deriving that set any
-/// other way would mean re-listing 86 commands in a second place, which is a worse trade than
+/// other way would mean re-listing 88 commands in a second place, which is a worse trade than
 /// widening the visibility of a compile-time constant. Still crate-private — no consumer outside
 /// this crate exists, and the table is not a public API. (#321)
 pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
@@ -286,6 +288,7 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::WorkerStatus,
     CommandId::WorkflowApprove,
     CommandId::WorkflowCancel,
+    CommandId::WorkflowCreate,
     CommandId::WorkflowDelete,
     CommandId::WorkflowEvents,
     CommandId::WorkflowGet,
@@ -296,11 +299,12 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::WorkflowRuns,
     CommandId::WorkflowStatus,
     CommandId::WorkflowStep,
+    CommandId::WorkflowUpdate,
     CommandId::WorkflowWait,
     CommandId::WorkflowValidate,
 ];
 
-/// One variant per leaf command — **all 86**, the same figure [`COMMAND_COUNT`] pins.
+/// One variant per leaf command — **all 88**, the same figure [`COMMAND_COUNT`] pins.
 ///
 /// Why an enum rather than a `String` key is the subject of this module's own docs: it is what
 /// makes an unclassified command a **compile error** instead of a runtime `None` (FR-4.2).
@@ -485,6 +489,8 @@ pub enum CommandId {
     WorkflowApprove,
     /// `cao workflow cancel`
     WorkflowCancel,
+    /// `cao workflow create`
+    WorkflowCreate,
     /// `cao workflow delete`
     WorkflowDelete,
     /// `cao workflow events`
@@ -505,6 +511,8 @@ pub enum CommandId {
     WorkflowStatus,
     /// `cao workflow step`
     WorkflowStep,
+    /// `cao workflow update`
+    WorkflowUpdate,
     /// `cao workflow wait`
     WorkflowWait,
     /// `cao workflow validate`
@@ -1361,6 +1369,46 @@ fn entry(id: CommandId) -> Command {
             params: &[Param { name: "plan_id", required: true, kind: ParamKind::Text }],
             handoff_reason: None,
         },
+        CommandId::WorkflowCreate => Command {
+            id: CommandId::WorkflowCreate,
+            parent: Some("workflow"),
+            leaf_name: "create",
+            summary: "Create a new Python workflow spec from a source file.",
+            // Hidden per the mandated default for an unclassified command, AND for a substantive
+            // reason worth stating rather than leaning on the default alone: `authoring-sequence`
+            // (#583 Bolt 3) is about to define what the authoring experience IS — describe, author,
+            // validate, present the plan, approve, run, observe. A pane entry offered now would be a
+            // guess at that shape, and a guess that ships is harder to withdraw than one not made.
+            //
+            // Note this DEPARTS from the sibling precedent: `validate`, `get` and even the
+            // destructive `delete` are all IN-APP. The departure is the point of recording it.
+            // (#583 Bolt 3, authoring-cli-verbs)
+            policy: Policy::Hidden,
+            params: &[
+                Param { name: "name", required: true, kind: ParamKind::Text },
+                Param { name: "from_file", required: true, kind: ParamKind::Text },
+            ],
+            handoff_reason: None,
+        },
+        CommandId::WorkflowUpdate => Command {
+            id: CommandId::WorkflowUpdate,
+            parent: Some("workflow"),
+            leaf_name: "update",
+            summary: "Replace an existing workflow spec's source, refusing a stale update.",
+            // Hidden for the same reason as `create` above, plus one specific to this verb: it
+            // requires an `--expected-hash` the caller must have obtained beforehand, and a TUI has
+            // no good way to supply that without either fetching it (which defeats the check — a
+            // hash read from the file about to be overwritten always matches) or asking the user to
+            // paste a digest, which is not a pane interaction anyone wants.
+            // (#583 Bolt 3, authoring-cli-verbs)
+            policy: Policy::Hidden,
+            params: &[
+                Param { name: "name", required: true, kind: ParamKind::Text },
+                Param { name: "from_file", required: true, kind: ParamKind::Text },
+                Param { name: "expected_hash", required: true, kind: ParamKind::Text },
+            ],
+            handoff_reason: None,
+        },
         CommandId::WorkflowCancel => Command {
             id: CommandId::WorkflowCancel,
             parent: Some("workflow"),
@@ -1590,7 +1638,7 @@ mod tests {
     ///
     /// Returns `(in_app, handoff, hidden)`. The counts are *derived*; every number they are
     /// compared against is a hard-coded literal in the test body. That direction matters — see
-    /// [`the_policy_distribution_is_twentyfour_eighteen_thirtyfive`].
+    /// [`the_policy_distribution_is_twentyfour_eighteen_fortysix`].
     fn distribution() -> (usize, usize, usize) {
         let mut counts = (0, 0, 0);
         for id in DISPLAY_ORDER {
@@ -1603,7 +1651,7 @@ mod tests {
         counts
     }
 
-    /// Test 1 — **the policy distribution is 24 IN-APP / 18 HANDOFF / 44 HIDE, totalling 86.**
+    /// Test 1 — **the policy distribution is 24 IN-APP / 18 HANDOFF / 46 HIDE, totalling 88.**
     ///
     /// Every number here is a **hard-coded literal**, and that is the entire design of the test.
     /// Deriving any of them from the table — `assert_eq!(in_app, TABLE.iter().filter(..).count())`
@@ -1636,13 +1684,16 @@ mod tests {
     /// merge then brought `cao workflow` {`runs`, `result`, `wait`, `events`} from PR #525 — caught
     /// in CI, which tests the PR merged against `main` and so saw four commands a local run could
     /// not. `runs`/`result` are ordinary journal reads (IN-APP); `wait`/`events` are unbounded
-    /// (HANDOFF). That gave **24/18/27 = 69**. Note what the shape of this failure was: every count here was internally
-    /// consistent and every test green, because nothing compared the table against the CLI. That
-    /// is what `test/test_command_catalog_matches_click.py` now does. (Review on PR #547.)
+    /// (HANDOFF). That gave **24/18/27 = 69** at the time. Note what the shape of this failure was:
+    /// every count here was internally consistent and every test green, because nothing compared the
+    /// table against the CLI. That is what `test/test_command_catalog_matches_click.py` now does.
+    /// (Review on PR #547.)
+    ///
+    /// `cao workflow approve` (#583 Bolt 2) then added one HIDE, giving **24/18/28 = 70**.
     ///
     /// Then issue **#616** added six `cao agent *` leaves (assign/cancel/handoff/result/
     /// send-message/status), all HIDE per the same mandated default — none has been deliberately
-    /// reviewed for IN-APP or HANDOFF yet. That gives **24/18/34 = 76**.
+    /// reviewed for IN-APP or HANDOFF yet. That gave **24/18/34 = 76**.
     ///
     /// Then **CAO on EKS v2** added nine: `cao fleet {status, shutdown}` and `cao worker {list,
     /// status, send, sessions, attach, logs, release}`, all HIDE. Unlike every earlier addition,
@@ -1652,32 +1703,41 @@ mod tests {
     ///
     /// **And it happened again.** `cao workflow step` (issue #640) reached the Click tree with no
     /// row here, and the guard — not review — is what said so. It is HIDE, per `project.md`'s
-    /// mandated default for a command not yet deliberately reviewed. `cao workflow approve`
-    /// (#583 Bolt 2) arrived the same way, also HIDE. With `step` on top of the EKS v2 nine, the
-    /// figures are **24/18/44 = 86**. The guard catching a missing row again is the argument for
-    /// keeping the cross-language check.
+    /// mandated default for a command not yet deliberately reviewed. With `step` on top of the
+    /// EKS v2 nine, `main` reached **24/18/44 = 86**. The guard catching a missing row again is
+    /// the argument for keeping the cross-language check.
+    ///
+    /// PR #699 added `cao workflow` {`create`, `update`} (#583 Bolt 3, `authoring-cli-verbs`),
+    /// both HIDE. Its original base had 70 leaves, giving **24/18/30 = 72** before this merge.
+    /// Combining those two verbs with all of `main` gives **24/18/46 = 88**, which this test
+    /// now asserts. The historical figures stay in the past tense to preserve the failure account.
+    ///
+    /// Before Bolt 3, four `69`s and one `70` in this file's prose were stale, and an intra-doc
+    /// link named a missing test. The Rust variant-count guard and Python parity test cover the
+    /// constant, array and assertions; `test_command_catalog_counts_are_not_stale.py` also checks
+    /// the prose, the distribution test name and its links.
     #[test]
-    fn the_policy_distribution_is_twentyfour_eighteen_fortyfour() {
+    fn the_policy_distribution_is_twentyfour_eighteen_fortysix() {
         let (in_app, handoff, hidden) = distribution();
 
         assert_eq!(in_app, 24, "expected 24 IN-APP commands, found {in_app}");
         assert_eq!(handoff, 18, "expected 18 HANDOFF commands, found {handoff}");
-        assert_eq!(hidden, 44, "expected 44 HIDE commands, found {hidden}");
+        assert_eq!(hidden, 46, "expected 46 HIDE commands, found {hidden}");
         assert_eq!(
             in_app + handoff + hidden,
-            86,
-            "the three policy counts must account for all 86 leaf commands of the Click tree"
+            88,
+            "the three policy counts must account for all 88 leaf commands of the Click tree"
         );
 
-        // The three counts summing to 86 does not prove 86 *distinct* commands were counted: a
+        // The three counts summing to 88 does not prove 88 *distinct* commands were counted: a
         // duplicated entry in DISPLAY_ORDER would inflate one policy while a real command went
         // uncounted, and the arithmetic above would still close. DISPLAY_ORDER is generated, so
         // this is a live hazard rather than a theoretical one.
         let distinct: BTreeSet<CommandId> = DISPLAY_ORDER.iter().copied().collect();
         assert_eq!(
             distinct.len(),
-            86,
-            "DISPLAY_ORDER must list 86 DISTINCT commands; a duplicate would let one command go \
+            88,
+            "DISPLAY_ORDER must list 88 DISTINCT commands; a duplicate would let one command go \
              uncounted while the totals still summed correctly"
         );
     }
@@ -1697,9 +1757,9 @@ mod tests {
     /// production. "The compiler has my back" is exactly where a contributor stops checking, so
     /// the uncovered case needs a test rather than a caveat in a doc comment.
     ///
-    /// Neither existing guard catches it. [`the_policy_distribution_is_twentyfour_eighteen_thirtyfive`]
+    /// Neither existing guard catches it. [`the_policy_distribution_is_twentyfour_eighteen_fortysix`]
     /// counts what `DISPLAY_ORDER` *contains*, so a variant missing from it is simply never
-    /// counted; and its `distinct.len() == 86` assertion detects a **duplicate**, which is the
+    /// counted; and its `distinct.len() == 88` assertion detects a **duplicate**, which is the
     /// opposite direction. [`COMMAND_COUNT`] pins the array's *length*, never its membership.
     ///
     /// # Why an exhaustive match and NOT a discriminant trick
@@ -1818,6 +1878,7 @@ mod tests {
                     CommandId::WorkerStatus => CommandId::WorkerStatus,
                     CommandId::WorkflowApprove => CommandId::WorkflowApprove,
                     CommandId::WorkflowCancel => CommandId::WorkflowCancel,
+                    CommandId::WorkflowCreate => CommandId::WorkflowCreate,
                     CommandId::WorkflowDelete => CommandId::WorkflowDelete,
                     CommandId::WorkflowEvents => CommandId::WorkflowEvents,
                     CommandId::WorkflowGet => CommandId::WorkflowGet,
@@ -1828,6 +1889,7 @@ mod tests {
                     CommandId::WorkflowRuns => CommandId::WorkflowRuns,
                     CommandId::WorkflowStep => CommandId::WorkflowStep,
                     CommandId::WorkflowStatus => CommandId::WorkflowStatus,
+                    CommandId::WorkflowUpdate => CommandId::WorkflowUpdate,
                     CommandId::WorkflowWait => CommandId::WorkflowWait,
                     CommandId::WorkflowValidate => CommandId::WorkflowValidate,
                 }
@@ -1909,6 +1971,7 @@ mod tests {
                 CommandId::WorkerStatus,
                 CommandId::WorkflowApprove,
                 CommandId::WorkflowCancel,
+                CommandId::WorkflowCreate,
                 CommandId::WorkflowDelete,
                 CommandId::WorkflowEvents,
                 CommandId::WorkflowGet,
@@ -1919,6 +1982,7 @@ mod tests {
                 CommandId::WorkflowRuns,
                 CommandId::WorkflowStatus,
                 CommandId::WorkflowStep,
+                CommandId::WorkflowUpdate,
                 CommandId::WorkflowWait,
                 CommandId::WorkflowValidate,
             ]

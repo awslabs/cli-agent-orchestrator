@@ -725,6 +725,15 @@ fn route(id: CommandId) -> Option<Route> {
         // path to a human authorisation act that nothing in the interface has reviewed.
         // (#583 Bolt 2, approval-operation)
         CommandId::WorkflowApprove => None,
+        // `cao workflow create` and `cao workflow update` are classified HIDE for the same reason
+        // `approve` is, so these arms are `None` on the same principle: routing a command the TUI does
+        // not offer would build a reachable path to a spec WRITE that nothing in the interface has
+        // reviewed. `update` additionally requires an `--expected-hash` the caller must already hold,
+        // and a route that fetched it would defeat the stale-update check outright — a hash read from
+        // the file about to be overwritten always matches.
+        // (#583 Bolt 3, authoring-cli-verbs)
+        CommandId::WorkflowCreate => None,
+        CommandId::WorkflowUpdate => None,
         // HIDE (issue #640), so it is unreachable through `commands()` and needs no route — the
         // arm exists because this `match` is exhaustive, not because a route was withheld. A route
         // does exist (`POST /workflows/runs/{run_id}/steps/{step_id}:replay`); it is unrouted here
@@ -2646,7 +2655,7 @@ mod tests {
 
     /// **23 routes for the 24 IN-APP commands, and `profile find` is the one without.**
     ///
-    /// The distribution is settled ground truth — 24 IN-APP / 18 HANDOFF / 44 HIDE = 86 — and
+    /// The distribution is settled ground truth — 24 IN-APP / 18 HANDOFF / 46 HIDE = 88 — and
     /// every number below is a **hard-coded literal**. Deriving any of them from `route()` or
     /// from the catalog would compare production against itself, which is the vacuous shape this
     /// project has hit repeatedly.
@@ -2710,7 +2719,7 @@ mod tests {
             .count();
         assert_eq!(
             in_app, 24,
-            "the settled distribution is 24 IN-APP / 18 HANDOFF / 44 HIDE = 86; if this moved, \
+            "the settled distribution is 24 IN-APP / 18 HANDOFF / 46 HIDE = 88; if this moved, \
              the 23-route figure above needs re-deriving rather than adjusting"
         );
     }

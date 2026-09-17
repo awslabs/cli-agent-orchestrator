@@ -26,6 +26,7 @@ import logging
 import os
 import re
 import time
+from collections.abc import Mapping
 from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple
 
 import requests
@@ -773,6 +774,9 @@ def _parse_run_step_error(
         fallback = f"status {response.status_code}"
         return None, fallback, None
 
+    if not isinstance(payload, Mapping):
+        fallback = f"status {response.status_code}"
+        return None, fallback, None
     detail = payload.get("detail")
     if isinstance(detail, dict):
         message = detail.get("message") or f"status {response.status_code}"
@@ -849,6 +853,21 @@ def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
     return data
 
 
+def _render_lint_findings(findings: Any) -> str:
+    """Render lint findings with severity, rule, source line, and message."""
+    if not isinstance(findings, list):
+        return ""
+    lines = []
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+        lines.append(
+            f"{finding.get('severity', '?')} {finding.get('rule_id', '?')} "
+            f"at line {finding.get('line', '?')}: {finding.get('message', '')}"
+        )
+    return "; ".join(lines)
+
+
 def _extract_error_detail(response: requests.Response, fallback: str) -> str:
     """Extract a human-readable error detail from an API response.
 
@@ -858,6 +877,9 @@ def _extract_error_detail(response: requests.Response, fallback: str) -> str:
     into an ``AttributeError`` raised out of the error path — so a transport
     fault surfaced as a crash instead of the typed ``success: False`` envelope
     every caller is written against. Check the type before subscripting.
+
+    Structured details carry an approval-refusal message or lint findings.
+    Keep accepting string details for callers talking to older servers.
     """
     try:
         payload = response.json()
@@ -868,6 +890,12 @@ def _extract_error_detail(response: requests.Response, fallback: str) -> str:
         return fallback
 
     detail = payload.get("detail")
+    if isinstance(detail, dict):
+        message = detail.get("message")
+        if isinstance(message, str) and message:
+            return message
+        rendered = _render_lint_findings(detail.get("findings"))
+        return rendered or fallback
     if isinstance(detail, str) and detail:
         return detail
     return fallback
