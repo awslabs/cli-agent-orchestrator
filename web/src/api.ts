@@ -1,4 +1,36 @@
-const BASE = ''  // Vite proxy handles routing to backend
+/**
+ * Path prefix this bundle is served under, with no trailing slash.
+ *
+ * Vite fills `import.meta.env.BASE_URL` from the `base` config (or `--base` on
+ * the CLI) and always terminates it with a slash. A default build therefore
+ * gives `/`, so BASE is `''` and every URL built below is byte-identical to the
+ * root-absolute paths it replaced. Only a build that opts in with
+ * `--base=/some/prefix/` sees a different value.
+ *
+ * `--base` on its own is not enough to serve the app under a prefix: Vite
+ * rewrites the asset references baked into index.html and the bundle, but it
+ * cannot touch a URL the app assembles at runtime, because those are ordinary
+ * strings it never sees as URLs. The three helpers here are those runtime URLs
+ * — REST, the terminal WebSocket, the workflow event stream — and they are the
+ * whole set (`DashboardHome`'s `fetch` is a local that shadows the global and
+ * calls `api.getTerminalStatus`).
+ *
+ * A relative `--base` such as `./` cannot work for runtime calls and is not
+ * supported; use an absolute prefix.
+ */
+const BASE = import.meta.env.BASE_URL.replace(/\/$/, '')
+
+/** URL for the terminal's xterm WebSocket, honouring BASE. */
+export function terminalSocketUrl(terminalId: string): string {
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
+  return `${protocol}//${location.host}${BASE}/terminals/${terminalId}/ws`
+}
+
+/** URL for a workflow run's SSE event stream, honouring BASE. */
+export function eventStreamUrl(runId: string, afterSeq?: number): string {
+  const q = afterSeq != null ? `?after_seq=${afterSeq}` : ''
+  return `${BASE}/workflows/runs/${encodeURIComponent(runId)}/events${q}`
+}
 
 /**
  * Error thrown by fetchJSON on a non-OK response. Carries the HTTP status and
