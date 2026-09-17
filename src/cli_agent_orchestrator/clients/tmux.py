@@ -493,14 +493,39 @@ class TmuxClient:
         """
         return self._read_listing(
             f"list-panes for '{session_name}' mark '{terminal_name}'",
-            lambda: next(
-                (
-                    pane
-                    for pane in session.panes
-                    if pane.show_option(TERMINAL_MARK_OPTION) == terminal_name
-                ),
-                None,
-            ),
+            lambda: self._pane_carrying_mark(session, terminal_name),
+        )
+
+    @staticmethod
+    def _pane_mark(pane: Pane) -> Optional[str]:
+        """Return the mark set on THIS pane, or None when it carries none.
+
+        Read through ``show-options -p`` rather than ``Pane.show_option``, for
+        two reasons. That accessor RAISES for a pane carrying no mark instead
+        of reporting absence, and every pane of an ordinary host window is in
+        that state. It also hands back libtmux's CONVERTED value, so a terminal
+        named ``123`` or ``on`` comes back as an int or a bool and stops
+        matching its own name — names ``validate_tmux_name`` accepts.
+
+        Without ``-A``, tmux lists only what this pane sets itself, so a mark
+        on the window or on the server answers for the window or the server and
+        never for its panes. Nothing is caught here: a lookup that fails for
+        any other reason stays visible to the caller.
+        """
+        prefix = f"{TERMINAL_MARK_OPTION} "
+        for line in pane.cmd("show-options", "-p").stdout or []:
+            if line.startswith(prefix):
+                # Names are [A-Za-z0-9_-] (validate_tmux_name), so the value
+                # carries no space tmux would have had to quote.
+                return line[len(prefix) :]
+        return None
+
+    @classmethod
+    def _pane_carrying_mark(cls, session: Session, terminal_name: str) -> Optional[Pane]:
+        """Return the pane whose own mark is ``terminal_name``."""
+        return next(
+            (pane for pane in session.panes if cls._pane_mark(pane) == terminal_name),
+            None,
         )
 
     def _resolve_pane(

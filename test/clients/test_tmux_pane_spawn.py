@@ -10,6 +10,9 @@ delivered to whichever pane happens to be focused.
 from unittest.mock import MagicMock, patch
 
 import pytest
+from libtmux.exc import LibTmuxException
+
+from cli_agent_orchestrator.clients.tmux import TERMINAL_MARK_OPTION
 
 
 @pytest.fixture
@@ -25,10 +28,34 @@ def tmux():
         yield client
 
 
-def marked_pane(mark, pane_id="%7"):
+def marked_pane(mark, pane_id="%7", inherited=None):
+    """A pane, the mark it carries, and a mark its window would lend it.
+
+    Models ``show-options``: without ``-A`` tmux lists only what this pane sets
+    itself, and with ``-A`` it adds what the pane would inherit. A double that
+    ignores the flag cannot see an implementation that asks for inheritance.
+
+    ``show_option`` is refused outright, because libtmux raises there for an
+    unmarked pane and converts the value for a marked one — the two behaviours
+    that let the first version of this through.
+    """
     pane = MagicMock()
-    pane.show_option.return_value = mark
     pane.pane_id = pane_id
+
+    def cmd(*args):
+        result = MagicMock()
+        if mark is not None:
+            result.stdout = [f"{TERMINAL_MARK_OPTION} {mark}"]
+        elif "-A" in args and inherited is not None:
+            result.stdout = [f"{TERMINAL_MARK_OPTION} {inherited}"]
+        else:
+            result.stdout = []
+        return result
+
+    pane.cmd.side_effect = cmd
+    pane.show_option.side_effect = AssertionError(
+        "show_option raises for an unmarked pane and converts the value it returns"
+    )
     return pane
 
 
@@ -64,6 +91,44 @@ class TestResolvePane:
         tmux.server.sessions.get.return_value = session
 
         assert tmux._resolve_pane(session, "ses", "coder-3") is None
+
+    def test_an_unmarked_pane_does_not_break_the_scan(self, tmux):
+        """The reported blocker: an ordinary host window's shell pane has no mark.
+
+        Asking such a pane for the option by name raises, so a per-pane read
+        aborted `create_pane` before the first split.
+        """
+        session = session_with(panes=[marked_pane(None, "%0"), marked_pane("coder-3", "%4")])
+        tmux.server.sessions.get.return_value = session
+
+        assert tmux._resolve_pane(session, "ses", "coder-3").pane_id == "%4"
+        assert tmux._resolve_pane(session, "ses", "nobody") is None
+
+    def test_a_mark_on_the_window_does_not_answer_for_its_panes(self, tmux):
+        """A pane option falls back to its window, so an inherited mark would match all."""
+        session = session_with(panes=[marked_pane(None, "%0", inherited="coder-3")])
+        tmux.server.sessions.get.return_value = session
+
+        assert tmux._resolve_pane(session, "ses", "coder-3") is None
+
+    def test_a_lookup_that_fails_for_another_reason_stays_visible(self, tmux):
+        """Only "this pane has no such option" means no match. Anything else is real."""
+        pane = marked_pane("coder-3", "%4")
+        pane.cmd.side_effect = LibTmuxException("server gone")
+        session = session_with(panes=[pane])
+        tmux.server.sessions.get.return_value = session
+
+        with pytest.raises(LibTmuxException):
+            tmux._resolve_pane(session, "ses", "coder-3")
+
+    @pytest.mark.parametrize("name", ["123", "on", "off"])
+    def test_a_name_libtmux_would_convert_still_resolves(self, tmux, name):
+        """`validate_tmux_name` accepts these, and libtmux turns them into int/bool."""
+        wanted = marked_pane(name, "%4")
+        session = session_with(panes=[marked_pane(None, "%0"), wanted])
+        tmux.server.sessions.get.return_value = session
+
+        assert tmux._resolve_pane(session, "ses", name) is wanted
 
     def test_required_raises_when_neither_exists(self, tmux):
         session = session_with()
