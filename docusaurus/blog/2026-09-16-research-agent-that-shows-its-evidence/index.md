@@ -11,16 +11,26 @@ Can a CAO agent answer a research question with real evidence, meaning a citatio
 
 Everything below was run on 2026-09-16 against the CAO `v2.5.1` release tag with the `claude_code` provider. The profile itself ([`examples/serply-research`](https://github.com/awslabs/cli-agent-orchestrator/tree/main/examples/serply-research)) merged after that release in [#790](https://github.com/awslabs/cli-agent-orchestrator/pull/790), so copy it from `main`. The mechanism it relies on, header substitution and remote-URL passthrough, is in `v2.5.1`.
 
-## The short version
+## What this agent is for
 
-I installed the profile with the key, launched it headless with a question, and read the answer off the terminal:
+The job is to answer a research question in a form a reader can check. Two examples: "which papers on retrieval augmented generation matter most, and what does each claim?" and "what did AWS announce about open source last month?". A checkable answer to the first names a citation count next to each paper. A checkable answer to the second names a publisher and a publication date next to each claim.
 
-```bash
-cao install examples/serply-research/serply_researcher.md \
-  --env SERPLY_API_KEY=your-serply-api-key
+Coding agents already have a web search tool, so why not use that? Because a web search result carries neither field. The agent gets a title and a snippet, and it fills the gap with words like "influential" and "recently". Verifying that by hand means opening Google Scholar and sorting by citations, opening each abstract, then opening Google News and reading the dates off each article. It takes a while per question, and none of it leaves a trail you can hand to someone else.
 
-cao launch --agents serply_researcher --headless --auto-approve \
-  --session-name rag "What are the three most cited papers on retrieval augmented generation, and what does each claim?"
+CAO changes three things about that:
+
+- **The research policy lives in a file, not in a chat.** An agent profile carries the instructions (which tool to use for which kind of question, report the count instead of the adjective, date every news claim), the tool allowlist, and the MCP wiring in one markdown document. It goes in a repository, gets reviewed, and behaves the same on every machine that installs it.
+- **The API key stays out of the file.** `cao install --env` writes the key into CAO's managed environment once, and the profile references it by name. The profile you commit and share is the profile that runs.
+- **One command runs it and leaves a record.** `cao launch --headless` with the question as an argument prints the answer in the terminal and leaves a tmux session behind, so you can scroll back through every tool call the agent made if a number looks wrong.
+
+Without CAO the same setup is a provider-specific MCP config file per machine with the key written into it, a system prompt pasted into each new session, and no record of the run. With CAO it is one profile and two commands.
+
+## Executive summary
+
+After the two commands in the [Setup](#setup) section below, I launched the agent headless with one question:
+
+```text
+What are the three most cited papers on retrieval augmented generation, and what does each claim?
 ```
 
 The agent called the Serply MCP server, ranked the results by citation count, fetched the three abstracts, and answered in the profile's required shape. This is the table it produced, unedited apart from width:
@@ -35,7 +45,23 @@ Below the table it summarized what each paper claims from the abstract, listed t
 
 That last paragraph is the point. The profile asks the agent to report the number rather than call a paper "influential", to date every news claim, and to say what it could not verify. With a tool that returns those fields, the agent does.
 
-If that is all you wanted, the setup steps are in the next section and you can stop there. The rest of the post is for readers who want to know why it works and where it strains.
+The next section shows how the pieces fit together, then the setup steps, then why the wiring works and where it strained.
+
+## How the pieces fit together
+
+There is one agent in this post. CAO can run several agents that hand work to each other, but a research question with a single evidence policy did not need a second one, so the interesting part is what sits around that agent rather than a chain of them.
+
+![Workflow diagram. A person in a terminal runs cao install with the key, which writes it into CAO's managed environment file, and cao launch headless with a question, which reaches cao-server. cao-server loads the serply_researcher profile, substitutes the key from the environment file, and starts the agent in a tmux session on the claude_code provider with the reviewer role. The agent talks over MCP to two servers: cao-mcp-server locally over stdio, and the serply MCP server at api.serply.io over HTTP with an X-Api-Key header, which exposes google_scholar_search, google_news_search, google_search and scrape_url and in turn queries Google Scholar, Google News, Google web and article pages. The answer, a table with citation counts and dated sources, flows back to the terminal.](./workflow.svg)
+
+The numbered steps in the diagram, in the order they happen:
+
+1. `cao install --env` copies the profile into CAO's profile directory and writes `SERPLY_API_KEY` into the managed environment file. This happens once.
+2. `cao launch --agents serply_researcher --headless` with the question as an argument asks `cao-server` to start a session. The server opens a tmux session and starts the provider inside it.
+3. While loading the profile, CAO substitutes `${SERPLY_API_KEY}` with the stored value, then hands the provider an MCP config with two servers: `cao-mcp-server` (CAO's own orchestration tools, local, over stdio) and `serply` (remote, over HTTP, with the key in a header).
+4. The agent reads the question, picks the tool the profile's rules point at, and calls it. Scholar results arrive with citation counts, News results with publishers and dates. When a snippet is too thin to support a claim, the agent calls `scrape_url` on the page.
+5. The agent prints its answer in the shape the profile demands and the terminal shows it. The tmux session stays open, so the tool calls behind each number are there to read.
+
+The agent runs under the `reviewer` role, which lets it read files but not run shell commands, edit, or use the provider's native web fetch. The two MCP servers are the only tools it has beyond that, and only one of them reaches the network.
 
 ## Setup
 
