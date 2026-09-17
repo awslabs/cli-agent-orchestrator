@@ -295,9 +295,15 @@ def get_session(session_name: str) -> Dict:
         # single source of truth and is backend-aware (tmux push vs herdr
         # native), so derive it here rather than persisting a stale column.
         from cli_agent_orchestrator.services.status_monitor import status_monitor
+        from cli_agent_orchestrator.services.terminal_service import reported_status
 
         for terminal in terminals:
-            terminal["status"] = status_monitor.get_status(terminal["id"]).value
+            # reported_status keeps this in step with GET /terminals/{id}: a
+            # terminal whose accepted initial message has not been dispatched yet
+            # must not read IDLE/COMPLETED anywhere a client can see it (#566).
+            terminal["status"] = reported_status(
+                terminal["id"], status_monitor.get_status(terminal["id"])
+            ).value
         return {"session": session_data, "terminals": terminals}
 
     except Exception as e:

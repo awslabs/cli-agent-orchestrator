@@ -861,6 +861,56 @@ class TestSessionOwnershipIntegration:
                     delete_session(second.session_name)
 
 
+class TestGetSessionMasksPendingDelivery:
+    """#566: the masking WIRING here, not just ``reported_status`` in isolation.
+
+    ``TestReportedStatusMasking`` pins the function; nothing pinned that
+    ``get_session`` actually calls it. Deleting the call left 162 tests passing
+    (gutosantos82's mutation check), so the whole invariant -- a terminal whose
+    accepted initial message is undelivered must never read completable anywhere a
+    client can see it -- rested on an unguarded call site. ``GET /sessions/{name}``
+    is one of the three outward surfaces, reached by ``examples/fleet/panel`` and
+    by ``ops_mcp_server.get_session_info``.
+    """
+
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_pending_delivery_is_masked_in_the_session_listing(
+        self, mock_get_backend, mock_list_terminals
+    ):
+        from cli_agent_orchestrator.models.terminal import TerminalStatus
+        from cli_agent_orchestrator.services import terminal_service
+
+        mock_get_backend.return_value.session_exists.return_value = True
+        mock_get_backend.return_value.list_sessions.return_value = [
+            {"id": "cao-test", "name": "Test Session"}
+        ]
+        mock_list_terminals.return_value = [
+            {"id": "pend1234", "session": "cao-test"},
+            {"id": "free5678", "session": "cao-test"},
+        ]
+
+        fake_monitor = MagicMock()
+        fake_monitor.get_status.return_value = TerminalStatus.IDLE
+
+        # Only pend1234 has an undelivered initial message.
+        with (
+            patch.object(terminal_service, "_pending_initial_delivery", {"pend1234"}),
+            patch("cli_agent_orchestrator.services.status_monitor.status_monitor", fake_monitor),
+        ):
+            result = get_session("cao-test")
+
+        by_id = {term["id"]: term["status"] for term in result["terminals"]}
+        assert by_id["pend1234"] == TerminalStatus.UNKNOWN.value, (
+            "get_session reported a completable status for a terminal whose initial "
+            "message has not been dispatched -- the mask is not wired into this surface, "
+            "so a client polling GET /sessions/{name} can still conclude 'done'"
+        )
+        assert (
+            by_id["free5678"] == TerminalStatus.IDLE.value
+        ), "masking leaked to a terminal with no pending delivery; it is per-terminal"
+
+
 class TestGetSession:
     """Tests for get_session function."""
 

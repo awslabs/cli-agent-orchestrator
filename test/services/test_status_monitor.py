@@ -1409,3 +1409,66 @@ class TestMidBurstProcessingProbe:
         sm._bursting["t1"] = True
         sm._schedule_screen_detection("t1", provider)
         assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+
+
+class TestOutputGenerationIsOutputOnly:
+    """PR #566: the delivery-confirmation gate needs a counter only OUTPUT can move.
+
+    ``_capture_generation`` must advance on ``notify_input_sent`` too (a new turn
+    invalidates in-flight capture verdicts), so it cannot serve: a redelivery's own
+    arm would satisfy "output arrived since dispatch" on a still-cached COMPLETED.
+    ``output_generation()`` therefore exposes a separate counter that only
+    ``_process_chunk`` bumps.
+    """
+
+    def test_unknown_terminal_reads_zero(self):
+        assert StatusMonitor().output_generation("never-seen") == 0
+
+    def test_arming_a_turn_does_not_advance_it(self):
+        sm = StatusMonitor()
+        sm.notify_input_sent("t1")
+        sm.notify_input_sent("t1", assume_processing=False)
+        assert sm.output_generation("t1") == 0, (
+            "notify_input_sent moved the output generation: a redelivery's own arm would "
+            "now pass for post-dispatch output and confirm a stale COMPLETED"
+        )
+        # The capture generation, by contrast, MUST have moved -- that is its job.
+        assert sm._capture_generation["t1"] == 2
+
+    @patch("cli_agent_orchestrator.services.status_monitor.get_server_settings")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_each_real_chunk_advances_it_by_one(self, mock_pm, mock_settings):
+        mock_settings.return_value = {"state_buffer_max": 32768}
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        provider.get_status.return_value = TerminalStatus.PROCESSING
+        mock_pm.get_provider.return_value = provider
+
+        sm = StatusMonitor()
+        sm.notify_input_sent("t1")  # dispatch: arms, does not count
+        boundary = sm.output_generation("t1")
+        for chunk in ("thinking ", "done.\n", "> "):
+            sm._process_chunk("t1", chunk)
+
+        assert sm.output_generation("t1") == boundary + 3
+        # Interleaving another arm (a redelivery) still adds nothing.
+        sm.notify_input_sent("t1")
+        assert sm.output_generation("t1") == boundary + 3
+
+    @patch("cli_agent_orchestrator.services.status_monitor.get_server_settings")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_forgetting_a_terminal_resets_it(self, mock_pm, mock_settings):
+        mock_settings.return_value = {"state_buffer_max": 32768}
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        provider.get_status.return_value = TerminalStatus.PROCESSING
+        mock_pm.get_provider.return_value = provider
+
+        sm = StatusMonitor()
+        sm._process_chunk("t1", "x")
+        assert sm.output_generation("t1") == 1
+        sm.reset_buffer("t1")
+        assert sm.output_generation("t1") == 0
+        sm._process_chunk("t1", "y")
+        sm.clear_terminal("t1")
+        assert sm.output_generation("t1") == 0
