@@ -45,6 +45,10 @@ from cli_agent_orchestrator.plugins import (
 from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_event
 from cli_agent_orchestrator.services.session_env import clear_session_env
 from cli_agent_orchestrator.services.session_lock import session_lifecycle_lock
+from cli_agent_orchestrator.services.settings_service import (
+    get_session_labels,
+    set_session_label,
+)
 from cli_agent_orchestrator.services.terminal_service import create_terminal
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 
@@ -255,7 +259,14 @@ def list_sessions() -> List[Dict]:
         if not cao_sessions:
             return []
         terminals_by_session = _terminals_grouped_by_session([s["id"] for s in cao_sessions])
-        return [_enrich_session_ownership(backend, s, terminals_by_session) for s in cao_sessions]
+        labels = get_session_labels()
+        sessions = [
+            _enrich_session_ownership(backend, s, terminals_by_session) for s in cao_sessions
+        ]
+        for session in sessions:
+            # Operator-assigned display alias (settings_service); None when unset.
+            session["label"] = labels.get(session["id"])
+        return sessions
     except Exception:
         # Swallowed to keep a caller's listing from raising, so exc_info for the
         # same reason as the two handlers above -- more so, in fact: this one
@@ -285,6 +296,8 @@ def get_session(session_name: str) -> Dict:
 
         if not session_data:
             raise ValueError(f"Session '{session_name}' not found")
+        # Operator-assigned display alias (settings_service); None when unset.
+        session_data["label"] = get_session_labels().get(session_name)
 
         terminals = list_terminals_by_session(session_name)
         # Enrich each terminal with its live status. list_terminals_by_session
@@ -557,6 +570,18 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
                 logger.warning(f"Failed to clear forwarded env for {session_name}: {e}")
                 result["errors"].append(
                     {"session": session_name, "step": "clear_session_env", "error": str(e)}
+                )
+
+            # Drop the session's display alias so a later same-name session does
+            # not inherit it. Same guard shape as the env cleanup above: a
+            # settings write failure is reported, never allowed to misreport the
+            # completed teardown.
+            try:
+                set_session_label(session_name, "")
+            except Exception as e:
+                logger.warning(f"Failed to clear label for {session_name}: {e}")
+                result["errors"].append(
+                    {"session": session_name, "step": "clear_session_label", "error": str(e)}
                 )
 
             if cleanup_complete:

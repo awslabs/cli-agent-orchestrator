@@ -9,12 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Operator ergonomics on the HTTP API: `working_directory` on `POST /sessions`
+  and `POST /sessions/{name}/terminals` accepts the spellings an operator
+  pastes from a browser on WSL (quoted, `~`, Windows drive paths mapped to the
+  `/mnt` interop mount) and creates a missing folder, bounded and only after
+  every cheaper validation; `GET /fs/dirs` lists server-side subdirectories
+  for a folder picker; `POST /sessions/{name}/label` gives a session a display
+  alias surfaced on the session listings; every handled response carries an
+  `X-Server-Time` header, exposed through CORS, so a browser can correct for
+  clock skew
+
 - Profiles tab in the Web UI: browse, search, create (from template with live
   preview, or from scratch via a schema-driven form), edit, clone, and delete
   agent profiles over the profile management APIs, with validate-before-save
   surfacing bounded findings and the truncation-marker contract (#510)
 
 ### Fixed
+
+- **a settings write over an unreadable `settings.json` deleted every other
+  setting (#737).** Each writer loaded the file leniently, so one that existed
+  but did not parse loaded as `{}`, and the write then persisted that empty
+  fallback with only the section being written. Writers now share one locked,
+  atomically published read-modify-write that refuses to run when the file is
+  present but cannot be read or parsed (`500`, file untouched); two concurrent
+  writers can no longer lose each other's update either.
 
 - **enabling `CAO_MEMORY_API_URL` rejected memory keys that work without it.**
   The `/internal/memory/store` and `/forget` routes validated the wire `key` as
