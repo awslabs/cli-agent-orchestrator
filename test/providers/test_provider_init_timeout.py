@@ -48,7 +48,7 @@ class TestInitializePassesResolvedInitTimeout:
     load_agent_profile (profile source), wait_for_shell / wait_until_status /
     wait_until_input_ready (the async waits), _build_claude_command (avoids
     temp-file I/O), _handle_startup_prompts (asserted separately),
-    _ensure_skip_bypass_prompt_setting (avoids writing
+    _ensure_startup_settings (avoids writing
     ~/.claude/settings.json), and the terminal backend.
     """
 
@@ -58,7 +58,7 @@ class TestInitializePassesResolvedInitTimeout:
             yield
 
     @pytest.mark.asyncio
-    @patch.object(ClaudeCodeProvider, "_ensure_skip_bypass_prompt_setting")
+    @patch.object(ClaudeCodeProvider, "_ensure_startup_settings")
     @patch.object(ClaudeCodeProvider, "_build_claude_command", return_value="claude")
     @patch.object(ClaudeCodeProvider, "_handle_startup_prompts")
     @patch(f"{_CC}.load_agent_profile")
@@ -91,7 +91,7 @@ class TestInitializePassesResolvedInitTimeout:
 
     @pytest.mark.asyncio
     @patch(_SETTINGS, return_value={"provider_init_timeout": 60})
-    @patch.object(ClaudeCodeProvider, "_ensure_skip_bypass_prompt_setting")
+    @patch.object(ClaudeCodeProvider, "_ensure_startup_settings")
     @patch.object(ClaudeCodeProvider, "_build_claude_command", return_value="claude")
     @patch.object(ClaudeCodeProvider, "_handle_startup_prompts")
     @patch(f"{_CC}.load_agent_profile")
@@ -125,7 +125,7 @@ class TestInitializePassesResolvedInitTimeout:
 
     @pytest.mark.asyncio
     @patch(_SETTINGS, return_value={"provider_init_timeout": 60})
-    @patch.object(ClaudeCodeProvider, "_ensure_skip_bypass_prompt_setting")
+    @patch.object(ClaudeCodeProvider, "_ensure_startup_settings")
     @patch.object(ClaudeCodeProvider, "_build_claude_command", return_value="claude")
     @patch.object(ClaudeCodeProvider, "_handle_startup_prompts")
     @patch(f"{_CC}.wait_for_shell")
@@ -155,7 +155,7 @@ class TestInitializePassesResolvedInitTimeout:
         assert mock_handle.call_args.kwargs["outer_timeout"] == 60
 
     @pytest.mark.asyncio
-    @patch.object(ClaudeCodeProvider, "_ensure_skip_bypass_prompt_setting")
+    @patch.object(ClaudeCodeProvider, "_ensure_startup_settings")
     @patch.object(ClaudeCodeProvider, "_build_claude_command", return_value="claude")
     @patch.object(ClaudeCodeProvider, "_handle_startup_prompts")
     @patch(f"{_CC}.load_agent_profile")
