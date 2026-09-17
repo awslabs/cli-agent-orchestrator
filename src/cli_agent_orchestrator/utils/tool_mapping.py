@@ -6,10 +6,7 @@ This module provides the mapping and a function to compute which native tools to
 given a set of allowed CAO tools.
 """
 
-import logging
 from typing import Dict, List, Set
-
-logger = logging.getLogger(__name__)
 
 # All CAO tool categories and what they map to in each provider.
 # Keys are provider names, values map CAO tool names to lists of native tool names.
@@ -134,7 +131,10 @@ def resolve_allowed_tools(
     Resolution order:
     1. profile_allowed_tools (explicit in profile or --allowed-tools CLI)
     2. Role-based defaults (built-in or custom from settings.json)
-    3. Unrestricted ["*"] (backward compatible — no role/allowedTools = no restrictions)
+    3. Developer defaults when role and allowedTools are both omitted
+
+    An unrecognized role raises ValueError. A typo must not be more
+    privileged than omitting the field.
 
     MCP server names from the profile are appended as @server_name.
     """
@@ -145,12 +145,10 @@ def resolve_allowed_tools(
         if role_defaults is not None:
             allowed = role_defaults
         else:
-            logger.warning(
-                "Unknown role '%s' — falling back to unrestricted. "
-                "Define custom roles in settings.json under 'roles'.",
-                role,
+            raise ValueError(
+                f"Unknown role {role!r}. Define it in settings.json under "
+                "'roles', or omit role for developer defaults."
             )
-            allowed = ["*"]
     else:
         # No role, no allowedTools — default to developer (secure default)
         from cli_agent_orchestrator.constants import ROLE_TOOL_DEFAULTS

@@ -45,6 +45,7 @@ role: supervisor
 | `supervisor` | `@cao-mcp-server`, `fs_read`, `fs_list` | Orchestrate workers + read files for context |
 | `developer` | `@builtin`, `fs_*`, `execute_bash`, `web_fetch`, `@cao-mcp-server` | Full access: read, write, execute, fetch, orchestrate |
 | `reviewer` | `@builtin`, `fs_read`, `fs_list`, `@cao-mcp-server` | Read-only: review code, no writes, execution, or network |
+| `workflow_scout` | `@builtin`, `fs_read`, `execute_bash`, `@cao-mcp-server` | Locate existing workflow specs (`cao workflow list` / `get`); no writes or network |
 
 #### Custom Roles
 
@@ -116,7 +117,7 @@ CAO translates these to each provider's native tool names automatically. You wri
 
 #### `discovery` is a separate opt-in, not part of `@cao-mcp-server`
 
-`discovery` gates `list_siblings`/`update_metadata` independently of `@cao-mcp-server`. A profile with `@cao-mcp-server` (handoff/assign/send_message) does **not** automatically get sibling discovery, and vice versa — none of the built-in roles (`supervisor`, `developer`, `reviewer`) include `discovery`; add it explicitly if a profile needs peer-to-peer discovery.
+`discovery` gates `list_siblings`/`update_metadata` independently of `@cao-mcp-server`. A profile with `@cao-mcp-server` (handoff/assign/send_message) does **not** automatically get sibling discovery, and vice versa — none of the built-in roles (`supervisor`, `developer`, `reviewer`, `workflow_scout`) include `discovery`; add it explicitly if a profile needs peer-to-peer discovery.
 
 This is deliberate (see the design discussion on [issue #432](https://github.com/awslabs/cli-agent-orchestrator/issues/432)): the supervisor/worker hierarchy `handoff`/`assign`/`send_message` are built around, and the flat peer layer `group`/`list_siblings`/`update_metadata` introduce, are two different communication topologies. A profile should be able to keep one without the other. See [Discovery Tool Coexistence](discovery-tool-coexistence.md) for the full rationale, the enforcement mechanism, and open follow-ups.
 
