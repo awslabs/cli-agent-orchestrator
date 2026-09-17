@@ -750,6 +750,37 @@ def test_publish_rejects_target_name_escape(tmp_path) -> None:
         os.close(managed_fd)
 
 
+def test_target_mode_rejects_target_name_escape_before_stat(tmp_path, monkeypatch) -> None:
+    fixture = build_vault_fixture(tmp_path)
+    managed_fd = os.open(fixture.root / "CAO", os.O_RDONLY | os.O_DIRECTORY)
+
+    def unexpected_stat(*_args, **_kwargs):
+        pytest.fail("unsafe target name reached os.stat")
+
+    monkeypatch.setattr(writer.os, "stat", unexpected_stat)
+
+    try:
+        with pytest.raises(ValueError, match="must not contain a path separator"):
+            writer._target_mode(managed_fd, "../outside.md")
+    finally:
+        os.close(managed_fd)
+
+
+def test_target_mode_refuses_symlink_via_regular_file_backstop(tmp_path) -> None:
+    fixture = build_vault_fixture(tmp_path)
+    managed = fixture.root / "CAO"
+    outside = tmp_path / "outside.md"
+    outside.write_text("outside", encoding="utf-8")
+    (managed / "managed-note.md").symlink_to(outside)
+    managed_fd = os.open(managed, os.O_RDONLY | os.O_DIRECTORY)
+
+    try:
+        with pytest.raises(writer.VaultWriteBoundaryError, match="not a regular file"):
+            writer._target_mode(managed_fd, "managed-note.md")
+    finally:
+        os.close(managed_fd)
+
+
 def test_publish_temp_creation_is_exclusive_nofollow_and_descriptor_relative(
     tmp_path, monkeypatch
 ) -> None:
@@ -932,6 +963,41 @@ def test_write_preserves_existing_mode_and_uses_umask_for_new_note(tmp_path) -> 
     finally:
         os.umask(old_umask)
     assert stat.S_IMODE(target.stat().st_mode) == 0o644
+
+
+def test_path_component_validator_results_flow_to_writer_path_sinks() -> None:
+    """Keep CodeQL's sanitizer-to-sink data flow explicit in each writer helper."""
+    tree = ast.parse(
+        Path(writer.__file__).read_text(encoding="utf-8"),
+        filename=str(writer.__file__),
+    )
+    expected_bindings = {
+        "_managed_target": "key",
+        "_read_contained_text": "target_name",
+        "_target_mode": "target_name",
+        "_publish_managed_note": "target_name",
+    }
+
+    functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    for function_name, expected_name in expected_bindings.items():
+        assignments = [
+            node
+            for node in ast.walk(functions[function_name])
+            if isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "validate_path_component"
+        ]
+        assert any(
+            len(assignment.targets) == 1
+            and isinstance(assignment.targets[0], ast.Name)
+            and assignment.targets[0].id == expected_name
+            for assignment in assignments
+        ), f"{function_name} must bind the validated {expected_name} before its path sink"
 
 
 def test_vault_writer_owns_nonempty_vault_write_sink_set() -> None:

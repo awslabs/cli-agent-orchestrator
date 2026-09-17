@@ -194,7 +194,7 @@ def write_managed_note(
 
 
 def _managed_target(vault: VaultSpec, key: str) -> tuple[str, str, str, str, str]:
-    validate_path_component(key, "vault key")
+    key = validate_path_component(key, "vault key")
     managed_folder = normalize_relpath(vault.managed_folder)
     root_real = os.path.realpath(vault.root)
     managed_base = os.path.join(root_real, *managed_folder.split("/"))
@@ -227,7 +227,7 @@ def _open_managed_dir_fd(root_real: str, managed_folder: str) -> int:
 
 def _read_contained_text(managed_fd: int, target_name: str, target: str) -> str:
     """Read the target through the same verified directory used to publish it."""
-    validate_path_component(target_name, "vault note filename")
+    target_name = validate_path_component(target_name, "vault note filename")
     try:
         fd = os.open(
             target_name,
@@ -452,7 +452,7 @@ def _umask_default_mode() -> int:
 
 
 def _target_mode(managed_fd: int, target_name: str) -> int:
-    validate_path_component(target_name, "vault note filename")
+    target_name = validate_path_component(target_name, "vault note filename")
     try:
         metadata = os.stat(target_name, dir_fd=managed_fd, follow_symlinks=False)
     except FileNotFoundError:
@@ -464,7 +464,7 @@ def _target_mode(managed_fd: int, target_name: str) -> int:
 
 def _publish_managed_note(managed_fd: int, target_name: str, content: str, mode: int) -> None:
     """Atomically replace one entry relative to a held managed-directory descriptor."""
-    validate_path_component(target_name, "vault note filename")
+    target_name = validate_path_component(target_name, "vault note filename")
     temp_name = ""
     fd = -1
     for _attempt in range(128):
