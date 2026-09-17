@@ -739,9 +739,30 @@ def test_read_sink_guard_raises_writer_containment_error(tmp_path) -> None:
         os.close(managed_fd)
 
 
-def test_publish_rejects_target_name_escape(tmp_path) -> None:
+def test_read_rejects_target_name_escape_before_open(tmp_path, monkeypatch) -> None:
     fixture = build_vault_fixture(tmp_path)
     managed_fd = os.open(fixture.root / "CAO", os.O_RDONLY | os.O_DIRECTORY)
+
+    def unexpected_open(*_args, **_kwargs):
+        pytest.fail("unsafe target name reached os.open")
+
+    monkeypatch.setattr(writer.os, "open", unexpected_open)
+
+    try:
+        with pytest.raises(ValueError, match="must not contain a path separator"):
+            writer._read_contained_text(managed_fd, "../outside.md", str(tmp_path / "outside.md"))
+    finally:
+        os.close(managed_fd)
+
+
+def test_publish_rejects_target_name_escape_before_replace(tmp_path, monkeypatch) -> None:
+    fixture = build_vault_fixture(tmp_path)
+    managed_fd = os.open(fixture.root / "CAO", os.O_RDONLY | os.O_DIRECTORY)
+
+    def unexpected_replace(*_args, **_kwargs):
+        pytest.fail("unsafe target name reached os.replace")
+
+    monkeypatch.setattr(writer.os, "replace", unexpected_replace)
 
     try:
         with pytest.raises(ValueError, match="must not contain a path separator"):
@@ -965,17 +986,16 @@ def test_write_preserves_existing_mode_and_uses_umask_for_new_note(tmp_path) -> 
     assert stat.S_IMODE(target.stat().st_mode) == 0o644
 
 
-def test_path_component_validator_results_flow_to_writer_path_sinks() -> None:
-    """Keep CodeQL's sanitizer-to-sink data flow explicit in each writer helper."""
+def test_writer_path_sinks_have_adjacent_inline_target_name_barriers() -> None:
+    """Keep CodeQL's recognized fullmatch barrier adjacent to each flagged sink."""
     tree = ast.parse(
         Path(writer.__file__).read_text(encoding="utf-8"),
         filename=str(writer.__file__),
     )
-    expected_bindings = {
-        "_managed_target": "key",
-        "_read_contained_text": "target_name",
-        "_target_mode": "target_name",
-        "_publish_managed_note": "target_name",
+    expected_sinks = {
+        "_read_contained_text": "open",
+        "_target_mode": "stat",
+        "_publish_managed_note": "replace",
     }
 
     functions = {
@@ -983,21 +1003,66 @@ def test_path_component_validator_results_flow_to_writer_path_sinks() -> None:
         for node in tree.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
-    for function_name, expected_name in expected_bindings.items():
-        assignments = [
-            node
-            for node in ast.walk(functions[function_name])
-            if isinstance(node, ast.Assign)
-            and isinstance(node.value, ast.Call)
-            and isinstance(node.value.func, ast.Name)
-            and node.value.func.id == "validate_path_component"
-        ]
-        assert any(
-            len(assignment.targets) == 1
-            and isinstance(assignment.targets[0], ast.Name)
-            and assignment.targets[0].id == expected_name
-            for assignment in assignments
-        ), f"{function_name} must bind the validated {expected_name} before its path sink"
+
+    def is_barrier(statement: ast.stmt) -> bool:
+        if not isinstance(statement, ast.If) or not isinstance(statement.test, ast.UnaryOp):
+            return False
+        if not isinstance(statement.test.op, ast.Not):
+            return False
+        call = statement.test.operand
+        return (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "fullmatch"
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "_VAULT_NOTE_FILENAME_RE"
+            and len(call.args) == 1
+            and isinstance(call.args[0], ast.Name)
+            and call.args[0].id == "target_name"
+            and any(isinstance(body_node, ast.Raise) for body_node in statement.body)
+        )
+
+    def contains_sink(statement: ast.stmt, sink_name: str) -> bool:
+        sink_arg_index = 1 if sink_name == "replace" else 0
+        for node in ast.walk(statement):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "os"
+                and node.func.attr == sink_name
+                and len(node.args) > sink_arg_index
+            ):
+                continue
+            sink_arg = node.args[sink_arg_index]
+            if isinstance(sink_arg, ast.Name) and sink_arg.id == "target_name":
+                return True
+        return False
+
+    def has_adjacent_barrier(node: ast.AST, sink_name: str) -> bool:
+        for _field, value in ast.iter_fields(node):
+            if isinstance(value, list):
+                statements = [item for item in value if isinstance(item, ast.stmt)]
+                if len(statements) == len(value):
+                    for index, statement in enumerate(statements):
+                        if (
+                            contains_sink(statement, sink_name)
+                            and index > 0
+                            and is_barrier(statements[index - 1])
+                        ):
+                            return True
+                for item in value:
+                    if isinstance(item, ast.AST) and has_adjacent_barrier(item, sink_name):
+                        return True
+            elif isinstance(value, ast.AST) and has_adjacent_barrier(value, sink_name):
+                return True
+        return False
+
+    for function_name, sink_name in expected_sinks.items():
+        assert has_adjacent_barrier(functions[function_name], sink_name), (
+            f"{function_name} must guard target_name with an adjacent inline fullmatch "
+            f"before os.{sink_name}"
+        )
 
 
 def test_vault_writer_owns_nonempty_vault_write_sink_set() -> None:

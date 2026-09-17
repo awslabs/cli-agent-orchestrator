@@ -6,6 +6,7 @@ import errno
 import hashlib
 import logging
 import os
+import re
 import secrets
 import stat
 from collections import Counter
@@ -39,6 +40,10 @@ from cli_agent_orchestrator.utils.atomic_file import _file_lock, _lock_path_for
 from cli_agent_orchestrator.utils.path_validation import validate_path_component
 
 logger = logging.getLogger(__name__)
+# Keep the fullmatch inline in each sink-owning function. CodeQL's
+# py/path-injection query recognizes the same-function barrier on the exact
+# variable reaching the sink, but not the shared validator's return binding.
+_VAULT_NOTE_FILENAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _boundary_write_refusals: Counter[str] = Counter()
 _boundary_write_refusals_lock = Lock()
 
@@ -228,6 +233,8 @@ def _open_managed_dir_fd(root_real: str, managed_folder: str) -> int:
 def _read_contained_text(managed_fd: int, target_name: str, target: str) -> str:
     """Read the target through the same verified directory used to publish it."""
     target_name = validate_path_component(target_name, "vault note filename")
+    if not _VAULT_NOTE_FILENAME_RE.fullmatch(target_name):
+        raise ValueError("vault note filename must match ^[A-Za-z0-9._-]+$")
     try:
         fd = os.open(
             target_name,
@@ -453,6 +460,8 @@ def _umask_default_mode() -> int:
 
 def _target_mode(managed_fd: int, target_name: str) -> int:
     target_name = validate_path_component(target_name, "vault note filename")
+    if not _VAULT_NOTE_FILENAME_RE.fullmatch(target_name):
+        raise ValueError("vault note filename must match ^[A-Za-z0-9._-]+$")
     try:
         metadata = os.stat(target_name, dir_fd=managed_fd, follow_symlinks=False)
     except FileNotFoundError:
@@ -488,6 +497,8 @@ def _publish_managed_note(managed_fd: int, target_name: str, content: str, mode:
             handle.flush()
             os.fchmod(handle.fileno(), mode)
             os.fsync(handle.fileno())
+        if not _VAULT_NOTE_FILENAME_RE.fullmatch(target_name):
+            raise ValueError("vault note filename must match ^[A-Za-z0-9._-]+$")
         os.replace(
             temp_name,
             target_name,
