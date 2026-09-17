@@ -1452,6 +1452,7 @@ async def create_terminal(
             group=group,
             metadata=metadata,
             status=initial_status,
+            status_generation=0,
             last_active=datetime.now(),
         )
 
@@ -2104,7 +2105,17 @@ def get_terminal(terminal_id: str) -> Dict:
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
-        status = status_monitor.get_status(terminal_id).value
+        # One atomic (status, evidence) pair from StatusMonitor (issue #735
+        # review: separate reads could pair a stale status with a newer
+        # evidence stamp — a controlled interleaving returned completed/3
+        # while the live latch was processing/3). ``status_generation`` is
+        # the dispatch sequence of the evidence behind ``status``: callers
+        # correlating a wait with a specific dispatch (POST
+        # /terminals/{id}/input returns input_generation) accept a
+        # completion only once this reaches their dispatch sequence.
+        status, status_generation = status_monitor.get_status_snapshot(terminal_id)
+        if status in {TerminalStatus.IDLE, TerminalStatus.COMPLETED}:
+            _retain_completed_dispatch_output(terminal_id, status_generation)
 
         return {
             "id": metadata["id"],
@@ -2117,7 +2128,8 @@ def get_terminal(terminal_id: str) -> Dict:
             "engine": metadata.get("engine"),
             "group": metadata.get("group"),
             "metadata": metadata.get("metadata"),
-            "status": status,
+            "status": status.value,
+            "status_generation": status_generation,
             "last_active": metadata["last_active"],
         }
 
@@ -2245,11 +2257,113 @@ def send_input(
     ``paste_enter_count`` property (e.g., some TUIs need 2 Enters because
     bracketed paste triggers multi-line mode).
 
+    Returns True when the input was dispatched successfully. Callers that
+    need to correlate their completion wait with THIS dispatch (the API's
+    ``input_generation``) call :func:`dispatch_input`, which returns the
+    dispatch sequence alongside the Boolean result.
+
     ``frozen_memory`` is forwarded UNCHANGED to :func:`inject_memory_context` and
     is otherwise none of this function's business — not inspected, not validated,
     not logged. It is last and defaulted so existing positional callers (notably
     ``agent_step.run_agent_step``, which passes exactly two arguments) are
     unaffected.
+    """
+    ok, _ = _dispatch_input_locked(
+        terminal_id,
+        message,
+        registry=registry,
+        sender_id=sender_id,
+        orchestration_type=orchestration_type,
+        frozen_memory=frozen_memory,
+    )
+    return ok
+
+
+def dispatch_input(
+    terminal_id: str,
+    message: str,
+    registry: PluginRegistry | None = None,
+    sender_id: str | None = None,
+    orchestration_type: OrchestrationType | None = None,
+    frozen_memory: str | None = None,
+) -> Tuple[bool, int]:
+    """Dispatch input and return ``(success, dispatch_sequence)``.
+
+    The sequence (StatusMonitor.notify_input_sent) is the immutable identity
+    of THIS dispatch: a caller correlating its wait with this send accepts a
+    completion only when the terminal's status evidence dispatch (GET
+    /terminals/{id}'s ``status_generation``) reaches this value — that
+    accepts a turn that finished before polling began while still rejecting
+    a completion marker left by an earlier turn, and unlike a per-chunk
+    output counter it cannot be satisfied by another dispatch's output.
+    """
+    return _dispatch_input_locked(
+        terminal_id,
+        message,
+        registry=registry,
+        sender_id=sender_id,
+        orchestration_type=orchestration_type,
+        frozen_memory=frozen_memory,
+    )
+
+
+# Per-terminal critical section for message dispatches. A dispatch is not
+# merely a paste: it arms the StatusMonitor's turn boundary (notify_input_sent
+# assigns the dispatch sequence), snapshots provider staleness guards and
+# clears the rolling buffer — state a second concurrent dispatch to the SAME
+# terminal would corrupt (its notify_input_sent would invalidate the first
+# dispatch's in-flight snapshot/clear, and each could consume the other's
+# completion evidence: issue #735 review — "adjacent dispatches can consume
+# each other's completion/output"). One turn at a time per terminal, enforced
+# with TerminalInputBlockedError; queued ownership is explicit — inbox
+# delivery serializes per terminal on its own lock and only delivers on
+# IDLE/COMPLETED, and the memory-service curator holds its own per-curator
+# lock, so neither goes through this gate.
+_dispatch_locks: Dict[str, threading.Lock] = {}
+_dispatch_locks_guard = threading.Lock()
+_dispatch_outputs: Dict[Tuple[str, int], str] = {}
+_dispatch_outputs_guard = threading.Lock()
+
+
+def _acquire_dispatch_slot(terminal_id: str) -> threading.Lock:
+    with _dispatch_locks_guard:
+        return _dispatch_locks.setdefault(terminal_id, threading.Lock())
+
+
+def _retain_completed_dispatch_output(terminal_id: str, dispatch_seq: int) -> None:
+    """Persist a completed turn before another dispatch can replace its pane."""
+    if dispatch_seq < 1 or not status_monitor.owns_dispatch(terminal_id, dispatch_seq):
+        return
+    try:
+        output = get_output(terminal_id, OutputMode.LAST)
+    except (OutputExtractionError, ValueError) as exc:
+        logger.warning(
+            "Failed to retain output for dispatch %s on %s: %s", dispatch_seq, terminal_id, exc
+        )
+        status_monitor.finish_dispatch(terminal_id, dispatch_seq)
+        return
+    if status_monitor.finish_dispatch(terminal_id, dispatch_seq):
+        with _dispatch_outputs_guard:
+            _dispatch_outputs[(terminal_id, dispatch_seq)] = output
+
+
+def _dispatch_input_locked(
+    terminal_id: str,
+    message: str,
+    registry: PluginRegistry | None = None,
+    sender_id: str | None = None,
+    orchestration_type: OrchestrationType | None = None,
+    frozen_memory: str | None = None,
+) -> Tuple[bool, int]:
+    """Shared dispatch core: send_input's Boolean wrapper and dispatch_input.
+
+    Holds the per-terminal dispatch slot for the whole notify → snapshot →
+    clear → paste sequence so two dispatches cannot interleave their turn
+    boundaries (each would invalidate the other's snapshot/clear and could
+    consume the other's completion evidence). The slot covers only that
+    in-flight window — a dispatch that arrives after the paste (slot free)
+    proceeds as before, including mid-turn input for providers that accept
+    it and manual prompt answers.
     """
     try:
         metadata = get_terminal_metadata(terminal_id)
@@ -2292,7 +2406,50 @@ def send_input(
                     "Use answer_user_prompt to submit a selection or approval before "
                     f"sending {orchestration_value} input."
                 )
+    except Exception as e:
+        logger.error(f"Failed to send input to terminal {terminal_id}: {e}")
+        raise
 
+    lock = _acquire_dispatch_slot(terminal_id)
+    if not lock.acquire(blocking=False):
+        # Another message dispatch holds the slot right now (its paste is in
+        # flight). Rejecting here, rather than queueing, keeps dispatch
+        # ownership explicit: the inbox queue is the supported way to line up
+        # messages for a busy terminal.
+        raise TerminalInputBlockedError(
+            f"Terminal {terminal_id} already has an input dispatch in flight. "
+            "Queue the message or wait for the current turn to finish."
+        )
+    try:
+        return _dispatch_input_holding_slot(
+            terminal_id,
+            message,
+            metadata=metadata,
+            provider=provider,
+            registry=registry,
+            sender_id=sender_id,
+            orchestration_type=orchestration_type,
+            orchestration_value=orchestration_value,
+            frozen_memory=frozen_memory,
+        )
+    finally:
+        lock.release()
+
+
+def _dispatch_input_holding_slot(
+    terminal_id: str,
+    message: str,
+    *,
+    metadata: Dict,
+    provider,
+    registry: PluginRegistry | None,
+    sender_id: str | None,
+    orchestration_type: OrchestrationType | None,
+    orchestration_value: str,
+    frozen_memory: str | None,
+) -> Tuple[bool, int]:
+    """Dispatch core under the per-terminal slot. Caller holds the slot."""
+    try:
         # Inject memory context into the very first user message after init.
         # Phase 1 wires injection inline for every provider. The Kiro
         # AgentSpawn hook will replace this path once the plugin
@@ -2312,10 +2469,15 @@ def send_input(
         # IDLE/COMPLETED). Without this, sticky ready-status would block
         # the genuine PROCESSING signal that arrives once the agent starts
         # working on the new message.
-        if provider and provider.assume_processing_on_dispatch is True:
-            status_monitor.notify_input_sent(terminal_id, assume_processing=True)
-        else:
-            status_monitor.notify_input_sent(terminal_id)
+        dispatch_seq = status_monitor.claim_dispatch(
+            terminal_id,
+            assume_processing=bool(provider and provider.assume_processing_on_dispatch is True),
+        )
+        if dispatch_seq is None:
+            raise TerminalInputBlockedError(
+                f"Terminal {terminal_id} already has an in-flight message dispatch. "
+                "Wait for it to finish or use the inbox queue."
+            )
 
         # Clear ONLY the rolling byte buffer BEFORE sending keys, so stale idle
         # prompts from BEFORE the input can't trigger a false COMPLETED
@@ -2343,14 +2505,18 @@ def send_input(
         if provider:
             provider.mark_input_received()
 
-        get_backend().send_keys(
-            metadata["tmux_session"],
-            metadata["tmux_window"],
-            message,
-            enter_count=enter_count,
-            force_bracketed_paste=True,
-            submit_delay=provider.paste_submit_delay if provider else 0.3,
-        )
+        try:
+            get_backend().send_keys(
+                metadata["tmux_session"],
+                metadata["tmux_window"],
+                message,
+                enter_count=enter_count,
+                force_bracketed_paste=True,
+                submit_delay=provider.paste_submit_delay if provider else 0.3,
+            )
+        except Exception:
+            status_monitor.abort_dispatch(terminal_id, dispatch_seq)
+            raise
 
         update_last_active(terminal_id)
         logger.info(f"Sent input to terminal: {terminal_id}")
@@ -2382,7 +2548,7 @@ def send_input(
                         traceparent=inject_traceparent(),
                     ),
                 )
-        return True
+        return True, dispatch_seq
 
     except Exception as e:
         logger.error(f"Failed to send input to terminal {terminal_id}: {e}")
@@ -2414,7 +2580,7 @@ def send_special_key(terminal_id: str, key: str) -> bool:
         # prompt, C-c interrupting work, C-d sending EOF) all initiate a new
         # processing cycle that must be allowed to push past any latched
         # ready status.
-        status_monitor.notify_input_sent(terminal_id)
+        status_monitor.continue_active_dispatch(terminal_id)
         get_backend().send_special_key(metadata["tmux_session"], metadata["tmux_window"], key)
 
         update_last_active(terminal_id)
@@ -2452,7 +2618,11 @@ def exit_terminal_cli(terminal_id: str) -> None:
         send_input(terminal_id, exit_command)
 
 
-def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
+def get_output(
+    terminal_id: str,
+    mode: OutputMode = OutputMode.FULL,
+    dispatch_sequence: int | None = None,
+) -> str:
     """Get terminal output.
 
     ``FULL`` mode returns the StatusMonitor rolling buffer (the streamed output
@@ -2480,6 +2650,15 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
     the raw tail is returned with a [PARTIAL RESPONSE] prefix so the caller
     knows the output may be incomplete.
     """
+    if dispatch_sequence is not None:
+        with _dispatch_outputs_guard:
+            output = _dispatch_outputs.pop((terminal_id, dispatch_sequence), None)
+        if output is None:
+            raise ValueError(
+                f"No retained output for terminal {terminal_id} dispatch {dispatch_sequence}"
+            )
+        return output
+
     # Escalation steps used when the provider does not declare extraction_tail_lines.
     _ESCALATION_STEPS = [200, 500, 1000, 5000]
 
@@ -2885,6 +3064,11 @@ def dismantle_terminal_runtime(
     from cli_agent_orchestrator.services.memory_service import _curator_locks
 
     _curator_locks.pop(terminal_id, None)
+    with _dispatch_locks_guard:
+        _dispatch_locks.pop(terminal_id, None)
+    with _dispatch_outputs_guard:
+        for key in [key for key in _dispatch_outputs if key[0] == terminal_id]:
+            _dispatch_outputs.pop(key, None)
     return True
 
 
