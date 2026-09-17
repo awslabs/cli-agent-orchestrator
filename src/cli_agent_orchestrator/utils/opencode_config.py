@@ -12,7 +12,7 @@ invocations are not a supported scenario.
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from cli_agent_orchestrator.constants import OPENCODE_CONFIG_DIR, OPENCODE_CONFIG_FILE, SKILLS_DIR
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_cao_mcp_command
@@ -21,6 +21,54 @@ from cli_agent_orchestrator.utils.path_validation import flatten_path_separators
 logger = logging.getLogger(__name__)
 
 _SCHEMA = "https://opencode.ai/config.json"
+
+# Per-role allowlists for cao-mcp-server tools, mirrored into OpenCode's
+# per-agent ``tools`` config so a worker only carries the MCP tool schemas its
+# role actually uses. OpenCode names MCP tools ``<server>_<tool>`` and agent
+# ``tools`` entries override the global default-deny (``<server>*: false``),
+# so listing the exact tools a role needs drops the other ~20 schemas (several
+# KB of context) from that agent's session. Unknown roles fall back to the
+# server-wide grant (``<server>*``) so behavior is unchanged for profiles that
+# don't declare a role. Tool names are the ``cao-mcp-server`` tool names in
+# mcp_server/server.py.
+CAO_MCP_TOOLS_BY_ROLE: Dict[str, List[str]] = {
+    # A supervisor delegates work: orchestration trio + sibling discovery +
+    # memory. It does not need the workflow_run/events machinery (those are
+    # for script-tier workers) or emit_ui.
+    "supervisor": [
+        "handoff",
+        "assign",
+        "send_message",
+        "answer_user_prompt",
+        "list_siblings",
+        "update_metadata",
+        "memory_store",
+        "memory_recall",
+        "memory_forget",
+        "load_skill",
+        "find_profiles",
+        "delete_terminal",
+    ],
+    # A worker receives work and reports back: callback + memory + skill load.
+    # It must NOT see handoff/assign (it would try to re-delegate), workflow_*
+    # (script-tier machinery), or emit_ui.
+    "developer": [
+        "send_message",
+        "memory_store",
+        "memory_recall",
+        "memory_forget",
+        "load_skill",
+        "list_siblings",
+        "update_metadata",
+    ],
+    "reviewer": [
+        "send_message",
+        "memory_store",
+        "memory_recall",
+        "memory_forget",
+        "load_skill",
+    ],
+}
 
 
 def to_opencode_agent_id(profile_name: str) -> str:
@@ -153,16 +201,40 @@ def upsert_mcp_server(name: str, config: Dict[str, Any]) -> None:
     write_config(data)
 
 
-def upsert_agent_tools(agent_name: str, mcp_names: List[str]) -> None:
+def _agent_tool_grants(mcp_names: List[str], role: Optional[str] = None) -> Dict[str, bool]:
+    """Compute the ``agent.<id>.tools`` grants for the given MCP servers.
+
+    With a known role, grant only the cao-mcp-server tools that role uses
+    (``<server>_<tool>: true``), so OpenCode only advertises those schemas to
+    the agent. With an unknown role, fall back to the server-wide wildcard
+    (``<server>*: true``) — the pre-allowlist behavior — so profiles without a
+    role keep working unchanged. Non-cao MCP servers are always granted
+    server-wide (CAO has no per-tool knowledge of third-party servers).
+    """
+    grants: Dict[str, bool] = {}
+    role_tools = CAO_MCP_TOOLS_BY_ROLE.get(role or "")
+    for name in mcp_names:
+        if name == "cao-mcp-server" and role_tools is not None:
+            for tool in role_tools:
+                grants[f"{name}_{tool}"] = True
+        else:
+            grants[f"{name}*"] = True
+    return grants
+
+
+def upsert_agent_tools(agent_name: str, mcp_names: List[str], role: Optional[str] = None) -> None:
     """Set ``agent.<agent_name>.tools`` to re-enable the listed MCP servers.
 
-    Creates or replaces the ``tools`` sub-dict for *agent_name*; other keys
-    under ``agent.<agent_name>`` (if any) are preserved.
+    With a known ``role``, the cao-mcp-server grant is per-tool
+    (``cao-mcp-server_<tool>: true``) so the agent only sees the schemas its
+    role needs; unknown roles get the server-wide wildcard (backward
+    compatible). Creates or replaces the ``tools`` sub-dict for *agent_name*;
+    other keys under ``agent.<agent_name>`` (if any) are preserved.
     """
     data = read_config()
     agents_section = data.setdefault("agent", {})
     agent_entry = agents_section.setdefault(agent_name, {})
-    agent_entry["tools"] = {f"{name}*": True for name in mcp_names}
+    agent_entry["tools"] = _agent_tool_grants(mcp_names, role)
     write_config(data)
 
 
