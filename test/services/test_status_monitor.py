@@ -1446,6 +1446,21 @@ class TestMidBurstProcessingProbe:
         sm._allow_processing_revert["t1"] = True
         return sm
 
+    def test_probe_keeps_the_dispatch_sampled_before_a_concurrent_send(self):
+        sm = self._bursting_monitor()
+        first = sm.notify_input_sent("t1")
+        sm._bursting["t1"] = True
+        provider = self._probing_provider([])
+
+        def busy_with_concurrent_send(lines):
+            sm.notify_input_sent("t1")
+            return True
+
+        provider.probe_processing_from_screen.side_effect = busy_with_concurrent_send
+        sm._schedule_screen_detection("t1", provider)
+
+        assert sm.get_status_snapshot("t1") == (TerminalStatus.PROCESSING, first)
+
     def _probing_provider(self, answers):
         provider = MagicMock()
         provider.supports_screen_detection = True

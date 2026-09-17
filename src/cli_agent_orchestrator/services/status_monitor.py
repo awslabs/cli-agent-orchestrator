@@ -443,9 +443,8 @@ class StatusMonitor:
         Rising edge (first chunk after quiet) → detect immediately (catches the
         PROCESSING transition the instant work resumes). Quiescence (no new
         chunk for PYTE_QUIESCENCE_DELAY_S) → detect again (the TUI repaint has
-        settled, so the screen shows the true end state). Detection NEVER runs
-        mid-burst, which is what eliminates the flaps naive per-chunk rendered
-        detection produces.
+        settled, so the screen shows the true end state). Mid-burst probes
+        accept only PROCESSING; ready states wait for a settled frame.
         """
         loop = self._loop or self._running_loop()
         if loop is None:
@@ -511,6 +510,7 @@ class StatusMonitor:
             if last_probe is not None and now - last_probe < PYTE_MIDBURST_PROBE_S:
                 return
             self._midburst_probe_at[terminal_id] = now
+            pinned_dispatch = self._dispatch_seq.get(terminal_id, 0)
 
         lines, _ = self._screen_lines(terminal_id)
         if not lines:
@@ -524,7 +524,9 @@ class StatusMonitor:
             logger.exception("Error probing mid-burst status for %s", terminal_id)
             return
         if busy:
-            self._apply_detection(terminal_id, TerminalStatus.PROCESSING)
+            self._apply_detection(
+                terminal_id, TerminalStatus.PROCESSING, evidence_dispatch=pinned_dispatch
+            )
 
     def _on_screen_quiescent(self, terminal_id: str, provider) -> None:
         """Quiescence timer fired: output stopped, so the screen has settled.
