@@ -1506,7 +1506,12 @@ class CodexProvider(BaseProvider):
         last_error: Optional[Exception] = None
         for attempt in range(attempts):
             try:
-                return get_backend().get_history(self.session_name, self.window_name) or ""
+                return (
+                    get_backend().get_history(
+                        self.session_name, self.window_name, full_history=True
+                    )
+                    or ""
+                )
             except Exception as e:  # noqa: BLE001 - every backend failure is retried
                 last_error = e
                 if attempt + 1 < attempts:
@@ -1532,19 +1537,6 @@ class CodexProvider(BaseProvider):
         cannot tell the composer from a submitted user cell, so it carries
         no verdict at all: the gate stays armed and the settled frame
         decides — an incomplete frame can delay a verdict, never disarm it.
-
-        A bounded observation that matches the baseline is still ambiguous
-        when the current turn is terse: a genuinely new cell that equals
-        (or is a truncated view of) the baseline's last cell reads as a
-        tail, and such a turn used to stay IDLE forever (issue #739
-        review). Resolve exactly that case against the full pane history —
-        the one view where an appended turn is always visible as growth
-        past the baseline regardless of cell text, because transcript
-        cells only accumulate. A full view that is not a tail of the
-        baseline is a post-dispatch occurrence; a tail, however much
-        scroll truncated its head, is unchanged retained content. See
-        ``_full_history_owns`` for the read's rate limit and fail-closed
-        behavior.
         """
         if not self._dispatch_pending:
             return True
@@ -1566,48 +1558,41 @@ class CodexProvider(BaseProvider):
         if not _is_suffix(observed, baseline):
             self._dispatch_pending = False
             return True
-        if self._full_history_owns(baseline):
-            self._dispatch_pending = False
-            return True
         return False
 
-    # Budget for the full-history ownership escalation, in seconds.
-    # get_status() is a hot path (every wait_until_status poll, every UI
-    # refresh) and the escalation forks a capture-pane subprocess — the same
-    # reasoning that rate-limits STALE_PROCESSING_CAPTURE_INTERVAL_S in
-    # status_monitor.py. While the pane is genuinely unchanged this bounds
-    # the escalation to one read per interval; a differing observation never
-    # needs the escalation at all, and the first ambiguous poll of a
-    # dispatch always escalates (the timestamp resets at mark_input_received),
-    # so an equal-content completion is only ever delayed past a PRIOR
-    # ambiguous poll by at most one interval.
     OWNERSHIP_ESCALATION_INTERVAL_S = 3.0
 
-    def _full_history_owns(self, baseline: list) -> bool:
-        """Resolve an ambiguous suffix match against the full pane history.
+    def _completion_observation(self, clean: str) -> str:
+        """Widen an ambiguous view before deciding both ownership and status.
 
-        The bounded observation cannot distinguish a terse new turn from
-        retained content when the new cell's text equals the baseline's
-        tail, so compare the pane's full cell sequence instead: transcript
-        cells only accumulate, so any post-dispatch turn — however terse —
-        leaves the full view no longer a tail of the pre-send baseline
-        (issue #739 review). A read that fails, comes back empty, or is
-        rate-limited is NOT ownership: the gate stays armed, so this only
-        ever delays a verdict, never falsely completes.
+        Only footer-bounded snapshots distinguish the composer from submitted
+        input. A failed, incomplete or rate-limited capture leaves the original
+        observation in place and the ownership gate armed.
         """
+        baseline = self._dispatch_marker_baseline
+        cutoff = _footer_cutoff_position(clean)
+        if (
+            not self._dispatch_pending
+            or baseline is None
+            or cutoff >= len(clean)
+            or not _is_suffix(_transcript_marker_cells(clean, cutoff), baseline)
+        ):
+            return clean
         now = time.monotonic()
         if now - self._ownership_escalation_at < self.OWNERSHIP_ESCALATION_INTERVAL_S:
-            return False
+            return clean
         self._ownership_escalation_at = now
         try:
-            raw = get_backend().get_history(self.session_name, self.window_name) or ""
+            raw = (
+                get_backend().get_history(self.session_name, self.window_name, full_history=True)
+                or ""
+            )
         except Exception:
-            return False
-        if not raw:
-            return False
-        clean = strip_terminal_escapes(raw)
-        full_cells = _transcript_marker_cells(clean, _footer_cutoff_position(clean))
-        return not _is_suffix(full_cells, baseline)
+            return clean
+        captured = strip_terminal_escapes(raw)
+        if _footer_cutoff_position(captured) >= len(captured):
+            return clean
+        return captured
 
     def get_status(self, output: str) -> TerminalStatus:
         # Native status (herdr): trust the backend's agent state when available;
@@ -1637,7 +1622,7 @@ class CodexProvider(BaseProvider):
         # Strip the RAW pipe-pane escapes (cursor positioning, in-place redraws),
         # not just SGR colour codes — otherwise cursor sequences survive and the
         # idle ``›`` prompt / structural checks below misfire on the raw stream.
-        clean_output = strip_terminal_escapes(output)
+        clean_output = self._completion_observation(strip_terminal_escapes(output))
         tail_output = "\n".join(clean_output.splitlines()[-25:])
 
         # Search for user messages, excluding the Codex TUI footer when present.

@@ -2759,6 +2759,64 @@ class TestCodexProviderTrustPrompt:
         assert provider.get_status(notice_pane) == TerminalStatus.IDLE
         assert provider._dispatch_pending is True
 
+    @pytest.mark.parametrize("screen", [False, True], ids=["buffer", "screen"])
+    @pytest.mark.parametrize(
+        ("new_content", "footer", "expected"),
+        [
+            ("", "  gpt-5.6", TerminalStatus.IDLE),
+            (
+                "› second question\n• Working (3s • esc to interrupt)\n",
+                "  gpt-5.6-sol default · /tmp/work",
+                TerminalStatus.PROCESSING,
+            ),
+        ],
+        ids=["unrecognized-footer", "newer-processing-frame"],
+    )
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_escalation_classifies_one_complete_snapshot(
+        self, mock_backend, screen, new_content, footer, expected
+    ):
+        """A later capture cannot lend ownership to an older completion."""
+        retained = "• You have 1 usage limit reset available. Run /usage to use one.\n"
+        composer = "\n› Ask Codex to do anything\n\n"
+        status_bar = "  gpt-5.6-sol default · /tmp/work\n"
+        prior = retained + composer + status_bar
+        backend = mock_backend.return_value
+        backend.get_history.return_value = prior
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider.mark_input_received()
+
+        backend.get_history.return_value = retained + new_content + composer + footer + "\n"
+        observe = (
+            (lambda output: provider.get_status_from_screen(output.splitlines()))
+            if screen
+            else provider.get_status
+        )
+        assert observe(prior) == expected
+        backend.get_history.return_value = prior
+        assert observe(prior) == TerminalStatus.IDLE
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_escalation_reads_full_scrollback_on_both_sides_of_dispatch(self, mock_backend):
+        """A turn outside the default capture window still establishes ownership."""
+        footer = "\n› Ask Codex to do anything\n\n  gpt-5.6-sol default · /tmp/work\n"
+        tail = "• Done.\n" + "detail\n" * 210 + footer
+        prior = "› first question\n" + tail
+        current = prior + "› second question\n" + tail
+        backend = mock_backend.return_value
+        backend.get_history.side_effect = lambda *args, **kwargs: (
+            prior if kwargs.get("full_history") else tail
+        )
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider.mark_input_received()
+        assert provider.get_status(tail) == TerminalStatus.IDLE
+
+        backend.get_history.side_effect = lambda *args, **kwargs: (
+            current if kwargs.get("full_history") else tail
+        )
+        with patch("cli_agent_orchestrator.providers.codex.time.monotonic", return_value=10**12):
+            assert provider.get_status(tail) == TerminalStatus.COMPLETED
+
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
     def test_equal_content_evicted_marker_turn_completes_via_full_history(self, mock_backend):
         """Review 5131322289 P1, second mode: a fast second turn whose user
