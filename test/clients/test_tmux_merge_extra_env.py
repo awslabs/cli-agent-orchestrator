@@ -65,3 +65,39 @@ def test_is_blocked_env_key_classification():
     # Unrelated keys aren't blocked.
     assert TmuxClient._is_blocked_env_key("AWS_REGION") is False
     assert TmuxClient._is_blocked_env_key("MNEMOSYNE_DIR") is False
+
+
+# --- _merge_trusted_env (profile-declared env) -------------------------------
+#
+# Profile env is installed configuration (the profile can already launch
+# arbitrary executables via mcpServers.command), so the operator-env prefix
+# blocklist does not apply. The byte cap does: it protects the tmux argv
+# limit, not a trust boundary.
+
+
+def test_trusted_merge_none_is_noop():
+    env = {"HOME": "/home/u"}
+    TmuxClient._merge_trusted_env(env, None)
+    assert env == {"HOME": "/home/u"}
+
+
+def test_trusted_merge_allows_blocked_prefixes():
+    """CLAUDE_CONFIG_DIR is the motivating case: point one claude_code worker
+    at an alternate config/auth directory from its profile."""
+    env: dict[str, str] = {}
+    TmuxClient._merge_trusted_env(env, {"CLAUDE_CONFIG_DIR": "/home/u/.claude-b"})
+    assert env["CLAUDE_CONFIG_DIR"] == "/home/u/.claude-b"
+
+
+def test_trusted_merge_keeps_byte_cap(caplog):
+    env: dict[str, str] = {}
+    TmuxClient._merge_trusted_env(env, {"BIG": "x" * 4096, "OK": "y"})
+    assert "BIG" not in env
+    assert env["OK"] == "y"
+
+
+def test_trusted_merge_wins_over_operator_env():
+    """Profile env is more specific than session-wide operator env."""
+    env = {"KIMI_MODEL_NAME": "from-operator"}
+    TmuxClient._merge_trusted_env(env, {"KIMI_MODEL_NAME": "from-profile"})
+    assert env["KIMI_MODEL_NAME"] == "from-profile"
