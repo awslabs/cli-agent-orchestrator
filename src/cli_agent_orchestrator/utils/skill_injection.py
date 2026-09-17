@@ -157,5 +157,16 @@ def _is_cao_managed_copilot_agent(name: str) -> bool:
         safe_name = validate_path_component(name, description="agent name")
     except ValueError:
         return False
-    context_file = AGENT_CONTEXT_DIR / f"{safe_name}.md"
-    return context_file.exists()
+    # Same directories the install writer and the ownership guard use: the
+    # configured ``agents.dirs.cao_installed`` when it departs from its default,
+    # plus the default itself while an override is active, because copies
+    # written before the writer honoured the setting live there (see
+    # settings_service.installed_context_lookup_dirs).
+    from cli_agent_orchestrator.services.settings_service import (
+        installed_context_lookup_dirs,
+    )
+
+    return any(
+        (context_dir / f"{safe_name}.md").exists()
+        for context_dir in installed_context_lookup_dirs(AGENT_CONTEXT_DIR)
+    )

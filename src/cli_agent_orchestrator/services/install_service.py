@@ -1,15 +1,18 @@
 """Service helpers for installing agent profiles."""
 
-import errno
 import logging
 import os
+import platform
 import re
+import secrets
+import stat
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Tuple
 from urllib.parse import urlparse
 
 import frontmatter
 import requests  # type: ignore[import-untyped]
+import yaml
 from pydantic import BaseModel
 
 from cli_agent_orchestrator.constants import (
@@ -33,6 +36,7 @@ from cli_agent_orchestrator.utils.agent_profiles import (
 from cli_agent_orchestrator.utils.env import resolve_env_vars, set_env_var
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 from cli_agent_orchestrator.utils.opencode_config import (
+    OpenCodeAgentIdCollisionError,
     ensure_skills_symlink,
     remove_agent_tools,
     to_opencode_agent_id,
@@ -69,6 +73,15 @@ class InstallResult(BaseModel):
 # traversal ("../etc/passwd"), separators, and absolute paths at the boundary.
 # CodeQL also recognises this regex as a path-injection sanitiser.
 _PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+# Context-copy provenance marker — stamped into <context dir>/<name>.md
+# frontmatter to record the original install source stem (the stem/name passed to
+# `cao install`). Used by the opencode collision guard to distinguish a profile's
+# own installed copy from a different profile that resolves to the same agent id.
+_CONTEXT_SOURCE_STEM_KEY = "x-cao-source-stem"
+_CONTEXT_SOURCE_STEM_RE = re.compile(rf"^\s*{re.escape(_CONTEXT_SOURCE_STEM_KEY)}\s*:")
+_TEMP_FILE_NAME_ATTEMPTS = 100
+_FRONTMATTER_DELIMITER_RE = re.compile(r"^-{3,}$")
 
 # Per-MCP-server tool-call timeout (milliseconds) injected into cao-mcp-server
 # entries in kiro agent profiles. kiro-cli's default MCP tool-call timeout
@@ -223,17 +236,407 @@ def parse_env_assignment(env_assignment: str) -> Tuple[str, str]:
     return key, value
 
 
-def _write_context_file(agent_name: str, raw_content: str) -> Path:
+def _line_body_and_ending(line: str) -> Tuple[str, str]:
+    if line.endswith("\r\n"):
+        return line[:-2], "\r\n"
+    if line.endswith("\n"):
+        return line[:-1], "\n"
+    if line.endswith("\r"):
+        return line[:-1], "\r"
+    return line, ""
+
+
+def _is_frontmatter_delimiter(line_body: str, *, allow_bom: bool = False) -> bool:
+    if allow_bom:
+        line_body = line_body.removeprefix("\ufeff")
+    # python-frontmatter's YAMLHandler accepts 3+ dashes as a delimiter
+    # (`^-{3,}\s*$`); matching that here keeps this writer's notion of "where
+    # the frontmatter block is" in sync with the parser CAO uses everywhere
+    # else, so real frontmatter with a `----` delimiter is not demoted into
+    # the body.
+    return bool(_FRONTMATTER_DELIMITER_RE.match(line_body.strip(" \t")))
+
+
+def _first_newline(raw_content: str) -> str:
+    match = re.search(r"\r\n|\n|\r", raw_content)
+    return match.group(0) if match else "\n"
+
+
+def _parses_as_yaml_mapping(text: str) -> bool:
+    """Return True if ``text`` is what python-frontmatter would treat as real
+    frontmatter metadata: a YAML mapping, or empty (``frontmatter.parse`` only
+    merges ``fm_data`` into ``metadata`` when it is a ``dict``; anything else \u2014
+    a bare scalar, a list, invalid YAML \u2014 is silently NOT metadata there).
+    """
+    try:
+        loaded = yaml.safe_load(text)
+    except yaml.YAMLError:
+        return False
+    return loaded is None or isinstance(loaded, dict)
+
+
+def _find_frontmatter_block(lines: List[str]) -> Optional[Tuple[int, int]]:
+    """Return opening/closing line indexes for the leading frontmatter block.
+
+    A candidate span only counts as frontmatter if the text between the
+    delimiters actually parses as a YAML mapping (see
+    :func:`_parses_as_yaml_mapping`) \u2014 matching what ``frontmatter.loads``
+    treats as real metadata, rather than a purely lexical dash match. Without
+    this, a frontmatter-less document whose body opens with a markdown
+    thematic break (a line of 3+ dashes) gets mistaken for a frontmatter
+    opener, the marker gets inserted into the middle of prose, and the
+    document becomes invalid YAML.
+    """
+    opening_idx: Optional[int] = None
+    for idx, line in enumerate(lines):
+        body, _ = _line_body_and_ending(line)
+        if body.removeprefix("\ufeff").strip(" \t") == "":
+            continue
+        if _is_frontmatter_delimiter(body, allow_bom=True):
+            opening_idx = idx
+        break
+
+    if opening_idx is None:
+        return None
+
+    for idx in range(opening_idx + 1, len(lines)):
+        body, _ = _line_body_and_ending(lines[idx])
+        if _is_frontmatter_delimiter(body):
+            block_text = "".join(lines[opening_idx + 1 : idx])
+            if _parses_as_yaml_mapping(block_text):
+                return opening_idx, idx
+            return None
+    return None
+
+
+def _frontmatter_block_indent(lines: List[str], opening_idx: int, closing_idx: int) -> str:
+    """Return the leading whitespace of the block's first real content line.
+
+    Frontmatter keys are not required to sit at column 0 \u2014 YAML only needs
+    consistent indentation. Inserting the marker at column 0 into a block
+    indented some other way breaks that consistency and corrupts the YAML;
+    matching the block's own indentation keeps it valid.
+    """
+    for idx in range(opening_idx + 1, closing_idx):
+        body, _ = _line_body_and_ending(lines[idx])
+        stripped = body.lstrip(" \t")
+        if stripped == "" or stripped.startswith("#"):
+            continue
+        return body[: len(body) - len(stripped)]
+    return ""
+
+
+def _yaml_single_quoted(value: str) -> str:
+    """Render a one-line YAML string scalar."""
+    if "\n" in value or "\r" in value:
+        raise ValueError("Context source stem must fit on one YAML line")
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _context_marker_line(source_name: str, newline: str) -> str:
+    return f"{_CONTEXT_SOURCE_STEM_KEY}: {_yaml_single_quoted(source_name)}{newline}"
+
+
+def _context_content_with_provenance(raw_content: str, source_name: str) -> str:
+    """Return context markdown annotated without reserializing frontmatter.
+
+    If a leading frontmatter block exists, every textually-matching marker
+    line is removed and a single clean one is inserted in the first matched
+    line's place (or at the top of the block if none matched). Documents
+    without a leading block get a minimal frontmatter block prepended,
+    leaving the original content byte-for-byte intact after that inserted
+    block.
+
+    The line-regex insertion above only recognises an unquoted, column-0
+    ``x-cao-source-stem:`` key. A source profile can carry a marker spelled a
+    way the regex cannot see (a quoted key, a folded/multi-line value, a
+    flow-mapping frontmatter document) while PyYAML's parser — the reader
+    every consumer of this content actually uses — sees it as the *same* key
+    and would resolve it (last-wins on duplicates) to a value CAO never
+    wrote. Trusting the regex's view there would let profile content dictate
+    its own provenance, defeating the guard this marker exists for. So the
+    assembled content is read back through :func:`_context_source_stem` —
+    the exact function the collision guard calls — and the install is
+    refused unless that readback agrees with ``source_name``. This also
+    catches content the textual insertion accidentally corrupted into
+    invalid YAML (e.g. a folded scalar's continuation line left orphaned)
+    before it is ever written to disk.
+    """
+    lines = raw_content.splitlines(keepends=True)
+    block = _find_frontmatter_block(lines)
+    if block is None:
+        newline = _first_newline(raw_content)
+        marker = _context_marker_line(source_name, newline)
+        content = f"---{newline}{marker}---{newline}{raw_content}"
+    else:
+        opening_idx, closing_idx = block
+        _, opening_newline = _line_body_and_ending(lines[opening_idx])
+        newline = opening_newline or _first_newline(raw_content)
+        indent = _frontmatter_block_indent(lines, opening_idx, closing_idx)
+        marker = indent + _context_marker_line(source_name, newline)
+
+        existing_indices = [
+            idx
+            for idx in range(opening_idx + 1, closing_idx)
+            if _CONTEXT_SOURCE_STEM_RE.match(_line_body_and_ending(lines[idx])[0])
+        ]
+        insert_at = existing_indices[0] if existing_indices else opening_idx + 1
+        for idx in reversed(existing_indices):
+            del lines[idx]
+        lines.insert(insert_at, marker)
+        content = "".join(lines)
+
+    try:
+        verified_stem = _context_source_stem(content)
+        verify_exc: Optional[Exception] = None
+    except Exception as exc:
+        verified_stem = None
+        verify_exc = exc
+    if verified_stem != source_name:
+        if verify_exc is not None:
+            cause = (
+                "the assembled context copy did not parse as valid YAML "
+                f"frontmatter ({verify_exc})"
+            )
+        elif verified_stem is None:
+            cause = f"the assembled context copy has no readable '{_CONTEXT_SOURCE_STEM_KEY}' value"
+        else:
+            cause = (
+                "the assembled context copy reads back "
+                f"'{_CONTEXT_SOURCE_STEM_KEY}: {verified_stem}' instead of "
+                f"'{source_name}' — the source profile's own frontmatter "
+                f"likely defines a conflicting '{_CONTEXT_SOURCE_STEM_KEY}' key"
+            )
+        raise ValueError(
+            "Refusing to write context copy: could not stamp a trustworthy "
+            f"'{_CONTEXT_SOURCE_STEM_KEY}' provenance marker for install "
+            f"source '{source_name}' because {cause}. Fix the source "
+            "profile's frontmatter (remove or rename the conflicting key, or "
+            "repair its YAML syntax), then reinstall."
+        )
+    return content
+
+
+def _context_source_stem(raw_content: str) -> Optional[str]:
+    """Read CAO source-stem provenance from generated context frontmatter."""
+    post = frontmatter.loads(raw_content)
+    value = post.metadata.get(_CONTEXT_SOURCE_STEM_KEY)
+    if isinstance(value, str):
+        return value
+
+    lines = raw_content.splitlines(keepends=True)
+    block = _find_frontmatter_block(lines)
+    if block is None:
+        return None
+
+    opening_idx, closing_idx = block
+    for idx in range(opening_idx + 1, closing_idx):
+        body, _ = _line_body_and_ending(lines[idx])
+        if not _CONTEXT_SOURCE_STEM_RE.match(body):
+            continue
+        marker_post = frontmatter.loads(f"---\n{body}\n---\n")
+        marker_value = marker_post.metadata.get(_CONTEXT_SOURCE_STEM_KEY)
+        return marker_value if isinstance(marker_value, str) else None
+    return None
+
+
+def _context_dir() -> Path:
+    """Resolve the shared context directory the way profile discovery does.
+
+    Discovery scans the ``cao_installed`` entry of ``agents.dirs`` (see
+    ``utils/agent_profiles.py``), and the opencode collision guard reads its
+    candidates from there. The writer has to deposit copies in the SAME place,
+    or an operator who overrides ``cao_installed`` gets copies discovery never
+    sees -- and a guard that is blind to exactly the files it protects.
+
+    ``settings_service.installed_context_dir_override`` owns the rule (the
+    setting counts only when it departs from its default); this falls back to
+    ``AGENT_CONTEXT_DIR`` so the constant stays authoritative when nothing is
+    configured, which is also what lets tests redirect the directory by
+    patching the constant alone.
+    """
+    from cli_agent_orchestrator.services.settings_service import (
+        installed_context_dir_override,
+    )
+
+    override = installed_context_dir_override()
+    return AGENT_CONTEXT_DIR if override is None else override
+
+
+def _context_lookup_dirs() -> List[Path]:
+    """Every directory an existing context copy may be sitting in.
+
+    The configured directory first, then -- only when an override is active --
+    the default it superseded. Releases before the override was honoured by the
+    writer deposited every copy at ``AGENT_CONTEXT_DIR`` even when
+    ``cao_installed`` pointed elsewhere, so an operator who upgrades with an
+    override already configured has ownership records in the legacy directory.
+    Probing it keeps those records in force: the guard still sees the owner of
+    an id, and the Copilot skill-injection probe still recognises the agents it
+    manages. New copies are written to ``_context_dir()`` only; the legacy copy
+    is left where it is.
+    """
+    from cli_agent_orchestrator.services.settings_service import (
+        installed_context_lookup_dirs,
+    )
+
+    return installed_context_lookup_dirs(AGENT_CONTEXT_DIR)
+
+
+def _installed_context_copy_path(stem: str, directory: Optional[Path] = None) -> Path:
+    """Return the installed context path for ``stem`` in ``directory``.
+
+    Prefers the flat ``<stem>.md`` the writer produces; falls back to the
+    directory-style ``<stem>/agent.md`` discovery also recognises, so an
+    operator-arranged copy in that shape still counts as occupying the id.
+    """
+    installed_dir = _context_dir() if directory is None else directory
+    flat = installed_dir / f"{stem}.md"
+    if flat.exists():
+        return flat
+    nested = installed_dir / stem / "agent.md"
+    if nested.exists():
+        return nested
+    return flat
+
+
+def _installed_context_copy_remedy(path: Path) -> str:
+    """Tell operators how to recover from an unproven installed context copy."""
+    return (
+        f"If '{path}' is your own profile's context copy from an earlier CAO "
+        "version, delete it and reinstall."
+    )
+
+
+class InstalledContextCopyCollisionError(ValueError):
+    """A different profile already owns the shared context copy this install would overwrite.
+
+    The provider-neutral counterpart of :class:`OpenCodeAgentIdCollisionError`:
+    raised by :func:`_guard_installed_copy_ownership` for every provider other
+    than OpenCode, whose installs additionally share the ``<id>.md`` agent file
+    and ``agent.<id>`` config section. Subclasses ``ValueError`` for the same
+    reason: ``install_agent``'s broad handler turns it into a clean CLI error.
+    """
+
+
+def _is_opencode(provider: str) -> bool:
+    return provider == ProviderType.OPENCODE_CLI.value
+
+
+def _collision_error_class(provider: str) -> type:
+    return (
+        OpenCodeAgentIdCollisionError
+        if _is_opencode(provider)
+        else InstalledContextCopyCollisionError
+    )
+
+
+def _installed_copy_display(provenance_stem: Optional[str], candidate_path: Path) -> str:
+    """Render the occupying context copy for collision errors."""
+    if provenance_stem:
+        return f"'{provenance_stem}.md' (installed copy at '{candidate_path}')"
+    return f"an installed copy without CAO source provenance at '{candidate_path}'"
+
+
+def _raise_unloadable_installed_collision(
+    target_id: str, source_name: str, profile_name: str, candidate_path: Path, provider: str
+) -> None:
+    """Block an install whose target slot is held by a copy of unknowable ownership."""
+    slot = (
+        f"OpenCode agent id '{target_id}'"
+        if _is_opencode(provider)
+        else f"Profile name '{target_id}'"
+    )
+    artifacts = "OpenCode artifacts" if _is_opencode(provider) else "installed artifacts"
+    raise _collision_error_class(provider)(
+        f"{slot} is already occupied by installed context copy '{candidate_path}', but "
+        "CAO cannot read or validate that file, so it cannot prove whether it belongs "
+        f"to the profile being installed ('{source_name}.md', name '{profile_name}'). "
+        f"The install was refused to avoid silently overwriting existing {artifacts}. "
+        f"{_installed_context_copy_remedy(candidate_path)}"
+    )
+
+
+def _raise_unreadable_installed_copy(
+    target_id: str, source_name: str, candidate_path: Path, exc: OSError, provider: str
+) -> None:
+    """Block an install whose target slot holds a copy CAO could not read (an I/O fault)."""
+    slot = (
+        f"OpenCode agent id '{target_id}'"
+        if _is_opencode(provider)
+        else f"Profile name '{target_id}'"
+    )
+    raise _collision_error_class(provider)(
+        f"{slot} is already occupied by installed context copy '{candidate_path}', which "
+        f"could not be read ({exc.strerror or exc.__class__.__name__}), so CAO cannot tell "
+        f"whether it belongs to the profile being installed ('{source_name}.md'). The install "
+        "was refused rather than overwrite it. Fix the file's permissions (or the underlying "
+        "I/O problem) and reinstall; do not delete the copy, it is the ownership record."
+    )
+
+
+def _non_regular_target_error(context_file: Path) -> ValueError:
+    return ValueError(
+        f"Context file '{context_file}' is already occupied by a non-regular "
+        "filesystem entry. The install was refused to avoid writing through "
+        "a symlink or overwriting a directory, device, socket, or FIFO. "
+        "Remove that path or replace it with a regular file, then reinstall."
+    )
+
+
+def _create_context_temp_file(context_file: Path) -> Tuple[int, Path]:
+    """Create a same-directory temp file for the context copy and return its
+    open fd and path.
+
+    Created 0o600, matching the mode the pre-atomic ``os.open`` sink asked for:
+    this holds agent instruction content under
+    ``~/.aws/cli-agent-orchestrator/`` and does not need to be group- or
+    world-readable. Naming the mode outright rather than requesting 0o666 and
+    letting the umask subtract also means the result does not depend on the
+    ambient umask, so a permissive umask cannot widen a new context copy. On a
+    reinstall the caller restores the existing target's mode via ``os.fchmod``
+    before the replace.
+
+    ``O_EXCL`` is what makes the name unguessable-and-unique rather than merely
+    unlikely to collide: the create fails rather than opening a file an attacker
+    pre-planted at the temp path.
+    """
+    last_exc: Optional[OSError] = None
+    for _ in range(_TEMP_FILE_NAME_ATTEMPTS):
+        candidate = context_file.parent / f".{context_file.name}.{secrets.token_hex(8)}.tmp"
+        try:
+            fd = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError as exc:
+            last_exc = exc
+            continue
+        return fd, candidate
+    raise OSError(
+        f"Could not create a unique temporary file next to '{context_file}'"
+    ) from last_exc
+
+
+def _write_context_file(agent_name: str, raw_content: str, source_name: str) -> Path:
     """Write the unresolved profile source to the shared context directory.
 
-    The context copy's filename derives from the profile's RESOLVED frontmatter
+    ``agent_name`` is the *resolved* profile name (frontmatter ``name:``) and
+    determines the filename — the context copy lives at
+    ``<context dir>/<resolved-name>.md`` (see ``_context_dir``), NOT under the original install
+    stem. ``source_name`` is the install *source handle* (the stem/name passed
+    to ``cao install``), so it can be stamped into the copy's frontmatter under
+    ``_CONTEXT_SOURCE_STEM_KEY``. The opencode collision guard later uses that
+    marker to prove "this installed-dir
+    artifact is a prior copy of the profile being reinstalled" versus "this is
+    a different profile that resolves to the same agent id" (see
+    :func:`_guard_installed_copy_ownership`). The marker is inserted
+    textually, preserving source formatting aside from that one marker line.
+
+    SECURITY. The filename derives from the profile's RESOLVED frontmatter
     ``name:``. That value is NOT covered by ``_PROFILE_NAME_RE`` -- that regex
     validates the install *source handle* (the URL stem / bare-name argument),
     not the resolved name -- and a profile can be installed straight from a URL,
     so the field is attacker-controlled. Without a guard, a name like
     ``../../foo`` or an absolute path steers this write outside
-    ``AGENT_CONTEXT_DIR`` and can overwrite a trusted ``.md`` instruction file.
-
+    the context directory and can overwrite a trusted ``.md`` instruction file.
     Three layers, all in this function (see the barrier note below):
 
     1. ``validate_path_component`` -- the shared segment validator, which rejects
@@ -242,27 +645,51 @@ def _write_context_file(agent_name: str, raw_content: str) -> Path:
        non-issue: a fullwidth solidus (U+FF0F) is rejected outright rather than
        having to be caught before it folds to ``/`` under NFKC.
     2. Lexical containment under the realpath of the base directory.
-    3. ``O_NOFOLLOW`` at the open, so the kernel refuses to write *through* a
-       symlink at the final component.
+    3. Refusal to write through a symlink at the final component -- enforced here
+       by the ``lstat`` type check plus ``os.replace`` (which replaces a symlink
+       rather than following it), where the pre-atomic writer used
+       ``O_NOFOLLOW`` on a direct open of the target. See the long comment at
+       that check for why the substitution is not a weakening.
+
+    ATOMICITY AND MODE. The target must be absent or a regular file; symlinks,
+    directories, FIFOs, sockets, and devices are refused before writing (one
+    ``lstat`` serves both that check and the existing-mode read, so neither
+    follows a symlink planted in the window between them). Content goes to a
+    same-directory temporary file and is atomically replaced into place, so CAO
+    never opens the target path itself and a failed write cannot leave a
+    truncated context copy. A brand-new copy is created 0o600; on a reinstall the
+    existing target's mode is restored via ``os.fchmod`` before the replace,
+    since otherwise ``os.replace`` would carry an unrelated mode onto the target
+    and silently tighten or widen permissions on every install.
     """
-    AGENT_CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
+    context_dir = _context_dir()
+    if not context_dir.is_absolute():
+        # ``installed_context_dir_override`` already discards blank and relative
+        # settings; this is the sink's own refusal to ever treat the server's
+        # working directory as the trusted write root (a profile named README or
+        # AGENTS would otherwise land on a repository file).
+        raise ValueError(
+            f"Refusing to write context copy: the installed-profile directory "
+            f"{str(context_dir)!r} is not an absolute path. Set agents.dirs.cao_installed "
+            "to an absolute directory or remove it to use the default."
+        )
+    context_dir.mkdir(parents=True, exist_ok=True)
     # BARRIER PLACEMENT: the validation and the containment check are inlined
-    # here, in the same function as the os.open() sink, rather than factored into
-    # a helper. This mirrors the deliberate repetition in
-    # ``services/profile_store`` -- CodeQL's py/path-injection dataflow only
-    # recognises a barrier that guards, in the same function as the sink, the
-    # very variable that reaches it. A helper that returns a validated path is
-    # more readable but invisible to the analysis, and this repo has a history of
-    # that alert reopening (see profile_store._PROFILE_NAME_RE). Load-bearing,
-    # not an oversight.
+    # here, in the same function as the write sink, rather than factored into a
+    # helper. This mirrors the deliberate repetition in ``services/profile_store``
+    # -- CodeQL's py/path-injection dataflow only recognises a barrier that
+    # guards, in the same function as the sink, the very variable that reaches
+    # it. A helper that returns a validated path is more readable but invisible
+    # to the analysis, and this repo has a history of that alert reopening (see
+    # profile_store._PROFILE_NAME_RE). Load-bearing, not an oversight.
     safe_name = validate_path_component(agent_name, description="profile name")
     # Resolve only the BASE (so a symlinked context root is handled) and keep the
     # final component UNRESOLVED. Resolving the whole candidate -- as
     # ``safe_join_under_base`` does -- would follow a symlink planted at the
     # target and silently write to wherever it resolves; leaving the final
-    # component lexical means such a symlink is refused by O_NOFOLLOW below.
-    # That is why this does not simply call ``safe_join_under_base``.
-    base = os.path.realpath(AGENT_CONTEXT_DIR)
+    # component lexical means such a symlink is refused by the lstat check
+    # below. That is why this does not simply call ``safe_join_under_base``.
+    base = os.path.realpath(context_dir)
     candidate = os.path.join(base, f"{safe_name}.md")
     if candidate != base and not candidate.startswith(base + os.sep):
         raise ValueError(
@@ -270,35 +697,61 @@ def _write_context_file(agent_name: str, raw_content: str) -> Path:
             f"to a path outside the agent context directory ({candidate!r})."
         )
     context_file = Path(candidate)
-    # O_NOFOLLOW so the kernel itself refuses to write THROUGH a symlink at the
-    # final component: a plain ``write_text``/``open`` follows a symlink, so even
-    # after the containment check above, a symlink planted at the target
-    # (pre-existing, or swapped in via a check-then-write race) would let the
-    # write land outside the directory. O_TRUNC (not O_EXCL) so a normal
-    # reinstall still overwrites the profile's own regular-file copy. ELOOP on a
-    # symlink target becomes a clear refusal rather than an opaque OS error.
-    #
-    # Mode 0o600: this lives under ~/.aws/cli-agent-orchestrator/ and holds agent
-    # instruction content, so it does not need to be group/world readable.
-    #
-    # PLATFORM NOTE: os.O_NOFOLLOW does not exist on Windows, so getattr(...) is 0
-    # there and the kernel-level symlink refusal degrades to a no-op. The name
-    # validation and containment check above still hold on Windows; only the
-    # write-time symlink/race guard is POSIX-only. Acceptable because the primary
-    # deployment target is POSIX and the validation already blocks the traversal
-    # vectors; flagged so it is a conscious limitation, not a silent gap.
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    # HOW THE SYMLINK REFUSAL IS ENFORCED HERE, having replaced O_NOFOLLOW.
+    # The pre-atomic writer opened the target directly, so it needed O_NOFOLLOW to
+    # stop the kernel writing THROUGH a symlink planted at the final component.
+    # This writer never opens the target at all: it writes a same-directory temp
+    # file and ``os.replace``s it into place, and ``os.replace`` replaces the
+    # symlink ITSELF rather than following it, so the write cannot land outside
+    # the directory even if the lstat below is raced. The lstat is what turns that
+    # into a clear refusal instead of silently clobbering an operator's symlink.
+    # Strictly stronger than the O_NOFOLLOW form on two counts: it also refuses
+    # directories/FIFOs/sockets/devices by type rather than by errno, and it holds
+    # on Windows, where os.O_NOFOLLOW does not exist and degraded to a no-op.
     try:
-        fd = os.open(context_file, flags, 0o600)
-    except OSError as exc:
-        if exc.errno in (errno.ELOOP, errno.EISDIR, errno.ENXIO):
-            raise ValueError(
-                f"Refusing to write context copy: {context_file} exists and is not a "
-                "regular file (symlink, directory, or device). Remove it and reinstall."
-            ) from exc
-        raise
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(raw_content)
+        st = os.lstat(context_file)
+    except FileNotFoundError:
+        st = None
+    if st is not None and not stat.S_ISREG(st.st_mode):
+        raise _non_regular_target_error(context_file)
+    # Reinstalls keep the target's current mode; a brand-new copy gets 0o600 from
+    # _create_context_temp_file. This file lives under
+    # ~/.aws/cli-agent-orchestrator/ and holds agent instruction content, so it is
+    # not group/world readable by default -- but silently RE-tightening a mode an
+    # operator widened on purpose would be its own surprise, so an existing mode
+    # is preserved rather than reasserted.
+    existing_mode = stat.S_IMODE(st.st_mode) if st is not None else None
+
+    content = _context_content_with_provenance(raw_content, source_name)
+    temp_path: Optional[Path] = None
+    try:
+        fd, temp_path = _create_context_temp_file(context_file)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as tmp:
+            tmp.write(content)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+            if existing_mode is not None and platform.system() != "Windows":
+                os.fchmod(tmp.fileno(), existing_mode)
+        os.replace(temp_path, context_file)
+    except Exception as exc:
+        if temp_path is not None:
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+        try:
+            recheck = os.lstat(context_file)
+        except FileNotFoundError:
+            recheck = None
+        if recheck is not None and not stat.S_ISREG(recheck.st_mode):
+            raise _non_regular_target_error(context_file) from exc
+        # Name the real target the operator asked to install, not an
+        # internal, randomly-suffixed temp filename that may no longer even
+        # exist (e.g. a read-only context dir before the temp file was ever
+        # created, or a mid-write failure, or a `.tmp` cleaner racing
+        # `os.replace`). `strerror` (unlike `str(exc)`) never embeds a path.
+        detail = getattr(exc, "strerror", None) or str(exc)
+        raise OSError(f"Failed to write context file '{context_file}': {detail}") from exc
     return context_file
 
 
@@ -313,6 +766,110 @@ def _build_provider_config(
         name=profile_name,
         description=description,
     )
+
+
+def _guard_installed_copy_ownership(source_name: str, profile_name: str, provider: str) -> None:
+    """Refuse an install that would overwrite a context copy owned by another profile.
+
+    Every install writes the shared context copy ``<context dir>/<resolved
+    name>.md``; an OpenCode install additionally writes ``OPENCODE_AGENTS_DIR/<id>.md``
+    and the ``agent.<id>`` section of ``opencode.json``, where ``<id>`` is the
+    resolved name (``to_opencode_agent_id`` is the identity for every name that
+    passes validation). Two profile FILES can resolve to the same ``name:``, so
+    the second install would silently replace the first's artifacts -- and the
+    context copy is not bookkeeping: a Kiro agent's ``resources`` point at it
+    and it is what the installed agent reads at runtime. That is why this runs
+    for every provider, not only OpenCode (round-3 review of #493).
+
+    **Occupancy is read from the destination itself**, not from profile
+    discovery. ``list_agent_profiles()`` keeps the first profile per stem, so an
+    installed copy is relegated to ``duplicated_in`` whenever the local store or
+    a provider directory holds a file of the same stem -- which is the ordinary
+    case of a profile installed under its own name -- and a disabled directory,
+    a ``~`` spelling or a discovery failure erased the evidence outright. The
+    files a second install overwrites are at known paths, so those paths are what
+    is probed: ``_context_lookup_dirs()`` (the configured directory, plus the
+    legacy default when an override is active) for ``<id>.md``.
+
+    **Ownership is the provenance marker.** ``_write_context_file`` stamps each
+    copy with ``_CONTEXT_SOURCE_STEM_KEY`` naming the install stem it came from.
+    A copy whose marker names ``source_name`` is this very profile's earlier
+    copy: reinstall and upgrade proceed. A marker naming a different stem is a
+    collision. A missing marker (a copy written before the marker existed)
+    cannot prove either, so it blocks with a recovery message rather than being
+    assumed to be self -- legitimate upgrades change the body, so payload
+    equality is not an identity signal. The installed copy's own ``name:`` is
+    never parsed here: it may hold an unresolved ``${VAR}`` placeholder, and the
+    id it occupies is already the filename.
+
+    A non-regular entry at the probed path (symlink, directory, device) is left
+    to ``_write_context_file``, whose lstat check refuses it with the message
+    that names the real problem. Only a collision implicating the profile being
+    installed blocks; two OTHER profiles clashing is not this install's concern.
+    This remains a pre-write check with no locking between check and write.
+    """
+    # Validated here, in the same function as the paths built from it, so the
+    # probe below cannot be steered outside the context directory by a hostile
+    # ``name:`` (the writer repeats this check at its own sink for the same
+    # reason; see the BARRIER PLACEMENT note there). A separator-bearing name is
+    # therefore refused AS an invalid name, whether or not its flattened id
+    # happens to be occupied: it can never be installed, so "rename the other
+    # profile" would be the wrong remedy.
+    safe_name = validate_path_component(profile_name, description="profile name")
+    target_id = to_opencode_agent_id(safe_name)
+
+    for context_dir in _context_lookup_dirs():
+        candidate_path = _installed_context_copy_path(target_id, context_dir)
+        try:
+            entry = os.lstat(candidate_path)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            _raise_unreadable_installed_copy(target_id, source_name, candidate_path, exc, provider)
+        if not stat.S_ISREG(entry.st_mode):
+            # The writer refuses this target itself, naming the real problem.
+            continue
+        try:
+            raw = candidate_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            # An I/O fault, not a bad file: the remedy is to fix access, not to
+            # delete the copy (which would discard the ownership record).
+            _raise_unreadable_installed_copy(target_id, source_name, candidate_path, exc, provider)
+        try:
+            provenance_stem = _context_source_stem(raw)
+        except Exception as exc:
+            logger.debug(
+                "Could not parse installed-profile provenance from '%s': %s", candidate_path, exc
+            )
+            _raise_unloadable_installed_collision(
+                target_id, source_name, profile_name, candidate_path, provider
+            )
+        if provenance_stem == source_name:
+            # Our own earlier copy (possibly in the legacy directory): a reinstall.
+            continue
+
+        existing = _installed_copy_display(provenance_stem, candidate_path)
+        recovery = "" if provenance_stem else f" {_installed_context_copy_remedy(candidate_path)}"
+        if _is_opencode(provider):
+            message = (
+                f"OpenCode agent id '{target_id}' is produced by both the profile "
+                f"being installed ('{source_name}.md', name '{profile_name}') and "
+                f"the existing profile {existing} (name '{target_id}'). Two "
+                "distinct profiles cannot share an OpenCode agent id: they install "
+                f"to the same '{target_id}.md' file and 'agent.{target_id}' config "
+                "section, so the second would silently overwrite the first. Rename "
+                "one of these profiles (their frontmatter 'name:' must differ)."
+            )
+        else:
+            message = (
+                f"Profile name '{target_id}' is already installed from the existing "
+                f"profile {existing}; installing '{source_name}.md' (name "
+                f"'{profile_name}') for {provider} would overwrite its shared context "
+                f"copy, which the installed agent reads at runtime. Two distinct "
+                "profiles cannot share a resolved name. Rename one of these profiles "
+                "(their frontmatter 'name:' must differ)."
+            )
+        raise _collision_error_class(provider)(message + recovery)
 
 
 def install_agent(
@@ -437,18 +994,26 @@ def install_agent(
             write_profile(agent_name, frontmatter.dumps(stored), overwrite=True)
 
         unresolved_vars = sorted(set(re.findall(r"\$\{(\w+)\}", resolved_content)))
-        context_file = _write_context_file(profile.name, raw_content)
 
         mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
         allowed_tools = resolve_allowed_tools(profile.allowedTools, profile.role, mcp_server_names)
 
         agent_file: Optional[Path] = None
         # Defence in depth. The resolved profile name is attacker-controlled, but
-        # _write_context_file above has already REJECTED any name carrying a path
-        # separator, so nothing separator-bearing reaches these provider sinks in
-        # the normal flow. The flatten stays so each sink is independently safe if
-        # the order ever changes or a new caller appears.
+        # the ownership guard and _write_context_file BELOW both reject any name
+        # carrying a path separator before any provider sink is reached, so
+        # nothing separator-bearing gets here in the normal flow. The flatten
+        # stays so each sink is independently safe if the order ever changes or
+        # a new caller appears.
         safe_filename = flatten_path_separators(profile.name)
+
+        # The ownership guard runs BEFORE any destructive write, for every
+        # provider: the shared context copy is the first thing an install
+        # overwrites and the artifact every provider's agent reads, so a rejected
+        # install must leave it -- and, for OpenCode, the agent file and config
+        # section it also shares -- untouched.
+        _guard_installed_copy_ownership(agent_name, profile.name, provider)
+        context_file = _write_context_file(profile.name, raw_content, agent_name)
 
         if provider == ProviderType.KIRO_CLI.value:
             if profile.engine == KiroEngine.KAS:
@@ -528,6 +1093,7 @@ def install_agent(
                 mode="all",
                 permission=cao_tools_to_opencode_permission(allowed_tools),
             )
+
             agent_id = to_opencode_agent_id(profile.name)
             agent_file = OPENCODE_AGENTS_DIR / f"{agent_id}.md"
             agent_file.write_text(

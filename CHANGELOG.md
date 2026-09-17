@@ -16,6 +16,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- refuse an install that would silently overwrite another profile's installed
+  artifacts, instead of letting the second install clobber the first (#493).
+  Two profile files can carry the same `name:`; the second used to replace the
+  first's shared context copy — which the installed agent reads at runtime —
+  and, for OpenCode, its agent file and `opencode.json` section. The check now
+  runs for **every provider** and reads ownership from the context copy at its
+  destination path rather than from profile discovery, so it holds when the
+  installed copy is shadowed by a same-named file elsewhere, when its `name:`
+  holds a `${VAR}` placeholder, when the directory is disabled, or when
+  discovery fails. A profile that merely *could* produce the same id — a
+  packaged built-in, or a local-store profile that has not been installed —
+  does not block the install, since it owns no file yet; installing a profile
+  whose `name:` matches one of the built-ins therefore still works, and the
+  same profile still installs for any number of providers
+
+- the shared context copy is written to the configured installed-profile
+  directory (`agents.dirs.cao_installed`), the directory profile discovery, the
+  collision guard and the Copilot skill-injection probe read, instead of always
+  the default path; a `~`, trailing-slash or symlinked spelling of the default
+  still counts as the default, and with the default setting nothing moves. A
+  blank or relative value under `agents.dirs` — for `cao_installed` or any
+  other key — is ignored with a warning wherever CAO opens directories (profile
+  discovery, the lookup behind `cao install <name>`, memory promotion's profile
+  lookup, the context-copy writer),
+  rather than making the server's working directory a profile source or the
+  write root; the Settings API still reports the value as saved. With an
+  override configured, the guard and the probe also consult the default
+  directory, so ownership records written there by earlier releases stay in
+  force (#493)
+
 - **enabling `CAO_MEMORY_API_URL` rejected memory keys that work without it.**
   The `/internal/memory/store` and `/forget` routes validated the wire `key` as
   the strict `MemoryKey` (`^[a-z0-9-]{1,60}$`), while the MCP tools have always
@@ -50,6 +80,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wherever the data dir is unreadable. The import is now lazy.
 
 ### Changed
+
+- record the originating install handle in each shared context copy's frontmatter
+  (`x-cao-source-stem`), so a reinstall can tell its own prior copy apart from a
+  different profile that resolves to the same OpenCode agent id. The key is
+  CAO-written: a source profile that declares it has that line replaced by CAO's
+  own at install, and the install is refused when the result does not read back
+  as the marker CAO wrote (#493)
+
+- write the shared context copy atomically, via a same-directory temporary file
+  and `os.replace`, so an interrupted install cannot leave a truncated copy; a new
+  copy is created `0o600` regardless of umask, and a reinstall preserves the
+  existing file's mode (#493)
 
 - `list_outcomes` clamps `limit` to 200 client-side; the service already clamped
   silently, so `limit=500` keeps working rather than becoming a 422.
