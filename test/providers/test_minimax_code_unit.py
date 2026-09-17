@@ -13,7 +13,11 @@ import yaml
 
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.providers.minimax_code import MiniMaxCodeProvider, ProviderError
+from cli_agent_orchestrator.providers.minimax_code import (
+    MINIMAX_CODE_MODEL_IDS,
+    MiniMaxCodeProvider,
+    ProviderError,
+)
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -30,6 +34,10 @@ def make_provider(**kwargs) -> MiniMaxCodeProvider:
         agent_profile=kwargs.pop("agent_profile", "developer"),
         **kwargs,
     )
+
+
+def test_current_model_catalog():
+    assert MINIMAX_CODE_MODEL_IDS == ("MiniMax-M3", "MiniMax-M2.7")
 
 
 def test_prepare_runtime_isolates_auth_and_generates_private_mcp_plugin(
