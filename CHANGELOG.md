@@ -105,6 +105,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   import executed its import-time `DB_DIR.mkdir()` in agents — and failed outright
   wherever the data dir is unreadable. The import is now lazy.
 
+- **CI referenced GitHub Actions by mutable tag**, including in the jobs that
+  hold `RELEASE_DEPLOY_KEY`, `CODECOV_TOKEN` and the Pages OIDC token; five
+  steps ran `npm install` rather than `npm ci` against committed lockfiles, and
+  every `uv sync` omitted `--frozen`. All 66 tag references across `ci.yml`,
+  `release.yml`, `gh-pages.yml`, `secret-scan.yml` and the four provider test
+  workflows are pinned to the commit each tag resolved to (tag kept as a
+  comment), `npm ci` is used throughout, and `uv sync --frozen` installs
+  exactly `uv.lock`. `publish-to-pypi.yml` and `cargo-deny.yml` were already
+  pinned.
+
 ### Changed
 
 - `list_outcomes` clamps `limit` to 200 client-side; the service already clamped

@@ -448,7 +448,7 @@ jobs:
       - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v4.2.0
 
       - name: Install the project
-        run: uv sync --all-extras --dev
+        run: uv sync --all-extras --dev --frozen
 
       # PyPI's index is eventually consistent: `publish-pypi` succeeding does not mean
       # `/pypi/<dist>/<version>/json` answers yet, and `verify_published` would fail on a
