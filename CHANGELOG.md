@@ -105,6 +105,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   import executed its import-time `DB_DIR.mkdir()` in agents — and failed outright
   wherever the data dir is unreadable. The import is now lazy.
 
+- **The local API bearer was sent to other nodes.** `handoff`/`assign` with a
+  `target_host`, `delete_terminal` with a `target_host`, and a remote worker's
+  `send_message` back to its supervisor's `CAO_CALLBACK_URL` all attached
+  `CAO_AUTH_LOCAL_TOKEN` to requests aimed at another host. The token now goes
+  only to this node's own `API_BASE_URL`; cross-node requests carry no
+  `Authorization` header (the elastic worker gateway headers are unaffected).
+  No change when authentication is off. Behaviour change when it is on: a
+  multi-node deployment that gave every node the same `CAO_AUTH_LOCAL_TOKEN`
+  was authenticating these cross-node calls by accident, and they now fail
+  with 401 on the remote node; the token is documented as this node's
+  loopback credential only.
+
 ### Changed
 
 - `list_outcomes` clamps `limit` to 200 client-side; the service already clamped
