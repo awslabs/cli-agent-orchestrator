@@ -652,6 +652,54 @@ class TestCreateSession:
         assert response.status_code == 201
         assert mock_svc.create_session.call_args.kwargs["env_vars"] == {"FEATURE_MODE": "enabled"}
 
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+            "BASH_ENV",
+            "NODE_OPTIONS",
+            "PYTHONPATH",
+            "HOME",
+            "PATH",
+        ],
+    )
+    def test_create_session_rejects_startup_hijack_env_vars(self, client, key):
+        """A direct HTTP caller cannot stage a loader/shell/interpreter hook into the pane.
+
+        Previously these reached TmuxClient._merge_extra_env unchecked; the
+        prefix-only filter there let them through, so with authentication off
+        any loopback client could run code as the operator at pane start.
+        """
+        payload = "/tmp/evil-payload-9f3a.so"
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock()
+            response = client.post(
+                "/sessions",
+                params={"agent_profile": "developer"},
+                json={"env_vars": {key: payload}},
+            )
+
+        assert response.status_code == 422
+        body = response.text
+        assert key in body
+        assert payload not in body  # NFR-SEC-4: the value never round-trips
+        mock_svc.create_session.assert_not_called()
+
+    def test_create_session_rejects_blocked_prefix_env_var_instead_of_dropping(self, client):
+        """The shared validator now runs at the HTTP boundary: a provider-prefixed key
+        that the CLI would refuse is a 422 here too, not a silent server-side drop."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock()
+            response = client.post(
+                "/sessions",
+                params={"agent_profile": "developer"},
+                json={"env_vars": {"CODEX_TOKEN": "x", "FEATURE_MODE": "enabled"}},
+            )
+
+        assert response.status_code == 422
+        mock_svc.create_session.assert_not_called()
+
     def test_create_session_rejects_malformed_model(self, client):
         """Malformed model IDs fail before any session is created."""
         with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:

@@ -21,6 +21,7 @@ from cli_agent_orchestrator.constants import (
     BRACKETED_PASTE_INCOMPATIBLE_SHELLS,
     TMUX_HISTORY_LINES,
 )
+from cli_agent_orchestrator.utils.forwarded_env import is_hijack_env_key
 from cli_agent_orchestrator.utils.path_validation import (
     BLOCKED_SYSTEM_DIRECTORIES,
     resolve_and_validate_path,
@@ -861,7 +862,16 @@ class TmuxClient:
 
     @classmethod
     def _is_blocked_env_key(cls, key: str) -> bool:
-        """Return True if ``key`` matches a blocked prefix and isn't allowlisted."""
+        """Return True if ``key`` must not reach the pane environment.
+
+        Two classes: provider prefixes (nested-session hazard, allowlist
+        applies) and the loader/shell/interpreter startup variables from
+        ``utils.forwarded_env`` (``LD_PRELOAD``, ``BASH_ENV``, ``NODE_OPTIONS``,
+        ...), whose value would run as the operator when the pane starts.
+        The second class has no allowlist.
+        """
+        if is_hijack_env_key(key):
+            return True
         if key in cls._BLOCKED_PREFIX_ALLOWLIST:
             return False
         return any(key.startswith(p) for p in cls._BLOCKED_ENV_PREFIXES)
@@ -880,7 +890,7 @@ class TmuxClient:
             return
         for key, value in extra_env.items():
             if cls._is_blocked_env_key(key):
-                logger.warning("Dropping forwarded env var with blocked prefix: %s", key)
+                logger.warning("Dropping forwarded env var with blocked key: %s", key)
                 continue
             if len(value.encode("utf-8")) >= cls._MAX_ENV_VALUE_BYTES:
                 logger.warning(

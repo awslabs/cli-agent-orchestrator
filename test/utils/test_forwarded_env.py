@@ -167,3 +167,55 @@ def test_aggregate_argv_budget_just_under_allowed():
     mapping = {f"K{i:04d}": "x" * value_bytes for i in range(n_entries)}
     assert n_entries * per_entry <= FORWARDED_ENV_MAX_TOTAL_BYTES  # confirm we are under budget
     assert validate_forwarded_env(mapping) == mapping
+
+
+@pytest.mark.parametrize(
+    "hijack_key",
+    [
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "LD_AUDIT",
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
+        "PATH",
+        "HOME",
+        "SHELL",
+        "BASH_ENV",
+        "ENV",
+        "ZDOTDIR",
+        "PROMPT_COMMAND",
+        "PS0",
+        "PS1",
+        "PS2",
+        "PS4",
+        "PYTHONSTARTUP",
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "PERL5OPT",
+        "PERL5LIB",
+        "NODE_OPTIONS",
+        "RUBYOPT",
+        "RUBYLIB",
+        "GCONV_PATH",
+    ],
+)
+def test_loader_shell_interpreter_startup_keys_rejected(hijack_key):
+    """A value in any of these runs as the operator when the pane starts."""
+    with pytest.raises(ForwardedEnvError, match="cannot be forwarded"):
+        validate_forwarded_env({hijack_key: "/tmp/x.so"})
+
+
+@pytest.mark.parametrize(
+    "key", ["ld_preload", "MY_LD_PRELOAD", "NODE_OPTIONS_BACKUP", "ENVIRONMENT"]
+)
+def test_lookalike_keys_are_not_rejected(key):
+    """Only the exact names and the LD_/DYLD_ families are refused; env is case-sensitive."""
+    assert validate_forwarded_env({key: "x"}) == {key: "x"}
+
+
+def test_hijack_key_error_never_echoes_value():
+    secret = "/home/op/evil-payload-9f3a.so"
+    with pytest.raises(ForwardedEnvError) as excinfo:
+        validate_forwarded_env({"LD_PRELOAD": secret})
+    assert secret not in str(excinfo.value)
+    assert "LD_PRELOAD" in str(excinfo.value)

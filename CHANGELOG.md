@@ -105,6 +105,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   import executed its import-time `DB_DIR.mkdir()` in agents — and failed outright
   wherever the data dir is unreadable. The import is now lazy.
 
+- **Forwarded session environment accepted loader, shell and interpreter
+  startup variables.** `--env`, the ops-MCP `launch_session` tool and
+  `POST /sessions` now refuse `LD_*`, `DYLD_*`, `GCONV_PATH`, `PATH`, `HOME`,
+  `SHELL`, `BASH_ENV`, `ENV`, `ZDOTDIR`, `PROMPT_COMMAND`, `PS0`, `PS1`, `PS2`,
+  `PS4`, `PYTHONSTARTUP`, `PYTHONPATH`, `PYTHONHOME`, `PERL5OPT`, `PERL5LIB`,
+  `NODE_OPTIONS`, `RUBYOPT` and `RUBYLIB`, whose value decides what runs as the
+  operator the moment the pane starts. `POST /sessions` also applies the existing forwarded-env rules at
+  the HTTP boundary (422 naming the key) instead of dropping violating keys
+  server-side with only a log warning.
+
 ### Changed
 
 - `list_outcomes` clamps `limit` to 200 client-side; the service already clamped
