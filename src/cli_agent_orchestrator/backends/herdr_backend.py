@@ -221,9 +221,19 @@ class HerdrBackend(TerminalBackend):
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
             if check and result.returncode != 0:
+                # stderr stays in the server log. The exception text travels to
+                # API clients as an HTTP 500 detail, and herdr's stderr can name
+                # local paths, socket locations and flags that a client has no
+                # business seeing.
+                logger.error(
+                    "herdr command failed (exit %s): %s\nstderr: %s",
+                    result.returncode,
+                    " ".join(cmd_display),
+                    result.stderr.strip(),
+                )
                 raise TerminalBackendError(
-                    f"herdr command failed: {' '.join(cmd_display)}\n"
-                    f"stderr: {result.stderr.strip()}"
+                    f"herdr command failed: {' '.join(cmd_display)} "
+                    f"(exit {result.returncode}; stderr is in the cao-server log)"
                 )
             return result
         except subprocess.TimeoutExpired as e:

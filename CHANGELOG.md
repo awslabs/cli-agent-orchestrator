@@ -135,6 +135,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   name now targets the CAO session of that name and can no longer remove a
   personal one. A dedicated tmux socket is tracked separately.
 
+- **A failed herdr command put its raw stderr into the error returned to API
+  clients.** herdr's stderr can name local paths, socket locations and flags.
+  The exception now carries the redacted command and exit status only; stderr
+  goes to the cao-server log.
+
 ### Changed
 
 - `list_outcomes` clamps `limit` to 200 client-side; the service already clamped
