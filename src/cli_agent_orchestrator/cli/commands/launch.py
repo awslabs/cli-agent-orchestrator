@@ -16,6 +16,13 @@ from cli_agent_orchestrator.constants import (
 )
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.settings_service import get_server_settings
+from cli_agent_orchestrator.utils.enforcement import (
+    NATIVE,
+    describe_enforcement,
+    enforcement_for,
+    is_restricted,
+    native_providers,
+)
 from cli_agent_orchestrator.utils.forwarded_env import (
     ForwardedEnvError,
     validate_forwarded_env,
@@ -102,7 +109,10 @@ def _parse_env_pairs(pairs):
 @click.option(
     "--auto-approve",
     is_flag=True,
-    help="Skip confirmation prompt (restrictions still enforced).",
+    help=(
+        "Skip the confirmation prompt. Does not change the tool policy; whether that "
+        "policy is enforced depends on the provider (see the Enforcement line)."
+    ),
 )
 @click.option(
     "--yolo",
@@ -249,13 +259,31 @@ def launch(
                 tool_summary = format_tool_summary(resolved_allowed_tools)
                 blocked = get_disallowed_tools(provider, resolved_allowed_tools)
                 blocked_summary = ", ".join(blocked) if blocked else "(none)"
+                level = enforcement_for(provider)
+                if level != NATIVE and is_restricted(resolved_allowed_tools) and not blocked:
+                    # Providers with no TOOL_MAPPING entry return an empty
+                    # deny list; "(none)" would read as "nothing is blocked
+                    # because nothing needs to be", which is the opposite of
+                    # what is true here.
+                    blocked_summary = "(not translated for this provider)"
 
                 click.echo(
                     f"\nAgent '{agents}' launching on {provider}:\n"
                     f"  Allowed:  {tool_summary}\n"
                     f"  Blocked:  {blocked_summary}\n"
+                    f"  Enforcement: {describe_enforcement(provider, resolved_allowed_tools)}\n"
                     f"  Directory: {display_dir}\n"
                 )
+                if level != NATIVE and is_restricted(resolved_allowed_tools):
+                    click.echo(
+                        click.style(
+                            "  WARNING: this provider does not enforce the Blocked list. "
+                            "The agent can use any tool.\n"
+                            f"  For enforced restrictions use one of: "
+                            f"{', '.join(native_providers())}.\n",
+                            fg="yellow",
+                        )
+                    )
                 if no_role_set:
                     click.echo(
                         "  Note: No role or allowedTools set — defaulting to 'developer'.\n"

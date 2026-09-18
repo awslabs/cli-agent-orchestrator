@@ -128,6 +128,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instructions), the line no longer grows with the profile, and the permission
   flags precede it.
 
+- **The launch confirmation showed a Blocked list on providers that cannot
+  enforce one.** `cao launch` printed `Allowed:`/`Blocked:` for every provider
+  and `--auto-approve` said restrictions were "still enforced", while Hermes
+  (`--yolo --accept-hooks`) and Cursor CLI (`--force`) apply no restriction at
+  all and were missing from the server's soft-enforcement set, so a restricted
+  supervisor on them ran unrestricted with nothing telling the operator. One
+  table (`utils/enforcement.py`) now classifies every provider as native,
+  prompt-only or none; the confirmation prints an `Enforcement:` line and a
+  warning on prompt-only and none providers, the empty deny list on untranslated
+  providers no longer reads as `(none)`, the server warning covers Hermes and
+  Cursor, and a test keeps the SECURITY.md and docs tables equal to the code
+  (SECURITY.md gains the seven missing rows, the docs table gains OMP). Kiro
+  CLI, the default provider, moves from "Hard" to "None": it is launched with
+  `--trust-all-tools` on every profile, and the `allowedTools` CAO writes into
+  the agent JSON only suppresses approval prompts in Kiro; `tools` decides
+  availability and is `["*"]` unless the profile sets it. Applying the CAO
+  policy to Kiro at launch, and refusing restricted roles on providers that
+  cannot enforce them, are separate decisions.
+
 ### Changed
 
 - `list_outcomes` clamps `limit` to 200 client-side; the service already clamped
