@@ -25,7 +25,7 @@ from __future__ import annotations
 import pytest
 
 from cli_agent_orchestrator.models.workflow_runtime import RunState
-from cli_agent_orchestrator.services import script_runner
+from cli_agent_orchestrator.services import script_runner, workflow_journal
 from cli_agent_orchestrator.services.script_runner import run_script_workflow
 
 pytestmark = [pytest.mark.e2e, pytest.mark.asyncio]
@@ -99,8 +99,11 @@ async def test_real_hang_is_reaped_within_bound(tmp_path, monkeypatch):
 
 
 async def test_real_nonzero_exit_is_failed(tmp_path):
-    """A real script exiting nonzero -> FAILED, kind=error."""
+    """A real nonzero script persists stderr after the child process exits."""
     spec = _RealSpec(tmp_path, source='import sys\nsys.stderr.write("boom\\n")\nsys.exit(3)\n')
     result = await run_script_workflow(spec, {}, "e2e-crash")
     assert result.state == RunState.FAILED
     assert result.kind == "error"
+    row = workflow_journal.get_run("e2e-crash")
+    assert row is not None
+    assert row.error == "boom"
