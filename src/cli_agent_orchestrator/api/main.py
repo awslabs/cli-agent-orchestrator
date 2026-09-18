@@ -6671,7 +6671,29 @@ async def get_handoff_result_endpoint(
     disabled (the default) — ``require_any_scope`` only enforces when an IdP
     is configured.
     """
-    record = get_handoff_result(job_id)
+    try:
+        record = get_handoff_result(job_id)
+    except Exception as exc:  # noqa: BLE001 — see the leak note below
+        # A storage failure must never hand the job_id to the ASGI error logger.
+        # This handler has no generic exception handler above it, so an escaping
+        # SQLAlchemy DBAPI error (a locked SQLite file being the realistic case)
+        # reaches uvicorn's ServerErrorMiddleware, which logs the whole traceback
+        # to ``uvicorn.error`` -- and that traceback prints the bound parameters,
+        # ``[parameters: ('<job_id>',)]``. The access-log filter in
+        # ``utils/logging.py`` scrubs the request PATH and never sees this
+        # surface, so the read path needs its own guard even though the write
+        # path is already covered (PR #453 review, read-error path).
+        # EXCEPTION CLASS NAME ONLY, and ``from None`` so nothing downstream can
+        # walk ``__cause__``/``__context__`` back to the parameter-bearing error.
+        logger.error(
+            "get_handoff_result: lookup failed for job_id_prefix=%s (%s)",
+            job_id[:8],
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Handoff result lookup failed; the record may still exist, retry shortly",
+        ) from None
     if record is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

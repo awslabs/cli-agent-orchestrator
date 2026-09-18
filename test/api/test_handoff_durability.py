@@ -324,3 +324,69 @@ class TestPersistFailureLogDoesNotLeakTheCapability:
         # records, so a fix that silenced the log entirely would fail here.
         assert self.JOB[:8] in rendered
         assert "OperationalError" in rendered
+
+
+class TestLookupFailureDoesNotLeakTheCapability:
+    """PR #453 review (haofeif, read-error path): fixing the WRITE warning left
+    the READ symmetrically exposed.
+
+    The retrieval handler had no guard and there is no generic exception handler
+    above it, so a SQLAlchemy lookup failure escaped to uvicorn's
+    ``ServerErrorMiddleware``, which logs the full traceback -- including
+    ``[parameters: ('<job_id>',)]`` -- to ``uvicorn.error``. The access-log
+    filter only scrubs the request path, so it never sees that surface.
+    """
+
+    JOB = "cafe1234" * 4
+
+    def test_lookup_failure_is_content_safe(self, client, caplog):
+        from sqlalchemy.exc import OperationalError
+
+        # Same shape SQLAlchemy raises against a locked SQLite file: the bound
+        # params (which are just the job_id here) are part of the exception.
+        exc = OperationalError(
+            "SELECT * FROM handoff_results WHERE job_id = ?",
+            (self.JOB,),
+            Exception("database is locked"),
+        )
+        # Sanity: the exception really does carry the id, so this test is not
+        # passing merely because nothing had it to leak.
+        assert self.JOB in str(exc)
+
+        with (
+            patch(_GET, side_effect=exc),
+            caplog.at_level(logging.ERROR, logger="cli_agent_orchestrator.api.main"),
+        ):
+            resp = client.get(HANDOFF_RESULTS_ROUTE.format(job_id=self.JOB))
+
+        # Reaching a response at all is half the fix: an escaping exception is
+        # what handed the traceback to uvicorn (the client re-raises by default,
+        # so this line fails outright if the guard is removed).
+        assert resp.status_code == 500
+        assert self.JOB not in resp.text
+
+        rendered = "\n".join(r.getMessage() for r in caplog.records)
+        formatted = "\n".join(logging.Formatter("%(message)s").format(r) for r in caplog.records)
+        assert self.JOB not in rendered
+        assert self.JOB not in formatted
+        assert not any(r.exc_info for r in caplog.records)
+
+        # Still actionable for an operator: which job, which failure class.
+        assert self.JOB[:8] in rendered
+        assert "OperationalError" in rendered
+
+    def test_successful_lookup_is_unaffected(self, client):
+        """The guard must not swallow a normal 200 (nor turn 404 into 500)."""
+        record = {
+            "job_id": self.JOB,
+            "state": "completed",
+            "terminal_id": "abc12345",
+            "last_message": "done",
+            "error_message": None,
+            "created_at": "2025-01-01T00:00:00+00:00",
+            "updated_at": "2025-01-01T00:01:00+00:00",
+        }
+        with patch(_GET, return_value=record):
+            assert client.get(HANDOFF_RESULTS_ROUTE.format(job_id=self.JOB)).status_code == 200
+        with patch(_GET, return_value=None):
+            assert client.get(HANDOFF_RESULTS_ROUTE.format(job_id=self.JOB)).status_code == 404
