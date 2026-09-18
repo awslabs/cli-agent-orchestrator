@@ -117,6 +117,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   import executed its import-time `DB_DIR.mkdir()` in agents — and failed outright
   wherever the data dir is unreadable. The import is now lazy.
 
+- **Grok's launch line inlined the whole `--rules` text ahead of the
+  permission flags.** A profile plus skill catalog of several KB pushed the
+  line past the tty's 4096-byte limit. The cut landed inside the quoted text,
+  so the shell hung on an unclosed quote and Grok never started (an init
+  timeout, not an unrestricted run), but the `--permission-mode`/`--allow`/
+  `--deny` flags were the part of the line behind the text. The rules now live
+  in a 0600 `rules.md` inside the terminal's private `GROK_HOME`, referenced
+  from the line with `"$(cat …)"` (as the Codex provider already does for its
+  instructions), the line no longer grows with the profile, and the permission
+  flags precede it.
+
 ### Changed
 
 - `list_outcomes` clamps `limit` to 200 client-side; the service already clamped
