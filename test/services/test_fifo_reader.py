@@ -1,6 +1,7 @@
 """Tests for the FIFO reader manager."""
 
 import os
+import stat
 import threading
 import time
 from unittest.mock import patch
@@ -9,7 +10,7 @@ import pyte
 import pytest
 
 from cli_agent_orchestrator.services import fifo_reader as fr
-from cli_agent_orchestrator.services.fifo_reader import FifoManager
+from cli_agent_orchestrator.services.fifo_reader import FifoManager, _open_fifo
 
 pytestmark = pytest.mark.skipif(
     not hasattr(os, "mkfifo"), reason="FIFOs require a POSIX platform (os.mkfifo)"
@@ -1112,3 +1113,77 @@ class TestConcurrencyRaces:
             "exactly the kind of unhandled RuntimeError that would kill it"
         )
         assert not watchdog.is_alive(), "watchdog thread must exit cleanly once stopped"
+
+
+class TestFifoPathHardening:
+    """The per-terminal FIFO path is predictable; only a real FIFO may live there."""
+
+    def _manager(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("cli_agent_orchestrator.services.fifo_reader.FIFO_DIR", tmp_path)
+        return FifoManager()
+
+    def test_symlink_at_fifo_path_is_refused_and_target_untouched(self, tmp_path, monkeypatch):
+        target = tmp_path / "victim.txt"
+        target.write_text("precious")
+        (tmp_path / "term-link.fifo").symlink_to(target)
+        manager = self._manager(tmp_path, monkeypatch)
+
+        with pytest.raises(OSError, match="not a FIFO"):
+            manager.create_reader("term-link")
+
+        with manager._lock:
+            assert "term-link" not in manager._threads
+        assert target.read_text() == "precious"
+        assert (tmp_path / "term-link.fifo").is_symlink()  # refused, not replaced
+
+    def test_regular_file_at_fifo_path_is_refused(self, tmp_path, monkeypatch):
+        (tmp_path / "term-file.fifo").write_text("not a pipe")
+        manager = self._manager(tmp_path, monkeypatch)
+        with pytest.raises(OSError, match="not a FIFO"):
+            manager.create_reader("term-file")
+        with manager._lock:
+            assert "term-file" not in manager._threads
+
+    def test_existing_fifo_is_reused(self, tmp_path, monkeypatch):
+        fifo_path = tmp_path / "term-keep.fifo"
+        os.mkfifo(fifo_path)
+        before = os.lstat(fifo_path).st_ino
+        manager = self._manager(tmp_path, monkeypatch)
+        manager.create_reader("term-keep")
+        try:
+            assert os.lstat(fifo_path).st_ino == before
+        finally:
+            manager.stop_reader("term-keep")
+
+    def test_created_fifo_is_owner_only(self, tmp_path, monkeypatch):
+        manager = self._manager(tmp_path, monkeypatch)
+        manager.create_reader("term-mode")
+        try:
+            mode = os.lstat(tmp_path / "term-mode.fifo").st_mode
+            assert stat.S_ISFIFO(mode)
+            assert stat.S_IMODE(mode) & 0o077 == 0
+        finally:
+            manager.stop_reader("term-mode")
+
+    def test_open_refuses_symlink_even_to_a_real_fifo(self, tmp_path):
+        real = tmp_path / "real.fifo"
+        os.mkfifo(real)
+        link = tmp_path / "link.fifo"
+        link.symlink_to(real)
+        with pytest.raises(OSError):
+            _open_fifo(link, os.O_RDONLY | os.O_NONBLOCK)
+
+    def test_open_refuses_regular_file(self, tmp_path):
+        plain = tmp_path / "plain.fifo"
+        plain.write_text("x")
+        with pytest.raises(OSError, match="not a FIFO"):
+            _open_fifo(plain, os.O_RDONLY | os.O_NONBLOCK)
+
+    def test_open_accepts_a_fifo(self, tmp_path):
+        real = tmp_path / "ok.fifo"
+        os.mkfifo(real)
+        fd = _open_fifo(real, os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            assert stat.S_ISFIFO(os.fstat(fd).st_mode)
+        finally:
+            os.close(fd)

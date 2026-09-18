@@ -115,6 +115,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the HTTP boundary (422 naming the key) instead of dropping violating keys
   server-side with only a log warning.
 
+- **The per-terminal output FIFO accepted whatever sat at its path.** The
+  reader checked `exists()` then called `mkfifo`, and opened the path following
+  symlinks, so a same-user process that planted a symlink or regular file at
+  the predictable `<CAO_HOME_DIR>/fifos/<terminal>.fifo` (by default under
+  `~/.aws/cli-agent-orchestrator`) could redirect the output stream. The FIFO is now created exclusively with mode 0600, an existing
+  non-FIFO at the path fails terminal creation instead of being used, and both
+  opens use `O_NOFOLLOW` and verify the descriptor is a FIFO.
+
 ### Changed
 
 - `list_outcomes` clamps `limit` to 200 client-side; the service already clamped
