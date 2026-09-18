@@ -123,6 +123,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-FIFO at the path fails terminal creation instead of being used, and both
   opens use `O_NOFOLLOW` and verify the descriptor is a FIFO.
 
+- **Session teardown could reach tmux sessions CAO did not create.** CAO
+  shares the operator's default tmux server and names every session it creates
+  `cao-<name>`, but `DELETE /sessions/{name}` (and so `cao shutdown --session`
+  and the ops `shutdown_session` tool) passed any valid name straight to the
+  kill, so a request for `dev` destroyed a personal session called `dev`. A
+  bare name is now canonicalised to `cao-<name>` on the route, the same rule
+  `POST /sessions` applies, and `session_service.delete_session`,
+  `TmuxClient.kill_session` and `TmuxClient.kill_window` refuse any name
+  without the prefix. Behaviour change: a shutdown request for an unprefixed
+  name now targets the CAO session of that name and can no longer remove a
+  personal one. A dedicated tmux socket is tracked separately.
+
 ### Changed
 
 - `list_outcomes` clamps `limit` to 200 client-side; the service already clamped

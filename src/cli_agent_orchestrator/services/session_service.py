@@ -396,6 +396,16 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
     Returns:
         Dict with 'deleted' (list of deleted session names) and 'errors' (list of error dicts).
     """
+    if not session_name.startswith(SESSION_PREFIX):
+        # Every CAO session is stored under SESSION_PREFIX, so an unprefixed
+        # name is never ours; at most it is a personal tmux session that
+        # happens to share the operator's server. Refuse before touching
+        # anything. The API canonicalises bare names to the prefixed form
+        # before calling here, so this is the guard for direct callers.
+        raise ValueError(
+            f"'{session_name}' is not a CAO session name (CAO sessions start with "
+            f"'{SESSION_PREFIX}'); refusing to delete a session CAO did not create"
+        )
     result: Dict = {"deleted": [], "errors": []}
     # Terminals whose row was actually dropped, with the metadata their
     # post_kill_terminal payload needs. Collected under the lock, dispatched

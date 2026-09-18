@@ -3455,6 +3455,14 @@ async def delete_session(
         validate_tmux_name(session_name, "session_name")
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    # Same naming contract as POST /sessions: a bare name is the caller's alias
+    # for the prefixed CAO session, never a reference to a personal tmux session
+    # of that name. Canonicalise here so DELETE /sessions/dev tears down
+    # cao-dev and can never reach an operator's own "dev".
+    from cli_agent_orchestrator.constants import SESSION_PREFIX
+
+    if not session_name.startswith(SESSION_PREFIX):
+        session_name = f"{SESSION_PREFIX}{session_name}"
     try:
         # Off the event loop: teardown is fully synchronous (tmux kills, FIFO
         # cleanup, DB writes) and has wedged the whole server — /health

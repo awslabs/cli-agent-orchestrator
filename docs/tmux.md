@@ -80,5 +80,5 @@ a 422 naming the key.
 
 ## Notes
 
-- CAO session names are automatically prefixed with `cao-`. Use the prefixed name (e.g. `cao-my-task`) when referencing a session in `tmux attach`, `cao session send`, or `cao shutdown`.
+- CAO session names are automatically prefixed with `cao-`. Use the prefixed name (e.g. `cao-my-task`) when referencing a session in `tmux attach`, `cao session send`, or `cao shutdown`. Teardown never leaves that namespace: `cao shutdown --session my-task` and `DELETE /sessions/my-task` act on `cao-my-task`, and CAO refuses to kill a tmux session whose name lacks the prefix, so a personal session that shares the operator's tmux server is out of reach.
 - Prefer `cao shutdown` over `tmux kill-session`: `cao shutdown` exits each provider cleanly before tearing down the tmux session, which avoids leaked CLI processes.

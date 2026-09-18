@@ -1053,17 +1053,27 @@ class TestDeleteSession:
         """DELETE /sessions/{name} deletes session and returns success."""
         with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
             mock_svc.delete_session.return_value = {
-                "deleted": ["test-session"],
+                "deleted": ["cao-test-session"],
                 "errors": [],
             }
 
-            response = client.delete("/sessions/test-session")
+            response = client.delete("/sessions/cao-test-session")
 
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
-        assert data["deleted"] == ["test-session"]
-        mock_svc.delete_session.assert_called_once_with("test-session", registry=ANY)
+        assert data["deleted"] == ["cao-test-session"]
+        mock_svc.delete_session.assert_called_once_with("cao-test-session", registry=ANY)
+
+    def test_delete_session_bare_name_targets_the_cao_session_only(self, client):
+        """DELETE /sessions/dev is an alias for cao-dev, never the operator's own 'dev'."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.delete_session.return_value = {"deleted": ["cao-dev"], "errors": []}
+
+            response = client.delete("/sessions/dev")
+
+        assert response.status_code == 200
+        mock_svc.delete_session.assert_called_once_with("cao-dev", registry=ANY)
 
     def test_delete_session_deferred_cleanup_is_conflict(self, client):
         """Deferred Grok cleanup must not look like a successful delete."""

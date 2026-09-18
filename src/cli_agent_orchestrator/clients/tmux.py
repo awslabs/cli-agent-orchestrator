@@ -19,6 +19,7 @@ from libtmux.window import Window
 
 from cli_agent_orchestrator.constants import (
     BRACKETED_PASTE_INCOMPATIBLE_SHELLS,
+    SESSION_PREFIX,
     TMUX_HISTORY_LINES,
 )
 from cli_agent_orchestrator.utils.forwarded_env import is_hijack_env_key
@@ -386,6 +387,24 @@ def _tmux_server_liveness(socket_path: str) -> str:
     if any(candidate in command_line for command_line in command_lines for candidate in candidates):
         return _SERVER_ALIVE
     return _SERVER_UNKNOWN
+
+
+def _require_cao_session_name(session_name: str, action: str) -> None:
+    """Refuse a destructive tmux action on a session CAO did not create.
+
+    CAO shares the operator's default tmux server, so a name reaching a kill
+    here could be a personal session. Every session CAO creates starts with
+    ``SESSION_PREFIX`` (``terminal_service.create_terminal`` prepends it), so
+    the prefix is the ownership test. Raised as ``ValueError`` rather than
+    returned as ``False``: callers read False as "not confirmed gone" and go
+    on to re-check liveness, which would turn a refused kill into a confusing
+    "session still alive" failure.
+    """
+    if not session_name.startswith(SESSION_PREFIX):
+        raise ValueError(
+            f"refusing to {action} tmux session {session_name!r}: CAO only acts on "
+            f"sessions it created, and those start with {SESSION_PREFIX!r}"
+        )
 
 
 class TmuxClient:
@@ -1730,6 +1749,7 @@ class TmuxClient:
         through the parse-free tmux CLI instead — and then verified like any
         other, so the fallback cannot report an unconfirmed kill as success.
         """
+        _require_cao_session_name(session_name, "kill")
         try:
             session = self._find_session(session_name)
             if session is None:
@@ -1791,6 +1811,7 @@ class TmuxClient:
         Like ``kill_session``, a listing parse failure falls back to the
         parse-free tmux CLI rather than reporting "nothing to kill".
         """
+        _require_cao_session_name(session_name, "kill a window in")
         try:
             session = self._find_session(session_name)
             if not session:

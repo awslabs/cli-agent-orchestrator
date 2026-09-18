@@ -307,14 +307,14 @@ class TestKillReachesThePane:
         pane = marked_pane("coder-3", "%4")
         tmux.server.sessions.get.return_value = session_with(panes=[pane])
 
-        assert tmux.kill_window("ses", "coder-3") is True
+        assert tmux.kill_window("cao-ses", "coder-3") is True
         pane.kill.assert_called_once()
 
     def test_unknown_terminal_is_not_a_kill(self, tmux):
         pane = marked_pane("reviewer-7", "%3")
         tmux.server.sessions.get.return_value = session_with(panes=[pane])
 
-        assert tmux.kill_window("ses", "coder-3") is False
+        assert tmux.kill_window("cao-ses", "coder-3") is False
         pane.kill.assert_not_called()
 
 
