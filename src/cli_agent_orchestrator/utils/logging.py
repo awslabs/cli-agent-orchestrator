@@ -15,24 +15,38 @@ _CREDENTIAL_RE = re.compile(
     r"\b(" + "|".join(_CREDENTIAL_PARAMS) + r")=([^&\s\"']+)",
 )
 
+# Route families where a PATH SEGMENT is itself the credential, not a query
+# parameter carrying one -- so ``_CREDENTIAL_RE`` above cannot reach it.
+# ``GET /handoff-results/<job_id>`` (issue #447): job_id is the sole retrieval
+# capability for a row that can hold raw worker output, and uvicorn logs the raw
+# path, so an access-log reader would otherwise hold the full capability for
+# every result fetched. Anchored on the route prefix and stopping at the next
+# ``/``, ``?`` or whitespace so a longer path or a query string still redacts.
+_CAPABILITY_PATH_RE = re.compile(r"(/handoff-results/)[^\s/?\"']+")
+
+
+def _scrub(text: str) -> str:
+    """Redact both credential query params and capability-bearing path segments."""
+    text = _CREDENTIAL_RE.sub(rf"\1={REDACTED}", text)
+    return _CAPABILITY_PATH_RE.sub(rf"\g<1>{REDACTED}", text)
+
 
 class RedactQueryTokenFilter(logging.Filter):
-    """Scrub credential-bearing query parameters from log records.
+    """Scrub credentials from log records, whether in a query param or a path.
 
     Attached to ``uvicorn.access`` so ``GET /agui/v1/stream?access_token=<JWT>``
     lines never persist the token (uvicorn logs the raw path+query, and a JWT in
-    an access log is replayable until ``exp``). Mutates the record in place and
-    always returns True — this filter redacts, it never drops.
+    an access log is replayable until ``exp``), and so
+    ``GET /handoff-results/<job_id>`` never persists the id that retrieves that
+    job's worker output. Mutates the record in place and always returns True —
+    this filter redacts, it never drops.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if isinstance(record.msg, str) and _CREDENTIAL_RE.search(record.msg):
-            record.msg = _CREDENTIAL_RE.sub(rf"\1={REDACTED}", record.msg)
+        if isinstance(record.msg, str):
+            record.msg = _scrub(record.msg)
         if isinstance(record.args, tuple):
-            record.args = tuple(
-                _CREDENTIAL_RE.sub(rf"\1={REDACTED}", arg) if isinstance(arg, str) else arg
-                for arg in record.args
-            )
+            record.args = tuple(_scrub(arg) if isinstance(arg, str) else arg for arg in record.args)
         return True
 
 

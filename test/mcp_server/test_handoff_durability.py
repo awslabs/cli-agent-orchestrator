@@ -164,3 +164,140 @@ class TestGetHandoffResultTool:
             result = get_handoff_result("deadbeef" * 4)
         assert result["success"] is False
         assert "Failed" in result["message"]
+
+
+class TestGetHandoffResultAuthAndPlacement:
+    """PR #453 review (haofeif), two P2 roots on the SAME request.
+
+    The retrieval endpoint is scope-gated and the row lives on whichever node
+    ran the step, so the GET needs the internal bearer header AND the caller's
+    node selection. Both mirror what ``delete_terminal`` already does.
+    """
+
+    JOB = "cafe1234" * 4
+
+    def _ok_get(self, mock_get):
+        mock_get.return_value.raise_for_status.return_value = None
+        mock_get.return_value.json.return_value = {
+            "state": "completed",
+            "terminal_id": "dev-t1",
+            "last_message": "done",
+            "error_message": None,
+        }
+
+    def test_sends_internal_bearer_header_when_auth_enabled(self):
+        """Without this header an auth-enabled deployment answers 401 to a
+        caller legitimately holding the job_id."""
+        with (
+            patch("cli_agent_orchestrator.mcp_server.server.requests.get") as mock_get,
+            patch(
+                "cli_agent_orchestrator.mcp_server.utils.get_local_bearer",
+                return_value="tok-123",
+            ),
+        ):
+            self._ok_get(mock_get)
+            result = get_handoff_result(self.JOB)
+
+        assert result["success"] is True
+        assert mock_get.call_args.kwargs["headers"] == {"Authorization": "Bearer tok-123"}
+
+    def test_sends_no_header_when_auth_disabled(self):
+        """Default-off posture must stay byte-for-byte unchanged: no token, no
+        header (``_auth_headers() or None``), not an empty dict."""
+        with (
+            patch("cli_agent_orchestrator.mcp_server.server.requests.get") as mock_get,
+            patch("cli_agent_orchestrator.mcp_server.utils.get_local_bearer", return_value=None),
+        ):
+            self._ok_get(mock_get)
+            get_handoff_result(self.JOB)
+
+        assert mock_get.call_args.kwargs["headers"] is None
+
+    def test_local_retrieval_targets_the_supervisor_node(self):
+        from cli_agent_orchestrator.constants import API_BASE_URL
+
+        with patch("cli_agent_orchestrator.mcp_server.server.requests.get") as mock_get:
+            self._ok_get(mock_get)
+            get_handoff_result(self.JOB)
+
+        assert mock_get.call_args[0][0] == f"{API_BASE_URL}/handoff-results/{self.JOB}"
+
+    def test_remote_retrieval_targets_the_node_that_ran_the_step(self):
+        """handoff(target_host=...) persists the row in THAT node's database, so
+        querying the supervisor's own base URL is a false not-found."""
+        with patch("cli_agent_orchestrator.mcp_server.server.requests.get") as mock_get:
+            self._ok_get(mock_get)
+            result = get_handoff_result(self.JOB, target_host="worker-7")
+
+        assert result["success"] is True
+        assert mock_get.call_args[0][0] == f"http://worker-7:9889/handoff-results/{self.JOB}"
+        # A black-holed remote node must fail on CONNECT, not burn the read budget.
+        assert isinstance(mock_get.call_args.kwargs["timeout"], tuple)
+
+    def test_local_404_points_at_the_remote_possibility(self):
+        """The one thing a supervisor can act on after a false not-found."""
+        with patch("cli_agent_orchestrator.mcp_server.server.requests.get") as mock_get:
+            http_err = requests.HTTPError()
+            http_err.response = MagicMock()
+            http_err.response.status_code = 404
+            mock_get.return_value.raise_for_status.side_effect = http_err
+            result = get_handoff_result(self.JOB)
+
+        assert result["success"] is False
+        assert "target_host" in result["message"]
+
+    def test_remote_404_names_the_node(self):
+        with patch("cli_agent_orchestrator.mcp_server.server.requests.get") as mock_get:
+            http_err = requests.HTTPError()
+            http_err.response = MagicMock()
+            http_err.response.status_code = 404
+            mock_get.return_value.raise_for_status.side_effect = http_err
+            result = get_handoff_result(self.JOB, target_host="worker-7")
+
+        assert "worker-7" in result["message"]
+
+
+class TestTimeoutMessageNamesTheNode:
+    """The recovery instruction has to be followable. For a remote handoff it
+    must quote target_host, or the supervisor walks straight into the local-404.
+
+    Driven through ``_run_step_and_build_result`` because that is the function
+    that owns both the timeout branch and ``target_host`` -- no remote
+    terminal-create machinery to stand up.
+    """
+
+    JOB = "cafe1234" * 4
+
+    def _pending(self, target_host=None):
+        from cli_agent_orchestrator.utils.orchestration import _run_step_and_build_result
+
+        with patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests:
+            mock_requests.post.side_effect = FakeTimeout("timed out")
+            mock_requests.Timeout = FakeTimeout
+            return asyncio.run(
+                _run_step_and_build_result(
+                    {"job_id": self.JOB},
+                    "developer",
+                    "kiro_cli",
+                    600,
+                    0.0,
+                    target_host=target_host,
+                )
+            )
+
+    def test_remote_timeout_quotes_target_host(self):
+        result = self._pending(target_host="worker-7")
+        assert result.pending is True
+        # Pinned to the RETRIEVAL clause, not just "target_host appears
+        # somewhere": the pre-existing remote-cleanup hint in this same message
+        # already says delete_terminal(..., target_host='worker-7'), so a looser
+        # assertion passes with this fix reverted (confirmed by reverting it).
+        assert (
+            f"get_handoff_result tool, job_id={self.JOB}, target_host='worker-7'" in result.message
+        )
+
+    def test_local_timeout_omits_target_host(self):
+        result = self._pending()
+        assert result.pending is True
+        assert f"get_handoff_result tool, job_id={self.JOB}" in result.message
+        assert "target_host" not in result.message

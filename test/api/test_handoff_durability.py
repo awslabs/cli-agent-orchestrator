@@ -4,6 +4,7 @@ Verifies the run-step handler writes to handoff_results before responding,
 and the GET /handoff-results/{job_id} retrieval endpoint works correctly.
 """
 
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -266,3 +267,60 @@ class TestGetHandoffResult:
 
         assert resp.status_code == 200
         assert resp.json()["state"] == "running"
+
+
+class TestPersistFailureLogDoesNotLeakTheCapability:
+    """PR #453 review (haofeif): truncating the formatted id is not enough while
+    the same call also emits the exception.
+
+    A SQLAlchemy DBAPI error stringifies its bound parameters --
+    ``[parameters: ('<job_id>', 'running', ...)]`` -- so ``exc_info=True`` (or
+    ``str(exc)``) reprints in full the id the format string deliberately
+    truncates. Exercised with a REAL parameter-bearing SQLAlchemy exception, not
+    a plain ``Exception``, because a bare mock cannot reproduce the leak.
+    """
+
+    JOB = "cafe1234" * 4
+
+    def _sqlalchemy_error_carrying_the_job_id(self):
+        from sqlalchemy.exc import OperationalError
+
+        # Same shape SQLAlchemy raises on a locked SQLite file: the statement and
+        # the bound params (which include job_id) are part of the exception.
+        return OperationalError(
+            "UPDATE handoff_results SET state=? WHERE job_id=?",
+            (self.JOB, "running"),
+            Exception("database is locked"),
+        )
+
+    def test_full_job_id_never_reaches_the_log_record(self, client, caplog):
+        exc = self._sqlalchemy_error_carrying_the_job_id()
+        # Sanity: the exception really does carry the id, so this test is not
+        # passing merely because nothing had it to leak.
+        assert self.JOB in str(exc)
+
+        result = AgentStepResult(
+            terminal_id="abc12345",
+            last_message="ok",
+            status=TerminalStatus.COMPLETED,
+        )
+        with (
+            patch(_RUN_STEP, new=AsyncMock(return_value=result)),
+            patch(_UPSERT, side_effect=exc),
+            caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.api.main"),
+        ):
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body(job_id=self.JOB))
+
+        assert resp.status_code == 200  # persistence stays best-effort
+        # Covers the formatted message, the args, AND any attached traceback text.
+        rendered = "\n".join(r.getMessage() for r in caplog.records)
+        formatted = "\n".join(logging.Formatter("%(message)s").format(r) for r in caplog.records)
+        assert self.JOB not in rendered
+        assert self.JOB not in formatted
+        assert not any(r.exc_info for r in caplog.records)
+
+        # Redaction must not cost the operator the two things they act on:
+        # WHICH job (prefix) and WHICH failure class. Asserted on the same
+        # records, so a fix that silenced the log entirely would fail here.
+        assert self.JOB[:8] in rendered
+        assert "OperationalError" in rendered

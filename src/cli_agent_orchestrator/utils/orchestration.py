@@ -951,9 +951,16 @@ async def _run_step_and_build_result(
             # own tool-call timeout with no job_id in hand. Closing that gap
             # (surfacing the job_id before the call can be pre-empted) is
             # tracked separately in #715; it is NOT fixed here.
+            # ``target_host`` is quoted here when set because the row lives in
+            # THAT node's database (PR #453 review, haofeif): the retrieval tool
+            # defaults to the supervisor's own node, so a remote job retrieved
+            # without it answers a false not-found.
+            retrieval_args = f"job_id={job_id}"
+            if target_host:
+                retrieval_args += f", target_host='{target_host}'"
             timeout_msg += (
                 f". The job may still be running server-side; retrieve the "
-                f"result with the get_handoff_result tool, job_id={job_id}"
+                f"result with the get_handoff_result tool, {retrieval_args}"
             )
         if target_host and not known_terminal_id:
             # Client-side timeout on a fresh remote create: the step may still

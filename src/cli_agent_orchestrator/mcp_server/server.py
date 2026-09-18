@@ -24,6 +24,7 @@ from cli_agent_orchestrator.constants import (
     WORKFLOW_RUN_REQUEST_TIMEOUT,
 )
 from cli_agent_orchestrator.mcp_server.models import HandoffResult
+from cli_agent_orchestrator.mcp_server.utils import _auth_headers
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.models.workflow_runtime import ReturnAck, parse_decision
 from cli_agent_orchestrator.services.elastic_worker_gateway import (
@@ -45,6 +46,7 @@ from cli_agent_orchestrator.utils.orchestration import (
     _extract_error_detail,
     _handoff_impl,
     _mcp_timeout,
+    _resolve_target_base_url,
     _send_message_impl,
 )
 from cli_agent_orchestrator.utils.workflow_events import parse_sse_frames
@@ -984,6 +986,16 @@ def get_handoff_result(
             "out but the job may still be running or already finished server-side)."
         )
     ),
+    target_host: Optional[str] = Field(
+        default=None,
+        description=(
+            "Remote CAO node that ran the handoff (same format as "
+            "assign/handoff target_host: DNS name, host:port, or URL). Required "
+            "when the pending handoff was placed remotely -- the result row lives "
+            "in THAT node's database, not this one, so omitting it returns a "
+            "false not-found. Omit for local handoffs (behavior unchanged)."
+        ),
+    ),
 ) -> Dict[str, Any]:
     """Retrieve a durably persisted handoff result by job_id (issue #447).
 
@@ -992,8 +1004,19 @@ def get_handoff_result(
     server-side under ``job_id``. Poll this tool until ``state`` is no longer
     ``"running"``.
 
+    Two things the request needs beyond the id, both mirroring
+    ``delete_terminal`` (PR #453 review, haofeif):
+
+    - The internal ``Authorization`` header. The retrieval endpoint is
+      scope-gated, so without it an auth-enabled deployment answers 401 to a
+      caller legitimately holding the job_id.
+    - ``target_host``. ``handoff(target_host=...)`` runs the step on that node
+      and persists the row in ITS database, so the supervisor's own base URL has
+      no such row.
+
     Args:
         job_id: The job_id from the pending handoff result.
+        target_host: Node that ran the handoff; omit for local.
 
     Returns:
         Dict with ``success``, ``state`` ("running"|"completed"|"error"),
@@ -1001,9 +1024,24 @@ def get_handoff_result(
         ``error_message`` (populated when errored). ``success=False`` with a
         ``message`` when the job_id is unknown or the request failed.
     """
+    # Direct (non-MCP) invocation gets pydantic's FieldInfo as the default rather
+    # than None. Normalized here in the tool wrapper for the same reason
+    # delete_terminal does it there: the leak is an artifact of FastMCP's Field
+    # default, so it belongs to server.py.
+    if not isinstance(target_host, str) or not target_host.strip():
+        target_host = None
+    location = f" on node {target_host}" if target_host else ""
     try:
+        base_url = _resolve_target_base_url(target_host) if target_host else API_BASE_URL
         path = HANDOFF_RESULTS_ROUTE.format(job_id=job_id)
-        response = requests.get(f"{API_BASE_URL}{path}", timeout=_mcp_timeout())
+        response = requests.get(
+            f"{base_url}{path}",
+            headers=_auth_headers() or None,
+            # A black-holed remote node must fail on CONNECT rather than burn the
+            # full read budget; a local read keeps its single scalar timeout so
+            # default-path behavior is unchanged.
+            timeout=(REMOTE_CONNECT_TIMEOUT, _mcp_timeout()) if target_host else _mcp_timeout(),
+        )
         response.raise_for_status()
         data = response.json()
         return {
@@ -1015,7 +1053,18 @@ def get_handoff_result(
         }
     except requests.HTTPError as e:
         if e.response is not None and e.response.status_code == 404:
-            return {"success": False, "message": f"No handoff result found for job_id {job_id}"}
+            return {
+                "success": False,
+                "message": (
+                    f"No handoff result found for job_id {job_id}{location}"
+                    + (
+                        ""
+                        if target_host
+                        else ". If the handoff was placed on a remote node, retry "
+                        "with target_host set to that node."
+                    )
+                ),
+            }
         return {"success": False, "message": f"Failed to retrieve handoff result: {str(e)}"}
     except Exception as e:
         return {"success": False, "message": f"Failed to retrieve handoff result: {str(e)}"}

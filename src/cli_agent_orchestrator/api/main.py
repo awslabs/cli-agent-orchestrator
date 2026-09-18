@@ -3768,17 +3768,25 @@ async def _record_job_state(job_id: Optional[str], state: str, **fields: Any) ->
         return
     try:
         await asyncio.to_thread(upsert_handoff_result, job_id, state, **fields)
-    except Exception:  # noqa: BLE001 — durability is best-effort; never fail the step
+    except Exception as exc:  # noqa: BLE001 — durability is best-effort; never fail the step
         # PREFIX ONLY, never the whole id (PR #453 review finding 4): job_id is the
         # SOLE retrieval capability for a row that can carry worker prompts and
         # output, so a full id in the server log escalates any log reader to that
         # worker's result. Eight hex chars is enough to correlate this line with a
         # job_id its legitimate holder already has, and 96 bits short of guessing one.
+        #
+        # EXCEPTION CLASS NAME ONLY -- no ``exc_info``, no ``str(exc)``. A
+        # SQLAlchemy DBAPI error stringifies its bound parameters
+        # (``[parameters: ('<job_id>', 'running', ...)]``), so either one would
+        # reprint in full the id the line above deliberately truncates, defeating
+        # the whole point of the prefix. The class name still separates the cases
+        # an operator acts on differently (OperationalError = locked/unwritable DB,
+        # IntegrityError = key collision) without echoing any row content.
         logger.warning(
-            "run_step: failed to persist job_id_prefix=%s as %s",
+            "run_step: failed to persist job_id_prefix=%s as %s (%s)",
             job_id[:8],
             state,
-            exc_info=True,
+            type(exc).__name__,
         )
 
 
