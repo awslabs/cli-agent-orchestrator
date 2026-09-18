@@ -23,6 +23,20 @@ def tmux():
 
         from cli_agent_orchestrator.clients.tmux import TmuxClient
 
+        client = TmuxClient(pane_mode=True)
+        client.server = mock_server
+        yield client
+
+
+@pytest.fixture
+def window_mode_tmux():
+    """A client in the default mode, which must ask tmux nothing to address a terminal."""
+    with patch("cli_agent_orchestrator.clients.tmux.libtmux") as mock_libtmux:
+        mock_server = MagicMock()
+        mock_libtmux.Server.return_value = mock_server
+
+        from cli_agent_orchestrator.clients.tmux import TmuxClient
+
         client = TmuxClient()
         client.server = mock_server
         yield client
@@ -151,6 +165,17 @@ class TestSendTargetAddressesThePane:
 
         assert tmux._send_target("ses", "win") == "ses:win"
 
+    def test_window_mode_asks_tmux_nothing(self, window_mode_tmux):
+        """The send path built this string with zero tmux calls before panes existed."""
+        assert window_mode_tmux._send_target("ses", "win") == "ses:win"
+        window_mode_tmux.server.sessions.get.assert_not_called()
+
+    def test_an_unreadable_listing_still_delivers(self, tmux):
+        """A listing that will not read must not abort the send."""
+        tmux.server.sessions.get.side_effect = LibTmuxException("server gone")
+
+        assert tmux._send_target("ses", "coder-3") == "ses:coder-3"
+
 
 # ── creation ─────────────────────────────────────────────────────────
 
@@ -195,13 +220,26 @@ class TestCreatePane:
             tmux.create_pane("ses", "cao-agents", "coder-3", "tid", str(tmp_path))
         host_window.split.assert_not_called()
 
-    def test_absent_host_window_is_its_own_error(self, tmux, tmp_path):
-        from cli_agent_orchestrator.clients.tmux import HostWindowMissing
+    def test_an_absent_host_window_is_created(self, tmux, tmp_path):
+        """Nothing in CAO makes this window, so the first pane terminal must."""
+        from cli_agent_orchestrator.clients.tmux import TERMINAL_MARK_OPTION
 
         session = session_with()
         tmux.server.sessions.get.return_value = session
+        new_pane = session.new_window.return_value.panes[0]
 
-        with pytest.raises(HostWindowMissing):
+        assert tmux.create_pane("ses", "cao-agents", "coder-3", "tid", str(tmp_path)) == "coder-3"
+        assert session.new_window.call_args.kwargs["window_name"] == "cao-agents"
+        new_pane.set_option.assert_called_once_with(TERMINAL_MARK_OPTION, "coder-3")
+
+    def test_a_full_host_window_asks_for_a_window_instead(self, tmux, tmp_path):
+        """tmux refuses a split for want of space with a plain LibTmuxException."""
+        from cli_agent_orchestrator.clients.tmux import PaneSpawnUnavailable
+
+        _, host_window = self._session(tmux)
+        host_window.split.side_effect = LibTmuxException("no space for new pane")
+
+        with pytest.raises(PaneSpawnUnavailable):
             tmux.create_pane("ses", "cao-agents", "coder-3", "tid", str(tmp_path))
 
 

@@ -45,11 +45,20 @@ class BackendFactory:
         if backend_name == "tmux":
             from cli_agent_orchestrator.backends.tmux_backend import (
                 DEFAULT_PANE_WINDOW,
+                SPAWN_MODES,
                 TmuxBackend,
             )
 
+            spawn_mode = ConfigService.get("terminal.spawn_mode", default="window")
+            if spawn_mode not in SPAWN_MODES:
+                logger.warning(
+                    f"Unknown terminal.spawn_mode '{spawn_mode}'; expected one of "
+                    f"{', '.join(sorted(SPAWN_MODES))}. Falling back to 'window'."
+                )
+                spawn_mode = "window"
+
             return TmuxBackend(
-                spawn_mode=ConfigService.get("terminal.spawn_mode", default="window"),
+                spawn_mode=spawn_mode,
                 pane_window=ConfigService.get("terminal.pane_window", default=DEFAULT_PANE_WINDOW),
             )
         elif backend_name == "herdr":

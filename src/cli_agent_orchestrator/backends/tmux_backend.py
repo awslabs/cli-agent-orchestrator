@@ -9,13 +9,17 @@ import logging
 from typing import Dict, List, Optional
 
 from cli_agent_orchestrator.backends.base import TerminalBackend, TerminalBackendError
-from cli_agent_orchestrator.clients.tmux import HostWindowMissing, TmuxClient
+from cli_agent_orchestrator.clients.tmux import PaneSpawnUnavailable, TmuxClient
 
 logger = logging.getLogger(__name__)
 
-# The window pane-mode terminals are split from. Named rather than "the
-# current window" so a spawn triggered from anywhere lands in one place.
+# The window pane-mode terminals share. Named rather than "the current window"
+# so a spawn triggered from anywhere lands in one place; the first pane-mode
+# terminal in a session creates it.
 DEFAULT_PANE_WINDOW = "cao-agents"
+
+# Anything else is a typo, and a typo must not silently turn the feature off.
+SPAWN_MODES = frozenset({"window", "pane"})
 
 
 class TmuxBackend(TerminalBackend):
@@ -34,9 +38,15 @@ class TmuxBackend(TerminalBackend):
         one view instead of one window per agent.
         """
         if client is None:
-            from cli_agent_orchestrator.clients.tmux import tmux_client
+            if spawn_mode == "pane":
+                # Its own client, not the module singleton: pane mode changes how
+                # a terminal is addressed, and nothing else sharing that singleton
+                # asked for it.
+                client = TmuxClient(pane_mode=True)
+            else:
+                from cli_agent_orchestrator.clients.tmux import tmux_client
 
-            client = tmux_client
+                client = tmux_client
         self._client = client
         self._spawn_mode = spawn_mode
         self._pane_window = pane_window
@@ -93,9 +103,10 @@ class TmuxBackend(TerminalBackend):
                         window_shell,
                         extra_env=extra_env,
                     )
-                except HostWindowMissing as e:
-                    # Only this case falls back: there is nothing to split.
-                    # A duplicate name or a refused directory must still fail.
+                except PaneSpawnUnavailable as e:
+                    # Only this case falls back: tmux has no room for another
+                    # pane in the host window. A duplicate name or a refused
+                    # directory must still fail.
                     logger.warning(f"Pane spawn for '{window_name}' fell back to a window: {e}")
             return self._client.create_window(
                 session_name,

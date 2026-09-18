@@ -6,7 +6,7 @@ import pytest
 
 from cli_agent_orchestrator.backends.base import TerminalBackendError
 from cli_agent_orchestrator.backends.tmux_backend import TmuxBackend
-from cli_agent_orchestrator.clients.tmux import HostWindowMissing
+from cli_agent_orchestrator.clients.tmux import PaneSpawnUnavailable
 
 
 @pytest.fixture
@@ -31,9 +31,9 @@ class TestSpawnModeRouting:
 
 
 class TestFallbackIsNarrow:
-    def test_a_missing_host_window_falls_back_to_a_window(self, client):
-        """Nothing to split is recoverable: the terminal still gets created."""
-        client.create_pane.side_effect = HostWindowMissing("no such window")
+    def test_a_full_host_window_falls_back_to_a_window(self, client):
+        """tmux having no room is recoverable: the terminal still gets created."""
+        client.create_pane.side_effect = PaneSpawnUnavailable("no space for new pane")
         backend = TmuxBackend(client=client, spawn_mode="pane")
 
         backend.create_window("ses", "coder-3", "tid")

@@ -12,6 +12,7 @@ from typing import Callable, Dict, FrozenSet, List, Optional, Tuple, TypeVar
 
 import libtmux
 from libtmux.constants import PaneDirection
+from libtmux.exc import LibTmuxException
 from libtmux.pane import Pane
 from libtmux.session import Session
 from libtmux.window import Window
@@ -29,14 +30,16 @@ from cli_agent_orchestrator.utils.terminal import validate_tmux_name
 logger = logging.getLogger(__name__)
 
 # A terminal that shares a window with siblings cannot be addressed by that
-# window's name. Its name goes into a pane-scoped user option instead: tmux
-# keeps @-options out of reach of the program running in the pane, unlike
-# pane_title, which any TUI can rewrite with an escape sequence.
+# window's name. Its name goes into a pane-scoped user option instead. A pane's
+# own output cannot set one, unlike pane_title, which any TUI rewrites with an
+# escape sequence — but this is NOT an authenticated identity: anything that can
+# reach the tmux socket can set the mark or claim the name, and agents are not
+# isolated from each other here. Treat it as a label, not a credential.
 TERMINAL_MARK_OPTION = "@cao_terminal"
 
 
-class HostWindowMissing(RuntimeError):
-    """The window a pane-mode terminal would have been split from is absent."""
+class PaneSpawnUnavailable(RuntimeError):
+    """This session cannot take another pane right now — spawn a window instead."""
 
 
 _T = TypeVar("_T")
@@ -373,8 +376,11 @@ class TmuxClient:
     _KILL_SESSION_VERIFY_TIMEOUT_SECONDS = 2.0
     _KILL_SESSION_VERIFY_INTERVAL_SECONDS = 0.2
 
-    def __init__(self) -> None:
+    def __init__(self, pane_mode: bool = False) -> None:
         self.server = libtmux.Server()
+        # Only pane mode has to ask tmux where a terminal is. Window mode keeps
+        # building its targets from its arguments, as it always did.
+        self.pane_mode = pane_mode
 
     # ── libtmux listing boundary ─────────────────────────────────────────
     #
@@ -522,11 +528,18 @@ class TmuxClient:
 
     @classmethod
     def _pane_carrying_mark(cls, session: Session, terminal_name: str) -> Optional[Pane]:
-        """Return the pane whose own mark is ``terminal_name``."""
-        return next(
-            (pane for pane in session.panes if cls._pane_mark(pane) == terminal_name),
-            None,
-        )
+        """Return the pane whose own mark is ``terminal_name``.
+
+        More than one is not supposed to happen — ``create_pane`` refuses a name
+        already marked — so say so rather than picking one quietly.
+        """
+        matches = [pane for pane in session.panes if cls._pane_mark(pane) == terminal_name]
+        if len(matches) > 1:
+            logger.warning(
+                f"{len(matches)} panes carry the mark '{terminal_name}'; using the first. "
+                "A mark is a label, not an authenticated identity."
+            )
+        return matches[0] if matches else None
 
     def _resolve_pane(
         self,
@@ -563,6 +576,12 @@ class TmuxClient:
         halves are already validated by the caller, and a pane id carries no
         tmux target delimiters of its own.
         """
+        window_target = f"{session_name}:{terminal_name}"
+        if not self.pane_mode:
+            # Window mode builds this target from its arguments and asks tmux
+            # nothing, as it did before panes existed. A listing here would put
+            # a round trip, and a new way to fail, on every send.
+            return window_target
         try:
             session = self._find_session(session_name)
             if session is not None and (
@@ -571,13 +590,12 @@ class TmuxClient:
                 pane = self._find_marked_pane(session, session_name, terminal_name)
                 if pane is not None and pane.pane_id:
                     return pane.pane_id
-        except TmuxLookupError:
-            # An unparseable listing is not a reason to refuse delivery. The
-            # window target is right in window mode, and in pane mode it names
-            # something absent, so tmux reports it rather than delivering the
-            # keys to the wrong agent.
-            pass
-        return f"{session_name}:{terminal_name}"
+        except Exception as e:
+            # A listing that will not read is not a reason to refuse delivery.
+            # The window target names something absent in pane mode, so tmux
+            # reports it rather than delivering the keys to the wrong agent.
+            logger.warning(f"Could not resolve a pane for {window_target}: {e}")
+        return window_target
 
     def attach_command(self, session_name: str, terminal_name: str) -> List[str]:
         """Return the tmux argv that attaches to a session with a terminal focused.
@@ -975,6 +993,57 @@ class TmuxClient:
             logger.error(f"Failed to create window in session {session_name}: {e}")
             raise
 
+    @staticmethod
+    def _open_host_window(
+        session: Session,
+        host_window_name: str,
+        working_directory: str,
+        window_shell: Optional[str],
+        pane_env: Dict[str, str],
+    ) -> Pane:
+        """Create the host window and return the pane the terminal runs in."""
+        kwargs: dict = {
+            "window_name": host_window_name,
+            "start_directory": working_directory,
+            "environment": pane_env,
+        }
+        if window_shell:
+            kwargs["window_shell"] = window_shell
+        return session.new_window(**kwargs).panes[0]
+
+    @staticmethod
+    def _split_host_window(
+        host_window: Window,
+        working_directory: str,
+        window_shell: Optional[str],
+        pane_env: Dict[str, str],
+    ) -> Pane:
+        """Split the host window and return the new pane, re-tiling what is there.
+
+        A window only holds so many panes before tmux refuses for want of space,
+        and it says so with a plain ``LibTmuxException``. That is a reason to put
+        this terminal in a window of its own, not to fail the spawn.
+        """
+        kwargs: dict = {
+            "start_directory": working_directory,
+            "environment": pane_env,
+            "direction": PaneDirection.Below,
+        }
+        if window_shell:
+            kwargs["shell"] = window_shell
+        try:
+            pane = host_window.split(**kwargs)
+        except LibTmuxException as e:
+            # Not f"{e}": libtmux stringifies its whole tmux context dict, and
+            # this lands in a warning on a path that fires once per spawn.
+            raise PaneSpawnUnavailable(
+                f"tmux has no room for another pane in '{host_window.name}'"
+            ) from e
+        # Successive splits halve the last pane and leave the window unreadable
+        # past a handful of agents; tiled re-balances them.
+        host_window.select_layout("tiled")
+        return pane
+
     def create_pane(
         self,
         session_name: str,
@@ -999,11 +1068,6 @@ class TmuxClient:
             if not session:
                 raise ValueError(f"Session '{session_name}' not found")
 
-            host_window = self._find_window(session, session_name, host_window_name)
-            if host_window is None:
-                raise HostWindowMissing(
-                    f"Window '{host_window_name}' not found in session '{session_name}'"
-                )
             if self._find_marked_pane(session, session_name, terminal_name) is not None:
                 raise ValueError(
                     f"Terminal '{terminal_name}' already exists in session '{session_name}'"
@@ -1013,19 +1077,20 @@ class TmuxClient:
             self._merge_extra_env(pane_env, extra_env)
             pane_env["CAO_TERMINAL_ID"] = terminal_id
 
-            kwargs: dict = {
-                "start_directory": working_directory,
-                "environment": pane_env,
-                "direction": PaneDirection.Below,
-            }
-            if window_shell:
-                kwargs["shell"] = window_shell
-
-            pane = host_window.split(**kwargs)
+            host_window = self._find_window(session, session_name, host_window_name)
+            if host_window is None:
+                # Nothing in CAO ever creates the host window: session windows are
+                # named after the profile that opened them. The first pane-mode
+                # terminal makes it, and takes its first pane — otherwise the mode
+                # would fall back to windows forever under its own defaults.
+                pane = self._open_host_window(
+                    session, host_window_name, working_directory, window_shell, pane_env
+                )
+            else:
+                pane = self._split_host_window(
+                    host_window, working_directory, window_shell, pane_env
+                )
             pane.set_option(TERMINAL_MARK_OPTION, terminal_name)
-            # Successive splits halve the last pane and leave the window
-            # unreadable past a handful of agents; tiled re-balances them.
-            host_window.select_layout("tiled")
 
             logger.info(
                 f"Created pane '{terminal_name}' in window "
