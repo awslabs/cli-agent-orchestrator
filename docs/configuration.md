@@ -201,6 +201,10 @@ CAO's default backend is [tmux](tmux.md). [herdr](https://herdr.dev/) is an expe
 
 - `backend`: `"tmux"` (default) or `"herdr"` [EXPERIMENTAL].
 - `herdr_session`: the herdr session name to connect to (default `"cao"`).
+- `spawn_mode`: `"window"` (default) or `"pane"` — where a terminal created by
+  `assign` / `handoff` lands. See [Watching a fleet in one window](#watching-a-fleet-in-one-window).
+- `pane_window`: the window `spawn_mode: "pane"` shares (default `"cao-agents"`).
+  The first pane terminal in a session creates it; nothing has to exist first.
 
 Select a backend for a single run without touching `settings.json`:
 
@@ -209,6 +213,42 @@ cao-server --terminal herdr
 ```
 
 `--terminal` (CLI flag) beats `CAO_TERMINAL_BACKEND` (env var) beats `terminal.backend` (file) beats the `"tmux"` default — the standard precedence chain. See [herdr.md](herdr.md) for herdr-specific setup, viewing/attaching, and troubleshooting.
+
+#### Watching a fleet in one window
+
+By default each terminal gets a tmux window of its own, so watching several
+agents means cycling through windows and a drifting agent is easy to miss.
+`spawn_mode: "pane"` puts every terminal into one window as a pane instead, so
+the whole fleet is visible at once and an agent can be interrupted where it
+sits. Panes are re-tiled after each spawn, so the window stays readable as the
+fleet grows.
+
+```json
+{
+  "terminal": {
+    "spawn_mode": "pane",
+    "pane_window": "cao-agents"
+  }
+}
+```
+
+A terminal that shares a window cannot be identified by that window's name, so
+each pane carries its terminal name in the `@cao_terminal` pane option and
+every lookup resolves through it. Set that option only at pane scope — pane
+options inherit from window options, and a value set globally would make every
+pane answer to the same name.
+
+`pane_window` does not have to exist: the first pane-mode terminal in a session
+creates it and takes its first pane, and the ones after it split that window.
+
+A window only holds so many panes before tmux refuses for want of space. That
+terminal is created as a window of its own instead, and a warning says so — the
+spawn is not failed. Other failures, such as a name already taken or a refused
+working directory, are reported rather than worked around.
+
+The name is a label, not an authenticated identity: anything that can reach the
+tmux socket can set the same mark. Agents are not isolated from each other here,
+so this is in line with the rest of the backend rather than a new exposure.
 
 ### MCP Apps (`apps`)
 
@@ -274,6 +314,8 @@ Every `CAO_*` variable below maps 1:1 to a `settings.json` key and is resolved t
 |---|---|---|
 | `CAO_TERMINAL_BACKEND` | `terminal.backend` | str |
 | `CAO_HERDR_SESSION` | `terminal.herdr_session` | str |
+| `CAO_TERMINAL_SPAWN_MODE` | `terminal.spawn_mode` | str |
+| `CAO_TERMINAL_PANE_WINDOW` | `terminal.pane_window` | str |
 | `CAO_MCP_APPS_ENABLED` | `apps.enabled` | bool |
 | `CAO_MCP_APPS_STATIC_DIR` | `apps.static_dir` | str |
 | `CAO_LOG_LEVEL` | `logging.level` | str |

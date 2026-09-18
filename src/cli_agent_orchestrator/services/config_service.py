@@ -71,6 +71,8 @@ class MemoryConfig(BaseModel):
 class TerminalConfig(BaseModel):
     backend: str = "tmux"
     herdr_session: str = "cao"
+    spawn_mode: str = "window"
+    pane_window: str = "cao-agents"
 
 
 class AppsConfig(BaseModel):
@@ -152,6 +154,8 @@ _LEGACY_KEY_MAP: Dict[str, Tuple[str, ...]] = {
 _OWNED_DEFAULTS: Dict[str, Any] = {
     "terminal.backend": "tmux",
     "terminal.herdr_session": "cao",
+    "terminal.spawn_mode": "window",
+    "terminal.pane_window": "cao-agents",
     "apps.enabled": False,
     "apps.static_dir": None,
     "auth.jwks_uri": "",
@@ -171,6 +175,8 @@ _OWNED_DEFAULTS: Dict[str, Any] = {
 ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
     "CAO_TERMINAL_BACKEND": ("terminal.backend", "str", "tmux"),
     "CAO_HERDR_SESSION": ("terminal.herdr_session", "str", "cao"),
+    "CAO_TERMINAL_SPAWN_MODE": ("terminal.spawn_mode", "str", "window"),
+    "CAO_TERMINAL_PANE_WINDOW": ("terminal.pane_window", "str", "cao-agents"),
     "CAO_MCP_APPS_ENABLED": ("apps.enabled", "bool", False),
     "CAO_MCP_APPS_STATIC_DIR": ("apps.static_dir", "str", None),
     "CAO_AUTH_JWKS_URI": ("auth.jwks_uri", "str", ""),

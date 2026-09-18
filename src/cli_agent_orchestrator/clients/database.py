@@ -39,7 +39,7 @@ class TerminalModel(Base):
 
     id = Column(String, primary_key=True)  # "abc123ef"
     tmux_session = Column(String, nullable=False)  # "cao-session-name"
-    tmux_window = Column(String, nullable=False)  # "window-name"
+    tmux_window = Column(String, nullable=False)  # a window name, or a pane mark
     provider = Column(String, nullable=False)  # "kiro_cli", "claude_code"
     agent_profile = Column(String)  # "developer", "reviewer" (optional)
     working_directory = Column(String, nullable=True)  # launch-time cwd (optional)
