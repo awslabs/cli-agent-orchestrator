@@ -114,6 +114,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Vendor patterns are matched before the generic `bearer`/`secret` ones, so
   the reported pattern name is the specific one.
 
+- **Atomic file writes read the process umask by setting it to 0.** The
+  writer behind profile, memory and archive updates derived a new file's mode
+  with `os.umask(0)` followed by a restore. The umask is process-wide and
+  cao-server is threaded, so a file created with the default mode by any other
+  thread inside that window could be born world-writable. A new file's temp is now created with
+  `O_EXCL` and mode 0666 so the kernel applies the umask itself; an existing
+  file's mode is preserved as before, and the umask is never touched.
+
 ### Changed
 
 - `list_outcomes` clamps `limit` to 200 client-side; the service already clamped
