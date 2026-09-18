@@ -122,6 +122,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `O_EXCL` and mode 0666 so the kernel applies the umask itself; an existing
   file's mode is preserved as before, and the umask is never touched.
 
+- **The blocked-path list for working directories and archive targets was
+  exact-match only.** `/etc/passwd` passed with `allow_file`, and an existing
+  directory such as `/etc/ssl` was a valid working directory. System
+  configuration, kernel and device pseudo-filesystems, boot files and the
+  system binary directories (`/etc`, `/proc`, `/sys`, `/dev`, `/boot`, `/bin`,
+  `/sbin`, `/usr/bin`, `/usr/sbin`, `/lib`, `/lib64`) are now refused at any
+  depth, with `/dev/shm` carved out. `/tmp`, `/var`, `/home`-style roots stay
+  exact-only because projects legitimately live beneath them.
+
 ### Changed
 
 - `list_outcomes` clamps `limit` to 200 client-side; the service already clamped

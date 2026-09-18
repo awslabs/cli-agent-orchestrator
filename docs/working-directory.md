@@ -45,7 +45,10 @@ All working directory paths are canonicalized and validated before use. Paths ar
 - The user's home directory and any subdirectory (`~/projects/foo`)
 - External volumes and mount points (e.g., `/Volumes/workplace/project`)
 - Custom paths like `/opt/projects`, NFS mounts, corporate dev desktops
-- Any real directory that is **not** a blocked system path
+- Any real directory that is **not** a blocked system path (the exact roots
+  such as `/`, `/tmp`, `/var`, and anything at any depth beneath `/etc`,
+  `/proc`, `/sys`, `/dev`, `/boot`, `/bin`, `/sbin`, `/usr/bin`, `/usr/sbin`,
+  `/lib`, `/lib64`)
 
 ### Blocked (unsafe) directories
 
