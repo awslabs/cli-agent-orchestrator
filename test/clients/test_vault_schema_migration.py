@@ -531,6 +531,64 @@ def test_legacy_vault_provenance_columns_are_nullable_lossless_and_idempotent(is
     assert exclusion == ("forgotten", "Mapped/Forgotten.md", None, None)
 
 
+def test_vault_key_provenance_migration_is_a_noop_without_vault_tables(isolated_db):
+    db_path, _ = isolated_db
+
+    db_mod._migrate_vault_key_provenance()
+
+    with sqlite3.connect(db_path) as conn:
+        tables = {
+            row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+
+    assert "vault_note" not in tables
+    assert "vault_exclusion" not in tables
+
+
+@pytest.mark.parametrize(
+    ("table", "legacy_schema"),
+    [
+        (
+            "vault_note",
+            """
+            CREATE TABLE vault_note (
+                note_uid VARCHAR NOT NULL PRIMARY KEY,
+                vault_id VARCHAR NOT NULL
+            )
+            """,
+        ),
+        (
+            "vault_exclusion",
+            """
+            CREATE TABLE vault_exclusion (
+                vault_id VARCHAR NOT NULL PRIMARY KEY,
+                scope VARCHAR NOT NULL
+            )
+            """,
+        ),
+    ],
+)
+def test_vault_key_provenance_migration_upgrades_only_existing_legacy_table(
+    isolated_db, table, legacy_schema
+):
+    db_path, _ = isolated_db
+    absent_table = "vault_exclusion" if table == "vault_note" else "vault_note"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(legacy_schema)
+
+    db_mod._migrate_vault_key_provenance()
+    db_mod._migrate_vault_key_provenance()
+
+    with sqlite3.connect(db_path) as conn:
+        tables = {
+            row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+    assert {"key_source", "key_source_reason"} <= columns
+    assert absent_table not in tables
+
+
 def test_source_kind_migration_failure_propagates(isolated_db):
     db_path, _ = isolated_db
     _create_legacy_memory_metadata(db_path)

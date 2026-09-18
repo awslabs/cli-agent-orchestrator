@@ -1128,6 +1128,12 @@ def _migrate_vault_key_provenance() -> None:
     try:
         with sqlite3.connect(str(DATABASE_FILE)) as conn:
             for table in ("vault_note", "vault_exclusion"):
+                table_exists = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                    (table,),
+                ).fetchone()
+                if table_exists is None:
+                    continue
                 columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
                 if "key_source" not in columns:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN key_source VARCHAR")
