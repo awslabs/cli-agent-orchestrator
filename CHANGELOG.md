@@ -105,6 +105,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   import executed its import-time `DB_DIR.mkdir()` in agents — and failed outright
   wherever the data dir is unreadable. The import is now lazy.
 
+- **The credential gate on federated memory writes and `--redact` exports
+  missed common key formats.** It now recognises Anthropic and OpenAI API
+  keys, GitHub fine-grained and OAuth/app tokens, Slack tokens, JSON Web
+  Tokens and AWS secret access keys (next to an `aws ... secret`/`access`
+  context word or a `SecretAccessKey` key), and it no longer lets a zero-width
+  character inside a prefix hide a credential.
+  Vendor patterns are matched before the generic `bearer`/`secret` ones, so
+  the reported pattern name is the specific one.
+
 ### Changed
 
 - `list_outcomes` clamps `limit` to 200 client-side; the service already clamped

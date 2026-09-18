@@ -58,3 +58,57 @@ class TestRedactSecretsEdgeCases:
         # first-match-name contract.
         assert scan_for_secrets(f"x {AWS_KEY}") == "aws_access_key"
         assert scan_for_secrets("clean") is None
+
+
+class TestRedactZeroWidth:
+    def test_hidden_credential_is_redacted_whole(self):
+        redacted, fired = redact_secrets("k=AK\u200bIAIOSFODNN7EXAMPLE")
+        assert redacted == "k=[REDACTED:aws_access_key]"
+        assert fired == ["aws_access_key"]
+        assert "IOSFODNN7EXAMPLE" not in redacted
+
+    def test_emoji_elsewhere_survives_when_a_credential_is_redacted(self):
+        # The joiner inside the emoji family is outside the credential span and
+        # must not be dropped just because a hidden credential sits nearby.
+        family = "\U0001f468\u200d\U0001f469\u200d\U0001f467"
+        redacted, fired = redact_secrets(f"family {family} key AK\u200bIAIOSFODNN7EXAMPLE")
+        assert redacted == f"family {family} key [REDACTED:aws_access_key]"
+        assert fired == ["aws_access_key"]
+
+    def test_clean_content_keeps_zero_width_characters(self):
+        # U+200D is the joiner inside emoji family sequences; clean text must
+        # come back byte-for-byte.
+        content = "family \U0001f468\u200d\U0001f469\u200d\U0001f467 ok"
+        redacted, fired = redact_secrets(content)
+        assert redacted == content
+        assert fired == []
+
+
+class TestRedactVendorFamilies:
+    def test_each_new_family_is_replaced_by_its_own_marker(self):
+        jwt = ".".join(
+            [
+                "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+                "eyJzdWIiOiIxMjM0NTY3ODkwIn0",
+                "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+            ]
+        )
+        secrets = {
+            "anthropic_api_key": "sk-ant-api03-" + "Qz7" * 30,
+            "openai_api_key": "sk-proj-" + "Ab9" * 20,
+            "github_fine_grained_pat": "github_pat_" + "A" * 22 + "_" + "b" * 59,
+            "slack_token": "xox" + "b-1234567890-1234567890-AbCdEfGhIjKlMnOp",
+            "jwt": jwt,
+        }
+        redacted, fired = redact_secrets(" ".join(secrets.values()))
+        for name, value in secrets.items():
+            assert value not in redacted, name
+            assert f"[REDACTED:{name}]" in redacted, name
+        assert fired == list(secrets)  # _SECRET_PATTERNS order
+
+    def test_aws_secret_key_context_form(self):
+        redacted, fired = redact_secrets(
+            "export AWS_SECRET_ACCESS_KEY=" + "wJalrXUtnFEMI/K7MDENG/" + "bPxRfiCYEXAMPLEKEY"
+        )
+        assert "wJalrXUtnFEMI" not in redacted
+        assert fired == ["aws_secret_access_key"]

@@ -66,3 +66,95 @@ def test_scan_for_secrets_empty():
 def test_bearer_space_form_is_caught():
     """The canonical space-separated Bearer header is caught by the gate."""
     assert scan_for_secrets("Authorization: Bearer abcdef0123456789ABCDEF") == "bearer_token"
+
+
+# Fixtures are assembled at runtime so no credential-shaped literal sits in the
+# source: the repo's gitleaks gate and GitHub push protection scan test files
+# too, and these are the documented AWS example key and the jwt.io sample.
+_AWS_DOC_SAMPLE = "wJalrXUtnFEMI/K7MDENG/" + "bPxRfiCYEXAMPLEKEY"
+_JWT_SAMPLE = ".".join(
+    [
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+        "eyJzdWIiOiIxMjM0NTY3ODkwIn0",
+        "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+    ]
+)
+
+# ---------------------------------------------------------------------------
+# Credential families added after the original six patterns. Each case names
+# the pattern the gate must attribute the match to; a specific name matters
+# because it is the only thing a caller may log.
+# ---------------------------------------------------------------------------
+
+_VENDOR_POSITIVE = [
+    ("anthropic_api_key", "key: sk-ant-api03-" + "Qz7" * 30),
+    ("openai_api_key", "OPENAI: sk-proj-" + "Ab9" * 20),
+    ("openai_api_key", "sk-svcacct-" + "Ab9" * 20),
+    ("openai_api_key", "sk-" + "a1B2c3D4e5F6g7H8i9J0" + "T3BlbkFJ" + "k1L2m3N4o5P6q7R8s9T0"),
+    ("github_fine_grained_pat", "github_pat_" + "A" * 22 + "_" + "b" * 59),
+    ("github_pat", "gho_" + "c" * 36),
+    ("github_pat", "ghu_" + "d" * 36),
+    ("github_pat", "ghr_" + "e" * 36),
+    ("slack_token", "xox" + "b-1234567890-1234567890-AbCdEfGhIjKlMnOp"),
+    ("slack_token", "xox" + "p-1234567890-1234567890-1234567890-abcdef0123456789"),
+    ("slack_token", "xox" + "e-1-AbCdEfGhIjKlMnOpQrStUv"),
+    (
+        "jwt",
+        _JWT_SAMPLE,
+    ),
+    ("aws_secret_access_key", "AWS_SECRET_ACCESS_KEY=" + _AWS_DOC_SAMPLE),
+    ("aws_secret_access_key", 'aws_secret_access_key: "' + _AWS_DOC_SAMPLE + '"'),
+    # STS / IAM JSON responses carry the key without the word "aws" nearby.
+    ("aws_secret_access_key", '{"SecretAccessKey": "' + _AWS_DOC_SAMPLE + '"}'),
+]
+
+
+@pytest.mark.parametrize(
+    "expected,content",
+    _VENDOR_POSITIVE,
+    ids=[f"{p[0]}-{i}" for i, p in enumerate(_VENDOR_POSITIVE)],
+)
+def test_vendor_credential_families_named_specifically(expected, content):
+    assert scan_for_secrets(content) == expected
+
+
+_VENDOR_NEGATIVE = [
+    (
+        "bare_40_base64_no_aws_context",
+        "digest " + _AWS_DOC_SAMPLE + " of the blob",
+    ),
+    ("sk_learn_prose", "we use sk-learn and sk-learn-extra for the classifier"),
+    ("short_sk_prefix", "sk-proj-short"),
+    ("two_part_dotted_base64", "eyJhbGciOiJIUzI1NiJ9.notajwtpayloadsegment"),
+    ("xoxo_prose", "signed xoxo-love-and-hugs-1234567890"),
+    ("github_pat_wrong_segment_lengths", "github_pat_" + "A" * 10 + "_" + "b" * 20),
+    ("ghx_unknown_github_prefix", "ghx_" + "a" * 36),
+    ("aws_access_key_id_context_only", "aws_access_key_id = AKIA-not-a-key-here"),
+    (
+        "aws_prose_then_40_digits",
+        "AWS access logs are stored at: " + "1234567890" * 4,
+    ),
+    (
+        "aws_prose_then_40_hex_sha",
+        "aws access review, see commit " + "a1b2c3d4e5f6a7b8c9d0" + "e1f2a3b4c5d6e7f8a9b0",
+    ),
+    ("slack_docs_path", "https://api.slack.com/xoxb-example-token"),
+]
+
+
+@pytest.mark.parametrize("label,content", _VENDOR_NEGATIVE, ids=[n[0] for n in _VENDOR_NEGATIVE])
+def test_vendor_lookalikes_stay_clean(label, content):
+    assert scan_for_secrets(content) is None
+
+
+class TestZeroWidthEvasion:
+    """A zero-width code point inside a prefix must not hide a credential."""
+
+    @pytest.mark.parametrize(
+        "zw", ["\u200b", "\u200c", "\u200d", "\u2060", "\ufeff"], ids=lambda c: f"U+{ord(c):04X}"
+    )
+    def test_split_aws_prefix_is_still_caught(self, zw):
+        assert scan_for_secrets(f"AK{zw}IAIOSFODNN7EXAMPLE") == "aws_access_key"
+
+    def test_split_vendor_prefix_is_still_caught(self):
+        assert scan_for_secrets("sk-\u200bant-" + "x" * 30) == "anthropic_api_key"
