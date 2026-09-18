@@ -130,15 +130,34 @@ def test_extract_relative_inline_markdown_md_link_ignores_label_fragment_and_cod
 
 
 @pytest.mark.parametrize(
+    "destination",
+    [
+        "./T.md",
+        "../T.md",
+        "Sub/../../T.md",
+        "./Sub/./T.md",
+    ],
+)
+def test_inline_markdown_extraction_retains_raw_dot_segment_destinations(destination):
+    result = extract_wikilinks(f"[target]({destination})")
+
+    assert result.links == ((False, destination),)
+    assert result.relative_paths == (True,)
+
+
+@pytest.mark.parametrize(
     "markdown",
     [
         "[absolute](/Target.md)",
-        "[parent escape](../Target.md)",
-        "[nested parent escape](Sub/../../Target.md)",
+        "[network path](//host/Target.md)",
         "[http](http://example.com/Target.md)",
         "[https](https://example.com/Target.md)",
         "[non-Markdown](Target.txt)",
         "[scheme](custom:Target.md)",
+        "[empty component](Sub//Target.md)",
+        "[fragment only](#Section)",
+        "[trailing slash](Target.md/)",
+        f"[oversize]({'x' * 257}.md)",
         r"\[escaped](Target.md)",
         r"[escaped destination]\(Target.md)",
         r"[escaped path](Sub/Target\.md)",
@@ -177,6 +196,116 @@ def test_relative_inline_resolution_requires_source_and_matches_exact_source_rel
     assert nested.outcome == "resolved"
     assert nested.target_key == "nested-target"
     assert nested.attributes == {"fragment": "Section"}
+
+
+@pytest.mark.parametrize(
+    ("raw_target", "source_relpath", "target_relpath"),
+    [
+        ("./Target.md", "Mapped/Source.md", "Mapped/Target.md"),
+        ("../Target.md", "Mapped/Nested/Source.md", "Mapped/Target.md"),
+        ("Sub/../../Target.md", "Mapped/Nested/Source.md", "Mapped/Target.md"),
+        ("./Sub/./Target.md", "Mapped/Source.md", "Mapped/Sub/Target.md"),
+    ],
+)
+def test_relative_inline_resolution_collapses_contained_dot_segments(
+    raw_target, source_relpath, target_relpath
+):
+    result = resolve_wikilink(
+        raw_target,
+        embed=False,
+        candidates=(LinkCandidate("target", target_relpath),),
+        relative_path=True,
+        source_relpath=source_relpath,
+    )
+
+    assert result.outcome == "resolved"
+    assert result.target_key == "target"
+
+
+@pytest.mark.parametrize(
+    ("raw_target", "source_relpath"),
+    [
+        ("../T.md", "Source.md"),
+        ("../../../T.md", "A/B/Source.md"),
+        ("../Sub/../T.md", "Source.md"),
+    ],
+)
+def test_relative_inline_resolution_refuses_vault_root_escapes(raw_target, source_relpath):
+    result = resolve_wikilink(
+        raw_target,
+        embed=False,
+        candidates=(LinkCandidate("target", "T.md"),),
+        relative_path=True,
+        source_relpath=source_relpath,
+    )
+
+    assert result.outcome == "unsupported"
+    assert result.finding_code == FindingCode.LINK_TARGET_INVALID
+
+
+@pytest.mark.parametrize(
+    "source_relpath",
+    [
+        "/Mapped/Source.md",
+        "Mapped/./Source.md",
+        "Mapped/../Source.md",
+        "Mapped//Source.md",
+        r"Mapped\Source.md",
+        "Mapped/Source.txt",
+    ],
+)
+def test_relative_inline_resolution_refuses_invalid_source_relpath(source_relpath):
+    result = resolve_wikilink(
+        "./T.md",
+        embed=False,
+        candidates=(LinkCandidate("target", "Mapped/T.md"),),
+        relative_path=True,
+        source_relpath=source_relpath,
+    )
+
+    assert result.outcome == "unsupported"
+    assert result.finding_code == FindingCode.LINK_TARGET_INVALID
+
+
+def test_relative_inline_resolution_does_not_decode_percent_escapes():
+    result = resolve_wikilink(
+        "%2e%2e/T.md",
+        embed=False,
+        candidates=(LinkCandidate("literal", "Mapped/%2e%2e/T.md"),),
+        relative_path=True,
+        source_relpath="Mapped/Source.md",
+    )
+
+    assert result.outcome == "resolved"
+    assert result.target_key == "literal"
+
+
+def test_relative_inline_dot_segment_fragment_preserves_heading_finding():
+    result = resolve_wikilink(
+        "./T.md#Section",
+        embed=False,
+        candidates=(LinkCandidate("target", "Mapped/T.md"),),
+        relative_path=True,
+        source_relpath="Mapped/Source.md",
+    )
+
+    assert result.outcome == "resolved"
+    assert result.target_key == "target"
+    assert result.finding_code == FindingCode.HEADING_FRAGMENT_IGNORED
+    assert result.attributes == {"fragment": "Section"}
+
+
+def test_relative_inline_block_reference_remains_unsupported():
+    result = resolve_wikilink(
+        "./T.md#^block",
+        embed=False,
+        candidates=(LinkCandidate("target", "Mapped/T.md"),),
+        relative_path=True,
+        source_relpath="Mapped/Source.md",
+    )
+
+    assert result.outcome == "unsupported"
+    assert result.finding_code == FindingCode.BLOCK_REFERENCE_UNSUPPORTED
 
 
 def test_qualified_wikilink_does_not_gain_relative_suffix_matching():

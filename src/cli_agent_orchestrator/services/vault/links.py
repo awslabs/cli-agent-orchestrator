@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from pathlib import PurePosixPath
 from typing import Mapping, Optional
 
 from cli_agent_orchestrator.services.vault.findings import FindingCode
@@ -125,7 +124,12 @@ def _matches(name: str, candidate: LinkCandidate, *, exact_path: bool = False) -
 
 
 def _relative_markdown_destination(destination: str) -> Optional[str]:
-    """Return a conservative relative Markdown note target, preserving its fragment."""
+    """Syntax-filter a relative Markdown target, preserving dot segments and fragments.
+
+    Containment is source-dependent, so ``.`` and ``..`` remain literal here
+    until :func:`_source_relative_name` can collapse them against the source
+    note. Candidate and scope filtering remain the resolution authority.
+    """
     path = destination.partition("#")[0]
     segments = path.split("/")
     if (
@@ -133,24 +137,52 @@ def _relative_markdown_destination(destination: str) -> Optional[str]:
         or path.startswith("/")
         or "?" in path
         or ":" in segments[0]
-        or any(segment in {"", ".", ".."} for segment in segments)
+        or any(segment == "" for segment in segments)
     ):
         return None
     return destination
 
 
 def _source_relative_name(name: str, source_relpath: Optional[str]) -> Optional[str]:
-    """Resolve an accepted inline path against its containing source directory."""
-    if source_relpath is None or "\\" in source_relpath or source_relpath.startswith("/"):
-        return None
-    source_parts = source_relpath.split("/")
+    """Lexically collapse an inline path against its source inside the vault root.
+
+    This operates only on POSIX path segments; it performs no filesystem or
+    symlink traversal. A ``..`` that would pop above the vault-relative root is
+    refused before candidate matching. Existing same-scope candidate filtering
+    remains authoritative, including links across configured mapping folders.
+    """
     if (
-        any(part in {"", ".", ".."} for part in source_parts)
-        or not source_relpath.lower().endswith(".md")
+        source_relpath is None
+        or "\\" in source_relpath
         or _relative_markdown_destination(name) is None
     ):
         return None
-    return str(PurePosixPath(source_relpath).parent / name)
+
+    # Keep this parser module side-effect free at import time. The canonical
+    # boundary normalizer is needed only during source-aware resolution.
+    from cli_agent_orchestrator.services.vault.boundary import normalize_relpath
+
+    try:
+        normalized_source = normalize_relpath(source_relpath)
+    except ValueError:
+        return None
+    if not normalized_source.lower().endswith(".md"):
+        return None
+
+    collapsed = normalized_source.split("/")[:-1]
+    for segment in name.split("/"):
+        if segment == ".":
+            continue
+        if segment == "..":
+            if not collapsed:
+                return None
+            collapsed.pop()
+            continue
+        collapsed.append(segment)
+    try:
+        return normalize_relpath("/".join(collapsed))
+    except ValueError:
+        return None
 
 
 def _is_non_markdown_attachment(name: str) -> bool:
