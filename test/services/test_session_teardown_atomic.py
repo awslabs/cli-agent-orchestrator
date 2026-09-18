@@ -1765,3 +1765,77 @@ def test_cancelled_create_rolls_back_worker_blocked_in_row_write(real_db, runtim
     assert backend.session_exists("cao-cancel-row") is False
     assert database.list_terminals_by_session("cao-cancel-row") == []
     assert session_lock._session_locks == {}
+
+
+# ---------------------------------------------------------------------------
+# Post-commit failure rollback must not kill a NEWER incarnation of the name.
+#
+# Provider initialisation runs after the locked create transaction returned. If
+# it fails, the outer handler in create_terminal rolls the backend session back.
+# That rollback used to be an unlocked kill_session(session_name): a teardown
+# plus a fresh create of the SAME name that landed in between was destroyed,
+# and its registry row was left pointing at nothing.
+# ---------------------------------------------------------------------------
+
+
+def _fail_in_provider_init(monkeypatch):
+    def _boom(provider, terminal_id, *args, **kwargs):
+        raise RuntimeError("provider init boom")
+
+    monkeypatch.setattr(terminal_service.provider_manager, "create_provider", _boom)
+
+
+def test_post_commit_failure_rollback_kills_the_session_it_created(real_db, runtime, monkeypatch):
+    """Control: with nobody else touching the name, the failed create still cleans up."""
+    backend = FakeTmuxBackend()
+    set_backend(backend)
+    _fail_in_provider_init(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="provider init boom"):
+        _create_in_thread_kw(session_name="cao-lonely", new_session=True)
+
+    assert backend.kill_session_calls == 1
+    assert backend.session_exists("cao-lonely") is False
+    assert database.list_terminals_by_session("cao-lonely") == []
+
+
+def test_post_commit_failure_rollback_leaves_a_newer_incarnation_alone(
+    real_db, runtime, monkeypatch
+):
+    """A teardown + recreate of the same name between the failure and the rollback
+    must survive: the rollback owns only the incarnation whose row it wrote."""
+    backend = FakeTmuxBackend()
+    set_backend(backend)
+    _fail_in_provider_init(monkeypatch)
+    name = "cao-rebuilt"
+
+    def _teardown_and_rebuild_between_failure_and_rollback(tid):
+        # Runs inside the outer failure handler, BEFORE the backend rollback:
+        # models another caller tearing the name down and rebuilding it.
+        runtime.fifo_readers.discard(tid)
+        database.delete_terminals_by_session(name)
+        backend.kill_session(name)
+        backend.add_session(name, {"w-new"})
+        database.create_terminal(
+            terminal_id="t-new",
+            tmux_session=name,
+            tmux_window="w-new",
+            provider="claude_code",
+            agent_profile="developer",
+        )
+
+    monkeypatch.setattr(
+        terminal_service.fifo_manager,
+        "stop_reader",
+        _teardown_and_rebuild_between_failure_and_rollback,
+    )
+
+    with pytest.raises(RuntimeError, match="provider init boom"):
+        _create_in_thread_kw(session_name=name, new_session=True)
+
+    # Exactly one kill: the simulated teardown's own. The rollback saw that its
+    # row was gone and left the rebuilt session alone.
+    assert backend.kill_session_calls == 1
+    assert backend.session_exists(name) is True
+    assert backend.windows(name) == {"w-new"}
+    assert {r["id"] for r in database.list_terminals_by_session(name)} == {"t-new"}

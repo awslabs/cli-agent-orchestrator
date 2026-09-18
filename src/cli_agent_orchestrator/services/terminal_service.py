@@ -405,6 +405,48 @@ def _roll_back_cancelled_create(
             )
 
 
+def _roll_back_backend_create_if_still_ours(
+    session_name: str,
+    window_name: Optional[str],
+    terminal_id: Optional[str],
+    *,
+    created_session: bool,
+) -> None:
+    """Undo a create that failed AFTER the locked transaction committed.
+
+    Provider initialisation, FIFO setup and the rest of ``create_terminal`` run
+    after the lifecycle lock was released, so by the time their failure reaches
+    the outer handler another caller may have torn the name down and rebuilt it
+    (``delete_session`` then a fresh ``new_session=True`` create, or the reverse
+    order of the same pair). An unlocked ``kill_session(session_name)`` there
+    destroyed that newer incarnation and left its registry row pointing at
+    nothing.
+
+    Reacquire the lock, then use this call's own registry row as the ownership
+    witness: the row was committed under the lock in the create transaction,
+    and every path that replaces the incarnation (``delete_session``'s scoped
+    row sweep, the ``delete_terminals_by_session`` a rebuilding create runs)
+    removes it under the same lock. If the row is gone, the name is no longer
+    ours and the backend session is left alone; the caller still drops the row,
+    which is idempotent. If the row is present the existing locked rollback runs
+    exactly as before. (``tmux_session`` is written once and never updated, so
+    a surviving row always names this session; the equality check is a guard
+    against that ever changing, not a branch that can fire today.)
+    """
+    with session_lifecycle_lock(session_name):
+        row = get_terminal_metadata(terminal_id) if terminal_id else None
+        if row is None or row.get("tmux_session") != session_name:
+            logger.warning(
+                f"Rollback: terminal {terminal_id} is no longer registered under "
+                f"{session_name}; another lifecycle operation owns that name now, so "
+                f"the backend session is left alone"
+            )
+            return
+        _roll_back_backend_create_locked(
+            session_name, window_name or "", created_session=created_session
+        )
+
+
 async def _finish_and_roll_back_cancelled_create(
     create_worker: "asyncio.Task[Tuple[str, bool, bool]]",
     session_name: str,
@@ -1512,14 +1554,14 @@ async def create_terminal(
         # (DELETE ... WHERE id = ?), so it is a no-op when the failure happened
         # before the row was written. Runs regardless of session_created so a
         if session_created and session_name:
+            # Locked and ownership-checked: see _roll_back_backend_create_if_still_ours.
+            # The helper also drops the forwarded env for a session it kills.
             try:
-                get_backend().kill_session(session_name)
-            except:
-                pass  # Ignore cleanup errors
-            # Session is gone, drop any forwarded env we stashed for it so
-            # secrets don't linger in memory or bleed into a future reuse
-            # of the same name.
-            clear_session_env(session_name)
+                _roll_back_backend_create_if_still_ours(
+                    session_name, window_name, terminal_id, created_session=True
+                )
+            except Exception:
+                logger.exception(f"Rollback: locked session rollback failed for {session_name}")
         elif window_created and session_name and window_name:
             # harness-control#186: a window added to an ALREADY-EXISTING session
             # (new_session=False -- every MCP spawn/assign-into-existing-session
@@ -1535,9 +1577,13 @@ async def create_terminal(
             # invisible to this terminal's own list/tree (the DB row is gone),
             # never cleaned up, sitting there indefinitely.
             try:
-                get_backend().kill_window(session_name, window_name)
+                _roll_back_backend_create_if_still_ours(
+                    session_name, window_name, terminal_id, created_session=False
+                )
             except Exception:
-                pass  # Ignore cleanup errors
+                logger.exception(
+                    f"Rollback: locked window rollback failed for {session_name}:{window_name}"
+                )
         # The process-owning tmux session/window must be stopped before a
         # provider releases private on-disk state.  In particular Grok can
         # have an updater still writing $GROK_HOME while its initialization

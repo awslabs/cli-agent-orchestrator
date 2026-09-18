@@ -140,6 +140,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The exception now carries the redacted command and exit status only; stderr
   goes to the cao-server log.
 
+- **A failed terminal create could kill a newer session of the same name.**
+  When provider initialisation failed after the session and its registry row
+  were committed, the rollback killed the tmux session by name without the
+  lifecycle lock, so a teardown and recreate of that name landing in between
+  lost the new session. The rollback now reacquires the lock and proceeds only
+  if this create's own registry row still names the session; otherwise the
+  name belongs to someone else and the backend session is left alone.
+
 ### Changed
 
 - `list_outcomes` clamps `limit` to 200 client-side; the service already clamped
