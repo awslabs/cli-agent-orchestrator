@@ -287,12 +287,34 @@ class TestPipeLivenessWatchdog:
         monkeypatch.setattr("cli_agent_orchestrator.services.fifo_reader.FIFO_DIR", tmp_path)
         return FifoManager()
 
-    def _enroll(self, manager, terminal_id, pane_holder, rearm_calls, last_data_at):
+    def _enroll(
+        self,
+        manager,
+        terminal_id,
+        pane_holder,
+        rearm_calls,
+        last_data_at,
+        fifo_buffer=None,
+    ):
         """Register a terminal with fake probe/rearm WITHOUT starting the reader
-        thread or the real watchdog — we call _check_pipe_liveness by hand."""
+        thread or the real watchdog — we call _check_pipe_liveness by hand.
+
+        The FIFO buffer defaults to the raw-stream shape tmux pipe-pane really
+        delivers: CRLF line ends, SGR runs and partial-redraw control
+        sequences, not the pane's rendered text.
+        """
+        if fifo_buffer is None:
+            fifo_buffer = {
+                "content": "\x1b[32m"
+                + pane_holder["content"].replace("\n", "\r\n")
+                + "\x1b[0m"
+            }
         manager._pane_probe[terminal_id] = lambda: pane_holder["content"]
         manager._rearm[terminal_id] = lambda: rearm_calls.append(True)
         manager._last_data_at[terminal_id] = last_data_at
+        if not hasattr(manager, "_fifo_buffer_probe"):
+            manager._fifo_buffer_probe = {}
+        manager._fifo_buffer_probe[terminal_id] = lambda: fifo_buffer["content"]
 
     def test_stall_is_detected_and_pipe_rearmed(self, tmp_path, monkeypatch):
         """Pane advanced but the FIFO delivered nothing since the last check ->
@@ -329,20 +351,36 @@ class TestPipeLivenessWatchdog:
         assert rearm_calls == [], "an idle terminal must never be re-armed"
 
     def test_healthy_pipe_is_not_rearmed(self, tmp_path, monkeypatch):
-        """Pane advancing AND the FIFO delivering bytes = a healthy pipe; no
-        re-arm even though the screen keeps changing."""
+        """Raw FIFO delivery must not cause strikes against capture-pane rows,
+        either during sustained redraws or after the terminal settles."""
+        monkeypatch.setattr(fr, "PIPE_LIVENESS_STALL_CHECKS", 2)
         manager = self._manager(tmp_path, monkeypatch)
-        pane = {"content": "line0"}
+        pane = {"content": "prompt\nline0"}
+        fifo_buffer = {"content": "prompt\r\n\x1b[32mline0\x1b[0m"}
         rearm_calls: list = []
-        self._enroll(manager, "term", pane, rearm_calls, last_data_at=time.monotonic())
+        self._enroll(
+            manager,
+            "term",
+            pane,
+            rearm_calls,
+            last_data_at=time.monotonic(),
+            fifo_buffer=fifo_buffer,
+        )
 
-        manager._check_pipe_liveness("term")  # baseline
-        for i in range(1, 4):
-            pane["content"] = f"line{i}"
-            # Simulate the reader delivering a byte right before this check.
+        manager._check_pipe_liveness("term")
+        strikes = []
+        for i in range(1, 9):
+            pane["content"] = f"prompt\nline{i}"
+            fifo_buffer["content"] += f"\r\x1b[2K\x1b[32mline{i}\x1b[0m"
             manager._last_data_at["term"] = time.monotonic()
             manager._check_pipe_liveness("term")
-        assert rearm_calls == [], "a healthy, delivering pipe must never be re-armed"
+            strikes.append(manager._liveness["term"][2])
+        for _ in range(4):
+            manager._check_pipe_liveness("term")
+            strikes.append(manager._liveness["term"][2])
+
+        assert (strikes, rearm_calls) == ([0] * 12, [])
+        assert manager._liveness["term"][0] == "prompt\nline8"
 
     def test_rearm_replays_live_pane_into_pipeline(self, tmp_path, monkeypatch):
         """After re-arm the lost bytes are gone, but the pane's CURRENT content
