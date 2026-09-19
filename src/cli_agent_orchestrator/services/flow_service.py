@@ -41,9 +41,42 @@ from cli_agent_orchestrator.utils.template import render_template
 logger = logging.getLogger(__name__)
 
 
+def _remap_crontab_dow(dow_expr: str) -> str:
+    """Convert crontab day-of-week (0=Sun..6=Sat, 7=Sun) to APScheduler's
+    day_of_week (0=Mon..6=Sun). APScheduler's CronTrigger.from_crontab does not
+    perform this conversion, so a raw crontab DOW field is off by one day.
+    """
+    if dow_expr == "*":
+        return "*"
+    days = set()
+    for token in dow_expr.split(","):
+        base, _, step = token.partition("/")
+        if "-" in base:
+            lo, hi = (int(x) % 7 for x in base.split("-"))
+            rng = list(range(lo, hi + 1)) if lo <= hi else list(range(lo, 7)) + list(range(0, hi + 1))
+        elif base == "*":
+            rng = list(range(7))
+        else:
+            rng = [int(base) % 7]
+        shifted = {(d - 1) % 7 for d in rng}
+        days |= set(sorted(shifted)[::int(step)]) if step else shifted
+    return ",".join(str(d) for d in sorted(days))
+
+
 def _get_next_run_time(cron_expression: str) -> datetime:
-    """Calculate next run time from cron expression."""
-    trigger = CronTrigger.from_crontab(cron_expression)
+    """Calculate next run time from a standard 5-field crontab expression.
+
+    Builds the CronTrigger with explicit fields so the day-of-week is remapped
+    from crontab numbering to APScheduler numbering (see _remap_crontab_dow).
+    """
+    minute, hour, day, month, dow = cron_expression.split()
+    trigger = CronTrigger(
+        minute=minute,
+        hour=hour,
+        day=day,
+        month=month,
+        day_of_week=_remap_crontab_dow(dow),
+    )
     next_time = trigger.get_next_fire_time(None, datetime.now())
     if next_time is None:
         raise ValueError(
