@@ -812,3 +812,97 @@ class TestHandoffEarlyTerminalId:
         assert result.success is False
         assert "CAO_TERMINAL_ID not set" in result.message
         mock_create.assert_not_called()
+
+
+class TestHandoffCreateTimeoutCoversProviderFloors:
+    """_HANDOFF_CREATE_TIMEOUT_S must exceed every provider's own unconditional
+    ready-timeout floor (antigravity_cli.py's max(180.0, init_timeout) is the
+    highest known one), or a legitimately-slow-but-successful init gets killed
+    client-side here -- with no exception handling around this specific call,
+    the operator gets a clean-looking failure and no terminal_id to clean up
+    the orphaned worker with."""
+
+    def test_constant_exceeds_known_provider_floors(self):
+        """This is the test that actually pins the regression: 150.0 (the old
+        value) is LESS than antigravity's 180.0 floor; 240.0 is not. Fails
+        against the pre-fix constant, passes after."""
+        assert _HANDOFF_CREATE_TIMEOUT_S > 180.0
+
+    def test_slow_but_successful_create_is_not_killed_client_side(self):
+        """Companion end-to-end sanity check, independent of the constant's
+        actual value: a real HTTP round trip (no `requests` mocking) against a
+        stand-in server that sleeps past a client timeout before answering
+        successfully must still surface the terminal_id, not just a clean
+        failure. Zero existing test exercised this path against a real
+        timeout window before this. Uses its own stand-in timeout/delay
+        values (not the real constant) purely so the test runs in
+        milliseconds -- the mechanism being verified is identical at the real
+        240.0s scale."""
+        import http.server
+        import json
+        import threading
+        import time
+
+        from cli_agent_orchestrator.utils import orchestration
+
+        created_terminal_ids = []
+
+        class SlowServerHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format, *args):  # noqa: A002 -- matches base signature
+                pass
+
+            def do_POST(self):
+                if self.path.split("?", 1)[0] == "/sessions":
+                    # Stand-in for cao-server actually finishing provider.initialize()
+                    # after longer than the OLD client timeout would have allowed,
+                    # but still comfortably under the fixed (current) one.
+                    time.sleep(1.2)
+                    terminal_id = "term-0001"
+                    created_terminal_ids.append(terminal_id)
+                    body = json.dumps({"id": terminal_id, "provider": "antigravity_cli"}).encode()
+                    self.send_response(201)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                # The --no-wait path also sends the message directly via
+                # POST /terminals/{id}/input -- not the create call under test,
+                # so just ack it.
+                self.send_response(200)
+                self.end_headers()
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), SlowServerHandler)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        old_base_url = orchestration.API_BASE_URL
+        old_timeout = orchestration._HANDOFF_CREATE_TIMEOUT_S
+        # Scale both the client timeout and server delay down 150:1 from the
+        # real 240.0s constant, preserving the same "server takes longer than
+        # the OLD 150.0s value but well within the fixed value" relationship.
+        orchestration.API_BASE_URL = f"http://127.0.0.1:{port}"
+        orchestration._HANDOFF_CREATE_TIMEOUT_S = 1.6  # stand-in for 240.0
+        os.environ.pop("CAO_TERMINAL_ID", None)
+
+        try:
+            reported = []
+            result = asyncio.run(
+                orchestration._handoff_impl(
+                    "some-agent-profile",
+                    "do the thing",
+                    on_terminal_id=reported.append,
+                    wait=False,
+                )
+            )
+        finally:
+            orchestration.API_BASE_URL = old_base_url
+            orchestration._HANDOFF_CREATE_TIMEOUT_S = old_timeout
+            server.shutdown()
+            thread.join(timeout=2)
+
+        assert result.success is True
+        assert result.terminal_id == "term-0001"
+        assert reported == ["term-0001"]
+        assert created_terminal_ids == ["term-0001"]
