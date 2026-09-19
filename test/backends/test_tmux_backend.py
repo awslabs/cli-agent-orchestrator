@@ -115,6 +115,24 @@ class TestTmuxBackendDelegation:
             enter_count=2,
             force_bracketed_paste=False,
             submit_delay=0.3,
+            pre_write_hook=None,
+        )
+
+    def test_send_keys_forwards_pre_write_hook(self, backend, mock_client):
+        """TmuxBackend threads pre_write_hook through unchanged so
+        terminal_service.send_input's status_monitor.mark_pre_write callback
+        reaches TmuxClient.send_keys, which fires it right before the pane
+        is actually touched (#709 thirteenth review round)."""
+        hook = MagicMock()
+        backend.send_keys("cao-test", "window-0", "hello", pre_write_hook=hook)
+        mock_client.send_keys.assert_called_once_with(
+            "cao-test",
+            "window-0",
+            "hello",
+            enter_count=1,
+            force_bracketed_paste=False,
+            submit_delay=0.3,
+            pre_write_hook=hook,
         )
 
     def test_send_special_key_delegates(self, backend, mock_client):

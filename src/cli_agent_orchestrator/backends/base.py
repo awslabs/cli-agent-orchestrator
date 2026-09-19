@@ -5,7 +5,7 @@ Core services depend only on this ABC, never on a concrete backend directly.
 """
 
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 
@@ -182,6 +182,7 @@ class TerminalBackend(ABC):
         enter_count: int = 1,
         force_bracketed_paste: bool = False,
         submit_delay: float = 0.3,
+        pre_write_hook: Optional[Callable[[], None]] = None,
     ) -> None:
         """Send text input to a window.
 
@@ -201,6 +202,17 @@ class TerminalBackend(ABC):
             submit_delay: Seconds to wait after pasting before sending Enter, so
                 a TUI (e.g. Claude Code's Ink renderer) finishes processing the
                 paste before submission. Backends without a paste step may ignore.
+            pre_write_hook: Optional callback invoked synchronously at the last
+                point before this call actually touches the pane, after any
+                of the backend's own prep that does not (tmux: after
+                load-buffer returns, immediately before paste-buffer; a
+                backend with no such prep calls it immediately before its
+                first write). Lets a caller (terminal_service.send_input, via
+                status_monitor.mark_pre_write) take a generation snapshot that
+                is not fooled by an unrelated transition landing during the
+                backend's own pre-write work (#709 thirteenth review round).
+                Backends that never call it leave the caller's earlier,
+                strictly-before-this-call snapshot as the answer.
         """
         ...
 
