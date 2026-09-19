@@ -65,6 +65,7 @@ from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_e
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import (
     Terminal,
+    TerminalCaptureUnavailableError,
     TerminalInputBlockedError,
     TerminalLimitError,
     TerminalStatus,
@@ -2001,15 +2002,35 @@ def _schedule_deferred_init(
                 # to ASSIGN here is always correct and cannot affect answer_user_prompt.
                 effective_orchestration_type = orchestration_type or OrchestrationType.ASSIGN
                 # send_input is blocking tmux I/O — off the loop so it can't
-                # freeze the server for concurrent requests.
-                await asyncio.to_thread(
-                    send_input,
-                    terminal_id,
-                    initial_message,
-                    registry=registry,
-                    sender_id=caller_id,
-                    orchestration_type=effective_orchestration_type,
-                )
+                # freeze the server for concurrent requests. A pre-send
+                # capture refusal (TerminalCaptureUnavailableError, raised
+                # before any key is typed) is transient infrastructure, not a
+                # dead worker: retry the delivery bounded so a blip during
+                # init doesn't tear down a healthy terminal (issue #739
+                # review).
+                delivery_attempts = 3
+                for attempt in range(delivery_attempts):
+                    try:
+                        await asyncio.to_thread(
+                            send_input,
+                            terminal_id,
+                            initial_message,
+                            registry=registry,
+                            sender_id=caller_id,
+                            orchestration_type=effective_orchestration_type,
+                        )
+                        break
+                    except TerminalCaptureUnavailableError:
+                        if attempt + 1 >= delivery_attempts:
+                            raise
+                        logger.warning(
+                            "Deferred init for %s: pre-send capture unavailable, "
+                            "retrying delivery (%d/%d)",
+                            terminal_id,
+                            attempt + 1,
+                            delivery_attempts - 1,
+                        )
+                        await asyncio.sleep(1.0)
                 # Delivery can be silently dropped (Enter swallowed / paste lost)
                 # when the TUI isn't input-ready. Confirm the worker actually
                 # started and re-submit if not; if it never starts, surface the
@@ -2064,6 +2085,32 @@ def _schedule_deferred_init(
                 f"clear the prompt, then re-send the task yourself (e.g. via "
                 f"send_message) -- it is not automatically re-delivered once the "
                 f"prompt is answered.",
+                registry,
+                delete_worker=False,
+            )
+        except TerminalCaptureUnavailableError as e:
+            # The worker initialized fine; the pre-send transcript capture
+            # refused the dispatch before any key was typed, after the
+            # bounded retry above. That is transient infrastructure, not a
+            # dead terminal: leave the worker alive (same call as
+            # TerminalInputBlockedError above) and tell the caller the task
+            # was NOT delivered, so they can re-send rather than have a
+            # healthy terminal deleted out from under them (issue #739
+            # review).
+            logger.warning(
+                "Deferred init for terminal %s: pre-send capture unavailable "
+                "after retries; task not delivered. Leaving worker alive for "
+                "re-delivery. (%s)",
+                terminal_id,
+                e,
+            )
+            await asyncio.to_thread(
+                _notify_caller_of_deferred_failure,
+                terminal_id,
+                f"Worker {terminal_id} could not be read for a pre-delivery "
+                f"capture; the assigned task has not been delivered (nothing "
+                f"was typed). Re-send the task yourself (e.g. via "
+                f"send_message) once the terminal is readable.",
                 registry,
                 delete_worker=False,
             )
