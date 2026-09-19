@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.providers.base import OutputExtractionError
 from cli_agent_orchestrator.providers.kimi_cli import (
     ANSI_CODE_PATTERN,
     ERROR_PATTERN,
@@ -25,6 +26,8 @@ from cli_agent_orchestrator.providers.kimi_cli import (
     USER_INPUT_BOX_START_PATTERN,
     WELCOME_BANNER_PATTERN,
     KimiCliProvider,
+    KimiDialect,
+    KimiProbeResult,
     ProviderError,
 )
 
@@ -34,6 +37,24 @@ FIXTURES_DIR = Path(__file__).parent / "fixtures"
 def _read_fixture(name: str) -> str:
     """Read a test fixture file."""
     return (FIXTURES_DIR / name).read_text()
+
+
+def _legacy_probe_result(binary: str = "/usr/local/bin/kimi") -> KimiProbeResult:
+    """A probe result describing a legacy ``kimi-cli`` install.
+
+    The legacy command-building tests below target the *launch command* that
+    the legacy dialect produces, not the capability probe that selects the
+    dialect. Stubbing the probe keeps those assertions exact (one ``send_keys``,
+    ``cd``, ``TERM=xterm-256color``, ``--yolo``, ``--agent-file``,
+    ``--mcp-config``); the probe itself has dedicated coverage in
+    ``TestKimiDialectDetection``.
+    """
+    return KimiProbeResult(
+        dialect=KimiDialect.LEGACY,
+        binary=binary,
+        source_home=Path("/home/user/.kimi"),
+        observed={"mcp-config": True, "mcp-config-file": False, "auto": False},
+    )
 
 
 # =============================================================================
@@ -50,6 +71,21 @@ class TestKimiCliProviderInitialization:
         # that path has its own tests. Stub it so command-send/timeout tests stay
         # fast and independent of the (mocked) get_history return type.
         with patch.object(KimiCliProvider, "_handle_startup_dialog", return_value=None):
+            yield
+
+    @pytest.fixture(autouse=True)
+    def _stub_legacy_probe(self):
+        # initialize() first resolves the dialect by asking the launch shell to
+        # dump `kimi --help`. That probe needs a real pane and has dedicated
+        # coverage in TestKimiDialectDetection; stubbing it here pins these
+        # tests to the legacy launch command they were written to assert.
+        # Without this the mocked backend never returns the probe sentinel and
+        # every test in this class would fail with UnsupportedKimiError.
+        with patch.object(
+            KimiCliProvider,
+            "_resolve_dialect",
+            return_value=_legacy_probe_result(),
+        ):
             yield
 
     @pytest.mark.asyncio
@@ -507,10 +543,16 @@ class TestKimiCliProviderMessageExtraction:
         assert "Python" in result
         assert "paradigm" in result.lower()
 
-    def test_extract_message_all_thinking_falls_back(self):
-        """Test fallback when all lines are filtered as thinking."""
+    def test_extract_message_all_thinking_raises(self):
+        """A response region that is entirely reasoning is an extraction failure.
+
+        This replaces the old "fall back to returning the thinking content"
+        contract. Returning reasoning as the answer is worse than failing: the
+        caller cannot tell the two apart, so chain handoffs, ``assign`` results
+        and memory writes would silently record the agent's private scratchpad
+        as its reply (issue #570's bug class, one layer deeper).
+        """
         provider = KimiCliProvider("term-1", "session-1", "window-1")
-        # All bullets are thinking (gray ANSI) — should fall back to returning all content
         output = (
             "╭──────────────────╮\n"
             "│ analyze this       │\n"
@@ -519,9 +561,40 @@ class TestKimiCliProviderMessageExtraction:
             "\x1b[38;5;244m• \x1b[39m\x1b[3m\x1b[38;5;244mI see several patterns.\x1b[0m\n"
             "user@my-app💫\n"
         )
+        with pytest.raises(OutputExtractionError):
+            provider.extract_last_message_from_script(output)
+
+    def test_extract_message_all_thinking_never_returns_reasoning(self):
+        """The failure must not carry the reasoning text in its message."""
+        provider = KimiCliProvider("term-1", "session-1", "window-1")
+        output = (
+            "╭──────────────────╮\n"
+            "│ analyze this       │\n"
+            "╰──────────────────╯\n"
+            "\x1b[38;5;244m• \x1b[39m\x1b[3m\x1b[38;5;244mLet me analyze the code.\x1b[0m\n"
+            "\x1b[38;5;244m• \x1b[39m\x1b[3m\x1b[38;5;244mI see several patterns.\x1b[0m\n"
+            "user@my-app💫\n"
+        )
+        with pytest.raises(OutputExtractionError) as excinfo:
+            provider.extract_last_message_from_script(output)
+        message = str(excinfo.value)
+        assert "analyze the code" not in message
+        assert "several patterns" not in message
+
+    def test_extract_message_thinking_plus_answer_returns_answer(self):
+        """One non-thinking bullet is enough to settle the answer."""
+        provider = KimiCliProvider("term-1", "session-1", "window-1")
+        output = (
+            "╭──────────────────╮\n"
+            "│ analyze this       │\n"
+            "╰──────────────────╯\n"
+            "\x1b[38;5;244m• \x1b[39m\x1b[3m\x1b[38;5;244mLet me analyze the code.\x1b[0m\n"
+            "• The answer is 391.\n"
+            "user@my-app💫\n"
+        )
         result = provider.extract_last_message_from_script(output)
-        # Should return the thinking content as fallback
-        assert "analyze" in result.lower() or "pattern" in result.lower()
+        assert "391" in result
+        assert "analyze the code" not in result
 
     def test_extract_message_with_status_bar_filtered(self):
         """Test that status bar lines are filtered from extracted content."""
@@ -1359,3 +1432,80 @@ class TestKimiScreenDetection:
     def test_torn_down_shell_is_unknown(self):
         screen = ["Bye!", "rkram@host:/tmp/x$"]
         assert self._p().get_status_from_screen(screen) == TerminalStatus.UNKNOWN
+
+
+class TestKimiScreenDetectionA3:
+    """A3 regressions on the rendered-screen path.
+
+    ``get_status_from_screen`` receives escape-free pyte-composited rows, so any
+    rule that depends on ANSI styling cannot apply here. These cases pin the
+    behaviour that must hold *without* styling: the shared bullet semantics
+    (A3-1), the shared boot-row shape (A3-3) and the dialect spinner rules
+    (A3-4).
+    """
+
+    def _code(self):
+        provider = KimiCliProvider("test123", "test-session", "window-0")
+        provider._dialect = KimiDialect.CODE
+        return provider
+
+    def test_wrapped_bullet_fragment_is_idle_not_completed(self):
+        """A3-1 on the screen path.
+
+        On a narrow terminal the status bar wraps, so a row can begin with a
+        bare ``●`` followed by punctuation. The old ``re.match(r"\\s*•")``
+        exclusion did not cover ``●`` at all, and a glyph-only bullet test
+        latched this idle terminal as COMPLETED.
+        """
+
+        screen = [
+            "Welcome to Kimi Code!",
+            "●)",
+            "agent (kimi-k2.6 ●)",
+            "context: 100%",
+        ]
+        assert self._code().get_status_from_screen(screen) == TerminalStatus.IDLE
+
+    def test_bare_bullet_without_payload_is_not_a_response(self):
+        screen = ["●", "agent (kimi-k2.6 ●)", "context: 100%"]
+        assert self._code().get_status_from_screen(screen) == TerminalStatus.IDLE
+
+    def test_kimi_code_bullet_mentioning_boot_chrome_is_completed(self):
+        """A3-3 — the boot gate must cover ``●``, not just the legacy ``•``.
+
+        The gate previously excluded only ``•``, so a Kimi Code answer whose
+        ``●`` row quoted the boot chrome re-stranded a genuinely finished
+        terminal at PROCESSING on every settled frame — and the inbox, which
+        delivers only on IDLE/COMPLETED, then never delivered to it.
+        """
+
+        screen = [
+            "✨ How does kimi boot?",
+            "● It logs 'connecting to mcp servers' until the MCP servers are ready.",
+            "── input ──────────────",
+            "yolo  agent (Kimi-k2.6 ●)  /tmp/x",
+            "context: 4.0% (10.4k/262.1k)",
+        ]
+        assert self._code().get_status_from_screen(screen) == TerminalStatus.COMPLETED
+
+    def test_standalone_moon_line_does_not_force_processing(self):
+        """A3-4 — under CODE semantics a moon is not evidence of work."""
+
+        screen = [
+            "✨ Show me the moon phases",
+            "● The phases are:",
+            "🌕",
+            "● That is all.",
+            "context: 2% (18.5k/977k)",
+        ]
+        assert self._code().get_status_from_screen(screen) == TerminalStatus.COMPLETED
+
+    def test_braille_spinner_is_still_processing_under_code(self):
+        screen = [
+            "✨ Analyze the data",
+            "● Working through it.",
+            "⠹ Using handoff({...})",
+            "yolo  agent (Kimi-k2.6 ●)  /tmp/x",
+            "context: 1% (9.8k/977k)",
+        ]
+        assert self._code().get_status_from_screen(screen) == TerminalStatus.PROCESSING
