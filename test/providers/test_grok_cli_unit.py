@@ -1416,3 +1416,59 @@ def test_atomic_write_repairs_existing_permissive_mode(tmp_path):
     make_provider()._atomic_write_private(target, "new\n")
     assert target.read_text(encoding="utf-8") == "new\n"
     assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
+def test_streamable_http_is_written_as_grok_http():
+    """Reproduced by review 3 on #584: CAO and Grok name the same transport differently.
+
+    The Agent Plugins ``mcp.json`` schema and CAO's mapper use the MCP spec's
+    ``streamable-http``; Grok's TOML calls it ``http``. Before the alias, wiring
+    Grok into plugin delivery meant a schema-valid plugin server raised
+    ``ProviderError`` out of ``_render_mcp_config`` — during terminal creation,
+    so the whole agent failed to launch rather than losing one tool.
+    """
+    rendered = make_provider()._render_mcp_config(
+        {"remote": {"url": "https://mcp.example.invalid", "type": "streamable-http"}}
+    )
+    assert 'type = "http"' in rendered
+    assert "streamable-http" not in rendered
+
+
+def test_sse_is_still_written_as_sse():
+    """SSE requires an explicit type in Grok, so it must not collapse to http."""
+    rendered = make_provider()._render_mcp_config(
+        {"remote": {"url": "https://mcp.example.invalid", "type": "sse"}}
+    )
+    assert 'type = "sse"' in rendered
+
+
+def test_the_profile_load_is_wrapped_in_plugin_delivery(tmp_path, monkeypatch):
+    """The launch-time seam: Grok must see installed plugins' MCP servers.
+
+    Asserted on the provider key as well as the call, because the key selects the
+    transport row — passing the module name instead of the ``ProviderType`` value
+    would silently fall through to the stdio-only default.
+    """
+    from cli_agent_orchestrator.models.provider import ProviderType
+
+    calls = []
+
+    def spy(profile, provider=None):
+        calls.append((profile, provider))
+        return profile
+
+    monkeypatch.setattr("cli_agent_orchestrator.providers.grok_cli.CAO_HOME_DIR", tmp_path)
+    monkeypatch.setattr("cli_agent_orchestrator.providers.grok_cli._with_plugin_mcp", spy)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.grok_cli.load_agent_profile",
+        lambda _name: _profile(),
+    )
+
+    provider = make_provider(agent_profile="analyst")
+    with patch(
+        "cli_agent_orchestrator.providers.grok_cli.shutil.which", return_value="/usr/bin/grok"
+    ):
+        provider._build_grok_command()
+
+    assert calls, "grok built its command without passing the profile through plugin delivery"
+    assert all(provider_key == ProviderType.GROK_CLI.value for _, provider_key in calls), calls

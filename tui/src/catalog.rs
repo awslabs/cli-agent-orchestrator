@@ -1,6 +1,6 @@
 //! The static run-policy table: what the TUI offers, and how (issue #321).
 //!
-//! One row per leaf command of the CAO Click tree — **86 of them** — each classified `InApp`,
+//! One row per leaf command of the CAO Click tree — **90 of them** — each classified `InApp`,
 //! `Handoff`, or `Hidden`. Three infallible lookups read that table and nothing else.
 //!
 //! # No I/O, and that is the security property (SR-1)
@@ -64,7 +64,7 @@ use std::vec::Vec;
 
 /// The number of leaf commands in the CAO Click tree.
 ///
-/// **86 as of this branch.** Two separate merges from `main` each brought four new leaf commands
+/// **90 as of this branch.** Two separate merges from `main` each brought four new leaf commands
 /// that this table did not know about, and both were caught by
 /// `test/test_command_catalog_matches_click.py` rather than by review — the second one in CI,
 /// because CI tests the PR MERGED against `main` while a local run only sees the branch. That is
@@ -111,7 +111,7 @@ use std::vec::Vec;
 /// must not offer itself — giving **33 IN-APP / 5 HANDOFF / 23 HIDE = 61**. Recorded here
 /// because a reader comparing the design's 60 against this 61 would otherwise suspect drift.
 /// (#321)
-const COMMAND_COUNT: usize = 86;
+const COMMAND_COUNT: usize = 90;
 
 /// What the TUI does with a command.
 ///
@@ -208,7 +208,7 @@ pub struct Command {
 ///
 /// `pub(crate)` since Bolt 3: `server-client`'s route-table tests walk it to assert that every
 /// IN-APP command has a route and that no HANDOFF or HIDE command does. Deriving that set any
-/// other way would mean re-listing 86 commands in a second place, which is a worse trade than
+/// other way would mean re-listing 90 commands in a second place, which is a worse trade than
 /// widening the visibility of a compile-time constant. Still crate-private — no consumer outside
 /// this crate exists, and the table is not a public API. (#321)
 pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
@@ -257,6 +257,10 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::MemoryRelationshipsReject,
     CommandId::MemoryRepair,
     CommandId::MemoryShow,
+    CommandId::PluginAdd,
+    CommandId::PluginList,
+    CommandId::PluginRemove,
+    CommandId::PluginValidate,
     CommandId::ProfileCreate,
     CommandId::ProfileFind,
     CommandId::ProfileList,
@@ -300,7 +304,7 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::WorkflowValidate,
 ];
 
-/// One variant per leaf command — **all 86**, the same figure [`COMMAND_COUNT`] pins.
+/// One variant per leaf command — **all 90**, the same figure [`COMMAND_COUNT`] pins.
 ///
 /// Why an enum rather than a `String` key is the subject of this module's own docs: it is what
 /// makes an unclassified command a **compile error** instead of a runtime `None` (FR-4.2).
@@ -413,6 +417,16 @@ pub enum CommandId {
     MemoryRepair,
     /// `cao memory show`
     MemoryShow,
+
+    // `cao plugin *` — Agent Plugins 1.0.0, NOT the event-plugin system in plugins/
+    /// `cao plugin add`
+    PluginAdd,
+    /// `cao plugin list`
+    PluginList,
+    /// `cao plugin remove`
+    PluginRemove,
+    /// `cao plugin validate`
+    PluginValidate,
 
     // `cao profile *`
     /// `cao profile create`
@@ -1059,6 +1073,58 @@ fn entry(id: CommandId) -> Command {
             handoff_reason: None,
         },
 
+        // ── `cao plugin *` — Agent Plugins 1.0.0 ──────────────────────────────────────────
+        // HIDE for the whole group, deliberately. The verb itself is unresolved maintainer
+        // decision M1, and requirements.md 16.5 forbids shipping this surface to end users
+        // before it is settled — a TUI entry is exactly such a surface. `Handoff` would not
+        // satisfy that: per `Policy`'s own contract a HANDOFF row *is* offered in the TUI and
+        // drives the terminal, so it ships the surface just as much as IN-APP does. Only
+        // `Hidden` is "not offered at all", and FR-4.3 requires hidden commands be absent from
+        // navigation rather than greyed out, which is the gate 16.5 actually asks for. This
+        // mirrors `hidden=True` on the Click group.
+        //
+        // Two further reasons keep these rows off IN-APP once M1 lands, so the reclassification
+        // then is HIDE → HANDOFF and not HIDE → IN-APP: `remove` must warn about live sessions
+        // and wait for confirmation before it deletes anything, which a single captured
+        // request/response cannot express; and `POST /plugins` runs untrusted content, whose
+        // warning belongs on real stdio.
+        CommandId::PluginAdd => Command {
+            id: CommandId::PluginAdd,
+            parent: Some("plugin"),
+            leaf_name: "add",
+            summary: "Install an agent plugin from a local path or a git URL.",
+            policy: Policy::Hidden,
+            params: &[Param { name: "source", required: true, kind: ParamKind::Text }, Param { name: "--ref", required: false, kind: ParamKind::Text }, Param { name: "--subdir", required: false, kind: ParamKind::Text }, Param { name: "--force", required: false, kind: ParamKind::Flag }, Param { name: "--dry-run", required: false, kind: ParamKind::Flag }, Param { name: "--json", required: false, kind: ParamKind::Flag }],
+            handoff_reason: None,
+        },
+        CommandId::PluginList => Command {
+            id: CommandId::PluginList,
+            parent: Some("plugin"),
+            leaf_name: "list",
+            summary: "List installed agent plugins.",
+            policy: Policy::Hidden,
+            params: &[Param { name: "--json", required: false, kind: ParamKind::Flag }],
+            handoff_reason: None,
+        },
+        CommandId::PluginRemove => Command {
+            id: CommandId::PluginRemove,
+            parent: Some("plugin"),
+            leaf_name: "remove",
+            summary: "Remove an installed agent plugin.",
+            policy: Policy::Hidden,
+            params: &[Param { name: "name", required: true, kind: ParamKind::Text }, Param { name: "--purge-data", required: false, kind: ParamKind::Flag }, Param { name: "--yes", required: false, kind: ParamKind::Flag }],
+            handoff_reason: None,
+        },
+        CommandId::PluginValidate => Command {
+            id: CommandId::PluginValidate,
+            parent: Some("plugin"),
+            leaf_name: "validate",
+            summary: "Validate a candidate plugin directory.",
+            policy: Policy::Hidden,
+            params: &[Param { name: "path", required: true, kind: ParamKind::Text }, Param { name: "--json", required: false, kind: ParamKind::Flag }],
+            handoff_reason: None,
+        },
+
         CommandId::ProfileCreate => Command {
             id: CommandId::ProfileCreate,
             parent: Some("profile"),
@@ -1590,7 +1656,7 @@ mod tests {
     ///
     /// Returns `(in_app, handoff, hidden)`. The counts are *derived*; every number they are
     /// compared against is a hard-coded literal in the test body. That direction matters — see
-    /// [`the_policy_distribution_is_twentyfour_eighteen_thirtyfive`].
+    /// [`the_policy_distribution_is_twentyfour_eighteen_fortyeight`].
     fn distribution() -> (usize, usize, usize) {
         let mut counts = (0, 0, 0);
         for id in DISPLAY_ORDER {
@@ -1603,7 +1669,7 @@ mod tests {
         counts
     }
 
-    /// Test 1 — **the policy distribution is 24 IN-APP / 18 HANDOFF / 44 HIDE, totalling 86.**
+    /// Test 1 — **the policy distribution is 24 IN-APP / 18 HANDOFF / 48 HIDE, totalling 90.**
     ///
     /// Every number here is a **hard-coded literal**, and that is the entire design of the test.
     /// Deriving any of them from the table — `assert_eq!(in_app, TABLE.iter().filter(..).count())`
@@ -1612,7 +1678,7 @@ mod tests {
     /// would look like if it had it.
     ///
     /// **Four assertions rather than one summed check**, also deliberately: a single
-    /// `in_app + handoff + hidden == 61` stays green when a command moves from IN-APP to HIDE,
+    /// `in_app + handoff + hidden == 90` stays green when a command moves from IN-APP to HIDE,
     /// because the total is conserved. Reclassification is exactly the change most likely to
     /// happen by accident, so each policy is pinned separately and the failure names *which* one
     /// moved.
@@ -1656,28 +1722,37 @@ mod tests {
     /// (#583 Bolt 2) arrived the same way, also HIDE. With `step` on top of the EKS v2 nine, the
     /// figures are **24/18/44 = 86**. The guard catching a missing row again is the argument for
     /// keeping the cross-language check.
+    ///
+    /// **Then `cao plugin` {add, list, remove, validate} landed** with Agent Plugins 1.0.0
+    /// support (#573). All four are HIDE: the verb is unresolved maintainer decision M1 and
+    /// requirements.md 16.5 forbids the surface reaching end users before it is settled. HANDOFF
+    /// would not have satisfied that — a HANDOFF row is offered in navigation and drives the
+    /// terminal, so it ships the surface — and only HIDE is "not offered at all" (FR-4.3). When
+    /// M1 lands these become HANDOFF, not IN-APP, because `remove` needs a warn-then-confirm
+    /// exchange that a captured one-shot request cannot carry. On top of the 86 above that gives
+    /// **24/18/48 = 90**.
     #[test]
-    fn the_policy_distribution_is_twentyfour_eighteen_fortyfour() {
+    fn the_policy_distribution_is_twentyfour_eighteen_fortyeight() {
         let (in_app, handoff, hidden) = distribution();
 
         assert_eq!(in_app, 24, "expected 24 IN-APP commands, found {in_app}");
         assert_eq!(handoff, 18, "expected 18 HANDOFF commands, found {handoff}");
-        assert_eq!(hidden, 44, "expected 44 HIDE commands, found {hidden}");
+        assert_eq!(hidden, 48, "expected 48 HIDE commands, found {hidden}");
         assert_eq!(
             in_app + handoff + hidden,
-            86,
-            "the three policy counts must account for all 86 leaf commands of the Click tree"
+            90,
+            "the three policy counts must account for all 90 leaf commands of the Click tree"
         );
 
-        // The three counts summing to 86 does not prove 86 *distinct* commands were counted: a
+        // The three counts summing to 90 does not prove 90 *distinct* commands were counted: a
         // duplicated entry in DISPLAY_ORDER would inflate one policy while a real command went
         // uncounted, and the arithmetic above would still close. DISPLAY_ORDER is generated, so
         // this is a live hazard rather than a theoretical one.
         let distinct: BTreeSet<CommandId> = DISPLAY_ORDER.iter().copied().collect();
         assert_eq!(
             distinct.len(),
-            86,
-            "DISPLAY_ORDER must list 86 DISTINCT commands; a duplicate would let one command go \
+            90,
+            "DISPLAY_ORDER must list 90 DISTINCT commands; a duplicate would let one command go \
              uncounted while the totals still summed correctly"
         );
     }
@@ -1697,9 +1772,9 @@ mod tests {
     /// production. "The compiler has my back" is exactly where a contributor stops checking, so
     /// the uncovered case needs a test rather than a caveat in a doc comment.
     ///
-    /// Neither existing guard catches it. [`the_policy_distribution_is_twentyfour_eighteen_thirtyfive`]
+    /// Neither existing guard catches it. [`the_policy_distribution_is_twentyfour_eighteen_fortyeight`]
     /// counts what `DISPLAY_ORDER` *contains*, so a variant missing from it is simply never
-    /// counted; and its `distinct.len() == 86` assertion detects a **duplicate**, which is the
+    /// counted; and its `distinct.len() == 90` assertion detects a **duplicate**, which is the
     /// opposite direction. [`COMMAND_COUNT`] pins the array's *length*, never its membership.
     ///
     /// # Why an exhaustive match and NOT a discriminant trick
@@ -1789,6 +1864,10 @@ mod tests {
                     CommandId::MemoryRelationshipsReject => CommandId::MemoryRelationshipsReject,
                     CommandId::MemoryRepair => CommandId::MemoryRepair,
                     CommandId::MemoryShow => CommandId::MemoryShow,
+                    CommandId::PluginAdd => CommandId::PluginAdd,
+                    CommandId::PluginList => CommandId::PluginList,
+                    CommandId::PluginRemove => CommandId::PluginRemove,
+                    CommandId::PluginValidate => CommandId::PluginValidate,
                     CommandId::ProfileCreate => CommandId::ProfileCreate,
                     CommandId::ProfileFind => CommandId::ProfileFind,
                     CommandId::ProfileList => CommandId::ProfileList,
@@ -1880,6 +1959,10 @@ mod tests {
                 CommandId::MemoryRelationshipsReject,
                 CommandId::MemoryRepair,
                 CommandId::MemoryShow,
+                CommandId::PluginAdd,
+                CommandId::PluginList,
+                CommandId::PluginRemove,
+                CommandId::PluginValidate,
                 CommandId::ProfileCreate,
                 CommandId::ProfileFind,
                 CommandId::ProfileList,
@@ -1980,7 +2063,9 @@ mod tests {
             offered.len(),
             42,
             "commands() must offer the 24 IN-APP plus 18 HANDOFF commands and nothing else; an \
-             empty or short list would satisfy the Hidden check below while offering nothing"
+             empty or short list would satisfy the Hidden check below while offering nothing. The \
+             four `cao plugin *` rows are HIDE pending maintainer decision M1, so they are \
+             deliberately absent from navigation (requirements.md 16.5, FR-4.3)"
         );
 
         for command in &offered {
@@ -2038,7 +2123,7 @@ mod tests {
             }
         }
 
-        // The exact sixteen, not merely sixteen of them. A count alone cannot distinguish "the
+        // The exact list, not merely a count of it. A count alone cannot distinguish "the
         // right sixteen" from "one reclassified in and another out" — and VR-3 exists because a
         // count-only check passed while two commands were misclassified.
         //
@@ -2069,7 +2154,8 @@ mod tests {
                 "workflow wait"
             ],
             "expected exactly these 18 HANDOFF commands; without this assertion the loop above \
-             passes vacuously when zero entries are HANDOFF"
+             passes vacuously when zero entries are HANDOFF. `cao plugin *` is deliberately NOT \
+             here: those four rows are HIDE until maintainer decision M1 settles the verb"
         );
     }
 

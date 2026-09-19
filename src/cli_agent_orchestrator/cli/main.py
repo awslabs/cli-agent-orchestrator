@@ -5,6 +5,7 @@ from importlib.metadata import PackageNotFoundError, version
 import click
 
 from cli_agent_orchestrator.cli.commands.agent import agent
+from cli_agent_orchestrator.cli.commands.agent_plugin import agent_plugin
 from cli_agent_orchestrator.cli.commands.config import config
 from cli_agent_orchestrator.cli.commands.env import env
 from cli_agent_orchestrator.cli.commands.fleet import fleet
@@ -52,6 +53,10 @@ cli.add_command(mcp_server)
 cli.add_command(info)
 cli.add_command(memory)
 cli.add_command(skills)
+# Agent Plugins 1.0.0 (docs/agent-plugins.md). Distinct from the event-plugin
+# system in plugins/. The verb itself is maintainer decision M1 — see the
+# module docstring; changing it is a one-line edit here.
+cli.add_command(agent_plugin)
 cli.add_command(session)
 cli.add_command(terminal)
 # Remote fleets. `cao fleet`/`cao worker` reach a cluster's worker broker over

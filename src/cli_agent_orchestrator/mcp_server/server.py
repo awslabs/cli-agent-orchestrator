@@ -1345,11 +1345,12 @@ def _caller_effective_allowed_tools(context: Dict[str, Any]) -> Optional[List[st
     if not profile_name:
         return None
 
+    from cli_agent_orchestrator.agent_plugins.mcp_delivery import grantable_server_names
     from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
     from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
 
     profile = load_agent_profile(profile_name)
-    mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
+    mcp_server_names = grantable_server_names(profile)
     return resolve_allowed_tools(profile.allowedTools, profile.role, mcp_server_names)
 
 

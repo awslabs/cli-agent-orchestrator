@@ -39,12 +39,36 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from cli_agent_orchestrator.agent_plugins.mcp_delivery import with_plugin_mcp as _with_plugin_mcp
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
+
+# Portable Agent Plugins `type` -> FastMCP `transport`. Kimi 1.20.0 pins
+# fastmcp==2.12.5 and hands each --mcp-config document to
+# `fastmcp.mcp_config.MCPConfig`.
+#
+# WHY THIS EXISTS: `RemoteMCPServer` has no `type` field, so a portable `type` is an
+# ignored extra. With `transport` absent FastMCP calls
+# `infer_transport_type_from_url`, which returns "sse" iff the URL PATH matches
+# `/sse(/|\?|&|$)` and "http" otherwise -- so the declared protocol was decided by
+# URL spelling: an SSE server published at `/events` started as Streamable HTTP,
+# and a Streamable HTTP server at `/sse` started as SSE. Reported by review
+# 5222539218 on #584 (item 5).
+#
+# Only these spellings translate. An absent or unrecognised `type` is left alone:
+# `_map_entry` always emits `type` for a plugin server, so a type-less entry came
+# from a hand-written profile, where inventing a `transport` would be a behaviour
+# change beyond this finding.
+KIMI_TRANSPORTS = {
+    "stdio": "stdio",
+    "streamable-http": "http",
+    "http": "http",
+    "sse": "sse",
+}
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
@@ -294,7 +318,7 @@ class KimiCliProvider(BaseProvider):
         if self._agent_profile is None:
             return None
         try:
-            return load_agent_profile(self._agent_profile)
+            return _with_plugin_mcp(load_agent_profile(self._agent_profile), "kimi_cli")
         except Exception:
             return None
 
@@ -328,7 +352,7 @@ class KimiCliProvider(BaseProvider):
         profile = None
         if self._agent_profile is not None:
             try:
-                profile = load_agent_profile(self._agent_profile)
+                profile = _with_plugin_mcp(load_agent_profile(self._agent_profile), "kimi_cli")
             except Exception as e:
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
 
@@ -408,6 +432,18 @@ class KimiCliProvider(BaseProvider):
                         if "CAO_TERMINAL_ID" not in env:
                             env["CAO_TERMINAL_ID"] = self.terminal_id
                             mcp_config[server_name]["env"] = env
+
+                        # Select the declared protocol explicitly rather than
+                        # letting FastMCP infer it from the URL path. `cwd` is
+                        # untouched -- `StdioMCPServer.cwd` honours it.
+                        entry = mcp_config[server_name]
+                        declared = entry.get("type")
+                        translated = (
+                            KIMI_TRANSPORTS.get(declared) if isinstance(declared, str) else None
+                        )
+                        if translated is not None:
+                            entry["transport"] = translated
+                            del entry["type"]
 
                     command_parts.extend(["--mcp-config", json.dumps(mcp_config)])
 

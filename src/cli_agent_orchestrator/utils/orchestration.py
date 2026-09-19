@@ -352,14 +352,13 @@ def _resolve_child_allowed_tools(
     Returns:
         Comma-separated string of allowed tools, or None for unrestricted.
     """
+    from cli_agent_orchestrator.agent_plugins.mcp_delivery import grantable_server_names
     from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
     from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
 
     try:
         child_profile = load_agent_profile(child_profile_name)
-        mcp_server_names = (
-            list(child_profile.mcpServers.keys()) if child_profile.mcpServers else None
-        )
+        mcp_server_names = grantable_server_names(child_profile)
         child_allowed = resolve_allowed_tools(
             child_profile.allowedTools, child_profile.role, mcp_server_names
         )

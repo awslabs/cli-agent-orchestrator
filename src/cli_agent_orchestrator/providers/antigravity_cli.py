@@ -52,6 +52,7 @@ import time
 from pathlib import Path
 from typing import List, Optional
 
+from cli_agent_orchestrator.agent_plugins.mcp_delivery import with_plugin_mcp as _with_plugin_mcp
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import SECURITY_PROMPT
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -274,7 +275,7 @@ class AntigravityCliProvider(BaseProvider):
         if self._agent_profile is None:
             return None
         try:
-            return load_agent_profile(self._agent_profile)
+            return _with_plugin_mcp(load_agent_profile(self._agent_profile), "antigravity_cli")
         except Exception:
             return None
 
@@ -309,7 +310,9 @@ class AntigravityCliProvider(BaseProvider):
         profile = None
         if self._agent_profile is not None:
             try:
-                profile = load_agent_profile(self._agent_profile)
+                profile = _with_plugin_mcp(
+                    load_agent_profile(self._agent_profile), "antigravity_cli"
+                )
             except Exception as exc:
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {exc}")
 
@@ -427,6 +430,12 @@ class AntigravityCliProvider(BaseProvider):
                 env = dict(cfg.get("env", {}))
                 env["CAO_TERMINAL_ID"] = self.terminal_id
                 entry["env"] = env
+                # Antigravity documents `cwd` ("Working directory for `stdio`
+                # servers."), so an agent plugin's directory is carried natively.
+                # Reported by review 5222539218 on #584 (item 4).
+                cwd = cfg.get("cwd")
+                if isinstance(cwd, str) and cwd:
+                    entry["cwd"] = cwd
                 # Use a per-terminal key so concurrent inits don't overwrite
                 # each other's entry before agy reads the config at startup.
                 unique_key = f"{server_name}-{self.terminal_id}"

@@ -116,7 +116,11 @@ def routed_requests(monkeypatch):
     client = TestClientWithHost(app)
     calls: List[Tuple[str, str]] = []
 
-    def _dispatch(method, url, params=None, json=None):
+    # ``timeout`` is accepted and ignored: the real ``_request_json`` bounds every
+    # call with ``_HTTP_TIMEOUT``, while a TestClient dispatch is in-process and has
+    # nothing to time out. Absorbing it here keeps the double's signature a superset
+    # of the caller's rather than pinning the absence of a bound.
+    def _dispatch(method, url, params=None, json=None, timeout=None, headers=None):
         # The helpers build f"{API_BASE_URL}{path}"; TestClient wants the path.
         path = "/" + str(url).split("://", 1)[1].split("/", 1)[1]
         calls.append((method.lower(), path))
@@ -262,7 +266,10 @@ class TestShutdownSessionAgainstRealRoute:
 
         routed = ops_server.requests.request
 
-        def _failing_get(method, url, params=None, json=None):
+        # ``headers`` and ``timeout`` are accepted and ignored: the double's
+        # signature must stay a SUPERSET of the caller's, never a pin on the
+        # absence of a credential or a bound (review 5222539218, item 7).
+        def _failing_get(method, url, params=None, json=None, timeout=None, headers=None):
             if method.lower() == "get":
                 raise requests.ConnectionError("connection refused")
             return routed(method, url, params=params, json=json)

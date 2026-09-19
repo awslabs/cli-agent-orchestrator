@@ -40,8 +40,8 @@ uv run cao-server                  # FastAPI + /events on :9889
 uv run cao-mcp-server              # registers the MCP App tools/resources
 ```
 
-The surface is packaged as the built-in **`mcp_apps` plugin** (discovered via the
-`cao.plugins` entry-point group). On MCP server startup the plugin's
+The surface is packaged as the built-in **`mcp_apps` event plugin** (discovered via the
+`cao.plugins` entry-point group). On MCP server startup the event plugin's
 `on_mcp_server` hook registers the tools, the `ui://cao/*` resources, the topology
 widget, and the capability advertisement — all best-effort, so an older FastMCP
 build or a missing frontend build degrades gracefully (logged, never fatal).
@@ -199,7 +199,7 @@ recorded here because they shape how the MCP Apps surface should evolve.
   tools/resources/widget, the `event_log_publisher` observer and the `/events`
   + `/events/history` HTTP endpoints are *also* gated, so "default-off" means
   *zero retention and zero exposure* of fleet metadata, not just "no UI". Any new
-  surface (endpoint, plugin hook, background task) MUST honor this flag.
+  surface (endpoint, event-plugin hook, background task) MUST honor this flag.
 - **Auth, when enabled, verifies issuer and audience** (not just signature/expiry),
   with audience defaulting to the PRM resource id. New protected resources should
   reuse `security/auth.py` (`get_current_scopes` / `require_any_scope`) rather than

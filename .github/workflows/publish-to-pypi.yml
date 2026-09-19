@@ -409,3 +409,93 @@ jobs:
       # exposure in this workflow. dc37677b is the commit that `release/v1` and the v1.14.2
       # tag both pointed at when this was pinned; verified by dereferencing the annotated tag.
       - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2
+
+  # Closes review 5222539218 item 8 on #584. The committed `agent-plugin/cao/mcp.json`
+  # pins an exact published version, so the pin can only ever name a release that already
+  # exists — which means it always lags the release that contains the newest fix. The
+  # boundedness gate in `scripts/build_agent_plugin.py` refuses a pin whose ops server has
+  # no request timeout, and this job is what lets that gate ever pass: it regenerates the
+  # packages AFTER publishing, so the pin advances to the release just published.
+  #
+  # NO `github.event_name` GUARD, deliberately. It carried one (`== 'release'`) and that
+  # guard is why the job had never run: `release.yml` creates releases with
+  # `softprops/action-gh-release` under GITHUB_TOKEN, and a release created by the workflow
+  # token does not emit `on: release`. Measured on the run history — every successful
+  # publish in this repo's history is a `workflow_dispatch`, and all three `release`-event
+  # runs failed — so the guard excluded the only path that publishes.
+  #
+  # `needs: publish-pypi` is the real gate and always was: it means a PyPI publish
+  # SUCCEEDED. A TestPyPI dispatch skips `publish-pypi` entirely, so a skipped dependency
+  # skips this job too and the committed pin cannot be rewritten to a version PyPI does not
+  # have. The event guard added no protection that `needs:` did not already provide.
+  # `test_agent_plugin_pin_boundedness.py` parses this file and asserts both halves.
+  regenerate-agent-plugin:
+    name: Regenerate the committed agent-plugin packages
+    needs: publish-pypi
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # `ssh-key` rather than the default GITHUB_TOKEN: a push made with the workflow
+      # token does not trigger downstream workflows, and this pushes to `main`. Same
+      # deploy key `release.yml` already uses, so no new secret is introduced.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          ref: main
+          fetch-depth: 0
+          ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
+
+      - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v4.2.0
+
+      - name: Install the project
+        run: uv sync --all-extras --dev
+
+      # PyPI's index is eventually consistent: `publish-pypi` succeeding does not mean
+      # `/pypi/<dist>/<version>/json` answers yet, and `verify_published` would fail on a
+      # release that is genuinely there. Bounded retry rather than a fixed sleep, so a slow
+      # index costs time instead of a red release.
+      - name: Regenerate with both gates required
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            if uv run python scripts/build_agent_plugin.py --require-bounded-client; then
+              echo "regenerated on attempt ${attempt}"
+              exit 0
+            fi
+            echo "attempt ${attempt} failed; PyPI may not have indexed the release yet"
+            sleep 30
+          done
+          echo "::error::Could not regenerate the agent-plugin packages after 5 attempts."
+          exit 1
+
+      # `--exit-code` so "nothing changed" is a normal, quiet outcome: a release whose pin
+      # already matched needs no commit, and committing nothing would fail.
+      #
+      # The version comes from `pyproject.toml`, not `GITHUB_REF_NAME`. This job no longer
+      # runs only on a tag-shaped `release` event, and on a `workflow_dispatch`
+      # GITHUB_REF_NAME is the branch (`main`) — it would produce
+      # "repin packages to main". `pyproject.toml` is what the build itself pins from, so
+      # it is the version the commit actually delivers.
+      - name: Commit the regenerated packages if they changed
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- agent-plugin/; then
+            echo "agent-plugin/ already matches the published release; nothing to commit"
+            exit 0
+          fi
+          version="$(uv run python -c 'import sys; sys.path.insert(0, "scripts"); import build_agent_plugin as b; print(b.package_version())')"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add agent-plugin/
+          git commit -m "chore(agent-plugin): repin packages to v${version}"
+          git push origin HEAD:main
+
+      # The ONLY caller of `--require-current-pin`. `make check-agent-plugin` in `ci.yml`
+      # deliberately tolerates `committed < pyproject`, because `release.yml` bumps the
+      # version on `main` before this job repins and strict equality in that window would
+      # redden `main` and every open PR (defect G1c). That tolerance needs somewhere it does
+      # NOT apply, or a forgotten repin is caught nowhere: this is it. After this job has
+      # regenerated and pushed, the committed packages MUST pin exactly the published
+      # version.
+      - name: Assert the committed packages now pin the current version exactly
+        run: uv run python scripts/build_agent_plugin.py --check --require-current-pin
