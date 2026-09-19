@@ -192,6 +192,7 @@ class TestAgentProviders:
         assert providers_dict["omp"]["binary"] == "omp"
         assert providers_dict["grok_cli"]["binary"] == "grok"
         assert providers_dict["mcode"]["binary"] == "mcode"
+        assert providers_dict["mcode"]["models"] == ["MiniMax-M3", "MiniMax-M2.7"]
 
 
 # ── Skills endpoint ──────────────────────────────────────────────────

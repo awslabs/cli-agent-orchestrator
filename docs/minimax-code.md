@@ -53,6 +53,12 @@ only in the terminal-local copy of `config.yaml`; the explicit launch override
 wins over the profile value. The user's normal MiniMax Code configuration is
 not modified.
 
+The current MiniMax model IDs are `MiniMax-M3` and `MiniMax-M2.7`. For example:
+
+```bash
+cao launch --agents developer --provider mcode --model MiniMax-M3
+```
+
 ## Runtime behavior
 
 CAO launches a command equivalent to:
