@@ -506,6 +506,14 @@ APPROVAL_HINT_RE = re.compile(r"↑/↓\s*select\s*·\s*1/2/3/4\s*choose")
 # A numbered option row, with the optional selection marker the renderer draws.
 APPROVAL_OPTION_RE = re.compile(r"^\s*(?:▶\s*)?\d+\.\s*(?:Approve|Reject)\b")
 APPROVAL_SELECT_MARKER = "▶"
+#: The option row the renderer currently *has selected*. A live dialog always
+#: carries this cursor — the operator is being asked to choose — while a menu
+#: quoted inside an answer is static text. Requiring it is what separates the two
+#: once the quoted menu has the title too (a fenced example of the whole dialog
+#: was reproduced truncating the answer).
+APPROVAL_SELECTED_OPTION_RE = re.compile(
+    re.escape(APPROVAL_SELECT_MARKER) + r"\s*\d+\.\s*(?:Approve|Reject)\b"
+)
 
 
 class KimiLineKind(enum.Enum):
@@ -666,17 +674,19 @@ def _confirm_context_kinds(
             for kind in confirmed
         ]
 
-    # The approval dialog is confirmed by its *whole* structure: the title the
-    # renderer draws (`▶ Run this command?`), the navigation hint, and a numbered
-    # option row. Requiring all three is what keeps prose out — a quoted menu
-    # (`• Available choices:` / `1. Approve once` / `↑/↓ select · 1/2/3/4 choose`)
-    # has the hint and the options but no title, and it was reproduced truncating
-    # the answer at the quote. The title alone is not enough either, for the
-    # opposite reason: the substring that classified the row would confirm it.
+    # The approval dialog is confirmed by its *whole* live structure: the title
+    # the renderer draws (`▶ Run this command?`), the navigation hint, and a
+    # numbered option row **carrying the selection cursor**. Each requirement
+    # excludes a different quote — a menu without the title
+    # (`• Available choices:` / `1. Approve once` / `↑/↓ select · 1/2/3/4 choose`),
+    # and a fenced example of the whole dialog with no cursor — both reproduced
+    # truncating the answer at the quote. The title alone is not enough either,
+    # for the opposite reason: the substring that classified the row would then
+    # confirm it.
     approval_confirmed = (
         any(APPROVAL_TITLE_RE.search(clean) for clean in clean_lines)
         and any(APPROVAL_HINT_RE.search(clean) for clean in clean_lines)
-        and any(APPROVAL_OPTION_RE.match(clean) for clean in clean_lines)
+        and any(APPROVAL_SELECTED_OPTION_RE.search(clean) for clean in clean_lines)
     )
     if not approval_confirmed:
         confirmed = [

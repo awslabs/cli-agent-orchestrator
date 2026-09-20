@@ -1737,3 +1737,64 @@ class TestPR799AdversarialThirdRound:
         )
         result, _ = _last(monkeypatch, pane)
         assert "Choose 2 to reject the command." in result
+
+    def test_a_styled_code_line_shaped_like_a_boot_message_survives(self, monkeypatch):
+        """A6-F1: syntax highlighting is not the renderer's boot indicator."""
+
+        pane = "\n".join(
+            [
+                "💫 Write a shell script",
+                "• Run:",
+                "```sh",
+                "cat <<EOF",
+                "\x1b[32mLoading configuration...\x1b[0m",
+                "EOF",
+                "echo done",
+                "```",
+                "💫",
+            ]
+        )
+        result, _ = _last(monkeypatch, pane)
+        assert "Loading configuration..." in result
+        assert "echo done" in result
+
+    def test_a_quoted_full_approval_dialog_survives(self, monkeypatch):
+        """A6-F2: a static menu has no selection cursor, so it is not live."""
+
+        pane = "\n".join(
+            [
+                "💫 Explain the approval menu",
+                "• The menu is:",
+                "```text",
+                "▶ Run this command?",
+                "1. Approve once",
+                "2. Reject",
+                "↑/↓ select · 1/2/3/4 choose",
+                "```",
+                "Choose Reject to cancel.",
+                "💫",
+            ]
+        )
+        result, _ = _last(monkeypatch, pane)
+        assert "Choose Reject to cancel." in result
+
+    def test_a_live_approval_dialog_still_ends_the_region(self, monkeypatch):
+        """The guard: the cursor-bearing dialog the renderer draws is live."""
+
+        pane = "\n".join(
+            [
+                "✨ run it",
+                "● The command is ready.",
+                "   ▶ Run this command?",
+                "",
+                "   ▶ 1. Approve once",
+                "     2. Reject",
+                "",
+                "   ↑/↓ select · 1/2/3/4 choose · ↵ confirm",
+                " ────────────────────────────────────────",
+                " Never Ask  Model thinking  /tmp/proj  master",
+                "",
+            ]
+        )
+        result, _ = _last(monkeypatch, pane)
+        assert result == "● The command is ready."

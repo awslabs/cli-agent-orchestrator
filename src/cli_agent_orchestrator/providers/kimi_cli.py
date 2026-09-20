@@ -259,6 +259,11 @@ KIMI_PALETTE_ENV_UNSET = ("COLORTERM",)
 #: only when it carries this slot or styling — see `_locate_response_region`.
 _SPINNER_SLOT_RE = re.compile(r"[\u2800-\u28ff]")
 
+#: The boot banner rows, which name themselves rather than relying on the spinner
+#: slot. Used with `_SPINNER_SLOT_RE` to decide whether a `BOOT_CHROME` row is
+#: really boot chrome when an answer is being extracted.
+_BOOT_BANNER_RE = re.compile(r"Welcome to Kimi Code|MCP Servers:\s*\d|MCP server \"")
+
 #: A3-5 — explicit opt-in for answering Kimi Code's workspace-trust dialog.
 #:
 #: Measured against Kimi Code 0.43.1 (A3-5 probe, see
@@ -2220,7 +2225,7 @@ class KimiCliProvider(BaseProvider):
             kind = kinds[index]
             if kind is kt.KimiLineKind.BOOT_CHROME:
                 raw = raw_lines[index] if raw_lines and index < len(raw_lines) else ""
-                if not (_SPINNER_SLOT_RE.search(raw or "") or "\x1b[" in (raw or "")):
+                if not KimiCliProvider._boot_chrome_is_shaped(raw, kt.strip_sgr(raw)):
                     continue
             elif kind not in end_anchors:
                 continue
@@ -2261,7 +2266,7 @@ class KimiCliProvider(BaseProvider):
             if kind is kt.KimiLineKind.BLANK:
                 continue
             if kind is kt.KimiLineKind.BOOT_CHROME and not self._boot_chrome_is_shaped(
-                raw_lines[i] if i < len(raw_lines) else ""
+                raw_lines[i] if i < len(raw_lines) else "", clean_line
             ):
                 # Inside the response region a boot *message* that the renderer
                 # did not draw as boot chrome — no spinner slot, no styling — is
@@ -2275,12 +2280,18 @@ class KimiCliProvider(BaseProvider):
         return answers, region_kinds
 
     #: True when a boot-chrome row is drawn as boot chrome: it carries the
-    #: renderer's braille indicator slot or an SGR sequence. The weakest
-    #: escape-free shape of a boot message is plain prose, which is also what an
-    #: answer that quotes one looks like.
+    #: renderer's braille indicator slot or is one of the banner rows. Generic
+    #: styling is *not* enough — a syntax-highlighted code line inside an answer
+    #: is styled too, and a highlighted `Loading configuration...` in a shell
+    #: heredoc was reproduced truncating the script. The boot *message* rows are
+    #: the ones the renderer draws in the spinner slot; the banner rows name
+    #: themselves.
     @staticmethod
-    def _boot_chrome_is_shaped(raw_line: str) -> bool:
-        return bool(_SPINNER_SLOT_RE.search(raw_line or "") or "\x1b[" in (raw_line or ""))
+    def _boot_chrome_is_shaped(raw_line: str, clean_line: str = "") -> bool:
+        return bool(
+            _SPINNER_SLOT_RE.search(raw_line or "")
+            or _BOOT_BANNER_RE.search(clean_line or "")
+        )
 
     @staticmethod
     def _reject_private_content(scope_kinds: List[kt.KimiLineKind], *, has_answers: bool) -> None:
