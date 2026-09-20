@@ -108,8 +108,24 @@ executable file whose shebang picks its interpreter, printing
 constructed rather than inherited. A script there gets `PATH`, `HOME`,
 `CAO_API_BASE_URL` and `CAO_FLOW_NAME` and nothing else, so anything else your
 script reads from the environment must move into the script or be fetched over the
-API. The server still owns the schedule, the JSON verdict and the launch; a runtime
-that disappears mid-script fails the run rather than being read as "skip".
+API. The server still owns the schedule and the JSON verdict; a runtime that
+disappears mid-script fails the run rather than being read as "skip".
+
+### Where the agent runs
+
+The session the flow launches is placed by its own variable,
+`CAO_FLOW_RUNTIME=<runtime id>`, and defaults to this host. Set it in a cluster
+deployment where the server container has no tmux of its own; it is separate from
+`CAO_SCRIPT_RUNTIME` so a quick health check and a long-lived agent can sit in
+different places.
+
+Two behaviours follow the placement. The previous run's session is recycled where
+it lives, so a busy agent in a runtime still blocks the next run and a teardown
+that does not confirm defers it rather than launching a second agent beside the
+first. And a named runtime that is not connected fails the run instead of falling
+back to this host — a silent fallback would start the agent in the container the
+variable exists to keep it out of. A flow that pins a non-default `engine` cannot
+be launched remotely yet and says so.
 
 ## Flow commands
 

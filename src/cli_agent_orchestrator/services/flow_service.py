@@ -31,7 +31,7 @@ from cli_agent_orchestrator.clients.database import (
 )
 from cli_agent_orchestrator.constants import DEFAULT_PROVIDER, PROVIDERS
 from cli_agent_orchestrator.models.flow import Flow
-from cli_agent_orchestrator.models.kiro_engine import parse_kiro_engine
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine, parse_kiro_engine
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.security.principal import Principal, may_start_work
@@ -318,6 +318,141 @@ async def _run_pre_script(flow_name: str, script_path: Path) -> Tuple[Optional[i
     return payload.get("returncode"), payload.get("stdout", ""), payload.get("stderr", "")
 
 
+def _flow_launch_runtime() -> Optional[str]:
+    """The runtime a scheduled flow's agent is launched on, or None for here.
+
+    Relocating the pre-script (above) is only half of the issue's flow story: the
+    session the flow then launches is user code too, and in the cluster topology
+    the server container has no tmux to launch it in. ``CAO_FLOW_RUNTIME`` names
+    the execution runtime that does.
+
+    Deliberately a SEPARATE decision from ``CAO_SCRIPT_RUNTIME``: a health check
+    and a long-lived agent are different workloads, and an operator may well want
+    the check beside the server's supervisor while agents go to dedicated worker
+    pods. Unset — the default, and every single-host installation — is the
+    unchanged local launch.
+
+    Unlike the pre-script path, this does not silently degrade to local when the
+    named runtime is absent; the launch attempt fails loudly (below). Falling back
+    would create the agent session in the container this env var exists to keep
+    user code out of, where an operator would then have to go find it.
+    """
+    return os.environ.get("CAO_FLOW_RUNTIME", "").strip() or None
+
+
+async def _launch_flow_terminal(
+    flow: Flow, session_name: str, owner_id: Optional[str]
+) -> Any:  # -> Terminal
+    """Create the flow's agent terminal, here or in its execution runtime (#745)."""
+    runtime_id = _flow_launch_runtime()
+    if runtime_id is None:
+        return await create_terminal(
+            session_name=session_name,
+            provider=flow.provider,
+            agent_profile=flow.agent_profile,
+            new_session=True,
+            engine=flow.engine,
+            # The agent this schedule launches works for whoever REGISTERED the
+            # schedule, not for whoever the daemon runs as (#745). Carrying it
+            # onto the terminal row is what lets the same owner be read later,
+            # when this terminal sends a message and nothing about the original
+            # registration request is still in scope.
+            owner=owner_id,
+        )
+
+    from fastapi import HTTPException
+
+    from cli_agent_orchestrator.runtime_channel.api import (
+        CreateRemoteTerminalBody,
+        launch_remote_terminal,
+    )
+
+    # LAUNCH carries no engine field, so a flow that asked for a non-default
+    # engine must not be launched remotely: the runtime would start v2 and the
+    # run would look successful while being the wrong agent. Refuse instead of
+    # dropping the field — the same rule the channel applies at hello.
+    if flow.engine is not None and parse_kiro_engine(flow.engine) is not KiroEngine.V2:
+        raise ValueError(
+            f"flow {flow.name} requests engine '{flow.engine}', which a remote "
+            f"launch on runtime '{runtime_id}' cannot carry; run it locally or "
+            f"unset CAO_FLOW_RUNTIME"
+        )
+
+    try:
+        return await launch_remote_terminal(
+            runtime_id,
+            CreateRemoteTerminalBody(
+                provider=flow.provider,
+                agent_profile=flow.agent_profile,
+                session_name=session_name,
+            ),
+            # Server-written, exactly as the HTTP path writes the caller's
+            # principal: the owner is never handed to the runtime in the LAUNCH
+            # payload, because an identity given to an executor is an identity it
+            # could re-present.
+            owner_id=owner_id,
+        )
+    except HTTPException as exc:
+        # The shared launch path reports transport and execution failures as HTTP
+        # status; a scheduler has no response to put them in. Keep the detail
+        # (which distinguishes "not connected" from "outcome unknown") and raise
+        # the ValueError this function's other failures already raise.
+        raise ValueError(
+            f"flow {flow.name}: remote launch on runtime '{runtime_id}' failed: {exc.detail}"
+        ) from exc
+
+
+def _remote_flow_terminals(terminals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The terminals in this list a runtime executes, not this host."""
+    from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
+
+    return [t for t in terminals if runtime_registry.is_remote(t["id"])]
+
+
+async def _recycle_remote_flow_terminals(flow_name: str, terminals: List[Dict[str, Any]]) -> bool:
+    """Tear down a previous run's REMOTE flow terminals, in their runtime (#745).
+
+    The local arm below asks this host's tmux whether the flow session survives.
+    For a remotely launched flow that question is unanswerable here — the session
+    is in another pod — so the central terminal rows are the handle, and teardown
+    goes over the channel, where the runtime runs the same local cleanup (tmux
+    kill, FIFO reader, provider state) the local arm does inline.
+
+    Returns False when the session must not be recycled yet: the conductor is
+    still working, or a teardown did not confirm. Retaining the rows keeps the
+    retry handle, matching the local deferred-cleanup arm.
+    """
+    from cli_agent_orchestrator.runtime_channel.api import remote_delete_terminal
+    from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
+
+    remote = _remote_flow_terminals(terminals)
+    if not remote:
+        return True
+
+    # Index 0 is the conductor, per ``list_terminals_by_session``'s ordering
+    # contract — the same read, and the same caveat, as the local arm.
+    conductor = terminals[0]
+    if (
+        runtime_registry.is_remote(conductor["id"])
+        and runtime_registry.get_status(conductor["id"]) == TerminalStatus.PROCESSING
+    ):
+        logger.info("Flow %s: remote session is busy, skipping", flow_name)
+        return False
+
+    for t in remote:
+        try:
+            await remote_delete_terminal(t["id"])
+        except Exception as e:
+            # Any failure here — a refusing runtime, a disconnect, a timeout —
+            # means the previous run's session may still be alive. Do not launch
+            # a second one into it.
+            logger.warning(
+                "Flow %s: remote cleanup deferred for terminal %s: %s", flow_name, t["id"], e
+            )
+            return False
+    return True
+
+
 def _is_terminal_busy(terminal_id: str) -> bool:
     try:
         return status_monitor.get_status(terminal_id) == TerminalStatus.PROCESSING
@@ -410,6 +545,14 @@ async def execute_flow(name: str) -> bool:
         # Launch session
         session_name = f"cao-flow-{flow.name}"
         terminals = list_terminals_by_session(session_name)
+        # Remote rows first: their session is in another pod, so nothing below
+        # can see or clean it. Re-read afterwards so a session whose placement
+        # changed between runs (the operator set or cleared CAO_FLOW_RUNTIME)
+        # still has its local leftovers handled by the local arm.
+        if _remote_flow_terminals(terminals):
+            if not await _recycle_remote_flow_terminals(name, terminals):
+                return False
+            terminals = list_terminals_by_session(session_name)
         if get_backend().session_exists(session_name):
             # Only check the first (conductor) terminal for busy status.
             # Worker terminals spawned by the conductor may have stale status
@@ -477,19 +620,7 @@ async def execute_flow(name: str) -> bool:
                 logger.warning("Flow %s has retained terminal cleanup; deferring next run", name)
                 return False
             delete_terminals_by_session(session_name)
-        terminal = await create_terminal(
-            session_name=session_name,
-            provider=flow.provider,
-            agent_profile=flow.agent_profile,
-            new_session=True,
-            engine=flow.engine,
-            # The agent this schedule launches works for whoever REGISTERED the
-            # schedule, not for whoever the daemon runs as (#745). Carrying it
-            # onto the terminal row is what lets the same owner be read later,
-            # when this terminal sends a message and nothing about the original
-            # registration request is still in scope.
-            owner=owner.id if owner else None,
-        )
+        terminal = await _launch_flow_terminal(flow, session_name, owner.id if owner else None)
 
         # Send rendered prompt to terminal. send_input is blocking tmux I/O
         # (now additionally a pane-foreground-command probe on top of the

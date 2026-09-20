@@ -83,6 +83,7 @@ __all__ = [
     "TEARDOWN_TIMEOUT",
     "remote_terminal_command",
     "remote_delete_terminal",
+    "launch_remote_terminal",
     "relay_remote_attach",
 ]
 
@@ -240,6 +241,23 @@ async def create_remote_terminal(
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
     principal: Principal = Depends(get_current_principal),
 ) -> Terminal:
+    return await launch_remote_terminal(runtime_id, body, owner_id=principal.id)
+
+
+async def launch_remote_terminal(
+    runtime_id: str,
+    body: CreateRemoteTerminalBody,
+    owner_id: Optional[str],
+) -> Terminal:
+    """Launch one terminal in a runtime and record it centrally (#745).
+
+    Extracted from the route so the scheduler can reach it: a flow firing in the
+    server container must place its agent in an execution runtime too, and it has
+    no request to carry a principal — it passes the flow's stored owner instead.
+    Everything the route did (registry row, runtime binding, reported status)
+    happens here, in one place, because a second launch path that forgot one of
+    them would leave a terminal nobody can route to.
+    """
     conn = runtime_registry.get_runtime(runtime_id)
     if conn is None:
         raise HTTPException(
@@ -289,7 +307,7 @@ async def create_remote_terminal(
         shell_command=info.get("shell_command"),
         working_directory=body.working_directory,
         metadata={"runtime_id": runtime_id},
-        owner=principal.id,
+        owner=owner_id,
     )
     runtime_registry.bind_terminal(info["id"], runtime_id)
     try:
@@ -312,7 +330,7 @@ async def create_remote_terminal(
         shell_command=info.get("shell_command"),
         group=None,
         metadata={"runtime_id": runtime_id},
-        owner=principal.id,
+        owner=owner_id,
         status=reported,
         last_active=datetime.now(),
     )

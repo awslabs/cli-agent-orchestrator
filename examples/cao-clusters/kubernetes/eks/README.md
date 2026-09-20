@@ -64,6 +64,19 @@ running a health check does not hand an execution pod the channel token and ever
 provider credential the server holds. A pre-script that reads some other inherited
 variable works locally and sees it unset remotely.
 
+**A flow's agent session** is placed the same way, with its own variable:
+`CAO_FLOW_RUNTIME=<runtime id>` on the central server launches the scheduled
+session in that runtime. Set it whenever the server pod has no tmux of its own —
+without it the launch has nowhere to go. It is separate from
+`CAO_SCRIPT_RUNTIME` on purpose: a 5-second health check and a long-lived agent
+are different workloads, and you may well want the check beside the supervisor
+while agents go to worker pods. Recycling follows the placement: the previous
+run's session is torn down in the runtime that holds it, and a teardown that does
+not confirm defers the run instead of launching a second agent alongside the
+first. Unlike a script, a named-but-disconnected flow runtime does not fall back
+to the server — the run fails, because falling back would start the agent in the
+container this boundary exists to keep user code out of.
+
 **Broker bridge mode (#745 step 4):** set `CAO_ELASTIC_WORKER_MODE=bridge` and
 `CAO_ELASTIC_CENTRAL_URL` on the broker (see `broker.yaml`), and give the
 namespace a `cao-runtime-token` Secret shared with the central server. The
