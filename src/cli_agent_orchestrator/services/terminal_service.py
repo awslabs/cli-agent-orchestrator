@@ -49,6 +49,7 @@ from cli_agent_orchestrator.clients.database import (
     update_last_active,
     update_terminal_group,
     update_terminal_metadata,
+    update_terminal_provider_variant,
     update_terminal_shell_command,
 )
 from cli_agent_orchestrator.constants import (
@@ -1436,6 +1437,9 @@ async def create_terminal(
                 shell_command = None
             if shell_command:
                 update_terminal_shell_command(terminal_id, shell_command)
+            runtime_variant = getattr(provider_instance, "runtime_variant", None)
+            if isinstance(runtime_variant, str) and runtime_variant:
+                update_terminal_provider_variant(terminal_id, runtime_variant)
 
         # Build and return the Terminal object. In the deferred-init path the
         # provider is still initializing on a background task, so the terminal
@@ -1981,6 +1985,9 @@ def _schedule_deferred_init(
             shell_command = provider_instance.shell_baseline
             if isinstance(shell_command, str) and shell_command:
                 update_terminal_shell_command(terminal_id, shell_command)
+            runtime_variant = getattr(provider_instance, "runtime_variant", None)
+            if isinstance(runtime_variant, str) and runtime_variant:
+                update_terminal_provider_variant(terminal_id, runtime_variant)
             if initial_message:
                 # For assign/handoff the sender is the CALLER (the supervisor),
                 # not this MCP server; _assign_impl on the MCP-server side already

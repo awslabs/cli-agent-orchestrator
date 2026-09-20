@@ -47,6 +47,11 @@ class TerminalModel(Base):
     shell_command = Column(String, nullable=True)  # shell process name captured before kiro launch
     caller_id = Column(String, nullable=True)  # terminal that created this one (callback target)
     engine = Column(String, nullable=True)  # resolved Kiro engine; NULL for legacy/non-Kiro rows
+    # Provider-specific launch variant whose semantics must survive cao-server
+    # restarts.  Kept generic so providers other than Kimi can use the same
+    # lifecycle seam without overloading Kiro's ``engine`` or user-owned
+    # ``metadata``.  Currently Kimi stores ``legacy`` / ``code`` here.
+    provider_variant = Column(String, nullable=True)
     # Ordered, general-to-specific array of strings (JSON-encoded), e.g.
     # '["tenant_1", "project_5", "folder_12"]'. CAO only does ordered-prefix
     # matching (list_siblings); consumers own what the levels mean (#432).
@@ -1763,6 +1768,10 @@ def _migrate_terminals_schema() -> None:
             conn.execute("ALTER TABLE terminals ADD COLUMN engine TEXT")
             conn.commit()
             logger.info("Migration: added engine column to terminals table")
+        if "provider_variant" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN provider_variant TEXT")
+            conn.commit()
+            logger.info("Migration: added provider_variant column to terminals table")
         if "group" not in columns:
             # "group" is a SQL reserved word in some dialects but not SQLite;
             # quoted defensively so this ALTER survives if that ever changes.
@@ -1792,6 +1801,7 @@ def create_terminal(
     shell_command: Optional[str] = None,
     caller_id: Optional[str] = None,
     engine: Optional[str] = None,
+    provider_variant: Optional[str] = None,
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
     working_directory: Optional[str] = None,
@@ -1831,6 +1841,7 @@ def create_terminal(
             shell_command=shell_command,
             caller_id=caller_id,
             engine=engine,
+            provider_variant=provider_variant,
             group=_json.dumps(group) if group else None,
             metadata_json=_json.dumps(metadata) if metadata else None,
         )
@@ -1861,6 +1872,7 @@ def create_terminal(
             "shell_command": terminal.shell_command,
             "caller_id": terminal.caller_id,
             "engine": terminal.engine,
+            "provider_variant": terminal.provider_variant,
             # Normalized the same way as what was actually stored (an empty
             # container is stored as NULL, same as omitted) -- self-ROAST
             # finding: echoing the raw `group`/`metadata` input here made
@@ -1965,6 +1977,7 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "shell_command": terminal.shell_command,
             "caller_id": terminal.caller_id,
             "engine": terminal.engine or ("v2" if terminal.provider == "kiro_cli" else None),
+            "provider_variant": terminal.provider_variant,
             "group": group,
             "metadata": metadata,
             "last_active": terminal.last_active,
@@ -2201,6 +2214,18 @@ def update_terminal_shell_command(terminal_id: str, shell_command: str) -> bool:
         terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
         if terminal:
             terminal.shell_command = shell_command
+            db.commit()
+            return True
+        return False
+
+
+def update_terminal_provider_variant(terminal_id: str, provider_variant: str) -> bool:
+    """Persist a resolved provider runtime variant for restart reconstruction."""
+
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if terminal:
+            terminal.provider_variant = provider_variant
             db.commit()
             return True
         return False

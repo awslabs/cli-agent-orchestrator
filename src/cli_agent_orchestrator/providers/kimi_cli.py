@@ -146,6 +146,27 @@ class KimiDialect(enum.Enum):
     UNKNOWN = "unknown"
 
 
+def restore_kimi_dialect(value: Optional[str]) -> Optional[KimiDialect]:
+    """Parse a persisted Kimi runtime variant, failing closed on bad state.
+
+    ``None`` is the only legacy-row case: terminals created before dialect
+    persistence simply have no recoverable variant and continue using the
+    historical fallback.  Once a value is present it must name a launchable
+    dialect; persisting/restoring ``UNKNOWN`` would silently guess semantics for
+    a terminal whose CLI family was never established.
+    """
+
+    if value is None:
+        return None
+    try:
+        dialect = KimiDialect(value)
+    except ValueError as exc:
+        raise UnsupportedKimiError(f"Unsupported persisted Kimi dialect: {value!r}") from exc
+    if dialect is KimiDialect.UNKNOWN:
+        raise UnsupportedKimiError("Cannot restore an UNKNOWN Kimi dialect")
+    return dialect
+
+
 # =============================================================================
 # Dialect detection — capability signature
 # =============================================================================
@@ -760,6 +781,19 @@ class KimiCliProvider(BaseProvider):
         # Latched once the workspace-trust dialog has been answered, so its
         # lingering text cannot cause a second keypress.
         self._trust_handled = False
+
+    @property
+    def runtime_variant(self) -> Optional[str]:
+        """Resolved launch dialect to persist with terminal lifecycle metadata."""
+
+        if self._dialect in (KimiDialect.LEGACY, KimiDialect.CODE):
+            return self._dialect.value
+        return None
+
+    def restore_runtime_variant(self, value: Optional[str]) -> None:
+        """Restore the launch dialect for an already-running terminal."""
+
+        self._dialect = restore_kimi_dialect(value)
 
     @property
     def paste_enter_count(self) -> int:
