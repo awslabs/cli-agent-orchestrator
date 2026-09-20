@@ -765,10 +765,24 @@ compatibility window.
 What a version mismatch actually looks like matters, because it is not a crash.
 The server answers with its own `hello` and closes `1002`; the bridge raises
 `protocol version mismatch: server N, bridge M`, and its reconnect loop treats
-that like any other connection failure — it backs off and retries, with the
-readiness marker cleared in `finally`. So the pod **never becomes Ready and is
-never dispatched work**: it sits at `0/1`, logs the mismatch on every attempt, and
-keeps whatever tmux sessions it already had. Nothing half-works.
+that like any other connection failure — it backs off (1s, doubling to a 30s
+ceiling) and retries, with the readiness marker cleared in `finally`. So the pod
+**never becomes Ready and is never dispatched work**: it sits at `0/1`, logs the
+mismatch on every attempt, and keeps whatever tmux sessions it already had.
+Nothing half-works.
+
+Observed in this namespace during #745's validation, when two executors were
+left on an older image while the server moved to `PROTOCOL_VERSION` 2: both sat
+at `0/1` for hours, neither appeared in `GET /runtimes`, and no work reached
+them — the gate behaving exactly as described. It also exposed a retry bug now
+fixed: the backoff was reset as soon as the socket opened, and a mismatch is
+raised after that, so an incompatible runtime retried at a flat 1s forever
+(6346 log lines from one pod). The reset now requires a completed hello, so a
+permanent mismatch settles at the 30s ceiling while a runtime that merely lost a
+working channel still comes back in about a second. Measured against this
+namespace's server from one executor pod, dialing with a deliberately bumped
+version: **60 attempts in 60s** before the fix, all gaps 1.01s; **7 attempts in
+90s** after, gaps `1, 2, 4, 8, 16, 30`.
 
 An auth failure (401/403) is the one case handled differently: it is re-raised
 rather than retried, because retrying a rejected credential is noise. `cao-bridge`

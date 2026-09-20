@@ -562,6 +562,23 @@ probe appeared in exactly one pod's pane. Note that `ps | grep cao-server` is
   with the terminal still reaching `completed` — the runtime's own verdict, which
   is the only one that was ever informed.
 
+- **An incompatible runtime backs off instead of hot-looping.** The compatibility
+  gate itself held up in the field: two executors left on an older image while the
+  server moved to `PROTOCOL_VERSION` 2 stayed `0/1`, never appeared in
+  `GET /runtimes`, and were never dispatched work. What the same observation
+  exposed is that the reconnect backoff was reset as soon as
+  `websockets.connect` returned — and every failure that is *permanent* happens
+  after that point, so a mismatched runtime retried at a flat 1s indefinitely
+  (6346 log lines from one pod). The reset now requires a completed hello, the
+  same condition the readiness marker already used, for the same reason: a socket
+  that opened is not a runtime that works. A mismatch settles at the 30s ceiling;
+  a runtime that lost a channel it had been serving still returns in about a
+  second. Coverage: 2 tests, each mutation-checked in both directions — resetting
+  at connect fails the growth test, never resetting fails the recovery test — and
+  **measured on the cluster** by dialing the live server from an executor pod with
+  a deliberately bumped version: 60 attempts in 60s (every gap 1.01s) before the
+  fix, 7 attempts in 90s with gaps `1, 2, 4, 8, 16, 30` after.
+
 **Deferred to its own workstream:**
 
 - **Per-runtime delegated credentials** — explicitly #774's scope. Both the

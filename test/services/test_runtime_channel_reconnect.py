@@ -247,3 +247,88 @@ class TestReconnectRecovery:
 
         assert ws.frames_of(StreamFrame) == []
         assert ws.frames_of(GapFrame) == []
+
+
+class TestReconnectBackoff:
+    """What the retry delay is allowed to reset on (#745).
+
+    Found on the cluster: two executors left on an older ``PROTOCOL_VERSION``
+    retried once a second for hours. The backoff was reset as soon as
+    ``websockets.connect`` returned, and a version mismatch is raised after that
+    point, so the growth could never happen for the one failure that is
+    permanent. The pod is correctly never Ready either way — the cost is log
+    volume against a server that has already refused it.
+    """
+
+    @staticmethod
+    async def _delays_over(monkeypatch, tmp_path, server_hello, attempts):
+        """Run the reconnect loop for ``attempts`` connections; return the
+        delays it waited between them."""
+        import cli_agent_orchestrator.runtime_channel.bridge as bridge_mod
+
+        # Private marker path: this drives the real run loop, which announces
+        # readiness on an established channel.
+        monkeypatch.setenv(bridge_mod.READY_FILE_ENV, str(tmp_path / "bridge-connected"))
+        # Scaled down so the assertions are about the shape of the growth, not
+        # about waiting for it.
+        monkeypatch.setattr(bridge_mod, "RECONNECT_BACKOFF_INITIAL", 0.01)
+        monkeypatch.setattr(bridge_mod, "RECONNECT_BACKOFF_MAX", 10.0)
+
+        bridge = _bridge()
+        connects = []
+        delays = []
+
+        class _Conn:
+            async def __aenter__(self):
+                return _FakeWS(server_hello)
+
+            async def __aexit__(self, *exc):
+                return False
+
+        def fake_connect(*a, **k):
+            connects.append(True)
+            if len(connects) >= attempts:
+                # Last attempt: the loop exits after this iteration instead of
+                # reconnecting forever.
+                bridge._stop.set()
+            return _Conn()
+
+        monkeypatch.setattr(bridge_mod.websockets, "connect", fake_connect)
+        real_wait_for = asyncio.wait_for
+
+        async def recording_wait_for(awaitable, timeout=None):
+            delays.append(timeout)
+            return await real_wait_for(awaitable, timeout=timeout)
+
+        monkeypatch.setattr(asyncio, "wait_for", recording_wait_for)
+        await real_wait_for(bridge.run(), timeout=10)
+        assert len(connects) == attempts
+        return delays
+
+    @pytest.mark.asyncio
+    async def test_a_channel_that_never_gets_past_hello_backs_off(self, monkeypatch, tmp_path):
+        delays = await self._delays_over(
+            monkeypatch,
+            tmp_path,
+            HelloFrame(protocol_version=PROTOCOL_VERSION + 1, runtime_id="server"),
+            attempts=4,
+        )
+
+        assert delays == [0.01, 0.02, 0.04, 0.08], "each refused hello must wait longer"
+
+    @pytest.mark.asyncio
+    async def test_a_channel_that_worked_starts_over(self, monkeypatch, tmp_path):
+        """The reset still has to happen for the case it was written for.
+
+        A runtime whose server restarted, or whose network blinked, established
+        a channel before losing it — that one must come back promptly rather
+        than inheriting a delay from an earlier outage.
+        """
+        delays = await self._delays_over(
+            monkeypatch,
+            tmp_path,
+            HelloFrame(protocol_version=PROTOCOL_VERSION, runtime_id="server"),
+            attempts=4,
+        )
+
+        assert delays == [0.01, 0.01, 0.01, 0.01], "a working channel resets the backoff"

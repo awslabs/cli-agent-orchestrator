@@ -126,6 +126,9 @@ class Bridge:
         # Interactive attach PTYs by terminal_id (#776): the PTY subprocess
         # lives HERE, beside the tmux socket; only bytes cross the channel.
         self._attach: Dict[str, dict] = {}
+        # Whether the current attempt got past the hello exchange. Read by the
+        # reconnect loop to decide if the backoff earned a reset.
+        self._established = False
 
     # --- outbound plumbing ---
 
@@ -692,7 +695,9 @@ class Bridge:
 
         logger.info("runtime channel established to %s", self._server_url)
         # After the hello exchange and the replay, not at connect: a socket that
-        # opened but failed version negotiation is not a working runtime.
+        # opened but failed version negotiation is not a working runtime. The
+        # reconnect backoff reads the same flag for the same reason.
+        self._established = True
         mark_channel_ready()
         async for raw in ws:
             frame: Frame = decode_frame(raw)
@@ -713,13 +718,16 @@ class Bridge:
         # report a channel that does not exist, so start from unready.
         clear_channel_ready()
         while not self._stop.is_set():
+            self._established = False
+            # Held rather than logged in place, so the delay in the message is
+            # the delay actually waited — it is decided below, not here.
+            reason = None
             try:
                 async with websockets.connect(
                     self._server_url,
                     additional_headers={RUNTIME_TOKEN_HEADER: self._token},
                     max_size=16 * 1024 * 1024,
                 ) as ws:
-                    backoff = RECONNECT_BACKOFF_INITIAL
                     await self._serve(ws)
             except asyncio.CancelledError:
                 raise
@@ -730,12 +738,22 @@ class Bridge:
                     # it were a transient network error (#776).
                     logger.error("runtime channel authentication rejected (%s)", status_code)
                     raise
-                logger.warning("runtime channel rejected (%s); retrying in %.0fs", e, backoff)
+                reason = f"rejected ({e})"
             except Exception as e:
-                logger.warning("runtime channel lost (%s); retrying in %.0fs", e, backoff)
+                reason = f"lost ({e})"
             finally:
                 self._ws = None
                 clear_channel_ready()
+            if self._established:
+                # A channel that actually worked starts the next backoff over;
+                # one that only opened does not. Resetting at connect instead
+                # pins a permanently incompatible runtime — wrong PROTOCOL_VERSION,
+                # say — to a 1s retry forever, because its failure always comes
+                # after the socket is up. It never becomes Ready either way, so
+                # the only thing the tight loop produces is log volume.
+                backoff = RECONNECT_BACKOFF_INITIAL
+            if reason is not None:
+                logger.warning("runtime channel %s; retrying in %.0fs", reason, backoff)
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=backoff)
             except asyncio.TimeoutError:
