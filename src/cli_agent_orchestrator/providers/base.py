@@ -20,6 +20,8 @@ and output format to reliably detect status changes.
 """
 
 import logging
+import math
+import os
 import re
 import time
 from abc import ABC, abstractmethod
@@ -31,6 +33,87 @@ if TYPE_CHECKING:
     from cli_agent_orchestrator.models.agent_profile import AgentProfile
 
 logger = logging.getLogger(__name__)
+
+# harness-control#890 (operator invariant, 2026-08-15): "no amount of CPU load may tear down a live
+# process". A cold-start CLI shell that cannot reach IDLE inside a fixed init budget is SLOW, not
+# dead -- and on an oversubscribed box (load >> cores) a 5-10s cold start routinely blows a 60s
+# budget purely because CPU is contended, which used to route straight to kill_window (a live pane
+# torn down by a performance signal). The durable answer is to DEGRADE THROUGHPUT, not liveness:
+# scale every init/settle timeout UP with the current 1-minute load average per core, so a busy box
+# simply waits longer instead of declaring a still-initializing pane dead. Read here from the
+# environment (floats) rather than get_server_settings(), whose overlay int-coerces every key.
+_DEFAULT_INIT_TIMEOUT_LOAD_MAX_FACTOR = 6.0
+
+
+def _env_float(name: str, default: float) -> float:
+    """Parse a CAO_* env override as a FINITE, NON-NEGATIVE float, else fall back to `default`.
+
+    Never raises: a misconfigured env var degrades to the default (and is logged once at DEBUG),
+    it never takes down the init path it is meant to make more forgiving.
+
+    ``float()`` alone is not enough, and the gap is not academic (PR #623 review): it happily
+    accepts ``"inf"``, ``"-inf"`` and ``"nan"``, each of which silently bypasses the fallback this
+    function promises and lands a value no caller can act on. ``CAO_INPUT_READY_TIMEOUT=inf``
+    makes the settle loop's ``time.monotonic() + timeout`` deadline infinite, so a pane that never
+    matches is waited on FOREVER; ``nan`` makes every ``<`` comparison against the deadline False,
+    so the same loop expires on its first iteration. A negative duration is the same class of
+    bug -- a deadline already in the past. Every value this helper resolves is a duration or a
+    scaling factor, so non-finite and negative are both rejected here rather than at each call
+    site, where the next reader of a new CAO_* knob would have to rediscover the hazard."""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        val = float(raw)
+    except ValueError:
+        logger.debug(
+            "Ignoring invalid %s=%r (expected float); using default %s", name, raw, default
+        )
+        return default
+    if not math.isfinite(val) or val < 0:
+        logger.debug(
+            "Ignoring out-of-range %s=%r (expected a finite, non-negative float); using default %s",
+            name,
+            raw,
+            default,
+        )
+        return default
+    return val
+
+
+def load_scaled_timeout(base_seconds: float) -> float:
+    """harness-control#890: scale a base timeout up by the per-core 1-minute load average.
+
+    Returns `base_seconds * clamp(load1 / cores, 1.0, CAO_INIT_TIMEOUT_LOAD_MAX_FACTOR)`. At or
+    below full utilization (load1 <= cores) this is a no-op (factor 1.0) -- the timeout is only
+    ever EXTENDED under contention, never shortened, so this can never make teardown-on-timeout
+    MORE aggressive than the pre-#890 fixed value. `CAO_INIT_TIMEOUT_LOAD_MAX_FACTOR` (default
+    6.0) bounds the extension so a runaway load spike can't push a single init to an unbounded
+    wait. Set the factor to 1.0 to disable load-awareness entirely. os.getloadavg() is unavailable
+    on some platforms (raises OSError/AttributeError) -- there we fall back to the base unchanged.
+    """
+    max_factor = _env_float(
+        "CAO_INIT_TIMEOUT_LOAD_MAX_FACTOR", _DEFAULT_INIT_TIMEOUT_LOAD_MAX_FACTOR
+    )
+    if max_factor <= 1.0:
+        return base_seconds
+    try:
+        load1 = os.getloadavg()[0]
+        cores = os.cpu_count() or 1
+    except (OSError, AttributeError, IndexError):
+        return base_seconds
+    factor = max(1.0, load1 / cores)
+    factor = min(factor, max_factor)
+    if factor > 1.0:
+        logger.debug(
+            "load-aware timeout: base %.1fs -> %.1fs (load1=%.2f, cores=%d, factor=%.2f)",
+            base_seconds,
+            base_seconds * factor,
+            load1,
+            cores,
+            factor,
+        )
+    return base_seconds * factor
 
 
 class OutputExtractionError(ValueError):
@@ -44,6 +127,22 @@ class OutputExtractionError(ValueError):
     Subclasses ``ValueError`` so existing ``except ValueError`` callers keep
     working; the API boundary catches this narrower type first so an extraction
     failure is not reported as 404 Not Found (issue #570).
+    """
+
+
+class UnknownTerminalError(ValueError):
+    """A terminal id has no registry row: it never existed, or it has just been deleted.
+
+    Narrower than the other ``ValueError``s ``ProviderManager.get_provider`` can raise, which all
+    describe a terminal that DOES exist but whose provider could not be CONSTRUCTED -- an unknown
+    persisted provider type, a Kiro row with no ``agent_profile``, a ``resume_session_id`` on a
+    non-``claude_code`` provider. Those are real faults that must stay loud. Only this one means
+    "there is nothing left to act on", which is the ordinary race during terminal deletion.
+
+    Subclasses ``ValueError`` so every pre-existing ``except ValueError`` caller keeps working
+    unchanged; callers that need to tell the two apart (``StatusMonitor._process_chunk``) catch
+    this type instead. Raised in ``providers/manager.py``. (PR #623 review, Copilot on
+    ``status_monitor.py``.)
     """
 
 
@@ -635,8 +734,13 @@ class BaseProvider(ABC):
         from cli_agent_orchestrator.services.settings_service import get_server_settings
 
         if profile is not None and profile.provider_init_timeout is not None:
-            return profile.provider_init_timeout
-        return int(get_server_settings()["provider_init_timeout"])
+            base = profile.provider_init_timeout
+        else:
+            base = int(get_server_settings()["provider_init_timeout"])
+        # harness-control#890: extend (never shorten) the init budget under CPU contention so a
+        # cold start on an oversubscribed box waits instead of being declared dead. See
+        # load_scaled_timeout's own docstring.
+        return int(load_scaled_timeout(base))
 
     def _translate_path(self, path: str, profile: Optional["AgentProfile"] = None) -> str:
         """Translate a host path to a container guest path using profile path_maps.

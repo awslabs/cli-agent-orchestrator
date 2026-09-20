@@ -75,7 +75,7 @@ from cli_agent_orchestrator.plugins import (
     PostKillTerminalEvent,
     PostSendMessageEvent,
 )
-from cli_agent_orchestrator.providers.base import OutputExtractionError
+from cli_agent_orchestrator.providers.base import OutputExtractionError, load_scaled_timeout
 from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroCapabilities,
     KiroPhase0KASError,
@@ -649,6 +649,74 @@ def _request_fingerprint(
     return hashlib.sha256(
         "\x00".join(_fingerprint_component(part) for part in parts).encode("utf-8")
     ).hexdigest()
+
+
+def _init_timeout_left_a_live_cli(
+    provider_instance,
+    terminal_id: str,
+    pre_init_command: Optional[str],
+) -> bool:
+    """Is there POSITIVE evidence that an init ``TimeoutError`` left a live CLI in the pane?
+
+    harness-control#890's invariant is "no amount of CPU LOAD may tear down a live process" --
+    which is a statement about a pane that is demonstrably alive. A bare ``TimeoutError`` does not
+    establish that (PR #623 review, Copilot on ``terminal_service.py``): providers raise the same
+    exception type for a genuinely broken launch. ``ClaudeCodeProvider.initialize()`` is the
+    worked example -- its final ``raise TimeoutError`` is documented in-place as the
+    "genuinely broken/unrecognized launch" path, deliberately chosen over a keep-alive signal
+    "rather than leaving an unreapable worker alive in UNKNOWN status". Treating every provider
+    timeout as proof of liveness silently overrode that decision for every provider at once.
+
+    So the keep-alive branch is opt-in ON EVIDENCE, and this is the evidence: the pane's
+    FOREGROUND COMMAND changed from what it was immediately before ``initialize()`` ran. Before
+    init the pane runs the login shell; ``initialize()``'s job is to launch the CLI into it. A
+    foreground command that is still the pre-init shell therefore means the CLI is not running --
+    it never launched, or it launched and already exited -- and there is no live process to
+    protect, so the caller must fall through to the pre-existing rollback path. This is the same
+    signal ``codex``/``kiro_cli``/``omp`` already use for "the TUI exited, the shell is showing
+    again" (see ``BaseProvider.shell_baseline``).
+
+    Returns False on ANY absence of evidence -- backend error, window gone, a backend that cannot
+    report a foreground command (``None``), or an unchanged command. Failing to the rollback path
+    keeps the pre-#890 behaviour as the default and confines the new keep-alive to the case it was
+    written for, rather than making an unavailable probe silently protective.
+    """
+    try:
+        current = get_backend().get_pane_current_command(
+            provider_instance.session_name, provider_instance.window_name
+        )
+    except Exception as probe_error:
+        logger.warning(
+            "Terminal %s: init timed out and the pane-liveness probe failed (%r); treating the "
+            "timeout as a real failure and rolling back, not keeping an unverified pane.",
+            terminal_id,
+            probe_error,
+        )
+        return False
+    if not current:
+        logger.warning(
+            "Terminal %s: init timed out and the backend reported no foreground command for the "
+            "pane; no evidence of a live CLI, so rolling back rather than keeping it.",
+            terminal_id,
+        )
+        return False
+    if current == pre_init_command:
+        logger.warning(
+            "Terminal %s: init timed out and the pane is still running its pre-init shell (%r) -- "
+            "the CLI never launched or has already exited. Rolling back; harness-control#890's "
+            "keep-alive covers a SLOW live process, not an absent one.",
+            terminal_id,
+            current,
+        )
+        return False
+    logger.info(
+        "Terminal %s: init timed out but the pane is running %r (was %r before init) -- the CLI "
+        "process is alive, so this is a performance signal, not liveness loss.",
+        terminal_id,
+        current,
+        pre_init_command,
+    )
+    return True
 
 
 async def create_terminal(
@@ -1408,6 +1476,19 @@ async def create_terminal(
             resume_session_id=resume_session_id,
         )
 
+        # harness-control#890: set when a synchronous init timed out but the live pane was kept
+        # (see the `except TimeoutError` below) -- drives the terminal's reported status to UNKNOWN.
+        init_timed_out = False
+
+        # Baseline for the pane-liveness check that gates that keep-alive: the foreground command
+        # BEFORE initialize() launches the CLI into the pane, i.e. the login shell. Captured here
+        # (not after the timeout, when it is too late) and handed to both the synchronous path
+        # below and the deferred one. See _init_timeout_left_a_live_cli.
+        try:
+            pre_init_command = get_backend().get_pane_current_command(session_name, window_name)
+        except Exception:
+            pre_init_command = None
+
         # Deferred-init path: return fast so callers (e.g. MCP assign) do not
         # block on `provider.initialize()`. The remaining initialize + input
         # send runs as a background task, so two concurrent assigns can each
@@ -1423,16 +1504,51 @@ async def create_terminal(
                 initial_message,
                 initial_message_orchestration_type,
                 registry,
+                pre_init_command=pre_init_command,
             )
         else:
-            await provider_instance.initialize()
+            try:
+                await provider_instance.initialize()
 
-            # Persist shell_command baseline if the provider captured one
-            shell_command = provider_instance.shell_baseline
-            if not isinstance(shell_command, str):
+                # Persist shell_command baseline if the provider captured one
+                shell_command = provider_instance.shell_baseline
+                if not isinstance(shell_command, str):
+                    shell_command = None
+                if shell_command:
+                    update_terminal_shell_command(terminal_id, shell_command)
+            except TimeoutError as te:
+                # harness-control#890 (operator invariant, 2026-08-15): "no amount of CPU load may
+                # tear down a live process." A provider init TimeoutError on a pane whose CLI is
+                # VERIFIABLY RUNNING is a PERFORMANCE signal, not death -- the process is alive,
+                # just too slow to reach IDLE within the (already load-scaled, see get_init_timeout)
+                # budget on a contended box. Routing that to the except-block below would
+                # kill_window / kill_session (the harness-control#186 orphan-cleanup path) -- i.e.
+                # destroy a live pane because CPU was busy, the exact self-sustaining recreate storm
+                # this issue closes. Instead we KEEP the live substrate (DB row, tmux window, FIFO
+                # reader, provider, status monitor -- all already wired up above) and report the
+                # terminal as UNKNOWN, identical to the deferred-init path: the StatusMonitor pushes
+                # its real status the moment the CLI finally settles, and clients poll
+                # GET /terminals/{id}.
+                #
+                # The liveness check is what keeps this narrow (PR #623 review, Copilot): without
+                # it, EVERY provider TimeoutError was treated as proof of life, including
+                # ClaudeCodeProvider's own documented "genuinely broken/unrecognized launch" raise.
+                # A timeout with no live CLI in the pane re-raises here and takes the unchanged
+                # teardown path below, exactly as it did before #890.
+                if not _init_timeout_left_a_live_cli(
+                    provider_instance, terminal_id, pre_init_command
+                ):
+                    raise
+                logger.warning(
+                    "Provider init for terminal %s did not settle within its (load-scaled) budget "
+                    "(%s) -- the pane's CLI is still running, so KEEPING it and reporting UNKNOWN "
+                    "rather than tearing it down (harness-control#890: CPU load is not liveness "
+                    "loss). It will report IDLE once it settles.",
+                    terminal_id,
+                    te,
+                )
+                init_timed_out = True
                 shell_command = None
-            if shell_command:
-                update_terminal_shell_command(terminal_id, shell_command)
 
         # Build and return the Terminal object. In the deferred-init path the
         # provider is still initializing on a background task, so the terminal
@@ -1440,7 +1556,11 @@ async def create_terminal(
         # can't mistake it for ready and send input early. Callers poll
         # GET /terminals/{id} for the live status once init completes. The
         # synchronous path has already reached IDLE by here.
-        initial_status = TerminalStatus.UNKNOWN if defer_init else TerminalStatus.IDLE
+        # harness-control#890: an init that TIMED OUT but was kept alive (see the
+        # `except TimeoutError` above) is likewise not-yet-ready -> UNKNOWN, not a fake IDLE.
+        initial_status = (
+            TerminalStatus.UNKNOWN if (defer_init or init_timed_out) else TerminalStatus.IDLE
+        )
         terminal = Terminal(
             id=terminal_id,
             name=window_name,
@@ -1724,6 +1844,21 @@ _DEFERRED_STARTED_STATUSES = {
     TerminalStatus.WAITING_USER_ANSWER,
 }
 
+# A slow-but-live worker (PR #623 review, Copilot on terminal_service.py) whose init timed out has
+# NOT received its initial_message: _run() jumped straight from initialize() to the exception
+# handler, past the send_input below. Rather than tell the caller the task is queued when nothing
+# queued it, wait for the CLI to finish settling on its own and deliver it then.
+#
+# {IDLE, COMPLETED} only, deliberately NOT WAITING_USER_ANSWER: send_input refuses to type an
+# orchestrated task into a live choice prompt (TerminalInputBlockedError), so "settled" here must
+# mean "actually accepting input". A worker that parks on a prompt never satisfies this wait and
+# the caller is told the truth instead.
+_SLOW_INIT_READY_STATUSES = {TerminalStatus.IDLE, TerminalStatus.COMPLETED}
+# Base budget for that second wait, load-scaled by the same rule as init itself: the reason we are
+# here at all is that the box is slow. Bounded, so a worker that never settles is reported rather
+# than waited on forever.
+_SLOW_INIT_SETTLE_TIMEOUT = 120.0
+
 
 def _worker_is_started_direct(terminal_id: str, provider) -> bool:
     """Direct visible-screen status check bypassing the event-driven status cache.
@@ -1949,12 +2084,72 @@ async def _confirm_worker_started_or_resubmit(
     return False
 
 
+async def _deliver_after_slow_init(
+    provider_instance,
+    terminal_id: str,
+    initial_message: str,
+    orchestration_type: Optional[OrchestrationType],
+    registry: "PluginRegistry | None",
+) -> bool:
+    """Deliver the initial task to a worker whose init timed out while staying alive.
+
+    ``_run()``'s ``except TimeoutError`` fires from inside ``await provider_instance.initialize()``,
+    so control never reaches the ``send_input`` that delivers ``initial_message`` -- the worker is
+    kept alive holding no task at all. Without this, the caller was told the worker "will pick up
+    the task once it settles" when nothing would ever hand it over, and a supervisor waiting on the
+    resulting callback waits forever (PR #623 review, Copilot).
+
+    Waits (bounded, load-scaled) for the CLI to finish settling on its own, then reuses the normal
+    deferred-delivery path -- ``send_input`` plus ``_confirm_worker_started_or_resubmit``, which
+    already handles a dropped paste / swallowed Enter. Returns True only when the worker is
+    confirmed to have STARTED the task; False means the caller must be told the task was not
+    delivered.
+    """
+    settle_timeout = load_scaled_timeout(_SLOW_INIT_SETTLE_TIMEOUT)
+    logger.info(
+        "Deferred init for terminal %s timed out but the worker is alive; waiting up to %.0fs for "
+        "it to settle so its assigned task can still be delivered.",
+        terminal_id,
+        settle_timeout,
+    )
+    if not await wait_until_status(
+        terminal_id,
+        _SLOW_INIT_READY_STATUSES,
+        timeout=settle_timeout,
+        polling_interval=1.0,
+    ):
+        return False
+
+    metadata = await asyncio.to_thread(get_terminal_metadata, terminal_id)
+    caller_id = metadata.get("caller_id") if metadata else None
+    # Same guard-eligible default as the normal deferred path: this is an unattended initial-task
+    # delivery, never an interactive human answer.
+    effective_orchestration_type = orchestration_type or OrchestrationType.ASSIGN
+    await asyncio.to_thread(
+        send_input,
+        terminal_id,
+        initial_message,
+        registry=registry,
+        sender_id=caller_id,
+        orchestration_type=effective_orchestration_type,
+    )
+    return await _confirm_worker_started_or_resubmit(
+        terminal_id,
+        initial_message,
+        registry,
+        caller_id,
+        effective_orchestration_type,
+        provider=provider_instance,
+    )
+
+
 def _schedule_deferred_init(
     provider_instance,
     terminal_id: str,
     initial_message: Optional[str],
     orchestration_type: Optional[OrchestrationType],
     registry: PluginRegistry | None,
+    pre_init_command: Optional[str] = None,
 ) -> None:
     """Kick off provider.initialize() in the background and, on success,
     deliver the initial message via send_input.
@@ -1969,6 +2164,14 @@ def _schedule_deferred_init(
     ``TerminalInputBlockedError`` (the worker is parked on a WAITING_USER_ANSWER
     prompt right after init) is NOT a teardown case: the worker is alive and
     answerable via answer_user_prompt, so we leave it in place and only log.
+
+    Nor is a ``TimeoutError`` raised over a pane whose CLI is still running
+    (harness-control#890) -- that worker is alive and merely slow, so it is kept and
+    ``_deliver_after_slow_init`` hands it the task ``initialize()`` never got far enough to
+    deliver. ``pre_init_command`` is the pane's foreground command captured by
+    ``create_terminal`` before ``initialize()`` ran; it is what makes that liveness call
+    evidence-based rather than an assumption (see ``_init_timeout_left_a_live_cli``). A timeout
+    that left NO live CLI behind still tears the worker down.
     """
 
     async def _run() -> None:
@@ -2066,6 +2269,90 @@ def _schedule_deferred_init(
                 f"clear the prompt, then re-send the task yourself (e.g. via "
                 f"send_message) -- it is not automatically re-delivered once the "
                 f"prompt is answered.",
+                registry,
+                delete_worker=False,
+            )
+        except TimeoutError as e:
+            # harness-control#890 (operator invariant): an init TimeoutError raised over a pane
+            # whose CLI is VERIFIABLY RUNNING is a PERFORMANCE signal, not death -- the process is
+            # alive, just too slow to settle under CPU load. Deleting that live worker (as the
+            # generic handler below does) is exactly "CPU load tears down a live process."
+            #
+            # The liveness probe is what keeps this narrow (PR #623 review, Copilot): a timeout
+            # with NO live CLI in the pane is a genuinely failed launch and still tears down, with
+            # the same message and delete_worker=True the generic handler has always used.
+            if not await asyncio.to_thread(
+                _init_timeout_left_a_live_cli, provider_instance, terminal_id, pre_init_command
+            ):
+                logger.error(
+                    "Deferred init for terminal %s timed out and left no live CLI in the pane: %r. "
+                    "Notifying caller and tearing down worker.",
+                    terminal_id,
+                    e,
+                )
+                await asyncio.to_thread(
+                    _notify_caller_of_deferred_failure,
+                    terminal_id,
+                    f"Worker {terminal_id} failed to initialize: {e!r}. It has been "
+                    f"deleted -- re-assign the task or report the failure.",
+                    registry,
+                    delete_worker=True,
+                )
+                return
+
+            logger.warning(
+                "Deferred init for terminal %s did not settle within its (load-scaled) budget: %r "
+                "-- KEEPING the live worker, not tearing it down (harness-control#890: CPU load is "
+                "not liveness loss). It will report IDLE once it settles.",
+                terminal_id,
+                e,
+            )
+
+            if not initial_message:
+                await asyncio.to_thread(
+                    _notify_caller_of_deferred_failure,
+                    terminal_id,
+                    f"Worker {terminal_id} is initializing slowly under load. It is still alive; "
+                    f"no task was assigned to it.",
+                    registry,
+                    delete_worker=False,
+                )
+                return
+
+            # The task was never delivered -- initialize() raised before send_input ran. Wait for
+            # the worker to settle and hand it over, rather than telling the caller it is queued.
+            try:
+                delivered = await _deliver_after_slow_init(
+                    provider_instance,
+                    terminal_id,
+                    initial_message,
+                    orchestration_type,
+                    registry,
+                )
+            except Exception as retry_error:
+                logger.error(
+                    "Deferred init for terminal %s: post-timeout delivery of the assigned task "
+                    "failed: %r. The worker stays alive; the caller is told the task was not "
+                    "delivered.",
+                    terminal_id,
+                    retry_error,
+                    exc_info=True,
+                )
+                delivered = False
+            if delivered:
+                logger.info(
+                    "Deferred init for terminal %s: worker settled after its init timeout and "
+                    "started the assigned task.",
+                    terminal_id,
+                )
+                return
+            await asyncio.to_thread(
+                _notify_caller_of_deferred_failure,
+                terminal_id,
+                f"Worker {terminal_id} is alive but its CLI did not finish initializing in time, "
+                f"so the assigned task was NOT delivered and is NOT queued for it. The worker was "
+                f"kept alive rather than deleted -- wait for it to report IDLE and re-send the "
+                f"task yourself (e.g. via send_message), or delete it and re-assign.",
                 registry,
                 delete_worker=False,
             )

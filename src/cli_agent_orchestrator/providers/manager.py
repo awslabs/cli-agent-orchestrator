@@ -7,7 +7,7 @@ from cli_agent_orchestrator.clients.database import get_terminal_metadata
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.providers.antigravity_cli import AntigravityCliProvider
-from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.providers.base import BaseProvider, UnknownTerminalError
 from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
 from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
@@ -208,7 +208,12 @@ class ProviderManager:
             Provider instance
 
         Raises:
-            ValueError: If terminal not found in database or provider creation fails
+            UnknownTerminalError: If the terminal has no row in the registry (a
+                ``ValueError`` subclass, so existing ``except ValueError`` callers are
+                unaffected). Callers that must distinguish "the terminal is gone" from
+                "the provider could not be built" catch this narrower type.
+            ValueError: If provider creation fails for a terminal that DOES exist --
+                unknown persisted provider type, missing required agent_profile, etc.
         """
         # Check if already exists
         provider = self._providers.get(terminal_id)
@@ -223,7 +228,7 @@ class ProviderManager:
         # Try to create on-demand from database metadata
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
-            raise ValueError(f"Terminal {terminal_id} not found in database")
+            raise UnknownTerminalError(f"Terminal {terminal_id} not found in database")
 
         persisted_engine = (
             resolve_kiro_engine(persisted=metadata.get("engine"))
