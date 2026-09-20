@@ -113,6 +113,132 @@ class TestRuntimeRegistry:
         assert registry.resume_position(TID, "capture") == 10
 
 
+class TestConcurrentRuntimes:
+    """Two runtimes connected at once (#745 acceptance: N workers execute
+    concurrently with input, output, results and cancellation routed to the
+    CORRECT runtime).
+
+    Every other test here registers a single runtime, which cannot fail the way
+    a shared server actually fails: with one connection, a registry that ignored
+    runtime_id entirely would still pass. These fix the routing.
+    """
+
+    T1 = "aaaa1111"
+    T2 = "bbbb2222"
+
+    @staticmethod
+    def _two_runtimes():
+        registry = RuntimeChannelRegistry()
+        sent = {"worker-1": [], "worker-2": []}
+
+        def sender(runtime_id):
+            async def send_text(text):
+                sent[runtime_id].append(decode_frame(text))
+
+            return send_text
+
+        conns = {r: registry.register(r, sender(r)) for r in sent}
+        registry.bind_terminal(TestConcurrentRuntimes.T1, "worker-1")
+        registry.bind_terminal(TestConcurrentRuntimes.T2, "worker-2")
+        return registry, conns, sent
+
+    @pytest.mark.asyncio
+    async def test_input_reaches_only_the_owning_runtime(self):
+        registry, conns, sent = self._two_runtimes()
+
+        async def respond(runtime_id, terminal_id, marker):
+            while not sent[runtime_id]:
+                await asyncio.sleep(0.01)
+            conns[runtime_id].resolve(
+                CommandResultFrame(
+                    op_id=sent[runtime_id][0].op_id,
+                    terminal_id=terminal_id,
+                    outcome=CommandOutcome.OK,
+                    payload={"marker": marker},
+                )
+            )
+
+        # Both in flight at once: each result must come back to its own caller.
+        r1, r2, _, _ = await asyncio.gather(
+            registry.send_terminal_command(self.T1, CommandType.INPUT, {"message": "one"}, 2),
+            registry.send_terminal_command(self.T2, CommandType.INPUT, {"message": "two"}, 2),
+            respond("worker-1", self.T1, "from-1"),
+            respond("worker-2", self.T2, "from-2"),
+        )
+
+        assert r1.payload["marker"] == "from-1"
+        assert r2.payload["marker"] == "from-2"
+        # And neither runtime saw the other's terminal or message.
+        assert [f.terminal_id for f in sent["worker-1"]] == [self.T1]
+        assert [f.terminal_id for f in sent["worker-2"]] == [self.T2]
+        assert sent["worker-1"][0].payload == {"message": "one"}
+        assert sent["worker-2"][0].payload == {"message": "two"}
+
+    @pytest.mark.asyncio
+    async def test_cancellation_is_routed_by_terminal_not_broadcast(self):
+        registry, conns, sent = self._two_runtimes()
+
+        async def respond():
+            while not sent["worker-2"]:
+                await asyncio.sleep(0.01)
+            conns["worker-2"].resolve(
+                CommandResultFrame(
+                    op_id=sent["worker-2"][0].op_id,
+                    terminal_id=self.T2,
+                    outcome=CommandOutcome.OK,
+                    payload={},
+                )
+            )
+
+        responder = asyncio.ensure_future(respond())
+        await registry.send_terminal_command(self.T2, CommandType.CANCEL, {}, 2)
+        await responder
+        assert sent["worker-1"] == [], "a cancel for worker-2 must not reach worker-1"
+
+    @pytest.mark.asyncio
+    async def test_one_runtime_dying_does_not_disturb_the_other(self):
+        registry, conns, sent = self._two_runtimes()
+        registry.set_status(self.T1, TerminalStatus.PROCESSING)
+        registry.set_status(self.T2, TerminalStatus.PROCESSING)
+
+        registry.unregister("worker-1", conns["worker-1"])
+
+        # The dead worker's terminal is explicitly unavailable and its status
+        # UNKNOWN rather than the stale last report...
+        with pytest.raises(RuntimeUnavailableError):
+            await registry.send_terminal_command(self.T1, CommandType.INPUT, {})
+        assert registry.get_status(self.T1) == TerminalStatus.UNKNOWN
+        # ...while the survivor keeps both its status and its channel.
+        assert registry.get_status(self.T2) == TerminalStatus.PROCESSING
+        assert "worker-2" in registry.list_runtimes()
+        assert "worker-1" not in registry.list_runtimes()
+
+        async def respond():
+            while not sent["worker-2"]:
+                await asyncio.sleep(0.01)
+            conns["worker-2"].resolve(
+                CommandResultFrame(
+                    op_id=sent["worker-2"][0].op_id,
+                    terminal_id=self.T2,
+                    outcome=CommandOutcome.OK,
+                    payload={"alive": True},
+                )
+            )
+
+        responder = asyncio.ensure_future(respond())
+        result = await registry.send_terminal_command(self.T2, CommandType.INPUT, {}, 2)
+        await responder
+        assert result.payload == {"alive": True}
+
+    def test_stream_positions_are_per_terminal(self):
+        registry, _, _ = self._two_runtimes()
+        registry.record_position(self.T1, "capture", 99)
+        # Fencing is per terminal: one busy worker must not advance another's
+        # resume point and silently skip output on reconnect.
+        assert registry.resume_position(self.T2, "capture") == 0
+        assert registry.resume_position(self.T1, "capture") == 99
+
+
 @pytest.fixture()
 def channel_client(monkeypatch, tmp_path):
     """TestClient wired to the real app with a runtime token configured."""

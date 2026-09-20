@@ -10,8 +10,13 @@ contract rather than one provider's quirks." Two enforcement layers:
    forwards each provider identifier opaquely into the shared
    ``terminal_service.create_terminal`` seam and reports the terminal back
    unchanged. Paid providers are covered by this fixture without live
-   credentials; mock_cli and claude_code additionally run live (EKS / local
-   e2e respectively).
+   credentials.
+
+What this file does NOT do: run a provider for real. The fixture patches
+``create_terminal``, so it proves the identifier travels opaquely, not that an
+agent executed. The live evidence for claude_code over cao-bridge is a manual
+run on EKS recorded in design.md; there is no automated non-mock gate in this
+suite, and claiming one here would be claiming CI coverage that does not exist.
 """
 
 import asyncio

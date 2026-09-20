@@ -87,9 +87,15 @@ used to be.
 
 ## 4. Runtime channel contract (the seam)
 
-One **persistent outbound WebSocket per runtime** (worker or supervisor pod), dialed from
-the runtime to the cao-server Service. No inbound connection to workers, no per-worker
-Service, no message broker.
+One **persistent outbound WebSocket per runtime**, dialed from the runtime to the
+cao-server Service. No inbound connection to workers, no per-worker Service, no message
+broker.
+
+The contract admits any runtime, but what ships here is **worker pods only**. The
+supervisor is still a full cao-server with its own inbound Service, and delegation still
+calls back to its `CAO_ADVERTISED_URL`, so acceptance criterion "the supervisor can
+delegate without its own CAO server or inbound API Service" is **not met by this
+slice** — it needs the supervisor itself to run as a bridge, which nothing here does.
 
 ```
 worker pod                                     cao-server pod
@@ -159,6 +165,12 @@ Every frame is one JSON object:
   server restart, runtimes reconnect and re-`hello`; the server rebuilds routing from
   persisted terminal→runtime association plus the hello snapshots.
 
+  Single ownership rests on the deployment shape — a one-replica StatefulSet with an
+  ordered rollout — not on a code-level guard: there is no lease, leader election or
+  single-writer lock on the SQLite state, and no test simulates two overlapping server
+  processes. An operator who scales the StatefulSet past one replica gets two writers
+  and nothing stops them. Enforcing that in code is follow-up work, not delivered here.
+
 ### 4.5 Server-side pieces
 
 - `RuntimeChannelRegistry`: terminal_id → live channel (+ persisted association for
@@ -222,13 +234,14 @@ a gp2 RWO PVC) and two `cao-bridge` workers dialing
 | Capability | Where | Status |
 | --- | --- | --- |
 | `runtime_channel/{protocol,replay_buffer}.py` frame contract + bounded replay | server & bridge | 26 unit tests |
-| `runtime_channel/registry.py` op_id correlation, ack, routing, UNKNOWN-on-disconnect | server | done |
+| `runtime_channel/registry.py` op_id correlation, ack, routing, UNKNOWN-on-disconnect | server | 14 tests, incl. 4 with **two runtimes connected at once** (input/cancel reach only the owning runtime; one runtime dying leaves the other's status and channel intact; positions are per terminal) |
+| `PROTOCOL_VERSION` mismatch rejected at hello on both sides; reconnect re-delivers unacked results and resumes each stream from the server's position or emits an explicit gap | server & bridge | 8 tests |
 | `runtime_channel/api.py` — WS endpoint (token fail-closed), `POST /runtimes/{id}/terminals`, `GET /runtimes` | server | done |
 | `runtime_channel/bridge.py` — `cao-bridge` reusing FIFO/StatusMonitor/LogWriter/TerminalBackend | worker | done |
 | `is_remote` routing seam on input / key / output / delete / status / browser-WS | `api/main.py`, `terminal_service.get_terminal` | done |
 | Queued-cancellation recheck at the drive boundary | `api/main.py` `_run_in_background` | 4 tests |
 | `CAO_NODE_MODE=bridge` in the EKS entrypoint | `examples/.../entrypoint.sh` | done |
-| Shared MCP HTTP hosting (`CAO_MCP_TRANSPORT=http`) + per-request caller identity replacing process-global `CAO_TERMINAL_ID`; shared-token gate fails closed; stdio unchanged | `mcp_server/{caller_context,http_hosting}.py`, `mcp_server/server.py`, `utils/orchestration.py` | 9 tests + live HTTP round-trip |
+| Shared MCP HTTP hosting (`CAO_MCP_TRANSPORT=http`) + per-request caller identity replacing process-global `CAO_TERMINAL_ID`; shared-token gate fails closed; stdio unchanged | `mcp_server/{caller_context,http_hosting}.py`, `mcp_server/server.py`, `utils/orchestration.py` | 9 tests (incl. concurrent-task identity isolation). No MCP-SDK client round-trip test, and no stdio→HTTP forwarding shim: providers still spawn stdio `cao-mcp-server`, so stdio is unchanged rather than bridged |
 | CLI→HTTP flow registration preserves `engine` + conditional pre-script (was silently dropped → unconditional launch); rejects arbitrary server paths | `api/main.py` `CreateFlowRequest` | 2 tests |
 | **Python workflow / flow pre-scripts execute in the runtime** (`CAO_SCRIPT_RUNTIME`), not the server host: `RUN_SCRIPT`/`CANCEL_SCRIPT` commands; server keeps record/journal/generation/cancel; outcome flows through the shared `_finalize`; `CAO_API_BASE_URL` rewritten to the advertised URL for callbacks; disconnect → explicit failure | `runtime_channel/{protocol,bridge}.py`, `services/script_runner.py` | 13 tests + **EKS-validated** |
 
@@ -289,8 +302,13 @@ worker's tmux session and the central row.
   provider id, plus one recorded `LAUNCH` contract fixture per shipped provider
   proving the identifier is forwarded opaquely into the shared
   `terminal_service.create_terminal` seam. Paid providers are covered without
-  live credentials; `mock_cli` and `claude_code` additionally run live.
-  Coverage: 14 tests.
+  live credentials. Coverage: 14 tests.
+
+  The fixture patches `create_terminal`, so it proves the identifier travels
+  opaquely — not that an agent ran. `mock_cli` and `claude_code` were additionally
+  driven live **by hand** (the EKS runs below); there is no automated non-mock
+  gate in the suite, and the `live_provider` marker registered in `pyproject.toml`
+  is currently unused.
 
 **Deferred to its own workstream:**
 

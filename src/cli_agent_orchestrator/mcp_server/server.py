@@ -2757,8 +2757,11 @@ def main():
     process per agent, identity from the process env, unchanged). Set it to
     ``http`` for the shared Streamable HTTP endpoint (#745): one process serves
     many agents, authenticated per request with a shared runtime token and a
-    per-request caller identity. A stdio forwarding shim can bridge providers
-    that only speak stdio to this endpoint without a second control server.
+    per-request caller identity.
+
+    No stdio-to-HTTP forwarding shim exists yet, and every shipped provider still
+    spawns its own stdio ``cao-mcp-server``. stdio is therefore unchanged rather
+    than bridged — the HTTP endpoint is available, not yet the default path.
     """
     transport = os.environ.get("CAO_MCP_TRANSPORT", "stdio").strip().lower()
     if transport == "http":
