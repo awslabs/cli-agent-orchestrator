@@ -891,18 +891,19 @@ def is_thinking_styled(raw_line: str) -> bool:
 
 
 def is_composer_row(clean_line: str) -> bool:
-    """True when ``clean_line`` is part of an input composer, not content.
+    """True when ``clean_line`` is shaped like part of an input composer.
 
-    Deliberately strict. The composer is recognisable by structure, and the
-    structure has to be narrow because both dialects use box-drawing glyphs:
+    Row-level *candidate* only. Two of these shapes are ambiguous on their own —
+    a Markdown table row can be `│ a │ b │`, and `| > | Redirect stdout |` matches
+    the prompt rule exactly — so :func:`classify_rows` confirms them against the
+    frame the renderer draws around the prompt before any of them is allowed to
+    end a response region (see :func:`_confirm_ready_frames`).
 
-    * the ``── input ──`` rule (intermediate Kimi Code builds),
-    * a bare ``╭``/``╰`` frame row,
-    * a ``│`` row whose inner text is empty or begins with ``>`` (the prompt).
+    Shapes:
 
-    A Markdown table row (``│ a │ b │``) has non-empty inner text that does not
-    begin with ``>``, so it stays content. Getting this wrong silently deletes
-    table rows from an extracted answer.
+    * the self-identifying ``── input ──`` rule (intermediate Kimi Code builds),
+    * a bare ``╭``/``╰`` frame edge,
+    * a ``│`` row whose inner text is empty, or that begins with ``>``.
     """
 
     if NEW_TUI_INPUT_RULE_RE.match(clean_line):
@@ -918,6 +919,58 @@ def is_composer_row(clean_line: str) -> bool:
         inner = stripped.strip("│|").strip()
         return inner == "" or inner.strip(_COMPOSER_FRAME_CHARS) == ""
     return False
+
+
+#: A box-drawing frame edge, which is what the renderer draws around the prompt
+#: row. A `│`-only shape is not enough: a Markdown table uses the same glyph in
+#: the same column position.
+_FRAME_EDGE_RE = re.compile(r"^\s*[╭╰]")
+#: How far either side of a prompt row its frame edge may sit. The measured
+#: composer is three rows (`╭──╮` / `│ > │` / `╰──╯`), so a small window is enough
+#: and a wide one would start letting unrelated box art qualify.
+_FRAME_EDGE_WINDOW = 4
+
+
+def _confirm_ready_frames(
+    cleans: Sequence[str], kinds: Sequence[KimiLineKind]
+) -> List[KimiLineKind]:
+    """Downgrade composer rows that no input frame backs.
+
+    A ``│ > … │`` row is the composer **only inside the box the renderer draws
+    around it**. Taken alone the same shape is a Markdown table row —
+    ``| > | Redirect stdout |`` matches the prompt rule character for character —
+    and because ``READY_INPUT_FRAME`` ends the response region, one such table row
+    truncated the answer. The self-identifying ``── input ──`` rule and a bare
+    ``╭``/``╰`` edge stand on their own; everything else needs a frame edge in the
+    window to be chrome.
+
+    Only rows that are *composer-shaped* are considered. ``READY_INPUT_FRAME`` is
+    also the kind of the legacy bare ``✨``/``💫`` idle prompt, which is not a
+    composer and has no frame to be backed by — narrowing on
+    :func:`is_composer_row` keeps that prompt a boundary.
+    """
+
+    self_identifying = {
+        index
+        for index, clean in enumerate(cleans)
+        if NEW_TUI_INPUT_RULE_RE.match(clean) or _FRAME_EDGE_RE.match(clean)
+    }
+    frame_backed = set(self_identifying)
+    for index in self_identifying:
+        for offset in range(1, _FRAME_EDGE_WINDOW + 1):
+            frame_backed.add(index - offset)
+            frame_backed.add(index + offset)
+
+    return [
+        (
+            KimiLineKind.CONTENT
+            if kind is KimiLineKind.READY_INPUT_FRAME
+            and index not in frame_backed
+            and is_composer_row(cleans[index])
+            else kind
+        )
+        for index, kind in enumerate(kinds)
+    ]
 
 
 def is_response_marker_line(clean_line: str) -> bool:
@@ -964,10 +1017,12 @@ def is_user_input_continuation(raw_line: str, clean_line: Optional[str] = None) 
     raw = raw_line or ""
     clean = strip_sgr(raw) if clean_line is None else clean_line
 
-    # A response bullet is assistant output, never user echo.
-    if is_response_marker_line(clean):
-        return False
-
+    # The colour *is* the evidence, and it is stronger than the bullet exclusion:
+    # a submitted message may contain a pasted list, so a colour-222 row that
+    # begins with a bullet continues the submission rather than becoming an
+    # answer bullet. The two are still distinguished — the renderer draws an
+    # answer in colour 253, which is not this colour — so an answer bullet can
+    # never be read as a continuation.
     return USER_INPUT_COLOR_INDEX in foreground_color_indices(raw)
 
 
@@ -1100,35 +1155,6 @@ def classify_line(
     return KimiLineKind.CONTENT
 
 
-def _continues_user_echo(
-    raw_line: str,
-    clean_line: str,
-    kind: KimiLineKind,
-    semantics: SpinnerSemantics,
-) -> bool:
-    """True when a row extends the submitted-message block that is already open.
-
-    The dialects need different evidence, and the difference is measured:
-
-    * **Kimi Code** wraps a long submission and draws every row in colour 222.
-      A plain row immediately after the submission is therefore *also* part of
-      it — and must be, because the escape-stripped consumers (and a capture
-      whose colour was lost) would otherwise publish the user's own message as
-      the agent's answer. This is safe because a Kimi Code answer always begins
-      with its own ``●`` bullet, which is not ``CONTENT`` and therefore closes
-      the block before any answer prose is reached.
-    * **Legacy** echoes the whole message inline in the prompt row and then
-      renders the *answer* below it as plain rows. Absorbing those would swallow
-      the answer — the reproduced case is a table: ``💫 Return a table`` followed
-      by ``Name | Value`` / ``A | 1``. Legacy therefore requires the positive
-      colour-222 continuation evidence and nothing weaker.
-    """
-
-    if is_user_input_continuation(raw_line, clean_line):
-        return True
-    return semantics is SpinnerSemantics.CODE and kind is KimiLineKind.CONTENT
-
-
 def classify_rows(
     raw_lines: Sequence[str],
     clean_lines: Optional[Sequence[str]] = None,
@@ -1194,10 +1220,12 @@ def classify_rows(
 
     kinds = [classify_line(raw, clean, semantics) for raw, clean in zip(raws, cleans)]
     kinds = _confirm_context_kinds(raws, cleans, kinds)
+    kinds = _confirm_ready_frames(cleans, kinds)
 
     result: List[KimiLineKind] = []
     in_tool_block = False
     in_user_echo = False
+    echo_absorbing_prose = False
     in_reasoning = False
 
     for raw, clean, kind in zip(raws, cleans, kinds):
@@ -1207,14 +1235,32 @@ def classify_rows(
         #     and only the echo's own continuation styling extends it ---
         if is_user_input_start(raw, clean):
             in_user_echo = True
+            echo_absorbing_prose = True
             in_tool_block = False
             in_reasoning = False
             result.append(KimiLineKind.USER_INPUT)
             continue
-        if in_user_echo and stripped and _continues_user_echo(raw, clean, kind, semantics):
-            result.append(KimiLineKind.USER_INPUT)
-            continue
-        in_user_echo = False
+        if in_user_echo:
+            # Positive evidence: the submitted message's own styling. It survives
+            # a blank line, because a submission may have several paragraphs and
+            # a pasted list — a blank row is not by itself "the submission ended".
+            if is_user_input_continuation(raw, clean):
+                echo_absorbing_prose = True
+                result.append(KimiLineKind.USER_INPUT)
+                continue
+            if not stripped:
+                # A blank line does not end the block, but it does end the weaker
+                # "the next plain row is still part of it" inference, so a blank
+                # row cannot pull ordinary answer prose into the submission.
+                echo_absorbing_prose = False
+                result.append(KimiLineKind.BLANK)
+                continue
+            if echo_absorbing_prose and semantics is SpinnerSemantics.CODE:
+                if kind is KimiLineKind.CONTENT:
+                    result.append(KimiLineKind.USER_INPUT)
+                    continue
+            in_user_echo = False
+            echo_absorbing_prose = False
 
         # A row-level USER_INPUT that neither started nor continued a submission
         # is not a submission at all: the colour is *continuation* evidence, so a
@@ -1231,7 +1277,12 @@ def classify_rows(
             result.append(kind)
             continue
         if in_reasoning:
-            if stripped and is_reasoning_continuation(raw):
+            if not stripped:
+                # A blank line may separate reasoning paragraphs. Styling, not
+                # layout, is what continues the block.
+                result.append(KimiLineKind.BLANK)
+                continue
+            if is_reasoning_continuation(raw):
                 result.append(KimiLineKind.THINKING_BULLET)
                 continue
             in_reasoning = False

@@ -68,6 +68,11 @@ def _reasoning_continuation(text: str) -> str:
     return f"   \x1b[38;5;244m\x1b[3m{text}\x1b[0m"
 
 
+def _user(text: str) -> str:
+    """A submitted-message row as Kimi Code draws it (bold + colour 222)."""
+    return "\x1b[1;38;5;222m" + text + "\x1b[0m"
+
+
 def _fixture(name: str) -> str:
     return (FIXTURES / name).read_text(encoding="utf-8", errors="replace")
 
@@ -1047,9 +1052,7 @@ class TestPR799AdversarialPluginMcpDelivery:
         profile.mcpServers = dict(servers)
         return profile
 
-    def test_kimi_code_merges_plugin_servers_into_the_runtime_mcp_json(
-        self, tmp_path, monkeypatch
-    ):
+    def test_kimi_code_merges_plugin_servers_into_the_runtime_mcp_json(self, tmp_path, monkeypatch):
         profile = self._profile({"profile-server": {"command": "srv"}})
         seen = {}
 
@@ -1086,9 +1089,7 @@ class TestPR799AdversarialPluginMcpDelivery:
         provider = KimiCliProvider("term-plugin-legacy", "s", "w", agent_profile="dev")
         provider._temp_dir = str(tmp_path / "legacy")
         Path(provider._temp_dir).mkdir()
-        monkeypatch.setattr(
-            kimi_cli_module, "load_agent_profile", lambda name: profile
-        )
+        monkeypatch.setattr(kimi_cli_module, "load_agent_profile", lambda name: profile)
 
         command = provider._build_kimi_command("/usr/local/bin/kimi")
 
@@ -1117,3 +1118,281 @@ class TestPR799AdversarialPluginMcpDelivery:
         provider._build_kimi_code_command()
 
         assert calls == {"load": 1, "wrap": 1}, calls
+
+
+# =============================================================================
+# Second-review residuals — reasoning/chrome, blank-separated blocks,
+# composer shape, and the retryable / non-retryable split
+# =============================================================================
+
+
+class TestPR799AdversarialRound2Residuals:
+    """The five findings of the second fresh independent review.
+
+    Four share one root: a block's lifetime was decided by layout (a blank row,
+    or a single row's shape) instead of by positive renderer evidence, and the
+    refusal/retry decision was made by which raise site ran rather than by what
+    the region positively contained.
+    """
+
+    # --- R2-1: reasoning plus chrome must still refuse --------------------
+
+    @pytest.mark.parametrize(
+        "chrome",
+        [
+            ["context: 2% (14.8k/977k)"],
+            ["╭────────────╮", "│ >          │", "╰────────────╯"],
+            [""],
+            ["", "context: 2% (14.8k/977k)"],
+        ],
+    )
+    def test_reasoning_beside_chrome_is_refused_without_raw_fallback(self, monkeypatch, chrome):
+        pane = "\n".join([_thinking(PRIVATE_REASONING), *chrome])
+        with pytest.raises(_rejected()) as excinfo:
+            _last(monkeypatch, pane)
+        message = str(excinfo.value)
+        assert PRIVATE_REASONING not in message
+        assert "[NO RESPONSE" not in message
+
+    def test_reasoning_beside_chrome_does_not_escalate(self, monkeypatch):
+        from cli_agent_orchestrator.services import terminal_service
+
+        pane = "\n".join([_thinking(PRIVATE_REASONING), "context: 2% (14.8k/977k)"])
+        provider = KimiCliProvider("term-r21", "s", "w")
+        backend = MagicMock()
+        backend.get_history.return_value = pane
+        monkeypatch.setattr(
+            terminal_service,
+            "get_terminal_metadata",
+            lambda tid: {"tmux_session": "s", "tmux_window": "w"},
+        )
+        monkeypatch.setattr(terminal_service.status_monitor, "get_buffer", lambda tid: pane)
+        monkeypatch.setattr(terminal_service, "get_backend", lambda: backend)
+        monkeypatch.setattr(terminal_service.provider_manager, "get_provider", lambda tid: provider)
+
+        with pytest.raises(_rejected()):
+            terminal_service.get_output("term-r21", terminal_service.OutputMode.LAST)
+        assert backend.get_history.call_count == 1
+
+    def test_reasoning_before_a_real_answer_is_published(self, monkeypatch):
+        """The guard: a valid turn is not refused because it reasoned first."""
+
+        pane = "\n".join(
+            [
+                "💫 Task",
+                _thinking(PRIVATE_REASONING),
+                "",
+                _answer("Public answer"),
+                "",
+            ]
+        )
+        result, _ = _last(monkeypatch, pane)
+        assert result == "● Public answer"
+        assert PRIVATE_REASONING not in result
+
+    # --- R2-2: a blank paragraph is not the end of reasoning --------------
+
+    def test_blank_separated_reasoning_paragraph_is_excluded(self, monkeypatch):
+        pane = "\n".join(
+            [
+                "💫 Task",
+                _thinking("Private heading"),
+                "",
+                _reasoning_continuation(PRIVATE_REASONING),
+                _answer("Public answer"),
+                "",
+            ]
+        )
+        result, _ = _last(monkeypatch, pane)
+        assert result == "● Public answer"
+        assert PRIVATE_REASONING not in result
+
+    def test_many_blank_separated_reasoning_paragraphs_are_excluded(self, monkeypatch):
+        pane = "\n".join(
+            [
+                "💫 Task",
+                _thinking("Private heading"),
+                "",
+                _reasoning_continuation("private one"),
+                "",
+                _reasoning_continuation("private two"),
+                "",
+                _answer("Public answer"),
+                "",
+            ]
+        )
+        result, _ = _last(monkeypatch, pane)
+        assert result == "● Public answer"
+
+    def test_reasoning_blank_chrome_is_refused(self, monkeypatch):
+        pane = "\n".join(
+            [
+                _thinking("Private heading"),
+                "",
+                _reasoning_continuation(PRIVATE_REASONING),
+                "",
+                "context: 2% (14.8k/977k)",
+            ]
+        )
+        with pytest.raises(_rejected()) as excinfo:
+            _last(monkeypatch, pane)
+        assert PRIVATE_REASONING not in str(excinfo.value)
+
+    # --- R2-3: multiline submissions --------------------------------------
+
+    def test_blank_separated_user_paragraph_is_excluded(self, monkeypatch):
+        pane = "\n".join(
+            [
+                _user("✨ Summarize the report"),
+                "",
+                _user("PRIVATE USER PARAGRAPH"),
+                _answer("Public answer"),
+                "",
+            ]
+        )
+        result, _ = _last(monkeypatch, pane)
+        assert result == "● Public answer"
+        assert "PRIVATE USER PARAGRAPH" not in result
+
+    def test_user_bullet_continuation_is_excluded(self, monkeypatch):
+        """A pasted list in a submission is still the submission."""
+
+        pane = "\n".join(
+            [
+                _user("✨ Summarize these items"),
+                _user("● PRIVATE USER ITEM"),
+                _answer("Public answer"),
+                "",
+            ]
+        )
+        result, _ = _last(monkeypatch, pane)
+        assert result == "● Public answer"
+        assert "PRIVATE USER ITEM" not in result
+
+    def test_colour_222_row_inside_an_answer_is_not_a_submission(self, monkeypatch):
+        """The control: colour 222 elsewhere in assistant output is content."""
+
+        pane = "\n".join(
+            [
+                "💫 Write code.",
+                _answer("Here is the snippet:"),
+                "    \x1b[38;5;222mcolour-222 code line\x1b[39m",
+                "trailing prose",
+                "",
+            ]
+        )
+        result, _ = _last(monkeypatch, pane)
+        assert "Here is the snippet:" in result
+        assert "colour-222 code line" in result
+        assert "trailing prose" in result
+
+    def test_legacy_answer_prose_after_a_submission_is_not_absorbed(self, monkeypatch):
+        """A blank cannot pull ordinary legacy answer prose into the submission."""
+
+        rows = ["✨ summarise", "", '{"name":"a",', "    indented prose line", _answer("FINAL")]
+        kinds = kt.classify_rows(rows, semantics=kt.SpinnerSemantics.CODE)
+        assert kinds[2] is kt.KimiLineKind.CONTENT
+        assert kinds[3] is kt.KimiLineKind.CONTENT
+
+    # --- R2-4: composer needs frame context -------------------------------
+
+    @pytest.mark.parametrize("operator", [">", "<", ">>", ">=", "| > |"])
+    def test_markdown_table_row_is_not_a_composer(self, monkeypatch, operator):
+        pane = "\n".join(
+            [
+                "💫 Explain shell operators",
+                "• Operators:",
+                "| Operator | Meaning |",
+                "| --- | --- |",
+                f"| {operator} | Redirect stdout |",
+                "Use these carefully.",
+                "💫",
+                "",
+            ]
+        )
+        result, _ = _last(monkeypatch, pane)
+        assert "Use these carefully." in result
+        assert "| --- | --- |" in result
+        assert f"| {operator} | Redirect stdout |" in result
+
+    def test_a_real_composer_still_ends_the_region(self):
+        """The control: a framed prompt row is chrome and stays an anchor."""
+
+        rows = [
+            *["x"] * 5,
+            _answer("The answer"),
+            " ╭────────────────────╮",
+            " │ >                  │",
+            " ╰────────────────────╯",
+        ]
+        kinds = kt.classify_rows(rows, semantics=kt.SpinnerSemantics.CODE)
+        assert kinds[7] is kt.KimiLineKind.READY_INPUT_FRAME
+
+    def test_unframed_prompt_shaped_row_is_content(self):
+        rows = [_answer("The answer"), "| > | Redirect stdout |"]
+        kinds = kt.classify_rows(rows, semantics=kt.SpinnerSemantics.CODE)
+        assert kinds[1] is kt.KimiLineKind.CONTENT
+
+    # --- R2-5: a missing anchor must stay retryable -----------------------
+
+    def test_a_wider_capture_recovers_the_answer(self, monkeypatch):
+        """A small capture that lacks the echo must not be terminal."""
+
+        rows = _fixture("kimi_code_0431_03_final_answer.txt").split("\n")
+        kinds = kt.classify_rows(rows, semantics=kt.SpinnerSemantics.CODE)
+        index = kinds.index(kt.KimiLineKind.FINAL_BULLET)
+        rows[index + 1 : index + 1] = ["Continuation of the public answer."] * 220
+        pane = "\n".join(rows)
+
+        from cli_agent_orchestrator.services import terminal_service
+
+        provider = KimiCliProvider("term-r25", "s", "w")
+        provider._dialect = kimi_cli_module.KimiDialect.CODE
+        backend = MagicMock()
+        backend.get_history.side_effect = lambda *a, **kw: (
+            "\n".join(rows[-kw["tail_lines"] :]) if "tail_lines" in kw else pane
+        )
+        monkeypatch.setattr(
+            terminal_service,
+            "get_terminal_metadata",
+            lambda tid: {"tmux_session": "s", "tmux_window": "w"},
+        )
+        monkeypatch.setattr(terminal_service.status_monitor, "get_buffer", lambda tid: pane)
+        monkeypatch.setattr(terminal_service, "get_backend", lambda: backend)
+        monkeypatch.setattr(terminal_service.provider_manager, "get_provider", lambda tid: provider)
+
+        result = terminal_service.get_output("term-r25", terminal_service.OutputMode.LAST)
+
+        assert backend.get_history.call_count > 1
+        assert "● STEP 1" in result
+        assert "Continuation of the public answer." in result
+
+    def test_chrome_only_region_is_retryable(self):
+        """Pure chrome is a missed anchor, not a refusal.
+
+        Asserted at the extractor, because the public path's response to a
+        retryable failure is to escalate and then return a labelled fallback —
+        which is exactly the behaviour the wider-capture case above relies on.
+        """
+
+        provider = KimiCliProvider("term-r25b", "s", "w")
+        with pytest.raises(OutputExtractionError) as excinfo:
+            provider.extract_last_message_from_script("context: 2% (14.8k/977k)")
+        assert not isinstance(excinfo.value, _rejected())
+
+    def test_tool_payload_only_region_is_not_republished(self, monkeypatch):
+        """The fail-closed half is preserved: payload is never the answer."""
+
+        pane = "\n".join(
+            [
+                "💫 Read the report.",
+                "● Used Read (report.txt) · 3 lines",
+                "───────",
+                "PRIVATE tool payload",
+                "● Public answer",
+                "",
+            ]
+        )
+        with pytest.raises(_rejected()) as excinfo:
+            _last(monkeypatch, pane)
+        assert "PRIVATE tool payload" not in str(excinfo.value)

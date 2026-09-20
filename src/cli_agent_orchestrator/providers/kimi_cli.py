@@ -113,6 +113,20 @@ from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
 
+#: Kinds that must never be republished as an agent's message. A response region
+#: holding one of these and no publishable answer is a deliberate refusal, not a
+#: capture that fell short — the raw-transcript fallback would republish exactly
+#: this content, so the refusal must not be retried into it. Chrome and user
+#: echoes are deliberately absent: a region of pure chrome means the anchor
+#: missed the answer, and a wider capture may still have it.
+_NON_PUBLISHABLE_KINDS = frozenset(
+    {
+        kt.KimiLineKind.THINKING_BULLET,
+        kt.KimiLineKind.TOOL_CALL,
+        kt.KimiLineKind.TOOL_CHROME,
+    }
+)
+
 # Serializes concurrent _ensure_mcp_timeout() read-modify-writes to
 # ~/.kimi/config.toml -- after the async conversion (issue #494),
 # _build_kimi_command runs inside asyncio.to_thread, so N concurrent inits can
@@ -2131,6 +2145,11 @@ class KimiCliProvider(BaseProvider):
         ]
 
         if not all_response_lines:
+            # The anchor landed on nothing. That is a missed anchor — retryable —
+            # unless the capture itself holds content that must never be
+            # republished, in which case escalating would only reach the raw
+            # fallback with that content inside it.
+            self._reject_private_content(row_kinds, has_answers=False)
             raise OutputExtractionError(
                 "Empty Kimi CLI response - no content found after the input marker"
             )
@@ -2215,30 +2234,46 @@ class KimiCliProvider(BaseProvider):
         return answers, region_kinds
 
     @staticmethod
-    def _reject_thinking_only(kinds: List[kt.KimiLineKind]) -> None:
-        """Fail closed when a turn produced nothing but reasoning.
+    def _reject_private_content(scope_kinds: List[kt.KimiLineKind], *, has_answers: bool) -> None:
+        """Refuse when a capture holds non-publishable content and no answer.
 
-        The previous behaviour here was to return the unfiltered reasoning text
-        as the "response" whenever every candidate row looked like thinking.
-        That is a leak: CAO hands the extracted string to handoff/assign callers
-        and to the memory layer, so a turn whose final answer was never rendered
-        (or whose marker changed between Kimi releases) would silently publish
-        the model's private reasoning as its answer. Raising is the only safe
-        outcome — the caller sees an extraction failure instead of a plausible
-        but wrong message.
+        Fail closed on content that must never be republished as an agent's
+        message: private reasoning, and tool-execution plumbing. If the capture
+        holds such a row and nothing publishable anywhere, the only safe outcome
+        is a refusal — the raw-transcript fallback would republish exactly that
+        content.
 
-        Raised as :class:`OutputExtractionRejected`, not the retryable
-        :class:`OutputExtractionError`: this is a deliberate refusal about
-        content that was found, so it must not be retried and must never be
-        replaced by the raw-transcript fallback, which contains the reasoning
-        that was just refused.
+        The decision is made on **content**, and on the whole capture rather than
+        on the located region:
+
+        * a chrome row alongside the reasoning used to defeat the old "every row
+          is a thinking bullet" test, and a composer frame could put the reasoning
+          *outside* the located region entirely; both let the retryable error
+          degrade the public path to the raw pane, which contains the reasoning
+          that should have been refused;
+        * conversely, a capture that holds no non-publishable content is not a
+          refusal at all. It is a capture that did not reach far enough — the
+          anchor landed past the answer, or the submitted echo scrolled out — and
+          a wider capture may still hold the answer, so the caller must be free to
+          escalate. A capture that already holds a publishable answer is the same
+          case: the region missed it, and escalation is the right response.
+
+        Raised as :class:`OutputExtractionRejected` rather than the retryable
+        :class:`OutputExtractionError`, so it is never retried and never replaced
+        by the raw pane.
         """
 
-        if kinds and all(kind is kt.KimiLineKind.THINKING_BULLET for kind in kinds):
+        if has_answers:
+            # A real answer is published; the other content is simply excluded.
+            return
+        if any(kind in kt.ANSWER_KINDS for kind in scope_kinds):
+            # Publishable content exists; the region simply did not include it.
+            return
+        if any(kind in _NON_PUBLISHABLE_KINDS for kind in scope_kinds):
             raise OutputExtractionRejected(
-                "Kimi returned only reasoning output for this turn: every candidate "
-                "line was classified as a thinking bullet, so there is no final "
-                "answer to extract. Refusing to return reasoning text as the response."
+                "Kimi returned no final answer for this turn: the capture held only "
+                "reasoning and/or tool-execution output. Refusing to return that "
+                "content as the response."
             )
 
     def _collect_response_text(
@@ -2254,11 +2289,17 @@ class KimiCliProvider(BaseProvider):
         answers, region_kinds = self._classify_response_region(
             raw_lines, clean_lines, start, end, kinds
         )
-        self._reject_thinking_only(region_kinds)
+        self._reject_private_content(
+            kinds if kinds is not None else region_kinds, has_answers=bool(answers)
+        )
         if not answers:
-            raise OutputExtractionRejected(
+            # No private content was identified either, so this is the retryable
+            # case: the region held only chrome and echoes, which usually means
+            # the anchor did not reach the answer. A wider capture may still have
+            # it, so the caller escalates instead of failing here.
+            raise OutputExtractionError(
                 "No extractable content in Kimi CLI output: every candidate line in "
-                "the response region was TUI chrome, a user echo, or reasoning."
+                "the response region was TUI chrome or a user echo."
             )
         return "\n".join(answers).strip()
 
@@ -2298,7 +2339,9 @@ class KimiCliProvider(BaseProvider):
         answers, region_kinds = self._classify_response_region(
             raw_lines, clean_lines, 0, prompt_idx, kinds
         )
-        self._reject_thinking_only(region_kinds)
+        self._reject_private_content(
+            kinds if kinds is not None else region_kinds, has_answers=bool(answers)
+        )
 
         if not answers:
             # Reached only when no input marker was found anywhere in the capture,
