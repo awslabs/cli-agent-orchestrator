@@ -2238,6 +2238,44 @@ def get_working_directory(terminal_id: str) -> Optional[str]:
         raise
 
 
+def _send_input_remote(
+    terminal_id: str,
+    message: str,
+    sender_id: str | None,
+    orchestration_type: OrchestrationType | None,
+) -> bool:
+    """Hand one send to the runtime that owns the terminal (#745).
+
+    Synchronous by contract, because every caller that lands here already is.
+    The runtime performs the real send_input beside its own tmux — including
+    memory injection, the provider's paste rules and the status gates — so this
+    side deliberately does none of that.
+    """
+    from cli_agent_orchestrator.runtime_channel.protocol import CommandOutcome, CommandType
+    from cli_agent_orchestrator.runtime_channel.registry import INPUT_TIMEOUT, runtime_registry
+
+    result = runtime_registry.send_terminal_command_blocking(
+        terminal_id,
+        CommandType.INPUT,
+        {
+            "message": message,
+            "sender_id": sender_id,
+            "orchestration_type": (
+                orchestration_type.value
+                if isinstance(orchestration_type, OrchestrationType)
+                else orchestration_type
+            ),
+        },
+        timeout=INPUT_TIMEOUT,
+    )
+    if result.outcome != CommandOutcome.OK:
+        raise RuntimeError(
+            f"runtime rejected input for {terminal_id}: "
+            f"{result.payload.get('error', result.outcome.value)}"
+        )
+    return bool(result.payload.get("success", False))
+
+
 def send_input(
     terminal_id: str,
     message: str,
@@ -2263,6 +2301,21 @@ def send_input(
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
+
+        # Remote terminal (#745): everything below this line is about a pane on
+        # THIS host — the provider, the memory injection, the status gates and
+        # the tmux paste. For a terminal executed by a runtime none of it is
+        # ours, and pasting locally either fails on a missing session or, worse,
+        # types into a local session that happens to share the name. Route the
+        # whole send instead. Callers that are already remote-aware (POST
+        # /terminals/{id}/input) never get here; the synchronous ones
+        # (inbox delivery, agent steps, memory recall) now behave the same.
+        # In a runtime process this registry is empty, so the bridge's own call
+        # back into send_input takes the local path and cannot recurse.
+        from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
+
+        if runtime_registry.is_remote(terminal_id):
+            return _send_input_remote(terminal_id, message, sender_id, orchestration_type)
 
         if (
             metadata.get("provider") == ProviderType.KIRO_CLI.value

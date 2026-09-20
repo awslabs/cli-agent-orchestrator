@@ -47,6 +47,10 @@ from cli_agent_orchestrator.runtime_channel.protocol import (
     encode_frame,
 )
 from cli_agent_orchestrator.runtime_channel.registry import (
+    EXTRACT_TIMEOUT,
+    INPUT_TIMEOUT,
+    LAUNCH_TIMEOUT,
+    TEARDOWN_TIMEOUT,
     RemoteCommandError,
     RuntimeUnavailableError,
     runtime_registry,
@@ -66,10 +70,19 @@ router = APIRouter()
 RUNTIME_TOKEN_HEADER = "x-cao-runtime-token"
 RUNTIME_TOKEN_ENV = "CAO_RUNTIME_TOKEN"
 
-LAUNCH_TIMEOUT = 240.0
-INPUT_TIMEOUT = 60.0
-EXTRACT_TIMEOUT = 60.0
-TEARDOWN_TIMEOUT = 120.0
+# Re-exported from the registry, which owns them now that non-HTTP senders
+# share the same deadlines. Kept as module attributes because call sites
+# reference them as runtime_channel_api.<NAME>.
+__all__ = [
+    "router",
+    "LAUNCH_TIMEOUT",
+    "INPUT_TIMEOUT",
+    "EXTRACT_TIMEOUT",
+    "TEARDOWN_TIMEOUT",
+    "remote_terminal_command",
+    "remote_delete_terminal",
+    "relay_remote_attach",
+]
 
 
 def _expected_token() -> Optional[str]:

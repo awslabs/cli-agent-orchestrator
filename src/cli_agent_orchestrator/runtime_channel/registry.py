@@ -36,6 +36,15 @@ logger = logging.getLogger(__name__)
 # per-call timeout at the call site.
 DEFAULT_COMMAND_TIMEOUT = 60.0
 
+# Per-operation deadlines. They live beside the registry rather than in the HTTP
+# layer because non-HTTP senders need them too: terminal_service routes a remote
+# send_input from any caller, and importing the endpoint module for a number
+# would drag the FastAPI/auth surface into the service layer.
+LAUNCH_TIMEOUT = 240.0
+INPUT_TIMEOUT = 60.0
+EXTRACT_TIMEOUT = 60.0
+TEARDOWN_TIMEOUT = 120.0
+
 
 class RuntimeUnavailableError(Exception):
     """No connected runtime can execute this operation right now."""
@@ -118,6 +127,8 @@ class RuntimeChannelRegistry:
         self._positions: Dict[Tuple[str, str], int] = {}
         # Live interactive-attach clients by terminal (#776).
         self._attach_sinks: Dict[str, "asyncio.Queue"] = {}
+        # The loop the channel connections belong to, captured at register().
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     # --- runtime lifecycle ---
 
@@ -131,6 +142,13 @@ class RuntimeChannelRegistry:
             existing.fail_all_pending(f"runtime {runtime_id} reconnected on a new channel")
         conn = RuntimeConnection(runtime_id, send_text)
         self._runtimes[runtime_id] = conn
+        # Capture the loop the channels live on. Command futures are created on
+        # it (see RuntimeConnection.send_command), so a caller on a worker thread
+        # has no way to dispatch without it — see send_terminal_command_blocking.
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:  # registered off-loop (unit tests) — nothing to capture
+            pass
         logger.info("runtime channel registered: %s", runtime_id)
         return conn
 
@@ -190,6 +208,48 @@ class RuntimeChannelRegistry:
         return await conn.send_command(
             command_type, payload, terminal_id=terminal_id, timeout=timeout
         )
+
+    def send_terminal_command_blocking(
+        self,
+        terminal_id: str,
+        command_type: CommandType,
+        payload: dict,
+        timeout: float = DEFAULT_COMMAND_TIMEOUT,
+    ) -> CommandResultFrame:
+        """Route one terminal-scoped operation from a worker thread.
+
+        Some senders are synchronous by construction and run off the loop: inbox
+        delivery is the one that matters (a worker's completion callback for a
+        supervisor whose session is in another pod), and it is already dispatched
+        via ``asyncio.to_thread``. Without this, such a caller would reach past
+        the channel into local tmux and fail with "session not found" for a
+        terminal that is alive in its own runtime.
+
+        Refuses to run on the loop thread: ``Future.result()`` there would block
+        the very loop that has to deliver the frame, deadlocking until timeout.
+        """
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            raise RuntimeUnavailableError(
+                f"no runtime channel loop is available to reach terminal {terminal_id}"
+            )
+        try:
+            on_loop = asyncio.get_running_loop() is loop
+        except RuntimeError:
+            on_loop = False
+        if on_loop:
+            raise RuntimeError(
+                "send_terminal_command_blocking called on the channel loop; "
+                "await send_terminal_command instead"
+            )
+        future = asyncio.run_coroutine_threadsafe(
+            self.send_terminal_command(terminal_id, command_type, payload, timeout=timeout),
+            loop,
+        )
+        # The coroutine already enforces `timeout`; this one only bounds the
+        # handoff itself, so it is the same deadline plus a small margin rather
+        # than a second, independent one.
+        return future.result(timeout + 5.0)
 
     # --- worker-reported state ---
 

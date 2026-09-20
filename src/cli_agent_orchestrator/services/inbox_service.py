@@ -25,6 +25,10 @@ from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.manager import provider_manager
+from cli_agent_orchestrator.runtime_channel.registry import (
+    RuntimeUnavailableError,
+    runtime_registry,
+)
 from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.status_monitor import status_monitor
@@ -112,7 +116,15 @@ class InboxService:
         if not messages:
             return
 
-        status = status_monitor.get_status(terminal_id)
+        # A remote terminal's status is derived in its own runtime and pushed
+        # over the channel; the local detector would probe a tmux socket that
+        # does not exist here and answer for the wrong pane (#745).
+        remote = runtime_registry.is_remote(terminal_id)
+        status = (
+            runtime_registry.get_status(terminal_id)
+            if remote
+            else status_monitor.get_status(terminal_id)
+        )
         if status not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
             # Not ready on the normal path. Eager delivery (#251) lets providers
             # that accept input mid-turn receive messages while PROCESSING or
@@ -147,7 +159,9 @@ class InboxService:
             batch = list(group)
             combined = "\n".join(m.message for m in batch)
             try:
-                if registry is None:
+                if remote:
+                    self._deliver_remote(terminal_id, combined, sender_id)
+                elif registry is None:
                     terminal_service.send_input(terminal_id, combined)
                 else:
                     terminal_service.send_input(
@@ -173,6 +187,35 @@ class InboxService:
                 for message in batch:
                     logger.error(f"Failed to deliver message {message.id} to {terminal_id}: {e}")
                     update_message_status(message.id, MessageStatus.FAILED)
+
+    def _deliver_remote(self, terminal_id: str, message: str, sender_id: str | None) -> None:
+        """Type a delivered message into a terminal that lives in another runtime.
+
+        This is the path a delegated result takes home: an elastic worker calls
+        complete_assignment, the message is queued against the supervisor's
+        terminal on the central server, and the supervisor's pane is in a
+        different pod. ``RuntimeUnavailableError`` is raised as
+        ``TerminalNotFoundError`` so the caller's existing transient branch
+        leaves the message PENDING for the reconcile sweep — a runtime that is
+        reconnecting is exactly the case that must not be marked FAILED.
+
+        The routing itself belongs to ``terminal_service.send_input``, which every
+        sender funnels through; what is specific to the inbox is the failure
+        classification. Plugin events fire in the runtime that performs the send
+        (as they do for POST /terminals/{id}/input), so no registry is threaded
+        through here.
+        """
+        try:
+            delivered = terminal_service.send_input(
+                terminal_id,
+                message,
+                sender_id=sender_id,
+                orchestration_type=OrchestrationType.SEND_MESSAGE,
+            )
+        except RuntimeUnavailableError as e:
+            raise TerminalNotFoundError(str(e)) from e
+        if not delivered:
+            raise RuntimeError(f"runtime did not accept input for {terminal_id}")
 
     def poll_opencode_pending_messages(self, registry: PluginRegistry | None = None) -> None:
         """Poll OpenCode terminals for pending inbox messages.
