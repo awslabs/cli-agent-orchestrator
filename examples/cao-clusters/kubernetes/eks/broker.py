@@ -68,6 +68,22 @@ WORKSPACE_ROOT = os.environ.get("CAO_ELASTIC_WORKSPACE_ROOT", "/home/cao/workspa
 PROJECT_ID = os.environ.get("CAO_ELASTIC_PROJECT_ID", "cao-cluster")
 WORKER_SERVICE_ACCOUNT = os.environ.get("CAO_ELASTIC_WORKER_SERVICE_ACCOUNT", "cao-elastic-worker")
 
+# IRSA fallback for the worker's AWS credentials (Bedrock). Pod Identity is the
+# default and needs nothing here: the control plane injects the credential.
+#
+# Set this to a role ARN on a cluster where Pod Identity injection is
+# unavailable, and the worker pod carries an explicitly projected web-identity
+# token instead. Worth knowing that the failure this avoids is silent: with no
+# credential injected, the pod falls back to the NODE role and the only symptom
+# is a 403 from Bedrock naming the node instance role, mid-conversation, inside
+# the agent.
+#
+# The projected token's audience is sts.amazonaws.com, not the API server's, so
+# this grants a worker nothing it could use against Kubernetes and
+# automount_service_account_token stays off.
+WORKER_IRSA_ROLE_ARN = os.environ.get("CAO_ELASTIC_WORKER_IRSA_ROLE_ARN", "").strip()
+_IRSA_TOKEN_DIR = "/var/run/secrets/eks.amazonaws.com/serviceaccount"
+
 
 # Execution-only bridge workers (#745). Mode "server" preserves today's
 # topology: a full cao-server plus per-worker Service. Mode "bridge" mints
@@ -120,6 +136,19 @@ RUNTIME_TOKEN_SECRET = os.environ.get("CAO_ELASTIC_RUNTIME_TOKEN_SECRET", "cao-r
 # REAPER_INTERVAL of slack.
 WORKER_TIMEOUT = int(os.environ.get("CAO_ELASTIC_WORKER_TIMEOUT", "3600"))
 READY_TIMEOUT = int(os.environ.get("CAO_ELASTIC_READY_TIMEOUT", "300"))
+# How long a worker pod gets to shut down after SIGTERM, and how long _release
+# then waits for the Deployment to actually disappear.
+#
+# These two MUST be related, not independently chosen: _release deletes with
+# Foreground propagation, so the Deployment survives until its pod does, which
+# is up to the full grace period. A flat 15s wait (what this used to be) is
+# therefore below the floor - unreachable for any worker that does not exit
+# immediately on SIGTERM. A bridge worker running a real agent doesn't, so a
+# release that had in fact torn everything down reported HTTP 500 and the lease
+# looked like cleanup_pending. The headroom covers kubelet and GC latency on top
+# of the grace period.
+WORKER_TERMINATION_GRACE_SECONDS = 30
+WORKLOAD_DELETION_TIMEOUT = float(WORKER_TERMINATION_GRACE_SECONDS + 15)
 # Does POST /workers block until the worker pod reports Ready?
 #
 # It used to, unconditionally, and that single `await` was the largest term in
@@ -490,6 +519,12 @@ def _build_worker_deployment(
 ) -> client.V1Deployment:
     """The pod/Deployment shape both worker modes share; only env, ports and
     the readiness probe differ (see _worker_deployment)."""
+    if WORKER_IRSA_ROLE_ARN:
+        env = list(env) + [
+            client.V1EnvVar(name="AWS_ROLE_ARN", value=WORKER_IRSA_ROLE_ARN),
+            client.V1EnvVar(name="AWS_WEB_IDENTITY_TOKEN_FILE", value=f"{_IRSA_TOKEN_DIR}/token"),
+            client.V1EnvVar(name="AWS_STS_REGIONAL_ENDPOINTS", value="regional"),
+        ]
     mounts = [
         client.V1VolumeMount(name="state", mount_path="/home/cao/.cao"),
         client.V1VolumeMount(
@@ -497,6 +532,15 @@ def _build_worker_deployment(
             mount_path="/home/cao/workspace",
         ),
     ]
+    # Appended, never inserted: the init container below mounts mounts[1].
+    if WORKER_IRSA_ROLE_ARN:
+        mounts.append(
+            client.V1VolumeMount(
+                name="aws-iam-token",
+                mount_path=_IRSA_TOKEN_DIR,
+                read_only=True,
+            )
+        )
     init = client.V1Container(
         name="prepare-workspace",
         image="public.ecr.aws/docker/library/busybox:1.36",
@@ -541,9 +585,10 @@ def _build_worker_deployment(
         # does not weaken the cap, it stops every worker from being created. What
         # the field bought is now _sweep_orphan_workers; see there for why age
         # rather than existence is the trigger.
-        # Pod Identity injects its own projected token volume via the webhook,
-        # so the default SA mount stays off: nothing in a worker should be able
-        # to talk to the API server.
+        # Pod Identity injects its own projected token volume, and the IRSA
+        # fallback above projects one scoped to sts.amazonaws.com, so the default
+        # SA mount stays off either way: nothing in a worker should be able to
+        # talk to the API server.
         automount_service_account_token=False,
         service_account_name=WORKER_SERVICE_ACCOUNT,
         security_context=client.V1PodSecurityContext(
@@ -592,8 +637,29 @@ def _build_worker_deployment(
                     claim_name=WORKSPACE_PVC
                 ),
             ),
+            *(
+                [
+                    client.V1Volume(
+                        name="aws-iam-token",
+                        projected=client.V1ProjectedVolumeSource(
+                            default_mode=0o420,
+                            sources=[
+                                client.V1VolumeProjection(
+                                    service_account_token=client.V1ServiceAccountTokenProjection(
+                                        audience="sts.amazonaws.com",
+                                        expiration_seconds=86400,
+                                        path="token",
+                                    )
+                                )
+                            ],
+                        ),
+                    )
+                ]
+                if WORKER_IRSA_ROLE_ARN
+                else []
+            ),
         ],
-        termination_grace_period_seconds=30,
+        termination_grace_period_seconds=WORKER_TERMINATION_GRACE_SECONDS,
     )
     template = client.V1PodTemplateSpec(
         metadata=client.V1ObjectMeta(labels=labels),
@@ -833,7 +899,7 @@ def _release(worker_id: str) -> None:
     except ApiException as exc:
         if exc.status != 404:
             raise
-    deadline = time.monotonic() + 15.0
+    deadline = time.monotonic() + WORKLOAD_DELETION_TIMEOUT
     while True:
         try:
             apps_api.read_namespaced_deployment(name, NAMESPACE)
@@ -842,7 +908,10 @@ def _release(worker_id: str) -> None:
                 break
             raise
         if time.monotonic() >= deadline:
-            raise TimeoutError(f"worker {worker_id} Deployment was not deleted within 15s")
+            raise TimeoutError(
+                f"worker {worker_id} Deployment was not deleted "
+                f"within {WORKLOAD_DELETION_TIMEOUT:g}s"
+            )
         time.sleep(0.1)
     # Belt and braces alongside the ownerReference: an explicit release should
     # not wait on garbage collection.

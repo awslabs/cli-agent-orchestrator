@@ -290,7 +290,11 @@ than at deploy time:
   where Pod Identity injection is unavailable, project a web-identity token
   explicitly instead — a `serviceAccountToken` volume with audience
   `sts.amazonaws.com` plus `AWS_ROLE_ARN` and `AWS_WEB_IDENTITY_TOKEN_FILE`
-  needs no admission webhook.
+  needs no admission webhook. Set `CAO_ELASTIC_WORKER_IRSA_ROLE_ARN` on the
+  broker and it adds exactly that to every worker pod it mints; leave it unset
+  and workers rely on Pod Identity as before. The role's trust policy needs
+  `sts:AssumeRoleWithWebIdentity` from the cluster's OIDC provider, conditioned
+  on `:aud = sts.amazonaws.com` and `:sub = system:serviceaccount:<ns>:<sa>`.
 
 Everything below is for a provider that authenticates with a key instead.
 

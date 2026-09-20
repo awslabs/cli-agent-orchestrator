@@ -1876,6 +1876,150 @@ with (
 bridge_client.delete(f"/workers/{bw}", headers={"X-CAO-Broker-Token": "test-token"})
 os.environ["CAO_ELASTIC_WORKER_MODE"] = "server"
 
+# --- 13. IRSA credential fallback (opt-in; Pod Identity is the default) -------
+#
+# The default must add nothing: a cluster with working Pod Identity should not
+# acquire a second credential path just by upgrading.
+default_spec = k8s.ApiClient().sanitize_for_serialization(
+    broker._worker_deployment("cafed00d", "rt-i", worker_request())
+)["spec"]["template"]["spec"]
+default_env = {e["name"] for e in default_spec["containers"][0]["env"]}
+check(
+    "without an IRSA role the pod carries no web-identity env",
+    not {"AWS_ROLE_ARN", "AWS_WEB_IDENTITY_TOKEN_FILE"} & default_env,
+    sorted(default_env & {"AWS_ROLE_ARN", "AWS_WEB_IDENTITY_TOKEN_FILE"}),
+)
+check(
+    "without an IRSA role the pod carries no token volume",
+    not any(v["name"] == "aws-iam-token" for v in default_spec["volumes"]),
+    [v["name"] for v in default_spec["volumes"]],
+)
+
+with patch.object(broker, "WORKER_IRSA_ROLE_ARN", "arn:aws:iam::1234:role/cao-bedrock"):
+    irsa_spec = k8s.ApiClient().sanitize_for_serialization(
+        broker._worker_deployment("cafebabe", "rt-i2", worker_request())
+    )["spec"]["template"]["spec"]
+irsa_container = irsa_spec["containers"][0]
+irsa_env = {e["name"]: e.get("value") for e in irsa_container["env"]}
+irsa_volume = next((v for v in irsa_spec["volumes"] if v["name"] == "aws-iam-token"), None)
+projection = (irsa_volume or {}).get("projected", {}).get("sources", [{}])[0]
+
+check(
+    "IRSA role reaches the container as AWS_ROLE_ARN",
+    irsa_env.get("AWS_ROLE_ARN") == "arn:aws:iam::1234:role/cao-bedrock",
+    irsa_env.get("AWS_ROLE_ARN"),
+)
+check(
+    "the token file env points at the projected path",
+    irsa_env.get("AWS_WEB_IDENTITY_TOKEN_FILE")
+    == "/var/run/secrets/eks.amazonaws.com/serviceaccount/token",
+    irsa_env.get("AWS_WEB_IDENTITY_TOKEN_FILE"),
+)
+check(
+    "the projected token's audience is STS, never the API server",
+    projection.get("serviceAccountToken", {}).get("audience") == "sts.amazonaws.com",
+    json.dumps(projection),
+)
+check(
+    "the token is mounted read-only where the env says it is",
+    any(
+        m["mountPath"] == "/var/run/secrets/eks.amazonaws.com/serviceaccount"
+        and m.get("readOnly") is True
+        for m in irsa_container["volumeMounts"]
+    ),
+    json.dumps(irsa_container["volumeMounts"]),
+)
+check(
+    "the API-server SA mount stays off even with IRSA projected",
+    irsa_spec.get("automountServiceAccountToken") is False,
+    irsa_spec.get("automountServiceAccountToken"),
+)
+check(
+    "the init container still mounts the workspace, not the token",
+    [m["name"] for m in irsa_spec["initContainers"][0]["volumeMounts"]] == ["workspace"],
+    [m["name"] for m in irsa_spec["initContainers"][0]["volumeMounts"]],
+)
+
+# --- 14. release waits out the worker's own termination grace period --------
+#
+# _release deletes with Foreground propagation, so the Deployment survives until
+# its pod does -- up to the full grace period. A wait chosen independently of
+# that (it used to be a flat 15s against a 30s grace period) is unreachable for
+# any worker that does not exit instantly on SIGTERM, and a bridge worker
+# running a real agent does not: on the cluster a teardown that had in fact
+# removed everything answered HTTP 500 and the lease looked like cleanup_pending.
+
+check(
+    "the deletion wait is bounded by the grace period, not below it",
+    broker.WORKLOAD_DELETION_TIMEOUT > broker.WORKER_TERMINATION_GRACE_SECONDS,
+    f"wait {broker.WORKLOAD_DELETION_TIMEOUT}s vs grace "
+    f"{broker.WORKER_TERMINATION_GRACE_SECONDS}s",
+)
+check(
+    "the pod's grace period is the same one the wait is derived from",
+    k8s.ApiClient().sanitize_for_serialization(
+        broker._worker_deployment("d0d0caca", "rt-g", worker_request())
+    )["spec"]["template"]["spec"]["terminationGracePeriodSeconds"]
+    == broker.WORKER_TERMINATION_GRACE_SECONDS,
+    "pod spec and the wait disagree about the grace period",
+)
+
+
+CLOCK = {"now": 0.0}
+
+
+class _LingeringApps(FakeApps):
+    """A Deployment that vanishes only after its pod's grace period elapses."""
+
+    def __init__(self, linger):
+        self.linger = linger
+        self.deleted_at = None
+
+    def delete_namespaced_deployment(self, name, ns, propagation_policy=None):
+        self.deleted_at = CLOCK["now"]
+
+    def read_namespaced_deployment(self, name, ns):
+        if self.deleted_at is not None and CLOCK["now"] - self.deleted_at >= self.linger:
+            raise k8s.rest.ApiException(status=404)
+        return Mock()
+
+
+_fake_clock = types.SimpleNamespace(
+    monotonic=lambda: CLOCK["now"],
+    # Every wait in _release is a time.sleep, so advancing here runs the poll
+    # loop in simulated time -- no real 45s in the test.
+    sleep=lambda seconds: CLOCK.__setitem__("now", CLOCK["now"] + seconds),
+)
+
+
+def _release_took(linger):
+    """Run _release against a Deployment that lingers `linger` seconds."""
+    CLOCK["now"] = 0.0
+    with (
+        patch.object(broker, "apps_api", _LingeringApps(linger)),
+        patch.object(broker, "time", _fake_clock),
+    ):
+        try:
+            broker._release("abcd1234")
+        except TimeoutError as exc:
+            return None, str(exc)
+    return CLOCK["now"], None
+
+
+elapsed, error = _release_took(broker.WORKER_TERMINATION_GRACE_SECONDS)
+check(
+    "a worker that uses its whole grace period still releases successfully",
+    error is None and elapsed >= broker.WORKER_TERMINATION_GRACE_SECONDS,
+    f"raised {error}" if error else f"returned after {elapsed}s",
+)
+
+elapsed, error = _release_took(broker.WORKLOAD_DELETION_TIMEOUT * 10)
+check(
+    "a workload that never goes away is still reported, not silently accepted",
+    error is not None and "was not deleted" in error,
+    f"returned after {elapsed}s instead of raising",
+)
+
 print()
 print("FAILURES:", FAILS if FAILS else "none")
 sys.exit(1 if FAILS else 0)

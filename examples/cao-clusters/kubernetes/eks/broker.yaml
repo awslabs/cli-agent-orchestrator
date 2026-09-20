@@ -80,6 +80,15 @@ spec:
               value: "server"
             - name: CAO_ELASTIC_CENTRAL_URL
               value: http://cao-supervisor.cao-cluster.svc.cluster.local:9889
+            # Opt-in credential fallback for clusters where EKS Pod Identity is
+            # not injecting. Set it to a role trusted by the cluster's OIDC
+            # provider and every minted worker also gets a projected
+            # web-identity token; unset (the default) leaves workers on Pod
+            # Identity. See "Provider credentials" in the README -- the failure
+            # this avoids is silent, because a pod with no injected credentials
+            # falls back to the NODE role and only fails later, inside Bedrock.
+            # - name: CAO_ELASTIC_WORKER_IRSA_ROLE_ARN
+            #   value: arn:aws:iam::<account>:role/<worker-role>
             # A lease with no completion inside this window is reaped and marked
             # `expired`. Generous enough for a slow delegated task, far below the
             # pod's own 3600s deadline so the broker always reaps first and can
