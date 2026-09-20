@@ -707,7 +707,9 @@ What each side does with the grace period:
   socket until the kubelet kills it. The server drops the runtime from
   `GET /runtimes` on that close and answers `UNKNOWN` for its terminals rather
   than reporting stale success. Delete an executor and you should see it leave
-  `/runtimes` in about a second, not at the end of the 30s grace period.
+  `/runtimes` within a couple of seconds — measured at ~2s in this namespace,
+  against ~33s (the whole grace period, then SIGKILL) before the channel was
+  closed on the signal.
 - **A minted worker** is deleted by the broker, which waits out the grace period
   and then settles the lease. `DELETE /workers/{id}` answering
   `200 {"released":true,"workload_present":false}` is the exercised case.
@@ -724,7 +726,7 @@ the surprises are.
 | Event | What survives | What does not |
 |---|---|---|
 | `cao-server` replaced | Terminal rows on the PVC; every executor's tmux session and running agent; routing, rebuilt from each `hello` snapshot, including each terminal's status. A delegated result that arrives during the window is queued and stays `pending` for the reconcile sweep, not marked `failed` | The reconnect window: pods read `0/1`, an attach closes `4010`, and a call to a route that needs a runtime gets `503 runtime not connected` |
-| `cao-supervisor` replaced | The terminal rows and the conversation history in central state | **The live session.** tmux dies with the pod, so a running agent turn is lost. There is no automatic resumption — nothing re-launches the agent or replays its turn. The rows outlive the sessions, so a call for one of them comes back as `502` carrying the runtime's own `Terminal not found` until the row is deleted |
+| `cao-supervisor` replaced | The terminal rows and the conversation history in central state | **The live session.** tmux dies with the pod, so a running agent turn is lost. There is no automatic resumption — nothing re-launches the agent or replays its turn. The rows outlive the sessions, so a call for one of them comes back as `502` carrying the runtime's own `Terminal not found`. Deleting such a terminal succeeds and clears the row: the runtime reports it absent rather than failing, so a scheduled flow that recycles the previous run's session is not blocked by an executor that restarted |
 | A worker pod replaced | The lease record on the broker, which the reaper settles | The assignment. A worker is per-task and is not meant to be replaced; a worker lost mid-task is reaped and reported, not retried |
 
 The middle row is the honest limitation of this slice. Durable *state* moved to

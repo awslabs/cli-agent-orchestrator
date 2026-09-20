@@ -340,6 +340,21 @@ class Bridge:
             await self._attach_close(terminal_id)
             deleted = await asyncio.to_thread(terminal_service.delete_terminal, terminal_id)
             self._buffers.pop(terminal_id, None)
+            if not deleted:
+                # "Not deleted" has two meanings that must not be conflated. A
+                # runtime with no row for this terminal has nothing to tear down:
+                # its pod was replaced, so the tmux server and the local row went
+                # with it, and the caller's goal state — no session here — already
+                # holds. Reporting that as a failure wedges every caller that
+                # recycles before launching, which is how a scheduled flow whose
+                # executor restarted would defer forever. A row that IS still here
+                # is a genuinely deferred cleanup and stays a failure, because a
+                # session that may be alive must never be declared gone.
+                absent = (
+                    await asyncio.to_thread(terminal_service.get_terminal_metadata, terminal_id)
+                ) is None
+                if absent:
+                    return CommandOutcome.OK, {"deleted": False, "absent": True}, terminal_id
             return (
                 CommandOutcome.OK if deleted else CommandOutcome.FAILED,
                 {"deleted": deleted},

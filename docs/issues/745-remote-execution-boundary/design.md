@@ -524,7 +524,25 @@ probe appeared in exactly one pod's pane. Note that `ps | grep cao-server` is
   directory before exit, so an incoming server does not wait on the outgoing one
   being reaped). Coverage: 2 tests, mutation-checked — dropping the close turns the
   test into the 10s timeout it is meant to catch. Documented in the EKS README
-  (*Resource limits and graceful shutdown*).
+  (*Resource limits and graceful shutdown*), and **measured on the cluster** with
+  the grace period set to the shipped 30s: deleting an executor on the pre-fix
+  image left it in `GET /runtimes` for 33s (the full grace period, then SIGKILL);
+  on the fixed image the same delete removed it in ~2s, with the bridge process
+  logging its exit 1.5s after the signal.
+
+- **A replaced executor must not wedge the schedule that used it.** Found by
+  re-running the placement flow after rolling the executor StatefulSet: the
+  previous run's central row survived on the server's volume, its runtime came
+  back with an empty state directory, and the recycle step read the runtime's
+  `deleted: false` as a cleanup that might have left an agent running. Correct
+  posture, wrong input — the flow deferred, and would have deferred on every later
+  run forever. `TEARDOWN` now separates the two meanings of "not deleted": a
+  runtime with no row for the terminal reports `absent`, which is the goal state
+  already holding, while a row that is still there stays a failure. The server
+  settles the central row and routing on `absent` (an id only its own runtime
+  could confirm is otherwise untearable for good) and still raises on a timeout,
+  where the outcome is genuinely unknown. Coverage: 6 tests, both halves
+  mutation-checked; confirmed on the cluster by the run that had been wedged.
 
 **Deferred to its own workstream:**
 

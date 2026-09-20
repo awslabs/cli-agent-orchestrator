@@ -446,12 +446,21 @@ async def relay_remote_attach(websocket, terminal_id: str) -> None:
 
 
 async def remote_delete_terminal(terminal_id: str) -> bool:
-    """TEARDOWN on the runtime, then drop the central row and routing."""
+    """TEARDOWN on the runtime, then drop the central row and routing.
+
+    A runtime that reports the terminal ``absent`` settles this too: the pod that
+    held the session was replaced, so there is nothing left to kill and the
+    central row points at a session its own runtime says does not exist. Keeping
+    that row would leave the id permanently untearable and, for a caller that
+    recycles before launching, permanently blocked. A teardown whose outcome is
+    merely unknown never reaches here — ``remote_terminal_command`` raises.
+    """
     result = await remote_terminal_command(
         terminal_id, CommandType.TEARDOWN, {}, timeout=TEARDOWN_TIMEOUT
     )
     deleted = bool(result.payload.get("deleted", False))
-    if deleted:
+    absent = bool(result.payload.get("absent", False))
+    if deleted or absent:
         db_delete_terminal(terminal_id)
         runtime_registry.unbind_terminal(terminal_id)
-    return deleted
+    return deleted or absent
