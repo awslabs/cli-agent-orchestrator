@@ -398,6 +398,21 @@ def _worker_deployment(
             # Memory goes straight to the central server's authenticated
             # internal memory routes; the broker gateway is not in this path.
             client.V1EnvVar(name="CAO_MEMORY_API_URL", value=central),
+            # Deliberately NO CAO_MCP_HTTP_URL here, unlike the supervisor.
+            #
+            # The supervisor is pointed at the shared MCP endpoint because its
+            # delegation tools need broker credentials that only the server pod
+            # holds. A worker's most important tool is the opposite case:
+            # complete_assignment reads CAO_ELASTIC_WORKER_ID and
+            # CAO_ELASTIC_RELEASE_TOKEN from the process it runs in, and those
+            # are minted per worker and set just below. Forward it and the tool
+            # executes in the server pod, finds neither, and answers
+            # "complete_assignment is only available inside an elastic worker" -
+            # which is the result path this whole topology exists to carry.
+            #
+            # So a worker keeps its own stdio MCP server. It costs nothing the
+            # boundary cares about: a worker is handed no broker TOKEN, so it
+            # cannot lease further workers whether its tools run here or there.
             client.V1EnvVar(name="CAO_HOME_DIR", value="/home/cao/.cao/state"),
             client.V1EnvVar(
                 name="CAO_INSTALL_PROFILES",

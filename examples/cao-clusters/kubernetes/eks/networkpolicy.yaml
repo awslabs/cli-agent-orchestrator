@@ -343,6 +343,20 @@ spec:
       ports:
         - port: 9889
           protocol: TCP
+    # The shared MCP endpoint, in a rule of its own so the peer list above does
+    # not widen with it. Only the supervisor dials 9891: its agent's declared
+    # cao-mcp-server is launched as the forwarding shim instead
+    # (CAO_MCP_HTTP_URL in supervisor.yaml), which is how a pod that runs an
+    # agent holds no broker credentials. Minted workers are deliberately absent
+    # — they keep a local MCP server, because complete_assignment reads the
+    # worker's own lease identity and cannot run in this pod.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cao-supervisor
+      ports:
+        - port: 9891
+          protocol: TCP
 ---
 # NetworkPolicy — restrict egress FROM the central server (#745).
 #
@@ -437,6 +451,18 @@ spec:
         - podSelector: {}
       ports:
         - port: 9889
+          protocol: TCP
+    # The shared MCP endpoint (#745). Named rather than left to the rule above,
+    # because 9891 answers in exactly one pod and there is no mode in which that
+    # changes. Without this rule the supervisor's agent comes up with its tools
+    # listed and every call to one hangs until the MCP timeout — a failure that
+    # reads as a broken tool rather than as a policy denial.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cao-server
+      ports:
+        - port: 9891
           protocol: TCP
     # DNS: the supervisor resolves the central server's service name. Note a
     # lease hands back an FQDN, not a bare pod name — a bare pod name does not

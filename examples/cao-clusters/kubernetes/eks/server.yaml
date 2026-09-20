@@ -47,6 +47,12 @@ spec:
         app.kubernetes.io/part-of: cao-elastic-fleet
     spec:
       serviceAccountName: cao-server
+      # Stated rather than left to the 30s default, because what this pod must
+      # finish on SIGTERM is specific: flush in-flight SQLite writes and let the
+      # kernel drop the owner lock, so the replacement can take it. The lock
+      # needs no grace at all — it dies with the process however the process
+      # dies — which is why this is unhurried rather than long.
+      terminationGracePeriodSeconds: 30
       securityContext:
         fsGroup: 1000
         fsGroupChangePolicy: OnRootMismatch
@@ -153,6 +159,101 @@ spec:
             limits:
               cpu: "1"
               memory: 2Gi
+        # The shared MCP endpoint (#745), in THIS pod rather than a Deployment
+        # of its own. Not a style choice: its tools read and write the same
+        # SQLite state as the server, and that state is on a ReadWriteOnce PVC
+        # which no second pod can mount. Same pod, same volume, one writer set.
+        #
+        # This is also what lets an agent pod hold no broker credentials. The
+        # delegation tools (assign_elastic and friends) resolve the broker from
+        # CAO_ELASTIC_BROKER_URL/_TOKEN, which exist only here — so a
+        # prompt-injected agent cannot ask Kubernetes for a pod even indirectly;
+        # it can only call a tool that runs in this pod, under this pod's
+        # identity, having already proved it holds the runtime token.
+        - name: cao-mcp
+          image: <server-image>:latest
+          # Wait for the server before binding: both processes open the same
+          # database, and only the server migrates it. Without this the endpoint
+          # can win the race on a first start, find no schema, and crash-loop
+          # until the server catches up — which reads as a broken image.
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              until python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:9889/health', timeout=2)" 2>/dev/null; do
+                echo "waiting for cao-server before starting the shared MCP endpoint"
+                sleep 2
+              done
+              exec cao-mcp-server
+          ports:
+            - name: mcp
+              containerPort: 9891
+          env:
+            - name: CAO_MCP_TRANSPORT
+              value: http
+            - name: CAO_MCP_HTTP_HOST
+              value: "0.0.0.0"
+            # Explicit, not the code default (9890): 9890 is the broker's port
+            # everywhere else in this example, and two different services
+            # answering on the same number is a debugging trap.
+            - name: CAO_MCP_HTTP_PORT
+              value: "9891"
+            # Fail-closed: build_http_app refuses to start an unauthenticated
+            # shared endpoint, so this secret is what makes the endpoint exist.
+            - name: CAO_RUNTIME_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: cao-runtime-token
+                  key: token
+            - name: CAO_HOME_DIR
+              value: /home/cao/.cao/state
+            - name: CAO_PROJECT_ID
+              value: cao-cluster
+            # The server is in this pod, so the API it calls is localhost.
+            - name: CAO_API_HOST
+              value: "127.0.0.1"
+            - name: CAO_API_PORT
+              value: "9889"
+            - name: CAO_MCP_REQUEST_TIMEOUT
+              value: "240"
+            # The delegation credentials. Deliberately duplicated from the
+            # server container rather than moved: both need them, and neither
+            # agent pods nor minted workers get them at all.
+            - name: CAO_ELASTIC_BROKER_URL
+              value: http://cao-worker-broker.cao-cluster.svc.cluster.local:9890
+            - name: CAO_ELASTIC_BROKER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: cao-elastic-broker-token
+                  key: token
+            - name: CAO_ELASTIC_CALLBACK_URL
+              value: "http://cao-server.cao-cluster.svc.cluster.local:9889"
+            - name: CAO_ELASTIC_WORKER_READY_WAIT
+              value: "120"
+          volumeMounts:
+            - name: state
+              mountPath: /home/cao/.cao
+            - name: workspace
+              mountPath: /home/cao/workspace
+              readOnly: true
+          # A TCP check only. There is no unauthenticated HTTP route to probe:
+          # every MCP call must carry the runtime token, so an HTTP probe would
+          # either need the secret or be answered 401 and restart the pod
+          # forever — the same trap the panel's probe documents.
+          readinessProbe:
+            tcpSocket:
+              port: 9891
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 9891
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
       volumes:
         - name: workspace
           persistentVolumeClaim:
@@ -188,3 +289,9 @@ spec:
     - name: http
       port: 9889
       targetPort: 9889
+    # The shared MCP endpoint every agent pod dials instead of starting its own
+    # MCP server. A Service port here is not the thing #745 forbids: what must
+    # not exist is an inbound Service on a pod that RUNS an agent.
+    - name: mcp
+      port: 9891
+      targetPort: 9891

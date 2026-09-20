@@ -46,6 +46,13 @@ spec:
       # an auth one. The association is created in
       # iac/cfn-infrastructure.yaml.
       serviceAccountName: cao-supervisor
+      # Matches the 30s the broker gives a minted worker, and for the same
+      # reason: SIGTERM reaches tmux and a provider CLI, which take a moment to
+      # exit. Nothing here is waiting to be *saved* — this pod's state is an
+      # emptyDir and the terminal row lives on the server — so the grace is for
+      # a clean exit, not for durability. A live agent session does not survive
+      # this pod either way; see the README's restart limitations.
+      terminationGracePeriodSeconds: 30
       securityContext:
         fsGroup: 1000
         fsGroupChangePolicy: OnRootMismatch
@@ -129,6 +136,18 @@ spec:
             # scheduling decision, and scheduling now happens on cao-server; a
             # broker URL in this pod would be an execution node reaching for the
             # one privileged API in the namespace.
+            #
+            # Which is exactly why this pod's agent uses the SHARED MCP endpoint
+            # rather than starting its own MCP server: the delegation tools need
+            # the broker credentials, and those live only in the server pod. With
+            # this set, the provider's declared `cao-mcp-server` is launched as
+            # `cao-mcp-stdio-bridge` instead (utils/mcp_resolution.py) and every
+            # tool call is forwarded, carrying this terminal's id as the caller.
+            # Unset it and the agent gets a local MCP server with no broker
+            # credentials, which is what "elastic workers are not configured"
+            # meant when this was first validated on EKS.
+            - name: CAO_MCP_HTTP_URL
+              value: "http://cao-server.cao-cluster.svc.cluster.local:9891/mcp"
             #
             # SigV4 against Bedrock, credentials from Pod Identity. Note this is
             # NOT CLAUDE_CODE_USE_ANTHROPIC_AWS, which is a different product

@@ -1733,6 +1733,20 @@ check(
     bridge_env.get("CAO_MEMORY_API_URL", {}).get("value") == "http://cao-supervisor:9889",
 )
 check(
+    "a bridge worker keeps its own MCP server, not the shared endpoint",
+    # Not an omission: complete_assignment reads the worker's OWN
+    # CAO_ELASTIC_WORKER_ID/_RELEASE_TOKEN, so forwarding a worker's tools to
+    # the server pod would break the result path this topology carries. The
+    # supervisor is the pod that must be forwarded; a worker must not be.
+    "CAO_MCP_HTTP_URL" not in bridge_env,
+    json.dumps(sorted(bridge_env)),
+)
+check(
+    "a bridge worker still gets the identity complete_assignment needs",
+    bridge_env.get("CAO_ELASTIC_WORKER_ID", {}).get("value") == "beadfeed"
+    and bridge_env.get("CAO_ELASTIC_RELEASE_TOKEN", {}).get("value") == "rt-b",
+)
+check(
     "no server env in a bridge worker",
     all(
         k not in bridge_env
