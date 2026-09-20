@@ -3221,7 +3221,12 @@ class TestD6ToolOutputBlock:
         assert kinds[2] is kt.KimiLineKind.TOOL_CHROME
 
     def test_composer_ends_the_block(self):
-        rows = [self.HEADER, self.PAYLOAD_1, *_styled_composer(), _A3_FOOTER]
+        rows = [
+            self.HEADER,
+            self.PAYLOAD_1,
+            *_styled_composer(),
+            _styled_footer("context: 0% (0/977k)"),
+        ]
         kinds = self.kinds(rows)
         assert kinds[1] is kt.KimiLineKind.TOOL_CHROME
         assert kt.KimiLineKind.READY_INPUT_FRAME in kinds
@@ -3303,6 +3308,38 @@ class TestD6ToolOutputBlock:
         )
         result = _code_provider("d6-f3b").extract_last_message_from_script(pane)
         assert result == "● The answer is 391.\nIt follows from the identity."
+
+    def test_pre_tool_assistant_chatter_is_not_the_final_response(self):
+        """mode=LAST publishes the answer after the final tool, not pre-tool chatter."""
+
+        pane = "\n".join(
+            [
+                _D6_PROMPT_FIRST,
+                _answer("I'll call the tool exactly as specified."),
+                self.HEADER,
+                self.PAYLOAD_1,
+                _answer("MCP-OK=2"),
+                *_A3_COMPOSER,
+                _styled_footer("context: 4% (33.4k/977k)"),
+            ]
+        )
+        result = _code_provider("d6-final-segment").extract_last_message_from_script(pane)
+        assert result == "● MCP-OK=2"
+
+    def test_no_tool_turn_keeps_multiple_answer_bullets(self):
+        """Tool segmentation must not collapse an ordinary multi-bullet answer."""
+
+        pane = "\n".join(
+            [
+                _D6_PROMPT_FIRST,
+                _answer("First point."),
+                _answer("Second point."),
+                *_A3_COMPOSER,
+                _styled_footer("context: 4% (33.4k/977k)"),
+            ]
+        )
+        result = _code_provider("d6-no-tool-multi").extract_last_message_from_script(pane)
+        assert result == "● First point.\n● Second point."
 
 
 class TestD6ProductionExtraction:

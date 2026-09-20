@@ -278,6 +278,8 @@ FOOTER_TIP_STYLE_RE = re.compile(
 )
 
 # Segments that constitute a footer row on their own.
+LEGACY_STATUS_ROW_RE = re.compile(r"^\s*\d+:\d+\s.*(?:agent|shell)\s*\(")
+
 FOOTER_WHOLE_ROW_RES: Tuple[re.Pattern, ...] = (
     # Context indicator at the start of the row, in the measured shape: the
     # percentage is followed by the parenthesised used/total counts. Requiring
@@ -299,7 +301,7 @@ FOOTER_WHOLE_ROW_RES: Tuple[re.Pattern, ...] = (
     # Two measured structural tokens — the time column and the agent segment —
     # are required together, so a prose line that merely starts with a clock
     # time is not swept up.
-    re.compile(r"^\s*\d+:\d+\s.*(?:agent|shell)\s*\("),
+    LEGACY_STATUS_ROW_RE,
 )
 
 # Composer frames.
@@ -678,52 +680,152 @@ def _confirm_context_kinds(
     clean_lines: Sequence[str],
     kinds: Sequence[KimiLineKind],
 ) -> List[KimiLineKind]:
-    """Downgrade context-sensitive UI kinds the surrounding rows do not confirm.
+    """Promote only rows inside *their own* rendered UI region.
 
-    A row whose *text* looks like part of a dialog or an approval prompt is not
-    UI state; only the whole structure is. The trust dialog needs its title, its
-    navigation hint and its option set (:func:`detect_trust_dialog`), and the
-    approval dialog needs its navigation hint *and* a numbered option row.
-    Without that context the row is ordinary answer content — and treating it as
-    chrome silently ends the response region, dropping the rest of the answer.
+    The terminal buffer is scrollback, not one screen.  A capture can therefore
+    contain an old trust/approval dialog and a later answer that merely uses the
+    same words.  Capture-global confirmation used to let the old dialog confer UI
+    meaning on the later answer row; because dialog kinds end the response region,
+    that silently truncated the current turn.
 
-    The approval confirmation deliberately does not accept the title alone: the
-    same substring that classified the row would then confirm it, so a sentence
-    that merely quotes the prompt would confirm itself. Reproduced collisions
-    this closes: a quoted menu example (``● Menu example:`` /
-    ``❯ Trust this folder`` / ``Continue…``), a fenced ``❯ Don't trust``, a
-    numbered procedure (``1. Approve the plan.``), prose quoting
-    ``▶ Run this command?``, and prose that merely starts with
-    ``Project MCP targets:``.
+    Row regexes remain useful as **candidates**, but destructive UI meaning is
+    index-specific: a trust/approval candidate survives only when that exact row
+    lies inside a locally confirmed rendered dialog span.  Likewise an exact
+    footer-shaped sentence is ordinary content unless the renderer drew it with
+    foreground styling.  This preserves the measured TUI while making historical
+    scrollback and plain answer text non-authoritative.
     """
 
+    raws = list(raw_lines)
+    cleans = list(clean_lines)
     confirmed = list(kinds)
 
-    if detect_trust_dialog(raw_lines) is None:
-        confirmed = [
-            KimiLineKind.CONTENT if kind is KimiLineKind.TRUST_DIALOG else kind
-            for kind in confirmed
-        ]
+    trust_rows = _confirmed_trust_dialog_rows(raws, cleans)
+    approval_rows = _confirmed_approval_dialog_rows(raws, cleans)
 
-    # The approval dialog is confirmed by its *whole* live structure: the title
-    # the renderer draws (`▶ Run this command?`), the navigation hint, and a
-    # numbered option row **carrying the selection cursor**. Each requirement
-    # excludes a different quote — a menu without the title
-    # (`• Available choices:` / `1. Approve once` / `↑/↓ select · 1/2/3/4 choose`),
-    # and a fenced example of the whole dialog with no cursor — both reproduced
-    # truncating the answer at the quote. The title alone is not enough either,
-    # for the opposite reason: the substring that classified the row would then
-    # confirm it.
-    approval_confirmed = (
-        any(APPROVAL_TITLE_RE.search(clean) for clean in clean_lines)
-        and any(APPROVAL_HINT_RE.search(clean) for clean in clean_lines)
-        and any(APPROVAL_SELECTED_OPTION_RE.search(clean) for clean in clean_lines)
-    )
-    if not approval_confirmed:
-        confirmed = [
-            KimiLineKind.CONTENT if kind is KimiLineKind.APPROVAL_DIALOG else kind
-            for kind in confirmed
-        ]
+    for index, kind in enumerate(confirmed):
+        if kind is KimiLineKind.TRUST_DIALOG and index not in trust_rows:
+            confirmed[index] = KimiLineKind.CONTENT
+        elif kind is KimiLineKind.APPROVAL_DIALOG and index not in approval_rows:
+            confirmed[index] = KimiLineKind.CONTENT
+        elif kind is KimiLineKind.STATUS_FOOTER:
+            # The real Kimi footer rows are renderer-coloured (the scrubbed live
+            # Kimi Code captures use colour 253).  Legacy has one stronger
+            # escape-free shape of its own — a clock column plus agent/shell
+            # segment — which remains structural without SGR. Plain text such as
+            # `context: 2% (14.8k/977k)` is valid answer prose and must not be a
+            # response boundary merely because it is text-identical to a footer.
+            raw = raws[index] if index < len(raws) else ""
+            clean = cleans[index] if index < len(cleans) else ""
+            if not (
+                _FOREGROUND_COLOR_RE.search(raw or "") or LEGACY_STATUS_ROW_RE.search(clean or "")
+            ):
+                confirmed[index] = KimiLineKind.CONTENT
+
+    return confirmed
+
+
+_DIALOG_REGION_MAX_LINES = 80
+
+
+def _dialog_scan_end(raw_lines: Sequence[str], clean_lines: Sequence[str], start: int) -> int:
+    """Bound one dialog search to its local turn/region.
+
+    A later submitted user message is an absolute boundary: no dialog that began
+    before it can own rows after it.  The hard line cap prevents a malformed
+    capture from turning structural confirmation into an unbounded forward scan.
+    """
+
+    end = min(len(clean_lines), start + _DIALOG_REGION_MAX_LINES)
+    for index in range(start + 1, end):
+        raw = raw_lines[index] if index < len(raw_lines) else ""
+        clean = clean_lines[index]
+        if is_user_input_start(raw, clean):
+            return index
+    return end
+
+
+def _confirmed_trust_dialog_rows(raw_lines: Sequence[str], clean_lines: Sequence[str]) -> Set[int]:
+    """Rows belonging to positively rendered trust-dialog spans.
+
+    A live trust dialog has a title, navigation hint, option set, an active
+    selection cursor, and renderer styling.  A model can quote all of the plain
+    text verbatim; without the renderer evidence that quote is still answer
+    content.  Multiple historical dialogs are handled independently, so one old
+    dialog cannot confirm matching text in a newer turn.
+    """
+
+    confirmed: Set[int] = set()
+    for start, clean in enumerate(clean_lines):
+        if not TRUST_TITLE_RE.match(clean):
+            continue
+
+        end = _dialog_scan_end(raw_lines, clean_lines, start)
+        hint_seen = False
+        option_rows: List[int] = []
+        selected_seen = False
+        styled_seen = False
+
+        for index in range(start, end):
+            row = clean_lines[index]
+            raw = raw_lines[index] if index < len(raw_lines) else ""
+            if index > start and TRUST_TITLE_RE.match(row):
+                break
+            if _SGR_RE.search(raw or ""):
+                styled_seen = True
+            if TRUST_HINT_RE.search(row):
+                hint_seen = True
+            stripped = row.strip()
+            body = _trust_option_body(stripped)
+            if body in TRUST_OPTIONS:
+                option_rows.append(index)
+                if stripped.startswith(TRUST_SELECT_MARKER):
+                    selected_seen = True
+
+        if not (hint_seen and option_rows and selected_seen and styled_seen):
+            continue
+
+        region_end = max(option_rows)
+        confirmed.update(range(start, region_end + 1))
+
+    return confirmed
+
+
+def _confirmed_approval_dialog_rows(
+    raw_lines: Sequence[str], clean_lines: Sequence[str]
+) -> Set[int]:
+    """Rows belonging to positively rendered approval-dialog spans."""
+
+    confirmed: Set[int] = set()
+    for start, clean in enumerate(clean_lines):
+        if not APPROVAL_TITLE_RE.search(clean):
+            continue
+
+        end = _dialog_scan_end(raw_lines, clean_lines, start)
+        hint_seen = False
+        selected_rows: List[int] = []
+        option_rows: List[int] = []
+        styled_seen = False
+
+        for index in range(start, end):
+            row = clean_lines[index]
+            raw = raw_lines[index] if index < len(raw_lines) else ""
+            if index > start and APPROVAL_TITLE_RE.search(row):
+                break
+            if _SGR_RE.search(raw or ""):
+                styled_seen = True
+            if APPROVAL_HINT_RE.search(row):
+                hint_seen = True
+            if APPROVAL_OPTION_RE.match(row):
+                option_rows.append(index)
+            if APPROVAL_SELECTED_OPTION_RE.search(row):
+                selected_rows.append(index)
+
+        if not (hint_seen and option_rows and selected_rows and styled_seen):
+            continue
+
+        region_end = max(option_rows)
+        confirmed.update(range(start, region_end + 1))
 
     return confirmed
 
@@ -1067,9 +1169,7 @@ def _confirm_ready_frames(
                 continue
             for below in range(1, _FRAME_EDGE_WINDOW + 1):
                 bottom = index + below
-                if bottom in closes and all(
-                    _box_row(cleans[k]) for k in range(index + 1, bottom)
-                ):
+                if bottom in closes and all(_box_row(cleans[k]) for k in range(index + 1, bottom)):
                     return True
         return False
 

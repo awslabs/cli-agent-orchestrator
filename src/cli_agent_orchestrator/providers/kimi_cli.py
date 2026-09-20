@@ -275,6 +275,7 @@ def _after_last_echo(scope_kinds: List[kt.KimiLineKind]) -> List[kt.KimiLineKind
             last_echo = index
     return scope_kinds[last_echo + 1 :]
 
+
 #: The boot banner rows, which name themselves rather than relying on the spinner
 #: slot. Used with `_SPINNER_SLOT_RE` to decide whether a `BOOT_CHROME` row is
 #: really boot chrome when an answer is being extracted.
@@ -2274,6 +2275,21 @@ class KimiCliProvider(BaseProvider):
         if kinds is None:
             kinds = kt.classify_rows(raw_lines, clean_lines, self._spinner_semantics())
 
+        # ``mode=LAST`` means the settled answer for this turn, not every
+        # publishable assistant sentence that happened during it.  Kimi Code may
+        # render a short assistant preamble ("I'll call the tool …") before a
+        # tool header, then render the actual answer after the tool finishes.
+        # Treating the whole region as one answer returned both rows.  When a
+        # tool was used, the final response segment therefore begins *after the
+        # last tool call*.  A turn with no tool call keeps the historical
+        # behaviour and may legitimately contain several answer bullets/lines.
+        last_tool_index: Optional[int] = None
+        for i in range(start, end):
+            if i < len(kinds) and kinds[i] is kt.KimiLineKind.TOOL_CALL:
+                last_tool_index = i
+
+        publish_start = start if last_tool_index is None else last_tool_index + 1
+
         answers: List[str] = []
         region_kinds: List[kt.KimiLineKind] = []
         for i in range(start, end):
@@ -2291,7 +2307,7 @@ class KimiCliProvider(BaseProvider):
                 # extracted script. Real boot rows carry the slot and colour.
                 kind = kt.KimiLineKind.CONTENT
             region_kinds.append(kind)
-            if kind in kt.ANSWER_KINDS:
+            if i >= publish_start and kind in kt.ANSWER_KINDS:
                 answers.append(clean_line.strip())
         return answers, region_kinds
 
@@ -2305,8 +2321,7 @@ class KimiCliProvider(BaseProvider):
     @staticmethod
     def _boot_chrome_is_shaped(raw_line: str, clean_line: str = "") -> bool:
         return bool(
-            _SPINNER_SLOT_RE.search(raw_line or "")
-            or _BOOT_BANNER_RE.search(clean_line or "")
+            _SPINNER_SLOT_RE.search(raw_line or "") or _BOOT_BANNER_RE.search(clean_line or "")
         )
 
     @staticmethod
@@ -2355,7 +2370,16 @@ class KimiCliProvider(BaseProvider):
         if has_answers:
             # A real answer is published; the other content is simply excluded.
             return
-        if any(kind is kt.KimiLineKind.FINAL_BULLET for kind in _after_last_echo(scope_kinds)):
+
+        # Every decision below is about the *current* turn.  Scrollback can hold
+        # old reasoning/tool output indefinitely; using the whole capture as
+        # refusal evidence makes a shallow current capture non-retryable merely
+        # because a previous turn was private.  The last positively identified
+        # user echo is the turn boundary already used by response location, so
+        # keep the security decision on the same scope.
+        turn_kinds = _after_last_echo(scope_kinds)
+
+        if any(kind is kt.KimiLineKind.FINAL_BULLET for kind in turn_kinds):
             # A positively drawn answer bullet *within this turn* means the
             # capture did not reach far enough, not that the turn produced no
             # answer: the region missed it and a wider capture may still hold it,
@@ -2366,7 +2390,7 @@ class KimiCliProvider(BaseProvider):
             # ``CONTENT`` is not evidence, because the shell preamble, the boot
             # banner and the footer's continuation row all classify that way.
             return
-        if any(kind in _NON_PUBLISHABLE_KINDS for kind in scope_kinds):
+        if any(kind in _NON_PUBLISHABLE_KINDS for kind in turn_kinds):
             raise OutputExtractionRejected(
                 "Kimi returned no final answer for this turn: the capture held only "
                 "reasoning and/or tool-execution output. Refusing to return that "

@@ -68,6 +68,12 @@ def _reasoning_continuation(text: str) -> str:
     return f"   \x1b[38;5;244m\x1b[3m{text}\x1b[0m"
 
 
+def _footer(text: str = "context: 2% (14.8k/977k)") -> str:
+    """A status/footer row as the renderer draws it (foreground colour 253)."""
+
+    return f" \x1b[38;5;253m{text}\x1b[39m"
+
+
 def _user(text: str) -> str:
     """A submitted-message row as Kimi Code draws it (bold + colour 222)."""
     return "\x1b[1;38;5;222m" + text + "\x1b[0m"
@@ -177,6 +183,135 @@ class TestPR799AdversarialReasoningRejection:
         with pytest.raises(_rejected()) as excinfo:
             _last(monkeypatch, pane)
         assert PRIVATE_REASONING not in str(excinfo.value)
+
+
+# =============================================================================
+# Structural turn/parser invariants — history must not define current UI
+# =============================================================================
+
+
+class TestPR799StructuralTurnParser:
+    """Metamorphic guards for the turn-scoped structural parser.
+
+    A terminal capture is scrollback, not one UI frame.  Historical dialogs,
+    answers, reasoning and tool calls may all remain above the current turn.
+    They must not promote text in the current answer into response-ending UI
+    state.  Conversely, quoting UI text is still ordinary answer content unless
+    the renderer's own local structure is present in the current turn.
+    """
+
+    @staticmethod
+    def _current_turn(*body: str) -> str:
+        return "\n".join([_user("✨ Summarize the configuration"), "", *body, ""])
+
+    def test_old_trust_dialog_cannot_promote_current_heading(self, monkeypatch):
+        """A9: a previous trust dialog must not own later matching prose."""
+
+        turn = self._current_turn(
+            _answer("Configuration summary:"),
+            "Project MCP targets:",
+            "- repo-tools",
+            "All checks passed.",
+        )
+        expected, _ = _last(monkeypatch, turn)
+        assert expected == (
+            "● Configuration summary:\n"
+            "Project MCP targets:\n"
+            "- repo-tools\n"
+            "All checks passed."
+        )
+
+        prefixed = _fixture("kimi_code_0431_07_workspace_trust_dialog_plain.txt") + "\n" + turn
+        actual, _ = _last(monkeypatch, prefixed)
+        assert actual == expected
+
+    def test_old_approval_dialog_cannot_promote_current_quote(self, monkeypatch):
+        """Historical approval chrome cannot turn a later quoted menu into UI."""
+
+        turn = self._current_turn(
+            _answer("Deployment notes:"),
+            "▶ Run this command?",
+            "▶ 1. Approve once",
+            "Continue with the next step.",
+        )
+        expected, _ = _last(monkeypatch, turn)
+        assert "Continue with the next step." in expected
+
+        prefixed = _fixture("kimi_code_0431_08_command_approval_dialog.txt") + "\n" + turn
+        actual, _ = _last(monkeypatch, prefixed)
+        assert actual == expected
+
+    def test_plain_full_trust_dialog_quote_is_answer_content(self, monkeypatch):
+        """Even a complete *textual* quote is not a live rendered dialog."""
+
+        turn = self._current_turn(
+            _answer("Example dialog:"),
+            "Trust this folder?",
+            "↑↓ navigate · Enter select · Esc exit",
+            "/tmp/example project",
+            "❯ Trust this folder",
+            "Don't trust",
+            "After the example.",
+        )
+        result, _ = _last(monkeypatch, turn)
+        assert result == (
+            "● Example dialog:\n"
+            "Trust this folder?\n"
+            "↑↓ navigate · Enter select · Esc exit\n"
+            "/tmp/example project\n"
+            "❯ Trust this folder\n"
+            "Don't trust\n"
+            "After the example."
+        )
+
+    def test_plain_exact_footer_shape_is_answer_content(self, monkeypatch):
+        """Footer text without renderer styling is ordinary model output."""
+
+        turn = self._current_turn(
+            _answer("Budget example:"),
+            "context: 2% (14.8k/977k)",
+            "That is only an example value.",
+        )
+        result, _ = _last(monkeypatch, turn)
+        assert result == (
+            "● Budget example:\n" "context: 2% (14.8k/977k)\n" "That is only an example value."
+        )
+
+    def test_historical_private_content_does_not_make_current_miss_nonretryable(self):
+        """Refusal evidence is scoped to the current turn, not old scrollback."""
+
+        provider = KimiCliProvider("term-turn-scope", "session-1", "window-1")
+        pane = "\n".join(
+            [
+                "💫 Old task",
+                _thinking("old private reasoning"),
+                _answer("Old public answer"),
+                _user("✨ Current task"),
+                "",
+            ]
+        )
+        with pytest.raises(OutputExtractionError) as excinfo:
+            provider.extract_last_message_from_script(pane)
+        assert not isinstance(excinfo.value, _rejected())
+
+    @pytest.mark.parametrize(
+        "history_fixture",
+        [
+            "kimi_code_0431_03_final_answer.txt",
+            "kimi_code_0431_07_workspace_trust_dialog_plain.txt",
+            "kimi_code_0431_08_command_approval_dialog.txt",
+            "kimi_code_0431_10_mcp_tool_turn.txt",
+            "kimi_code_0431_12_mcp_tool_turn_reasoning_first.txt",
+        ],
+    )
+    def test_history_prefix_does_not_change_current_answer(self, monkeypatch, history_fixture):
+        turn = self._current_turn(
+            _answer("Current answer"),
+            "ordinary continuation",
+        )
+        expected, _ = _last(monkeypatch, turn)
+        actual, _ = _last(monkeypatch, _fixture(history_fixture) + "\n" + turn)
+        assert actual == expected
 
 
 # =============================================================================
@@ -1140,10 +1275,10 @@ class TestPR799AdversarialRound2Residuals:
     @pytest.mark.parametrize(
         "chrome",
         [
-            ["context: 2% (14.8k/977k)"],
+            [_footer()],
             ["╭────────────╮", "│ >          │", "╰────────────╯"],
             [""],
-            ["", "context: 2% (14.8k/977k)"],
+            ["", _footer()],
         ],
     )
     def test_reasoning_beside_chrome_is_refused_without_raw_fallback(self, monkeypatch, chrome):
@@ -1157,7 +1292,7 @@ class TestPR799AdversarialRound2Residuals:
     def test_reasoning_beside_chrome_does_not_escalate(self, monkeypatch):
         from cli_agent_orchestrator.services import terminal_service
 
-        pane = "\n".join([_thinking(PRIVATE_REASONING), "context: 2% (14.8k/977k)"])
+        pane = "\n".join([_thinking(PRIVATE_REASONING), _footer()])
         provider = KimiCliProvider("term-r21", "s", "w")
         backend = MagicMock()
         backend.get_history.return_value = pane
@@ -1231,7 +1366,7 @@ class TestPR799AdversarialRound2Residuals:
                 "",
                 _reasoning_continuation(PRIVATE_REASONING),
                 "",
-                "context: 2% (14.8k/977k)",
+                _footer(),
             ]
         )
         with pytest.raises(_rejected()) as excinfo:
@@ -1377,7 +1512,7 @@ class TestPR799AdversarialRound2Residuals:
 
         provider = KimiCliProvider("term-r25b", "s", "w")
         with pytest.raises(OutputExtractionError) as excinfo:
-            provider.extract_last_message_from_script("context: 2% (14.8k/977k)")
+            provider.extract_last_message_from_script(_footer())
         assert not isinstance(excinfo.value, _rejected())
 
     def test_tool_payload_only_region_is_not_republished(self, monkeypatch):
@@ -1461,6 +1596,7 @@ class TestPR799AdversarialRendererPalette:
         kinds = kt.classify_rows(pane.split("\n"), semantics=kt.SpinnerSemantics.CODE)
         assert kt.KimiLineKind.THINKING_BULLET in kinds
         assert kt.KimiLineKind.FINAL_BULLET not in kinds
+
 
 class TestPR799AdversarialThirdRound:
     """The three findings of the third fresh independent review.
@@ -1557,7 +1693,9 @@ class TestPR799AdversarialThirdRound:
             assert kt.is_tool_call_row(row) is False, row
 
     def test_a_prose_answer_after_a_tool_verb_is_extracted(self, monkeypatch):
-        pane = "\n".join(["💫 Which parser did you use? Reply with two words.", "• Used pandas", "💫"])
+        pane = "\n".join(
+            ["💫 Which parser did you use? Reply with two words.", "• Used pandas", "💫"]
+        )
         result, _ = _last(monkeypatch, pane)
         assert result == "• Used pandas"
 
@@ -1680,7 +1818,9 @@ class TestPR799AdversarialThirdRound:
             ]
         )
         result, _ = _last(monkeypatch, pane)
-        assert result == "• Used Python · no external dependencies.\nRun python3 app.py to start it."
+        assert (
+            result == "• Used Python · no external dependencies.\nRun python3 app.py to start it."
+        )
 
     def test_plugin_sse_server_is_translated_for_the_runtime_home(self):
         """A5-F1: the Kimi Code mcp.json must select the declared protocol.
@@ -1785,12 +1925,12 @@ class TestPR799AdversarialThirdRound:
             [
                 "✨ run it",
                 "● The command is ready.",
-                "   ▶ Run this command?",
+                "   \x1b[1m\x1b[38;5;215m▶\x1b[0m " "\x1b[1m\x1b[38;5;215mRun this command?\x1b[0m",
                 "",
-                "   ▶ 1. Approve once",
-                "     2. Reject",
+                "   \x1b[1m\x1b[38;5;116m▶\x1b[0m " "\x1b[1m\x1b[38;5;116m1. Approve once\x1b[0m",
+                "   \x1b[38;5;255m  2. Reject\x1b[39m",
                 "",
-                "   ↑/↓ select · 1/2/3/4 choose · ↵ confirm",
+                "   \x1b[38;5;242m↑/↓ select · 1/2/3/4 choose · ↵ confirm\x1b[39m",
                 " ────────────────────────────────────────",
                 " Never Ask  Model thinking  /tmp/proj  master",
                 "",
@@ -1866,7 +2006,9 @@ class TestPR799AdversarialThirdRound:
         backend = MagicMock()
         backend.get_history.return_value = pane
         monkeypatch.setattr(
-            terminal_service, "get_terminal_metadata", lambda tid: {"tmux_session": "s", "tmux_window": "w"}
+            terminal_service,
+            "get_terminal_metadata",
+            lambda tid: {"tmux_session": "s", "tmux_window": "w"},
         )
         monkeypatch.setattr(terminal_service.status_monitor, "get_buffer", lambda tid: pane)
         monkeypatch.setattr(terminal_service, "get_backend", lambda: backend)
