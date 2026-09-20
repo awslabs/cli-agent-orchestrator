@@ -10,6 +10,7 @@ which ends the server-side attach and closes the socket.
 
 import json
 import os
+import select
 import shutil
 import signal
 import sys
@@ -79,6 +80,12 @@ def attach_remote_terminal(terminal_id: str, base_url: str, token: Optional[str]
         _send_resize()
         reader.start()
         while not stop.is_set():
+            # Poll rather than block in os.read: the remote side detaching (or
+            # the socket dying) sets `stop` from the reader thread, and a plain
+            # blocking read would sit here until the user happened to press a
+            # key — the detach would look like a hang.
+            if not select.select([stdin_fd], [], [], 0.2)[0]:
+                continue
             data = os.read(stdin_fd, 1024)
             if not data:
                 break
