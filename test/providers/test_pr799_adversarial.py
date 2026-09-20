@@ -2125,3 +2125,235 @@ class TestPR799AdversarialThirdRound:
         )
         result, _ = _last(monkeypatch, pane)
         assert "🌕 Full moon: 2026-09-26" in result
+
+
+# =============================================================================
+# Structural channel-ownership review — renderer evidence must own boundaries
+# =============================================================================
+
+
+class TestPR799StructuralChannelOwnership:
+    """Fresh-review regressions for private-channel ownership and UI evidence.
+
+    These are intentionally public-path tests where practical. The common
+    contract is stronger than any one collision:
+
+    * an established private block owns its rows until positive renderer
+      evidence changes channel;
+    * a shallow/unanchored capture is never sufficient evidence to publish an
+      orphan continuation;
+    * exhausted Kimi extraction never substitutes the raw pane;
+    * destructive UI kinds require their own renderer evidence rather than
+      borrowing styling from unrelated rows later in the capture.
+    """
+
+    @staticmethod
+    def _composer():
+        return [
+            " \x1b[38;5;240m╭────────╮\x1b[39m",
+            " \x1b[38;5;240m│ >      │\x1b[39m",
+            " \x1b[38;5;240m╰────────╯\x1b[39m",
+        ]
+
+    @classmethod
+    def _pane(cls, *body):
+        return "\n".join([_user("✨ Current task"), "", *body, *cls._composer(), _footer()])
+
+    @staticmethod
+    def _get_last_code(monkeypatch, captures):
+        """Drive public LAST with a real CODE provider and controlled captures."""
+
+        from cli_agent_orchestrator.services import terminal_service
+
+        provider = KimiCliProvider("term-structural-review", "s", "w")
+        provider._dialect = kimi_cli_module.KimiDialect.CODE
+        backend = MagicMock()
+        if isinstance(captures, (list, tuple)):
+            values = list(captures)
+            backend.get_history.side_effect = values
+            buffer_value = values[0]
+        else:
+            backend.get_history.return_value = captures
+            buffer_value = captures
+
+        monkeypatch.setattr(
+            terminal_service,
+            "get_terminal_metadata",
+            lambda tid: {"tmux_session": "s", "tmux_window": "w"},
+        )
+        monkeypatch.setattr(terminal_service.status_monitor, "get_buffer", lambda tid: buffer_value)
+        monkeypatch.setattr(terminal_service, "get_backend", lambda: backend)
+        monkeypatch.setattr(terminal_service.provider_manager, "get_provider", lambda tid: provider)
+        return (
+            terminal_service.get_output("term-structural-review", terminal_service.OutputMode.LAST),
+            backend,
+        )
+
+    def test_tool_payload_cannot_fake_a_user_submission_boundary(self, monkeypatch):
+        pane = self._pane(
+            "● Used Read (report.txt) · 3 lines",
+            "\x1b[2m✨ quoted prompt\x1b[0m",
+            "\x1b[2m● PRIVATE_TOOL_PAYLOAD\x1b[0m",
+            _answer("SAFE_FINAL"),
+        )
+
+        result, _ = self._get_last_code(monkeypatch, pane)
+        assert result == "● SAFE_FINAL"
+        assert "PRIVATE_TOOL_PAYLOAD" not in result
+
+    @pytest.mark.parametrize(
+        "orphan",
+        [
+            "\x1b[38;5;244m\x1b[3mPRIVATE_REASONING\x1b[0m",
+            "\x1b[38;5;222mPRIVATE_USER_CONTINUATION\x1b[0m",
+            "\x1b[2mPRIVATE_TOOL_CONTINUATION\x1b[0m",
+        ],
+    )
+    def test_unanchored_private_continuation_retries_until_owner_is_visible(
+        self, monkeypatch, orphan
+    ):
+        # The compact named input rule is the exact shallow-capture shape from
+        # the fresh review. With no user/response header in view, the leading
+        # styled continuation is ambiguous and must trigger widening rather than
+        # being published as CONTENT.
+        shallow = "\n".join([orphan, "── input ──", _footer()])
+        full = self._pane(_answer("SAFE_FINAL"))
+
+        result, backend = self._get_last_code(monkeypatch, [shallow, full])
+        assert result == "● SAFE_FINAL"
+        assert backend.get_history.call_count == 2
+        assert "PRIVATE_" not in result
+
+    def test_exhausted_kimi_last_never_returns_raw_submitted_input(self, monkeypatch):
+        from cli_agent_orchestrator.providers.base import OutputExtractionError
+
+        pane = "\n".join([_user("✨ PRIVATE USER TEXT"), *self._composer(), _footer()])
+
+        with pytest.raises(OutputExtractionError) as excinfo:
+            self._get_last_code(monkeypatch, pane)
+
+        message = str(excinfo.value)
+        assert "PRIVATE USER TEXT" not in message
+        assert "[NO RESPONSE" not in message
+        assert "[PARTIAL RESPONSE" not in message
+
+    @pytest.mark.parametrize(
+        "quoted",
+        [
+            [
+                "~~~text",
+                "▶ Run this command?",
+                "↑/↓ select · 1/2/3/4 choose",
+                "▶ 1. Approve once",
+                "2. Reject",
+                "~~~",
+            ],
+            [
+                "~~~text",
+                "Trust this folder?",
+                "↑↓ navigate · Enter select · Esc exit",
+                "/tmp/example",
+                "❯ Trust this folder",
+                "Don't trust",
+                "~~~",
+            ],
+        ],
+    )
+    def test_plain_quoted_dialog_cannot_borrow_styling_from_real_composer(
+        self, monkeypatch, quoted
+    ):
+        pane = self._pane(_answer("Example:"), *quoted, "TAIL")
+        result, _ = self._get_last_code(monkeypatch, pane)
+        assert "TAIL" in result
+        assert quoted[1] in result
+
+    def test_answer_bullet_colour_cannot_certify_footer_prose(self, monkeypatch):
+        pane = self._pane(
+            # Keep colour 253 active across the whole answer row. This is a
+            # valid renderer shape and is the exact collision the reviewer
+            # reproduced: the row contains two footer-looking fields but is
+            # positively an answer bullet.
+            " \x1b[38;5;253m● The fields are context: 2% and " "agent (Kimi-k2.6 ●).\x1b[39m",
+            "TAIL",
+        )
+        result, _ = self._get_last_code(monkeypatch, pane)
+        # Exact equality, not membership: at the pre-fix head this pane could
+        # only be served by the raw-pane fallback, which contains the answer text
+        # too and would satisfy a substring assertion for the wrong reason.
+        assert result == "● The fields are context: 2% and agent (Kimi-k2.6 ●).\nTAIL"
+
+    def test_answer_moon_tip_phrase_is_not_idle_tip(self, monkeypatch):
+        pane = self._pane(
+            _answer("The UI displays 🌕 · Tip: use /help."),
+            "TAIL",
+        )
+        result, _ = self._get_last_code(monkeypatch, pane)
+        assert "The UI displays 🌕 · Tip: use /help." in result
+        assert "TAIL" in result
+
+    def test_leading_braille_prose_is_not_a_spinner(self, monkeypatch):
+        pane = self._pane(
+            _answer("Braille alphabet:"),
+            "⠁ is A",
+            "⠃ is B",
+            "TAIL",
+        )
+        result, _ = self._get_last_code(monkeypatch, pane)
+        assert "⠁ is A" in result
+        assert "⠃ is B" in result
+        assert "TAIL" in result
+
+    def test_braille_prose_over_a_settled_composer_is_not_processing(self):
+        """The status side of the same collision: braille text is not work.
+
+        The extraction path is only half the defect — reading any braille
+        codepoint as the working indicator also pins a settled terminal at
+        PROCESSING, which is what the inbox keys delivery off.
+        """
+
+        from cli_agent_orchestrator.models.terminal import TerminalStatus
+
+        provider = KimiCliProvider("term-structural-braille", "s", "w")
+        provider._dialect = kimi_cli_module.KimiDialect.CODE
+        rows = [
+            kt.strip_sgr(_user("✨ Current task")),
+            "",
+            kt.strip_sgr(_answer("Braille alphabet:")),
+            "⠁ is A",
+            "⠃ is B",
+            "TAIL",
+            *[kt.strip_sgr(row) for row in self._composer()],
+            kt.strip_sgr(_footer()),
+        ]
+        assert provider.get_status("\n".join(rows)) is TerminalStatus.COMPLETED
+
+    def test_measured_spinner_frame_is_still_processing(self):
+        """The control: the frames the renderer actually animates stay work."""
+
+        from cli_agent_orchestrator.models.terminal import TerminalStatus
+
+        provider = KimiCliProvider("term-structural-spinner", "s", "w")
+        provider._dialect = kimi_cli_module.KimiDialect.CODE
+        rows = [
+            kt.strip_sgr(_user("✨ Current task")),
+            kt.strip_sgr(_answer("Working through it.")),
+            "\x1b[38;5;111m⠹\x1b[39m Using handoff({...})",
+            *[kt.strip_sgr(row) for row in self._composer()],
+            kt.strip_sgr(_footer()),
+        ]
+        assert provider.get_status("\n".join(rows)) is TerminalStatus.PROCESSING
+
+    def test_plain_quoted_box_art_is_not_a_composer(self, monkeypatch):
+        pane = self._pane(
+            _answer("Draw this:"),
+            "~~~text",
+            "╭──╮",
+            "│ > │",
+            "╰──╯",
+            "~~~",
+            "TAIL",
+        )
+        result, _ = self._get_last_code(monkeypatch, pane)
+        assert "╭──╮" in result
+        assert "│ > │" in result
+        assert "TAIL" in result

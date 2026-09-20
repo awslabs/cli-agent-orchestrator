@@ -2608,6 +2608,15 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
             except ValueError:
                 pass
 
+            # Some provider panes contain channels that are never publishable
+            # as an agent response. Exhausting the capture window only proves
+            # extraction failed; it does not make those raw bytes safe.
+            if not getattr(provider, "allow_raw_transcript_fallback", True):
+                raise OutputExtractionError(
+                    f"{provider.__class__.__name__} could not extract a publishable "
+                    "response after exhausting capture escalation."
+                ) from last_err
+
             # Full scrollback also failed — distinguish overflow from no response.
             # If the buffer is close to full (>=90% of last escalation cap), the
             # response marker was likely produced but pushed past the scrollback

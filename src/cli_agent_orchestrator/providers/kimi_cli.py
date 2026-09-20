@@ -724,6 +724,12 @@ class KimiCliProvider(BaseProvider):
     # the same bullets the IDLE/PROCESSING path uses, in both dialects.
     _KIMI_RESPONSE_MARKER_RE = re.compile(r"^[•●]\s")
 
+    @property
+    def allow_raw_transcript_fallback(self) -> bool:
+        """Kimi raw panes contain channels that LAST must never publish."""
+
+        return False
+
     def __init__(
         self,
         terminal_id: str,
@@ -2489,10 +2495,31 @@ class KimiCliProvider(BaseProvider):
                 prompt_idx = i
                 break
 
-        # Collect content from start to prompt through the shared classifier, so
-        # thinking filtering here cannot drift from the main extraction path.
+        # Kimi Code can expose private continuation rows after their owning
+        # header has scrolled out. Without a submitted-message anchor, arbitrary
+        # leading CONTENT is therefore ambiguous. Require a positively rendered
+        # final-answer marker before publishing anything; otherwise keep the
+        # failure retryable so the caller can widen the capture.
+        start_idx = 0
+        if self._dialect is KimiDialect.CODE:
+            final_markers = [
+                index
+                for index in range(prompt_idx)
+                if kinds is not None
+                and index < len(kinds)
+                and kinds[index] is kt.KimiLineKind.FINAL_BULLET
+            ]
+            if not final_markers:
+                raise OutputExtractionError(
+                    "Kimi Code capture has no submitted-message anchor or final-answer "
+                    "marker; widening is required before channel ownership is known."
+                )
+            start_idx = final_markers[0]
+
+        # Collect content from the proven response boundary through the shared
+        # classifier, so thinking filtering here cannot drift from the main path.
         answers, region_kinds = self._classify_response_region(
-            raw_lines, clean_lines, 0, prompt_idx, kinds
+            raw_lines, clean_lines, start_idx, prompt_idx, kinds
         )
         self._reject_private_content(
             kinds if kinds is not None else region_kinds, has_answers=bool(answers)

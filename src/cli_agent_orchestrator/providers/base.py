@@ -336,6 +336,19 @@ class BaseProvider(ABC):
         """
         return 0
 
+    @property
+    def allow_raw_transcript_fallback(self) -> bool:
+        """Whether LAST output may degrade to the provider raw terminal pane.
+
+        The historical service behavior is permissive because several providers
+        have no private sub-channels in their rendered transcript. Providers
+        whose pane can contain non-publishable channels must override this to
+        False. Extraction retries still widen normally; only the raw-pane
+        substitution after exhaustion is disabled.
+        """
+
+        return True
+
     @abstractmethod
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract the last message from terminal script output.

@@ -68,6 +68,21 @@ _BRAILLE_RE = re.compile(r"[\u2800-\u28ff]")
 # answer and can pin the terminal at PROCESSING.
 _SPINNER_PREFIX_RE = re.compile(r"^\s*[\u2800-\u28ff]")
 
+#: The frames the TUI actually animates in that slot. Measured across the raw
+#: 0.43.1 captures: the ten glyphs of the classic "dots" spinner, each labelled
+#: with the current activity (``working…``, ``Thinking...``, ``Composing...``,
+#: ``Loading configuration...``). The slot *and* the frame are what make a row a
+#: working indicator.
+#:
+#: A braille codepoint that is not a frame is ordinary text: reproduced, the
+#: answer ``● Braille alphabet:`` followed by ``⠁ is A`` / ``⠃ is B`` was read as
+#: a live turn, which dropped the rows out of the answer and reported a settled
+#: terminal as PROCESSING. Requiring the measured frame is deliberately narrow —
+#: a frame the set does not know stays PROCESSING, because a missed PROCESSING
+#: stalls a turn while a false one is corrected by the dispatch-grace and
+#: rendered-pane confirmation in ``get_status``.
+SPINNER_FRAMES = frozenset("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+
 # The reasoning block's continuation styling. Kimi draws reasoning in grey 244
 # and italicises it; a wrapped reasoning line repeats that styling without
 # repeating the bullet. This is the positive evidence that lets a reasoning
@@ -556,6 +571,26 @@ class KimiLineKind(enum.Enum):
     CONTENT = "content"
 
 
+class SpinnerSemantics(enum.Enum):
+    """Which glyphs count as live work, per dialect.
+
+    A0 measured the split: the legacy ``kimi-cli`` TUI animates a bare moon
+    phase while working, while Kimi Code animates a braille indicator and only
+    rotates moon phases through its *idle* tip row. Collapsing the two into one
+    rule either reads a settled Kimi Code terminal as PROCESSING or drops the
+    legacy signal entirely, so the dialect is an explicit argument.
+
+    ``LEGACY`` is the default so any caller that has not resolved a dialect
+    keeps the historical behaviour.
+
+    Defined here, above the first helper that takes it, because the structural
+    confirmation passes below classify rows with dialect-specific evidence.
+    """
+
+    LEGACY = "legacy"
+    CODE = "code"
+
+
 # Kinds that carry assistant-visible answer text. A row classified as anything
 # else is chrome, reasoning, execution detail, or user echo and must never reach
 # the caller as the agent's final message.
@@ -679,6 +714,7 @@ def _confirm_context_kinds(
     raw_lines: Sequence[str],
     clean_lines: Sequence[str],
     kinds: Sequence[KimiLineKind],
+    semantics: SpinnerSemantics = SpinnerSemantics.LEGACY,
 ) -> List[KimiLineKind]:
     """Promote only rows inside *their own* rendered UI region.
 
@@ -700,8 +736,8 @@ def _confirm_context_kinds(
     cleans = list(clean_lines)
     confirmed = list(kinds)
 
-    trust_rows = _confirmed_trust_dialog_rows(raws, cleans)
-    approval_rows = _confirmed_approval_dialog_rows(raws, cleans)
+    trust_rows = _confirmed_trust_dialog_rows(raws, cleans, semantics)
+    approval_rows = _confirmed_approval_dialog_rows(raws, cleans, semantics)
 
     for index, kind in enumerate(confirmed):
         if kind is KimiLineKind.TRUST_DIALOG and index not in trust_rows:
@@ -717,6 +753,9 @@ def _confirm_context_kinds(
             # response boundary merely because it is text-identical to a footer.
             raw = raws[index] if index < len(raws) else ""
             clean = cleans[index] if index < len(cleans) else ""
+            if is_response_marker_line(clean) and FINAL_ANSWER_BULLET_STYLE_RE.search(raw or ""):
+                confirmed[index] = KimiLineKind.FINAL_BULLET
+                continue
             if not (
                 _FOREGROUND_COLOR_RE.search(raw or "") or LEGACY_STATUS_ROW_RE.search(clean or "")
             ):
@@ -728,24 +767,37 @@ def _confirm_context_kinds(
 _DIALOG_REGION_MAX_LINES = 80
 
 
-def _dialog_scan_end(raw_lines: Sequence[str], clean_lines: Sequence[str], start: int) -> int:
+def _dialog_scan_end(
+    raw_lines: Sequence[str],
+    clean_lines: Sequence[str],
+    start: int,
+    semantics: SpinnerSemantics = SpinnerSemantics.LEGACY,
+) -> int:
     """Bound one dialog search to its local turn/region.
 
     A later submitted user message is an absolute boundary: no dialog that began
     before it can own rows after it.  The hard line cap prevents a malformed
     capture from turning structural confirmation into an unbounded forward scan.
+
+    ``semantics`` is passed through to :func:`is_user_input_start` so the
+    boundary is identified with the same dialect-specific submission evidence the
+    main pass uses; a dimmed sparkle inside payload is not a submission.
     """
 
     end = min(len(clean_lines), start + _DIALOG_REGION_MAX_LINES)
     for index in range(start + 1, end):
         raw = raw_lines[index] if index < len(raw_lines) else ""
         clean = clean_lines[index]
-        if is_user_input_start(raw, clean):
+        if is_user_input_start(raw, clean, semantics):
             return index
     return end
 
 
-def _confirmed_trust_dialog_rows(raw_lines: Sequence[str], clean_lines: Sequence[str]) -> Set[int]:
+def _confirmed_trust_dialog_rows(
+    raw_lines: Sequence[str],
+    clean_lines: Sequence[str],
+    semantics: SpinnerSemantics = SpinnerSemantics.LEGACY,
+) -> Set[int]:
     """Rows belonging to positively rendered trust-dialog spans.
 
     A live trust dialog has a title, navigation hint, option set, an active
@@ -753,6 +805,11 @@ def _confirmed_trust_dialog_rows(raw_lines: Sequence[str], clean_lines: Sequence
     text verbatim; without the renderer evidence that quote is still answer
     content.  Multiple historical dialogs are handled independently, so one old
     dialog cannot confirm matching text in a newer turn.
+
+    The renderer evidence is *the dialog's own* colours, not any SGR anywhere in
+    the forward scan.  Borrowing styling from unrelated rows let a plain quoted
+    dialog that was followed by a real composer certify itself as a live dialog,
+    which ended the response region and dropped the rest of the answer.
     """
 
     confirmed: Set[int] = set()
@@ -760,19 +817,20 @@ def _confirmed_trust_dialog_rows(raw_lines: Sequence[str], clean_lines: Sequence
         if not TRUST_TITLE_RE.match(clean):
             continue
 
-        end = _dialog_scan_end(raw_lines, clean_lines, start)
+        end = _dialog_scan_end(raw_lines, clean_lines, start, semantics)
         hint_seen = False
         option_rows: List[int] = []
         selected_seen = False
-        styled_seen = False
+        title_styled = 111 in foreground_color_indices(
+            raw_lines[start] if start < len(raw_lines) else ""
+        )
+        selected_styled = False
 
         for index in range(start, end):
             row = clean_lines[index]
             raw = raw_lines[index] if index < len(raw_lines) else ""
             if index > start and TRUST_TITLE_RE.match(row):
                 break
-            if _SGR_RE.search(raw or ""):
-                styled_seen = True
             if TRUST_HINT_RE.search(row):
                 hint_seen = True
             stripped = row.strip()
@@ -781,8 +839,9 @@ def _confirmed_trust_dialog_rows(raw_lines: Sequence[str], clean_lines: Sequence
                 option_rows.append(index)
                 if stripped.startswith(TRUST_SELECT_MARKER):
                     selected_seen = True
+                    selected_styled = 111 in foreground_color_indices(raw)
 
-        if not (hint_seen and option_rows and selected_seen and styled_seen):
+        if not (hint_seen and option_rows and selected_seen and title_styled and selected_styled):
             continue
 
         region_end = max(option_rows)
@@ -792,36 +851,45 @@ def _confirmed_trust_dialog_rows(raw_lines: Sequence[str], clean_lines: Sequence
 
 
 def _confirmed_approval_dialog_rows(
-    raw_lines: Sequence[str], clean_lines: Sequence[str]
+    raw_lines: Sequence[str],
+    clean_lines: Sequence[str],
+    semantics: SpinnerSemantics = SpinnerSemantics.LEGACY,
 ) -> Set[int]:
-    """Rows belonging to positively rendered approval-dialog spans."""
+    """Rows belonging to positively rendered approval-dialog spans.
+
+    The measured approval dialog carries its own colours — 215 on the title and
+    116 on the selected option — so those are the evidence, not the presence of
+    any SGR in the region.
+    """
 
     confirmed: Set[int] = set()
     for start, clean in enumerate(clean_lines):
         if not APPROVAL_TITLE_RE.search(clean):
             continue
 
-        end = _dialog_scan_end(raw_lines, clean_lines, start)
+        end = _dialog_scan_end(raw_lines, clean_lines, start, semantics)
         hint_seen = False
         selected_rows: List[int] = []
         option_rows: List[int] = []
-        styled_seen = False
+        title_styled = 215 in foreground_color_indices(
+            raw_lines[start] if start < len(raw_lines) else ""
+        )
+        selected_styled = False
 
         for index in range(start, end):
             row = clean_lines[index]
             raw = raw_lines[index] if index < len(raw_lines) else ""
             if index > start and APPROVAL_TITLE_RE.search(row):
                 break
-            if _SGR_RE.search(raw or ""):
-                styled_seen = True
             if APPROVAL_HINT_RE.search(row):
                 hint_seen = True
             if APPROVAL_OPTION_RE.match(row):
                 option_rows.append(index)
             if APPROVAL_SELECTED_OPTION_RE.search(row):
                 selected_rows.append(index)
+                selected_styled = 116 in foreground_color_indices(raw)
 
-        if not (hint_seen and option_rows and selected_rows and styled_seen):
+        if not (hint_seen and option_rows and selected_rows and title_styled and selected_styled):
             continue
 
         region_end = max(option_rows)
@@ -879,23 +947,6 @@ def foreground_color_indices(raw_line: str) -> Set[int]:
     return indices
 
 
-class SpinnerSemantics(enum.Enum):
-    """Which glyphs count as live work, per dialect.
-
-    A0 measured the split: the legacy ``kimi-cli`` TUI animates a bare moon
-    phase while working, while Kimi Code animates a braille indicator and only
-    rotates moon phases through its *idle* tip row. Collapsing the two into one
-    rule either reads a settled Kimi Code terminal as PROCESSING or drops the
-    legacy signal entirely, so the dialect is an explicit argument.
-
-    ``LEGACY`` is the default so any caller that has not resolved a dialect
-    keeps the historical behaviour.
-    """
-
-    LEGACY = "legacy"
-    CODE = "code"
-
-
 def has_live_spinner_glyph(line: str) -> bool:
     """True when ``line`` carries a braille working indicator."""
 
@@ -949,7 +1000,9 @@ def is_idle_tip_line(clean_line: str, raw_line: str = "") -> bool:
     *plus* the ``· Tip:`` suffix and the absence of any braille indicator.
     """
 
-    if not _MOON_RE.search(clean_line):
+    if is_response_marker_line(clean_line):
+        return False
+    if not _MOON_PREFIX_RE.match(clean_line):
         return False
     if _BRAILLE_RE.search(clean_line) or _BRAILLE_RE.search(raw_line):
         return False
@@ -981,7 +1034,10 @@ def is_live_spinner_line(
 
     Positive evidence only:
 
-    * a braille glyph (the measured 0.43.1 indicator: ``⠙ working…``), and
+    * a measured spinner *frame* (:data:`SPINNER_FRAMES`) in the row's own
+      prefix — the slot where the renderer draws its indicator (0.43.1:
+      ``⠙ working…``). A braille codepoint that is not one of those frames is
+      ordinary text, and
     * the row is not boot chrome (``⠧ MCP Servers: 0/1 connected`` is drawn while
       the terminal is idle at the welcome screen), and
     * the row is not the idle rotating tip.
@@ -1002,9 +1058,9 @@ def is_live_spinner_line(
         return False
     if is_boot_chrome_line(clean_line, raw_line):
         return False
-    # The indicator is a braille glyph in the spinner slot, not braille anywhere
+    # The indicator is a measured frame in the spinner slot, not braille anywhere
     # on the row: an answer that mentions the character is still an answer.
-    if _SPINNER_PREFIX_RE.match(clean_line):
+    if _SPINNER_PREFIX_RE.match(clean_line) and clean_line.lstrip()[0] in SPINNER_FRAMES:
         return True
     if _MOON_ONLY_RE.match(clean_line):
         return semantics is SpinnerSemantics.LEGACY
@@ -1121,9 +1177,98 @@ _FRAME_BOX_ROW_RE = re.compile(r"^\s*│")
 #: and a wide one would start letting unrelated box art qualify.
 _FRAME_EDGE_WINDOW = 2
 
+#: The colour the renderer draws the Kimi Code input box in (measured: 0.43.1
+#: draws the frame edges, the border columns and the prompt row in colour 240).
+#: Positive evidence, exactly like the dialog colours: a box carrying it is the
+#: renderer's own composer wherever it appears.
+COMPOSER_FRAME_COLOR_INDEX = 240
+
+#: A Markdown code fence. The renderer never draws its composer inside one, so a
+#: frame edge inside a fence is the answer *quoting* box art. Only fences with a
+#: matching closer count — a dangling opener leaves the frame meaningful, which
+#: is the fail-safe direction.
+_FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
+
+
+def _quoted_row_indices(clean_lines: Sequence[str]) -> Set[int]:
+    """Row indices inside a *closed* Markdown code fence."""
+
+    quoted: Set[int] = set()
+    opener: Optional[int] = None
+    opener_char = ""
+    opener_len = 0
+
+    for index, clean in enumerate(clean_lines):
+        match = _FENCE_RE.match(clean or "")
+        if not match:
+            continue
+        token = match.group(1)
+        if opener is None:
+            opener, opener_char, opener_len = index, token[0], len(token)
+            continue
+        if token[0] == opener_char and len(token) >= opener_len:
+            quoted.update(range(opener, index + 1))
+            opener = None
+
+    return quoted
+
+
+def _has_evidenced_composer(raw_lines: Sequence[str], clean_lines: Sequence[str]) -> bool:
+    """True when these rows contain a frame edge drawn in the composer colour."""
+
+    for index, clean in enumerate(clean_lines):
+        if not _FRAME_EDGE_RE.match(clean or ""):
+            continue
+        raw = raw_lines[index] if index < len(raw_lines) else ""
+        if COMPOSER_FRAME_COLOR_INDEX in foreground_color_indices(raw):
+            return True
+    return False
+
+
+def _composer_frame_edge(
+    index: int,
+    raw_lines: Sequence[str],
+    clean_lines: Sequence[str],
+    semantics: SpinnerSemantics,
+    evidenced: bool,
+    quoted: Set[int],
+) -> bool:
+    """True when the row is composer frame chrome rather than quoted box art.
+
+    Unchanged for the legacy dialect, which has no framed composer: its bare
+    ``╭``/``╰`` box keeps the historical meaning.
+
+    Under :attr:`SpinnerSemantics.CODE` the renderer draws the input box in
+    colour 240, so a frame edge carries its own evidence when the current turn
+    shows the real composer (``evidenced``). A *bare* edge is then a shape the
+    answer can produce — the reproduced collision put ``╭──╮ / │ > │ / ╰──╯``
+    inside an answer, and reading it as the composer ended the region there and
+    dropped the rest of the answer. Two things still make a bare edge chrome:
+
+    * the turn shows no colour-240 composer at all, which is the escape-free
+      path the screen/status consumers see and which has no colour to lean on —
+      the same escape-free fallback the footer keeps via
+      :data:`LEGACY_STATUS_ROW_RE`;
+    * the edge is not inside a closed fence, so it is not quoted art.
+    """
+
+    clean = clean_lines[index] if index < len(clean_lines) else ""
+    if not _FRAME_EDGE_RE.match(clean or ""):
+        return False
+    if semantics is not SpinnerSemantics.CODE:
+        return True
+    raw = raw_lines[index] if index < len(raw_lines) else ""
+    if COMPOSER_FRAME_COLOR_INDEX in foreground_color_indices(raw):
+        return True
+    return not evidenced and index not in quoted
+
 
 def _confirm_ready_frames(
-    cleans: Sequence[str], kinds: Sequence[KimiLineKind]
+    raw_lines: Sequence[str],
+    cleans: Sequence[str],
+    kinds: Sequence[KimiLineKind],
+    semantics: SpinnerSemantics = SpinnerSemantics.LEGACY,
+    turn_start: int = 0,
 ) -> List[KimiLineKind]:
     """Downgrade composer rows that no input frame backs.
 
@@ -1131,9 +1276,17 @@ def _confirm_ready_frames(
     around it**. Taken alone the same shape is a Markdown table row —
     ``| > | Redirect stdout |`` matches the prompt rule character for character —
     and because ``READY_INPUT_FRAME`` ends the response region, one such table row
-    truncated the answer. The self-identifying ``── input ──`` rule and a bare
-    ``╭``/``╰`` edge stand on their own; everything else needs a frame edge in the
-    window to be chrome.
+    truncated the answer. The self-identifying ``── input ──`` rule stands on its
+    own; everything else needs a frame edge in the window to be chrome.
+
+    What counts as a frame edge is dialect-specific. Under
+    :attr:`SpinnerSemantics.CODE` a bare edge is chrome only when the *current
+    turn* shows no colour-240 composer and the edge is not quoted art — see
+    :func:`_composer_frame_edge`. Treating a quoted ``╭──╮ / │ > │ / ╰──╯`` as
+    the composer ended the region in the middle of an answer that was drawing
+    box art. ``turn_start`` is the current turn's first row, so the renderer
+    evidence is scoped exactly as the answer is: a historical turn's composer
+    cannot change how this turn's rows are read.
 
     Only rows that are *composer-shaped* are considered. ``READY_INPUT_FRAME`` is
     also the kind of the legacy bare ``✨``/``💫`` idle prompt, which is not a
@@ -1141,10 +1294,20 @@ def _confirm_ready_frames(
     :func:`is_composer_row` keeps that prompt a boundary.
     """
 
+    quoted = _quoted_row_indices(cleans) if semantics is SpinnerSemantics.CODE else set()
+    evidenced = (
+        _has_evidenced_composer(raw_lines[turn_start:], cleans[turn_start:])
+        if semantics is SpinnerSemantics.CODE
+        else False
+    )
+
+    def _frame_edge(index: int, clean: str) -> bool:
+        return _composer_frame_edge(index, raw_lines, cleans, semantics, evidenced, quoted)
+
     self_identifying = {
         index
         for index, clean in enumerate(cleans)
-        if NEW_TUI_INPUT_RULE_RE.match(clean) or _FRAME_EDGE_RE.match(clean)
+        if NEW_TUI_INPUT_RULE_RE.match(clean) or _frame_edge(index, clean)
     }
     frame_backed = set(self_identifying)
     # The `── input ──` rule names the input box itself, so its immediate
@@ -1160,8 +1323,16 @@ def _confirm_ready_frames(
     # rows in between. Distance alone is not enough — a legacy input box four
     # rows above a Markdown table put `| > | Redirect stdout |` within the window
     # and deleted the row from the answer.
-    opens = {index for index, clean in enumerate(cleans) if _FRAME_EDGE_OPEN_RE.match(clean)}
-    closes = {index for index, clean in enumerate(cleans) if _FRAME_EDGE_CLOSE_RE.match(clean)}
+    opens = {
+        index
+        for index, clean in enumerate(cleans)
+        if _FRAME_EDGE_OPEN_RE.match(clean) and _frame_edge(index, clean)
+    }
+    closes = {
+        index
+        for index, clean in enumerate(cleans)
+        if _FRAME_EDGE_CLOSE_RE.match(clean) and _frame_edge(index, clean)
+    }
 
     def _box_row(clean: str) -> bool:
         return bool(_FRAME_BOX_ROW_RE.match(clean or ""))
@@ -1246,19 +1417,39 @@ def is_user_input_continuation(raw_line: str, clean_line: Optional[str] = None) 
     return USER_INPUT_COLOR_INDEX in foreground_color_indices(raw)
 
 
-def is_user_input_start(raw_line: str, clean_line: Optional[str] = None) -> bool:
+def is_user_input_start(
+    raw_line: str,
+    clean_line: Optional[str] = None,
+    semantics: SpinnerSemantics = SpinnerSemantics.LEGACY,
+) -> bool:
     """True when the row is a positively identified *submitted* user message.
 
     The measured first row is sparkle-prefixed and drawn bold + colour 222.
     Requiring the sparkle is what makes this a block start: it is the renderer's
     own "this is a submission" marker, whereas a bare colour-222 row is
     ambiguous and is accepted only as continuation.
+
+    Under :attr:`SpinnerSemantics.CODE` a *styled* sparkle row must also carry
+    the submission colour 222. Payload and quoted text can begin with the glyph
+    — reproduced: a dimmed ``ESC[2m✨ …`` row inside a tool block reset the tool
+    state and let the payload after it out as the answer — so styling that is
+    present but is not the submission colour is positive evidence *against* a
+    submission. An escape-free capture carries no styling to contradict the
+    glyph, and that is the shape the screen/status consumers see, so it keeps
+    the historical meaning.
     """
 
     raw = raw_line or ""
     clean = strip_sgr(raw) if clean_line is None else clean_line
 
     if is_response_marker_line(clean):
+        return False
+
+    if (
+        semantics is SpinnerSemantics.CODE
+        and _SGR_RE.search(raw)
+        and USER_INPUT_COLOR_INDEX not in foreground_color_indices(raw)
+    ):
         return False
 
     return bool(
@@ -1439,8 +1630,16 @@ def classify_rows(
         ]
 
     kinds = [classify_line(raw, clean, semantics) for raw, clean in zip(raws, cleans)]
-    kinds = _confirm_context_kinds(raws, cleans, kinds)
-    kinds = _confirm_ready_frames(cleans, kinds)
+    kinds = _confirm_context_kinds(raws, cleans, kinds, semantics)
+    # The last positively identified submission starts the current turn. Renderer
+    # evidence for the composer is scoped to it, so a historical turn's composer
+    # cannot change how the current turn's rows are read (the historical-prefix
+    # invariant).
+    turn_start = 0
+    for index, (raw, clean) in enumerate(zip(raws, cleans)):
+        if is_user_input_start(raw, clean, semantics):
+            turn_start = index
+    kinds = _confirm_ready_frames(raws, cleans, kinds, semantics, turn_start)
 
     result: List[KimiLineKind] = []
     in_tool_block = False
@@ -1453,7 +1652,7 @@ def classify_rows(
 
         # --- submitted user message: a positive submission starts the block,
         #     and only the echo's own continuation styling extends it ---
-        if is_user_input_start(raw, clean):
+        if is_user_input_start(raw, clean, semantics):
             in_user_echo = True
             echo_absorbing_prose = True
             in_tool_block = False
