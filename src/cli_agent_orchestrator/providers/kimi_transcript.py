@@ -365,6 +365,12 @@ RULE_RE = re.compile(r"^\s*[─━═]{3,}\s*$")
 _TOOL_IDENTIFIER = r"[A-Za-z_][A-Za-z0-9_.-]*"
 #: The measured detail separator: a `·` with horizontal whitespace on both sides.
 _TOOL_DETAIL_SEP = r"[^\S\n]·[^\S\n]"
+#: The measured detail *body* after that separator: a line count (`· 10 lines`)
+#: or the MCP server that served the call (`· MCP/cao-mcp-server (kimi)`). The
+#: separator alone is not evidence — prose writes middots too, and
+#: `• Used Python · no external dependencies.` was reproduced as an answer this
+#: rule refused.
+_TOOL_DETAIL_BODY = r"(?:\d+ lines?(?![^\S\n]*\w)|MCP/)"
 #: Optional parenthesised argument list, as in `Used Read (ANSWER_SPEC.md)`.
 _TOOL_ARG_LIST = r"[^\S\n]*\([^)]*\)"
 
@@ -408,6 +414,7 @@ TOOL_CALL_CLEAN_RE = re.compile(
     + _TOOL_ARG_LIST
     + r")?"
     + _TOOL_DETAIL_SEP
+    + _TOOL_DETAIL_BODY
     + r")"
 )
 
@@ -949,10 +956,14 @@ def is_composer_row(clean_line: str) -> bool:
 #: row. A `│`-only shape is not enough: a Markdown table uses the same glyph in
 #: the same column position.
 _FRAME_EDGE_RE = re.compile(r"^\s*[╭╰]")
+_FRAME_EDGE_OPEN_RE = re.compile(r"^\s*╭")
+_FRAME_EDGE_CLOSE_RE = re.compile(r"^\s*╰")
+#: A row drawn as part of a box (the composer's interior / a table's interior).
+_FRAME_BOX_ROW_RE = re.compile(r"^\s*│")
 #: How far either side of a prompt row its frame edge may sit. The measured
 #: composer is three rows (`╭──╮` / `│ > │` / `╰──╯`), so a small window is enough
 #: and a wide one would start letting unrelated box art qualify.
-_FRAME_EDGE_WINDOW = 4
+_FRAME_EDGE_WINDOW = 2
 
 
 def _confirm_ready_frames(
@@ -980,10 +991,41 @@ def _confirm_ready_frames(
         if NEW_TUI_INPUT_RULE_RE.match(clean) or _FRAME_EDGE_RE.match(clean)
     }
     frame_backed = set(self_identifying)
-    for index in self_identifying:
-        for offset in range(1, _FRAME_EDGE_WINDOW + 1):
-            frame_backed.add(index - offset)
-            frame_backed.add(index + offset)
+    # The `── input ──` rule names the input box itself, so its immediate
+    # neighbourhood is composer even when the renderer draws no edges around it.
+    for index, clean in enumerate(cleans):
+        if NEW_TUI_INPUT_RULE_RE.match(clean):
+            for offset in range(1, _FRAME_EDGE_WINDOW + 1):
+                frame_backed.add(index - offset)
+                frame_backed.add(index + offset)
+
+    # A prompt row is otherwise composer only when it sits *inside* a frame: an
+    # opening edge within the window, a closing edge within the window, and box
+    # rows in between. Distance alone is not enough — a legacy input box four
+    # rows above a Markdown table put `| > | Redirect stdout |` within the window
+    # and deleted the row from the answer.
+    opens = {index for index, clean in enumerate(cleans) if _FRAME_EDGE_OPEN_RE.match(clean)}
+    closes = {index for index, clean in enumerate(cleans) if _FRAME_EDGE_CLOSE_RE.match(clean)}
+
+    def _box_row(clean: str) -> bool:
+        return bool(_FRAME_BOX_ROW_RE.match(clean or ""))
+
+    def _inside_a_frame(index: int) -> bool:
+        for above in range(1, _FRAME_EDGE_WINDOW + 1):
+            top = index - above
+            if top not in opens or not all(_box_row(cleans[k]) for k in range(top + 1, index)):
+                continue
+            for below in range(1, _FRAME_EDGE_WINDOW + 1):
+                bottom = index + below
+                if bottom in closes and all(
+                    _box_row(cleans[k]) for k in range(index + 1, bottom)
+                ):
+                    return True
+        return False
+
+    for index in range(len(cleans)):
+        if _inside_a_frame(index):
+            frame_backed.add(index)
 
     return [
         (

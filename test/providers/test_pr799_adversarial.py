@@ -1647,3 +1647,37 @@ class TestPR799AdversarialThirdRound:
         )
         result, _ = _last(monkeypatch, pane)
         assert result == "● Answer line"
+
+    def test_a_table_row_is_not_framed_by_a_legacy_input_box(self):
+        """A4-F1: only an actual box makes a prompt-shaped row composer chrome."""
+
+        pane = "\n".join(
+            [
+                "╭────────────────────────────╮",
+                "│ Explain shell redirection. │",
+                "╰────────────────────────────╯",
+                "• Operators:",
+                "| Operator | Meaning |",
+                "|----------|---------|",
+                "| > | Redirect stdout |",
+                "| >> | Append stdout |",
+                "💫",
+            ]
+        )
+        result = KimiCliProvider("t", "s", "w").extract_last_message_from_script(pane)
+        assert "| > | Redirect stdout |" in result
+        assert "| >> | Append stdout |" in result
+
+    def test_prose_with_a_detail_separator_is_not_a_tool_row(self, monkeypatch):
+        """A4-F2: the separator alone is not the measured detail grammar."""
+
+        pane = "\n".join(
+            [
+                "💫 Summarize the implementation.",
+                "• Used Python · no external dependencies.",
+                "Run python3 app.py to start it.",
+                "💫",
+            ]
+        )
+        result, _ = _last(monkeypatch, pane)
+        assert result == "• Used Python · no external dependencies.\nRun python3 app.py to start it."
