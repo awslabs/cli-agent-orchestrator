@@ -381,6 +381,30 @@ exists for, not only asserted.
   gate in the suite, and the `live_provider` marker registered in `pyproject.toml`
   is currently unused.
 
+- **One routing chokepoint for input, so delegation survives the boundary.**
+  `POST /terminals/{id}/input` was remote-aware from slice 1, but the server's
+  *synchronous* senders were not: inbox delivery of a delegated result, agent
+  steps, memory recall and handoff approval all called
+  `terminal_service.send_input` directly, which paste-buffers into the local tmux
+  socket. On EKS that dropped a completed worker's answer with
+  `Session 'cao-2b412d60' not found` while the supervisor's session was alive in
+  its own pod, and marked the message `FAILED`. The remote branch now sits in
+  `send_input` itself, above the provider lookup, the memory injection, the
+  status gate and the paste — everything below it is about a pane on this host,
+  and for a remote terminal the paste is not merely useless but wrong, since a
+  local session sharing the name would receive another agent's message. In a
+  runtime process the registry is empty, so the bridge's own INPUT handler takes
+  the local path and cannot recurse. The inbox additionally reads readiness from
+  the runtime rather than the local detector (which would probe a tmux socket the
+  server does not own) and treats a disconnected runtime as transient: back to
+  `PENDING` for the reconcile sweep, not `FAILED`. Because delivery runs on a
+  worker thread (`asyncio.to_thread`), the registry captures the channel's loop
+  at `register()` and hands off with `run_coroutine_threadsafe`; a call made from
+  the loop thread is refused rather than deadlocking on `Future.result()`.
+  The per-operation timeouts moved from `runtime_channel/api.py` to the registry
+  so the service layer can read `INPUT_TIMEOUT` without importing the FastAPI
+  endpoint module. Coverage: 19 tests.
+
 **Deferred to its own workstream:**
 
 - **Per-runtime delegated credentials** — explicitly #774's scope. Both the

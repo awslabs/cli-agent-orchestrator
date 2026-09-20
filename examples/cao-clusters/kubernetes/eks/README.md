@@ -614,9 +614,10 @@ act:
 examples/cao-clusters/kubernetes/eks/deploy.sh cao-workshop "${TAG}"
 
 # 2. Check what is running before you take it away. Every live session is
-#    served by this pod, and an open lease is settled by it.
+#    routed by this pod, and an open lease is settled by it. /runtimes is the
+#    view that sees them: /sessions reads local tmux, and this pod has none.
 kubectl -n cao-cluster exec cao-server-0 -- \
-  curl -fsS -H 'Host: localhost' http://localhost:9889/sessions
+  curl -fsS -H 'Host: localhost' http://localhost:9889/runtimes
 
 # 3. Delete the pod. The controller recreates it from the new spec only after
 #    this one is fully gone, so the lock is free when the replacement opens it.
@@ -656,8 +657,8 @@ the surprises are.
 
 | Event | What survives | What does not |
 |---|---|---|
-| `cao-server` replaced | Terminal rows on the PVC; every executor's tmux session and running agent; routing, rebuilt from each `hello` snapshot, including each terminal's status | The reconnect window: pods read `0/1`, an attach closes `4010`, and a call to a route that needs a runtime gets `503 runtime not connected` |
-| `cao-supervisor` replaced | The terminal rows and the conversation history in central state | **The live session.** tmux dies with the pod, so a running agent turn is lost. There is no automatic resumption — nothing re-launches the agent or replays its turn |
+| `cao-server` replaced | Terminal rows on the PVC; every executor's tmux session and running agent; routing, rebuilt from each `hello` snapshot, including each terminal's status. A delegated result that arrives during the window is queued and stays `pending` for the reconcile sweep, not marked `failed` | The reconnect window: pods read `0/1`, an attach closes `4010`, and a call to a route that needs a runtime gets `503 runtime not connected` |
+| `cao-supervisor` replaced | The terminal rows and the conversation history in central state | **The live session.** tmux dies with the pod, so a running agent turn is lost. There is no automatic resumption — nothing re-launches the agent or replays its turn. The rows outlive the sessions, so a call for one of them comes back as `502` carrying the runtime's own `Terminal not found` until the row is deleted |
 | A worker pod replaced | The lease record on the broker, which the reaper settles | The assignment. A worker is per-task and is not meant to be replaced; a worker lost mid-task is reaped and reported, not retried |
 
 The middle row is the honest limitation of this slice. Durable *state* moved to
@@ -669,8 +670,13 @@ would plan the server's, and check for live work first:
 
 ```bash
 kubectl -n cao-cluster exec cao-server-0 -- \
-  curl -fsS -H 'Host: localhost' http://localhost:9889/sessions
+  curl -fsS -H 'Host: localhost' http://localhost:9889/runtimes
 ```
+
+Ask `/runtimes`, not `/sessions`. `/sessions` enumerates the *local* tmux server,
+and this one has none: it answers `[]` on a server with four live agents in
+executor pods. `/runtimes` lists each connected runtime with the terminals bound
+to it, which is the only view of live work the central server actually has.
 
 <a id="version-compatibility"></a>
 ## Version compatibility and upgrades
@@ -712,7 +718,7 @@ examples/cao-clusters/kubernetes/eks/deploy.sh cao-workshop "${TAG}"
 
 # 2. Drain: check for live sessions and open leases before replacing anything.
 kubectl -n cao-cluster exec cao-server-0 -- \
-  curl -fsS -H 'Host: localhost' http://localhost:9889/sessions
+  curl -fsS -H 'Host: localhost' http://localhost:9889/runtimes
 kubectl -n cao-cluster exec deploy/cao-worker-broker -- \
   curl -fsS -H "X-CAO-Broker-Token: $(kubectl -n cao-cluster get secret \
     cao-elastic-broker-token -o jsonpath='{.data.token}' | base64 -d)" \
