@@ -192,6 +192,68 @@ class TestTheMarkerFollowsTheChannel:
         assert observed == [False]
 
 
+class _ParkedWS(_FakeWS):
+    """A channel that stays open until it is closed, like a real idle socket.
+
+    ``_FakeWS`` ends its own session, which is the dropped-connection shape. A
+    pod being terminated is the other one: nothing is wrong with the socket, and
+    the only thing that ends the session is the bridge deciding to stop.
+    """
+
+    def __init__(self, server_hello):
+        super().__init__(server_hello)
+        self._closed = asyncio.Event()
+        self.close_calls = 0
+
+    async def close(self):
+        self.close_calls += 1
+        self._closed.set()
+
+    def __aiter__(self):
+        async def gen():
+            await self._closed.wait()
+            return
+            yield  # pragma: no cover - generator marker
+
+        return gen()
+
+
+class TestAnOrderlyStop:
+    @pytest.mark.asyncio
+    async def test_a_signal_closes_a_live_channel_and_withdraws_readiness(
+        self, ready_file, monkeypatch
+    ):
+        """The SIGTERM handler must not leave the pod parked on its socket.
+
+        A bridge that only set its stop event would sit out the whole
+        terminationGracePeriod still probing ready, and the server would learn it
+        was gone from a connection that died with the process at SIGKILL.
+        """
+        bridge = _bridge()
+        ws = _ParkedWS(_good_hello())
+        monkeypatch.setattr(bridge_mod.websockets, "connect", lambda *a, **k: ws)
+
+        run = asyncio.create_task(bridge.run())
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if ready_file.exists():
+                break
+        assert ready_file.exists(), "the channel never came up"
+
+        bridge.stop()  # what the signal handler installed in _amain calls
+        await asyncio.wait_for(run, timeout=10)
+
+        assert ws.close_calls == 1, "the live socket was left for the kubelet to kill"
+        assert not ready_file.exists()
+
+    @pytest.mark.asyncio
+    async def test_a_signal_before_any_channel_is_harmless(self, ready_file):
+        """SIGTERM during the initial backoff has no socket to close."""
+        bridge = _bridge()
+        bridge.stop()  # must not raise
+        assert not ready_file.exists()
+
+
 class TestMarkerMechanics:
     def test_the_default_path_travels_with_the_state_directory(self):
         from cli_agent_orchestrator.constants import CAO_HOME_DIR

@@ -91,11 +91,16 @@ One **persistent outbound WebSocket per runtime**, dialed from the runtime to th
 cao-server Service. No inbound connection to workers, no per-worker Service, no message
 broker.
 
-The contract admits any runtime, but what ships here is **worker pods only**. The
-supervisor is still a full cao-server with its own inbound Service, and delegation still
-calls back to its `CAO_ADVERTISED_URL`, so acceptance criterion "the supervisor can
-delegate without its own CAO server or inbound API Service" is **not met by this
-slice** — it needs the supervisor itself to run as a bridge, which nothing here does.
+The contract admits any runtime, and the supervisor is one of them: `CAO_NODE_MODE=bridge`
+execs `cao-bridge` instead of `cao-server`, and the shipped supervisor manifest publishes
+no `ports:` and no Service, so nothing reaches the pod inbound. That is what closes the
+acceptance criterion "the supervisor can delegate without its own CAO server or inbound
+API Service" — the delegation tool runs in the server pod over the shared MCP endpoint
+(where the broker credentials are), and the worker's answer arrives as an inbox message
+the server types into the supervisor's pane over this channel. Confirmed on the cluster,
+including the part that only a cluster finds: an earlier attempt queued the answer
+correctly and typed it into the *server's* own tmux, where the supervisor's session does
+not exist.
 
 ```
 worker pod                                     cao-server pod
@@ -375,6 +380,24 @@ and deleting `cao-server-0` withdrew the readiness marker within 3s, restored
 it on reconnect, rebuilt routing from the hello snapshot, and the pre-existing
 terminal answered a fresh prompt.
 
+**Criterion 6, end to end on the cluster, including the version gate.** Rolling
+the server to `PROTOCOL_VERSION 2` while thirteen v1 bridges were connected
+refused all thirteen at hello (`protocol version mismatch: server 2, bridge 1`
+in each bridge's log, `GET /runtimes` → `[]`); they withdrew their readiness
+markers, were replaced, and reconnected. With `CAO_SCRIPT_RUNTIME=cao-scale-3`
+and `CAO_FLOW_RUNTIME=cao-scale-7`, a flow whose pre-script is a `#!/bin/bash`
+file rendered the prompt `pre-script ran on cao-scale-3 as cao;
+api=http://cao-server…:9889; flow=placement-check; runtime token seen by the
+script=absent` — the shebang honoured, the script in its runtime, the callback
+rewritten to the advertised Service, and the channel token absent from the
+constructed env. The agent's tmux session existed only in `cao-scale-7`;
+`cao-scale-3` ran no tmux server at all and neither did `cao-server-0`. A second
+run recycled the session in its runtime (one row, session recreated); moving
+`CAO_FLOW_RUNTIME` to `cao-scale-0` moved the session with it; and pointing it
+at a runtime that does not exist failed the run
+(`remote launch on runtime 'cao-scale-99' failed: … not connected`) with no
+session in the server container and no orphan row.
+
 That last run is also where the status-on-reconnect gap surfaced: routing came
 back correctly but `GET /terminals/{id}` read `unknown`, because status is
 pushed on change and the restarted server had never seen a frame for a terminal
@@ -485,6 +508,23 @@ probe appeared in exactly one pod's pane. Note that `ps | grep cao-server` is
   The per-operation timeouts moved from `runtime_channel/api.py` to the registry
   so the service layer can read `INPUT_TIMEOUT` without importing the FastAPI
   endpoint module. Coverage: 19 tests.
+
+- **Graceful shutdown and resource limits, the last half of the placement
+  criterion.** Both were already true of the manifests (`requests`/`limits` on
+  every workload including the broker-minted worker, `terminationGracePeriodSeconds:
+  30` on the server and supervisor, and the broker's deletion wait derived from
+  that same constant rather than a flat 15s) but neither was written down, and one
+  of the two was not actually orderly: `Bridge.stop()` set its event while `_serve`
+  stayed parked on an idle socket, so a terminating executor kept announcing
+  readiness until the kubelet's SIGKILL and the server learned of it from a
+  connection that died with the process. `stop()` now closes the live channel, which
+  runs the reconnect loop's `finally` — marker withdrawn, clean close, runtime out
+  of `GET /runtimes` while the pod is still shutting down. The server side was
+  already orderly (`release_server_ownership()` in the shutdown path frees the state
+  directory before exit, so an incoming server does not wait on the outgoing one
+  being reaped). Coverage: 2 tests, mutation-checked — dropping the close turns the
+  test into the 10s timeout it is meant to catch. Documented in the EKS README
+  (*Resource limits and graceful shutdown*).
 
 **Deferred to its own workstream:**
 

@@ -670,6 +670,51 @@ registry row on `cao-server`, not the session, which is why the supervisor's sta
 volume is an `emptyDir` — it makes "nothing durable lives in the pod that runs the
 agent" a property of the manifest instead of a claim in this README.
 
+<a id="resource-limits-and-shutdown"></a>
+### Resource limits and graceful shutdown
+
+Every workload here ships both `requests` and `limits`, including the ones the
+broker mints, so a runaway agent is throttled or OOM-killed instead of taking a
+node down with it.
+
+| Workload | requests | limits |
+|---|---|---|
+| `cao-server` | 250m / 512Mi | 1 / 2Gi |
+| `cao-mcp-server` (sidecar) | 100m / 256Mi | 1 / 1Gi |
+| `cao-supervisor` | 250m / 1Gi | 1 / 3Gi |
+| broker-minted worker (`broker.py`) | 250m / 1Gi | 1 / 3Gi |
+| `cao-broker` | 50m / 128Mi | 500m / 512Mi |
+| `cao-panel` | 100m / 128Mi | 500m / 256Mi |
+
+A pod that runs an agent needs the larger memory ceiling because a provider CLI,
+its MCP subprocesses and tmux all live there; the server's own ceiling is small
+on purpose, since nothing user-supplied executes in it.
+
+Shutdown is 30 seconds everywhere that matters — `terminationGracePeriodSeconds:
+30` on the server and supervisor pods, and the same value in `broker.py`
+(`WORKER_TERMINATION_GRACE_SECONDS`) for a minted worker, with the broker's own
+deletion wait derived from it (`WORKER_TERMINATION_GRACE_SECONDS + 15`) rather
+than a flat number that expires while the pod is still `Terminating`.
+
+What each side does with the grace period:
+
+- **`cao-server`** runs its shutdown path and calls `release_server_ownership()`,
+  which unlocks the state directory before the process exits. The kernel would
+  free the `flock` anyway, so this is not what makes the rollout safe — it is what
+  keeps the incoming server from waiting on the outgoing one being reaped.
+- **An executor (`cao-bridge`)** takes SIGTERM as a stop: it closes the channel
+  and withdraws its readiness marker at once, instead of staying parked on an idle
+  socket until the kubelet kills it. The server drops the runtime from
+  `GET /runtimes` on that close and answers `UNKNOWN` for its terminals rather
+  than reporting stale success. Delete an executor and you should see it leave
+  `/runtimes` in about a second, not at the end of the 30s grace period.
+- **A minted worker** is deleted by the broker, which waits out the grace period
+  and then settles the lease. `DELETE /workers/{id}` answering
+  `200 {"released":true,"workload_present":false}` is the exercised case.
+
+A live agent turn is not saved by any of this. Grace buys an orderly channel
+close and lock release, not a resumable session — see the table below.
+
 <a id="restart-limitations"></a>
 ### Restart limitations
 

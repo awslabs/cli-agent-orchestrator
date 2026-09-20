@@ -728,7 +728,25 @@ class Bridge:
             backoff = min(backoff * 2, RECONNECT_BACKOFF_MAX)
 
     def stop(self) -> None:
+        """SIGTERM/SIGINT: stop reconnecting, and close a live channel now.
+
+        Setting the event alone is not enough while a channel is up: `_serve` is
+        parked on the socket and would notice nothing until the kubelet's SIGKILL
+        at the end of the pod's termination grace period. Closing here runs the
+        reconnect loop's `finally`, so readiness is withdrawn while the pod is
+        still shutting down and the server sees a close rather than a connection
+        that died with the process.
+        """
         self._stop.set()
+        ws = self._ws
+        if ws is None:
+            return
+        try:
+            asyncio.get_running_loop().create_task(ws.close())
+        except RuntimeError:
+            # No running loop, so there is no `_serve` parked on this socket
+            # either; the event on its own ends the reconnect loop.
+            pass
 
 
 async def _amain() -> None:
