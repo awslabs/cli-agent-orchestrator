@@ -142,6 +142,20 @@ class StatusMonitor:
         # applied across that boundary would consume the arm and latch-block the new
         # turn's genuine PROCESSING.
         self._capture_generation: Dict[str, int] = {}
+        # Per-terminal OUTPUT-ONLY generation. Bumped under the lock by
+        # _process_chunk alone -- never by notify_input_sent -- so a strictly
+        # greater value than one sampled at a dispatch boundary means real output
+        # has landed since that boundary. This is what output_generation() exposes
+        # and what delivery confirmation gates on (PR #566). It is kept separate
+        # from _capture_generation on purpose: that counter must ALSO advance on
+        # notify_input_sent (a new turn invalidates in-flight capture verdicts),
+        # and a counter that moves on arm cannot distinguish "the worker produced
+        # output" from "we sent keys again" -- a resubmit's own arm would satisfy
+        # the gate on a still-cached pre-dispatch COMPLETED. The byte-buffer epoch
+        # that clear_rolling_buffer hands stateful providers is not a substitute
+        # either: it advances on CLEAR, never on output, so it cannot say whether
+        # anything arrived after the boundary.
+        self._output_generation: Dict[str, int] = {}
         # --- pyte rendered-screen detection state (only used when CAO_PYTE_STATUS
         # is on AND the provider opts in via supports_screen_detection) ---
         # Per-terminal pyte Screen+Stream that composites the raw byte stream
@@ -230,6 +244,7 @@ class StatusMonitor:
             # by a later read.
             self._buffer_changed_at[terminal_id] = time.monotonic()
             self._capture_generation[terminal_id] = self._capture_generation.get(terminal_id, 0) + 1
+            self._output_generation[terminal_id] = self._output_generation.get(terminal_id, 0) + 1
             self._pending_stale_capture.pop(terminal_id, None)
             if use_screen:
                 self._feed_screen_locked(terminal_id, chunk)
@@ -623,6 +638,51 @@ class StatusMonitor:
             except RuntimeError:
                 pass  # loop already closed during shutdown — the timer is moot
 
+    def output_generation(self, terminal_id: str) -> int:
+        """Return the terminal's current OUTPUT generation.
+
+        Advances in exactly one place: ``_process_chunk``, when a chunk of output
+        from the terminal lands. It does NOT advance in ``notify_input_sent``, so
+        a value strictly greater than one sampled at a dispatch boundary means the
+        terminal emitted output after that boundary; in particular a redelivery's
+        own arm cannot make it read that way.
+
+        What that does and does not prove: it proves the FIFO reader delivered a
+        chunk after the sample, not that the chunk belongs to the dispatched task.
+        A late startup frame (spinner redraw, MCP startup line) landing after the
+        sample but before the pasted keys reach the pane counts too. That is the
+        same approximation the rolling-buffer status detection already makes --
+        it parses whatever bytes have landed since the clear -- and it is the
+        conservative side of the previous defect, where a real completion was
+        rejected. Callers gate a started STATUS on this; they do not treat the
+        counter alone as completion evidence.
+
+        This exists because a status VALUE cannot carry recency information.
+        ``notify_input_sent`` deliberately leaves ``_last_status`` alone while
+        arming the revert, so a ready status cached BEFORE a send is
+        indistinguishable from one earned after it — the defect PR #566 hit when
+        a pre-dispatch COMPLETED satisfied delivery confirmation instantly.
+
+        The boundary must be sampled INSIDE the send, after the monitor is armed
+        and the rolling buffer cleared but before any key reaches the pane (see
+        ``terminal_service.dispatch_input``). Sampling after the send returns is
+        too late: ``send_keys`` includes the provider's submit delay, during which
+        a fast worker can emit and complete, and those chunks would then sit
+        inside the baseline -- a genuine completion would read as pre-dispatch
+        and the worker would be resubmitted to and finally torn down.
+
+        Read-only and lock-guarded. Returns 0 for an unknown terminal, which is
+        below any real generation and so never reads as "something happened".
+
+        NOT meaningful for event-inbox backends (herdr): they start no FIFO
+        reader, so ``_process_chunk`` never runs and this never advances.
+        ``get_status`` derives their status on demand instead, which is why they
+        have no staleness problem to solve and callers must not gate on this for
+        them.
+        """
+        with self._lock:
+            return self._output_generation.get(terminal_id, 0)
+
     def notify_input_sent(self, terminal_id: str, *, assume_processing: bool = False) -> None:
         """Arm the next PROCESSING transition.
 
@@ -695,6 +755,7 @@ class StatusMonitor:
             self._buffer_changed_at.pop(terminal_id, None)
             self._pending_stale_capture.pop(terminal_id, None)
             self._capture_generation.pop(terminal_id, None)
+            self._output_generation.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
 
@@ -720,6 +781,7 @@ class StatusMonitor:
             self._buffer_changed_at.pop(terminal_id, None)
             self._pending_stale_capture.pop(terminal_id, None)
             self._capture_generation.pop(terminal_id, None)
+            self._output_generation.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
 
