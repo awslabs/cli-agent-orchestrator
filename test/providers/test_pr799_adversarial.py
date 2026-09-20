@@ -1681,3 +1681,59 @@ class TestPR799AdversarialThirdRound:
         )
         result, _ = _last(monkeypatch, pane)
         assert result == "• Used Python · no external dependencies.\nRun python3 app.py to start it."
+
+    def test_plugin_sse_server_is_translated_for_the_runtime_home(self):
+        """A5-F1: the Kimi Code mcp.json must select the declared protocol.
+
+        `type` is a portable Agent Plugins field that Kimi ignores; without the
+        `transport` translation an SSE server published at `/events` starts as
+        Streamable HTTP.
+        """
+
+        from cli_agent_orchestrator.providers.kimi_runtime_home import merge_mcp_servers
+
+        merged = merge_mcp_servers({}, {"events": {"type": "sse", "url": "https://x/events"}})
+        assert merged["events"] == {"transport": "sse", "url": "https://x/events"}
+
+        http = merge_mcp_servers({}, {"api": {"type": "streamable-http", "url": "https://x/api"}})
+        assert http["api"]["transport"] == "http"
+        assert "type" not in http["api"]
+
+    def test_a_typed_entry_is_left_alone(self):
+        """An unrecognised/absent portable `type` invents nothing."""
+
+        from cli_agent_orchestrator.providers.kimi_runtime_home import merge_mcp_servers
+
+        merged = merge_mcp_servers({}, {"hand": {"url": "https://x/y"}})
+        assert "transport" not in merged["hand"]
+
+    def test_reasoning_in_a_partial_capture_stays_retryable(self):
+        """A5-F2: a capture that merely missed the answer must not refuse."""
+
+        rows = _fixture("kimi_code_0431_03_final_answer.txt").split("\n")
+        index = next(i for i, row in enumerate(rows) if "\x1b[38;5;253m●" in row)
+        rows[index:index] = [" \x1b[38;5;244m● \x1b[3mAnother private reasoning step.\x1b[0m"] * 220
+
+        provider = KimiCliProvider("term-a5f2", "s", "w")
+        provider._dialect = kimi_cli_module.KimiDialect.CODE
+        with pytest.raises(OutputExtractionError) as excinfo:
+            provider.extract_last_message_from_script("\n".join(rows[-200:]))
+        # Retryable, so the caller escalates and the wider capture recovers it.
+        assert not isinstance(excinfo.value, _rejected())
+
+    def test_a_quoted_approval_menu_is_answer_content(self, monkeypatch):
+        """A5-F3: hint + options without the title is prose, not a live dialog."""
+
+        pane = "\n".join(
+            [
+                "💫 Explain the approval menu",
+                "• Available choices:",
+                "    1. Approve once",
+                "    2. Reject",
+                "    ↑/↓ select · 1/2/3/4 choose",
+                "• Choose 2 to reject the command.",
+                "💫",
+            ]
+        )
+        result, _ = _last(monkeypatch, pane)
+        assert "Choose 2 to reject the command." in result

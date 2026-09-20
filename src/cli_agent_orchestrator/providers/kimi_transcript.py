@@ -666,8 +666,17 @@ def _confirm_context_kinds(
             for kind in confirmed
         ]
 
-    approval_confirmed = any(APPROVAL_HINT_RE.search(clean) for clean in clean_lines) and any(
-        APPROVAL_OPTION_RE.match(clean) for clean in clean_lines
+    # The approval dialog is confirmed by its *whole* structure: the title the
+    # renderer draws (`▶ Run this command?`), the navigation hint, and a numbered
+    # option row. Requiring all three is what keeps prose out — a quoted menu
+    # (`• Available choices:` / `1. Approve once` / `↑/↓ select · 1/2/3/4 choose`)
+    # has the hint and the options but no title, and it was reproduced truncating
+    # the answer at the quote. The title alone is not enough either, for the
+    # opposite reason: the substring that classified the row would confirm it.
+    approval_confirmed = (
+        any(APPROVAL_TITLE_RE.search(clean) for clean in clean_lines)
+        and any(APPROVAL_HINT_RE.search(clean) for clean in clean_lines)
+        and any(APPROVAL_OPTION_RE.match(clean) for clean in clean_lines)
     )
     if not approval_confirmed:
         confirmed = [

@@ -77,6 +77,7 @@ from cli_agent_orchestrator.providers.base import (
     OutputExtractionRejected,
 )
 from cli_agent_orchestrator.providers.kimi_runtime_home import (
+    KIMI_TRANSPORTS,
     KimiCodeRuntimeHomeBuilder,
     RuntimeHomeError,
     kimi_agent_name,
@@ -86,28 +87,10 @@ from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 
-# Portable Agent Plugins `type` -> FastMCP `transport`. Kimi 1.20.0 pins
-# fastmcp==2.12.5 and hands each --mcp-config document to
-# `fastmcp.mcp_config.MCPConfig`.
-#
-# WHY THIS EXISTS: `RemoteMCPServer` has no `type` field, so a portable `type` is an
-# ignored extra. With `transport` absent FastMCP calls
-# `infer_transport_type_from_url`, which returns "sse" iff the URL PATH matches
-# `/sse(/|\?|&|$)` and "http" otherwise -- so the declared protocol was decided by
-# URL spelling: an SSE server published at `/events` started as Streamable HTTP,
-# and a Streamable HTTP server at `/sse` started as SSE. Reported by review
-# 5222539218 on #584 (item 5).
-#
-# Only these spellings translate. An absent or unrecognised `type` is left alone:
-# `_map_entry` always emits `type` for a plugin server, so a type-less entry came
-# from a hand-written profile, where inventing a `transport` would be a behaviour
-# change beyond this finding.
-KIMI_TRANSPORTS = {
-    "stdio": "stdio",
-    "streamable-http": "http",
-    "http": "http",
-    "sse": "sse",
-}
+# Portable Agent Plugins `type` -> FastMCP `transport`, applied by the legacy
+# `--mcp-config` builder below and by the Kimi Code runtime `mcp.json` builder.
+# Both share one mapping so the two dialects cannot drift.
+# See `kimi_runtime_home.KIMI_TRANSPORTS` for the measured rationale.
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
@@ -2323,16 +2306,19 @@ class KimiCliProvider(BaseProvider):
           a wider capture may still hold the answer, so the caller must be free to
           escalate.
 
-        "Already holds an answer" is deliberately *not* exempted from the refusal.
-        An earlier version returned early whenever any row of the capture was
-        answer-shaped, and answer-shaped is not the same as answer: the shell
-        preamble, the boot banner and the footer's own continuation row all
-        classify as ``CONTENT``. Reproduced on the live 0.43.1/2.0.2 captures: a
-        turn showing the reasoning row plus the trailing ``context: N%`` footer
-        therefore refused nothing, raised the retryable error, exhausted the
-        escalation and published the reasoning inside the raw pane. A publishable
-        answer *in the region* is what makes publication legitimate, and that is
-        exactly :func:`_collect_response_text`'s ``answers`` list.
+        A capture that holds a positively drawn answer bullet — an
+        ``FINAL_BULLET``, the renderer's own colour-253 ``●`` — is exempt: the
+        region missed it and a wider capture may still hold it, so the caller
+        escalates instead of failing. What is *not* evidence is the answer-kind
+        catch-all. An earlier version exempted any ``ANSWER_KIND``, and
+        answer-shaped is not the same as answer: the shell preamble, the boot
+        banner and the footer's own continuation row all classify as ``CONTENT``.
+        Reproduced on the live 0.43.1/2.0.2 captures: a turn showing the reasoning
+        row plus the trailing ``context: N%`` footer therefore refused nothing,
+        raised the retryable error, exhausted the escalation and published the
+        reasoning inside the raw pane. A publishable answer *in the region* is
+        what makes publication legitimate, and that is exactly
+        :func:`_collect_response_text`'s ``answers`` list.
 
         Raised as :class:`OutputExtractionRejected` rather than the retryable
         :class:`OutputExtractionError`, so it is never retried and never replaced
@@ -2341,6 +2327,15 @@ class KimiCliProvider(BaseProvider):
 
         if has_answers:
             # A real answer is published; the other content is simply excluded.
+            return
+        if any(kind is kt.KimiLineKind.FINAL_BULLET for kind in scope_kinds):
+            # A positively drawn answer bullet elsewhere in the capture is a
+            # capture that did not reach far enough, not a turn without an
+            # answer: the region missed it and a wider capture may hold it, so
+            # the caller must be free to escalate. Only the answer *bullet* is
+            # exempt — plain ``CONTENT`` is not evidence, because the shell
+            # preamble, the boot banner and the footer's continuation row all
+            # classify that way.
             return
         if any(kind in _NON_PUBLISHABLE_KINDS for kind in scope_kinds):
             raise OutputExtractionRejected(

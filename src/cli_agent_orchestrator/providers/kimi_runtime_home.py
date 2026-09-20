@@ -63,6 +63,26 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 
+# Portable Agent Plugins `type` -> FastMCP `transport`. Kimi pins fastmcp and
+# hands each MCP document to `fastmcp.mcp_config.MCPConfig`; `RemoteMCPServer`
+# has no `type` field, so a portable `type` is an ignored extra and `transport`
+# decides the protocol. With `transport` absent Kimi infers it from the URL
+# *path* (`sse` only when the path matches `/sse(/|?|&|$)`, `http` otherwise), so
+# an SSE server published at `/events` would start as Streamable HTTP.
+#
+# Both launch paths translate through this one mapping: the legacy builder writes
+# it into `--mcp-config`, and `merge_mcp_servers` writes it into the Kimi Code
+# runtime `mcp.json`. Only these spellings translate. An absent or unrecognised
+# `type` is left alone — `_map_entry` always emits `type` for a plugin server, so
+# a type-less entry came from a hand-written profile, where inventing a
+# `transport` would be a behaviour change beyond this finding.
+KIMI_TRANSPORTS = {
+    "stdio": "stdio",
+    "streamable-http": "http",
+    "http": "http",
+    "sse": "sse",
+}
+
 logger = logging.getLogger(__name__)
 
 #: Name of the runtime home created inside the provider's temp directory.
@@ -366,6 +386,15 @@ def merge_mcp_servers(
         config = _normalise_profile_server(raw)
         if "command" in config:
             config = resolve_mcp_server_config(config)
+        # Select the declared protocol explicitly rather than letting Kimi infer
+        # it from the URL path (see `KIMI_TRANSPORTS`). Applied on both launch
+        # paths; without it this one emitted `type: sse` and Kimi started the
+        # server as Streamable HTTP.
+        declared = config.get("type")
+        translated = KIMI_TRANSPORTS.get(declared) if isinstance(declared, str) else None
+        if translated is not None:
+            config["transport"] = translated
+            del config["type"]
         # CAO's single `timeout` knob maps onto Kimi's per-server pair, which
         # override the launch-scoped KIMI_MCP_*_TIMEOUT_MS defaults. `timeout`
         # itself is dropped: it is not part of Kimi's server schema.
