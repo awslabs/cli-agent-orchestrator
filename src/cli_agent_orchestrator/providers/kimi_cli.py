@@ -251,6 +251,26 @@ KIMI_NO_AUTO_UPDATE_ENV = {
     "KIMI_CLI_NO_AUTO_UPDATE": "1",
 }
 
+#: Ambient capabilities removed from the launch environment.
+#:
+#: The extractor's palette is *measured*: reasoning is 244, the final-answer
+#: bullet 253, submitted input 222 (`USER_INPUT_COLOR_INDEX`). When the inherited
+#: environment advertises 24-bit colour, the TUI emits ``38;2;r;g;b`` instead of
+#: ``38;5;n`` — reproduced live on Kimi Code 2.0.2 with the host's
+#: ``COLORTERM=truecolor``: the answer bullet renders ``38;2;224;224;224``, a
+#: near-grey that :func:`kimi_transcript.is_thinking_styled` reads as reasoning
+#: (its documented fail-closed direction), the answer colour 253 never appears,
+#: and ``mode=last`` degrades to the raw-transcript fallback. The user echo moves
+#: to ``38;2;255;203;107`` in the same switch, so submission continuation styling
+#: is lost too.
+#:
+#: ``TERM`` is already pinned for the same class of reason (Kimi exits under
+#: ``TERM=tmux-256color``); this removes the capability that would otherwise
+#: change the renderer's palette out from under the measured constants. Unsetting
+#: is stricter than an empty value: some renderers test for the *presence* of the
+#: variable.
+KIMI_PALETTE_ENV_UNSET = ("COLORTERM",)
+
 #: A3-5 — explicit opt-in for answering Kimi Code's workspace-trust dialog.
 #:
 #: Measured against Kimi Code 0.43.1 (A3-5 probe, see
@@ -1123,14 +1143,18 @@ class KimiCliProvider(BaseProvider):
             raise ProviderError(f"Failed to build Kimi Code runtime home: {exc}") from exc
         self._runtime_home_builder = builder
 
-        command_parts = [
-            "env",
-            f"KIMI_CODE_HOME={runtime.home}",
-            f"CAO_TERMINAL_ID={self.terminal_id}",
-            "TERM=xterm-256color",
-            f"KIMI_MCP_TOOL_TIMEOUT_MS={KIMI_MCP_TOOL_TIMEOUT_MS}",
-            f"KIMI_MCP_STARTUP_TIMEOUT_MS={KIMI_MCP_STARTUP_TIMEOUT_MS}",
-        ]
+        command_parts = ["env"]
+        for name in KIMI_PALETTE_ENV_UNSET:
+            command_parts.extend(["-u", name])
+        command_parts.extend(
+            [
+                f"KIMI_CODE_HOME={runtime.home}",
+                f"CAO_TERMINAL_ID={self.terminal_id}",
+                "TERM=xterm-256color",
+                f"KIMI_MCP_TOOL_TIMEOUT_MS={KIMI_MCP_TOOL_TIMEOUT_MS}",
+                f"KIMI_MCP_STARTUP_TIMEOUT_MS={KIMI_MCP_STARTUP_TIMEOUT_MS}",
+            ]
+        )
         for key, value in KIMI_NO_AUTO_UPDATE_ENV.items():
             command_parts.append(f"{key}={value}")
 
@@ -1465,9 +1489,13 @@ class KimiCliProvider(BaseProvider):
                     f"'{self._agent_profile}': {e}"
                 )
 
-        # cd to unique temp dir (per-directory lock) + set TERM for tmux compatibility
+        # cd to unique temp dir (per-directory lock) + set TERM for tmux
+        # compatibility, and drop the ambient 24-bit capability that would move
+        # the renderer off the palette the extractor was measured against
+        # (see KIMI_PALETTE_ENV_UNSET).
         kimi_cmd = shlex.join(command_parts)
-        return f"cd {shlex.quote(temp_dir)} && TERM=xterm-256color {kimi_cmd}"
+        unset = " ".join(f"-u {shlex.quote(name)}" for name in KIMI_PALETTE_ENV_UNSET)
+        return f"cd {shlex.quote(temp_dir)} && env {unset} TERM=xterm-256color {kimi_cmd}"
 
     @classmethod
     def _ensure_mcp_timeout(cls) -> None:

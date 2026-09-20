@@ -1396,3 +1396,68 @@ class TestPR799AdversarialRound2Residuals:
         with pytest.raises(_rejected()) as excinfo:
             _last(monkeypatch, pane)
         assert "PRIVATE tool payload" not in str(excinfo.value)
+
+
+# =============================================================================
+# Renderer palette — the measured colours depend on the launch environment
+# =============================================================================
+
+
+class TestPR799AdversarialRendererPalette:
+    """Both dialects must launch the TUI on the palette the extractor measured.
+
+    Found by the live E2E against real Kimi Code 2.0.2 on a host advertising
+    ``COLORTERM=truecolor``: the inherited capability switched the renderer to
+    24-bit colour, the final-answer bullet rendered ``38;2;224;224;224`` — a
+    near-grey that the fail-closed reasoning rule reads as reasoning — the answer
+    colour 253 never appeared, and ``mode=last`` degraded to the raw-transcript
+    fallback. The user echo moved to ``38;2;255;203;107`` in the same switch, so
+    submission continuation styling was lost as well. ``TERM`` was already
+    pinned; the 24-bit capability is removed the same way.
+    """
+
+    def test_kimi_code_launch_removes_the_ambient_capability(self, tmp_path, monkeypatch):
+        profile = MagicMock()
+        profile.model = None
+        profile.system_prompt = None
+        profile.name = "dev"
+        profile.mcpServers = {}
+        monkeypatch.setattr(kimi_cli_module, "load_agent_profile", lambda name: profile)
+        provider = KimiCliProvider("term-palette", "s", "w", agent_profile="dev")
+        provider._kimi_binary = "/usr/bin/kimi"
+        provider._dialect = kimi_cli_module.KimiDialect.CODE
+        provider._temp_dir = str(tmp_path)
+        provider._kimi_source_home = tmp_path / "src-home"
+        (tmp_path / "src-home").mkdir(exist_ok=True)
+
+        command = provider._build_kimi_code_command()
+
+        assert "-u COLORTERM" in command, command
+
+    def test_legacy_launch_removes_the_ambient_capability(self, tmp_path, monkeypatch):
+        provider = KimiCliProvider("term-palette-legacy", "s", "w")
+        provider._temp_dir = str(tmp_path / "legacy")
+        Path(provider._temp_dir).mkdir()
+
+        command = provider._build_kimi_command("/usr/local/bin/kimi")
+
+        assert "-u COLORTERM" in command, command
+
+    def test_truecolor_answer_bullet_is_not_publishable(self):
+        """Why the capability must go: the near-grey answer reads as reasoning.
+
+        This is the measured 2.0.2 rendering, not a synthetic shape — the fix is
+        to prevent the palette switch, and this case documents that the extractor
+        alone cannot recover it (the fail-closed direction is deliberate).
+        """
+
+        pane = "\n".join(
+            [
+                "\x1b[1m\x1b[38;2;255;203;107m✨ Task\x1b[0m",
+                " \x1b[38;2;224;224;224m● \x1b[39mMCP-OK=2",
+                "",
+            ]
+        )
+        kinds = kt.classify_rows(pane.split("\n"), semantics=kt.SpinnerSemantics.CODE)
+        assert kt.KimiLineKind.THINKING_BULLET in kinds
+        assert kt.KimiLineKind.FINAL_BULLET not in kinds
