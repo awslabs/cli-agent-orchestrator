@@ -1536,14 +1536,20 @@ class TestPR799AdversarialThirdRound:
         """The positive controls the escape-free rule exists for."""
 
         for row in [
-            "● Used Read",
             "● Used Read (ANSWER_SPEC.md)",
-            "● Used find_profiles",
+            "● Used find_profiles · MCP/cao-mcp-server (kimi)",
             "● Using handoff({...})",
             "● Used Read (report.txt) · 3 lines",
-            "● Used memory.recall",
+            "● Used memory.recall (query=x)",
+            "● Running a command · $ uname -a",
         ]:
             assert kt.is_tool_call_row(row) is True, row
+
+    def test_a_bare_verb_and_word_is_prose(self):
+        """No structural evidence, so it is answer content, not a tool row."""
+
+        for row in ["● Used Read", "● Used Python", "• Used pandas", "● Using Docker"]:
+            assert kt.is_tool_call_row(row) is False, row
 
     def test_a_prose_answer_after_a_tool_verb_is_extracted(self, monkeypatch):
         pane = "\n".join(["💫 Which parser did you use? Reply with two words.", "• Used pandas", "💫"])
@@ -1565,3 +1571,24 @@ class TestPR799AdversarialThirdRound:
         pane = "\n".join(["💫 Say hello in italics", "• \x1b[3mHello there!\x1b[0m", "💫"])
         result, _ = _last(monkeypatch, pane)
         assert result == "• Hello there!"
+
+    def test_a_bare_verb_and_word_answer_is_extracted(self, monkeypatch):
+        """A2-F1: a bare `<verb> <word>` row carries no structural evidence."""
+
+        pane = "\n".join(["💫 Which language did you use?", "• Used Python", "💫"])
+        result, _ = _last(monkeypatch, pane)
+        assert result == "• Used Python"
+
+    def test_an_italic_answer_after_reasoning_is_extracted(self, monkeypatch):
+        """A2-F2: an answer bullet ends the reasoning block however it is styled."""
+
+        pane = "\n".join(
+            [
+                "💫 Say hello in italics",
+                "\x1b[38;5;244m• Choosing a greeting.\x1b[0m",
+                "• \x1b[3mHello!\x1b[0m",
+                "💫",
+            ]
+        )
+        result, _ = _last(monkeypatch, pane)
+        assert result == "• Hello!"

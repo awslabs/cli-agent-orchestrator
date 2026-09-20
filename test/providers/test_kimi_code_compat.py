@@ -2663,16 +2663,25 @@ class TestA3ToolRowLeak:
         "● Used Read (ANSWER_SPEC.md) · 10 lines",
         "● Used Bash (ls -la) · 3 lines",
         "● Used Grep (pattern=foo) · 1 line",
-        "● Used Read",
         "● Running a command · $ uname -a",
         "● Using handoff({...})",
     )
 
     #: Ordinary prose that merely starts with the same verb.
+    #:
+    #: `● Used Python` is deliberately here rather than in TOOL_ROWS. A bare
+    #: `<verb> <word>` row carries no structural evidence — no `·` detail
+    #: separator, no argument list — so by the same doctrine that keeps a row's
+    #: *text* from making it UI state it is answer content. The measured collapse
+    #: is always `● Used <Tool> (<arg>) · <N> lines`, so the evidence is there
+    #: whenever the renderer drew a tool row; treating the bare shape as a tool
+    #: row instead refused answers such as "Used Python".
     PROSE_ROWS = (
         "● Used widely in production.",
         "● Used Python extensively for this.",
         "● Used to be a problem, but no longer.",
+        "● Used Python",
+        "• Used pandas",
     )
 
     @pytest.mark.parametrize("row", TOOL_ROWS)

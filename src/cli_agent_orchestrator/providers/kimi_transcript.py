@@ -363,15 +363,6 @@ RULE_RE = re.compile(r"^\s*[─━═]{3,}\s*$")
 # so a capitalised-identifier rule let every CAO MCP tool row through as answer
 # text — the D6 production defect.
 _TOOL_IDENTIFIER = r"[A-Za-z_][A-Za-z0-9_.-]*"
-#: An identifier that reads as a tool *name* rather than an ordinary word: a
-#: capitalised (or underscore-prefixed) name, or any name carrying a `_`, `.`,
-#: `/` or `-` — CAO's own tools are snake_case. The distinction matters only in
-#: the escape-free form with no `·` separator and no argument list, where
-#: `• Used Read` is a collapsed tool row but `• Used pandas` is an answer to
-#: "which parser did you use?" — the two are the same shape otherwise.
-_TOOLISH_IDENTIFIER = (
-    r"(?:[A-Z_][A-Za-z0-9_.-]*|[A-Za-z0-9][A-Za-z0-9]*[_.\/-][A-Za-z0-9_.-]*)"
-)
 #: The measured detail separator: a `·` with horizontal whitespace on both sides.
 _TOOL_DETAIL_SEP = r"[^\S\n]·[^\S\n]"
 #: Optional parenthesised argument list, as in `Used Read (ANSWER_SPEC.md)`.
@@ -396,12 +387,15 @@ TOOL_CALL_RE = re.compile(
     + r")"
 )
 # The escape-free form. A sentence that merely *begins* with a tool verb is
-# answer content, so a row is a tool row only when it carries the measured `·`
-# detail separator, an argument list, or is exactly `<verb> <tool-name>` with
-# nothing after it. In that last, bare shape the identifier must read as a tool
-# name (:data:`_TOOLISH_IDENTIFIER`): `Used Read` is a collapsed tool row, while
-# `Used pandas` is an answer to "which parser did you use?" and only the
-# identifier's own shape separates the two.
+# answer content, so a row is a tool row only when it carries structural
+# evidence the renderer itself draws: the measured `·` detail separator, or a
+# parenthesised argument list.
+#
+# The bare `<verb> <identifier>` shape deliberately does NOT qualify. It carries
+# nothing but text, and text is not UI state — the same doctrine that keeps
+# `• Used Python` and `• Used pandas` answers rather than execution plumbing.
+# The measured collapse is always `● Used <Tool> (<arg>) · <N> lines`, so the
+# evidence is present whenever the renderer emitted it.
 TOOL_CALL_CLEAN_RE = re.compile(
     r"^\s*[•●]\s*(?:"
     + r"Running a command"
@@ -415,9 +409,6 @@ TOOL_CALL_CLEAN_RE = re.compile(
     + r"|(?:Used|Using|Calling)[^\S\n]+"
     + _TOOL_IDENTIFIER
     + _TOOL_ARG_LIST
-    + r"[^\S\n]*$"
-    + r"|(?:Used|Using|Calling)[^\S\n]+"
-    + _TOOLISH_IDENTIFIER
     + r"[^\S\n]*$"
     + r")"
 )
@@ -1317,7 +1308,11 @@ def classify_rows(
                 # layout, is what continues the block.
                 result.append(KimiLineKind.BLANK)
                 continue
-            if is_reasoning_continuation(raw):
+            # A row the classifier reads as an answer bullet is a *new* response,
+            # not a continuation, however it is styled. Italic emphasis is how an
+            # answer renders too, so absorbing on styling alone would swallow a
+            # legitimate italic answer that follows reasoning.
+            if kind is not KimiLineKind.FINAL_BULLET and is_reasoning_continuation(raw):
                 result.append(KimiLineKind.THINKING_BULLET)
                 continue
             in_reasoning = False
