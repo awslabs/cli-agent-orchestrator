@@ -58,7 +58,10 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
-from cli_agent_orchestrator.utils.mcp_resolution import resolve_cao_mcp_command
+from cli_agent_orchestrator.utils.mcp_resolution import (
+    resolve_cao_mcp_command,
+    shared_endpoint_child_env,
+)
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
@@ -426,6 +429,10 @@ class AntigravityCliProvider(BaseProvider):
                 }
                 env = dict(cfg.get("env", {}))
                 env["CAO_TERMINAL_ID"] = self.terminal_id
+                # The resolver may have swapped in the forwarding shim
+                # (#745), which needs the endpoint and token here. Empty
+                # when no shared endpoint is configured.
+                env.update(shared_endpoint_child_env())
                 entry["env"] = env
                 # Use a per-terminal key so concurrent inits don't overwrite
                 # each other's entry before agy reads the config at startup.

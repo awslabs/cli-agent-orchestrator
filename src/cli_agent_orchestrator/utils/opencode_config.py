@@ -15,7 +15,10 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from cli_agent_orchestrator.constants import OPENCODE_CONFIG_DIR, OPENCODE_CONFIG_FILE, SKILLS_DIR
-from cli_agent_orchestrator.utils.mcp_resolution import resolve_cao_mcp_command
+from cli_agent_orchestrator.utils.mcp_resolution import (
+    resolve_cao_mcp_command,
+    shared_endpoint_child_env,
+)
 from cli_agent_orchestrator.utils.path_validation import flatten_path_separators
 
 logger = logging.getLogger(__name__)
@@ -130,8 +133,13 @@ def translate_mcp_server_config(cao_config: Dict[str, Any]) -> Dict[str, Any]:
         "command": full_command,
         "enabled": True,
     }
-    if "env" in cao_config:
-        result["environment"] = cao_config["env"]
+    environment = dict(cao_config.get("env") or {})
+    # The resolver may have swapped in the forwarding shim (#745), which
+    # needs the endpoint and token here. Empty when none is configured, so
+    # an entry that had no "env" still gets no "environment" key.
+    environment.update(shared_endpoint_child_env())
+    if environment:
+        result["environment"] = environment
     return result
 
 

@@ -20,15 +20,29 @@ inline:
 
 Any command other than the bare ``cao-mcp-server`` (e.g. a user's custom MCP
 server, or an explicit absolute path) passes through unchanged.
+
+This is also where a bundled entry is redirected to the shared HTTP endpoint
+(#745). When ``CAO_MCP_HTTP_URL`` is set, ``cao-mcp-server`` is replaced by
+``cao-mcp-stdio-bridge`` with the endpoint and token injected into the child
+env. Doing it here rather than in each provider is what lets the shim's promise
+hold literally — no provider code knows the endpoint exists — and it is why an
+agent pod needs no MCP server, and therefore no broker credentials, of its own.
 """
 
 import logging
+import os
 import shutil
 import sys
 from pathlib import Path
 from typing import List, Tuple
 
 logger = logging.getLogger(__name__)
+
+# Set when a shared HTTP MCP endpoint exists for agents to use instead of each
+# starting its own in-pod server (#745). Read here rather than imported from
+# ``mcp_server.http_hosting`` to keep this leaf utility free of that dependency.
+SHARED_ENDPOINT_URL_ENV = "CAO_MCP_HTTP_URL"
+RUNTIME_TOKEN_ENV = "CAO_RUNTIME_TOKEN"
 
 # The bundled orchestration MCP server's console-script name.
 CAO_MCP_SERVER_COMMAND = "cao-mcp-server"
@@ -101,6 +115,15 @@ def resolve_cao_mcp_command(
     Returns:
         A ``(command, args)`` tuple.
     """
+    # When a shared endpoint is configured, the bundled orchestration server
+    # becomes the forwarding shim (#745) — one substitution, before path
+    # resolution, so every caller of this function is consistent. Only the
+    # bundled command is substituted: someone else's MCP server is not ours to
+    # redirect, and an entry already naming the shim needs no change.
+    if command == CAO_MCP_SERVER_COMMAND and shared_endpoint_url():
+        logger.debug("redirecting %s to the shared endpoint via the shim", command)
+        command = CAO_MCP_STDIO_BRIDGE_COMMAND
+
     module = _BUNDLED_COMMANDS.get(command)
     if module is None:
         return command, list(args)
@@ -130,6 +153,34 @@ def resolve_cao_mcp_command(
     return interpreter, ["-m", module, *args]
 
 
+def shared_endpoint_url() -> str:
+    """The shared HTTP MCP endpoint's URL, or "" when there is none."""
+    return os.environ.get(SHARED_ENDPOINT_URL_ENV, "").strip()
+
+
+def shared_endpoint_child_env() -> dict:
+    """Env a forwarded MCP child needs, for callers that build env themselves.
+
+    Exactly two things the profile cannot know: which endpoint to dial and the
+    token to present. Empty dict when no endpoint is configured, so a caller can
+    merge it unconditionally.
+
+    The token is omitted when unset rather than sent empty — the shim's own
+    check then reports it as absent, which is the legible failure. It is not a
+    new secret in the agent's reach either way: the pod that runs the agent
+    already carries ``CAO_RUNTIME_TOKEN`` in its environment, because that is
+    what its runtime channel authenticates with.
+    """
+    url = shared_endpoint_url()
+    if not url:
+        return {}
+    env = {SHARED_ENDPOINT_URL_ENV: url}
+    token = os.environ.get(RUNTIME_TOKEN_ENV, "").strip()
+    if token:
+        env[RUNTIME_TOKEN_ENV] = token
+    return env
+
+
 def resolve_mcp_server_config(config: dict, *, persisted: bool = False) -> dict:
     """Return a copy of an MCP server config with its command resolved.
 
@@ -148,6 +199,13 @@ def resolve_mcp_server_config(config: dict, *, persisted: bool = False) -> dict:
     if "command" not in config:
         return dict(config)
     resolved = dict(config)
+    # A bundled entry being redirected to the shared endpoint also needs the
+    # endpoint and token in the child's env; the command swap itself happens in
+    # resolve_cao_mcp_command. A value the profile set explicitly wins.
+    if resolved.get("command") == CAO_MCP_SERVER_COMMAND:
+        extra = shared_endpoint_child_env()
+        if extra:
+            resolved["env"] = {**extra, **dict(resolved.get("env") or {})}
     command = resolved.get("command", "")
     args = resolved.get("args", []) or []
     new_command, new_args = resolve_cao_mcp_command(command, args, persisted=persisted)
