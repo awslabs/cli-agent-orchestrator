@@ -2172,10 +2172,25 @@ class KimiCliProvider(BaseProvider):
                 box_end_idx = i
 
         # Strategy 2: Find the last prompt-with-input line — v1.20.0+
+        #
+        # The pattern is a *text* anchor, and its text is exactly what Kimi Code
+        # draws private payload with: a dimmed `✨ …` row inside tool output
+        # ANSI-strips to the same shape as a real submission. Under CODE the
+        # renderer marks a submission with its own colour, so a match that is not
+        # a positively identified submission is not an anchor — reproduced, a
+        # shallow capture of `ESC[2m✨ …` + dimmed payload published the payload
+        # after a single fetch. With no qualifying anchor the capture falls
+        # through to `_extract_without_input_box`, which demands renderer-evidenced
+        # answer text and otherwise lets the caller widen.
         prompt_input_idx = None
         for i, line in enumerate(clean_lines):
-            if re.search(PROMPT_WITH_INPUT_PATTERN, line):
-                prompt_input_idx = i
+            if not re.search(PROMPT_WITH_INPUT_PATTERN, line):
+                continue
+            if self._dialect is KimiDialect.CODE and not kt.is_user_input_start(
+                raw_lines[i], line, kt.SpinnerSemantics.CODE
+            ):
+                continue
+            prompt_input_idx = i
 
         # Choose the best anchor: the LATEST marker wins. The newest "Kimi
         # Code" TUI draws decorative ╰─ boxes during boot (its own welcome box
@@ -2497,22 +2512,25 @@ class KimiCliProvider(BaseProvider):
 
         # Kimi Code can expose private continuation rows after their owning
         # header has scrolled out. Without a submitted-message anchor, arbitrary
-        # leading CONTENT is therefore ambiguous. Require a positively rendered
-        # final-answer marker before publishing anything; otherwise keep the
-        # failure retryable so the caller can widen the capture.
+        # leading content is therefore ambiguous — including content that merely
+        # *looks* like an answer bullet. Tool payload is drawn dim and routinely
+        # starts with the answer's bullet, so an unstyled `●` row is not
+        # evidence: reproduced, a shallow capture of
+        # `ESC[2m● PRIVATE_TOOL_PAYLOAD` + a colour-253 answer published the
+        # payload. The marker must carry the renderer's own answer colour, and
+        # otherwise the failure stays retryable so the caller can widen.
         start_idx = 0
         if self._dialect is KimiDialect.CODE:
             final_markers = [
                 index
                 for index in range(prompt_idx)
-                if kinds is not None
-                and index < len(kinds)
-                and kinds[index] is kt.KimiLineKind.FINAL_BULLET
+                if index < len(raw_lines)
+                and kt.FINAL_ANSWER_BULLET_STYLE_RE.search(raw_lines[index])
             ]
             if not final_markers:
                 raise OutputExtractionError(
-                    "Kimi Code capture has no submitted-message anchor or final-answer "
-                    "marker; widening is required before channel ownership is known."
+                    "Kimi Code capture has no submitted-message anchor or renderer-evidenced "
+                    "final-answer marker; widening is required before channel ownership is known."
                 )
             start_idx = final_markers[0]
 

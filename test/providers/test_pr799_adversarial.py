@@ -2199,6 +2199,157 @@ class TestPR799StructuralChannelOwnership:
 
         result, _ = self._get_last_code(monkeypatch, pane)
         assert result == "● SAFE_FINAL"
+
+    # --- renderer evidence required before a channel transition -----------
+
+    def test_shallow_capture_cannot_publish_a_dimmed_payload_bullet(self, monkeypatch):
+        """A dimmed `●` row is payload, not renderer-evidenced answer text.
+
+        The unanchored capture rule originally accepted any ``FINAL_BULLET`` kind
+        as the answer marker. Tool payload is drawn dim and routinely starts with
+        the answer's bullet, so the marker must carry the renderer's own colour.
+        """
+
+        pane = "\n".join(
+            [
+                "\x1b[2m● PRIVATE_TOOL_PAYLOAD\x1b[0m",
+                _answer("SAFE_FINAL"),
+                "── input ──",
+                _footer(),
+            ]
+        )
+
+        result, _ = self._get_last_code(monkeypatch, pane)
+        assert result == "● SAFE_FINAL"
+        assert "PRIVATE_TOOL_PAYLOAD" not in result
+
+    def test_dimmed_sparkle_is_not_a_legacy_text_anchor(self, monkeypatch):
+        """The legacy `✨` anchor is text; under CODE it needs the submission colour.
+
+        An ANSI-stripped dimmed sparkle matches the legacy prompt pattern exactly,
+        which anchored the response region *after* it and published the payload
+        that followed — bypassing the CODE ownership rule entirely.
+        """
+
+        shallow = "\n".join(
+            [
+                "\x1b[2m✨ quoted prompt\x1b[0m",
+                "\x1b[2mPRIVATE_TOOL_PAYLOAD\x1b[0m",
+                _answer("SAFE_FINAL"),
+                "── input ──",
+                _footer(),
+            ]
+        )
+        full = self._pane(_answer("SAFE_FINAL"))
+
+        result, backend = self._get_last_code(monkeypatch, [shallow, full])
+        assert result == "● SAFE_FINAL"
+        assert backend.get_history.call_count == 2
+        assert "PRIVATE_TOOL_PAYLOAD" not in result
+
+    def test_plain_sparkle_inside_an_established_tool_block_stays_payload(self, monkeypatch):
+        """An open private block owns its rows over a candidate transition.
+
+        The escape-free fallback lets a plain sparkle *start* a submission where
+        no private block is open. Inside an established tool block that same row
+        must not take the channel: it reset the tool state and published the
+        dimmed payload after it.
+        """
+
+        pane = "\n".join(
+            [
+                _user("✨ Current task"),
+                "",
+                "● Used Read (report.txt) · 3 lines",
+                "✨ quoted prompt",
+                "\x1b[2m● PRIVATE_TOOL_PAYLOAD\x1b[0m",
+                _answer("SAFE_FINAL"),
+                *self._composer(),
+                _footer(),
+            ]
+        )
+
+        result, _ = self._get_last_code(monkeypatch, pane)
+        assert result == "● SAFE_FINAL"
+        assert "PRIVATE_TOOL_PAYLOAD" not in result
+
+    def test_row_drawn_in_the_answer_colour_is_not_a_spinner(self, monkeypatch):
+        """Braille in an answer line is answer text, not the working indicator.
+
+        The measured indicator is drawn in the spinner colour; answer text is
+        drawn in 253. Reading a 253 row as work dropped it from the answer *and*
+        pinned a settled terminal at PROCESSING.
+        """
+
+        from cli_agent_orchestrator.models.terminal import TerminalStatus
+
+        pane = self._pane(
+            _answer("Braille alphabet:"),
+            "   \x1b[38;5;253m⠋ is F\x1b[39m",
+            "TAIL",
+        )
+        result, _ = self._get_last_code(monkeypatch, pane)
+        assert "⠋ is F" in result
+        assert "TAIL" in result
+
+        # The predicate the status path delegates to must agree.
+        drawn = "   \x1b[38;5;253m⠋ is F\x1b[39m"
+        assert kt.is_live_spinner_line(kt.strip_sgr(drawn), drawn) is False
+
+        provider = KimiCliProvider("term-structural-frame", "s", "w")
+        provider._dialect = kimi_cli_module.KimiDialect.CODE
+        rows = [
+            kt.strip_sgr(_user("✨ Current task")),
+            kt.strip_sgr(_answer("Braille alphabet:")),
+            drawn,
+            "TAIL",
+            *[kt.strip_sgr(row) for row in self._composer()],
+            kt.strip_sgr(_footer()),
+        ]
+        assert provider.get_status_from_screen(rows) is not TerminalStatus.PROCESSING
+
+    def test_row_drawn_in_the_answer_colour_is_not_an_idle_tip(self, monkeypatch):
+        """A moon-tip line inside an answer is answer text."""
+
+        pane = self._pane(
+            _answer("Example:"),
+            "   \x1b[38;5;253m🌕 · Tip: use /help\x1b[39m",
+            "TAIL",
+        )
+        result, _ = self._get_last_code(monkeypatch, pane)
+        assert "🌕 · Tip: use /help" in result
+        assert "TAIL" in result
+
+        drawn = "   \x1b[38;5;253m🌕 · Tip: use /help\x1b[39m"
+        assert kt.is_idle_tip_line(kt.strip_sgr(drawn), drawn) is False
+
+    def test_measured_indicator_colours_still_classify(self):
+        """The controls: the renderer's own indicator rows still classify."""
+
+        spinner = "\x1b[38;5;111m⠙\x1b[39m working…"
+        case = "\x1b[38;5;111m⠙\x1b[39m Using handoff({...})"
+        tip = "🌕\x1b[38;5;244m · Tip: ctrl-s to add guidance"
+        for row in (spinner, case):
+            assert kt.is_live_spinner_line(kt.strip_sgr(row), row) is True
+            assert kt.classify_line(row, kt.strip_sgr(row)) is kt.KimiLineKind.LIVE_SPINNER
+        assert kt.is_idle_tip_line(kt.strip_sgr(tip), tip) is True
+        assert kt.classify_line(tip, kt.strip_sgr(tip)) is kt.KimiLineKind.IDLE_TIP
+
+    def test_wrapped_submission_is_still_absorbed_at_the_boundary(self, monkeypatch):
+        """The control: the plain-sparkle guard does not weaken the echo rule."""
+
+        pane = "\n".join(
+            [
+                "\x1b[1;38;5;222m✨ current task\x1b[0m",
+                "    \x1b[1;38;5;222mline two of the submission\x1b[0m",
+                "",
+                _answer("SAFE_FINAL"),
+                _footer(),
+            ]
+        )
+
+        result, _ = self._get_last_code(monkeypatch, pane)
+        assert result == "● SAFE_FINAL"
         assert "PRIVATE_TOOL_PAYLOAD" not in result
 
     @pytest.mark.parametrize(
@@ -2357,3 +2508,91 @@ class TestPR799StructuralChannelOwnership:
         assert "╭──╮" in result
         assert "│ > │" in result
         assert "TAIL" in result
+
+    # --- answer text that merely *mentions* chrome vocabulary -------------
+
+    def test_answer_mentioning_collapsed_output_text_survives(self, monkeypatch):
+        """Quoting the collapse phrase is prose, not execution plumbing.
+
+        The measured collapse row is the row's own leading content
+        (``   … (3 more lines, ctrl+o to expand)``). An unanchored search made
+        the phrase destructive anywhere on a row, so an answer that explained it
+        was dropped — even with a colour-253 answer bullet.
+        """
+
+        body = "The UI shows … (3 more lines, ctrl+o to expand) when output is collapsed."
+        pane = self._pane(_answer(body), "TAIL")
+
+        result, _ = self._get_last_code(monkeypatch, pane)
+        assert result == f"● {body}\nTAIL"
+
+    def test_legacy_answer_mentioning_collapsed_output_text_survives(self, monkeypatch):
+        """The same collision on the legacy path, which has no answer colour."""
+
+        body = "The UI shows … (3 more lines, ctrl+o to expand) when output is collapsed."
+        pane = "\n".join(["💫 Explain the output", "", f"• {body}", "", "💫"])
+
+        result, _ = _last(monkeypatch, pane)
+        assert result == f"• {body}"
+
+    def test_answer_with_inline_colour_222_span_is_not_an_echo(self, monkeypatch):
+        """An inline submission-coloured span is the answer's own emphasis.
+
+        The renderer draws a submitted row in 222 from its leading graphic
+        position; colour applied to a fragment mid-sentence is not a wrapped
+        submission. Reading it as one absorbed the answer into the user echo.
+        """
+
+        pane = "\n".join(
+            [
+                "💫 Explain the output",
+                "",
+                "• Use \x1b[38;5;222mVALUE\x1b[39m here.",
+                "",
+                "💫",
+            ]
+        )
+
+        result, _ = _last(monkeypatch, pane)
+        assert result == "• Use VALUE here."
+
+    def test_measured_collapsed_output_row_stays_tool_chrome(self):
+        """The control: the renderer's own collapse row is still plumbing."""
+
+        assert (
+            kt.classify_line("   \x1b[2m… (3 more lines, ctrl+o to expand)\x1b[0m")
+            is kt.KimiLineKind.TOOL_CHROME
+        )
+        assert kt.classify_line("… (3 more lines, ctrl+o to expand)") is kt.KimiLineKind.TOOL_CHROME
+
+    def test_wrapped_submission_colour_still_continues_the_echo(self):
+        """The control: a row *drawn* in 222 is still a submission continuation.
+
+        A submitted message may contain a pasted list, so a row whose own leading
+        content (bullet included) is drawn in the submission colour continues the
+        block rather than becoming a fresh answer bullet.
+        """
+
+        assert kt.is_user_input_continuation("    \x1b[1;38;5;222mline two\x1b[22m\x1b[39m") is True
+        assert kt.is_user_input_continuation("• \x1b[38;5;222m- pasted item") is True
+        assert kt.is_user_input_continuation("• Use \x1b[38;5;222mVALUE\x1b[39m here.") is False
+        assert (
+            kt.is_user_input_continuation(" \x1b[38;5;253m● \x1b[39massertion ran\x1b[38;5;222m")
+            is False
+        )
+
+    def test_wrapped_submission_is_still_absorbed_through_the_public_path(self, monkeypatch):
+        """The control at the public boundary: the echo is not published."""
+
+        pane = "\n".join(
+            [
+                "\x1b[1;38;5;222m✨ current task\x1b[0m",
+                "    \x1b[1;38;5;222mline two of the submission\x1b[0m",
+                "",
+                _answer("SAFE_FINAL"),
+                _footer(),
+            ]
+        )
+
+        result, _ = self._get_last_code(monkeypatch, pane)
+        assert result == "● SAFE_FINAL"

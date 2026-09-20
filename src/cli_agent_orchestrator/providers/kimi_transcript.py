@@ -153,6 +153,14 @@ BULLET_THEN_ITALIC_RE = re.compile(r"[•●][^\S\n]*\x1b\[3m")
 # rule so no styling heuristic can suppress a real answer.
 FINAL_ANSWER_BULLET_STYLE_RE = re.compile(r"\x1b\[38;5;253m[^\S\n]*[•●]")
 
+#: The foreground colour the renderer draws *answer text* in (measured 0.43.1).
+#: A row drawn in it is assistant output wherever it sits: an answer may open a
+#: line with a spinner frame or the moon-tip vocabulary, and reading such a row
+#: as a transient indicator both drops it from the answer and can pin a settled
+#: terminal at PROCESSING. The real indicators are drawn in the spinner colour
+#: (111) or not at all, never in the answer colour.
+ANSWER_COLOR_INDEX = 253
+
 # 24-bit foreground before a bullet. The triple must be grey/near-grey to count
 # as reasoning.
 TRUECOLOR_BULLET_RE = re.compile(r"\x1b\[38;2;(\d{1,3});(\d{1,3});(\d{1,3})m[^\S\n]*[•●]")
@@ -351,7 +359,14 @@ USER_INPUT_COLOR_INDEX = 222
 LEGACY_IDLE_PROMPT_RE = re.compile(r"^\s*[✨💫]\s*$")
 
 # Dimmed "… (N more lines, ctrl+o to expand)" tool-output collapse row.
-COLLAPSED_TOOL_OUTPUT_RE = re.compile(r"…\s*\(\d+ more lines")
+# Anchored to the row's own leading content: the measured row is exactly
+# ``   ESC[2m… (3 more lines, ctrl+o to expand)``, so the ellipsis starting the
+# row is what identifies the renderer's collapse row. An unanchored search made
+# the phrase destructive anywhere on a row, so an answer that merely *mentioned*
+# it — reproduced: `• The UI shows … (3 more lines, ctrl+o to expand) when output
+# is collapsed.` — was classified as execution plumbing and dropped from the
+# answer, even with a colour-253 answer bullet.
+COLLAPSED_TOOL_OUTPUT_RE = re.compile(r"^\s*[•●]?\s*…\s*\(\d+ more lines")
 
 # Kimi Code's inline key hints that sit under a running tool call. Matched as
 # the exact observed strings, not as a loose `^Press ` prefix: an assistant
@@ -921,30 +936,59 @@ def foreground_color_indices(raw_line: str) -> Set[int]:
 
     indices: Set[int] = set()
     for match in _SGR_PARAMS_RE.finditer(raw_line or ""):
-        params = [part for part in match.group(1).split(";") if part != ""]
-        index = 0
-        while index < len(params):
-            try:
-                value = int(params[index])
-            except ValueError:
-                break
-            if value in (38, 48) and index + 1 < len(params):
-                mode = params[index + 1]
-                if mode == "5" and index + 2 < len(params):
-                    if value == 38:
-                        try:
-                            indices.add(int(params[index + 2]))
-                        except ValueError:
-                            pass
-                    index += 3
-                    continue
-                if mode == "2" and index + 4 < len(params):
-                    index += 5
-                    continue
-                index += 2
-                continue
-            index += 1
+        indices |= _foreground_indices_in(match.group(1))
     return indices
+
+
+def _foreground_indices_in(params_text: str) -> Set[int]:
+    """The 256-colour foreground indices one SGR parameter list selects."""
+
+    indices: Set[int] = set()
+    params = [part for part in (params_text or "").split(";") if part != ""]
+    index = 0
+    while index < len(params):
+        try:
+            value = int(params[index])
+        except ValueError:
+            break
+        if value in (38, 48) and index + 1 < len(params):
+            mode = params[index + 1]
+            if mode == "5" and index + 2 < len(params):
+                if value == 38:
+                    try:
+                        indices.add(int(params[index + 2]))
+                    except ValueError:
+                        pass
+                index += 3
+                continue
+            if mode == "2" and index + 4 < len(params):
+                index += 5
+                continue
+            index += 2
+            continue
+        index += 1
+    return indices
+
+
+def is_drawn_in_foreground(raw_line: str, color_index: int) -> bool:
+    """True when ``color_index`` styles the row from its leading graphic position.
+
+    A row is *drawn* in a colour when the renderer sets it before the row's first
+    visible character — the measured shapes are ``ESC[1;38;5;222m✨ message`` and
+    an indented continuation ``    ESC[1;38;5;222mwrapped text``. The same colour
+    applied to a fragment in the middle of a row is inline emphasis by the answer,
+    not row styling: reproduced, the answer bullet
+    ``• Use ESC[38;5;222mVALUEESC[39m here.`` was absorbed as a submitted-message
+    continuation and the answer disappeared.
+    """
+
+    raw = raw_line or ""
+    for match in _SGR_PARAMS_RE.finditer(raw):
+        if color_index not in _foreground_indices_in(match.group(1)):
+            continue
+        prefix = _SGR_RE.sub("", raw[: match.start()])
+        return not any(character.isalnum() for character in prefix)
+    return False
 
 
 def has_live_spinner_glyph(line: str) -> bool:
@@ -997,10 +1041,16 @@ def is_idle_tip_line(clean_line: str, raw_line: str = "") -> bool:
     The tip row is drawn where the working indicator would be, so a glyph-only
     test reads a settled terminal as PROCESSING — A0's D1 defect, reproduced by
     fixtures 05 and 09. The row is positively identified by a moon-phase glyph
-    *plus* the ``· Tip:`` suffix and the absence of any braille indicator.
+    *plus* the ``· Tip:`` suffix and the absence of any braille indicator — and
+    by *not* being an answer row. The renderer draws its tip in the indicator's
+    own colours (the measured row is a bare moon followed by grey-244 tip text);
+    a row drawn in the answer colour is the assistant quoting the tip, which is
+    why an answer line `🌕 · Tip: use /help` stays answer text.
     """
 
     if is_response_marker_line(clean_line):
+        return False
+    if is_drawn_in_foreground(raw_line, ANSWER_COLOR_INDEX):
         return False
     if not _MOON_PREFIX_RE.match(clean_line):
         return False
@@ -1057,6 +1107,12 @@ def is_live_spinner_line(
     if is_idle_tip_line(clean_line, raw_line):
         return False
     if is_boot_chrome_line(clean_line, raw_line):
+        return False
+    if is_drawn_in_foreground(raw_line, ANSWER_COLOR_INDEX):
+        # A row the renderer drew in the answer colour is assistant output, not
+        # the working indicator: an answer may open a line with a frame glyph
+        # (`⠋ is F`) or the moon-tip vocabulary, and reading it as work both drops
+        # it from the answer and pins a settled terminal at PROCESSING.
         return False
     # The indicator is a measured frame in the spinner slot, not braille anywhere
     # on the row: an answer that mentions the character is still an answer.
@@ -1403,18 +1459,28 @@ def is_user_input_continuation(raw_line: str, clean_line: Optional[str] = None) 
     not start a block, because an answer or a code block can contain a colour-222
     row, and treating one as a fresh submission moves the extraction start past
     the answer content that preceded it.
+
+    Two things a continuation is not:
+
+    * a **positively rendered answer bullet**. Kimi draws the answer in colour
+      253, which is not this colour, so a colour-253 bullet is an answer however
+      the rest of the row is styled — the same precedence
+      :func:`is_reasoning_continuation` applies. Reproduced: after a legacy prompt,
+      ``• Use ESC[38;5;222mVALUEESC[39m here.`` was absorbed into the echo and the
+      answer disappeared.
+    * a row where colour 222 appears only *inside* the text. The renderer draws a
+      submission in 222 from the row's leading graphic position; an inline span is
+      the answer's own emphasis. See :func:`is_drawn_in_foreground`.
+
+    The pasted-list case is preserved: a row whose own leading content (bullet
+    included) is drawn in 222 still continues the submission.
     """
 
     raw = raw_line or ""
-    clean = strip_sgr(raw) if clean_line is None else clean_line
 
-    # The colour *is* the evidence, and it is stronger than the bullet exclusion:
-    # a submitted message may contain a pasted list, so a colour-222 row that
-    # begins with a bullet continues the submission rather than becoming an
-    # answer bullet. The two are still distinguished — the renderer draws an
-    # answer in colour 253, which is not this colour — so an answer bullet can
-    # never be read as a continuation.
-    return USER_INPUT_COLOR_INDEX in foreground_color_indices(raw)
+    if FINAL_ANSWER_BULLET_STYLE_RE.search(raw):
+        return False
+    return is_drawn_in_foreground(raw, USER_INPUT_COLOR_INDEX)
 
 
 def is_user_input_start(
@@ -1652,7 +1718,20 @@ def classify_rows(
 
         # --- submitted user message: a positive submission starts the block,
         #     and only the echo's own continuation styling extends it ---
-        if is_user_input_start(raw, clean, semantics):
+        #
+        # An *established* private block owns its rows. Under CODE a sparkle row
+        # that is not drawn in the submission colour cannot take the channel away
+        # from payload that is already open: reproduced, a plain `✨ …` row inside
+        # an established tool block reset the tool state and the dimmed payload
+        # after it was published as the answer. The escape-free fallback that lets
+        # a plain sparkle start a submission is still available where no private
+        # block is open (the shape the screen/status consumers see).
+        starts_submission = is_user_input_start(raw, clean, semantics) and not (
+            in_tool_block
+            and semantics is SpinnerSemantics.CODE
+            and USER_INPUT_COLOR_INDEX not in foreground_color_indices(raw)
+        )
+        if starts_submission:
             in_user_echo = True
             echo_absorbing_prose = True
             in_tool_block = False
