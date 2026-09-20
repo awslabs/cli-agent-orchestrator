@@ -205,8 +205,9 @@ def _drive_headless_message(terminal, message, is_async):
     default=None,
     metavar="RUNTIME_ID",
     help="Launch on a named execution runtime connected to the shared server "
-    "(#745; see GET /runtimes). Headless only — the terminal runs in that "
-    "runtime and is driven through the server.",
+    "(#745; see GET /runtimes). The terminal runs in that runtime and is driven "
+    "through the server; without --headless this TTY attaches to it over the "
+    "server's relay (#776).",
 )
 def launch(
     message,
