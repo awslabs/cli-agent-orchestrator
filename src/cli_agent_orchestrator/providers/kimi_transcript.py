@@ -106,11 +106,17 @@ THINKING_STYLE_PATTERNS: Tuple[re.Pattern, ...] = (
     re.compile(r"\x1b\[38;5;244m\x1b\[3m[^\S\n]*[•●]"),
     # bullet then italic (current Kimi Code: `ESC[38;5;244m● ESC[3m…`)
     re.compile(r"\x1b\[38;5;244m[^\S\n]*[•●][^\S\n]*\x1b\[3m"),
-    # bullet then italic, with the colour carried on the text rather than the
-    # bullet. Italic directly after a bullet is a measured thinking shape; the
-    # final-answer colour is excluded separately in `is_thinking_styled`.
-    re.compile(r"[•●][^\S\n]*\x1b\[3m"),
 )
+
+#: The reasoning foreground (grey 244). A bullet-then-italic row is reasoning
+#: only when the row carries this colour somewhere: the measured shape is
+#: `ESC[38;5;244m● ESC[3m…` (already covered above) or the colour carried on the
+#: *text* instead of the bullet. Italic alone is not evidence — a legacy answer
+#: that happens to be italic is the same shape, and refusing it would turn a good
+#: answer into a terminal extraction failure.
+REASONING_GREY_RE = re.compile(r"\x1b\[38;5;244m")
+#: `•` immediately followed by italic, with no colour on the bullet itself.
+BULLET_THEN_ITALIC_RE = re.compile(r"[•●][^\S\n]*\x1b\[3m")
 
 # The final-answer bullet colour (253). Decisive: a bullet drawn in it is an
 # answer even when the text that follows is italic, which is exactly what a
@@ -357,6 +363,15 @@ RULE_RE = re.compile(r"^\s*[─━═]{3,}\s*$")
 # so a capitalised-identifier rule let every CAO MCP tool row through as answer
 # text — the D6 production defect.
 _TOOL_IDENTIFIER = r"[A-Za-z_][A-Za-z0-9_.-]*"
+#: An identifier that reads as a tool *name* rather than an ordinary word: a
+#: capitalised (or underscore-prefixed) name, or any name carrying a `_`, `.`,
+#: `/` or `-` — CAO's own tools are snake_case. The distinction matters only in
+#: the escape-free form with no `·` separator and no argument list, where
+#: `• Used Read` is a collapsed tool row but `• Used pandas` is an answer to
+#: "which parser did you use?" — the two are the same shape otherwise.
+_TOOLISH_IDENTIFIER = (
+    r"(?:[A-Z_][A-Za-z0-9_.-]*|[A-Za-z0-9][A-Za-z0-9]*[_.\/-][A-Za-z0-9_.-]*)"
+)
 #: The measured detail separator: a `·` with horizontal whitespace on both sides.
 _TOOL_DETAIL_SEP = r"[^\S\n]·[^\S\n]"
 #: Optional parenthesised argument list, as in `Used Read (ANSWER_SPEC.md)`.
@@ -380,9 +395,13 @@ TOOL_CALL_RE = re.compile(
     + _TOOL_NAME_STYLE
     + r")"
 )
-# The escape-free form. Both branches require the measured `·` detail separator,
-# or an identifier that is the whole row, so a sentence that merely *begins* with
-# a tool verb — with or without a call-like parenthesis — stays answer content.
+# The escape-free form. A sentence that merely *begins* with a tool verb is
+# answer content, so a row is a tool row only when it carries the measured `·`
+# detail separator, an argument list, or is exactly `<verb> <tool-name>` with
+# nothing after it. In that last, bare shape the identifier must read as a tool
+# name (:data:`_TOOLISH_IDENTIFIER`): `Used Read` is a collapsed tool row, while
+# `Used pandas` is an answer to "which parser did you use?" and only the
+# identifier's own shape separates the two.
 TOOL_CALL_CLEAN_RE = re.compile(
     r"^\s*[•●]\s*(?:"
     + r"Running a command"
@@ -391,9 +410,15 @@ TOOL_CALL_CLEAN_RE = re.compile(
     + _TOOL_IDENTIFIER
     + r"(?:"
     + _TOOL_ARG_LIST
-    + r")?(?:"
+    + r")?"
     + _TOOL_DETAIL_SEP
-    + r"|[^\S\n]*$)"
+    + r"|(?:Used|Using|Calling)[^\S\n]+"
+    + _TOOL_IDENTIFIER
+    + _TOOL_ARG_LIST
+    + r"[^\S\n]*$"
+    + r"|(?:Used|Using|Calling)[^\S\n]+"
+    + _TOOLISH_IDENTIFIER
+    + r"[^\S\n]*$"
     + r")"
 )
 
@@ -877,11 +902,21 @@ def is_thinking_styled(raw_line: str) -> bool:
     answer bullet raises :class:`OutputExtractionError` and the caller sees a
     failure, whereas a misread reasoning bullet would silently publish private
     reasoning as the agent's message.
+
+    Italic, though, is not reasoning evidence on its own. Both measured forms
+    carry the grey as well — on the bullet (the patterns above) or on the text
+    (:data:`BULLET_THEN_ITALIC_RE` plus :data:`REASONING_GREY_RE`) — while an
+    emphasised *answer* renders as a bullet followed by italic with no grey at
+    all. Treating that as reasoning would refuse a perfectly good legacy answer.
     """
 
     if FINAL_ANSWER_BULLET_STYLE_RE.search(raw_line):
         return False
     if any(pattern.search(raw_line) for pattern in THINKING_STYLE_PATTERNS):
+        return True
+    # The "colour carried on the text rather than the bullet" shape needs the
+    # colour as well: italic alone is also how an emphasised *answer* renders.
+    if BULLET_THEN_ITALIC_RE.search(raw_line) and REASONING_GREY_RE.search(raw_line):
         return True
     for match in TRUECOLOR_BULLET_RE.finditer(raw_line):
         red, green, blue = (int(match.group(index)) for index in (1, 2, 3))

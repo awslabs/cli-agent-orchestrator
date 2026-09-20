@@ -495,8 +495,8 @@ separate sessions). Existing `env` entries are preserved, and an existing
 
 1. **Initialize**: Create unique temp dir → set MCP timeout in
    `~/.kimi/config.toml` (if MCP servers) → wait for shell → send
-   `cd <tempdir> && TERM=xterm-256color kimi --yolo` → wait for IDLE or
-   COMPLETED (up to 120s)
+   `cd <tempdir> && env -u COLORTERM TERM=xterm-256color kimi --yolo` → wait for
+   IDLE or COMPLETED (up to 120s)
 2. **Status Detection**: Check bottom 50 lines for idle prompt pattern
    (end-of-line anchored)
 3. **Message Extraction**: Line-based approach mapping raw and clean output for
@@ -509,7 +509,7 @@ separate sessions). Existing `env` entries are preserved, and an existing
 
 1. **Initialize**: probe the launch shell for the binary + dialect + source
    `KIMI_CODE_HOME` → build the runtime home and merge MCP servers → launch
-   `env KIMI_CODE_HOME=… CAO_TERMINAL_ID=… TERM=xterm-256color
+   `env -u COLORTERM KIMI_CODE_HOME=… CAO_TERMINAL_ID=… TERM=xterm-256color
    KIMI_MCP_*_TIMEOUT_MS=… KIMI_*_NO_AUTO_UPDATE=1 <binary> --auto [--model M]
    [--agent-file P]` in the terminal's real cwd → answer the workspace-trust
    dialog (opt-in only) and the upgrade reminder → wait for IDLE or COMPLETED
@@ -582,6 +582,12 @@ The provider handles several v1.20.0 behavioral changes:
   appears inline on the prompt line (`💫 message text`).
 - **TERM variable**: Kimi CLI silently exits when `TERM=tmux-256color` (the tmux
   default). The provider overrides with `TERM=xterm-256color`.
+- **Colour depth**: the extractor's palette is measured (reasoning 244, final
+  answer 253, submitted input 222). When the inherited environment advertises
+  24-bit colour the TUI renders `38;2;r;g;b` instead, and the answer bullet
+  becomes a near-grey the reasoning rule reads as reasoning, so extraction
+  degrades. Both dialects therefore unset `COLORTERM` for the launch, exactly as
+  they pin `TERM`.
 - **Per-directory lock**: Only one Kimi instance can run in a given directory.
   Each provider instance uses its own temp directory via `cd`.
 

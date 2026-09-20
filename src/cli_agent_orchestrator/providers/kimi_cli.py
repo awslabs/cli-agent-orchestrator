@@ -2267,9 +2267,9 @@ class KimiCliProvider(BaseProvider):
 
         Fail closed on content that must never be republished as an agent's
         message: private reasoning, and tool-execution plumbing. If the capture
-        holds such a row and nothing publishable anywhere, the only safe outcome
-        is a refusal — the raw-transcript fallback would republish exactly that
-        content.
+        holds such a row and the located region holds no publishable answer, the
+        only safe outcome is a refusal — the raw-transcript fallback would
+        republish exactly that content.
 
         The decision is made on **content**, and on the whole capture rather than
         on the located region:
@@ -2283,8 +2283,18 @@ class KimiCliProvider(BaseProvider):
           refusal at all. It is a capture that did not reach far enough — the
           anchor landed past the answer, or the submitted echo scrolled out — and
           a wider capture may still hold the answer, so the caller must be free to
-          escalate. A capture that already holds a publishable answer is the same
-          case: the region missed it, and escalation is the right response.
+          escalate.
+
+        "Already holds an answer" is deliberately *not* exempted from the refusal.
+        An earlier version returned early whenever any row of the capture was
+        answer-shaped, and answer-shaped is not the same as answer: the shell
+        preamble, the boot banner and the footer's own continuation row all
+        classify as ``CONTENT``. Reproduced on the live 0.43.1/2.0.2 captures: a
+        turn showing the reasoning row plus the trailing ``context: N%`` footer
+        therefore refused nothing, raised the retryable error, exhausted the
+        escalation and published the reasoning inside the raw pane. A publishable
+        answer *in the region* is what makes publication legitimate, and that is
+        exactly :func:`_collect_response_text`'s ``answers`` list.
 
         Raised as :class:`OutputExtractionRejected` rather than the retryable
         :class:`OutputExtractionError`, so it is never retried and never replaced
@@ -2293,9 +2303,6 @@ class KimiCliProvider(BaseProvider):
 
         if has_answers:
             # A real answer is published; the other content is simply excluded.
-            return
-        if any(kind in kt.ANSWER_KINDS for kind in scope_kinds):
-            # Publishable content exists; the region simply did not include it.
             return
         if any(kind in _NON_PUBLISHABLE_KINDS for kind in scope_kinds):
             raise OutputExtractionRejected(

@@ -1461,3 +1461,107 @@ class TestPR799AdversarialRendererPalette:
         kinds = kt.classify_rows(pane.split("\n"), semantics=kt.SpinnerSemantics.CODE)
         assert kt.KimiLineKind.THINKING_BULLET in kinds
         assert kt.KimiLineKind.FINAL_BULLET not in kinds
+
+class TestPR799AdversarialThirdRound:
+    """The three findings of the third fresh independent review.
+
+    All three were reproduced before the fix, against the commit that closed the
+    second round.
+    """
+
+    # --- F1 (P1): an answer-shaped chrome row must not defeat the refusal ---
+
+    def test_reasoning_with_chrome_elsewhere_still_refuses(self, monkeypatch):
+        """The shell preamble and boot banner classify as CONTENT.
+
+        The refusal used to return early whenever *any* row of the capture was
+        answer-shaped, and answer-shaped is not answer. A turn showing reasoning
+        and no answer therefore raised the retryable error instead, exhausted the
+        escalation and republished the reasoning inside the raw pane.
+        """
+
+        rows = _fixture("kimi_code_0431_12_mcp_tool_turn_reasoning_first.txt").split("\n")
+        pane = "\n".join(row for row in rows if "\x1b[38;5;253m●" not in row)
+
+        with pytest.raises(_rejected()) as excinfo:
+            _last(monkeypatch, pane)
+
+        message = str(excinfo.value)
+        assert "I need to call find_profiles once" not in message
+        assert "[NO RESPONSE" not in message
+
+    def test_reasoning_beside_a_chrome_row_outside_the_region_still_refuses(self, monkeypatch):
+        """The footer's own wrapped row classifies as CONTENT, and sits outside
+        the located region — it must not exempt the capture from the refusal."""
+
+        pane = "\n".join(
+            [
+                _user("✨ Summarize the report"),
+                _thinking(PRIVATE_REASONING),
+                " ╭────────────────────╮",
+                " │ >                  │",
+                " ╰────────────────────╯",
+                "Never Ask  Some Model thinking: high  /tmp/project  master",
+                "",
+            ]
+        )
+        with pytest.raises(_rejected()) as excinfo:
+            _last(monkeypatch, pane)
+        assert PRIVATE_REASONING not in str(excinfo.value)
+
+    def test_an_answer_in_the_region_is_still_published(self, monkeypatch):
+        """The guard: the refusal must not swallow a region that has an answer."""
+
+        pane = "\n".join(
+            [
+                "💫 Task",
+                _thinking(PRIVATE_REASONING),
+                _answer("Public answer"),
+                "",
+            ]
+        )
+        result, _ = _last(monkeypatch, pane)
+        assert result == "● Public answer"
+
+    # --- F2 (P2): tool-ish prose must stay an answer -----------------------
+
+    @pytest.mark.parametrize("verb", ["Used", "Using", "Calling"])
+    def test_short_prose_after_a_tool_verb_is_an_answer(self, verb):
+        """`• Used pandas` is prose; `• Used Read` is a collapsed tool row."""
+
+        assert kt.is_tool_call_row(f"• {verb} pandas") is False
+        assert kt.is_tool_call_row(f"● {verb} pandas") is False
+
+    def test_the_measured_tool_shapes_are_still_tool_rows(self):
+        """The positive controls the escape-free rule exists for."""
+
+        for row in [
+            "● Used Read",
+            "● Used Read (ANSWER_SPEC.md)",
+            "● Used find_profiles",
+            "● Using handoff({...})",
+            "● Used Read (report.txt) · 3 lines",
+            "● Used memory.recall",
+        ]:
+            assert kt.is_tool_call_row(row) is True, row
+
+    def test_a_prose_answer_after_a_tool_verb_is_extracted(self, monkeypatch):
+        pane = "\n".join(["💫 Which parser did you use? Reply with two words.", "• Used pandas", "💫"])
+        result, _ = _last(monkeypatch, pane)
+        assert result == "• Used pandas"
+
+    # --- F3 (P2): italic alone is not reasoning ---------------------------
+
+    def test_an_italic_legacy_answer_is_not_reasoning(self):
+        assert kt.is_thinking_styled("• \x1b[3mHello there!\x1b[0m") is False
+
+    def test_grey_backed_italics_are_still_reasoning(self):
+        """The measured shapes keep working, colour on bullet or on text."""
+
+        assert kt.is_thinking_styled("\x1b[38;5;244m• \x1b[39m\x1b[3m\x1b[38;5;244mthinking\x1b[0m")
+        assert kt.is_thinking_styled("• \x1b[3m\x1b[38;5;244mthinking\x1b[0m") is True
+
+    def test_an_italic_answer_is_extracted(self, monkeypatch):
+        pane = "\n".join(["💫 Say hello in italics", "• \x1b[3mHello there!\x1b[0m", "💫"])
+        result, _ = _last(monkeypatch, pane)
+        assert result == "• Hello there!"
