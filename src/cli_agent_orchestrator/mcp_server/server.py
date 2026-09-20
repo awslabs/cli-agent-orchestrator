@@ -23,6 +23,7 @@ from cli_agent_orchestrator.constants import (
     WORKFLOW_RUN_REQUEST_TIMEOUT,
 )
 from cli_agent_orchestrator.mcp_server import utils as mcp_utils
+from cli_agent_orchestrator.mcp_server.caller_context import resolve_caller_terminal_id
 from cli_agent_orchestrator.mcp_server.models import HandoffResult
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.models.workflow_runtime import ReturnAck, parse_decision
@@ -131,7 +132,7 @@ def _send_user_prompt_answer(terminal_id: str, answer: str) -> Dict[str, Any]:
             f"{API_BASE_URL}/terminals/{terminal_id}/input",
             params={
                 "message": answer,
-                "sender_id": os.environ.get("CAO_TERMINAL_ID", "supervisor"),
+                "sender_id": resolve_caller_terminal_id() or "supervisor",
             },
             timeout=_mcp_timeout(),
         )
@@ -216,7 +217,7 @@ def _send_terminal_input(terminal_id: str, message: str) -> None:
         f"{API_BASE_URL}/terminals/{terminal_id}/input",
         params={
             "message": message,
-            "sender_id": os.environ.get("CAO_TERMINAL_ID", "supervisor"),
+            "sender_id": resolve_caller_terminal_id() or "supervisor",
         },
         timeout=_mcp_timeout(),
     )
@@ -897,7 +898,7 @@ async def emit_ui(
     Returns:
         Dict with the emitted event id and component name.
     """
-    terminal_id = os.getenv("CAO_TERMINAL_ID")
+    terminal_id = resolve_caller_terminal_id()
     response = requests.post(
         f"{API_BASE_URL}/agui/v1/emit_ui",
         json={
@@ -999,7 +1000,7 @@ def _own_terminal_id_or_error(action: str) -> Union[str, Dict[str, Any]]:
     model could set — the same trust mechanism ``send_message``/``handoff``
     already rely on (#432).
     """
-    own_terminal_id = os.environ.get("CAO_TERMINAL_ID")
+    own_terminal_id = resolve_caller_terminal_id()
     if not own_terminal_id:
         return {
             "success": False,
@@ -1383,7 +1384,7 @@ def _tool_denied_reason(tool_name: str) -> Optional[str]:
     established here from the environment rather than inferred from the
     absence of an exception.
     """
-    if not os.environ.get("CAO_TERMINAL_ID"):
+    if not resolve_caller_terminal_id():
         return None
 
     try:
@@ -2713,8 +2714,23 @@ register_mcp_server_surfaces(mcp)
 
 
 def main():
-    """Main entry point for the MCP server."""
-    mcp.run()
+    """Main entry point for the MCP server.
+
+    Transport is selected by ``CAO_MCP_TRANSPORT`` (default ``stdio`` — one
+    process per agent, identity from the process env, unchanged). Set it to
+    ``http`` for the shared Streamable HTTP endpoint (#745): one process serves
+    many agents, authenticated per request with a shared runtime token and a
+    per-request caller identity. A stdio forwarding shim can bridge providers
+    that only speak stdio to this endpoint without a second control server.
+    """
+    transport = os.environ.get("CAO_MCP_TRANSPORT", "stdio").strip().lower()
+    if transport == "http":
+        from cli_agent_orchestrator.mcp_server.http_hosting import build_http_app
+
+        app, host, port = build_http_app(mcp)
+        app.run(transport="http", host=host, port=port)
+    else:
+        mcp.run()
 
 
 if __name__ == "__main__":

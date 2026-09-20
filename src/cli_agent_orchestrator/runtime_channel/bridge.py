@@ -1,0 +1,503 @@
+"""cao-bridge: execution-only runtime for remote workers (#745/#776).
+
+Runs beside the agent's tmux server in a worker pod and holds one persistent
+OUTBOUND WebSocket to the central cao-server. It is not a renamed cao-server:
+no HTTP API, no scheduler, no MCP, no plugins — it reuses the existing local
+execution stack (terminal_service, FIFO reader, StatusMonitor, LogWriter, the
+in-process bus) and forwards what used to be co-located hops over the channel:
+
+- commands come DOWN (launch, input, special_key, extract, teardown) with
+  op_id correlation; results are retained until the server acks them, so a
+  lost response is re-deliverable instead of re-executed;
+- terminal output and worker-derived status stream UP with per-stream
+  (generation, position) sequencing from a bounded replay buffer, so a server
+  that reconnects resumes or sees an explicit gap.
+
+The bridge keeps its own local SQLite registry (throwaway pod storage) as
+runtime-internal bookkeeping for the reused service layer; the central
+server's row remains the authoritative terminal identity.
+"""
+
+import asyncio
+import base64
+import logging
+import os
+import re
+import signal
+import sys
+import tempfile
+from typing import Dict, Optional
+
+import websockets
+
+from cli_agent_orchestrator.clients.database import init_db
+from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.runtime_channel.protocol import (
+    PROTOCOL_VERSION,
+    AckFrame,
+    CommandFrame,
+    CommandOutcome,
+    CommandResultFrame,
+    CommandType,
+    EventFrame,
+    EventType,
+    Frame,
+    GapFrame,
+    HeartbeatFrame,
+    HelloFrame,
+    StreamFrame,
+    StreamName,
+    StreamPosition,
+    decode_frame,
+    encode_frame,
+)
+from cli_agent_orchestrator.runtime_channel.replay_buffer import ReplayBuffer
+from cli_agent_orchestrator.services.event_bus import bus
+from cli_agent_orchestrator.services.log_writer import log_writer
+from cli_agent_orchestrator.services.status_monitor import status_monitor
+from cli_agent_orchestrator.utils.logging import setup_logging
+
+logger = logging.getLogger(__name__)
+
+RUNTIME_TOKEN_HEADER = "X-CAO-Runtime-Token"
+RECONNECT_BACKOFF_INITIAL = 1.0
+RECONNECT_BACKOFF_MAX = 30.0
+HEARTBEAT_INTERVAL = 15.0
+REPLAY_BUFFER_BYTES = 1024 * 1024  # per terminal capture stream
+
+_OUTPUT_TOPIC = re.compile(r"^terminal\.([a-f0-9]{8})\.output$")
+_STATUS_TOPIC = re.compile(r"^terminal\.([a-f0-9]{8})\.status$")
+
+
+class Bridge:
+    def __init__(self, server_url: str, runtime_id: str, token: str):
+        self._server_url = server_url
+        self._runtime_id = runtime_id
+        self._token = token
+        self._buffers: Dict[str, ReplayBuffer] = {}
+        # Results not yet acked by the server, re-sent after every reconnect.
+        # Bounded by the number of in-flight ops, which the server bounds.
+        self._unacked: Dict[str, CommandResultFrame] = {}
+        self._ws: Optional[websockets.ClientConnection] = None
+        self._send_lock = asyncio.Lock()
+        self._stop = asyncio.Event()
+        # In-flight script subprocesses by op_id, so CANCEL_SCRIPT can terminate
+        # the exact run without touching any other (#745, script relocation).
+        self._script_procs: Dict[str, asyncio.subprocess.Process] = {}
+
+    # --- outbound plumbing ---
+
+    async def _send(self, frame) -> None:
+        """Send if connected; silently skip otherwise (the replay buffer and
+        unacked-result map are what survive the disconnection, not the send)."""
+        ws = self._ws
+        if ws is None:
+            return
+        async with self._send_lock:
+            try:
+                await ws.send(encode_frame(frame))
+            except websockets.exceptions.ConnectionClosed:
+                pass
+
+    def _buffer_for(self, terminal_id: str) -> ReplayBuffer:
+        buf = self._buffers.get(terminal_id)
+        if buf is None:
+            buf = ReplayBuffer(max_bytes=REPLAY_BUFFER_BYTES)
+            self._buffers[terminal_id] = buf
+        return buf
+
+    # --- bus forwarding (runtime → server) ---
+
+    async def _forward_output(self) -> None:
+        queue = bus.subscribe("terminal.*.output")
+        try:
+            while True:
+                event = await queue.get()
+                match = _OUTPUT_TOPIC.match(event["topic"])
+                if not match:
+                    continue
+                terminal_id = match.group(1)
+                data = event["data"].get("data", "")
+                if not data:
+                    continue
+                raw = data.encode("utf-8", errors="replace")
+                buf = self._buffer_for(terminal_id)
+                pos = buf.append(raw)
+                await self._send(
+                    StreamFrame(
+                        terminal_id=terminal_id,
+                        stream=StreamName.CAPTURE,
+                        generation=buf.generation,
+                        pos=pos,
+                        data=base64.b64encode(raw).decode(),
+                    )
+                )
+        finally:
+            bus.unsubscribe("terminal.*.output", queue)
+
+    async def _forward_status(self) -> None:
+        queue = bus.subscribe("terminal.*.status")
+        try:
+            while True:
+                event = await queue.get()
+                match = _STATUS_TOPIC.match(event["topic"])
+                if not match:
+                    continue
+                terminal_id = match.group(1)
+                try:
+                    status = TerminalStatus(event["data"]["status"])
+                except (KeyError, ValueError):
+                    continue
+                await self._send(
+                    EventFrame(
+                        terminal_id=terminal_id,
+                        generation=self._buffer_for(terminal_id).generation,
+                        type=EventType.STATUS,
+                        status=status,
+                    )
+                )
+        finally:
+            bus.unsubscribe("terminal.*.status", queue)
+
+    async def _heartbeat(self) -> None:
+        while True:
+            await asyncio.sleep(HEARTBEAT_INTERVAL)
+            await self._send(HeartbeatFrame(streams=self._stream_positions()))
+
+    def _stream_positions(self) -> list:
+        return [
+            StreamPosition(
+                terminal_id=tid,
+                stream=StreamName.CAPTURE,
+                generation=buf.generation,
+                end_pos=buf.end_pos,
+            )
+            for tid, buf in self._buffers.items()
+        ]
+
+    # --- command execution (server → runtime) ---
+
+    async def _handle_command(self, frame: CommandFrame) -> None:
+        try:
+            outcome, payload, terminal_id = await self._execute(frame)
+        except Exception as e:
+            logger.exception("command %s (%s) failed", frame.op_id, frame.type.value)
+            outcome, payload, terminal_id = (
+                CommandOutcome.FAILED,
+                {"error": str(e)},
+                frame.terminal_id,
+            )
+        result = CommandResultFrame(
+            op_id=frame.op_id, terminal_id=terminal_id, outcome=outcome, payload=payload
+        )
+        # Retain BEFORE sending: an ack that never arrives (channel died with
+        # the result in flight) must leave the result re-deliverable.
+        self._unacked[frame.op_id] = result
+        await self._send(result)
+
+    async def _execute(self, frame: CommandFrame):
+        # Imported here, not at module top: importing terminal_service pulls in
+        # the provider stack, which is only needed once a command arrives.
+        from cli_agent_orchestrator.services import terminal_service
+
+        payload = frame.payload
+
+        # Runtime-scoped commands (no terminal_id): script execution (#745).
+        if frame.type == CommandType.RUN_SCRIPT:
+            result = await self._run_script(
+                frame.op_id,
+                payload["script"],
+                payload.get("env", {}),
+                float(payload.get("timeout", 300.0)),
+                float(payload.get("term_grace", 10.0)),
+            )
+            return CommandOutcome.OK, result, None
+        if frame.type == CommandType.CANCEL_SCRIPT:
+            target_op = payload["target_op_id"]
+            proc = self._script_procs.get(target_op)
+            if proc is not None:
+                await self._terminate_process(proc, float(payload.get("term_grace", 10.0)))
+                return CommandOutcome.CANCEL_REQUESTED, {"cancelled": True}, None
+            return CommandOutcome.OK, {"cancelled": False, "reason": "not running"}, None
+
+        if frame.type == CommandType.LAUNCH:
+            terminal = await terminal_service.create_terminal(
+                provider=payload["provider"],
+                agent_profile=payload["agent_profile"],
+                session_name=payload.get("session_name"),
+                new_session=True,
+                working_directory=payload.get("working_directory"),
+                env_vars=payload.get("env_vars"),
+                model=payload.get("model"),
+            )
+            if payload.get("initial_message"):
+                await asyncio.to_thread(
+                    terminal_service.send_input, terminal.id, payload["initial_message"]
+                )
+            return (
+                CommandOutcome.OK,
+                {
+                    "terminal": {
+                        "id": terminal.id,
+                        "name": terminal.name,
+                        # Enum fields may arrive as enum or plain str depending
+                        # on the model's coercion settings — normalize both.
+                        "provider": getattr(terminal.provider, "value", terminal.provider),
+                        "session_name": terminal.session_name,
+                        "agent_profile": terminal.agent_profile,
+                        "allowed_tools": terminal.allowed_tools,
+                        "shell_command": terminal.shell_command,
+                        "status": getattr(terminal.status, "value", terminal.status),
+                    }
+                },
+                terminal.id,
+            )
+
+        terminal_id = frame.terminal_id
+        if terminal_id is None:
+            raise ValueError(f"command {frame.type.value} requires a terminal_id")
+
+        if frame.type == CommandType.INPUT:
+            success = await asyncio.to_thread(
+                terminal_service.send_input,
+                terminal_id,
+                payload["message"],
+                sender_id=payload.get("sender_id"),
+                orchestration_type=payload.get("orchestration_type"),
+            )
+            return CommandOutcome.OK, {"success": success}, terminal_id
+        if frame.type == CommandType.SPECIAL_KEY:
+            success = await asyncio.to_thread(
+                terminal_service.send_special_key, terminal_id, payload["key"]
+            )
+            return CommandOutcome.OK, {"success": success}, terminal_id
+        if frame.type == CommandType.EXTRACT:
+            mode = terminal_service.OutputMode(payload.get("mode", "full"))
+            output = await asyncio.to_thread(terminal_service.get_output, terminal_id, mode)
+            return CommandOutcome.OK, {"output": output}, terminal_id
+        if frame.type == CommandType.TEARDOWN:
+            deleted = await asyncio.to_thread(terminal_service.delete_terminal, terminal_id)
+            self._buffers.pop(terminal_id, None)
+            return (
+                CommandOutcome.OK if deleted else CommandOutcome.FAILED,
+                {"deleted": deleted},
+                terminal_id,
+            )
+        raise ValueError(f"unsupported command type: {frame.type.value}")
+
+    # --- script execution (#745) ---
+
+    async def _run_script(
+        self, op_id: str, script_body: str, env: dict, timeout: float, term_grace: float
+    ) -> dict:
+        """Run a workflow/flow script here, beside the agent, not on the server.
+
+        Returns the RAW outcome (returncode, stdout, stderr, timed_out); the
+        central server owns interpretation, journaling, generation fencing and
+        the run record. The constructed env is used verbatim — the server built
+        it through the ``build_env`` allowlist and rewrote ``CAO_API_BASE_URL``
+        to a callback address the script can reach, so its ``workflow_return``
+        calls route back to the central server.
+        """
+        from cli_agent_orchestrator.constants import WORKFLOW_SCRIPT_LOG_CAP
+
+        with tempfile.TemporaryDirectory(prefix="cao-bridge-script-") as tmp:
+            script_path = os.path.join(tmp, "workflow.py")
+            with open(script_path, "w") as f:
+                f.write(script_body)
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    sys.executable,
+                    script_path,
+                    env=dict(env),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+            except Exception as exc:
+                return {
+                    "returncode": None,
+                    "stdout": "",
+                    "stderr": f"spawn failed: {exc}",
+                    "timed_out": False,
+                }
+            self._script_procs[op_id] = proc
+            timed_out = False
+            try:
+                try:
+                    out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    timed_out = True
+                    await self._terminate_process(proc, term_grace)
+                    out, err = b"", b""
+                    try:
+                        out, err = await asyncio.wait_for(proc.communicate(), timeout=term_grace)
+                    except asyncio.TimeoutError:
+                        pass
+            finally:
+                self._script_procs.pop(op_id, None)
+            return {
+                "returncode": proc.returncode,
+                # Cap both streams so a runaway script cannot blow the frame size.
+                "stdout": out.decode("utf-8", errors="replace")[-WORKFLOW_SCRIPT_LOG_CAP:],
+                "stderr": err.decode("utf-8", errors="replace")[-WORKFLOW_SCRIPT_LOG_CAP:],
+                "timed_out": timed_out,
+            }
+
+    async def _terminate_process(self, proc: asyncio.subprocess.Process, grace: float) -> None:
+        """SIGTERM → grace → SIGKILL, mirroring the server-side reaper escalation."""
+        if proc.returncode is not None:
+            return
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            return
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=grace)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+
+    # --- connection lifecycle ---
+
+    async def _serve(self, ws) -> None:
+        self._ws = ws
+        await ws.send(
+            encode_frame(
+                HelloFrame(
+                    protocol_version=PROTOCOL_VERSION,
+                    runtime_id=self._runtime_id,
+                    streams=self._stream_positions(),
+                )
+            )
+        )
+        server_hello = decode_frame(await ws.recv())
+        if not isinstance(server_hello, HelloFrame):
+            raise ValueError("server did not answer hello with hello")
+        if server_hello.protocol_version != PROTOCOL_VERSION:
+            raise ValueError(
+                f"protocol version mismatch: server {server_hello.protocol_version}, "
+                f"bridge {PROTOCOL_VERSION}"
+            )
+
+        # Re-deliver results the server never acked, then replay stream bytes
+        # from the server's resume positions (or emit an explicit gap).
+        for result in list(self._unacked.values()):
+            await self._send(result)
+        for resume in server_hello.resume:
+            buf = self._buffers.get(resume.terminal_id)
+            if buf is None:
+                continue
+            gap, chunks = buf.replay_from(min(resume.end_pos, buf.end_pos))
+            if gap is not None:
+                await self._send(
+                    GapFrame(
+                        terminal_id=resume.terminal_id,
+                        stream=StreamName.CAPTURE,
+                        generation=buf.generation,
+                        from_pos=gap.from_pos,
+                        to_pos=gap.to_pos,
+                    )
+                )
+            for pos, chunk in chunks:
+                await self._send(
+                    StreamFrame(
+                        terminal_id=resume.terminal_id,
+                        stream=StreamName.CAPTURE,
+                        generation=buf.generation,
+                        pos=pos,
+                        data=base64.b64encode(chunk).decode(),
+                    )
+                )
+
+        logger.info("runtime channel established to %s", self._server_url)
+        async for raw in ws:
+            frame: Frame = decode_frame(raw)
+            if isinstance(frame, CommandFrame):
+                # Concurrent dispatch: a slow LAUNCH must not block an input
+                # or teardown for another terminal.
+                asyncio.create_task(self._handle_command(frame))
+            elif isinstance(frame, AckFrame):
+                self._unacked.pop(frame.op_id, None)
+            elif isinstance(frame, HeartbeatFrame):
+                pass
+            else:
+                logger.warning("unexpected frame kind from server: %s", frame.kind)
+
+    async def run(self) -> None:
+        backoff = RECONNECT_BACKOFF_INITIAL
+        while not self._stop.is_set():
+            try:
+                async with websockets.connect(
+                    self._server_url,
+                    additional_headers={RUNTIME_TOKEN_HEADER: self._token},
+                    max_size=16 * 1024 * 1024,
+                ) as ws:
+                    backoff = RECONNECT_BACKOFF_INITIAL
+                    await self._serve(ws)
+            except asyncio.CancelledError:
+                raise
+            except websockets.exceptions.InvalidStatus as e:
+                status_code = e.response.status_code
+                if status_code in (401, 403):
+                    # Auth failure is surfaced and fatal — never retried as if
+                    # it were a transient network error (#776).
+                    logger.error("runtime channel authentication rejected (%s)", status_code)
+                    raise
+                logger.warning("runtime channel rejected (%s); retrying in %.0fs", e, backoff)
+            except Exception as e:
+                logger.warning("runtime channel lost (%s); retrying in %.0fs", e, backoff)
+            finally:
+                self._ws = None
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=backoff)
+            except asyncio.TimeoutError:
+                pass
+            backoff = min(backoff * 2, RECONNECT_BACKOFF_MAX)
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
+async def _amain() -> None:
+    server_url = os.environ.get("CAO_BRIDGE_SERVER_URL")
+    runtime_id = os.environ.get("CAO_BRIDGE_RUNTIME_ID")
+    token = os.environ.get("CAO_RUNTIME_TOKEN")
+    if not server_url or not runtime_id or not token:
+        raise SystemExit(
+            "cao-bridge requires CAO_BRIDGE_SERVER_URL, CAO_BRIDGE_RUNTIME_ID "
+            "and CAO_RUNTIME_TOKEN"
+        )
+
+    setup_logging()
+    init_db()
+    loop = asyncio.get_running_loop()
+    bus.set_loop(loop)
+
+    bridge = Bridge(server_url, runtime_id, token)
+    tasks = [
+        asyncio.create_task(status_monitor.run()),
+        asyncio.create_task(log_writer.run()),
+        asyncio.create_task(bridge._forward_output()),
+        asyncio.create_task(bridge._forward_status()),
+        asyncio.create_task(bridge._heartbeat()),
+    ]
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, bridge.stop)
+
+    try:
+        await bridge.run()
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def main() -> None:
+    asyncio.run(_amain())
+
+
+if __name__ == "__main__":
+    main()

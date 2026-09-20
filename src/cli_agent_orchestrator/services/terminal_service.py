@@ -2104,7 +2104,15 @@ def get_terminal(terminal_id: str) -> Dict:
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
-        status = status_monitor.get_status(terminal_id).value
+        # Remote terminal (#745): status is derived in the runtime beside its
+        # tmux socket and reported over the channel; this server must never
+        # probe local tmux for it. Local terminals keep the existing detector.
+        from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
+
+        if runtime_registry.is_remote(terminal_id):
+            status = runtime_registry.get_status(terminal_id).value
+        else:
+            status = status_monitor.get_status(terminal_id).value
 
         return {
             "id": metadata["id"],

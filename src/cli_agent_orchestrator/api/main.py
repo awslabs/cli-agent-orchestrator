@@ -1152,6 +1152,13 @@ class CreateFlowRequest(BaseModel):
     agent_profile: str
     provider: str = "kiro_cli"
     prompt_template: str
+    # #745: the flow file format supports an optional Kiro engine and a
+    # conditional pre-script (``script``), and the Flow model carries both.
+    # This HTTP model used to omit them, so registering a flow through HTTP
+    # silently dropped the pre-script — turning a CONDITIONAL launch into an
+    # UNCONDITIONAL one. Both are preserved here instead of dropped.
+    engine: Optional[KiroEngine] = None
+    script: Optional[str] = None
 
     @field_validator("name")
     @classmethod
@@ -1159,6 +1166,28 @@ class CreateFlowRequest(BaseModel):
         """Prevent path traversal — flow name becomes a filename."""
         if "/" in v or "\\" in v or ".." in v:
             raise ValueError("Flow name must not contain '/', '\\', or '..'")
+        return v
+
+    @field_validator("script")
+    @classmethod
+    def validate_script(cls, v: Optional[str]) -> Optional[str]:
+        """Preserve the pre-script, but do NOT accept an arbitrary server path.
+
+        ``execute_flow`` resolves a relative ``script`` against the flow file's
+        own directory and runs it with ``subprocess.run``. Over HTTP that makes
+        an absolute path or a traversal a way to execute any file on the server,
+        so restrict the HTTP create path to a bare relative filename inside the
+        flows directory. Reject rather than weaken (#745).
+        """
+        if v is None or v == "":
+            return v
+        if v.startswith("/") or "\\" in v or ".." in v:
+            raise ValueError(
+                "Flow script must be a relative filename inside the flows directory "
+                "(no absolute path, no '..', no '\\')"
+            )
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in v):
+            raise ValueError("Flow script must not contain control characters")
         return v
 
     @field_validator("schedule", "agent_profile", "provider")
@@ -1429,6 +1458,16 @@ app = FastAPI(
     version=SERVER_VERSION,
     lifespan=lifespan,
 )
+
+# Remote execution runtime channel (#745). Additive surface; the WebSocket
+# endpoint fails closed unless CAO_RUNTIME_TOKEN is configured, so a purely
+# local installation exposes no anonymous execution channel.
+from cli_agent_orchestrator.runtime_channel import api as runtime_channel_api
+from cli_agent_orchestrator.runtime_channel.api import router as runtime_channel_router
+from cli_agent_orchestrator.runtime_channel.protocol import CommandType as RuntimeCommandType
+from cli_agent_orchestrator.runtime_channel.registry import RemoteCommandError, runtime_registry
+
+app.include_router(runtime_channel_router)
 
 # Methods whose request could change server state. The Origin check only
 # guards these — GET/HEAD/OPTIONS stay open (reads leak nothing stateful, and
@@ -3581,6 +3620,20 @@ async def send_terminal_input(
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
     try:
+        # Remote terminal (#745): the provider, tmux socket and status monitor
+        # live in the runtime — route the whole send_input there.
+        if runtime_registry.is_remote(terminal_id):
+            result = await runtime_channel_api.remote_terminal_command(
+                terminal_id,
+                RuntimeCommandType.INPUT,
+                {
+                    "message": message,
+                    "sender_id": sender_id,
+                    "orchestration_type": orchestration_type.value if orchestration_type else None,
+                },
+                timeout=runtime_channel_api.INPUT_TIMEOUT,
+            )
+            return {"success": bool(result.payload.get("success", False))}
         # send_input is blocking tmux I/O (bracketed paste + key sends). Run it
         # off the event loop so a slow tmux call can't freeze every other
         # request — including /health and concurrent assign/handoff. Same
@@ -3594,6 +3647,8 @@ async def send_terminal_input(
             orchestration_type=orchestration_type,
         )
         return {"success": success}
+    except RemoteCommandError as e:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
     except TerminalInputBlockedError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
@@ -3622,9 +3677,19 @@ async def send_terminal_key(
         )
 
     try:
+        if runtime_registry.is_remote(terminal_id):
+            result = await runtime_channel_api.remote_terminal_command(
+                terminal_id,
+                RuntimeCommandType.SPECIAL_KEY,
+                {"key": key},
+                timeout=runtime_channel_api.INPUT_TIMEOUT,
+            )
+            return {"success": bool(result.payload.get("success", False))}
         # Blocking tmux send-keys — off the loop.
         success = await asyncio.to_thread(terminal_service.send_special_key, terminal_id, key)
         return {"success": success}
+    except RemoteCommandError as e:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -3641,11 +3706,21 @@ async def get_terminal_output(
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> TerminalOutputResponse:
     try:
+        if runtime_registry.is_remote(terminal_id):
+            result = await runtime_channel_api.remote_terminal_command(
+                terminal_id,
+                RuntimeCommandType.EXTRACT,
+                {"mode": mode.value},
+                timeout=runtime_channel_api.EXTRACT_TIMEOUT,
+            )
+            return TerminalOutputResponse(output=result.payload.get("output", ""), mode=mode)
         # get_output does a blocking tmux capture-pane plus provider regex
         # extraction over the scrollback — run it off the loop so a large
         # transcript can't stall the whole server.
         output = await asyncio.to_thread(terminal_service.get_output, terminal_id, mode)
         return TerminalOutputResponse(output=output, mode=mode)
+    except RemoteCommandError as e:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
     except OutputExtractionError as e:
         # Ordered before the ValueError arm it subclasses, same as run_step: the
         # terminal and the route both resolved -- only the response marker was
@@ -4583,6 +4658,23 @@ async def _run_in_background(
 
     try:
         async with _get_drive_semaphore():
+            # #745: a cancellation durably accepted while this admitted run
+            # waited on capacity must make it ineligible for dispatch. Before
+            # this recheck, the script tier verified cancellation only after
+            # its subprocess exited (script_runner._drive_process), so user
+            # code could start after CANCELLED was already journaled. Recheck
+            # the existing record/journal state at the execution boundary —
+            # no re-admission, no new run row. Once dispatch proceeds, the
+            # existing requested/stopped/failed/unknown semantics apply.
+            journal_row = workflow_journal.get_run(run_id)
+            if getattr(record, "cancelled", False) or (
+                journal_row is not None and journal_row.state == RunState.CANCELLED.value
+            ):
+                logger.info(
+                    "background workflow run '%s' was cancelled while queued; not dispatching",
+                    run_id,
+                )
+                return
             if tier == "yaml":
                 await workflow_service.start_run_prepared(record)
             else:
@@ -6629,6 +6721,17 @@ async def delete_terminal(
 ) -> Dict:
     """Delete a terminal."""
     try:
+        if runtime_registry.is_remote(terminal_id):
+            try:
+                success = await runtime_channel_api.remote_delete_terminal(terminal_id)
+            except RemoteCommandError as e:
+                raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
+            if not success:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"remote cleanup deferred for terminal '{terminal_id}'; retry delete",
+                )
+            return {"success": True}
         # delete_terminal is fully synchronous: blocking tmux kills, a
         # full-history scrollback snapshot capture, and DB writes. Off the
         # loop so a stalled tmux/FIFO op bounds its blast radius to this one
@@ -6884,6 +6987,17 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
         await websocket.close(code=4004, reason="Terminal not found")
         return
 
+    # Remote terminal (#745): the tmux socket lives in the runtime pod, so a
+    # local attach subprocess cannot exist. The relayed interactive attach is
+    # #776 scope; until it lands, refuse explicitly instead of spawning an
+    # attach against a tmux session this server does not have.
+    if runtime_registry.is_remote(terminal_id):
+        await websocket.close(
+            code=4010,
+            reason="Terminal runs on a remote runtime; interactive attach not yet relayed",
+        )
+        return
+
     # Defence-in-depth: re-validate the names from the DB before they
     # flow into a tmux subprocess argument. The POST /sessions handler
     # now validates user-supplied session_name, but pre-existing rows
@@ -7081,15 +7195,20 @@ async def create_flow(
 
         # Serialize via yaml.safe_dump so a multi-line value becomes a quoted
         # scalar rather than injecting a new frontmatter key.
-        frontmatter = yaml.safe_dump(
-            {
-                "name": body.name,
-                "schedule": body.schedule,
-                "agent_profile": body.agent_profile,
-                "provider": body.provider,
-            },
-            sort_keys=False,
-        )
+        frontmatter_data = {
+            "name": body.name,
+            "schedule": body.schedule,
+            "agent_profile": body.agent_profile,
+            "provider": body.provider,
+        }
+        # Preserve the optional engine and pre-script rather than dropping them
+        # (#745). Only emit when set, so a flow without them serializes exactly
+        # as before.
+        if body.engine is not None:
+            frontmatter_data["engine"] = body.engine.value
+        if body.script:
+            frontmatter_data["script"] = body.script
+        frontmatter = yaml.safe_dump(frontmatter_data, sort_keys=False)
         file_content = "---\n" + frontmatter + "---\n" + body.prompt_template
 
         file_path.write_text(file_content)

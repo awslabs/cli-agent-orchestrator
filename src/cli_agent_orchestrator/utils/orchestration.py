@@ -99,12 +99,16 @@ def _current_terminal_id() -> Optional[str]:
     """Return a valid CAO terminal ID from the calling process's environment, if configured.
 
     The canonical resolver for "who is calling" -- shared by the MCP tools
-    (via ``CAO_TERMINAL_ID`` in the MCP subprocess's env) and the ``cao
-    agent`` CLI commands (via the same env var in the invoking shell). Same
-    validation either way: an unset var means "no caller identity available"
-    (``None``), a malformed one is a hard error, never silently ignored.
+    and the ``cao agent`` CLI commands. Resolution prefers a per-request caller
+    identity (set by the shared HTTP MCP endpoint's middleware, #745) and falls
+    back to ``CAO_TERMINAL_ID`` in the process env (the stdio MCP subprocess and
+    the invoking CLI shell). Same validation either way: an unset value means
+    "no caller identity available" (``None``), a malformed one is a hard error,
+    never silently ignored.
     """
-    terminal_id = os.environ.get("CAO_TERMINAL_ID")
+    from cli_agent_orchestrator.mcp_server.caller_context import resolve_caller_terminal_id
+
+    terminal_id = resolve_caller_terminal_id()
     if not terminal_id:
         return None
     if not _TERMINAL_ID_PATTERN.fullmatch(terminal_id):
@@ -630,8 +634,9 @@ def _send_direct_input(
             "message": message,
             # "supervisor" fallback is safe here: sender_id is a display label
             # for plugin event emission, never a routable callback address
-            # (unlike the hard-error paths added for issue #284).
-            "sender_id": os.environ.get("CAO_TERMINAL_ID", "supervisor"),
+            # (unlike the hard-error paths added for issue #284). Resolved via
+            # the shared per-request/env resolver (#745) rather than the raw env.
+            "sender_id": _current_terminal_id() or "supervisor",
             "orchestration_type": orchestration_type,
         },
         headers=_auth_headers() or None,

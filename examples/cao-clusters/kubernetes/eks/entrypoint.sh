@@ -127,6 +127,20 @@ if [ -n "${CAO_INSTALL_PROFILES:-}" ]; then
   done
 fi
 
+# Execution-only bridge mode (#745): the worker pod runs cao-bridge — the
+# thin runtime that dials the central cao-server's runtime channel and
+# executes terminals beside its own tmux — instead of a full cao-server.
+# Branches AFTER seeding/profile install (the bridge launches providers, so
+# it needs the same profile store) and BEFORE the provider warm-up (warm-up
+# invokes the provider CLI directly and stays a server-pod concern for now).
+if [ "${CAO_NODE_MODE:-server}" = "bridge" ]; then
+  : "${CAO_BRIDGE_SERVER_URL:?CAO_NODE_MODE=bridge requires CAO_BRIDGE_SERVER_URL}"
+  : "${CAO_BRIDGE_RUNTIME_ID:?CAO_NODE_MODE=bridge requires CAO_BRIDGE_RUNTIME_ID}"
+  : "${CAO_RUNTIME_TOKEN:?CAO_NODE_MODE=bridge requires CAO_RUNTIME_TOKEN}"
+  echo "[cao-entrypoint] starting cao-bridge (execution-only runtime ${CAO_BRIDGE_RUNTIME_ID})"
+  exec cao-bridge
+fi
+
 # Provider preflight — one throwaway model call per pinned tier.
 #
 # This is not a health check, it is a warm-up, and it exists because of two

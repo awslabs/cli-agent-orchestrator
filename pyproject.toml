@@ -115,6 +115,7 @@ otel = [
 [project.scripts]
 "cao" = "cli_agent_orchestrator.cli.main:cli"
 "cao-server" = "cli_agent_orchestrator.api.main:main"
+"cao-bridge" = "cli_agent_orchestrator.runtime_channel.bridge:main"
 "cao-mcp-server" = "cli_agent_orchestrator.mcp_server.server:main"
 "cao-ops-mcp-server" = "cli_agent_orchestrator.ops_mcp_server.server:main"
 

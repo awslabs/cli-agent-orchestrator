@@ -129,6 +129,10 @@ class ScriptRunRecord:
     started_at: str
     finished_at: Optional[str]
     tier: str = "script"
+    # (runtime_id, op_id) while this run's script executes in a remote runtime
+    # (#745); None for local execution. Read by cancel_script_run to relay a
+    # CANCEL_SCRIPT command instead of terminating a local ``process``.
+    remote_script: Optional[Tuple[str, str]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -1028,6 +1032,154 @@ async def _finalize(
 # ---------------------------------------------------------------------------
 # Shared drive: spawn -> concurrent drain -> reap -> exit interp -> finalize
 # ---------------------------------------------------------------------------
+def _remote_script_runtime() -> Optional[str]:
+    """The runtime id scripts should execute on, or None for local execution.
+
+    Set ``CAO_SCRIPT_RUNTIME`` on the central server to relocate workflow /
+    flow-pre-script execution into that connected runtime (#745) instead of
+    spawning subprocesses in the server container. Unset (the default) or a
+    runtime that is not currently connected → local execution, unchanged.
+    """
+    runtime_id = os.environ.get("CAO_SCRIPT_RUNTIME", "").strip()
+    if not runtime_id:
+        return None
+    from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
+
+    return runtime_id if runtime_registry.get_runtime(runtime_id) is not None else None
+
+
+def _script_callback_env(env: Dict[str, str]) -> Dict[str, str]:
+    """Rewrite ``CAO_API_BASE_URL`` so a script running in a remote runtime can
+    still reach the central server for its ``workflow_return`` callbacks.
+
+    Uses ``CAO_ADVERTISED_URL`` (the address peers use to reach this server)
+    when set; otherwise leaves the env untouched (single-node / same-host).
+    """
+    advertised = os.environ.get("CAO_ADVERTISED_URL", "").strip()
+    if not advertised:
+        return env
+    rewritten = dict(env)
+    rewritten["CAO_API_BASE_URL"] = advertised.rstrip("/")
+    return rewritten
+
+
+async def _interpret_and_finalize(
+    record: ScriptRunRecord,
+    *,
+    returncode: Optional[int],
+    stdout: str,
+    stderr: str,
+    timed_out: bool,
+) -> WorkflowRunResult:
+    """Shared post-execution interpretation for local and remote runs (#745).
+
+    Given the raw outcome, apply the SAME state machine both paths share:
+    timeout → generation-bump + FAILED/timeout; a concurrent cancel → CANCELLED;
+    clean exit → COMPLETED + sentinel scan; nonzero → FAILED. Extracted so the
+    remote drive reuses the exact semantics rather than reimplementing them.
+    """
+    if timed_out:
+        await _reconcile_orphans(record.run_id)
+        record.generation = _bump(record.generation)
+        await _persist_generation_best_effort(record)
+        return await _finalize(
+            record,
+            state=RunState.FAILED,
+            kind="timeout",
+            error=(stderr + "\n[wall-clock timeout]").strip(),
+            warnings=[f"run exceeded the {WORKFLOW_SCRIPT_TIMEOUT}s wall-clock bound"],
+        )
+    if record.cancelled or record.state == RunState.CANCELLED:
+        await _reconcile_orphans(record.run_id)
+        return await _finalize(record, state=RunState.CANCELLED, kind="cancelled")
+    if returncode == 0:
+        output, warnings = _scan_sentinel(stdout)
+        return await _finalize(
+            record, state=RunState.COMPLETED, kind=None, output=output, warnings=warnings
+        )
+    await _reconcile_orphans(record.run_id)
+    return await _finalize(record, state=RunState.FAILED, kind="error", error=stderr.strip())
+
+
+async def _drive_process_remote(
+    record: ScriptRunRecord, runtime_id: str, script_path: str, env: Dict[str, str]
+) -> WorkflowRunResult:
+    """Run the script in a remote runtime over the channel, not on this host.
+
+    The server keeps ownership of the record, journal, generation fencing and
+    cancellation; the runtime only produces the raw outcome. Cancellation is
+    relayed as a CANCEL_SCRIPT command keyed by this run's op_id.
+    """
+    from cli_agent_orchestrator.runtime_channel.protocol import CommandType
+    from cli_agent_orchestrator.runtime_channel.registry import (
+        RuntimeUnavailableError,
+        runtime_registry,
+    )
+
+    conn = runtime_registry.get_runtime(runtime_id)
+    if conn is None:
+        return await _finalize(
+            record,
+            state=RunState.FAILED,
+            kind="error",
+            error=f"script runtime '{runtime_id}' is not connected",
+        )
+    try:
+        script_body = await asyncio.to_thread(lambda: open(script_path).read())
+    except OSError as exc:
+        return await _finalize(
+            record, state=RunState.FAILED, kind="error", error=f"cannot read script: {exc}"
+        )
+
+    # Record the op so cancel_script_run can relay a CANCEL_SCRIPT for it. The
+    # op_id is minted here and reused as the command's correlation id.
+    import uuid as _uuid
+
+    op_id = _uuid.uuid4().hex
+    record.remote_script = (runtime_id, op_id)
+    # Bound the wait past the script's own wall-clock timeout so a runtime that
+    # honours the timeout answers first; a missing answer is treated as unknown.
+    wait_timeout = WORKFLOW_SCRIPT_TIMEOUT + WORKFLOW_SCRIPT_TERM_GRACE + 30.0
+    try:
+        result = await conn.send_command(
+            CommandType.RUN_SCRIPT,
+            {
+                "script": script_body,
+                "env": _script_callback_env(env),
+                "timeout": WORKFLOW_SCRIPT_TIMEOUT,
+                "term_grace": WORKFLOW_SCRIPT_TERM_GRACE,
+            },
+            timeout=wait_timeout,
+        )
+    except RuntimeUnavailableError:
+        await _reconcile_orphans(record.run_id)
+        return await _finalize(
+            record,
+            state=RunState.FAILED,
+            kind="error",
+            error=f"script runtime '{runtime_id}' disconnected during execution (outcome unknown)",
+        )
+    except (asyncio.TimeoutError, TimeoutError):
+        await _reconcile_orphans(record.run_id)
+        return await _finalize(
+            record,
+            state=RunState.FAILED,
+            kind="error",
+            error=f"no response from script runtime '{runtime_id}' (outcome unknown)",
+        )
+    finally:
+        record.remote_script = None
+
+    payload = result.payload
+    return await _interpret_and_finalize(
+        record,
+        returncode=payload.get("returncode"),
+        stdout=payload.get("stdout", ""),
+        stderr=payload.get("stderr", ""),
+        timed_out=bool(payload.get("timed_out", False)),
+    )
+
+
 async def _drive_process(
     record: ScriptRunRecord, script_path: str, env: Dict[str, str]
 ) -> WorkflowRunResult:
@@ -1036,7 +1188,14 @@ async def _drive_process(
     THE single execution path for both a fresh run (A1) and a resume (A2) — the
     only difference is the env (``CAO_WORKFLOW_RESUME``) and the script path
     (author file vs materialized snapshot). Never ``shell=True`` (C-2).
+
+    #745: when ``CAO_SCRIPT_RUNTIME`` names a connected runtime, execution is
+    relocated there (``_drive_process_remote``) instead of spawning locally;
+    the server keeps the record/journal/generation/cancel ownership either way.
     """
+    remote_runtime = _remote_script_runtime()
+    if remote_runtime is not None:
+        return await _drive_process_remote(record, remote_runtime, script_path, env)
     try:
         record.process = await asyncio.create_subprocess_exec(
             sys.executable,
@@ -1625,6 +1784,24 @@ async def cancel_script_run(record: ScriptRunRecord) -> None:
             await _terminate(record.process, WORKFLOW_SCRIPT_TERM_GRACE)
         except Exception as e:  # noqa: BLE001 — cancel must never raise into the caller (INV-4)
             logger.warning("cancel: _terminate for run '%s' failed: %s", record.run_id, e)
+    elif record.remote_script is not None:
+        # #745: the script runs in a remote runtime — relay a CANCEL_SCRIPT for
+        # its op_id so the runtime terminates the exact subprocess. Best-effort,
+        # like the local terminate: a failed relay must never raise into cancel.
+        runtime_id, op_id = record.remote_script
+        try:
+            from cli_agent_orchestrator.runtime_channel.protocol import CommandType
+            from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
+
+            conn = runtime_registry.get_runtime(runtime_id)
+            if conn is not None:
+                await conn.send_command(
+                    CommandType.CANCEL_SCRIPT,
+                    {"target_op_id": op_id, "term_grace": WORKFLOW_SCRIPT_TERM_GRACE},
+                    timeout=WORKFLOW_SCRIPT_TERM_GRACE + 5.0,
+                )
+        except Exception as e:  # noqa: BLE001 — cancel must never raise into the caller (INV-4)
+            logger.warning("cancel: remote CANCEL_SCRIPT for run '%s' failed: %s", record.run_id, e)
 
     # 3. THEN sweep in-flight terminals (best-effort, self-guarding).
     await _reconcile_orphans(record.run_id)

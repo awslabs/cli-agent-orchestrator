@@ -4,6 +4,56 @@ One persistent CAO supervisor, one narrow broker, and one disposable
 single-replica Deployment per `assign_elastic` call. Worker runtime state is `emptyDir`; the supervisor
 owns durable CAO memory on its EBS claim. Both mount the shared EFS workspace.
 
+## Remote execution bridge (CAO 3.0, #745)
+
+This example currently runs a full `cao-server` in every worker pod. CAO 3.0
+introduces an alternative topology where **one central `cao-server` serves thin
+execution-only `cao-bridge` workers** — ten agents mean one server, not eleven.
+See `docs/issues/745-remote-execution-boundary/design.md` for the full contract.
+
+**What ships and is validated (slice 1 + shared MCP):**
+
+- `cao-bridge` (the `CAO_NODE_MODE=bridge` entrypoint branch) is an
+  execution-only runtime: it holds one persistent **outbound** WebSocket to the
+  central server's `\/runtime\/channel`, runs the provider beside its own tmux,
+  and streams output/status up while commands (launch, input, key, extract,
+  teardown) come down with `op_id` correlation and acknowledged retained
+  results. No per-worker `cao-server`, no per-worker Service.
+- The central server exposes `POST /runtimes/{id}/terminals`, `GET /runtimes`,
+  and routes input/output/status/delete for a remote terminal over its bound
+  channel. In remote mode the server never touches tmux — it runs in a
+  container with no tmux binary.
+- Shared **cao-mcp-server** HTTP hosting (`CAO_MCP_TRANSPORT=http`) resolves the
+  caller's terminal identity per authenticated request instead of a
+  process-global `CAO_TERMINAL_ID`.
+
+**Configuration (bridge worker):** `CAO_NODE_MODE=bridge`,
+`CAO_BRIDGE_SERVER_URL=ws://cao-server:9889/runtime/channel`,
+`CAO_BRIDGE_RUNTIME_ID=<unique>`, `CAO_RUNTIME_TOKEN=<shared secret>`. The
+central server needs the same `CAO_RUNTIME_TOKEN` (fail-closed: unset → the
+channel refuses all connections) and durable state on a `ReadWriteOnce` PVC
+with `CAO_HOME_DIR` pointed at the mount and an `fsGroup` matching the `cao`
+uid (1000), so terminal rows survive a restart.
+
+**Supported scope of the bridge slice:** launch, input, key, output extraction,
+worker-derived status, teardown, and multi-worker routing for the existing
+`TerminalBackend` terminal path (provider-agnostic — proven with `mock_cli` and
+`claude_code`). A server restart preserves the DB row and rebuilds
+terminal→runtime routing from each runtime's reconnect (`hello`) snapshot; a
+lost worker yields an explicit `503 runtime not connected` rather than false
+success.
+
+**Not yet in this slice (each a follow-on PR):** interactive browser/CLI attach
+relay (#776 — the browser WS closes `4010` for a remote terminal), Python
+workflow / flow pre-script relocation into runtimes, the broker minting
+execution-only bridge workers end-to-end (its lease/gateway/memory model still
+assumes per-worker servers), the full CLI client matrix, and per-runtime
+delegated credentials (#774) replacing the shared token.
+
+---
+
+## Full-server elastic topology (current default)
+
 | Component | Kubernetes kind | Storage | Lifecycle |
 |---|---|---|---|
 | `cao-supervisor` | StatefulSet, one replica | EBS state + shared EFS workspace | Persistent |
