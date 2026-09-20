@@ -1087,7 +1087,14 @@ class KimiCliProvider(BaseProvider):
         profile = None
         if self._agent_profile is not None:
             try:
-                profile = load_agent_profile(self._agent_profile)
+                # The plugin-augmented profile, exactly as the legacy builder
+                # consumes it. Both dialects re-read the profile at launch (the
+                # documented reason `with_plugin_mcp` exists at all), so the
+                # Kimi Code path must pass through the same seam: without this
+                # the merged `mcp.json` is built from the profile alone and every
+                # installed plugin's MCP servers are silently missing from this
+                # dialect. Each call re-reads, so there is nothing to double-merge.
+                profile = _with_plugin_mcp(load_agent_profile(self._agent_profile), "kimi_cli")
             except Exception as e:
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
 

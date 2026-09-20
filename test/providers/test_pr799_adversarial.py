@@ -21,6 +21,7 @@ detail separator, dialogs need the whole dialog, reasoning needs reasoning
 styling, and tool payload cannot certify its own end by resembling chrome.
 """
 
+import json
 import os
 import shlex
 import shutil
@@ -1007,3 +1008,112 @@ class TestPR799AdversarialReviewRound1:
         result = KimiCodeRuntimeHomeBuilder(source, tmp_path / "runtime2").build(None)
         assert result.trust_records == []
         assert "wd_a" in result.trust_skipped
+
+
+# =============================================================================
+# Latest-main integration — Agent Plugins MCP delivery on both dialects
+# =============================================================================
+
+
+class TestPR799AdversarialPluginMcpDelivery:
+    """Both Kimi dialects must consume the plugin-augmented profile.
+
+    ``with_plugin_mcp`` is the launch-time seam every provider that re-reads its
+    profile at launch passes through — the upstream Agent Plugins work exists
+    precisely because providers re-read and would otherwise discard the
+    install-time merge. Upstream applied it to the two legacy Kimi sites; the
+    Kimi Code builder loads the profile at its own site, so without it the merged
+    ``mcp.json`` is built from the profile alone and every installed plugin's MCP
+    servers are silently missing from this dialect.
+    """
+
+    @staticmethod
+    def _code_provider(tmp_path, monkeypatch, profile):
+        monkeypatch.setattr(kimi_cli_module, "load_agent_profile", lambda name: profile)
+        provider = KimiCliProvider("term-plugin", "s", "w", agent_profile="dev")
+        provider._kimi_binary = "/usr/bin/kimi"
+        provider._dialect = kimi_cli_module.KimiDialect.CODE
+        provider._temp_dir = str(tmp_path)
+        provider._kimi_source_home = tmp_path / "src-home"
+        (tmp_path / "src-home").mkdir(exist_ok=True)
+        return provider
+
+    @staticmethod
+    def _profile(servers):
+        profile = MagicMock()
+        profile.model = None
+        profile.system_prompt = None
+        profile.name = "dev"
+        profile.mcpServers = dict(servers)
+        return profile
+
+    def test_kimi_code_merges_plugin_servers_into_the_runtime_mcp_json(
+        self, tmp_path, monkeypatch
+    ):
+        profile = self._profile({"profile-server": {"command": "srv"}})
+        seen = {}
+
+        def fake_with_plugin_mcp(loaded, provider=None):
+            seen["provider"] = provider
+            merged = dict(loaded.mcpServers or {})
+            merged["plugin-server"] = {"command": "plugin-srv", "args": []}
+            loaded.mcpServers = merged
+            return loaded
+
+        monkeypatch.setattr(kimi_cli_module, "_with_plugin_mcp", fake_with_plugin_mcp)
+        provider = self._code_provider(tmp_path, monkeypatch, profile)
+
+        provider._build_kimi_code_command()
+
+        assert seen.get("provider") == "kimi_cli"
+        mcp_doc = json.loads((tmp_path / "kimi-home" / "mcp.json").read_text(encoding="utf-8"))
+        servers = mcp_doc["mcpServers"]
+        assert "plugin-server" in servers, sorted(servers)
+        assert "profile-server" in servers, sorted(servers)
+
+    def test_legacy_dialect_still_merges_plugin_servers(self, tmp_path, monkeypatch):
+        """The upstream legacy behaviour is preserved, not replaced."""
+
+        profile = self._profile({})
+        seen = {}
+
+        def fake_with_plugin_mcp(loaded, provider=None):
+            seen["provider"] = provider
+            loaded.mcpServers = {"plugin-server": {"command": "plugin-srv"}}
+            return loaded
+
+        monkeypatch.setattr(kimi_cli_module, "_with_plugin_mcp", fake_with_plugin_mcp)
+        provider = KimiCliProvider("term-plugin-legacy", "s", "w", agent_profile="dev")
+        provider._temp_dir = str(tmp_path / "legacy")
+        Path(provider._temp_dir).mkdir()
+        monkeypatch.setattr(
+            kimi_cli_module, "load_agent_profile", lambda name: profile
+        )
+
+        command = provider._build_kimi_command("/usr/local/bin/kimi")
+
+        assert seen.get("provider") == "kimi_cli"
+        assert "plugin-server" in command
+
+    def test_profile_loader_is_called_once_per_build(self, tmp_path, monkeypatch):
+        """No double-merge: each build re-reads and wraps exactly once."""
+
+        calls = {"load": 0, "wrap": 0}
+        profile = self._profile({})
+
+        def counting_load(name):
+            calls["load"] += 1
+            return profile
+
+        def counting_wrap(loaded, provider=None):
+            calls["wrap"] += 1
+            return loaded
+
+        provider = self._code_provider(tmp_path, monkeypatch, profile)
+        # Applied after the fixture's own loader patch, which would otherwise win.
+        monkeypatch.setattr(kimi_cli_module, "load_agent_profile", counting_load)
+        monkeypatch.setattr(kimi_cli_module, "_with_plugin_mcp", counting_wrap)
+
+        provider._build_kimi_code_command()
+
+        assert calls == {"load": 1, "wrap": 1}, calls
