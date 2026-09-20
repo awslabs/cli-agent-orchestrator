@@ -29,7 +29,15 @@ from cli_agent_orchestrator.models.terminal import TerminalId, TerminalStatus
 # One protocol version for the whole frame set. Bumped on any incompatible
 # change; both sides reject a mismatched hello before accepting work
 # (#745: "unsupported combinations must fail before accepting new work").
-PROTOCOL_VERSION = 1
+#
+# 2: RUN_SCRIPT gained ``mode`` (``python`` | ``executable``). A v1 bridge
+# ignores unknown payload keys and runs every body through ``sys.executable``,
+# so a flow pre-script — documented as a `#!/bin/bash` file — would be handed to
+# the Python interpreter and fail as a syntax error attributed to the user's
+# script. That is a dropped field reinterpreted as a different command, which
+# this channel is required to refuse at connect rather than discover at call
+# time; hence a bump and not a silent addition.
+PROTOCOL_VERSION = 2
 
 
 class FrameKind(str, Enum):
@@ -59,9 +67,11 @@ class CommandType(str, Enum):
     CANCEL = "cancel"
     TEARDOWN = "teardown"
     # Run a Python workflow / flow pre-script in the runtime instead of on the
-    # server host (#745). RUN_SCRIPT carries the script body + constructed env;
-    # CANCEL_SCRIPT terminates an in-flight run by its op_id. These are
-    # runtime-scoped (no terminal_id): scripts are not terminals.
+    # server host (#745). RUN_SCRIPT carries the script body + constructed env +
+    # ``mode`` (``python`` runs it under the runtime's interpreter; ``executable``
+    # marks it executable and runs it directly, so a pre-script's shebang decides
+    # its interpreter). CANCEL_SCRIPT terminates an in-flight run by its op_id.
+    # These are runtime-scoped (no terminal_id): scripts are not terminals.
     RUN_SCRIPT = "run_script"
     CANCEL_SCRIPT = "cancel_script"
 

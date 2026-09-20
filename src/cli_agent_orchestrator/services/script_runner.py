@@ -1048,6 +1048,22 @@ def _remote_script_runtime() -> Optional[str]:
     return runtime_id if runtime_registry.get_runtime(runtime_id) is not None else None
 
 
+def remote_script_runtime() -> Optional[str]:
+    """Public seam over `_remote_script_runtime` (#745).
+
+    ``flow_service`` asks the same question about a flow's pre-script that this
+    module asks about a workflow script, and the answer must be the same one: a
+    single place decides where user code runs. Delegates rather than duplicating
+    the env read, so a test that patches the private name still governs both.
+    """
+    return _remote_script_runtime()
+
+
+def script_callback_env(env: Dict[str, str]) -> Dict[str, str]:
+    """Public seam over `_script_callback_env` (#745), for the same reason."""
+    return _script_callback_env(env)
+
+
 def _script_callback_env(env: Dict[str, str]) -> Dict[str, str]:
     """Rewrite ``CAO_API_BASE_URL`` so a script running in a remote runtime can
     still reach the central server for its ``workflow_return`` callbacks.

@@ -95,6 +95,22 @@ else
 fi
 ```
 
+### Where the script runs
+
+By default the pre-script runs on the same host as the CAO server, with that
+process's environment, exactly as it always has.
+
+In a cluster deployment the server can be told to run it in an execution runtime
+instead (`CAO_SCRIPT_RUNTIME=<runtime id>`, see the EKS example), which keeps user
+code out of the container holding the database. The contract is unchanged — an
+executable file whose shebang picks its interpreter, printing
+`{"execute": …, "output": {…}}` — with one difference: the remote environment is
+constructed rather than inherited. A script there gets `PATH`, `HOME`,
+`CAO_API_BASE_URL` and `CAO_FLOW_NAME` and nothing else, so anything else your
+script reads from the environment must move into the script or be fetched over the
+API. The server still owns the schedule, the JSON verdict and the launch; a runtime
+that disappears mid-script fails the run rather than being read as "skip".
+
 ## Flow commands
 
 ```bash

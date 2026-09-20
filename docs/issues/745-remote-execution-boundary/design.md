@@ -269,6 +269,16 @@ moment work would begin:
   fingerprint. Two principals who pick the same key (`retry`, `job-1`) must
   collide loudly rather than be handed each other's live agent.
 
+Confirmed on the cluster (`cao-745b`), not only in tests: both migrations ran
+against the live PVC database and left all 18 pre-existing terminal rows at
+`owner = None`; a launch and a `POST /flows` each persisted `cao:local#local` in
+the new column with the terminal's `metadata` still holding only `runtime_id`;
+with the principal revoked the flow was not dispatched and no `cao-flow-%`
+terminal appeared while its schedule advanced, the sender's inbox message stayed
+`pending`, and `disable` still returned success; and after the revocation was
+removed the same message was **delivered**, which is the property `PENDING`
+rather than `FAILED` exists to preserve.
+
 What this does **not** supply is the trusted record it reads from. There is no
 tenant model, no membership store and no removal workflow here: #774
 (per-runtime delegated credentials), #778 and #779 own those. Until they land,
@@ -337,7 +347,8 @@ not one written for the test: `cao-server` as a StatefulSet with
 | Bridge readiness for a pod with no HTTP: a marker written after the hello is accepted and withdrawn on disconnect, on fatal rejection and at startup; the shipped manifest's exec probe is pinned to the configured path by test | `runtime_channel/bridge.py`, `examples/.../supervisor.yaml` | 10 tests |
 | **Status survives a server restart**: `HelloFrame.statuses` carries the runtime's verdict per live terminal and the server seeds its cache from the snapshot it already uses to rebuild routing — status is pushed on change, so an idle terminal would otherwise read UNKNOWN indefinitely. A runtime omits what it cannot read rather than claiming UNKNOWN; a hello cannot set status for another runtime's terminal; a disconnected runtime still reports UNKNOWN | `runtime_channel/{protocol,bridge,api}.py` | 8 tests, all three non-behaviours mutation-checked; **found in live EKS validation, not by a test** |
 | CLI→HTTP flow registration preserves `engine` + conditional pre-script (was silently dropped → unconditional launch); rejects arbitrary server paths | `api/main.py` `CreateFlowRequest` | 2 tests |
-| **Python workflow / flow pre-scripts execute in the runtime** (`CAO_SCRIPT_RUNTIME`), not the server host: `RUN_SCRIPT`/`CANCEL_SCRIPT` commands; server keeps record/journal/generation/cancel; outcome flows through the shared `_finalize`; `CAO_API_BASE_URL` rewritten to the advertised URL for callbacks; disconnect → explicit failure | `runtime_channel/{protocol,bridge}.py`, `services/script_runner.py` | 13 tests + **EKS-validated** |
+| **Python workflow scripts execute in the runtime** (`CAO_SCRIPT_RUNTIME`), not the server host: `RUN_SCRIPT`/`CANCEL_SCRIPT` commands; server keeps record/journal/generation/cancel; outcome flows through the shared `_finalize`; `CAO_API_BASE_URL` rewritten to the advertised URL for callbacks; disconnect → explicit failure | `runtime_channel/{protocol,bridge}.py`, `services/script_runner.py` | 13 tests + **EKS-validated** |
+| **Flow pre-scripts too** — the other user-code path the issue names by file and line. `RUN_SCRIPT` gained `mode: executable` (the file's shebang picks its interpreter; `docs/flows.md`'s example is bash) and `PROTOCOL_VERSION` went to `2` so a v1 bridge is refused at hello rather than running a bash script through `sys.executable`. The remote env is constructed, not the server's own; timeout, non-zero exit, unparseable JSON and a disconnect all raise instead of reading as "skip" | `services/flow_service.py`, `runtime_channel/{protocol,bridge}.py` | 17 tests (11 new + 6 bridge-mode); the mode field and the env construction each fail a test if reverted |
 | **Owner carried through queues, schedules and cross-pod callbacks** (criterion 14, in part): `flows.owner` + `terminals.owner` written server-side at registration/launch; dispatch gated at `execute_flow` (above the pre-script, schedule still advances) and at inbox delivery (sender's owner; held messages stay `PENDING`); revocation withdraws *start* authority only | `security/principal.py`, `security/auth.py`, `services/{flow,inbox,session,terminal}_service.py`, `runtime_channel/api.py`, `clients/database.py` | 68 tests (58 in five new files, 10 appended to `test/security/test_auth.py`); the two trust decisions (owner absent from the `LAUNCH` payload; owner not in agent-writable `metadata`) are pinned by tests that fail if either is undone |
 
 **EKS-verified**: server container has no tmux binary; tmux sessions live only
@@ -382,6 +393,16 @@ image, the same teardown reproduced the flat-15s release bug as an HTTP 500
 while the pod was already `Terminating` — so the derived
 `WORKER_TERMINATION_GRACE_SECONDS + 15` wait is checked against the failure it
 exists for, not only asserted.
+
+The server-count criterion was then measured rather than reasoned about: ten
+extra `cao-bridge` pods were added beside the three supervisors, all 13 runtimes
+connected to the same `cao-server-0`, and a scan of `/proc/*/cmdline` in every
+pod of the namespace found exactly **one** `cao-server` process cluster-wide
+(pid 1 in the server pod). Routing stayed per runtime at that width: terminals
+launched on two of the ten bound only to their own runtimes, and each input
+probe appeared in exactly one pod's pane. Note that `ps | grep cao-server` is
+*not* a valid count — a supervisor's tmux command line carries
+`CAO_API_HOST=cao-server…` as pane env and matches.
 
 **Also delivered on this branch (the issue's steps 4–5):**
 

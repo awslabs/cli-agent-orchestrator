@@ -270,6 +270,7 @@ class Bridge:
                 payload.get("env", {}),
                 float(payload.get("timeout", 300.0)),
                 float(payload.get("term_grace", 10.0)),
+                str(payload.get("mode", "python")),
             )
             return CommandOutcome.OK, result, None
         if frame.type == CommandType.CANCEL_SCRIPT:
@@ -521,7 +522,13 @@ class Bridge:
     # --- script execution (#745) ---
 
     async def _run_script(
-        self, op_id: str, script_body: str, env: dict, timeout: float, term_grace: float
+        self,
+        op_id: str,
+        script_body: str,
+        env: dict,
+        timeout: float,
+        term_grace: float,
+        mode: str = "python",
     ) -> dict:
         """Run a workflow/flow script here, beside the agent, not on the server.
 
@@ -531,17 +538,40 @@ class Bridge:
         it through the ``build_env`` allowlist and rewrote ``CAO_API_BASE_URL``
         to a callback address the script can reach, so its ``workflow_return``
         calls route back to the central server.
+
+        ``mode`` distinguishes the two kinds of user code that reach this seam.
+        A workflow script is a Python file the server runs under its own
+        interpreter, so ``python`` execs ``sys.executable``. A flow pre-script is
+        documented as an executable file (`docs/flows.md`'s example is
+        `#!/bin/bash`) and is run directly on the server host today, so
+        ``executable`` reproduces that: mode `0700`, then exec the file itself
+        and let its shebang choose the interpreter. Running a bash pre-script
+        through ``sys.executable`` would fail as a Python SyntaxError blamed on
+        the user's script, which is why the distinction is in the protocol rather
+        than guessed from the body.
         """
         from cli_agent_orchestrator.constants import WORKFLOW_SCRIPT_LOG_CAP
 
+        if mode not in ("python", "executable"):
+            return {
+                "returncode": None,
+                "stdout": "",
+                "stderr": f"unsupported script mode: {mode!r}",
+                "timed_out": False,
+            }
+
         with tempfile.TemporaryDirectory(prefix="cao-bridge-script-") as tmp:
-            script_path = os.path.join(tmp, "workflow.py")
+            executable_mode = mode == "executable"
+            script_path = os.path.join(tmp, "prescript" if executable_mode else "workflow.py")
             with open(script_path, "w") as f:
                 f.write(script_body)
+            # Owner-only: the file carries the caller's code into a pod that may
+            # host other work, and it never needs to be readable by anyone else.
+            os.chmod(script_path, 0o700 if executable_mode else 0o600)
+            argv = [script_path] if executable_mode else [sys.executable, script_path]
             try:
                 proc = await asyncio.create_subprocess_exec(
-                    sys.executable,
-                    script_path,
+                    *argv,
                     env=dict(env),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,

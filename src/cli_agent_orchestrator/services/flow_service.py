@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import os
 import re
 import subprocess
 from datetime import datetime
@@ -35,6 +36,10 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.security.principal import Principal, may_start_work
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
+from cli_agent_orchestrator.services.script_runner import (
+    remote_script_runtime,
+    script_callback_env,
+)
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.terminal_service import create_terminal, send_input
 from cli_agent_orchestrator.utils.template import render_template
@@ -210,6 +215,109 @@ def enable_flow(name: str) -> bool:
     return True
 
 
+# The pre-script's wall-clock bound, unchanged from the literal it replaces, plus
+# the SIGTERM→SIGKILL grace a remote runtime needs to answer within it.
+PRE_SCRIPT_TIMEOUT = 30
+PRE_SCRIPT_TERM_GRACE = 5.0
+
+
+def _pre_script_env(flow_name: str) -> Dict[str, str]:
+    """The env a pre-script gets when it runs in a runtime instead of here.
+
+    The local path inherits the server process environment. Forwarding that
+    across the boundary would hand an execution pod every secret the server
+    holds — `CAO_RUNTIME_TOKEN`, provider credentials, whatever the operator set
+    — to run a health check, so the remote env is CONSTRUCTED like the workflow
+    path's (`script_runner.build_env`): the OS floor, the flow's own name, and a
+    callback base rewritten to the address peers can reach.
+
+    This is a deliberate difference between the two paths, not an oversight: a
+    pre-script that reads some other inherited variable works locally and sees it
+    unset remotely. It is recorded in `docs/flows.md` rather than left to be
+    discovered.
+    """
+    from cli_agent_orchestrator.constants import API_BASE_URL
+
+    return script_callback_env(
+        {
+            "PATH": os.environ.get("PATH", ""),
+            "HOME": os.environ.get("HOME", ""),
+            "CAO_API_BASE_URL": API_BASE_URL,
+            "CAO_FLOW_NAME": flow_name,
+        }
+    )
+
+
+async def _run_pre_script(flow_name: str, script_path: Path) -> Tuple[Optional[int], str, str]:
+    """Run a flow's pre-script and return its raw (returncode, stdout, stderr).
+
+    #745: when `CAO_SCRIPT_RUNTIME` names a connected runtime the script runs
+    THERE — this is user code, and the issue's boundary puts user code in an
+    execution workload rather than beside the central database. The server keeps
+    what it already owned: the schedule, the JSON contract, the execute/skip
+    decision and the launch. Unset, or a runtime that is not connected, is the
+    unchanged local path.
+
+    A runtime that dies mid-script, or does not answer, raises — the outcome is
+    genuinely unknown, and the caller's contract for an unusable pre-script is
+    already an exception (a missing script, a non-zero exit and unparseable JSON
+    all raise today). Silently treating unknown as `execute: false` would look
+    like a healthy skip.
+    """
+    runtime_id = remote_script_runtime()
+    if runtime_id is None:
+        result = subprocess.run(
+            [str(script_path)], capture_output=True, text=True, timeout=PRE_SCRIPT_TIMEOUT
+        )
+        return result.returncode, result.stdout, result.stderr
+
+    from cli_agent_orchestrator.runtime_channel.protocol import CommandType
+    from cli_agent_orchestrator.runtime_channel.registry import (
+        RuntimeUnavailableError,
+        runtime_registry,
+    )
+
+    conn = runtime_registry.get_runtime(runtime_id)
+    if conn is None:
+        raise ValueError(f"script runtime '{runtime_id}' is not connected")
+
+    script_body = await asyncio.to_thread(script_path.read_text)
+    try:
+        result_frame = await conn.send_command(
+            CommandType.RUN_SCRIPT,
+            {
+                "script": script_body,
+                "env": _pre_script_env(flow_name),
+                "timeout": PRE_SCRIPT_TIMEOUT,
+                "term_grace": PRE_SCRIPT_TERM_GRACE,
+                # A pre-script's shebang picks its interpreter; docs/flows.md's
+                # example is bash. Never sys.executable.
+                "mode": "executable",
+            },
+            # Outlive the script's own bound so the runtime answers first; a
+            # missing answer is a disconnect, not a skip.
+            timeout=PRE_SCRIPT_TIMEOUT + PRE_SCRIPT_TERM_GRACE + 30.0,
+        )
+    except RuntimeUnavailableError as exc:
+        raise ValueError(
+            f"script runtime '{runtime_id}' disconnected while running the "
+            f"pre-script for flow {flow_name} (outcome unknown)"
+        ) from exc
+    except (asyncio.TimeoutError, TimeoutError) as exc:
+        raise ValueError(
+            f"script runtime '{runtime_id}' did not answer the pre-script for "
+            f"flow {flow_name} (outcome unknown)"
+        ) from exc
+
+    payload = result_frame.payload or {}
+    if payload.get("timed_out"):
+        raise ValueError(
+            f"Pre-script for flow {flow_name} exceeded the {PRE_SCRIPT_TIMEOUT}s bound "
+            f"in runtime {runtime_id}"
+        )
+    return payload.get("returncode"), payload.get("stdout", ""), payload.get("stderr", "")
+
+
 def _is_terminal_busy(terminal_id: str) -> bool:
     try:
         return status_monitor.get_status(terminal_id) == TerminalStatus.PROCESSING
@@ -265,17 +373,15 @@ async def execute_flow(name: str) -> bool:
             if not script_path.exists():
                 raise ValueError(f"Script not found: {script_path}")
 
-            result = subprocess.run([str(script_path)], capture_output=True, text=True, timeout=30)
+            returncode, stdout, stderr = await _run_pre_script(name, script_path)
 
-            if result.returncode != 0:
-                logger.error(f"Script failed: {result.stderr}")
-                raise ValueError(
-                    f"Script failed with exit code {result.returncode}: {result.stderr}"
-                )
+            if returncode != 0:
+                logger.error(f"Script failed: {stderr}")
+                raise ValueError(f"Script failed with exit code {returncode}: {stderr}")
 
             # Parse JSON output
             try:
-                output = json.loads(result.stdout)
+                output = json.loads(stdout)
             except json.JSONDecodeError as e:
                 raise ValueError(f"Script output is not valid JSON: {e}")
 

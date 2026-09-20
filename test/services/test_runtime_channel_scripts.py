@@ -86,6 +86,81 @@ class TestBridgeScriptExecutor:
         assert result["returncode"] != 0  # terminated
 
 
+class TestBridgeScriptModes:
+    """Two kinds of user code reach this executor, and they are not interchangeable.
+
+    A workflow script is Python the server runs under its own interpreter. A flow
+    pre-script is an executable file whose shebang chooses one — `docs/flows.md`'s
+    worked example is `#!/bin/bash`. Handing that to `sys.executable` produces a
+    Python SyntaxError blamed on the user's health check, so the mode is carried in
+    the protocol rather than sniffed from the body.
+    """
+
+    @pytest.mark.asyncio
+    async def test_executable_mode_honours_the_shebang(self, bridge):
+        import os
+
+        result = await bridge._run_script(
+            "op-mode-1",
+            '#!/bin/sh\necho \'{"execute": true, "output": {}}\'\n',
+            {"PATH": os.environ.get("PATH", "")},
+            timeout=30.0,
+            term_grace=5.0,
+            mode="executable",
+        )
+        assert result["returncode"] == 0
+        assert '"execute": true' in result["stdout"]
+
+    @pytest.mark.asyncio
+    async def test_a_shell_script_under_python_mode_would_fail(self, bridge):
+        """The reason the mode exists, stated as a test rather than a comment."""
+        import os
+
+        result = await bridge._run_script(
+            "op-mode-2",
+            "#!/bin/sh\necho hi\n",
+            {"PATH": os.environ.get("PATH", "")},
+            timeout=30.0,
+            term_grace=5.0,
+        )
+        assert result["returncode"] != 0
+
+    @pytest.mark.asyncio
+    async def test_default_mode_is_still_python(self, bridge):
+        result = await bridge._run_script(
+            "op-mode-3",
+            "import sys; print(sys.version_info[0])",
+            {"PATH": ""},
+            timeout=30.0,
+            term_grace=5.0,
+        )
+        assert result["returncode"] == 0
+        assert result["stdout"].strip() == "3"
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_mode_is_refused_not_guessed(self, bridge):
+        result = await bridge._run_script(
+            "op-mode-4", "print('x')", {"PATH": ""}, timeout=30.0, term_grace=5.0, mode="perl"
+        )
+        assert result["returncode"] is None
+        assert "unsupported script mode" in result["stderr"]
+
+    @pytest.mark.asyncio
+    async def test_the_script_file_is_owner_only(self, bridge):
+        """The body is the caller's code, in a pod that may host other work."""
+        import os
+
+        result = await bridge._run_script(
+            "op-mode-5",
+            '#!/bin/sh\nstat -f %Lp "$0" 2>/dev/null || stat -c %a "$0"\n',
+            {"PATH": os.environ.get("PATH", "")},
+            timeout=30.0,
+            term_grace=5.0,
+            mode="executable",
+        )
+        assert result["stdout"].strip() == "700"
+
+
 class TestServerRemoteDriveSelection:
     def test_no_runtime_env_is_local(self, monkeypatch):
         from cli_agent_orchestrator.services import script_runner
@@ -113,6 +188,20 @@ class TestServerRemoteDriveSelection:
             assert script_runner._remote_script_runtime() == "worker-live"
         finally:
             runtime_registry.unregister("worker-live", conn)
+
+    def test_the_public_seams_delegate_rather_than_duplicate(self, monkeypatch):
+        """`flow_service` asks the same question for a pre-script (#745).
+
+        If the public wrapper read the env itself, patching one name would move
+        workflow scripts and leave pre-scripts behind — two answers to "where does
+        user code run" is the bug this seam prevents.
+        """
+        from cli_agent_orchestrator.services import script_runner
+
+        monkeypatch.setattr(script_runner, "_remote_script_runtime", lambda: "worker-answer")
+        assert script_runner.remote_script_runtime() == "worker-answer"
+        monkeypatch.setattr(script_runner, "_script_callback_env", lambda env: {**env, "seen": "1"})
+        assert script_runner.script_callback_env({})["seen"] == "1"
 
     def test_callback_env_rewrites_api_base_url(self, monkeypatch):
         from cli_agent_orchestrator.services import script_runner

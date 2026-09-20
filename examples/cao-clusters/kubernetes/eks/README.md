@@ -50,11 +50,19 @@ terminal→runtime routing from each runtime's reconnect (`hello`) snapshot; a
 lost worker yields an explicit `503 runtime not connected` rather than false
 success.
 
-**Python workflow scripts** also execute in a runtime rather than the server
-host: set `CAO_SCRIPT_RUNTIME=<runtime id>` on the central server and
-`CAO_ADVERTISED_URL` so script callbacks resolve to the shared Service. The
-server keeps journal/cancel/generation ownership; a disconnected runtime is an
-explicit failure, never a false success.
+**Python workflow scripts and flow pre-scripts** also execute in a runtime rather
+than the server host: set `CAO_SCRIPT_RUNTIME=<runtime id>` on the central server
+and `CAO_ADVERTISED_URL` so script callbacks resolve to the shared Service. The
+server keeps journal/cancel/generation ownership (and, for a flow, the schedule
+and the execute/skip decision); a disconnected runtime is an explicit failure,
+never a false success.
+
+One difference worth knowing before you move a flow: a pre-script running locally
+inherits the server's environment, while one running in a runtime gets a
+constructed env (`PATH`, `HOME`, `CAO_API_BASE_URL`, `CAO_FLOW_NAME`) so that
+running a health check does not hand an execution pod the channel token and every
+provider credential the server holds. A pre-script that reads some other inherited
+variable works locally and sees it unset remotely.
 
 **Broker bridge mode (#745 step 4):** set `CAO_ELASTIC_WORKER_MODE=bridge` and
 `CAO_ELASTIC_CENTRAL_URL` on the broker (see `broker.yaml`), and give the
@@ -683,7 +691,7 @@ to it, which is the only view of live work the central server actually has.
 
 Every component in this namespace runs the **same image**, and that is the
 supported configuration. The runtime channel carries an explicit
-`PROTOCOL_VERSION` (`runtime_channel/protocol.py`, currently `1`), checked for
+`PROTOCOL_VERSION` (`runtime_channel/protocol.py`, currently `2`), checked for
 **equality** on both sides of the `hello` exchange — there is no negotiation and no
 compatibility window.
 
