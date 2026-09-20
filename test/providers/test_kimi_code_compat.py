@@ -2405,6 +2405,34 @@ _A3_COMPOSER = ("╭────────────────────
 _A3_FOOTER = " Never Ask  A3 Probe thinking  …/proj  master   context: 0% (0/977k)"
 
 
+def _answer(text: str) -> str:
+    """A final-answer row drawn the way the renderer draws it (colour 253).
+
+    The tool-block state machine ends a block only on *renderer* evidence, and
+    an unstyled ``●`` is not evidence: it is exactly what tool payload that
+    starts with a bullet looks like. Synthetic rows therefore carry the measured
+    answer styling, so these tests describe what a real capture contains.
+    """
+
+    return f" \x1b[38;5;253m● \x1b[39m{text}"
+
+
+def _styled_footer(text: str = "context: 4% (33.7k/977k)") -> str:
+    """A status-footer row drawn in the renderer's own colour."""
+
+    return f" \x1b[38;5;253m{text}\x1b[39m"
+
+
+def _styled_composer() -> tuple:
+    """The composer frame as drawn: box glyphs in colour 240."""
+
+    return (
+        " \x1b[38;5;240m╭────────────────────╮\x1b[39m",
+        " \x1b[38;5;240m│\x1b[39m > \x1b[7m \x1b[0m",
+        " \x1b[38;5;240m╰────────────────────╯\x1b[39m",
+    )
+
+
 class TestA3WrappedBulletStatus:
     """A3-1 — a wrapped status-bar fragment must not latch COMPLETED.
 
@@ -2669,7 +2697,7 @@ class TestA3ToolRowLeak:
             [
                 "✨ do the thing",
                 "● Used Read (ANSWER_SPEC.md) · 10 lines",
-                "● The real answer.",
+                _answer("The real answer."),
                 *_A3_COMPOSER,
                 _A3_FOOTER,
             ]
@@ -3124,7 +3152,7 @@ class TestD6ToolOutputBlock:
     HEADER_2 = "● Using send_message · MCP/cao-mcp-server"
     PAYLOAD_1 = '[{"name":"a",'
     PAYLOAD_2 = ' "role":"developer"}]'
-    FINAL = "● FINAL"
+    FINAL = _answer("FINAL")
 
     def kinds(self, rows):
         return kt.classify_rows(list(rows), semantics=kt.SpinnerSemantics.CODE)
@@ -3170,23 +3198,54 @@ class TestD6ToolOutputBlock:
         assert kinds[2] is kt.KimiLineKind.THINKING_BULLET
 
     def test_user_echo_ends_the_block(self):
-        rows = [self.HEADER, self.PAYLOAD_1, _D6_PROMPT_CONT, self.FINAL]
+        """A new *submission* ends the block: the sparkle row, not a bare
+        colour-222 row (colour is continuation evidence only)."""
+
+        rows = [self.HEADER, self.PAYLOAD_1, _D6_PROMPT_FIRST, self.FINAL]
         kinds = self.kinds(rows)
         assert kinds[1] is kt.KimiLineKind.TOOL_CHROME
         assert kinds[2] is kt.KimiLineKind.USER_INPUT
 
+    def test_standalone_colour_222_row_does_not_start_a_submission(self):
+        """The reviewed collision: colour 222 inside an answer is not an echo."""
+
+        rows = [self.HEADER, self.PAYLOAD_1, _D6_PROMPT_CONT, self.FINAL]
+        kinds = self.kinds(rows)
+        assert kinds[2] is kt.KimiLineKind.TOOL_CHROME
+
     def test_composer_ends_the_block(self):
-        rows = [self.HEADER, self.PAYLOAD_1, *_A3_COMPOSER, _A3_FOOTER]
+        rows = [self.HEADER, self.PAYLOAD_1, *_styled_composer(), _A3_FOOTER]
         kinds = self.kinds(rows)
         assert kinds[1] is kt.KimiLineKind.TOOL_CHROME
         assert kt.KimiLineKind.READY_INPUT_FRAME in kinds
         assert kinds[-1] is kt.KimiLineKind.STATUS_FOOTER
 
     def test_status_footer_ends_the_block(self):
-        rows = [self.HEADER, self.PAYLOAD_1, "context: 4% (33.7k/977k)", self.FINAL]
+        rows = [self.HEADER, self.PAYLOAD_1, _styled_footer("context: 4% (33.7k/977k)"), self.FINAL]
         kinds = self.kinds(rows)
         assert kinds[1] is kt.KimiLineKind.TOOL_CHROME
         assert kinds[2] is kt.KimiLineKind.STATUS_FOOTER
+
+    def test_unstyled_chrome_text_does_not_end_the_block(self):
+        """Payload cannot certify its own end by *looking* like chrome.
+
+        An escape-free ``context: N% (a/b)`` line and a ``────`` rule are both
+        things tool output can contain verbatim, so they stay payload.
+        """
+
+        for fake_chrome in ("context: 99% (1/2)", "─" * 12, "connecting to mcp servers..."):
+            rows = [self.HEADER, fake_chrome, "PRIVATE payload", self.FINAL]
+            kinds = self.kinds(rows)
+            assert kinds[1] is kt.KimiLineKind.TOOL_CHROME, fake_chrome
+            assert kinds[2] is kt.KimiLineKind.TOOL_CHROME, fake_chrome
+
+    def test_unstyled_answer_bullet_does_not_end_the_block(self):
+        """Fail closed: an escape-free bullet is indistinguishable from payload."""
+
+        rows = [self.HEADER, self.PAYLOAD_1, "● PRIVATE payload bullet", self.FINAL]
+        kinds = self.kinds(rows)
+        assert kinds[2] is kt.KimiLineKind.TOOL_CHROME
+        assert kinds[3] is kt.KimiLineKind.FINAL_BULLET
 
     def test_no_block_starts_without_a_tool_header(self):
         """Indented prose outside a tool block is answer content, not payload."""
@@ -3213,7 +3272,7 @@ class TestD6ToolOutputBlock:
                 "",
                 self.PAYLOAD_2,
                 "",
-                "● The real answer.",
+                _answer("The real answer."),
                 *_A3_COMPOSER,
                 _A3_FOOTER,
             ]
@@ -3229,7 +3288,7 @@ class TestD6ToolOutputBlock:
                 _D6_PROMPT_FIRST,
                 self.HEADER,
                 self.PAYLOAD_1,
-                "● The answer is 391.",
+                _answer("The answer is 391."),
                 "It follows from the identity.",
                 *_A3_COMPOSER,
                 _A3_FOOTER,
@@ -3300,7 +3359,7 @@ class TestD6ProductionExtraction:
                 "● Used find_profiles · MCP/cao-mcp-server (kimi)",
                 '[{"name":"kimi-installed-deploy-smoke"}] …',
                 "",
-                "● MCP-OK=1",
+                _answer("MCP-OK=1"),
                 *_A3_COMPOSER,
                 _A3_FOOTER,
             ]
@@ -3317,7 +3376,7 @@ class TestD6ProductionExtraction:
                 "● Used find_profiles · MCP/cao-mcp-server (kimi)",
                 '[{"name":"kimi-installed-deploy-smoke"}] …',
                 "",
-                "● MCP-OK=1",
+                _answer("MCP-OK=1"),
                 *_A3_COMPOSER,
                 _A3_FOOTER,
             ]
@@ -3342,7 +3401,7 @@ class TestD6ProductionExtraction:
                 "● Used find_profiles · MCP/cao-mcp-server (kimi)",
                 '[{"name":"kimi-installed-deploy-smoke"}] …',
                 "",
-                "● MCP-OK=1",
+                _answer("MCP-OK=1"),
                 *_A3_COMPOSER,
                 _A3_FOOTER,
             ]
@@ -3365,7 +3424,7 @@ class TestD6SequenceClassifierIsShared:
                 "✨ go",
                 "● Used find_profiles · MCP/cao-mcp-server",
                 '[{"a":1}]',
-                "● answer",
+                _answer("answer"),
             ]
         )
         kinds = [kind for _, _, kind in kt.classify_lines(pane, kt.SpinnerSemantics.CODE)]
@@ -3588,7 +3647,7 @@ class TestD6ReasoningBeforeToolCall:
             "\x1b[38;5;244m● \x1b[3mI need to call find_profiles.\x1b[0m",
             "● Used find_profiles · MCP/cao-mcp-server (kimi)",
             '[{"name":"a"}]',
-            "● MCP-OK=2",
+            _answer("MCP-OK=2"),
         ]
         assert kt.classify_rows(rows, semantics=kt.SpinnerSemantics.CODE) == [
             kt.KimiLineKind.THINKING_BULLET,
@@ -3621,29 +3680,36 @@ def _without_sgr(text: str) -> str:
 
 
 class TestP2ReviewProbeShellBoundary:
-    """P2-1 — the probe must run under an explicitly chosen POSIX shell.
+    """P2-1 / #14 — the probe must reach the pane as shell-neutral tokens.
 
-    ``_probe_kimi_environment`` types its program straight into the pane, so the
-    program is parsed by whatever shell the pane runs. ``fish`` rejects
+    ``_probe_kimi_environment`` types its command straight into the pane, so it
+    is parsed by whatever shell the pane runs. ``fish`` rejects
     ``${VAR:-default}`` outright ("${ is not a valid variable"), so a fish pane
     never wrote the completion marker and a working Kimi Code binary was
-    classified UNKNOWN. The POSIX program must therefore be handed to a shell
-    that is selected explicitly and is independent of the pane's interactive
-    shell.
+    classified UNKNOWN. Moving the program into ``/bin/sh`` fixed that but not
+    the *transport*: POSIX quoting is not fish quoting, and a probe path
+    containing a backslash-before-apostrophe made ``shlex.quote`` produce a
+    string fish rejects ("Unexpected end of string", exit 127).
+
+    The command is therefore built only from :data:`SHELL_SAFE_CHARS`, with the
+    POSIX program in a CAO-owned script and the probe file passed as a positional
+    parameter. There is nothing for any shell to quote, split or expand.
     """
 
     @pytest.fixture
     def probe_command_for(self, tmp_path, monkeypatch):
         """Drive the real probe and return the exact command typed into the pane.
 
-        Returned as a factory so a test can choose the temp directory (and with
-        it the probe path) the provider is pointed at.
+        Returned as a factory so a test can choose the temp directory the
+        provider is pointed at.
         """
 
         def _run(temp_dir: Path) -> str:
             provider = KimiCliProvider("term-probe", "session-1", "window-1")
             provider._temp_dir = str(temp_dir)
-            probe_path = temp_dir / "kimi-probe.txt"
+            # The provider may relocate transport artifacts to a safe directory
+            # when the supplied temp dir has shell-hostile characters.
+            probe_path = Path(provider._ensure_shell_safe_dir()) / "kimi-probe.txt"
             captured: Dict[str, str] = {}
 
             def fake_send_keys(session_name, window_name, keys):
@@ -3665,33 +3731,38 @@ class TestP2ReviewProbeShellBoundary:
 
         return _run
 
-    def test_posix_syntax_lives_inside_the_compatible_shell_payload(
+    def test_posix_syntax_lives_inside_the_compatible_shell_script(
         self, probe_command_for, tmp_path
     ):
-        """The pane shell must only ever see a shell-agnostic invocation."""
+        """Every token the pane parses must be shell-safe by construction."""
 
         command = probe_command_for(tmp_path)
         argv = shlex.split(command)
 
-        # One argv-level call into an explicitly chosen POSIX shell...
-        assert argv[0] == "/bin/sh"
-        assert argv[1] == "-c"
-        payload = argv[2]
-        assert argv[3] == "cao-kimi-probe"
-        assert argv[4] == str(tmp_path / "kimi-probe.txt")
+        # One argv-level call into an explicitly chosen POSIX shell, naming a
+        # script and its probe file.
+        assert argv[0] == kimi_cli_module.KIMI_COMPATIBLE_SHELL
+        assert len(argv) == 3
+        script_path, probe_path = argv[1], argv[2]
+        assert script_path == str(tmp_path / "kimi-probe.sh")
+        assert probe_path == str(tmp_path / "kimi-probe.txt")
 
-        # ...which carries every POSIX-only construct.
-        assert "${KIMI_CODE_HOME:-$HOME/.kimi-code}" in payload
-        assert "$(command -v kimi 2>/dev/null)" in payload
-        assert "kimi --help" in payload
-        assert KIMI_PROBE_END_MARKER in payload
+        # Nothing in the typed command needs quoting in *any* shell: no
+        # expansion, no substitution, no quoting metacharacter at all.
+        for token in argv:
+            assert kimi_cli_module.is_shell_safe_token(token), token
+        assert "${" not in command
+        assert "$(" not in command
+        assert "'" not in command
+        assert "\\" not in command
 
-        # Nothing POSIX-only may sit outside it: the pane shell parses only
-        # `argv[0]`, the trailing argv, and no parameter expansion of its own.
-        for token in (argv[0], *argv[3:]):
-            assert "${" not in token
-            assert "$(" not in token
-        assert command.count("${KIMI_CODE_HOME:-$HOME/.kimi-code}") == 1
+        # The POSIX program lives in the script, which only /bin/sh ever reads.
+        body = (tmp_path / "kimi-probe.sh").read_text(encoding="utf-8")
+        assert "${KIMI_CODE_HOME:-$HOME/.kimi-code}" in body
+        assert "$(command -v kimi 2>/dev/null)" in body
+        assert "kimi --help" in body
+        assert KIMI_PROBE_END_MARKER in body
+        assert command.count("${KIMI_CODE_HOME:-$HOME/.kimi-code}") == 0
 
     def test_outer_command_parses_under_a_non_posix_pane_shell(self, probe_command_for, tmp_path):
         """Live check when ``fish`` is installed (4.x rejects ``${var:-x}``)."""
@@ -3747,19 +3818,49 @@ class TestP2ReviewProbeShellBoundary:
         assert "CAO_KIMI_HOME=/tmp/pane home\n" in written
         assert "Usage: kimi" in written
 
-    def test_probe_path_with_spaces_and_quotes_cannot_inject(self, probe_command_for, tmp_path):
-        """The probe path is one shell word, whatever it contains."""
+    @pytest.mark.parametrize(
+        "hostile_name",
+        [
+            "sp ace",
+            "apo'strophe",
+            "back\\slash",
+            "back\\'quote",
+            "multi\\\\backslash",
+            "dol$lar;tick`mark",
+            'dq"uote',
+            "par(en)s[brack]ets",
+            "uni\u00e9\u4e2d",
+        ],
+    )
+    def test_hostile_temp_dir_never_reaches_the_pane(
+        self, probe_command_for, tmp_path, hostile_name
+    ):
+        """A shell-hostile scratch path must not become a typed token."""
+
+        hostile = tmp_path / hostile_name
+        hostile.mkdir()
+
+        command = probe_command_for(hostile)
+        argv = shlex.split(command)
+
+        assert str(hostile) not in command
+        for token in argv:
+            assert kimi_cli_module.is_shell_safe_token(token), token
+        # The relocated artifacts are real and reachable.
+        probe_path = Path(argv[2])
+        assert probe_path.parent.name.startswith("cao_kimi_")
+        assert KIMI_PROBE_END_MARKER in probe_path.read_text(encoding="utf-8")
+
+    def test_hostile_temp_dir_round_trips_under_fish(self, probe_command_for, tmp_path):
+        """The relocated command must execute under a real fish."""
 
         fish = shutil.which("fish")
         if fish is None:
             pytest.skip("fish is not installed")
 
-        hostile = tmp_path / "sp ace'q;uote"
+        hostile = tmp_path / "back\\'quote"
         hostile.mkdir()
-        probe_path = hostile / "kimi-probe.txt"
-
         command = probe_command_for(hostile)
-        assert shlex.split(command)[-1] == str(probe_path)
 
         result = subprocess.run(
             [fish, "--no-config", "-c", command],
@@ -3768,6 +3869,7 @@ class TestP2ReviewProbeShellBoundary:
             env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)},
         )
         assert result.returncode == 0, result.stderr
+        probe_path = Path(shlex.split(command)[2])
         assert KIMI_PROBE_END_MARKER in probe_path.read_text(encoding="utf-8")
 
 
@@ -3831,7 +3933,7 @@ class TestP2ReviewProseIsNotAToolCall:
                 "💫 Run uname.",
                 "● Running a command · $ uname -a",
                 "Linux host 6.1.0 x86_64 GNU/Linux",
-                "● Checked: uname -a output above.",
+                _answer("Checked: uname -a output above."),
             ]
         )
         result = _extract_last_message(script)
@@ -4083,7 +4185,7 @@ class TestP2ReviewPublicOutputPath:
                 "💫 Run uname.",
                 "● Running a command · $ uname -a",
                 "Linux host 6.1.0 x86_64 GNU/Linux",
-                "● Checked: uname -a output above.",
+                _answer("Checked: uname -a output above."),
             ]
         )
         assert self._get_last(monkeypatch, pane) == "● Checked: uname -a output above."

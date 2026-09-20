@@ -40,6 +40,22 @@ def _read_fixture(name: str) -> str:
     return (FIXTURES_DIR / name).read_text()
 
 
+def _launch_line(sent_command: str) -> str:
+    """The POSIX launch line that the pane command will actually run.
+
+    ``initialize`` types a shell-neutral ``/bin/sh <script>`` invocation at the
+    pane, because POSIX quoting is not fish quoting (a path with a
+    backslash-before-apostrophe made ``shlex.quote`` produce a string fish
+    rejects). The launch line itself therefore lives in the script, and that is
+    what the assertions below describe.
+    """
+
+    argv = sent_command.split()
+    assert argv[0] == "/bin/sh", sent_command
+    assert len(argv) == 2, sent_command
+    return Path(argv[1]).read_text(encoding="utf-8")
+
+
 def _legacy_probe_result(binary: str = "/usr/local/bin/kimi") -> KimiProbeResult:
     """A probe result describing a legacy ``kimi-cli`` install.
 
@@ -156,8 +172,9 @@ class TestKimiCliProviderInitialization:
         # Verify kimi command includes --agent-file
         call_args = mock_tmux.return_value.send_keys.call_args
         command = call_args[0][2]
-        assert "--agent-file" in command
-        assert "--yolo" in command
+        launch_line = _launch_line(command)
+        assert "--agent-file" in launch_line
+        assert "--yolo" in launch_line
 
         # Cleanup temp files
         provider.cleanup()
@@ -205,9 +222,10 @@ class TestKimiCliProviderInitialization:
 
         call_args = mock_tmux.return_value.send_keys.call_args
         command = call_args[0][2]
-        assert "--mcp-config" in command
+        launch_line = _launch_line(command)
+        assert "--mcp-config" in launch_line
         # No --config flag in command (breaks OAuth authentication)
-        assert "--config" not in command
+        assert "--config" not in launch_line
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.kimi_cli.wait_until_status")
@@ -225,9 +243,10 @@ class TestKimiCliProviderInitialization:
 
         call_args = mock_tmux.return_value.send_keys.call_args
         command = call_args[0][2]
-        assert "cd " in command
-        assert "TERM=xterm-256color" in command
-        assert "kimi --yolo" in command
+        launch_line = _launch_line(command)
+        assert "cd " in launch_line
+        assert "TERM=xterm-256color" in launch_line
+        assert "kimi --yolo" in launch_line
         provider.cleanup()
 
 

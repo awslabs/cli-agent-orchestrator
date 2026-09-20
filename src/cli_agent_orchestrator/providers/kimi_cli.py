@@ -59,6 +59,7 @@ import re
 import shlex
 import shutil
 import stat
+import string
 import tempfile
 import threading
 import time
@@ -70,7 +71,11 @@ from cli_agent_orchestrator.agent_plugins.mcp_delivery import with_plugin_mcp as
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers import kimi_transcript as kt
-from cli_agent_orchestrator.providers.base import BaseProvider, OutputExtractionError
+from cli_agent_orchestrator.providers.base import (
+    BaseProvider,
+    OutputExtractionError,
+    OutputExtractionRejected,
+)
 from cli_agent_orchestrator.providers.kimi_runtime_home import (
     KimiCodeRuntimeHomeBuilder,
     RuntimeHomeError,
@@ -289,49 +294,93 @@ KIMI_PROBE_TIMEOUT_SECONDS = 20.0
 #: command, which would match this marker before the command even ran).
 KIMI_PROBE_END_MARKER = "CAO-KIMI-PROBE-END"
 
-#: The shell the probe program is handed to, chosen explicitly and absolutely.
-#: The program contains POSIX parameter expansion (``${VAR:-default}``) and
-#: command substitution, neither of which a non-POSIX pane shell can parse —
-#: ``fish`` rejects ``${`` outright ("${ is not a valid variable"), so a fish
-#: pane never wrote the completion marker and a working Kimi Code binary was
-#: classified UNKNOWN. The pane's own shell must therefore only ever parse a
-#: shell-agnostic invocation; the POSIX program runs in this child shell, which
-#: inherits the pane's environment (PATH, HOME, KIMI_CODE_HOME) so ``command -v
-#: kimi`` still observes the exact environment the launched ``kimi`` will see.
-KIMI_PROBE_SHELL = "/bin/sh"
+#: The shell the probe program and the launch line are handed to, chosen
+#: explicitly and absolutely. Both are POSIX and contain constructs a non-POSIX
+#: pane shell cannot parse — ``fish`` rejects ``${`` outright ("${ is not a valid
+#: variable"), so a fish pane never wrote the completion marker and a working
+#: Kimi Code binary was classified UNKNOWN. The pane's own shell must therefore
+#: only ever parse a shell-agnostic invocation; the POSIX text runs in this child
+#: shell, which inherits the pane's environment (PATH, HOME, KIMI_CODE_HOME) so
+#: ``command -v kimi`` still observes exactly what the launched ``kimi`` sees.
+KIMI_COMPATIBLE_SHELL = "/bin/sh"
+
+#: Characters that every shell we can meet (POSIX sh, bash, zsh, fish, csh)
+#: treats as an ordinary literal. A token built only from these needs no quoting
+#: at all, and that is the only transport that is provably identical across
+#: shells: POSIX quoting is *not* fish quoting. ``'\''`` — the POSIX idiom for an
+#: embedded apostrophe — ends the string early in fish when a backslash precedes
+#: the apostrophe ("Unexpected end of string, quotes are not balanced", exit
+#: 127), and ``\\`` means one backslash in fish but two in POSIX sh. Reproduced
+#: with a probe path of ``/tmp/back\'quote/kimi-probe.txt``.
+SHELL_SAFE_CHARS = frozenset(string.ascii_letters + string.digits + "_-./:=+,@%")
 
 
-def build_kimi_probe_command(probe_path: str) -> str:
-    """The exact command typed into the pane to run the capability probe.
+def is_shell_safe_token(value: str) -> bool:
+    """True when ``value`` can be typed into any shell without quoting."""
 
-    The POSIX program is passed to an explicitly selected shell as a single
-    argv word, and the probe file is passed as a positional parameter instead of
-    being interpolated into the program, so no temp-path content is ever parsed
-    as shell syntax. Everything the pane's shell has to parse is the
-    shell-agnostic shape::
+    return bool(value) and all(char in SHELL_SAFE_CHARS for char in value)
 
-        /bin/sh -c '<program>' cao-kimi-probe '<probe path>'
 
-    A ``fish`` (or any other non-POSIX) pane therefore sees only a command name
-    and two arguments; ``${KIMI_CODE_HOME:-$HOME/.kimi-code}`` is expanded by
-    the ``/bin/sh`` child, which inherits the pane's environment.
+def shell_safe_temp_root() -> str:
+    """A temp root whose path needs no quoting in any shell.
+
+    The operator's temp root is used when it is already safe, which is the normal
+    case. Otherwise ``/tmp`` is used: a dynamic value that cannot be transported
+    safely must not be transported at all, and falling back keeps the probe and
+    the launch working on a hostile ``TMPDIR`` instead of failing on it.
     """
 
-    program = (
-        "{ printf 'CAO_KIMI_BIN=%s\\n' \"$(command -v kimi 2>/dev/null)\"; "
-        "printf 'CAO_KIMI_HOME=%s\\n' \"${KIMI_CODE_HOME:-$HOME/.kimi-code}\"; "
-        "kimi --help 2>&1; "
-        "printf '\\n%s\\n' '" + KIMI_PROBE_END_MARKER + '\'; } > "$1" 2>&1'
-    )
-    return " ".join(
-        (
-            KIMI_PROBE_SHELL,
-            "-c",
-            shlex.quote(program),
-            "cao-kimi-probe",
-            shlex.quote(probe_path),
+    for candidate in (tempfile.gettempdir(), "/tmp"):
+        try:
+            resolved = os.path.realpath(candidate)
+        except OSError:  # pragma: no cover - defensive
+            continue
+        if os.path.isdir(resolved) and is_shell_safe_token(resolved):
+            return resolved
+    return "/tmp"
+
+
+#: Body of the POSIX probe program. It is written to a file (never typed at the
+#: pane) so the pane shell has nothing to parse but safe tokens. ``$1`` is the
+#: probe file, passed as a positional parameter rather than interpolated, so no
+#: dynamic value ever becomes shell syntax.
+KIMI_PROBE_PROGRAM = (
+    "{ printf 'CAO_KIMI_BIN=%s\\n' \"$(command -v kimi 2>/dev/null)\"; "
+    "printf 'CAO_KIMI_HOME=%s\\n' \"${KIMI_CODE_HOME:-$HOME/.kimi-code}\"; "
+    "kimi --help 2>&1; "
+    "printf '\\n%s\\n' '" + KIMI_PROBE_END_MARKER + '\'; } > "$1" 2>&1'
+)
+
+
+def build_kimi_probe_command(script_path: str, probe_path: str) -> str:
+    """The exact command typed into the pane to run the capability probe.
+
+    Every token is drawn from the shell-safe alphabet *by construction*, so the
+    pane's shell — whatever it is — parses the same command and has nothing to
+    expand, split or unquote. The POSIX program lives in ``script_path`` and is
+    executed by an explicitly selected ``/bin/sh``, with the probe file passed as
+    a positional parameter.
+    """
+
+    if not is_shell_safe_token(script_path) or not is_shell_safe_token(probe_path):
+        raise ValueError(
+            "Kimi probe paths must be shell-safe (see is_shell_safe_token); "
+            f"got script={script_path!r} probe={probe_path!r}"
         )
-    )
+    return " ".join((KIMI_COMPATIBLE_SHELL, script_path, probe_path))
+
+
+def build_kimi_launch_command(script_path: str) -> str:
+    """The exact command typed into the pane to launch Kimi.
+
+    The launch line itself is POSIX (it quotes the operator's own paths, model
+    names and binary), so it is written to ``script_path`` and handed to
+    ``/bin/sh``. The pane shell sees only this fixed, quote-free invocation.
+    """
+
+    if not is_shell_safe_token(script_path):
+        raise ValueError(f"Kimi launch script path must be shell-safe; got {script_path!r}")
+    return " ".join((KIMI_COMPATIBLE_SHELL, script_path))
 
 
 #: Successful probes only, keyed by binary identity. A failed probe is never
@@ -553,7 +602,10 @@ def _is_live_turn_spinner_line(
     ``semantics`` defaults to the legacy rules so a caller that has not resolved
     a dialect keeps the historical behaviour.
     """
-    return kt.is_live_spinner_line(line, line, semantics)
+    # The caller may hand in a raw, ANSI-bearing row, so the escape-free form has
+    # to be derived rather than assumed: the indicator is identified by its
+    # position at the row's prefix, and a leading colour sequence would hide it.
+    return kt.is_live_spinner_line(kt.strip_sgr(line), line, semantics)
 
 
 # Response markers.
@@ -625,6 +677,9 @@ class KimiCliProvider(BaseProvider):
         self._model = model
         # Track temp directory for cleanup (created when agent profile needs temp files)
         self._temp_dir: Optional[str] = None
+        # Shell-safe scratch directory for the artifacts typed at the pane (the
+        # probe program and the launch script). See _ensure_shell_safe_dir.
+        self._shell_safe_dir: Optional[str] = None
         # Latching flag: set True when user input box (╭─) is detected in ANY
         # get_status() call. Persists even after the box scrolls out of the
         # tmux capture window (200 lines). This is needed because:
@@ -702,11 +757,66 @@ class KimiCliProvider(BaseProvider):
     # =====================================================================
 
     def _ensure_temp_dir(self, prefix: str = "cao_kimi_") -> str:
-        """Return this provider's scratch directory, creating it on first use."""
+        """Return this provider's scratch directory, creating it on first use.
+
+        Created under a shell-safe root so every path CAO derives from it can be
+        typed into any pane shell without quoting — see
+        :func:`is_shell_safe_token`. The generated name is ``<prefix><random>``,
+        which is itself drawn from the safe alphabet.
+        """
 
         if not self._temp_dir:
-            self._temp_dir = tempfile.mkdtemp(prefix=prefix)
+            self._temp_dir = tempfile.mkdtemp(prefix=prefix, dir=shell_safe_temp_root())
         return self._temp_dir
+
+    def _ensure_shell_safe_dir(self) -> str:
+        """A scratch directory whose path needs no quoting in any shell.
+
+        Normally the provider's own temp dir. A caller-supplied ``_temp_dir``
+        with shell-hostile characters is not used for transport: the probe and
+        launch artifacts move to a safe directory instead, so a hostile path can
+        never reach a shell parser.
+        """
+
+        if self._shell_safe_dir is None:
+            base = self._ensure_temp_dir()
+            if is_shell_safe_token(base):
+                self._shell_safe_dir = base
+            else:
+                self._shell_safe_dir = tempfile.mkdtemp(
+                    prefix="cao_kimi_", dir=shell_safe_temp_root()
+                )
+        return self._shell_safe_dir
+
+    @staticmethod
+    def _write_private_script(directory: str, name: str, body: str) -> str:
+        """Write an executable helper script and return its path."""
+
+        path = os.path.join(directory, name)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(body)
+        os.chmod(path, 0o700)
+        return path
+
+    def _materialize_launch_command(self, command: str) -> str:
+        """Move a POSIX launch line into a script and return the pane command.
+
+        The launch line quotes the operator's own paths, model names and resolved
+        binary, so it is POSIX text that an arbitrary pane shell must not be
+        asked to parse. It is written to a CAO-owned script and handed to
+        ``/bin/sh``; the pane receives a fixed invocation built only from
+        shell-safe characters.
+        """
+
+        directory = self._ensure_shell_safe_dir()
+        script = self._write_private_script(
+            directory,
+            "kimi-launch.sh",
+            "#!/bin/sh\n# CAO-managed launch line (POSIX). Do not edit.\nexec /bin/sh -c "
+            + shlex.quote(command)
+            + "\n",
+        )
+        return build_kimi_launch_command(script)
 
     @staticmethod
     def _dialect_failure_reason(observed: Dict[str, bool]) -> str:
@@ -767,17 +877,22 @@ class KimiCliProvider(BaseProvider):
                 capability signature. Never falls back to the legacy dialect.
         """
 
-        temp_dir = await asyncio.to_thread(self._ensure_temp_dir)
-        probe_path = os.path.join(temp_dir, "kimi-probe.txt")
+        probe_dir = await asyncio.to_thread(self._ensure_shell_safe_dir)
+        probe_path = os.path.join(probe_dir, "kimi-probe.txt")
 
-        # The program below is POSIX and contains `${VAR:-default}` and
-        # `$(...)`. It is handed to an explicitly selected shell instead of
-        # being typed at the pane's interactive shell, because the pane's shell
-        # is the operator's choice: `fish` cannot parse either construct, so it
-        # would fail before writing the completion marker and a working Kimi
-        # Code binary would be classified UNKNOWN. This shell is a child of the
-        # pane shell, so PATH/HOME/KIMI_CODE_HOME — and therefore `command -v
-        # kimi` — are exactly what the launched `kimi` will see.
+        # The program is POSIX and contains `${VAR:-default}` and `$(...)`. It is
+        # written to a file and handed to an explicitly selected shell instead of
+        # being typed at the pane, because the pane's shell is the operator's
+        # choice: `fish` cannot parse either construct, so it would fail before
+        # writing the completion marker and a working Kimi Code binary would be
+        # classified UNKNOWN. The command typed at the pane is built only from
+        # shell-safe characters, so no shell has to quote, split or expand
+        # anything — POSIX quoting is not fish quoting, and a probe path
+        # containing a backslash-before-apostrophe broke `shlex.quote` under fish.
+        #
+        # This shell is a child of the pane shell, so PATH/HOME/KIMI_CODE_HOME —
+        # and therefore `command -v kimi` — are exactly what the launched `kimi`
+        # will see.
         #
         # The completion signal is read from the FILE, never from the pane. The
         # pane is unusable for this: `send_keys` types the script as literal
@@ -787,7 +902,10 @@ class KimiCliProvider(BaseProvider):
         # probe read a half-written file, classifying a perfectly good Kimi Code
         # binary as UNKNOWN. The end marker is written by the shell as the last
         # thing it does, so its presence in the file means the dump is complete.
-        probe_script = build_kimi_probe_command(probe_path)
+        script_path = await asyncio.to_thread(
+            self._write_private_script, probe_dir, "kimi-probe.sh", KIMI_PROBE_PROGRAM + "\n"
+        )
+        probe_script = build_kimi_probe_command(script_path, probe_path)
 
         await asyncio.to_thread(
             get_backend().send_keys, self.session_name, self.window_name, probe_script
@@ -1564,6 +1682,12 @@ class KimiCliProvider(BaseProvider):
         else:
             command = await asyncio.to_thread(self._build_kimi_command, probe.binary)
 
+        # The launch line is POSIX text that quotes the operator's own paths,
+        # model names and resolved binary. Hand it to /bin/sh via a CAO-owned
+        # script so the pane's shell — which may be fish, zsh, or anything else —
+        # never has to parse POSIX quoting it may not share.
+        command = await asyncio.to_thread(self._materialize_launch_command, command)
+
         # Send Kimi command to the tmux window
         await asyncio.to_thread(
             get_backend().send_keys, self.session_name, self.window_name, command
@@ -2095,10 +2219,16 @@ class KimiCliProvider(BaseProvider):
         the model's private reasoning as its answer. Raising is the only safe
         outcome — the caller sees an extraction failure instead of a plausible
         but wrong message.
+
+        Raised as :class:`OutputExtractionRejected`, not the retryable
+        :class:`OutputExtractionError`: this is a deliberate refusal about
+        content that was found, so it must not be retried and must never be
+        replaced by the raw-transcript fallback, which contains the reasoning
+        that was just refused.
         """
 
         if kinds and all(kind is kt.KimiLineKind.THINKING_BULLET for kind in kinds):
-            raise OutputExtractionError(
+            raise OutputExtractionRejected(
                 "Kimi returned only reasoning output for this turn: every candidate "
                 "line was classified as a thinking bullet, so there is no final "
                 "answer to extract. Refusing to return reasoning text as the response."
@@ -2119,7 +2249,7 @@ class KimiCliProvider(BaseProvider):
         )
         self._reject_thinking_only(region_kinds)
         if not answers:
-            raise OutputExtractionError(
+            raise OutputExtractionRejected(
                 "No extractable content in Kimi CLI output: every candidate line in "
                 "the response region was TUI chrome, a user echo, or reasoning."
             )
@@ -2164,6 +2294,9 @@ class KimiCliProvider(BaseProvider):
         self._reject_thinking_only(region_kinds)
 
         if not answers:
+            # Reached only when no input marker was found anywhere in the capture,
+            # so this is the "capture too shallow / marker missing" case, not a
+            # refusal about content that was found: it stays retryable.
             raise OutputExtractionError(
                 "No extractable content in Kimi CLI output (input box scrolled out): "
                 "every candidate line was TUI chrome, a user echo, or reasoning."

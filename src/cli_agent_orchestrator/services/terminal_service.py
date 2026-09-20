@@ -75,7 +75,10 @@ from cli_agent_orchestrator.plugins import (
     PostKillTerminalEvent,
     PostSendMessageEvent,
 )
-from cli_agent_orchestrator.providers.base import OutputExtractionError
+from cli_agent_orchestrator.providers.base import (
+    OutputExtractionError,
+    OutputExtractionRejected,
+)
 from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroCapabilities,
     KiroPhase0KASError,
@@ -2526,6 +2529,12 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
                                 tail_lines=fixed_extract_lines,
                             )
                         return provider.extract_last_message_from_script(full_output)
+                    except OutputExtractionRejected:
+                        # A deliberate content refusal — private reasoning, or a
+                        # region that held nothing but chrome and echo. Retrying
+                        # cannot help, and the raw fallback below would republish
+                        # the very content that was refused.
+                        raise
                     except ValueError as exc:
                         last_err = exc
                         logger.debug(
@@ -2560,6 +2569,10 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
                             step_lines,
                         )
                     return result
+                except OutputExtractionRejected:
+                    # Deliberate content refusal: escalate nothing, fall back to
+                    # nothing. See the fixed-tail branch above.
+                    raise
                 except ValueError as exc:
                     last_err = exc
                     logger.debug(
@@ -2582,6 +2595,9 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
                 result = provider.extract_last_message_from_script(full_output)
                 logger.debug("get_output: %s marker found in full_history", terminal_id)
                 return result
+            except OutputExtractionRejected:
+                # Deliberate content refusal: never degrade to the raw pane.
+                raise
             except ValueError:
                 pass
 

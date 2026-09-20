@@ -57,6 +57,21 @@ _SGR_PARAMS_RE = re.compile(r"\x1b\[([0-9;]*)m")
 # Braille Patterns block — the Kimi Code live working indicator ("⠙ working…").
 _BRAILLE_RE = re.compile(r"[\u2800-\u28ff]")
 
+# The live working indicator is a braille glyph *at the indicator position*: the
+# row's own prefix, where the renderer draws the spinner slot. Membership of the
+# Braille block anywhere on a row is not evidence — an answer that mentions the
+# character ("● The Braille letter A is ⠁.") or quotes it in a code block would
+# otherwise be classified as a live turn, which both drops the row out of the
+# answer and can pin the terminal at PROCESSING.
+_SPINNER_PREFIX_RE = re.compile(r"^\s*[\u2800-\u28ff]")
+
+# The reasoning block's continuation styling. Kimi draws reasoning in grey 244
+# and italicises it; a wrapped reasoning line repeats that styling without
+# repeating the bullet. This is the positive evidence that lets a reasoning
+# block absorb its own continuation rows without also suppressing arbitrary
+# unstyled prose that follows a thinking bullet.
+_REASONING_CONTINUATION_RE = re.compile(r"\x1b\[3m|\x1b\[38;5;244m")
+
 # Moon phases U+1F311..U+1F318. In Kimi Code these appear in the *idle* rotating
 # tip row ("🌕 · Tip: …"), which is why they are NOT a processing signal here.
 _MOON_RE = re.compile(r"[\U0001F311-\U0001F318]")
@@ -212,6 +227,15 @@ MCP_BOOT_ROW_RE = re.compile(
 # incidental mention is not enough, which is what keeps
 # "The reported context: 50% is expected." and
 # "Use ctrl-o to hide or reveal tool output if needed." in the answer.
+#
+# The rotating tips are *corroborating* evidence, not independent segments. A
+# real status row carries one measured field (the git branch, the agent segment,
+# the context indicator) plus a tip; an ordinary answer can mention the tips
+# themselves, and "Use ctrl-o to hide or reveal tool output and shift-tab to Plan
+# mode." matched two of them, classified as STATUS_FOOTER and truncated the rest
+# of the answer. When the row is styled, the tip must carry the footer's own
+# colour (242), which an answer does not; an escape-free row has no colour to
+# lean on, so a measured field is required there instead.
 FOOTER_SEGMENT_RES: Tuple[re.Pattern, ...] = (
     # context-usage indicator
     re.compile(r"context:\s*\d+(?:\.\d+)?%"),
@@ -219,22 +243,32 @@ FOOTER_SEGMENT_RES: Tuple[re.Pattern, ...] = (
     re.compile(r"agent\s*\([^)●]{0,80}●\)"),
     # git branch segment: `master [±]`
     re.compile(r"\[[±+\-]\]"),
-    # rotating footer tips, drawn in colour 242 on the status row
-    re.compile(r"ctrl-o to hide or reveal tool output"),
-    re.compile(r"shift-tab to Plan mode"),
-    re.compile(r"/goal for multi-step"),
     # approval-mode token at row start: `yolo  …` / `Ask When Needed  …`
     re.compile(r"^\s*(?:yolo|Ask When Needed|Never Ask)\b"),
 )
 
+#: The rotating tips, as the status row draws them.
+FOOTER_TIP_RE = re.compile(
+    r"ctrl-o to hide or reveal tool output|shift-tab to Plan mode|/goal for multi-step"
+)
+#: The same tips carrying the footer's own foreground colour.
+FOOTER_TIP_STYLE_RE = re.compile(
+    r"\x1b\[38;5;242m[^\x1b]*(?:ctrl-o to hide or reveal tool output"
+    r"|shift-tab to Plan mode|/goal for multi-step)"
+)
+
 # Segments that constitute a footer row on their own.
 FOOTER_WHOLE_ROW_RES: Tuple[re.Pattern, ...] = (
-    # Context indicator at the start of the row. Deliberately not end-anchored:
-    # a narrow terminal wraps the tail, so the real row is
-    # `                    context: 0.0% (0/262.1k` followed by `)` on the next
-    # row. Row-start anchoring is what keeps prose that merely mentions the
-    # phrase — "The reported context: 50% is expected." — out of this rule.
-    re.compile(r"^\s*context:\s*\d+(?:\.\d+)?%"),
+    # Context indicator at the start of the row, in the measured shape: the
+    # percentage is followed by the parenthesised used/total counts. Requiring
+    # that suffix is what keeps ordinary prose that merely *states* a metric —
+    # "context: 50% means half the budget is used." — in the answer. The counts
+    # are the renderer's own field, so a sentence does not carry them by accident.
+    # Deliberately not end-anchored: a narrow terminal wraps the tail, so the
+    # real row is `                    context: 0.0% (0/262.1k` followed by `)`
+    # on the next row. Row-start anchoring plus the measured suffix is what keeps
+    # a metric *mention* out of this rule.
+    re.compile(r"^\s*context:\s*\d+(?:\.\d+)?%\s*\("),
     re.compile(r"^\s*agent\s*\([^)●]{0,80}●\)\s*$"),
     re.compile(
         r"^\s*(?:ctrl-o to hide or reveal tool output"
@@ -293,52 +327,74 @@ TOOL_HINT_RE = re.compile(r"^\s*Press (?:Ctrl\+B to run in background|Esc to int
 # content.
 RULE_RE = re.compile(r"^\s*[─━═]{3,}\s*$")
 
-# Kimi Code tool-execution header. Shares the colour-253 bullet with a final
-# answer, so the escape-free form is separated by *shape*, and the styled form
-# by the bold+colour-111 tool-name style, never by the bullet alone.
+# Kimi Code tool-execution header. The measured shape is a bullet plus a
+# renderer-drawn tool name, so the *styled* form is identified by the
+# bold + colour-111 tool-name style and the *escape-free* form by the measured
+# detail separator the renderer appends.
 #
-# Two measured families:
+# Measured headers (A0 captures + the live 0.43.1 source-side turn):
 #
 #   in-flight   `● Using find_profiles · MCP/cao-mcp-server`
 #   completed   `● Used find_profiles · MCP/cao-mcp-server (kimi)`
 #   built-in    `● Running a command · $ uname -a`
 #               `● Used Read (ANSWER_SPEC.md) · 10 lines`
+#   live 0.43.1 `● Used <bold111>find_profiles</bold> · MCP/cao-mcp-server (kimi)`
 #
-# The identifier is matched with **any** case. Capitalisation is deliberately
-# not the discriminator: CAO's own MCP tools are snake_case (`find_profiles`,
-# `send_message`, `memory_recall`, …), so a capitalised-identifier rule let
-# every CAO MCP tool row through as answer text — the D6 production defect.
-# What separates a tool row from prose is the measured *structural suffix* the
-# renderer appends: a `·` detail separator (which for MCP tools is the
-# `· MCP/<server>` target), a parenthesised argument list, or nothing else on
-# the row. `● Used widely in production.` carries none of those and stays
-# content.
-_TOOL_IDENTIFIER = r"[A-Za-z_][A-Za-z0-9_]*"
-_TOOL_ROW_SUFFIX = r"(?=\s*[·(]|\s*$)"
+# Every measured row carries the `·` detail separator. That is the positive
+# renderer structure, and it is the only thing that separates a tool header from
+# a sentence. An English verb plus an identifier plus an opening parenthesis is
+# NOT evidence: `● Calling retry() twice is safe.`,
+# `● Calling connect (with TLS) encrypts the connection.` and
+# `● Using Python (3.12) is recommended.` are ordinary answer prose, and a
+# misread header opens a tool block whose continuation rows are then suppressed
+# as TOOL_CHROME — destroying the answer, and at the public `mode=LAST` boundary
+# degrading to the raw-transcript fallback.
+#
+# The identifier is matched with **any** case, and the tool-name character set
+# includes `-` and `.` because real MCP tool names use them (`search-docs`,
+# `docs.search`). Capitalisation is deliberately not the discriminator: CAO's own
+# MCP tools are snake_case (`find_profiles`, `send_message`, `memory_recall`, …),
+# so a capitalised-identifier rule let every CAO MCP tool row through as answer
+# text — the D6 production defect.
+_TOOL_IDENTIFIER = r"[A-Za-z_][A-Za-z0-9_.-]*"
+#: The measured detail separator: a `·` with horizontal whitespace on both sides.
+_TOOL_DETAIL_SEP = r"[^\S\n]·[^\S\n]"
+#: Optional parenthesised argument list, as in `Used Read (ANSWER_SPEC.md)`.
+_TOOL_ARG_LIST = r"[^\S\n]*\([^)]*\)"
 
 # The tool name in the styled form, bold + colour 111. Both SGR orders are
 # measured (`ESC[1mESC[38;5;111m` in the A0 captures, `ESC[38;5;111mESC[1m` in
 # the 0.43.1 live capture), so both are accepted.
 _TOOL_NAME_STYLE = r"(?:\x1b\[1m\x1b\[38;5;111m|\x1b\[38;5;111m\x1b\[1m)"
+_TOOL_VERBS = r"(?:Running a command|Calling|Using|Used|Read|Write|Edit|Search|Fetch)"
 
+# The styled form: the renderer draws either the verb or the identifier in the
+# tool-name style. Both measured orders are accepted.
 TOOL_CALL_RE = re.compile(
-    r"^\s*(?:\x1b\[[0-9;]*m)*[•●]?[^\S\n]*"
+    r"^\s*(?:\x1b\[[0-9;]*m)*[•●]?[^\S\n]*(?:"
     + _TOOL_NAME_STYLE
-    + r"(?:Running a command|Calling|Using|Used|Read|Write|Edit|Search|Fetch)"
+    + _TOOL_VERBS
+    + r"|"
+    + _TOOL_VERBS
+    + r"[^\S\n]+"
+    + _TOOL_NAME_STYLE
+    + r")"
 )
-# The escape-free form of the same row. Every branch is anchored to a measured
-# structural suffix, so prose that merely *begins* with a tool verb is not swept
-# up. `● Running a command · $ uname -a` carries the `·` detail separator;
-# `● Used Read (ANSWER_SPEC.md) · 10 lines` carries the parenthesised argument
-# list; an identifier with nothing after it is the row and nothing else. Without
-# those anchors, `● Calling this function twice returns two rows.` and
-# `● Running a command is unnecessary here.` were classified TOOL_CALL — and
-# because `classify_rows` opens a tool block on that kind, the continuation rows
-# of the answer were then suppressed as TOOL_CHROME and the answer was lost.
+# The escape-free form. Both branches require the measured `·` detail separator,
+# or an identifier that is the whole row, so a sentence that merely *begins* with
+# a tool verb — with or without a call-like parenthesis — stays answer content.
 TOOL_CALL_CLEAN_RE = re.compile(
     r"^\s*[•●]\s*(?:"
-    r"Running a command(?=\s*·)"
-    r"|(?:Used|Using|Calling)\s+" + _TOOL_IDENTIFIER + _TOOL_ROW_SUFFIX + r")"
+    + r"Running a command"
+    + _TOOL_DETAIL_SEP
+    + r"|(?:Used|Using|Calling)[^\S\n]+"
+    + _TOOL_IDENTIFIER
+    + r"(?:"
+    + _TOOL_ARG_LIST
+    + r")?(?:"
+    + _TOOL_DETAIL_SEP
+    + r"|[^\S\n]*$)"
+    + r")"
 )
 
 # ---------------------------------------------------------------------------
@@ -419,8 +475,15 @@ def is_trust_workspace_candidate(clean_line: str) -> bool:
     return True
 
 
-APPROVAL_TITLE_RE = re.compile(r"▶\s*(?:Run this command\?|Approve\s|Allow\s)")
+# The approval dialog's own rows. The title is anchored to the row start so a
+# sentence that merely *mentions* it ("The dialog says ▶ Run this command?
+# before execution.") is not even a candidate — a substring test classified the
+# mentioning sentence as the dialog and, because the dialog ends the response
+# region, truncated the answer at that row.
+APPROVAL_TITLE_RE = re.compile(r"^\s*▶\s*(?:Run this command\?|Approve\s|Allow\s)")
 APPROVAL_HINT_RE = re.compile(r"↑/↓\s*select\s*·\s*1/2/3/4\s*choose")
+# A numbered option row, with the optional selection marker the renderer draws.
+APPROVAL_OPTION_RE = re.compile(r"^\s*(?:▶\s*)?\d+\.\s*(?:Approve|Reject)\b")
 APPROVAL_SELECT_MARKER = "▶"
 
 
@@ -475,16 +538,22 @@ CHROME_KINDS = frozenset(
     }
 )
 
-# Kinds that positively end a tool-output block (see `classify_rows`). Every
-# entry is a row shape that cannot be tool payload: it either opens something
-# new (a user echo, a fresh tool call is handled at the call site), or it is
-# assistant output, or it is chrome that only renders once the tool has
-# finished. A `CONTENT` or `BLANK` row is deliberately absent — those are
-# exactly the shapes a payload takes.
+# Kinds that positively end a tool-output block (see `classify_rows`).
+#
+# Tool output is arbitrary content, so a payload row must not be able to certify
+# that it has stopped being payload by happening to resemble TUI chrome. Only
+# rows whose *structure* cannot be payload end the block, and the ones a payload
+# can trivially forge are deliberately absent:
+#
+# * ``RULE`` — a payload can contain a `────` line (reproduced: it let private
+#   payload into the answer);
+# * ``BOOT_CHROME`` — payload can contain "connecting to mcp servers…";
+# * ``FINAL_BULLET`` — a bare bullet is exactly what payload that starts with a
+#   bullet looks like, so only the renderer's *answer colour* ends the block
+#   (see `_ends_tool_block`);
+# * ``CONTENT``/``BLANK`` — those are the shapes a payload takes.
 TOOL_BLOCK_END_KINDS = frozenset(
     {
-        KimiLineKind.FINAL_BULLET,
-        KimiLineKind.THINKING_BULLET,
         KimiLineKind.USER_INPUT,
         KimiLineKind.READY_INPUT_FRAME,
         KimiLineKind.STATUS_FOOTER,
@@ -492,10 +561,100 @@ TOOL_BLOCK_END_KINDS = frozenset(
         KimiLineKind.IDLE_TIP,
         KimiLineKind.TRUST_DIALOG,
         KimiLineKind.APPROVAL_DIALOG,
-        KimiLineKind.BOOT_CHROME,
-        KimiLineKind.RULE,
     }
 )
+
+
+#: Tool-block end kinds whose *plain text* a payload can trivially reproduce.
+#: They end a block only when the row carries renderer styling, because an
+#: escape-free capture cannot prove the row is chrome rather than payload.
+#: Dialogs are deliberately absent: they are already confirmed against the whole
+#: capture by :func:`_confirm_context_kinds`, which is stronger evidence than
+#: styling.
+_STYLE_REQUIRED_END_KINDS = frozenset(
+    {
+        KimiLineKind.STATUS_FOOTER,
+        KimiLineKind.READY_INPUT_FRAME,
+        KimiLineKind.LIVE_SPINNER,
+        KimiLineKind.IDLE_TIP,
+    }
+)
+
+
+def _ends_tool_block(raw_line: str, kind: KimiLineKind) -> bool:
+    """True when a row inside a tool block is positively *not* tool payload.
+
+    Tool output is arbitrary content, so a payload row must not be able to
+    certify that it has stopped being payload by happening to resemble TUI
+    chrome. Only renderer evidence that belongs outside payload ends the block:
+
+    * a final-answer bullet drawn in the answer colour (colour 253);
+    * a sequence-confirmed dialog;
+    * a composer frame, status footer, spinner or idle tip **drawn with
+      styling** — their plain-text shapes are exactly what a payload can
+      contain (reproduced: an escape-free ``context: 99% (1/2)`` line and a
+      ``────`` rule both let private payload into the answer).
+
+    An *unstyled* response bullet is not evidence either: it is
+    indistinguishable from payload that starts with a bullet, so an escape-free
+    capture keeps the block open and fails closed rather than publishing payload
+    as the answer.
+
+    Reasoning and user submissions are handled by the caller, which has to
+    update their own block state as well.
+    """
+
+    if kind is KimiLineKind.FINAL_BULLET:
+        return bool(FINAL_ANSWER_BULLET_STYLE_RE.search(raw_line or ""))
+    if kind not in TOOL_BLOCK_END_KINDS:
+        return False
+    if kind in _STYLE_REQUIRED_END_KINDS and not _SGR_RE.search(raw_line or ""):
+        return False
+    return True
+
+
+def _confirm_context_kinds(
+    raw_lines: Sequence[str],
+    clean_lines: Sequence[str],
+    kinds: Sequence[KimiLineKind],
+) -> List[KimiLineKind]:
+    """Downgrade context-sensitive UI kinds the surrounding rows do not confirm.
+
+    A row whose *text* looks like part of a dialog or an approval prompt is not
+    UI state; only the whole structure is. The trust dialog needs its title, its
+    navigation hint and its option set (:func:`detect_trust_dialog`), and the
+    approval dialog needs its navigation hint *and* a numbered option row.
+    Without that context the row is ordinary answer content — and treating it as
+    chrome silently ends the response region, dropping the rest of the answer.
+
+    The approval confirmation deliberately does not accept the title alone: the
+    same substring that classified the row would then confirm it, so a sentence
+    that merely quotes the prompt would confirm itself. Reproduced collisions
+    this closes: a quoted menu example (``● Menu example:`` /
+    ``❯ Trust this folder`` / ``Continue…``), a fenced ``❯ Don't trust``, a
+    numbered procedure (``1. Approve the plan.``), prose quoting
+    ``▶ Run this command?``, and prose that merely starts with
+    ``Project MCP targets:``.
+    """
+
+    confirmed = list(kinds)
+
+    if detect_trust_dialog(raw_lines) is None:
+        confirmed = [
+            KimiLineKind.CONTENT if kind is KimiLineKind.TRUST_DIALOG else kind
+            for kind in confirmed
+        ]
+
+    approval_confirmed = any(APPROVAL_HINT_RE.search(clean) for clean in clean_lines) and any(
+        APPROVAL_OPTION_RE.match(clean) for clean in clean_lines
+    )
+    if not approval_confirmed:
+        confirmed = [
+            KimiLineKind.CONTENT if kind is KimiLineKind.APPROVAL_DIALOG else kind
+            for kind in confirmed
+        ]
+
+    return confirmed
 
 
 def strip_sgr(line: str) -> str:
@@ -586,17 +745,26 @@ def is_boot_chrome_line(clean_line: str, raw_line: str = "") -> bool:
     return bool(BOOT_MESSAGE_ROW_RE.match(clean_line) or MCP_BOOT_ROW_RE.match(clean_line))
 
 
-def is_status_footer_line(clean_line: str) -> bool:
+def is_status_footer_line(clean_line: str, raw_line: str = "") -> bool:
     """True when the row is TUI status/footer chrome rather than content.
 
-    A footer row either *is* one measured segment, or carries two or more of
-    them. One incidental mention inside a sentence is not a footer — that is
-    what keeps "The reported context: 50% is expected." in the answer.
+    A footer row either *is* one measured field (``FOOTER_WHOLE_ROW_RES``) or
+    carries two or more of them. One incidental mention inside a sentence is not
+    a footer — that is what keeps "The reported context: 50% is expected." in the
+    answer. A rotating tip is corroborating evidence only: it counts alongside a
+    measured field, never on its own, because an answer can name the tips.
     """
 
     if any(pattern.match(clean_line) for pattern in FOOTER_WHOLE_ROW_RES):
         return True
-    return sum(1 for pattern in FOOTER_SEGMENT_RES if pattern.search(clean_line)) >= 2
+    segments = sum(1 for pattern in FOOTER_SEGMENT_RES if pattern.search(clean_line))
+    if segments >= 2:
+        return True
+    if not FOOTER_TIP_RE.search(clean_line):
+        return False
+    if _SGR_RE.search(raw_line or ""):
+        return bool(FOOTER_TIP_STYLE_RE.search(raw_line))
+    return segments >= 1
 
 
 def is_idle_tip_line(clean_line: str, raw_line: str = "") -> bool:
@@ -661,11 +829,35 @@ def is_live_spinner_line(
         return False
     if is_boot_chrome_line(clean_line, raw_line):
         return False
-    if _BRAILLE_RE.search(clean_line):
+    # The indicator is a braille glyph in the spinner slot, not braille anywhere
+    # on the row: an answer that mentions the character is still an answer.
+    if _SPINNER_PREFIX_RE.match(clean_line):
         return True
     if _MOON_RE.search(clean_line):
         return semantics is SpinnerSemantics.LEGACY
     return False
+
+
+def is_reasoning_continuation(raw_line: str) -> bool:
+    """True when a row carries the reasoning block's own continuation styling.
+
+    Used only *inside* an established reasoning block: it is the positive
+    renderer evidence that the row belongs to the same private reasoning, so a
+    wrapped reasoning line is not published as the agent's answer. It is
+    deliberately not a licence to suppress arbitrary unstyled prose after a
+    thinking bullet.
+
+    The final-answer colour is decisive in the other direction, exactly as it is
+    in :func:`is_thinking_styled`. Kimi draws the answer in colour 253 and
+    italicises emphasis *within* an answer, so an emphasised answer bullet that
+    immediately follows reasoning also carries italic — without this check the
+    reasoning block would swallow the very answer it precedes.
+    """
+
+    raw = raw_line or ""
+    if FINAL_ANSWER_BULLET_STYLE_RE.search(raw):
+        return False
+    return bool(_REASONING_CONTINUATION_RE.search(raw))
 
 
 def is_thinking_styled(raw_line: str) -> bool:
@@ -758,39 +950,63 @@ def has_response_marker(text: str) -> bool:
     return any(is_response_marker_line(line) for line in (text or "").split("\n"))
 
 
-def is_user_input_echo(raw_line: str, clean_line: Optional[str] = None) -> bool:
-    """True when the row is the echo of a *submitted user message*.
+def is_user_input_continuation(raw_line: str, clean_line: Optional[str] = None) -> bool:
+    """True when the row continues an *established* submitted-message block.
 
-    Two measured shapes, deliberately decided by one predicate so that the
-    region locator and the extractor cannot disagree about where the user's
-    message ends:
-
-    * the first submitted row — sparkle-prefixed, drawn bold + colour 222;
-    * a **wrapped continuation** row — no sparkle, carrying the same colour-222
-      foreground (``ESC[1;38;5;222m``). A long submitted message wraps, and the
-      continuation rows carry no glyph of their own. Treating only the
-      sparkle row as the echo left the continuation inside the response region,
-      where it was published as the agent's answer (D6 production defect).
-
-    Prose is not swept up: a row must carry the colour-222 foreground or the
-    sparkle, and a response bullet is rejected outright so an answer that
-    quotes a sparkle cannot be read as a submission.
+    Kimi Code draws submitted input in colour 222. Only the first row carries
+    the sparkle, so a wrapped continuation row carries the colour without the
+    glyph. That makes colour 222 *continuation* evidence only: on its own it must
+    not start a block, because an answer or a code block can contain a colour-222
+    row, and treating one as a fresh submission moves the extraction start past
+    the answer content that preceded it.
     """
 
     raw = raw_line or ""
     clean = strip_sgr(raw) if clean_line is None else clean_line
 
-    # A response bullet is assistant output, never user echo — checked first so
-    # a styled answer can never be reclassified as a submission.
+    # A response bullet is assistant output, never user echo.
     if is_response_marker_line(clean):
         return False
 
-    if USER_INPUT_COLOR_INDEX in foreground_color_indices(raw):
-        return True
+    return USER_INPUT_COLOR_INDEX in foreground_color_indices(raw)
+
+
+def is_user_input_start(raw_line: str, clean_line: Optional[str] = None) -> bool:
+    """True when the row is a positively identified *submitted* user message.
+
+    The measured first row is sparkle-prefixed and drawn bold + colour 222.
+    Requiring the sparkle is what makes this a block start: it is the renderer's
+    own "this is a submission" marker, whereas a bare colour-222 row is
+    ambiguous and is accepted only as continuation.
+    """
+
+    raw = raw_line or ""
+    clean = strip_sgr(raw) if clean_line is None else clean_line
+
+    if is_response_marker_line(clean):
+        return False
 
     return bool(
         USER_INPUT_SPARKLE_RE.search(clean)
         and (USER_INPUT_STYLE_RE.search(raw) or clean.lstrip().startswith(("✨", "💫")))
+    )
+
+
+def is_user_input_echo(raw_line: str, clean_line: Optional[str] = None) -> bool:
+    """Row-level predicate: the row is *styled* like submitted user input.
+
+    Context-free, so it answers "is this row drawn like the user's message"
+    rather than "does this row start a submission". :func:`classify_rows` uses
+    the narrower :func:`is_user_input_start` / :func:`is_user_input_continuation`
+    split, because only sequence context can tell the two apart.
+
+    Prose is not swept up: a row must carry the colour-222 foreground or the
+    sparkle, and a response bullet is rejected outright so an answer that quotes
+    a sparkle cannot be read as a submission.
+    """
+
+    return is_user_input_start(raw_line, clean_line) or is_user_input_continuation(
+        raw_line, clean_line
     )
 
 
@@ -835,7 +1051,7 @@ def classify_line(
         return KimiLineKind.TRUST_DIALOG
     if APPROVAL_TITLE_RE.search(clean) or APPROVAL_HINT_RE.search(clean):
         return KimiLineKind.APPROVAL_DIALOG
-    if re.match(r"^\s*\d+\.\s*(?:Approve|Reject)\b", clean):
+    if APPROVAL_OPTION_RE.match(clean):
         return KimiLineKind.APPROVAL_DIALOG
 
     # --- live work indicators before generic chrome ---
@@ -853,7 +1069,7 @@ def classify_line(
     if is_boot_chrome_line(clean, raw):
         return KimiLineKind.BOOT_CHROME
 
-    if is_status_footer_line(clean):
+    if is_status_footer_line(clean, raw):
         return KimiLineKind.STATUS_FOOTER
 
     if is_composer_row(clean):
@@ -884,6 +1100,35 @@ def classify_line(
     return KimiLineKind.CONTENT
 
 
+def _continues_user_echo(
+    raw_line: str,
+    clean_line: str,
+    kind: KimiLineKind,
+    semantics: SpinnerSemantics,
+) -> bool:
+    """True when a row extends the submitted-message block that is already open.
+
+    The dialects need different evidence, and the difference is measured:
+
+    * **Kimi Code** wraps a long submission and draws every row in colour 222.
+      A plain row immediately after the submission is therefore *also* part of
+      it — and must be, because the escape-stripped consumers (and a capture
+      whose colour was lost) would otherwise publish the user's own message as
+      the agent's answer. This is safe because a Kimi Code answer always begins
+      with its own ``●`` bullet, which is not ``CONTENT`` and therefore closes
+      the block before any answer prose is reached.
+    * **Legacy** echoes the whole message inline in the prompt row and then
+      renders the *answer* below it as plain rows. Absorbing those would swallow
+      the answer — the reproduced case is a table: ``💫 Return a table`` followed
+      by ``Name | Value`` / ``A | 1``. Legacy therefore requires the positive
+      colour-222 continuation evidence and nothing weaker.
+    """
+
+    if is_user_input_continuation(raw_line, clean_line):
+        return True
+    return semantics is SpinnerSemantics.CODE and kind is KimiLineKind.CONTENT
+
+
 def classify_rows(
     raw_lines: Sequence[str],
     clean_lines: Optional[Sequence[str]] = None,
@@ -899,73 +1144,115 @@ def classify_rows(
     plain text). This is the D6 production defect: the user message's second
     line, the tool header and the tool payload were all published as the answer.
 
-    Two blocks are tracked, and both are asymmetric in the same way — each can
-    only become active on a **positively identified** row, never on a heuristic
-    about layout:
+    Four things are tracked, and all of them are asymmetric in the same way —
+    each can only become active on a **positively identified** row, and each can
+    only be left on positive evidence, never on a heuristic about layout:
 
-    **User echo (D6-F1).** Opens on a :data:`KimiLineKind.USER_INPUT` row. A
-    submitted message that wraps renders its continuation rows as ordinary
-    prose: the first row carries the sparkle and colour 222, and the wrapped
-    rows either repeat the colour *or* carry no styling at all (the
-    colour-free shape is what the escape-stripped consumers see). Immediately
-    following ``CONTENT`` rows are therefore part of the same submission, until
-    a blank row or any structured row ends it. A blank row always ends it, and
-    an answer bullet is structured, so a real answer is never absorbed.
+    **User submission (D6-F1).** Opens only on a positively identified submitted
+    row — the sparkle-prefixed, colour-222 shape the renderer draws. A wrapped
+    message's continuation rows repeat the colour 222 without the sparkle, so a
+    colour-222 row *continues* an established block but can never start one:
+    otherwise a colour-222 row inside an answer or a code block would look like a
+    fresh submission and move the extraction start past earlier answer content.
+    Unstyled prose after a submission is *not* absorbed (the legacy table case).
+
+    **Reasoning.** Opens on a :data:`KimiLineKind.THINKING_BULLET`. A wrapped
+    reasoning line repeats the reasoning styling (grey 244 / italic) without the
+    bullet, so those rows are absorbed as reasoning rather than published.
+    Arbitrary *unstyled* prose after a thinking bullet is not absorbed.
 
     **Tool output (D6-F3).** Opens on a :data:`KimiLineKind.TOOL_CALL` row.
     Inside it, rows that would otherwise be ``CONTENT`` become
     :data:`KimiLineKind.TOOL_CHROME`, and blank rows are kept as blanks without
-    ending it (payloads are often blank-line separated). It ends at the first
-    positive boundary — an answer bullet, reasoning, a new user echo, the
-    composer, the footer, a spinner/tip, a dialog, boot chrome, or a rule.
+    ending it (payloads are often blank-line separated). It ends only on
+    positive renderer evidence that the row is not payload — see
+    :func:`_ends_tool_block`. Payload cannot certify its own end by resembling
+    chrome, and an escape-free capture fails closed rather than publishing
+    payload as the answer.
 
-    Because the two are mutually exclusive and both end on structured rows,
-    exactly one semantic source of truth exists for each; the extractor
-    consumes the result rather than re-deriving context per row.
+    **Context-sensitive UI kinds.** ``TRUST_DIALOG`` and ``APPROVAL_DIALOG`` are
+    confirmed against the whole capture before any of the above runs, so a row
+    that merely *quotes* a dialog is ordinary content — see
+    :func:`_confirm_context_kinds`.
 
     ``clean_lines`` may be supplied by a caller that already stripped SGR.
     """
 
-    kinds: List[KimiLineKind] = []
+    raws = list(raw_lines)
+    if clean_lines is None:
+        cleans = [strip_sgr(raw) for raw in raws]
+    else:
+        provided = list(clean_lines)
+        cleans = [
+            (
+                provided[index]
+                if index < len(provided) and provided[index] is not None
+                else strip_sgr(raw)
+            )
+            for index, raw in enumerate(raws)
+        ]
+
+    kinds = [classify_line(raw, clean, semantics) for raw, clean in zip(raws, cleans)]
+    kinds = _confirm_context_kinds(raws, cleans, kinds)
+
+    result: List[KimiLineKind] = []
     in_tool_block = False
     in_user_echo = False
+    in_reasoning = False
 
-    for index, raw in enumerate(raw_lines):
-        if clean_lines is not None and index < len(clean_lines):
-            clean = clean_lines[index]
-        else:
-            clean = strip_sgr(raw)
+    for raw, clean, kind in zip(raws, cleans, kinds):
+        stripped = clean.strip()
 
-        kind = classify_line(raw, clean, semantics)
-
-        # --- user echo: opens on a positive echo row, absorbs wrapped prose ---
-        if kind is KimiLineKind.USER_INPUT:
+        # --- submitted user message: a positive submission starts the block,
+        #     and only the echo's own continuation styling extends it ---
+        if is_user_input_start(raw, clean):
             in_user_echo = True
             in_tool_block = False
-            kinds.append(kind)
+            in_reasoning = False
+            result.append(KimiLineKind.USER_INPUT)
             continue
-        if in_user_echo:
-            if kind is KimiLineKind.CONTENT and clean.strip():
-                kinds.append(KimiLineKind.USER_INPUT)
+        if in_user_echo and stripped and _continues_user_echo(raw, clean, kind, semantics):
+            result.append(KimiLineKind.USER_INPUT)
+            continue
+        in_user_echo = False
+
+        # A row-level USER_INPUT that neither started nor continued a submission
+        # is not a submission at all: the colour is *continuation* evidence, so a
+        # colour-222 row sitting inside an answer must not become a fresh echo —
+        # the region locator anchors on the last echo, and would drop every
+        # answer row before this one.
+        if kind is KimiLineKind.USER_INPUT:
+            kind = KimiLineKind.CONTENT
+
+        # --- reasoning: the bullet opens the block, its own styling extends it ---
+        if kind is KimiLineKind.THINKING_BULLET:
+            in_reasoning = True
+            in_tool_block = False
+            result.append(kind)
+            continue
+        if in_reasoning:
+            if stripped and is_reasoning_continuation(raw):
+                result.append(KimiLineKind.THINKING_BULLET)
                 continue
-            in_user_echo = False
+            in_reasoning = False
 
         # --- tool output: opens on a positive tool header ---
         if kind is KimiLineKind.TOOL_CALL:
             in_tool_block = True
-            kinds.append(kind)
+            in_reasoning = False
+            result.append(kind)
             continue
         if not in_tool_block:
-            kinds.append(kind)
+            result.append(kind)
             continue
-        if kind in TOOL_BLOCK_END_KINDS:
+        if _ends_tool_block(raw, kind):
             in_tool_block = False
-            kinds.append(kind)
+            result.append(kind)
             continue
         # Inside a block: blank rows continue it, everything else is payload.
-        kinds.append(kind if kind is KimiLineKind.BLANK else KimiLineKind.TOOL_CHROME)
+        result.append(kind if kind is KimiLineKind.BLANK else KimiLineKind.TOOL_CHROME)
 
-    return kinds
+    return result
 
 
 def classify_lines(

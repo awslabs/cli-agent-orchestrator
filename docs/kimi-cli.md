@@ -76,13 +76,23 @@ Rules that matter:
   provider for the life of the process.
 - The probe runs **in the launch shell's environment** and its absolute binary
   path is reused verbatim for `exec`. Probing one PATH while tmux launches
-  another is the PR #664 bug class. The probe *program* is POSIX and is handed
-  to an explicitly selected `/bin/sh` (a child of the pane shell) rather than
-  typed at the pane's own shell, because the pane shell is the operator's
-  choice: `fish` cannot parse `${VAR:-default}` and would fail before reporting
-  anything. The child shell inherits the pane's `PATH`, `HOME` and
-  `KIMI_CODE_HOME`, so `command -v kimi` still observes exactly what the
-  launched `kimi` will see, and probe and exec still refer to the same file.
+  another is the PR #664 bug class.
+- **Nothing dynamic is ever quoted for the pane shell.** Both the probe program
+  and the launch line are POSIX text, and POSIX quoting is not fish quoting:
+  `shlex.quote` renders an embedded apostrophe as `'\''`, which `fish` ends early
+  when a backslash precedes it (`Unexpected end of string`, exit 127), and `\\`
+  means one backslash in `fish` but two in POSIX `sh`. CAO therefore writes the
+  POSIX text to a script in a scratch directory whose path is drawn from a
+  shell-safe alphabet, and types only a fixed, quote-free invocation
+  (`/bin/sh <script> [<probe file>]`). The pane's shell — whatever it is — has
+  nothing to expand, split or unquote, and an operator temp root with hostile
+  characters falls back to a safe one rather than being transported.
+- The probe program is executed by an explicitly selected `/bin/sh` started as a
+  child of the pane shell, because the pane shell is the operator's choice:
+  `fish` cannot parse `${VAR:-default}` and would fail before reporting anything.
+  The child inherits the pane's `PATH`, `HOME` and `KIMI_CODE_HOME`, so
+  `command -v kimi` still observes exactly what the launched `kimi` will see,
+  and probe and exec still refer to the same file.
 
 ## Kimi Code Path
 

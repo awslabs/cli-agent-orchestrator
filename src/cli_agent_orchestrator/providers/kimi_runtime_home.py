@@ -109,6 +109,13 @@ TRUST_DIR_NAME = "workspace-trust"
 #: files, symlink entries and every other filesystem entry each consume one unit
 #: of this budget.
 #:
+#: **P3 — the bound covers enumeration too.** The traversal previously read each
+#: source directory in full (``sorted(scan)``) and only then applied the budget,
+#: so a single 10,000-entry directory was fully enumerated and allocated even
+#: though only 4,096 records were copied. Only a budget-sized prefix of a
+#: directory is read now, so the one bound limits directory enumeration,
+#: allocation, copying and recursive descent together.
+#:
 #: Reaching the limit truncates rather than fails: traversal is pruned, no
 #: further entry is copied, the disposition is recorded
 #: (``RuntimeHomeResult.trust_truncated``) and a warning is emitted. The launch
@@ -678,6 +685,16 @@ class KimiCodeRuntimeHomeBuilder:
         Directories, regular files, symlink entries and every other filesystem
         entry each consume one unit of :data:`MAX_TRUST_ENTRIES`.
 
+        **The budget also governs enumeration** (P3). ``sorted(scan)`` read a
+        directory *in full* before the budget applied, so a single directory of
+        10,000 entries consumed all 10,000 scandir entries and allocated 10,000
+        ``DirEntry`` objects while copying only 4,096. Only a budget-sized prefix
+        is now read, so enumeration, allocation, copying and recursive descent
+        are bounded together. Global sort order is deliberately **not**
+        preserved: it is exactly what defeated the bound. Within the bounded
+        prefix entries are still sorted per directory, so a store under budget
+        is processed in the same deterministic order as before.
+
         Only ordinary regular files are copied. Everything else — FIFO, socket,
         block device, character device, symlink, unreadable entry — is skipped
         with a warning and recorded, so a non-regular entry degrades one entry
@@ -712,14 +729,23 @@ class KimiCodeRuntimeHomeBuilder:
         # (source directory, path relative to the trust root)
         pending: List[Tuple[Path, Path]] = [(src, Path())]
 
-        while pending:
-            if budget <= 0:
-                truncated = True
-                break
+        while pending and budget > 0:
             root_path, rel = pending.pop(0)
+            more_entries = False
             try:
                 with os.scandir(root_path) as scan:
-                    entries = sorted(scan, key=lambda e: e.name)
+                    # Bound the *pull*, not just the copy. ``sorted(scan)``
+                    # materialised the entire directory before the budget was
+                    # applied, so enumeration and allocation were unbounded even
+                    # though the record count was not. Read at most the
+                    # remaining budget; at most one further entry is pulled,
+                    # only to learn that work remains.
+                    entries: List[os.DirEntry[str]] = []
+                    for entry in scan:
+                        if len(entries) >= budget:
+                            more_entries = True
+                            break
+                        entries.append(entry)
             except OSError as exc:
                 skipped.append(cls._rel_entry(rel, root_path.name))
                 logger.warning(
@@ -729,10 +755,11 @@ class KimiCodeRuntimeHomeBuilder:
                 )
                 continue
 
+            # Sort only the bounded prefix. Global sorting is deliberately not
+            # preserved: it is exactly what defeated the resource bound.
+            entries.sort(key=lambda e: e.name)
+
             for entry in entries:
-                if budget <= 0:
-                    truncated = True
-                    break
                 entry_rel = cls._rel_entry(rel, entry.name)
                 kind = cls._entry_kind(entry)
                 # Every entry consumes budget, whatever it turns out to be.
@@ -742,7 +769,27 @@ class KimiCodeRuntimeHomeBuilder:
                     cls._secure_dir(dst / entry_rel)
                     pending.append((Path(entry.path), Path(entry_rel)))
                 elif kind == "file":
-                    shutil.copyfile(entry.path, dst / entry_rel)
+                    # A record can be identified as a regular file and still be
+                    # unreadable, and a source entry can vanish between the
+                    # enumeration and the copy. Neither may abort the launch:
+                    # the documented contract is that such an entry degrades to
+                    # "this one record was not inherited", not "no Kimi Code
+                    # worker can start". Any partially written destination is
+                    # removed so the runtime home never holds a truncated record.
+                    try:
+                        shutil.copyfile(entry.path, dst / entry_rel)
+                    except OSError as exc:
+                        try:
+                            (dst / entry_rel).unlink()
+                        except OSError:  # pragma: no cover - nothing to remove
+                            pass
+                        skipped.append(entry_rel)
+                        logger.warning(
+                            "kimi_runtime_home_trust_skip reason=unreadable " "entry=%s err=%s",
+                            entry.path,
+                            exc,
+                        )
+                        continue
                     os.chmod(dst / entry_rel, 0o600)
                     records.append(entry_rel)
                 else:
@@ -751,6 +798,13 @@ class KimiCodeRuntimeHomeBuilder:
                     logger.warning(
                         "kimi_runtime_home_trust_skip reason=%s entry=%s", kind, entry.path
                     )
+
+            # The budget is exhausted and there is still work — unread entries
+            # in this directory or pending subdirectories. Both are "truncated";
+            # neither is enumerated further.
+            if budget <= 0 and (pending or more_entries):
+                truncated = True
+                break
 
         if truncated:
             logger.warning(
@@ -810,7 +864,27 @@ class KimiCodeRuntimeHomeBuilder:
 
     @classmethod
     def _copy_tree(cls, src: Path, dst: Path, *, secret: bool) -> None:
-        """Copy a directory tree without following symlinks out of the tree."""
+        """Copy a preserved directory tree, choosing the symlink policy by kind.
+
+        For ordinary preserved trees (``skills/``, ``plugins/``) an internal
+        symlink is *user semantics*: a user may legitimately link a shared skills
+        directory into their home, so links are reproduced verbatim
+        (``symlinks=True``) and never walked through.
+
+        For a **secret** tree (``credentials/``, see :data:`SECRET_DIR_NAMES`)
+        that policy is wrong. A reproduced link is a *writable path from the
+        disposable runtime home back into shared or source state*: a Kimi write
+        through the runtime copy would mutate the operator's real credential
+        file. Secret trees therefore use :meth:`_copy_secret_tree`, which
+        materialises ordinary regular files as real 0600 files and *skips* every
+        symlink instead of reproducing it. That is the same conservative policy
+        :meth:`_copy_trust_tree` already applies to trust state, for the same
+        reason.
+        """
+
+        if secret:
+            cls._copy_secret_tree(src, dst)
+            return
 
         shutil.copytree(
             src,
@@ -845,6 +919,81 @@ class KimiCodeRuntimeHomeBuilder:
                     os.chmod(child, 0o600 if secret else (source_mode & 0o700) or 0o600)
                 except OSError:  # pragma: no cover
                     pass
+
+    @classmethod
+    def _copy_secret_tree(cls, src: Path, dst: Path) -> None:
+        """Copy a secret-bearing tree as real files, never as symlinks (P2).
+
+        A secret directory is credential state. Reproducing an internal symlink
+        here — the ordinary :meth:`_copy_tree` policy, which is correct for
+        ``skills/`` — leaves the runtime home holding *a writable path back out
+        of the home*: a Kimi write through the runtime copy mutates whatever the
+        link points at, which may be shared state the worker does not own (the
+        reproduction linked ``credentials/token.json`` at a file outside the
+        source home). Only real files and real directories are safe here, so:
+
+        * ordinary regular files are copied by content and forced to 0600;
+        * real directories are recreated 0700 and recursed **only** as real
+          directories. ``os.walk(followlinks=False)`` plus an explicit symlink
+          filter means a directory link is neither reproduced nor descended, so
+          a cyclic or unbounded walk through links is impossible;
+        * every symlink (file or directory, relative, absolute or dangling) and
+          every non-regular entry is **skipped** with a warning.
+
+        Skipping degrades one credential entry, never the launch: the runtime
+        home still builds. Nothing under ``dst`` is ever a symlink, so a write
+        through it can only reach a file the runtime home owns. This mirrors the
+        conservative policy of :meth:`_copy_trust_tree` for the same reason.
+        """
+
+        cls._secure_dir(dst)
+        for root, dirnames, filenames in os.walk(src, followlinks=False):
+            root_path = Path(root)
+            rel = root_path.relative_to(src)
+            target_root = dst / rel if str(rel) != "." else dst
+            cls._secure_dir(target_root)
+
+            # Reassign in place: ``os.walk`` reads this list to decide descent.
+            # A symlinked directory must be neither recreated nor entered.
+            kept_dirs: List[str] = []
+            for dirname in dirnames:
+                child = root_path / dirname
+                if child.is_symlink():
+                    logger.warning("kimi_runtime_home_secret_skip reason=symlink entry=%s", child)
+                    continue
+                kept_dirs.append(dirname)
+            dirnames[:] = kept_dirs
+
+            for filename in filenames:
+                child = root_path / filename
+                if child.is_symlink():
+                    logger.warning("kimi_runtime_home_secret_skip reason=symlink entry=%s", child)
+                    continue
+                try:
+                    source_mode = os.stat(child).st_mode
+                except OSError as exc:
+                    logger.warning(
+                        "kimi_runtime_home_secret_skip reason=unreadable entry=%s err=%s",
+                        child,
+                        exc,
+                    )
+                    continue
+                if not stat.S_ISREG(source_mode):
+                    logger.warning(
+                        "kimi_runtime_home_secret_skip reason=not-a-regular-file entry=%s",
+                        child,
+                    )
+                    continue
+                dest = target_root / filename
+                try:
+                    shutil.copyfile(child, dest, follow_symlinks=False)
+                    os.chmod(dest, 0o600)
+                except OSError as exc:
+                    logger.warning(
+                        "kimi_runtime_home_secret_skip reason=copy-failed entry=%s err=%s",
+                        child,
+                        exc,
+                    )
 
     @staticmethod
     def _write_mcp_json(path: Path, servers: Mapping[str, Any]) -> None:
