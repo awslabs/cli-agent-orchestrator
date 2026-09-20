@@ -382,6 +382,53 @@ class TestHerdrBackendCommands:
         assert "Enter" in calls[-1]
 
     @patch("subprocess.run")
+    def test_send_keys_pre_write_hook_fires_immediately_before_send_text(self, mock_run, backend):
+        """pre_write_hook fires at the last point before the pane is
+        actually touched: pane resolution and text-wrapping never touch the
+        pane, so the hook must run right before send-text, the first call
+        that does (#709 thirteenth review round, mirroring TmuxClient)."""
+        ws = [{"label": "cao-test", "workspace_id": "w1"}]
+        tabs = [{"tab_id": "tab-0", "workspace_id": "w1", "label": "window-0"}]
+        panes = [{"tab_id": "tab-0", "pane_id": "w1-1", "workspace_id": "w1"}]
+
+        mock_run.side_effect = [
+            _completed(_make_workspace_list_response(ws)),
+            _completed(_make_tab_list_response(tabs)),
+            _completed(_make_pane_list_response(panes)),
+            _completed(),  # send-text
+            _completed(),  # send-keys Enter
+        ]
+
+        calls_at_hook_time = []
+
+        def hook():
+            calls_at_hook_time.append(mock_run.call_count)
+
+        backend.send_keys("cao-test", "window-0", "hello world", pre_write_hook=hook)
+
+        assert len(calls_at_hook_time) == 1
+        # The 3 resolution calls have run; send-text has not yet (4th call).
+        assert calls_at_hook_time[0] == 3
+
+    @patch("subprocess.run")
+    def test_send_keys_pre_write_hook_omitted_by_default(self, mock_run, backend):
+        ws = [{"label": "cao-test", "workspace_id": "w1"}]
+        tabs = [{"tab_id": "tab-0", "workspace_id": "w1", "label": "window-0"}]
+        panes = [{"tab_id": "tab-0", "pane_id": "w1-1", "workspace_id": "w1"}]
+
+        mock_run.side_effect = [
+            _completed(_make_workspace_list_response(ws)),
+            _completed(_make_tab_list_response(tabs)),
+            _completed(_make_pane_list_response(panes)),
+            _completed(),  # send-text
+            _completed(),  # send-keys Enter
+        ]
+
+        backend.send_keys("cao-test", "window-0", "hello world")
+
+        assert mock_run.call_count == 5
+
+    @patch("subprocess.run")
     def test_send_keys_force_bracketed_wraps_when_pane_runs_a_real_tui(self, mock_run, backend):
         ws = [{"label": "cao-test", "workspace_id": "w1"}]
         tabs = [{"tab_id": "tab-0", "workspace_id": "w1", "label": "window-0"}]

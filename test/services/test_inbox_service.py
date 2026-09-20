@@ -1,16 +1,34 @@
 """Tests for the event-driven InboxService."""
 
 import asyncio
+import threading
+import time
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
+import cli_agent_orchestrator.services.inbox_service as inbox_service_module
 from cli_agent_orchestrator.backends.base import TerminalNotFoundError
+from cli_agent_orchestrator.clients import database
+from cli_agent_orchestrator.clients.database import InboxModel
 from cli_agent_orchestrator.constants import INBOX_RECONCILE_GRACE_SECONDS
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.inbox_service import InboxService
+from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+
+@pytest.fixture(autouse=True)
+def _reset_dispatch_active():
+    """_dispatch_active (#709 coalescing) is module-level state keyed by
+    terminal_id and persists until a later status event clears it. Tests
+    across this file reuse the same terminal ids (e.g. "term-1", "t1"), so
+    without a reset a dispatch marked active by one test would make an
+    unrelated later test's deliver_pending call coalesce instead of send."""
+    inbox_service_module._dispatch_active.clear()
+    yield
+    inbox_service_module._dispatch_active.clear()
 
 
 def _make_message(id=1, receiver_id="term-1", message="hello", status=MessageStatus.PENDING):
@@ -28,41 +46,53 @@ class TestDeliverPending:
     """Tests for InboxService.deliver_pending()."""
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.claim_pending_messages")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
-    def test_delivers_message_when_idle(self, mock_get, mock_monitor, mock_term_svc, mock_update):
+    def test_delivers_message_when_idle(
+        self, mock_get, mock_monitor, mock_term_svc, mock_claim, mock_update
+    ):
         mock_get.return_value = [_make_message()]
+        mock_claim.return_value = [_make_message(status=MessageStatus.DELIVERED)]
         mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_monitor.get_status_generation.return_value = 0
+        mock_monitor.get_pre_write_generation.return_value = 0
 
         svc = InboxService()
         svc.deliver_pending("term-1")
 
+        mock_claim.assert_called_once_with("term-1", limit=1)
         mock_term_svc.send_input.assert_called_once_with("term-1", "hello")
-        mock_update.assert_called_once_with(1, MessageStatus.DELIVERED)
+        mock_update.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.claim_pending_messages")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
     def test_delivers_message_when_completed(
-        self, mock_get, mock_monitor, mock_term_svc, mock_update
+        self, mock_get, mock_monitor, mock_term_svc, mock_claim, mock_update
     ):
         mock_get.return_value = [_make_message()]
+        mock_claim.return_value = [_make_message(status=MessageStatus.DELIVERED)]
         mock_monitor.get_status.return_value = TerminalStatus.COMPLETED
+        mock_monitor.get_status_generation.return_value = 0
+        mock_monitor.get_pre_write_generation.return_value = 0
 
         svc = InboxService()
         svc.deliver_pending("term-1")
 
+        mock_claim.assert_called_once_with("term-1", limit=1)
         mock_term_svc.send_input.assert_called_once_with("term-1", "hello")
-        mock_update.assert_called_once_with(1, MessageStatus.DELIVERED)
+        mock_update.assert_not_called()
 
-    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.claim_pending_messages")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
     def test_skips_when_no_pending_messages(
-        self, mock_get, mock_monitor, mock_term_svc, mock_update
+        self, mock_get, mock_monitor, mock_term_svc, mock_claim
     ):
         mock_get.return_value = []
 
@@ -70,13 +100,13 @@ class TestDeliverPending:
         svc.deliver_pending("term-1")
 
         mock_term_svc.send_input.assert_not_called()
-        mock_update.assert_not_called()
+        mock_claim.assert_not_called()
 
-    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.claim_pending_messages")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
-    def test_skips_when_processing(self, mock_get, mock_monitor, mock_term_svc, mock_update):
+    def test_skips_when_processing(self, mock_get, mock_monitor, mock_term_svc, mock_claim):
         mock_get.return_value = [_make_message()]
         mock_monitor.get_status.return_value = TerminalStatus.PROCESSING
 
@@ -84,13 +114,13 @@ class TestDeliverPending:
         svc.deliver_pending("term-1")
 
         mock_term_svc.send_input.assert_not_called()
-        mock_update.assert_not_called()
+        mock_claim.assert_not_called()
 
-    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.claim_pending_messages")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
-    def test_skips_when_unknown(self, mock_get, mock_monitor, mock_term_svc, mock_update):
+    def test_skips_when_unknown(self, mock_get, mock_monitor, mock_term_svc, mock_claim):
         mock_get.return_value = [_make_message()]
         mock_monitor.get_status.return_value = TerminalStatus.UNKNOWN
 
@@ -98,169 +128,846 @@ class TestDeliverPending:
         svc.deliver_pending("term-1")
 
         mock_term_svc.send_input.assert_not_called()
-        mock_update.assert_not_called()
+        mock_claim.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.claim_pending_messages")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
     def test_delivers_multiple_messages_concatenated(
-        self, mock_get, mock_monitor, mock_term_svc, mock_update
+        self, mock_get, mock_monitor, mock_term_svc, mock_claim, mock_update
     ):
         msgs = [_make_message(id=1, message="hello"), _make_message(id=2, message="world")]
         mock_get.return_value = msgs
+        mock_claim.return_value = [
+            _make_message(id=1, message="hello", status=MessageStatus.DELIVERED),
+            _make_message(id=2, message="world", status=MessageStatus.DELIVERED),
+        ]
         mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_monitor.get_status_generation.return_value = 0
+        mock_monitor.get_pre_write_generation.return_value = 0
 
         svc = InboxService()
         svc.deliver_pending("term-1", num_messages=2)
 
         mock_get.assert_called_once_with("term-1", limit=2)
+        mock_claim.assert_called_once_with("term-1", limit=2)
         mock_term_svc.send_input.assert_called_once_with("term-1", "hello\nworld")
-        assert mock_update.call_count == 2
+        mock_update.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.claim_pending_messages")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
     def test_delivers_all_when_num_messages_zero(
-        self, mock_get, mock_monitor, mock_term_svc, mock_update
+        self, mock_get, mock_monitor, mock_term_svc, mock_claim, mock_update
     ):
         msgs = [_make_message(id=i, message=f"msg{i}") for i in range(3)]
         mock_get.return_value = msgs
+        mock_claim.return_value = [
+            _make_message(id=i, message=f"msg{i}", status=MessageStatus.DELIVERED) for i in range(3)
+        ]
         mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_monitor.get_status_generation.return_value = 0
+        mock_monitor.get_pre_write_generation.return_value = 0
 
         svc = InboxService()
         svc.deliver_pending("term-1", num_messages=0)
 
         mock_get.assert_called_once_with("term-1", limit=100)
+        mock_claim.assert_called_once_with("term-1", limit=100)
         mock_term_svc.send_input.assert_called_once_with("term-1", "msg0\nmsg1\nmsg2")
-        assert mock_update.call_count == 3
+        mock_update.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.claim_pending_messages")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
-    def test_marks_failed_on_send_error(self, mock_get, mock_monitor, mock_term_svc, mock_update):
+    def test_marks_failed_on_send_error(
+        self, mock_get, mock_monitor, mock_term_svc, mock_claim, mock_update
+    ):
         mock_get.return_value = [_make_message()]
+        mock_claim.return_value = [_make_message(status=MessageStatus.DELIVERED)]
         mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_monitor.get_status_generation.return_value = 0
         mock_term_svc.send_input.side_effect = RuntimeError("tmux error")
 
         svc = InboxService()
         svc.deliver_pending("term-1")
 
-        # Status is set to DELIVERED before send_input (#164), then reset to
-        # FAILED when the send raises.
-        mock_update.assert_has_calls(
-            [
-                call(1, MessageStatus.DELIVERED),
-                call(1, MessageStatus.FAILED),
-            ]
-        )
-        assert mock_update.call_count == 2
+        # The claim already moved the message to DELIVERED atomically (#406);
+        # only the post-failure reset to FAILED goes through update_message_status.
+        mock_update.assert_called_once_with(1, MessageStatus.FAILED)
+        # (#709 eighth review round): the marker is armed before send_input is
+        # called, so a failed send must abort it explicitly: otherwise
+        # nothing would ever clear a marker confirming a dispatch that never
+        # reached the terminal.
+        assert inbox_service_module._is_dispatch_active("term-1") is False
 
-    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.claim_pending_messages")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
-    def test_marks_delivered_before_send_input(
-        self, mock_get, mock_monitor, mock_term_svc, mock_update
-    ):
-        """Regression for the double-delivery race (#164).
+    def test_claims_before_send_input(self, mock_get, mock_monitor, mock_term_svc, mock_claim):
+        """Regression for the double-delivery race (#164, #406).
 
         send_input()'s output flows back through the FIFO/StatusMonitor pipeline
-        and can re-emit a status event that re-enters deliver_pending. The
-        message must already be DELIVERED by then, so the status update has to
+        and can re-emit a status event that re-enters deliver_pending from a
+        second thread while this call is still in flight. The message must
+        already be claimed (moved out of PENDING) by then, so the claim has to
         happen before send_input is called.
         """
         mock_get.return_value = [_make_message()]
         mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_monitor.get_status_generation.return_value = 0
+        mock_monitor.get_pre_write_generation.return_value = 0
 
         order = []
-        mock_update.side_effect = lambda *args, **kwargs: order.append(("update", args))
+
+        def _claim(*args, **kwargs):
+            order.append(("claim", args))
+            return [_make_message(status=MessageStatus.DELIVERED)]
+
+        mock_claim.side_effect = _claim
         mock_term_svc.send_input.side_effect = lambda *args, **kwargs: order.append(("send", args))
 
         svc = InboxService()
         svc.deliver_pending("term-1")
 
-        assert order[0] == ("update", (1, MessageStatus.DELIVERED))
+        assert order[0] == ("claim", ("term-1",))
         assert order[1][0] == "send"
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.claim_pending_messages")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
     def test_resolution_failure_leaves_message_pending(
-        self, mock_get, mock_monitor, mock_term_svc, mock_update
+        self, mock_get, mock_monitor, mock_term_svc, mock_claim, mock_update
     ):
         """A TerminalNotFoundError during send leaves the message PENDING, not FAILED.
 
         Pane resolution can transiently fail (e.g. herdr pane not yet resolvable).
-        Status is optimistically set DELIVERED before send (to close the
+        The claim already moved the message to DELIVERED atomically (to close the
         re-entrancy race), so on a resolution failure it must be reset to PENDING
         for a later retry — never left DELIVERED or marked FAILED.
         """
         mock_get.return_value = [_make_message()]
+        mock_claim.return_value = [_make_message(status=MessageStatus.DELIVERED)]
         mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_monitor.get_status_generation.return_value = 0
         mock_term_svc.send_input.side_effect = TerminalNotFoundError("s:w")
 
         svc = InboxService()
         svc.deliver_pending("term-1")
 
-        # Final status is PENDING (reset after the optimistic DELIVERED), never FAILED.
-        assert mock_update.call_args_list[-1] == call(1, MessageStatus.PENDING)
-        assert call(1, MessageStatus.FAILED) not in mock_update.call_args_list
+        # Only the reset to PENDING goes through update_message_status; never FAILED.
+        mock_update.assert_called_once_with(1, MessageStatus.PENDING)
+        # (#709 eighth review round): a resolution failure is not a dispatch
+        # either; the marker armed before send_input must be aborted too.
+        assert inbox_service_module._is_dispatch_active("term-1") is False
 
-    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+
+class TestConcurrentDeliverySerialization:
+    """The atomic claim (#406) stops two callers from claiming the same row,
+    but not from claiming two DIFFERENT rows and then both calling
+    send_input at once, interleaving their tmux paste/delay/Enter sequences
+    (reviewer-reproduced race on #709, first pass).
+
+    The per-terminal lock added for that fixes the byte-level interleaving,
+    but a queued contender still ran the full delivery the instant it got the
+    lock: status_monitor.get_status() keeps returning the cached IDLE from
+    before the first send until the real pipeline observes actual terminal
+    output, so the second caller saw the same stale ready value and dispatched
+    its own message into a terminal that had not started on the first one yet
+    (reviewer-reproduced second pass: two IDLE checks, paste:first, enter:first,
+    paste:second, enter:second, both rows DELIVERED in one IDLE cycle). The
+    tests below cover the coalescing fix for that.
+    """
+
+    def test_two_concurrent_deliveries_to_same_terminal_never_overlap(self, isolated_memory_db):
+        with database.SessionLocal() as seed:
+            seed.add_all(
+                [
+                    InboxModel(
+                        sender_id="s",
+                        receiver_id="term-1",
+                        message=f"m{i}",
+                        status=MessageStatus.PENDING.value,
+                        created_at=datetime.now(),
+                    )
+                    for i in range(2)
+                ]
+            )
+            seed.commit()
+
+        intervals = []
+        intervals_lock = threading.Lock()
+        barrier = threading.Barrier(2)
+
+        def fake_send_input(terminal_id, message, **kwargs):
+            start = time.monotonic()
+            time.sleep(0.05)
+            end = time.monotonic()
+            with intervals_lock:
+                intervals.append((start, end))
+            return True
+
+        def worker():
+            barrier.wait()
+            InboxService().deliver_pending("term-1")
+
+        with (
+            patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as mock_monitor,
+            patch("cli_agent_orchestrator.services.inbox_service.terminal_service") as mock_term,
+        ):
+            mock_monitor.get_status.return_value = TerminalStatus.IDLE
+            mock_monitor.get_status_generation.return_value = 0
+            mock_monitor.get_pre_write_generation.return_value = 0
+            mock_term.send_input.side_effect = fake_send_input
+
+            threads = [threading.Thread(target=worker) for _ in range(2)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        # Exactly one dispatch: the queued contender coalesces instead of
+        # sending into the same still-cached IDLE status the first caller
+        # already used (#709, second review pass). The prior version of this
+        # test asserted len(intervals) == 2, which is exactly the bug the
+        # reviewer flagged: it codified "both messages get sent" as correct.
+        assert len(intervals) == 1, f"expected exactly one dispatch, got {intervals}"
+
+        with database.SessionLocal() as check:
+            statuses = sorted(
+                m.status for m in check.query(InboxModel).filter_by(receiver_id="term-1").all()
+            )
+        # One row delivered, the other left PENDING for a later ready event
+        # rather than being claimed and sent alongside it.
+        assert statuses == sorted([MessageStatus.DELIVERED.value, MessageStatus.PENDING.value])
+
+    def test_coalesced_message_delivers_on_next_status_event(self, isolated_memory_db):
+        """The row left PENDING by coalescing is not stuck forever: once the
+        real pipeline reports the next status event for the terminal,
+        InboxService.run() clears the busy marker (see TestRun) and a later
+        IDLE-triggered deliver_pending call sends the coalesced message."""
+        with database.SessionLocal() as seed:
+            seed.add_all(
+                [
+                    InboxModel(
+                        sender_id="s",
+                        receiver_id="term-1",
+                        message=f"m{i}",
+                        status=MessageStatus.PENDING.value,
+                        created_at=datetime.now(),
+                    )
+                    for i in range(2)
+                ]
+            )
+            seed.commit()
+
+        with (
+            patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as mock_monitor,
+            patch("cli_agent_orchestrator.services.inbox_service.terminal_service") as mock_term,
+        ):
+            mock_monitor.get_status.return_value = TerminalStatus.IDLE
+            mock_monitor.get_status_generation.return_value = 0
+            mock_monitor.get_pre_write_generation.return_value = 0
+            svc = InboxService()
+
+            svc.deliver_pending("term-1")
+            assert mock_term.send_input.call_count == 1
+
+            # Still within the same stale-IDLE window: coalesces, does not
+            # send a second message.
+            svc.deliver_pending("term-1")
+            assert mock_term.send_input.call_count == 1
+
+            # A later status event for the terminal (any value: run() clears
+            # the marker before deciding whether to deliver) proves the real
+            # pipeline moved past the cached status the first send used. Its
+            # generation (1) is newer than the one recorded at dispatch (0).
+            inbox_service_module._clear_dispatch_active("term-1", 1)
+
+            svc.deliver_pending("term-1")
+            assert mock_term.send_input.call_count == 2
+
+        with database.SessionLocal() as check:
+            statuses = sorted(
+                m.status for m in check.query(InboxModel).filter_by(receiver_id="term-1").all()
+            )
+        assert statuses == sorted([MessageStatus.DELIVERED.value, MessageStatus.DELIVERED.value])
+
+    def test_dispatch_marker_survives_elapsed_time_with_no_transition(self):
+        """Reviewer-reproduced fifth-round finding on #709: a provider is not
+        contractually bound to emit output or a PROCESSING transition inside
+        any fixed window, so elapsed time alone must never authorize another
+        send. Only a genuinely newer generation (a real transition) may clear
+        the marker; simply waiting must not."""
+        inbox_service_module._mark_dispatch_active("term-1")
+        assert inbox_service_module._is_dispatch_active("term-1") is True
+        time.sleep(0.2)
+        assert inbox_service_module._is_dispatch_active("term-1") is True
+
+    def test_two_deliveries_with_no_status_event_still_coalesce_past_the_old_window(
+        self, isolated_memory_db
+    ):
+        """Reviewer-reproduced fifth-round finding on #709: with the cached
+        status and generation unchanged the whole time (no status event at
+        all, matching a slow/silent provider start), a second deliver_pending
+        call must still coalesce even once real time has moved well past what
+        used to be the five-second coalescing window. Mirrors
+        test_coalesced_message_delivers_on_next_status_event but never clears
+        the marker, so a second real send here means the guard authorized
+        itself on elapsed time alone."""
+        with database.SessionLocal() as seed:
+            seed.add_all(
+                [
+                    InboxModel(
+                        sender_id="s",
+                        receiver_id="term-1",
+                        message=f"m{i}",
+                        status=MessageStatus.PENDING.value,
+                        created_at=datetime.now(),
+                    )
+                    for i in range(2)
+                ]
+            )
+            seed.commit()
+
+        with (
+            patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as mock_monitor,
+            patch("cli_agent_orchestrator.services.inbox_service.terminal_service") as mock_term,
+        ):
+            mock_monitor.get_status.return_value = TerminalStatus.IDLE
+            mock_monitor.get_status_generation.return_value = 0
+            mock_monitor.get_pre_write_generation.return_value = 0
+            svc = InboxService()
+
+            svc.deliver_pending("term-1")
+            assert mock_term.send_input.call_count == 1
+
+            time.sleep(0.2)
+
+            svc.deliver_pending("term-1")
+            assert mock_term.send_input.call_count == 1
+
+        with database.SessionLocal() as check:
+            statuses = sorted(
+                m.status for m in check.query(InboxModel).filter_by(receiver_id="term-1").all()
+            )
+        assert statuses == sorted([MessageStatus.DELIVERED.value, MessageStatus.PENDING.value])
+
+    @patch("cli_agent_orchestrator.services.inbox_service.claim_pending_messages")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
-    def test_concurrent_delivery_for_one_terminal_sends_exactly_once(
-        self, mock_get, mock_monitor, mock_term_svc, mock_update
+    def test_marker_armed_before_send_is_not_cleared_by_an_event_consumed_during_dispatch(
+        self, mock_get, mock_monitor, mock_term, mock_claim
     ):
-        """deliver_pending is read(PENDING) -> status check -> mark DELIVERED -> send,
-        with no atomic claim at the DB layer. Its callers genuinely overlap on worker
-        threads (the status-event consumer, the immediate POST path, the OpenCode poller,
-        the reconcile sweep), and two calls both reading the same oldest row before
-        either marks it would execute one agent task twice. The per-terminal lock must
-        serialize the whole sequence: with the mark artificially slowed to hold the
-        read->mark window open, two racing threads must produce exactly one send."""
-        import threading
-        import time
+        """Reviewer-reproduced ninth-round finding on #709 (haofeif): the
+        marker used to be confirmable from the moment it was armed, using a
+        generation read BEFORE send_input was even called. An event about
+        output that predates this dispatch (queued before send_input started
+        preparing metadata/status/provider work, still ahead of the actual
+        backend dispatch boundary) could exceed that pre-dispatch snapshot
+        and clear the marker before the real send happened at all, letting a
+        second caller dispatch into the terminal while the first message was
+        still being typed.
 
+        The fix keeps the marker unconfirmable (boundary None) from the
+        moment it is armed until send_input returns: no event, however new
+        its generation, can confirm an attempt whose backend dispatch has
+        not happened yet. Simulated here by having the mocked send_input
+        itself invoke the real clearing path, standing in for the event
+        consumer running concurrently while this call is still inside the
+        blocking send: the marker must already be armed by the time that
+        happens, and it must stay armed once it does.
+        """
+        mock_get.return_value = [_make_message()]
+        mock_claim.return_value = [_make_message(status=MessageStatus.DELIVERED)]
         mock_monitor.get_status.return_value = TerminalStatus.IDLE
-        message = _make_message()
-        store = {"status": MessageStatus.PENDING}
-        store_guard = threading.Lock()
+        mock_monitor.get_status_generation.return_value = 0
+        mock_monitor.get_pre_write_generation.return_value = 0
 
-        def read_pending(terminal_id, limit=1):
-            with store_guard:
-                return [message] if store["status"] == MessageStatus.PENDING else []
+        armed_before_send = {}
 
-        def slow_mark(message_id, status):
-            # Hold the read->mark window open long enough that an unserialized second
-            # thread would re-read the row as PENDING.
-            time.sleep(0.15)
-            with store_guard:
-                store["status"] = status
+        def _send_input(*args, **kwargs):
+            armed_before_send["value"] = inbox_service_module._is_dispatch_active("term-1")
+            # Stand-in for a status event about pre-existing output landing
+            # and being consumed by InboxService.run() on another thread
+            # while this call is still inside send_input, before the real
+            # dispatch this call is making has happened.
+            inbox_service_module._clear_dispatch_active("term-1", 1)
 
-        mock_get.side_effect = read_pending
-        mock_update.side_effect = slow_mark
+        mock_term.send_input.side_effect = _send_input
 
         svc = InboxService()
-        start = threading.Barrier(2)
+        svc.deliver_pending("term-1")
 
-        def race():
-            start.wait(timeout=5)
+        assert armed_before_send["value"] is True
+        # Still active: the event landed before send_input returned, so the
+        # attempt was never confirmable and the event could not have been
+        # about this dispatch.
+        assert inbox_service_module._is_dispatch_active("term-1") is True
+
+    @patch("cli_agent_orchestrator.services.inbox_service.claim_pending_messages")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_marker_confirmed_after_send_is_cleared_by_a_later_event(
+        self, mock_get, mock_monitor, mock_term, mock_claim
+    ):
+        """Companion to the test above: once send_input returns, the attempt's
+        boundary becomes the generation read right then, and only an event
+        strictly newer than THAT can clear it (#709 ninth review round)."""
+        mock_get.return_value = [_make_message()]
+        mock_claim.return_value = [_make_message(status=MessageStatus.DELIVERED)]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_monitor.get_status_generation.return_value = 0
+        mock_monitor.get_pre_write_generation.return_value = 0
+
+        svc = InboxService()
+        svc.deliver_pending("term-1")
+
+        assert inbox_service_module._is_dispatch_active("term-1") is True
+        # Confirmed at generation 0 (the mocked post-send read); generation 1
+        # is strictly newer and clears it.
+        inbox_service_module._clear_dispatch_active("term-1", 1)
+        assert inbox_service_module._is_dispatch_active("term-1") is False
+
+    @patch("cli_agent_orchestrator.services.inbox_service.claim_pending_messages")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_completion_landing_during_send_input_resolves_the_marker_immediately(
+        self, mock_get, mock_monitor, mock_term, mock_claim
+    ):
+        """Reviewer-reproduced eleventh-round finding on #709 (haofeif): a
+        genuine completion can be detected and consumed by InboxService.run()
+        while send_input is still executing (it keeps working after
+        send_keys, e.g. updating last-active metadata), i.e. while the
+        marker's boundary is still None and the event cannot confirm it. The
+        tenth-round code then read a fresh post-call generation and used it
+        as the boundary, but that generation already reflects the completion
+        that just happened and will not repeat, so only a strictly newer
+        future event could ever clear it: none is coming, and the marker
+        strands forever, coalescing every later message to this terminal.
+
+        The fix compares the post-call generation against the pre-write
+        snapshot status_monitor took when send_input called notify_input_sent:
+        if it already moved past that, the attempt resolves immediately
+        instead of arming a boundary nothing can ever exceed.
+        """
+        mock_get.return_value = [_make_message()]
+        mock_claim.return_value = [_make_message(status=MessageStatus.DELIVERED)]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        # notify_input_sent's own pre-write snapshot reads 0; confirm()'s
+        # post-call read reads 1 (a real transition landed and was consumed
+        # elsewhere during send_input itself, at or after the write).
+        mock_monitor.get_pre_write_generation.return_value = 0
+        mock_monitor.get_status_generation.return_value = 1
+
+        svc = InboxService()
+        svc.deliver_pending("term-1")
+
+        assert inbox_service_module._is_dispatch_active("term-1") is False
+
+    @patch("cli_agent_orchestrator.services.inbox_service.claim_pending_messages")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_prep_time_completion_does_not_resolve_the_marker(
+        self, mock_get, mock_monitor, mock_term, mock_claim
+    ):
+        """Reviewer-reproduced twelfth-round finding on #709 (haofeif): the
+        eleventh-round fix compared the post-call generation against a
+        snapshot taken before send_input was even called, so a transition
+        landing during send_input's own PREP (get_terminal_metadata,
+        inject_memory_context), before the backend write, looked
+        identical to one landing at or after the write. Prep-time activity
+        predates this dispatch and is not evidence of a response to it;
+        treating it as confirmation drops the marker immediately and lets a
+        second, sibling dispatch through before the terminal has actually
+        started on the first message.
+
+        The fix compares against status_monitor's own pre-write snapshot
+        (taken by notify_input_sent, which send_input calls after prep and
+        immediately before the write) instead of a snapshot taken at arm
+        time: a transition observed before that call is already folded into
+        the pre-write snapshot, so it cannot register as "newer" than it.
+        """
+        mock_get.return_value = [_make_message()]
+        mock_claim.return_value = [_make_message(status=MessageStatus.DELIVERED)]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        # A transition landed during send_input's prep, before notify_input_sent
+        # (and therefore before the write) ever ran: by the time notify_input_sent
+        # takes its snapshot, the counter already reads 1. Nothing moves after
+        # that: the post-call read is also 1.
+        mock_monitor.get_pre_write_generation.return_value = 1
+        mock_monitor.get_status_generation.return_value = 1
+
+        svc = InboxService()
+        svc.deliver_pending("term-1")
+
+        # Unchanged since the pre-write snapshot: the marker stays active,
+        # armed at boundary 1, rather than resolving immediately.
+        assert inbox_service_module._is_dispatch_active("term-1") is True
+        inbox_service_module._clear_dispatch_active("term-1", 1)
+        assert inbox_service_module._is_dispatch_active("term-1") is True
+        inbox_service_module._clear_dispatch_active("term-1", 2)
+        assert inbox_service_module._is_dispatch_active("term-1") is False
+
+    @patch("cli_agent_orchestrator.services.inbox_service.claim_pending_messages")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_prep_time_completion_against_the_real_status_monitor(
+        self, mock_get, mock_term, mock_claim
+    ):
+        """Same finding as the test above, but against the REAL StatusMonitor
+        singleton instead of a mock, so the ordering between "prep" and "the
+        write" is genuine rather than asserted by the mock setup: a fix
+        comparing the wrong two snapshots cannot pass this one by construction
+        of the mock. ``terminal_service.send_input`` is faked to reproduce
+        send_input's real internal order, prep then notify_input_sent then
+        the write, with a genuine status transition landing during prep,
+        before notify_input_sent's own snapshot.
+
+        Confirmed this fails on the pre-fix code: reverting only
+        inbox_service.py and status_monitor.py (keeping this test) makes the
+        pre-fix ``_arm_dispatch_active`` read its pre-dispatch generation
+        before ``terminal_service.send_input`` is even called, i.e. before
+        the fake's prep-time bump below runs, so it sees 0; the post-call
+        read then sees 1, ``1 > 0`` reads as "a genuine transition landed
+        during the call", and the marker is dropped immediately, exactly the
+        stranding bug this round reports.
+        """
+        mock_get.return_value = [_make_message()]
+        mock_claim.return_value = [_make_message(status=MessageStatus.DELIVERED)]
+        status_monitor.clear_terminal("term-1")
+        status_monitor._last_status["term-1"] = TerminalStatus.IDLE
+
+        def fake_send_input(terminal_id, message, **kwargs):
+            # Prep (get_terminal_metadata, inject_memory_context in the real
+            # send_input): a genuine, unrelated transition is detected and
+            # published here, BEFORE the backend write.
+            status_monitor._apply_detection(terminal_id, TerminalStatus.COMPLETED)
+            # send_input calls notify_input_sent immediately before the
+            # write; its snapshot is taken here, after the prep-time bump
+            # above already landed.
+            status_monitor.notify_input_sent(terminal_id)
+            # The write itself: nothing else moves the counter.
+            return True
+
+        mock_term.send_input.side_effect = fake_send_input
+
+        try:
+            svc = InboxService()
             svc.deliver_pending("term-1")
 
-        threads = [threading.Thread(target=race) for _ in range(2)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=10)
+            # The prep-time transition must not be read as confirmation: the
+            # marker stays active, waiting for a real post-write event.
+            assert inbox_service_module._is_dispatch_active("term-1") is True
+        finally:
+            status_monitor.clear_terminal("term-1")
 
-        assert mock_term_svc.send_input.call_count == 1
-        assert store["status"] == MessageStatus.DELIVERED
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.claim_pending_messages")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_write_time_completion_against_the_real_status_monitor(
+        self, mock_get, mock_term, mock_claim, mock_update
+    ):
+        """Reviewer-reproduced thirteenth-round finding on #709 (haofeif): the
+        twelfth-round fix moved the pre-write snapshot into notify_input_sent,
+        but real work still runs between that snapshot and the actual pane
+        write: send_input's own clear_rolling_buffer and
+        provider.mark_input_received, then the backend's cancel-mode and
+        load-buffer calls (tmux.py), neither of which touches the pane. A
+        genuine, unrelated transition landing in that window is indistinguishable
+        from one landing during prep, but the twelfth-round fix only guarded
+        against the prep case.
+
+        Against the REAL StatusMonitor singleton (not mocked), so the ordering
+        is genuine rather than asserted by a mock: ``terminal_service.send_input``
+        is faked to reproduce the real internal order: prep, notify_input_sent,
+        then further pre-write steps culminating in the backend's own
+        mark_pre_write call immediately before the pane write, with a genuine
+        status transition landing in between, after notify_input_sent but
+        before mark_pre_write.
+
+        Confirmed this fails on the pre-fix code (status_monitor.py, terminal_
+        service.py, clients/tmux.py, and the two backend files all reverted to
+        their pre-thirteenth-round content, this test kept): the fake's call
+        to status_monitor.mark_pre_write raises AttributeError (the method does
+        not exist yet), deliver_pending's generic except branch catches it and
+        aborts the attempt, and the assertion below fails on
+        ``_is_dispatch_active("term-1") is False``: an aborted attempt looks
+        different from haofeif's report (a delivery failure, not a stray
+        second send), but it demonstrates the same root fact: nothing in the
+        pre-fix code can tell the difference between this stale transition and
+        a genuine post-write one. Confirmed directly against unmodified
+        production code (no test, no new method) with a standalone repro
+        driving only notify_input_sent, _apply_detection and
+        _confirm_dispatch_active: the marker resolves immediately on exactly
+        this transition, reproducing haofeif's reported outcome verbatim.
+        """
+        mock_get.return_value = [_make_message()]
+        mock_claim.return_value = [_make_message(status=MessageStatus.DELIVERED)]
+        status_monitor.clear_terminal("term-1")
+        status_monitor._last_status["term-1"] = TerminalStatus.IDLE
+
+        def fake_send_input(terminal_id, message, **kwargs):
+            # Prep (get_terminal_metadata, inject_memory_context): no bump.
+            # notify_input_sent's own snapshot, taken right after prep.
+            status_monitor.notify_input_sent(terminal_id)
+            # send_input's remaining pre-write steps (clear_rolling_buffer,
+            # provider.mark_input_received) and the backend's own pre-write
+            # work (cancel-mode, load-buffer) run here in production; a
+            # genuine, unrelated transition lands during that window, well
+            # before the pane is actually touched.
+            status_monitor._apply_detection(terminal_id, TerminalStatus.COMPLETED)
+            # The backend's pre_write_hook fires at the last point before the
+            # pane write (tmux.py: immediately before paste-buffer).
+            status_monitor.mark_pre_write(terminal_id)
+            # The write itself: nothing else moves the counter.
+            return True
+
+        mock_term.send_input.side_effect = fake_send_input
+
+        try:
+            svc = InboxService()
+            svc.deliver_pending("term-1")
+
+            # The transition predates the real write (mark_pre_write folded it
+            # in): the marker must stay active, waiting for a genuine
+            # post-write event, not resolve on this stale one.
+            assert inbox_service_module._is_dispatch_active("term-1") is True
+        finally:
+            status_monitor.clear_terminal("term-1")
+
+    def test_marker_stranded_by_arm_after_send_is_the_bug_this_fix_closes(self):
+        """Same race as above, replayed against the OLD ordering directly
+        (mark after send, using the post-dispatch generation) to show it is
+        not merely a theoretical concern: calling _mark_dispatch_active AFTER
+        the event has already been cleared installs a marker nothing will
+        ever confirm again, exactly haofeif's reported outcome."""
+        assert inbox_service_module._is_dispatch_active("term-1") is False
+
+        # The event fires and is consumed first (old ordering: send, then
+        # read+mark), finding no marker to clear: a no-op.
+        inbox_service_module._clear_dispatch_active("term-1", 1)
+        assert inbox_service_module._is_dispatch_active("term-1") is False
+
+        # The old code now marks busy against the post-dispatch generation,
+        # which the event above already confirmed and will not repeat.
+        inbox_service_module._mark_dispatch_active("term-1", 1)
+        assert inbox_service_module._is_dispatch_active("term-1") is True
+
+        # Nothing at or below generation 1 can clear it: it is stranded.
+        inbox_service_module._clear_dispatch_active("term-1", 1)
+        assert inbox_service_module._is_dispatch_active("term-1") is True
+
+    def test_second_message_delivers_once_the_confirmed_dispatch_marker_clears(
+        self, isolated_memory_db
+    ):
+        """End-to-end companion to the two tests above: a genuine completion
+        event landing after the first send confirms clears the marker, so a
+        second pending message delivers on the very next call instead of
+        coalescing forever."""
+        with database.SessionLocal() as seed:
+            seed.add_all(
+                [
+                    InboxModel(
+                        sender_id="s",
+                        receiver_id="term-1",
+                        message=f"m{i}",
+                        status=MessageStatus.PENDING.value,
+                        created_at=datetime.now(),
+                    )
+                    for i in range(2)
+                ]
+            )
+            seed.commit()
+
+        with (
+            patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as mock_monitor,
+            patch("cli_agent_orchestrator.services.inbox_service.terminal_service") as mock_term,
+        ):
+            mock_monitor.get_status.return_value = TerminalStatus.IDLE
+            mock_monitor.get_status_generation.return_value = 0
+            mock_monitor.get_pre_write_generation.return_value = 0
+            svc = InboxService()
+
+            svc.deliver_pending("term-1")
+            assert mock_term.send_input.call_count == 1
+            assert inbox_service_module._is_dispatch_active("term-1") is True
+
+            # A genuine status event landing after the send confirms: its
+            # generation (1) is strictly newer than the one read right after
+            # send_input returned (0).
+            inbox_service_module._clear_dispatch_active("term-1", 1)
+            assert inbox_service_module._is_dispatch_active("term-1") is False
+
+            svc.deliver_pending("term-1")
+            assert mock_term.send_input.call_count == 2
+
+        with database.SessionLocal() as check:
+            statuses = sorted(
+                m.status for m in check.query(InboxModel).filter_by(receiver_id="term-1").all()
+            )
+        assert statuses == sorted([MessageStatus.DELIVERED.value, MessageStatus.DELIVERED.value])
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.claim_pending_messages")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_second_sender_groups_failure_does_not_strand_the_first_groups_marker(
+        self, mock_get, mock_monitor, mock_term_svc, mock_claim, mock_update
+    ):
+        """Reviewer-reproduced tenth-round finding on #709 (haofeif): with
+        num_messages > 1, distinct sender groups dispatch sequentially under
+        one terminal lock, each arming its own attempt. If group 1's send
+        succeeds and group 2's then fails, group 2's abort must remove only
+        its own token's entry, never the one still protecting group 1's
+        successful-but-unconfirmed dispatch."""
+
+        def _msg(id, sender_id, status):
+            return InboxMessage(
+                id=id,
+                sender_id=sender_id,
+                receiver_id="term-1",
+                message=f"m{id}",
+                status=status,
+                created_at=datetime.now(),
+            )
+
+        mock_get.return_value = [
+            _msg(1, "sender-1", MessageStatus.PENDING),
+            _msg(2, "sender-2", MessageStatus.PENDING),
+        ]
+        mock_claim.return_value = [
+            _msg(1, "sender-1", MessageStatus.DELIVERED),
+            _msg(2, "sender-2", MessageStatus.DELIVERED),
+        ]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_monitor.get_status_generation.return_value = 0
+        mock_monitor.get_pre_write_generation.return_value = 0
+        mock_term_svc.send_input.side_effect = [None, RuntimeError("tmux error")]
+
+        svc = InboxService()
+        svc.deliver_pending("term-1", num_messages=0)
+
+        # Group 2 (message id 2) was reset to FAILED; group 1 was never touched.
+        mock_update.assert_called_once_with(2, MessageStatus.FAILED)
+        # Group 1's dispatch reached the terminal and is still unconfirmed by
+        # a real status event, so it must still be protected even though
+        # group 2's own attempt was aborted right after it.
+        assert inbox_service_module._is_dispatch_active("term-1") is True
+
+
+class TestDispatchActiveTeardown:
+    """gutosantos82's blocking finding on #709: status_monitor.clear_terminal
+    and reset_buffer pop _status_generations (the counter restarts) but never
+    told inbox_service to drop _dispatch_active, so a reset landing inside an
+    unconfirmed dispatch window permanently stranded that terminal's inbox.
+    These exercise the real status_monitor singleton, not a mock: the defect
+    was in the wiring between the two modules, not in either one alone."""
+
+    def test_clear_terminal_drops_a_stranded_dispatch_marker(self):
+        """Without the teardown hook, a marker recorded at generation 5
+        survives clear_terminal forever: the counter clear_terminal just
+        performed means every future event's generation restarts at 0, so it
+        can never exceed 5 and _clear_dispatch_active's strictly-greater
+        check never fires."""
+        inbox_service_module._mark_dispatch_active("term-reset-clear", generation=5)
+        assert inbox_service_module._is_dispatch_active("term-reset-clear") is True
+
+        status_monitor.clear_terminal("term-reset-clear")
+
+        assert inbox_service_module._is_dispatch_active("term-reset-clear") is False
+
+    def test_reset_buffer_drops_a_stranded_dispatch_marker(self):
+        """Same failure family via the other reset path the review named:
+        reset_buffer also pops _status_generations without touching
+        _dispatch_active."""
+        inbox_service_module._mark_dispatch_active("term-reset-buffer", generation=5)
+        assert inbox_service_module._is_dispatch_active("term-reset-buffer") is True
+
+        status_monitor.reset_buffer("term-reset-buffer")
+
+        assert inbox_service_module._is_dispatch_active("term-reset-buffer") is False
+
+    def test_terminal_teardown_reaps_an_unconfirmed_marker_instead_of_leaking(self):
+        """Secondary "Important" finding: a terminal deleted while holding an
+        unconfirmed marker previously leaked that _dispatch_active entry for
+        the process lifetime (clear_terminal pops _status_generations and
+        _delivery_locks self-cleans via refcounting, but nothing reaped this
+        dict). The same hook that fixes the stranding bug reaps it too."""
+        inbox_service_module._mark_dispatch_active("term-teardown-leak", generation=1)
+
+        status_monitor.clear_terminal("term-teardown-leak")
+
+        with inbox_service_module._dispatch_active_guard:
+            assert "term-teardown-leak" not in inbox_service_module._dispatch_active
+
+    def test_reset_mid_dispatch_no_longer_strands_delivery(self, isolated_memory_db):
+        """End-to-end reproduction of the reviewer's exact scenario: a
+        dispatch marker set at generation 5, then a reset lands inside the
+        still-unconfirmed window (status_monitor.clear_terminal, restarting
+        the counter). The first post-reset event carries generation 1,
+        at or below the stale marker's recorded 5, so the old
+        strictly-greater check in _clear_dispatch_active could never fire.
+        Before the fix this coalesces the still-PENDING message forever, with
+        no recovery short of a server restart; after the fix the teardown
+        hook already dropped the marker during the reset itself, so
+        deliver_pending sends normally."""
+        with database.SessionLocal() as seed:
+            seed.add(
+                InboxModel(
+                    sender_id="s",
+                    receiver_id="term-reset-e2e",
+                    message="hello",
+                    status=MessageStatus.PENDING.value,
+                    created_at=datetime.now(),
+                )
+            )
+            seed.commit()
+
+        with patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as mock_monitor:
+            mock_monitor.get_status_generation.return_value = 5
+            inbox_service_module._mark_dispatch_active("term-reset-e2e")
+        assert inbox_service_module._is_dispatch_active("term-reset-e2e") is True
+
+        # The terminal is reset/relaunched while the dispatch above is still
+        # unconfirmed. Use the real singleton: it is the one carrying the
+        # teardown hook under test.
+        status_monitor.clear_terminal("term-reset-e2e")
+
+        with (
+            patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as mock_monitor,
+            patch("cli_agent_orchestrator.services.inbox_service.terminal_service") as mock_term,
+        ):
+            # First post-reset event: the counter restarted, so this reads
+            # back as generation 1, at or below the stale marker's 5.
+            mock_monitor.get_status.return_value = TerminalStatus.IDLE
+            mock_monitor.get_status_generation.return_value = 1
+            mock_monitor.get_pre_write_generation.return_value = 1
+            svc = InboxService()
+            svc.deliver_pending("term-reset-e2e")
+
+        mock_term.send_input.assert_called_once()
+        with database.SessionLocal() as check:
+            statuses = [
+                m.status
+                for m in check.query(InboxModel).filter_by(receiver_id="term-reset-e2e").all()
+            ]
+        assert statuses == [MessageStatus.DELIVERED.value]
 
 
 class TestEagerInboxDelivery:
@@ -272,16 +979,20 @@ class TestEagerInboxDelivery:
     """
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.claim_pending_messages")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
     @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
     def test_delivery_idle_status_always_works(
-        self, mock_get, mock_monitor, mock_pm, mock_term_svc, mock_update
+        self, mock_get, mock_monitor, mock_pm, mock_term_svc, mock_claim, mock_update
     ):
         """IDLE delivers regardless of env var or provider capability."""
         mock_get.return_value = [_make_message()]
+        mock_claim.return_value = [_make_message(status=MessageStatus.DELIVERED)]
         mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_monitor.get_status_generation.return_value = 0
+        mock_monitor.get_pre_write_generation.return_value = 0
         provider = MagicMock()
         provider.accepts_input_while_processing = False
         mock_pm.get_provider.return_value = provider
@@ -293,16 +1004,20 @@ class TestEagerInboxDelivery:
         mock_term_svc.send_input.assert_called_once()
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.claim_pending_messages")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
     @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
     def test_delivery_completed_status_always_works(
-        self, mock_get, mock_monitor, mock_pm, mock_term_svc, mock_update
+        self, mock_get, mock_monitor, mock_pm, mock_term_svc, mock_claim, mock_update
     ):
         """COMPLETED delivers regardless of env var or provider capability."""
         mock_get.return_value = [_make_message()]
+        mock_claim.return_value = [_make_message(status=MessageStatus.DELIVERED)]
         mock_monitor.get_status.return_value = TerminalStatus.COMPLETED
+        mock_monitor.get_status_generation.return_value = 0
+        mock_monitor.get_pre_write_generation.return_value = 0
         provider = MagicMock()
         provider.accepts_input_while_processing = False
         mock_pm.get_provider.return_value = provider
@@ -314,16 +1029,20 @@ class TestEagerInboxDelivery:
         mock_term_svc.send_input.assert_called_once()
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.claim_pending_messages")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
     @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
     def test_delivery_processing_with_eager_enabled_and_capable_provider(
-        self, mock_get, mock_monitor, mock_pm, mock_term_svc, mock_update
+        self, mock_get, mock_monitor, mock_pm, mock_term_svc, mock_claim, mock_update
     ):
         """PROCESSING + eager ON + capable provider -> delivers."""
         mock_get.return_value = [_make_message()]
+        mock_claim.return_value = [_make_message(status=MessageStatus.DELIVERED)]
         mock_monitor.get_status.return_value = TerminalStatus.PROCESSING
+        mock_monitor.get_status_generation.return_value = 0
+        mock_monitor.get_pre_write_generation.return_value = 0
         provider = MagicMock()
         provider.accepts_input_while_processing = True
         mock_pm.get_provider.return_value = provider
@@ -377,16 +1096,20 @@ class TestEagerInboxDelivery:
         mock_term_svc.send_input.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.claim_pending_messages")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
     @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
     def test_delivery_waiting_user_answer_with_eager_enabled_and_capable_provider(
-        self, mock_get, mock_monitor, mock_pm, mock_term_svc, mock_update
+        self, mock_get, mock_monitor, mock_pm, mock_term_svc, mock_claim, mock_update
     ):
         """WAITING_USER_ANSWER + eager ON + capable provider -> delivers."""
         mock_get.return_value = [_make_message()]
+        mock_claim.return_value = [_make_message(status=MessageStatus.DELIVERED)]
         mock_monitor.get_status.return_value = TerminalStatus.WAITING_USER_ANSWER
+        mock_monitor.get_status_generation.return_value = 0
+        mock_monitor.get_pre_write_generation.return_value = 0
         provider = MagicMock()
         provider.accepts_input_while_processing = True
         mock_pm.get_provider.return_value = provider
@@ -491,7 +1214,7 @@ class TestRun:
         await queue.put(
             {
                 "topic": "terminal.abc123.status",
-                "data": {"status": TerminalStatus.IDLE.value},
+                "data": {"status": TerminalStatus.IDLE.value, "generation": 1},
             }
         )
 
@@ -521,7 +1244,7 @@ class TestRun:
         await queue.put(
             {
                 "topic": "terminal.xyz789.status",
-                "data": {"status": TerminalStatus.COMPLETED.value},
+                "data": {"status": TerminalStatus.COMPLETED.value, "generation": 1},
             }
         )
 
@@ -547,7 +1270,7 @@ class TestRun:
         await queue.put(
             {
                 "topic": "terminal.abc123.status",
-                "data": {"status": TerminalStatus.PROCESSING.value},
+                "data": {"status": TerminalStatus.PROCESSING.value, "generation": 1},
             }
         )
 
@@ -565,6 +1288,126 @@ class TestRun:
         svc.deliver_pending.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_processing_event_clears_dispatch_active(self):
+        """A PROCESSING event does not trigger delivery, but it is exactly the
+        real pipeline catching up on a prior dispatch (#709): it must still
+        clear the busy marker so the terminal is not coalescing against a
+        cached status that has already moved on, as long as it postdates
+        the dispatch. status_monitor is patched (not the real singleton,
+        which other test modules also exercise against this same terminal
+        id) so the dispatch-time generation is pinned to a known value."""
+        with patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as mock_monitor:
+            mock_monitor.get_status_generation.return_value = 0
+            inbox_service_module._mark_dispatch_active("abc123")
+
+        svc = InboxService()
+        svc.deliver_pending = MagicMock()
+
+        queue = asyncio.Queue()
+        await queue.put(
+            {
+                "topic": "terminal.abc123.status",
+                "data": {"status": TerminalStatus.PROCESSING.value, "generation": 1},
+            }
+        )
+
+        with patch("cli_agent_orchestrator.services.inbox_service.bus") as mock_bus:
+            mock_bus.subscribe.return_value = queue
+
+            task = asyncio.create_task(svc.run())
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        assert inbox_service_module._is_dispatch_active("abc123") is False
+
+    @pytest.mark.asyncio
+    async def test_stale_queued_event_does_not_clear_dispatch_active(self):
+        """Reviewer-reproduced third-round finding on #709: a status event can
+        already be sitting in run()'s queue when a dispatch happens (the
+        immediate API, OpenCode poller, and reconcile paths all call
+        deliver_pending() outside this consumer). If run() then clears the
+        marker on that stale, already-superseded event, a queued contender
+        reads the still-cached ready status and dispatches into the same
+        cycle, the exact bug the busy marker exists to prevent. The event's
+        generation (1) does not postdate the dispatch's own generation
+        snapshot (1, i.e. taken after that same transition already landed),
+        so the marker must survive."""
+        with patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as mock_monitor:
+            # The transition that produced the queued event has already
+            # happened by the time deliver_pending dispatches and marks busy,
+            # so get_status_generation reflects it (1), not the pre-transition
+            # value (0) run() has not consumed yet.
+            mock_monitor.get_status_generation.return_value = 1
+            inbox_service_module._mark_dispatch_active("abc123")
+
+        svc = InboxService()
+        svc.deliver_pending = MagicMock()
+
+        queue = asyncio.Queue()
+        # The event already queued before the dispatch above.
+        await queue.put(
+            {
+                "topic": "terminal.abc123.status",
+                "data": {"status": TerminalStatus.IDLE.value, "generation": 1},
+            }
+        )
+
+        with patch("cli_agent_orchestrator.services.inbox_service.bus") as mock_bus:
+            mock_bus.subscribe.return_value = queue
+
+            task = asyncio.create_task(svc.run())
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        # The marker must still be active: the queued event did not postdate
+        # the dispatch, so clearing it here would let a concurrent contender
+        # read the still-stale cached status.
+        assert inbox_service_module._is_dispatch_active("abc123") is True
+
+    @pytest.mark.asyncio
+    async def test_genuinely_newer_event_still_clears_dispatch_active(self):
+        """The mirror of the stale-event case: once a REAL post-dispatch
+        transition arrives (generation strictly greater than the one
+        recorded at dispatch time), the marker must still clear: the fix
+        for the stale-event bug must not regress into never clearing at
+        all."""
+        with patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as mock_monitor:
+            mock_monitor.get_status_generation.return_value = 1
+            inbox_service_module._mark_dispatch_active("abc123")
+
+        svc = InboxService()
+        svc.deliver_pending = MagicMock()
+
+        queue = asyncio.Queue()
+        await queue.put(
+            {
+                "topic": "terminal.abc123.status",
+                "data": {"status": TerminalStatus.IDLE.value, "generation": 2},
+            }
+        )
+
+        with patch("cli_agent_orchestrator.services.inbox_service.bus") as mock_bus:
+            mock_bus.subscribe.return_value = queue
+
+            task = asyncio.create_task(svc.run())
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        assert inbox_service_module._is_dispatch_active("abc123") is False
+
+    @pytest.mark.asyncio
     async def test_threads_registry_to_delivery(self):
         """run(registry) threads the plugin registry to deliver_pending so
         status-driven deliveries fire PostSendMessageEvent hooks with the same
@@ -578,7 +1421,7 @@ class TestRun:
         await queue.put(
             {
                 "topic": "terminal.abc123.status",
-                "data": {"status": TerminalStatus.IDLE.value},
+                "data": {"status": TerminalStatus.IDLE.value, "generation": 1},
             }
         )
 
@@ -609,7 +1452,7 @@ class TestRun:
         await queue.put(
             {
                 "topic": "terminal.abc123.status",
-                "data": {"status": TerminalStatus.IDLE.value},
+                "data": {"status": TerminalStatus.IDLE.value, "generation": 1},
             }
         )
 

@@ -187,6 +187,45 @@ class TestSendKeys:
         assert len(load_call[1]["input"]) == 50000
 
 
+class TestSendKeysPreWriteHook:
+    """pre_write_hook fires at the last point before the pane is actually
+    touched: after load-buffer returns (it only stores bytes in a tmux
+    buffer, never touching the pane) and before paste-buffer (the first
+    call that does). Lets a caller (terminal_service.send_input, via
+    status_monitor.mark_pre_write) take a generation snapshot that a stale,
+    unrelated transition during cancel-mode/load-buffer cannot fool (#709
+    thirteenth review round)."""
+
+    def test_fires_between_load_buffer_and_paste_buffer(self, client, mock_subprocess, mock_uuid):
+        calls_at_hook_time = []
+
+        def hook():
+            calls_at_hook_time.append(list(mock_subprocess.run.call_args_list))
+
+        client.send_keys("sess", "win", "hello", pre_write_hook=hook)
+
+        assert len(calls_at_hook_time) == 1
+        seen = payload_calls_from(calls_at_hook_time[0])
+        # load-buffer already ran, paste-buffer has not yet.
+        assert len(seen) == 1
+        assert seen[0][0][0][:2] == ["tmux", "load-buffer"]
+
+    def test_not_called_when_omitted(self, client, mock_subprocess, mock_uuid):
+        """Default is None; no callback occurs, no error (#709)."""
+        client.send_keys("sess", "win", "hello")
+        assert mock_subprocess.run.call_count == 6
+
+    def test_hook_runs_exactly_once_per_call(self, client, mock_subprocess, mock_uuid):
+        hook = MagicMock()
+        client.send_keys("sess", "win", "hello", pre_write_hook=hook)
+        hook.assert_called_once_with()
+
+
+def payload_calls_from(call_args_list):
+    """Same filter as payload_calls, over an already-captured call list."""
+    return [c for c in call_args_list if c[0][0][-2:] != ["-X", "cancel"]]
+
+
 class TestSendKeysNoHandCraftedMarkersOnModernTmux:
     """Regression tests for issue #413 (tmux >= 3.7).
 
