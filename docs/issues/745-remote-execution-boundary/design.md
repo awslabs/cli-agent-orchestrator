@@ -247,9 +247,20 @@ transport; sign-in/revocation policy lives in #774/#779.
 ## 8. Slice-1 status (implemented)
 
 Landed on this branch and validated locally plus on the EKS chaos-cluster
-(`us-east-1`): one central `cao-server` (Deployment/`Recreate` + Service, DB on
-a gp2 RWO PVC) and two `cao-bridge` workers dialing
-`ws://cao-server:9889/runtime/channel`.
+(`us-east-1`), twice and in two shapes.
+
+The first stack was assembled ad hoc to exercise the channel: one central
+`cao-server` (Deployment/`Recreate` + Service, DB on a gp2 RWO PVC) and two
+`cao-bridge` workers dialing `ws://cao-server:9889/runtime/channel`.
+
+The second is the **shipped example itself** — `kubectl kustomize
+examples/cao-clusters/kubernetes/eks` rendered into a second namespace with
+only the substitutions this cluster forces (no gp3, no EFS, Pod Identity
+injection broken so a projected web-identity token stands in, Bedrock
+inference profiles) — so the topology under test is the one a reader deploys,
+not one written for the test: `cao-server` as a StatefulSet with
+`updateStrategy: OnDelete`, and `cao-supervisor` as a `cao-bridge` pod with no
+`ports:`, a portless headless Service and an `emptyDir` state volume.
 
 | Capability | Where | Status |
 | --- | --- | --- |
@@ -266,6 +277,7 @@ a gp2 RWO PVC) and two `cao-bridge` workers dialing
 | **stdio→HTTP forwarding shim** so a stdio-only provider reaches the shared endpoint: `cao-mcp-stdio-bridge` proxies to the endpoint's own tool surface and turns the `CAO_TERMINAL_ID` a provider already injects into the per-request caller header — no provider changes. Registers no tools, holds no state, reads no database; a missing token is fatal rather than a quiet fallback to running tools in the agent's pod | `mcp_server/stdio_bridge.py`, `utils/mcp_resolution.py` | done; the same round-trip assertions hold through the shim as a child process |
 | **Single active server owner, enforced**: exclusive `flock` on the state directory before `init_db`; a second server refuses to serve and names the holder. Deployed as `updateStrategy: OnDelete` with a documented non-overlapping replacement procedure | `services/server_owner.py`, `examples/.../server.yaml` + README | 1 test module; mutation-checked (removing the guard and swallowing a conflict are both caught) |
 | Bridge readiness for a pod with no HTTP: a marker written after the hello is accepted and withdrawn on disconnect, on fatal rejection and at startup; the shipped manifest's exec probe is pinned to the configured path by test | `runtime_channel/bridge.py`, `examples/.../supervisor.yaml` | 10 tests |
+| **Status survives a server restart**: `HelloFrame.statuses` carries the runtime's verdict per live terminal and the server seeds its cache from the snapshot it already uses to rebuild routing — status is pushed on change, so an idle terminal would otherwise read UNKNOWN indefinitely. A runtime omits what it cannot read rather than claiming UNKNOWN; a hello cannot set status for another runtime's terminal; a disconnected runtime still reports UNKNOWN | `runtime_channel/{protocol,bridge,api}.py` | 8 tests, all three non-behaviours mutation-checked; **found in live EKS validation, not by a test** |
 | CLI→HTTP flow registration preserves `engine` + conditional pre-script (was silently dropped → unconditional launch); rejects arbitrary server paths | `api/main.py` `CreateFlowRequest` | 2 tests |
 | **Python workflow / flow pre-scripts execute in the runtime** (`CAO_SCRIPT_RUNTIME`), not the server host: `RUN_SCRIPT`/`CANCEL_SCRIPT` commands; server keeps record/journal/generation/cancel; outcome flows through the shared `_finalize`; `CAO_API_BASE_URL` rewritten to the advertised URL for callbacks; disconnect → explicit failure | `runtime_channel/{protocol,bridge}.py`, `services/script_runner.py` | 13 tests + **EKS-validated** |
 
@@ -276,6 +288,41 @@ preserves the DB row (PVC) and rebuilds terminal→runtime routing from the hell
 snapshot with output retained; a killed worker yields an explicit
 `503 runtime … not connected` (never false success); teardown removes the
 worker's tmux session and the central row.
+
+**EKS-verified on the shipped example** (second namespace, both stacks running
+side by side): the supervisor pod serves nothing — no listener on `9889` from
+inside it or from the server, and its Service publishes no port at all; its
+readiness comes from the marker `cao-bridge` writes (`pid 1`, i.e. the bridge
+*is* the container's process, which is why the manifest ships no liveness
+probe); `GET /runtimes` on the server lists the supervisor as a connected
+runtime; a second `cao-server` started inside the same pod refused with
+`ServerOwnershipError` naming the holder; a terminal launched through
+`POST /runtimes/cao-supervisor-0/terminals` ran Claude Code on Bedrock in the
+supervisor pod and its answer came back through the server, with the DB row on
+the server's PVC pointing at a tmux session that exists only in the supervisor;
+and deleting `cao-server-0` withdrew the readiness marker within 3s, restored
+it on reconnect, rebuilt routing from the hello snapshot, and the pre-existing
+terminal answered a fresh prompt.
+
+That last run is also where the status-on-reconnect gap surfaced: routing came
+back correctly but `GET /terminals/{id}` read `unknown`, because status is
+pushed on change and the restarted server had never seen a frame for a terminal
+that had gone quiet. `HelloFrame.statuses` closes it — the runtime states its
+verdict in the same snapshot that rebuilds routing. Re-run on the fixed image
+with the agent quiescent and **no interaction at all**: `unknown` while the
+channel was down (correct — the server cannot know), then `completed` the
+moment the bridge reconnected.
+
+The broker's bridge cycle was exercised in the same namespace: a lease carrying
+`mode: bridge` and a `runtime_id`, **no per-worker Service created**, the
+runtime connected to the central server in ~20s, a central launch onto the
+leased worker answering with its own response line, then
+`DELETE /workers/{id}` → `200 {"released":true,"workload_present":false}` with
+the runtime dropped from `GET /runtimes`. Run first against a pre-fix broker
+image, the same teardown reproduced the flat-15s release bug as an HTTP 500
+while the pod was already `Terminating` — so the derived
+`WORKER_TERMINATION_GRACE_SECONDS + 15` wait is checked against the failure it
+exists for, not only asserted.
 
 **Also delivered on this branch (the issue's steps 4–5):**
 
