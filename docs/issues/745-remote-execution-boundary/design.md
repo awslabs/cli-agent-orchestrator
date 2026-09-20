@@ -165,11 +165,21 @@ Every frame is one JSON object:
   server restart, runtimes reconnect and re-`hello`; the server rebuilds routing from
   persisted terminal→runtime association plus the hello snapshots.
 
-  Single ownership rests on the deployment shape — a one-replica StatefulSet with an
-  ordered rollout — not on a code-level guard: there is no lease, leader election or
-  single-writer lock on the SQLite state, and no test simulates two overlapping server
-  processes. An operator who scales the StatefulSet past one replica gets two writers
-  and nothing stops them. Enforcing that in code is follow-up work, not delivered here.
+  Single ownership is enforced in code, not left to the deployment shape. The server
+  takes an exclusive `flock` on its state directory at startup
+  (`services/server_owner.py`) and refuses to serve while another process holds it, so
+  an operator who scales the StatefulSet past one replica gets a refusal naming the
+  holder rather than a second writer. `replicas: 1` alone would not have been enough: a
+  rolling update overlaps pods by design, which is why the deployed StatefulSet is
+  `updateStrategy: OnDelete` and replacement is a documented non-overlapping procedure
+  (see the EKS example's README).
+
+  The lock needs no stale-entry expiry — the kernel releases an `flock` when the holder
+  dies, including on SIGKILL — and it is re-entrant within one process, because the fd
+  is shared and reference-counted; an in-process server started twice (TestClient, an
+  embedded server) would otherwise deadlock against itself. `CAO_SERVER_OWNER_LOCK=0`
+  opts out for local development against one state directory, and is documented as a
+  footgun rather than a supported topology.
 
 ### 4.5 Server-side pieces
 
@@ -195,8 +205,18 @@ Every frame is one JSON object:
   journal ownership central.
 - Shared MCP hosting: HTTP transport with per-request authenticated caller context
   replacing process-global `CAO_TERMINAL_ID` (`mcp_server/server.py` reads it from env
-  today); stdio forwarding shim with **no shared child process and no header-derived
-  identity** (per #745's review findings).
+  today); stdio forwarding shim with **no shared child process** (per #745's review
+  findings).
+
+  As built, the shim is one child process per agent — the provider's own stdio
+  subprocess, unchanged — and it does carry the caller identity in a header. That is
+  header-*carried*, not header-*trusted*: the header is only read from a request that
+  already presented the shared runtime token, and the shim takes the value from the
+  `CAO_TERMINAL_ID` the provider injected into its child env rather than from anything
+  the agent can choose. A request without the token is refused over the wire, so a
+  spoofed header needs the token first — which is the same boundary every other
+  runtime-authenticated call rests on, and which #774 narrows to per-runtime
+  credentials.
 - Broker/EKS example: execution-only worker Deployments, no per-worker Service, central
   StatefulSet preserved; client/operation preservation matrix.
 
@@ -241,7 +261,11 @@ a gp2 RWO PVC) and two `cao-bridge` workers dialing
 | `is_remote` routing seam on input / key / output / delete / status / browser-WS | `api/main.py`, `terminal_service.get_terminal` | done |
 | Queued-cancellation recheck at the drive boundary | `api/main.py` `_run_in_background` | 4 tests |
 | `CAO_NODE_MODE=bridge` in the EKS entrypoint | `examples/.../entrypoint.sh` | done |
-| Shared MCP HTTP hosting (`CAO_MCP_TRANSPORT=http`) + per-request caller identity replacing process-global `CAO_TERMINAL_ID`; shared-token gate fails closed; stdio unchanged | `mcp_server/{caller_context,http_hosting}.py`, `mcp_server/server.py`, `utils/orchestration.py` | 9 tests (incl. concurrent-task identity isolation). No MCP-SDK client round-trip test, and no stdio→HTTP forwarding shim: providers still spawn stdio `cao-mcp-server`, so stdio is unchanged rather than bridged |
+| Shared MCP HTTP hosting (`CAO_MCP_TRANSPORT=http`) + per-request caller identity replacing process-global `CAO_TERMINAL_ID`; shared-token gate fails closed; stdio unchanged | `mcp_server/{caller_context,http_hosting}.py`, `mcp_server/server.py`, `utils/orchestration.py` | 9 tests (incl. concurrent-task identity isolation) |
+| MCP compatibility driven by the official SDK client over a real socket, not asserted against the spec: version negotiation, two concurrent sessions with distinct identities, no identity inherited by a sequential call, a bad or absent token refused over the wire | `test/mcp_server/test_shared_endpoint_roundtrip.py` | done; the prior test called the middleware in-process with a bare `object()` as its context |
+| **stdio→HTTP forwarding shim** so a stdio-only provider reaches the shared endpoint: `cao-mcp-stdio-bridge` proxies to the endpoint's own tool surface and turns the `CAO_TERMINAL_ID` a provider already injects into the per-request caller header — no provider changes. Registers no tools, holds no state, reads no database; a missing token is fatal rather than a quiet fallback to running tools in the agent's pod | `mcp_server/stdio_bridge.py`, `utils/mcp_resolution.py` | done; the same round-trip assertions hold through the shim as a child process |
+| **Single active server owner, enforced**: exclusive `flock` on the state directory before `init_db`; a second server refuses to serve and names the holder. Deployed as `updateStrategy: OnDelete` with a documented non-overlapping replacement procedure | `services/server_owner.py`, `examples/.../server.yaml` + README | 1 test module; mutation-checked (removing the guard and swallowing a conflict are both caught) |
+| Bridge readiness for a pod with no HTTP: a marker written after the hello is accepted and withdrawn on disconnect, on fatal rejection and at startup; the shipped manifest's exec probe is pinned to the configured path by test | `runtime_channel/bridge.py`, `examples/.../supervisor.yaml` | 10 tests |
 | CLI→HTTP flow registration preserves `engine` + conditional pre-script (was silently dropped → unconditional launch); rejects arbitrary server paths | `api/main.py` `CreateFlowRequest` | 2 tests |
 | **Python workflow / flow pre-scripts execute in the runtime** (`CAO_SCRIPT_RUNTIME`), not the server host: `RUN_SCRIPT`/`CANCEL_SCRIPT` commands; server keeps record/journal/generation/cancel; outcome flows through the shared `_finalize`; `CAO_API_BASE_URL` rewritten to the advertised URL for callbacks; disconnect → explicit failure | `runtime_channel/{protocol,bridge}.py`, `services/script_runner.py` | 13 tests + **EKS-validated** |
 

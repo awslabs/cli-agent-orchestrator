@@ -59,10 +59,10 @@ spec:
             - name: CAO_ELASTIC_PROJECT_ID
               value: cao-cluster
             # Fixed upstream for the broker's allowlisted callback/memory
-            # gateway. Workers receive the broker URL instead and cannot reach
-            # this supervisor URL through NetworkPolicy.
+            # gateway. This is the CENTRAL server (#745), not the supervisor: the
+            # supervisor has no API to forward to any more.
             - name: CAO_SUPERVISOR_API_URL
-              value: http://cao-supervisor.cao-cluster.svc.cluster.local:9889
+              value: http://cao-server.cao-cluster.svc.cluster.local:9889
             - name: CAO_ELASTIC_BROKER_URL
               value: http://cao-worker-broker.cao-cluster.svc.cluster.local:9890
             - name: CAO_ELASTIC_BROKER_TOKEN
@@ -76,10 +76,14 @@ spec:
             # no per-worker Service or HTTP API; terminals are owned and routed
             # by the central server. Bridge mode needs the cao-runtime-token
             # Secret (key "token") in this namespace, shared with the supervisor.
+            # "bridge" is the default in this example now. The alternative,
+            # "server", mints a full cao-server plus a Service per worker - which
+            # is the topology #745 replaced, kept selectable because a cluster
+            # without the runtime-token Secret cannot run bridge workers at all.
             - name: CAO_ELASTIC_WORKER_MODE
-              value: "server"
+              value: "bridge"
             - name: CAO_ELASTIC_CENTRAL_URL
-              value: http://cao-supervisor.cao-cluster.svc.cluster.local:9889
+              value: http://cao-server.cao-cluster.svc.cluster.local:9889
             # Opt-in credential fallback for clusters where EKS Pod Identity is
             # not injecting. Set it to a role trusted by the cluster's OIDC
             # provider and every minted worker also gets a projected

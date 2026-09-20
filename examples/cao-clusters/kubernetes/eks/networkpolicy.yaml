@@ -1,7 +1,12 @@
 # NetworkPolicy — restrict access to worker pods' port 9889.
-# Only the supervisor can reach workers.
-# This is critical: cao-server is an unauthenticated command-execution surface;
-# NetworkPolicy is the minimum trust boundary in k8s.
+#
+# This policy only has work to do under CAO_ELASTIC_WORKER_MODE=server. Bridge
+# workers (the default here, #745) expose no port at all: they hold one OUTBOUND
+# channel to cao-server, so this policy reduces to deny-all for them and the
+# `from` list below is what still applies if a deployment switches back.
+#
+# It matters either way: cao-server is an unauthenticated command-execution
+# surface, and NetworkPolicy is the minimum trust boundary in k8s.
 #
 # These select `app.kubernetes.io/name: cao-elastic-worker`, the label broker.py
 # stamps on every worker pod it mints — so a worker that exists for 40 seconds is
@@ -23,11 +28,14 @@ spec:
     - Ingress
   ingress:
     - from:
-        # Allow supervisor to reach workers (remote agent placement via
-        # assign/handoff target_host)
+        # The central server places remote terminals, so under mode=server it is
+        # the pod that dials a worker's /sessions. It is cao-server and NOT
+        # cao-supervisor here: placement is a scheduling decision and it moved
+        # with the server (#745). A supervisor entry would grant an execution pod
+        # a path to another execution pod's API for no caller that exists.
         - podSelector:
             matchLabels:
-              app.kubernetes.io/name: cao-supervisor
+              app.kubernetes.io/name: cao-server
         # The panel probes every node in its fleet registry to build the view.
         # Without this it renders the node as permanently unreachable.
         - podSelector:
@@ -48,8 +56,12 @@ spec:
 # NetworkPolicy — ingress to the broker's lease API.
 #
 # Two callers, and both are needed for a lease to complete its cycle:
-#   supervisor      POST /workers        to take a lease (assign_elastic)
+#   cao-server      POST /workers        to take a lease (assign_elastic)
 #   elastic worker  completion, terminal-ended, inbox and memory gateway calls
+#
+# The supervisor is deliberately absent (#745): taking a lease is a scheduling
+# decision and scheduling lives on cao-server, so the pod that runs the agent has
+# no reason to reach the one privileged API in the namespace - and now cannot.
 #
 # Leaving the worker out is a tempting simplification and a bad one: the worker's
 # release call would be dropped, the reaper would eventually mark the lease
@@ -72,7 +84,7 @@ spec:
     - from:
         - podSelector:
             matchLabels:
-              app.kubernetes.io/name: cao-supervisor
+              app.kubernetes.io/name: cao-server
         - podSelector:
             matchLabels:
               app.kubernetes.io/name: cao-elastic-worker
@@ -111,9 +123,9 @@ spec:
   policyTypes:
     - Egress
   egress:
-    # Narrow gateway upstream. Workers cannot reach the supervisor directly;
-    # the broker authenticates their per-worker release token and forwards only
-    # the explicit inbox and memory routes.
+    # Narrow gateway upstream: the CENTRAL server (#745). The broker
+    # authenticates a worker's per-worker release token and forwards only the
+    # explicit inbox and memory routes.
     #
     # The worker selector is the other direction and the other caller: `cao
     # worker` from outside the cluster, forwarded to whichever worker it names.
@@ -132,7 +144,7 @@ spec:
     - to:
         - podSelector:
             matchLabels:
-              app.kubernetes.io/name: cao-supervisor
+              app.kubernetes.io/name: cao-server
         - podSelector:
             matchLabels:
               app.kubernetes.io/name: cao-elastic-worker
@@ -190,11 +202,19 @@ spec:
   policyTypes:
     - Egress
   egress:
-    # Intra-namespace: the authenticated broker gateway and peer services.
-    # The supervisor's ingress policy independently rejects worker pods.
+    # Intra-namespace: the central server's API and channel, plus the
+    # authenticated broker gateway.
+    #
+    # This used to be bounded on the other side - cao-supervisor-ingress rejected
+    # worker pods, so "all intra-namespace" still could not reach the control API.
+    # That is no longer true: a bridge worker's channel and its MCP calls both go
+    # to cao-server:9889, so cao-server-ingress must admit it and the only
+    # remaining boundary is the runtime token plus per-request caller identity
+    # (#774). Stated at the ingress policy below as well, because a reader
+    # checking one side should not have to infer the other.
     - to:
         - podSelector: {}
-    # DNS: workers resolve the supervisor's/peers' service DNS names.
+    # DNS: workers resolve cao-server and the broker by service DNS name.
     # The k8s-app=kube-dns label matches CoreDNS/kube-dns on EKS and most
     # kubeadm clusters; other distros may label their DNS pods differently
     # (e.g. Rancher/k3s) — adjust the selector to your cluster's DNS pods.
@@ -265,29 +285,53 @@ spec:
         - port: 80
           protocol: TCP
 ---
-# NetworkPolicy — restrict access to supervisor pod.
-# Workers deliberately cannot reach this port. Their callbacks and shared-memory
-# calls go to the broker's authenticated, allowlisted gateway; only the broker
-# can forward those requests here.
+# NetworkPolicy — ingress to the ONE API in the namespace (#745).
 #
-# The panel still needs the full API for fleet probes. The broker runs no agent
-# and forwards only the routes it names one by one, so it is the narrow
-# application-layer boundary NetworkPolicy itself cannot express.
+# This replaces cao-supervisor-ingress. The supervisor has no inbound port left,
+# so there is nothing to allow or deny there; what needs bounding is the central
+# server, which every execution pod is now a legitimate client of.
+#
+# Be clear about what changed in the trust model, because it is a real loss and
+# not a wash. Previously NetworkPolicy itself kept worker pods away from the
+# control API: their callbacks had to pass through the broker's allowlisted
+# gateway, which forwards only named routes. A bridge runtime holds an OUTBOUND
+# channel to this server and its agent's MCP tool calls dial this API directly,
+# so that network-layer separation cannot exist here by construction. The
+# boundary is now the application layer:
+#
+#   * WS /runtime/channel requires the shared CAO_RUNTIME_TOKEN and fails closed
+#     without it;
+#   * a tool call carries the caller's terminal id, and the server decides what
+#     that terminal may do rather than trusting the pod it came from.
+#
+# The shared token means any pod holding it can act as any runtime, which is
+# exactly what #774 replaces with per-runtime delegated credentials. Until then,
+# what is enforced here is "inside this namespace, on this one port".
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: cao-supervisor-ingress
+  name: cao-server-ingress
   namespace: cao-cluster
   labels:
     app.kubernetes.io/part-of: cao-fleet
 spec:
   podSelector:
     matchLabels:
-      app.kubernetes.io/name: cao-supervisor
+      app.kubernetes.io/name: cao-server
   policyTypes:
     - Ingress
   ingress:
     - from:
+        # The supervisor and every minted worker: one outbound runtime channel
+        # each, plus their agents' MCP tool calls.
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cao-supervisor
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cao-elastic-worker
+        # The broker: the workers' allowlisted callback gateway forwards here,
+        # and it polls /runtimes to decide whether a bridge worker is usable.
         - podSelector:
             matchLabels:
               app.kubernetes.io/name: cao-worker-broker
@@ -296,6 +340,60 @@ spec:
         - podSelector:
             matchLabels:
               app.kubernetes.io/name: cao-fleet-panel
+      ports:
+        - port: 9889
+          protocol: TCP
+---
+# NetworkPolicy — restrict egress FROM the central server (#745).
+#
+# The tightest egress in the namespace, and it can be: this pod installs no
+# provider, calls no model, and fetches no credentials, so it needs neither
+# vendor HTTPS nor the Pod Identity endpoint. DNS plus the broker's lease API is
+# the whole list.
+#
+# Without a policy of this policyType selecting it, the pod that owns all the
+# orchestration state would have unrestricted egress - including IMDS - which is
+# the same one-sided boundary cao-supervisor-egress was written to close.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cao-server-egress
+  namespace: cao-cluster
+  labels:
+    app.kubernetes.io/part-of: cao-fleet
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: cao-server
+  policyTypes:
+    - Egress
+  egress:
+    # The broker's lease API. Scheduling moved here, so this is the one outbound
+    # call the server makes.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cao-worker-broker
+      ports:
+        - port: 9890
+          protocol: TCP
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # Under CAO_ELASTIC_WORKER_MODE=server the server also dials each worker's
+    # own API, and the runtime channel does not exist. Kept for that path; in
+    # bridge mode (the default) every executor dials IN and this matches nothing.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cao-elastic-worker
       ports:
         - port: 9889
           protocol: TCP
@@ -325,17 +423,25 @@ spec:
   policyTypes:
     - Egress
   egress:
-    # Intra-namespace, all ports. This is what lets the supervisor reach the
-    # broker on 9890 to take a lease, and then the leased worker on 9889 at the
-    # per-worker Service the broker created for it. Worker Services come and go
-    # per task, so a rule enumerating destinations by name could not work here;
-    # the bound that matters is "this namespace only", which this keeps.
+    # Intra-namespace on 9889 only (#745). Narrower than it used to be, because
+    # there is less to reach: the supervisor no longer takes leases from the
+    # broker on 9890 and no longer dials per-worker Services, so its whole
+    # outbound surface inside the cluster is the central API - the runtime
+    # channel it holds, and its agent's tool calls.
+    #
+    # Still expressed as "any pod in this namespace on 9889" rather than naming
+    # cao-server: under CAO_ELASTIC_WORKER_MODE=server the old direct-to-worker
+    # path returns, and worker Services come and go per task, so nothing can be
+    # enumerated by name.
     - to:
         - podSelector: {}
-    # DNS: the supervisor resolves the broker's and each leased worker's service
-    # name. Note a lease hands back an FQDN, not a bare pod name — a bare pod
-    # name does not resolve, which is the first thing that breaks in any
-    # cross-pod delegation and reads like a CAO bug.
+      ports:
+        - port: 9889
+          protocol: TCP
+    # DNS: the supervisor resolves the central server's service name. Note a
+    # lease hands back an FQDN, not a bare pod name — a bare pod name does not
+    # resolve, which is the first thing that breaks in any cross-pod delegation
+    # and reads like a CAO bug.
     - to:
         - namespaceSelector: {}
           podSelector:
@@ -346,7 +452,7 @@ spec:
           protocol: UDP
         - port: 53
           protocol: TCP
-    # Provider API egress. The supervisor runs a real provider too
+    # Provider API egress. The supervisor is where the provider actually runs
     # (CAO_INSTALL_PROFILES=code_supervisor:claude_code), so it needs the same
     # vendor-HTTPS path as workers — without this rule the supervisor's own
     # agent hangs with no network error. Identical carve-outs: private ranges
@@ -420,8 +526,10 @@ spec:
           protocol: UDP
         - port: 53
           protocol: TCP
-    # The fleet: the supervisor, and whichever workers hold a lease. Both answer
-    # the cao-server API on 9889.
+    # The fleet. In bridge mode that is ONE host - the central server - because
+    # every terminal in the namespace is served by it; the worker selector below
+    # only matters under CAO_ELASTIC_WORKER_MODE=server, where each worker runs
+    # its own API behind a per-task Service.
     #
     # This rule is only half of what makes a worker reachable. The panel dials
     # Service DNS, so the CNI has to allow the Service's CLUSTERIP, and it derives
@@ -442,7 +550,7 @@ spec:
     - to:
         - podSelector:
             matchLabels:
-              app.kubernetes.io/name: cao-supervisor
+              app.kubernetes.io/name: cao-server
         - podSelector:
             matchLabels:
               app.kubernetes.io/name: cao-elastic-worker

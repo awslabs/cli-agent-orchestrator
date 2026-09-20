@@ -59,9 +59,10 @@ log = logging.getLogger("cao.broker")
 NAMESPACE = os.environ.get("CAO_ELASTIC_NAMESPACE", "cao-cluster")
 WORKER_IMAGE = os.environ["CAO_ELASTIC_WORKER_IMAGE"]
 WORKSPACE_PVC = os.environ.get("CAO_ELASTIC_WORKSPACE_PVC", "cao-elastic-workspace")
-SUPERVISOR_API_URL = os.environ.get("CAO_SUPERVISOR_API_URL", "http://cao-supervisor:9889").rstrip(
-    "/"
-)
+# The CENTRAL server (#745). Named CAO_SUPERVISOR_API_URL for compatibility with
+# deployments that predate the split; what it points at is the one cao-server in
+# the namespace, which is no longer the supervisor pod.
+SUPERVISOR_API_URL = os.environ.get("CAO_SUPERVISOR_API_URL", "http://cao-server:9889").rstrip("/")
 BROKER_PUBLIC_URL = os.environ.get("CAO_ELASTIC_BROKER_URL", "http://cao-worker-broker:9890")
 BROKER_TOKEN = os.environ["CAO_ELASTIC_BROKER_TOKEN"]
 WORKSPACE_ROOT = os.environ.get("CAO_ELASTIC_WORKSPACE_ROOT", "/home/cao/workspace/workers")
@@ -97,8 +98,12 @@ def _worker_mode() -> str:
 
 
 def _central_url() -> str:
-    """The shared cao-server bridge workers dial. Defaults to the supervisor,
-    which in the bridge topology IS the central server."""
+    """The shared cao-server bridge workers dial.
+
+    Defaults to SUPERVISOR_API_URL, which in this topology already names the
+    central server - the two are the same address, kept as separate variables
+    only so a deployment can point the worker channel somewhere else.
+    """
     return os.environ.get("CAO_ELASTIC_CENTRAL_URL", SUPERVISOR_API_URL).rstrip("/")
 
 
@@ -388,7 +393,7 @@ def _worker_deployment(
             # The agent's MCP tools and orchestration helpers dial the CENTRAL
             # API, never localhost — these flow into the tmux session env (the
             # CAO_ prefix passthrough) and into provider MCP configs.
-            client.V1EnvVar(name="CAO_API_HOST", value=parsed.hostname or "cao-supervisor"),
+            client.V1EnvVar(name="CAO_API_HOST", value=parsed.hostname or "cao-server"),
             client.V1EnvVar(name="CAO_API_PORT", value=str(parsed.port or 9889)),
             # Memory goes straight to the central server's authenticated
             # internal memory routes; the broker gateway is not in this path.
@@ -812,7 +817,7 @@ def _worker_machine(worker_id: str) -> dict[str, str]:
     Service that no longer exists.
     """
     if _worker_mode() == "bridge":
-        host = urlparse(_central_url()).hostname or "cao-supervisor"
+        host = urlparse(_central_url()).hostname or "cao-server"
     else:
         host = f"{_workload_name(worker_id)}.{NAMESPACE}.svc.cluster.local"
     return {

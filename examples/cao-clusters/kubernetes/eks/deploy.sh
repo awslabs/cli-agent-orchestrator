@@ -203,6 +203,18 @@ else
     --from-literal="token=$(openssl rand -hex 24)"
 fi
 
+# The runtime-channel token, on the same terms. Shared by the central server and
+# every execution pod: the server accepts a bridge only with it, and a bridge
+# refuses to start without it, so a regenerated token would silently strand every
+# running executor - hence kept across runs like the two above.
+if kubectl -n cao-cluster get secret cao-runtime-token >/dev/null 2>&1; then
+  echo "runtime token already present, keeping it"
+else
+  echo "minting runtime token"
+  kubectl -n cao-cluster create secret generic cao-runtime-token \
+    --from-literal="token=$(openssl rand -hex 24)"
+fi
+
 # The panel token, on the same terms. Not optional: panel.yaml reads it through a
 # secretKeyRef with no `optional: true`, so a missing secret stops the pod at
 # CreateContainerConfigError rather than starting it unauthenticated. Kept across
@@ -215,12 +227,64 @@ else
     --from-literal="token=$(openssl rand -hex 24)"
 fi
 
+# The pre-#745 layout cannot be upgraded in place, and kubectl's error for that
+# is two screens of field diffs. Both objects below changed in ways Kubernetes
+# forbids updating:
+#
+#   * the supervisor StatefulSet dropped its `volumeClaimTemplates` (its state is
+#     an emptyDir now - nothing there needs to outlive the pod);
+#   * the supervisor Service became headless, and `spec.clusterIP` is immutable.
+#
+# Deleting them is the operator's call, not this script's: the StatefulSet may be
+# running an agent mid-task, and its old `state-cao-supervisor-0` PVC holds the
+# only copy of the conversation this topology used to keep there. So say exactly
+# what to run and stop.
+LEGACY=""
+if [ -n "$(kubectl -n cao-cluster get statefulset cao-supervisor \
+             -o jsonpath='{.spec.volumeClaimTemplates}' 2>/dev/null)" ]; then
+  LEGACY="statefulset/cao-supervisor"
+fi
+if [ "$(kubectl -n cao-cluster get service cao-supervisor \
+          -o jsonpath='{.spec.clusterIP}' 2>/dev/null)" != "None" ] &&
+   kubectl -n cao-cluster get service cao-supervisor >/dev/null 2>&1; then
+  LEGACY="${LEGACY:+$LEGACY }service/cao-supervisor"
+fi
+if [ -n "$LEGACY" ]; then
+  cat >&2 <<MSG
+error: this namespace still runs the pre-#745 single-node layout, which cannot be
+       updated in place. Finish or drain any running task, then:
+
+         kubectl -n cao-cluster delete $LEGACY
+
+       The old state PVC is left alone deliberately. Nothing in the new layout
+       reads it, so keep it until you are sure you want it gone:
+
+         kubectl -n cao-cluster get pvc state-cao-supervisor-0
+
+       Re-run this script afterwards.
+MSG
+  exit 1
+fi
+
 echo "applying"
 kubectl apply -k "$RENDER"
 
-# The supervisor is a StatefulSet here, not a Deployment, and there is no worker
-# workload to wait for: a worker is a Deployment the broker mints per task, and
-# none is created by this apply at all.
+# The server first: a bridge cannot become Ready until the server it dials
+# answers, so waiting on the supervisor before the server would just spend the
+# supervisor's timeout watching a backoff loop.
+#
+# Both are StatefulSets, not Deployments, and there is no worker workload to wait
+# for: a worker is a Deployment the broker mints per task, and none is created by
+# this apply at all.
+#
+# `rollout status` on a StatefulSet with updateStrategy OnDelete returns as soon
+# as the pod is Ready (it does not wait for an update it will never perform), so
+# this is still a real readiness gate for the server.
+kubectl -n cao-cluster rollout status statefulset/cao-server --timeout=600s
+# The supervisor's Ready means its runtime channel is established, not just that
+# uvicorn bound a port - the probe is an exec on the marker cao-bridge writes
+# after the hello is accepted. Generous, because it is behind a provider install
+# and two Bedrock warm-ups.
 kubectl -n cao-cluster rollout status statefulset/cao-supervisor --timeout=900s
 kubectl -n cao-cluster rollout status deployment/cao-worker-broker --timeout=300s
 kubectl -n cao-cluster rollout status deployment/cao-fleet-panel --timeout=300s

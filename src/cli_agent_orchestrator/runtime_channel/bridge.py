@@ -26,11 +26,13 @@ import re
 import signal
 import sys
 import tempfile
+from pathlib import Path
 from typing import Dict, Optional
 
 import websockets
 
 from cli_agent_orchestrator.clients.database import init_db
+from cli_agent_orchestrator.constants import CAO_HOME_DIR
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.runtime_channel.protocol import (
     PROTOCOL_VERSION,
@@ -67,6 +69,43 @@ REPLAY_BUFFER_BYTES = 1024 * 1024  # per terminal capture stream
 
 _OUTPUT_TOPIC = re.compile(r"^terminal\.([a-f0-9]{8})\.output$")
 _STATUS_TOPIC = re.compile(r"^terminal\.([a-f0-9]{8})\.status$")
+
+# A bridge serves no HTTP, so there is nothing to GET for readiness. This file
+# exists exactly while the runtime channel is established and the hello has been
+# accepted, which is the only condition under which the pod can do any work:
+# the orchestrator reaches it over the channel, never inbound. An exec probe on
+# this path is therefore a true readiness signal rather than a liveness proxy.
+READY_FILE_ENV = "CAO_BRIDGE_READY_FILE"
+DEFAULT_READY_FILE = CAO_HOME_DIR / "bridge-connected"
+
+
+def ready_file_path() -> Path:
+    """Where the channel-established marker lives. Env override read per call."""
+    override = os.environ.get(READY_FILE_ENV, "").strip()
+    return Path(override) if override else DEFAULT_READY_FILE
+
+
+def mark_channel_ready() -> None:
+    """Announce an established channel. Never fatal.
+
+    A read-only or missing state mount must degrade to an unready pod, not to a
+    crashed runtime: the channel is up and usable either way, and killing the
+    process would discard live terminals to fix a reporting problem.
+    """
+    path = ready_file_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"{os.getpid()}\n")
+    except OSError as e:
+        logger.warning("could not write readiness marker %s (%s)", path, e)
+
+
+def clear_channel_ready() -> None:
+    """Withdraw readiness the moment the channel is gone."""
+    try:
+        ready_file_path().unlink(missing_ok=True)
+    except OSError as e:  # pragma: no cover - unlink on a live path
+        logger.warning("could not remove readiness marker (%s)", e)
 
 
 class Bridge:
@@ -588,6 +627,9 @@ class Bridge:
                 )
 
         logger.info("runtime channel established to %s", self._server_url)
+        # After the hello exchange and the replay, not at connect: a socket that
+        # opened but failed version negotiation is not a working runtime.
+        mark_channel_ready()
         async for raw in ws:
             frame: Frame = decode_frame(raw)
             if isinstance(frame, CommandFrame):
@@ -603,6 +645,9 @@ class Bridge:
 
     async def run(self) -> None:
         backoff = RECONNECT_BACKOFF_INITIAL
+        # A marker left behind by a killed predecessor sharing this mount would
+        # report a channel that does not exist, so start from unready.
+        clear_channel_ready()
         while not self._stop.is_set():
             try:
                 async with websockets.connect(
@@ -626,6 +671,7 @@ class Bridge:
                 logger.warning("runtime channel lost (%s); retrying in %.0fs", e, backoff)
             finally:
                 self._ws = None
+                clear_channel_ready()
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=backoff)
             except asyncio.TimeoutError:

@@ -1,5 +1,11 @@
-# Canonical elastic-worker deployment: one long-lived supervisor, one narrow
-# privileged broker, and worker pods that exist only for the duration of a task.
+# Canonical elastic-worker deployment (#745): ONE central cao-server that owns
+# the API and all state, execution-only pods that run agents and hold no state of
+# their own, one narrow privileged broker, and worker pods that exist only for
+# the duration of a task.
+#
+# The supervisor is one of those execution-only pods. It runs the participant's
+# agent and has no server, no inbound Service and no PVC - so the pod a person
+# talks *through* is no longer the pod that owns the conversation.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
@@ -7,9 +13,14 @@ resources:
   - storageclass-gp3.yaml
   - storage.yaml
   - rbac.yaml
+  # The one server in the namespace. Listed before the pods that dial it, though
+  # order does not matter to kubectl: a bridge retries with backoff until the
+  # server answers, so a fleet applied in any order converges.
+  - server.yaml
   # Base fleet registry the panel mounts. Jointly owned: this supplies the
-  # supervisor entry, and the broker adds and removes the worker entries as it
-  # leases and releases them, so the live object diverges from the file by design.
+  # central server entry, and the broker adds and removes the worker entries as
+  # it leases and releases them, so the live object diverges from the file by
+  # design.
   - configmap-fleet.yaml
   - broker.yaml
   - supervisor.yaml
@@ -27,9 +38,11 @@ resources:
   # canonical Bedrock default.
 
 # There is no statefulset-workers.yaml and no service-workers-headless.yaml: a
-# worker is a single-replica Deployment the broker mints per task, and the broker
-# gives each one its own ClusterIP Service, so there is no fixed fleet to address
-# by ordinal. Not a StatefulSet, because release is out of order - the broker
+# worker is a single-replica Deployment the broker mints per task, so there is no
+# fixed fleet to address by ordinal - and in bridge mode there is nothing to
+# address at all, because a worker dials the server rather than being dialled and
+# so gets no Service of its own. Not a StatefulSet, because release is out of
+# order - the broker
 # deletes whichever worker just finished, and a StatefulSet only scales down from
 # the highest ordinal.
 #
@@ -58,7 +71,9 @@ images:
   - name: <server-image>
     # Built from Dockerfile, which installs Claude Code from public npm
     # and carries the entrypoint that runs `cao init`, installs the profiles
-    # named in CAO_INSTALL_PROFILES, and execs cao-server.
+    # named in CAO_INSTALL_PROFILES, and then execs either cao-server or
+    # cao-bridge depending on CAO_NODE_MODE. One image serves both roles, which
+    # is why the server and the executors can never be on split tags.
     newTag: 2.4.1-el1
   - name: <broker-image>
     # Built from Dockerfile.broker.
