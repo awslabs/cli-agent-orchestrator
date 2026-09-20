@@ -544,6 +544,20 @@ probe appeared in exactly one pod's pane. Note that `ps | grep cao-server` is
   where the outcome is genuinely unknown. Coverage: 6 tests, both halves
   mutation-checked; confirmed on the cluster by the run that had been wedged.
 
+- **The server stops deriving a second status opinion for panes it cannot see.**
+  Every remote launch logged three `Error in StatusMonitor: Terminal … not found
+  in database` tracebacks, visible in the cluster log for each of the runs above.
+  The cause is structural rather than cosmetic: the server republishes an
+  executor's output onto its own bus, so its `StatusMonitor` was regex-scanning
+  bytes from other pods to reach a verdict the registry already holds from the
+  runtime that owns the pane — and for the first chunks of a launch the central
+  row does not exist yet, which surfaced as a logged exception per chunk. The run
+  loop now skips terminals the registry calls remote (in a bridge process the
+  registry is empty, so a runtime keeps deriving status for its own panes exactly
+  as before), and a chunk for an id with no row is ignored rather than raised:
+  bytes legitimately arrive on both sides of a row's life. Coverage: 4 tests, both
+  guards mutation-checked.
+
 **Deferred to its own workstream:**
 
 - **Per-runtime delegated credentials** — explicitly #774's scope. Both the

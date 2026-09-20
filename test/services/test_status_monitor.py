@@ -10,6 +10,8 @@ import threading
 import time
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.status_monitor import (
     STALE_PROCESSING_BUFFER_QUIET_S,
@@ -1409,3 +1411,74 @@ class TestMidBurstProcessingProbe:
         sm._bursting["t1"] = True
         sm._schedule_screen_detection("t1", provider)
         assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+
+
+class TestChunksTheServerMustNotInterpret:
+    """The remote boundary reaches the status pipeline too (#745).
+
+    On a central server the output of every executor's pane is republished onto
+    the bus, so the monitor sees bytes for terminals that live in other pods and
+    for ids whose central row has not landed yet. Neither is its business, and
+    treating them as work produced three ERROR tracebacks per remote launch.
+    """
+
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_a_chunk_for_an_unknown_terminal_is_ignored_quietly(self, mock_pm):
+        mock_pm.get_provider.side_effect = ValueError("Terminal t-gone not found in database")
+        sm = StatusMonitor()
+
+        sm._process_chunk("t-gone", "some output")  # must not raise
+
+        # Nothing was attributed to an id with no row.
+        assert "t-gone" not in sm._buffers
+        assert "t-gone" not in sm._last_status
+
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_a_local_chunk_is_still_processed(self, mock_pm):
+        """The guard is about a missing row, not about giving up on lookups."""
+        mock_pm.get_provider.return_value = MagicMock(supports_screen_detection=False)
+        sm = StatusMonitor()
+        sm._loop = MagicMock()
+
+        sm._process_chunk("t1", "hello")
+
+        assert sm._buffers["t1"] == "hello"
+
+    def test_a_remote_terminal_is_recognised_through_the_registry(self):
+        with patch(
+            "cli_agent_orchestrator.runtime_channel.registry.runtime_registry"
+        ) as mock_registry:
+            mock_registry.is_remote.return_value = True
+            assert StatusMonitor._belongs_to_a_runtime("t-remote") is True
+            mock_registry.is_remote.assert_called_once_with("t-remote")
+
+    @pytest.mark.asyncio
+    async def test_the_run_loop_skips_a_terminal_that_lives_in_a_runtime(self):
+        """Its status is the runtime's verdict, pushed over the channel.
+
+        A second opinion derived here from republished bytes would cost the
+        server every executor's pane and could contradict the only process that
+        can see the pane.
+        """
+        import asyncio
+
+        from cli_agent_orchestrator.services.event_bus import bus
+
+        sm = StatusMonitor()
+        processed = []
+        with (
+            patch.object(StatusMonitor, "_belongs_to_a_runtime", staticmethod(lambda tid: True)),
+            patch.object(sm, "_process_chunk", side_effect=lambda *a: processed.append(a)),
+        ):
+            bus.set_loop(asyncio.get_running_loop())
+            task = asyncio.create_task(sm.run())
+            await asyncio.sleep(0)  # let it subscribe
+            bus.publish("terminal.t-remote.output", {"data": {"data": "bytes"}})
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        assert processed == []
