@@ -101,7 +101,7 @@ better than the one it replaces — one property genuinely regressed.
 
 | Component | Kubernetes kind | Storage | Inbound port | Lifecycle |
 |---|---|---|---|---|
-| `cao-server` | StatefulSet, one replica, `OnDelete` | EBS state + shared EFS workspace (read-only) | 9889 | Persistent |
+| `cao-server` | StatefulSet, one replica, `OnDelete` | EBS state + shared EFS workspace (read-only) | 9889 (API), 9891 (shared MCP) | Persistent |
 | `cao-supervisor` | StatefulSet, one replica | `emptyDir` state + shared EFS workspace | **none** | Persistent |
 | `cao-worker-broker` | Deployment, one replica | None | 9890 | Persistent |
 | `cao-worker-<id>` | Deployment, one replica, one per assignment | `emptyDir` state + shared EFS workspace | **none** in bridge mode | Released on callback |
@@ -180,6 +180,77 @@ this case — the one where nothing happened — is the case where the lease is 
 returned. The broker reaps it and records why; see [Reading the lease
 ledger](#reading-the-lease-ledger). Custom profiles should say "do all tool calls
 first, speak once at the end".
+
+<a id="the-shared-mcp-endpoint"></a>
+## The shared MCP endpoint
+
+The supervisor's agent does not run its own MCP server. It talks to one that runs
+as the `cao-mcp` sidecar in the `cao-server` pod, on port 9891.
+
+This exists because of a contradiction the rest of #745 creates. Taking a worker
+lease is a scheduling decision, so `CAO_ELASTIC_BROKER_URL` and
+`CAO_ELASTIC_BROKER_TOKEN` live only on `cao-server` and the supervisor has no
+network path to port 9890. But `assign_elastic` is an MCP *tool*, and a tool runs
+wherever the MCP server runs — so with a local MCP server in the supervisor pod,
+delegation failed in the pod that holds no credentials:
+
+```
+Elastic assignment failed: elastic workers are not configured: set
+CAO_ELASTIC_BROKER_URL and CAO_ELASTIC_BROKER_TOKEN on the supervisor
+```
+
+The fix is to move the tool, not the credential. One variable does it:
+
+```yaml
+- name: CAO_MCP_HTTP_URL
+  value: "http://cao-server.cao-cluster.svc.cluster.local:9891/mcp"
+```
+
+With that set, `utils/mcp_resolution.py` launches the provider's declared
+`cao-mcp-server` as `cao-mcp-stdio-bridge` instead — a stdio shim that registers
+no tools and holds no state, forwarding every call to the shared endpoint with
+this terminal's id as the caller identity and `CAO_RUNTIME_TOKEN` as the
+credential. No provider code knows the endpoint exists; the substitution happens
+at the one resolver every provider already funnels through, so it applies to
+Claude Code, Copilot, OpenCode, Kiro and Antigravity alike.
+
+What that buys: a pod running a command-capable agent can call a delegation tool
+without ever holding the credential that delegation needs. The tool executes in
+the server pod, under the server's identity, having already proved it holds the
+runtime token.
+
+Three details that are deliberate and easy to get wrong:
+
+- **The sidecar is in the server pod, not a Deployment of its own.** Its tools
+  read and write the same SQLite state the server owns, and that state is on a
+  `ReadWriteOnce` PVC no second pod can mount. Same pod, same volume, one writer
+  set.
+- **Port 9891, not the code default 9890.** 9890 is the broker's port everywhere
+  else here, and two services answering on one number is a debugging trap.
+- **Minted workers are NOT pointed at it.** `complete_assignment` reads
+  `CAO_ELASTIC_WORKER_ID` and `CAO_ELASTIC_RELEASE_TOKEN` from the process it runs
+  in, and those are minted per worker. Forward a worker's tools and the call
+  executes in the server pod, finds neither, and answers "complete_assignment is
+  only available inside an elastic worker" — breaking the result path. A worker
+  keeps a local MCP server, and gives up nothing: it is handed no broker *token*,
+  so it cannot lease further workers either way.
+
+Unset `CAO_MCP_HTTP_URL` and every pod goes back to a local MCP server. That is
+the default, and it is what a local (non-cluster) CAO install always does.
+
+To check the wiring on a running cluster:
+
+```bash
+# The endpoint answers, and refuses an unauthenticated caller (401/406, not a
+# hang — a hang here means NetworkPolicy, not MCP).
+kubectl -n cao-cluster exec cao-supervisor-0 -c cao-node -- \
+  curl -si -m 5 -o /dev/null -w '%{http_code}\n' \
+  http://cao-server.cao-cluster.svc.cluster.local:9891/mcp
+
+# The agent's own config points at the shim, not at cao-mcp-server.
+kubectl -n cao-cluster exec cao-supervisor-0 -c cao-node -- \
+  sh -lc 'cat ~/.cao/state/*/mcp.json 2>/dev/null || cat ~/.claude.json' | grep -i mcp
+```
 
 ## Prerequisites
 
@@ -576,6 +647,113 @@ it, and its terminals die with its tmux server. The state that survives is the
 registry row on `cao-server`, not the session, which is why the supervisor's state
 volume is an `emptyDir` — it makes "nothing durable lives in the pod that runs the
 agent" a property of the manifest instead of a claim in this README.
+
+<a id="restart-limitations"></a>
+### Restart limitations
+
+Stated as a list because the difference between "survives" and "resumes" is where
+the surprises are.
+
+| Event | What survives | What does not |
+|---|---|---|
+| `cao-server` replaced | Terminal rows on the PVC; every executor's tmux session and running agent; routing, rebuilt from each `hello` snapshot, including each terminal's status | The reconnect window: pods read `0/1`, an attach closes `4010`, and a call to a route that needs a runtime gets `503 runtime not connected` |
+| `cao-supervisor` replaced | The terminal rows and the conversation history in central state | **The live session.** tmux dies with the pod, so a running agent turn is lost. There is no automatic resumption — nothing re-launches the agent or replays its turn |
+| A worker pod replaced | The lease record on the broker, which the reaper settles | The assignment. A worker is per-task and is not meant to be replaced; a worker lost mid-task is reaped and reported, not retried |
+
+The middle row is the honest limitation of this slice. Durable *state* moved to
+the server, which is what makes a supervisor pod replaceable at all, but a live
+agent process is not state and does not move with it. Replacing a supervisor pod
+costs the profile install (~45s for Claude Code), two Bedrock warm-ups, and any
+in-flight turn. Plan a supervisor replacement for a quiet moment the same way you
+would plan the server's, and check for live work first:
+
+```bash
+kubectl -n cao-cluster exec cao-server-0 -- \
+  curl -fsS -H 'Host: localhost' http://localhost:9889/sessions
+```
+
+<a id="version-compatibility"></a>
+## Version compatibility and upgrades
+
+Every component in this namespace runs the **same image**, and that is the
+supported configuration. The runtime channel carries an explicit
+`PROTOCOL_VERSION` (`runtime_channel/protocol.py`, currently `1`), checked for
+**equality** on both sides of the `hello` exchange — there is no negotiation and no
+compatibility window.
+
+| Pairing | Result |
+|---|---|
+| Server and bridge on the same image | Supported |
+| Server and bridge on different images, same `PROTOCOL_VERSION` | Works, unsupported. Nothing checks anything else, so a route one side does not implement fails at call time rather than at connect time |
+| Different `PROTOCOL_VERSION` | Refused at `hello`, before any work is accepted |
+| Bridge with no `CAO_RUNTIME_TOKEN`, or the wrong one | Refused at connect (401/403) |
+
+What a version mismatch actually looks like matters, because it is not a crash.
+The server answers with its own `hello` and closes `1002`; the bridge raises
+`protocol version mismatch: server N, bridge M`, and its reconnect loop treats
+that like any other connection failure — it backs off and retries, with the
+readiness marker cleared in `finally`. So the pod **never becomes Ready and is
+never dispatched work**: it sits at `0/1`, logs the mismatch on every attempt, and
+keeps whatever tmux sessions it already had. Nothing half-works.
+
+An auth failure (401/403) is the one case handled differently: it is re-raised
+rather than retried, because retrying a rejected credential is noise. `cao-bridge`
+is PID 1, so the container exits and the pod goes to `CrashLoopBackOff` with
+`runtime channel authentication rejected` in its logs — a loud failure for a
+misconfiguration that no amount of waiting fixes.
+
+That gives the upgrade procedure its shape: the mismatch window is safe but not
+free, and a pod that is `0/1` for a long time is the thing to look for.
+
+```bash
+# 1. Build and push ONE tag, and apply it everywhere. deploy.sh renders every
+#    manifest from the same tag, which is what keeps this from drifting.
+examples/cao-clusters/kubernetes/eks/deploy.sh cao-workshop "${TAG}"
+
+# 2. Drain: check for live sessions and open leases before replacing anything.
+kubectl -n cao-cluster exec cao-server-0 -- \
+  curl -fsS -H 'Host: localhost' http://localhost:9889/sessions
+kubectl -n cao-cluster exec deploy/cao-worker-broker -- \
+  curl -fsS -H "X-CAO-Broker-Token: $(kubectl -n cao-cluster get secret \
+    cao-elastic-broker-token -o jsonpath='{.data.token}' | base64 -d)" \
+  http://localhost:9890/workers
+
+# 3. Executors first, server last. An old bridge against a new server is refused
+#    at hello and retries; replacing the executors first means the window is
+#    spent on pods that are already being replaced.
+kubectl -n cao-cluster rollout restart statefulset/cao-supervisor
+kubectl -n cao-cluster rollout status statefulset/cao-supervisor --timeout=900s
+
+# 4. Then the server, by the OnDelete procedure above.
+kubectl -n cao-cluster delete pod cao-server-0
+kubectl -n cao-cluster rollout status statefulset/cao-server --timeout=600s
+
+# 5. Confirm the fleet reassembled. Every executor must appear here; one that
+#    does not is either 0/1 (look for the mismatch or auth log) or gone.
+kubectl -n cao-cluster exec cao-server-0 -- \
+  curl -fsS -H 'Host: localhost' http://localhost:9889/runtimes
+kubectl -n cao-cluster get pods -l app.kubernetes.io/part-of=cao-elastic-fleet
+```
+
+Rollback is the same procedure with the previous tag, and it is safe in the
+direction that matters: the state PVC is the only thing not replaced, and schema
+migrations are forward-only. So rolling **back** across a migration is not
+supported — a server on an older image against a migrated database is the one
+combination to avoid. Keep the tag you are rolling back to, and if the rollback
+crosses a schema change, snapshot the EBS volume first:
+
+```bash
+kubectl -n cao-cluster get pvc state-cao-server-0 \
+  -o jsonpath='{.spec.volumeName}{"\n"}'
+aws ec2 create-snapshot --volume-id <handle> --description 'pre-rollback'
+```
+
+A mismatched bridge is diagnosed from its own logs, not from the server's:
+
+```bash
+kubectl -n cao-cluster logs cao-supervisor-0 -c cao-node --tail=40 | \
+  grep -i 'protocol\|hello\|401\|403'
+```
 
 ## The fleet panel
 
