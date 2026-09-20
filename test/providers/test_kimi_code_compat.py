@@ -2664,7 +2664,6 @@ class TestA3ToolRowLeak:
         "● Used Bash (ls -la) · 3 lines",
         "● Used Grep (pattern=foo) · 1 line",
         "● Running a command · $ uname -a",
-        "● Using handoff({...})",
     )
 
     #: Ordinary prose that merely starts with the same verb.
@@ -3108,7 +3107,6 @@ class TestD6McpToolRows:
         "● Used Bash · 3 lines",
         "● Used Bash (ls -la) · 3 lines",
         "● Running a command · $ uname -a",
-        "● Using handoff({...})",
     )
 
     #: Ordinary prose that must remain answer text.

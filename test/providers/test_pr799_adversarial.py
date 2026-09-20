@@ -1536,19 +1536,24 @@ class TestPR799AdversarialThirdRound:
         """The positive controls the escape-free rule exists for."""
 
         for row in [
-            "● Used Read (ANSWER_SPEC.md)",
+            "● Used Read (ANSWER_SPEC.md) · 10 lines",
             "● Used find_profiles · MCP/cao-mcp-server (kimi)",
-            "● Using handoff({...})",
             "● Used Read (report.txt) · 3 lines",
-            "● Used memory.recall (query=x)",
+            "● Used memory.recall (query=x) · 2 lines",
             "● Running a command · $ uname -a",
         ]:
             assert kt.is_tool_call_row(row) is True, row
 
     def test_a_bare_verb_and_word_is_prose(self):
-        """No structural evidence, so it is answer content, not a tool row."""
+        """No `·` detail separator, so it is answer content, not a tool row."""
 
-        for row in ["● Used Read", "● Used Python", "• Used pandas", "● Using Docker"]:
+        for row in [
+            "● Used Read",
+            "● Used Python",
+            "• Used pandas",
+            "● Using Docker",
+            "• Using Python (3.12)",
+        ]:
             assert kt.is_tool_call_row(row) is False, row
 
     def test_a_prose_answer_after_a_tool_verb_is_extracted(self, monkeypatch):
@@ -1592,3 +1597,53 @@ class TestPR799AdversarialThirdRound:
         )
         result, _ = _last(monkeypatch, pane)
         assert result == "• Hello!"
+
+    def test_prose_with_a_parenthesised_argument_is_not_a_tool_row(self, monkeypatch):
+        """A3-F1: `• Using Python (3.12)` is prose, not execution plumbing."""
+
+        pane = "\n".join(
+            [
+                "💫 Which runtime does this example use?",
+                "• Using Python (3.12)",
+                "Run python main.py to start.",
+                "💫",
+            ]
+        )
+        result, _ = _last(monkeypatch, pane)
+        assert result == "• Using Python (3.12)\nRun python main.py to start."
+
+    def test_a_code_line_shaped_like_a_boot_message_survives(self, monkeypatch):
+        """A3-F2: a heredoc body reading as a boot message is not chrome."""
+
+        pane = "\n".join(
+            [
+                "💫 Write a shell script that prints a startup message",
+                "• Run this script:",
+                "cat <<'EOF'",
+                "Loading configuration...",
+                "EOF",
+                "exec myapp",
+                "💫",
+            ]
+        )
+        result, _ = _last(monkeypatch, pane)
+        assert "Loading configuration..." in result
+        assert "exec myapp" in result
+
+    def test_real_boot_chrome_still_ends_the_region(self, monkeypatch):
+        """The guard: a boot row the renderer drew still ends the region."""
+
+        pane = "\n".join(
+            [
+                "✨ go",
+                "● Answer line",
+                "⠙ Loading configuration...",
+                "not part of the answer",
+                "╭──────╮",
+                "│ >    │",
+                "╰──────╯",
+                "",
+            ]
+        )
+        result, _ = _last(monkeypatch, pane)
+        assert result == "● Answer line"

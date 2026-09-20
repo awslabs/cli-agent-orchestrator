@@ -271,6 +271,11 @@ KIMI_NO_AUTO_UPDATE_ENV = {
 #: variable.
 KIMI_PALETTE_ENV_UNSET = ("COLORTERM",)
 
+#: The braille indicator slot the renderer puts on its boot/progress rows
+#: (`⠋ Loading configuration...`). A boot-chrome row ends the response region
+#: only when it carries this slot or styling — see `_locate_response_region`.
+_SPINNER_SLOT_RE = re.compile(r"[\u2800-\u28ff]")
+
 #: A3-5 — explicit opt-in for answering Kimi Code's workspace-trust dialog.
 #:
 #: Measured against Kimi Code 0.43.1 (A3-5 probe, see
@@ -2101,7 +2106,7 @@ class KimiCliProvider(BaseProvider):
         # from a slice: a tool-payload row carries no marker of its own, so the
         # header that identifies it has to be in scope (D6).
         row_kinds = kt.classify_rows(raw_lines, clean_lines, self._spinner_semantics())
-        layout_region = self._locate_response_region(row_kinds)
+        layout_region = self._locate_response_region(row_kinds, raw_lines)
         if layout_region is not None:
             layout_start, layout_end = layout_region
             return self._collect_response_text(
@@ -2189,6 +2194,7 @@ class KimiCliProvider(BaseProvider):
     @staticmethod
     def _locate_response_region(
         kinds: List[kt.KimiLineKind],
+        raw_lines: Optional[List[str]] = None,
     ) -> Optional[Tuple[int, int]]:
         """Locate the response region from row kinds alone.
 
@@ -2202,6 +2208,16 @@ class KimiCliProvider(BaseProvider):
         exactly where that chrome starts. Falling through to end-of-capture
         keeps a pane whose composer was pushed out of the capture window
         working.
+
+        ``BOOT_CHROME`` is the one anchor that also needs to be *shaped* like boot
+        chrome. Its weakest escape-free form is bare prose — `Loading
+        configuration...` — and an answer that quotes one (a shell heredoc was
+        the reproduced case) would otherwise end the region and truncate the
+        answer at that line. The renderer draws its boot rows with the spinner
+        slot and its own colour, so a row anchors only when it carries the
+        braille indicator glyph or an SGR sequence. The other anchors are already
+        confirmed structurally: a composer needs its frame, a dialog needs the
+        whole dialog, and the footer is measured text.
         """
 
         echo_idx = -1
@@ -2216,11 +2232,16 @@ class KimiCliProvider(BaseProvider):
             kt.KimiLineKind.APPROVAL_DIALOG,
             kt.KimiLineKind.TRUST_DIALOG,
             kt.KimiLineKind.STATUS_FOOTER,
-            kt.KimiLineKind.BOOT_CHROME,
         )
         for index in range(echo_idx + 1, len(kinds)):
-            if kinds[index] in end_anchors:
-                return echo_idx + 1, index
+            kind = kinds[index]
+            if kind is kt.KimiLineKind.BOOT_CHROME:
+                raw = raw_lines[index] if raw_lines and index < len(raw_lines) else ""
+                if not (_SPINNER_SLOT_RE.search(raw or "") or "\x1b[" in (raw or "")):
+                    continue
+            elif kind not in end_anchors:
+                continue
+            return echo_idx + 1, index
         return echo_idx + 1, len(kinds)
 
     def _classify_response_region(
@@ -2256,10 +2277,27 @@ class KimiCliProvider(BaseProvider):
             kind = kinds[i] if i < len(kinds) else kt.KimiLineKind.BLANK
             if kind is kt.KimiLineKind.BLANK:
                 continue
+            if kind is kt.KimiLineKind.BOOT_CHROME and not self._boot_chrome_is_shaped(
+                raw_lines[i] if i < len(raw_lines) else ""
+            ):
+                # Inside the response region a boot *message* that the renderer
+                # did not draw as boot chrome — no spinner slot, no styling — is
+                # answer text. The reproduced case is a shell heredoc whose body
+                # is `Loading configuration...`, which was dropped from the
+                # extracted script. Real boot rows carry the slot and colour.
+                kind = kt.KimiLineKind.CONTENT
             region_kinds.append(kind)
             if kind in kt.ANSWER_KINDS:
                 answers.append(clean_line.strip())
         return answers, region_kinds
+
+    #: True when a boot-chrome row is drawn as boot chrome: it carries the
+    #: renderer's braille indicator slot or an SGR sequence. The weakest
+    #: escape-free shape of a boot message is plain prose, which is also what an
+    #: answer that quotes one looks like.
+    @staticmethod
+    def _boot_chrome_is_shaped(raw_line: str) -> bool:
+        return bool(_SPINNER_SLOT_RE.search(raw_line or "") or "\x1b[" in (raw_line or ""))
 
     @staticmethod
     def _reject_private_content(scope_kinds: List[kt.KimiLineKind], *, has_answers: bool) -> None:

@@ -387,15 +387,17 @@ TOOL_CALL_RE = re.compile(
     + r")"
 )
 # The escape-free form. A sentence that merely *begins* with a tool verb is
-# answer content, so a row is a tool row only when it carries structural
-# evidence the renderer itself draws: the measured `·` detail separator, or a
-# parenthesised argument list.
+# answer content, so a row is a tool row only when it carries the renderer's own
+# structural evidence: the measured `·` detail separator.
 #
-# The bare `<verb> <identifier>` shape deliberately does NOT qualify. It carries
-# nothing but text, and text is not UI state — the same doctrine that keeps
-# `• Used Python` and `• Used pandas` answers rather than execution plumbing.
-# The measured collapse is always `● Used <Tool> (<arg>) · <N> lines`, so the
-# evidence is present whenever the renderer emitted it.
+# Neither the bare `<verb> <word>` shape nor a parenthesised argument list is
+# enough on its own, because both are also how ordinary prose looks —
+# `• Used Python` and `• Using Python (3.12)` were each reproduced as answers
+# that this rule refused. Every measured completed tool row carries the `·`
+# detail separator (`● Used <Tool> (<arg>) · <N> lines`, `● Used find_profiles ·
+# MCP/cao-mcp-server`), so requiring it loses no measured shape while keeping
+# prose out. A row still in flight is a braille spinner, which
+# :func:`is_live_spinner_line` handles separately.
 TOOL_CALL_CLEAN_RE = re.compile(
     r"^\s*[•●]\s*(?:"
     + r"Running a command"
@@ -406,10 +408,6 @@ TOOL_CALL_CLEAN_RE = re.compile(
     + _TOOL_ARG_LIST
     + r")?"
     + _TOOL_DETAIL_SEP
-    + r"|(?:Used|Using|Calling)[^\S\n]+"
-    + _TOOL_IDENTIFIER
-    + _TOOL_ARG_LIST
-    + r"[^\S\n]*$"
     + r")"
 )
 
