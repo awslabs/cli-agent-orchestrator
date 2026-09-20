@@ -161,8 +161,12 @@ RUN if [ "${INSTALL_KIRO_CLI}" = "1" ]; then \
 # user; a bare `useradd` would fail the build on one that does.
 RUN id -u cao >/dev/null 2>&1 || useradd --create-home --shell /bin/bash cao
 
-RUN --mount=from=builder,source=/build/dist,target=/tmp/dist \
-    pip install --no-cache-dir /tmp/dist/*.whl
+# COPY --from rather than BuildKit's `RUN --mount=from=...`: the mount form
+# silently no-ops on non-BuildKit builders (kaniko builds the layer with an
+# EMPTY /tmp/dist and pip fails), and the wheel is small enough that the extra
+# layer costs nothing next to the provider install above.
+COPY --from=builder /build/dist /tmp/dist
+RUN pip install --no-cache-dir /tmp/dist/*.whl && rm -rf /tmp/dist
 
 # Credentials-free mock provider binary for smoke tests (`--provider mock_cli`).
 # Real deployments install an authenticated provider CLI on top of this image.
