@@ -217,6 +217,24 @@ class Bridge:
             for tid, buf in self._buffers.items()
         ]
 
+    def _terminal_statuses(self) -> dict:
+        """Current status per live terminal, for the hello snapshot.
+
+        A terminal the runtime cannot read a verdict for is left out rather
+        than reported as UNKNOWN: absent means "no claim", and the server's
+        own UNKNOWN default already covers that.
+        """
+        statuses = {}
+        for tid in self._buffers:
+            try:
+                status = status_monitor.get_status(tid)
+            except Exception as e:  # a status read must never fail the hello
+                logger.warning("could not read status for %s at hello: %s", tid, e)
+                continue
+            if status != TerminalStatus.UNKNOWN:
+                statuses[tid] = status
+        return statuses
+
     # --- command execution (server → runtime) ---
 
     async def _handle_command(self, frame: CommandFrame) -> None:
@@ -584,6 +602,7 @@ class Bridge:
                     protocol_version=PROTOCOL_VERSION,
                     runtime_id=self._runtime_id,
                     streams=self._stream_positions(),
+                    statuses=self._terminal_statuses(),
                 )
             )
         )

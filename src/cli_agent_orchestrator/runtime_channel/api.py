@@ -123,6 +123,14 @@ async def runtime_channel(ws: WebSocket) -> None:
                 ),
             )
         )
+    # Seed the status cache from the same snapshot. Status is pushed on change,
+    # so without this a server that restarted while a terminal sat quiescent
+    # would answer UNKNOWN until the agent next moved — indefinitely, for an
+    # idle agent. Only terminals this hello actually bound are seeded.
+    for terminal_id, reported in hello.statuses.items():
+        if runtime_registry.runtime_for_terminal(terminal_id) == runtime_id:
+            runtime_registry.set_status(terminal_id, reported)
+
     await ws.send_text(
         encode_frame(
             HelloFrame(protocol_version=PROTOCOL_VERSION, runtime_id="server", resume=resume)

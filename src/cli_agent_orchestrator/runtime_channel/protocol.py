@@ -177,13 +177,19 @@ class HelloFrame(_FrameBase):
 
     The runtime advertises its live streams and their end positions; the
     server replies with resume positions per stream. Resume inside the replay
-    window replays; outside it the runtime emits a GapFrame instead."""
+    window replays; outside it the runtime emits a GapFrame instead.
+
+    ``statuses`` carries the runtime's current verdict per live terminal.
+    Status is only ever pushed on change, so a server that restarted while a
+    terminal sat quiescent would otherwise answer UNKNOWN until the agent
+    happened to move — the runtime knows the answer, so it states it here."""
 
     kind: Literal[FrameKind.HELLO] = FrameKind.HELLO
     protocol_version: int
     runtime_id: str = Field(min_length=1)
     streams: List[StreamPosition] = Field(default_factory=list)
     resume: List[StreamPosition] = Field(default_factory=list)
+    statuses: Dict[TerminalId, TerminalStatus] = Field(default_factory=dict)
 
 
 class HeartbeatFrame(_FrameBase):
