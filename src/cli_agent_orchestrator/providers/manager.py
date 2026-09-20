@@ -14,7 +14,11 @@ from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
 from cli_agent_orchestrator.providers.cursor_cli import CursorCliProvider
 from cli_agent_orchestrator.providers.grok_cli import GrokCliProvider
 from cli_agent_orchestrator.providers.hermes import HermesProvider
-from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider, UnsupportedKimiError
+from cli_agent_orchestrator.providers.kimi_cli import (
+    KimiCliProvider,
+    KimiDialect,
+    UnsupportedKimiError,
+)
 from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
 from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
 from cli_agent_orchestrator.providers.minimax_code import MiniMaxCodeProvider
@@ -275,10 +279,11 @@ class ProviderManager:
         return provider
 
     def cleanup_provider(self, terminal_id: str) -> bool:
-        """Cleanup a provider, retaining retryable Grok state on failure.
+        """Cleanup a provider, retaining retryable private state on failure.
 
         Grok's private home can only be deleted after its escaped updater has
-        been positively stopped or ruled out.  A ``False`` return therefore
+        been positively stopped or ruled out, and Kimi Code's home holds a copy
+        of the operator's credentials.  A ``False`` return therefore
         deliberately keeps the map entry (and lets the service keep DB
         metadata) so a later lifecycle retry does not lose the only route to
         that deterministic home.
@@ -322,6 +327,47 @@ class ProviderManager:
                 logger.info(
                     "Cleaned up restored MiniMax Code provider for terminal: %s", terminal_id
                 )
+            elif metadata and metadata.get("provider") == ProviderType.KIMI_CLI.value:
+                # Kimi Code copies the operator's credentials, MCP configuration
+                # and Kimi state into a deterministic managed home, so a restart
+                # that loses the provider instance would otherwise leak them.
+                #
+                # The removal is deliberately *variant-independent* while the
+                # reconstruction above stays fail-closed on a NULL/unknown
+                # variant. Two concrete lifecycle reasons prove a managed home
+                # can exist for a terminal whose persisted variant is not
+                # ``code``:
+                #
+                # * ``initialize()`` materialises the home, and therefore copies
+                #   the credentials, before it returns; the service persists
+                #   ``provider_variant`` only afterwards, so a crash inside that
+                #   window leaves a credential-bearing home on a NULL-variant row
+                #   (reproduced: cleanup reported success while the copied
+                #   ``auth.json`` remained on disk);
+                # * a terminal re-launched under the other dialect keeps the home
+                #   its earlier CODE launch created.
+                #
+                # Nothing about the *dialect* is inferred here — no provider is
+                # reconstructed for a NULL/unknown row — and the deletion target
+                # is this terminal's own deterministic path inside CAO's managed
+                # root, validated before any recursive delete. ``cleanup()`` is a
+                # no-op returning True when there is no such home, which is the
+                # ordinary legacy case.
+                restored_kimi_provider = KimiCliProvider(
+                    terminal_id,
+                    metadata["tmux_session"],
+                    metadata["tmux_window"],
+                    metadata.get("agent_profile"),
+                )
+                variant = metadata.get("provider_variant")
+                if variant == KimiDialect.CODE.value:
+                    restored_kimi_provider.restore_runtime_variant(variant)
+                if restored_kimi_provider.cleanup() is False:
+                    logger.warning(
+                        "Cleanup deferred for restored Kimi Code provider: %s", terminal_id
+                    )
+                    return False
+                logger.info("Cleaned up restored Kimi provider for terminal: %s", terminal_id)
             return True
         except Exception as e:
             logger.error(f"Failed to cleanup provider for terminal {terminal_id}: {e}")

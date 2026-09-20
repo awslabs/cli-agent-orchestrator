@@ -319,3 +319,81 @@ class TestTrustTraversalBudget:
         assert result.trust_truncated is False
         assert len(result.trust_records) == MAX_TRUST_ENTRIES
         assert counter["pulled"] == MAX_TRUST_ENTRIES
+
+
+class TestPreservedTreeSymlinkPolicy:
+    """Finding 3 (P2) — a preserved tree keeps a user's links *and* their meaning.
+
+    ``skills/`` and ``plugins/`` are ordinary preserved trees, so their symlinks
+    are user semantics and are reproduced verbatim. That is correct only while the
+    link still names the same target after the tree moves: the runtime home is a
+    different directory, so a *relative* link that left the source home left the
+    runtime home too and dangled — reproduced, a linked shared skills directory
+    existed in the real home and did not exist for the worker. Absolute links are
+    stable, and relative links inside the tree keep their text because the
+    preserved structure resolves them the same way.
+    """
+
+    def test_external_relative_link_keeps_its_target(self, tmp_path):
+        """The linked-in skill is readable from the runtime home."""
+
+        source = tmp_path / "src"
+        skills = source / "skills"
+        skills.mkdir(parents=True)
+        shared = tmp_path / "shared-skills"
+        shared.mkdir()
+        (shared / "SKILL.md").write_text("shared skill")
+        # A link that leaves the source home, exactly as an operator would make it.
+        (skills / "shared").symlink_to(os.path.relpath(shared, skills))
+
+        result = _build(source, tmp_path / "temp")
+
+        link = result.home / "skills" / "shared"
+        assert link.is_symlink()
+        assert link.exists(), "the linked skill must still resolve in the runtime home"
+        assert (link / "SKILL.md").read_text() == "shared skill"
+
+    def test_internal_relative_link_is_preserved_verbatim(self, tmp_path):
+        """A link inside the tree keeps its relative text and still resolves."""
+
+        source = tmp_path / "src"
+        skills = source / "skills"
+        skills.mkdir(parents=True)
+        (skills / "SKILL.md").write_text("internal skill")
+        (skills / "alias").symlink_to("SKILL.md")
+
+        result = _build(source, tmp_path / "temp")
+
+        link = result.home / "skills" / "alias"
+        assert os.readlink(link) == "SKILL.md"
+        assert link.read_text() == "internal skill"
+
+    def test_absolute_link_keeps_its_target(self, tmp_path):
+        source = tmp_path / "src"
+        skills = source / "skills"
+        skills.mkdir(parents=True)
+        shared = tmp_path / "shared-skills"
+        shared.mkdir()
+        (shared / "SKILL.md").write_text("absolute skill")
+        (skills / "shared").symlink_to(shared)
+
+        result = _build(source, tmp_path / "temp")
+
+        link = result.home / "skills" / "shared"
+        assert os.readlink(link) == str(shared)
+        assert link.exists()
+
+    def test_a_link_that_already_dangled_does_not_abort_the_build(self, tmp_path):
+        """Rebasing must not turn a source-side dangling link into a failure."""
+
+        source = tmp_path / "src"
+        skills = source / "skills"
+        skills.mkdir(parents=True)
+        (skills / "gone").symlink_to("nested/missing")
+
+        result = _build(source, tmp_path / "temp")
+
+        link = result.home / "skills" / "gone"
+        assert result.home.is_dir()
+        assert link.is_symlink()
+        assert not link.exists()

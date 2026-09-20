@@ -900,6 +900,18 @@ class KimiCodeRuntimeHomeBuilder:
         directory into their home, so links are reproduced verbatim
         (``symlinks=True``) and never walked through.
 
+        Verbatim reproduction is only correct for links that keep their meaning
+        when the tree moves. An *absolute* link does, and a *relative* link that
+        stays inside the tree does too (the structure is preserved, so the same
+        relative text resolves to the same place). A relative link whose target
+        lies **outside** the tree does not: the text is reproduced but it now
+        resolves under the disposable home, so the link dangles and a skill or
+        plugin the operator linked in silently disappears for workers —
+        reproduced: ``skills/shared -> ../../shared-skills`` resolved in the real
+        home and did not exist in the runtime home. Those links are rebased to
+        the absolute target they named in the source home (see
+        :meth:`_rebase_external_relative_links`).
+
         For a **secret** tree (``credentials/``, see :data:`SECRET_DIR_NAMES`)
         that policy is wrong. A reproduced link is a *writable path from the
         disposable runtime home back into shared or source state*: a Kimi write
@@ -922,6 +934,7 @@ class KimiCodeRuntimeHomeBuilder:
             ignore_dangling_symlinks=True,
             dirs_exist_ok=True,
         )
+        cls._rebase_external_relative_links(src, dst)
         for root, dirnames, filenames in os.walk(dst, followlinks=False):
             root_path = Path(root)
             try:
@@ -1023,6 +1036,39 @@ class KimiCodeRuntimeHomeBuilder:
                         child,
                         exc,
                     )
+
+    @staticmethod
+    def _rebase_external_relative_links(src: Path, dst: Path) -> None:
+        """Make relocated copies of external relative symlinks point where they did.
+
+        A relative link is reproduced verbatim by ``copytree(symlinks=True)``,
+        which is right only while the tree keeps its shape. The disposable home is
+        a *different* directory, so a relative link that left the source home now
+        leaves the runtime home and dangles. Each such link is rewritten to the
+        absolute path it resolved to in the source home, which is the same target
+        by construction.
+
+        The link is resolved *at its source location*, never in the copy: the
+        copied text answers the wrong question once the tree has moved. Links that
+        stay inside the tree keep their relative text — the preserved structure
+        keeps them correct — and absolute links are already stable.
+        """
+
+        source_root = Path(os.path.realpath(src))
+        for root, dirnames, filenames in os.walk(dst, followlinks=False):
+            for name in list(dirnames) + list(filenames):
+                link = Path(root) / name
+                if not link.is_symlink():
+                    continue
+                target = os.readlink(link)
+                if os.path.isabs(target):
+                    continue
+                resolved = Path(os.path.realpath(src / link.relative_to(dst)))
+                if resolved.is_relative_to(source_root):
+                    # Internal: the copied structure reproduces the same target.
+                    continue
+                link.unlink()
+                os.symlink(str(resolved), link)
 
     @staticmethod
     def _write_mcp_json(path: Path, servers: Mapping[str, Any]) -> None:

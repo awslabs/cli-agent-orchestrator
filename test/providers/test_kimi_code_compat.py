@@ -890,7 +890,7 @@ class TestKimiCodeLaunchCommand:
         provider._kimi_source_home = tmp_path / "src"
         command = provider._build_kimi_code_command()
         assert "KIMI_CODE_HOME=" in command
-        assert str(Path(provider._temp_dir) / "kimi-home") in command
+        assert str(provider._managed_runtime_home()) in command
 
     def test_exports_terminal_id_for_mcp_children(self, tmp_path):
         provider = _code_provider("term-abc")
@@ -947,7 +947,7 @@ class TestKimiCodeLaunchCommand:
         provider = _code_provider()
         provider._kimi_source_home = source
         provider._build_kimi_code_command()
-        assert (Path(provider._temp_dir) / "kimi-home" / "config.toml").is_file()
+        assert (provider._managed_runtime_home() / "config.toml").is_file()
 
     def test_cleanup_removes_runtime_home(self, tmp_path):
         source = tmp_path / "src"
@@ -955,9 +955,9 @@ class TestKimiCodeLaunchCommand:
         provider = _code_provider()
         provider._kimi_source_home = source
         provider._build_kimi_code_command()
-        home = Path(provider._temp_dir) / "kimi-home"
+        home = provider._managed_runtime_home()
         assert home.is_dir()
-        provider.cleanup()
+        assert provider.cleanup() is True
         assert not home.exists()
 
 
@@ -3197,12 +3197,22 @@ class TestD6ToolOutputBlock:
         assert kinds[1] is kt.KimiLineKind.TOOL_CHROME
         assert kinds[2] is kt.KimiLineKind.FINAL_BULLET
 
-    def test_reasoning_ends_the_block(self):
+    def test_reasoning_inside_a_tool_block_stays_private(self):
+        """An open block owns its rows: a reasoning candidate does not release it.
+
+        Reasoning styling is a shape tool output can also carry, so a
+        grey-bullet row inside an open tool block is payload, not evidence that
+        the block ended. Only a positively evidenced public answer — the
+        renderer's colour-253 ``●``, here ``self.FINAL`` — ends the block.
+        """
+
         thinking = "\x1b[38;5;244m● \x1b[3mlet me think about it\x1b[0m"
         rows = [self.HEADER, self.PAYLOAD_1, thinking, self.FINAL]
         kinds = self.kinds(rows)
         assert kinds[1] is kt.KimiLineKind.TOOL_CHROME
-        assert kinds[2] is kt.KimiLineKind.THINKING_BULLET
+        assert kinds[2] is kt.KimiLineKind.TOOL_CHROME
+        assert kinds[2] not in kt.ANSWER_KINDS
+        assert kinds[3] is kt.KimiLineKind.FINAL_BULLET
 
     def test_user_echo_ends_the_block(self):
         """A new *submission* ends the block: the sparkle row, not a bare
@@ -3510,8 +3520,14 @@ class TestD6RealSourceSideTurn:
     * the MCP result arrives wrapped in a multi-line ``<mcp-result-extras>``
       block, so the payload spans several rows rather than one JSON line;
     * Kimi renders an intermediate reasoning bullet (*"Zero profiles returned.
-      Reply one line."*) between the payload and the answer, which must end the
-      tool block without itself reaching the answer.
+      Reply one line."*) between the payload and the answer. An open tool block
+      owns its rows until a positively evidenced public answer arrives, so that
+      reasoning candidate is payload (``TOOL_CHROME``): it neither ends the
+      block nor reaches the answer.
+
+    The answer row carries the measured colour-253 styling (``_answer``), the
+    same as the real capture, so the block ends on renderer evidence rather
+    than on an unstyled bullet.
     """
 
     def _pane(self):
@@ -3525,7 +3541,7 @@ class TestD6RealSourceSideTurn:
                 '{"structuredContent":{"result":[]},"_meta":{"fastmcp":{"wrap_result":true}}}',
                 "</mcp-result-extras>",
                 "\x1b[38;5;244m● \x1b[3mZero profiles returned. Reply one line.\x1b[0m",
-                "● MCP-OK=0",
+                _answer("MCP-OK=0"),
                 *_A3_COMPOSER,
                 _A3_FOOTER,
             ]
@@ -3544,6 +3560,14 @@ class TestD6RealSourceSideTurn:
         assert "hand off, message, or delete anything." not in result
 
     def test_payload_and_reasoning_are_classified_as_non_answer(self):
+        """The intermediate reasoning is private payload, not a reasoning kind.
+
+        An open tool block owns its rows until a positively evidenced public
+        answer arrives, so the grey-bullet reasoning row between the payload and
+        the answer is ``TOOL_CHROME`` — non-answer, and never released as text.
+        Only the renderer's colour-253 answer bullet ends the block.
+        """
+
         pane = self._pane()
         raw_lines = pane.split("\n")
         clean_lines = [kt.strip_sgr(row) for row in raw_lines]
@@ -3551,7 +3575,8 @@ class TestD6RealSourceSideTurn:
         assert kinds[4] is kt.KimiLineKind.TOOL_CHROME
         assert kinds[5] is kt.KimiLineKind.TOOL_CHROME
         assert kinds[6] is kt.KimiLineKind.TOOL_CHROME
-        assert kinds[7] is kt.KimiLineKind.THINKING_BULLET
+        assert kinds[7] is kt.KimiLineKind.TOOL_CHROME
+        assert kinds[7] not in kt.ANSWER_KINDS
         assert kinds[8] is kt.KimiLineKind.FINAL_BULLET
         for kind in kinds:
             assert kind not in (kt.KimiLineKind.TOOL_CALL, kt.KimiLineKind.TOOL_CHROME) or (
@@ -3559,7 +3584,12 @@ class TestD6RealSourceSideTurn:
             )
 
     def test_echo_continuation_and_tool_block_are_both_absent(self):
-        """Both D6 mechanisms in one pane, asserting on the classified region."""
+        """Both D6 mechanisms in one pane, asserting on the classified region.
+
+        The region is the tool block plus the answer: the wrapped echo is
+        outside it, and the intermediate reasoning row is one more payload row
+        inside it.
+        """
 
         pane = self._pane()
         raw_lines = pane.split("\n")
@@ -3568,12 +3598,13 @@ class TestD6RealSourceSideTurn:
         start, end = KimiCliProvider._locate_response_region(kinds)
         region = [k for k in kinds[start:end] if k is not kt.KimiLineKind.BLANK]
         assert kt.KimiLineKind.USER_INPUT not in region
+        assert kt.KimiLineKind.THINKING_BULLET not in region
         assert region == [
             kt.KimiLineKind.TOOL_CALL,
             kt.KimiLineKind.TOOL_CHROME,
             kt.KimiLineKind.TOOL_CHROME,
             kt.KimiLineKind.TOOL_CHROME,
-            kt.KimiLineKind.THINKING_BULLET,
+            kt.KimiLineKind.TOOL_CHROME,
             kt.KimiLineKind.FINAL_BULLET,
         ]
 
@@ -3623,8 +3654,18 @@ class TestD6SourceSideRealCapture:
         assert provider.get_status(_fixture(self.FIXTURE)) is TerminalStatus.COMPLETED
 
     def test_answer_region_contains_no_answer_kind_other_than_the_answer(self):
+        """The located region holds the answer and no other answer kind.
+
+        The capture is the real rendering, so its answer bullet already carries
+        the renderer's colour-253 styling: the block ends on renderer evidence,
+        not on an unstyled bullet that payload could also produce. The
+        intermediate reasoning row inside the block is therefore payload
+        (``TOOL_CHROME``) — private, and not an answer kind.
+        """
+
         provider = _code_provider("d6-src-region")
         pane = _fixture(self.FIXTURE)
+        assert "\x1b[38;5;253m●" in pane
         raw_lines = pane.split("\n")
         clean_lines = [kt.strip_sgr(row) for row in raw_lines]
         kinds = kt.classify_rows(raw_lines, clean_lines, kt.SpinnerSemantics.CODE)
@@ -3635,8 +3676,10 @@ class TestD6SourceSideRealCapture:
             if kinds[i] in kt.ANSWER_KINDS and clean_lines[i].strip()
         ]
         assert answers == ["● MCP-OK=<N>"]
+        answer_kinds = [kind for kind in kinds[start:end] if kind in kt.ANSWER_KINDS]
+        assert answer_kinds == [kt.KimiLineKind.FINAL_BULLET]
         assert kt.KimiLineKind.TOOL_CHROME in kinds[start:end]
-        assert kt.KimiLineKind.THINKING_BULLET in kinds[start:end]
+        assert kt.KimiLineKind.THINKING_BULLET not in kinds[start:end]
 
 
 class TestD6ReasoningBeforeToolCall:

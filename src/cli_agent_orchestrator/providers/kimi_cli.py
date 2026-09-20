@@ -47,11 +47,17 @@ silently taking the legacy path.
 Row-level semantics for both dialects live in
 :mod:`cli_agent_orchestrator.providers.kimi_transcript`; per-worker
 ``KIMI_CODE_HOME`` construction lives in
-:mod:`cli_agent_orchestrator.providers.kimi_runtime_home`.
+:mod:`cli_agent_orchestrator.providers.kimi_runtime_home`. That home is built at
+a managed path derived from the terminal id
+(``CAO_HOME_DIR/providers/kimi_code/<sha256(terminal_id)>/kimi-home``) rather
+than in a random scratch directory, so a terminal deleted after a cao-server
+restart can still have its copied credentials removed — see the managed-location
+section on :class:`KimiCliProvider`.
 """
 
 import asyncio
 import enum
+import hashlib
 import json
 import logging
 import os
@@ -69,6 +75,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from cli_agent_orchestrator.agent_plugins.mcp_delivery import with_plugin_mcp as _with_plugin_mcp
 from cli_agent_orchestrator.backends.registry import get_backend
+from cli_agent_orchestrator.constants import CAO_HOME_DIR
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers import kimi_transcript as kt
 from cli_agent_orchestrator.providers.base import (
@@ -78,6 +85,7 @@ from cli_agent_orchestrator.providers.base import (
 )
 from cli_agent_orchestrator.providers.kimi_runtime_home import (
     KIMI_TRANSPORTS,
+    RUNTIME_HOME_DIR_NAME,
     KimiCodeRuntimeHomeBuilder,
     RuntimeHomeError,
     kimi_agent_name,
@@ -853,6 +861,83 @@ class KimiCliProvider(BaseProvider):
             self._temp_dir = tempfile.mkdtemp(prefix=prefix, dir=shell_safe_temp_root())
         return self._temp_dir
 
+    # =====================================================================
+    # Kimi Code runtime home: deterministic managed location
+    # =====================================================================
+    #
+    # The runtime home holds a snapshot of the operator's credentials, MCP
+    # configuration and Kimi state, so it must not live in a random scratch
+    # directory whose path exists only in the live provider instance. After a
+    # cao-server restart the provider is rebuilt from database metadata — where
+    # ``provider_variant`` is the only Kimi state persisted — the old temp path
+    # is unrecoverable, ``cleanup()`` becomes a no-op, and the copied credentials
+    # stay on disk forever. Naming the directory deterministically from the
+    # terminal id (mirroring ``minimax_code`` and ``grok_cli``) lets cleanup
+    # recover it with neither a database column nor a persisted free-form path.
+
+    @staticmethod
+    def _managed_runtime_root() -> Path:
+        """Return the only directory containing CAO-owned Kimi Code homes."""
+
+        return CAO_HOME_DIR / "providers" / "kimi_code"
+
+    def _managed_terminal_dir(self) -> Path:
+        """Return this terminal's deterministic managed Kimi Code directory.
+
+        ``CAO_HOME_DIR`` is read from the module global on every call rather
+        than captured at import, so the path a home is built under is the same
+        path cleanup later validates, including with a relocated/test CAO home.
+        """
+
+        digest = hashlib.sha256(self.terminal_id.encode("utf-8")).hexdigest()
+        return self._managed_runtime_root() / digest
+
+    def _managed_runtime_home(self) -> Path:
+        """Return this terminal's managed Kimi Code runtime home."""
+
+        return self._managed_terminal_dir() / RUNTIME_HOME_DIR_NAME
+
+    def _is_managed_terminal_dir(self, directory: Path) -> bool:
+        """Return whether ``directory`` is this terminal's deterministic dir.
+
+        ``cleanup()`` must be usable on a provider recreated after a
+        cao-server restart, where nothing in memory names the runtime home, so
+        the terminal id has to identify CAO's managed directory on its own. Do
+        not turn that recovery path into a general recursive-delete primitive:
+        the target must be *exactly* the deterministic child of CAO's managed
+        Kimi Code root, because ``Path`` equality is lexical and a "somewhere
+        below the root" test would let a crafted path delete outside CAO state.
+        Every managed ancestor must additionally be a real directory rather than
+        a symlink that redirects the delete, and any doubt — or an ``OSError``
+        while inspecting — returns ``False``.
+        """
+
+        root = self._managed_runtime_root()
+        if directory != self._managed_terminal_dir() or directory.parent != root:
+            return False
+        if root.name != "kimi_code" or root.parent.name != "providers":
+            return False
+        try:
+            if any(
+                ancestor.is_symlink() for ancestor in (CAO_HOME_DIR, root.parent, root, directory)
+            ):
+                return False
+            # Defense in depth for platform-specific path normalization: the
+            # parent must resolve to this exact non-symlink managed root.
+            return directory.parent.resolve(strict=False) == root.resolve(strict=False)
+        except OSError:
+            return False
+
+    def _is_managed_runtime_home(self, home: Path) -> bool:
+        """Return whether ``home`` is this terminal's managed runtime home.
+
+        The home itself is deliberately allowed to be a symlink so cleanup can
+        unlink it without following its target — the same property that keeps a
+        linked credential path from being written through.
+        """
+
+        return home.name == RUNTIME_HOME_DIR_NAME and self._is_managed_terminal_dir(home.parent)
+
     def _ensure_shell_safe_dir(self) -> str:
         """A scratch directory whose path needs no quoting in any shell.
 
@@ -1149,7 +1234,10 @@ class KimiCliProvider(BaseProvider):
           A0 proved does not exist in Kimi Code.
         * ``KIMI_CODE_HOME`` points at this worker's runtime home, so each worker
           gets its own ``mcp.json`` and arbitrary per-profile MCP surfaces stay
-          isolated.
+          isolated. That home is the terminal's deterministic managed directory
+          (``CAO_HOME_DIR/providers/kimi_code/<terminal digest>/kimi-home``), not
+          a random scratch path, so a terminal deleted after a cao-server restart
+          can still have its copied credentials removed.
         * ``CAO_TERMINAL_ID`` is exported for the Kimi process: Kimi Code's stdio
           MCP children inherit the parent environment, so one export reaches
           every server (including user-level ones) without per-server injection.
@@ -1185,8 +1273,35 @@ class KimiCliProvider(BaseProvider):
         temp_dir = self._ensure_temp_dir()
         source_home = self._kimi_source_home or resolve_source_home(None)
 
+        # The runtime home is CAO-managed state, not scratch: it belongs at the
+        # terminal's deterministic managed path so cleanup can find it again
+        # after a restart (see the managed-location section above). Validating
+        # here rather than trusting the derivation keeps the builder parent and
+        # the cleanup target provably the same directory, and a refusal is an
+        # error — silently building outside CAO state would reintroduce the leak.
+        terminal_dir = self._managed_terminal_dir()
+        if not self._is_managed_terminal_dir(terminal_dir):
+            raise ProviderError(
+                f"Refusing to build a Kimi Code runtime home outside the managed "
+                f"Kimi Code directory: {terminal_dir}"
+            )
+        if terminal_dir.exists():
+            # A previous lifecycle can be interrupted between build and cleanup
+            # (crash, SIGKILL, restart), leaving a home that already carries the
+            # operator's credentials, MCP configuration and trust records. The
+            # new worker must not inherit any of it, so the validated directory
+            # is reset first. The recursive delete is restricted to exactly the
+            # path validated above and never follows the link case, which
+            # `_is_managed_terminal_dir` already refused.
+            try:
+                shutil.rmtree(terminal_dir)
+            except OSError as exc:
+                raise ProviderError(
+                    f"Failed to reset Kimi Code runtime directory {terminal_dir}: {exc}"
+                ) from exc
+
         mcp_servers = profile.mcpServers if profile is not None else None
-        builder = KimiCodeRuntimeHomeBuilder(source_home, Path(temp_dir))
+        builder = KimiCodeRuntimeHomeBuilder(source_home, terminal_dir)
         try:
             runtime = builder.build(mcp_servers)
         except RuntimeHomeError as exc:
@@ -2159,17 +2274,30 @@ class KimiCliProvider(BaseProvider):
             )
 
         # Strategy 1: Find the last user input box end line (╰─) — pre-v1.20.0
+        #
+        # A *legacy* anchor, kept for the legacy dialect only. `╰─` is a text
+        # shape, and Kimi Code draws the same border in its own private payload
+        # and around its own composer — reproduced: a shallow CODE capture of
+        # `dim payload / ╰──╯ / dim payload / colour-253 answer` published
+        # `PRIVATE_PAYLOAD\n● PUBLIC` through both the extractor and
+        # `get_output(LAST)`, and the wide and undimmed spellings did the same.
+        # The defect is the anchor's *authority*, not one glyph spelling. CODE
+        # has its own dialect, its own current-turn region
+        # (`_locate_response_region`), its own submission evidence (Strategy 2,
+        # colour-checked) and its own retryable unanchored fallback, so a legacy
+        # text anchor must not establish a submitted-turn boundary there.
         box_end_idx = None
-        # Only consider box-end lines that come AFTER the welcome banner.
-        # The welcome banner itself has ╰─, so we skip it by finding the
-        # welcome banner line first.
-        welcome_idx = 0
-        for i, line in enumerate(clean_lines):
-            if re.search(WELCOME_BANNER_PATTERN, line):
-                welcome_idx = i
-        for i in range(welcome_idx + 1, len(clean_lines)):
-            if re.search(USER_INPUT_BOX_END_PATTERN, clean_lines[i]):
-                box_end_idx = i
+        if self._dialect is not KimiDialect.CODE:
+            # Only consider box-end lines that come AFTER the welcome banner.
+            # The welcome banner itself has ╰─, so we skip it by finding the
+            # welcome banner line first.
+            welcome_idx = 0
+            for i, line in enumerate(clean_lines):
+                if re.search(WELCOME_BANNER_PATTERN, line):
+                    welcome_idx = i
+            for i in range(welcome_idx + 1, len(clean_lines)):
+                if re.search(USER_INPUT_BOX_END_PATTERN, clean_lines[i]):
+                    box_end_idx = i
 
         # Strategy 2: Find the last prompt-with-input line — v1.20.0+
         #
@@ -2636,14 +2764,71 @@ class KimiCliProvider(BaseProvider):
             )
             return {}
 
-    def cleanup(self) -> None:
+    def _remove_managed_runtime_home(self) -> bool:
+        """Remove the managed Kimi Code runtime home and prove it is gone.
+
+        ``False`` is a retryable outcome rather than an exception: the caller
+        keeps the terminal's lifecycle metadata so a later DELETE can finish the
+        removal. ``True`` is only returned after the home's absence is
+        re-checked, because a success that leaves the operator's copied
+        credentials on disk is the exact leak this path closes.
+        """
+
+        home = self._managed_runtime_home()
+        if not self._is_managed_runtime_home(home):
+            logger.warning("Refusing to remove non-managed Kimi Code home %s", home)
+            return False
+        try:
+            # ``rmtree`` refuses a symlink root, which is safe but would leave
+            # the managed entry behind. Unlinking the link itself never follows
+            # its target, so a home replaced by a symlink is still removed
+            # without touching whatever it points at.
+            if home.is_symlink():
+                home.unlink()
+            else:
+                shutil.rmtree(home)
+        except FileNotFoundError:
+            # Already absent: the goal state is reached.
+            return True
+        except OSError as exc:
+            logger.warning("Failed to remove Kimi Code runtime home %s: %s", home, exc)
+            return False
+        # Best effort: the terminal directory is CAO-owned and empty once its
+        # home is gone, but a concurrent build for the same terminal may still
+        # be writing there, so a failed empty ``rmdir`` is not an error.
+        try:
+            home.parent.rmdir()
+        except OSError:
+            pass
+        return not home.exists()
+
+    def cleanup(self) -> bool:
         """Clean up Kimi CLI provider resources.
 
-        Removes any temporary files created for agent profiles
-        and resets the initialization state. MCP timeout is NOT restored
-        because multiple Kimi instances may share the config file concurrently.
+        Returns ``True`` only when nothing CAO-managed remains on disk for this
+        terminal.
+
+        The managed-home removal is **not** gated on the dialect. Kimi Code
+        copies the operator's credentials, MCP configuration and Kimi state into
+        a deterministic managed directory, and that is exactly why the path is
+        derived from the terminal id: the provider object is rebuilt from
+        terminal metadata after a cao-server restart, where ``_temp_dir`` is
+        ``None`` and nothing in memory names the directory. Two concrete
+        lifecycle reasons mean the directory can exist while the dialect is
+        unknown or legacy — ``initialize()`` materialises the home before the
+        service persists ``provider_variant`` (a crash in that window leaves a
+        credential-bearing home on a NULL-variant row), and a terminal
+        re-launched under the other dialect keeps the home its earlier CODE
+        launch created. Attempting the removal unconditionally is not a dialect
+        guess: no behaviour is inferred from it, the target is this terminal's
+        own validated path, and the call is a no-op returning ``True`` when no
+        such home exists.
+
+        The scratch directory holds launch artifacts only and never decides the
+        outcome. MCP timeout is NOT restored because multiple Kimi instances may
+        share the config file concurrently.
         """
-        # Remove temp directory if it was created for agent profile
+        # Best effort: launch artifacts, not credentials.
         if self._temp_dir:
             if os.path.exists(self._temp_dir):
                 shutil.rmtree(self._temp_dir, ignore_errors=True)
@@ -2651,3 +2836,5 @@ class KimiCliProvider(BaseProvider):
 
         self._initialized = False
         self._has_received_input = False
+
+        return self._remove_managed_runtime_home()

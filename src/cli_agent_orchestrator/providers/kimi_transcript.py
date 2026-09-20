@@ -1768,10 +1768,36 @@ def classify_rows(
         if kind is KimiLineKind.USER_INPUT:
             kind = KimiLineKind.CONTENT
 
+        # --- tool output: opens on a positive tool header, and while it is open it
+        #     *owns* its rows. This is resolved before any candidate channel
+        #     transition, because ownership beats a candidate: a row inside an open
+        #     private block is payload unless the block itself has positive public
+        #     evidence that it ended. A reasoning-shaped row is not that evidence —
+        #     reproduced: `● quote` (grey) inside a tool block opened a reasoning
+        #     block, released the tool block, and the dim payload after it was
+        #     published as the answer, through both the extractor and LAST.
+        #
+        #     A real `tool -> reasoning -> answer` sequence therefore keeps its
+        #     reasoning private; LAST never needed to expose it. The public answer
+        #     is what ends the block (see `_ends_tool_block`: the renderer's answer
+        #     colour, a confirmed dialog, or chrome drawn with its own styling).
+        if kind is KimiLineKind.TOOL_CALL:
+            in_tool_block = True
+            in_reasoning = False
+            result.append(kind)
+            continue
+        if in_tool_block:
+            if _ends_tool_block(raw, kind):
+                in_tool_block = False
+                result.append(kind)
+                continue
+            # Inside a block: blank rows continue it, everything else is payload.
+            result.append(kind if kind is KimiLineKind.BLANK else KimiLineKind.TOOL_CHROME)
+            continue
+
         # --- reasoning: the bullet opens the block, its own styling extends it ---
         if kind is KimiLineKind.THINKING_BULLET:
             in_reasoning = True
-            in_tool_block = False
             result.append(kind)
             continue
         if in_reasoning:
@@ -1789,21 +1815,7 @@ def classify_rows(
                 continue
             in_reasoning = False
 
-        # --- tool output: opens on a positive tool header ---
-        if kind is KimiLineKind.TOOL_CALL:
-            in_tool_block = True
-            in_reasoning = False
-            result.append(kind)
-            continue
-        if not in_tool_block:
-            result.append(kind)
-            continue
-        if _ends_tool_block(raw, kind):
-            in_tool_block = False
-            result.append(kind)
-            continue
-        # Inside a block: blank rows continue it, everything else is payload.
-        result.append(kind if kind is KimiLineKind.BLANK else KimiLineKind.TOOL_CHROME)
+        result.append(kind)
 
     return result
 

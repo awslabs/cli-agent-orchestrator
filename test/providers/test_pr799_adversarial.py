@@ -1298,7 +1298,9 @@ class TestPR799AdversarialPluginMcpDelivery:
         provider._build_kimi_code_command()
 
         assert seen.get("provider") == "kimi_cli"
-        mcp_doc = json.loads((tmp_path / "kimi-home" / "mcp.json").read_text(encoding="utf-8"))
+        mcp_doc = json.loads(
+            (provider._managed_runtime_home() / "mcp.json").read_text(encoding="utf-8")
+        )
         servers = mcp_doc["mcpServers"]
         assert "plugin-server" in servers, sorted(servers)
         assert "profile-server" in servers, sorted(servers)
@@ -1942,7 +1944,17 @@ class TestPR799AdversarialThirdRound:
         assert "transport" not in merged["hand"]
 
     def test_reasoning_in_a_partial_capture_stays_retryable(self):
-        """A5-F2: a capture that merely missed the answer must not refuse."""
+        """A5-F2: a capture that merely missed the answer must not refuse.
+
+        The A5-F2 intent is unchanged: a private-content row in a capture that
+        did not reach the answer must never become a terminal refusal, because
+        a wider capture may still hold the answer. The outcome is now stronger
+        than "retryable". Under the CODE dialect the legacy ``╰─`` box-end
+        anchor no longer establishes a submitted-turn boundary, so the 220
+        leading reasoning rows do not push the answer past the anchor: the
+        same widened capture returns it directly. Widening recovers the answer
+        instead of merely being permitted to.
+        """
 
         rows = _fixture("kimi_code_0431_03_final_answer.txt").split("\n")
         index = next(i for i, row in enumerate(rows) if "\x1b[38;5;253m●" in row)
@@ -1950,10 +1962,15 @@ class TestPR799AdversarialThirdRound:
 
         provider = KimiCliProvider("term-a5f2", "s", "w")
         provider._dialect = kimi_cli_module.KimiDialect.CODE
-        with pytest.raises(OutputExtractionError) as excinfo:
-            provider.extract_last_message_from_script("\n".join(rows[-200:]))
-        # Retryable, so the caller escalates and the wider capture recovers it.
-        assert not isinstance(excinfo.value, _rejected())
+        try:
+            result = provider.extract_last_message_from_script("\n".join(rows[-200:]))
+        except OutputExtractionError as excinfo:
+            # Never a refusal, and no longer even a retry: the public answer is
+            # reachable, so failing to return it is the wrong outcome.
+            assert not isinstance(excinfo, _rejected())
+            pytest.fail(f"the widened capture must return the public answer: {excinfo}")
+        assert result == "● STEP 1\nSTEP 2\nSTEP 3\nSTEP 4\nSTEP 5\nA0-FIXTURE-DONE."
+        assert "Another private reasoning step." not in result
 
     def test_a_quoted_approval_menu_is_answer_content(self, monkeypatch):
         """A5-F3: hint + options without the title is prose, not a live dialog."""
@@ -2596,3 +2613,149 @@ class TestPR799StructuralChannelOwnership:
 
         result, _ = self._get_last_code(monkeypatch, pane)
         assert result == "● SAFE_FINAL"
+
+
+# =============================================================================
+# Final ownership closure — B1: legacy anchor authority, B3: block ownership
+# =============================================================================
+
+
+class TestPR799FinalOwnershipClosure:
+    """The last two private-disclosure seams, at the ownership/dialect level.
+
+    **B1.** The legacy pre-v1.20 ``╰─`` box-end anchor is a *text* shape, and Kimi
+    Code draws the same glyph in private payload. Under CODE it must not by itself
+    establish a submitted-turn boundary: the dialect has its own current-turn
+    machinery, its own submission evidence and its own retryable unanchored
+    fallback. The defect is the anchor's *authority*, not one glyph spelling.
+
+    **B3.** An open tool block owns its rows until positive public evidence
+    displaces it. A reasoning-shaped row is a candidate channel transition, not
+    evidence that the block ended — reproduced: a grey bullet inside a tool block
+    released the block and the dim payload after it was published as the answer.
+    """
+
+    #: The renderer's answer bullet, and rows that are private whichever channel
+    #: they belong to (dim payload, a legacy box border drawn dim, a grey bullet).
+    _PUBLIC = "\x1b[38;5;253m● \x1b[39mPUBLIC"
+    _PAYLOAD = "\x1b[2mPRIVATE_PAYLOAD\x1b[0m"
+    _BOX_DIM = "\x1b[2m╰──╯\x1b[0m"
+    _BOX_PLAIN = "╰──────────────────────────╯"
+    _BOX_WIDE = "╰──────────────────────────────────────────────────────────╯"
+    _GREY_BULLET = "\x1b[38;5;244m● quote\x1b[0m"
+
+    #: Reuse the sibling class's public-boundary driver rather than duplicating it.
+    _composer = staticmethod(TestPR799StructuralChannelOwnership._composer)
+    _get_last_code = staticmethod(TestPR799StructuralChannelOwnership._get_last_code)
+
+    # --- B1: the legacy box anchor has no authority under CODE --------------
+
+    @pytest.mark.parametrize("box", [_BOX_DIM, _BOX_PLAIN, _BOX_WIDE])
+    def test_legacy_box_end_cannot_anchor_a_code_turn(self, monkeypatch, box):
+        """Every spelling of the legacy box end, not just the dimmed one."""
+
+        pane = "\n".join(
+            [self._PAYLOAD, box, self._PAYLOAD, self._PUBLIC, "── input ──", _footer()]
+        )
+
+        result, _ = self._get_last_code(monkeypatch, pane)
+        assert result == "● PUBLIC"
+        assert "PRIVATE_PAYLOAD" not in result
+
+    def test_legacy_box_end_without_an_answer_stays_retryable(self, monkeypatch):
+        """No public answer and no anchor: the CODE contract is widening, not bytes."""
+
+        pane = "\n".join([self._PAYLOAD, self._BOX_DIM, self._PAYLOAD, "── input ──", _footer()])
+
+        from cli_agent_orchestrator.providers.base import OutputExtractionError
+
+        with pytest.raises(OutputExtractionError):
+            self._get_last_code(monkeypatch, pane)
+
+    def test_legacy_box_end_still_anchors_the_legacy_dialect(self, monkeypatch):
+        """The legacy path keeps its own anchor: this is a dialect rule, not a ban."""
+
+        pane = "\n".join([self._PAYLOAD, self._BOX_PLAIN, self._PUBLIC, "✨"])
+
+        result, _ = _last(monkeypatch, pane)
+        assert "PUBLIC" in result
+
+    def test_legacy_box_anchor_is_not_replaced_by_another_text_heuristic(self, monkeypatch):
+        """The CODE pane must not fall back to publishing leading content either way.
+
+        Whichever anchor the extractor chooses, the private row above it is not
+        answer text: with a public answer present the answer is returned, and the
+        payload before it is not.
+        """
+
+        pane = "\n".join(
+            [
+                "── input ──",
+                self._PAYLOAD,
+                self._BOX_WIDE,
+                self._PAYLOAD,
+                self._PUBLIC,
+                "── input ──",
+                _footer(),
+            ]
+        )
+
+        result, _ = self._get_last_code(monkeypatch, pane)
+        assert "PRIVATE_PAYLOAD" not in result
+        assert result == "● PUBLIC"
+
+    # --- B3: an open tool block owns its rows ------------------------------
+
+    @pytest.mark.parametrize(
+        "intruder",
+        [
+            _GREY_BULLET,
+            "\x1b[38;5;244m\x1b[3mquote continuation\x1b[0m",
+            "● plain bullet payload",
+            "… (3 more lines, ctrl+o to expand)",
+            "\x1b[38;5;244m● first\x1b[0m\n\x1b[38;5;244m● second\x1b[0m",
+            "\n\x1b[38;5;244m● after a blank\x1b[0m",
+            "ordinary prose that is really payload",
+        ],
+    )
+    def test_tool_block_owns_its_rows_until_public_evidence(self, monkeypatch, intruder):
+        """A reasoning-shaped (or chrome-shaped, or prose) row cannot release a block."""
+
+        pane = "\n".join(
+            [
+                _user("✨ task"),
+                "",
+                "● Used Read (report.txt) · 3 lines",
+                *intruder.split("\n"),
+                self._PAYLOAD,
+                self._PUBLIC,
+                *self._composer(),
+                _footer(),
+            ]
+        )
+
+        result, _ = self._get_last_code(monkeypatch, pane)
+        assert result == "● PUBLIC"
+        assert "PRIVATE_PAYLOAD" not in result
+
+    def test_a_real_tool_then_reasoning_then_answer_sequence_stays_private(self, monkeypatch):
+        """§12: the intermediate reasoning never needs to be published."""
+
+        pane = "\n".join(
+            [
+                _user("✨ task"),
+                "",
+                "● Used Read (report.txt) · 3 lines",
+                '\x1b[2m[{"a":1}]\x1b[0m',
+                self._GREY_BULLET,
+                "● still tool owned",
+                self._PUBLIC,
+                *self._composer(),
+                _footer(),
+            ]
+        )
+
+        result, _ = self._get_last_code(monkeypatch, pane)
+        assert result == "● PUBLIC"
+        for leaked in ("PRIVATE", "quote", "still tool owned", "Used Read", '[{"a"'):
+            assert leaked not in result
