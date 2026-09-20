@@ -259,6 +259,22 @@ KIMI_PALETTE_ENV_UNSET = ("COLORTERM",)
 #: only when it carries this slot or styling — see `_locate_response_region`.
 _SPINNER_SLOT_RE = re.compile(r"[\u2800-\u28ff]")
 
+
+def _after_last_echo(scope_kinds: List[kt.KimiLineKind]) -> List[kt.KimiLineKind]:
+    """The rows belonging to the newest turn.
+
+    A capture can hold several turns. The last user-input echo marks where the
+    current turn begins, so only rows from there on may be used as evidence
+    about *this* turn's outcome. With no echo at all the whole capture is the
+    scope — there is nothing to divide by.
+    """
+
+    last_echo = -1
+    for index, kind in enumerate(scope_kinds):
+        if kind is kt.KimiLineKind.USER_INPUT:
+            last_echo = index
+    return scope_kinds[last_echo + 1 :]
+
 #: The boot banner rows, which name themselves rather than relying on the spinner
 #: slot. Used with `_SPINNER_SLOT_RE` to decide whether a `BOOT_CHROME` row is
 #: really boot chrome when an answer is being extracted.
@@ -2339,14 +2355,16 @@ class KimiCliProvider(BaseProvider):
         if has_answers:
             # A real answer is published; the other content is simply excluded.
             return
-        if any(kind is kt.KimiLineKind.FINAL_BULLET for kind in scope_kinds):
-            # A positively drawn answer bullet elsewhere in the capture is a
-            # capture that did not reach far enough, not a turn without an
-            # answer: the region missed it and a wider capture may hold it, so
-            # the caller must be free to escalate. Only the answer *bullet* is
-            # exempt — plain ``CONTENT`` is not evidence, because the shell
-            # preamble, the boot banner and the footer's continuation row all
-            # classify that way.
+        if any(kind is kt.KimiLineKind.FINAL_BULLET for kind in _after_last_echo(scope_kinds)):
+            # A positively drawn answer bullet *within this turn* means the
+            # capture did not reach far enough, not that the turn produced no
+            # answer: the region missed it and a wider capture may still hold it,
+            # so the caller escalates instead of failing. The scope matters — an
+            # answer bullet from an earlier turn must not exempt a reasoning-only
+            # turn now, which would escalate into the raw pane and disclose the
+            # previous turn's reasoning. Only the answer bullet is exempt; plain
+            # ``CONTENT`` is not evidence, because the shell preamble, the boot
+            # banner and the footer's continuation row all classify that way.
             return
         if any(kind in _NON_PUBLISHABLE_KINDS for kind in scope_kinds):
             raise OutputExtractionRejected(

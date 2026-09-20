@@ -75,6 +75,12 @@ _REASONING_CONTINUATION_RE = re.compile(r"\x1b\[3m|\x1b\[38;5;244m")
 # Moon phases U+1F311..U+1F318. In Kimi Code these appear in the *idle* rotating
 # tip row ("🌕 · Tip: …"), which is why they are NOT a processing signal here.
 _MOON_RE = re.compile(r"[\U0001F311-\U0001F318]")
+#: The moon in the *indicator slot* — the start of the row. A bare moon row is the
+#: legacy processing glyph, and the idle tip leads with it; a moon *inside* a line
+#: is content (reproduced: a cron entry line,
+#: ``0 0 * * * echo "🌕 Backup starting"``, was classified as a live spinner and
+#: silently dropped from the answer).
+_MOON_PREFIX_RE = re.compile(r"^\s*[\U0001F311-\U0001F318]")
 
 # The idle tip suffix. Kimi Code rotates tips; every observed variant ends the
 # row with " · Tip: " in colour 244.
@@ -873,7 +879,7 @@ def is_live_spinner_line(
     # on the row: an answer that mentions the character is still an answer.
     if _SPINNER_PREFIX_RE.match(clean_line):
         return True
-    if _MOON_RE.search(clean_line):
+    if _MOON_PREFIX_RE.match(clean_line):
         return semantics is SpinnerSemantics.LEGACY
     return False
 

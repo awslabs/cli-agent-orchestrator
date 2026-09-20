@@ -1798,3 +1798,52 @@ class TestPR799AdversarialThirdRound:
         )
         result, _ = _last(monkeypatch, pane)
         assert result == "● The command is ready."
+
+    def test_a_previous_turns_answer_does_not_exempt_this_turn(self, monkeypatch):
+        """A7-F1 (P1): an old answer bullet must not excuse a reasoning-only turn.
+
+        The exemption that lets a partial capture escalate is scoped to the
+        current turn. Applying it capture-wide let a previous turn's answer
+        exempt a reasoning-only turn now, which escalated into the raw pane and
+        disclosed the previous turn's private reasoning.
+        """
+
+        pane = "\n".join(
+            [
+                "💫 Previous task",
+                "\x1b[38;5;244m• PRIVATE_PREVIOUS_TURN\x1b[0m",
+                "• Previous public answer",
+                "💫 New task",
+                "\x1b[38;5;244m• Working through the new task\x1b[0m",
+                "💫",
+            ]
+        )
+        with pytest.raises(_rejected()) as excinfo:
+            _last(monkeypatch, pane)
+        assert "PRIVATE_PREVIOUS_TURN" not in str(excinfo.value)
+
+    def test_a_moon_inside_a_line_is_content(self, monkeypatch):
+        """A7-F2: the indicator slot is the start of the row, not anywhere."""
+
+        assert kt.is_live_spinner_line("🌕", "🌕", kt.SpinnerSemantics.LEGACY) is True
+        assert (
+            kt.is_live_spinner_line(
+                '0 0 * * * echo "🌕 Backup starting"',
+                '0 0 * * * echo "🌕 Backup starting"',
+                kt.SpinnerSemantics.LEGACY,
+            )
+            is False
+        )
+
+        pane = "\n".join(
+            [
+                "💫 Return the cron entries",
+                "• Cron configuration:",
+                '0 0 * * * echo "🌕 Backup starting"',
+                "0 1 * * * /usr/bin/backup",
+                "💫",
+            ]
+        )
+        result, _ = _last(monkeypatch, pane)
+        assert 'echo "🌕 Backup starting"' in result
+        assert "/usr/bin/backup" in result
