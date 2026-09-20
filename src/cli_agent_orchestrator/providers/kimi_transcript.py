@@ -49,6 +49,9 @@ from typing import List, Optional, Sequence, Set, Tuple
 # working if they only hold the raw line.
 # ---------------------------------------------------------------------------
 _SGR_RE = re.compile(r"\x1b\[[0-9;]*m")
+#: A *foreground colour* SGR: `ESC[38;5;Nm`, `ESC[38;2;R;G;Bm`, or a basic /
+#: bright foreground (`ESC[3Nm` / `ESC[9Nm`, possibly with other attributes).
+_FOREGROUND_COLOR_RE = re.compile(r"\x1b\[(?:[0-9]+;)*(?:3[0-9]|9[0-9])m|\x1b\[38;")
 
 # The same sequence, but retaining its parameter list so a rule can ask *which*
 # colour a row is drawn in rather than merely "is styled".
@@ -81,6 +84,11 @@ _MOON_RE = re.compile(r"[\U0001F311-\U0001F318]")
 #: ``0 0 * * * echo "🌕 Backup starting"``, was classified as a live spinner and
 #: silently dropped from the answer).
 _MOON_PREFIX_RE = re.compile(r"^\s*[\U0001F311-\U0001F318]")
+#: A moon and nothing else — the legacy processing glyph. The historical
+#: bare-moon support is deliberately narrow: a moon that carries payload is
+#: answer text (`🌕 Full moon: 2026-09-26` was reproduced being dropped), and the
+#: rotating tip row is identified separately by its `· Tip:` suffix.
+_MOON_ONLY_RE = re.compile(r"^\s*[\U0001F311-\U0001F318]\s*$")
 
 # The idle tip suffix. Kimi Code rotates tips; every observed variant ends the
 # row with " · Tip: " in colour 244.
@@ -615,6 +623,18 @@ _STYLE_REQUIRED_END_KINDS = frozenset(
     }
 )
 
+#: End kinds that need the renderer's *foreground colour*, not merely any SGR.
+#: Tool payload is routinely dimmed (`ESC[2m`), so a payload row that happens to
+#: begin with the spinner glyph would otherwise certify its own end and let the
+#: rest of the payload out as answer text. The renderer draws its spinner and tip
+#: in a foreground colour.
+_COLOR_REQUIRED_END_KINDS = frozenset(
+    {
+        KimiLineKind.LIVE_SPINNER,
+        KimiLineKind.IDLE_TIP,
+    }
+)
+
 
 def _ends_tool_block(raw_line: str, kind: KimiLineKind) -> bool:
     """True when a row inside a tool block is positively *not* tool payload.
@@ -642,6 +662,11 @@ def _ends_tool_block(raw_line: str, kind: KimiLineKind) -> bool:
     if kind is KimiLineKind.FINAL_BULLET:
         return bool(FINAL_ANSWER_BULLET_STYLE_RE.search(raw_line or ""))
     if kind not in TOOL_BLOCK_END_KINDS:
+        return False
+    if kind in _COLOR_REQUIRED_END_KINDS and not _FOREGROUND_COLOR_RE.search(raw_line or ""):
+        # A payload can contain the *glyph* (`⠙ working…` in a captured log) and
+        # is itself dimmed, so "any SGR" is not evidence. The renderer draws its
+        # spinner in a foreground colour, which payload does not carry.
         return False
     if kind in _STYLE_REQUIRED_END_KINDS and not _SGR_RE.search(raw_line or ""):
         return False
@@ -879,7 +904,7 @@ def is_live_spinner_line(
     # on the row: an answer that mentions the character is still an answer.
     if _SPINNER_PREFIX_RE.match(clean_line):
         return True
-    if _MOON_PREFIX_RE.match(clean_line):
+    if _MOON_ONLY_RE.match(clean_line):
         return semantics is SpinnerSemantics.LEGACY
     return False
 

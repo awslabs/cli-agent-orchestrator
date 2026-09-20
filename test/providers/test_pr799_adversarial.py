@@ -1847,3 +1847,45 @@ class TestPR799AdversarialThirdRound:
         result, _ = _last(monkeypatch, pane)
         assert 'echo "🌕 Backup starting"' in result
         assert "/usr/bin/backup" in result
+
+    def test_dimmed_payload_cannot_close_its_own_tool_block(self, monkeypatch):
+        """A8-F1 (P1): payload is dimmed, so "any SGR" is not spinner evidence."""
+
+        from cli_agent_orchestrator.services import terminal_service
+
+        rows = _fixture("kimi_code_0431_10_mcp_tool_turn.txt").split("\n")
+        index = next(i for i, row in enumerate(rows) if '[{"name"' in row)
+        rows[index : index + 1] = [
+            "   \x1b[2m⠙ working…\x1b[22m",
+            "   \x1b[2mPRIVATE_TOOL_PAYLOAD\x1b[22m",
+        ]
+        pane = "\n".join(rows)
+
+        provider = KimiCliProvider("term-a8f1", "s", "w")
+        provider._dialect = kimi_cli_module.KimiDialect.CODE
+        backend = MagicMock()
+        backend.get_history.return_value = pane
+        monkeypatch.setattr(
+            terminal_service, "get_terminal_metadata", lambda tid: {"tmux_session": "s", "tmux_window": "w"}
+        )
+        monkeypatch.setattr(terminal_service.status_monitor, "get_buffer", lambda tid: pane)
+        monkeypatch.setattr(terminal_service, "get_backend", lambda: backend)
+        monkeypatch.setattr(terminal_service.provider_manager, "get_provider", lambda tid: provider)
+
+        result = terminal_service.get_output("term-a8f1", terminal_service.OutputMode.LAST)
+        assert "PRIVATE_TOOL_PAYLOAD" not in result
+
+    def test_a_moon_prefixed_answer_line_survives_in_legacy(self, monkeypatch):
+        """A8-F2: the legacy indicator is a *bare* moon, not a moon-prefixed line."""
+
+        pane = "\n".join(
+            [
+                "💫 Give me an observing guide",
+                "• Observing guide:",
+                "🌕 Full moon: 2026-09-26",
+                "• End of guide.",
+                "💫",
+            ]
+        )
+        result, _ = _last(monkeypatch, pane)
+        assert "🌕 Full moon: 2026-09-26" in result
