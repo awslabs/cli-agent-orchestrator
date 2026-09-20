@@ -154,6 +154,10 @@ from cli_agent_orchestrator.services.log_writer import log_writer
 from cli_agent_orchestrator.services.profile_search import (
     DEFAULT_LIMIT as PROFILE_SEARCH_DEFAULT_LIMIT,
 )
+from cli_agent_orchestrator.services.server_owner import (
+    acquire_server_ownership,
+    release_server_ownership,
+)
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.services.terminal_service import (
@@ -1276,6 +1280,10 @@ async def lifespan(app: FastAPI):
         init_telemetry(OTEL_SERVICE_NAME)
     except Exception:
         logger.warning("OTel telemetry init failed; continuing", exc_info=True)
+    # Claim exclusive ownership of the state directory BEFORE opening it. A
+    # second server on the same state refuses to serve rather than racing the
+    # first through a rolling update or a manual pod replacement (#745).
+    acquire_server_ownership()
     init_db()
     _seed_default_skills_at_startup()
     _reconcile_memory_at_startup()
@@ -1420,6 +1428,10 @@ async def lifespan(app: FastAPI):
         shutdown_telemetry()
     except Exception:
         logger.warning("Error shutting down OTel telemetry", exc_info=True)
+    # Free the state directory for the next owner. The kernel would do this
+    # when the process exits anyway; releasing here means a rollout's incoming
+    # server does not have to wait for the outgoing one to be reaped.
+    release_server_ownership()
     logger.info("Shutting down CLI Agent Orchestrator server...")
 
 

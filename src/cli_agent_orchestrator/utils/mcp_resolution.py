@@ -37,18 +37,35 @@ CAO_MCP_SERVER_COMMAND = "cao-mcp-server"
 # interpreter directly, with no dependency on a script being on PATH.
 CAO_MCP_SERVER_MODULE = "cli_agent_orchestrator.mcp_server.server"
 
-# Console-script filename to look for next to the interpreter. On Windows the
-# script is installed as a .exe wrapper.
-_SCRIPT_FILENAME = (
-    f"{CAO_MCP_SERVER_COMMAND}.exe" if sys.platform == "win32" else CAO_MCP_SERVER_COMMAND
-)
+# The stdio→HTTP forwarding shim (#745). A provider pointed at the shared
+# endpoint declares this instead of ``cao-mcp-server``, and needs the identical
+# PATH-independent resolution: it is bundled the same way and fails the same
+# way when the agent subprocess's PATH does not include the script dir.
+CAO_MCP_STDIO_BRIDGE_COMMAND = "cao-mcp-stdio-bridge"
+CAO_MCP_STDIO_BRIDGE_MODULE = "cli_agent_orchestrator.mcp_server.stdio_bridge"
+
+# Bundled console script → module entrypoint. A command absent from this map is
+# someone else's MCP server and passes through untouched.
+_BUNDLED_COMMANDS = {
+    CAO_MCP_SERVER_COMMAND: CAO_MCP_SERVER_MODULE,
+    CAO_MCP_STDIO_BRIDGE_COMMAND: CAO_MCP_STDIO_BRIDGE_MODULE,
+}
 
 
-def _sibling_script() -> str:
-    """Absolute path to cao-mcp-server next to the running interpreter, or ""."""
+def _script_filename(command: str) -> str:
+    """Console-script filename to look for. Windows installs a .exe wrapper."""
+    return f"{command}.exe" if sys.platform == "win32" else command
+
+
+# Retained for the default command so existing references keep working.
+_SCRIPT_FILENAME = _script_filename(CAO_MCP_SERVER_COMMAND)
+
+
+def _sibling_script(command: str = CAO_MCP_SERVER_COMMAND) -> str:
+    """Absolute path to a bundled script next to the running interpreter, or ""."""
     if not sys.executable:  # frozen/embedded interpreter — Path("") would raise
         return ""
-    sibling = Path(sys.executable).with_name(_SCRIPT_FILENAME)
+    sibling = Path(sys.executable).with_name(_script_filename(command))
     return str(sibling) if sibling.exists() else ""
 
 
@@ -84,11 +101,12 @@ def resolve_cao_mcp_command(
     Returns:
         A ``(command, args)`` tuple.
     """
-    if command != CAO_MCP_SERVER_COMMAND:
+    module = _BUNDLED_COMMANDS.get(command)
+    if module is None:
         return command, list(args)
 
-    sibling = _sibling_script()
-    on_path = shutil.which(CAO_MCP_SERVER_COMMAND)
+    sibling = _sibling_script(command)
+    on_path = shutil.which(command)
     order = (
         [("PATH", on_path), ("sibling", sibling)]
         if persisted
@@ -109,7 +127,7 @@ def resolve_cao_mcp_command(
     # the server in this tier too.
     interpreter = sys.executable or "python3"
     logger.debug("Resolved %s to module entrypoint via %s", command, interpreter)
-    return interpreter, ["-m", CAO_MCP_SERVER_MODULE, *args]
+    return interpreter, ["-m", module, *args]
 
 
 def resolve_mcp_server_config(config: dict, *, persisted: bool = False) -> dict:

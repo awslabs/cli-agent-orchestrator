@@ -117,6 +117,7 @@ otel = [
 "cao-server" = "cli_agent_orchestrator.api.main:main"
 "cao-bridge" = "cli_agent_orchestrator.runtime_channel.bridge:main"
 "cao-mcp-server" = "cli_agent_orchestrator.mcp_server.server:main"
+"cao-mcp-stdio-bridge" = "cli_agent_orchestrator.mcp_server.stdio_bridge:main"
 "cao-ops-mcp-server" = "cli_agent_orchestrator.ops_mcp_server.server:main"
 
 [project.entry-points."cao.plugins"]

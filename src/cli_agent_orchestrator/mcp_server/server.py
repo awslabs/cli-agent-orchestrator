@@ -2759,9 +2759,12 @@ def main():
     many agents, authenticated per request with a shared runtime token and a
     per-request caller identity.
 
-    No stdio-to-HTTP forwarding shim exists yet, and every shipped provider still
-    spawns its own stdio ``cao-mcp-server``. stdio is therefore unchanged rather
-    than bridged — the HTTP endpoint is available, not yet the default path.
+    A stdio-only provider reaches the shared endpoint through
+    ``cao-mcp-stdio-bridge`` (see ``stdio_bridge.py``): point the provider's
+    configured command at the shim and the ``CAO_TERMINAL_ID`` it already
+    injects becomes the per-request caller identity. Shipped profiles still
+    declare plain ``cao-mcp-server``, so stdio hosting remains the default and
+    the shared endpoint is opt-in per deployment.
     """
     transport = os.environ.get("CAO_MCP_TRANSPORT", "stdio").strip().lower()
     if transport == "http":

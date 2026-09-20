@@ -43,6 +43,13 @@ logger = logging.getLogger(__name__)
 RUNTIME_TOKEN_HEADER = "x-cao-runtime-token"
 RUNTIME_TOKEN_ENV = "CAO_RUNTIME_TOKEN"
 
+# FastMCP's Streamable HTTP default mount path. Named here so the server, the
+# stdio forwarding shim and the tests all derive the endpoint from one place
+# rather than each hardcoding "/mcp".
+MCP_HTTP_PATH = "/mcp"
+DEFAULT_HTTP_HOST = "127.0.0.1"
+DEFAULT_HTTP_PORT = 9890
+
 
 class SharedTokenError(RuntimeError):
     """Raised at startup when shared HTTP hosting has no token configured."""
@@ -87,6 +94,29 @@ def build_http_app(mcp):
             "start an unauthenticated shared endpoint"
         )
     mcp.add_middleware(CallerIdentityMiddleware(expected))
-    host = os.environ.get("CAO_MCP_HTTP_HOST", "127.0.0.1")
-    port = int(os.environ.get("CAO_MCP_HTTP_PORT", "9890"))
+    host, port = configured_host_port()
     return mcp, host, port
+
+
+def configured_host_port():
+    """The (host, port) the shared endpoint binds, from env or defaults."""
+    host = os.environ.get("CAO_MCP_HTTP_HOST", DEFAULT_HTTP_HOST)
+    port = int(os.environ.get("CAO_MCP_HTTP_PORT", str(DEFAULT_HTTP_PORT)))
+    return host, port
+
+
+def shared_endpoint_url() -> str:
+    """URL a client should dial for the shared HTTP MCP endpoint.
+
+    ``CAO_MCP_HTTP_URL`` wins when set, because a bind address is not an
+    advertised address: in a cluster the endpoint binds ``0.0.0.0`` inside its
+    pod and callers reach it through a Service DNS name. Falling back to the
+    bind host is only correct for the same-host case.
+    """
+    explicit = os.environ.get("CAO_MCP_HTTP_URL", "").strip()
+    if explicit:
+        return explicit
+    host, port = configured_host_port()
+    if host in ("0.0.0.0", "::", ""):
+        host = DEFAULT_HTTP_HOST
+    return f"http://{host}:{port}{MCP_HTTP_PATH}"
