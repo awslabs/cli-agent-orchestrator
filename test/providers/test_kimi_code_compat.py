@@ -21,12 +21,16 @@ status/extraction tests drive the real ``get_status()`` /
 hand-written approximations.
 """
 
+import asyncio
 import json
 import logging
 import os
 import re
+import shlex
+import shutil
 import socket
 import stat
+import subprocess
 from pathlib import Path
 from typing import Any, Dict
 from unittest.mock import MagicMock
@@ -34,6 +38,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.providers import kimi_cli as kimi_cli_module
 from cli_agent_orchestrator.providers import kimi_transcript as kt
 from cli_agent_orchestrator.providers.base import OutputExtractionError
 from cli_agent_orchestrator.providers.kimi_cli import (
@@ -41,6 +46,7 @@ from cli_agent_orchestrator.providers.kimi_cli import (
     KIMI_MCP_STARTUP_TIMEOUT_MS,
     KIMI_MCP_TOOL_TIMEOUT_MS,
     KIMI_NO_AUTO_UPDATE_ENV,
+    KIMI_PROBE_END_MARKER,
     KIMI_TRUST_OPT_IN_ENV,
     LEGACY_CAPABILITY_FLAGS,
     KimiCliProvider,
@@ -3590,3 +3596,502 @@ class TestD6ReasoningBeforeToolCall:
             kt.KimiLineKind.TOOL_CHROME,
             kt.KimiLineKind.FINAL_BULLET,
         ]
+
+
+# =============================================================================
+# PR #799 — upstream P2 review findings
+#
+# One class per reviewed finding, each carrying the regression that failed
+# against the pre-fix candidate. The shared `P2Review` prefix makes the family
+# selectable on its own:
+#
+#     pytest -q test/providers/test_kimi_code_compat.py -k P2Review
+# =============================================================================
+
+
+def _extract_last_message(script_output: str, terminal_id: str = "t-p2-review") -> str:
+    """Drive the real extraction entry point (the one terminal_service calls)."""
+
+    provider = KimiCliProvider(terminal_id, "session-1", "window-1")
+    return provider.extract_last_message_from_script(script_output)
+
+
+def _without_sgr(text: str) -> str:
+    return re.sub(r"\x1b\[[0-9;]*m", "", text)
+
+
+class TestP2ReviewProbeShellBoundary:
+    """P2-1 — the probe must run under an explicitly chosen POSIX shell.
+
+    ``_probe_kimi_environment`` types its program straight into the pane, so the
+    program is parsed by whatever shell the pane runs. ``fish`` rejects
+    ``${VAR:-default}`` outright ("${ is not a valid variable"), so a fish pane
+    never wrote the completion marker and a working Kimi Code binary was
+    classified UNKNOWN. The POSIX program must therefore be handed to a shell
+    that is selected explicitly and is independent of the pane's interactive
+    shell.
+    """
+
+    @pytest.fixture
+    def probe_command_for(self, tmp_path, monkeypatch):
+        """Drive the real probe and return the exact command typed into the pane.
+
+        Returned as a factory so a test can choose the temp directory (and with
+        it the probe path) the provider is pointed at.
+        """
+
+        def _run(temp_dir: Path) -> str:
+            provider = KimiCliProvider("term-probe", "session-1", "window-1")
+            provider._temp_dir = str(temp_dir)
+            probe_path = temp_dir / "kimi-probe.txt"
+            captured: Dict[str, str] = {}
+
+            def fake_send_keys(session_name, window_name, keys):
+                captured["command"] = keys
+                probe_path.write_text(
+                    "CAO_KIMI_BIN=/usr/bin/kimi\n"
+                    "CAO_KIMI_HOME=/home/u/.kimi-code\n" + KIMI_CODE_HELP + "\n"
+                    "CAO-KIMI-PROBE-END\n",
+                    encoding="utf-8",
+                )
+
+            backend = MagicMock()
+            backend.send_keys.side_effect = fake_send_keys
+            monkeypatch.setattr(kimi_cli_module, "get_backend", lambda: backend)
+
+            probe = asyncio.run(provider._probe_kimi_environment())
+            assert probe.dialect is KimiDialect.CODE
+            return captured["command"]
+
+        return _run
+
+    def test_posix_syntax_lives_inside_the_compatible_shell_payload(
+        self, probe_command_for, tmp_path
+    ):
+        """The pane shell must only ever see a shell-agnostic invocation."""
+
+        command = probe_command_for(tmp_path)
+        argv = shlex.split(command)
+
+        # One argv-level call into an explicitly chosen POSIX shell...
+        assert argv[0] == "/bin/sh"
+        assert argv[1] == "-c"
+        payload = argv[2]
+        assert argv[3] == "cao-kimi-probe"
+        assert argv[4] == str(tmp_path / "kimi-probe.txt")
+
+        # ...which carries every POSIX-only construct.
+        assert "${KIMI_CODE_HOME:-$HOME/.kimi-code}" in payload
+        assert "$(command -v kimi 2>/dev/null)" in payload
+        assert "kimi --help" in payload
+        assert KIMI_PROBE_END_MARKER in payload
+
+        # Nothing POSIX-only may sit outside it: the pane shell parses only
+        # `argv[0]`, the trailing argv, and no parameter expansion of its own.
+        for token in (argv[0], *argv[3:]):
+            assert "${" not in token
+            assert "$(" not in token
+        assert command.count("${KIMI_CODE_HOME:-$HOME/.kimi-code}") == 1
+
+    def test_outer_command_parses_under_a_non_posix_pane_shell(self, probe_command_for, tmp_path):
+        """Live check when ``fish`` is installed (4.x rejects ``${var:-x}``)."""
+
+        fish = shutil.which("fish")
+        if fish is None:
+            pytest.skip("fish is not installed")
+
+        command = probe_command_for(tmp_path)
+        result = subprocess.run(
+            [fish, "--no-config", "-c", command],
+            capture_output=True,
+            text=True,
+            env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)},
+        )
+        assert result.returncode == 0, result.stderr
+
+        written = (tmp_path / "kimi-probe.txt").read_text(encoding="utf-8")
+        assert written.startswith("CAO_KIMI_BIN=")
+        assert "CAO_KIMI_HOME=" in written
+        assert KIMI_PROBE_END_MARKER in written
+
+    def test_inner_shell_sees_the_pane_environment(self, probe_command_for, tmp_path):
+        """PATH / HOME / KIMI_CODE_HOME must be the pane's, not cao-server's."""
+
+        fish = shutil.which("fish")
+        if fish is None:
+            pytest.skip("fish is not installed")
+
+        pane_bin = tmp_path / "pane-bin"
+        pane_bin.mkdir()
+        pane_kimi = pane_bin / "kimi"
+        pane_kimi.write_text("#!/bin/sh\necho 'Usage: kimi'\n", encoding="utf-8")
+        pane_kimi.chmod(0o755)
+
+        command = probe_command_for(tmp_path)
+        result = subprocess.run(
+            [fish, "--no-config", "-c", command],
+            capture_output=True,
+            text=True,
+            env={
+                "PATH": f"{pane_bin}:/usr/bin:/bin",
+                "HOME": str(tmp_path),
+                "KIMI_CODE_HOME": "/tmp/pane home",
+            },
+        )
+        assert result.returncode == 0, result.stderr
+
+        written = (tmp_path / "kimi-probe.txt").read_text(encoding="utf-8")
+        # The binary the inner shell resolves is the pane's, and the resolved
+        # absolute path is what the launch reuses.
+        assert f"CAO_KIMI_BIN={pane_kimi}\n" in written
+        assert "CAO_KIMI_HOME=/tmp/pane home\n" in written
+        assert "Usage: kimi" in written
+
+    def test_probe_path_with_spaces_and_quotes_cannot_inject(self, probe_command_for, tmp_path):
+        """The probe path is one shell word, whatever it contains."""
+
+        fish = shutil.which("fish")
+        if fish is None:
+            pytest.skip("fish is not installed")
+
+        hostile = tmp_path / "sp ace'q;uote"
+        hostile.mkdir()
+        probe_path = hostile / "kimi-probe.txt"
+
+        command = probe_command_for(hostile)
+        assert shlex.split(command)[-1] == str(probe_path)
+
+        result = subprocess.run(
+            [fish, "--no-config", "-c", command],
+            capture_output=True,
+            text=True,
+            env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)},
+        )
+        assert result.returncode == 0, result.stderr
+        assert KIMI_PROBE_END_MARKER in probe_path.read_text(encoding="utf-8")
+
+
+class TestP2ReviewProseIsNotAToolCall:
+    """P2-2 — ordinary answer prose must not be read as a tool header.
+
+    ``classify_rows`` opens a tool block on ``TOOL_CALL``, so a misclassified
+    prose bullet did not merely lose one row: every following row was folded
+    into the block as ``TOOL_CHROME`` and the answer was destroyed. The
+    escape-free regex keyed on the English verb prefixes alone, so
+    "Calling this function twice returns two rows." and
+    "Running a command is unnecessary here." both matched.
+    """
+
+    @pytest.mark.parametrize(
+        "row",
+        [
+            "• Calling this function twice returns two rows.",
+            "• Running a command is unnecessary here.",
+            "● Calling this function twice returns two rows.",
+            "● Running a command is unnecessary here.",
+        ],
+    )
+    def test_prose_bullets_remain_answer_content(self, row):
+        assert kt.classify_line(row) is kt.KimiLineKind.FINAL_BULLET
+        assert kt.KimiLineKind.FINAL_BULLET in kt.ANSWER_KINDS
+
+    @pytest.mark.parametrize(
+        "row",
+        [
+            "● Running a command · $ uname -a",
+            "● Used Read (ANSWER_SPEC.md) · 10 lines",
+            "● Used find_profiles · MCP/cao-mcp-server (kimi)",
+            "● Using find_profiles · MCP/cao-mcp-server",
+        ],
+    )
+    def test_measured_tool_headers_stay_tool_calls(self, row):
+        assert kt.classify_line(row) is kt.KimiLineKind.TOOL_CALL
+        assert kt.KimiLineKind.TOOL_CALL not in kt.ANSWER_KINDS
+
+    def test_whole_prose_answer_survives_extraction(self):
+        """The reviewed mechanism: the block swallowed the continuation rows."""
+
+        script = "\n".join(
+            [
+                "💫 Explain the call syntax.",
+                "• Calling this function twice returns two rows.",
+                "Running a command is unnecessary here.",
+            ]
+        )
+        assert _extract_last_message(script) == (
+            "• Calling this function twice returns two rows.\n"
+            "Running a command is unnecessary here."
+        )
+
+    def test_tool_plumbing_is_still_removed_by_extraction(self):
+        """The D6 filter must not be weakened by the tighter prose rule."""
+
+        script = "\n".join(
+            [
+                "💫 Run uname.",
+                "● Running a command · $ uname -a",
+                "Linux host 6.1.0 x86_64 GNU/Linux",
+                "● Checked: uname -a output above.",
+            ]
+        )
+        result = _extract_last_message(script)
+        assert result == "● Checked: uname -a output above."
+        assert "Running a command" not in result
+        assert "GNU/Linux" not in result
+
+
+class TestP2ReviewQuotedTrustMarker:
+    """P2-3 — a quoted ``❯`` must not end the response region.
+
+    ``classify_line`` returned ``TRUST_DIALOG`` for any row *containing* the
+    marker, and ``TRUST_DIALOG`` is a response-end anchor, so an answer that
+    merely printed the glyph was silently truncated at that row.
+    """
+
+    def test_quoted_marker_row_is_not_a_trust_dialog(self):
+        row = "• $ printf '❯'"
+        assert kt.classify_line(row) is not kt.KimiLineKind.TRUST_DIALOG
+        assert kt.classify_line(row) is kt.KimiLineKind.FINAL_BULLET
+
+    def test_extraction_is_not_truncated_by_a_quoted_marker(self):
+        """The reviewed case: content after the quoted marker must survive."""
+
+        script = "\n".join(
+            [
+                "💫 Show me the marker.",
+                "",
+                "intro",
+                "$ printf '❯'",
+                "Done.",
+                "",
+            ]
+        )
+        assert _extract_last_message(script) == "intro\n$ printf '❯'\nDone."
+
+    @pytest.mark.parametrize(
+        "row",
+        [
+            "❯ Trust this folder",
+            "    ❯ Trust this folder",
+            "❯ Don't trust",
+            "         Don't trust",
+        ],
+    )
+    def test_real_trust_option_rows_still_classify_as_dialog(self, row):
+        assert kt.classify_line(row) is kt.KimiLineKind.TRUST_DIALOG
+
+    def test_measured_trust_dialogs_are_still_detected(self):
+        for name in (
+            "kimi_code_0431_06_workspace_trust_dialog_gated_mcp.txt",
+            "kimi_code_0431_07_workspace_trust_dialog_plain.txt",
+        ):
+            dialog = kt.detect_trust_dialog(_fixture(name).split("\n"))
+            assert dialog is not None, name
+            assert dialog.options == [kt.TRUST_OPTION_TRUST, kt.TRUST_OPTION_REJECT], name
+            assert dialog.selected_option == kt.TRUST_OPTION_TRUST, name
+
+
+class TestP2ReviewLegacyIdlePromptBoundary:
+    """P2-4 — the legacy bare ``✨`` / ``💫`` idle prompt must end the answer.
+
+    The classifier had no row kind for the bare form, so the terminal's own
+    idle prompt was emitted as the last line of the extracted answer.
+    """
+
+    @pytest.mark.parametrize("marker", ["💫", "✨"])
+    def test_final_bare_prompt_is_not_part_of_the_answer(self, marker):
+        script = "\n".join([f"{marker} What is two plus two?", "• Four.", marker, ""])
+        assert _extract_last_message(script) == "• Four."
+
+    @pytest.mark.parametrize("marker", ["💫", "✨"])
+    def test_bare_prompt_row_is_ready_chrome(self, marker):
+        assert kt.classify_line(marker) is kt.KimiLineKind.READY_INPUT_FRAME
+        assert kt.KimiLineKind.READY_INPUT_FRAME in kt.CHROME_KINDS
+        assert kt.KimiLineKind.READY_INPUT_FRAME not in kt.ANSWER_KINDS
+
+    @pytest.mark.parametrize("marker", ["💫", "✨"])
+    def test_bare_prompt_is_scoped_to_the_legacy_dialect(self, marker):
+        """Kimi Code's composer is boxed, so its rows are not swept up."""
+
+        assert (
+            kt.classify_line(marker, semantics=kt.SpinnerSemantics.CODE)
+            is not kt.KimiLineKind.READY_INPUT_FRAME
+        )
+
+    def test_prose_containing_a_sparkle_is_untouched(self):
+        assert (
+            kt.classify_line("• Use the ✨ glyph in your answer.") is kt.KimiLineKind.FINAL_BULLET
+        )
+        assert kt.classify_line("The ✨ marker is the legacy prompt.") is kt.KimiLineKind.CONTENT
+        assert kt.classify_line("• I used 💫 to mean the composer.") is kt.KimiLineKind.FINAL_BULLET
+
+    def test_kimi_code_moon_semantics_are_unchanged(self):
+        moon = "\U0001f315"
+        assert (
+            kt.classify_line(moon, semantics=kt.SpinnerSemantics.CODE)
+            is not kt.KimiLineKind.LIVE_SPINNER
+        )
+        assert (
+            kt.classify_line(moon, semantics=kt.SpinnerSemantics.CODE)
+            is not kt.KimiLineKind.READY_INPUT_FRAME
+        )
+
+
+#: A trust dialog whose workspace path contains a space, rendered as measured:
+#: the workspace row is drawn in colour 255 between the navigation hint and the
+#: option list.
+_TRUST_DIALOG_SPACED_WORKSPACE = [
+    "\x1b[1m\x1b[38;5;111m Trust this folder?\x1b[0m",
+    "\x1b[38;5;242m ↑↓ navigate · Enter select · Esc exit\x1b[39m",
+    "",
+    "  \x1b[38;5;255m/tmp/my project\x1b[39m",
+    "",
+    "  \x1b[38;5;242mProject-level MCP servers are disabled until you explicitly "
+    "choose Trust.\x1b[39m",
+    "",
+    "  \x1b[38;5;111m  ❯ \x1b[1mTrust this folder\x1b[0m",
+    "     \x1b[38;5;242mEnable project MCP servers. Remembered for this folder.\x1b[39m",
+    "",
+    "  \x1b[38;5;244m    \x1b[38;5;253mDon't trust\x1b[0m",
+    "     \x1b[38;5;242mExit Kimi Code. Asked again next launch.\x1b[39m",
+]
+
+
+class TestP2ReviewTrustWorkspaceWithSpaces:
+    """P2-5 — a rendered workspace path may contain spaces.
+
+    The row was matched by a whitespace-free token heuristic plus an explicit
+    ``" " not in stripped`` guard, so ``/tmp/my project`` was rejected and the
+    dialog became unanswerable. The row must be identified from the dialog's
+    structure instead, without weakening the exact-cwd comparison that is the
+    actual security gate.
+    """
+
+    def test_spaced_workspace_is_recovered(self):
+        dialog = kt.detect_trust_dialog(_TRUST_DIALOG_SPACED_WORKSPACE)
+        assert dialog is not None
+        assert dialog.workspace == "/tmp/my project"
+        assert dialog.selected_option == kt.TRUST_OPTION_TRUST
+
+    def test_spaced_workspace_is_recovered_without_styling(self):
+        """Escape-free input (the screen path) must work too."""
+
+        rows = [_without_sgr(row) for row in _TRUST_DIALOG_SPACED_WORKSPACE]
+        dialog = kt.detect_trust_dialog(rows)
+        assert dialog is not None
+        assert dialog.workspace == "/tmp/my project"
+
+    def test_measured_fixture_workspaces_are_unchanged(self):
+        for name, expected in (
+            ("kimi_code_0431_06_workspace_trust_dialog_gated_mcp.txt", "<A0DIR>/project"),
+            ("kimi_code_0431_07_workspace_trust_dialog_plain.txt", "<A0DIR>/project"),
+        ):
+            dialog = kt.detect_trust_dialog(_fixture(name).split("\n"))
+            assert dialog is not None, name
+            assert dialog.workspace == expected, name
+
+    def test_a_path_shaped_prose_row_is_not_trusted_as_the_workspace(self):
+        """Structure, not "contains a slash", decides which row is the folder."""
+
+        rows = [
+            "\x1b[1m\x1b[38;5;111m Trust this folder?\x1b[0m",
+            "\x1b[38;5;242m ↑↓ navigate · Enter select · Esc exit\x1b[39m",
+            "  \x1b[38;5;255m/tmp/my project\x1b[39m",
+            "  \x1b[38;5;242mMCP config lives in /etc/mcp/servers.json\x1b[39m",
+            "  \x1b[38;5;111m  ❯ \x1b[1mTrust this folder\x1b[0m",
+            "  \x1b[38;5;244m    \x1b[38;5;253mDon't trust\x1b[0m",
+        ]
+        dialog = kt.detect_trust_dialog(rows)
+        assert dialog is not None
+        assert dialog.workspace == "/tmp/my project"
+
+    @pytest.mark.asyncio
+    async def test_exact_cwd_match_is_still_required(self, monkeypatch):
+        """A spaced workspace must not loosen the equality check."""
+
+        monkeypatch.setenv(KIMI_TRUST_OPT_IN_ENV, "1")
+        provider = KimiCliProvider("term-p2-trust", "session-1", "window-1")
+        pane = "\n".join(_TRUST_DIALOG_SPACED_WORKSPACE)
+
+        backend = MagicMock()
+        backend.get_pane_working_directory.return_value = "/tmp/my project "
+        monkeypatch.setattr(kimi_cli_module, "get_backend", lambda: backend)
+
+        with pytest.raises(Exception, match="other than this terminal"):
+            await provider._handle_trust_dialog(pane)
+        backend.send_special_key.assert_not_called()
+        assert provider._trust_handled is False
+
+    @pytest.mark.asyncio
+    async def test_matching_spaced_workspace_is_answered(self, monkeypatch):
+        monkeypatch.setenv(KIMI_TRUST_OPT_IN_ENV, "1")
+        provider = KimiCliProvider("term-p2-trust-ok", "session-1", "window-1")
+        pane = "\n".join(_TRUST_DIALOG_SPACED_WORKSPACE)
+
+        backend = MagicMock()
+        backend.get_pane_working_directory.return_value = "/tmp/my project"
+        monkeypatch.setattr(kimi_cli_module, "get_backend", lambda: backend)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.status_monitor.status_monitor.notify_input_sent",
+            lambda *a, **k: None,
+        )
+
+        assert await provider._handle_trust_dialog(pane) is True
+        assert backend.send_special_key.call_args[0][2] == "Enter"
+
+
+class TestP2ReviewPublicOutputPath:
+    """The reviewed findings surface through ``get_output(mode=LAST)``.
+
+    These drive that public entry point — with a real ``KimiCliProvider`` handed
+    back by the provider manager — rather than the extraction helper, so the
+    fixes are proven at the boundary the review traced them through.
+    """
+
+    def _get_last(self, monkeypatch, pane: str) -> str:
+        from cli_agent_orchestrator.services import terminal_service
+
+        provider = KimiCliProvider("term-p2-public", "session-1", "window-1")
+        backend = MagicMock()
+        backend.get_history.return_value = pane
+        monkeypatch.setattr(
+            terminal_service,
+            "get_terminal_metadata",
+            lambda terminal_id: {"tmux_session": "s", "tmux_window": "w"},
+        )
+        monkeypatch.setattr(terminal_service.status_monitor, "get_buffer", lambda tid: pane)
+        monkeypatch.setattr(terminal_service, "get_backend", lambda: backend)
+        monkeypatch.setattr(terminal_service.provider_manager, "get_provider", lambda tid: provider)
+        return terminal_service.get_output("term-p2-public", terminal_service.OutputMode.LAST)
+
+    def test_ordinary_prose_answer_is_preserved(self, monkeypatch):
+        pane = "\n".join(
+            [
+                "💫 Explain the call syntax.",
+                "• Calling this function twice returns two rows.",
+                "Running a command is unnecessary here.",
+            ]
+        )
+        assert self._get_last(monkeypatch, pane) == (
+            "• Calling this function twice returns two rows.\n"
+            "Running a command is unnecessary here."
+        )
+
+    def test_tool_plumbing_is_still_removed(self, monkeypatch):
+        pane = "\n".join(
+            [
+                "💫 Run uname.",
+                "● Running a command · $ uname -a",
+                "Linux host 6.1.0 x86_64 GNU/Linux",
+                "● Checked: uname -a output above.",
+            ]
+        )
+        assert self._get_last(monkeypatch, pane) == "● Checked: uname -a output above."
+
+    def test_quoted_marker_does_not_truncate(self, monkeypatch):
+        pane = "\n".join(["💫 Show me the marker.", "", "intro", "$ printf '❯'", "Done.", ""])
+        assert self._get_last(monkeypatch, pane) == "intro\n$ printf '❯'\nDone."
+
+    def test_legacy_final_idle_prompt_is_absent(self, monkeypatch):
+        pane = "\n".join(["💫 What is two plus two?", "• Four.", "💫", ""])
+        assert self._get_last(monkeypatch, pane) == "• Four."

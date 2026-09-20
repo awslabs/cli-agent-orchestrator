@@ -268,6 +268,17 @@ USER_INPUT_STYLE_RE = re.compile(r"\x1b\[1m\x1b\[38;5;222m|\x1b\[38;5;222m")
 #: repeating the sparkle, which is the only signal those rows carry.
 USER_INPUT_COLOR_INDEX = 222
 
+# The legacy TUI's idle prompt: a sparkle on a row of its own (`✨` / `💫`),
+# with nothing after it. The provider's `IDLE_PROMPT_PATTERN` has always treated
+# the sparkle as the idle-prompt marker, but the classifier had no row kind for
+# the bare form, so the terminal's own prompt row fell through to CONTENT and
+# was published as the last line of the extracted answer. Anchored to the whole
+# row, so an answer that merely mentions the glyph is untouched. Kimi Code
+# replaced this composer with a boxed frame, and its moons carry different
+# semantics, so the rule is scoped to the legacy dialect by
+# `is_legacy_idle_prompt_line`.
+LEGACY_IDLE_PROMPT_RE = re.compile(r"^\s*[✨💫]\s*$")
+
 # Dimmed "… (N more lines, ctrl+o to expand)" tool-output collapse row.
 COLLAPSED_TOOL_OUTPUT_RE = re.compile(r"…\s*\(\d+ more lines")
 
@@ -316,12 +327,18 @@ TOOL_CALL_RE = re.compile(
     + r"(?:Running a command|Calling|Using|Used|Read|Write|Edit|Search|Fetch)"
 )
 # The escape-free form of the same row. Every branch is anchored to a measured
-# structural suffix for the identifier-carrying verbs.
+# structural suffix, so prose that merely *begins* with a tool verb is not swept
+# up. `● Running a command · $ uname -a` carries the `·` detail separator;
+# `● Used Read (ANSWER_SPEC.md) · 10 lines` carries the parenthesised argument
+# list; an identifier with nothing after it is the row and nothing else. Without
+# those anchors, `● Calling this function twice returns two rows.` and
+# `● Running a command is unnecessary here.` were classified TOOL_CALL — and
+# because `classify_rows` opens a tool block on that kind, the continuation rows
+# of the answer were then suppressed as TOOL_CHROME and the answer was lost.
 TOOL_CALL_CLEAN_RE = re.compile(
     r"^\s*[•●]\s*(?:"
-    r"Running a command"
-    r"|Calling "
-    r"|(?:Used|Using)\s+" + _TOOL_IDENTIFIER + _TOOL_ROW_SUFFIX + r")"
+    r"Running a command(?=\s*·)"
+    r"|(?:Used|Using|Calling)\s+" + _TOOL_IDENTIFIER + _TOOL_ROW_SUFFIX + r")"
 )
 
 # ---------------------------------------------------------------------------
@@ -338,13 +355,69 @@ TRUST_OPTIONS: Tuple[str, ...] = (TRUST_OPTION_TRUST, TRUST_OPTION_REJECT)
 # the other.
 TRUST_SELECT_MARKER = "❯"
 # The trust dialog prints the workspace it is asking about on its own row, in
-# colour 255. Matched structurally (a lone path-shaped token) rather than by an
-# absolute-path prefix: the A0 scrubbed fixtures carry the placeholder
-# `<A0DIR>/project`, and a real capture may equally be a container-translated
-# guest path. The caller still compares the captured value against the actual
-# pane working directory before acting, so a loose match here cannot cause a
-# trust decision for the wrong folder.
-TRUST_PATH_TOKEN_RE = re.compile(r"^\S*/\S*$")
+# colour 255 (measured on both A0 trust captures). That row is identified from
+# the dialog's structure — its position between the navigation hint and the
+# option list, its measured colour, and the fact that it is not one of the
+# dialog's own chrome rows — rather than by "a whitespace-free token containing
+# a slash". That earlier heuristic rejected every workspace path with a space in
+# it (`/tmp/my project`), which made the dialog unanswerable, while
+# simultaneously accepting any slash-bearing string elsewhere in the dialog
+# body. The caller still compares the captured value against the actual pane
+# working directory with an exact equality test before acting, so identifying
+# the wrong row here cannot cause a trust decision for the wrong folder — it can
+# only fail closed.
+TRUST_WORKSPACE_COLOR_INDEX = 255
+# The gated-MCP section header, drawn between the workspace row and the option
+# list. It is dialog chrome, never the workspace.
+TRUST_MCP_TARGETS_PREFIX = "Project MCP targets:"
+
+
+def _trust_option_body(stripped: str) -> str:
+    """The option label on a row, with any selection marker removed."""
+
+    if stripped.startswith(TRUST_SELECT_MARKER):
+        return stripped[len(TRUST_SELECT_MARKER) :].strip()
+    return stripped
+
+
+def is_trust_option_row(clean_line: str) -> bool:
+    """True when the row is one of the trust dialog's option rows.
+
+    Positive identification: an optional selection marker followed by one of
+    the exact measured option labels. A row that merely *contains* the marker is
+    not a dialog row — matching on containment classified a quoted marker in
+    assistant prose as TRUST_DIALOG, and because TRUST_DIALOG ends a response
+    region the remainder of the answer was silently dropped.
+    """
+
+    return _trust_option_body(clean_line.strip()) in TRUST_OPTIONS
+
+
+def is_trust_workspace_candidate(clean_line: str) -> bool:
+    """True when the row can be the workspace the dialog is asking about.
+
+    Structurally: a non-empty row that names a path and is not one of the
+    dialog's own chrome rows (title, navigation hint, option, gated-MCP header,
+    or a bare rule). :func:`detect_trust_dialog` then uses the row's position
+    and its measured colour to choose between candidates.
+
+    Deliberately not restricted to whitespace-free tokens: a real workspace path
+    may contain spaces, and rejecting those made the dialog unanswerable.
+    """
+
+    stripped = clean_line.strip()
+    if not stripped or "/" not in stripped:
+        return False
+    if TRUST_TITLE_RE.match(clean_line) or TRUST_HINT_RE.search(clean_line):
+        return False
+    if is_trust_option_row(clean_line):
+        return False
+    if stripped.startswith(TRUST_MCP_TARGETS_PREFIX):
+        return False
+    if RULE_RE.match(clean_line):
+        return False
+    return True
+
 
 APPROVAL_TITLE_RE = re.compile(r"▶\s*(?:Run this command\?|Approve\s|Allow\s)")
 APPROVAL_HINT_RE = re.compile(r"↑/↓\s*select\s*·\s*1/2/3/4\s*choose")
@@ -540,6 +613,22 @@ def is_idle_tip_line(clean_line: str, raw_line: str = "") -> bool:
     if _BRAILLE_RE.search(clean_line) or _BRAILLE_RE.search(raw_line):
         return False
     return bool(_TIP_RE.search(clean_line))
+
+
+def is_legacy_idle_prompt_line(
+    clean_line: str,
+    semantics: SpinnerSemantics = SpinnerSemantics.LEGACY,
+) -> bool:
+    """True when the row is the legacy TUI's bare ``✨`` / ``💫`` idle prompt.
+
+    Anchored to the whole row, so an answer that merely mentions the glyph stays
+    content, and scoped to the legacy dialect, whose composer this is: Kimi Code
+    draws a boxed composer instead, and its moon glyphs have separate semantics.
+    """
+
+    if semantics is SpinnerSemantics.CODE:
+        return False
+    return bool(LEGACY_IDLE_PROMPT_RE.match(clean_line))
 
 
 def is_live_spinner_line(
@@ -740,9 +829,9 @@ def classify_line(
     # --- dialogs first: their rows would otherwise be read as content ---
     if TRUST_TITLE_RE.match(clean) or TRUST_HINT_RE.search(clean):
         return KimiLineKind.TRUST_DIALOG
-    if TRUST_SELECT_MARKER in clean:
+    if is_trust_option_row(clean):
         return KimiLineKind.TRUST_DIALOG
-    if stripped in TRUST_OPTIONS or stripped.startswith("Project MCP targets:"):
+    if stripped.startswith(TRUST_MCP_TARGETS_PREFIX):
         return KimiLineKind.TRUST_DIALOG
     if APPROVAL_TITLE_RE.search(clean) or APPROVAL_HINT_RE.search(clean):
         return KimiLineKind.APPROVAL_DIALOG
@@ -754,6 +843,11 @@ def classify_line(
         return KimiLineKind.LIVE_SPINNER
     if is_idle_tip_line(clean, raw):
         return KimiLineKind.IDLE_TIP
+    # The legacy composer's bare prompt is ready chrome: it is the row the TUI
+    # shows once the turn has settled, so it must end the response region rather
+    # than ride along as the answer's last line.
+    if is_legacy_idle_prompt_line(clean, semantics):
+        return KimiLineKind.READY_INPUT_FRAME
 
     # --- chrome, structurally identified ---
     if is_boot_chrome_line(clean, raw):
@@ -934,6 +1028,7 @@ def detect_trust_dialog(rows: Sequence[str]) -> Optional[TrustDialog]:
     options: List[str] = []
     selected_index: Optional[int] = None
     workspace: Optional[str] = None
+    workspace_is_styled = False
 
     for raw in rows:
         clean = strip_sgr(raw)
@@ -946,28 +1041,23 @@ def detect_trust_dialog(rows: Sequence[str]) -> Optional[TrustDialog]:
 
         stripped = clean.strip()
         # Option rows: optional `❯ ` marker, then an exact known label.
-        has_marker = stripped.startswith(TRUST_SELECT_MARKER)
-        body = stripped[1:].strip() if has_marker else stripped
+        body = _trust_option_body(stripped)
         if body in TRUST_OPTIONS:
             if body not in options:
                 options.append(body)
-            if has_marker and selected_index is None:
+            if stripped.startswith(TRUST_SELECT_MARKER) and selected_index is None:
                 selected_index = options.index(body)
             continue
 
-        # Workspace row: a lone path-shaped token. The dialog draws it between
-        # the navigation hint and the option list, so it is matched anywhere
-        # rather than only before the title.
-        if (
-            workspace is None
-            and stripped
-            and " " not in stripped
-            and TRUST_PATH_TOKEN_RE.match(stripped)
-            and not stripped.startswith(
-                (TRUST_SELECT_MARKER, APPROVAL_SELECT_MARKER, "↑", "↓", "·")
-            )
-        ):
-            workspace = stripped
+        # Workspace row: a path-naming row in the dialog body — after the
+        # navigation hint and before the option list. The measured renderer
+        # draws it in colour 255, which is preferred over position alone when
+        # both signals are available.
+        if hint_seen and not options and is_trust_workspace_candidate(clean):
+            styled = TRUST_WORKSPACE_COLOR_INDEX in foreground_color_indices(raw)
+            if workspace is None or (styled and not workspace_is_styled):
+                workspace = stripped
+                workspace_is_styled = styled
 
     if not (title_seen and hint_seen and options):
         return None

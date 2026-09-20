@@ -74,9 +74,15 @@ Rules that matter:
   `(absolute path, st_mtime_ns, st_size)`. An `UNKNOWN` verdict must not become
   sticky — a transient PATH problem at boot would otherwise disable the
   provider for the life of the process.
-- The probe and the launch run **in the same shell**, and the probe's absolute
-  binary path is reused verbatim for `exec`. Probing one PATH while tmux
-  launches another is the PR #664 bug class.
+- The probe runs **in the launch shell's environment** and its absolute binary
+  path is reused verbatim for `exec`. Probing one PATH while tmux launches
+  another is the PR #664 bug class. The probe *program* is POSIX and is handed
+  to an explicitly selected `/bin/sh` (a child of the pane shell) rather than
+  typed at the pane's own shell, because the pane shell is the operator's
+  choice: `fish` cannot parse `${VAR:-default}` and would fail before reporting
+  anything. The child shell inherits the pane's `PATH`, `HOME` and
+  `KIMI_CODE_HOME`, so `command -v kimi` still observes exactly what the
+  launched `kimi` will see, and probe and exec still refer to the same file.
 
 ## Kimi Code Path
 

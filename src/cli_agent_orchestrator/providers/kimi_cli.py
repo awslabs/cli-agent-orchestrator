@@ -289,6 +289,51 @@ KIMI_PROBE_TIMEOUT_SECONDS = 20.0
 #: command, which would match this marker before the command even ran).
 KIMI_PROBE_END_MARKER = "CAO-KIMI-PROBE-END"
 
+#: The shell the probe program is handed to, chosen explicitly and absolutely.
+#: The program contains POSIX parameter expansion (``${VAR:-default}``) and
+#: command substitution, neither of which a non-POSIX pane shell can parse —
+#: ``fish`` rejects ``${`` outright ("${ is not a valid variable"), so a fish
+#: pane never wrote the completion marker and a working Kimi Code binary was
+#: classified UNKNOWN. The pane's own shell must therefore only ever parse a
+#: shell-agnostic invocation; the POSIX program runs in this child shell, which
+#: inherits the pane's environment (PATH, HOME, KIMI_CODE_HOME) so ``command -v
+#: kimi`` still observes the exact environment the launched ``kimi`` will see.
+KIMI_PROBE_SHELL = "/bin/sh"
+
+
+def build_kimi_probe_command(probe_path: str) -> str:
+    """The exact command typed into the pane to run the capability probe.
+
+    The POSIX program is passed to an explicitly selected shell as a single
+    argv word, and the probe file is passed as a positional parameter instead of
+    being interpolated into the program, so no temp-path content is ever parsed
+    as shell syntax. Everything the pane's shell has to parse is the
+    shell-agnostic shape::
+
+        /bin/sh -c '<program>' cao-kimi-probe '<probe path>'
+
+    A ``fish`` (or any other non-POSIX) pane therefore sees only a command name
+    and two arguments; ``${KIMI_CODE_HOME:-$HOME/.kimi-code}`` is expanded by
+    the ``/bin/sh`` child, which inherits the pane's environment.
+    """
+
+    program = (
+        "{ printf 'CAO_KIMI_BIN=%s\\n' \"$(command -v kimi 2>/dev/null)\"; "
+        "printf 'CAO_KIMI_HOME=%s\\n' \"${KIMI_CODE_HOME:-$HOME/.kimi-code}\"; "
+        "kimi --help 2>&1; "
+        "printf '\\n%s\\n' '" + KIMI_PROBE_END_MARKER + '\'; } > "$1" 2>&1'
+    )
+    return " ".join(
+        (
+            KIMI_PROBE_SHELL,
+            "-c",
+            shlex.quote(program),
+            "cao-kimi-probe",
+            shlex.quote(probe_path),
+        )
+    )
+
+
 #: Successful probes only, keyed by binary identity. A failed probe is never
 #: cached — an UNKNOWN verdict must not become sticky, or a transient PATH or
 #: filesystem problem at boot would permanently disable the provider for this
@@ -707,6 +752,12 @@ class KimiCliProvider(BaseProvider):
         * ``CAO_KIMI_HOME`` — the effective ``KIMI_CODE_HOME`` in that same shell,
         * the full ``--help`` text, which is the capability signature.
 
+        The command is a POSIX program handed to an explicitly selected shell
+        (:data:`KIMI_PROBE_SHELL`), not typed at the pane's interactive shell —
+        see :func:`build_kimi_probe_command`. The program is still *resolved in*
+        the pane's environment, so the probe and the launch agree even when the
+        pane runs a shell that cannot parse the program itself.
+
         The returned absolute path is then used verbatim for the launch, so
         probe and exec provably refer to the same file.
 
@@ -718,10 +769,15 @@ class KimiCliProvider(BaseProvider):
 
         temp_dir = await asyncio.to_thread(self._ensure_temp_dir)
         probe_path = os.path.join(temp_dir, "kimi-probe.txt")
-        quoted = shlex.quote(probe_path)
 
-        # Single-line shell program: resolve the binary, dump its `--help`, and
-        # terminate the file with an explicit end marker.
+        # The program below is POSIX and contains `${VAR:-default}` and
+        # `$(...)`. It is handed to an explicitly selected shell instead of
+        # being typed at the pane's interactive shell, because the pane's shell
+        # is the operator's choice: `fish` cannot parse either construct, so it
+        # would fail before writing the completion marker and a working Kimi
+        # Code binary would be classified UNKNOWN. This shell is a child of the
+        # pane shell, so PATH/HOME/KIMI_CODE_HOME — and therefore `command -v
+        # kimi` — are exactly what the launched `kimi` will see.
         #
         # The completion signal is read from the FILE, never from the pane. The
         # pane is unusable for this: `send_keys` types the script as literal
@@ -731,12 +787,7 @@ class KimiCliProvider(BaseProvider):
         # probe read a half-written file, classifying a perfectly good Kimi Code
         # binary as UNKNOWN. The end marker is written by the shell as the last
         # thing it does, so its presence in the file means the dump is complete.
-        probe_script = (
-            "{ printf 'CAO_KIMI_BIN=%s\\n' \"$(command -v kimi 2>/dev/null)\"; "
-            "printf 'CAO_KIMI_HOME=%s\\n' \"${KIMI_CODE_HOME:-$HOME/.kimi-code}\"; "
-            "kimi --help 2>&1; "
-            "printf '\\n%s\\n' '" + KIMI_PROBE_END_MARKER + "'; } > " + quoted + " 2>&1"
-        )
+        probe_script = build_kimi_probe_command(probe_path)
 
         await asyncio.to_thread(
             get_backend().send_keys, self.session_name, self.window_name, probe_script
