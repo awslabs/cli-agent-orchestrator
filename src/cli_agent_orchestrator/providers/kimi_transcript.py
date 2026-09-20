@@ -1094,7 +1094,7 @@ def is_composer_row(clean_line: str) -> bool:
     stripped = clean_line.strip()
     if not stripped:
         return False
-    if stripped[0] in "╭╰":
+    if _FRAME_EDGE_RE.match(clean_line):
         return True
     if stripped[0] in "│|":
         if COMPOSER_PROMPT_RE.match(clean_line):
@@ -1107,9 +1107,13 @@ def is_composer_row(clean_line: str) -> bool:
 #: A box-drawing frame edge, which is what the renderer draws around the prompt
 #: row. A `│`-only shape is not enough: a Markdown table uses the same glyph in
 #: the same column position.
-_FRAME_EDGE_RE = re.compile(r"^\s*[╭╰]")
-_FRAME_EDGE_OPEN_RE = re.compile(r"^\s*╭")
-_FRAME_EDGE_CLOSE_RE = re.compile(r"^\s*╰")
+# A real frame edge is a border, not arbitrary prose whose first codepoint is a
+# box-drawing corner.  Requiring the horizontal run (and optional matching end
+# corner) preserves the measured composer while keeping answers such as
+# ``╭ U+256D BOX DRAWINGS LIGHT ARC DOWN AND RIGHT`` as content.
+_FRAME_EDGE_RE = re.compile(r"^\s*(?:╭[─━═]{2,}╮?|╰[─━═]{2,}╯?)\s*$")
+_FRAME_EDGE_OPEN_RE = re.compile(r"^\s*╭[─━═]{2,}╮?\s*$")
+_FRAME_EDGE_CLOSE_RE = re.compile(r"^\s*╰[─━═]{2,}╯?\s*$")
 #: A row drawn as part of a box (the composer's interior / a table's interior).
 _FRAME_BOX_ROW_RE = re.compile(r"^\s*│")
 #: How far either side of a prompt row its frame edge may sit. The measured

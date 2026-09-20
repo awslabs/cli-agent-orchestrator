@@ -277,6 +277,25 @@ class TestPR799StructuralTurnParser:
             "● Budget example:\n" "context: 2% (14.8k/977k)\n" "That is only an example value."
         )
 
+    def test_box_drawing_corner_in_answer_is_not_a_composer_boundary(self, monkeypatch):
+        """A corner glyph starts a frame only when the rest of the row is a border."""
+
+        pane = "\n".join(
+            [
+                "💫 Explain this Unicode character",
+                "• Here is the character:",
+                "╭ U+256D BOX DRAWINGS LIGHT ARC DOWN AND RIGHT",
+                "• It starts a rounded box.",
+                "💫",
+            ]
+        )
+        result, _ = _last(monkeypatch, pane)
+        assert result == (
+            "• Here is the character:\n"
+            "╭ U+256D BOX DRAWINGS LIGHT ARC DOWN AND RIGHT\n"
+            "• It starts a rounded box."
+        )
+
     def test_historical_private_content_does_not_make_current_miss_nonretryable(self):
         """Refusal evidence is scoped to the current turn, not old scrollback."""
 
@@ -312,6 +331,81 @@ class TestPR799StructuralTurnParser:
         expected, _ = _last(monkeypatch, turn)
         actual, _ = _last(monkeypatch, _fixture(history_fixture) + "\n" + turn)
         assert actual == expected
+
+    @pytest.mark.parametrize(
+        "answer_line",
+        [
+            "Project MCP targets:",
+            "context: 2% (14.8k/977k)",
+            "▶ Run this command?",
+            "Loading configuration...",
+            "| > | is a Markdown-table cell, not a composer prompt.",
+            "Used Python · no external dependencies.",
+            "╭ U+256D BOX DRAWINGS LIGHT ARC DOWN AND RIGHT",
+        ],
+    )
+    @pytest.mark.parametrize(
+        "history_fixture",
+        [
+            "kimi_code_0431_03_final_answer.txt",
+            "kimi_code_0431_07_workspace_trust_dialog_plain.txt",
+            "kimi_code_0431_08_command_approval_dialog.txt",
+            "kimi_code_0431_10_mcp_tool_turn.txt",
+            "kimi_code_0431_12_mcp_tool_turn_reasoning_first.txt",
+        ],
+    )
+    def test_ui_like_answer_text_is_history_prefix_invariant(
+        self, monkeypatch, history_fixture, answer_line
+    ):
+        """Old chrome may not promote identical current-turn prose into UI state.
+
+        This is deliberately metamorphic rather than one regression per token:
+        adding valid historical scrollback must not change extraction of the
+        same current turn, even when the answer happens to contain text that is
+        meaningful to the renderer elsewhere.
+        """
+
+        turn = self._current_turn(
+            _answer("Quoted UI-looking text:"),
+            answer_line,
+            "Still part of the answer.",
+        )
+        expected, _ = _last(monkeypatch, turn)
+        actual, _ = _last(monkeypatch, _fixture(history_fixture) + "\n" + turn)
+
+        assert actual == expected
+        assert answer_line in actual
+        assert actual.endswith("Still part of the answer.")
+
+    @pytest.mark.parametrize(
+        "history_fixture",
+        [
+            "kimi_code_0431_03_final_answer.txt",
+            "kimi_code_0431_07_workspace_trust_dialog_plain.txt",
+            "kimi_code_0431_08_command_approval_dialog.txt",
+            "kimi_code_0431_10_mcp_tool_turn.txt",
+        ],
+    )
+    def test_history_prefix_never_turns_private_reasoning_publishable(
+        self, monkeypatch, history_fixture
+    ):
+        """Historical public UI cannot exempt a private current turn."""
+
+        current = "\n".join(
+            [
+                _user("✨ Think privately"),
+                "",
+                _thinking(PRIVATE_REASONING),
+                _footer(),
+                "",
+            ]
+        )
+        pane = _fixture(history_fixture) + "\n" + current
+
+        with pytest.raises(_rejected()) as excinfo:
+            _last(monkeypatch, pane)
+
+        assert PRIVATE_REASONING not in str(excinfo.value)
 
 
 # =============================================================================
