@@ -1477,6 +1477,133 @@ def _assign_remote(
 
 
 # Implementation function for assign
+def _wait_runtime_connected(runtime_id: str, wait_seconds: float) -> None:
+    """Wait for an execution-only runtime to dial the central server (#745).
+
+    The bridge-worker analogue of ``_wait_remote_ready``: a bridge pod has no
+    HTTP /health to poll, so "usable" means its runtime channel is registered —
+    observable in this server's own ``GET /runtimes``. Raises TimeoutError with
+    the same caller-facing semantics as the /health wait.
+    """
+    deadline = time.monotonic() + wait_seconds
+    poll = 0.5
+    last_error: Optional[str] = None
+    while time.monotonic() < deadline:
+        try:
+            response = requests.get(f"{API_BASE_URL}/runtimes", timeout=(5, 10))
+            response.raise_for_status()
+            if runtime_id in response.json().get("runtimes", {}):
+                return
+            last_error = "not yet connected"
+        except requests.RequestException as exc:
+            last_error = str(exc)
+        time.sleep(poll)
+        poll = min(poll * 1.5, 3.0)
+    raise TimeoutError(
+        f"runtime {runtime_id!r} did not connect to the central server within "
+        f"{wait_seconds:.0f}s ({last_error})"
+    )
+
+
+def _assign_bridge(
+    *,
+    agent_profile: str,
+    worker_message: str,
+    current_terminal_id: str,
+    runtime_id: str,
+    provider: Optional[str],
+    working_directory: Optional[str],
+    engine: Optional[str],
+    model: Optional[str],
+    use_worktree: bool,
+    ready_wait_seconds: float = 0.0,
+    callback_url: Optional[str] = None,
+    remote_session_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Create an assign worker on an execution-only bridge runtime (#745).
+
+    The worker pod runs ``cao-bridge``, not a cao-server: THIS node owns the
+    terminal row and routes launch/input/output over the runtime channel, so
+    the create call goes to our own ``POST /runtimes/{runtime_id}/terminals``
+    instead of a per-worker Service. Results route back exactly as in the
+    remote path — via injected ``CAO_CALLBACK_URL``/``CAO_CALLBACK_TERMINAL_ID``
+    — except the callback URL may simply be this server's advertised address,
+    because the worker's MCP tools already dial the central API.
+    """
+    if engine is not None:
+        return {
+            "success": False,
+            "terminal_id": None,
+            "message": (
+                "Assignment failed: engine selection is not supported on the "
+                "bridge launch path yet; omit engine or use a server-mode worker."
+            ),
+        }
+    if use_worktree:
+        return {
+            "success": False,
+            "terminal_id": None,
+            "message": (
+                "Assignment failed: use_worktree is not supported together with "
+                "a bridge runtime (no worktree provisioning on the channel)."
+            ),
+        }
+    advertised_url = (callback_url or os.environ.get(ADVERTISED_URL_ENV) or API_BASE_URL).rstrip(
+        "/"
+    )
+    if ready_wait_seconds > 0:
+        _wait_runtime_connected(runtime_id, ready_wait_seconds)
+
+    body: Dict[str, Any] = {
+        "provider": provider or "",
+        "agent_profile": agent_profile,
+        "initial_message": worker_message,
+        "env_vars": {
+            CALLBACK_URL_ENV: advertised_url,
+            CALLBACK_TERMINAL_ID_ENV: current_terminal_id,
+        },
+    }
+    if remote_session_name:
+        body["session_name"] = remote_session_name
+    if working_directory:
+        body["working_directory"] = working_directory
+    if model is not None:
+        body["model"] = model
+
+    # LAUNCH waits for provider init on the runtime, so allow the channel's
+    # full launch budget rather than the ordinary MCP call timeout.
+    response = requests.post(
+        f"{API_BASE_URL}/runtimes/{runtime_id}/terminals",
+        json=body,
+        timeout=(REMOTE_CONNECT_TIMEOUT, 300),
+    )
+    if response.status_code >= 400:
+        detail = _extract_error_detail(response, f"status {response.status_code}")
+        return {
+            "success": False,
+            "terminal_id": None,
+            "runtime_id": runtime_id,
+            "message": f"Assignment failed on runtime {runtime_id}: {detail}",
+        }
+    data = response.json()
+    terminal_id = data["id"]
+    session_name = data.get("session_name")
+    return {
+        "success": True,
+        "terminal_id": terminal_id,
+        "runtime_id": runtime_id,
+        "session_name": session_name,
+        "message": (
+            f"Task assigned to {agent_profile} on runtime {runtime_id} "
+            f"(terminal: {terminal_id}"
+            + (f", session: {session_name}" if session_name else "")
+            + "). The task was delivered after the worker initialized; results "
+            f"will arrive via send_message. Cleanup when finished: "
+            f"delete_terminal('{terminal_id}')."
+        ),
+    }
+
+
 def _assign_impl(
     agent_profile: str,
     message: str,
@@ -1488,6 +1615,8 @@ def _assign_impl(
     ready_wait_seconds: float = 0.0,
     callback_url: Optional[str] = None,
     remote_session_name: Optional[str] = None,
+    runtime_id: Optional[str] = None,
+    provider: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Implementation of assign logic.
 
@@ -1544,6 +1673,22 @@ def _assign_impl(
             )
         else:
             worker_message = message
+
+        if runtime_id:
+            return _assign_bridge(
+                agent_profile=agent_profile,
+                worker_message=worker_message,
+                current_terminal_id=current_terminal_id,
+                runtime_id=runtime_id,
+                provider=provider,
+                working_directory=working_directory,
+                engine=engine,
+                model=model,
+                use_worktree=use_worktree,
+                ready_wait_seconds=ready_wait_seconds,
+                callback_url=callback_url,
+                remote_session_name=remote_session_name,
+            )
 
         if target_host:
             return _assign_remote(

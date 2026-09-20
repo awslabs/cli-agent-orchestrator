@@ -71,6 +71,42 @@ def _parse_env_pairs(pairs):
         raise click.ClickException(f"--{exc}") from exc
 
 
+def _drive_headless_message(terminal, message, is_async):
+    """Deliver MESSAGE to a detached terminal and (unless async) print the
+    final output. Pure HTTP against the server's /terminals endpoints, so it
+    works identically for a server-local terminal and one routed to a remote
+    runtime (#745)."""
+    ready = wait_until_terminal_status(
+        terminal["id"],
+        {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
+        timeout=120,
+    )
+    if not ready:
+        raise click.ClickException(f"Conductor {terminal['id']} did not become ready within 120s")
+    request_timeout = get_server_settings()["mcp_request_timeout"]
+    response = requests.post(
+        f"{API_BASE_URL}/terminals/{terminal['id']}/input",
+        params={"message": message},
+        timeout=request_timeout,
+    )
+    response.raise_for_status()
+    time.sleep(3)
+    if is_async:
+        click.echo(f"Message sent to {terminal['name']}. Running in background.")
+        return
+    poll_until_done(terminal["id"], timeout=300)
+    request_timeout = get_server_settings()["mcp_request_timeout"]
+    output_resp = requests.get(
+        f"{API_BASE_URL}/terminals/{terminal['id']}/output",
+        params={"mode": "last"},
+        timeout=request_timeout,
+    )
+    output_resp.raise_for_status()
+    output = output_resp.json().get("output", "")
+    if output:
+        click.echo(output)
+
+
 @click.command()
 @click.argument("message", required=False, default=None)
 @click.option("--agents", required=True, help="Agent profile to launch")
@@ -139,6 +175,15 @@ def _parse_env_pairs(pairs):
     help="Resume a prior Claude Code conversation in the launched supervisor "
     "(claude --resume <id>). claude_code provider only.",
 )
+@click.option(
+    "--runtime",
+    "runtime_id",
+    default=None,
+    metavar="RUNTIME_ID",
+    help="Launch on a named execution runtime connected to the shared server "
+    "(#745; see GET /runtimes). Headless only — the terminal runs in that "
+    "runtime and is driven through the server.",
+)
 def launch(
     message,
     agents,
@@ -154,8 +199,20 @@ def launch(
     memory,
     env_pairs,
     resume_session_id,
+    runtime_id,
 ):
     """Launch cao session with specified agent profile."""
+    from cli_agent_orchestrator.utils.remote_server import is_remote_server
+
+    if is_remote_server() and not headless:
+        # Interactive attach needs the tmux socket, which lives beside the
+        # remote runtime — the client-side attach relay is #776's scope.
+        # Explicit error, not a silent local attach (#745).
+        raise click.ClickException(
+            "Interactive attach to a shared server is not supported yet; "
+            "use 'cao launch --headless' (optionally with --message) or the "
+            "browser terminal."
+        )
     try:
         display_dir = working_directory or os.path.realpath(os.getcwd())
         explicit_provider = provider is not None  # True only when --provider was passed
@@ -268,13 +325,59 @@ def launch(
                 if not auto_approve and not click.confirm("Proceed?", default=True):
                     raise click.ClickException("Launch cancelled by user")
 
+        if runtime_id:
+            # Launch on a named execution runtime (#745): the shared server
+            # relays the launch over its runtime channel; the terminal lives in
+            # that runtime and is driven through the server's ordinary
+            # /terminals endpoints below. Restrictions/engine resolve from the
+            # runtime's own profile store, so client-side overrides that cannot
+            # travel are refused rather than silently dropped.
+            if not headless:
+                raise click.ClickException("--runtime requires --headless")
+            if engine or resume_session_id:
+                raise click.ClickException(
+                    "--engine/--resume-session-id are not supported with --runtime"
+                )
+            if allowed_tools:
+                raise click.ClickException(
+                    "--allowed-tools cannot travel to a runtime launch; set "
+                    "restrictions in the runtime's installed profile"
+                )
+            body = {"provider": provider, "agent_profile": agents}
+            if session_name:
+                body["session_name"] = session_name
+            if working_directory:
+                body["working_directory"] = working_directory
+            if forwarded_env:
+                body["env_vars"] = forwarded_env
+            # Resolved at call time (not the import-time constant) so a
+            # CAO_API_BASE_URL exported after process start still wins.
+            from cli_agent_orchestrator.utils.remote_server import remote_base_url
+
+            base = remote_base_url() or API_BASE_URL
+            response = requests.post(
+                f"{base}/runtimes/{runtime_id}/terminals",
+                json=body,
+                timeout=300,
+            )
+            response.raise_for_status()
+            terminal = response.json()
+            click.echo(f"Session created: {terminal['session_name']}")
+            click.echo(f"Terminal created: {terminal['name']} (runtime: {runtime_id})")
+            if message:
+                _drive_headless_message(terminal, message, is_async)
+            return
+
         # Call API to create session — pass working_directory only if explicitly
-        # provided. When omitted, the server defaults to its own CWD.
-        url = f"http://{SERVER_HOST}:{SERVER_PORT}/sessions"
-        params = {
-            "agent_profile": agents,
-            "working_directory": working_directory or os.getcwd(),
-        }
+        # provided. When omitted, the server defaults to its own CWD; against a
+        # shared server the client's cwd is not a valid remote workspace, so it
+        # is never sent implicitly (#745).
+        url = f"{API_BASE_URL}/sessions"
+        params = {"agent_profile": agents}
+        if working_directory:
+            params["working_directory"] = working_directory
+        elif not is_remote_server():
+            params["working_directory"] = os.getcwd()
         if explicit_provider:
             params["provider"] = provider
         if engine is not None:
@@ -331,37 +434,7 @@ def launch(
                 )
             get_backend().attach_session(terminal["session_name"])
         elif message:
-            ready = wait_until_terminal_status(
-                terminal["id"],
-                {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-                timeout=120,
-            )
-            if not ready:
-                raise click.ClickException(
-                    f"Conductor {terminal['id']} did not become ready within 120s"
-                )
-            request_timeout = get_server_settings()["mcp_request_timeout"]
-            response = requests.post(
-                f"{API_BASE_URL}/terminals/{terminal['id']}/input",
-                params={"message": message},
-                timeout=request_timeout,
-            )
-            response.raise_for_status()
-            time.sleep(3)
-            if is_async:
-                click.echo(f"Message sent to {terminal['name']}. Running in background.")
-                return
-            poll_until_done(terminal["id"], timeout=300)
-            request_timeout = get_server_settings()["mcp_request_timeout"]
-            output_resp = requests.get(
-                f"{API_BASE_URL}/terminals/{terminal['id']}/output",
-                params={"mode": "last"},
-                timeout=request_timeout,
-            )
-            output_resp.raise_for_status()
-            output = output_resp.json().get("output", "")
-            if output:
-                click.echo(output)
+            _drive_headless_message(terminal, message, is_async)
 
     except requests.exceptions.RequestException as e:
         raise click.ClickException(f"Failed to connect to cao-server: {str(e)}")

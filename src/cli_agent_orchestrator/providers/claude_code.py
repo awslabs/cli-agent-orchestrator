@@ -480,7 +480,14 @@ class ClaudeCodeProvider(BaseProvider):
                     env = mcp_config[server_name].get("env", {})
                     if "CAO_TERMINAL_ID" not in env:
                         env["CAO_TERMINAL_ID"] = self.terminal_id
-                        mcp_config[server_name]["env"] = env
+                    # In an execution-only runtime (#745) the CAO API is not on
+                    # localhost: forward the pod's explicit server address into
+                    # the MCP subprocess. Local mode leaves these unset, so
+                    # nothing is injected and behavior is unchanged.
+                    for var in ("CAO_API_HOST", "CAO_API_PORT", "CAO_MEMORY_API_URL"):
+                        if var not in env and os.environ.get(var):
+                            env[var] = os.environ[var]
+                    mcp_config[server_name]["env"] = env
 
                 tmp_dir = CAO_HOME_DIR / "tmp"
                 tmp_dir.mkdir(parents=True, exist_ok=True)

@@ -240,24 +240,50 @@ snapshot with output retained; a killed worker yields an explicit
 `503 runtime … not connected` (never false success); teardown removes the
 worker's tmux session and the central row.
 
-**Deferred, each large enough to be its own PR (the issue's own delivery plan
-splits these across steps 2–5):**
+**Also delivered on this branch (the issue's steps 4–5):**
+
+- **Broker → execution-only worker Deployments** (`CAO_ELASTIC_WORKER_MODE=bridge`):
+  the broker mints bridge workers (no per-worker Service or cao-server), the
+  lease carries `mode`/`runtime_id`/`provider`, and `assign_elastic` routes a
+  bridge lease through the central `POST /runtimes/{id}/terminals`
+  (`orchestration._assign_bridge`). Readiness = "runtime connected", observed
+  via `GET /runtimes` by the reaper's never-usable verdict, the caller's
+  connected-wait, and `GATE_ON_READY`. The `cao worker` operator proxy keeps
+  its allowlist but answers from the central server, scoped per runtime.
+  Worker pods point `CAO_API_HOST`/`CAO_API_PORT`/`CAO_MEMORY_API_URL` at the
+  central server (providers forward them into MCP subprocess env), and
+  `store_lesson` now writes through the memory gateway so no pod-local store
+  diverges silently. Server mode is byte-for-byte unchanged.
+  Coverage: 6 unit tests + a bridge section in the standalone broker suite
+  (all sections green in both modes) + **EKS-validated** end-to-end with
+  `mock_cli` (lease → connect → central launch → task delivered → scoped
+  proxy → complete → teardown; foreign-terminal proxying refused 404).
+- **CLI client matrix against a shared server** (`CAO_API_BASE_URL` opt-in):
+  `cao schedule` (add/list/remove/enable/disable/run) and `cao memory`
+  (list/show/delete/clear/export) go over HTTP; engine/pre-script survive the
+  CLI→HTTP flow add; `cao launch --headless` works remotely (with
+  `--runtime <id>` placing the terminal on a named execution runtime — EKS-
+  validated laptop→server→worker-pod round trip) and never sends
+  the client cwd implicitly; server-filesystem/tmux operations (`terminal
+  restore`, `memory repair/lint/heal/compact/promote/import/relationships`,
+  interactive launch) raise explicit errors instead of touching local state.
+  15 tests. Local mode (env unset) is byte-for-byte unchanged (595 CLI tests
+  green).
+
+**Deferred to their own workstreams:**
 
 - **Interactive browser + native-CLI attach relay** — explicitly #776's scope
   ("#776 includes moving that path beside the remote agent"). The WS attach
-  currently closes `4010` for a remote terminal.
-- **Broker → execution-only worker Deployments** (#745 step 4, coupled with
-  #776 step 5). The EKS broker still mints full per-worker `cao-server` +
-  Service; converting it to bridge workers reshapes the lease/gateway/reaper
-  model and its 1,497-line test suite. Validated the target topology
-  standalone (this branch's throwaway manifests) ahead of that refactor.
-- **Full CLI client matrix** — `cao launch`/`schedule`/`memory`/`worker`
-  operating against a shared server with no local-state fallback. Overlaps
-  #776's CLI attach relay.
+  closes `4010` for a remote terminal; remote interactive `cao launch` errors
+  and points at `--headless`.
 - **Per-runtime delegated credentials** — explicitly #774's scope. Both the
   runtime channel and the shared MCP endpoint authenticate with a shared
   `CAO_RUNTIME_TOKEN` (fail-closed) until #774 supplies per-caller credentials
   whose verified subject replaces the token + caller header.
+- **Live provider on-cluster elastic run** — blocked by the validation
+  cluster's IAM (no Bedrock on the node role); the live-provider gate is
+  covered by the local claude_code-over-`cao-bridge` end-to-end run (no server
+  or Service beside the runtime).
 
 **Compatibility gate**: the runtime channel rejects a `PROTOCOL_VERSION`
 mismatch at hello, before any command is accepted — the "unsupported

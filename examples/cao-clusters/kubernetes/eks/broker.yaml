@@ -70,6 +70,16 @@ spec:
                 secretKeyRef:
                   name: cao-elastic-broker-token
                   key: token
+            # Worker topology (#745). "server" (default) mints a full cao-server
+            # + Service per worker. "bridge" mints execution-only workers that
+            # run cao-bridge and dial CAO_ELASTIC_CENTRAL_URL's runtime channel:
+            # no per-worker Service or HTTP API; terminals are owned and routed
+            # by the central server. Bridge mode needs the cao-runtime-token
+            # Secret (key "token") in this namespace, shared with the supervisor.
+            - name: CAO_ELASTIC_WORKER_MODE
+              value: "server"
+            - name: CAO_ELASTIC_CENTRAL_URL
+              value: http://cao-supervisor.cao-cluster.svc.cluster.local:9889
             # A lease with no completion inside this window is reaped and marked
             # `expired`. Generous enough for a slow delegated task, far below the
             # pod's own 3600s deadline so the broker always reaps first and can

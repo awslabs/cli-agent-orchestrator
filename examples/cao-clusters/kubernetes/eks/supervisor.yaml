@@ -68,8 +68,21 @@ spec:
             # Elastic workers receive this URL for callbacks instead of the
             # full supervisor control API. The broker authenticates their
             # per-worker release token and forwards only inbox/memory routes.
+            # Bridge mode (#745): point this at CAO_ADVERTISED_URL instead —
+            # bridge workers already talk to the central API for every tool
+            # call, so the broker gateway hop buys nothing there.
             - name: CAO_ELASTIC_CALLBACK_URL
               value: "http://cao-worker-broker.cao-cluster.svc.cluster.local:9890"
+            # Shared runtime-channel token (#745). With it set, this server
+            # accepts `cao-bridge` runtimes on WS /runtime/channel (fail-closed
+            # without it) — required when the broker mints bridge-mode workers
+            # (CAO_ELASTIC_WORKER_MODE=bridge on the broker).
+            - name: CAO_RUNTIME_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: cao-runtime-token
+                  key: token
+                  optional: true
             - name: CAO_HOME_DIR
               value: /home/cao/.cao/state
             - name: CAO_PROJECT_ID

@@ -25,6 +25,12 @@ def restore(terminal_id: str):
     working directory and loads the saved scrollback history into the pane.
     The session must still exist.
     """
+    from cli_agent_orchestrator.utils.remote_server import require_local
+
+    # Restore reads snapshot/scrollback files the server wrote and creates a
+    # tmux window on the surviving runtime — both live beside the server, so
+    # a shared-server client cannot perform it (#745: explicit, not misrouted).
+    require_local("cao terminal restore")
     snapshot_path = TERMINAL_LOG_DIR / f"{terminal_id}.snapshot.json"
     scrollback_path = TERMINAL_LOG_DIR / f"{terminal_id}.scrollback"
 

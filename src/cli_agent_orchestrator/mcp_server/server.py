@@ -769,18 +769,37 @@ async def assign_elastic(
         # then posts the task to it, both blocking. This is the longer of the two
         # blocks, so threading only the broker call above would have left the
         # serialisation almost entirely in place.
-        result = await asyncio.to_thread(
-            _assign_impl,
-            agent_profile,
-            worker_message,
-            str(lease["working_directory"]),
-            engine=engine,
-            model=model,
-            target_host=str(lease["target_host"]),
-            ready_wait_seconds=_elastic_ready_wait(),
-            callback_url=os.environ.get(ELASTIC_CALLBACK_URL_ENV) or None,
-            remote_session_name=str(lease["session_name"]),
-        )
+        # A bridge-mode lease (#745) names a runtime the CENTRAL server routes
+        # to over the channel — no per-worker Service or cao-server exists, so
+        # the launch goes through POST /runtimes/{id}/terminals instead of the
+        # worker's own /sessions.
+        if lease.get("mode") == "bridge":
+            result = await asyncio.to_thread(
+                _assign_impl,
+                agent_profile,
+                worker_message,
+                str(lease["working_directory"]),
+                engine=engine,
+                model=model,
+                runtime_id=str(lease["runtime_id"]),
+                provider=lease.get("provider"),
+                ready_wait_seconds=_elastic_ready_wait(),
+                callback_url=os.environ.get(ELASTIC_CALLBACK_URL_ENV) or None,
+                remote_session_name=str(lease["session_name"]),
+            )
+        else:
+            result = await asyncio.to_thread(
+                _assign_impl,
+                agent_profile,
+                worker_message,
+                str(lease["working_directory"]),
+                engine=engine,
+                model=model,
+                target_host=str(lease["target_host"]),
+                ready_wait_seconds=_elastic_ready_wait(),
+                callback_url=os.environ.get(ELASTIC_CALLBACK_URL_ENV) or None,
+                remote_session_name=str(lease["session_name"]),
+            )
         result["worker_id"] = worker_id
         result["elastic"] = True
         if not result.get("success"):
@@ -1892,15 +1911,33 @@ async def store_lesson(
         # terminal_id) still identify the actual caller.
         lesson_context = {**terminal_context, "agent_profile": target}
 
-        service = MemoryService()
-        memory = await service.store(
-            content=content,
-            scope="agent",
-            memory_type="feedback",
-            key=key,
-            tags=tags or "",
-            terminal_context=lesson_context,
+        # In a remote runtime (CAO_MEMORY_API_URL set, #745) the write goes
+        # through the gateway — a direct MemoryService write would land in the
+        # pod's throwaway local store, silently divergent from the central one.
+        from cli_agent_orchestrator.services.memory_gateway import (
+            remote_memory_url,
+            store_memory,
         )
+
+        if remote_memory_url():
+            memory = await store_memory(
+                content=content,
+                scope="agent",
+                memory_type="feedback",
+                key=key,
+                tags=tags or "",
+                terminal_context=lesson_context,
+            )
+        else:
+            service = MemoryService()
+            memory = await service.store(
+                content=content,
+                scope="agent",
+                memory_type="feedback",
+                key=key,
+                tags=tags or "",
+                terminal_context=lesson_context,
+            )
         return {
             "success": True,
             "key": memory.key,

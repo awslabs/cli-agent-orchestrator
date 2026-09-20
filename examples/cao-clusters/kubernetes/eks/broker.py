@@ -40,6 +40,7 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 import requests
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request, status
@@ -66,6 +67,51 @@ BROKER_TOKEN = os.environ["CAO_ELASTIC_BROKER_TOKEN"]
 WORKSPACE_ROOT = os.environ.get("CAO_ELASTIC_WORKSPACE_ROOT", "/home/cao/workspace/workers")
 PROJECT_ID = os.environ.get("CAO_ELASTIC_PROJECT_ID", "cao-cluster")
 WORKER_SERVICE_ACCOUNT = os.environ.get("CAO_ELASTIC_WORKER_SERVICE_ACCOUNT", "cao-elastic-worker")
+
+
+# Execution-only bridge workers (#745). Mode "server" preserves today's
+# topology: a full cao-server plus per-worker Service. Mode "bridge" mints
+# workers that run `cao-bridge` and dial the CENTRAL server's runtime channel:
+# no per-worker Service, no worker HTTP API, no worker server process —
+# terminals are owned by the central server, which routes launch/input/output
+# over the channel (POST /runtimes/{runtime_id}/terminals). Read per call so
+# the standalone test file can exercise both modes in one process.
+def _worker_mode() -> str:
+    return os.environ.get("CAO_ELASTIC_WORKER_MODE", "server").strip().lower()
+
+
+def _central_url() -> str:
+    """The shared cao-server bridge workers dial. Defaults to the supervisor,
+    which in the bridge topology IS the central server."""
+    return os.environ.get("CAO_ELASTIC_CENTRAL_URL", SUPERVISOR_API_URL).rstrip("/")
+
+
+def _central_ws_url() -> str:
+    parsed = urlparse(_central_url())
+    scheme = "wss" if parsed.scheme == "https" else "ws"
+    return f"{scheme}://{parsed.netloc}/runtime/channel"
+
+
+def _connected_runtimes() -> set[str]:
+    """Runtime ids currently dialed into the central server.
+
+    In bridge mode this is what "usable" means — a bridge pod has no /health
+    endpoint, so pod Ready alone cannot stand in for it. Failure to reach the
+    central server reads as "nothing connected"; callers treat that as
+    not-ready rather than a verdict.
+    """
+    try:
+        response = requests.get(f"{_central_url()}/runtimes", timeout=(5, 10))
+        response.raise_for_status()
+        return set(response.json().get("runtimes", {}))
+    except (requests.RequestException, ValueError) as exc:
+        log.warning("could not list central runtimes: %s", exc)
+        return set()
+
+
+# Secret carrying the shared runtime-channel token (key "token"). Required in
+# bridge mode: the central channel endpoint fails closed without it.
+RUNTIME_TOKEN_SECRET = os.environ.get("CAO_ELASTIC_RUNTIME_TOKEN_SECRET", "cao-runtime-token")
 # Outer bound on a worker's life, as a backstop for a broker that forgot it.
 # This used to be activeDeadlineSeconds on the worker's Job; a Deployment cannot
 # carry it at all (see the pod spec), so it is now enforced by
@@ -194,6 +240,14 @@ class WorkerLease(BaseModel):
     working_directory: str
     session_name: str
     release_token: str
+    # Bridge mode (#745): the runtime id the CENTRAL server routes to, and the
+    # provider the worker's profile was installed with (the central launch
+    # body requires it — a bridge worker's provider cannot be resolved from a
+    # worker-local profile store the caller can't see). Server mode omits both
+    # and callers keep dialing target_host.
+    mode: str = "server"
+    runtime_id: Optional[str] = None
+    provider: Optional[str] = None
 
 
 class WorkerStatus(BaseModel):
@@ -284,6 +338,64 @@ def _worker_deployment(
     name = _workload_name(worker_id)
     labels = _labels(worker_id)
     working_directory = _working_directory(worker_id)
+    if _worker_mode() == "bridge":
+        central = _central_url()
+        parsed = urlparse(central)
+        env = [
+            # Execution-only runtime (#745): entrypoint.sh execs cao-bridge,
+            # which dials the central server's runtime channel. No server
+            # bind/allowed-hosts/terminal-cap env — there is no server here.
+            client.V1EnvVar(name="CAO_NODE_MODE", value="bridge"),
+            client.V1EnvVar(name="CAO_BRIDGE_SERVER_URL", value=_central_ws_url()),
+            client.V1EnvVar(name="CAO_BRIDGE_RUNTIME_ID", value=name),
+            client.V1EnvVar(
+                name="CAO_RUNTIME_TOKEN",
+                value_from=client.V1EnvVarSource(
+                    secret_key_ref=client.V1SecretKeySelector(
+                        name=RUNTIME_TOKEN_SECRET, key="token"
+                    )
+                ),
+            ),
+            # The agent's MCP tools and orchestration helpers dial the CENTRAL
+            # API, never localhost — these flow into the tmux session env (the
+            # CAO_ prefix passthrough) and into provider MCP configs.
+            client.V1EnvVar(name="CAO_API_HOST", value=parsed.hostname or "cao-supervisor"),
+            client.V1EnvVar(name="CAO_API_PORT", value=str(parsed.port or 9889)),
+            # Memory goes straight to the central server's authenticated
+            # internal memory routes; the broker gateway is not in this path.
+            client.V1EnvVar(name="CAO_MEMORY_API_URL", value=central),
+            client.V1EnvVar(name="CAO_HOME_DIR", value="/home/cao/.cao/state"),
+            client.V1EnvVar(
+                name="CAO_INSTALL_PROFILES",
+                value=f"{request.agent_profile}:{request.provider}",
+            ),
+            client.V1EnvVar(name="CAO_PROJECT_ID", value=PROJECT_ID),
+            client.V1EnvVar(name="CAO_ELASTIC_WORKER_ID", value=worker_id),
+            client.V1EnvVar(name="CAO_ELASTIC_BROKER_URL", value=BROKER_PUBLIC_URL),
+            client.V1EnvVar(name="CAO_ELASTIC_RELEASE_TOKEN", value=release_token),
+            client.V1EnvVar(name="CAO_ELASTIC_WORKING_DIRECTORY", value=working_directory),
+        ]
+        env.extend(
+            client.V1EnvVar(name=name_, value=os.environ[name_]) for name_ in WORKER_ENV_PASSTHROUGH
+        )
+        return _build_worker_deployment(
+            worker_id,
+            release_token,
+            request,
+            name=name,
+            labels=labels,
+            working_directory=working_directory,
+            env=env,
+            ports=None,
+            # No HTTP server to probe. Readiness = the bridge process is up;
+            # "usable" (runtime connected) is observed centrally by the reaper
+            # and by the caller's connected-wait, not by the kubelet.
+            readiness_probe=client.V1Probe(
+                _exec=client.V1ExecAction(command=["sh", "-c", "pgrep -f cao-bridge >/dev/null"]),
+                initial_delay_seconds=1,
+                period_seconds=2,
+            ),
+        )
     env = [
         client.V1EnvVar(name="CAO_BIND_HOST", value="0.0.0.0"),
         client.V1EnvVar(name="CAO_API_PORT", value="9889"),
@@ -328,6 +440,56 @@ def _worker_deployment(
     env.extend(
         client.V1EnvVar(name=name_, value=os.environ[name_]) for name_ in WORKER_ENV_PASSTHROUGH
     )
+    return _build_worker_deployment(
+        worker_id,
+        release_token,
+        request,
+        name=name,
+        labels=labels,
+        working_directory=working_directory,
+        env=env,
+        ports=[client.V1ContainerPort(name="http", container_port=9889)],
+        readiness_probe=client.V1Probe(
+            http_get=client.V1HTTPGetAction(
+                path="/health",
+                port=9889,
+                http_headers=[client.V1HTTPHeader(name="Host", value="localhost")],
+            ),
+            # Both values are a floor on how fast this pod can be USED, and both
+            # are paid on every task in this topology rather than once at startup.
+            #
+            # They were 5 and 3, chosen when CAO's boot was 12-14s: at that scale
+            # an initial delay of 5s was free and a 3s period cost at most 3s.
+            # Moving the Bedrock warm-up off this path and seeding the state
+            # directory takes boot to roughly 2-3s, at which point the OLD numbers
+            # dominate what is left - a 5s delay against a 2.5s boot is 2.5s of
+            # pure idle, and then up to 3s more waiting for a probe to come round.
+            # A saving elsewhere turns into a floor here, so they move together.
+            #
+            # 0 rather than 1 on the delay: the first probe then fires immediately
+            # and simply fails, which costs one connection refused in the events
+            # and never costs a second of latency. `period_seconds=1` makes the
+            # worst-case wait after the server binds 1s instead of 3s.
+            initial_delay_seconds=0,
+            period_seconds=1,
+        ),
+    )
+
+
+def _build_worker_deployment(
+    worker_id: str,
+    release_token: str,
+    request: WorkerRequest,
+    *,
+    name: str,
+    labels: dict[str, str],
+    working_directory: str,
+    env: list,
+    ports: Optional[list],
+    readiness_probe: client.V1Probe,
+) -> client.V1Deployment:
+    """The pod/Deployment shape both worker modes share; only env, ports and
+    the readiness probe differ (see _worker_deployment)."""
     mounts = [
         client.V1VolumeMount(name="state", mount_path="/home/cao/.cao"),
         client.V1VolumeMount(
@@ -357,36 +519,13 @@ def _worker_deployment(
                 )
             )
         ],
-        ports=[client.V1ContainerPort(name="http", container_port=9889)],
+        ports=ports,
         volume_mounts=mounts,
         resources=client.V1ResourceRequirements(
             requests={"cpu": "250m", "memory": "1Gi"},
             limits={"cpu": "1", "memory": "3Gi"},
         ),
-        readiness_probe=client.V1Probe(
-            http_get=client.V1HTTPGetAction(
-                path="/health",
-                port=9889,
-                http_headers=[client.V1HTTPHeader(name="Host", value="localhost")],
-            ),
-            # Both values are a floor on how fast this pod can be USED, and both
-            # are paid on every task in this topology rather than once at startup.
-            #
-            # They were 5 and 3, chosen when CAO's boot was 12-14s: at that scale
-            # an initial delay of 5s was free and a 3s period cost at most 3s.
-            # Moving the Bedrock warm-up off this path and seeding the state
-            # directory takes boot to roughly 2-3s, at which point the OLD numbers
-            # dominate what is left - a 5s delay against a 2.5s boot is 2.5s of
-            # pure idle, and then up to 3s more waiting for a probe to come round.
-            # A saving elsewhere turns into a floor here, so they move together.
-            #
-            # 0 rather than 1 on the delay: the first probe then fires immediately
-            # and simply fails, which costs one connection refused in the events
-            # and never costs a second of latency. `period_seconds=1` makes the
-            # worst-case wait after the server binds 1s instead of 3s.
-            initial_delay_seconds=0,
-            period_seconds=1,
-        ),
+        readiness_probe=readiness_probe,
     )
     pod_spec = client.V1PodSpec(
         # A Deployment accepts no other value. It also means a worker whose
@@ -570,10 +709,15 @@ def _wait_ready(worker_id: str) -> None:
     started = time.monotonic()
     deadline = started + READY_TIMEOUT
     selector = f"cao.aws/worker-id={worker_id}"
+    bridge = _worker_mode() == "bridge"
     while time.monotonic() < deadline:
+        # Bridge mode: "usable" is the runtime channel being connected to the
+        # central server, not a pod probe — there is no /health in the pod.
+        if bridge and _workload_name(worker_id) in _connected_runtimes():
+            return
         pods = core_api.list_namespaced_pod(NAMESPACE, label_selector=selector).items
         for pod in pods:
-            if _pod_ready(pod):
+            if _pod_ready(pod) and not bridge:
                 return
             if pod.status.phase in {"Failed", "Succeeded"}:
                 raise RuntimeError(f"worker pod ended before readiness: {pod.status.phase}")
@@ -595,10 +739,19 @@ def _wait_ready(worker_id: str) -> None:
 
 
 def _worker_machine(worker_id: str) -> dict[str, str]:
-    """The panel's fleet entry for one worker."""
+    """The panel's fleet entry for one worker.
+
+    Bridge mode: the worker has no host of its own — its terminals are served
+    by the central server — so the panel probes the central host instead of a
+    Service that no longer exists.
+    """
+    if _worker_mode() == "bridge":
+        host = urlparse(_central_url()).hostname or "cao-supervisor"
+    else:
+        host = f"{_workload_name(worker_id)}.{NAMESPACE}.svc.cluster.local"
     return {
         "name": f"worker-{worker_id}",
-        "host": f"{_workload_name(worker_id)}.{NAMESPACE}.svc.cluster.local",
+        "host": host,
         "label": f"Worker {worker_id}",
         "role": "worker",
     }
@@ -820,6 +973,11 @@ def _reap_once() -> None:
     agent that lease refers to no longer exists.
     """
     now = time.monotonic()
+    # Bridge mode: "ready" means the runtime channel is connected to the
+    # central server, not that the pod passes a kubelet probe. One GET covers
+    # every open lease this sweep.
+    bridge = _worker_mode() == "bridge"
+    connected = _connected_runtimes() if bridge else set()
     with _leases_lock:
         open_ids = [wid for wid, l in _leases.items() if l["state"] == "leased"]
         stale = [
@@ -882,8 +1040,7 @@ def _reap_once() -> None:
             matching = [
                 candidate
                 for candidate in pods
-                if candidate.metadata is not None
-                and candidate.metadata.uid == known_pod_uid
+                if candidate.metadata is not None and candidate.metadata.uid == known_pod_uid
             ]
             if not matching:
                 _release_and_settle(
@@ -923,8 +1080,7 @@ def _reap_once() -> None:
                 matching = [
                     candidate
                     for candidate in pods
-                    if candidate.metadata is not None
-                    and candidate.metadata.uid == winning_pod_uid
+                    if candidate.metadata is not None and candidate.metadata.uid == winning_pod_uid
                 ]
                 if not matching:
                     _release_and_settle(
@@ -937,9 +1093,7 @@ def _reap_once() -> None:
                     continue
                 pod = matching[0]
 
-        restarts = sum(
-            (cs.restart_count or 0) for cs in (pod.status.container_statuses or [])
-        )
+        restarts = sum((cs.restart_count or 0) for cs in (pod.status.container_statuses or []))
         if restarts:
             _release_and_settle(
                 worker_id,
@@ -968,7 +1122,8 @@ def _reap_once() -> None:
         # keeps the deadline one-way: a worker that goes NotReady later is a
         # completion problem, and COMPLETION_TIMEOUT owns it.
         if not ever_ready:
-            if _pod_ready(pod):
+            usable = _workload_name(worker_id) in connected if bridge else _pod_ready(pod)
+            if usable:
                 with _leases_lock:
                     lease = _leases.get(worker_id)
                     if lease is not None and lease["ready_at"] is None:
@@ -977,9 +1132,16 @@ def _reap_once() -> None:
                 _release_and_settle(
                     worker_id,
                     "failed",
-                    f"worker pod never reported Ready within {READY_TIMEOUT}s "
-                    f"(phase {phase}) - it was leased but never usable; check "
-                    f"scheduling, the image pull, and the pod's events",
+                    (
+                        f"worker runtime never connected to the central server "
+                        f"within {READY_TIMEOUT}s (pod phase {phase}) - it was "
+                        f"leased but never usable; check the pod's events and "
+                        f"the central server's /runtime/channel auth"
+                        if bridge
+                        else f"worker pod never reported Ready within {READY_TIMEOUT}s "
+                        f"(phase {phase}) - it was leased but never usable; check "
+                        f"scheduling, the image pull, and the pod's events"
+                    ),
                 )
                 log.warning(
                     "worker %s: not ready after %ss (phase %s), released",
@@ -1295,7 +1457,11 @@ def create_worker(
             NAMESPACE,
             _worker_deployment(worker_id, release_token, request),
         )
-        core_api.create_namespaced_service(NAMESPACE, _worker_service(worker_id, workload))
+        # A bridge worker takes no inbound connections at all — the pod dials
+        # out to the central server — so there is nothing for a Service to
+        # front (#745: no per-worker Service).
+        if _worker_mode() != "bridge":
+            core_api.create_namespaced_service(NAMESPACE, _worker_service(worker_id, workload))
         # The reaper ignores `creating` leases. Deployment-to-Pod creation is
         # asynchronous, so `leased` still does not imply a Pod exists; the
         # separate pod_observed_at marker distinguishes "not created yet" from
@@ -1331,6 +1497,9 @@ def create_worker(
         working_directory=_working_directory(worker_id),
         session_name=_session_name(worker_id),
         release_token=release_token,
+        mode=_worker_mode(),
+        runtime_id=name if _worker_mode() == "bridge" else None,
+        provider=request.provider if _worker_mode() == "bridge" else None,
     )
 
 
@@ -1537,10 +1706,7 @@ def _require_live_lease_for_write(worker_id: str) -> None:
 
 
 def _worker_api_allowed(method: str, path: str) -> bool:
-    return any(
-        pattern.fullmatch(path)
-        for pattern in _WORKER_API_ALLOWLIST.get(method.upper(), ())
-    )
+    return any(pattern.fullmatch(path) for pattern in _WORKER_API_ALLOWLIST.get(method.upper(), ()))
 
 
 def _forward_to_worker(
@@ -1580,6 +1746,110 @@ def _forward_to_worker(
     )
 
 
+def _central_runtime_terminals(runtime_id: str) -> set[str]:
+    """Terminal ids the central server currently routes to this runtime."""
+    try:
+        response = requests.get(f"{_central_url()}/runtimes", timeout=(5, 10))
+        response.raise_for_status()
+        info = response.json().get("runtimes", {}).get(runtime_id)
+    except (requests.RequestException, ValueError) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"central server did not answer: {type(exc).__name__}",
+        ) from exc
+    if info is None:
+        raise HTTPException(
+            status_code=503,
+            detail=f"worker runtime {runtime_id} is not connected to the central server",
+        )
+    return set(info.get("terminals", ()))
+
+
+def _forward_to_central(
+    worker_id: str,
+    method: str,
+    path: str,
+    *,
+    query: str,
+    body: bytes,
+    headers: dict[str, str],
+) -> Response:
+    """Bridge-mode operator proxy (#745): the worker has no HTTP API, so the
+    allowlisted calls are answered by the CENTRAL server — scoped so a request
+    naming one worker can never resolve another runtime's terminals or an
+    unfiltered central session list.
+    """
+    runtime_id = _workload_name(worker_id)
+    session = _session_name(worker_id)
+
+    if path == "health":
+        # Synthetic: a bridge worker is healthy iff its channel is connected.
+        if runtime_id in _connected_runtimes():
+            return Response(
+                content=json.dumps({"status": "ok", "runtime_id": runtime_id}),
+                media_type="application/json",
+            )
+        raise HTTPException(
+            status_code=503,
+            detail=f"worker runtime {runtime_id} is not connected to the central server",
+        )
+    if path == "sessions":
+        # The worker-scoped session only, never the central list.
+        target_path = f"sessions/{session}"
+        wrap_list = True
+    elif path.startswith("sessions/"):
+        requested = path.split("/")[1]
+        if requested != session:
+            raise HTTPException(
+                status_code=404,
+                detail=f"session '{requested}' does not belong to worker {worker_id}",
+            )
+        target_path = path
+        wrap_list = False
+    else:  # terminals/{id}[/...] — the allowlist admits nothing else
+        terminal_id = path.split("/")[1]
+        if terminal_id not in _central_runtime_terminals(runtime_id):
+            raise HTTPException(
+                status_code=404,
+                detail=f"terminal '{terminal_id}' does not belong to worker {worker_id}",
+            )
+        target_path = path
+        wrap_list = False
+
+    try:
+        upstream = requests.request(
+            method,
+            f"{_central_url()}/{target_path}",
+            params=query,
+            data=body or None,
+            headers=headers,
+            allow_redirects=False,
+            timeout=(5.0, 60.0),
+        )
+    except requests.RequestException as exc:
+        log.warning("central api request failed for %s %s: %s", method, target_path, exc)
+        raise HTTPException(
+            status_code=502,
+            detail=f"central server did not answer: {type(exc).__name__}",
+        ) from exc
+    content = upstream.content
+    if wrap_list and upstream.status_code == 200:
+        # `GET sessions` on a worker returned a list; preserve that shape.
+        content = json.dumps([upstream.json()]).encode()
+    elif wrap_list and upstream.status_code == 404:
+        content, upstream_status = json.dumps([]).encode(), 200
+        return Response(content=content, status_code=upstream_status, media_type="application/json")
+    return Response(
+        content=content,
+        status_code=upstream.status_code,
+        headers={
+            key: value
+            for key, value in upstream.headers.items()
+            if key.lower() not in _DROP_RESPONSE_HEADERS
+        },
+    )
+
+
 @app.api_route("/workers/{worker_id}/api/{path:path}", methods=["GET", "POST"])
 async def worker_api(
     worker_id: str,
@@ -1605,6 +1875,20 @@ async def worker_api(
         raise HTTPException(
             status_code=404,
             detail=f"'{request.method} /{path}' is not proxied to workers",
+        )
+    if _worker_mode() == "bridge":
+        return await run_in_threadpool(
+            _forward_to_central,
+            worker_id,
+            request.method,
+            path,
+            query=request.url.query,
+            body=await request.body(),
+            headers={
+                key: value
+                for key, value in request.headers.items()
+                if key.lower() in _FORWARD_REQUEST_HEADERS
+            },
         )
     return await run_in_threadpool(
         _forward_to_worker,
@@ -1654,9 +1938,7 @@ def _worker_pod(worker_id: str) -> client.V1Pod:
 
     if known_pod_uid is not None:
         matching = [
-            pod
-            for pod in pods
-            if pod.metadata is not None and pod.metadata.uid == known_pod_uid
+            pod for pod in pods if pod.metadata is not None and pod.metadata.uid == known_pod_uid
         ]
         if not matching:
             raise HTTPException(
@@ -1690,8 +1972,7 @@ def _worker_pod(worker_id: str) -> client.V1Pod:
             matching = [
                 candidate
                 for candidate in pods
-                if candidate.metadata is not None
-                and candidate.metadata.uid == winning_pod_uid
+                if candidate.metadata is not None and candidate.metadata.uid == winning_pod_uid
             ]
             if not matching:
                 raise HTTPException(

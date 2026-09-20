@@ -43,12 +43,42 @@ terminal→runtime routing from each runtime's reconnect (`hello`) snapshot; a
 lost worker yields an explicit `503 runtime not connected` rather than false
 success.
 
+**Python workflow scripts** also execute in a runtime rather than the server
+host: set `CAO_SCRIPT_RUNTIME=<runtime id>` on the central server and
+`CAO_ADVERTISED_URL` so script callbacks resolve to the shared Service. The
+server keeps journal/cancel/generation ownership; a disconnected runtime is an
+explicit failure, never a false success.
+
+**Broker bridge mode (#745 step 4):** set `CAO_ELASTIC_WORKER_MODE=bridge` and
+`CAO_ELASTIC_CENTRAL_URL` on the broker (see `broker.yaml`), and give the
+namespace a `cao-runtime-token` Secret shared with the central server. The
+broker then mints execution-only workers — `cao-bridge` dialing the central
+channel, **no per-worker Service, no worker HTTP API** — and the lease carries
+`mode: bridge` + `runtime_id`, which `assign_elastic` routes through the
+central `POST /runtimes/{id}/terminals` instead of a worker's `/sessions`.
+Worker pods get `CAO_API_HOST`/`CAO_API_PORT`/`CAO_MEMORY_API_URL` pointed at
+the central server so the agent's MCP tools (handoff, send_message,
+complete_assignment, memory — including `store_lesson`) operate on central
+state. Readiness means "runtime connected" (observed via `GET /runtimes` by
+both the reaper and the caller's wait), and the `cao worker` operator proxy
+keeps its allowlist but answers from the central server, scoped so one
+worker's id can never resolve another runtime's terminals or an unfiltered
+session list. `CAO_ELASTIC_WORKER_MODE=server` (the default) preserves the
+existing full-server topology byte-for-byte.
+
+**CLI against a shared server:** export `CAO_API_BASE_URL=<server url>` and
+`cao schedule`/`cao memory` read/change the server's state over HTTP (never a
+client-local database), `cao launch --headless` works end-to-end —
+`--runtime <id>` places the terminal on a named execution runtime when the
+central server itself hosts no tmux — and
+operations that need the server's filesystem or tmux (`cao terminal restore`,
+`cao memory repair/import/...`, interactive `cao launch`) fail with an
+explicit error instead of silently operating on local state.
+
 **Not yet in this slice (each a follow-on PR):** interactive browser/CLI attach
-relay (#776 — the browser WS closes `4010` for a remote terminal), Python
-workflow / flow pre-script relocation into runtimes, the broker minting
-execution-only bridge workers end-to-end (its lease/gateway/memory model still
-assumes per-worker servers), the full CLI client matrix, and per-runtime
-delegated credentials (#774) replacing the shared token.
+relay (#776 — the browser WS closes `4010` for a remote terminal; interactive
+`cao launch` against a shared server errors and points at `--headless`), and
+per-runtime delegated credentials (#774) replacing the shared token.
 
 ---
 
