@@ -68,17 +68,23 @@ existing full-server topology byte-for-byte.
 
 **CLI against a shared server:** export `CAO_API_BASE_URL=<server url>` and
 `cao schedule`/`cao memory` read/change the server's state over HTTP (never a
-client-local database), `cao launch --headless` works end-to-end —
-`--runtime <id>` places the terminal on a named execution runtime when the
-central server itself hosts no tmux — and
-operations that need the server's filesystem or tmux (`cao terminal restore`,
-`cao memory repair/import/...`, interactive `cao launch`) fail with an
-explicit error instead of silently operating on local state.
+client-local database), `cao launch` works end-to-end both headless and
+interactive — `--runtime <id>` places the terminal on a named execution runtime
+when the central server itself hosts no tmux — and operations that need the
+server's own filesystem (`cao terminal restore`, `cao memory
+repair/import/...`) fail with an explicit error instead of silently operating on
+local state.
 
-**Not yet in this slice (each a follow-on PR):** interactive browser/CLI attach
-relay (#776 — the browser WS closes `4010` for a remote terminal; interactive
-`cao launch` against a shared server errors and points at `--headless`), and
-per-runtime delegated credentials (#774) replacing the shared token.
+**Interactive attach across the pod boundary:** the PTY is spawned in the worker
+pod, beside its tmux socket, and the server relays bytes over the runtime
+channel. `/terminals/{id}/ws` keeps its exact client-facing protocol, so the
+browser terminal cannot tell a remote agent from a local one, and interactive
+`cao launch` against a shared server attaches through that same endpoint with no
+client-local tmux. A terminal whose runtime is not connected closes `4010`
+rather than appearing to attach.
+
+**Not yet in this slice:** per-runtime delegated credentials (#774) replacing
+the shared `CAO_RUNTIME_TOKEN`.
 
 ---
 
@@ -267,6 +273,24 @@ Claude Code on Bedrock is the default and needs no credential plumbing at all:
 each pod signs its own requests with SigV4 from its EKS Pod Identity association,
 so there is nothing to store, synchronise or rotate. The one secret in the
 namespace is the broker token, minted locally by `deploy.sh`.
+
+Two account-level prerequisites are easy to miss, because both fail as a
+`403 … not authorized to perform: bedrock:InvokeModel` *inside* the agent rather
+than at deploy time:
+
+- **Grant the inference profile, not just the foundation model.** Accounts where
+  the Anthropic models are only reachable through a cross-region inference
+  profile need `ANTHROPIC_MODEL=us.anthropic.claude-…` and a policy resource
+  covering `arn:aws:bedrock:*:<account>:inference-profile/us.anthropic.*`. A
+  policy scoped to `foundation-model/anthropic.*` alone is denied.
+- **Confirm the pod actually receives the association's credentials.** Check for
+  the injected `AWS_CONTAINER_CREDENTIALS_FULL_URI` in a pod on the target
+  service account; if it is absent, the pod silently falls back to the *node*
+  role, and the 403 names the node instance role rather than yours. On a cluster
+  where Pod Identity injection is unavailable, project a web-identity token
+  explicitly instead — a `serviceAccountToken` volume with audience
+  `sts.amazonaws.com` plus `AWS_ROLE_ARN` and `AWS_WEB_IDENTITY_TOKEN_FILE`
+  needs no admission webhook.
 
 Everything below is for a provider that authenticates with a key instead.
 

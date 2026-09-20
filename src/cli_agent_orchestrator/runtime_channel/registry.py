@@ -116,6 +116,8 @@ class RuntimeChannelRegistry:
         # Returned to the runtime on hello so it can replay what this server
         # missed while disconnected (bounded by the runtime's replay window).
         self._positions: Dict[Tuple[str, str], int] = {}
+        # Live interactive-attach clients by terminal (#776).
+        self._attach_sinks: Dict[str, "asyncio.Queue"] = {}
 
     # --- runtime lifecycle ---
 
@@ -209,6 +211,26 @@ class RuntimeChannelRegistry:
 
     def resume_position(self, terminal_id: str, stream: str) -> int:
         return self._positions.get((terminal_id, stream), 0)
+
+    # --- interactive attach relay (#776) ---
+    #
+    # One live attach client per terminal: attach bytes arriving on the
+    # channel are handed to that client's queue instead of the bus. `None`
+    # on the queue means the runtime-side PTY ended (EOF/detach).
+
+    def bind_attach(self, terminal_id: str, sink: "asyncio.Queue") -> None:
+        self._attach_sinks[terminal_id] = sink
+
+    def unbind_attach(self, terminal_id: str, sink: "asyncio.Queue") -> None:
+        if self._attach_sinks.get(terminal_id) is sink:
+            del self._attach_sinks[terminal_id]
+
+    def deliver_attach(self, terminal_id: str, data: Optional[bytes]) -> bool:
+        sink = self._attach_sinks.get(terminal_id)
+        if sink is None:
+            return False
+        sink.put_nowait(data)
+        return True
 
 
 runtime_registry = RuntimeChannelRegistry()

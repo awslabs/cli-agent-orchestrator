@@ -15,6 +15,7 @@ Mounted onto the existing cao-server app — additive, opt-in surface:
 - ``GET /runtimes``: operator visibility into connected runtimes.
 """
 
+import asyncio
 import base64
 import hmac
 import logging
@@ -40,6 +41,7 @@ from cli_agent_orchestrator.runtime_channel.protocol import (
     HeartbeatFrame,
     HelloFrame,
     StreamFrame,
+    StreamName,
     StreamPosition,
     decode_frame,
     encode_frame,
@@ -143,6 +145,11 @@ async def runtime_channel(ws: WebSocket) -> None:
                 # executed by this runtime — keep routing bound even if the
                 # hello snapshot predated the terminal's creation.
                 runtime_registry.bind_terminal(frame.terminal_id, runtime_id)
+                if frame.stream == StreamName.ATTACH:
+                    # Interactive bytes go to the live attach client, never
+                    # the bus; an empty frame is the runtime PTY's EOF.
+                    runtime_registry.deliver_attach(frame.terminal_id, raw if raw else None)
+                    continue
                 runtime_registry.record_position(
                     frame.terminal_id, frame.stream.value, frame.pos + len(raw)
                 )
@@ -301,6 +308,88 @@ async def remote_terminal_command(
             result.payload.get("error", f"remote operation failed: {result.outcome.value}"),
         )
     return result
+
+
+async def relay_remote_attach(websocket, terminal_id: str) -> None:
+    """Relay the browser/native WS attach protocol to a remote runtime (#776).
+
+    Client-facing contract is IDENTICAL to the local PTY path in
+    ``api/main.py``: binary frames carry terminal bytes down; JSON text frames
+    ``{"type": "input"|"resize", ...}`` come up. Runtime-facing: ATTACH_OPEN /
+    ATTACH_DATA / RESIZE / ATTACH_CLOSE commands, and attach-stream frames
+    routed to this socket via the registry sink. The PTY subprocess lives in
+    the runtime pod, beside the tmux socket.
+
+    Caller has already ACCEPTED the websocket and enforced IP/Origin/auth.
+    """
+    import base64 as _b64
+    import json as _json
+
+    from starlette.websockets import WebSocketDisconnect as _WSDisconnect
+
+    sink: asyncio.Queue = asyncio.Queue()
+    runtime_registry.bind_attach(terminal_id, sink)
+    try:
+        try:
+            result = await runtime_registry.send_terminal_command(
+                terminal_id, CommandType.ATTACH_OPEN, {"rows": 24, "cols": 80}, timeout=30.0
+            )
+        except (RuntimeUnavailableError, TimeoutError) as exc:
+            await websocket.close(code=4010, reason=f"remote attach failed: {exc}")
+            return
+        if result.outcome != CommandOutcome.OK or not result.payload.get("opened", False):
+            await websocket.close(code=4010, reason="remote attach failed to open")
+            return
+
+        async def _downstream():
+            while True:
+                data = await sink.get()
+                if data is None:
+                    break
+                await websocket.send_bytes(data)
+
+        async def _upstream():
+            while True:
+                msg = await websocket.receive_text()
+                payload = _json.loads(msg)
+                if payload.get("type") == "input":
+                    await runtime_registry.send_terminal_command(
+                        terminal_id,
+                        CommandType.ATTACH_DATA,
+                        {"data": _b64.b64encode(payload["data"].encode()).decode()},
+                        timeout=INPUT_TIMEOUT,
+                    )
+                elif payload.get("type") == "resize":
+                    await runtime_registry.send_terminal_command(
+                        terminal_id,
+                        CommandType.RESIZE,
+                        {"rows": payload.get("rows", 24), "cols": payload.get("cols", 80)},
+                        timeout=INPUT_TIMEOUT,
+                    )
+
+        down = asyncio.create_task(_downstream())
+        up = asyncio.create_task(_upstream())
+        try:
+            done, pending = await asyncio.wait({down, up}, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            for task in done:
+                exc = task.exception()
+                if exc is not None and not isinstance(exc, (_WSDisconnect, RuntimeError)):
+                    logger.warning("remote attach relay error for %s: %s", terminal_id, exc)
+        finally:
+            try:
+                await websocket.close()
+            except Exception:  # noqa: BLE001 — already closed is fine
+                pass
+    finally:
+        runtime_registry.unbind_attach(terminal_id, sink)
+        try:
+            await runtime_registry.send_terminal_command(
+                terminal_id, CommandType.ATTACH_CLOSE, {}, timeout=10.0
+            )
+        except Exception:  # noqa: BLE001 — best-effort close on a dead runtime
+            pass
 
 
 async def remote_delete_terminal(terminal_id: str) -> bool:

@@ -71,6 +71,30 @@ def _parse_env_pairs(pairs):
         raise click.ClickException(f"--{exc}") from exc
 
 
+def _attach_via_relay(terminal):
+    """Interactive attach through the server's WS relay (#745/#776): waits for
+    init like the local branch, then binds this TTY to the terminal's PTY —
+    which may live on the server or in a remote runtime. Detach with the
+    session's detach key (tmux: Ctrl-b d)."""
+    from cli_agent_orchestrator.utils.remote_attach import attach_remote_terminal
+    from cli_agent_orchestrator.utils.remote_server import remote_base_url
+
+    ready = wait_until_terminal_status(
+        terminal["id"],
+        {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
+        timeout=120,
+    )
+    if not ready:
+        click.echo(
+            click.style(
+                f"  Warning: {terminal['id']} did not reach idle within 120s — "
+                "attaching anyway; input may be unreliable until init completes.",
+                fg="yellow",
+            )
+        )
+    attach_remote_terminal(terminal["id"], remote_base_url() or API_BASE_URL)
+
+
 def _drive_headless_message(terminal, message, is_async):
     """Deliver MESSAGE to a detached terminal and (unless async) print the
     final output. Pure HTTP against the server's /terminals endpoints, so it
@@ -204,15 +228,6 @@ def launch(
     """Launch cao session with specified agent profile."""
     from cli_agent_orchestrator.utils.remote_server import is_remote_server
 
-    if is_remote_server() and not headless:
-        # Interactive attach needs the tmux socket, which lives beside the
-        # remote runtime — the client-side attach relay is #776's scope.
-        # Explicit error, not a silent local attach (#745).
-        raise click.ClickException(
-            "Interactive attach to a shared server is not supported yet; "
-            "use 'cao launch --headless' (optionally with --message) or the "
-            "browser terminal."
-        )
     try:
         display_dir = working_directory or os.path.realpath(os.getcwd())
         explicit_provider = provider is not None  # True only when --provider was passed
@@ -332,8 +347,6 @@ def launch(
             # /terminals endpoints below. Restrictions/engine resolve from the
             # runtime's own profile store, so client-side overrides that cannot
             # travel are refused rather than silently dropped.
-            if not headless:
-                raise click.ClickException("--runtime requires --headless")
             if engine or resume_session_id:
                 raise click.ClickException(
                     "--engine/--resume-session-id are not supported with --runtime"
@@ -364,7 +377,9 @@ def launch(
             terminal = response.json()
             click.echo(f"Session created: {terminal['session_name']}")
             click.echo(f"Terminal created: {terminal['name']} (runtime: {runtime_id})")
-            if message:
+            if not headless:
+                _attach_via_relay(terminal)
+            elif message:
                 _drive_headless_message(terminal, message, is_async)
             return
 
@@ -415,6 +430,11 @@ def launch(
         # if it times out we still attach so the user can inspect the
         # half-initialized session rather than orphan it in tmux.
         if not headless:
+            if is_remote_server():
+                # No client-local tmux against a shared server: attach through
+                # the server's WS relay (#745/#776) — same wait semantics.
+                _attach_via_relay(terminal)
+                return
             # Align the CLI's backend singleton with the running server.
             # Without this, ``cao-server --terminal herdr`` + no config.json
             # entry causes the CLI to default to tmux. See issue #308.

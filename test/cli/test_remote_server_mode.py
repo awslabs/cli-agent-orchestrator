@@ -177,12 +177,29 @@ class TestMemoryRemote:
 
 
 class TestLaunchRemote:
-    def test_interactive_launch_is_explicit_error(self, remote_env):
-        from cli_agent_orchestrator.cli.commands.launch import launch
+    def test_interactive_remote_launch_attaches_via_relay(self, remote_env):
+        """No client-local tmux: interactive launch against a shared server
+        goes through the server's WS attach relay (#745/#776)."""
+        from cli_agent_orchestrator.cli.commands import launch as launch_mod
 
-        result = CliRunner().invoke(launch, ["--agents", "developer"])
-        assert result.exit_code != 0
-        assert "--headless" in result.output
+        created = MagicMock(status_code=200)
+        created.json.return_value = {
+            "id": "def67890",
+            "name": "developer-def6",
+            "session_name": "cao-abc",
+        }
+        with (
+            patch.object(launch_mod.requests, "post", return_value=created),
+            patch.object(launch_mod, "_attach_via_relay") as attach,
+            patch.object(launch_mod, "get_backend") as backend,
+        ):
+            result = CliRunner().invoke(
+                launch_mod.launch,
+                ["--agents", "developer", "--provider", "mock_cli", "--yolo"],
+            )
+        assert result.exit_code == 0, result.output
+        attach.assert_called_once()
+        backend.return_value.attach_session.assert_not_called()
 
     def test_restore_is_explicit_error(self, remote_env):
         from cli_agent_orchestrator.cli.commands.terminal import terminal
@@ -191,14 +208,34 @@ class TestLaunchRemote:
         assert result.exit_code != 0
         assert "not supported against a shared server" in result.output
 
-    def test_runtime_launch_requires_headless(self, local_env):
-        from cli_agent_orchestrator.cli.commands.launch import launch
+    def test_interactive_runtime_launch_attaches_via_relay(self, remote_env):
+        from cli_agent_orchestrator.cli.commands import launch as launch_mod
 
-        result = CliRunner().invoke(
-            launch, ["--agents", "developer", "--runtime", "cao-worker-x", "--yolo"]
-        )
-        assert result.exit_code != 0
-        assert "--runtime requires --headless" in result.output
+        created = MagicMock(status_code=200)
+        created.json.return_value = {
+            "id": "def67890",
+            "name": "developer-def6",
+            "session_name": "cao-abc",
+        }
+        with (
+            patch.object(launch_mod.requests, "post", return_value=created) as post,
+            patch.object(launch_mod, "_attach_via_relay") as attach,
+        ):
+            result = CliRunner().invoke(
+                launch_mod.launch,
+                [
+                    "--agents",
+                    "developer",
+                    "--provider",
+                    "mock_cli",
+                    "--runtime",
+                    "cao-worker-x",
+                    "--yolo",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        assert post.call_args.args[0].endswith("/runtimes/cao-worker-x/terminals")
+        attach.assert_called_once()
 
     def test_runtime_launch_posts_to_the_runtime_path(self, remote_env):
         from cli_agent_orchestrator.cli.commands import launch as launch_mod

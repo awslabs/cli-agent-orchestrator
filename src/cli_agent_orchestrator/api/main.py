@@ -6987,15 +6987,14 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
         await websocket.close(code=4004, reason="Terminal not found")
         return
 
-    # Remote terminal (#745): the tmux socket lives in the runtime pod, so a
-    # local attach subprocess cannot exist. The relayed interactive attach is
-    # #776 scope; until it lands, refuse explicitly instead of spawning an
-    # attach against a tmux session this server does not have.
+    # Remote terminal (#745/#776): the tmux socket lives in the runtime pod,
+    # so the PTY subprocess is spawned THERE and its bytes are relayed over
+    # the runtime channel. Same client-facing protocol as the local branch
+    # below; a disconnected runtime closes 4010 rather than false-attaching.
     if runtime_registry.is_remote(terminal_id):
-        await websocket.close(
-            code=4010,
-            reason="Terminal runs on a remote runtime; interactive attach not yet relayed",
-        )
+        from cli_agent_orchestrator.runtime_channel.api import relay_remote_attach
+
+        await relay_remote_attach(websocket, terminal_id)
         return
 
     # Defence-in-depth: re-validate the names from the DB before they

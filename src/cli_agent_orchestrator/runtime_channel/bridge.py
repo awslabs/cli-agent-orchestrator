@@ -84,6 +84,9 @@ class Bridge:
         # In-flight script subprocesses by op_id, so CANCEL_SCRIPT can terminate
         # the exact run without touching any other (#745, script relocation).
         self._script_procs: Dict[str, asyncio.subprocess.Process] = {}
+        # Interactive attach PTYs by terminal_id (#776): the PTY subprocess
+        # lives HERE, beside the tmux socket; only bytes cross the channel.
+        self._attach: Dict[str, dict] = {}
 
     # --- outbound plumbing ---
 
@@ -276,6 +279,7 @@ class Bridge:
             output = await asyncio.to_thread(terminal_service.get_output, terminal_id, mode)
             return CommandOutcome.OK, {"output": output}, terminal_id
         if frame.type == CommandType.TEARDOWN:
+            await self._attach_close(terminal_id)
             deleted = await asyncio.to_thread(terminal_service.delete_terminal, terminal_id)
             self._buffers.pop(terminal_id, None)
             return (
@@ -283,7 +287,179 @@ class Bridge:
                 {"deleted": deleted},
                 terminal_id,
             )
+        if frame.type == CommandType.ATTACH_OPEN:
+            opened = await self._attach_open(
+                terminal_id, int(payload.get("rows", 24)), int(payload.get("cols", 80))
+            )
+            return (
+                CommandOutcome.OK if opened else CommandOutcome.FAILED,
+                {"opened": opened},
+                terminal_id,
+            )
+        if frame.type == CommandType.ATTACH_DATA:
+            written = self._attach_write(terminal_id, base64.b64decode(payload["data"]))
+            return CommandOutcome.OK, {"written": written}, terminal_id
+        if frame.type == CommandType.RESIZE:
+            resized = self._attach_resize(
+                terminal_id, int(payload.get("rows", 24)), int(payload.get("cols", 80))
+            )
+            return CommandOutcome.OK, {"resized": resized}, terminal_id
+        if frame.type == CommandType.ATTACH_CLOSE:
+            await self._attach_close(terminal_id)
+            return CommandOutcome.OK, {"closed": True}, terminal_id
         raise ValueError(f"unsupported command type: {frame.type.value}")
+
+    # --- interactive attach (#776): PTY lives beside the tmux socket ---
+
+    async def _attach_open(self, terminal_id: str, rows: int, cols: int) -> bool:
+        """Spawn the backend's interactive attach client in a local PTY and
+        pump its output up the channel as the ``attach`` stream. One attach
+        per terminal; a second open replaces the first (last caller wins,
+        mirroring tmux's own attach semantics)."""
+        import fcntl
+        import pty
+        import struct
+        import subprocess
+        import termios
+
+        from cli_agent_orchestrator.backends.registry import get_backend
+        from cli_agent_orchestrator.clients.database import get_terminal_metadata
+
+        await self._attach_close(terminal_id)
+
+        metadata = get_terminal_metadata(terminal_id)
+        if not metadata:
+            return False
+        try:
+            attach_command = await asyncio.to_thread(
+                get_backend().prepare_web_attach,
+                metadata["tmux_session"],
+                metadata["tmux_window"],
+            )
+        except Exception as exc:  # noqa: BLE001 — reported as a failed open
+            logger.warning("attach open failed for %s: %s", terminal_id, exc)
+            return False
+
+        master_fd, slave_fd = pty.openpty()
+        fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+        env = dict(os.environ)
+        if env.get("TERM", "dumb") == "dumb":
+            env["TERM"] = "xterm-256color"
+        proc = subprocess.Popen(
+            attach_command,
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            close_fds=True,
+            preexec_fn=os.setsid,
+            env=env,
+        )
+        os.close(slave_fd)
+        flag = fcntl.fcntl(master_fd, fcntl.F_GETFL)
+        fcntl.fcntl(master_fd, fcntl.F_SETFL, flag | os.O_NONBLOCK)
+
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue()
+
+        def _on_pty_data():
+            try:
+                data = os.read(master_fd, 65536)
+                queue.put_nowait(data if data else None)
+            except BlockingIOError:
+                pass
+            except OSError:
+                queue.put_nowait(None)
+
+        loop.add_reader(master_fd, _on_pty_data)
+        # Positions restart per attach: the attach stream is live-interaction
+        # bytes, not replayable history — a reconnect renders a fresh screen
+        # (tmux redraws), so no replay buffer is kept (#776 allows an explicit
+        # fresh generation here).
+        state = {
+            "proc": proc,
+            "master_fd": master_fd,
+            "queue": queue,
+            "pos": 0,
+            "task": None,
+        }
+        state["task"] = asyncio.create_task(self._attach_pump(terminal_id, state))
+        self._attach[terminal_id] = state
+        return True
+
+    async def _attach_pump(self, terminal_id: str, state: dict) -> None:
+        while True:
+            data = await state["queue"].get()
+            if data is None:
+                break
+            pos = state["pos"]
+            state["pos"] += len(data)
+            await self._send(
+                StreamFrame(
+                    terminal_id=terminal_id,
+                    stream=StreamName.ATTACH,
+                    generation=0,
+                    pos=pos,
+                    data=base64.b64encode(data).decode(),
+                )
+            )
+        # PTY hit EOF (client exited / detached): tell the server so it can
+        # close the client-facing socket instead of leaving it silent.
+        await self._send(
+            StreamFrame(
+                terminal_id=terminal_id,
+                stream=StreamName.ATTACH,
+                generation=0,
+                pos=state["pos"],
+                data="",
+            )
+        )
+
+    def _attach_write(self, terminal_id: str, data: bytes) -> bool:
+        state = self._attach.get(terminal_id)
+        if state is None:
+            return False
+        try:
+            os.write(state["master_fd"], data)
+            return True
+        except OSError:
+            return False
+
+    def _attach_resize(self, terminal_id: str, rows: int, cols: int) -> bool:
+        import fcntl
+        import struct
+        import termios
+
+        state = self._attach.get(terminal_id)
+        if state is None:
+            return False
+        try:
+            fcntl.ioctl(
+                state["master_fd"], termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0)
+            )
+            return True
+        except OSError:
+            return False
+
+    async def _attach_close(self, terminal_id: str) -> None:
+        state = self._attach.pop(terminal_id, None)
+        if state is None:
+            return
+        loop = asyncio.get_running_loop()
+        try:
+            loop.remove_reader(state["master_fd"])
+        except (ValueError, OSError):
+            pass
+        task = state.get("task")
+        if task is not None:
+            task.cancel()
+        try:
+            state["proc"].terminate()
+        except OSError:
+            pass
+        try:
+            os.close(state["master_fd"])
+        except OSError:
+            pass
 
     # --- script execution (#745) ---
 

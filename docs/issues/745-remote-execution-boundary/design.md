@@ -261,29 +261,43 @@ worker's tmux session and the central row.
 - **CLI client matrix against a shared server** (`CAO_API_BASE_URL` opt-in):
   `cao schedule` (add/list/remove/enable/disable/run) and `cao memory`
   (list/show/delete/clear/export) go over HTTP; engine/pre-script survive the
-  CLI→HTTP flow add; `cao launch --headless` works remotely (with
-  `--runtime <id>` placing the terminal on a named execution runtime — EKS-
-  validated laptop→server→worker-pod round trip) and never sends
-  the client cwd implicitly; server-filesystem/tmux operations (`terminal
-  restore`, `memory repair/lint/heal/compact/promote/import/relationships`,
-  interactive launch) raise explicit errors instead of touching local state.
-  15 tests. Local mode (env unset) is byte-for-byte unchanged (595 CLI tests
-  green).
+  CLI→HTTP flow add; `cao launch` works remotely both headless and interactive
+  (with `--runtime <id>` placing the terminal on a named execution runtime —
+  EKS-validated laptop→server→worker-pod round trip) and never sends the client
+  cwd implicitly; operations that genuinely need the server's own filesystem
+  (`terminal restore`,
+  `memory repair/lint/heal/compact/promote/import/relationships`) raise explicit
+  errors instead of silently touching client-local state. 18 tests. Local mode
+  (env unset) is byte-for-byte unchanged (598 CLI tests green).
 
-**Deferred to their own workstreams:**
+- **Interactive attach relay, browser and native CLI** (§4.4's last bullet):
+  `ATTACH_OPEN`/`ATTACH_DATA`/`RESIZE`/`ATTACH_CLOSE` commands plus a dedicated
+  `attach` stream. The PTY subprocess is spawned in the runtime, beside the tmux
+  socket, from the same `backend.prepare_web_attach()` the local path uses;
+  attach-stream frames are routed to a per-terminal sink in the registry rather
+  than republished on the bus (interactive bytes are not history), and an empty
+  frame is the runtime PTY's EOF. `/terminals/{id}/ws` keeps its client-facing
+  protocol byte-for-byte — binary down, `{"type": "input"|"resize"}` JSON up —
+  so the browser terminal is unchanged and cannot tell local from remote.
+  Native `cao launch` against a shared server attaches over that same endpoint
+  (`utils/remote_attach.py`: raw-mode TTY, SIGWINCH→resize, termios restored in
+  `finally`) instead of requiring a client-local tmux. A runtime that is not
+  connected still closes `4010`, so an unreachable terminal fails loudly.
+  Coverage: 4 attach tests + 2 CLI relay tests.
+- **Provider-agnostic transport** is enforced, not asserted: a static check
+  that no `runtime_channel` module imports the providers package or names a
+  provider id, plus one recorded `LAUNCH` contract fixture per shipped provider
+  proving the identifier is forwarded opaquely into the shared
+  `terminal_service.create_terminal` seam. Paid providers are covered without
+  live credentials; `mock_cli` and `claude_code` additionally run live.
+  Coverage: 14 tests.
 
-- **Interactive browser + native-CLI attach relay** — explicitly #776's scope
-  ("#776 includes moving that path beside the remote agent"). The WS attach
-  closes `4010` for a remote terminal; remote interactive `cao launch` errors
-  and points at `--headless`.
+**Deferred to its own workstream:**
+
 - **Per-runtime delegated credentials** — explicitly #774's scope. Both the
   runtime channel and the shared MCP endpoint authenticate with a shared
   `CAO_RUNTIME_TOKEN` (fail-closed) until #774 supplies per-caller credentials
   whose verified subject replaces the token + caller header.
-- **Live provider on-cluster elastic run** — blocked by the validation
-  cluster's IAM (no Bedrock on the node role); the live-provider gate is
-  covered by the local claude_code-over-`cao-bridge` end-to-end run (no server
-  or Service beside the runtime).
 
 **Compatibility gate**: the runtime channel rejects a `PROTOCOL_VERSION`
 mismatch at hello, before any command is accepted — the "unsupported
