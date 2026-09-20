@@ -37,6 +37,12 @@ from fastapi import Depends, Header, HTTPException, status
 from jwt import PyJWKClient, PyJWKClientError
 
 from cli_agent_orchestrator.constants import API_BASE_URL
+from cli_agent_orchestrator.security.principal import (
+    LOCAL_ISSUER,
+    LOCAL_PRINCIPAL,
+    Principal,
+    PrincipalError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -244,27 +250,22 @@ def _scopes_from_claims(claims: dict) -> List[str]:
     return deduped
 
 
-def extract_scopes_from_token(token: str) -> List[str]:
+def _verify_token(token: str) -> dict:
     """Validate ``token`` (RS256 + issuer + audience + expiry via JWKS) and
-    return scopes.
+    return its claims.
 
-    Default-off: when auth is disabled, returns the full scope set without
-    touching the token. When enabled, raises (``jwt.PyJWTError`` subclasses or
-    a generic ``Exception`` from the JWKS fetch) on any validation failure so the
-    caller can map it to HTTP 401.
+    Split out of ``extract_scopes_from_token`` so the caller-identity path
+    (#745's owner context) reads the SAME verified claim set rather than
+    decoding the token a second time with its own options — two decoders would
+    be two chances for them to disagree about what was proven.
 
-    Validation pins the token to the configured authorization server (``iss``)
-    and audience (``aud``) in addition to the RS256 signature and ``exp`` so a
-    token minted by a different IdP — or for a different resource on the same
-    IdP — is rejected rather than accepted on signature alone.
+    Callers must check ``is_auth_enabled()`` first; with auth disabled there is
+    no token to verify and no claims to return.
     """
-
-    if not is_auth_enabled():
-        return list(FULL_SCOPE_SET)
 
     uri = get_jwks_uri()
     if not uri:  # pragma: no cover - guarded by is_auth_enabled
-        return list(FULL_SCOPE_SET)
+        return {}
 
     client = _jwks_cache.get_client(uri)
     try:
@@ -288,7 +289,7 @@ def extract_scopes_from_token(token: str) -> List[str]:
     if expected_issuer is not None:
         required_claims.append("iss")
     options = {"require": required_claims, "verify_aud": audience is not None}
-    claims = jwt.decode(
+    return jwt.decode(
         token,
         signing_key.key,
         algorithms=_ALGORITHMS,
@@ -296,7 +297,51 @@ def extract_scopes_from_token(token: str) -> List[str]:
         issuer=expected_issuer,
         options=cast("Any", options),
     )
-    return _scopes_from_claims(claims)
+
+
+def extract_scopes_from_token(token: str) -> List[str]:
+    """Validate ``token`` and return scopes.
+
+    Default-off: when auth is disabled, returns the full scope set without
+    touching the token. When enabled, raises (``jwt.PyJWTError`` subclasses or
+    a generic ``Exception`` from the JWKS fetch) on any validation failure so the
+    caller can map it to HTTP 401.
+
+    Validation pins the token to the configured authorization server (``iss``)
+    and audience (``aud``) in addition to the RS256 signature and ``exp`` so a
+    token minted by a different IdP — or for a different resource on the same
+    IdP — is rejected rather than accepted on signature alone.
+    """
+
+    if not is_auth_enabled():
+        return list(FULL_SCOPE_SET)
+
+    return _scopes_from_claims(_verify_token(token))
+
+
+def extract_principal_from_token(token: str) -> Principal:
+    """Validate ``token`` and return the principal that owns work done for it.
+
+    The subject comes from the verified ``sub`` claim and the issuer from the
+    verified ``iss`` — never from anything the caller supplied outside the
+    signature, which is #745's "agent-supplied IDs alone are not authorization"
+    applied to ownership.
+
+    A token that verifies but carries no ``sub`` is refused rather than
+    downgraded to the local principal: an installation with an IdP configured
+    has an answer to "who is this", and silently substituting "local" would
+    hand a token-holder the single-user owner's work.
+    """
+
+    if not is_auth_enabled():
+        return LOCAL_PRINCIPAL
+
+    claims = _verify_token(token)
+    subject = str(claims.get("sub", "")).strip()
+    if not subject:
+        raise PrincipalError("token carries no 'sub' claim to own work with")
+    issuer = str(claims.get("iss", "")).strip() or LOCAL_ISSUER
+    return Principal(subject=subject, issuer=issuer)
 
 
 def get_scopes_for_local_token() -> List[str]:
@@ -411,6 +456,41 @@ async def get_current_scopes(
         )
     try:
         return extract_scopes_from_token(token)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"invalid token: {exc}",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+async def get_current_principal(
+    authorization: Optional[str] = Header(default=None),
+) -> Principal:
+    """FastAPI dependency returning the owner to record against accepted work.
+
+    Used by the routes that accept work outliving their own request — a flow
+    registration that fires on a cron, an assignment executed in a pod minted
+    later — so the owner is captured while the request still has one (#745).
+
+    Default-off: returns ``LOCAL_PRINCIPAL`` without inspecting the request, so
+    a single-user installation records a named local owner rather than nothing.
+    With auth enabled the rules are ``get_current_scopes``': a missing or
+    invalid token is 401.
+    """
+
+    if not is_auth_enabled():
+        return LOCAL_PRINCIPAL
+
+    token = _extract_bearer(authorization)
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="missing bearer token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    try:
+        return extract_principal_from_token(token)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

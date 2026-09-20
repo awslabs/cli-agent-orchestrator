@@ -1466,6 +1466,9 @@ class TestFlowOperations:
         mock_flow.last_run = None
         mock_flow.next_run = datetime.now()
         mock_flow.enabled = True
+        # A MagicMock attribute is a MagicMock, and Flow.owner is a real
+        # Optional[str] since #745 -- state the absence explicitly.
+        mock_flow.owner = None
 
         mock_query = MagicMock()
         mock_query.filter.return_value.first.return_value = mock_flow
@@ -1494,6 +1497,9 @@ class TestFlowOperations:
         mock_flow.last_run = None
         mock_flow.next_run = datetime.now()
         mock_flow.enabled = True
+        # A MagicMock attribute is a MagicMock, and Flow.owner is a real
+        # Optional[str] since #745 -- state the absence explicitly.
+        mock_flow.owner = None
 
         mock_query = MagicMock()
         mock_query.order_by.return_value.all.return_value = [mock_flow]
@@ -1557,6 +1563,9 @@ class TestFlowOperations:
         mock_flow.last_run = None
         mock_flow.next_run = datetime.now()
         mock_flow.enabled = True
+        # A MagicMock attribute is a MagicMock, and Flow.owner is a real
+        # Optional[str] since #745 -- state the absence explicitly.
+        mock_flow.owner = None
 
         mock_query = MagicMock()
         mock_query.filter.return_value.all.return_value = [mock_flow]

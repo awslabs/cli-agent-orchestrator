@@ -68,6 +68,7 @@ async def create_session(
     resume_session_id: str | None = None,
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
+    owner: Optional[str] = None,
 ) -> Terminal:
     """Create a new session by creating its initial terminal.
 
@@ -97,6 +98,10 @@ async def create_session(
     mechanics. A caller supplying the same key on a retry gets back the
     SAME terminal this function already created for it, without a second
     tmux window or provider process.
+
+    ``owner`` (#745): forwarded as-is to ``create_terminal``, which records it on
+    the terminal row. The route passes the principal from the verified token, so
+    the session's initial terminal knows whose work it is doing.
     """
     if initial_message == "":
         raise ValueError("initial_message must not be empty")
@@ -127,6 +132,7 @@ async def create_session(
         resume_session_id=resume_session_id,
         group=group,
         metadata=metadata,
+        owner=owner,
     )
     dispatch_plugin_event(
         registry,

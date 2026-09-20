@@ -19,6 +19,7 @@ from cli_agent_orchestrator.api.main import (
 )
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import Terminal
+from cli_agent_orchestrator.security.principal import LOCAL_PRINCIPAL
 from cli_agent_orchestrator.services.inbox_service import inbox_service
 from cli_agent_orchestrator.services.terminal_service import (
     IdempotencyKeyConflict,
@@ -353,6 +354,11 @@ class TestCreateSession:
             resume_session_id=None,
             group=None,
             metadata=None,
+            # With auth disabled the request principal is the named local user
+            # (#745). The session records it rather than None: the terminal this
+            # creates outlives the request, and "nobody" is the anonymisation the
+            # owner exists to prevent.
+            owner=LOCAL_PRINCIPAL.id,
         )
 
     def test_create_session_forwards_use_worktree_true(self, client):

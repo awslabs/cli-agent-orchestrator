@@ -59,8 +59,10 @@ from cli_agent_orchestrator.security.auth import (
     SCOPE_ADMIN,
     SCOPE_READ,
     SCOPE_WRITE,
+    get_current_principal,
     require_any_scope,
 )
+from cli_agent_orchestrator.security.principal import Principal
 from cli_agent_orchestrator.services.event_bus import bus
 
 logger = logging.getLogger(__name__)
@@ -236,6 +238,7 @@ async def create_remote_terminal(
     runtime_id: str,
     body: CreateRemoteTerminalBody,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+    principal: Principal = Depends(get_current_principal),
 ) -> Terminal:
     conn = runtime_registry.get_runtime(runtime_id)
     if conn is None:
@@ -267,6 +270,15 @@ async def create_remote_terminal(
     # Persist the authoritative registry row centrally. runtime_id is recorded
     # in metadata so the association is inspectable and survives restarts
     # alongside the hello-snapshot rebinding.
+    #
+    # ``owner`` records who this remote terminal's work is for (#745). It is
+    # written here, on the server, and deliberately NOT sent to the runtime in
+    # the LAUNCH payload: the executor pod is the least trusted party in this
+    # topology, and an identity handed to it is an identity it could re-present.
+    # Every later question about this terminal ("may this still start work?",
+    # "whose callback is this?") is answered by reading this row, which is the
+    # concrete form of #745's rule that agent-supplied IDs alone are not
+    # authorization.
     db_create_terminal(
         info["id"],
         info["session_name"],
@@ -277,6 +289,7 @@ async def create_remote_terminal(
         shell_command=info.get("shell_command"),
         working_directory=body.working_directory,
         metadata={"runtime_id": runtime_id},
+        owner=principal.id,
     )
     runtime_registry.bind_terminal(info["id"], runtime_id)
     try:
@@ -299,6 +312,7 @@ async def create_remote_terminal(
         shell_command=info.get("shell_command"),
         group=None,
         metadata={"runtime_id": runtime_id},
+        owner=principal.id,
         status=reported,
         last_active=datetime.now(),
     )

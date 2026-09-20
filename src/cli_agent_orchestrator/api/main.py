@@ -118,10 +118,12 @@ from cli_agent_orchestrator.security.auth import (
     _extract_bearer,
     extract_scopes_from_token,
     get_authorization_servers,
+    get_current_principal,
     get_current_scopes,
     is_auth_enabled,
     require_any_scope,
 )
+from cli_agent_orchestrator.security.principal import Principal
 from cli_agent_orchestrator.services import (
     approval_gate,
     approval_provenance,
@@ -2949,6 +2951,7 @@ async def create_session(
     resume_session_id: Optional[str] = None,
     body: Optional[CreateSessionBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+    principal: Principal = Depends(get_current_principal),
 ) -> Terminal:
     """Create a new session with exactly one terminal.
 
@@ -3061,6 +3064,8 @@ async def create_session(
             resume_session_id=resume_session_id,
             group=body.group if body else None,
             metadata=body.metadata if body else None,
+            # Whose work this session is, taken from the verified token (#745).
+            owner=principal.id,
         )
 
         if memory_manager and str(memory_manager).lower() in ("true", "1", "yes"):
@@ -3103,6 +3108,10 @@ async def create_session(
                         working_directory=working_directory,
                         registry=registry,
                         idempotency_key=sidecar_idempotency_key,
+                        # Same owner as the primary it serves: the sidecar is
+                        # spawned in a background task, after this request's
+                        # principal would otherwise be out of scope (#745).
+                        owner=principal.id,
                     )
                 except Exception as e:
                     logger.warning(f"Failed to spawn memory_manager sidecar: {e}")
@@ -3242,6 +3251,7 @@ async def create_terminal_in_session(
     idempotency_key: Optional[str] = None,
     body: Optional[CreateTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+    principal: Principal = Depends(get_current_principal),
 ) -> Terminal:
     """Create additional terminal in existing session.
 
@@ -3354,6 +3364,7 @@ async def create_terminal_in_session(
             model=model,
             use_worktree=use_worktree,
             idempotency_key=idempotency_key,
+            owner=principal.id,
         )
         return result
     except HTTPException:
@@ -7192,6 +7203,7 @@ async def get_flow(
 async def create_flow(
     body: CreateFlowRequest,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+    principal: Principal = Depends(get_current_principal),
 ) -> Flow:
     """Create a new flow.
 
@@ -7224,7 +7236,9 @@ async def create_flow(
 
         file_path.write_text(file_content)
 
-        return flow_service.add_flow(str(file_path))
+        # Record who this schedule belongs to while the request still says so
+        # (#745): the daemon that fires it minutes from now has no caller.
+        return flow_service.add_flow(str(file_path), owner=principal.id)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:

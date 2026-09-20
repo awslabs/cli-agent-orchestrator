@@ -12,6 +12,7 @@ from typing import Dict
 from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.clients.database import (
     get_pending_messages,
+    get_terminal_metadata,
     list_pending_receiver_ids_by_provider,
     list_pending_receiver_ids_older_than,
     update_message_status,
@@ -29,12 +30,42 @@ from cli_agent_orchestrator.runtime_channel.registry import (
     RuntimeUnavailableError,
     runtime_registry,
 )
+from cli_agent_orchestrator.security.principal import (
+    Principal,
+    PrincipalError,
+    may_start_work,
+    revocation,
+)
 from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.utils.event import terminal_id_from_topic
 
 logger = logging.getLogger(__name__)
+
+
+def _terminal_owner(terminal_id: str | None) -> Principal | None:
+    """Resolve whose work a terminal's messages are, from the server's own row.
+
+    The owner is read from the ``terminals.owner`` column the server wrote when
+    it accepted the launch — never from the agent-writable ``metadata`` bag, and
+    never from anything the sending agent presented. A worker that could name its
+    own owner could name someone else's (#745).
+
+    ``None`` means unknown: no row, no owner recorded (a terminal created before
+    the column existed), or a value this build cannot parse. Unknown is not
+    revoked — see ``RevocationRegistry.is_revoked``.
+    """
+    if not terminal_id:
+        return None
+    row = get_terminal_metadata(terminal_id)
+    if not row:
+        return None
+    try:
+        return Principal.parse(row.get("owner"))
+    except PrincipalError:
+        logger.warning("terminal %s has an unreadable owner; treating as unknown", terminal_id)
+        return None
 
 
 class InboxService:
@@ -115,6 +146,36 @@ class InboxService:
         messages = get_pending_messages(terminal_id, limit=limit)
         if not messages:
             return
+
+        # Owner gate (#745). A queued message is deferred work: it was enqueued
+        # by one request and is typed into a live agent later, so "may this
+        # owner still start work?" is a question for delivery time, not enqueue
+        # time. Held messages stay PENDING rather than becoming FAILED — a
+        # revocation that is later reversed should deliver them, and FAILED
+        # would be a claim about the message that is not true.
+        #
+        # Gated on any_revoked() so the ownership lookup (one DB read per
+        # distinct sender) does not happen at all in the normal case.
+        if revocation.any_revoked():
+            owners: Dict[str | None, Principal | None] = {}
+            allowed = []
+            for message in messages:
+                if message.sender_id not in owners:
+                    owners[message.sender_id] = _terminal_owner(message.sender_id)
+                owner = owners[message.sender_id]
+                if may_start_work(owner):
+                    allowed.append(message)
+                else:
+                    logger.warning(
+                        "Holding message %s for %s: sender %s's owner %s is revoked",
+                        message.id,
+                        terminal_id,
+                        message.sender_id,
+                        owner.id if owner else "?",
+                    )
+            messages = allowed
+            if not messages:
+                return
 
         # A remote terminal's status is derived in its own runtime and pushed
         # over the channel; the local detector would probe a tmux socket that

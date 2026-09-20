@@ -7,7 +7,7 @@ import re
 import subprocess
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, cast
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 import frontmatter  # type: ignore
 from apscheduler.triggers.cron import CronTrigger  # type: ignore
@@ -33,6 +33,7 @@ from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.kiro_engine import parse_kiro_engine
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.manager import provider_manager
+from cli_agent_orchestrator.security.principal import Principal, may_start_work
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.terminal_service import create_terminal, send_input
@@ -67,8 +68,14 @@ def _parse_flow_file(file_path: Path) -> Tuple[Dict, str]:
     return post.metadata, post.content
 
 
-def add_flow(file_path: str) -> Flow:
-    """Add flow from file."""
+def add_flow(file_path: str, owner: Optional[str] = None) -> Flow:
+    """Add flow from file.
+
+    ``owner`` is the canonical principal id of the caller registering the
+    schedule (#745). It is recorded now because this is the last moment it is
+    known: the flow fires from a background daemon whose only other candidate
+    for "who is this for" is the server's own identity.
+    """
     try:
         path = Path(file_path).resolve()
         metadata, _ = _parse_flow_file(path)
@@ -109,6 +116,7 @@ def add_flow(file_path: str) -> Flow:
             next_run=next_run,
             enabled=True,
             prompt_template=None,
+            owner=owner,
         )
 
         # Create flow in database
@@ -120,6 +128,7 @@ def add_flow(file_path: str) -> Flow:
             provider=provider,
             script=script,
             next_run=next_run,
+            owner=owner,
         )
         flow = Flow.model_validate({**flow.model_dump(), "engine": validated_flow.engine})
 
@@ -213,6 +222,26 @@ async def execute_flow(name: str) -> bool:
     try:
         logger.info(f"Executing flow: {name}")
         flow = get_flow(name)
+
+        # Dispatch gate (#745): a schedule outlives the request that created it,
+        # so whether its owner may still start work is a question only answerable
+        # HERE, at the moment work would begin. Placed above the pre-script
+        # deliberately — that script is the owner's code too, and running it is
+        # starting work on their behalf.
+        #
+        # The schedule still advances (the same thing the execute=false arm does
+        # below), so a withdrawn owner's flow does not re-queue every minute
+        # forever; and nothing about this path touches disable/remove, which stay
+        # available to stop the flow for good.
+        owner = Principal.parse(flow.owner)
+        if not may_start_work(owner):
+            db_update_flow_run_times(
+                name, last_run=datetime.now(), next_run=_get_next_run_time(flow.schedule)
+            )
+            logger.warning(
+                "Flow %s: not dispatched — owner %s is revoked", name, owner.id if owner else "?"
+            )
+            return False
 
         # Read flow file
         file_path = Path(flow.file_path)
@@ -348,6 +377,12 @@ async def execute_flow(name: str) -> bool:
             agent_profile=flow.agent_profile,
             new_session=True,
             engine=flow.engine,
+            # The agent this schedule launches works for whoever REGISTERED the
+            # schedule, not for whoever the daemon runs as (#745). Carrying it
+            # onto the terminal row is what lets the same owner be read later,
+            # when this terminal sends a message and nothing about the original
+            # registration request is still in scope.
+            owner=owner.id if owner else None,
         )
 
         # Send rendered prompt to terminal. send_input is blocking tmux I/O

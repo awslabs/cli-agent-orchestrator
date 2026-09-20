@@ -207,6 +207,9 @@ class TestCreateTerminal:
             idempotency_key=None,
             # No key supplied, so no fingerprint is computed (review on PR #634).
             request_fingerprint=None,
+            # No owner supplied by this caller, so the row records none (#745) --
+            # unknown, which the revocation gate reads as not-revoked.
+            owner=None,
         )
         assert mock_provider_manager.create_provider.call_args.args[5] == ["fs_read"]
 
@@ -1189,6 +1192,7 @@ def _record(terminal_id="prior-terminal", **overrides):
         "resume_session_id": None,
         "initial_message": None,
         "initial_message_orchestration_type": None,
+        "owner": None,
     }
     fields.update(overrides)
     return IdempotencyRecord(
@@ -1281,6 +1285,12 @@ class TestIdempotencyKeyRequestFingerprint:
             # was discarded with no conflict and no delivery.
             ("initial_message", "a different task"),
             ("initial_message_orchestration_type", OrchestrationType.HANDOFF),
+            # #745: the same escalation caller_id guards, one level up. Two
+            # principals who happen to pick the same key (`retry`, `job-1`) must
+            # not be handed each other's live agent -- and unlike caller_id, the
+            # owner is the value every later authorization decision reads, so an
+            # unhashed one would silently re-label whose work the terminal is.
+            ("owner", "https://idp.example/#auth0|member"),
         ],
     )
     @pytest.mark.asyncio
@@ -1399,8 +1409,22 @@ class TestIdempotencyKeyRequestFingerprint:
             None,
             None,
             None,
+            None,
         ) == _request_fingerprint(
-            "kiro_cli", "developer", None, None, None, None, False, None, None, {}, None, None, None
+            "kiro_cli",
+            "developer",
+            None,
+            None,
+            None,
+            None,
+            False,
+            None,
+            None,
+            {},
+            None,
+            None,
+            None,
+            None,
         )
 
     @pytest.mark.asyncio
@@ -1414,8 +1438,8 @@ class TestIdempotencyKeyRequestFingerprint:
     ):
         """Pins an ACCEPTED RESIDUAL, not a bug.
 
-        Two callers both with ``caller_id=None`` and identical in all other six
-        fields are indistinguishable by fingerprint, so the second reuses the
+        Two callers both with ``caller_id=None`` and identical in every other
+        hashed field are indistinguishable by fingerprint, so the second reuses the
         first's terminal. That is the documented, intended outcome: by every
         property the server can observe these are the same request. Pinned so
         nobody later "fixes" it into a conflict without a decision.
@@ -1501,6 +1525,7 @@ class TestIdempotencyKeyRequestFingerprint:
             None,
             None,
             False,
+            None,
             None,
             None,
             None,

@@ -466,6 +466,7 @@ def _request_fingerprint(
     resume_session_id: Optional[str],
     initial_message: Optional[str],
     initial_message_orchestration_type: Optional[OrchestrationType],
+    owner: Optional[str],
 ) -> str:
     """Fingerprint the create-terminal request an idempotency key stands for.
 
@@ -645,6 +646,14 @@ def _request_fingerprint(
         resume_session_id or "",
         initial_message or "",
         orchestration_value,
+        # WHOSE terminal this is (#745). Hashed for the same reason `caller_id`
+        # is, one level up: a key is a caller-chosen string, so two principals
+        # can pick the same one, and unhashed `owner` would hand principal B the
+        # terminal created for principal A -- a cross-owner hand-off of a live
+        # agent, from a guess. Hashed, that second call is a loud 409. It is also
+        # a persisted COLUMN on the row (`terminals.owner`), which is the test
+        # `allowed_tools` and `engine` are here by.
+        owner or "",
     ]
     return hashlib.sha256(
         "\x00".join(_fingerprint_component(part) for part in parts).encode("utf-8")
@@ -672,6 +681,7 @@ async def create_terminal(
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
     idempotency_key: Optional[str] = None,
+    owner: Optional[str] = None,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -736,7 +746,7 @@ async def create_terminal(
             unprotected behavior every current caller keeps.
 
             The key does NOT identify the request on its own -- it is matched
-            together with a fingerprint of ELEVEN fields (see
+            together with a fingerprint of FOURTEEN fields (see
             ``_request_fingerprint``). Presenting a key that a DIFFERENT
             request already claimed raises ``IdempotencyKeyConflict``
             (HTTP 409) rather than handing back a terminal that answers
@@ -752,12 +762,13 @@ async def create_terminal(
             hashed or excluded-with-a-reason. Adding a parameter to either
             endpoint means classifying it here.
 
-            HASHED (11) -- these determine what the terminal IS, or what
-            privileges and context it launches with:
+            HASHED (14) -- these determine what the terminal IS, what
+            privileges and context it launches with, or what it was asked to do:
             ``provider``, ``agent_profile``, ``session_name``,
             ``working_directory``, ``caller_id``, ``model``, ``use_worktree``,
             ``engine``, ``allowed_tools``, ``env_vars``,
-            ``resume_session_id``.
+            ``resume_session_id``, ``initial_message``,
+            ``initial_message_orchestration_type``, ``owner``.
 
             EXCLUDED, each for a checked reason:
 
@@ -768,10 +779,6 @@ async def create_terminal(
               the ``update_metadata`` MCP tool, so a create-time key is not
               their integrity boundary -- a caller who cares about their value
               cannot rely on creation to fix it anyway.
-            - ``initial_message`` and ``initial_message_orchestration_type``.
-              The delivered payload and its routing, not the terminal: neither
-              is persisted on the row, and a genuine retry re-sends the same
-              message. These create endpoints do not own the prompt.
             - ``defer_init``. Excluded, and this one was decided against the
               instinct that it looks like identity, because three things check
               out against the code:
@@ -855,13 +862,13 @@ async def create_terminal(
             something for one provider, two requests differing in it are
             different requests, and the pair must not be conflated by a key.
 
-            Two accepted residuals, recorded so they are not mistaken for
-            bugs. Note neither is an exclusion from the field set above --
-            those are enumerated there with their reasons; these are limits of
-            what a fingerprint over those fields can distinguish:
+            One accepted residual, recorded so it is not mistaken for a
+            bug. Note it is not an exclusion from the field set above -- those
+            are enumerated there with their reasons; this is a limit of what a
+            fingerprint over those fields can distinguish:
 
             1. Two callers that BOTH have ``caller_id=None`` and are otherwise
-               identical in all eleven fields are indistinguishable by
+               identical in all fourteen fields are indistinguishable by
                fingerprint, so the second reuses the first's terminal. At that
                point the two requests are the same request by every property
                the server can observe, and reuse is the defensible answer.
@@ -871,24 +878,28 @@ async def create_terminal(
                ``POST /sessions`` does not expose it -- so every keyed
                fresh-session create arrives with ``caller_id=None`` and this
                residual is the norm there, not the exception.
-            2. The DELIVERED PROMPT is not hashed, so two same-shape requests
-               carrying different messages reuse one terminal. This is
-               deliberate and must not be "fixed" by adding the prompt -- a
-               genuine retry re-sends the same prompt, and these create
-               endpoints are not the prompt's owner.
-
             KNOWN DIVERGENCE, stated so the next reader need not rediscover
-            it: even with eleven fields this remains a WEAKER contract than
+            it: even with fourteen fields this remains a WEAKER contract than
             the other reuse path in this repo.
             ``agent_step._validate_reused_terminal`` RAISES on a provider or
             engine mismatch against the PERSISTED row, and ``RunStepRequest``
             rejects ``env_vars`` combined with ``reuse_terminal_id`` outright.
             Here a mismatch is refused only insofar as it changes one of the
-            eleven hashed fields, and the comparison is
+            fourteen hashed fields, and the comparison is
             request-against-request rather than
             request-against-persisted-metadata. The practical gap: a field
             that is excluded above, or a difference between the request and
             what the mapped terminal actually persisted, is not caught here.
+
+        owner: Canonical principal id of whoever this terminal's work belongs
+            to (#745). Written to its own ``terminals.owner`` column, not into
+            ``metadata`` -- the running agent can rewrite ``metadata`` through
+            the ``update_metadata`` MCP tool, and an owner it can rewrite is not
+            an owner anything may be authorized against. Callers that know the
+            requester pass it (the API's create routes, from the verified token);
+            scheduled work passes the OWNER RECORDED AT REGISTRATION rather than
+            whoever the server runs as, which is the whole point. ``None`` leaves
+            it unrecorded, which reads as unknown, not as the local user.
 
     Returns:
         Terminal object with all metadata populated
@@ -925,6 +936,7 @@ async def create_terminal(
             resume_session_id,
             initial_message,
             initial_message_orchestration_type,
+            owner,
         )
         existing_record = get_idempotency_record(idempotency_key)
         existing_terminal_id = existing_record.terminal_id if existing_record else None
@@ -1313,6 +1325,7 @@ async def create_terminal(
                         working_directory=resolved_working_directory,
                         idempotency_key=idempotency_key,
                         request_fingerprint=request_fingerprint,
+                        owner=owner,
                     )
                 except BaseException:
                     _roll_back_backend_create_locked(
@@ -1451,6 +1464,7 @@ async def create_terminal(
             shell_command=shell_command,
             group=group,
             metadata=metadata,
+            owner=owner,
             status=initial_status,
             last_active=datetime.now(),
         )
@@ -2125,6 +2139,7 @@ def get_terminal(terminal_id: str) -> Dict:
             "engine": metadata.get("engine"),
             "group": metadata.get("group"),
             "metadata": metadata.get("metadata"),
+            "owner": metadata.get("owner"),
             "status": status,
             "last_active": metadata["last_active"],
         }

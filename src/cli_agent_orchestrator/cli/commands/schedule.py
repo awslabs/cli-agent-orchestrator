@@ -11,6 +11,7 @@ from pathlib import Path
 import click
 
 from cli_agent_orchestrator.clients.database import init_db
+from cli_agent_orchestrator.security.principal import LOCAL_PRINCIPAL
 from cli_agent_orchestrator.services import flow_service
 from cli_agent_orchestrator.utils.remote_server import api_request, is_remote_server
 
@@ -64,7 +65,11 @@ def add(file_path):
         if is_remote_server():
             _remote_add(file_path)
             return
-        added = flow_service.add_flow(file_path)
+        # Local registration: the owner is the single-user installation's named
+        # principal (#745). LOCAL_PRINCIPAL rather than None — "nobody recorded
+        # an owner" and "the local user owns this" are different facts, and the
+        # revocation gate treats them differently.
+        added = flow_service.add_flow(file_path, owner=LOCAL_PRINCIPAL.id)
         _echo_flow_added(added.name, added.schedule, added.agent_profile, added.next_run)
     except click.ClickException:
         raise

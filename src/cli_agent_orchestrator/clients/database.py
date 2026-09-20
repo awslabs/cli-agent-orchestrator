@@ -57,6 +57,15 @@ class TerminalModel(Base):
     # MetaData object on every mapped class; the DB column itself is still
     # literally named "metadata" per #432's design.
     metadata_json = Column("metadata", Text, nullable=True)
+    # Canonical principal id of whoever's work this terminal is doing (#745).
+    # Its OWN column rather than a key in ``metadata`` above, which is written by
+    # the running agent itself through the ``update_metadata`` MCP tool: an
+    # identity kept in an agent-writable bag is an identity the agent can forge,
+    # and this value is read to decide whether work may still be started. Only
+    # the server writes it, at creation. NULL = not recorded (a row predating the
+    # column), which reads as unknown, not as the local user. Added to existing
+    # DBs by ``_migrate_add_terminal_owner``.
+    owner = Column(String, nullable=True)
     last_active = Column(DateTime, default=datetime.now)
 
     # ORDERING CONTRACT: the two session-scoped reads -- ``list_terminals_by_session``
@@ -337,6 +346,12 @@ class FlowModel(Base):
     last_run = Column(DateTime, nullable=True)
     next_run = Column(DateTime, nullable=True)
     enabled = Column(Boolean, default=True)
+    # The principal that registered this schedule, as its canonical id (#745).
+    # A flow fires long after the request that created it returned, so without
+    # this the dispatch has no owner to check and the work silently becomes the
+    # server's own. NULL = registered before this column existed; migrated onto
+    # existing DBs by ``_migrate_add_flow_owner``.
+    owner = Column(String, nullable=True)
 
 
 class IdempotencyKeyModel(Base):
@@ -431,6 +446,12 @@ def init_db() -> None:
     # Appended LAST (issue #657). Adds one partial index to memory_metadata;
     # reads no other table, so registry order is immaterial here too.
     _migrate_memory_scope_null_uniqueness()
+    # Appended LAST (#745). One nullable column each on ``flows`` and
+    # ``terminals``; touches no table above, so registry order is immaterial here
+    # too. ``_migrate_terminals_schema`` runs first and adds its own columns, but
+    # the two do not overlap and each ALTER is guarded by its own PRAGMA read.
+    _migrate_add_flow_owner()
+    _migrate_add_terminal_owner()
 
 
 def _restrict_db_file_permissions() -> None:
@@ -584,6 +605,54 @@ def _migrate_add_related_keys() -> None:
                 logger.info("Migration: added related_keys column to memory_metadata")
     except Exception as e:
         logger.debug(f"Migration check for related_keys failed: {e}")
+
+
+def _migrate_add_flow_owner() -> None:
+    """Add the ``owner`` column to ``flows`` if missing (#745).
+
+    Same idempotent ALTER pattern as ``_migrate_add_related_keys``. Nullable
+    with no backfill on purpose: a flow registered before this column existed
+    has an owner nobody recorded, and inventing one — the local principal, say —
+    would assert something untrue about who a scheduled agent runs for. NULL
+    reads as "unknown", which the revocation gate treats as not-revoked, so
+    existing schedules keep firing across the upgrade.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            cursor = conn.execute("PRAGMA table_info(flows)")
+            columns = {row[1] for row in cursor.fetchall()}
+            if columns and "owner" not in columns:
+                conn.execute("ALTER TABLE flows ADD COLUMN owner TEXT")
+                logger.info("Migration: added owner column to flows")
+    except Exception as e:
+        logger.debug(f"Migration check for flow owner failed: {e}")
+
+
+def _migrate_add_terminal_owner() -> None:
+    """Add the ``owner`` column to ``terminals`` if missing (#745).
+
+    Same idempotent, nullable, no-backfill pattern as
+    ``_migrate_add_flow_owner``, and for the same reason: the owner of a terminal
+    that already existed is not knowable now, and writing the local principal
+    into those rows would be a claim rather than a record.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            cursor = conn.execute("PRAGMA table_info(terminals)")
+            columns = {row[1] for row in cursor.fetchall()}
+            if columns and "owner" not in columns:
+                conn.execute("ALTER TABLE terminals ADD COLUMN owner TEXT")
+                logger.info("Migration: added owner column to terminals")
+    except Exception as e:
+        logger.debug(f"Migration check for terminal owner failed: {e}")
 
 
 def _migrate_memory_relationships() -> None:
@@ -1384,8 +1453,13 @@ def create_terminal(
     working_directory: Optional[str] = None,
     idempotency_key: Optional[str] = None,
     request_fingerprint: Optional[str] = None,
+    owner: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record.
+
+    ``owner`` is the canonical principal id of whoever this terminal's work is
+    for (#745), written by the server only -- see the column comment on
+    ``TerminalModel.owner`` for why it is not a ``metadata`` key.
 
     ``idempotency_key``, when given, is persisted in the SAME ``SessionLocal``
     session as the terminal row -- one ``commit()``, so SQLite's single-writer
@@ -1420,6 +1494,7 @@ def create_terminal(
             engine=engine,
             group=_json.dumps(group) if group else None,
             metadata_json=_json.dumps(metadata) if metadata else None,
+            owner=owner,
         )
         db.add(terminal)
         if idempotency_key:
@@ -1456,6 +1531,7 @@ def create_terminal(
             # returns {"group": None}, an API-consistency gap.
             "group": group if group else None,
             "metadata": metadata if metadata else None,
+            "owner": terminal.owner,
         }
 
 
@@ -1554,6 +1630,7 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "engine": terminal.engine or ("v2" if terminal.provider == "kiro_cli" else None),
             "group": group,
             "metadata": metadata,
+            "owner": terminal.owner,
             "last_active": terminal.last_active,
         }
 
@@ -2099,8 +2176,14 @@ def create_flow(
     provider: str,
     script: str,
     next_run: datetime,
+    owner: Optional[str] = None,
 ) -> Flow:
-    """Create flow record."""
+    """Create flow record.
+
+    ``owner`` is the canonical principal id of whoever registered the schedule
+    (#745). Optional so every existing caller is unchanged; the HTTP and CLI
+    registration paths pass it.
+    """
     with SessionLocal() as db:
         flow = FlowModel(
             name=name,
@@ -2110,6 +2193,7 @@ def create_flow(
             provider=provider,
             script=script,
             next_run=next_run,
+            owner=owner,
         )
         db.add(flow)
         db.commit()
@@ -2125,6 +2209,7 @@ def create_flow(
             next_run=flow.next_run,
             enabled=flow.enabled,
             prompt_template=None,
+            owner=flow.owner,
         )
 
 
@@ -2145,6 +2230,7 @@ def get_flow(name: str) -> Optional[Flow]:
             next_run=flow.next_run,
             enabled=flow.enabled,
             prompt_template=None,
+            owner=flow.owner,
         )
 
 
@@ -2164,6 +2250,7 @@ def list_flows() -> List[Flow]:
                 next_run=f.next_run,
                 enabled=f.enabled,
                 prompt_template=None,
+                owner=f.owner,
             )
             for f in flows
         ]
@@ -2221,6 +2308,7 @@ def get_flows_to_run() -> List[Flow]:
                 next_run=f.next_run,
                 enabled=f.enabled,
                 prompt_template=None,
+                owner=f.owner,
             )
             for f in flows
         ]

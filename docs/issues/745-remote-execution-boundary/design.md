@@ -220,6 +220,64 @@ Every frame is one JSON object:
 - Broker/EKS example: execution-only worker Deployments, no per-worker Service, central
   StatefulSet preserved; client/operation preservation matrix.
 
+### 5.1 Ownership of deferred work (criterion 14)
+
+Centralizing the server made a latent problem explicit. Locally, "whose work is
+this" was answerable by inspection: one user, one machine, one process. In this
+topology the work that matters most is *deferred* — a schedule fires from a
+daemon, a queued message is typed in by a status event, a delegated result comes
+back from another pod — and at each of those moments the request that started it
+has returned. The only identity still in scope is the server's own, which is
+precisely the anonymisation the criterion forbids.
+
+So the owner is recorded at the last moment it is known and read back at the
+moment work would begin:
+
+- **Form.** A `Principal` is `issuer#subject`, taken from the verified token's
+  `iss`/`sub`. A token with no `sub` is refused rather than owned by a default:
+  a request that cannot say who it is for must not get one assigned. With auth
+  disabled the owner is the *named* local principal (`cao:local#local`), not
+  `None` — "the local user" is an answer, absence of one is not, and the two must
+  not be spelled alike.
+- **Storage.** `flows.owner` and `terminals.owner`, each its own column added by
+  an idempotent PRAGMA-gated `ALTER`. Deliberately **not** a key in
+  `terminals.metadata`: the `update_metadata` tool lets the running agent replace
+  that dict wholesale, so an owner stored there is an owner the agent chooses.
+  `NULL` reads as *unknown*, and unknown is not revoked, so upgrading a live
+  install strands no schedule.
+- **Direction of travel.** Server → database → server. The owner is **not** in
+  the `LAUNCH` payload sent to a runtime. The executor pod is the least-trusted
+  party here; an identity handed to it is an identity it can re-present, which is
+  the same reason `assign_elastic`'s callback target is resolved from the
+  recorded caller rather than from what the worker claims. This is the concrete
+  form of the rule the rest of this document rests on: agent-supplied ids are not
+  authorization.
+- **Where the gate goes.** At dispatch, not at enqueue. `execute_flow` checks
+  before running the pre-script, because that script is the owner's code too and
+  running it is starting work on their behalf; the schedule still advances, so a
+  held flow does not re-attempt every minute forever. Inbox delivery resolves the
+  **sender's** owner (the receiver's pane is where work lands, not whose work it
+  is) and leaves held messages `PENDING` — `FAILED` would assert a delivery
+  attempt that never happened, and a reinstated owner's message should still
+  arrive. The lookup sits behind an `any_revoked()` fast path so an installation
+  with nothing revoked pays nothing per delivery.
+- **Asymmetry.** `may_start_work` can refuse; `may_stop_work` never does.
+  Revocation that also withdrew the authority to kill, disable or delete would
+  leave a removed member's agent running with nobody able to stop it — worse than
+  the access it withdrew.
+- **Idempotency.** `owner` is hashed into the `create_terminal` request
+  fingerprint. Two principals who pick the same key (`retry`, `job-1`) must
+  collide loudly rather than be handed each other's live agent.
+
+What this does **not** supply is the trusted record it reads from. There is no
+tenant model, no membership store and no removal workflow here: #774
+(per-runtime delegated credentials), #778 and #779 own those. Until they land,
+the revocation list is operator-supplied (`CAO_REVOKED_PRINCIPALS`), the issuer
+is trusted transitively through the token the server already verifies, and a
+`tenant` key in the principal document is tolerated on read while nothing writes
+one. The criterion's *behaviour* is therefore testable and tested; its source of
+truth is still owed.
+
 ## 6. Non-goals (inherited, restated)
 
 No message broker; no at-least-once guarantee for raw terminal output (bounded replay +
@@ -280,6 +338,7 @@ not one written for the test: `cao-server` as a StatefulSet with
 | **Status survives a server restart**: `HelloFrame.statuses` carries the runtime's verdict per live terminal and the server seeds its cache from the snapshot it already uses to rebuild routing — status is pushed on change, so an idle terminal would otherwise read UNKNOWN indefinitely. A runtime omits what it cannot read rather than claiming UNKNOWN; a hello cannot set status for another runtime's terminal; a disconnected runtime still reports UNKNOWN | `runtime_channel/{protocol,bridge,api}.py` | 8 tests, all three non-behaviours mutation-checked; **found in live EKS validation, not by a test** |
 | CLI→HTTP flow registration preserves `engine` + conditional pre-script (was silently dropped → unconditional launch); rejects arbitrary server paths | `api/main.py` `CreateFlowRequest` | 2 tests |
 | **Python workflow / flow pre-scripts execute in the runtime** (`CAO_SCRIPT_RUNTIME`), not the server host: `RUN_SCRIPT`/`CANCEL_SCRIPT` commands; server keeps record/journal/generation/cancel; outcome flows through the shared `_finalize`; `CAO_API_BASE_URL` rewritten to the advertised URL for callbacks; disconnect → explicit failure | `runtime_channel/{protocol,bridge}.py`, `services/script_runner.py` | 13 tests + **EKS-validated** |
+| **Owner carried through queues, schedules and cross-pod callbacks** (criterion 14, in part): `flows.owner` + `terminals.owner` written server-side at registration/launch; dispatch gated at `execute_flow` (above the pre-script, schedule still advances) and at inbox delivery (sender's owner; held messages stay `PENDING`); revocation withdraws *start* authority only | `security/principal.py`, `security/auth.py`, `services/{flow,inbox,session,terminal}_service.py`, `runtime_channel/api.py`, `clients/database.py` | 68 tests (58 in five new files, 10 appended to `test/security/test_auth.py`); the two trust decisions (owner absent from the `LAUNCH` payload; owner not in agent-writable `metadata`) are pinned by tests that fail if either is undone |
 
 **EKS-verified**: server container has no tmux binary; tmux sessions live only
 in worker pods; two workers execute concurrently with correct input/output

@@ -23,3 +23,9 @@ class Flow(BaseModel):
     next_run: Optional[datetime] = Field(None, description="Next scheduled execution time")
     enabled: bool = Field(True, description="Whether flow is enabled")
     prompt_template: Optional[str] = Field(None, description="Prompt template text")
+    # Canonical principal id of whoever registered the schedule (#745). A flow
+    # fires long after that request returned, so the owner has to be recorded
+    # rather than inferred from whoever the server runs as. None = registered
+    # before the field existed; the dispatch gate reads that as unknown, not as
+    # the local user.
+    owner: Optional[str] = Field(None, description="Principal id that registered this flow")
