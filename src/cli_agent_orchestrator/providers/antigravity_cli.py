@@ -61,7 +61,7 @@ from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.mcp_resolution import (
     resolve_cao_mcp_command,
-    shared_endpoint_child_env,
+    shared_endpoint_child_env_for,
 )
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
@@ -434,8 +434,11 @@ class AntigravityCliProvider(BaseProvider):
                 env["CAO_TERMINAL_ID"] = self.terminal_id
                 # The resolver may have swapped in the forwarding shim
                 # (#745), which needs the endpoint and token here. Empty
-                # when no shared endpoint is configured.
-                env.update(shared_endpoint_child_env())
+                # when no shared endpoint is configured — and empty for a
+                # server that is not ours, which is launched as declared and
+                # must not be handed the channel token (this loop covers every
+                # profile/plugin entry, not just the bundled one).
+                env.update(shared_endpoint_child_env_for(cfg.get("command", "")))
                 entry["env"] = env
                 # Antigravity documents `cwd` ("Working directory for `stdio`
                 # servers."), so an agent plugin's directory is carried natively.
@@ -452,8 +455,15 @@ class AntigravityCliProvider(BaseProvider):
             tmp_path = path.with_suffix(".json.tmp")
             with open(tmp_path, "w") as f:
                 json.dump(config, f, indent=2)
+            # An existing file keeps the mode the user chose; a file this
+            # process creates is owner-only rather than umask-default. The
+            # bundled entry's env holds CAO_RUNTIME_TOKEN when a shared
+            # endpoint is configured (#745), and agy reads this path at every
+            # later launch, so it persists (Copilot review on #802, finding 8).
             if path.exists():
                 os.chmod(tmp_path, stat.S_IMODE(os.stat(path).st_mode))
+            else:
+                os.chmod(tmp_path, 0o600)
             os.replace(tmp_path, path)
 
     def _unregister_mcp_servers(self) -> None:

@@ -181,6 +181,27 @@ def shared_endpoint_child_env() -> dict:
     return env
 
 
+def shared_endpoint_child_env_for(command: str) -> dict:
+    """:func:`shared_endpoint_child_env`, but only for the entry it belongs to.
+
+    *command* is the entry's command **as declared**, before resolution. The
+    forwarding env is CAO's own: only the bundled server (or an entry already
+    naming the shim) is redirected, so only that child needs the endpoint — and
+    only that child should be handed ``CAO_RUNTIME_TOKEN``. A third-party MCP
+    server declared by an agent profile or plugin is launched unchanged; giving
+    it the channel credential would widen the token's reach to code CAO does not
+    ship, for no purpose, and — where the provider persists its config — write it
+    into a file that server's author never expected to hold a secret.
+
+    Reported by Copilot review on #802 (findings 2 and 9): providers that build
+    a child env by hand merged this unconditionally, while
+    :func:`resolve_mcp_server_config` had always gated it.
+    """
+    if command not in _BUNDLED_COMMANDS:
+        return {}
+    return shared_endpoint_child_env()
+
+
 def resolve_mcp_server_config(config: dict, *, persisted: bool = False) -> dict:
     """Return a copy of an MCP server config with its command resolved.
 

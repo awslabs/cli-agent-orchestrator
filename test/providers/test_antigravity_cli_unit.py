@@ -952,6 +952,101 @@ def test_prune_stale_mcp_entries_on_register(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# The channel token in a persisted config (#802 review, findings 2 and 8)
+# --------------------------------------------------------------------------- #
+
+
+def _write_agy_config(tmp_path, servers, monkeypatch):
+    """Run the real registration against *servers*, return the written file."""
+    from cli_agent_orchestrator.models.agent_profile import AgentProfile
+    from cli_agent_orchestrator.utils.mcp_resolution import (
+        RUNTIME_TOKEN_ENV,
+        SHARED_ENDPOINT_URL_ENV,
+    )
+
+    monkeypatch.setenv(SHARED_ENDPOINT_URL_ENV, "http://cao-server:9891/mcp")
+    monkeypatch.setenv(RUNTIME_TOKEN_ENV, "runtime-token-value")
+    cfg = tmp_path / "mcp_config.json"
+    profile = AgentProfile(
+        name="dev_gemini",
+        description="Dev",
+        system_prompt="You develop.",
+        mcpServers=servers,
+    )
+    p = make_provider(terminal_id="new-tid", agent_profile="dev_gemini")
+    with (
+        patch(
+            "cli_agent_orchestrator.providers.antigravity_cli.shutil.which",
+            return_value="/usr/local/bin/agy",
+        ),
+        patch(
+            "cli_agent_orchestrator.providers.antigravity_cli.load_agent_profile",
+            return_value=profile,
+        ),
+        patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=cfg),
+    ):
+        p._build_agy_command()
+    return cfg
+
+
+def test_only_caos_own_entry_is_given_the_channel_token(tmp_path, monkeypatch):
+    """A profile's third-party server is launched as declared, with no secret.
+
+    This loop writes every server a profile or plugin declares, so merging the
+    forwarding env unconditionally handed `CAO_RUNTIME_TOKEN` — the credential
+    for the whole runtime channel — to code CAO does not ship, and persisted it
+    in a shared config file (Copilot review on #802, finding 2).
+    """
+    from cli_agent_orchestrator.utils.mcp_resolution import (
+        RUNTIME_TOKEN_ENV,
+        SHARED_ENDPOINT_URL_ENV,
+    )
+
+    cfg = _write_agy_config(
+        tmp_path,
+        {
+            "cao-mcp-server": {"command": "cao-mcp-server", "args": []},
+            "third-party": {"command": "my-own-mcp", "args": ["--flag"]},
+        },
+        monkeypatch,
+    )
+    servers = json.loads(cfg.read_text())["mcpServers"]
+
+    ours = servers["cao-mcp-server-new-tid"]["env"]
+    theirs = servers["third-party-new-tid"]["env"]
+    assert ours[RUNTIME_TOKEN_ENV] == "runtime-token-value"
+    assert ours[SHARED_ENDPOINT_URL_ENV] == "http://cao-server:9891/mcp"
+    assert RUNTIME_TOKEN_ENV not in theirs
+    assert SHARED_ENDPOINT_URL_ENV not in theirs
+    # It still gets what it has always got, so nothing is broken by the gate.
+    assert theirs["CAO_TERMINAL_ID"] == "new-tid"
+    assert servers["third-party-new-tid"]["command"] == "my-own-mcp"
+
+
+def test_a_config_this_process_creates_is_owner_only(tmp_path, monkeypatch):
+    """agy re-reads this path at every launch, so the token persists in it."""
+    import stat as stat_mod
+
+    cfg = _write_agy_config(
+        tmp_path, {"cao-mcp-server": {"command": "cao-mcp-server", "args": []}}, monkeypatch
+    )
+    assert stat_mod.S_IMODE(cfg.stat().st_mode) == 0o600
+
+
+def test_a_config_the_user_already_owns_keeps_their_mode(tmp_path, monkeypatch):
+    """Tightening a file the user created is their decision, not ours."""
+    import stat as stat_mod
+
+    cfg = tmp_path / "mcp_config.json"
+    cfg.write_text(json.dumps({"mcpServers": {}}))
+    cfg.chmod(0o644)
+    _write_agy_config(
+        tmp_path, {"cao-mcp-server": {"command": "cao-mcp-server", "args": []}}, monkeypatch
+    )
+    assert stat_mod.S_IMODE(cfg.stat().st_mode) == 0o644
+
+
+# --------------------------------------------------------------------------- #
 # Cleanup future exception surfacing (finding 3)
 # --------------------------------------------------------------------------- #
 

@@ -248,6 +248,28 @@ class TestWriteConfig:
         write_config({"x": 1})
         assert tmp_config.read_text(encoding="utf-8").endswith("\n")
 
+    def test_the_file_is_owner_only(self, tmp_config: Path):
+        """An `mcp` entry's `environment` holds credentials.
+
+        CAO's own forwarded server carries `CAO_RUNTIME_TOKEN` (#745) and a
+        profile may put an API key in any entry, so a umask-default
+        world-readable file hands those to every local account on a shared host
+        (Copilot review on #802, finding 8).
+        """
+        import stat
+
+        write_config({"x": 1})
+        assert stat.S_IMODE(tmp_config.stat().st_mode) == 0o600
+
+    def test_a_config_written_before_this_is_tightened_too(self, tmp_config: Path):
+        import stat
+
+        tmp_config.parent.mkdir(parents=True)
+        tmp_config.write_text("{}", encoding="utf-8")
+        tmp_config.chmod(0o644)
+        write_config({"x": 1})
+        assert stat.S_IMODE(tmp_config.stat().st_mode) == 0o600
+
 
 class TestUpsertMcpServer:
     def test_fresh_file_creation(self, tmp_config: Path):

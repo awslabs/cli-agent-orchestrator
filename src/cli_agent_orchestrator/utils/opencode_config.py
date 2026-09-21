@@ -11,13 +11,14 @@ invocations are not a supported scenario.
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Set
 
 from cli_agent_orchestrator.constants import OPENCODE_CONFIG_DIR, OPENCODE_CONFIG_FILE, SKILLS_DIR
 from cli_agent_orchestrator.utils.mcp_resolution import (
     resolve_cao_mcp_command,
-    shared_endpoint_child_env,
+    shared_endpoint_child_env_for,
 )
 from cli_agent_orchestrator.utils.path_validation import flatten_path_separators
 
@@ -113,12 +114,21 @@ def read_config() -> Dict[str, Any]:
 
 
 def write_config(data: Dict[str, Any]) -> None:
-    """Persist *data* to ``opencode.json``, creating parent directories as needed."""
+    """Persist *data* to ``opencode.json``, creating parent directories as needed.
+
+    Owner-only (0600): an ``mcp`` entry's ``environment`` carries credentials —
+    for CAO's own forwarded server that is ``CAO_RUNTIME_TOKEN`` (#745), and a
+    profile may put an API key in any entry. Default umask leaves this
+    world-readable, which on a shared host hands the token to every local
+    account (Copilot review on #802, finding 8). Applied on the existing file
+    too, so an install predating this does not stay open.
+    """
     OPENCODE_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
     OPENCODE_CONFIG_FILE.write_text(
         json.dumps(data, indent=2) + "\n",
         encoding="utf-8",
     )
+    os.chmod(OPENCODE_CONFIG_FILE, 0o600)
 
 
 def translate_mcp_server_config(cao_config: Dict[str, Any]) -> Dict[str, Any]:
@@ -166,8 +176,12 @@ def translate_mcp_server_config(cao_config: Dict[str, Any]) -> Dict[str, Any]:
     environment = dict(cao_config.get("env") or {})
     # The resolver may have swapped in the forwarding shim (#745), which
     # needs the endpoint and token here. Empty when none is configured, so
-    # an entry that had no "env" still gets no "environment" key.
-    environment.update(shared_endpoint_child_env())
+    # an entry that had no "env" still gets no "environment" key — and empty
+    # for a server that is not ours: this translator runs over every profile
+    # and plugin entry, and ``opencode.json`` is written to disk, so an
+    # unconditional merge would persist the channel token beside third-party
+    # commands (Copilot review on #802, finding 9).
+    environment.update(shared_endpoint_child_env_for(cao_config.get("command", "")))
     if environment:
         result["environment"] = environment
     # Emitted only when the source actually has one: an invented `cwd` would

@@ -37,6 +37,7 @@ from cli_agent_orchestrator.utils.mcp_resolution import (
     resolve_cao_mcp_command,
     resolve_mcp_server_config,
     shared_endpoint_child_env,
+    shared_endpoint_child_env_for,
 )
 
 ENDPOINT = "http://cao-server.cao-cluster.svc.cluster.local:9891/mcp"
@@ -146,6 +147,46 @@ class TestOnlyTheBundledCommand:
         assert _is_shim(command, args), (command, args)
 
 
+class TestTheTokenReachesOnlyCaosOwnChild:
+    """Two providers build the child env by hand instead of taking the resolver's.
+
+    `resolve_mcp_server_config` has always gated the forwarding env on the command,
+    but a provider that merges `shared_endpoint_child_env()` into every entry it
+    writes hands `CAO_RUNTIME_TOKEN` — the channel credential for the whole
+    runtime — to third-party MCP servers CAO does not ship, for no purpose. Where
+    the provider persists its config, it also writes that secret into a file whose
+    author never expected to hold one (Copilot review on #802, findings 2 and 9).
+    """
+
+    def test_the_helper_is_silent_for_a_third_party_command(self, shared_endpoint):
+        assert shared_endpoint_child_env_for("my-own-mcp") == {}
+        assert shared_endpoint_child_env_for("") == {}
+
+    def test_the_helper_still_answers_for_the_bundled_command(self, shared_endpoint):
+        env = shared_endpoint_child_env_for(CAO_MCP_SERVER_COMMAND)
+        assert env[SHARED_ENDPOINT_URL_ENV] == ENDPOINT
+        assert env[RUNTIME_TOKEN_ENV] == "runtime-token-value"
+
+    def test_an_entry_already_naming_the_shim_still_gets_it(self, shared_endpoint):
+        assert (
+            shared_endpoint_child_env_for(CAO_MCP_STDIO_BRIDGE_COMMAND)[SHARED_ENDPOINT_URL_ENV]
+            == ENDPOINT
+        )
+
+    def test_opencode_does_not_hand_a_third_party_server_the_token(self, shared_endpoint):
+        from cli_agent_orchestrator.utils.opencode_config import translate_mcp_server_config
+
+        translated = translate_mcp_server_config({"command": "my-own-mcp", "args": ["--flag"]})
+        assert RUNTIME_TOKEN_ENV not in translated.get("environment", {})
+        assert SHARED_ENDPOINT_URL_ENV not in translated.get("environment", {})
+
+    def test_opencode_still_gives_caos_own_server_the_token(self, shared_endpoint):
+        from cli_agent_orchestrator.utils.opencode_config import translate_mcp_server_config
+
+        translated = translate_mcp_server_config({"command": CAO_MCP_SERVER_COMMAND, "args": []})
+        assert translated["environment"][RUNTIME_TOKEN_ENV] == "runtime-token-value"
+
+
 class TestProvidersInheritIt:
     """The point of doing this in the resolver: no provider knows about it."""
 
@@ -173,6 +214,9 @@ class TestProvidersInheritIt:
 
         provider = CopilotCliProvider.__new__(CopilotCliProvider)
         provider.terminal_id = "abcd1234"
+        # No profile: this asserts the endpoint reaches CAO's own server entry,
+        # which is written whether or not a profile contributes plugin servers.
+        provider._agent_profile = None
         config = json.loads(provider._build_runtime_mcp_config())
 
         entry = config["mcpServers"]["cao-mcp-server"]
