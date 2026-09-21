@@ -3348,6 +3348,54 @@ async def create_terminal_in_session(
                     ),
                 )
 
+        # #745: the caller may be an agent executing in a runtime, not in this
+        # container. Its tmux session lives there, so adding a window locally
+        # would fail ("Session '<name>' not found") — and the worker belongs in
+        # the SAME runtime as the agent that asked for it anyway. Forwarding
+        # here, in the one endpoint MCP assign/handoff already call, keeps a
+        # single orchestration implementation: tool, CLI and HTTP clients send
+        # the request they always sent, every validation above still applies,
+        # and placement is decided centrally from the caller's recorded runtime
+        # rather than by the agent.
+        caller_runtime = runtime_registry.runtime_for_terminal(caller_id) if caller_id else None
+        if caller_runtime is not None:
+            from cli_agent_orchestrator.runtime_channel.api import (
+                CreateRemoteTerminalBody,
+                launch_remote_terminal,
+            )
+
+            if idempotency_key is not None:
+                # The remote launch records the central row itself and has no
+                # key/fingerprint table behind it, so accepting the key would
+                # promise retry safety this path does not yet provide. Say so
+                # instead of dropping the guarantee silently.
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        "idempotency_key is not supported when the caller executes in a "
+                        f"remote runtime (caller '{caller_id}' runs on '{caller_runtime}')"
+                    ),
+                )
+            return await launch_remote_terminal(
+                caller_runtime,
+                CreateRemoteTerminalBody(
+                    provider=resolved_provider,
+                    agent_profile=agent_profile,
+                    session_name=session_name,
+                    new_session=False,
+                    working_directory=working_directory,
+                    model=model,
+                    caller_id=caller_id,
+                    allowed_tools=allowed_tools_list,
+                    defer_init=defer_init,
+                    initial_message=initial_message,
+                    initial_message_orchestration_type=(orch_type.value if orch_type else None),
+                    engine=(getattr(engine, "value", engine) if engine else None),
+                    use_worktree=use_worktree,
+                ),
+                owner_id=principal.id,
+            )
+
         result = await terminal_service.create_terminal(
             provider=resolved_provider,
             agent_profile=agent_profile,

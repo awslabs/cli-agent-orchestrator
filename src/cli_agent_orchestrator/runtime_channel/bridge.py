@@ -33,6 +33,7 @@ import websockets
 
 from cli_agent_orchestrator.clients.database import init_db
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
+from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.runtime_channel.protocol import (
     PROTOCOL_VERSION,
@@ -285,16 +286,36 @@ class Bridge:
             return CommandOutcome.OK, {"cancelled": False, "reason": "not running"}, None
 
         if frame.type == CommandType.LAUNCH:
+            # ``new_session`` false adds a window to a session this runtime
+            # already owns: an in-session assign/handoff by an agent executing
+            # here places its worker BESIDE it, in the same tmux session, since
+            # that session exists in this pod and not in the server container.
+            new_session = bool(payload.get("new_session", True))
+            defer_init = bool(payload.get("defer_init", False))
+            orch_type = payload.get("initial_message_orchestration_type")
             terminal = await terminal_service.create_terminal(
                 provider=payload["provider"],
                 agent_profile=payload["agent_profile"],
                 session_name=payload.get("session_name"),
-                new_session=True,
+                new_session=new_session,
                 working_directory=payload.get("working_directory"),
                 env_vars=payload.get("env_vars"),
                 model=payload.get("model"),
+                caller_id=payload.get("caller_id"),
+                allowed_tools=payload.get("allowed_tools"),
+                # Deferred init keeps the caller's tool call short: the window
+                # and its registry row exist on return, provider startup and
+                # the first message run in a local background task exactly as
+                # they do for a co-located assign.
+                defer_init=defer_init,
+                initial_message=payload.get("initial_message") if defer_init else None,
+                initial_message_orchestration_type=(
+                    OrchestrationType(orch_type) if defer_init and orch_type else None
+                ),
+                engine=payload.get("engine"),
+                use_worktree=bool(payload.get("use_worktree", False)),
             )
-            if payload.get("initial_message"):
+            if payload.get("initial_message") and not defer_init:
                 await asyncio.to_thread(
                     terminal_service.send_input, terminal.id, payload["initial_message"]
                 )

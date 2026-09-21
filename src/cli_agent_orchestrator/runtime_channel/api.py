@@ -225,6 +225,21 @@ class CreateRemoteTerminalBody(BaseModel):
     env_vars: Optional[Dict[str, str]] = None
     model: Optional[str] = None
     initial_message: Optional[str] = None
+    # An in-session assign/handoff by an agent that executes in a runtime is
+    # forwarded here by POST /sessions/{name}/terminals, so the fields that
+    # request carries have to survive the hop: the worker joins the caller's
+    # existing session in that runtime (``new_session`` false), remembers which
+    # terminal asked for it (``caller_id``, what send_message routes callbacks
+    # by), and keeps assign's deferred-init contract.
+    new_session: bool = True
+    caller_id: Optional[str] = None
+    allowed_tools: Optional[List[str]] = None
+    defer_init: bool = False
+    initial_message_orchestration_type: Optional[str] = None
+    engine: Optional[str] = None
+    # The worktree is provisioned by the runtime, in the filesystem the agent
+    # will actually run in — the central container's disk is not that workspace.
+    use_worktree: bool = False
 
 
 @router.get("/runtimes")
@@ -305,6 +320,7 @@ async def launch_remote_terminal(
         agent_profile=info.get("agent_profile"),
         allowed_tools=info.get("allowed_tools"),
         shell_command=info.get("shell_command"),
+        caller_id=body.caller_id,
         working_directory=body.working_directory,
         metadata={"runtime_id": runtime_id},
         owner=owner_id,
@@ -324,7 +340,7 @@ async def launch_remote_terminal(
         provider=info["provider"],
         session_name=info["session_name"],
         agent_profile=info.get("agent_profile"),
-        caller_id=None,
+        caller_id=body.caller_id,
         allowed_tools=info.get("allowed_tools"),
         engine=None,
         shell_command=info.get("shell_command"),
