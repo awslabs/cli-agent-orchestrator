@@ -84,6 +84,32 @@ def _never_touch_the_real_plugin_store(tmp_path_factory, monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def _no_live_sessions_unless_a_test_says_so(monkeypatch):
+    """Default the live-session walk to empty for every test.
+
+    ``affected_sessions`` answers "which running agents reference a skill this
+    plugin projects" by walking the real ``list_sessions()`` -> terminals ->
+    profiles chain. Tests that care about a live session patch ``list_sessions``
+    themselves; the rest assert ``== []`` and were relying on the machine
+    happening to have no CAO session open. On a developer laptop with one
+    running -- which is the normal state while working on CAO, and exactly what
+    a validation run leaves behind -- seven tests across four files fail with
+    real terminal ids from the developer's own database, and none of them fail
+    in CI.
+
+    Autouse and ``[]`` rather than per-test, for the same reason as
+    ``_isolate_settings`` above: the assumption is "no live sessions", so state
+    it once instead of leaving each test to inherit whatever the machine has.
+    Patching the same attribute a test patches later is harmless -- the test's
+    own ``monkeypatch.setattr`` wins and both are undone at teardown.
+    """
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.session_service.list_sessions",
+        lambda: [],
+    )
+
+
 @pytest.fixture
 def skills_dir(tmp_path) -> Path:
     """An isolated stand-in for the global ``SKILLS_DIR``."""
