@@ -391,6 +391,72 @@ def _seed_omp_e2e_state(home_dir: Path) -> None:
             shutil.copy2(examples_dir / f"{name}.md", target)
 
 
+def _seed_kiro_launcher(home_dir: Path) -> None:
+    """Link kiro-cli's chat binary into the redirected HOME. Not a credential.
+
+    ``kiro-cli`` execs ``$HOME/.local/bin/kiro-cli-chat`` rather than resolving
+    it from ``PATH``, so under the isolated HOME it prints ``failed to launch
+    <tmp>/.local/bin/kiro-cli-chat`` and exits 0 with nothing on stdout. The
+    capability probe reads that as malformed help and every kiro session is
+    refused with "returned unusable help output" — a wrapper packaging detail
+    surfacing as a CAO error, on a machine where ``kiro-cli chat --help`` works
+    perfectly outside the fixture.
+
+    Only the launcher is linked, and only when the developer's real HOME already
+    has it. It is an executable on disk, not authentication state: a kiro session
+    still needs the provider's own credentials, which stay where they are (see
+    ``_seed_home_passthrough`` for opting those in deliberately).
+    """
+    real_home = os.environ.get("HOME")
+    if not real_home:
+        return
+    source = Path(real_home) / ".local" / "bin" / "kiro-cli-chat"
+    if not source.exists():
+        return
+    dest_dir = home_dir / ".local" / "bin"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / "kiro-cli-chat"
+    if dest.exists() or dest.is_symlink():
+        return
+    dest.symlink_to(source.resolve())
+
+
+def _seed_home_passthrough(home_dir: Path) -> None:
+    """Symlink developer-named HOME entries into the isolated HOME. Opt-in only.
+
+    Every provider CLI authenticates through state under HOME — a cookie jar, a
+    token cache, a config file naming a credential helper. The HOME redirect is
+    the point of this fixture (a test must not write into the developer's real
+    ``~/.aws``), but it also means no provider can log in, so the 127
+    provider-gated e2e tests cannot run on a workstation even when every CLI is
+    installed and working.
+
+    ``CAO_E2E_HOME_PASSTHROUGH`` is the deliberate escape hatch: a colon-
+    separated list of paths relative to the real HOME, symlinked (never copied,
+    so nothing is duplicated into a temp directory) into the isolated one.
+    Unset — the default, and what CI uses — changes nothing.
+
+    Naming the entries is the caller's decision on purpose. This fixture does not
+    guess at credential locations, and no default value here mentions one.
+    """
+    spec = os.environ.get("CAO_E2E_HOME_PASSTHROUGH", "").strip()
+    real_home = os.environ.get("HOME")
+    if not spec or not real_home:
+        return
+    for raw in spec.split(":"):
+        rel = raw.strip().strip("/")
+        if not rel:
+            continue
+        source = Path(real_home) / rel
+        if not source.exists():
+            continue
+        dest = home_dir / rel
+        if dest.exists() or dest.is_symlink():
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.symlink_to(source.resolve())
+
+
 def _start_cao_server(
     home_dir: Path,
     port: int,
@@ -407,6 +473,8 @@ def _start_cao_server(
     home_dir.mkdir(parents=True, exist_ok=True)
     _seed_packaged_skills(home_dir)
     _seed_omp_e2e_state(home_dir)
+    _seed_kiro_launcher(home_dir)
+    _seed_home_passthrough(home_dir)
     log_path = home_dir / "server.log"
     log_handle = open(log_path, "ab")  # noqa: SIM115 — handle lifetime is in stop()
 
@@ -550,6 +618,35 @@ def cao_server_with_auth(
         jwks.stop()
 
 
+def skip_if_provider_unusable(status_code: int, body: str, provider: str) -> None:
+    """Skip when a session creation failed because the provider cannot boot here.
+
+    Provider boot is fragile — the CLI may be installed but unauthenticated,
+    rate-limited, or slow to TUI-init, and several wrappers read their login
+    state from ``$HOME``, which this fixture deliberately redirects. A 5xx that
+    names the provider is a property of the machine, not a broken contract.
+
+    Shared so a test that drives a provider through a *subprocess* (``cao
+    launch`` in an example runner) classifies the same failure the same way the
+    ``cao_terminal`` fixture does, instead of reporting a red test for a CLI that
+    was never going to start.
+    """
+    if status_code >= 500 and any(
+        marker in body.lower()
+        for marker in (
+            "initialization timed out",
+            "not installed",
+            "not found",
+            "command not found",
+            "unusable help output",
+            provider.lower(),
+        )
+    ):
+        pytest.skip(
+            f"provider {provider!r} not usable on this host " f"(HTTP {status_code}): {body[:200]}"
+        )
+
+
 @pytest.fixture
 def cao_terminal(
     cao_server: CaoServer,
@@ -582,25 +679,10 @@ def cao_terminal(
         },
     )
     if resp.status_code not in (200, 201):
-        # Provider boot is fragile — CLI may be installed but unauthenticated,
-        # rate-limited, or slow to TUI-init. Treat any 5xx that names the
-        # provider as a skip, not a fixture-contract failure. The integration
-        # tests own provider responsiveness.
+        # The integration tests own provider responsiveness; a provider that
+        # cannot boot on this host is a skip, not a fixture-contract failure.
         body = resp.text
-        if resp.status_code >= 500 and any(
-            marker in body.lower()
-            for marker in (
-                "initialization timed out",
-                "not installed",
-                "not found",
-                "command not found",
-                provider.lower(),
-            )
-        ):
-            pytest.skip(
-                f"provider {provider!r} not usable on this host "
-                f"(HTTP {resp.status_code}): {body[:200]}"
-            )
+        skip_if_provider_unusable(resp.status_code, body, provider)
         raise RuntimeError(f"POST /sessions failed: {resp.status_code} {body}")
     data = resp.json()
     terminal_id = data["id"]

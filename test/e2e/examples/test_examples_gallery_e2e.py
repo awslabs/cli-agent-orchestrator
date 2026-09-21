@@ -34,7 +34,15 @@ _EXAMPLES_DIR = Path(__file__).resolve().parents[3] / "docs" / "examples"
 
 
 class _RunStepFakeHandler(BaseHTTPRequestHandler):
-    """Records every POST body and answers 200 with a canned RunStepResponse."""
+    """Records every POST body and answers 200 with a canned RunStepResponse.
+
+    Every field the shim reads must be present, ``replayed`` included. The shim
+    indexes it directly and deliberately — a defaulting read would hand an
+    author ``replayed=False`` for a step it never confirmed — so a stub missing
+    the key fails the run with ``KeyError: 'replayed'`` instead of exercising
+    the example. Mirror ``RunStepResponse``, do not trim it to the fields a
+    particular assertion happens to look at.
+    """
 
     def do_POST(self):  # noqa: N802 — BaseHTTPRequestHandler's naming convention
         length = int(self.headers.get("Content-Length", 0))
@@ -48,6 +56,7 @@ class _RunStepFakeHandler(BaseHTTPRequestHandler):
                 "terminal_id": f"term-{step_id}",
                 "last_message": f"ack:{step_id}",
                 "status": "COMPLETED",
+                "replayed": False,
             }
         ).encode("utf-8")
         self.send_response(200)
