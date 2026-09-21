@@ -75,6 +75,35 @@ class ReplayBuffer:
             self._retained -= len(evicted)
         return start
 
+    def append_at(self, start: int, chunk: bytes) -> Tuple[Optional[GapInfo], int]:
+        """Record a chunk whose position the PRODUCER assigned; returns (gap, pos).
+
+        ``append`` numbers chunks in arrival order, which is only the same thing
+        as stream order when nothing between the producer and here can lose one.
+        For a runtime bridge the in-process event bus sits in between, and it is
+        bounded and drops on a full queue, so arrival-order numbering turned a
+        stream with holes into a contiguous one: the server received a shortened
+        transcript with a watermark that claimed it was whole, and neither side
+        could ever report the loss.
+
+        A ``start`` past the watermark is exactly that loss, with its extent
+        known: the returned ``GapInfo`` covers the missing bytes, the watermark
+        jumps over them, and the caller turns it into a GapFrame. The retained
+        window keeps a hole rather than filler -- nothing may invent bytes the
+        terminal did not emit.
+
+        A ``start`` BEHIND the watermark is a producer that restarted its count
+        (a torn-down terminal's last flush, a re-created reader). Those bytes are
+        real and new to this stream, so they are appended contiguously and the
+        stale offset is ignored; the caller can compare the returned position
+        with ``start`` to notice.
+        """
+        if start <= self._end_pos:
+            return None, self.append(chunk)
+        gap = GapInfo(from_pos=self._end_pos, to_pos=start)
+        self._end_pos = start
+        return gap, self.append(chunk)
+
     def replay_from(self, pos: int) -> Tuple[Optional[GapInfo], List[Tuple[int, bytes]]]:
         """Return (gap, chunks) needed to bring a consumer at ``pos`` current.
 

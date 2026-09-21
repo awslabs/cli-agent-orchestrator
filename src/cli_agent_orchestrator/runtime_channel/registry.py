@@ -47,7 +47,30 @@ TEARDOWN_TIMEOUT = 120.0
 
 
 class RuntimeUnavailableError(Exception):
-    """No connected runtime can execute this operation right now."""
+    """No connected runtime can execute this operation right now.
+
+    On its own this says nothing about whether the work happened: a channel that
+    closes while a command is in flight raises it for an operation the runtime
+    may have already performed. Callers that retry MUST check for the subclass
+    below instead.
+    """
+
+
+class RuntimeNotDispatchedError(RuntimeUnavailableError):
+    """The command never reached a runtime, so retrying cannot duplicate work.
+
+    The distinction is the difference between a retry and a double delivery. An
+    inbox message for a supervisor in another pod is the case that bites: with
+    one exception type for both, "the runtime was gone before we sent" and "the
+    channel dropped after the runtime typed the message" were classified the
+    same way — transient — and the reconcile sweep re-delivered a message the
+    supervisor had already received, as though the worker had answered twice
+    (review finding 6 on #802).
+
+    Raised only where nothing was put on the wire. A dispatched command whose
+    answer never came back stays ``RuntimeUnavailableError``: unknown, and not
+    for this layer to guess about.
+    """
 
 
 class RemoteCommandError(Exception):
@@ -102,7 +125,15 @@ class RuntimeConnection:
         future: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending[op_id] = future
         try:
-            await self._send_text(encode_frame(frame))
+            try:
+                await self._send_text(encode_frame(frame))
+            except Exception as exc:  # noqa: BLE001 — transport failure, any kind
+                # The frame did not go out, so nothing ran. Saying so lets a
+                # caller retry safely; the wait below, once entered, can only
+                # ever produce "unknown".
+                raise RuntimeNotDispatchedError(
+                    f"could not send {command_type.value} to runtime {self.runtime_id}: {exc}"
+                ) from exc
             return await asyncio.wait_for(future, timeout=timeout)
         finally:
             self._pending.pop(op_id, None)
@@ -304,10 +335,10 @@ class RuntimeChannelRegistry:
         # honest answer to give until its executor says hello again.
         runtime_id = self.runtime_for_terminal(terminal_id)
         if runtime_id is None:
-            raise RuntimeUnavailableError(f"terminal {terminal_id} is not bound to a runtime")
+            raise RuntimeNotDispatchedError(f"terminal {terminal_id} is not bound to a runtime")
         conn = self._runtimes.get(runtime_id)
         if conn is None:
-            raise RuntimeUnavailableError(
+            raise RuntimeNotDispatchedError(
                 f"runtime {runtime_id} for terminal {terminal_id} is not connected"
             )
         return await conn.send_command(
@@ -335,7 +366,7 @@ class RuntimeChannelRegistry:
         """
         loop = self._loop
         if loop is None or loop.is_closed():
-            raise RuntimeUnavailableError(
+            raise RuntimeNotDispatchedError(
                 f"no runtime channel loop is available to reach terminal {terminal_id}"
             )
         try:

@@ -401,7 +401,11 @@ class TestPipeLivenessWatchdog:
         # Single-line content has no "\n" to CRLF-convert, so the republished
         # payload equals the raw pane content verbatim; the multi-line CRLF
         # conversion itself is covered by test_rearm_replay_converts_lf_to_crlf.
-        assert ("terminal.term.output", {"data": pane["content"]}) in published
+        # The payload also carries the stream offset every output event gets
+        # (#745 review finding 3); only the bytes are this test's subject.
+        assert [(topic, data["data"]) for topic, data in published] == [
+            ("terminal.term.output", pane["content"])
+        ]
 
     def test_rearm_replay_converts_lf_to_crlf(self, tmp_path, monkeypatch):
         """Regression for the round-2 review finding: capture-pane joins lines
@@ -426,10 +430,11 @@ class TestPipeLivenessWatchdog:
         manager._check_pipe_liveness("term")
 
         assert rearm_calls == [True]
-        assert ("terminal.term.output", {"data": multiline.replace("\n", "\r\n")}) in published
+        replayed = [(topic, data["data"]) for topic, data in published]
+        assert ("terminal.term.output", multiline.replace("\n", "\r\n")) in replayed
         # And the raw bare-LF form must NOT have been published — that's
         # exactly the payload that staircases pyte's screen.
-        assert ("terminal.term.output", {"data": multiline}) not in published
+        assert ("terminal.term.output", multiline) not in replayed
 
     def test_pyte_screen_staircases_on_bare_lf_and_is_fixed_by_crlf(self):
         """End-to-end confirmation (not just string equality) that bare "\\n"
@@ -840,7 +845,9 @@ class TestColdStartStallDetection:
         manager._check_pipe_liveness("term")
 
         assert rearm_calls == [True]
-        assert ("terminal.term.output", {"data": pane["content"]}) in published
+        assert [(topic, data["data"]) for topic, data in published] == [
+            ("terminal.term.output", pane["content"])
+        ]
 
     def test_cold_start_end_to_end_via_real_reader_thread(self, tmp_path, monkeypatch):
         """Integration-level: create_reader() seeds the cold-start state

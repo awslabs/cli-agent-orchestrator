@@ -27,6 +27,7 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.runtime_channel.registry import (
+    RuntimeNotDispatchedError,
     RuntimeUnavailableError,
     runtime_registry,
 )
@@ -255,10 +256,18 @@ class InboxService:
         This is the path a delegated result takes home: an elastic worker calls
         complete_assignment, the message is queued against the supervisor's
         terminal on the central server, and the supervisor's pane is in a
-        different pod. ``RuntimeUnavailableError`` is raised as
-        ``TerminalNotFoundError`` so the caller's existing transient branch
-        leaves the message PENDING for the reconcile sweep — a runtime that is
-        reconnecting is exactly the case that must not be marked FAILED.
+        different pod. A disconnect that happened BEFORE the command was sent is
+        raised as ``TerminalNotFoundError`` so the caller's existing transient
+        branch leaves the message PENDING for the reconcile sweep — a runtime that
+        is reconnecting is exactly the case that must not be marked FAILED.
+
+        A disconnect AFTER dispatch is a different thing wearing the same name.
+        The runtime may already have typed the message into the supervisor's
+        pane; only its acknowledgement was lost. Retrying that delivers the
+        worker's answer to the supervisor twice, which reads as two results for
+        one delegation — worse than a message the operator can see marked FAILED
+        (review finding 6 on #802). So only the not-dispatched case is treated as
+        transient; the unknown case is surfaced as a failure, loudly.
 
         The routing itself belongs to ``terminal_service.send_input``, which every
         sender funnels through; what is specific to the inbox is the failure
@@ -273,8 +282,16 @@ class InboxService:
                 sender_id=sender_id,
                 orchestration_type=OrchestrationType.SEND_MESSAGE,
             )
-        except RuntimeUnavailableError as e:
+        except RuntimeNotDispatchedError as e:
             raise TerminalNotFoundError(str(e)) from e
+        except RuntimeUnavailableError as e:
+            logger.error(
+                "delivery to remote terminal %s was dispatched but unacknowledged (%s); "
+                "not retrying — the message may already be in the pane",
+                terminal_id,
+                e,
+            )
+            raise
         if not delivered:
             raise RuntimeError(f"runtime did not accept input for {terminal_id}")
 

@@ -155,6 +155,19 @@ class Bridge:
     # --- bus forwarding (runtime → server) ---
 
     async def _forward_output(self) -> None:
+        """Stream captured output up, with the loss the bus caused made visible.
+
+        The subscription queue is bounded and the bus drops on full — that is
+        deliberate back-pressure for a TUI that can emit faster than anything
+        downstream reads. What was NOT deliberate: numbering the chunks here,
+        after that drop. Positions came out contiguous whatever the bus had
+        thrown away, so the watermark advertised at every hello and heartbeat
+        described a complete stream that the server had only part of, and no
+        GapFrame was ever possible (review finding 3 on #802). The producer now
+        stamps each event with its offset in the terminal's byte stream, so a
+        missing event is arithmetic here rather than an invisible hole: the gap
+        is reported first, and only then the bytes that follow it.
+        """
         queue = bus.subscribe("terminal.*.output")
         try:
             while True:
@@ -168,7 +181,30 @@ class Bridge:
                     continue
                 raw = data.encode("utf-8", errors="replace")
                 buf = self._buffer_for(terminal_id)
-                pos = buf.append(raw)
+                offset = event["data"].get("offset")
+                if offset is None:
+                    # A publisher that carries no offset (a non-FIFO producer)
+                    # keeps the old arrival-order numbering; nothing claims its
+                    # stream is gap-checked.
+                    gap, pos = None, buf.append(raw)
+                else:
+                    gap, pos = buf.append_at(int(offset), raw)
+                if gap is not None:
+                    logger.warning(
+                        "dropped output for terminal %s: [%s, %s) never reached the channel",
+                        terminal_id,
+                        gap.from_pos,
+                        gap.to_pos,
+                    )
+                    await self._send(
+                        GapFrame(
+                            terminal_id=terminal_id,
+                            stream=StreamName.CAPTURE,
+                            generation=buf.generation,
+                            from_pos=gap.from_pos,
+                            to_pos=gap.to_pos,
+                        )
+                    )
                 await self._send(
                     StreamFrame(
                         terminal_id=terminal_id,

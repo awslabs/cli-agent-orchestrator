@@ -33,6 +33,8 @@ from cli_agent_orchestrator.runtime_channel.protocol import (
 )
 from cli_agent_orchestrator.runtime_channel.registry import (
     RuntimeChannelRegistry,
+    RuntimeConnection,
+    RuntimeNotDispatchedError,
     RuntimeUnavailableError,
 )
 from cli_agent_orchestrator.services.inbox_service import InboxService
@@ -110,10 +112,10 @@ class TestARemoteReceiverIsDeliveredTo:
 
 
 class TestFailureIsClassifiedByWhetherRetryCanHelp:
-    def test_a_disconnected_runtime_leaves_the_message_pending(self, wiring):
+    def test_a_runtime_that_was_gone_before_we_sent_leaves_the_message_pending(self, wiring):
         """A reconnecting runtime is transient — the answer is not lost, it is
         early. FAILED here would silently discard a completed worker's result."""
-        wiring.sender.send_input.side_effect = RuntimeUnavailableError(
+        wiring.sender.send_input.side_effect = RuntimeNotDispatchedError(
             "runtime cao-supervisor-0 for terminal ef38cd1c is not connected"
         )
 
@@ -121,6 +123,36 @@ class TestFailureIsClassifiedByWhetherRetryCanHelp:
 
         statuses = [c.args[1] for c in wiring.update.call_args_list]
         assert statuses == [MessageStatus.DELIVERED, MessageStatus.PENDING]
+
+    def test_a_channel_lost_after_dispatch_is_not_retried(self, wiring):
+        """The message may already be in the supervisor's pane.
+
+        Both cases used to raise the same exception and both were classified
+        transient, so the reconcile sweep re-typed a worker's answer the
+        supervisor had already received — one delegation, two results, and no
+        way for the supervisor to tell (review finding 6 on #802). Only the
+        acknowledgement was lost here, so PENDING is the one status this must
+        not end in.
+        """
+        wiring.sender.send_input.side_effect = RuntimeUnavailableError(
+            "runtime channel closed for runtime cao-supervisor-0"
+        )
+
+        InboxService().deliver_pending(REMOTE)
+
+        statuses = [c.args[1] for c in wiring.update.call_args_list]
+        assert MessageStatus.PENDING not in statuses
+        assert statuses[-1] == MessageStatus.FAILED
+
+    def test_a_missing_answer_is_not_retried_either(self, wiring):
+        """A timeout means the response is missing, not that the work is."""
+        wiring.sender.send_input.side_effect = TimeoutError("no result for op in 60s")
+
+        InboxService().deliver_pending(REMOTE)
+
+        statuses = [c.args[1] for c in wiring.update.call_args_list]
+        assert MessageStatus.PENDING not in statuses
+        assert statuses[-1] == MessageStatus.FAILED
 
     def test_a_runtime_that_refused_the_input_marks_it_failed(self, wiring):
         wiring.sender.send_input.return_value = False
@@ -198,6 +230,13 @@ class TestTheBlockingHandoffOntoTheChannelLoop:
                 REMOTE, CommandType.INPUT, {"message": "757"}, 5.0
             )
 
+    def test_nothing_dispatched_says_so_by_type(self):
+        registry = RuntimeChannelRegistry()
+        with pytest.raises(RuntimeNotDispatchedError):
+            registry.send_terminal_command_blocking(
+                REMOTE, CommandType.INPUT, {"message": "757"}, 5.0
+            )
+
     def test_a_closed_loop_reports_unavailable_too(self):
         """The loop is captured at register() and can be outlived on shutdown."""
         registry = RuntimeChannelRegistry()
@@ -214,3 +253,59 @@ class TestTheBlockingHandoffOntoTheChannelLoop:
             registry.send_terminal_command_blocking(
                 REMOTE, CommandType.INPUT, {"message": "757"}, 5.0
             )
+
+
+class TestTheChannelSaysWhetherItSent:
+    """The classification the inbox depends on, proven at its source.
+
+    ``RuntimeUnavailableError`` covers two situations that are opposite in the
+    only way that matters to a retry. The subclass marks the safe one, and it is
+    raised only where the frame demonstrably never left.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_transport_that_refuses_the_frame_is_not_dispatched(self):
+        async def send_text(_raw):
+            raise ConnectionResetError("websocket is closed")
+
+        conn = RuntimeConnection("cao-supervisor-0", send_text)
+        with pytest.raises(RuntimeNotDispatchedError):
+            await conn.send_command(CommandType.INPUT, {"message": "757"}, timeout=5.0)
+
+    @pytest.mark.asyncio
+    async def test_a_channel_lost_after_the_frame_went_out_is_only_unavailable(self):
+        """``fail_all_pending`` fires on disconnect for commands already sent."""
+        sent = []
+
+        async def send_text(raw):
+            sent.append(raw)
+
+        conn = RuntimeConnection("cao-supervisor-0", send_text)
+        task = asyncio.ensure_future(
+            conn.send_command(CommandType.INPUT, {"message": "757"}, timeout=30.0)
+        )
+        await asyncio.sleep(0)
+        assert sent, "precondition: the frame is on the wire"
+
+        conn.fail_all_pending("runtime channel closed")
+        with pytest.raises(RuntimeUnavailableError) as exc:
+            await task
+        assert not isinstance(exc.value, RuntimeNotDispatchedError)
+
+    @pytest.mark.asyncio
+    async def test_a_missing_answer_is_a_timeout_not_an_unavailable_runtime(self):
+        async def send_text(_raw):
+            pass
+
+        conn = RuntimeConnection("cao-supervisor-0", send_text)
+        with pytest.raises(asyncio.TimeoutError):
+            await conn.send_command(CommandType.INPUT, {"message": "757"}, timeout=0.05)
+
+    @pytest.mark.asyncio
+    async def test_an_unbound_terminal_is_not_dispatched(self):
+        registry = RuntimeChannelRegistry()
+        with patch(
+            "cli_agent_orchestrator.clients.database.get_terminal_metadata", return_value=None
+        ):
+            with pytest.raises(RuntimeNotDispatchedError):
+                await registry.send_terminal_command(REMOTE, CommandType.INPUT, {"message": "757"})

@@ -1285,16 +1285,22 @@ async def test_remote_script_run_executes_in_runtime_and_completes(
     class _RoutingConn:
         runtime_id = "worker-live"
 
-        async def send_command(self, command_type, payload, terminal_id=None, timeout=None):
+        async def send_command(
+            self, command_type, payload, terminal_id=None, timeout=None, op_id=None
+        ):
             assert command_type == CommandType.RUN_SCRIPT
+            # The driver mints the op_id and the bridge indexes the subprocess
+            # under it, so the fake honours the one it is handed rather than
+            # inventing a second identity (#802 finding 1).
+            assert op_id, "the caller must name the operation it will later cancel"
             result = await bridge._run_script(
-                "op-x",
+                op_id,
                 payload["script"],
                 payload["env"],
                 payload["timeout"],
                 payload["term_grace"],
             )
-            return CommandResultFrame(op_id="op-x", outcome=CommandOutcome.OK, payload=result)
+            return CommandResultFrame(op_id=op_id, outcome=CommandOutcome.OK, payload=result)
 
     conn = _RoutingConn()
     monkeypatch.setattr(
@@ -1339,11 +1345,14 @@ async def test_remote_script_run_nonzero_exit_is_failed(
     class _RoutingConn:
         runtime_id = "worker-live"
 
-        async def send_command(self, command_type, payload, terminal_id=None, timeout=None):
+        async def send_command(
+            self, command_type, payload, terminal_id=None, timeout=None, op_id=None
+        ):
+            assert op_id, "the caller must name the operation it will later cancel"
             result = await bridge._run_script(
-                "op-y", payload["script"], payload["env"], payload["timeout"], payload["term_grace"]
+                op_id, payload["script"], payload["env"], payload["timeout"], payload["term_grace"]
             )
-            return CommandResultFrame(op_id="op-y", outcome=CommandOutcome.OK, payload=result)
+            return CommandResultFrame(op_id=op_id, outcome=CommandOutcome.OK, payload=result)
 
     conn = _RoutingConn()
     monkeypatch.setattr(
