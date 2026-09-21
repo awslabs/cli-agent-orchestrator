@@ -118,8 +118,11 @@ outcome the setting exists to prevent. Retry the run when the runtime is back.
 shared server (`CAO_API_BASE_URL`) sends the parsed fields, not the file, so a
 relative path — which resolves beside the flow file locally — is refused at
 `cao schedule add` time rather than failing inside a scheduled run hours later.
-Use an absolute path that exists on the server, or in the runtime named by
-`CAO_SCRIPT_RUNTIME`.
+Use an absolute path that exists **on the server**. That holds even with
+`CAO_SCRIPT_RUNTIME` set: the server reads the file and sends its *contents* to
+the runtime, so the runtime never needs a copy — but the server does need the
+original. A path that exists only inside the runtime fails the run with
+`Script not found` before anything is dispatched.
 
 ### Where the agent runs
 

@@ -158,8 +158,10 @@ def _patch_terminal_layer(
         patch(f"{_AGENT_STEP}.terminal_service.get_output", return_value=output),
         patch(f"{_AGENT_STEP}.terminal_service.exit_terminal_cli", return_value=None),
         patch(f"{_AGENT_STEP}.wait_until_status", new=AsyncMock(return_value=True)),
+        # ``effective_status``, not ``status_monitor``: the step's status poll now
+        # routes by where the pane lives, and the local arm is only one of two.
         patch(
-            f"{_AGENT_STEP}.status_monitor.get_status",
+            f"{_AGENT_STEP}.effective_status",
             return_value=TerminalStatus.COMPLETED,
         ),
         patch(
