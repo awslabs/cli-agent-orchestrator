@@ -2,43 +2,72 @@
 title: "How CAO memory helps you and your agents keep context"
 authors: [fanhongy]
 tags: [deep-dive]
-description: How CAO gives agents shared memory across sessions and providers, while keeping storage local, scoped, and recoverable.
+description: How CAO gives agents one shared memory layer across sessions, models, and CLI providers.
 ---
 
 A coding agent can solve a hard problem. But its session is temporary. The next agent may
 repeat the same investigation.
 
-CAO memory gives agents a shared knowledge layer. It works across sessions, providers, and
-models. It also gives operators clear control over scope and retention.
+CAO memory gives every supported agent the same memory tools. An agent can remember a fact
+with one CLI provider and recall it later with another. The memory belongs to CAO, not to a
+specific model or CLI.
 
-A useful memory system must answer five questions:
-
-- Where does a fact apply?
-- Who can read or change it?
-- Which copy is authoritative?
-- What happens when a write partly fails?
-- Which facts should enter the prompt?
-
-This post explains how CAO answers those questions. For commands and configuration, see the
-[memory reference][memory-reference].
+This post explains how that shared layer works. For commands and configuration, see the
+[original CAO memory reference](https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/memory.md).
 
 {/* truncate */}
 
-> **Publication note:** This draft was checked against CAO commit `29b235cf`.
-> PLACEHOLDER — replace or supplement that commit with the matching release before
-> publication.
+## One MCP memory layer for every agent
 
-## Design constraints
+CAO exposes three core MCP operations:
 
-CAO memory has five goals. It must be readable, searchable, scoped, recoverable, and small
-enough for a prompt.
+- `memory_store` saves or updates a fact.
+- `memory_recall` searches stored facts.
+- `memory_forget` removes a fact.
 
-The base system stays local. It does not need embeddings, a remote database, or an LLM.
-Those features can sit on top of the local store.
+These operations stay the same across Kiro CLI, Claude Code, Codex, and other CAO agents.
+The provider may change. The model may change. The memory API and scope rules do not.
 
-## Markdown content, SQLite state
+CAO resolves scope before it calls the provider. This gives every agent a consistent view
+of project, session, global, agent, and federated memory. Access still follows the scope and
+caller policy.
 
-CAO uses two stores:
+This is the main reason CAO owns the memory layer. A provider-specific memory feature would
+split knowledge into separate stores. CAO keeps one store and one API.
+
+## What the design must do
+
+The shared layer has five goals:
+
+1. **Unified.** Every CAO agent uses the same MCP operations and scope rules.
+2. **Readable.** People can inspect memory without a special database tool.
+3. **Searchable.** Agents can find a fact without reading the whole store.
+4. **Scoped.** A session note does not become a global rule.
+5. **Recoverable.** A partial write can be detected and repaired.
+
+The prompt also has a hard size limit. CAO must choose a small set of useful memories. It
+cannot inject the whole store.
+
+## Local by default
+
+CAO keeps memory on the machine by default. Markdown files hold the content under the CAO
+home directory. The CAO SQLite database holds metadata and lifecycle state. BM25 search
+runs in the CAO process and reads the local Markdown files.
+
+This local design has clear benefits. Memory works without a cloud service. The files stay
+under the operator's control. Reads are fast. A person can open the files and check what an
+agent may recall.
+
+An LLM is not required for the first write or for BM25 search. CAO can use an LLM later to
+organize an existing topic. That step is optional.
+
+A distributed CAO deployment can use remote memory. Setting `CAO_MEMORY_API_URL` routes the
+same store, recall, forget, and context operations to a memory-owning CAO server. The MCP
+contract does not change. Only the location of the store changes.
+
+## Markdown stores content; SQLite tracks metadata
+
+CAO uses two local stores:
 
 ```text
                          CAO memory
@@ -50,38 +79,46 @@ CAO uses two stores:
         article content                  scope identity
         timestamped entries              timestamps
         human-readable header            access counters
-        rendered See Also links          provenance
+        generated related links          provenance
                                          compilation state
                                          typed relationships
 ```
 
-Markdown holds the content. Each topic has a stable key, a header, and timestamped entries.
-An update adds a new entry to the same file.
+Markdown holds the actual memory text. Each topic has a stable key. The key identifies the
+topic and becomes part of its file name.
 
-SQLite holds query and lifecycle state. This includes timestamps, access counts,
-provenance, token estimates, compilation state, and relationships.
+The file header records the memory ID, scope, type, and tags. Timestamped sections record
+when each observation was added. When an agent updates the same key, CAO appends a new
+timestamped section to that topic. It does not create a second memory with the same key and
+scope.
+
+SQLite tracks data used for filtering, ranking, and lifecycle rules. This includes scope
+IDs, timestamps, access counts, provenance, token estimates, and relationship state.
+BM25 still searches the Markdown content. SQLite does not replace that content search.
 
 The two stores have different authority:
 
 | Concern | Authority |
 | --- | --- |
-| Topic text and history | Markdown |
-| Search metadata and usage | SQLite |
+| Topic text and timestamped history | Markdown |
+| Search metadata and usage counters | SQLite |
 | Relationship lifecycle and human decisions | SQLite |
-| Human-readable index and `See Also` links | Generated views |
+| Human-readable index | Generated from the stores |
+| `## See Also` related-topic links | Generated from relationship state |
+
+`See Also` is a real section in a topic file. CAO writes normal Markdown links under the
+`## See Also` heading. The links point to related memory topics. They are a readable view of
+SQLite relationship state, not a second source of truth.
 
 Some SQLite data can be rebuilt from Markdown. Some cannot. For example, a rejected
-relationship is a human decision. That decision does not exist in the topic text.
-
-This split keeps both paths simple. Humans can read the Markdown files. CAO can query
-SQLite without parsing every article.
+relationship is a human decision. That decision must remain in SQLite.
 
 ## Save first, organize later
 
-A memory write follows this path:
+A CAO agent calls `memory_store`. The memory service then follows a fixed write path:
 
 ```text
-agent observation
+agent calls memory_store
        │
        ▼
 validate scope, identity, and write policy
@@ -101,48 +138,47 @@ update the Markdown index
 upsert SQLite metadata
 ```
 
-CAO writes to a temporary file first. It then replaces the topic file atomically. A
-per-topic lock prevents two writers from losing each other's updates. The shared index has
-its own lock.
+This first path is deterministic because it uses fixed code, not model output. CAO locks
+the topic, writes a known append format, and publishes it with an atomic file replacement.
+The same rules run for every write.
 
-A new topic does not use an LLM. An existing topic may use one when compile mode is `llm`.
-The compiler can merge repeated entries and find related topics. This work runs in the
-background. A slow model never blocks the initial save.
+The shared Markdown index has its own lock. This prevents two topics from losing each
+other's index updates.
 
-The compiler also checks for newer writes. It records the exact content that triggered the
-job. Before publishing its result, it compares that content with the current file. If the
-file changed, CAO drops the stale result.
+When creating a new topic in memory, CAO does not use an LLM. An existing topic may use an
+LLM when compile mode is `llm`. The LLM can merge repeated entries and find related topics.
+This work runs after the initial save.
 
-The rule is simple: save the observation first. Improve its structure later.
+The compiler checks for newer writes before it publishes a result. If the topic changed,
+CAO drops the stale result. A slow or failed LLM never removes the saved observation.
+
+The rule we follow is simple: save the observation first. Improve the structure later. CAO
+uses an LLM for that second step only when the operator enables it.
 
 ## Partial writes are visible
 
 The filesystem and SQLite cannot share one transaction. CAO handles that limit directly.
 
 The topic file and Markdown index are written before SQLite metadata. If the SQLite write
-fails, CAO raises `MemoryPartialWriteError`. The error includes the key, scope, file path,
-and completed phases.
+fails, CAO raises `MemoryPartialWriteError`. The error lists the key, scope, file path, and
+completed phases.
 
-This tells the caller what happened. The content may already be safe on disk. Retrying the
-same write could create a duplicate entry.
+This tells the caller what is already safe. Retrying the same write could add a duplicate
+entry.
 
-CAO can repair the missing projection. Reconciliation scans the topic files. It validates
-their paths and headers. It then rebuilds missing metadata and index entries. It never
-recreates topic content from SQLite.
+CAO can repair the missing metadata. Reconciliation scans the topic files, validates them,
+and rebuilds missing rows or index entries. It never rebuilds topic text from SQLite.
 
-## One memory contract across agents and providers
+## Scope tells CAO where memory applies
 
-Scope belongs to CAO, not to a model or CLI. Switching from Kiro CLI to Claude Code or
-Codex does not create a new project-memory store. A new agent can use the same eligible
-memories.
-
-A memory is identified by more than its key:
+We define a memory with:
 
 ```text
 (key, scope, scope_id)
 ```
 
-CAO supports five scopes:
+The key names the topic. The scope says where the fact applies. The scope ID names the
+specific project, session, or agent when needed.
 
 | Scope | Applies to | Retention |
 | --- | --- | --- |
@@ -152,11 +188,17 @@ CAO supports five scopes:
 | `agent` | One agent profile | Permanent |
 | `federated` | All projects on one machine | Permanent |
 
-Memories of type `user` or `feedback` never expire. Cleanup runs when `cao-server` starts.
-It is not a continuous background sweep.
+The retention periods match the expected lifetime of each scope. Session memory is temporary,
+so it expires first. Project memory lasts longer because project decisions often stay useful
+across many sessions. Global, agent, and federated memory are designed to cross project or
+session boundaries, so they do not expire.
 
-Project, session, and agent scopes need an identity. CAO refuses the write if that identity
-cannot be resolved. It does not fall back to a wider scope.
+Memories of type `user` or `feedback` also never expire. User preferences and explicit
+corrections should not silently disappear. Cleanup runs when `cao-server` starts. It is not
+a continuous sweep.
+
+Project, session, and agent scopes need an identity. CAO rejects the write if it cannot
+resolve that identity. It never falls back to a wider scope.
 
 Project identity follows this order:
 
@@ -165,7 +207,7 @@ Project identity follows this order:
 3. `sha256(realpath(cwd))[:12]`.
 
 The Git-based ID survives normal checkout moves. CAO also records a path-hash alias for
-older stores. It never saves a raw remote URL because that URL may contain credentials.
+older stores. It does not save raw remote URLs because they may contain credentials.
 
 Scope and type are separate. Scope says where a fact applies. Type says whether the fact is
 a project note, user preference, correction, or reference.
@@ -176,25 +218,29 @@ CAO has two retrieval paths.
 
 **Automatic injection** gives an agent a small starting set. It checks session, project,
 and global memory in that order. Each scope gets at most ten entries and its own character
-limit. Empty space from one scope is not reassigned to another.
+limit. Empty space from one scope is not given to another.
 
-CAO delivers the block in two ways. It updates the provider's project instructions. It also
-prepends a `<cao-memory>` block to the first user message. This is a startup snapshot. It is
-not updated on every turn.
+Every provider receives the same `<cao-memory>` content block on the first user message.
+Built-in provider plugins also write the block into the file that provider reads:
+
+- Claude Code: `.claude/CLAUDE.md`
+- Codex: `AGENTS.md`
+- Kiro CLI: `.kiro/steering/cao-memory.md`
+
+The file path is provider-specific. The memory selection and scope rules are not. Injection
+is a startup snapshot, not a live update on every turn.
 
 **Explicit recall** searches beyond that snapshot. It supports metadata, BM25, and hybrid
-search. Hybrid search returns metadata matches first. BM25 fills any remaining result slots.
+search. Hybrid search returns metadata matches first. BM25 fills the remaining result slots.
 Results can be sorted by recency, usage, or a combined score.
 
 A successful recall may increase `access_count`. A failed counter update never blocks the
 read.
 
-CAO does not require embeddings. BM25 is local and predictable. It may miss a fact that uses
-very different wording.
+## Keep CAO workflow replays consistent
 
-## Freeze memory for workflow replay
-
-Memory can change a workflow's output. That makes memory an execution input.
+CAO workflows are a separate feature. They run repeatable, multi-step jobs. Memory matters
+to workflows because a recalled fact can change the result.
 
 Suppose a workflow reads a project rule today. The rule changes tomorrow. A replay should
 not mix the old workflow inputs with the new rule.
@@ -213,53 +259,17 @@ without memory. This is safer than using context that cannot be reproduced.
 CAO stores relationships as typed edges. It does not ask a model to rebuild the graph on
 every read.
 
-Each edge records:
-
-- a type, such as `relates_to`, `contradiction`, or `supersedes`;
-- an origin, such as `compiler`, `wiki_lint`, or `human`;
-- a status, such as `active`, `proposal`, or `rejected`;
-- optional confidence, rank, and evidence;
-- the source memory's update time.
+Each edge records a type, origin, status, and source update time. It may also carry
+confidence, rank, and evidence.
 
 A producer can replace only its own edges. Compiler output cannot remove a human edge.
-Rejected and deleted edges also survive recomputation.
+Rejected and deleted edges survive recomputation.
 
 CAO marks an edge stale when its source memory changes. A stale edge needs recomputation.
 Reading it does not change it.
 
-The Markdown `See Also` section is only a view of this graph. It is not another graph store.
-
-CAO has two different promotion actions. Relationship promotion accepts a proposed edge.
-Instruction promotion copies a lesson into an agent profile.
-
-## Remote memory uses the same API
-
-CAO uses local Markdown and SQLite by default. A distributed setup can point the same
-operations at a memory API.
-
-The API still uses terminal context to resolve scope. It also returns the same typed partial
-write error. Without an API URL, CAO calls the local `MemoryService`.
-
-The storage location changes. The memory contract does not.
-
-## Treat import and export as boundaries
-
-OKF export scans topic text and history for credential patterns. A matching topic is skipped
-unless redaction is requested. The CLI needs `--include-private` for session or agent
-memory. The HTTP endpoint refuses those scopes.
-
-Import treats every bundle as untrusted. The operator chooses the target scope. CAO checks
-paths and keys. It rejects path escapes and symlinks. It removes imported `See Also` views.
-Accepted content goes through `MemoryService.store()`.
-
-OKF is portable, but it is not a full backup. It does not keep scope IDs, UUIDs, usage
-counts, provenance, or relationship decisions.
-
-The exported files are a read-only mirror. CAO does not merge edits from that mirror back
-into the live store.
-
-The Markdown store is readable by design. It is not a secrets manager. Credentials belong
-in a dedicated secrets system.
+CAO has two promotion actions. Relationship promotion accepts a proposed edge. Instruction
+promotion copies a lesson into an agent profile.
 
 ## How the opt-in learning loop works
 
@@ -293,22 +303,19 @@ The flow has five steps:
 2. The supervisor hands work to the retrospector. This does not happen automatically at
    session end.
 3. The retrospector reads outcomes and checks existing lessons. Its prompt asks for a short,
-   reusable lesson. It also asks for an `Applies when:` trigger. These are prompt rules, not
-   proof that the lesson is correct.
+   reusable lesson and an `Applies when:` trigger. These prompt rules do not prove that the
+   lesson is correct.
 4. `store_lesson` writes the lesson to the worker's `agent` scope as `feedback`. A caller
    needs the `store_lesson` capability to write into another agent's scope.
 5. The worker recalls the lesson later. Recall can increase `access_count`. After three
    recalls by default, the operator can review a promotion plan.
 
-An unpromoted agent lesson requires explicit recall. The automatic injection path currently
-uses only session, project, and global memory.
+An unpromoted agent lesson needs explicit recall. Automatic injection currently uses only
+session, project, and global memory.
 
 Promotion copies the lesson into the profile's `## Learned Patterns` block. It does not
-delete the original memory. The operator must review the change like any other system
-prompt update.
-
-Recall count is only a rough signal. It shows that the lesson was used again. It does not
-prove that the lesson improved quality. Use real benchmarks when they exist.
+delete the original memory. The operator should review the change like any system prompt
+update.
 
 ## Costs and savings
 
@@ -322,28 +329,29 @@ Memory also has costs:
 - Automatic injection can become stale during a long session.
 - A stored fact can be wrong.
 - More injected lessons use more prompt space.
-- OKF does not preserve every internal field.
 
-The useful comparison is simple. Is storing and checking the conclusion cheaper than
-finding it again on every run?
+The useful question is simple: is storing and checking the conclusion cheaper than finding
+it again on every run?
 
-## Take memory into Obsidian
+## Move and view memory outside CAO
 
-CAO can export its memory graph to an Obsidian vault. The export contains one Markdown note
-per node. Notes include YAML metadata, an H1 title, and `[[wikilinks]]` for relationships.
+CAO supports two different use cases: moving topic content and viewing relationships.
 
-This export is one-way. CAO does not read edits back. Use OKF instead when you need portable
-content that CAO can import.
+**OKF export and import** move portable topic content. Export checks content for credential
+patterns. Import requires the operator to choose the target scope. OKF does not preserve
+scope IDs, UUIDs, usage counts, provenance, or relationship decisions. It is a migration
+format, not a full backup.
+
+**Obsidian graph export** creates a vault for browsing. It writes one Markdown note per
+node, with YAML metadata, an H1 title, and `[[wikilinks]]` for relationships. This export is
+one-way. CAO does not read edits back.
 
 ![Current Obsidian export and PR #674 canonical vault architecture](./obsidian-memory-architecture.svg)
 
-[PR #674](https://github.com/awslabs/cli-agent-orchestrator/pull/674) adds a second model.
-A mapped vault folder becomes the canonical Markdown source for a scope. Unmapped scopes
-continue to use the native wiki. SQLite, BM25, and graph state become rebuildable views of
-the vault notes.
+[PR #674](https://github.com/awslabs/cli-agent-orchestrator/pull/674) adds another model. A
+mapped vault folder becomes the canonical Markdown source for a scope. Unmapped scopes keep
+the native wiki. SQLite, BM25, and graph state become rebuildable views of the vault notes.
 
 CAO writes only inside one managed folder. Other mapped folders are read-only sources.
 Release one has no file watcher. External edits need reconciliation before indexes and
 relationships are current.
-
-[memory-reference]: https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/memory.md
