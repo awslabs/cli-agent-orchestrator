@@ -315,6 +315,15 @@ class Bridge:
                 engine=payload.get("engine"),
                 use_worktree=bool(payload.get("use_worktree", False)),
             )
+            # Open the terminal's buffer now, not at its first byte. `_buffers`
+            # is this runtime's record of which panes it owns: the hello snapshot
+            # (streams + statuses) is built from it, so a pane that has not
+            # emitted anything yet — a provider still starting, an agent idle at
+            # its prompt — was left out of the snapshot entirely, and a server
+            # that restarted in that window neither rebound its routing nor
+            # learned its status (Copilot review on #802, finding 11). An empty
+            # buffer reports end_pos 0, which is exactly true.
+            self._buffer_for(terminal.id)
             if payload.get("initial_message") and not defer_init:
                 await asyncio.to_thread(
                     terminal_service.send_input, terminal.id, payload["initial_message"]
@@ -500,16 +509,21 @@ class Bridge:
                 )
             )
         # PTY hit EOF (client exited / detached): tell the server so it can
-        # close the client-facing socket instead of leaving it silent.
-        await self._send(
-            StreamFrame(
-                terminal_id=terminal_id,
-                stream=StreamName.ATTACH,
-                generation=0,
-                pos=state["pos"],
-                data="",
+        # close the client-facing socket instead of leaving it silent. Sent only
+        # while this state is still the terminal's live attach — a second
+        # ATTACH_OPEN replaces the PTY, and the outgoing pump's EOF would
+        # otherwise reach the server after the new client bound its sink and
+        # close a session that had just opened.
+        if self._attach.get(terminal_id) is state:
+            await self._send(
+                StreamFrame(
+                    terminal_id=terminal_id,
+                    stream=StreamName.ATTACH,
+                    generation=0,
+                    pos=state["pos"],
+                    data="",
+                )
             )
-        )
 
     def _attach_write(self, terminal_id: str, data: bytes) -> bool:
         state = self._attach.get(terminal_id)
@@ -692,7 +706,26 @@ class Bridge:
             buf = self._buffers.get(resume.terminal_id)
             if buf is None:
                 continue
-            gap, chunks = buf.replay_from(min(resume.end_pos, buf.end_pos))
+            start = resume.end_pos
+            if start > buf.end_pos:
+                # The server claims bytes past this buffer's watermark. It can
+                # happen legitimately — a pane recovered under an id whose
+                # earlier stream this server had consumed, so its position
+                # belongs to a buffer that no longer exists — but it is never
+                # ordinary, and `replay_from` would raise on it. Clamp so the
+                # reconnect proceeds, and SAY SO: silently substituting a
+                # different position leaves the server believing it is current
+                # on a stream it is not (Copilot review on #802, finding 12).
+                logger.warning(
+                    "server resume position %s for terminal %s is past this "
+                    "runtime's watermark %s; replaying from the watermark "
+                    "(stream restarted under a reused id?)",
+                    resume.end_pos,
+                    resume.terminal_id,
+                    buf.end_pos,
+                )
+                start = buf.end_pos
+            gap, chunks = buf.replay_from(start)
             if gap is not None:
                 await self._send(
                     GapFrame(

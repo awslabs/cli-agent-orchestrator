@@ -1254,8 +1254,31 @@ class TestListSessionsRemoteRuntimes:
         try:
             yield runtime_registry
         finally:
-            for terminal_id in runtime_registry.remote_terminal_ids():
+            for terminal_id in list(runtime_registry._terminal_runtime):
                 runtime_registry.unbind_terminal(terminal_id)
+            for runtime_id in list(runtime_registry._runtimes):
+                runtime_registry.unregister(runtime_id, runtime_registry.get_runtime(runtime_id))
+
+    @pytest.fixture
+    def place(self, registry):
+        """Put *terminal_id* on a runtime whose channel is CONNECTED.
+
+        Both halves are the state a live pod actually has, and enumeration needs
+        both: a binding whose runtime has disconnected is deliberately kept for
+        routing errors but must not be listed as an active session (#802 finding
+        13). A test that only bound would be describing a pod that is already
+        gone.
+        """
+
+        async def _send(_text):  # a live channel; nothing here reads what it sends
+            pass
+
+        def _place(terminal_id, runtime_id):
+            if registry.get_runtime(runtime_id) is None:
+                registry.register(runtime_id, _send)
+            registry.bind_terminal(terminal_id, runtime_id)
+
+        return _place
 
     @staticmethod
     def _row(session_name, terminal_id, **overrides):
@@ -1281,11 +1304,11 @@ class TestListSessionsRemoteRuntimes:
         return backend
 
     def test_a_session_executing_in_a_runtime_is_listed(
-        self, real_session_db, registry, monkeypatch
+        self, real_session_db, registry, place, monkeypatch
     ):
         """The case the cluster hit: no local tmux, one agent in a runtime."""
         self._row("cao-remote", "aaaaaaaa")
-        registry.bind_terminal("aaaaaaaa", "cao-scale-7")
+        place("aaaaaaaa", "cao-scale-7")
         monkeypatch.setattr(session_service_mod, "get_backend", lambda: self._backend())
 
         result = list_sessions()
@@ -1299,7 +1322,7 @@ class TestListSessionsRemoteRuntimes:
         assert result[0]["working_directory"] == "/repo/aaaaaaaa"
 
     def test_the_reported_status_stays_inside_the_session_model(
-        self, real_session_db, registry, monkeypatch
+        self, real_session_db, registry, place, monkeypatch
     ):
         """A new status vocabulary would break callers parsing these rows.
 
@@ -1312,7 +1335,7 @@ class TestListSessionsRemoteRuntimes:
         from cli_agent_orchestrator.models.session import Session
 
         self._row("cao-remote", "aaaaaaaa")
-        registry.bind_terminal("aaaaaaaa", "cao-scale-7")
+        place("aaaaaaaa", "cao-scale-7")
         monkeypatch.setattr(session_service_mod, "get_backend", lambda: self._backend())
 
         row = list_sessions()[0]
@@ -1321,13 +1344,13 @@ class TestListSessionsRemoteRuntimes:
         assert Session(id=row["id"], name=row["name"], status=row["status"]).status == "detached"
 
     def test_a_session_spanning_two_runtimes_reports_both(
-        self, real_session_db, registry, monkeypatch
+        self, real_session_db, registry, place, monkeypatch
     ):
         """Flow placement puts one session's agents on different executors."""
         self._row("cao-flow", "aaaaaaaa")
         self._row("cao-flow", "bbbbbbbb")
-        registry.bind_terminal("aaaaaaaa", "cao-scale-7")
-        registry.bind_terminal("bbbbbbbb", "cao-scale-3")
+        place("aaaaaaaa", "cao-scale-7")
+        place("bbbbbbbb", "cao-scale-3")
         monkeypatch.setattr(session_service_mod, "get_backend", lambda: self._backend())
 
         result = list_sessions()
@@ -1336,7 +1359,7 @@ class TestListSessionsRemoteRuntimes:
         assert result[0]["runtimes"] == ["cao-scale-3", "cao-scale-7"]
 
     def test_a_session_tmux_already_reports_is_not_listed_twice(
-        self, real_session_db, registry, monkeypatch
+        self, real_session_db, registry, place, monkeypatch
     ):
         """A hybrid host -- local tmux plus attached runtimes -- lists each once.
 
@@ -1346,7 +1369,7 @@ class TestListSessionsRemoteRuntimes:
         """
         self._row("cao-both", "aaaaaaaa")
         self._row("cao-both", "bbbbbbbb")
-        registry.bind_terminal("bbbbbbbb", "cao-scale-7")
+        place("bbbbbbbb", "cao-scale-7")
         monkeypatch.setattr(
             session_service_mod,
             "get_backend",
@@ -1360,12 +1383,32 @@ class TestListSessionsRemoteRuntimes:
         assert "runtimes" not in result[0]
 
     def test_a_remote_terminal_outside_the_cao_prefix_is_ignored(
-        self, real_session_db, registry, monkeypatch
+        self, real_session_db, registry, place, monkeypatch
     ):
         """Same SESSION_PREFIX filter as the local listing, for the same reason."""
         self._row("not-ours", "aaaaaaaa")
-        registry.bind_terminal("aaaaaaaa", "cao-scale-7")
+        place("aaaaaaaa", "cao-scale-7")
         monkeypatch.setattr(session_service_mod, "get_backend", lambda: self._backend())
+
+        assert list_sessions() == []
+
+    def test_a_session_whose_runtime_disconnected_stops_being_listed(
+        self, real_session_db, registry, place, monkeypatch
+    ):
+        """A replaced pod's sessions must leave the listing when its channel does.
+
+        The binding survives the channel on purpose (it is what makes a command
+        for the terminal fail explicitly), so enumerating the raw map kept the
+        dead executor's sessions in ``cao session list`` indefinitely — the same
+        confident-wrong-answer failure this path was added to remove, one
+        direction over (Copilot review on #802, finding 13).
+        """
+        self._row("cao-remote", "aaaaaaaa")
+        place("aaaaaaaa", "cao-scale-7")
+        monkeypatch.setattr(session_service_mod, "get_backend", lambda: self._backend())
+        assert [s["id"] for s in list_sessions()] == ["cao-remote"]
+
+        registry.unregister("cao-scale-7", registry.get_runtime("cao-scale-7"))
 
         assert list_sessions() == []
 
@@ -1392,13 +1435,15 @@ class TestListSessionsRemoteRuntimes:
         assert [s["id"] for s in list_sessions()] == ["cao-local"]
         assert reads == []
 
-    def test_a_failed_remote_read_keeps_the_local_listing(self, registry, monkeypatch, caplog):
+    def test_a_failed_remote_read_keeps_the_local_listing(
+        self, registry, place, monkeypatch, caplog
+    ):
         """A DB or registry fault degrades to "no remote sessions", not to [].
 
         The local listing is what a single-host user sees; it must survive a
         fault in a path they are not even using.
         """
-        registry.bind_terminal("aaaaaaaa", "cao-scale-7")
+        place("aaaaaaaa", "cao-scale-7")
 
         def _boom(terminal_ids):
             raise RuntimeError("database is gone")
@@ -1414,7 +1459,7 @@ class TestListSessionsRemoteRuntimes:
         assert _swallowed_log(caplog, "Failed to list remote sessions").exc_info
 
     def test_a_remote_agents_cwd_is_never_read_from_the_servers_tmux(
-        self, real_session_db, registry, monkeypatch
+        self, real_session_db, registry, place, monkeypatch
     ):
         """With no persisted cwd, the pane fallback must be skipped, not attempted.
 
@@ -1424,7 +1469,7 @@ class TestListSessionsRemoteRuntimes:
         backend here raises if reached, standing in for both.
         """
         self._row("cao-remote", "aaaaaaaa", working_directory=None, agent_profile=None)
-        registry.bind_terminal("aaaaaaaa", "cao-scale-7")
+        place("aaaaaaaa", "cao-scale-7")
         backend = self._backend()
         monkeypatch.setattr(session_service_mod, "get_backend", lambda: backend)
 

@@ -156,6 +156,20 @@ async def runtime_channel(ws: WebSocket) -> None:
     try:
         while True:
             frame = decode_frame(await ws.receive_text())
+            if runtime_registry.get_runtime(runtime_id) is not conn:
+                # A reconnect under the same runtime id has replaced this
+                # channel (``register`` already failed its waiters). A half-open
+                # socket can keep delivering for a while, and acting on those
+                # frames would let the superseded connection rebind terminals
+                # and advance stream positions behind the live one — the
+                # protocol's ``generation`` field is meant to fence exactly this,
+                # but nothing has ever advanced it, so identity of the
+                # registered connection is the check that actually holds today
+                # (Copilot review on #802, finding 3).
+                logger.warning(
+                    "ignoring frames from a superseded channel for runtime %s", runtime_id
+                )
+                break
             conn.last_seen = time.time()
             if isinstance(frame, CommandResultFrame):
                 conn.resolve(frame)
@@ -452,13 +466,17 @@ async def relay_remote_attach(websocket, terminal_id: str) -> None:
             except Exception:  # noqa: BLE001 — already closed is fine
                 pass
     finally:
-        runtime_registry.unbind_attach(terminal_id, sink)
-        try:
-            await runtime_registry.send_terminal_command(
-                terminal_id, CommandType.ATTACH_CLOSE, {}, timeout=10.0
-            )
-        except Exception:  # noqa: BLE001 — best-effort close on a dead runtime
-            pass
+        # Only the relay that still owns the attach closes the runtime PTY.
+        # A second client on the same terminal displaces this one; closing on
+        # the way out would then tear down the PTY the replacement is using
+        # (Copilot review on #802, finding 4).
+        if runtime_registry.unbind_attach(terminal_id, sink):
+            try:
+                await runtime_registry.send_terminal_command(
+                    terminal_id, CommandType.ATTACH_CLOSE, {}, timeout=10.0
+                )
+            except Exception:  # noqa: BLE001 — best-effort close on a dead runtime
+                pass
 
 
 async def remote_delete_terminal(terminal_id: str) -> bool:

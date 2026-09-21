@@ -106,6 +106,15 @@ class TestRuntimeRegistry:
         with pytest.raises(RuntimeUnavailableError):
             await pending
 
+    @staticmethod
+    def _connected(registry, *runtime_ids):
+        """Register a live channel per id, as a real hello would."""
+
+        async def send_text(_text):
+            pass
+
+        return [registry.register(rid, send_text) for rid in runtime_ids]
+
     def test_remote_terminal_ids_spans_every_runtime(self):
         """The whole bound set, not one runtime's — what ``list_sessions`` needs.
 
@@ -114,6 +123,7 @@ class TestRuntimeRegistry:
         flattening) would list part of a session and silently drop the rest.
         """
         registry = RuntimeChannelRegistry()
+        self._connected(registry, "worker-1", "worker-2")
         registry.bind_terminal("t-a", "worker-1")
         registry.bind_terminal("t-b", "worker-2")
 
@@ -121,6 +131,28 @@ class TestRuntimeRegistry:
 
         registry.unbind_terminal("t-a")
         assert registry.remote_terminal_ids() == ["t-b"]
+
+    def test_remote_terminal_ids_drops_a_disconnected_runtimes_terminals(self):
+        """Enumeration is a liveness question; routing state is not.
+
+        ``unregister`` deliberately leaves the binding in place so a command for
+        the terminal fails with "runtime not connected" instead of looking like
+        an unknown terminal. Reporting that same binding here kept ``GET
+        /sessions`` listing a dead pod's sessions as active forever (Copilot
+        review on #802, finding 13).
+        """
+        registry = RuntimeChannelRegistry()
+        conn_a, _ = self._connected(registry, "worker-1", "worker-2")
+        registry.bind_terminal("t-a", "worker-1")
+        registry.bind_terminal("t-b", "worker-2")
+
+        registry.unregister("worker-1", conn_a)
+
+        assert registry.remote_terminal_ids() == ["t-b"]
+        # Routing still knows where t-a was, which is what turns a command for
+        # it into an explicit failure rather than a missing terminal.
+        assert registry.runtime_for_terminal("t-a") == "worker-1"
+        assert registry.is_remote("t-a") is True
 
     def test_remote_terminal_ids_is_a_snapshot_not_a_view(self):
         """Callers iterate it while awaiting a DB read.
@@ -130,6 +162,7 @@ class TestRuntimeRegistry:
         — a fault in one runtime breaking an unrelated listing.
         """
         registry = RuntimeChannelRegistry()
+        self._connected(registry, "worker-1", "worker-2")
         registry.bind_terminal("t-a", "worker-1")
 
         ids = registry.remote_terminal_ids()
@@ -410,4 +443,78 @@ class TestChannelEndpoint:
         assert (f"terminal.{TID}.status", {"status": "completed"}) in received
         assert runtime_registry.get_status(TID) == TerminalStatus.UNKNOWN
         assert runtime_registry.resume_position(TID, "capture") == len(b"hello from worker")
+        runtime_registry.unbind_terminal(TID)
+
+    def test_a_superseded_channel_stops_being_read(self, channel_client):
+        """A reconnect under the same runtime id retires the channel it replaced.
+
+        A pod that reconnects before the server noticed the old socket leaves two
+        frame loops running for one runtime id. The registry holds only the new
+        connection, but the old loop kept consuming: its stale output was
+        republished as live and advanced the resume watermark, so the replacement's
+        genuine output was then skipped as already-seen. The protocol carries a
+        `generation` field meant to fence this, but nothing has ever advanced it,
+        so identity of the registered connection is the check that holds today
+        (Copilot review on #802, finding 3).
+        """
+        from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
+        from cli_agent_orchestrator.services.event_bus import bus
+
+        received = []
+        original_publish = bus.publish
+        bus.publish = lambda topic, data: received.append((topic, data))
+        headers = {"Host": "localhost", "X-CAO-Runtime-Token": "test-runtime-token"}
+        try:
+            with channel_client.websocket_connect("/runtime/channel", headers=headers) as old:
+                old.send_text(_hello())
+                decode_frame(old.receive_text())
+                first = runtime_registry.get_runtime("worker-1")
+
+                with channel_client.websocket_connect("/runtime/channel", headers=headers) as new:
+                    new.send_text(_hello())
+                    decode_frame(new.receive_text())
+                    assert runtime_registry.get_runtime("worker-1") is not first
+
+                    # The retired channel speaks anyway.
+                    old.send_text(
+                        encode_frame(
+                            StreamFrame(
+                                terminal_id=TID,
+                                stream=StreamName.CAPTURE,
+                                generation=0,
+                                pos=0,
+                                data=base64.b64encode(b"stale output").decode(),
+                            )
+                        )
+                    )
+                    # The live channel's output is what reaches subscribers.
+                    new.send_text(
+                        encode_frame(
+                            StreamFrame(
+                                terminal_id=TID,
+                                stream=StreamName.CAPTURE,
+                                generation=0,
+                                pos=0,
+                                data=base64.b64encode(b"live output").decode(),
+                            )
+                        )
+                    )
+                    new.send_text(
+                        encode_frame(
+                            CommandResultFrame(
+                                op_id="sync-op", terminal_id=TID, outcome=CommandOutcome.OK
+                            )
+                        )
+                    )
+                    ack = decode_frame(new.receive_text())
+                    assert isinstance(ack, AckFrame) and ack.op_id == "sync-op"
+        finally:
+            bus.publish = original_publish
+
+        topics = [(t, d) for t, d in received if t == f"terminal.{TID}.output"]
+        assert (f"terminal.{TID}.output", {"data": "live output"}) in topics
+        assert (f"terminal.{TID}.output", {"data": "stale output"}) not in topics
+        # And the watermark tracks only the live channel, so nothing it sends next
+        # is mistaken for output already consumed.
+        assert runtime_registry.resume_position(TID, "capture") == len(b"live output")
         runtime_registry.unbind_terminal(TID)

@@ -191,7 +191,7 @@ class RuntimeChannelRegistry:
         return self._terminal_runtime.get(terminal_id)
 
     def remote_terminal_ids(self) -> List[str]:
-        """Every terminal currently bound to a runtime, across all runtimes.
+        """Every terminal bound to a runtime that is currently CONNECTED.
 
         A snapshot (new list), not a view: callers iterate it while awaiting DB
         reads, and a channel disconnecting mid-iteration must not raise
@@ -201,8 +201,16 @@ class RuntimeChannelRegistry:
         is for callers that need the whole set without caring which runtime owns
         which -- ``session_service.list_sessions``, which turns it into the set
         of sessions executing off-box.
+
+        A binding OUTLIVES its channel on purpose: ``unregister`` leaves
+        ``_terminal_runtime`` intact so a command for a terminal whose executor
+        vanished fails with "runtime X is not connected" rather than being
+        misread as a terminal that never existed. That makes the raw dict the
+        wrong answer for a liveness question -- ``GET /sessions`` listed a dead
+        pod's sessions as active indefinitely (Copilot review on #802, finding
+        13). Routing keeps the full map; enumeration gets only the live part.
         """
-        return list(self._terminal_runtime)
+        return [tid for tid, rid in self._terminal_runtime.items() if rid in self._runtimes]
 
     async def send_terminal_command(
         self,
@@ -292,12 +300,36 @@ class RuntimeChannelRegistry:
     # channel are handed to that client's queue instead of the bus. `None`
     # on the queue means the runtime-side PTY ended (EOF/detach).
 
-    def bind_attach(self, terminal_id: str, sink: "asyncio.Queue") -> None:
-        self._attach_sinks[terminal_id] = sink
+    def bind_attach(self, terminal_id: str, sink: "asyncio.Queue") -> bool:
+        """Make *sink* the live attach client, ending any client it displaces.
 
-    def unbind_attach(self, terminal_id: str, sink: "asyncio.Queue") -> None:
+        Returns True when this call displaced an earlier client. That client is
+        sent ``None`` — the same EOF the runtime PTY's own end produces — so its
+        relay unwinds immediately instead of parking forever on a queue nothing
+        will ever feed again (Copilot review on #802, finding 6). Ownership is
+        what the ``None`` conveys, not a PTY that ended: the PTY is still alive
+        and now belongs to *sink*, which is why the displaced relay must not go
+        on to close it (see :meth:`unbind_attach`).
+        """
+        previous = self._attach_sinks.get(terminal_id)
+        self._attach_sinks[terminal_id] = sink
+        if previous is not None and previous is not sink:
+            previous.put_nowait(None)
+            return True
+        return False
+
+    def unbind_attach(self, terminal_id: str, sink: "asyncio.Queue") -> bool:
+        """Release *sink*'s claim; True only if it was still the live client.
+
+        The return value is the caller's authority to send ``ATTACH_CLOSE``. A
+        relay that was displaced by a later client must not: the runtime-side
+        PTY it would close is now the replacement's, so an unconditional close
+        in the old relay's ``finally`` killed a live attach (finding 4).
+        """
         if self._attach_sinks.get(terminal_id) is sink:
             del self._attach_sinks[terminal_id]
+            return True
+        return False
 
     def deliver_attach(self, terminal_id: str, data: Optional[bytes]) -> bool:
         sink = self._attach_sinks.get(terminal_id)

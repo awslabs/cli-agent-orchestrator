@@ -170,6 +170,66 @@ async def test_server_relay_forwards_both_directions():
 
 
 @pytest.mark.asyncio
+async def test_a_second_client_displaces_the_first_without_killing_the_pty():
+    """Two attaches to one terminal: the loser must not close the winner's PTY.
+
+    One live attach sink exists per terminal, so a second client takes the
+    binding over. The displaced relay used to send ATTACH_CLOSE on its way out,
+    which reached the runtime AFTER the replacement's ATTACH_OPEN and tore down
+    the PTY the new client was already reading — a blank screen for a session
+    that is fine (Copilot review on #802, finding 4).
+    """
+    from cli_agent_orchestrator.runtime_channel.api import relay_remote_attach
+
+    closes = []
+    first_open = asyncio.Event()
+
+    async def fake_send_terminal_command(terminal_id, ctype, payload, timeout):
+        if ctype == CommandType.ATTACH_OPEN:
+            first_open.set()
+        if ctype == CommandType.ATTACH_CLOSE:
+            closes.append(terminal_id)
+        return CommandResultFrame(
+            op_id="x", outcome=CommandOutcome.OK, payload={"opened": True}, terminal_id=terminal_id
+        )
+
+    # The first client never sends anything and stays up until it is displaced.
+    class _Idle(_FakeWebSocket):
+        async def receive_text(self):
+            await asyncio.sleep(3600)
+
+    first = _Idle([])
+    with patch.object(
+        runtime_registry, "send_terminal_command", side_effect=fake_send_terminal_command
+    ):
+        first_relay = asyncio.create_task(relay_remote_attach(first, "abcd1234"))
+        await asyncio.wait_for(first_open.wait(), timeout=2.0)
+
+        # A second client arrives and takes the binding; the first's downstream
+        # reader sees the None sentinel and unwinds.
+        second_sink: asyncio.Queue = asyncio.Queue()
+        assert runtime_registry.bind_attach("abcd1234", second_sink) is True
+        await asyncio.wait_for(first_relay, timeout=2.0)
+
+        # The displaced relay no longer owns the attach, so it sent no close.
+        assert closes == []
+        # The replacement still owns it, and releasing it does close the PTY.
+        assert runtime_registry.unbind_attach("abcd1234", second_sink) is True
+
+
+@pytest.mark.asyncio
+async def test_releasing_a_sink_that_was_already_displaced_is_a_no_op():
+    sink_a: asyncio.Queue = asyncio.Queue()
+    sink_b: asyncio.Queue = asyncio.Queue()
+    assert runtime_registry.bind_attach("eeee1111", sink_a) is False  # nothing displaced
+    assert runtime_registry.bind_attach("eeee1111", sink_b) is True  # displaced A
+    assert sink_a.get_nowait() is None  # A was told its stream ended
+    assert runtime_registry.unbind_attach("eeee1111", sink_a) is False
+    assert runtime_registry.unbind_attach("eeee1111", sink_b) is True
+    assert runtime_registry.unbind_attach("eeee1111", sink_b) is False
+
+
+@pytest.mark.asyncio
 async def test_server_relay_reports_unconnected_runtime_as_4010():
     from cli_agent_orchestrator.runtime_channel.api import relay_remote_attach
     from cli_agent_orchestrator.runtime_channel.registry import RuntimeUnavailableError

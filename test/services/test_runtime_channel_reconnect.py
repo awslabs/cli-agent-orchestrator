@@ -14,6 +14,7 @@ Two claims of the boundary contract had implementations but no test:
 
 import asyncio
 import base64
+from types import SimpleNamespace
 
 import pytest
 
@@ -247,6 +248,85 @@ class TestReconnectRecovery:
 
         assert ws.frames_of(StreamFrame) == []
         assert ws.frames_of(GapFrame) == []
+
+    @pytest.mark.asyncio
+    async def test_a_pane_that_has_emitted_nothing_is_still_advertised(self):
+        """`_buffers` is this runtime's record of which panes it owns.
+
+        The hello snapshot is built from it, so a terminal that had not produced
+        a byte yet — a provider still starting, an agent sitting idle at its
+        prompt — was absent from the snapshot, and a server that restarted in
+        that window neither rebound its routing nor learned its status. LAUNCH now
+        opens the buffer, which reports end_pos 0: exactly true (Copilot review on
+        #802, finding 11).
+        """
+        from unittest.mock import AsyncMock, patch
+
+        from cli_agent_orchestrator.services import terminal_service
+
+        bridge = _bridge()
+        launched = SimpleNamespace(
+            id="beef0001",
+            name="agent-0",
+            provider="kiro_cli",
+            session_name="cao-1234",
+            agent_profile="developer",
+            allowed_tools=None,
+            shell_command=None,
+            status="initializing",
+        )
+        with patch.object(terminal_service, "create_terminal", AsyncMock(return_value=launched)):
+            outcome, payload, _ = await bridge._execute(
+                CommandFrame(
+                    op_id="op-launch",
+                    type=CommandType.LAUNCH,
+                    terminal_id=None,
+                    payload={"provider": "kiro_cli", "agent_profile": "developer"},
+                )
+            )
+        assert outcome == CommandOutcome.OK
+
+        ws = _FakeWS(HelloFrame(protocol_version=PROTOCOL_VERSION, runtime_id="server"))
+        await bridge._serve(ws)
+
+        hello = ws.frames_of(HelloFrame)[0]
+        assert ("beef0001", 0) in {(s.terminal_id, s.end_pos) for s in hello.streams}
+
+    @pytest.mark.asyncio
+    async def test_a_resume_position_past_this_runtimes_buffer_is_clamped(self, caplog):
+        """The server asks to resume from further on than this runtime ever got.
+
+        `replay_from` raises for a position past its end, which would abort the
+        handshake in a loop. Clamping to the watermark keeps the channel coming
+        up, but it means the server's bookkeeping and this runtime's disagree —
+        a stream restarted under a reused terminal id — so it is logged rather
+        than silently corrected (Copilot review on #802, finding 12).
+        """
+        import logging
+
+        bridge = _bridge()
+        bridge._buffer_for(TID).append(b"12345")
+        ws = _FakeWS(
+            HelloFrame(
+                protocol_version=PROTOCOL_VERSION,
+                runtime_id="server",
+                resume=[
+                    StreamPosition(
+                        terminal_id=TID,
+                        stream=StreamName.CAPTURE,
+                        generation=0,
+                        end_pos=9999,
+                    )
+                ],
+            )
+        )
+
+        with caplog.at_level(logging.WARNING):
+            await asyncio.wait_for(bridge._serve(ws), timeout=5)
+
+        assert "past this runtime's watermark" in caplog.text
+        # Clamped, so the handshake completed and nothing was re-sent as new.
+        assert ws.frames_of(StreamFrame) == []
 
 
 class TestReconnectBackoff:
