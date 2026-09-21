@@ -184,6 +184,18 @@ cao launch --agents analysis_supervisor --provider kimi_cli
 cao launch --agents analysis_supervisor --provider grok_cli
 ```
 
+### Running against a shared server (CAO 3.0)
+
+Nothing in this example changes when the supervisor executes in a remote runtime
+instead of on your laptop. Install the profiles where the agent runs (the runtime's
+`~/.cao/agents/`), launch the supervisor onto that runtime — `cao launch --runtime
+<id>` or `POST /runtimes/<id>/terminals` — and every `assign`/`handoff` it makes
+places the worker in the *same* runtime and the same tmux session as the
+supervisor. That is what keeps callbacks working: `send_message` without a
+`receiver_id` routes to the recorded caller, and the caller is a sibling window in
+that pod. See `examples/cao-clusters/kubernetes/eks/README.md` for the EKS
+deployment.
+
 ## Usage
 
 In the supervisor terminal, try this example task:

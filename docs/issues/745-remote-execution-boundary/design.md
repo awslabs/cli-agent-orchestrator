@@ -608,6 +608,39 @@ probe appeared in exactly one pod's pane. Note that `ps | grep cao-server` is
   central server, and the listing drops it instead of failing: the stale-binding
   case, live.
 
+- **An agent running in a runtime can assign work again.** Found by running
+  `examples/assign/` end to end on the cluster: the supervisor's every `assign`
+  and `handoff` came back `404 {"detail":"Session 'cao-cluster-assign-745' not
+  found"}` while that session was demonstrably alive in `cao-supervisor-0`. In
+  a single-container install `POST /sessions/{name}/terminals` — the one endpoint
+  in-session assign and handoff call — could add the worker's tmux window right
+  where the request was served, and that assumption is what broke: the session is
+  not missing, it is in a runtime pod, and so is where the worker belongs.
+  Placement now follows the *caller's* recorded runtime: if
+  `runtime_for_terminal(caller_id)` names one, the request is forwarded to that
+  runtime's LAUNCH with `new_session` false, so the worker lands beside the agent
+  that asked for it, in the same tmux session, and the pair are siblings for
+  send_message/inbox routing. The fields that request carries had to survive the
+  hop — `caller_id` (what an omitted-`receiver_id` callback routes by),
+  assign's deferred-init contract, `allowed_tools`, `engine`, `use_worktree`
+  (provisioned in the filesystem the agent actually runs in) — while `owner` is
+  still written centrally and never sent to the executor. `idempotency_key` is
+  refused with 400 rather than silently dropped: the remote launch has no key
+  table behind it, so honoring the key would promise a retry returns the first
+  worker when it would in fact produce a second. A caller bound to no runtime
+  takes the unchanged local path, so a single-host install is untouched.
+  Coverage: 4 tests, and **measured on the cluster** with real Claude Code
+  agents on Bedrock: before, every assign returned that 404 and no worker
+  existed; after, supervisor `dabd53c5` (launched via
+  `POST /runtimes/cao-supervisor-0/terminals`) plus workers `ff8fff81`
+  (`data_analyst`) and `4294b1b1` (`report_generator`) all sit in session
+  `cao-assign-745` with `caller_id=dabd53c5` and `metadata.runtime_id=
+  cao-supervisor-0`, `tmux list-windows` in that pod shows the three `claude`
+  panes, the handoff's `report_template.md` was written inside the pod, both
+  callbacks reached the supervisor's inbox `delivered`, and the combined report
+  matches the input CSV (South $121,500 the best region, March $89,000 the
+  strongest month, $244,500 total).
+
 **Deferred to its own workstream:**
 
 - **Per-runtime delegated credentials** — explicitly #774's scope. Both the

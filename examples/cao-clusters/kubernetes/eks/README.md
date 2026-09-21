@@ -111,6 +111,21 @@ browser terminal cannot tell a remote agent from a local one, and interactive
 client-local tmux. A terminal whose runtime is not connected closes `4010`
 rather than appearing to attach.
 
+**In-session `assign` and `handoff` place the worker in the caller's runtime.**
+An agent already executing in a runtime — the `cao-supervisor` pod, or a minted
+worker — calls `POST /sessions/{name}/terminals`, and the server forwards that
+launch to whichever runtime holds the *caller's* terminal instead of trying to add
+a tmux window in its own container (which has no tmux, and no such session). The
+worker joins the caller's existing session, so `tmux list-windows` in that pod
+shows the pair side by side and a `send_message` with no `receiver_id` routes back
+to the agent that assigned the work. `examples/assign/` therefore runs unchanged
+here: install its three profiles into the runtime pod's `~/.cao/agents/`, launch
+the supervisor with `POST /runtimes/<id>/terminals`, and the assigns, the handoff
+and the inbox callbacks all resolve inside that pod. One request field is
+refused rather than ignored: `idempotency_key` with a remote caller answers `400`,
+because the remote launch keeps no key table and a retry would mint a second
+worker instead of returning the first.
+
 **Not yet in this slice:** per-runtime delegated credentials (#774) replacing
 the shared `CAO_RUNTIME_TOKEN`. Read [What moved, and what it
 costs](#what-moved-and-what-it-costs) before deciding this topology is strictly
