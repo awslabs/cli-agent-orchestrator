@@ -599,7 +599,14 @@ probe appeared in exactly one pod's pane. Note that `ps | grep cao-server` is
   remote agent's cwd. `status` stays `detached` rather than a new `remote` value
   so callers parsing rows into `models.session.Session` keep validating.
   Coverage: 16 tests, 7 mutations checked (including both directions on the cwd
-  guard).
+  guard), and **measured on the cluster**: the same `GET /sessions` that returned
+  `[]` against 5 bound terminals returns the 4 live sessions with their runtime
+  ids after rolling the server onto the fixed image, and `cao session list` from
+  a laptop renders them with conductor and status. The rollout doubles as a
+  recovery check — the bindings it reports were rebuilt from each runtime's
+  `hello` snapshot, not persisted. One binding (`7e27c8a0`) has no row on the
+  central server, and the listing drops it instead of failing: the stale-binding
+  case, live.
 
 **Deferred to its own workstream:**
 

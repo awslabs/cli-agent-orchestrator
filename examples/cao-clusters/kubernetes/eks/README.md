@@ -741,10 +741,31 @@ kubectl -n cao-cluster exec cao-server-0 -- \
   curl -fsS -H 'Host: localhost' http://localhost:9889/runtimes
 ```
 
-Ask `/runtimes`, not `/sessions`. `/sessions` enumerates the *local* tmux server,
-and this one has none: it answers `[]` on a server with four live agents in
-executor pods. `/runtimes` lists each connected runtime with the terminals bound
-to it, which is the only view of live work the central server actually has.
+`/runtimes` lists each connected runtime with the terminals bound to it — the
+per-executor view, and the one to check before replacing a pod.
+
+`/sessions` answers the other question, "what is running", and includes sessions
+executing in a runtime. Each carries the `runtimes` executing it:
+
+```json
+[{"id": "cao-flow-placement-check", "status": "detached",
+  "runtimes": ["cao-scale-7"], "agent_profile": "developer"}]
+```
+
+`cao session list` renders the same rows, so it works against a shared server
+too. Two properties worth knowing:
+
+- Liveness comes from the runtime channel, not from the database. A session lists
+  because one of its terminals is bound to a *connected* runtime; rows whose
+  executor is gone do not come back from the dead, and a binding whose row was
+  already deleted is skipped rather than erroring the whole listing.
+- `working_directory` is `null` for a remote agent that did not persist one. The
+  pane is in the runtime, so the fallback that reads it locally is deliberately
+  not attempted — on a hybrid host it would report one of the *server's*
+  directories as the agent's.
+
+Before this was fixed, `/sessions` enumerated only the server's own tmux, which
+this pod does not run: it answered `[]` with four live agents in executor pods.
 
 <a id="version-compatibility"></a>
 ## Version compatibility and upgrades
