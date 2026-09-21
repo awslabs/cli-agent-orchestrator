@@ -1033,8 +1033,13 @@ def test_a_config_this_process_creates_is_owner_only(tmp_path, monkeypatch):
     assert stat_mod.S_IMODE(cfg.stat().st_mode) == 0o600
 
 
-def test_a_config_the_user_already_owns_keeps_their_mode(tmp_path, monkeypatch):
-    """Tightening a file the user created is their decision, not ours."""
+def test_an_existing_world_readable_config_is_tightened(tmp_path, monkeypatch):
+    """0600 is a property of what the file holds, not an operator preference.
+
+    This used to read the old mode back and reapply it, so a config predating the
+    rule — or one another tool created 0644 — kept the CAO_RUNTIME_TOKEN this very
+    write put into it readable by every local account (Copilot review on #802).
+    """
     import stat as stat_mod
 
     cfg = tmp_path / "mcp_config.json"
@@ -1043,7 +1048,7 @@ def test_a_config_the_user_already_owns_keeps_their_mode(tmp_path, monkeypatch):
     _write_agy_config(
         tmp_path, {"cao-mcp-server": {"command": "cao-mcp-server", "args": []}}, monkeypatch
     )
-    assert stat_mod.S_IMODE(cfg.stat().st_mode) == 0o644
+    assert stat_mod.S_IMODE(cfg.stat().st_mode) == 0o600
 
 
 # --------------------------------------------------------------------------- #

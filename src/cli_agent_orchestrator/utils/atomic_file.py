@@ -367,6 +367,46 @@ def locked_atomic_delete(
         target.unlink()
 
 
+def write_owner_only(target: Path, content: str, encoding: str = "utf-8") -> None:
+    """Publish ``content`` to ``target`` so it is NEVER readable by anyone else.
+
+    For files that structurally carry a credential — a provider's MCP config
+    holding ``CAO_RUNTIME_TOKEN`` (#745) — where 0600 is a property of the file's
+    contents rather than a preference the operator may have overridden. That rules
+    out both of the patterns used elsewhere here:
+
+    - ``write_text`` then ``chmod(0o600)`` narrows the file only AFTER the whole
+      credential-bearing body has been flushed at the umask-default mode. On a
+      shared host another local account can open it inside that window and keep
+      reading through the descriptor afterwards.
+    - :func:`_atomic_publish` deliberately PRESERVES an existing file's mode, which
+      is right for user-authored files and wrong here: a config that predates this
+      rule, or that some other tool created 0644, stays world-readable with a token
+      inside it.
+
+    ``tempfile.mkstemp`` creates the temp at 0600 by construction, so the bytes are
+    owner-only from the first one written; the mode is never widened, and
+    ``os.replace`` publishes atomically. Callers wanting mode preservation want
+    :func:`locked_atomic_write` instead (Copilot review on #802).
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(
+        dir=str(target.parent),
+        prefix=f".{target.name}.",
+        suffix=".tmp",
+    )
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, target)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            temp_path.unlink()
+
+
 def _atomic_publish(target: Path, content: str, encoding: str) -> None:
     """Write ``content`` to ``target`` via a unique temp file + ``os.replace``.
 

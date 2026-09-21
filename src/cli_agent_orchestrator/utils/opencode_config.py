@@ -11,11 +11,11 @@ invocations are not a supported scenario.
 
 import json
 import logging
-import os
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Set
 
 from cli_agent_orchestrator.constants import OPENCODE_CONFIG_DIR, OPENCODE_CONFIG_FILE, SKILLS_DIR
+from cli_agent_orchestrator.utils.atomic_file import write_owner_only
 from cli_agent_orchestrator.utils.mcp_resolution import (
     resolve_cao_mcp_command,
     shared_endpoint_child_env_for,
@@ -122,13 +122,15 @@ def write_config(data: Dict[str, Any]) -> None:
     world-readable, which on a shared host hands the token to every local
     account (Copilot review on #802, finding 8). Applied on the existing file
     too, so an install predating this does not stay open.
+
+    Owner-only from the FIRST byte rather than chmodded after the fact: writing
+    the body and then narrowing the mode leaves a window in which another local
+    account can open the finished credential-bearing file, and a descriptor it
+    obtained there keeps reading long after the chmod. ``write_owner_only``
+    publishes through a temp file that is 0600 by construction (second Copilot
+    review on #802).
     """
-    OPENCODE_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    OPENCODE_CONFIG_FILE.write_text(
-        json.dumps(data, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    os.chmod(OPENCODE_CONFIG_FILE, 0o600)
+    write_owner_only(OPENCODE_CONFIG_FILE, json.dumps(data, indent=2) + "\n")
 
 
 def translate_mcp_server_config(cao_config: Dict[str, Any]) -> Dict[str, Any]:
