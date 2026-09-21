@@ -1083,6 +1083,187 @@ kubectl -n cao-cluster exec cao-server-0 -- \
   cao memory delete elastic-demo-shared --scope project --yes
 ```
 
+## Run the assign example on a runtime
+
+`examples/assign/` is the in-session orchestration example: a supervisor that
+**assigns** to a worker (async, callback by `send_message`) and **hands off** to
+another (blocking). Everything below runs unmodified here — the point of the
+walkthrough is that `assign` and `handoff` place their workers in the pod where
+the *calling* agent already runs, so the supervisor and its workers end up as
+sibling windows in one tmux session inside `cao-supervisor-0`, not in the server
+container.
+
+Verified on this cluster with Claude Code on Bedrock; the transcript at the end of
+this section is from that run.
+
+**Step 1 — stage the three profiles in both pods.** The runtime needs them because
+the provider reads the profile when it starts the pane; the *server* needs them
+too, because a delegation resolves the target's provider from the server's profile
+store. `provider: claude_code` must be pinned in the frontmatter of all three —
+an unpinned profile falls back to `DEFAULT_PROVIDER` (`kiro_cli`), which is not in
+this image.
+
+```bash
+# Pin the provider in local copies, then push them into each pod's agent store.
+mkdir -p /tmp/assign-profiles
+for f in analysis_supervisor data_analyst report_generator; do
+  python3 - "$f" <<'PY'
+import pathlib, sys
+name = sys.argv[1]
+text = pathlib.Path(f"examples/assign/{name}.md").read_text()
+if "\nprovider:" not in text:
+    head, sep, body = text.partition("\n---\n")   # end of frontmatter
+    text = head + "\nprovider: claude_code" + sep + body
+pathlib.Path(f"/tmp/assign-profiles/{name}.md").write_text(text)
+PY
+done
+
+for pod in cao-server-0 cao-supervisor-0; do
+  for f in analysis_supervisor data_analyst report_generator; do
+    kubectl -n cao-cluster exec -i "$pod" -c cao-node -- \
+      sh -c "cat > /home/cao/.cao/state/agent-store/$f.md" < "/tmp/assign-profiles/$f.md"
+  done
+done
+```
+
+`/home/cao/.cao/state` is `CAO_HOME_DIR`, so `agent-store/` there is what `cao
+install` writes to. Two things that will bite otherwise: `/home/cao/workspace` is
+the **read-only** EFS mount in `cao-server-0` (write the dataset under
+`CAO_HOME_DIR` instead), and the supervisor's state volume is an `emptyDir`, so
+replacing that pod discards the profiles and they must be re-staged.
+
+**Step 2 — give the agents something real to analyse.** A file both the analyst
+and the supervisor can read, in a directory that is writable in both pods:
+
+```bash
+for pod in cao-server-0 cao-supervisor-0; do
+  kubectl -n cao-cluster exec -i "$pod" -c cao-node -- \
+    sh -c 'mkdir -p /home/cao/.cao/state/assign-demo &&
+           cat > /home/cao/.cao/state/assign-demo/sales_q1.csv' <<'CSV'
+region,month,units,revenue
+north,jan,120,24000
+north,feb,90,18500
+north,mar,140,29000
+south,jan,200,41000
+south,feb,210,43500
+south,mar,180,37000
+west,jan,60,13000
+west,feb,75,15500
+west,mar,110,23000
+CSV
+done
+```
+
+**Step 3 — launch the supervisor onto the runtime.** `POST
+/runtimes/cao-supervisor-0/terminals` on the central server: the path names where
+the agent runs, the host names who owns the record.
+
+```bash
+kubectl -n cao-cluster exec -i cao-server-0 -c cao-node -- python - <<'PY'
+import requests
+
+task = """
+Read /home/cao/.cao/state/assign-demo/sales_q1.csv. Then, using your MCP tools
+and without doing the work yourself:
+
+1. assign to agent_profile="data_analyst": have it compute revenue by region,
+   the best region, revenue by month and the strongest month from that CSV, and
+   send the numbers back with send_message.
+2. handoff to agent_profile="report_generator": have it write a template with
+   Summary / Regional Breakdown / Recommendation sections to
+   /home/cao/.cao/state/assign-demo/report_template.md and return the contents.
+3. End your turn after both calls. Do not sleep or poll -- the analyst's callback
+   is delivered to your inbox when you are idle. When it arrives, combine it with
+   the template into the final report.
+"""
+
+r = requests.post(
+    "http://localhost:9889/runtimes/cao-supervisor-0/terminals",
+    json={
+        "agent_profile": "analysis_supervisor",
+        "provider": "claude_code",
+        "working_directory": "/home/cao/.cao/state/assign-demo",
+        "initial_message": task,
+    },
+    timeout=240,   # launch travels the channel, then the provider starts in the pod
+)
+r.raise_for_status()
+print(r.json()["id"], r.json()["session_name"])
+PY
+```
+
+**Step 4 — watch the workers land beside the supervisor.** This is the behaviour
+the section exists to show. The supervisor's `assign`/`handoff` reach the server as
+`POST /sessions/{session}/terminals`, and the server forwards each to the runtime
+holding the caller instead of adding a window to its own (nonexistent) tmux:
+
+```bash
+# The three agents, one session, one runtime -- caller_id is what a callback routes by.
+kubectl -n cao-cluster exec cao-server-0 -c cao-node -- python -c "
+import requests
+for t in requests.get('http://localhost:9889/sessions/<session>/terminals', timeout=30).json():
+    d = requests.get(f\"http://localhost:9889/terminals/{t['id']}\", timeout=30).json()
+    print(d['id'], d['agent_profile'], d['session_name'],
+          'caller=%s' % d['caller_id'], (d['metadata'] or {}).get('runtime_id'), d['status'])
+"
+
+# Sibling windows, in the runtime pod:
+kubectl -n cao-cluster exec cao-supervisor-0 -c cao-node -- tmux list-windows -t '<session>'
+
+# And the launches themselves, 201 rather than the 404 this used to be:
+kubectl -n cao-cluster logs cao-server-0 -c cao-node | grep 'POST /sessions/<session>/terminals'
+```
+
+**Step 5 — verify by artifact, not by reported status.** Three independent
+signals, each produced by a different agent:
+
+```bash
+# The handoff's file, written inside the runtime pod:
+kubectl -n cao-cluster exec cao-supervisor-0 -c cao-node -- \
+  cat /home/cao/.cao/state/assign-demo/report_template.md
+
+# The assign's callback, in the supervisor's inbox on the central server:
+kubectl -n cao-cluster exec cao-server-0 -c cao-node -- python -c "
+import requests
+for m in requests.get('http://localhost:9889/terminals/<supervisor-id>/inbox/messages', timeout=30).json():
+    print(m['id'], m['status'], 'from', m['sender_id'], '|', m['message'][:80])
+"
+
+# The supervisor's own final report:
+kubectl -n cao-cluster exec cao-supervisor-0 -c cao-node -- \
+  tmux capture-pane -p -t '<session>:0' -S -80
+```
+
+Check the arithmetic against the CSV rather than accepting a plausible-looking
+report — an agent that invents numbers and an agent that read the file produce
+equally confident prose. On the verified run: North $71,500 / South $121,500 /
+West $51,500, total $244,500, March strongest at $89,000, which is what summing
+the rows above gives.
+
+What that run produced, for comparison:
+
+```
+dabd53c5 analysis_supervisor cao-assign-745 caller=None     cao-supervisor-0 completed
+ff8fff81 data_analyst        cao-assign-745 caller=dabd53c5 cao-supervisor-0 completed
+4294b1b1 report_generator    cao-assign-745 caller=dabd53c5 cao-supervisor-0 completed
+
+0: analysis_supervisor-4ead* (1 panes)
+1: data_analyst-8788 (1 panes)
+2: report_generator-dd40 (1 panes)
+
+5 delivered from ff8fff81 | Q1 Sales Analysis: Revenue by Region: - North: $71,500 …
+6 delivered from 4294b1b1 | # Report ## Summary [Overview of findings and key insights] …
+```
+
+Two failure modes worth recognising rather than debugging blind. A worker that
+finishes its work but answers **in its own pane** instead of calling
+`send_message` leaves the supervisor waiting with nothing in its inbox — that is
+prompt behaviour, not routing, and telling the worker explicitly to use the tool
+fixes it. And `idempotency_key` on an in-session assign from a remote caller is
+answered `400`, deliberately: there is no key table behind a remote launch, so
+honouring it would promise that a retry returns the first worker when it would
+mint a second.
+
 ## Cleanup
 
 Order matters, because every PV here is `Retain`. Deleting the namespace or the
