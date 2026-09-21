@@ -20,7 +20,7 @@ whose verified subject replaces the header entirely.
 import contextvars
 import os
 import re
-from typing import Optional
+from typing import Optional, Union
 
 _TERMINAL_ID_PATTERN = re.compile(r"^[a-f0-9]{8}$")
 
@@ -28,7 +28,24 @@ _TERMINAL_ID_PATTERN = re.compile(r"^[a-f0-9]{8}$")
 # trusted once the request has passed the shared-token gate.
 CALLER_TERMINAL_HEADER = "x-cao-caller-terminal-id"
 
-_caller_terminal_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+
+class _Anonymous:
+    """A request IS in flight and it named no caller.
+
+    Distinct from the ContextVar's ``None`` default, which means no request is
+    in flight at all (the stdio path). Storing ``None`` for both made a
+    headerless HTTP request indistinguishable from stdio, so it fell through to
+    the process-global ``CAO_TERMINAL_ID`` and acted as whichever agent happens
+    to own the hosting process — review finding 7 on #802.
+    """
+
+    def __repr__(self) -> str:  # pragma: no cover — debugging aid
+        return "<anonymous caller>"
+
+
+_ANONYMOUS = _Anonymous()
+
+_caller_terminal_id: contextvars.ContextVar[Union[str, _Anonymous, None]] = contextvars.ContextVar(
     "cao_caller_terminal_id", default=None
 )
 
@@ -46,8 +63,13 @@ def _validate(terminal_id: str) -> str:
 
 
 def set_caller_terminal_id(terminal_id: Optional[str]) -> contextvars.Token:
-    """Bind the caller terminal id for the current request. Returns a reset token."""
-    value = _validate(terminal_id) if terminal_id else None
+    """Bind the caller terminal id for the current request. Returns a reset token.
+
+    Call this once per request even when the request names no caller: passing
+    ``None`` marks the request anonymous, which is what stops it from borrowing
+    the hosting process's ``CAO_TERMINAL_ID``.
+    """
+    value: Union[str, _Anonymous] = _validate(terminal_id) if terminal_id else _ANONYMOUS
     return _caller_terminal_id.set(value)
 
 
@@ -58,6 +80,16 @@ def reset_caller_terminal_id(token: contextvars.Token) -> None:
 def resolve_caller_terminal_id() -> Optional[str]:
     """The caller's terminal id: per-request context first, then process env.
 
+    Three outcomes, and the middle one is the point:
+
+    * a request bound an id → that id;
+    * a request is in flight and bound none → ``None``. The env var is NOT
+      consulted, because on a shared endpoint it names the agent that happens
+      to host the process, not the one that called. Answering with it would let
+      a headerless request read and write another agent's terminal.
+    * no request in flight → ``CAO_TERMINAL_ID`` (the stdio path, one process
+      per agent, byte-for-byte unchanged).
+
     A pure lookup — it does not validate the env value, preserving the existing
     leniency of the direct-env callers (``_own_terminal_id_or_error`` and the
     discovery/metadata impls). The per-request value was already validated at
@@ -66,6 +98,8 @@ def resolve_caller_terminal_id() -> Optional[str]:
     ``None`` means no caller identity is available.
     """
     ctx_value = _caller_terminal_id.get()
-    if ctx_value is not None:
+    if isinstance(ctx_value, str):
         return ctx_value
+    if ctx_value is _ANONYMOUS:
+        return None
     return os.environ.get("CAO_TERMINAL_ID") or None
