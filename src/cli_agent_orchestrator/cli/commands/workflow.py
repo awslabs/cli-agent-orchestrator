@@ -37,6 +37,7 @@ from cli_agent_orchestrator.constants import (
     WORKFLOW_RUN_REQUEST_TIMEOUT,
     WORKFLOW_STEP_REQUEST_TIMEOUT,
 )
+from cli_agent_orchestrator.utils.remote_server import auth_headers
 from cli_agent_orchestrator.utils.workflow_events import SseFrame, parse_sse_frames
 
 # Whole-run states that end the follow/poll loop (mirror ``RunState``'s terminal
@@ -77,6 +78,7 @@ def validate_cmd(file, as_json):
             f"{API_BASE_URL}/workflows/validate",
             json={"path": file},
             timeout=MCP_REQUEST_TIMEOUT,
+            headers=auth_headers(),
         )
     except requests.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
@@ -115,7 +117,10 @@ def list_cmd(scan_dir, as_json):
         params["dir"] = scan_dir
     try:
         response = requests.get(
-            f"{API_BASE_URL}/workflows", params=params, timeout=MCP_REQUEST_TIMEOUT
+            f"{API_BASE_URL}/workflows",
+            params=params,
+            timeout=MCP_REQUEST_TIMEOUT,
+            headers=auth_headers(),
         )
     except requests.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
@@ -153,7 +158,9 @@ def list_cmd(scan_dir, as_json):
 def get_cmd(name, as_json):
     """Show the parsed/validated spec for a workflow name or file path."""
     try:
-        response = requests.get(f"{API_BASE_URL}/workflows/{name}", timeout=MCP_REQUEST_TIMEOUT)
+        response = requests.get(
+            f"{API_BASE_URL}/workflows/{name}", timeout=MCP_REQUEST_TIMEOUT, headers=auth_headers()
+        )
     except requests.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
@@ -210,6 +217,7 @@ def approve_cmd(plan_id, as_json):
             # verbatim, because a normalisation is how two distinct plans could share one approval.
             json={"plan_id": plan_id},
             timeout=MCP_REQUEST_TIMEOUT,
+            headers=auth_headers(),
         )
     except requests.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
@@ -244,7 +252,9 @@ def delete_cmd(name, yes):
     if not yes:
         click.confirm(f"Delete workflow '{name}'?", abort=True)
     try:
-        response = requests.delete(f"{API_BASE_URL}/workflows/{name}", timeout=MCP_REQUEST_TIMEOUT)
+        response = requests.delete(
+            f"{API_BASE_URL}/workflows/{name}", timeout=MCP_REQUEST_TIMEOUT, headers=auth_headers()
+        )
     except requests.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
@@ -426,7 +436,9 @@ def _poll_to_terminal(run_id, as_json):
     while True:
         try:
             response = requests.get(
-                f"{API_BASE_URL}/workflows/runs/{run_id}", timeout=MCP_REQUEST_TIMEOUT
+                f"{API_BASE_URL}/workflows/runs/{run_id}",
+                timeout=MCP_REQUEST_TIMEOUT,
+                headers=auth_headers(),
             )
         except requests.exceptions.RequestException as e:
             transport_failures += 1
@@ -513,6 +525,7 @@ def run_cmd(name_or_path, inputs, run_id, detach, wait, as_json):
                 f"{API_BASE_URL}/workflows/runs",
                 json=payload,
                 timeout=WORKFLOW_RUN_REQUEST_TIMEOUT,
+                headers=auth_headers(),
             )
         except requests.exceptions.RequestException as e:
             raise click.ClickException(f"could not reach cao-server: {e}")
@@ -536,6 +549,7 @@ def run_cmd(name_or_path, inputs, run_id, detach, wait, as_json):
             f"{API_BASE_URL}/workflows/runs:submit",
             json=payload,
             timeout=MCP_REQUEST_TIMEOUT,
+            headers=auth_headers(),
         )
     except requests.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
@@ -610,6 +624,7 @@ def _resolve_latest_run_id():
             f"{API_BASE_URL}/workflows/runs",
             params={"limit": 1},
             timeout=MCP_REQUEST_TIMEOUT,
+            headers=auth_headers(),
         )
     except requests.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
@@ -638,7 +653,9 @@ def status_cmd(run_id, as_json):
 
     try:
         response = requests.get(
-            f"{API_BASE_URL}/workflows/runs/{run_id}", timeout=MCP_REQUEST_TIMEOUT
+            f"{API_BASE_URL}/workflows/runs/{run_id}",
+            timeout=MCP_REQUEST_TIMEOUT,
+            headers=auth_headers(),
         )
     except requests.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
@@ -673,7 +690,10 @@ def runs_cmd(state, limit, as_json):
         params["limit"] = limit
     try:
         response = requests.get(
-            f"{API_BASE_URL}/workflows/runs", params=params, timeout=MCP_REQUEST_TIMEOUT
+            f"{API_BASE_URL}/workflows/runs",
+            params=params,
+            timeout=MCP_REQUEST_TIMEOUT,
+            headers=auth_headers(),
         )
     except requests.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
@@ -731,7 +751,9 @@ def result_cmd(run_id, as_json):
     """Show the complete retained result for a (finished or in-flight) run."""
     try:
         response = requests.get(
-            f"{API_BASE_URL}/workflows/runs/{run_id}/result", timeout=MCP_REQUEST_TIMEOUT
+            f"{API_BASE_URL}/workflows/runs/{run_id}/result",
+            timeout=MCP_REQUEST_TIMEOUT,
+            headers=auth_headers(),
         )
     except requests.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
@@ -789,6 +811,7 @@ def resume_cmd(run_id, decide, as_json):
             f"{API_BASE_URL}/workflows/runs/{run_id}/resume",
             json={"decisions": decisions} if decisions else None,
             timeout=WORKFLOW_RUN_REQUEST_TIMEOUT,
+            headers=auth_headers(),
         )
     except requests.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
@@ -906,6 +929,7 @@ def step_cmd(run_id, step_id, prompt_file, prompt_override, as_json):
             f"{API_BASE_URL}/workflows/runs/{run_id}/steps/{step_id}:replay",
             json=payload,
             timeout=WORKFLOW_STEP_REQUEST_TIMEOUT,
+            headers=auth_headers(),
         )
     except requests.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
@@ -933,7 +957,9 @@ def cancel_cmd(run_id):
     """Cooperatively cancel a running workflow."""
     try:
         response = requests.post(
-            f"{API_BASE_URL}/workflows/runs/{run_id}/cancel", timeout=MCP_REQUEST_TIMEOUT
+            f"{API_BASE_URL}/workflows/runs/{run_id}/cancel",
+            timeout=MCP_REQUEST_TIMEOUT,
+            headers=auth_headers(),
         )
     except requests.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
@@ -992,7 +1018,11 @@ def _events_route_or_run_missing(run_id: str) -> click.ClickException:
     than asserting a server capability it could not verify.
     """
     try:
-        probe = requests.get(f"{API_BASE_URL}/workflows/runs/{run_id}", timeout=MCP_REQUEST_TIMEOUT)
+        probe = requests.get(
+            f"{API_BASE_URL}/workflows/runs/{run_id}",
+            timeout=MCP_REQUEST_TIMEOUT,
+            headers=auth_headers(),
+        )
     except requests.exceptions.RequestException:
         return click.ClickException(f"unknown run '{run_id}'")
     if probe.status_code == 200:
@@ -1108,7 +1138,9 @@ def _final_events_status(run_id: str):
     """
     try:
         response = requests.get(
-            f"{API_BASE_URL}/workflows/runs/{run_id}", timeout=MCP_REQUEST_TIMEOUT
+            f"{API_BASE_URL}/workflows/runs/{run_id}",
+            timeout=MCP_REQUEST_TIMEOUT,
+            headers=auth_headers(),
         )
     except requests.exceptions.RequestException:
         return None
@@ -1133,6 +1165,7 @@ def _events_batch_read(run_id: str, after_seq, as_json: bool) -> None:
             f"{API_BASE_URL}/workflows/runs/{run_id}/events",
             params=params,
             timeout=MCP_REQUEST_TIMEOUT,
+            headers=auth_headers(),
         )
     except requests.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")

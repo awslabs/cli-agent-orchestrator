@@ -12,6 +12,7 @@ from cli_agent_orchestrator.constants import (
     SERVER_PORT,
     SESSION_PREFIX,
 )
+from cli_agent_orchestrator.utils.remote_server import auth_headers
 
 
 @click.command()
@@ -42,7 +43,7 @@ def info():
             try:
                 # Call API to get session details
                 url = f"http://{SERVER_HOST}:{SERVER_PORT}/sessions/{session_name}"
-                response = requests.get(url)
+                response = requests.get(url, headers=auth_headers())
 
                 if response.status_code == 200:
                     data = response.json()

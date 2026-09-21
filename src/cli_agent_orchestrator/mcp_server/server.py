@@ -110,7 +110,9 @@ def _send_user_prompt_answer(terminal_id: str, answer: str) -> Dict[str, Any]:
 
     try:
         status_response = requests.get(
-            f"{API_BASE_URL}/terminals/{terminal_id}", timeout=_mcp_timeout()
+            f"{API_BASE_URL}/terminals/{terminal_id}",
+            timeout=_mcp_timeout(),
+            headers=_auth_headers() or None,
         )
         status_response.raise_for_status()
         terminal = status_response.json()
@@ -138,6 +140,7 @@ def _send_user_prompt_answer(terminal_id: str, answer: str) -> Dict[str, Any]:
                 "sender_id": resolve_caller_terminal_id() or "supervisor",
             },
             timeout=_mcp_timeout(),
+            headers=_auth_headers() or None,
         )
         response.raise_for_status()
         return {
@@ -166,6 +169,7 @@ def _try_send_hermes_prompt_answer(terminal_id: str, answer: str) -> Optional[Di
         f"{API_BASE_URL}/terminals/{terminal_id}/output",
         params={"mode": "full"},
         timeout=_mcp_timeout(),
+        headers=_auth_headers() or None,
     )
     output_response.raise_for_status()
     output = output_response.json().get("output", "")
@@ -211,6 +215,7 @@ def _send_terminal_key(terminal_id: str, key: str) -> None:
         f"{API_BASE_URL}/terminals/{terminal_id}/key",
         params={"key": key},
         timeout=_mcp_timeout(),
+        headers=_auth_headers() or None,
     )
     response.raise_for_status()
 
@@ -223,6 +228,7 @@ def _send_terminal_input(terminal_id: str, message: str) -> None:
             "sender_id": resolve_caller_terminal_id() or "supervisor",
         },
         timeout=_mcp_timeout(),
+        headers=_auth_headers() or None,
     )
     response.raise_for_status()
 
@@ -230,7 +236,9 @@ def _send_terminal_input(terminal_id: str, message: str) -> None:
 def _load_skill_impl(name: str) -> Union[str, Dict[str, Any]]:
     """Fetch a skill body from cao-server and return content or a structured error."""
     try:
-        response = requests.get(f"{API_BASE_URL}/skills/{name}", timeout=_mcp_timeout())
+        response = requests.get(
+            f"{API_BASE_URL}/skills/{name}", timeout=_mcp_timeout(), headers=_auth_headers() or None
+        )
         response.raise_for_status()
         return response.json()["content"]
     except requests.HTTPError as exc:
@@ -929,6 +937,7 @@ async def emit_ui(
             "terminal_id": terminal_id,
         },
         timeout=_mcp_timeout(),
+        headers=_auth_headers() or None,
     )
     if response.status_code == 400:
         raise ValueError(_extract_error_detail(response, "invalid UI intent"))
@@ -1143,7 +1152,9 @@ def _require_discovery_marker(own_terminal_id: str, action: str) -> Optional[Dic
     """
     try:
         response = requests.get(
-            f"{API_BASE_URL}/terminals/{own_terminal_id}", timeout=_mcp_timeout()
+            f"{API_BASE_URL}/terminals/{own_terminal_id}",
+            timeout=_mcp_timeout(),
+            headers=_auth_headers() or None,
         )
         response.raise_for_status()
         allowed_tools = response.json().get("allowed_tools")
@@ -1193,6 +1204,7 @@ def _list_siblings_impl(depth: Optional[int], cross_session: bool = False) -> Di
             f"{API_BASE_URL}/terminals/{own_terminal_id}/siblings",
             params=params,
             timeout=_mcp_timeout(),
+            headers=_auth_headers() or None,
         )
         response.raise_for_status()
         return {"success": True, "siblings": response.json()}
@@ -1218,6 +1230,7 @@ def _update_metadata_impl(metadata: Dict[str, Any]) -> Dict[str, Any]:
             f"{API_BASE_URL}/terminals/{own_terminal_id}/metadata",
             json={"metadata": metadata},
             timeout=_mcp_timeout(),
+            headers=_auth_headers() or None,
         )
         response.raise_for_status()
         return {"success": True, "metadata": response.json().get("metadata")}
@@ -2133,6 +2146,7 @@ async def workflow_return(
             f"{API_BASE_URL}/workflows/runs/{run_id}/steps/{step_id}/output",
             json=payload,
             timeout=_mcp_timeout(),
+            headers=_auth_headers() or None,
         )
     except requests.RequestException as e:
         return ReturnAck(
@@ -2210,6 +2224,7 @@ async def workflow_run(
             f"{API_BASE_URL}/workflows/runs",
             json=payload,
             timeout=WORKFLOW_RUN_REQUEST_TIMEOUT,
+            headers=_auth_headers() or None,
         )
     except requests.RequestException as e:
         return {"ok": False, "error": f"could not reach cao-server: {e}"}
@@ -2297,6 +2312,7 @@ async def workflow_resume(
             f"{API_BASE_URL}/workflows/runs/{run_id}/resume",
             json={"decisions": dict(supplied)} if supplied else None,
             timeout=WORKFLOW_RUN_REQUEST_TIMEOUT,
+            headers=_auth_headers() or None,
         )
     except requests.RequestException as e:
         return {"ok": False, "error": f"could not reach cao-server: {e}"}
@@ -2329,6 +2345,7 @@ async def workflow_cancel(
         response = requests.post(
             f"{API_BASE_URL}/workflows/runs/{run_id}/cancel",
             timeout=_mcp_timeout(),
+            headers=_auth_headers() or None,
         )
     except requests.RequestException as e:
         return {"ok": False, "error": f"could not reach cao-server: {e}"}
@@ -2394,6 +2411,7 @@ async def workflow_start(
             f"{API_BASE_URL}/workflows/runs:submit",
             json=payload,
             timeout=_mcp_timeout(),
+            headers=_auth_headers() or None,
         )
     except requests.RequestException as e:
         return {"ok": False, "error": f"could not reach cao-server: {e}"}
@@ -2447,6 +2465,7 @@ async def workflow_plan_approval(
         response = requests.get(
             f"{API_BASE_URL}/workflows/runs/{run_id}/plan",
             timeout=_mcp_timeout(),
+            headers=_auth_headers() or None,
         )
     except requests.RequestException as e:
         return {"ok": False, "error": f"could not reach cao-server: {e}"}
@@ -2483,6 +2502,7 @@ async def workflow_status(
         response = requests.get(
             f"{API_BASE_URL}/workflows/runs/{run_id}",
             timeout=_mcp_timeout(),
+            headers=_auth_headers() or None,
         )
     except requests.RequestException as e:
         return {"ok": False, "error": f"could not reach cao-server: {e}"}
@@ -2523,6 +2543,7 @@ async def workflow_result(
         response = requests.get(
             f"{API_BASE_URL}/workflows/runs/{run_id}/result",
             timeout=_mcp_timeout(),
+            headers=_auth_headers() or None,
         )
     except requests.RequestException as e:
         return {"ok": False, "error": f"could not reach cao-server: {e}"}
@@ -2556,6 +2577,7 @@ async def workflow_list(
             f"{API_BASE_URL}/workflows/runs",
             params=params,
             timeout=_mcp_timeout(),
+            headers=_auth_headers() or None,
         )
     except requests.RequestException as e:
         return {"ok": False, "error": f"could not reach cao-server: {e}"}
@@ -2593,6 +2615,7 @@ async def workflow_wait(
             response = requests.get(
                 f"{API_BASE_URL}/workflows/runs/{run_id}",
                 timeout=_mcp_timeout(),
+                headers=_auth_headers() or None,
             )
         except requests.RequestException as e:
             return {"ok": False, "error": f"could not reach cao-server: {e}"}
@@ -2619,6 +2642,7 @@ async def workflow_wait(
         result_response = requests.get(
             f"{API_BASE_URL}/workflows/runs/{run_id}/result",
             timeout=_mcp_timeout(),
+            headers=_auth_headers() or None,
         )
     except requests.RequestException as e:
         return {"ok": False, "error": f"could not reach cao-server: {e}"}
@@ -2657,7 +2681,11 @@ def _classify_events_404(run_id: str, detail: str) -> tuple:
     than asserting a server capability it could not verify.
     """
     try:
-        probe = requests.get(f"{API_BASE_URL}/workflows/runs/{run_id}", timeout=_mcp_timeout())
+        probe = requests.get(
+            f"{API_BASE_URL}/workflows/runs/{run_id}",
+            timeout=_mcp_timeout(),
+            headers=_auth_headers() or None,
+        )
     except requests.RequestException:
         return detail, False
     if probe.status_code == 200:

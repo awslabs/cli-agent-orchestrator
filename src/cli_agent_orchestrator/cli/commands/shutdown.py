@@ -4,11 +4,12 @@ import click
 import requests
 
 from cli_agent_orchestrator.constants import API_BASE_URL
+from cli_agent_orchestrator.utils.remote_server import auth_headers
 
 
 def _list_sessions():
     try:
-        response = requests.get(f"{API_BASE_URL}/sessions")
+        response = requests.get(f"{API_BASE_URL}/sessions", headers=auth_headers())
         response.raise_for_status()
         return response.json()
     except requests.exceptions.RequestException as e:
@@ -17,7 +18,7 @@ def _list_sessions():
 
 def _delete_session(name):
     try:
-        response = requests.delete(f"{API_BASE_URL}/sessions/{name}")
+        response = requests.delete(f"{API_BASE_URL}/sessions/{name}", headers=auth_headers())
         if response.status_code == 404:
             click.echo(f"Session '{name}' already removed", err=True)
             return False

@@ -256,7 +256,9 @@ def _wait_remote_ready(base_url: str, timeout: float) -> None:
     while True:
         attempt += 1
         try:
-            response = requests.get(f"{base_url}/health", timeout=(2.0, 5.0))
+            response = requests.get(
+                f"{base_url}/health", timeout=(2.0, 5.0), headers=_auth_headers() or None
+            )
             if response.status_code < 400:
                 if attempt > 1:
                     logger.info("Remote node %s answered /health on attempt %d", base_url, attempt)
@@ -302,6 +304,7 @@ def _resolve_remote_provider(base_url: str, agent_profile: str) -> str:
         response = requests.get(
             f"{base_url}/agents/profiles/{agent_profile}",
             timeout=(REMOTE_CONNECT_TIMEOUT, _mcp_timeout()),
+            headers=_auth_headers() or None,
         )
     except requests.RequestException as exc:
         raise ValueError(
@@ -336,6 +339,7 @@ def _cleanup_remote_terminal(base_url: str, terminal_id: str) -> bool:
         response = requests.delete(
             f"{base_url}/terminals/{terminal_id}",
             timeout=(REMOTE_CONNECT_TIMEOUT, _mcp_timeout()),
+            headers=_auth_headers() or None,
         )
         if response.status_code == 404:
             return True
@@ -1476,6 +1480,7 @@ def _assign_remote(
             },
         },
         timeout=(REMOTE_CONNECT_TIMEOUT, _mcp_timeout()),
+        headers=_auth_headers() or None,
     )
     if response.status_code >= 400:
         # Surface the remote node's JSON detail (e.g. a 429 "Terminal limit
@@ -1547,7 +1552,9 @@ def _wait_runtime_connected(runtime_id: str, wait_seconds: float) -> None:
     last_error: Optional[str] = None
     while time.monotonic() < deadline:
         try:
-            response = requests.get(f"{API_BASE_URL}/runtimes", timeout=(5, 10))
+            response = requests.get(
+                f"{API_BASE_URL}/runtimes", timeout=(5, 10), headers=_auth_headers() or None
+            )
             response.raise_for_status()
             if runtime_id in response.json().get("runtimes", {}):
                 return
@@ -1639,6 +1646,7 @@ def _assign_bridge(
         f"{API_BASE_URL}/runtimes/{runtime_id}/terminals",
         json=body,
         timeout=(REMOTE_CONNECT_TIMEOUT, 300),
+        headers=_auth_headers() or None,
     )
     if response.status_code >= 400:
         detail = _extract_error_detail(response, f"status {response.status_code}")

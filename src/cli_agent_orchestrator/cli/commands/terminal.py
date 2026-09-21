@@ -25,7 +25,7 @@ def restore(terminal_id: str):
     working directory and loads the saved scrollback history into the pane.
     The session must still exist.
     """
-    from cli_agent_orchestrator.utils.remote_server import require_local
+    from cli_agent_orchestrator.utils.remote_server import auth_headers, require_local
 
     # Restore reads snapshot/scrollback files the server wrote and creates a
     # tmux window on the surviving runtime — both live beside the server, so
@@ -48,7 +48,7 @@ def restore(terminal_id: str):
 
     # Verify session exists
     try:
-        response = requests.get(f"{API_BASE_URL}/sessions/{session_name}")
+        response = requests.get(f"{API_BASE_URL}/sessions/{session_name}", headers=auth_headers())
         if response.status_code == 404:
             raise click.ClickException(
                 f"Session '{session_name}' no longer exists. Cannot restore."

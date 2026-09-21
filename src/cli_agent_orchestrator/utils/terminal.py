@@ -12,6 +12,7 @@ import requests
 
 from cli_agent_orchestrator.constants import API_BASE_URL, SESSION_PREFIX
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.utils.remote_server import auth_headers
 
 logger = logging.getLogger(__name__)
 
@@ -254,7 +255,7 @@ def sync_backend_from_server() -> None:
     from cli_agent_orchestrator.backends.registry import set_backend
 
     try:
-        resp = requests.get(f"{API_BASE_URL}/health", timeout=2.0)
+        resp = requests.get(f"{API_BASE_URL}/health", timeout=2.0, headers=auth_headers())
         resp.raise_for_status()
         data = resp.json()
         backend_name = data.get("terminal_backend")
@@ -320,7 +321,9 @@ def poll_until_done(
             else:
                 # Per-request timeout so a stalled server/network can't block past
                 # the outer timeout budget (matches wait_until_terminal_status).
-                resp = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=5.0)
+                resp = requests.get(
+                    f"{API_BASE_URL}/terminals/{terminal_id}", timeout=5.0, headers=auth_headers()
+                )
                 resp.raise_for_status()
                 status = resp.json().get("status")
             if status == TerminalStatus.COMPLETED.value:
@@ -390,7 +393,9 @@ def wait_until_terminal_status(
     while time.time() - start_time < timeout:
         poll_count += 1
         try:
-            response = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=5.0)
+            response = requests.get(
+                f"{API_BASE_URL}/terminals/{terminal_id}", timeout=5.0, headers=auth_headers()
+            )
             if response.status_code == 200:
                 current_status = response.json().get("status")
                 last_seen = current_status
