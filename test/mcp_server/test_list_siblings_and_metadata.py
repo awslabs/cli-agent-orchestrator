@@ -47,6 +47,7 @@ class TestListSiblingsImpl:
             "http://127.0.0.1:9889/terminals/caller-abc/siblings",
             params={},
             timeout=_mcp_timeout(),
+            headers=None,
         )
 
     @_PERMISSIVE_MARKER
@@ -64,6 +65,7 @@ class TestListSiblingsImpl:
             "http://127.0.0.1:9889/terminals/caller-abc/siblings",
             params={"depth": 2},
             timeout=_mcp_timeout(),
+            headers=None,
         )
 
     @_PERMISSIVE_MARKER
@@ -84,6 +86,7 @@ class TestListSiblingsImpl:
             "http://127.0.0.1:9889/terminals/caller-abc/siblings",
             params={"cross_session": "true"},
             timeout=_mcp_timeout(),
+            headers=None,
         )
 
     @_PERMISSIVE_MARKER
@@ -101,6 +104,7 @@ class TestListSiblingsImpl:
             "http://127.0.0.1:9889/terminals/caller-abc/siblings",
             params={},
             timeout=_mcp_timeout(),
+            headers=None,
         )
 
     def test_no_terminal_id_returns_error_without_network_call(self):
@@ -166,6 +170,7 @@ class TestUpdateMetadataImpl:
             "http://127.0.0.1:9889/terminals/caller-abc/metadata",
             json={"metadata": {"task": "reviewing PR"}},
             timeout=_mcp_timeout(),
+            headers=None,
         )
 
     def test_no_terminal_id_returns_error_without_network_call(self):

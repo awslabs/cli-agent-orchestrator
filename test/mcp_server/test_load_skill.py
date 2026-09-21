@@ -34,7 +34,9 @@ class TestLoadSkillImpl:
 
         assert result == "# Use pytest"
         mock_get.assert_called_once_with(
-            "http://127.0.0.1:9889/skills/python-testing", timeout=_mcp_timeout()
+            "http://127.0.0.1:9889/skills/python-testing",
+            timeout=_mcp_timeout(),
+            headers=None,
         )
 
     @patch("cli_agent_orchestrator.mcp_server.server.requests.get")
