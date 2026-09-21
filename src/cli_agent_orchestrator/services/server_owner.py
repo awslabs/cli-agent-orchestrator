@@ -49,13 +49,49 @@ OWNER_LOCK_PATH = DB_DIR / "server-owner.lock"
 
 _DISABLE_VALUES = frozenset({"0", "false", "no", "off"})
 
-# One fd per process, reference counted. flock is associated with the open file
-# description, not the process, so a second open() in this same process would
-# block against the first - which is what an app started twice in-process (the
-# test suite's TestClient, an embedded server) would do. Sharing the fd makes
-# re-entry a no-op instead of a self-deadlock.
-_lock_fd: Optional[int] = None
-_holders = 0
+# One fd per state directory, reference counted per directory. flock is
+# associated with the open file description, not the process, so a second open()
+# of the SAME file in this process would block against the first - which is what
+# an app started twice in-process (the test suite's TestClient, an embedded
+# server) would do. Sharing that fd makes re-entry a no-op instead of a
+# self-deadlock.
+#
+# Keyed by path, and not a single slot, because re-entry is only re-entry for the
+# directory already held. A second lock_path is a second state directory, and a
+# shared-slot refcount would hand it a success it never acquired - leaving that
+# directory free for another process to own at the same time, which is the exact
+# thing this module exists to prevent (Copilot review on #802).
+_locks: "dict[Path, _Claim]" = {}
+
+
+class _Claim:
+    """A held flock: the open descriptor plus how many callers depend on it."""
+
+    __slots__ = ("fd", "holders")
+
+    def __init__(self, fd: int) -> None:
+        self.fd = fd
+        self.holders = 1
+
+
+def _key(lock_path: Path) -> Path:
+    """Identity of a state directory for re-entry purposes.
+
+    Resolved, so ``/tmp/x`` and ``/private/tmp/x`` - the same file on macOS - are
+    one claim rather than two. Non-strict: the lock file need not exist yet.
+    """
+    return Path(lock_path).resolve()
+
+
+def holders_for(lock_path: Optional[Path] = None) -> int:
+    """How many callers currently depend on the claim on ``lock_path`` (0 if none)."""
+    claim = _locks.get(_key(lock_path or OWNER_LOCK_PATH))
+    return claim.holders if claim else 0
+
+
+def is_held(lock_path: Optional[Path] = None) -> bool:
+    """Whether this process holds the lock on ``lock_path``."""
+    return _key(lock_path or OWNER_LOCK_PATH) in _locks
 
 
 class ServerOwnershipError(RuntimeError):
@@ -109,9 +145,8 @@ def acquire_server_ownership(lock_path: Optional[Path] = None) -> bool:
     ``lock_path`` is resolved at call time, not bound as a default, so the
     module constant stays overridable.
     """
-    global _lock_fd, _holders
-
     lock_path = lock_path or OWNER_LOCK_PATH
+    key = _key(lock_path)
 
     if not ownership_enforced():
         logger.warning(
@@ -120,8 +155,9 @@ def acquire_server_ownership(lock_path: Optional[Path] = None) -> bool:
         )
         return False
 
-    if _lock_fd is not None:
-        _holders += 1
+    claim = _locks.get(key)
+    if claim is not None:
+        claim.holders += 1
         return True
 
     if not _FCNTL_AVAILABLE:  # pragma: no cover - non-Unix
@@ -154,33 +190,35 @@ def acquire_server_ownership(lock_path: Optional[Path] = None) -> bool:
         # future refusal its "who holds it" detail and nothing more.
         logger.warning("could not record owner identity in %s", lock_path, exc_info=True)
 
-    _lock_fd = fd
-    _holders = 1
+    _locks[key] = _Claim(fd)
     logger.info("cao-server owns %s (pid %s)", lock_path.parent, identity["pid"])
     return True
 
 
-def release_server_ownership() -> None:
-    """Drop this process's claim once the last holder is done.
+def release_server_ownership(lock_path: Optional[Path] = None) -> None:
+    """Drop this process's claim on ``lock_path`` once its last holder is done.
 
     Explicit release matters for an orderly rollout: the outgoing server frees
     the lock at shutdown so its replacement can start without waiting for the
     kernel to reap the process.
-    """
-    global _lock_fd, _holders
 
-    if _lock_fd is None:
+    Releasing a path this process does not hold is a no-op, so a shutdown path
+    that runs without a matching acquire (a startup that failed before the
+    claim) does not raise.
+    """
+    key = _key(lock_path or OWNER_LOCK_PATH)
+    claim = _locks.get(key)
+    if claim is None:
         return
-    _holders -= 1
-    if _holders > 0:
+    claim.holders -= 1
+    if claim.holders > 0:
         return
     try:
-        fcntl.flock(_lock_fd, fcntl.LOCK_UN)
+        fcntl.flock(claim.fd, fcntl.LOCK_UN)
     except OSError:
         pass
     try:
-        os.close(_lock_fd)
+        os.close(claim.fd)
     except OSError:
         pass
-    _lock_fd = None
-    _holders = 0
+    del _locks[key]

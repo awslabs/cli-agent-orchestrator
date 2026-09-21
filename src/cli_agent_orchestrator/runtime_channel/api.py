@@ -93,6 +93,59 @@ def _expected_token() -> Optional[str]:
     return token or None
 
 
+def _note_heartbeat_watermark(behind: dict, stream_pos: StreamPosition, runtime_id: str) -> None:
+    """Say so when a heartbeat shows the server is behind the runtime's stream.
+
+    The heartbeat exists so the loss of a FINAL chunk is detectable when no later
+    output ever arrives (#776), but the handler only rebound routing and threw the
+    watermarks away, so nothing acted on the one signal that carries them
+    (Copilot review on #802).
+
+    What this deliberately does NOT do is adopt the advertised ``end_pos`` as the
+    resume position, which was the reviewed suggestion. The recorded position
+    means "bytes the server has actually received". Those undelivered bytes are
+    still in the runtime's replay buffer -- ``Bridge._send`` swallows a
+    ``ConnectionClosed``, which is exactly how a chunk goes missing while the
+    buffer keeps it -- so the stale watermark is what makes the next reconnect
+    replay them. Moving it forward would mark unreceived output as received and
+    throw away the only path that recovers it, turning a recoverable gap into
+    silent loss. If the range is evicted before that reconnect, the reconnect's
+    bounded ``GapFrame`` reports the loss and advances the watermark; that is the
+    path allowed to declare bytes gone, because the runtime is the only party
+    that knows they are.
+
+    So the watermark is left alone and the discrepancy is stated. It is only
+    reported once it has survived two consecutive heartbeats without progress: a
+    reconnect's replay is a stream of chunks, a heartbeat can interleave between
+    them, and a warning that fires during normal recovery is a warning operators
+    learn to ignore.
+    """
+    key = (stream_pos.terminal_id, stream_pos.stream.value)
+    recorded = runtime_registry.resume_position(*key)
+    if stream_pos.end_pos <= recorded:
+        behind.pop(key, None)
+        return
+
+    previous = behind.get(key)
+    if previous == (stream_pos.end_pos, stream_pos.generation, recorded):
+        logger.warning(
+            "runtime %s reports terminal %s %s at %s but this server has only "
+            "received %s; %s bytes never arrived and are awaiting a reconnect "
+            "replay (generation %s)",
+            runtime_id,
+            stream_pos.terminal_id,
+            key[1],
+            stream_pos.end_pos,
+            recorded,
+            stream_pos.end_pos - recorded,
+            stream_pos.generation,
+        )
+        behind.pop(key, None)
+        return
+
+    behind[key] = (stream_pos.end_pos, stream_pos.generation, recorded)
+
+
 @router.websocket("/runtime/channel")
 async def runtime_channel(ws: WebSocket) -> None:
     expected = _expected_token()
@@ -160,6 +213,12 @@ async def runtime_channel(ws: WebSocket) -> None:
             HelloFrame(protocol_version=PROTOCOL_VERSION, runtime_id="server", resume=resume)
         )
     )
+
+    # Per-connection record of a heartbeat watermark this server has not caught
+    # up to, keyed by (terminal, stream) -> (advertised end_pos, generation). A
+    # reconnect starts the observation over, which is correct: the reconnect's
+    # own replay is what resolves the discrepancy.
+    behind: dict = {}
 
     try:
         while True:
@@ -244,6 +303,7 @@ async def runtime_channel(ws: WebSocket) -> None:
             elif isinstance(frame, HeartbeatFrame):
                 for stream_pos in frame.streams:
                     runtime_registry.bind_terminal(stream_pos.terminal_id, runtime_id)
+                    _note_heartbeat_watermark(behind, stream_pos, runtime_id)
             else:
                 logger.warning("unexpected frame kind from runtime %s: %s", runtime_id, frame.kind)
     except WebSocketDisconnect:

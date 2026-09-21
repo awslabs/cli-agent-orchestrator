@@ -48,21 +48,21 @@ def lock_path(tmp_path, monkeypatch):
     """A private lock file, with this process's lock state reset around it."""
     path = tmp_path / "server-owner.lock"
     monkeypatch.setattr(server_owner, "OWNER_LOCK_PATH", path)
-    monkeypatch.setattr(server_owner, "_lock_fd", None)
-    monkeypatch.setattr(server_owner, "_holders", 0)
+    monkeypatch.setattr(server_owner, "_locks", {})
     yield path
-    server_owner._holders = 1
-    release_server_ownership()
+    for held in list(server_owner._locks):
+        while server_owner.is_held(held):
+            release_server_ownership(held)
 
 
 @pytest.fixture()
-def holder(lock_path):
-    """A live second server process owning ``lock_path``."""
+def holder_at():
+    """Start a live second server process owning an arbitrary lock path."""
     procs = []
 
-    def start():
+    def start(path):
         proc = subprocess.Popen(
-            [sys.executable, "-c", _HOLDER, str(lock_path)],
+            [sys.executable, "-c", _HOLDER, str(path)],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             text=True,
@@ -76,6 +76,12 @@ def holder(lock_path):
         if proc.poll() is None:
             proc.kill()
         proc.wait(timeout=10)
+
+
+@pytest.fixture()
+def holder(lock_path, holder_at):
+    """A live second server process owning ``lock_path``."""
+    return lambda: holder_at(lock_path)
 
 
 class TestSecondServerRefused:
@@ -164,15 +170,77 @@ class TestOwnershipHandover:
         """
         assert acquire_server_ownership() is True
         assert acquire_server_ownership() is True
-        assert server_owner._holders == 2
+        assert server_owner.holders_for(lock_path) == 2
 
         release_server_ownership()
-        assert server_owner._lock_fd is not None, "still held while one holder remains"
+        assert server_owner.is_held(lock_path), "still held while one holder remains"
         release_server_ownership()
-        assert server_owner._lock_fd is None
+        assert not server_owner.is_held(lock_path)
 
     def test_release_without_a_lock_is_a_noop(self, lock_path):
         release_server_ownership()  # must not raise
+
+
+class TestReentryIsPerStateDirectory:
+    """Re-entry is only re-entry for the directory already held (#802 review).
+
+    A single refcounted slot answered True to *any* second ``lock_path`` while it
+    held one, so an embedded or test server started for a different
+    ``CAO_HOME_DIR`` believed it owned that directory without ever locking it -
+    leaving the second state free for another process to own simultaneously.
+    That is the failure this module exists to prevent, arriving through the
+    mechanism meant to make the safe case work.
+    """
+
+    @pytest.fixture()
+    def second_lock_path(self, tmp_path):
+        path = tmp_path / "other-home" / "server-owner.lock"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def test_a_second_directory_is_actually_locked_not_counted(self, lock_path, second_lock_path):
+        acquire_server_ownership(lock_path)
+
+        assert acquire_server_ownership(second_lock_path) is True
+
+        # The proof is on disk, not in the refcount: the old code returned True
+        # here having opened nothing.
+        assert second_lock_path.exists()
+        assert server_owner.holders_for(lock_path) == 1
+        assert server_owner.holders_for(second_lock_path) == 1
+
+    def test_another_process_cannot_also_own_the_second_directory(
+        self, lock_path, second_lock_path, holder_at
+    ):
+        acquire_server_ownership(lock_path)
+        acquire_server_ownership(second_lock_path)
+
+        # The whole point: a real flock is held, so a genuinely separate process
+        # is refused. Under the shared-slot refcount this child started happily.
+        with pytest.raises(AssertionError, match="never took the lock"):
+            holder_at(second_lock_path)
+
+    def test_releasing_one_directory_leaves_the_other_held(self, lock_path, second_lock_path):
+        acquire_server_ownership(lock_path)
+        acquire_server_ownership(second_lock_path)
+
+        release_server_ownership(second_lock_path)
+
+        assert not server_owner.is_held(second_lock_path)
+        assert server_owner.is_held(lock_path), "releasing one state must not free another"
+
+    def test_the_same_directory_by_another_name_is_still_re_entry(self, lock_path):
+        """Paths are compared resolved, so ``./x`` and ``x`` are one claim.
+
+        Treating them as two would make this process flock a file it already
+        holds and deadlock on itself - the original reason re-entry exists.
+        """
+        acquire_server_ownership(lock_path)
+
+        aliased = lock_path.parent / "." / lock_path.name
+        assert acquire_server_ownership(aliased) is True
+
+        assert server_owner.holders_for(lock_path) == 2
 
 
 class TestOptOut:
@@ -198,7 +266,7 @@ class TestOptOut:
         # Explicitly opted out, so no refusal - and no lock either, which is
         # the footgun the warning in the source describes.
         assert acquire_server_ownership() is False
-        assert server_owner._lock_fd is None
+        assert not server_owner.is_held(lock_path)
 
 
 class TestLockLocation:

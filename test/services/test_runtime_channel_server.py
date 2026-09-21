@@ -16,6 +16,7 @@ from cli_agent_orchestrator.runtime_channel.protocol import (
     EventFrame,
     EventType,
     GapFrame,
+    HeartbeatFrame,
     HelloFrame,
     StreamFrame,
     StreamName,
@@ -725,3 +726,195 @@ class TestABoundedGapIsConsumed:
             f"terminal.{GAP_TID}.output",
             {"data": "", "gap": {"from_pos": 0, "to_pos": 64}},
         ) in received
+
+
+HB_TID = "cafed00d"
+
+
+class TestAHeartbeatWatermarkTheServerIsBehind:
+    """The heartbeat carries end positions so a lost FINAL chunk is detectable.
+
+    The handler bound routing and discarded the positions, so nothing acted on the
+    one signal that carries them: output that never arrived, with no later output
+    coming to reveal it, went unnoticed indefinitely (Copilot review on #802).
+
+    The reviewed suggestion — persist the advertised ``end_pos`` as the resume
+    position — is what these tests rule out. The recorded position means "bytes the
+    server has received"; those bytes are still in the runtime's replay buffer, so
+    the stale watermark is precisely what makes the next reconnect replay them.
+    Adopting the advertised position would mark unreceived output as received and
+    discard the only path that recovers it.
+    """
+
+    HEADERS = {"Host": "localhost", "X-CAO-Runtime-Token": "test-runtime-token"}
+
+    @staticmethod
+    def _heartbeat(end_pos, generation=0):
+        return encode_frame(
+            HeartbeatFrame(
+                streams=[
+                    StreamPosition(
+                        terminal_id=HB_TID,
+                        stream=StreamName.CAPTURE,
+                        generation=generation,
+                        end_pos=end_pos,
+                    )
+                ]
+            )
+        )
+
+    @staticmethod
+    def _sync(ws, op_id):
+        """Ordered round-trip, so the heartbeats before it have been handled."""
+        ws.send_text(
+            encode_frame(
+                CommandResultFrame(op_id=op_id, terminal_id=HB_TID, outcome=CommandOutcome.OK)
+            )
+        )
+        ack = decode_frame(ws.receive_text())
+        assert isinstance(ack, AckFrame) and ack.op_id == op_id
+
+    @pytest.fixture(autouse=True)
+    def _clean_registry(self):
+        from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
+
+        runtime_registry.unbind_terminal(HB_TID)
+        yield
+        runtime_registry.unbind_terminal(HB_TID)
+
+    def test_a_heartbeat_never_advances_the_resume_position(self, channel_client):
+        """The bytes are unreceived, not lost: the watermark must stay truthful."""
+        from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
+
+        with channel_client.websocket_connect("/runtime/channel", headers=self.HEADERS) as ws:
+            ws.send_text(_hello())
+            decode_frame(ws.receive_text())
+            ws.send_text(self._heartbeat(500))
+            ws.send_text(self._heartbeat(500))
+            self._sync(ws, "sync-hb")
+
+            assert runtime_registry.resume_position(HB_TID, "capture") == 0
+
+    def test_a_reconnect_still_asks_for_the_bytes_that_never_arrived(self, channel_client):
+        """The recovery the advertised position would have thrown away."""
+        with channel_client.websocket_connect("/runtime/channel", headers=self.HEADERS) as ws:
+            ws.send_text(_hello())
+            decode_frame(ws.receive_text())
+            ws.send_text(
+                encode_frame(
+                    StreamFrame(
+                        terminal_id=HB_TID,
+                        stream=StreamName.CAPTURE,
+                        generation=0,
+                        pos=0,
+                        data=base64.b64encode(b"first chunk").decode(),
+                    )
+                )
+            )
+            ws.send_text(self._heartbeat(500))
+            ws.send_text(self._heartbeat(500))
+            self._sync(ws, "sync-hb")
+
+        with channel_client.websocket_connect("/runtime/channel", headers=self.HEADERS) as ws:
+            ws.send_text(
+                _hello(
+                    streams=[
+                        StreamPosition(
+                            terminal_id=HB_TID,
+                            stream=StreamName.CAPTURE,
+                            generation=0,
+                            end_pos=500,
+                        )
+                    ]
+                )
+            )
+            reply = decode_frame(ws.receive_text())
+
+        assert reply.resume[0].end_pos == len(b"first chunk"), (
+            "the reconnect must resume where the server's received bytes end, "
+            "so the runtime replays what never arrived"
+        )
+
+    def test_a_persistent_shortfall_is_reported(self, channel_client, caplog):
+        """Two heartbeats with no progress: nobody would otherwise learn of it."""
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.runtime_channel.api"):
+            with channel_client.websocket_connect("/runtime/channel", headers=self.HEADERS) as ws:
+                ws.send_text(_hello())
+                decode_frame(ws.receive_text())
+                ws.send_text(self._heartbeat(500))
+                ws.send_text(self._heartbeat(500))
+                self._sync(ws, "sync-hb")
+
+        assert any(
+            HB_TID in record.message and "500" in record.message
+            for record in caplog.records
+            if record.levelno >= logging.WARNING
+        ), f"no warning named the shortfall: {[r.message for r in caplog.records]}"
+
+    def test_one_heartbeat_alone_says_nothing(self, channel_client, caplog):
+        """A reconnect's replay is a stream of chunks and a heartbeat can land
+        between them, so a single observation is not evidence of loss. A warning
+        that fires during ordinary recovery is one operators learn to ignore."""
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.runtime_channel.api"):
+            with channel_client.websocket_connect("/runtime/channel", headers=self.HEADERS) as ws:
+                ws.send_text(_hello())
+                decode_frame(ws.receive_text())
+                ws.send_text(self._heartbeat(500))
+                self._sync(ws, "sync-hb")
+
+        assert not [r for r in caplog.records if HB_TID in r.message]
+
+    def test_output_arriving_between_heartbeats_clears_the_suspicion(self, channel_client, caplog):
+        """Progress is the discriminator: bytes landed, so nothing was lost."""
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.runtime_channel.api"):
+            with channel_client.websocket_connect("/runtime/channel", headers=self.HEADERS) as ws:
+                ws.send_text(_hello())
+                decode_frame(ws.receive_text())
+                ws.send_text(self._heartbeat(11))
+                ws.send_text(
+                    encode_frame(
+                        StreamFrame(
+                            terminal_id=HB_TID,
+                            stream=StreamName.CAPTURE,
+                            generation=0,
+                            pos=0,
+                            data=base64.b64encode(b"first chunk").decode(),
+                        )
+                    )
+                )
+                ws.send_text(self._heartbeat(11))
+                self._sync(ws, "sync-hb")
+
+        assert not [r for r in caplog.records if HB_TID in r.message]
+
+    def test_a_heartbeat_the_server_is_level_with_is_silent(self, channel_client, caplog):
+        """The steady state, which is every heartbeat on a healthy channel."""
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.runtime_channel.api"):
+            with channel_client.websocket_connect("/runtime/channel", headers=self.HEADERS) as ws:
+                ws.send_text(_hello())
+                decode_frame(ws.receive_text())
+                ws.send_text(self._heartbeat(0))
+                ws.send_text(self._heartbeat(0))
+                self._sync(ws, "sync-hb")
+
+        assert not [r for r in caplog.records if HB_TID in r.message]
+
+    def test_a_heartbeat_still_binds_routing(self, channel_client):
+        """The behaviour that was already there has to survive the addition."""
+        from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
+
+        with channel_client.websocket_connect("/runtime/channel", headers=self.HEADERS) as ws:
+            ws.send_text(_hello())
+            decode_frame(ws.receive_text())
+            ws.send_text(self._heartbeat(500))
+            self._sync(ws, "sync-hb")
+
+            assert runtime_registry.runtime_for_terminal(HB_TID) == "worker-1"
