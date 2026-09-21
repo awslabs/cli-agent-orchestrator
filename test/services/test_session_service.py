@@ -1235,3 +1235,220 @@ def test_list_sessions_reports_the_creator_as_owner(real_session_db, monkeypatch
 
     assert reported["agent_profile"] == "supervisor"
     assert reported["working_directory"] == "/repo/owner"
+
+
+class TestListSessionsRemoteRuntimes:
+    """``list_sessions`` must see sessions that execute in a runtime (#745).
+
+    The shared ``cao-server`` of a cluster deployment runs no tmux of its own, so
+    the backend listing is empty there and ``GET /sessions`` / ``cao session
+    list`` answered "no active sessions" while agents were running — a confident
+    wrong answer rather than an explicit one.
+    """
+
+    @pytest.fixture
+    def registry(self):
+        """The real registry, emptied afterwards — it is a module global."""
+        from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
+
+        try:
+            yield runtime_registry
+        finally:
+            for terminal_id in runtime_registry.remote_terminal_ids():
+                runtime_registry.unbind_terminal(terminal_id)
+
+    @staticmethod
+    def _row(session_name, terminal_id, **overrides):
+        fields = {
+            "terminal_id": terminal_id,
+            "tmux_session": session_name,
+            "tmux_window": f"developer-{terminal_id}",
+            "provider": "kiro_cli",
+            "agent_profile": "developer",
+            "working_directory": f"/repo/{terminal_id}",
+        }
+        fields.update(overrides)
+        db_mod.create_terminal(**fields)
+
+    @staticmethod
+    def _backend(*session_names, cwd_is_an_error=True):
+        backend = MagicMock()
+        backend.list_sessions.return_value = [{"id": n, "name": n} for n in session_names]
+        if cwd_is_an_error:
+            backend.get_pane_working_directory.side_effect = AssertionError(
+                "a remote agent's pane is not in the server's tmux"
+            )
+        return backend
+
+    def test_a_session_executing_in_a_runtime_is_listed(
+        self, real_session_db, registry, monkeypatch
+    ):
+        """The case the cluster hit: no local tmux, one agent in a runtime."""
+        self._row("cao-remote", "aaaaaaaa")
+        registry.bind_terminal("aaaaaaaa", "cao-scale-7")
+        monkeypatch.setattr(session_service_mod, "get_backend", lambda: self._backend())
+
+        result = list_sessions()
+
+        assert [s["id"] for s in result] == ["cao-remote"]
+        assert result[0]["name"] == "cao-remote"
+        assert result[0]["runtimes"] == ["cao-scale-7"]
+        # Ownership metadata is enriched for a remote session exactly as for a
+        # local one -- the DB row is the same row either way.
+        assert result[0]["agent_profile"] == "developer"
+        assert result[0]["working_directory"] == "/repo/aaaaaaaa"
+
+    def test_the_reported_status_stays_inside_the_session_model(
+        self, real_session_db, registry, monkeypatch
+    ):
+        """A new status vocabulary would break callers parsing these rows.
+
+        ``models.session.SessionStatus`` has three values and ``Session``
+        validates against them, so inventing ``"remote"`` here would turn a
+        listing into a ValidationError for any caller that parses it. The remote
+        fact rides on ``runtimes`` instead, and "detached" is literally true --
+        no client is attached to it.
+        """
+        from cli_agent_orchestrator.models.session import Session
+
+        self._row("cao-remote", "aaaaaaaa")
+        registry.bind_terminal("aaaaaaaa", "cao-scale-7")
+        monkeypatch.setattr(session_service_mod, "get_backend", lambda: self._backend())
+
+        row = list_sessions()[0]
+
+        assert row["status"] == "detached"
+        assert Session(id=row["id"], name=row["name"], status=row["status"]).status == "detached"
+
+    def test_a_session_spanning_two_runtimes_reports_both(
+        self, real_session_db, registry, monkeypatch
+    ):
+        """Flow placement puts one session's agents on different executors."""
+        self._row("cao-flow", "aaaaaaaa")
+        self._row("cao-flow", "bbbbbbbb")
+        registry.bind_terminal("aaaaaaaa", "cao-scale-7")
+        registry.bind_terminal("bbbbbbbb", "cao-scale-3")
+        monkeypatch.setattr(session_service_mod, "get_backend", lambda: self._backend())
+
+        result = list_sessions()
+
+        assert [s["id"] for s in result] == ["cao-flow"]
+        assert result[0]["runtimes"] == ["cao-scale-3", "cao-scale-7"]
+
+    def test_a_session_tmux_already_reports_is_not_listed_twice(
+        self, real_session_db, registry, monkeypatch
+    ):
+        """A hybrid host -- local tmux plus attached runtimes -- lists each once.
+
+        The backend's row wins, because it is the one carrying the real tmux
+        status. Without the exclusion the session appears twice and the fleet
+        snapshot double-counts its terminals.
+        """
+        self._row("cao-both", "aaaaaaaa")
+        self._row("cao-both", "bbbbbbbb")
+        registry.bind_terminal("bbbbbbbb", "cao-scale-7")
+        monkeypatch.setattr(
+            session_service_mod,
+            "get_backend",
+            lambda: self._backend("cao-both", cwd_is_an_error=False),
+        )
+
+        result = list_sessions()
+
+        assert [s["id"] for s in result] == ["cao-both"]
+        # From the backend's listing, so it carries no ``runtimes`` key.
+        assert "runtimes" not in result[0]
+
+    def test_a_remote_terminal_outside_the_cao_prefix_is_ignored(
+        self, real_session_db, registry, monkeypatch
+    ):
+        """Same SESSION_PREFIX filter as the local listing, for the same reason."""
+        self._row("not-ours", "aaaaaaaa")
+        registry.bind_terminal("aaaaaaaa", "cao-scale-7")
+        monkeypatch.setattr(session_service_mod, "get_backend", lambda: self._backend())
+
+        assert list_sessions() == []
+
+    def test_nothing_remote_costs_no_query(self, monkeypatch):
+        """A purely local install must not pay for this path at all.
+
+        The registry is empty on every non-cluster server, so the by-id read has
+        to short-circuit before reaching the database.
+
+        Records the call rather than raising in it: ``_remote_sessions`` swallows
+        exceptions by design, so an ``AssertionError`` thrown here would be eaten
+        and the test would pass no matter what.
+        """
+        reads = []
+
+        def _record(terminal_ids):
+            reads.append(list(terminal_ids))
+            return []
+
+        monkeypatch.setattr(session_service_mod, "list_terminals_by_ids", _record)
+        monkeypatch.setattr(session_service_mod, "list_terminals_in_sessions", lambda names: [])
+        monkeypatch.setattr(session_service_mod, "get_backend", lambda: self._backend("cao-local"))
+
+        assert [s["id"] for s in list_sessions()] == ["cao-local"]
+        assert reads == []
+
+    def test_a_failed_remote_read_keeps_the_local_listing(self, registry, monkeypatch, caplog):
+        """A DB or registry fault degrades to "no remote sessions", not to [].
+
+        The local listing is what a single-host user sees; it must survive a
+        fault in a path they are not even using.
+        """
+        registry.bind_terminal("aaaaaaaa", "cao-scale-7")
+
+        def _boom(terminal_ids):
+            raise RuntimeError("database is gone")
+
+        monkeypatch.setattr(session_service_mod, "list_terminals_by_ids", _boom)
+        monkeypatch.setattr(session_service_mod, "list_terminals_in_sessions", lambda names: [])
+        monkeypatch.setattr(session_service_mod, "get_backend", lambda: self._backend("cao-local"))
+
+        with caplog.at_level(logging.WARNING):
+            result = list_sessions()
+
+        assert [s["id"] for s in result] == ["cao-local"]
+        assert _swallowed_log(caplog, "Failed to list remote sessions").exc_info
+
+    def test_a_remote_agents_cwd_is_never_read_from_the_servers_tmux(
+        self, real_session_db, registry, monkeypatch
+    ):
+        """With no persisted cwd, the pane fallback must be skipped, not attempted.
+
+        The pane lives in the runtime. On a server with no tmux the fallback only
+        logs, but on a hybrid host running a same-named local session it would
+        ANSWER -- reporting a local directory as a remote agent's cwd. The
+        backend here raises if reached, standing in for both.
+        """
+        self._row("cao-remote", "aaaaaaaa", working_directory=None, agent_profile=None)
+        registry.bind_terminal("aaaaaaaa", "cao-scale-7")
+        backend = self._backend()
+        monkeypatch.setattr(session_service_mod, "get_backend", lambda: backend)
+
+        result = list_sessions()
+
+        assert result[0]["working_directory"] is None
+        backend.get_pane_working_directory.assert_not_called()
+
+    def test_a_local_sessions_cwd_still_falls_back_to_its_pane(
+        self, real_session_db, registry, monkeypatch
+    ):
+        """The other direction: the skip must be keyed on remoteness, not removed.
+
+        Guards the local pane fallback, which has its own tests, against being
+        disabled for everyone by the remote guard above.
+        """
+        self._row("cao-local", "aaaaaaaa", working_directory=None, agent_profile=None)
+        backend = self._backend("cao-local", cwd_is_an_error=False)
+        backend.get_pane_working_directory.return_value = "/from/the/pane"
+        monkeypatch.setattr(session_service_mod, "get_backend", lambda: backend)
+
+        result = list_sessions()
+
+        assert result[0]["working_directory"] == "/from/the/pane"
+        backend.get_pane_working_directory.assert_called_once_with(
+            "cao-local", "developer-aaaaaaaa"
+        )

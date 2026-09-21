@@ -18,7 +18,7 @@ import asyncio
 import logging
 import time
 import uuid
-from typing import Awaitable, Callable, Dict, Optional, Tuple
+from typing import Awaitable, Callable, Dict, List, Optional, Tuple
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.runtime_channel.protocol import (
@@ -189,6 +189,20 @@ class RuntimeChannelRegistry:
 
     def runtime_for_terminal(self, terminal_id: str) -> Optional[str]:
         return self._terminal_runtime.get(terminal_id)
+
+    def remote_terminal_ids(self) -> List[str]:
+        """Every terminal currently bound to a runtime, across all runtimes.
+
+        A snapshot (new list), not a view: callers iterate it while awaiting DB
+        reads, and a channel disconnecting mid-iteration must not raise
+        "dictionary changed size during iteration" at them.
+
+        ``list_runtimes`` answers the same question per connected runtime; this
+        is for callers that need the whole set without caring which runtime owns
+        which -- ``session_service.list_sessions``, which turns it into the set
+        of sessions executing off-box.
+        """
+        return list(self._terminal_runtime)
 
     async def send_terminal_command(
         self,

@@ -579,6 +579,28 @@ probe appeared in exactly one pod's pane. Note that `ps | grep cao-server` is
   a deliberately bumped version: 60 attempts in 60s (every gap 1.01s) before the
   fix, 7 attempts in 90s with gaps `1, 2, 4, 8, 16, 30` after.
 
+- **Session enumeration stops answering "none" for agents that exist.** Found by
+  driving the status/interaction surface from a laptop against the cluster:
+  `GET /sessions` and `cao session list` reported no active sessions while five
+  agents were running on it. `session_service.list_sessions` was built entirely
+  from `backend.list_sessions()` — the *server's own* tmux, which on a shared
+  `cao-server` does not exist at all (`error connecting to /tmp/tmux-1000/default`).
+  Everything else session-scoped reads the database and was already correct
+  remotely (`session status`, `session send`, `GET /sessions/{name}/terminals`
+  were each exercised from the laptop); only the enumeration was blind, and it
+  failed in the shape this design specifically rules out — a confident wrong
+  answer instead of an explicit one. The listing now unions the backend's
+  sessions with those the registry's terminal→runtime bindings place in a
+  runtime, tagged with the runtime ids executing them. Liveness comes from the
+  bindings rather than the rows, because a row outlives its runtime and a binding
+  does not; a session the backend already reports is not listed twice, so a
+  hybrid host is unaffected; and the pane-cwd fallback is skipped for a remote
+  terminal, which on a hybrid host would otherwise report a local directory as a
+  remote agent's cwd. `status` stays `detached` rather than a new `remote` value
+  so callers parsing rows into `models.session.Session` keep validating.
+  Coverage: 16 tests, 7 mutations checked (including both directions on the cwd
+  guard).
+
 **Deferred to its own workstream:**
 
 - **Per-runtime delegated credentials** — explicitly #774's scope. Both the

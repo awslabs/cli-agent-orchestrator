@@ -37,6 +37,7 @@ from cli_agent_orchestrator.clients.database import (
     list_pending_receiver_ids_by_provider,
     list_pending_receiver_ids_older_than,
     list_siblings_by_group_prefix,
+    list_terminals_by_ids,
     list_terminals_by_session,
     list_terminals_in_sessions,
     update_flow_enabled,
@@ -2447,3 +2448,113 @@ def test_no_upsert_against_the_terminals_table():
         "upsert against terminals would break the ownership ordering contract "
         "(see TerminalModel); use UPDATE instead:\n  " + "\n  ".join(offenders)
     )
+
+
+class TestListTerminalsByIds:
+    """Tests for ``list_terminals_by_ids`` (#745).
+
+    The by-id counterpart of ``list_terminals_in_sessions``:
+    ``session_service._remote_sessions`` holds the terminal ids the runtime
+    registry has bound and needs the sessions they belong to.
+    """
+
+    @pytest.fixture
+    def db(self, tmp_path, monkeypatch):
+        engine = create_engine(
+            f"sqlite:///{tmp_path / 'by-ids.db'}",
+            connect_args={"check_same_thread": False},
+        )
+        Base.metadata.create_all(bind=engine)
+        Local = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.clients.database.SessionLocal",
+            Local,
+        )
+        return Local
+
+    @staticmethod
+    def _add(Local, terminal_id, tmux_session, agent_profile="developer"):
+        with Local() as s:
+            s.add(
+                TerminalModel(
+                    id=terminal_id,
+                    tmux_session=tmux_session,
+                    tmux_window=f"win-{terminal_id}",
+                    provider="kiro_cli",
+                    agent_profile=agent_profile,
+                    working_directory=f"/w/{terminal_id}",
+                    last_active=datetime.now(),
+                )
+            )
+            s.commit()
+
+    def test_returns_only_the_requested_ids(self, db):
+        """Rows for other terminals are not read — this is what bounds the query.
+
+        ``list_all_terminals`` would answer too, and scale with the whole table
+        including rows whose session tmux no longer reports (only swept at server
+        startup, so they accumulate on a long-uptime server).
+        """
+        self._add(db, "a1", "cao-alpha")
+        self._add(db, "b1", "cao-beta")
+        for n in range(25):
+            self._add(db, f"dead{n:02d}", f"cao-dead-{n}")
+
+        result = list_terminals_by_ids(["a1", "b1"])
+
+        assert {t["id"] for t in result} == {"a1", "b1"}
+        assert {t["tmux_session"] for t in result} == {"cao-alpha", "cao-beta"}
+
+    def test_no_ids_does_not_query(self, db):
+        """An empty request short-circuits rather than degenerating to a scan.
+
+        This is the purely-local install: nothing is bound to a runtime, so the
+        remote branch of ``list_sessions`` must cost zero queries.
+        """
+        self._add(db, "a1", "cao-alpha")
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal") as mock_local:
+            assert list_terminals_by_ids([]) == []
+            mock_local.assert_not_called()
+
+    def test_an_unknown_id_is_dropped_not_raised(self, db):
+        """A stale binding yields a short list, never an error.
+
+        The caller's ids come from the registry, which can name a terminal whose
+        row was already deleted. That must not blank the session listing.
+        """
+        self._add(db, "a1", "cao-alpha")
+
+        result = list_terminals_by_ids(["a1", "gone"])
+
+        assert [t["id"] for t in result] == ["a1"]
+
+    def test_order_is_creation_order_not_id_order(self, db):
+        """Ordered by ``rowid``, like its sibling — so grouping is deterministic.
+
+        The ids are the #703 pair: the creator is inserted first but its uuid
+        sorts ABOVE the child's, so ``ORDER BY id`` fails this. Requested in the
+        opposite order as well, so the result cannot be following the argument.
+        """
+        self._add(db, "f0000000", "cao-alpha", agent_profile="supervisor")
+        self._add(db, "10000000", "cao-alpha", agent_profile="developer")
+
+        result = list_terminals_by_ids(["10000000", "f0000000"])
+
+        assert [t["id"] for t in result] == ["f0000000", "10000000"]
+
+    def test_matches_the_by_session_read_shape(self, db):
+        """Same keys as the session-scoped reads, so consumers are interchangeable."""
+        self._add(db, "a1", "cao-alpha")
+
+        assert list_terminals_by_ids(["a1"]) == list_terminals_in_sessions(["cao-alpha"])
+        assert set(list_terminals_by_ids(["a1"])[0]) == {
+            "id",
+            "tmux_session",
+            "tmux_window",
+            "provider",
+            "agent_profile",
+            "working_directory",
+            "engine",
+            "last_active",
+        }

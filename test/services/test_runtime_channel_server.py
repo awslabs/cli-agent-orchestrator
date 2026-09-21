@@ -106,6 +106,38 @@ class TestRuntimeRegistry:
         with pytest.raises(RuntimeUnavailableError):
             await pending
 
+    def test_remote_terminal_ids_spans_every_runtime(self):
+        """The whole bound set, not one runtime's — what ``list_sessions`` needs.
+
+        A session's agents can be placed on different executors, so an answer
+        derived from a single runtime (or from ``list_runtimes`` without
+        flattening) would list part of a session and silently drop the rest.
+        """
+        registry = RuntimeChannelRegistry()
+        registry.bind_terminal("t-a", "worker-1")
+        registry.bind_terminal("t-b", "worker-2")
+
+        assert sorted(registry.remote_terminal_ids()) == ["t-a", "t-b"]
+
+        registry.unbind_terminal("t-a")
+        assert registry.remote_terminal_ids() == ["t-b"]
+
+    def test_remote_terminal_ids_is_a_snapshot_not_a_view(self):
+        """Callers iterate it while awaiting a DB read.
+
+        Returning the live key view instead would raise "dictionary changed size
+        during iteration" at a caller the moment a channel disconnected mid-read
+        — a fault in one runtime breaking an unrelated listing.
+        """
+        registry = RuntimeChannelRegistry()
+        registry.bind_terminal("t-a", "worker-1")
+
+        ids = registry.remote_terminal_ids()
+        for _ in ids:
+            registry.bind_terminal("t-b", "worker-2")  # a channel connects mid-iteration
+
+        assert ids == ["t-a"]
+
     def test_positions_monotonic(self):
         registry = RuntimeChannelRegistry()
         registry.record_position(TID, "capture", 10)

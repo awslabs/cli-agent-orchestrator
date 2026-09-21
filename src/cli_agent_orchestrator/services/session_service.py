@@ -9,7 +9,8 @@ Session Hierarchy:
     - Provider: The CLI agent running in the terminal (e.g., KiroCliProvider)
 
 Key Operations:
-- list_sessions(): Get all CAO-managed sessions (filtered by SESSION_PREFIX)
+- list_sessions(): Get all CAO-managed sessions (filtered by SESSION_PREFIX),
+  including those executing in a remote runtime rather than in local tmux
 - get_session(): Get session details including all terminal metadata
 - delete_session(): Clean up session, providers, database records, and tmux session
 
@@ -23,18 +24,20 @@ lock in ``services/session_lock.py`` — see ``delete_session`` for why.
 """
 
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from cli_agent_orchestrator.backends.base import TerminalBackend
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
     delete_terminals_by_ids,
+    list_terminals_by_ids,
     list_terminals_by_session,
     list_terminals_in_sessions,
 )
 from cli_agent_orchestrator.constants import SESSION_PREFIX
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
+from cli_agent_orchestrator.models.session import SessionStatus
 from cli_agent_orchestrator.models.terminal import Terminal
 from cli_agent_orchestrator.plugins import (
     PluginRegistry,
@@ -42,6 +45,7 @@ from cli_agent_orchestrator.plugins import (
     PostKillSessionEvent,
     PostKillTerminalEvent,
 )
+from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
 from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_event
 from cli_agent_orchestrator.services.session_env import clear_session_env
 from cli_agent_orchestrator.services.session_lock import session_lifecycle_lock
@@ -223,7 +227,14 @@ def _enrich_session_ownership(
         persisted_working_directory = ownership_terminal.get("working_directory")
         if persisted_working_directory:
             enriched["working_directory"] = persisted_working_directory
-        elif ownership_terminal.get("tmux_window"):
+        elif ownership_terminal.get("tmux_window") and not runtime_registry.is_remote(
+            ownership_terminal["id"]
+        ):
+            # Skipped for a remote terminal on purpose: the pane lives in the
+            # runtime, so this reads the SERVER's tmux. On a server with no tmux
+            # it only logs a warning, but on a hybrid host that happens to run a
+            # same-named local session it would answer -- reporting some local
+            # directory as a remote agent's cwd. None is the honest answer.
             try:
                 enriched["working_directory"] = backend.get_pane_working_directory(
                     session_name, ownership_terminal["tmux_window"]
@@ -239,8 +250,72 @@ def _enrich_session_ownership(
     return enriched
 
 
+def _remote_sessions(local_session_names: Set[str]) -> List[Dict[str, Any]]:
+    """Sessions whose agents execute in a connected runtime, not in local tmux.
+
+    The shared ``cao-server`` of a cluster deployment (#745) runs no tmux of its
+    own — every agent lives in a ``cao-bridge`` runtime — so the backend listing
+    ``list_sessions`` is built from reports nothing there. That made
+    ``GET /sessions`` and ``cao session list`` answer "no active sessions" while
+    agents were running: a confident wrong answer, and the one shape of failure
+    the remote boundary is supposed to avoid. Everything else session-scoped
+    (``get_session``, inbox delivery, ``cao session send``) reads the database
+    and was already correct remotely; only the enumeration was blind.
+
+    The registry's terminal→runtime bindings are the liveness signal, not the
+    database: a row survives its runtime, a binding does not, so listing from
+    the DB alone would resurrect sessions whose executor is gone. Sessions tmux
+    already reports are skipped (``local_session_names``) so a hybrid host —
+    local tmux plus attached runtimes — lists each session once, from the
+    backend, with remote terminals contributing only their runtime ids.
+
+    Order follows ``list_terminals_by_ids``' ``rowid`` order, i.e. terminal
+    creation order, so repeated calls agree.
+    """
+    try:
+        terminal_ids = runtime_registry.remote_terminal_ids()
+        # Zero queries when nothing is remote, which is every purely local
+        # install -- the cost of this path is paid only by deployments using it.
+        if not terminal_ids:
+            return []
+        runtimes_by_session: Dict[str, Set[str]] = {}
+        for terminal in list_terminals_by_ids(terminal_ids):
+            session_name = terminal.get("tmux_session") or ""
+            if not session_name.startswith(SESSION_PREFIX):
+                continue
+            if session_name in local_session_names:
+                continue
+            runtime_id = runtime_registry.runtime_for_terminal(terminal["id"])
+            entry = runtimes_by_session.setdefault(session_name, set())
+            if runtime_id:
+                # Absent only if the channel dropped between the snapshot above
+                # and here. The session still lists -- one of its terminals was
+                # bound a moment ago -- just without that runtime's id.
+                entry.add(runtime_id)
+        return [
+            {
+                "id": session_name,
+                "name": session_name,
+                # "detached" rather than a new "remote" value: it is literally
+                # true (no client is attached) and it stays inside
+                # models.session.SessionStatus, so a caller parsing these rows
+                # into that model does not start failing validation. The remote
+                # fact is carried explicitly by "runtimes" instead.
+                "status": SessionStatus.DETACHED.value,
+                "runtimes": sorted(runtime_ids),
+            }
+            for session_name, runtime_ids in runtimes_by_session.items()
+        ]
+    except Exception:
+        # Swallowed like the other reads on this path: a registry or DB problem
+        # must degrade to "no remote sessions", never blank the local listing
+        # the caller renders. exc_info to keep it diagnosable from the log.
+        logger.warning("Failed to list remote sessions", exc_info=True)
+        return []
+
+
 def list_sessions() -> List[Dict]:
-    """List all sessions from tmux."""
+    """List all sessions — local tmux plus any executing in a remote runtime."""
     try:
         backend = get_backend()
         tmux_sessions = backend.list_sessions()
@@ -254,6 +329,7 @@ def list_sessions() -> List[Dict]:
             # future backend that does not.
             if (s.get("id") or "").startswith(SESSION_PREFIX)
         ]
+        cao_sessions += _remote_sessions({s.get("id") or "" for s in cao_sessions})
         # Filter BEFORE the terminal read: it is what bounds the read to live
         # CAO sessions, and it keeps a host running only non-CAO tmux sessions
         # at zero queries, as it was when the read was per-session and therefore

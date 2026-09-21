@@ -1928,6 +1928,46 @@ def list_terminals_in_sessions(tmux_sessions: List[str]) -> List[Dict[str, Any]]
         ]
 
 
+def list_terminals_by_ids(terminal_ids: List[str]) -> List[Dict[str, Any]]:
+    """List the given terminals in one query, ordered by ``rowid``.
+
+    The by-id counterpart of ``list_terminals_in_sessions``: the caller knows
+    terminal ids and needs the sessions they belong to. ``list_all_terminals``
+    would answer too, but its cost scales with the whole table including rows
+    for sessions that no longer exist (see ``list_terminals_in_sessions``),
+    while this stays proportional to the ids asked for.
+
+    Ordered by ``rowid`` for the same reason as its sibling -- creation order,
+    so a caller grouping these rows gets a deterministic order rather than
+    whatever the query plan plans. Ids absent from the table are simply not
+    returned, so a caller passing stale ids gets a short list, not an error.
+
+    Returns an empty list without querying when given no ids.
+    """
+    if not terminal_ids:
+        return []
+    with SessionLocal() as db:
+        terminals = (
+            db.query(TerminalModel)
+            .filter(TerminalModel.id.in_(terminal_ids))
+            .order_by(literal_column("terminals.rowid"))
+            .all()
+        )
+        return [
+            {
+                "id": t.id,
+                "tmux_session": t.tmux_session,
+                "tmux_window": t.tmux_window,
+                "provider": t.provider,
+                "agent_profile": t.agent_profile,
+                "working_directory": t.working_directory,
+                "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
+                "last_active": t.last_active,
+            }
+            for t in terminals
+        ]
+
+
 def list_all_terminals() -> List[Dict[str, Any]]:
     """List all terminals."""
     with SessionLocal() as db:
