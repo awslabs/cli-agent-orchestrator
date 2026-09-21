@@ -37,14 +37,21 @@ def attach_remote_terminal(terminal_id: str, base_url: str, token: Optional[str]
     from websockets.sync.client import connect
 
     url = _ws_url(base_url, terminal_id)
-    if token:
-        url += f"?token={token}"
+    # The credential goes in the handshake HEADER, never in the URL. The server
+    # accepts ``?token=`` too, but only because a browser cannot set a header on
+    # a WebSocket handshake; this client can. A query parameter is logged by
+    # uvicorn and by any proxy in between, and the access log's redaction filter
+    # is keyed on the parameter names the browser paths use, so a native attach
+    # would have persisted a reusable bearer token in plaintext (Copilot review
+    # on #802). ``token`` is now redacted as well, for the browser path that has
+    # no alternative — but the native path should not need the redaction.
+    headers = {"Authorization": f"Bearer {token}"} if token else None
 
     if not sys.stdin.isatty():
         raise click.ClickException("interactive attach requires a TTY (use --headless)")
 
     try:
-        ws = connect(url, max_size=None)
+        ws = connect(url, max_size=None, additional_headers=headers)
     except InvalidStatus as exc:
         raise click.ClickException(f"server refused the attach handshake: {exc}")
     except OSError as exc:

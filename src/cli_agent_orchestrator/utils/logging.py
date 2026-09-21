@@ -8,8 +8,12 @@ from cli_agent_orchestrator.services.config_service import ConfigService
 
 # Query parameters that carry bearer credentials. `access_token` is the AG-UI
 # SSE pattern (browser EventSource cannot set an Authorization header);
-# `ticket` is reserved for the planned short-lived-ticket handshake.
-_CREDENTIAL_PARAMS = ("access_token", "ticket")
+# `token` is the same concession for the terminal WebSocket handshake, which a
+# browser also cannot put a header on — the native attach client sends the
+# header instead, but the viewer's URL reaches this log either way, and a token
+# named differently is no less replayable (Copilot review on #802); `ticket` is
+# reserved for the planned short-lived-ticket handshake.
+_CREDENTIAL_PARAMS = ("access_token", "token", "ticket")
 REDACTED = "[REDACTED]"
 _CREDENTIAL_RE = re.compile(
     r"\b(" + "|".join(_CREDENTIAL_PARAMS) + r")=([^&\s\"']+)",

@@ -18,7 +18,7 @@ from cli_agent_orchestrator.constants import (
     PYTE_SCREEN_ROWS,
 )
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.providers.manager import provider_manager
+from cli_agent_orchestrator.providers.manager import TerminalNotFoundError, provider_manager
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.event import terminal_id_from_topic
@@ -230,13 +230,21 @@ class StatusMonitor:
         """
         try:
             provider = provider_manager.get_provider(terminal_id)
-        except ValueError:
+        except TerminalNotFoundError:
             # No registry row for this id. Bytes can legitimately arrive on
             # either side of a row's life: a remote launch republishes a pane's
             # first output before the central row lands, and a terminal can be
             # deleted with its last chunk still in flight. There is nothing to
             # attribute the chunk to and nothing wrong, so this must not be a
             # logged exception - it was three tracebacks per remote launch.
+            #
+            # Narrowly this exception, not every ValueError: get_provider also
+            # raises one when the row EXISTS and the provider refused to be
+            # built (unknown provider type, kiro profile without an agent). That
+            # terminal is local, its status buffer would have stayed empty and
+            # its last status unset, and the misconfiguration would never have
+            # been logged (Copilot review on #802). It now falls through to the
+            # caller's handler, which logs it.
             logger.debug("status chunk for unknown terminal %s ignored", terminal_id)
             return
         use_screen = (

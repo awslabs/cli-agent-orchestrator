@@ -12,7 +12,7 @@ produces an explicit GapInfo the caller turns into a GapFrame.
 
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, List, Optional, Tuple
+from typing import Deque, List, Optional, Tuple, Union
 
 
 @dataclass(frozen=True)
@@ -21,6 +21,12 @@ class GapInfo:
 
     from_pos: int
     to_pos: int
+
+
+#: One element of a replay: either bytes at a position, or a reported hole where
+#: bytes should have been. :meth:`ReplayBuffer.replay_from` returns these in
+#: stream order so a caller can emit them without reordering.
+ReplayItem = Union[GapInfo, Tuple[int, bytes]]
 
 
 class ReplayBuffer:
@@ -104,35 +110,62 @@ class ReplayBuffer:
         self._end_pos = start
         return gap, self.append(chunk)
 
-    def replay_from(self, pos: int) -> Tuple[Optional[GapInfo], List[Tuple[int, bytes]]]:
-        """Return (gap, chunks) needed to bring a consumer at ``pos`` current.
+    def replay_from(self, pos: int) -> List[ReplayItem]:
+        """Return everything needed to bring a consumer at ``pos`` current.
 
-        - ``pos`` inside the window: no gap, chunks from ``pos`` onward (the
-          first chunk is trimmed so its start is exactly ``pos``).
-        - ``pos`` before the window: GapInfo(pos, window_start) plus every
-          retained chunk.
-        - ``pos`` at or past end_pos: nothing to do. A pos beyond the
-          watermark is a protocol violation (the consumer claims bytes that
-          were never produced) and raises ValueError.
+        Items come back in STREAM ORDER, each either a ``GapInfo`` or a
+        ``(pos, chunk)`` pair, so a caller emits them in the order the terminal
+        produced them:
+
+        - ``pos`` inside the window: the chunks from ``pos`` onward (the first is
+          trimmed so its start is exactly ``pos``), with a ``GapInfo`` before any
+          chunk that does not start where the previous one ended.
+        - ``pos`` before the window: a leading ``GapInfo(pos, window_start)``,
+          then the retained items.
+        - ``pos`` at or past end_pos: nothing to do. A pos beyond the watermark
+          is a protocol violation (the consumer claims bytes that were never
+          produced) and raises ValueError.
+
+        Interior holes are reported, not just the evicted prefix. ``append_at``
+        leaves a hole in the retained window when the bus drops a chunk, and it
+        returns a ``GapInfo`` the live path turns into a GapFrame — but if the
+        channel is down at that moment, that frame is never sent. The consumer
+        then reconnects asking for the end of the last chunk it did receive,
+        which is INSIDE the window, so a gap keyed only on ``window_start``
+        reported nothing: the next chunk arrived at a higher position, the server
+        recorded it, and a transcript with a hole in it was accepted as whole —
+        exactly the loss positions exist to make reportable (Copilot review
+        on #802). Chunk starts are the authority here; a hole needs no extra
+        bookkeeping to detect, only to be looked for.
+
+        Stream order matters for the same reason. Sending every gap first and
+        the bytes afterwards would advance a consumer's watermark past chunks it
+        has not received, so a reconnect dying mid-replay would leave it claiming
+        bytes that were never delivered — reintroducing the silent loss one layer
+        up.
         """
         if pos > self._end_pos:
             raise ValueError(f"resume position {pos} is past end_pos {self._end_pos}")
         if pos == self._end_pos:
-            return None, []
+            return []
 
-        gap: Optional[GapInfo] = None
+        out: List[ReplayItem] = []
         start = self.window_start
         if pos < start:
-            gap = GapInfo(from_pos=pos, to_pos=start)
+            out.append(GapInfo(from_pos=pos, to_pos=start))
             pos = start
 
-        out: List[Tuple[int, bytes]] = []
+        expected = pos
         for chunk_start, chunk in self._chunks:
             chunk_end = chunk_start + len(chunk)
-            if chunk_end <= pos:
+            if chunk_end <= expected:
                 continue
-            if chunk_start < pos:
-                out.append((pos, chunk[pos - chunk_start :]))
+            if chunk_start > expected:
+                out.append(GapInfo(from_pos=expected, to_pos=chunk_start))
+                out.append((chunk_start, chunk))
+            elif chunk_start < expected:
+                out.append((expected, chunk[expected - chunk_start :]))
             else:
                 out.append((chunk_start, chunk))
-        return gap, out
+            expected = chunk_end
+        return out

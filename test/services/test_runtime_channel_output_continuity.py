@@ -23,7 +23,7 @@ import pytest
 
 from cli_agent_orchestrator.runtime_channel.bridge import Bridge
 from cli_agent_orchestrator.runtime_channel.protocol import GapFrame, StreamFrame
-from cli_agent_orchestrator.runtime_channel.replay_buffer import ReplayBuffer
+from cli_agent_orchestrator.runtime_channel.replay_buffer import GapInfo, ReplayBuffer
 from cli_agent_orchestrator.services.fifo_reader import FifoManager
 
 TID = "aaaa1111"
@@ -52,8 +52,51 @@ class TestProducerAssignedPositions:
         buf = ReplayBuffer(max_bytes=1024)
         buf.append_at(0, b"abc")
         buf.append_at(103, b"xyz")
-        _, chunks = buf.replay_from(0)
-        assert [(p, c) for p, c in chunks] == [(0, b"abc"), (103, b"xyz")]
+        items = buf.replay_from(0)
+        assert [i for i in items if not isinstance(i, GapInfo)] == [(0, b"abc"), (103, b"xyz")]
+
+    def test_a_replay_re_reports_an_interior_hole(self):
+        """The hole is reported again on reconnect, in stream order.
+
+        ``append_at`` returns the gap once, and the live path turns it into a
+        GapFrame — but a chunk is dropped precisely when things are going wrong,
+        and if the channel is down at that moment that frame is never sent. The
+        consumer then resumes from the end of the last chunk it DID receive,
+        which is inside the retained window, so a gap keyed only on
+        ``window_start`` reported nothing and the higher-positioned chunk was
+        accepted as if it followed contiguously (Copilot review on #802).
+        """
+        buf = ReplayBuffer(max_bytes=1024)
+        buf.append_at(0, b"abc")
+        buf.append_at(103, b"xyz")  # the live GapFrame for [3,103) never landed
+
+        assert buf.replay_from(3) == [GapInfo(from_pos=3, to_pos=103), (103, b"xyz")]
+
+    def test_a_gap_precedes_the_bytes_that_follow_it(self):
+        """Order is load-bearing: a consumer must not advance past undelivered bytes.
+
+        Every gap first and the bytes afterwards would let a reconnect that dies
+        mid-replay leave the consumer's watermark past chunks it never received —
+        the same silent loss, one layer up.
+        """
+        buf = ReplayBuffer(max_bytes=1024)
+        buf.append_at(0, b"aa")  # [0,2)
+        buf.append_at(10, b"bb")  # [10,12) — hole [2,10)
+        buf.append_at(30, b"cc")  # [30,32) — hole [12,30)
+
+        assert buf.replay_from(2) == [
+            GapInfo(from_pos=2, to_pos=10),
+            (10, b"bb"),
+            GapInfo(from_pos=12, to_pos=30),
+            (30, b"cc"),
+        ]
+
+    def test_a_mid_chunk_resume_after_a_hole_still_trims(self):
+        buf = ReplayBuffer(max_bytes=1024)
+        buf.append_at(0, b"abc")
+        buf.append_at(10, b"defgh")
+
+        assert buf.replay_from(11) == [(11, b"efgh")]
 
     def test_a_watermark_that_counts_the_loss_is_the_point(self):
         """Contrast with arrival-order numbering, which is what the bug was."""

@@ -1614,6 +1614,58 @@ class TestClaudeCodeProviderContainerPathTranslation:
         assert "/app/config" not in mcp_arg
 
 
+class TestTheMcpConfigIsNeverWorldReadable:
+    """The file holds a credential, so 0600 is a property of it, not a preference.
+
+    ``resolve_mcp_server_config`` hands CAO's own bundled server the runtime
+    channel token, so this file structurally carries a secret. ``write_text``
+    then ``chmod`` published the whole body at the umask default first, and left
+    a pre-existing inode's mode untouched for the duration of the write (Copilot
+    review on #802).
+    """
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_a_fresh_file_is_owner_only(self, mock_load, tmp_path):
+        mock_load.return_value = AgentProfile(
+            name="test-agent",
+            description="d",
+            system_prompt="p",
+            mcpServers={"test-mcp": {"command": "echo", "args": []}},
+        )
+        provider = ClaudeCodeProvider("test-mode-new", "sess", "win", "test-agent")
+
+        with patch("cli_agent_orchestrator.providers.claude_code.CAO_HOME_DIR", tmp_path):
+            provider._build_claude_command()
+
+        mcp_file = tmp_path / "tmp" / "test-mode-new.mcp.json"
+        assert stat.S_IMODE(mcp_file.stat().st_mode) == 0o600
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_a_preexisting_0644_file_is_replaced_not_widened(self, mock_load, tmp_path):
+        """The name is deterministic per terminal, so an old inode is reachable.
+
+        A mode-preserving writer would keep 0644 here and write a token into a
+        world-readable file; this must publish a new owner-only inode instead.
+        """
+        mock_load.return_value = AgentProfile(
+            name="test-agent",
+            description="d",
+            system_prompt="p",
+            mcpServers={"test-mcp": {"command": "echo", "args": []}},
+        )
+        stale = tmp_path / "tmp" / "test-mode-old.mcp.json"
+        stale.parent.mkdir(parents=True)
+        stale.write_text("{}")
+        stale.chmod(0o644)
+        provider = ClaudeCodeProvider("test-mode-old", "sess", "win", "test-agent")
+
+        with patch("cli_agent_orchestrator.providers.claude_code.CAO_HOME_DIR", tmp_path):
+            provider._build_claude_command()
+
+        assert stat.S_IMODE(stale.stat().st_mode) == 0o600
+        assert "mcpServers" in json.loads(stale.read_text())
+
+
 class TestClaudeCodeProviderModelFlag:
     """Tests that profile.model is forwarded to Claude Code via --model."""
 

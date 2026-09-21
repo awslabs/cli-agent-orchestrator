@@ -23,6 +23,7 @@ from cli_agent_orchestrator.models.terminal import TerminalInputBlockedError, Te
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.atomic_file import write_owner_only
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
@@ -493,11 +494,16 @@ class ClaudeCodeProvider(BaseProvider):
                 tmp_dir = CAO_HOME_DIR / "tmp"
                 tmp_dir.mkdir(parents=True, exist_ok=True)
                 mcp_file = tmp_dir / f"{self.terminal_id}.mcp.json"
-                mcp_file.write_text(json.dumps({"mcpServers": mcp_config}), encoding="utf-8")
-                try:
-                    mcp_file.chmod(0o600)
-                except OSError:
-                    pass
+                # Owner-only from the first byte. The env above can carry
+                # CAO_RUNTIME_TOKEN — resolve_mcp_server_config hands the
+                # bundled server the channel credential — so this file
+                # structurally holds a secret, and `write_text` then `chmod`
+                # publishes the whole body at the umask default first: another
+                # local account can open it inside that window and keep reading
+                # through the descriptor after the narrowing. The name is
+                # deterministic per terminal, so an inode left 0644 by an older
+                # build is not hypothetical either (Copilot review on #802).
+                write_owner_only(mcp_file, json.dumps({"mcpServers": mcp_config}))
                 command_parts.extend(
                     [
                         "--mcp-config",

@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.providers.manager import TerminalNotFoundError
 from cli_agent_orchestrator.services.status_monitor import (
     STALE_PROCESSING_BUFFER_QUIET_S,
     STALE_PROCESSING_CONFIRM_TTL_S,
@@ -1424,7 +1425,9 @@ class TestChunksTheServerMustNotInterpret:
 
     @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
     def test_a_chunk_for_an_unknown_terminal_is_ignored_quietly(self, mock_pm):
-        mock_pm.get_provider.side_effect = ValueError("Terminal t-gone not found in database")
+        mock_pm.get_provider.side_effect = TerminalNotFoundError(
+            "Terminal t-gone not found in database"
+        )
         sm = StatusMonitor()
 
         sm._process_chunk("t-gone", "some output")  # must not raise
@@ -1432,6 +1435,24 @@ class TestChunksTheServerMustNotInterpret:
         # Nothing was attributed to an id with no row.
         assert "t-gone" not in sm._buffers
         assert "t-gone" not in sm._last_status
+
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_a_provider_that_failed_to_build_is_not_mistaken_for_a_missing_row(self, mock_pm):
+        """A configuration fault must not be swallowed by the missing-row guard.
+
+        ``get_provider`` raises ``ValueError`` for two unrelated situations: no
+        row for the id (ordinary, quiet) and a row whose provider refused to be
+        constructed — an unknown provider type, a kiro profile with no agent.
+        Catching the base class treated the second as the first, so a local
+        terminal silently never accumulated a buffer or a status and nothing was
+        logged. The narrow exception is the missing row only; anything else
+        propagates to the caller's handler, which logs it.
+        """
+        mock_pm.get_provider.side_effect = ValueError("Unknown provider type: typo_cli")
+        sm = StatusMonitor()
+
+        with pytest.raises(ValueError, match="Unknown provider type"):
+            sm._process_chunk("t-misconfigured", "some output")
 
     @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
     def test_a_local_chunk_is_still_processed(self, mock_pm):

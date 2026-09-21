@@ -63,6 +63,26 @@ class TestRedactQueryTokenFilter:
         assert "SECRET" not in out
         assert out.count(f"access_token={REDACTED}") == 2
 
+    def test_scrubs_the_websocket_token_param(self):
+        """``?token=`` is the terminal WS handshake's browser concession.
+
+        A browser cannot set a header on a WebSocket handshake, so the viewer has
+        to put the bearer token in the URL — and uvicorn logs the raw path. The
+        filter listed ``access_token`` and ``ticket`` only, so this one persisted
+        in plaintext and stayed replayable until ``exp`` (Copilot review
+        on #802). The native attach client sends a header instead; this covers
+        the caller that has no alternative.
+        """
+        out = _rendered(_record("GET /terminals/abcd1234/ws?token=eyJhbGciOi.abc.def HTTP/1.1"))
+        assert "eyJhbGciOi" not in out
+        assert f"token={REDACTED}" in out
+
+    def test_scrubbing_token_does_not_mangle_access_token(self):
+        """The two parameter names overlap; the longer one must still redact whole."""
+        out = _rendered(_record("GET /agui/v1/stream?access_token=SECRET.J.WT HTTP/1.1"))
+        assert "SECRET" not in out
+        assert f"access_token={REDACTED}" in out
+
     def test_scrubs_ticket_param_and_preserves_other_params(self):
         out = _rendered(_record("GET /agui/v1/stream?ticket=TKT123&since=x HTTP/1.1"))
         assert "TKT123" not in out

@@ -15,6 +15,7 @@ from cli_agent_orchestrator.runtime_channel import (
     EventFrame,
     EventType,
     GapFrame,
+    GapInfo,
     HeartbeatFrame,
     HelloFrame,
     ReplayBuffer,
@@ -107,21 +108,19 @@ class TestReplayBuffer:
         assert buf.append(b"abc") == 0
         assert buf.append(b"defg") == 3
         assert buf.end_pos == 7
-        gap, chunks = buf.replay_from(0)
-        assert gap is None
-        assert b"".join(c for _, c in chunks) == b"abcdefg"
+        items = buf.replay_from(0)
+        assert not any(isinstance(i, GapInfo) for i in items)
+        assert b"".join(c for _, c in items) == b"abcdefg"
 
     def test_replay_from_mid_chunk_trims(self):
         buf = ReplayBuffer(max_bytes=100)
         buf.append(b"abcdef")
-        gap, chunks = buf.replay_from(2)
-        assert gap is None
-        assert chunks == [(2, b"cdef")]
+        assert buf.replay_from(2) == [(2, b"cdef")]
 
     def test_replay_at_watermark_is_empty(self):
         buf = ReplayBuffer(max_bytes=100)
         buf.append(b"abc")
-        assert buf.replay_from(3) == (None, [])
+        assert buf.replay_from(3) == []
 
     def test_eviction_produces_explicit_gap(self):
         buf = ReplayBuffer(max_bytes=6)
@@ -129,27 +128,22 @@ class TestReplayBuffer:
         buf.append(b"bbb")  # [3,6)
         buf.append(b"ccc")  # [6,9) — evicts "aaa"
         assert buf.window_start == 3
-        gap, chunks = buf.replay_from(0)
-        assert gap is not None
-        assert (gap.from_pos, gap.to_pos) == (0, 3)
-        assert b"".join(c for _, c in chunks) == b"bbbccc"
+        items = buf.replay_from(0)
+        assert items[0] == GapInfo(from_pos=0, to_pos=3)
+        assert b"".join(c for _, c in items[1:]) == b"bbbccc"
 
     def test_gap_bounded_to_window_start_not_resume_chunk(self):
         buf = ReplayBuffer(max_bytes=4)
         buf.append(b"aaaa")  # [0,4)
         buf.append(b"bb")  # [4,6) — evicts "aaaa"
-        gap, chunks = buf.replay_from(1)
-        assert (gap.from_pos, gap.to_pos) == (1, 4)
-        assert chunks == [(4, b"bb")]
+        assert buf.replay_from(1) == [GapInfo(from_pos=1, to_pos=4), (4, b"bb")]
 
     def test_oversized_chunk_still_advances_watermark(self):
         buf = ReplayBuffer(max_bytes=4)
         assert buf.append(b"abcdefgh") == 0
         assert buf.end_pos == 8
         # Whole-chunk eviction dropped it; the loss is visible, not silent.
-        gap, chunks = buf.replay_from(0)
-        assert (gap.from_pos, gap.to_pos) == (0, 8)
-        assert chunks == []
+        assert buf.replay_from(0) == [GapInfo(from_pos=0, to_pos=8)]
 
     def test_resume_past_watermark_is_protocol_violation(self):
         buf = ReplayBuffer(max_bytes=10)
@@ -161,7 +155,7 @@ class TestReplayBuffer:
         buf = ReplayBuffer(max_bytes=10)
         assert buf.append(b"") == 0
         assert buf.end_pos == 0
-        assert buf.replay_from(0) == (None, [])
+        assert buf.replay_from(0) == []
 
     def test_generation_is_carried(self):
         assert ReplayBuffer(max_bytes=1, generation=5).generation == 5

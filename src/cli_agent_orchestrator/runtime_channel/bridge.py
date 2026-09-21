@@ -54,7 +54,7 @@ from cli_agent_orchestrator.runtime_channel.protocol import (
     decode_frame,
     encode_frame,
 )
-from cli_agent_orchestrator.runtime_channel.replay_buffer import ReplayBuffer
+from cli_agent_orchestrator.runtime_channel.replay_buffer import GapInfo, ReplayBuffer
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.log_writer import log_writer
 from cli_agent_orchestrator.services.status_monitor import status_monitor
@@ -772,18 +772,24 @@ class Bridge:
                     buf.end_pos,
                 )
                 start = buf.end_pos
-            gap, chunks = buf.replay_from(start)
-            if gap is not None:
-                await self._send(
-                    GapFrame(
-                        terminal_id=resume.terminal_id,
-                        stream=StreamName.CAPTURE,
-                        generation=buf.generation,
-                        from_pos=gap.from_pos,
-                        to_pos=gap.to_pos,
+            # Gaps and bytes come back interleaved in stream order and are sent
+            # that way: a hole the live path could not report (the channel was
+            # already down when the bus dropped the chunk) is re-reported here,
+            # ahead of the bytes that follow it, so the server never advances
+            # past a range it has not received.
+            for item in buf.replay_from(start):
+                if isinstance(item, GapInfo):
+                    await self._send(
+                        GapFrame(
+                            terminal_id=resume.terminal_id,
+                            stream=StreamName.CAPTURE,
+                            generation=buf.generation,
+                            from_pos=item.from_pos,
+                            to_pos=item.to_pos,
+                        )
                     )
-                )
-            for pos, chunk in chunks:
+                    continue
+                pos, chunk = item
                 await self._send(
                     StreamFrame(
                         terminal_id=resume.terminal_id,

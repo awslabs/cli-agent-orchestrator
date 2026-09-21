@@ -97,6 +97,56 @@ class TestDetach:
             os.close(master)
             os.close(slave)
 
+
+class TestTheCredentialIsNotInTheUrl:
+    """A bearer token in a query string is a token in every log on the path.
+
+    The server accepts ``?token=`` only because a browser cannot set a header on
+    a WebSocket handshake. This client can, and must: uvicorn logs the raw
+    path+query, the access log's redaction was keyed on the parameter names the
+    browser paths use, and any proxy in between keeps its own copy — so a native
+    attach persisted a reusable credential in plaintext (Copilot review on #802).
+    """
+
+    def test_the_token_travels_as_an_authorization_header(self):
+        master, slave = pty.openpty()
+        ws = _FakeWS([b"bytes"])
+        try:
+            with (
+                patch.object(remote_attach.sys, "stdin", _Stdin(slave)),
+                patch("websockets.sync.client.connect", return_value=ws) as connect,
+            ):
+                remote_attach.attach_remote_terminal(
+                    "abcd1234", "http://server:9889", token="SECRET.J.WT"
+                )
+        finally:
+            os.close(master)
+            os.close(slave)
+
+        url = connect.call_args.args[0]
+        assert "SECRET.J.WT" not in url
+        assert "token" not in url
+        assert connect.call_args.kwargs["additional_headers"] == {
+            "Authorization": "Bearer SECRET.J.WT"
+        }
+
+    def test_no_token_sends_no_header(self):
+        master, slave = pty.openpty()
+        ws = _FakeWS([b"bytes"])
+        try:
+            with (
+                patch.object(remote_attach.sys, "stdin", _Stdin(slave)),
+                patch("websockets.sync.client.connect", return_value=ws) as connect,
+            ):
+                remote_attach.attach_remote_terminal("abcd1234", "http://server:9889")
+        finally:
+            os.close(master)
+            os.close(slave)
+
+        assert connect.call_args.kwargs["additional_headers"] is None
+
+
+class TestRefusals:
     def test_non_tty_is_refused_before_connecting(self):
         class _NotATty:
             def isatty(self):
