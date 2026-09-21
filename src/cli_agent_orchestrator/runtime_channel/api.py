@@ -213,6 +213,23 @@ async def runtime_channel(ws: WebSocket) -> None:
                     frame.from_pos,
                     frame.to_pos,
                 )
+                if frame.to_pos is not None:
+                    # A BOUNDED gap is a definitive answer: those bytes are gone
+                    # and no reconnect will ever produce them. Only StreamFrames
+                    # advanced the watermark, so a gap that replayed no chunks
+                    # alongside it (one evicted chunk larger than the whole
+                    # window) left the resume position before ``to_pos`` — and
+                    # every reconnect then asked for the same lost range and got
+                    # the same gap, forever, never reaching live bytes. Consuming
+                    # the gap is what closes that loop.
+                    #
+                    # ``to_pos is None`` is the runtime saying it cannot bound
+                    # the loss (a lost generation). Advancing on that would skip
+                    # past bytes that may yet arrive, so it is deliberately left
+                    # to the generation path (Copilot review on #802).
+                    runtime_registry.record_position(
+                        frame.terminal_id, frame.stream.value, frame.to_pos
+                    )
                 bus.publish(
                     f"terminal.{frame.terminal_id}.output",
                     {"data": "", "gap": {"from_pos": frame.from_pos, "to_pos": frame.to_pos}},

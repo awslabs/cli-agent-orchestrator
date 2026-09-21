@@ -15,6 +15,7 @@ from cli_agent_orchestrator.runtime_channel.protocol import (
     CommandType,
     EventFrame,
     EventType,
+    GapFrame,
     HelloFrame,
     StreamFrame,
     StreamName,
@@ -518,3 +519,209 @@ class TestChannelEndpoint:
         # is mistaken for output already consumed.
         assert runtime_registry.resume_position(TID, "capture") == len(b"live output")
         runtime_registry.unbind_terminal(TID)
+
+
+GAP_TID = "beefcafe"
+
+
+class TestABoundedGapIsConsumed:
+    """Reported loss has to move the watermark, or the channel never catches up.
+
+    Only StreamFrames advanced the resume position. A runtime whose replay window
+    evicted a chunk larger than the window itself answers the resume request with a
+    gap and no bytes, so the position stayed where it was — and the next reconnect
+    asked for the same already-lost range, got the same gap, and so on. The stream
+    could never reach live output again. A *bounded* gap is the runtime stating
+    exactly which bytes are gone, which is enough to move past them; an unbounded
+    one (``to_pos is None``) is it saying it cannot tell, so that stays put
+    (Copilot review on #802).
+    """
+
+    HEADERS = {"Host": "localhost", "X-CAO-Runtime-Token": "test-runtime-token"}
+
+    @staticmethod
+    def _gap(from_pos, to_pos):
+        return encode_frame(
+            GapFrame(
+                terminal_id=GAP_TID,
+                stream=StreamName.CAPTURE,
+                generation=0,
+                from_pos=from_pos,
+                to_pos=to_pos,
+            )
+        )
+
+    @staticmethod
+    def _sync(ws, op_id):
+        """Round-trip an ack so the frames sent before it have been handled.
+
+        The endpoint processes frames in order on one task, so an ack for a result
+        sent afterwards proves the gap ahead of it was consumed — without sleeping.
+        """
+        ws.send_text(
+            encode_frame(
+                CommandResultFrame(op_id=op_id, terminal_id=GAP_TID, outcome=CommandOutcome.OK)
+            )
+        )
+        ack = decode_frame(ws.receive_text())
+        assert isinstance(ack, AckFrame) and ack.op_id == op_id
+
+    @pytest.fixture(autouse=True)
+    def _clean_registry(self):
+        from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
+
+        runtime_registry.unbind_terminal(GAP_TID)
+        yield
+        runtime_registry.unbind_terminal(GAP_TID)
+
+    def test_a_bounded_gap_advances_the_resume_position(self, channel_client):
+        from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
+
+        with channel_client.websocket_connect("/runtime/channel", headers=self.HEADERS) as ws:
+            ws.send_text(_hello())
+            decode_frame(ws.receive_text())
+            ws.send_text(self._gap(0, 64))
+            self._sync(ws, "sync-gap")
+
+            assert runtime_registry.resume_position(GAP_TID, "capture") == 64
+
+    def test_a_reconnect_after_a_bounded_gap_asks_for_live_bytes_not_the_lost_range(
+        self, channel_client
+    ):
+        """The loop this closes, end to end.
+
+        The second hello advertises the same position it did the first time — the
+        runtime's own watermark is unchanged by the loss. What must change is the
+        server's answer: it has to ask for bytes after the gap, because asking for
+        the lost ones again is what spun forever.
+        """
+        with channel_client.websocket_connect("/runtime/channel", headers=self.HEADERS) as ws:
+            ws.send_text(_hello())
+            decode_frame(ws.receive_text())
+            ws.send_text(self._gap(0, 64))
+            self._sync(ws, "sync-gap")
+
+        with channel_client.websocket_connect("/runtime/channel", headers=self.HEADERS) as ws:
+            ws.send_text(
+                _hello(
+                    streams=[
+                        StreamPosition(
+                            terminal_id=GAP_TID,
+                            stream=StreamName.CAPTURE,
+                            generation=0,
+                            end_pos=200,
+                        )
+                    ]
+                )
+            )
+            reply = decode_frame(ws.receive_text())
+
+        assert reply.resume[0].terminal_id == GAP_TID
+        assert reply.resume[0].end_pos == 64, "the reconnect asked for the lost range again"
+
+    def test_bytes_after_a_consumed_gap_still_land_contiguously(self, channel_client):
+        """Consuming the gap must not make the runtime's next output look stale."""
+        from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
+
+        with channel_client.websocket_connect("/runtime/channel", headers=self.HEADERS) as ws:
+            ws.send_text(_hello())
+            decode_frame(ws.receive_text())
+            ws.send_text(self._gap(0, 64))
+            ws.send_text(
+                encode_frame(
+                    StreamFrame(
+                        terminal_id=GAP_TID,
+                        stream=StreamName.CAPTURE,
+                        generation=0,
+                        pos=64,
+                        data=base64.b64encode(b"after the loss").decode(),
+                    )
+                )
+            )
+            self._sync(ws, "sync-after")
+
+            assert runtime_registry.resume_position(GAP_TID, "capture") == 64 + len(
+                b"after the loss"
+            )
+
+    def test_an_unbounded_gap_leaves_the_position_alone(self, channel_client):
+        """``to_pos is None`` is "I cannot tell you what was lost".
+
+        Advancing on that would skip past bytes that may still arrive, and there is
+        no value to advance *to*. A lost generation is recovered by the generation
+        path instead, so this arm must stay where it was.
+        """
+        from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
+
+        with channel_client.websocket_connect("/runtime/channel", headers=self.HEADERS) as ws:
+            ws.send_text(_hello())
+            decode_frame(ws.receive_text())
+            ws.send_text(
+                encode_frame(
+                    StreamFrame(
+                        terminal_id=GAP_TID,
+                        stream=StreamName.CAPTURE,
+                        generation=0,
+                        pos=0,
+                        data=base64.b64encode(b"12345").decode(),
+                    )
+                )
+            )
+            ws.send_text(self._gap(5, None))
+            self._sync(ws, "sync-unbounded")
+
+            assert runtime_registry.resume_position(GAP_TID, "capture") == 5
+
+    def test_a_gap_behind_the_watermark_does_not_rewind_it(self, channel_client):
+        """A retained gap re-sent after the stream moved on must not undo progress.
+
+        ``record_position`` only ever moves forward, and the gap arm goes through it
+        for that reason: a late or duplicated gap frame cannot reopen a range the
+        server has already consumed and cause the bytes after it to be replayed.
+        """
+        from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
+
+        with channel_client.websocket_connect("/runtime/channel", headers=self.HEADERS) as ws:
+            ws.send_text(_hello())
+            decode_frame(ws.receive_text())
+            ws.send_text(
+                encode_frame(
+                    StreamFrame(
+                        terminal_id=GAP_TID,
+                        stream=StreamName.CAPTURE,
+                        generation=0,
+                        pos=0,
+                        data=base64.b64encode(b"0123456789").decode(),
+                    )
+                )
+            )
+            ws.send_text(self._gap(0, 4))
+            self._sync(ws, "sync-stale-gap")
+
+            assert runtime_registry.resume_position(GAP_TID, "capture") == 10
+
+    def test_the_loss_is_still_reported_to_subscribers(self, channel_client):
+        """Consuming a gap is bookkeeping, not suppression.
+
+        The subscriber-visible marker is the only signal that a transcript has a
+        hole in it, so the fix must not have traded a silent hole for a spinning
+        one.
+        """
+        from cli_agent_orchestrator.services.event_bus import bus
+
+        received = []
+        original_publish = bus.publish
+        bus.publish = lambda topic, data: received.append((topic, data))
+        try:
+            with channel_client.websocket_connect("/runtime/channel", headers=self.HEADERS) as ws:
+                ws.send_text(_hello())
+                decode_frame(ws.receive_text())
+                ws.send_text(self._gap(0, 64))
+                self._sync(ws, "sync-published")
+        finally:
+            bus.publish = original_publish
+
+        assert (
+            f"terminal.{GAP_TID}.output",
+            {"data": "", "gap": {"from_pos": 0, "to_pos": 64}},
+        ) in received
