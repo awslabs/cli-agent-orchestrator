@@ -45,6 +45,30 @@ _AUTH_TEST_DOMAIN = "test.local"
 _AUTH_TEST_AUDIENCE = "cao://test"
 
 
+@pytest.fixture(scope="session", autouse=True)
+def shipped_owner_lock_path(tmp_path_factory):
+    """Point the server owner lock (#745) at a per-session path, not the user's.
+
+    ``OWNER_LOCK_PATH`` defaults to the real ``DB_DIR``, so any test that drives
+    the app lifespan tries to take the same lock a ``cao-server`` running on this
+    machine already holds — and ``flock`` is per-kernel, so it correctly refuses.
+    The result was 25 failures across ``test/api`` on a developer laptop with a
+    server up and none in CI: an outcome that depends on what else is running is
+    worse than either verdict. The lock's own behaviour is unaffected, because
+    ``test/services/test_server_owner.py`` passes the path it wants explicitly.
+
+    Yields the **shipped** default, which the redirect would otherwise hide from
+    the one test whose subject is where the lock lives.
+    """
+    from cli_agent_orchestrator.services import server_owner
+
+    shipped = server_owner.OWNER_LOCK_PATH
+    lock_path = tmp_path_factory.mktemp("server-owner") / "server-owner.lock"
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(server_owner, "OWNER_LOCK_PATH", lock_path)
+        yield shipped
+
+
 @pytest.fixture
 def rsa_keys():
     """Generate a fresh RSA-2048 keypair for the test.

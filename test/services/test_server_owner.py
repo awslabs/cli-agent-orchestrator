@@ -202,12 +202,14 @@ class TestOptOut:
 
 
 class TestLockLocation:
-    def test_the_lock_lives_with_the_state_it_guards(self):
+    def test_the_lock_lives_with_the_state_it_guards(self, shipped_owner_lock_path):
         from cli_agent_orchestrator.constants import DB_DIR
 
         # Next to the database, not in /tmp: the guard must travel with the
         # PVC, or two pods mounting the same volume would each get their own.
-        assert server_owner.OWNER_LOCK_PATH.parent == DB_DIR
+        # Asserted against the shipped default rather than the live attribute,
+        # which the suite redirects so it never contends with a real server.
+        assert shipped_owner_lock_path.parent == DB_DIR
 
     def test_the_lock_file_is_not_world_readable(self, lock_path):
         acquire_server_ownership()
