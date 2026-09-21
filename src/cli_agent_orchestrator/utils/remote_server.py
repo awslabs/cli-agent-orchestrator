@@ -52,9 +52,32 @@ def require_local(operation: str) -> None:
         )
 
 
-def _headers() -> dict:
-    token = os.environ.get(API_TOKEN_ENV, "").strip()
+def api_token() -> Optional[str]:
+    """The configured bearer token, or None. For the WS attach query param."""
+    return os.environ.get(API_TOKEN_ENV, "").strip() or None
+
+
+def auth_headers() -> dict:
+    """Authorization header for the selected server, empty when no token is set.
+
+    Public because not every call can go through :func:`api_request`: commands
+    that assemble their own request (``cao launch``) still need the credential,
+    and a hand-rolled call that omits it fails only on a server with auth
+    enabled — the configuration least likely to be the one under test.
+    """
+    token = api_token()
     return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+def server_base_url() -> str:
+    """The base URL every CLI request should use: shared target, else local.
+
+    Resolved per call, so a ``CAO_API_BASE_URL`` exported after the process
+    started still wins over the import-time constant.
+    """
+    from cli_agent_orchestrator.constants import API_BASE_URL
+
+    return remote_base_url() or API_BASE_URL
 
 
 def api_request(method: str, path: str, **kwargs) -> requests.Response:
@@ -63,11 +86,9 @@ def api_request(method: str, path: str, **kwargs) -> requests.Response:
     Raises click.ClickException on connection errors or non-2xx responses,
     with the server's ``detail`` message when present.
     """
-    from cli_agent_orchestrator.constants import API_BASE_URL
-
-    base = remote_base_url() or API_BASE_URL
+    base = server_base_url()
     kwargs.setdefault("timeout", _REQUEST_TIMEOUT)
-    headers = {**_headers(), **kwargs.pop("headers", {})}
+    headers = {**auth_headers(), **kwargs.pop("headers", {})}
     try:
         response = requests.request(method, f"{base}{path}", headers=headers, **kwargs)
     except requests.exceptions.RequestException as e:
