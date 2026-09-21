@@ -141,6 +141,22 @@ def _text(result):
     return "".join(block.text for block in result.content if getattr(block, "text", None))
 
 
+def _flatten_error(exc):
+    """All the text in an exception, including an ExceptionGroup's members.
+
+    A failure raised inside the streamable-HTTP task group surfaces as a
+    ``BaseExceptionGroup``, so ``str(exc)`` alone does not contain the server's
+    message.
+    """
+    parts = [f"{type(exc).__name__}: {exc}"]
+    for inner in getattr(exc, "exceptions", ()):
+        parts.append(_flatten_error(inner))
+    cause = getattr(exc, "__cause__", None)
+    if cause is not None:
+        parts.append(_flatten_error(cause))
+    return " | ".join(parts)
+
+
 class TestOfficialSdkRoundTrip:
     @pytest.mark.asyncio
     async def test_a_real_client_initializes_and_calls_a_tool(self, shared_endpoint):
@@ -206,19 +222,59 @@ class TestOfficialSdkRoundTrip:
 
 
 class TestAuthOverTheWire:
-    @pytest.mark.asyncio
-    async def test_a_wrong_token_cannot_call_a_tool(self, shared_endpoint):
-        async with _session(shared_endpoint, _headers(caller="abcd1234", token="wrong")) as s:
-            result = await asyncio.wait_for(s.call_tool("whoami"), CALL_TIMEOUT)
-        assert result.isError is True
-        assert "unauthorized" in _text(result).lower()
+    """Every request, not just the tool call.
+
+    The check used to hang off ``on_call_tool``, which FastMCP dispatches only
+    for ``tools/call``. ``initialize`` and ``tools/list`` went to the base class's
+    pass-through, so an unauthenticated client could open a session and read the
+    whole tool surface — every name, description and argument schema of the
+    control plane — and was refused only when it tried to use one. These tests
+    drive the handshake itself, because that is where the hole was (Copilot review
+    on #802).
+    """
 
     @pytest.mark.asyncio
-    async def test_no_token_at_all_cannot_call_a_tool(self, shared_endpoint):
-        async with _session(shared_endpoint, _headers(caller="abcd1234", token=None)) as s:
-            result = await asyncio.wait_for(s.call_tool("whoami"), CALL_TIMEOUT)
-        assert result.isError is True
-        assert "unauthorized" in _text(result).lower()
+    async def test_a_wrong_token_cannot_even_open_a_session(self, shared_endpoint, caplog):
+        with pytest.raises(BaseException) as excinfo:
+            async with _session(shared_endpoint, _headers(caller="abcd1234", token="wrong")):
+                pass
+        # The client is told only that its request was rejected — the endpoint
+        # does not describe its own auth to an unauthenticated caller — so the
+        # refusal is asserted at the server, where the reason is recorded.
+        assert "McpError" in _flatten_error(excinfo.value)
+        assert "unauthorized" in caplog.text.lower()
+
+    @pytest.mark.asyncio
+    async def test_no_token_at_all_cannot_even_open_a_session(self, shared_endpoint, caplog):
+        with pytest.raises(BaseException) as excinfo:
+            async with _session(shared_endpoint, _headers(caller="abcd1234", token=None)):
+                pass
+        assert "McpError" in _flatten_error(excinfo.value)
+        assert "unauthorized" in caplog.text.lower()
+
+    @pytest.mark.asyncio
+    async def test_an_unauthenticated_client_cannot_enumerate_the_tools(self, shared_endpoint):
+        """The disclosure the old gate allowed, asserted at the transport.
+
+        ``tools/list`` without an initialized session — a raw POST, exactly what
+        a client that skipped the handshake would send.
+        """
+        body = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                shared_endpoint,
+                json=body,
+                headers={"Accept": "application/json, text/event-stream"},
+                timeout=CALL_TIMEOUT,
+            )
+        assert "whoami" not in response.text
+
+    @pytest.mark.asyncio
+    async def test_the_right_token_still_lists_the_tools(self, shared_endpoint):
+        """The gate refuses the unauthenticated, not everyone."""
+        async with _session(shared_endpoint, _headers(caller="abcd1234")) as session:
+            tools = await asyncio.wait_for(session.list_tools(), CALL_TIMEOUT)
+        assert "whoami" in {t.name for t in tools.tools}
 
 
 def _shim_params(url, env_extra):

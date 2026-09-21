@@ -9,10 +9,12 @@ process-global ``CAO_TERMINAL_ID``.
 Two gates, in order, before any tool runs:
 
 1. **Shared-token auth.** Every request must carry ``X-CAO-Runtime-Token``
-   matching ``CAO_RUNTIME_TOKEN``. Absent config → the endpoint refuses to
-   start, so a shared endpoint is never brought up unauthenticated. (#774
-   replaces this shared token with per-caller delegated credentials whose
-   verified subject becomes the identity directly.)
+   matching ``CAO_RUNTIME_TOKEN`` — including ``initialize`` and ``tools/list``,
+   not only ``tools/call``, so an unauthenticated client cannot enumerate the
+   endpoint's tool surface. Absent config → the endpoint refuses to start, so a
+   shared endpoint is never brought up unauthenticated. (#774 replaces this
+   shared token with per-caller delegated credentials whose verified subject
+   becomes the identity directly.)
 2. **Per-request identity.** The caller's terminal id is read from
    ``X-CAO-Caller-Terminal-Id`` and bound to a request-scoped context for the
    duration of the call, then reset. An agent-supplied id is only trusted
@@ -61,12 +63,37 @@ class CallerIdentityMiddleware(Middleware):
     def __init__(self, expected_token: str):
         self._expected_token = expected_token
 
-    async def on_call_tool(self, context: MiddlewareContext, call_next):
+    async def on_message(self, context: MiddlewareContext, call_next):
+        """Gate 1 for EVERY message, not just tool calls.
+
+        FastMCP dispatches a middleware's method-specific hooks (``on_call_tool``,
+        ``on_list_tools``, ``on_initialize``) and leaves the rest at the base
+        class's pass-through, with ``on_message`` wrapped outermost around all of
+        them. Checking the token in ``on_call_tool`` alone therefore left
+        ``initialize`` and ``tools/list`` ungated: an unauthenticated client could
+        open a session against the shared endpoint and enumerate its whole tool
+        surface — every tool name, description and argument schema — and learn the
+        shape of the control plane before being refused at the first call. The
+        docstring above says every request must carry the token; ``on_message`` is
+        where that is true of every request (Copilot review on #802).
+        """
+        self._require_token()
+        return await call_next(context)
+
+    def _require_token(self) -> None:
         headers = get_http_headers()
         presented = headers.get(RUNTIME_TOKEN_HEADER, "")
         if not hmac.compare_digest(presented, self._expected_token):
             # Never fall through to an anonymous/global identity — refuse.
             raise ValueError("unauthorized: missing or invalid runtime token")
+
+    async def on_call_tool(self, context: MiddlewareContext, call_next):
+        # Re-checked, not assumed: this hook is reachable directly in a unit test
+        # and ``on_message``'s outermost position is FastMCP's arrangement, not
+        # ours. An authorization gate should not depend on another layer having
+        # run first.
+        self._require_token()
+        headers = get_http_headers()
 
         caller = headers.get(CALLER_TERMINAL_HEADER) or None
         try:
