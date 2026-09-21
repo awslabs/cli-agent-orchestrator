@@ -1,0 +1,171 @@
+{
+  "_comment": [
+    "Conformance corpus expectations \u2014 one entry per row of design.md's",
+    "failure-isolation table. Each case names the exact finding codes and the",
+    "specification clause each finding must cite, so a change in behaviour shows",
+    "up here as a data diff rather than buried in assertion code. This file is",
+    "the artifact that makes CAO's Agent Plugins conformance reviewable rather",
+    "than merely asserted.",
+    "",
+    "Fields: loadable, skills (exact discovered names, sorted), mcp_present, and",
+    "findings as {code: spec_ref} pairs that must appear exactly once each.",
+    "'exact_findings': false means additional findings are tolerated; the",
+    "default (absent) means the listed set must be the complete set.",
+    "Increment 2 changed three rows: mcp.json is now parsed, validated against the pinned mcp.schema.json, and mapped, so a valid one yields no finding at all rather than an 'unsupported component type' warning, and an unusable one is SKIPPED (MCP disabled for that plugin, skills unaffected) rather than ignored."
+  ],
+  "manifest-missing": {
+    "row": "plugin.json missing \u2192 plugin rejected; nothing published",
+    "loadable": false,
+    "skills": [],
+    "mcp_present": false,
+    "findings": {
+      "manifest.missing": "\u00a74.2"
+    }
+  },
+  "manifest-invalid-json": {
+    "row": "plugin.json invalid JSON \u2192 plugin rejected",
+    "loadable": false,
+    "skills": [],
+    "mcp_present": false,
+    "findings": {
+      "manifest.invalid_json": "\u00a75.1"
+    }
+  },
+  "manifest-missing-name": {
+    "row": "plugin.json missing a required field \u2192 plugin rejected",
+    "loadable": false,
+    "skills": [],
+    "mcp_present": false,
+    "findings": {
+      "manifest.invalid": "\u00a75.2"
+    }
+  },
+  "manifest-unsupported-schema": {
+    "row": "unrecognized $schema \u2192 plugin rejected, unsupported version reported",
+    "loadable": false,
+    "skills": [],
+    "mcp_present": false,
+    "findings": {
+      "manifest.schema_unsupported": "\u00a75.2"
+    }
+  },
+  "manifest-bad-name": {
+    "row": "name violating the \u00a75.5 constraints \u2192 plugin rejected",
+    "loadable": false,
+    "skills": [],
+    "mcp_present": false,
+    "findings": {
+      "manifest.name_invalid": "\u00a75.5"
+    }
+  },
+  "manifest-unknown-field": {
+    "row": "unknown top-level manifest field \u2192 non-fatal, reported, ignored",
+    "loadable": true,
+    "skills": [
+      "alpha"
+    ],
+    "mcp_present": false,
+    "findings": {
+      "manifest.unknown_field": "\u00a75.2"
+    }
+  },
+  "extensions-not-object": {
+    "row": "extensions not an object \u2192 non-fatal, reported, ignored",
+    "loadable": true,
+    "skills": [
+      "alpha"
+    ],
+    "mcp_present": false,
+    "findings": {
+      "manifest.extensions_not_object": "\u00a78.1"
+    }
+  },
+  "extensions-unimplemented-namespace": {
+    "row": "extensions namespace CAO does not implement \u2192 ignored WITHOUT validating contents, no finding at all",
+    "loadable": true,
+    "skills": [
+      "alpha"
+    ],
+    "mcp_present": false,
+    "findings": {}
+  },
+  "skills-not-a-directory": {
+    "row": "skills exists but is not a directory \u2192 skills type invalid, MCP unaffected",
+    "loadable": true,
+    "skills": [],
+    "mcp_present": true,
+    "findings": {
+      "skills.not_a_directory": "\u00a76.2"
+    }
+  },
+  "skills-absent": {
+    "row": "missing fixed component location is not an error",
+    "loadable": true,
+    "skills": [],
+    "mcp_present": false,
+    "findings": {}
+  },
+  "skill-invalid-sibling": {
+    "row": "one skill invalid among N \u2192 that skill skipped, other N\u22121 delivered",
+    "loadable": true,
+    "skills": [
+      "alpha",
+      "beta"
+    ],
+    "mcp_present": false,
+    "findings": {
+      "skill.invalid": "\u00a77.1"
+    }
+  },
+  "skill-missing-skill-md": {
+    "row": "skill directory with no SKILL.md \u2192 that skill skipped with a report",
+    "loadable": true,
+    "skills": [
+      "alpha"
+    ],
+    "mcp_present": false,
+    "findings": {
+      "skill.missing_skill_md": "\u00a77.1"
+    }
+  },
+  "skill-escapes-root": {
+    "row": "SKILL.md symlink escaping the plugin root \u2192 that skill skipped",
+    "loadable": true,
+    "skills": [
+      "alpha"
+    ],
+    "mcp_present": false,
+    "findings": {
+      "skill.escapes_root": "\u00a74.1"
+    }
+  },
+  "skill-symlink-inside-root": {
+    "row": "symlink whose target resolves within the root is permitted",
+    "loadable": true,
+    "skills": [
+      "linked"
+    ],
+    "mcp_present": false,
+    "findings": {}
+  },
+  "mcp-present": {
+    "row": "valid mcp.json \u2192 parsed, validated, and mapped; skills unaffected",
+    "loadable": true,
+    "skills": [
+      "alpha"
+    ],
+    "mcp_present": true,
+    "findings": {}
+  },
+  "mcp-invalid": {
+    "row": "mcp.json invalid \u2192 MCP disabled for that plugin; skills still deliver. The plugin remains loadable: an unusable MCP configuration is not a manifest violation.",
+    "loadable": true,
+    "skills": [
+      "alpha"
+    ],
+    "mcp_present": true,
+    "findings": {
+      "mcp.invalid_json": "\u00a77.2.2"
+    }
+  }
+}

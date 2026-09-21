@@ -1,0 +1,125 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="640" viewBox="0 0 1120 640" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14">
+  <title>How the serply_researcher agent is launched by CAO and where its search tools come from</title>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#1f2937"/>
+    </marker>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#1d4ed8"/>
+    </marker>
+    <marker id="arrow-amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#a16207"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#047857"/>
+    </marker>
+    <marker id="arrow-teal" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#0f766e"/>
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="1120" height="640" fill="#ffffff"/>
+
+  <!-- Column titles and dividers -->
+  <text x="150" y="28" text-anchor="middle" fill="#6b7280" font-size="12" letter-spacing="1">YOUR MACHINE</text>
+  <text x="580" y="28" text-anchor="middle" fill="#6b7280" font-size="12" letter-spacing="1">CAO</text>
+  <text x="980" y="28" text-anchor="middle" fill="#6b7280" font-size="12" letter-spacing="1">OUTSIDE</text>
+  <line x1="355" y1="40" x2="355" y2="600" stroke="#e5e7eb" stroke-dasharray="4 4"/>
+  <line x1="800" y1="40" x2="800" y2="600" stroke="#e5e7eb" stroke-dasharray="4 4"/>
+
+  <!-- You -->
+  <rect x="30" y="60" width="240" height="70" rx="8" fill="#f3f4f6" stroke="#1f2937" stroke-width="1.5"/>
+  <text x="150" y="88" text-anchor="middle" font-weight="600" fill="#111827">You, in a terminal</text>
+  <text x="150" y="110" text-anchor="middle" fill="#374151" font-size="13">two commands, one question</text>
+
+  <!-- 1: install, You -> managed env -->
+  <line x1="150" y1="130" x2="150" y2="260" stroke="#1f2937" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <circle cx="150" cy="170" r="11" fill="#1f2937"/>
+  <text x="150" y="175" text-anchor="middle" fill="#ffffff" font-size="12" font-weight="700">1</text>
+  <text x="168" y="168" fill="#374151" font-size="12" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">cao install --env</text>
+  <text x="168" y="186" fill="#6b7280" font-size="12">writes the key once</text>
+
+  <!-- Managed env -->
+  <rect x="30" y="260" width="240" height="90" rx="8" fill="#fef9c3" stroke="#a16207" stroke-width="1.5"/>
+  <text x="150" y="286" text-anchor="middle" font-weight="600" fill="#111827">CAO managed environment</text>
+  <text x="150" y="309" text-anchor="middle" fill="#374151" font-size="11" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">~/.aws/cli-agent-orchestrator/.env</text>
+  <text x="150" y="331" text-anchor="middle" fill="#374151" font-size="11" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">SERPLY_API_KEY=...</text>
+
+  <!-- 2: launch, You -> cao-server -->
+  <line x1="270" y1="95" x2="440" y2="95" stroke="#1f2937" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <circle cx="290" cy="72" r="11" fill="#1f2937"/>
+  <text x="290" y="77" text-anchor="middle" fill="#ffffff" font-size="12" font-weight="700">2</text>
+  <text x="306" y="76" fill="#374151" font-size="12" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">cao launch</text>
+  <text x="355" y="115" text-anchor="middle" fill="#6b7280" font-size="12">headless, one question</text>
+
+  <!-- cao-server -->
+  <rect x="440" y="60" width="280" height="70" rx="8" fill="#eff6ff" stroke="#1d4ed8" stroke-width="1.5"/>
+  <text x="580" y="88" text-anchor="middle" font-weight="600" fill="#111827">cao-server</text>
+  <text x="580" y="110" text-anchor="middle" fill="#374151" font-size="13">loads the profile, opens a tmux session</text>
+
+  <!-- 3: substitution, managed env -> agent -->
+  <line x1="270" y1="305" x2="440" y2="305" stroke="#a16207" stroke-width="1.5" marker-end="url(#arrow-amber)"/>
+  <circle cx="290" cy="282" r="11" fill="#a16207"/>
+  <text x="290" y="287" text-anchor="middle" fill="#ffffff" font-size="12" font-weight="700">3</text>
+  <text x="306" y="286" fill="#374151" font-size="12" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">${SERPLY_API_KEY}</text>
+  <text x="355" y="325" text-anchor="middle" fill="#6b7280" font-size="12">substituted at load</text>
+
+  <!-- cao-server -> agent -->
+  <line x1="580" y1="130" x2="580" y2="200" stroke="#1d4ed8" stroke-width="1.5" marker-end="url(#arrow-blue)"/>
+
+  <!-- Agent -->
+  <rect x="440" y="200" width="280" height="210" rx="8" fill="#eff6ff" stroke="#1d4ed8" stroke-width="1.5"/>
+  <text x="580" y="226" text-anchor="middle" font-weight="600" fill="#111827">The one agent in this post</text>
+  <text x="580" y="250" text-anchor="middle" fill="#374151" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">serply_researcher</text>
+  <text x="580" y="272" text-anchor="middle" fill="#374151" font-size="12">in a tmux session, provider claude_code</text>
+  <text x="580" y="292" text-anchor="middle" fill="#374151" font-size="12">role reviewer: reads files, no shell,</text>
+  <text x="580" y="310" text-anchor="middle" fill="#374151" font-size="12">no edits, no native web fetch</text>
+  <line x1="460" y1="326" x2="700" y2="326" stroke="#bfdbfe"/>
+  <text x="580" y="348" text-anchor="middle" fill="#374151" font-size="12">Profile rules: Scholar for prior work,</text>
+  <text x="580" y="366" text-anchor="middle" fill="#374151" font-size="12">News for events, read the page when</text>
+  <text x="580" y="384" text-anchor="middle" fill="#374151" font-size="12">the snippet is thin, report counts and dates</text>
+
+  <!-- 4: agent <-> serply MCP -->
+  <line x1="720" y1="305" x2="880" y2="305" stroke="#1f2937" stroke-width="1.5" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+  <circle cx="740" cy="282" r="11" fill="#1f2937"/>
+  <text x="740" y="287" text-anchor="middle" fill="#ffffff" font-size="12" font-weight="700">4</text>
+  <text x="756" y="286" fill="#374151" font-size="12">MCP over HTTP</text>
+  <text x="800" y="325" text-anchor="middle" fill="#6b7280" font-size="12">tool calls and results</text>
+
+  <!-- Serply MCP server -->
+  <rect x="880" y="200" width="210" height="210" rx="8" fill="#ecfdf5" stroke="#047857" stroke-width="1.5"/>
+  <text x="985" y="226" text-anchor="middle" font-weight="600" fill="#111827">serply MCP server</text>
+  <text x="985" y="248" text-anchor="middle" fill="#374151" font-size="12" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">api.serply.io/mcp</text>
+  <text x="985" y="268" text-anchor="middle" fill="#374151" font-size="12" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">X-Api-Key header</text>
+  <line x1="900" y1="282" x2="1070" y2="282" stroke="#a7f3d0"/>
+  <text x="985" y="304" text-anchor="middle" fill="#374151" font-size="12" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">google_scholar_search</text>
+  <text x="985" y="324" text-anchor="middle" fill="#374151" font-size="12" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">google_news_search</text>
+  <text x="985" y="344" text-anchor="middle" fill="#374151" font-size="12" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">google_search</text>
+  <text x="985" y="364" text-anchor="middle" fill="#374151" font-size="12" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">scrape_url</text>
+  <text x="985" y="392" text-anchor="middle" fill="#6b7280" font-size="11">plus ten more the profile does not use</text>
+
+  <!-- Serply <-> Google -->
+  <line x1="985" y1="410" x2="985" y2="470" stroke="#047857" stroke-width="1.5" marker-end="url(#arrow-green)" marker-start="url(#arrow-green)"/>
+  <rect x="875" y="470" width="220" height="80" rx="8" fill="#f3f4f6" stroke="#1f2937" stroke-width="1.5"/>
+  <text x="985" y="498" text-anchor="middle" font-weight="600" fill="#111827" font-size="12">Google Scholar, Google News,</text>
+  <text x="985" y="518" text-anchor="middle" font-weight="600" fill="#111827" font-size="12">Google web</text>
+  <text x="985" y="538" text-anchor="middle" fill="#374151" font-size="12">and the article pages themselves</text>
+
+  <!-- Agent <-> cao-mcp-server (local, stdio) -->
+  <line x1="580" y1="410" x2="580" y2="470" stroke="#1d4ed8" stroke-width="1.5" marker-end="url(#arrow-blue)" marker-start="url(#arrow-blue)"/>
+  <text x="592" y="445" fill="#6b7280" font-size="12">MCP over stdio</text>
+  <rect x="440" y="470" width="280" height="80" rx="8" fill="#eff6ff" stroke="#1d4ed8" stroke-width="1.5"/>
+  <text x="580" y="498" text-anchor="middle" font-weight="600" fill="#111827">cao-mcp-server</text>
+  <text x="580" y="518" text-anchor="middle" fill="#374151" font-size="12">CAO's own orchestration tools</text>
+  <text x="580" y="536" text-anchor="middle" fill="#374151" font-size="12">(handoff, assign, memory); idle in this run</text>
+
+  <!-- 5: answer back to the terminal -->
+  <path d="M 440 395 L 15 395 L 15 95 L 30 95" fill="none" stroke="#0f766e" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#arrow-teal)"/>
+  <circle cx="60" cy="425" r="11" fill="#0f766e"/>
+  <text x="60" y="430" text-anchor="middle" fill="#ffffff" font-size="12" font-weight="700">5</text>
+  <text x="78" y="422" fill="#374151" font-size="12">answer printed in the terminal:</text>
+  <text x="78" y="440" fill="#374151" font-size="12">a table with citation counts, dated</text>
+  <text x="78" y="458" fill="#374151" font-size="12">sources, and what it could not verify</text>
+
+  <!-- footer -->
+  <text x="560" y="600" text-anchor="middle" fill="#6b7280" font-size="12">Solid arrows: control and tool calls. Dashed arrow: the result. The key travels along 1 and 3 only; the agent sees tools, not the key.</text>
+</svg>

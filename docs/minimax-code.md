@@ -103,6 +103,17 @@ by the default MCP timeout. Absolute executable paths are converted to a bare
 command plus a terminal-local `PATH` prefix because the MiniMax Plugin schema
 requires PATH-resolved commands.
 
+MCP servers declared by installed [agent plugins](agent-plugins.md) are merged
+into that generated Plugin at launch time, alongside the profile's own —
+recomputed on every terminal creation rather than persisted, so the paths never
+go stale. One constraint is specific to this provider: the MiniMax Plugin schema
+accepts only server names matching
+`^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$`, so an agent-plugin server named e.g. `Acme` is
+skipped for `mcode` with a report and delivered normally to other providers. It is
+skipped rather than passed through because the serializer rejects such a name
+while the terminal is being created, which would cost you the agent rather than
+one tool.
+
 ## Tool restrictions
 
 MiniMax Code has no public native flag for CAO's `allowedTools` vocabulary.
@@ -148,3 +159,8 @@ PYTHONPATH=src .venv/bin/python -m pytest -m e2e \
   test/e2e/test_supervisor_orchestration.py \
   -k MiniMaxCode -v -o 'addopts='
 ```
+
+### Agent-plugin MCP working directory
+
+Its MCP config format has no working-directory key (checked against the vendor's own MCP documentation, 2026-09-16), so CAO carries an agent plugin's declared `cwd` by launching the server through `/bin/sh -c 'cd -- "$1" && shift && exec "$@"'`. `exec` replaces the shell, the environment passes through, and argument boundaries survive because each argument stays a separate argv element. On a host with no `/bin/sh` such a server is skipped with `mcp.cwd_unsupported` rather than started in the wrong directory.
+See [Agent Plugins](agent-plugins.md) for the full per-provider table.

@@ -1,0 +1,19 @@
+agent-plugins-example — vendored canonical Agent Plugin fixture
+===============================================================
+
+This directory is an unmodified copy of the upstream Agent Plugins reference
+package, vendored as the **known-good positive fixture** in CAO's Agent Plugins
+conformance corpus (design.md "Testing Strategy"; requirements.md Requirement
+23.4). It is test data only: nothing here ships in the CAO wheel and nothing in
+`src/` reads it.
+
+Source project : Agent Plugins Example
+Source URL     : https://github.com/agentplugins/agent-plugins-example
+Source commit  : 5f3f5084a821aefa792e79500dd8f0462ab83473
+Targets        : Agent Plugins specification v1.0.0
+License        : MIT (see the LICENSE file in this directory)
+
+The upstream `README.md` is not vendored — it documents the upstream repository
+rather than the package contents, and the fixture only needs the plugin root
+(`plugin.json` plus `skills/`). Refresh this copy by re-copying from the
+upstream repository at a newer commit and updating the commit above.

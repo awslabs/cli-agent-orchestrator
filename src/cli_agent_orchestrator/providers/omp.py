@@ -16,8 +16,10 @@ import shutil
 from pathlib import Path
 from typing import List, Optional
 
+from cli_agent_orchestrator.agent_plugins.mcp_delivery import with_plugin_mcp as _with_plugin_mcp
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR, SECURITY_PROMPT
+from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
@@ -128,7 +130,7 @@ class OmpProvider(BaseProvider):
         if self._agent_profile is None:
             return None
         try:
-            return load_agent_profile(self._agent_profile)
+            return _with_plugin_mcp(load_agent_profile(self._agent_profile), ProviderType.OMP.value)
         except Exception as exc:
             raise ProviderError(
                 f"Failed to load agent profile '{self._agent_profile}': {exc}"

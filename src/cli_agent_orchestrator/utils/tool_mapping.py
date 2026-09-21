@@ -6,8 +6,9 @@ This module provides the mapping and a function to compute which native tools to
 given a set of allowed CAO tools.
 """
 
+import fnmatch
 import logging
-from typing import Dict, List, Set
+from typing import Dict, Iterable, List, Set
 
 logger = logging.getLogger(__name__)
 
@@ -165,6 +166,82 @@ def resolve_allowed_tools(
                 allowed.append(tool_ref)
 
     return allowed
+
+
+#: ``@...`` entries that are CAO vocabulary rather than an MCP server reference.
+#: ``@builtin`` names a provider's own built-in tool set (see
+#: ``opencode_permissions.cao_tools_to_opencode_permission``), so it must never be
+#: read as a name — or as a *pattern* — to match a server against. Excluded for
+#: both grant sites by the one rule rather than by one of them, which is the
+#: drift this helper exists to prevent.
+_MCP_REF_VOCABULARY = frozenset({"builtin"})
+
+
+def granted_mcp_servers(
+    allowed_tools: Iterable[str] | None,
+    server_names: Iterable[str] | None,
+) -> List[str]:
+    """Return the CONCRETE MCP server names a CAO allowlist grants.
+
+    The one matching rule shared by every place that turns ``allowedTools`` into
+    provider MCP policy — today ``services/install_service.py`` (OpenCode's
+    ``agent.<id>.tools`` map) and ``providers/grok_cli.py`` (Grok's
+    ``MCPTool(<server>__*)`` rules). ``docs/agent-plugins.md`` documents three
+    ways to name a server — ``"*"``, an explicit ``@server-name``, or **a
+    matching glob** such as ``@plugin-*`` — and both sites implemented only exact
+    membership, so the documented glob authorized nothing. Two independently
+    written matchers is exactly the drift that produced that gap, so there is one.
+
+    Three properties are load-bearing:
+
+    * **Expansion is over the concrete names given**, never over the pattern.
+      A caller passes the servers actually delivered/configured for this agent
+      and gets back a subset of them, so a pattern matching nothing yields
+      nothing. Interpolating the pattern into provider policy instead would
+      pre-authorize whatever later answered to that name.
+    * **Case-sensitive**, via :func:`fnmatch.fnmatchcase`. Plain
+      :func:`fnmatch.fnmatch` case-folds wherever ``os.path.normcase`` does, so
+      on such a host ``@PLUGIN-*`` would silently widen to ``plugin-tools``.
+    * **Exact membership is preserved independently of the glob.** A name equal
+      to the reference matches even when it contains characters ``fnmatch``
+      treats as syntax (``@srv[1]`` grants a server literally named ``srv[1]``),
+      so the previous behaviour is a strict subset of this one.
+
+    This does **not** grant anything on its own and must not be made to: a
+    pattern reaches here only because a human wrote it into a profile's
+    ``allowedTools``, which is what keeps a plugin install from widening any
+    allowlist (issue #573 AC7). ``resolve_allowed_tools`` decides what is in the
+    allowlist; this only expands what is already there.
+
+    Args:
+        allowed_tools: The resolved CAO allowlist.
+        server_names: The concrete server names delivered/configured for this
+            agent. Any iterable of names, e.g. an ``mcpServers`` dict.
+
+    Returns:
+        The matching concrete names, sorted and deduplicated.
+    """
+    names = [name for name in (server_names or ()) if isinstance(name, str)]
+    if not names:
+        return []
+
+    allowed = [entry for entry in (allowed_tools or ()) if isinstance(entry, str)]
+    if "*" in allowed:
+        # Already means "everything" upstream in ``resolve_allowed_tools``; the
+        # expansion must not narrow it.
+        return sorted(set(names))
+
+    granted: Set[str] = set()
+    for entry in allowed:
+        if not entry.startswith("@"):
+            continue
+        pattern = entry[1:]
+        if not pattern or pattern in _MCP_REF_VOCABULARY:
+            continue
+        granted.update(
+            name for name in names if name == pattern or fnmatch.fnmatchcase(name, pattern)
+        )
+    return sorted(granted)
 
 
 def get_disallowed_tools(provider: str, allowed: List[str]) -> List[str]:

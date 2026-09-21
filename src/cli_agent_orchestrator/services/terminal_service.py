@@ -1066,9 +1066,10 @@ async def create_terminal(
                 profile=getattr(profile, "engine", None),
             )
             if allowed_tools is None and profile is not None:
+                from cli_agent_orchestrator.agent_plugins.mcp_delivery import grantable_server_names
                 from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
 
-                mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
+                mcp_server_names = grantable_server_names(profile)
                 allowed_tools = resolve_allowed_tools(
                     profile.allowedTools, profile.role, mcp_server_names
                 )
@@ -1096,9 +1097,10 @@ async def create_terminal(
 
         # Resolve tool policy before persistence for non-Kiro providers too.
         if allowed_tools is None and profile is not None:
+            from cli_agent_orchestrator.agent_plugins.mcp_delivery import grantable_server_names
             from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
 
-            mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
+            mcp_server_names = grantable_server_names(profile)
             allowed_tools = resolve_allowed_tools(
                 profile.allowedTools, profile.role, mcp_server_names
             )

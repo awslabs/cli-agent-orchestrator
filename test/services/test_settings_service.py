@@ -75,6 +75,14 @@ class TestLoad:
         assert result == data
 
 
+def test_get_memory_settings_drops_unvalidated_vault_data(settings_file):
+    settings_file.write_text(
+        json.dumps({"memory": {"vault": {"root": "/etc/shadow", "mappings": []}}})
+    )
+
+    assert "vault" not in settings_service.get_memory_settings()
+
+
 class TestSave:
     """Tests for _save function."""
 

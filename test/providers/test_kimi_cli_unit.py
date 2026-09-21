@@ -4,6 +4,7 @@ Covers initialization, status detection, message extraction, command building,
 pattern matching, and cleanup — targeting >90% code coverage.
 """
 
+import json
 import os
 import re
 import tempfile
@@ -1359,3 +1360,81 @@ class TestKimiScreenDetection:
     def test_torn_down_shell_is_unknown(self):
         screen = ["Bye!", "rkram@host:/tmp/x$"]
         assert self._p().get_status_from_screen(screen) == TerminalStatus.UNKNOWN
+
+
+class TestKimiTransportTranslation:
+    """Reported by review 5222539218 on #584 (item 5).
+
+    Kimi 1.20.0 pins ``fastmcp==2.12.5`` and feeds each ``--mcp-config`` document to
+    ``fastmcp.mcp_config.MCPConfig``. ``RemoteMCPServer`` has no ``type`` field, so a
+    portable ``type`` is an ignored extra; when ``transport`` is absent FastMCP calls
+    ``infer_transport_type_from_url``, which returns ``"sse"`` iff the URL *path*
+    matches ``/sse(/|\\?|&|$)`` and ``"http"`` otherwise. An SSE server published at
+    ``/events`` was therefore started as Streamable HTTP, and a Streamable HTTP
+    server published at ``/sse`` was started as SSE -- the declared protocol was
+    decided by URL spelling. Writing ``transport`` explicitly selects it.
+    """
+
+    @staticmethod
+    def _mcp_doc(command: str) -> dict:
+        """Return the JSON document Kimi is handed after ``--mcp-config``."""
+        import shlex
+
+        tokens = shlex.split(command)
+        return json.loads(tokens[tokens.index("--mcp-config") + 1])
+
+    def _build(self, tmp_path, servers):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = servers
+        with patch(
+            "cli_agent_orchestrator.providers.kimi_cli.load_agent_profile",
+            return_value=mock_profile,
+        ):
+            provider = KimiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
+            with patch(
+                "cli_agent_orchestrator.providers.kimi_cli.Path.home", return_value=tmp_path
+            ):
+                return self._mcp_doc(provider._build_kimi_command())
+
+    def test_streamable_http_becomes_transport_http(self, tmp_path):
+        """The portable spelling maps to FastMCP's ``http``, and ``type`` is removed.
+
+        The URL path is ``/sse`` precisely so inference would have chosen wrong.
+        """
+        doc = self._build(tmp_path, {"s": {"type": "streamable-http", "url": "https://x/sse"}})
+        assert doc["s"]["transport"] == "http"
+        assert "type" not in doc["s"]
+
+    def test_sse_becomes_transport_sse(self, tmp_path):
+        """An SSE server on a non-``/sse`` path is still started as SSE."""
+        doc = self._build(tmp_path, {"s": {"type": "sse", "url": "https://x/events"}})
+        assert doc["s"]["transport"] == "sse"
+        assert "type" not in doc["s"]
+
+    def test_http_alias_becomes_transport_http(self, tmp_path):
+        doc = self._build(tmp_path, {"s": {"type": "http", "url": "https://x/events"}})
+        assert doc["s"]["transport"] == "http"
+
+    def test_stdio_carries_transport_stdio_and_cwd(self, tmp_path):
+        """``cwd`` survives: FastMCP's ``StdioMCPServer`` honours it."""
+        doc = self._build(tmp_path, {"s": {"type": "stdio", "command": "srv", "cwd": "/p"}})
+        assert doc["s"]["transport"] == "stdio"
+        assert doc["s"]["cwd"] == "/p"
+
+    def test_an_entry_without_a_type_is_left_for_fastmcp_to_infer(self, tmp_path):
+        """Profile entries are unchanged: the mapper only ever emits ``type`` itself.
+
+        ``_map_entry`` always sets ``type`` for a plugin server, so a type-less entry
+        can only have come from a hand-written profile, where adding a ``transport``
+        CAO never asked for would be a behaviour change beyond this finding.
+        """
+        doc = self._build(tmp_path, {"s": {"command": "srv"}})
+        assert "transport" not in doc["s"]
+
+    def test_an_unknown_type_is_left_untouched(self, tmp_path):
+        """An unrecognised spelling is passed through rather than guessed at."""
+        doc = self._build(tmp_path, {"s": {"type": "websocket", "url": "https://x/ws"}})
+        assert "transport" not in doc["s"]
+        assert doc["s"]["type"] == "websocket"

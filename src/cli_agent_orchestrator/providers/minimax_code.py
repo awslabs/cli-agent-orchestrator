@@ -15,8 +15,11 @@ from typing import Any, Optional
 
 import yaml
 
+from cli_agent_orchestrator.agent_plugins.mcp_delivery import with_plugin_mcp as _with_plugin_mcp
+from cli_agent_orchestrator.agent_plugins.mcp_mapping import PROVIDER_SERVER_NAME_PATTERNS
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR, SECURITY_PROMPT
+from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
@@ -25,7 +28,10 @@ from cli_agent_orchestrator.utils.terminal import wait_for_shell
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 _PLUGIN_NAME = "cao-orchestrator"
-_PLUGIN_SERVER_NAME = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
+#: Imported from the delivery table rather than re-declared here: the plugin
+#: pipeline must skip a server this serializer would raise on, and two copies of
+#: the pattern would be free to drift into a gap that crashes terminal creation.
+_PLUGIN_SERVER_NAME = PROVIDER_SERVER_NAME_PATTERNS[ProviderType.MINIMAX_CODE.value]
 _USER_LINE_PATTERN = re.compile(r"^\s*›[^\S\n]+(.*)$")
 _COMPLETION_LINE_PATTERN = re.compile(r"^\s*└\s+Completed in\s+\d", re.IGNORECASE)
 # Line-start indent is matched with [^\S\n] (horizontal whitespace) rather than \s
@@ -380,7 +386,9 @@ class MiniMaxCodeProvider(BaseProvider):
         profile = None
         if self._agent_profile is not None:
             try:
-                profile = load_agent_profile(self._agent_profile)
+                profile = _with_plugin_mcp(
+                    load_agent_profile(self._agent_profile), ProviderType.MINIMAX_CODE.value
+                )
             except Exception as exc:
                 raise ProviderError(
                     f"Failed to load agent profile {self._agent_profile!r}: {exc}"
@@ -437,7 +445,9 @@ class MiniMaxCodeProvider(BaseProvider):
         if self._agent_profile is None:
             return None
         try:
-            return load_agent_profile(self._agent_profile)
+            return _with_plugin_mcp(
+                load_agent_profile(self._agent_profile), ProviderType.MINIMAX_CODE.value
+            )
         except Exception:
             return None
 

@@ -94,6 +94,20 @@ MCP servers from agent profiles are passed via `--mcp-config` as a JSON string:
 kimi --yolo --mcp-config '{"server-name": {"command": "npx", "args": ["-y", "cao-mcp-server"]}}'
 ```
 
+### Transport selection
+
+Kimi CLI hands each `--mcp-config` document to FastMCP. FastMCP's remote server
+model has no `type` field, and when `transport` is absent it infers one from the
+URL *path* — `sse` when the path ends in `/sse`, Streamable HTTP otherwise. A
+declared SSE server published at `/events` would therefore start as Streamable
+HTTP, and a Streamable HTTP server published at `/sse` would start as SSE.
+
+CAO writes FastMCP's `transport` explicitly from an [agent plugin](agent-plugins.md)
+server's portable `type`, so the declared protocol is selected rather than guessed
+from URL spelling. A `cwd` is passed through unchanged and is honoured by FastMCP
+for stdio servers. An entry that carries no `type` — a hand-written profile entry —
+is left exactly as written, so FastMCP's own inference still applies to it.
+
 ### MCP Tool Call Timeout
 
 Kimi CLI defaults to a 60-second MCP tool call timeout (`tool_call_timeout_ms=60000` in `~/.kimi/config.toml`). This is too short for `handoff` operations, which create a worker terminal, wait for completion, and extract output — routinely exceeding 60 seconds.

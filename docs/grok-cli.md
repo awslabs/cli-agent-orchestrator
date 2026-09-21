@@ -155,9 +155,14 @@ CAO creates a private Grok home for every terminal and launches Grok with
 generated config atomically with mode `0600`. It does not run `grok mcp add`
 and does not modify the user's `~/.grok/config.toml`.
 
-The isolated config contains the profile's MCP servers. CAO injects the
-terminal-specific `CAO_TERMINAL_ID` into stdio MCP server environments so
-`cao-mcp-server` can route `assign`, `handoff`, and `send_message` correctly.
+The isolated config contains the profile's MCP servers, plus any declared by
+installed [agent plugins](agent-plugins.md) — merged at launch time and
+recomputed on every terminal creation rather than persisted, so the paths never
+go stale. Grok names the streamable-HTTP transport `http`, so CAO writes a
+`streamable-http` server as `type = "http"`; `sse` is preserved as `sse`. CAO
+injects the terminal-specific `CAO_TERMINAL_ID` into stdio MCP server
+environments so `cao-mcp-server` can route `assign`, `handoff`, and
+`send_message` correctly.
 Existing login state is reused without copying credential contents into CAO
 logs or the repository. Generated state is removed when the terminal is
 cleaned up.
@@ -172,6 +177,12 @@ user's privileges; selecting No quits Grok. If that screen is detected, CAO
 fails startup with an actionable error. Review and remove project-local
 configuration such as `.mcp.json` or `.grok/` before launching the CAO
 terminal, or use standalone Grok when you intentionally want to trust it.
+
+
+### Agent-plugin MCP working directory
+
+Its MCP config format has no working-directory key (checked against the vendor's own MCP documentation, 2026-09-16), so CAO carries an agent plugin's declared `cwd` by launching the server through `/bin/sh -c 'cd -- "$1" && shift && exec "$@"'`. `exec` replaces the shell, the environment passes through, and argument boundaries survive because each argument stays a separate argv element. On a host with no `/bin/sh` such a server is skipped with `mcp.cwd_unsupported` rather than started in the wrong directory.
+See [Agent Plugins](agent-plugins.md) for the full per-provider table.
 
 ## Tool Restrictions
 

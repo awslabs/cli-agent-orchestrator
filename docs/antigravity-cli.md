@@ -74,6 +74,12 @@ Response extraction returns the text between the last echoed `> <query>` line an
 
 `agy` reads MCP servers from `~/.gemini/config/mcp_config.json` (top-level `mcpServers` key). The provider merges the agent profile's `mcpServers` into that file at launch — preserving any existing, non-CAO entries — and forwards `CAO_TERMINAL_ID` into each server's env so `cao-mcp-server` can resolve the current terminal for handoff / assign. Entries are removed on `cleanup()`. There is no per-invocation MCP config flag, but CAO serializes launches (initialize waits for the agent to become ready), so each `agy` process reads the config and spawns its MCP subprocess with the correct terminal id before the next terminal writes.
 
+
+### Agent-plugin MCP working directory
+
+Its MCP config format documents a working-directory key, so CAO writes an agent plugin's declared `cwd` there directly.
+See [Agent Plugins](agent-plugins.md) for the full per-provider table.
+
 ## Tool Restrictions
 
 `agy` is in `SOFT_ENFORCEMENT_PROVIDERS`: tool restrictions are advisory. When a profile is not allowed every tool (e.g. the read-only reviewer), the security prompt is appended to the injected system prompt. There is no native hard-block flag.

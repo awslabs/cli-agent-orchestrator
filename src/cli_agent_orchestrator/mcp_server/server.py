@@ -15,6 +15,7 @@ from cli_agent_orchestrator.constants import (
     API_BASE_URL,
     DISCOVERY_TOOL_MARKER,
     ELASTIC_CALLBACK_URL_ENV,
+    HANDOFF_RESULTS_ROUTE,
     WORKFLOW_EVENTS_CONNECT_TIMEOUT,
     WORKFLOW_EVENTS_MCP_MAX_EVENTS,
     WORKFLOW_EVENTS_MCP_MAX_SECONDS,
@@ -25,6 +26,7 @@ from cli_agent_orchestrator.constants import (
 from cli_agent_orchestrator.mcp_server import utils as mcp_utils
 from cli_agent_orchestrator.mcp_server.caller_context import resolve_caller_terminal_id
 from cli_agent_orchestrator.mcp_server.models import HandoffResult
+from cli_agent_orchestrator.mcp_server.utils import _auth_headers
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.models.workflow_runtime import ReturnAck, parse_decision
 from cli_agent_orchestrator.services.elastic_worker_gateway import (
@@ -49,6 +51,7 @@ from cli_agent_orchestrator.utils.orchestration import (
     _extract_error_detail,
     _handoff_impl,
     _mcp_timeout,
+    _resolve_target_base_url,
     _send_message_impl,
 )
 from cli_agent_orchestrator.utils.workflow_events import parse_sse_frames
@@ -1011,6 +1014,98 @@ def delete_terminal(
     return _delete_terminal_impl(terminal_id, target_host=target_host)
 
 
+@mcp.tool()
+def get_handoff_result(
+    job_id: str = Field(
+        description=(
+            "The job_id returned by handoff when pending=True (transport timed "
+            "out but the job may still be running or already finished server-side)."
+        )
+    ),
+    target_host: Optional[str] = Field(
+        default=None,
+        description=(
+            "Remote CAO node that ran the handoff (same format as "
+            "assign/handoff target_host: DNS name, host:port, or URL). Required "
+            "when the pending handoff was placed remotely -- the result row lives "
+            "in THAT node's database, not this one, so omitting it returns a "
+            "false not-found. Omit for local handoffs (behavior unchanged)."
+        ),
+    ),
+) -> Dict[str, Any]:
+    """Retrieve a durably persisted handoff result by job_id (issue #447).
+
+    Call this when a prior ``handoff`` call returned ``pending=True`` — the
+    transport timed out before the result arrived, but the work continues
+    server-side under ``job_id``. Poll this tool until ``state`` is no longer
+    ``"running"``.
+
+    Two things the request needs beyond the id, both mirroring
+    ``delete_terminal`` (PR #453 review, haofeif):
+
+    - The internal ``Authorization`` header. The retrieval endpoint is
+      scope-gated, so without it an auth-enabled deployment answers 401 to a
+      caller legitimately holding the job_id.
+    - ``target_host``. ``handoff(target_host=...)`` runs the step on that node
+      and persists the row in ITS database, so the supervisor's own base URL has
+      no such row.
+
+    Args:
+        job_id: The job_id from the pending handoff result.
+        target_host: Node that ran the handoff; omit for local.
+
+    Returns:
+        Dict with ``success``, ``state`` ("running"|"completed"|"error"),
+        ``terminal_id``, ``last_message`` (populated when completed), and
+        ``error_message`` (populated when errored). ``success=False`` with a
+        ``message`` when the job_id is unknown or the request failed.
+    """
+    # Direct (non-MCP) invocation gets pydantic's FieldInfo as the default rather
+    # than None. Normalized here in the tool wrapper for the same reason
+    # delete_terminal does it there: the leak is an artifact of FastMCP's Field
+    # default, so it belongs to server.py.
+    if not isinstance(target_host, str) or not target_host.strip():
+        target_host = None
+    location = f" on node {target_host}" if target_host else ""
+    try:
+        base_url = _resolve_target_base_url(target_host) if target_host else API_BASE_URL
+        path = HANDOFF_RESULTS_ROUTE.format(job_id=job_id)
+        response = requests.get(
+            f"{base_url}{path}",
+            headers=_auth_headers() or None,
+            # A black-holed remote node must fail on CONNECT rather than burn the
+            # full read budget; a local read keeps its single scalar timeout so
+            # default-path behavior is unchanged.
+            timeout=(REMOTE_CONNECT_TIMEOUT, _mcp_timeout()) if target_host else _mcp_timeout(),
+        )
+        response.raise_for_status()
+        data = response.json()
+        return {
+            "success": True,
+            "state": data.get("state"),
+            "terminal_id": data.get("terminal_id"),
+            "last_message": data.get("last_message"),
+            "error_message": data.get("error_message"),
+        }
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code == 404:
+            return {
+                "success": False,
+                "message": (
+                    f"No handoff result found for job_id {job_id}{location}"
+                    + (
+                        ""
+                        if target_host
+                        else ". If the handoff was placed on a remote node, retry "
+                        "with target_host set to that node."
+                    )
+                ),
+            }
+        return {"success": False, "message": f"Failed to retrieve handoff result: {str(e)}"}
+    except Exception as e:
+        return {"success": False, "message": f"Failed to retrieve handoff result: {str(e)}"}
+
+
 def _own_terminal_id_or_error(action: str) -> Union[str, Dict[str, Any]]:
     """Resolve this MCP process's own terminal id, or an error dict.
 
@@ -1365,11 +1460,12 @@ def _caller_effective_allowed_tools(context: Dict[str, Any]) -> Optional[List[st
     if not profile_name:
         return None
 
+    from cli_agent_orchestrator.agent_plugins.mcp_delivery import grantable_server_names
     from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
     from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
 
     profile = load_agent_profile(profile_name)
-    mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
+    mcp_server_names = grantable_server_names(profile)
     return resolve_allowed_tools(profile.allowedTools, profile.role, mcp_server_names)
 
 
@@ -1599,6 +1695,14 @@ async def memory_recall(
             if remote_memory_url()
             else await MemoryService().recall(**kwargs)
         )
+        # Curated recall is inserted verbatim into another terminal's context.
+        # Keep its vault/native scope set aligned with the deterministic builder:
+        # agent-scoped memories are explicit-recall-only in this release.
+        from cli_agent_orchestrator.services.vault.reader import MEMORY_MANAGER_PROFILE
+
+        if (terminal_context or {}).get("agent_profile") == MEMORY_MANAGER_PROFILE:
+            injectable_scopes = {"session", "project", "global"}
+            memories = [memory for memory in memories if memory.scope in injectable_scopes]
         return {
             "success": True,
             "memories": [
@@ -1608,7 +1712,20 @@ async def memory_recall(
                     "memory_type": m.memory_type,
                     "scope": m.scope,
                     "tags": m.tags,
-                    "file_path": m.file_path,
+                    "file_path": (
+                        getattr(m, "source_path", None)
+                        if getattr(m, "source_kind", "native") == "vault"
+                        else m.file_path
+                    ),
+                    "source_kind": getattr(m, "source_kind", "native"),
+                    "source_path": getattr(m, "source_path", None),
+                    "indexed_at": (
+                        m.indexed_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+                        if getattr(m, "indexed_at", None)
+                        else None
+                    ),
+                    "index_freshness": getattr(m, "index_freshness", None),
+                    "content_truncated": bool(getattr(m, "content_truncated", False)),
                     "updated_at": m.updated_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 }
                 for m in memories
@@ -1633,7 +1750,8 @@ async def memory_forget(
 ) -> Dict[str, Any]:
     """Remove a memory by key and scope.
 
-    Deletes the wiki topic file and removes the entry from index.md.
+    Deletes native memory files or deindexes vault-backed memory without
+    deleting the underlying vault note.
     """
     from cli_agent_orchestrator.services.memory_gateway import forget_memory, remote_memory_url
     from cli_agent_orchestrator.services.memory_service import MemoryService
@@ -1655,7 +1773,9 @@ async def memory_forget(
         )
         return {
             "success": True,
-            "deleted": deleted,
+            "deleted": bool(deleted),
+            "action": deleted.action,
+            "path": deleted.path,
             "key": key,
             "scope": scope,
         }

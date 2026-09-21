@@ -83,3 +83,51 @@ class TestRedactQueryTokenFilter:
         install_access_log_redaction()
         count = sum(isinstance(f, RedactQueryTokenFilter) for f in access_logger.filters)
         assert count == 1
+
+
+class TestRedactCapabilityPath:
+    """PR #453 review (haofeif): the job_id is a PATH segment, not a query param.
+
+    ``GET /handoff-results/<job_id>`` puts the sole retrieval capability for a
+    row of raw worker output directly in the path uvicorn logs verbatim, where
+    ``_CREDENTIAL_RE`` -- which only matches ``name=value`` query pairs -- cannot
+    reach it. Truncating the id in the application's own warning is not enough
+    while the access log still records it in full.
+    """
+
+    JOB_ID = "cafe1234cafe1234cafe1234cafe1234"
+
+    def test_scrubs_job_id_in_plain_message(self):
+        out = _rendered(_record(f"GET /handoff-results/{self.JOB_ID} HTTP/1.1"))
+        assert self.JOB_ID not in out
+        assert f"/handoff-results/{REDACTED}" in out
+
+    def test_scrubs_job_id_in_uvicorn_style_args(self):
+        # The real access-log shape: path arrives via record.args, not msg.
+        rec = _record(
+            '%s - "%s %s HTTP/%s" %d',
+            ("127.0.0.1:5", "GET", f"/handoff-results/{self.JOB_ID}", "1.1", 200),
+        )
+        out = _rendered(rec)
+        assert self.JOB_ID not in out
+        assert f"/handoff-results/{REDACTED}" in out
+
+    def test_scrubs_job_id_with_trailing_query_string(self):
+        # Stopping at '?' keeps the id redacted without swallowing the query.
+        out = _rendered(_record(f"GET /handoff-results/{self.JOB_ID}?x=1 HTTP/1.1"))
+        assert self.JOB_ID not in out
+        assert "x=1" in out
+
+    def test_route_prefix_itself_is_preserved(self):
+        # Operators still need to see WHICH route was called; only the id goes.
+        out = _rendered(_record(f"GET /handoff-results/{self.JOB_ID} HTTP/1.1"))
+        assert "/handoff-results/" in out
+
+    def test_both_credential_classes_scrubbed_in_one_pass(self):
+        # A query credential and a path capability in the same record: fixing
+        # only one class would leak the other.
+        out = _rendered(
+            _record(f"GET /handoff-results/{self.JOB_ID}?access_token=SECRET.J.WT HTTP/1.1")
+        )
+        assert self.JOB_ID not in out
+        assert "SECRET" not in out

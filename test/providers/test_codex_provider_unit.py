@@ -377,7 +377,9 @@ class TestCodexBuildCommand:
         command = provider._build_codex_command()
 
         assert "mcp_servers.test-server.command=" in command
-        assert "mcp_servers.test-server.env.API_KEY=" in command
+        # Contract changed by review 5222539218 (item 6): env is one inline table
+        # with quoted keys, so any schema-valid key is expressible.
+        assert 'mcp_servers.test-server.env={ "API_KEY" = "secret123" }' in command
         assert "secret123" in command
         # CAO_TERMINAL_ID always forwarded even without explicit env_vars
         assert "mcp_servers.test-server.env_vars=" in command
@@ -880,15 +882,53 @@ class TestMcpKeyValidation:
         with pytest.raises(ValueError, match="Invalid mcpServers name key"):
             provider._build_codex_command()
 
-    @pytest.mark.parametrize("env_key", ['K"X', "K\nY", "K\n", "BAD KEY", "a=b", "", "K.DOTTED"])
+    @pytest.mark.parametrize("env_key", ['K"X', "K\nY", "K\n", "BAD KEY", "a=b", "K.DOTTED"])
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
-    def test_rejects_unsafe_env_key(self, mock_load, env_key):
+    def test_an_env_key_is_no_longer_rejected_but_escaped(self, mock_load, env_key):
+        """CONTRACT INVERTED by review 5222539218 on #584 (item 6).
+
+        This asserted the reported defect: a schema-valid Agent Plugins env key such
+        as ``LOG.LEVEL`` raised and cost the operator the whole Codex launch. The env
+        map now lives on the VALUE side as one inline table with quoted keys, where
+        the TOML basic-string grammar expresses every one of these safely -- so the
+        right behaviour is to round-trip, not to raise. The NAME is still validated
+        (``test_rejects_unsafe_server_name`` above) because it is interpolated into
+        the override PATH, which is a different grammar.
+        """
+        import re as _re
+
+        try:  # Python 3.11+
+            import tomllib
+        except ModuleNotFoundError:  # Python 3.10 — tomli is a declared dependency there
+            import tomli as tomllib  # type: ignore[no-redef]
+
         mock_load.return_value = self._profile_with(
             {"srv": {"command": "cmd", "args": [], "env": {env_key: "value"}}}
         )
         provider = CodexProvider("tid", "sess", "win", "agent")
-        with pytest.raises(ValueError, match="Invalid mcpServers env key"):
-            provider._build_codex_command()
+        command = provider._build_codex_command()
+        match = _re.search(r"mcp_servers\.srv\.env=(\{.*?\})'", command)
+        assert match, command
+        assert tomllib.loads(f"x = {match.group(1)}")["x"] == {env_key: "value"}
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_an_empty_env_key_is_still_expressible(self, mock_load):
+        """TOML permits a quoted empty key; nothing about it corrupts the document."""
+        import re as _re
+
+        try:  # Python 3.11+
+            import tomllib
+        except ModuleNotFoundError:  # Python 3.10 — tomli is a declared dependency there
+            import tomli as tomllib  # type: ignore[no-redef]
+
+        mock_load.return_value = self._profile_with(
+            {"srv": {"command": "cmd", "args": [], "env": {"": "value"}}}
+        )
+        provider = CodexProvider("tid", "sess", "win", "agent")
+        command = provider._build_codex_command()
+        match = _re.search(r"mcp_servers\.srv\.env=(\{.*?\})'", command)
+        assert match, command
+        assert tomllib.loads(f"x = {match.group(1)}")["x"] == {"": "value"}
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_accepts_normal_names_and_env_keys(self, mock_load):
@@ -898,7 +938,7 @@ class TestMcpKeyValidation:
         provider = CodexProvider("tid", "sess", "win", "agent")
         command = provider._build_codex_command()
         assert "mcp_servers.cao-mcp-server.command=" in command
-        assert "mcp_servers.cao-mcp-server.env.API_KEY=" in command
+        assert 'mcp_servers.cao-mcp-server.env={ "API_KEY" = "v" }' in command
 
 
 class TestCodexProviderCodexConfig:
@@ -4289,3 +4329,110 @@ class TestCodexProviderBlocksOrchestratedInputWhileWaitingUserAnswer:
         mock_tmux.send_keys.assert_not_called()
         mock_notify.assert_called_once()
         assert mock_notify.call_args.kwargs["delete_worker"] is False
+
+
+class TestCodexEnvIsOneInlineTable:
+    """Reported by review 5222539218 on #584 (item 6).
+
+    ``LOG.LEVEL`` is a schema-valid Agent Plugins environment key. Emitted as
+    ``-c mcp_servers.s.env.LOG.LEVEL=…`` it landed in the override PATH, where the
+    dot nests it under the wrong TOML table and ``_validate_config_key`` raises --
+    aborting the entire Codex launch over one environment variable. The env map
+    belongs on the VALUE side, which Codex parses as TOML, so one inline table with
+    quoted keys expresses any key.
+    """
+
+    @staticmethod
+    def _env_table(command: str) -> dict:
+        """Parse the single ``…env={ … }`` override back through tomllib."""
+        import re as _re
+
+        try:  # Python 3.11+
+            import tomllib
+        except ModuleNotFoundError:  # Python 3.10 — tomli is a declared dependency there
+            import tomli as tomllib  # type: ignore[no-redef]
+
+        match = _re.search(r"mcp_servers\.s\.env=(\{.*?\})'", command)
+        assert match, f"no single env inline table in: {command}"
+        return tomllib.loads(f"x = {match.group(1)}")["x"]
+
+    def _build(self, env):
+        profile = MagicMock()
+        profile.model = None
+        profile.system_prompt = ""
+        profile.codexProfile = None
+        profile.codexConfig = None
+        profile.mcpServers = {"s": {"command": "srv", "env": env}}
+        with patch(
+            "cli_agent_orchestrator.providers.codex.load_agent_profile", return_value=profile
+        ):
+            provider = CodexProvider("test1234", "sess", "win-0", "agent")
+            return provider._build_codex_command()
+
+    def test_env_is_written_as_one_inline_table(self):
+        command = self._build({"A": "1", "LOG.LEVEL": "info"})
+        assert self._env_table(command) == {"A": "1", "LOG.LEVEL": "info"}
+        assert "env.LOG.LEVEL" not in command, "the dotted key must not reach the path"
+
+    def test_a_dotted_env_key_no_longer_aborts_the_launch(self):
+        """The reviewer's exact scenario: this used to raise ValueError."""
+        command = self._build({"LOG.LEVEL": "info"})
+        assert self._env_table(command)["LOG.LEVEL"] == "info"
+
+    def test_env_values_with_quotes_and_newlines_round_trip_through_tomllib(self):
+        command = self._build({'Q"K': 'a"b', "NL": "x\ny"})
+        assert self._env_table(command) == {'Q"K': 'a"b', "NL": "x\ny"}
+
+    def test_a_dotted_server_name_still_raises_for_profile_entries(self):
+        """Only PLUGIN entries are pre-filtered; a hand-written profile still fails fast.
+
+        The mapping-time gate cannot see a profile the operator wrote, so the
+        provider-side guard on the NAME stays.
+        """
+        profile = MagicMock()
+        profile.model = None
+        profile.system_prompt = ""
+        profile.codexProfile = None
+        profile.codexConfig = None
+        profile.mcpServers = {"acme.tools": {"command": "srv"}}
+        with patch(
+            "cli_agent_orchestrator.providers.codex.load_agent_profile", return_value=profile
+        ):
+            provider = CodexProvider("test1234", "sess", "win-0", "agent")
+            with pytest.raises(ValueError, match="mcpServers name"):
+                provider._build_codex_command()
+
+
+class TestCodexNativeCwd:
+    """Reported by review 5222539218 on #584 (item 4).
+
+    Codex's config reference documents ``mcp_servers.<id>.cwd`` ("Working directory
+    for the MCP stdio server process"), so the plugin's directory is carried
+    natively rather than through the ``/bin/sh`` wrapper the formats without such a
+    field need.
+    """
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_cwd_is_emitted_as_a_config_override(self, mock_load):
+        profile = MagicMock()
+        profile.model = None
+        profile.system_prompt = ""
+        profile.codexProfile = None
+        profile.codexConfig = None
+        profile.mcpServers = {"s": {"command": "srv", "args": ["--x"], "cwd": "/p"}}
+        mock_load.return_value = profile
+        provider = CodexProvider("test1234", "sess", "win-0", "agent")
+        command = provider._build_codex_command()
+        assert 'mcp_servers.s.cwd="/p"' in command, command
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_no_cwd_override_when_the_entry_has_none(self, mock_load):
+        profile = MagicMock()
+        profile.model = None
+        profile.system_prompt = ""
+        profile.codexProfile = None
+        profile.codexConfig = None
+        profile.mcpServers = {"s": {"command": "srv"}}
+        mock_load.return_value = profile
+        provider = CodexProvider("test1234", "sess", "win-0", "agent")
+        assert "mcp_servers.s.cwd=" not in provider._build_codex_command()

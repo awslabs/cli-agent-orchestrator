@@ -216,3 +216,54 @@ def resolve_mcp_server_config(config: dict, *, persisted: bool = False) -> dict:
     resolved["command"] = new_command
     resolved["args"] = new_args
     return resolved
+
+
+#: The POSIX shell fragment that carries a working directory for a provider whose
+#: MCP config format has no field for one. ``$1`` is the directory, ``$0`` is the
+#: label below, and everything after ``$1`` is the real command. ``exec`` replaces
+#: the shell so no extra process survives, the environment passes through
+#: untouched, and argument boundaries are preserved without any quoting because
+#: each argument is a separate argv element rather than text to be re-parsed.
+_CWD_SHIM_SCRIPT = 'cd -- "$1" && shift && exec "$@"'
+
+#: ``$0`` for the shim. Purely cosmetic -- it is what shows up in ``ps`` -- but a
+#: named label beats an empty or misleading one when an operator is looking at a
+#: process list wondering what spawned their MCP server.
+_CWD_SHIM_LABEL = "cao-cwd-shim"
+
+
+def apply_cwd_shim(config: dict) -> dict:
+    """Return ``config`` with its ``cwd`` carried by a ``/bin/sh`` wrapper.
+
+    Seven of CAO's providers write MCP configuration in a format with **no
+    working-directory field** (verified against each vendor's own documentation,
+    2026-09-16). The Agent Plugins mapper always supplies an absolute, contained
+    ``cwd`` -- defaulting to the plugin root -- so a plugin whose ``command`` or
+    ``args`` are relative to its own directory would otherwise execute from the
+    provider's session directory. Reported by review 5222539218 on #584 (item 4).
+
+    PURE and it NEVER RAISES, both deliberately. It is called on the delivery
+    path, where the alternative to returning something usable is costing the
+    operator the whole agent rather than one server; and it returns a new dict so
+    a caller iterating a mapping cannot be surprised by mutation.
+
+    Identity unless the entry has BOTH a non-empty string ``command`` and a
+    non-empty string ``cwd``. A remote entry has no ``command`` and is therefore
+    untouched -- belt and braces, since only ``_map_stdio`` ever sets ``cwd``.
+    """
+
+    command = config.get("command")
+    cwd = config.get("cwd")
+    if not isinstance(command, str) or not command:
+        return config
+    if not isinstance(cwd, str) or not cwd:
+        return config
+
+    raw_args = config.get("args")
+    args = list(raw_args) if isinstance(raw_args, (list, tuple)) else []
+
+    shimmed = dict(config)
+    shimmed["command"] = "/bin/sh"
+    shimmed["args"] = ["-c", _CWD_SHIM_SCRIPT, _CWD_SHIM_LABEL, cwd, command, *args]
+    shimmed.pop("cwd", None)
+    return shimmed

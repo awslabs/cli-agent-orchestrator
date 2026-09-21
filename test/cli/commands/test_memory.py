@@ -3,10 +3,15 @@
 CLI command tests mock MemoryService to isolate command logic.
 """
 
+import asyncio
 from datetime import datetime, timezone
+from pathlib import Path
+from test.fixtures.vault_factory import build_vault_fixture
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from click.testing import CliRunner
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.cli.commands.memory import (
     clear,
@@ -16,7 +21,13 @@ from cli_agent_orchestrator.cli.commands.memory import (
     list_memories,
     show,
 )
+from cli_agent_orchestrator.clients.database import Base
 from cli_agent_orchestrator.models.memory import Memory
+from cli_agent_orchestrator.services import memory_service, settings_service
+from cli_agent_orchestrator.services.memory_service import ForgetResult, MemoryService
+from cli_agent_orchestrator.services.vault import reader
+from cli_agent_orchestrator.services.vault import reconcile as reconcile_module
+from cli_agent_orchestrator.services.vault.config import VaultConfig
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -47,6 +58,38 @@ def _make_memory(
         updated_at=now,
         content=content,
     )
+
+
+def _real_vault_service(tmp_path: Path, monkeypatch, keys: tuple[str, ...]):
+    """Index real vault notes and return their service and immutable byte snapshots."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'state.db'}")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine)
+    monkeypatch.setattr(reconcile_module, "SessionLocal", session_factory)
+    monkeypatch.setattr(reader, "SessionLocal", session_factory)
+    monkeypatch.setattr(reconcile_module, "_replace_vault_edges", lambda _notes, **_kwargs: None)
+    monkeypatch.setattr(reconcile_module, "_clear_stale_vault_edges", lambda *_args: None)
+    monkeypatch.setattr(reconcile_module, "_emit_audit_events", lambda *_args: None)
+    monkeypatch.setattr(memory_service, "_is_memory_enabled", lambda: True)
+
+    fixture = build_vault_fixture(tmp_path)
+    config = VaultConfig(enabled=True, vaults=[fixture.vault])
+    monkeypatch.setattr(settings_service, "get_vault_config", lambda: config)
+    service = MemoryService(base_dir=tmp_path / "native", db_engine=engine)
+    for key in keys:
+        stored = asyncio.run(
+            service.store(
+                content=f"body for {key}",
+                scope="global",
+                memory_type="reference",
+                key=key,
+            )
+        )
+        assert stored.source_kind == "vault"
+
+    reconcile_module.reconcile(fixture.vault, apply=True, run_id="cli-clear-index")
+    note_paths = tuple(fixture.root / "CAO" / f"{key}.md" for key in keys)
+    return service, {path: path.read_bytes() for path in note_paths}
 
 
 # ===========================================================================
@@ -189,7 +232,7 @@ class TestMemoryDeleteWithConfirmation:
     def test_memory_delete_with_confirmation(self, mock_get_svc):
         """delete command should prompt for confirmation and delete."""
         mock_svc = MagicMock()
-        mock_svc.forget = AsyncMock(return_value=True)
+        mock_svc.forget = AsyncMock(return_value=ForgetResult("deleted", "native", "topic.md"))
         mock_get_svc.return_value = mock_svc
 
         runner = CliRunner()
@@ -206,7 +249,7 @@ class TestMemoryDeleteWithConfirmation:
     def test_memory_delete_prompts_user(self, mock_get_svc):
         """delete command without --yes should prompt for confirmation."""
         mock_svc = MagicMock()
-        mock_svc.forget = AsyncMock(return_value=True)
+        mock_svc.forget = AsyncMock(return_value=ForgetResult("deleted", "native", "topic.md"))
         mock_get_svc.return_value = mock_svc
 
         runner = CliRunner()
@@ -219,7 +262,7 @@ class TestMemoryDeleteWithConfirmation:
     def test_memory_delete_not_found(self, mock_get_svc):
         """delete command should error when key not found."""
         mock_svc = MagicMock()
-        mock_svc.forget = AsyncMock(return_value=False)
+        mock_svc.forget = AsyncMock(return_value=ForgetResult("absent", "native", None))
         mock_get_svc.return_value = mock_svc
 
         runner = CliRunner()
@@ -227,6 +270,21 @@ class TestMemoryDeleteWithConfirmation:
 
         assert result.exit_code != 0
         assert "not found" in result.output
+
+    @patch("cli_agent_orchestrator.cli.commands.memory._get_memory_service")
+    def test_memory_delete_reports_retained_vault_file_after_deindex(self, mock_get_svc):
+        mock_svc = MagicMock()
+        mock_svc.forget = AsyncMock(
+            return_value=ForgetResult("deindexed", "vault", "CAO/managed-topic.md")
+        )
+        mock_get_svc.return_value = mock_svc
+
+        result = CliRunner().invoke(delete, ["managed-topic", "--scope", "global", "--yes"])
+
+        assert result.exit_code == 0
+        assert "De-indexed 'managed-topic'" in result.output
+        assert "file is retained in your vault at CAO/managed-topic.md" in result.output
+        assert "Deleted memory" not in result.output
 
 
 class TestMemoryKeyValidation:
@@ -293,7 +351,7 @@ class TestMemoryClearRequiresScope:
                 _make_memory(key="m2", scope="session"),
             ]
         )
-        mock_svc.forget = AsyncMock(return_value=True)
+        mock_svc.forget = AsyncMock(return_value=ForgetResult("deleted", "native", "session/m1.md"))
         mock_get_svc.return_value = mock_svc
 
         runner = CliRunner()
@@ -302,6 +360,48 @@ class TestMemoryClearRequiresScope:
         assert result.exit_code == 0
         assert "Cleared" in result.output
         assert mock_svc.forget.call_count == 2
+
+    def test_memory_clear_counts_vault_deindexed_results(self, tmp_path, monkeypatch):
+        keys = ("cli-alpha", "cli-beta")
+        service, note_bytes = _real_vault_service(tmp_path, monkeypatch, keys)
+        before = asyncio.run(service.recall(scope="global", limit=1000))
+
+        with patch(
+            "cli_agent_orchestrator.cli.commands.memory._get_memory_service",
+            return_value=service,
+        ):
+            result = CliRunner().invoke(clear, ["--scope", "global", "--yes"])
+
+        after = asyncio.run(service.recall(scope="global", limit=1000))
+        assert result.exit_code == 0
+        assert {memory.key for memory in before} == set(keys)
+        assert result.output == "Cleared 2 global-scoped memory(ies).\n"
+        assert after == []
+        assert all(path.read_bytes() == content for path, content in note_bytes.items())
+
+    @patch("cli_agent_orchestrator.cli.commands.memory._get_memory_service")
+    def test_memory_clear_counts_each_success_action_once(self, mock_get_svc):
+        mock_svc = MagicMock()
+        mock_svc.recall = AsyncMock(
+            return_value=[_make_memory(key=f"m{index}", scope="global") for index in range(5)]
+        )
+        mock_svc.forget = AsyncMock(
+            side_effect=[
+                ForgetResult("deleted", "native", "global/m0.md"),
+                ForgetResult("deindexed", "vault", "CAO/m1.md"),
+                ForgetResult("deleted_and_deindexed", "both", "CAO/m2.md"),
+                ForgetResult("absent", "native", None),
+                RuntimeError("induced failure"),
+            ]
+        )
+        mock_get_svc.return_value = mock_svc
+
+        result = CliRunner().invoke(clear, ["--scope", "global", "--yes"])
+
+        assert result.exit_code == 0
+        assert "Cleared 3 global-scoped memory(ies)." in result.output
+        assert "Warning: Failed to delete 'm4'." in result.output
+        assert mock_svc.forget.await_count == 5
 
     @patch("cli_agent_orchestrator.cli.commands.memory._get_memory_service")
     def test_memory_clear_empty_scope(self, mock_get_svc):

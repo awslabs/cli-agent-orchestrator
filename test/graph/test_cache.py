@@ -178,6 +178,239 @@ class TestGraphViewCache:
             assert cache._fresh(key) is None
         assert len(cache._entries) == 0
 
+    @pytest.mark.asyncio
+    async def test_expired_fingerprint_history_reclaims_entries_and_locks(self):
+        """A new fingerprint lookup sweeps unreachable expired history."""
+        clock = _FakeClock()
+        cache = GraphViewCache(ttl_s=300.0, clock=clock)
+        keys = [
+            ("memory", "global", None, True, "fingerprint-1"),
+            ("memory", "global", None, True, "fingerprint-2"),
+            ("memory", "global", None, True, "fingerprint-3"),
+        ]
+
+        for index, key in enumerate(keys[:2]):
+            await cache.get_or_build(key, lambda index=index: _async_view(f"old-{index}"))
+
+        clock.advance(300.0)
+        await cache.get_or_build(keys[2], lambda: _async_view("live"))
+
+        assert set(cache._entries) == {keys[2]}
+        assert set(cache._locks) == {keys[2]}
+        assert cache._lock_users == {}
+
+    @pytest.mark.asyncio
+    async def test_sweep_keeps_lock_referenced_before_acquire(self, monkeypatch):
+        """A sweep cannot replace a lock returned to a not-yet-waiting caller."""
+        clock = _FakeClock()
+        cache = GraphViewCache(ttl_s=300.0, clock=clock)
+        key = ("memory", "global", None, True, "fingerprint")
+        other = ("memory", "global", None, True, "other")
+        returned = asyncio.Event()
+        resume = asyncio.Event()
+        second_referenced = asyncio.Event()
+        calls = 0
+        original_lock_for = cache._lock_for
+        key_lock_calls = 0
+
+        async def paused_lock_for(requested):
+            nonlocal key_lock_calls
+            lock = await original_lock_for(requested)
+            if requested == key:
+                key_lock_calls += 1
+                if key_lock_calls == 1:
+                    returned.set()
+                    await resume.wait()
+                else:
+                    second_referenced.set()
+            return lock
+
+        async def builder():
+            nonlocal calls
+            calls += 1
+            return _view("shared")
+
+        monkeypatch.setattr(cache, "_lock_for", paused_lock_for)
+        first = asyncio.create_task(cache.get_or_build(key, builder))
+        await returned.wait()
+        referenced_lock = cache._locks[key]
+
+        clock.advance(300.0)
+        await cache.get_or_build(other, lambda: _async_view("other"))
+        second = asyncio.create_task(cache.get_or_build(key, builder))
+        await second_referenced.wait()
+
+        assert cache._locks[key] is referenced_lock
+        resume.set()
+        results = await asyncio.gather(first, second)
+
+        assert calls == 1
+        assert sum(not cached for _view_value, cached, _as_of in results) == 1
+
+    @pytest.mark.asyncio
+    async def test_builder_exception_releases_lock_reference_and_retries(self):
+        cache = GraphViewCache(ttl_s=300.0)
+        key = ("memory", "global", None, True, "failure")
+        calls = 0
+
+        async def builder():
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("build failed")
+            return _view("recovered")
+
+        with pytest.raises(RuntimeError, match="build failed"):
+            await cache.get_or_build(key, builder)
+
+        assert key not in cache._entries
+        assert key not in cache._locks
+        assert key not in cache._lock_users
+
+        view, cached, _ = await cache.get_or_build(key, builder)
+        assert ([node.id for node in view.nodes], cached, calls) == (["recovered"], False, 2)
+
+    @pytest.mark.asyncio
+    async def test_cancelled_waiter_releases_only_its_lock_reference(self, monkeypatch):
+        cache = GraphViewCache(ttl_s=300.0)
+        key = ("memory", "global", None, True, "waiter")
+        started = asyncio.Event()
+        release = asyncio.Event()
+        second_referenced = asyncio.Event()
+        original_lock_for = cache._lock_for
+        lock_for_calls = 0
+
+        async def observed_lock_for(requested):
+            nonlocal lock_for_calls
+            lock = await original_lock_for(requested)
+            lock_for_calls += 1
+            if lock_for_calls == 2:
+                second_referenced.set()
+            return lock
+
+        async def slow_builder():
+            started.set()
+            await release.wait()
+            return _view("built")
+
+        monkeypatch.setattr(cache, "_lock_for", observed_lock_for)
+        active = asyncio.create_task(cache.get_or_build(key, slow_builder))
+        await started.wait()
+        waiter = asyncio.create_task(cache.get_or_build(key, slow_builder))
+        await second_referenced.wait()
+
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+
+        assert cache._lock_users[key] == 1
+        assert key in cache._locks
+        release.set()
+        await active
+        assert key not in cache._lock_users
+        assert key in cache._locks
+
+    @pytest.mark.asyncio
+    async def test_cancelled_builder_keeps_lock_for_registered_waiter(self, monkeypatch):
+        cache = GraphViewCache(ttl_s=300.0)
+        key = ("memory", "global", None, True, "builder")
+        started = asyncio.Event()
+        second_referenced = asyncio.Event()
+        original_lock_for = cache._lock_for
+        lock_for_calls = 0
+
+        async def observed_lock_for(requested):
+            nonlocal lock_for_calls
+            lock = await original_lock_for(requested)
+            lock_for_calls += 1
+            if lock_for_calls == 2:
+                second_referenced.set()
+            return lock
+
+        async def cancelled_builder():
+            started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        monkeypatch.setattr(cache, "_lock_for", observed_lock_for)
+        active = asyncio.create_task(cache.get_or_build(key, cancelled_builder))
+        await started.wait()
+        waiter = asyncio.create_task(cache.get_or_build(key, lambda: _async_view("recovered")))
+        await second_referenced.wait()
+
+        active.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await active
+        view, cached, _ = await waiter
+
+        assert ([node.id for node in view.nodes], cached) == (["recovered"], False)
+        assert key not in cache._lock_users
+        assert key in cache._locks
+
+    @pytest.mark.asyncio
+    async def test_clear_during_active_build_preserves_single_flight_lock(self, monkeypatch):
+        cache = GraphViewCache(ttl_s=300.0)
+        key = ("memory", "global", None, True, "clear")
+        started = asyncio.Event()
+        release = asyncio.Event()
+        second_referenced = asyncio.Event()
+        calls = 0
+        lock_for_calls = 0
+        original_lock_for = cache._lock_for
+
+        async def observed_lock_for(requested):
+            nonlocal lock_for_calls
+            lock = await original_lock_for(requested)
+            lock_for_calls += 1
+            if lock_for_calls == 2:
+                second_referenced.set()
+            return lock
+
+        async def slow_builder():
+            nonlocal calls
+            calls += 1
+            started.set()
+            await release.wait()
+            return _view("built")
+
+        monkeypatch.setattr(cache, "_lock_for", observed_lock_for)
+        active = asyncio.create_task(cache.get_or_build(key, slow_builder))
+        await started.wait()
+        active_lock = cache._locks[key]
+        cache.clear()
+        waiter = asyncio.create_task(cache.get_or_build(key, slow_builder))
+        await second_referenced.wait()
+
+        assert cache._locks[key] is active_lock
+        release.set()
+        first, second = await asyncio.gather(active, waiter)
+
+        assert calls == 1
+        assert (first[1], second[1]) == (False, True)
+        cache.clear()
+        assert cache._entries == {}
+        assert cache._locks == {}
+        assert cache._lock_users == {}
+
+    @pytest.mark.asyncio
+    async def test_four_tuple_key_expires_and_reclaims(self):
+        clock = _FakeClock()
+        cache = GraphViewCache(ttl_s=300.0, clock=clock)
+        key = ("other", "global", None, False)
+        other = ("other", "project", "project-id", False)
+
+        await cache.get_or_build(key, lambda: _async_view("first"))
+        _, cached, _ = await cache.get_or_build(key, lambda: _async_view("unused"))
+        assert cached is True
+
+        clock.advance(300.0)
+        await cache.get_or_build(other, lambda: _async_view("other"))
+        assert key not in cache._entries
+        assert key not in cache._locks
+
+        view, cached, _ = await cache.get_or_build(key, lambda: _async_view("rebuilt"))
+        assert ([node.id for node in view.nodes], cached) == (["rebuilt"], False)
+
     def test_make_meta_does_not_mutate_base(self):
         base = {"provider": "memory", "scope": "global"}
         out = make_meta(base, cached=True, as_of="2026-07-14T00:00:00+00:00")
@@ -186,6 +419,10 @@ class TestGraphViewCache:
 
     def test_default_ttl_is_five_minutes(self):
         assert DEFAULT_TTL_S == 300.0
+
+
+async def _async_view(node_id: str) -> GraphView:
+    return _view(node_id)
 
 
 # ---------------------------------------------------------------------------

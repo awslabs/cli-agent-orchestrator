@@ -6,6 +6,7 @@ from cli_agent_orchestrator.utils.tool_mapping import (
     format_tool_summary,
     get_allowed_tools,
     get_disallowed_tools,
+    granted_mcp_servers,
     resolve_allowed_tools,
 )
 
@@ -295,3 +296,64 @@ class TestClaudeCodeSubagentEscape:
 
     def test_unrestricted_star_keeps_everything(self):
         assert get_disallowed_tools("claude_code", ["*"]) == []
+
+
+class TestGrantedMcpServers:
+    """The one matching rule both grant sites share.
+
+    These pin the rule's vocabulary. They are NOT what proves the defect fixed:
+    the rule was always easy to write correctly, and the gap was that neither
+    call site applied one. That is asserted on the emitted artifacts in
+    ``test/agent_plugins/test_no_auto_grant.py`` (OpenCode's ``opencode.json``)
+    and ``test/providers/test_grok_cli_unit.py`` (Grok's launch command).
+    """
+
+    SERVERS = ["plugin-tools", "other-tools", "cao-mcp-server"]
+
+    def test_a_glob_selects_the_matching_servers(self):
+        assert granted_mcp_servers(["fs_read", "@plugin-*"], self.SERVERS) == ["plugin-tools"]
+
+    def test_an_exact_reference_still_works(self):
+        assert granted_mcp_servers(["@cao-mcp-server"], self.SERVERS) == ["cao-mcp-server"]
+
+    def test_star_grants_every_delivered_server(self):
+        assert granted_mcp_servers(["*"], self.SERVERS) == sorted(self.SERVERS)
+
+    def test_an_empty_allowlist_grants_nothing(self):
+        assert granted_mcp_servers([], self.SERVERS) == []
+
+    def test_a_non_matching_glob_grants_nothing(self):
+        assert granted_mcp_servers(["@ghost-*"], self.SERVERS) == []
+
+    def test_matching_is_case_sensitive(self):
+        """``fnmatchcase``, not ``fnmatch``: the latter case-folds on some hosts."""
+        assert granted_mcp_servers(["@PLUGIN-*"], self.SERVERS) == []
+        assert granted_mcp_servers(["@Plugin-Tools"], self.SERVERS) == []
+
+    def test_expansion_is_over_the_given_names_only(self):
+        """A pattern is never returned as though it were a server name."""
+        assert granted_mcp_servers(["@plugin-*"], []) == []
+        assert granted_mcp_servers(["@*"], None) == []
+
+    def test_builtin_is_cao_vocabulary_not_a_server_reference(self):
+        """``@builtin`` names a provider's own tool set, so it matches nothing."""
+        assert granted_mcp_servers(["@builtin"], ["builtin", "plugin-tools"]) == []
+
+    def test_a_bare_at_sign_matches_nothing(self):
+        assert granted_mcp_servers(["@"], self.SERVERS) == []
+
+    def test_an_exact_name_containing_glob_syntax_still_matches(self):
+        """Exact membership is checked independently, so nothing the old rule
+        granted is lost — even for a name ``fnmatch`` would read as syntax.
+
+        Such a reference now ALSO matches what it denotes as a pattern
+        (``@srv[1]`` is a one-character class), which is inherent to the
+        documented glob semantics. Conventional MCP names contain no ``fnmatch``
+        metacharacter, so the two readings coincide in practice, and Grok's
+        ``_MCP_SERVER_REF`` refuses such a name outright.
+        """
+        assert granted_mcp_servers(["@srv[1]"], ["srv[1]", "srv1"]) == ["srv1", "srv[1]"]
+        assert granted_mcp_servers(["@srv[1]"], ["srv[1]"]) == ["srv[1]"]
+
+    def test_non_string_entries_are_ignored(self):
+        assert granted_mcp_servers(["@plugin-*", None, 7], self.SERVERS) == ["plugin-tools"]
