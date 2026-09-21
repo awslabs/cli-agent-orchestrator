@@ -1343,6 +1343,11 @@ class TestKimiCodeDispatchGrace:
         provider.mark_input_received()
         assert provider.get_status(self.NEW_TUI_READY_CHROME) == TerminalStatus.PROCESSING
 
+    def test_kimi_opts_into_deferred_init_direct_status_probe(self):
+        """A cache miss must be recoverable without re-pasting the task."""
+
+        assert KimiCliProvider.supports_direct_status_probe is True
+
     def test_grace_expires_to_completed_when_pane_clear(self):
         import time as _time
 

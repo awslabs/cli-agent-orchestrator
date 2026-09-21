@@ -443,3 +443,42 @@ class TestWorkerIsStartedDirect:
             patch.object(ts, "get_backend") as mock_be,
         ):
             assert ts._worker_is_started_direct("t1", provider) is False
+
+    def test_kimi_code_settled_pane_proves_initial_task_started(self):
+        """Regression: a fast Kimi turn may never update the cached status edge.
+
+        Deferred init must use the provider's live pane before deciding the paste
+        was dropped; otherwise it re-sends the already-executed initial task and
+        eventually tears the terminal down.
+        """
+
+        import time
+
+        from cli_agent_orchestrator.models.terminal import TerminalStatus
+        from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider, KimiDialect
+
+        ready = (
+            "● Finished the requested task.\n"
+            "── input ─────────────────────────────────\n"
+            "──────────────────────────────────────────\n"
+            "auto  agent (DeepSeek V4.1 Flash ●)  /tmp/project  ctrl-o: editor\n"
+            "context: 1.0% (2.6k/262.1k)\n"
+        )
+        provider = KimiCliProvider("t1", "s1", "w1")
+        provider._dialect = KimiDialect.CODE
+        provider.mark_input_received()
+        provider._last_dispatch_time = time.time() - 9.0
+
+        with (
+            patch.object(
+                ts,
+                "get_terminal_metadata",
+                return_value={"tmux_session": "s1", "tmux_window": "w1"},
+            ),
+            patch.object(ts, "get_backend") as service_backend,
+            patch("cli_agent_orchestrator.providers.kimi_cli.get_backend") as kimi_backend,
+        ):
+            service_backend.return_value.get_history.return_value = ready
+            kimi_backend.return_value.get_history.return_value = ready
+            assert ts._worker_is_started_direct("t1", provider) is True
+            assert provider.get_status(ready) is TerminalStatus.COMPLETED

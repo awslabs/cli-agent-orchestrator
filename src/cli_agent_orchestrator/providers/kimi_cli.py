@@ -2145,6 +2145,22 @@ class KimiCliProvider(BaseProvider):
     # Opt in to pyte rendered-screen detection (gated by CAO_PYTE_STATUS).
     supports_screen_detection = True
 
+    # Deferred-init submit verification polls the event-driven status cache
+    # first. Kimi Code can finish a short turn between rendered-screen edges,
+    # leaving that cache IDLE even though the paste was accepted and the worker
+    # ran. Without a direct probe, deferred init mistakes the cache miss for a
+    # dropped paste, re-delivers the task, and can eventually tear down a healthy
+    # terminal after the retry budget expires.
+    #
+    # Kimi's get_status() is safe on a live capture-pane snapshot: this provider
+    # instance carries the dispatch bookkeeping set by mark_input_received()
+    # (_last_dispatch_time / _has_received_input), and the CODE detector
+    # distinguishes live spinners from settled ready chrome. Opt in to the
+    # existing terminal_service direct-probe guard so a real PROCESSING or
+    # COMPLETED frame proves that the worker started and suppresses duplicate
+    # re-delivery.
+    supports_direct_status_probe = True
+
     def get_status_from_screen(self, screen_lines: List[str]) -> TerminalStatus:
         """Detect status from a pyte-composited viewport (escape-free rows).
 
