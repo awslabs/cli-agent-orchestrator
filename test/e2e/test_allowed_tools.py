@@ -47,6 +47,7 @@ from test.e2e.conftest import (
     get_terminal_status,
     wait_for_status,
 )
+from test.fixtures.cao_server import skip_if_provider_unusable
 
 import psutil
 import pytest
@@ -108,6 +109,10 @@ def _create_terminal_with_tools(
     """Create a terminal with explicit allowed_tools via the API.
 
     Returns (terminal_id, actual_session_name).
+
+    Boot failures classify through the same helper ``create_terminal`` uses: a
+    provider CLI that cannot start on this host is a skip, not a red test about
+    allowedTools enforcement.
     """
     last_resp = None
     for attempt in range(1 + retries):
@@ -135,6 +140,8 @@ def _create_terminal_with_tools(
         if resp.status_code != 500 or attempt >= retries:
             break
 
+    if last_resp is not None:
+        skip_if_provider_unusable(last_resp.status_code, last_resp.text, provider)
     assert last_resp is not None and last_resp.status_code in (
         200,
         201,

@@ -18,7 +18,11 @@ import os
 import shutil
 import time
 from pathlib import Path
-from test.fixtures.cao_server import CaoServer, _patch_api_base_url_for_e2e
+from test.fixtures.cao_server import (
+    CaoServer,
+    _patch_api_base_url_for_e2e,
+    skip_if_provider_unusable,
+)
 
 import pytest
 import requests
@@ -223,6 +227,10 @@ def create_terminal(
     API rate limiting), retries up to ``retries`` times with ``retry_delay``
     seconds between attempts. The retry uses a fresh session name to avoid
     conflicts with partially-created resources from the failed attempt.
+
+    A provider that still cannot boot after the retries is a property of the
+    host, not a broken contract, so it skips rather than fails — same
+    classifier the ``cao_terminal`` fixture uses, so the two agree.
     """
     last_resp = None
     for attempt in range(1 + retries):
@@ -254,6 +262,8 @@ def create_terminal(
         if resp.status_code != 500 or attempt >= retries:
             break
 
+    if last_resp is not None:
+        skip_if_provider_unusable(last_resp.status_code, last_resp.text, provider)
     assert last_resp is not None and last_resp.status_code in (
         200,
         201,
