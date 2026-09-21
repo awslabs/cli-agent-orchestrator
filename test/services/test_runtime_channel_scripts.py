@@ -168,12 +168,21 @@ class TestServerRemoteDriveSelection:
         monkeypatch.delenv("CAO_SCRIPT_RUNTIME", raising=False)
         assert script_runner._remote_script_runtime() is None
 
-    def test_configured_but_disconnected_is_local(self, monkeypatch):
+    def test_configured_but_disconnected_still_selects_the_runtime(self, monkeypatch):
+        """A disconnect must not relocate user code into the server container.
+
+        The earlier behaviour returned None here, so a runtime that was briefly
+        down turned into a local spawn beside the central database — the exact
+        placement ``CAO_SCRIPT_RUNTIME`` exists to prevent, and the opposite of
+        what the design and the EKS runbook promise ("disconnect → explicit
+        failure"). The remote path reports the disconnect as a failed run, which
+        is retryable; a run that quietly succeeded in the wrong pod is not
+        (Copilot review on #802, finding 7).
+        """
         from cli_agent_orchestrator.services import script_runner
 
         monkeypatch.setenv("CAO_SCRIPT_RUNTIME", "worker-not-connected")
-        # No such runtime is registered → falls back to local execution.
-        assert script_runner._remote_script_runtime() is None
+        assert script_runner._remote_script_runtime() == "worker-not-connected"
 
     def test_configured_and_connected_selects_runtime(self, monkeypatch):
         from cli_agent_orchestrator.runtime_channel.registry import runtime_registry

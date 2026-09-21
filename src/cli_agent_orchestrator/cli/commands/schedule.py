@@ -31,6 +31,34 @@ def _echo_flow_added(name, schedule_expr, agent_profile, next_run):
     click.echo(f"  Next run: {next_run}")
 
 
+def _remote_script_path(script: str, file_path: str) -> str:
+    """The pre-script path as the server will read it, or refuse to register.
+
+    Locally a relative ``script`` resolves against the flow file's own directory.
+    Remotely the flow file does not travel: the server writes its own copy under
+    ``CAO_HOME_DIR/flows``, so the same relative path resolves there instead —
+    against a directory that has never seen the client's checkout. The flow
+    registers cleanly and then fails minutes later inside a scheduled run, with
+    a "Script not found" naming a path the operator never wrote. Worse, if some
+    unrelated file does sit at that name on the server, the schedule silently
+    executes the wrong code.
+
+    So the refusal happens here, while a human is still watching the command.
+    An absolute path is accepted unchanged: it is a claim about the machine that
+    runs the script, which is exactly the claim only the operator can make
+    (Copilot review on #802, finding 10).
+    """
+    if not Path(script).is_absolute():
+        raise click.ClickException(
+            f"Pre-script '{script}' in {file_path} is a relative path, which cannot be "
+            "registered on a shared server: the flow file stays on this machine, so the "
+            "server would resolve it against its own flows directory. Use an absolute "
+            "path that exists where the flow's pre-script runs (the server, or the "
+            "runtime named by CAO_SCRIPT_RUNTIME)."
+        )
+    return script
+
+
 def _remote_add(file_path: str) -> None:
     """Parse the client-local flow file and register it on the shared server.
 
@@ -52,7 +80,7 @@ def _remote_add(file_path: str) -> None:
     if metadata.get("engine"):
         body["engine"] = metadata["engine"]
     if metadata.get("script"):
-        body["script"] = metadata["script"]
+        body["script"] = _remote_script_path(metadata["script"], file_path)
     flow = api_request("post", "/flows", json=body).json()
     _echo_flow_added(flow["name"], flow["schedule"], flow["agent_profile"], flow.get("next_run"))
 

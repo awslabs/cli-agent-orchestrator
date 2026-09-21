@@ -144,42 +144,6 @@ async def test_no_script_runtime_runs_the_pre_script_here(
     mock_create_terminal.assert_called_once()
 
 
-@pytest.mark.asyncio
-@patch("cli_agent_orchestrator.services.flow_service.subprocess.run")
-@_patches
-async def test_a_named_runtime_that_is_not_connected_falls_back_to_local(
-    mock_db_get,
-    mock_update_times,
-    mock_backend,
-    mock_list,
-    mock_create_terminal,
-    mock_send_input,
-    mock_run,
-    flow_file,
-    pre_script,
-    monkeypatch,
-):
-    """`remote_script_runtime` already resolves "named but absent" to None.
-
-    Reading the env directly here instead would make a flow fail whenever the
-    runtime is briefly down, where the workflow path degrades to local execution.
-    One decision, one place.
-    """
-    monkeypatch.setenv("CAO_SCRIPT_RUNTIME", "cao-worker-gone")
-    registry = MagicMock()
-    registry.get_runtime.return_value = None
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.runtime_channel.registry.runtime_registry", registry
-    )
-    mock_db_get.return_value = _flow(flow_file, pre_script)
-    mock_backend.return_value.session_exists.return_value = False
-    mock_list.return_value = []
-    mock_run.return_value = subprocess.CompletedProcess([], 0, GOOD_JSON, "")
-
-    assert await execute_flow("monitor-service") is True
-    mock_run.assert_called_once()
-
-
 # --- relocation ------------------------------------------------------------
 
 
@@ -420,4 +384,44 @@ async def test_unparseable_remote_output_still_fails_the_flow(
 
     with pytest.raises(ValueError, match="not valid JSON"):
         await execute_flow("monitor-service")
+    mock_create_terminal.assert_not_called()
+
+
+@pytest.mark.asyncio
+@patch("cli_agent_orchestrator.services.flow_service.subprocess.run")
+@_patches
+async def test_a_named_runtime_that_is_not_connected_fails_instead_of_running_here(
+    mock_db_get,
+    mock_update_times,
+    mock_backend,
+    mock_list,
+    mock_create_terminal,
+    mock_send_input,
+    mock_run,
+    flow_file,
+    pre_script,
+    monkeypatch,
+):
+    """A disconnect is a failed run, not a relocation back into the server.
+
+    `CAO_SCRIPT_RUNTIME` is an operator's placement decision: this health check
+    must not execute beside the central database. Answering "the runtime is down"
+    with a local spawn would do the one thing the setting exists to prevent, and
+    would do it silently — the flow would report success. A raised failure is
+    retryable once the runtime returns; a run that succeeded in the wrong pod is
+    not (Copilot review on #802, finding 7).
+    """
+    monkeypatch.setenv("CAO_SCRIPT_RUNTIME", "cao-worker-gone")
+    registry = MagicMock()
+    registry.get_runtime.return_value = None
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.runtime_channel.registry.runtime_registry", registry
+    )
+    mock_db_get.return_value = _flow(flow_file, pre_script)
+    mock_backend.return_value.session_exists.return_value = False
+    mock_list.return_value = []
+
+    with pytest.raises(ValueError, match="'cao-worker-gone' is not connected"):
+        await execute_flow("monitor-service")
+    mock_run.assert_not_called()
     mock_create_terminal.assert_not_called()

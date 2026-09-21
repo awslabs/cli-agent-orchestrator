@@ -251,12 +251,13 @@ def _pre_script_env(flow_name: str) -> Dict[str, str]:
 async def _run_pre_script(flow_name: str, script_path: Path) -> Tuple[Optional[int], str, str]:
     """Run a flow's pre-script and return its raw (returncode, stdout, stderr).
 
-    #745: when `CAO_SCRIPT_RUNTIME` names a connected runtime the script runs
-    THERE — this is user code, and the issue's boundary puts user code in an
-    execution workload rather than beside the central database. The server keeps
-    what it already owned: the schedule, the JSON contract, the execute/skip
-    decision and the launch. Unset, or a runtime that is not connected, is the
-    unchanged local path.
+    #745: when `CAO_SCRIPT_RUNTIME` names a runtime the script runs THERE — this
+    is user code, and the issue's boundary puts user code in an execution
+    workload rather than beside the central database. The server keeps what it
+    already owned: the schedule, the JSON contract, the execute/skip decision
+    and the launch. Unset is the unchanged local path; a runtime that is named
+    but not connected raises, because the fallback for a placement the operator
+    asked for cannot be "run it here after all".
 
     A runtime that dies mid-script, or does not answer, raises — the outcome is
     genuinely unknown, and the caller's contract for an unusable pre-script is

@@ -109,7 +109,17 @@ constructed rather than inherited. A script there gets `PATH`, `HOME`,
 `CAO_API_BASE_URL` and `CAO_FLOW_NAME` and nothing else, so anything else your
 script reads from the environment must move into the script or be fetched over the
 API. The server still owns the schedule and the JSON verdict; a runtime that
-disappears mid-script fails the run rather than being read as "skip".
+disappears mid-script fails the run rather than being read as "skip". A runtime
+that is named but not connected fails the run as well: once you have said where
+this code runs, "run it on the server after all" is not a fallback, it is the
+outcome the setting exists to prevent. Retry the run when the runtime is back.
+
+`script:` must be reachable from wherever it runs. Registering a flow against a
+shared server (`CAO_API_BASE_URL`) sends the parsed fields, not the file, so a
+relative path — which resolves beside the flow file locally — is refused at
+`cao schedule add` time rather than failing inside a scheduled run hours later.
+Use an absolute path that exists on the server, or in the runtime named by
+`CAO_SCRIPT_RUNTIME`.
 
 ### Where the agent runs
 
