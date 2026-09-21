@@ -139,13 +139,21 @@ async def runtime_channel(ws: WebSocket) -> None:
                 ),
             )
         )
+    # The hello is this incarnation's complete statement of what it owns, so
+    # anything still bound here and absent from it is gone: discard that cached
+    # state BEFORE seeding, or a reconnect resurrects a dead terminal's last
+    # PROCESSING/COMPLETED and answers it as current (review finding 2 on #802).
+    for terminal_id in runtime_registry.reconcile_hello(
+        runtime_id, [sp.terminal_id for sp in hello.streams]
+    ):
+        bus.publish(f"terminal.{terminal_id}.status", {"status": TerminalStatus.UNKNOWN.value})
     # Seed the status cache from the same snapshot. Status is pushed on change,
     # so without this a server that restarted while a terminal sat quiescent
     # would answer UNKNOWN until the agent next moved — indefinitely, for an
     # idle agent. Only terminals this hello actually bound are seeded.
     for terminal_id, reported in hello.statuses.items():
         if runtime_registry.runtime_for_terminal(terminal_id) == runtime_id:
-            runtime_registry.set_status(terminal_id, reported)
+            runtime_registry.set_status(terminal_id, reported, conn=conn)
 
     await ws.send_text(
         encode_frame(
@@ -212,7 +220,7 @@ async def runtime_channel(ws: WebSocket) -> None:
             elif isinstance(frame, EventFrame):
                 runtime_registry.bind_terminal(frame.terminal_id, runtime_id)
                 if frame.type == EventType.STATUS and frame.status is not None:
-                    runtime_registry.set_status(frame.terminal_id, frame.status)
+                    runtime_registry.set_status(frame.terminal_id, frame.status, conn=conn)
                     bus.publish(
                         f"terminal.{frame.terminal_id}.status", {"status": frame.status.value}
                     )

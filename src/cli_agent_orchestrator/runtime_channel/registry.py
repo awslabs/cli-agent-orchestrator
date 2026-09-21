@@ -18,7 +18,7 @@ import asyncio
 import logging
 import time
 import uuid
-from typing import Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Awaitable, Callable, Dict, Iterable, List, Optional, Tuple
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.runtime_channel.protocol import (
@@ -67,6 +67,9 @@ class RuntimeConnection:
         self._pending: Dict[str, asyncio.Future] = {}
         self.connected_at = time.time()
         self.last_seen = time.time()
+        # Set by the registry at register(); 0 means "never registered", which is
+        # what an unregistered connection built directly in a test has.
+        self.incarnation = 0
 
     async def send_command(
         self,
@@ -140,6 +143,14 @@ class RuntimeChannelRegistry:
         self._attach_sinks: Dict[str, "asyncio.Queue"] = {}
         # The loop the channel connections belong to, captured at register().
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        # How many times each runtime id has been claimed by a channel in this
+        # process. Stamped onto the connection so a report can be checked against
+        # the incarnation that is current now, not the one that sent it.
+        self._incarnations: Dict[str, int] = {}
+        # Placement as recovered from the central row, for terminals this process
+        # has not (yet) seen a hello for. ``None`` means "the row says local", so
+        # a local terminal is asked about the database once, not on every poll.
+        self._recovered_placement: Dict[str, Optional[str]] = {}
 
     # --- runtime lifecycle ---
 
@@ -152,6 +163,11 @@ class RuntimeChannelRegistry:
             # channel's waiters rather than leaving them to time out.
             existing.fail_all_pending(f"runtime {runtime_id} reconnected on a new channel")
         conn = RuntimeConnection(runtime_id, send_text)
+        # The incarnation of a runtime id: one more executor process (or one more
+        # channel from the same one) claiming this identity. Reported state is
+        # accepted only from the current incarnation -- see ``set_status``.
+        self._incarnations[runtime_id] = self._incarnations.get(runtime_id, 0) + 1
+        conn.incarnation = self._incarnations[runtime_id]
         self._runtimes[runtime_id] = conn
         # Capture the loop the channels live on. Command futures are created on
         # it (see RuntimeConnection.send_command), so a caller on a worker thread
@@ -188,18 +204,71 @@ class RuntimeChannelRegistry:
 
     def bind_terminal(self, terminal_id: str, runtime_id: str) -> None:
         self._terminal_runtime[terminal_id] = runtime_id
+        self._recovered_placement.pop(terminal_id, None)
 
     def unbind_terminal(self, terminal_id: str) -> None:
         self._terminal_runtime.pop(terminal_id, None)
+        self._recovered_placement.pop(terminal_id, None)
         self._status.pop(terminal_id, None)
         for stream in StreamName:
             self._positions.pop((terminal_id, stream.value), None)
 
+    def _placement_from_the_central_row(self, terminal_id: str) -> Optional[str]:
+        """The runtime this terminal was launched on, per the persisted row.
+
+        Bindings live in this process, but the server they belong to is
+        replaceable: a rollout, a crash loop or a scale-out gives a new pod an
+        empty ``_terminal_runtime`` while every remote terminal it now serves is
+        still running in its executor. Until that executor's hello arrives --
+        seconds at best, indefinitely if the executor is gone -- a placement
+        question answered from memory alone says "local", and the caller drives
+        the CONTROLLER's tmux: on a pure controller that fails against a tmux
+        that was never there, and on a hybrid host it can address an unrelated
+        local pane (review finding 5 on #802).
+
+        ``POST /runtimes/{id}/terminals`` writes ``metadata.runtime_id`` for
+        exactly this reason, so the answer is durable; it just was not being
+        read. Recovered placement is cached (including the "this row is local"
+        answer, as ``None``) because a terminal's placement is fixed when it is
+        created, and ``is_remote`` is on the status-poll path.
+
+        Never raises: a database that cannot be read is an unknown placement, and
+        an unknown placement must not be cached as "local".
+        """
+        if terminal_id in self._recovered_placement:
+            return self._recovered_placement[terminal_id]
+        try:
+            from cli_agent_orchestrator.clients.database import get_terminal_metadata
+
+            row = get_terminal_metadata(terminal_id)
+        except Exception as exc:  # noqa: BLE001 — placement is best-effort here
+            logger.warning("placement lookup for terminal %s failed: %s", terminal_id, exc)
+            return None
+        runtime_id = None
+        if row:
+            metadata = row.get("metadata") or {}
+            value = metadata.get("runtime_id")
+            runtime_id = str(value) if value else None
+        if row is not None:
+            self._recovered_placement[terminal_id] = runtime_id
+        return runtime_id
+
     def is_remote(self, terminal_id: str) -> bool:
-        return terminal_id in self._terminal_runtime
+        """Whether this terminal executes in a runtime rather than on this host.
+
+        Deliberately NOT a liveness question: a terminal whose executor is
+        disconnected is still remote, and the command path says "runtime X is not
+        connected" rather than silently running the work here.
+        """
+        if terminal_id in self._terminal_runtime:
+            return True
+        return self._placement_from_the_central_row(terminal_id) is not None
 
     def runtime_for_terminal(self, terminal_id: str) -> Optional[str]:
-        return self._terminal_runtime.get(terminal_id)
+        bound = self._terminal_runtime.get(terminal_id)
+        if bound is not None:
+            return bound
+        return self._placement_from_the_central_row(terminal_id)
 
     def remote_terminal_ids(self) -> List[str]:
         """Every terminal bound to a runtime that is currently CONNECTED.
@@ -230,7 +299,10 @@ class RuntimeChannelRegistry:
         payload: dict,
         timeout: float = DEFAULT_COMMAND_TIMEOUT,
     ) -> CommandResultFrame:
-        runtime_id = self._terminal_runtime.get(terminal_id)
+        # Recovered placement counts: after a server replacement the row is the
+        # only record of where this terminal runs, and "not connected" is the
+        # honest answer to give until its executor says hello again.
+        runtime_id = self.runtime_for_terminal(terminal_id)
         if runtime_id is None:
             raise RuntimeUnavailableError(f"terminal {terminal_id} is not bound to a runtime")
         conn = self._runtimes.get(runtime_id)
@@ -286,8 +358,79 @@ class RuntimeChannelRegistry:
 
     # --- worker-reported state ---
 
-    def set_status(self, terminal_id: str, status: TerminalStatus) -> None:
+    def set_status(
+        self,
+        terminal_id: str,
+        status: TerminalStatus,
+        conn: Optional[RuntimeConnection] = None,
+    ) -> None:
+        """Record what a runtime says this terminal is doing.
+
+        ``conn`` is the channel the report arrived on. A report from a connection
+        that is no longer the registered one for its runtime id is DROPPED: it
+        describes a process that has already been replaced, and applying it lets
+        an older incarnation's ``COMPLETED`` overwrite the live incarnation's
+        ``PROCESSING`` -- a supervisor then reads a finished worker that is still
+        mid-task, or the reverse (review finding 2 on #802). The protocol carries
+        a ``generation`` field intended for this, but nothing in the codebase ever
+        advances it, so the identity and incarnation of the registered connection
+        is the fence that actually holds.
+
+        Callers with no connection in hand (the local status monitor's own
+        bookkeeping) pass nothing and are unaffected.
+        """
+        if conn is not None:
+            current = self._runtimes.get(conn.runtime_id)
+            if current is not conn or conn.incarnation != self._incarnations.get(
+                conn.runtime_id, 0
+            ):
+                logger.warning(
+                    "dropping %s report for terminal %s from superseded incarnation %s of "
+                    "runtime %s (current: %s)",
+                    status.value,
+                    terminal_id,
+                    conn.incarnation,
+                    conn.runtime_id,
+                    self._incarnations.get(conn.runtime_id, 0),
+                )
+                return
         self._status[terminal_id] = status
+
+    def reconcile_hello(self, runtime_id: str, advertised: Iterable[str]) -> List[str]:
+        """Forget state for terminals the runtime's new hello does not claim.
+
+        A hello is the incoming incarnation's complete statement of what it owns.
+        Anything this process still has bound to that runtime and absent from the
+        statement no longer exists: the pod was replaced, or restarted, and its
+        panes died with it. Leaving the cached status behind meant a reconnect
+        RESURRECTED a dead terminal's last ``PROCESSING`` or ``COMPLETED`` --
+        answered as current, because the runtime is connected again (review
+        finding 2 on #802). Stream positions go too; they describe a byte stream
+        that no longer has a producer.
+
+        The binding is deliberately KEPT. The central row still says this terminal
+        was placed on this runtime, and "bound, status unknown" is the truthful
+        state; dropping the binding would make the terminal look local, which is
+        the failure mode finding 5 is about. Returns the ids it invalidated so the
+        caller can log or publish them.
+        """
+        claimed = set(advertised)
+        stale = [
+            tid
+            for tid, rid in self._terminal_runtime.items()
+            if rid == runtime_id and tid not in claimed
+        ]
+        for tid in stale:
+            self._status.pop(tid, None)
+            for stream in StreamName:
+                self._positions.pop((tid, stream.value), None)
+        if stale:
+            logger.warning(
+                "runtime %s reconnected without terminals %s; their cached state is discarded",
+                runtime_id,
+                sorted(stale),
+            )
+        return stale
 
     def get_status(self, terminal_id: str) -> TerminalStatus:
         runtime_id = self._terminal_runtime.get(terminal_id)
