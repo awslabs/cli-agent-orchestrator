@@ -298,7 +298,9 @@ class Bridge:
     async def _execute(self, frame: CommandFrame):
         # Imported here, not at module top: importing terminal_service pulls in
         # the provider stack, which is only needed once a command arrives.
+        from cli_agent_orchestrator.constants import DEFAULT_PROVIDER
         from cli_agent_orchestrator.services import terminal_service
+        from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 
         payload = frame.payload
 
@@ -329,8 +331,17 @@ class Bridge:
             new_session = bool(payload.get("new_session", True))
             defer_init = bool(payload.get("defer_init", False))
             orch_type = payload.get("initial_message_orchestration_type")
+            # An absent provider means "whatever this installation says", and
+            # this installation is the only one that can answer: the profile
+            # store, the installed CLIs and the engine all live here, not in the
+            # client that typed the command or the server that relayed it. A
+            # present provider is an explicit override the caller asked for, so
+            # it is honoured as given (review finding 8 on #802).
+            provider = payload.get("provider") or resolve_provider(
+                payload["agent_profile"], DEFAULT_PROVIDER
+            )
             terminal = await terminal_service.create_terminal(
-                provider=payload["provider"],
+                provider=provider,
                 agent_profile=payload["agent_profile"],
                 session_name=payload.get("session_name"),
                 new_session=new_session,

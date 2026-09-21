@@ -3659,7 +3659,12 @@ async def create_terminal_in_session(
             return await launch_remote_terminal(
                 caller_runtime,
                 CreateRemoteTerminalBody(
-                    provider=resolved_provider,
+                    # The caller's own ``provider``, NOT ``resolved_provider``:
+                    # that was resolved against this container's profile store,
+                    # and the agent is about to run in the runtime's, off a
+                    # different `cao install` (review finding 8 on #802). Unset
+                    # stays unset so the runtime answers for itself.
+                    provider=provider,
                     agent_profile=agent_profile,
                     session_name=session_name,
                     new_session=False,

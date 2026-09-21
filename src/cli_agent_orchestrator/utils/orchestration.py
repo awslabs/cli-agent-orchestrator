@@ -1612,7 +1612,6 @@ def _assign_bridge(
         _wait_runtime_connected(runtime_id, ready_wait_seconds)
 
     body: Dict[str, Any] = {
-        "provider": provider or "",
         "agent_profile": agent_profile,
         "initial_message": worker_message,
         "env_vars": {
@@ -1620,6 +1619,13 @@ def _assign_bridge(
             CALLBACK_TERMINAL_ID_ENV: current_terminal_id,
         },
     }
+    # An explicit provider from the caller travels; "unset" stays unset so the
+    # worker pod resolves it from its own installed profile. The previous
+    # ``provider or ""`` sent an empty string, which is neither — the runtime
+    # took it as the provider name and the launch failed there (review finding 8
+    # on #802).
+    if provider:
+        body["provider"] = provider
     if remote_session_name:
         body["session_name"] = remote_session_name
     if working_directory:

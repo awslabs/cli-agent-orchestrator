@@ -240,7 +240,14 @@ async def runtime_channel(ws: WebSocket) -> None:
 class CreateRemoteTerminalBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    provider: str
+    # Optional on purpose (review finding 8 on #802). The profile store that
+    # says which CLI an agent runs on lives in the RUNTIME — its image, its
+    # `cao install`. A provider resolved from a client's or this server's own
+    # profiles is an answer about the wrong machine, and sending it silently
+    # overrode the runtime's ``provider:`` field. Omit it and the runtime
+    # resolves from its own profile; send it only to express an explicit
+    # override the caller actually asked for (``cao launch --provider``).
+    provider: Optional[str] = None
     agent_profile: str
     session_name: Optional[str] = None
     working_directory: Optional[str] = None

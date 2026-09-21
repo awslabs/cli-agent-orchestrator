@@ -377,7 +377,17 @@ def launch(
                     "--allowed-tools cannot travel to a runtime launch; set "
                     "restrictions in the runtime's installed profile"
                 )
-            body = {"provider": provider, "agent_profile": agents}
+            # Only an explicit --provider travels. ``provider`` at this point has
+            # already been resolved against THIS machine's profile store (a few
+            # lines above), and on a runtime launch that store is the wrong one —
+            # the agent runs in the runtime's image, off the profile `cao install`
+            # put there. Sending the local answer silently overrode the runtime's
+            # own ``provider:`` field, so an agent the runtime installs on
+            # opencode_cli was started on this client's default instead (review
+            # finding 8 on #802). Omitted, the runtime resolves it itself.
+            body = {"agent_profile": agents}
+            if explicit_provider:
+                body["provider"] = provider
             if session_name:
                 body["session_name"] = session_name
             if working_directory:
