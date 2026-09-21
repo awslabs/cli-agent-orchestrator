@@ -44,7 +44,7 @@ def _patch_terminal_layer(
 
     ``ready`` is the bool the readiness ``wait_until_status`` returns (only
     consulted on the created-here path). The post-input completion wait polls
-    ``status_monitor.get_status`` directly (issue #409): pass ``status_sequence``
+    ``effective_status`` directly (issue #409): pass ``status_sequence``
     (a side_effect list of TerminalStatus values, one per poll) to script the
     completion loop, or rely on ``final_status`` as a constant return.
     """
@@ -58,9 +58,9 @@ def _patch_terminal_layer(
     exit_cli = patch(f"{_MODULE}.terminal_service.exit_terminal_cli", return_value=None)
     wait = patch(f"{_MODULE}.wait_until_status", new=AsyncMock(return_value=ready))
     if status_sequence is not None:
-        status = patch(f"{_MODULE}.status_monitor.get_status", side_effect=list(status_sequence))
+        status = patch(f"{_MODULE}.effective_status", side_effect=list(status_sequence))
     else:
-        status = patch(f"{_MODULE}.status_monitor.get_status", return_value=final_status)
+        status = patch(f"{_MODULE}.effective_status", return_value=final_status)
     get_wd = patch(
         f"{_MODULE}.terminal_service.get_working_directory",
         return_value=get_wd_return,
@@ -778,11 +778,12 @@ class TestIdleCompletionSignal:
         assert exc_info.value.kind == "error"
 
     def test_completion_poll_dispatches_get_status_via_to_thread(self):
-        """#558: status_monitor.get_status() can shell out to a real tmux capture-pane
-        subprocess (the stale-PROCESSING fallback); calling it inline in
+        """#558: the status read can shell out to a real tmux capture-pane
+        subprocess (the stale-PROCESSING fallback), and for a remote terminal it
+        consults the runtime registry; calling it inline in
         _wait_for_completion's poll loop would fork tmux ON the event loop every poll.
         Pin the asyncio.to_thread wrapping directly -- every other test here mocks
-        status_monitor.get_status itself, which cannot see HOW it was called, so a
+        the status read itself, which cannot see HOW it was called, so a
         regression back to a bare synchronous call would stay green."""
         create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
             final_status=TerminalStatus.COMPLETED,
@@ -797,18 +798,18 @@ class TestIdleCompletionSignal:
             status,
             patch(f"{_MODULE}.asyncio.to_thread", wraps=asyncio.to_thread) as mock_to_thread,
         ):
-            from cli_agent_orchestrator.services.agent_step import status_monitor
+            from cli_agent_orchestrator.services import agent_step
 
             asyncio.run(run_agent_step("kiro_cli", "dev", "x"))
 
-            # Captured while still inside the patch context -- status_monitor.get_status
+            # Captured while still inside the patch context -- effective_status
             # is the active mock here (patched by `status` above); comparing against it
             # after the patches unwind would compare against the restored, unpatched
-            # method instead.
+            # function instead.
             get_status_calls = [
-                c for c in mock_to_thread.call_args_list if c.args[0] == status_monitor.get_status
+                c for c in mock_to_thread.call_args_list if c.args[0] == agent_step.effective_status
             ]
-        assert get_status_calls, "status_monitor.get_status was never dispatched via to_thread"
+        assert get_status_calls, "the status read was never dispatched via to_thread"
         assert all(c.args[1] == "abc12345" for c in get_status_calls)
 
 
@@ -843,7 +844,7 @@ class TestPromptDeliveryVerification:
             get_output,
             exit_cli,
             wait,
-            patch(f"{_MODULE}.status_monitor.get_status", side_effect=get_status),
+            patch(f"{_MODULE}.effective_status", side_effect=get_status),
             patch(f"{_MODULE}._COMPLETION_POLL_INTERVAL", 0.01),
             patch(f"{_MODULE}._PROMPT_PICKUP_GRACE", 0.0),
             patch(
@@ -948,7 +949,7 @@ class TestPromptDeliveryVerification:
             get_output as m_out,
             exit_cli,
             wait,
-            patch(f"{_MODULE}.status_monitor.get_status", side_effect=_idle_forever),
+            patch(f"{_MODULE}.effective_status", side_effect=_idle_forever),
             patch(f"{_MODULE}._COMPLETION_POLL_INTERVAL", 0.01),
             patch(f"{_MODULE}._PROMPT_PICKUP_GRACE", 0.0),
             patch(
@@ -981,7 +982,7 @@ class TestInterruptibleCancel:
             ev = asyncio.Event()
             ev.set()
             with patch(
-                f"{_MODULE}.status_monitor.get_status",
+                f"{_MODULE}.effective_status",
                 return_value=TerminalStatus.PROCESSING,
             ):
                 await _wait_for_completion("term-hung", timeout=600, cancel_event=ev)
@@ -1007,7 +1008,7 @@ class TestInterruptibleCancel:
                 ev.set()
 
             with patch(
-                f"{_MODULE}.status_monitor.get_status",
+                f"{_MODULE}.effective_status",
                 return_value=TerminalStatus.PROCESSING,  # never settles
             ):
                 waiter = asyncio.ensure_future(
