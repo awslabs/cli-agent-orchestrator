@@ -1086,7 +1086,7 @@ class TestKimiCliProviderMisc:
     def test_cleanup_removes_temp_dir(self):
         """Test cleanup removes temporary directory and its contents."""
         provider = KimiCliProvider("term-1", "session-1", "window-1")
-        provider._temp_dir = tempfile.mkdtemp(prefix="cao_kimi_test_")
+        provider._ensure_temp_dir()
         temp_path = provider._temp_dir  # Save path before cleanup resets it
 
         # Create a file in temp dir to verify it's removed
@@ -1478,7 +1478,9 @@ class TestKimiTransportTranslation:
         import shlex
 
         tokens = shlex.split(command)
-        return json.loads(tokens[tokens.index("--mcp-config") + 1])
+        document = json.loads(tokens[tokens.index("--mcp-config") + 1])
+        assert isinstance(document, dict)
+        return document
 
     def _build(self, tmp_path, servers):
         mock_profile = MagicMock()

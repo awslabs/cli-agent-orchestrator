@@ -3831,8 +3831,9 @@ class TestP2ReviewProbeShellBoundary:
         assert argv[0] == kimi_cli_module.KIMI_COMPATIBLE_SHELL
         assert len(argv) == 3
         script_path, probe_path = argv[1], argv[2]
-        assert script_path == str(tmp_path / "kimi-probe.sh")
-        assert probe_path == str(tmp_path / "kimi-probe.txt")
+        assert Path(script_path).name == "kimi-probe.sh"
+        assert Path(probe_path) == Path(script_path).with_name("kimi-probe.txt")
+        assert Path(script_path).parent != tmp_path
 
         # Nothing in the typed command needs quoting in *any* shell: no
         # expansion, no substitution, no quoting metacharacter at all.
@@ -3844,7 +3845,7 @@ class TestP2ReviewProbeShellBoundary:
         assert "\\" not in command
 
         # The POSIX program lives in the script, which only /bin/sh ever reads.
-        body = (tmp_path / "kimi-probe.sh").read_text(encoding="utf-8")
+        body = Path(script_path).read_text(encoding="utf-8")
         assert "${KIMI_CODE_HOME:-$HOME/.kimi-code}" in body
         assert "$(command -v kimi 2>/dev/null)" in body
         assert "kimi --help" in body
@@ -3867,7 +3868,7 @@ class TestP2ReviewProbeShellBoundary:
         )
         assert result.returncode == 0, result.stderr
 
-        written = (tmp_path / "kimi-probe.txt").read_text(encoding="utf-8")
+        written = Path(shlex.split(command)[2]).read_text(encoding="utf-8")
         assert written.startswith("CAO_KIMI_BIN=")
         assert "CAO_KIMI_HOME=" in written
         assert KIMI_PROBE_END_MARKER in written
@@ -3898,7 +3899,7 @@ class TestP2ReviewProbeShellBoundary:
         )
         assert result.returncode == 0, result.stderr
 
-        written = (tmp_path / "kimi-probe.txt").read_text(encoding="utf-8")
+        written = Path(shlex.split(command)[2]).read_text(encoding="utf-8")
         # The binary the inner shell resolves is the pane's, and the resolved
         # absolute path is what the launch reuses.
         assert f"CAO_KIMI_BIN={pane_kimi}\n" in written
@@ -3935,7 +3936,7 @@ class TestP2ReviewProbeShellBoundary:
             assert kimi_cli_module.is_shell_safe_token(token), token
         # The relocated artifacts are real and reachable.
         probe_path = Path(argv[2])
-        assert probe_path.parent.name.startswith("cao_kimi_")
+        assert probe_path.parent.parent.name.startswith("cao_kimi_")
         assert KIMI_PROBE_END_MARKER in probe_path.read_text(encoding="utf-8")
 
     def test_hostile_temp_dir_round_trips_under_fish(self, probe_command_for, tmp_path):

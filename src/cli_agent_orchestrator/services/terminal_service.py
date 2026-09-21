@@ -1741,16 +1741,16 @@ def _worker_is_started_direct(terminal_id: str, provider) -> bool:
     reality the cached status stays IDLE even though the worker already
     transitioned to PROCESSING.
 
-    This function does a live ``capture-pane`` to grab the visible screen
-    (not the 8 KB rolling buffer, which is too small to reliably hold the
-    footer) and calls ``provider.get_status()`` directly, catching the real
-    state so the retry loop doesn't re-deliver into a working terminal.
+    Kimi requires evidence from the rolling byte buffer cleared by send_input
+    before dispatch. Capture-pane history can retain a previous completed turn,
+    so it is never supplied to Kimi's execution-evidence latch. Other opted-in
+    providers use their existing live capture-pane status contract.
 
     Only providers that set ``supports_direct_status_probe = True`` should
     be passed to this function; the ``get_status()`` contract for other
     providers (e.g. kiro_cli, antigravity_cli, cursor_cli) relies on
     dispatch bookkeeping and cannot distinguish IDLE from COMPLETED on a
-    rendered capture-pane snapshot.
+    rendered capture-pane snapshot. Kimi opts in with a separate evidence hook.
     """
     try:
         metadata = get_terminal_metadata(terminal_id)
@@ -1760,6 +1760,8 @@ def _worker_is_started_direct(terminal_id: str, provider) -> bool:
         window_name = metadata.get("tmux_window")
         if not session_name or not window_name:
             return False
+        if getattr(provider, "requires_execution_evidence", False) is True:
+            return provider.has_execution_evidence(status_monitor.get_buffer(terminal_id)) is True
         output = get_backend().get_history(session_name, window_name, tail_lines=200)
         status = provider.get_status(output)
     except Exception:
@@ -1881,6 +1883,14 @@ def redeliver_dropped_message(
         )
         send_special_key(terminal_id, "Enter")
         return False
+    if getattr(provider, "execution_evidence_ambiguous", False) is True:
+        logger.warning(
+            "Delivery to %s is unconfirmed after execution context was evicted; "
+            "skipping full re-send to avoid a duplicate task (attempt %d)",
+            terminal_id,
+            attempt,
+        )
+        return False
     if full_resend_requires_probe and not probe_capable:
         # No probe → cannot rule out a working worker whose prompt left the
         # pane; a full re-send could silently duplicate the task. Skip the
@@ -1921,12 +1931,31 @@ async def _confirm_worker_started_or_resubmit(
     still stuck at IDLE after all resubmit attempts. Blocking tmux/DB I/O runs
     off the loop via to_thread so concurrent deferred inits aren't frozen.
     """
-    if await wait_until_status(
-        terminal_id,
-        _DEFERRED_STARTED_STATUSES,
-        timeout=_DEFERRED_SUBMIT_CONFIRM_TIMEOUT,
-        polling_interval=0.5,
-    ):
+    if provider is None:
+        try:
+            provider = provider_manager.get_provider(terminal_id)
+        except Exception:
+            provider = None
+
+    async def wait_for_start() -> bool:
+        if getattr(provider, "requires_execution_evidence", False) is True:
+            # Cached PROCESSING/COMPLETED may be dispatch-derived too. Poll
+            # independent evidence for the full grace period before resending.
+            deadline = time.monotonic() + _DEFERRED_SUBMIT_CONFIRM_TIMEOUT
+            while True:
+                if await asyncio.to_thread(_worker_is_started_direct, terminal_id, provider):
+                    return True
+                if time.monotonic() >= deadline:
+                    return False
+                await asyncio.sleep(0.5)
+        return await wait_until_status(
+            terminal_id,
+            _DEFERRED_STARTED_STATUSES,
+            timeout=_DEFERRED_SUBMIT_CONFIRM_TIMEOUT,
+            polling_interval=0.5,
+        )
+
+    if await wait_for_start():
         return True
 
     for attempt in range(1, _DEFERRED_SUBMIT_MAX_RESUBMITS + 1):
@@ -1945,12 +1974,7 @@ async def _confirm_worker_started_or_resubmit(
         )
         if already_started:
             return True
-        if await wait_until_status(
-            terminal_id,
-            _DEFERRED_STARTED_STATUSES,
-            timeout=_DEFERRED_SUBMIT_CONFIRM_TIMEOUT,
-            polling_interval=0.5,
-        ):
+        if await wait_for_start():
             return True
 
     return False

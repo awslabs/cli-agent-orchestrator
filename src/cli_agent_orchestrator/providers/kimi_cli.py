@@ -767,6 +767,11 @@ class KimiCliProvider(BaseProvider):
         # Without this, get_status() returns IDLE instead of COMPLETED after
         # the agent finishes processing, causing handoff to time out.
         self._has_received_input = False
+        self._execution_observed = False
+        self._awaiting_turn = False
+        self._turn_activity_seen = False
+        self.execution_evidence_ambiguous = False
+        self._status_buffer_epoch = 0
         # Wallclock of the last send_input() dispatch (terminal_service calls
         # mark_input_received). Used by the newest-TUI status path: right
         # after a paste, the TUI repaints the ready chrome (status bar) before
@@ -825,6 +830,19 @@ class KimiCliProvider(BaseProvider):
         """
         super().mark_input_received()
         self._has_received_input = True
+        self._begin_execution_generation()
+
+    def _begin_execution_generation(self) -> None:
+        self._awaiting_turn = True
+        self._turn_activity_seen = False
+        self.execution_evidence_ambiguous = False
+        self._execution_observed = False
+
+    def notify_status_buffer_reset(self, epoch: int) -> None:
+        """A new buffer generation still awaits actual activity, not a redraw."""
+        if epoch > self._status_buffer_epoch:
+            self._status_buffer_epoch = epoch
+            self._begin_execution_generation()
 
     def _try_load_profile(self):
         """Best-effort profile load for timeout resolution only.
@@ -848,18 +866,73 @@ class KimiCliProvider(BaseProvider):
     # Kimi Code compatibility: dialect probe
     # =====================================================================
 
+    @staticmethod
+    def _managed_scratch_root() -> Path:
+        """Fixed private POSIX root; TMPDIR must never decide secret ownership."""
+        return Path("/tmp").resolve() / f"cao_kimi_{os.getuid()}"
+
+    def _managed_scratch_dir(self) -> Path:
+        # Namespace by CAO home as well as terminal id: separate installations
+        # using the same temp root must not own one another's launch artifacts.
+        identity = f"{CAO_HOME_DIR.absolute()}\0{self.terminal_id}"
+        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        return self._managed_scratch_root() / digest
+
+    def _is_managed_scratch_dir(self, directory: Path) -> bool:
+        """Validate exact ownership; only the leaf may be an unlinkable symlink."""
+        root = self._managed_scratch_root()
+        if directory != self._managed_scratch_dir() or directory.parent != root:
+            return False
+        if root.name != f"cao_kimi_{os.getuid()}":
+            return False
+        try:
+            if any(parent.is_symlink() for parent in (root, *root.parents)):
+                return False
+            for path in (root, directory):
+                if path == directory and path.is_symlink():
+                    continue
+                if path.exists():
+                    info = path.stat()
+                    if (
+                        not stat.S_ISDIR(info.st_mode)
+                        or info.st_uid != os.getuid()
+                        or info.st_mode & 0o077
+                    ):
+                        return False
+            return True
+        except OSError:
+            return False
+
+    def _ensure_managed_scratch(self) -> str:
+        directory = self._managed_scratch_dir()
+        if not self._is_managed_scratch_dir(directory) or directory.is_symlink():
+            raise ProviderError(f"Refusing unsafe Kimi scratch directory: {directory}")
+        directory.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        directory.mkdir(mode=0o700, exist_ok=True)
+        return str(directory)
+
     def _ensure_temp_dir(self, prefix: str = "cao_kimi_") -> str:
-        """Return this provider's scratch directory, creating it on first use.
-
-        Created under a shell-safe root so every path CAO derives from it can be
-        typed into any pane shell without quoting — see
-        :func:`is_shell_safe_token`. The generated name is ``<prefix><random>``,
-        which is itself drawn from the safe alphabet.
-        """
-
+        """Return isolated scratch recoverable from terminal identity after restart."""
         if not self._temp_dir:
-            self._temp_dir = tempfile.mkdtemp(prefix=prefix, dir=shell_safe_temp_root())
+            self._temp_dir = self._ensure_managed_scratch()
         return self._temp_dir
+
+    def _remove_managed_scratch(self) -> bool:
+        directory = self._managed_scratch_dir()
+        if not self._is_managed_scratch_dir(directory):
+            logger.warning("Refusing to remove non-managed Kimi scratch %s", directory)
+            return False
+        try:
+            if directory.is_symlink():
+                directory.unlink()
+            else:
+                shutil.rmtree(directory)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning("Failed to remove Kimi scratch %s: %s", directory, exc)
+            return False
+        return not os.path.lexists(directory)
 
     # =====================================================================
     # Kimi Code runtime home: deterministic managed location
@@ -939,22 +1012,13 @@ class KimiCliProvider(BaseProvider):
         return home.name == RUNTIME_HOME_DIR_NAME and self._is_managed_terminal_dir(home.parent)
 
     def _ensure_shell_safe_dir(self) -> str:
-        """A scratch directory whose path needs no quoting in any shell.
+        """Keep probe/launch scripts in this terminal's recoverable safe path.
 
-        Normally the provider's own temp dir. A caller-supplied ``_temp_dir``
-        with shell-hostile characters is not used for transport: the probe and
-        launch artifacts move to a safe directory instead, so a hostile path can
-        never reach a shell parser.
+        A caller-supplied scratch path may hold an agent file, but never decides
+        the location of credential-bearing launch scripts or cleanup targets.
         """
-
         if self._shell_safe_dir is None:
-            base = self._ensure_temp_dir()
-            if is_shell_safe_token(base):
-                self._shell_safe_dir = base
-            else:
-                self._shell_safe_dir = tempfile.mkdtemp(
-                    prefix="cao_kimi_", dir=shell_safe_temp_root()
-                )
+            self._shell_safe_dir = self._ensure_managed_scratch()
         return self._shell_safe_dir
 
     @staticmethod
@@ -962,9 +1026,10 @@ class KimiCliProvider(BaseProvider):
         """Write an executable helper script and return its path."""
 
         path = os.path.join(directory, name)
-        with open(path, "w", encoding="utf-8") as handle:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o700)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            os.fchmod(handle.fileno(), 0o700)
             handle.write(body)
-        os.chmod(path, 0o700)
         return path
 
     def _materialize_launch_command(self, command: str) -> str:
@@ -2145,21 +2210,60 @@ class KimiCliProvider(BaseProvider):
     # Opt in to pyte rendered-screen detection (gated by CAO_PYTE_STATUS).
     supports_screen_detection = True
 
-    # Deferred-init submit verification polls the event-driven status cache
-    # first. Kimi Code can finish a short turn between rendered-screen edges,
-    # leaving that cache IDLE even though the paste was accepted and the worker
-    # ran. Without a direct probe, deferred init mistakes the cache miss for a
-    # dropped paste, re-delivers the task, and can eventually tear down a healthy
-    # terminal after the retry budget expires.
-    #
-    # Kimi's get_status() is safe on a live capture-pane snapshot: this provider
-    # instance carries the dispatch bookkeeping set by mark_input_received()
-    # (_last_dispatch_time / _has_received_input), and the CODE detector
-    # distinguishes live spinners from settled ready chrome. Opt in to the
-    # existing terminal_service direct-probe guard so a real PROCESSING or
-    # COMPLETED frame proves that the worker started and suppresses duplicate
-    # re-delivery.
     supports_direct_status_probe = True
+    requires_execution_evidence = True
+
+    def has_execution_evidence(self, current_turn_output: str) -> bool:
+        """Accept only transient activity observed in the awaiting generation.
+
+        Like MiniMax's stale-redraw guard, a fresh byte-buffer epoch does not
+        make retained completion current. Kimi has no distinct completion ID:
+        answers, tool calls, reasoning and submitted prompts can all be redrawn
+        from an older turn. None establish activity, even after buffer clear.
+
+        Callers supply post-clear bytes, including the monitor observation
+        before rolling-buffer eviction. A live spinner
+        (including legacy's processing indicator) proves activity; retaining it
+        accepts processing followed by completion in one burst or later probes.
+        Generic status/capture-pane parsing never updates this state.
+        """
+        if not self._awaiting_turn:
+            return self._execution_observed
+
+        # Pipe-pane emits cursor positioning and carriage-return redraws, not
+        # just capture-pane rows. Normalize those into logical lines while
+        # retaining SGR: answer styling and private/fenced ownership must still
+        # prevent quoted spinner text from claiming activity.
+        if self.execution_evidence_ambiguous:
+            return False
+        rows = kt.normalize_activity_rows(current_turn_output)
+        # A pipe chunk can end anywhere in a row: even a bare spinner may
+        # still grow into boot chrome or an idle tip. Only completed logical
+        # rows can establish irreversible activity. Normalization preserves
+        # newline, carriage-return redraw and cursor-to-row-start boundaries;
+        # SGR changes and end-of-chunk are not row boundaries. The monitor
+        # retains the unfinished suffix and supplies it again with later bytes.
+        rows = rows.rpartition("\n")[0]
+        kinds = kt.classify_lines(rows, self._spinner_semantics(), include_unclosed_fences=True)
+        if any(kind is kt.KimiLineKind.LIVE_SPINNER for _, _, kind in kinds):
+            self._turn_activity_seen = True
+        if self._turn_activity_seen:
+            self._execution_observed = True
+            self._awaiting_turn = False
+        return self._execution_observed
+
+    def observe_execution_output(self, output: str, epoch: int, *, truncated: bool) -> None:
+        """Observe generation bytes under the monitor lock, BEFORE eviction.
+
+        Never parse a cropped suffix as a new transcript: its missing prefix
+        could own a quoted spinner. If we lose context before seeing activity,
+        leave acceptance unconfirmed and disallow an unsafe full resend.
+        """
+        if epoch != self._status_buffer_epoch or not self._awaiting_turn:
+            return
+        self.has_execution_evidence(output)
+        if truncated and not self._execution_observed:
+            self.execution_evidence_ambiguous = True
 
     def get_status_from_screen(self, screen_lines: List[str]) -> TerminalStatus:
         """Detect status from a pyte-composited viewport (escape-free rows).
@@ -2840,17 +2944,20 @@ class KimiCliProvider(BaseProvider):
         own validated path, and the call is a no-op returning ``True`` when no
         such home exists.
 
-        The scratch directory holds launch artifacts only and never decides the
-        outcome. MCP timeout is NOT restored because multiple Kimi instances may
-        share the config file concurrently.
+        Scratch includes legacy MCP credentials in kimi-launch.sh, so its
+        removal is also mandatory and recoverable from terminal identity.
+        MCP timeout is not restored because multiple instances share it.
         """
-        # Best effort: launch artifacts, not credentials.
-        if self._temp_dir:
-            if os.path.exists(self._temp_dir):
-                shutil.rmtree(self._temp_dir, ignore_errors=True)
+        scratch_removed = self._remove_managed_scratch()
+        home_removed = self._remove_managed_runtime_home()
+        if scratch_removed:
             self._temp_dir = None
-
+            self._shell_safe_dir = None
         self._initialized = False
         self._has_received_input = False
-
-        return self._remove_managed_runtime_home()
+        self._execution_observed = False
+        self._awaiting_turn = False
+        self._turn_activity_seen = False
+        self.execution_evidence_ambiguous = False
+        self._status_buffer_epoch = 0
+        return scratch_removed and home_removed

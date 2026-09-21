@@ -83,12 +83,14 @@ def _fixture(name: str) -> str:
     return (FIXTURES / name).read_text(encoding="utf-8", errors="replace")
 
 
-def _last(monkeypatch, pane: str):
+def _last(monkeypatch, pane: str, dialect=None):
     """Run the public ``get_output(mode=LAST)`` path against ``pane``."""
 
     from cli_agent_orchestrator.services import terminal_service
 
     provider = KimiCliProvider("term-adv", "session-1", "window-1")
+    if dialect is not None:
+        provider._dialect = dialect
     backend = MagicMock()
     backend.get_history.return_value = pane
     monkeypatch.setattr(
@@ -2759,3 +2761,843 @@ class TestPR799FinalOwnershipClosure:
         assert result == "● PUBLIC"
         for leaked in ("PRIVATE", "quote", "still tool owned", "Used Read", '[{"a"'):
             assert leaked not in result
+
+
+class TestPR799CurrentMaintainerReview:
+    """Current upstream review, reproduced on 10ddb550 before source edits."""
+
+    @pytest.mark.parametrize(
+        "dialect", [kimi_cli_module.KimiDialect.LEGACY, kimi_cli_module.KimiDialect.CODE]
+    )
+    @pytest.mark.parametrize("elapsed", [0, 9])
+    def test_dropped_initial_paste_is_not_started(self, monkeypatch, dialect, elapsed):
+        import time
+
+        from cli_agent_orchestrator.services import terminal_service as ts
+
+        pane = _fixture(
+            "kimi_code_0431_01_fresh_startup_idle.txt"
+            if dialect is kimi_cli_module.KimiDialect.CODE
+            else "kimi_cli_idle_output.txt"
+        )
+        provider = KimiCliProvider("review-drop", "s", "w")
+        provider._dialect = dialect
+        provider.mark_input_received()
+        provider._last_dispatch_time = time.time() - elapsed
+        backend = MagicMock()
+        backend.get_history.return_value = pane
+        monkeypatch.setattr(ts.status_monitor, "get_buffer", lambda _: pane)
+        monkeypatch.setattr(ts, "get_backend", lambda: backend)
+        monkeypatch.setattr(kimi_cli_module, "get_backend", lambda: backend)
+        monkeypatch.setattr(
+            ts, "get_terminal_metadata", lambda _: {"tmux_session": "s", "tmux_window": "w"}
+        )
+        assert ts._worker_is_started_direct("review-drop", provider) is False
+        send = MagicMock()
+        monkeypatch.setattr(ts, "send_input", send)
+        monkeypatch.setattr(ts, "_message_visible_in_box", lambda *_: False)
+        assert ts.redeliver_dropped_message("review-drop", "do the task", 1, provider) is False
+        send.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "dialect", [kimi_cli_module.KimiDialect.LEGACY, kimi_cli_module.KimiDialect.CODE]
+    )
+    @pytest.mark.parametrize("example", [False, True])
+    def test_public_last_preserves_answer_owned_tool_examples(self, monkeypatch, dialect, example):
+        from cli_agent_orchestrator.services import terminal_service as ts
+
+        provider = KimiCliProvider("review-prose", "s", "w")
+        provider._dialect = dialect
+        body = (
+            [
+                _answer("Example:"),
+                "```text",
+                "● Used search_docs · MCP/helpdesk",
+                "```",
+                "The API is sufficient.",
+            ]
+            if example
+            else [
+                _answer("Running a command · optional for this read-only check."),
+                "The API is sufficient.",
+            ]
+        )
+        pane = "\n".join([_user("✨ Explain the check"), "", *body, ""])
+        backend = MagicMock()
+        backend.get_history.return_value = pane
+        monkeypatch.setattr(ts, "get_backend", lambda: backend)
+        monkeypatch.setattr(
+            ts, "get_terminal_metadata", lambda _: {"tmux_session": "s", "tmux_window": "w"}
+        )
+        monkeypatch.setattr(ts.status_monitor, "get_buffer", lambda _: pane)
+        monkeypatch.setattr(ts.provider_manager, "get_provider", lambda _: provider)
+        expected = "\n".join(kt.strip_sgr(row).strip() for row in body)
+        assert ts.get_output("review-prose", ts.OutputMode.LAST) == expected
+
+    def test_restart_removes_legacy_launch_script(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(kimi_cli_module, "CAO_HOME_DIR", tmp_path / "cao")
+        monkeypatch.setattr(kimi_cli_module, "shell_safe_temp_root", lambda: str(tmp_path))
+        from cli_agent_orchestrator.providers import manager as manager_module
+        from cli_agent_orchestrator.providers.manager import ProviderManager
+
+        profile = MagicMock(model=None, system_prompt=None)
+        profile.mcpServers = {
+            "example": {"command": "example-mcp", "env": {"TOKEN": "synthetic-test-secret"}}
+        }
+        monkeypatch.setattr(kimi_cli_module, "load_agent_profile", lambda _: profile)
+        monkeypatch.setattr(kimi_cli_module, "_with_plugin_mcp", lambda profile, _: profile)
+        monkeypatch.setattr(KimiCliProvider, "_ensure_mcp_timeout", lambda _: None)
+        provider = KimiCliProvider("review-restart", "s", "w", agent_profile="review")
+        provider._dialect = kimi_cli_module.KimiDialect.LEGACY
+        command = provider._build_kimi_command("/usr/bin/kimi")
+        assert f"cd {provider._temp_dir}" in command
+        assert "--yolo" in command
+        provider._materialize_launch_command(command)
+        script = Path(provider._shell_safe_dir) / "kimi-launch.sh"
+        assert "synthetic-test-secret" in script.read_text()
+        assert script.stat().st_mode & 0o777 == 0o700
+        restarted = KimiCliProvider("review-restart", "s", "w")
+        restarted._dialect = kimi_cli_module.KimiDialect.LEGACY
+        assert restarted._temp_dir is None
+        monkeypatch.setattr(
+            manager_module,
+            "get_terminal_metadata",
+            lambda _: {
+                "provider": "kimi_cli",
+                "tmux_session": "s",
+                "tmux_window": "w",
+                "agent_profile": "review",
+                "provider_variant": "legacy",
+            },
+        )
+        assert ProviderManager().cleanup_provider("review-restart") is True
+        assert not script.exists()
+
+    @pytest.mark.parametrize(
+        "fixture,dialect",
+        [
+            ("kimi_code_0431_02_processing_turn.txt", kimi_cli_module.KimiDialect.CODE),
+            ("kimi_code_0431_04_post_answer_idle.txt", kimi_cli_module.KimiDialect.CODE),
+            ("kimi_cli_processing_output.txt", kimi_cli_module.KimiDialect.LEGACY),
+            ("kimi_cli_completed_output.txt", kimi_cli_module.KimiDialect.LEGACY),
+        ],
+    )
+    def test_genuine_execution_prevents_resend(self, monkeypatch, fixture, dialect):
+        from cli_agent_orchestrator.services import terminal_service as ts
+
+        provider = KimiCliProvider("review-real", "s", "w")
+        provider._dialect = dialect
+        provider.mark_input_received()
+        backend = MagicMock()
+        backend.get_history.return_value = _fixture("kimi_code_0431_01_fresh_startup_idle.txt")
+        # Settled text alone cannot prove acceptance. These captures follow a
+        # transient processing frame in the same post-clear raw byte burst.
+        activity = (
+            "⠙ Thinking… 1s · 4 tokens" if dialect is kimi_cli_module.KimiDialect.CODE else "🌑"
+        )
+        current = activity + "\n" + _fixture(fixture)
+        monkeypatch.setattr(ts.status_monitor, "get_buffer", lambda _: current)
+        monkeypatch.setattr(ts, "get_backend", lambda: backend)
+        monkeypatch.setattr(
+            ts, "get_terminal_metadata", lambda _: {"tmux_session": "s", "tmux_window": "w"}
+        )
+        send, key = MagicMock(), MagicMock()
+        monkeypatch.setattr(ts, "send_input", send)
+        monkeypatch.setattr(ts, "send_special_key", key)
+        assert ts.redeliver_dropped_message("review-real", "do the task", 1, provider) is True
+        backend.get_history.assert_not_called()
+        send.assert_not_called()
+        key.assert_not_called()
+
+    def test_observed_execution_survives_scrolling_but_resets_for_next_dispatch(self):
+        provider = KimiCliProvider("review-latch", "s", "w")
+        provider._dialect = kimi_cli_module.KimiDialect.CODE
+        provider.mark_input_received()
+        current = _fixture("kimi_code_0431_02_processing_turn.txt")
+        assert provider.has_execution_evidence(current) is True
+        assert provider.has_execution_evidence("") is True
+        provider.mark_input_received()
+        assert provider.has_execution_evidence("") is False
+
+    @pytest.mark.parametrize(
+        "pane",
+        [
+            _fixture("kimi_code_0431_05_mcp_startup.txt"),
+            _fixture("kimi_code_0431_09_false_moon_spinner_idle.txt"),
+            _user("✨ task pasted but no execution yet"),
+            "── input ──\n> task pasted but no execution yet\ncontext: 2% (1/2)",
+        ],
+    )
+    def test_boot_composer_and_submission_are_not_execution(self, pane):
+        provider = KimiCliProvider("review-not-started", "s", "w")
+        provider._dialect = kimi_cli_module.KimiDialect.CODE
+        provider.mark_input_received()
+        assert provider.has_execution_evidence(pane) is False
+
+    @pytest.mark.parametrize(
+        "text", ["Used search_docs · MCP/helpdesk", "Running a command · $ example"]
+    )
+    def test_answer_styling_wins_over_tool_text(self, monkeypatch, text):
+        pane = "\n".join(["💫 Explain", _answer(text), "The API is sufficient.", ""])
+        actual, _ = _last(monkeypatch, pane)
+        assert actual == "● " + text + "\nThe API is sufficient."
+
+    @pytest.mark.parametrize(
+        "dialect", [kimi_cli_module.KimiDialect.LEGACY, kimi_cli_module.KimiDialect.CODE]
+    )
+    @pytest.mark.parametrize("fence", ["```", "~~~~"])
+    def test_fence_inside_private_tool_output_cannot_release_payload(
+        self, monkeypatch, fence, dialect
+    ):
+        pane = "\n".join(
+            [
+                _user("✨ Check"),
+                "",
+                "● Used search_docs · MCP/helpdesk",
+                fence + "text",
+                "● Used quoted_tool · MCP/helpdesk",
+                "PRIVATE-TOOL-PAYLOAD",
+                fence,
+                "PRIVATE-AFTER-FENCE",
+                _answer("The API is sufficient."),
+                "",
+            ]
+        )
+        actual, _ = _last(monkeypatch, pane, dialect)
+        assert actual == "● The API is sufficient."
+
+    @pytest.mark.parametrize(
+        "dialect", [kimi_cli_module.KimiDialect.LEGACY, kimi_cli_module.KimiDialect.CODE]
+    )
+    @pytest.mark.parametrize("styled", [False, True])
+    def test_real_tool_headers_and_payload_stay_private(self, monkeypatch, styled, dialect):
+        tool = "● Running a command · $ uname -a"
+        if styled:
+            tool = "\x1b[38;5;253m● \x1b[1m\x1b[38;5;111mRunning a command\x1b[0;2m · $ uname -a"
+        pane = "\n".join(["💫 Check", tool, "PRIVATE-COMMAND-OUTPUT", _answer("Done."), ""])
+        actual, _ = _last(monkeypatch, pane, dialect)
+        assert actual == "● Done."
+
+    @pytest.mark.parametrize("replacement", ["root-link", "leaf-link", "internal-link"])
+    def test_scratch_cleanup_never_follows_symlinks(self, tmp_path, monkeypatch, replacement):
+        monkeypatch.setattr(
+            KimiCliProvider,
+            "_managed_scratch_root",
+            staticmethod(lambda: tmp_path / f"cao_kimi_{os.getuid()}"),
+        )
+        provider = KimiCliProvider("review-safety", "s", "w")
+        directory = Path(provider._ensure_temp_dir())
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        sentinel = outside / "keep"
+        sentinel.write_text("untouched")
+        if replacement == "root-link":
+            directory.rmdir()
+            directory.parent.rmdir()
+            directory.parent.symlink_to(outside, target_is_directory=True)
+        elif replacement == "leaf-link":
+            directory.rmdir()
+            directory.symlink_to(outside, target_is_directory=True)
+        else:
+            (directory / "link").symlink_to(outside, target_is_directory=True)
+        assert provider.cleanup() is (replacement != "root-link")
+        assert sentinel.read_text() == "untouched"
+        if replacement != "root-link":
+            assert not os.path.lexists(directory)
+
+    def test_scratch_cleanup_rejects_arbitrary_paths_and_preserves_neighbor(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            KimiCliProvider,
+            "_managed_scratch_root",
+            staticmethod(lambda: tmp_path / f"cao_kimi_{os.getuid()}"),
+        )
+        first = KimiCliProvider("review-one", "s", "w")
+        second = KimiCliProvider("review-two", "s", "w")
+        owned = Path(first._ensure_temp_dir())
+        neighbor = Path(second._ensure_temp_dir())
+        arbitrary = tmp_path / "do-not-delete"
+        arbitrary.mkdir()
+        first._temp_dir = str(arbitrary)
+        assert not first._is_managed_scratch_dir(neighbor)
+        assert not first._is_managed_scratch_dir(owned.parent)
+        assert not first._is_managed_scratch_dir(owned / ".." / neighbor.name)
+        assert first.cleanup() is True
+        assert not owned.exists()
+        assert arbitrary.exists() and neighbor.exists()
+
+    @pytest.mark.parametrize(
+        "failure", [PermissionError("busy"), FileNotFoundError("child vanished")]
+    )
+    def test_scratch_failure_is_retryable_after_restart(self, tmp_path, monkeypatch, failure):
+        from unittest.mock import patch
+
+        monkeypatch.setattr(
+            KimiCliProvider,
+            "_managed_scratch_root",
+            staticmethod(lambda: tmp_path / f"cao_kimi_{os.getuid()}"),
+        )
+        provider = KimiCliProvider("review-retry", "s", "w")
+        directory = Path(provider._ensure_temp_dir())
+        (directory / "kimi-launch.sh").write_text("synthetic-secret")
+        restarted = KimiCliProvider("review-retry", "s", "w")
+        with patch.object(kimi_cli_module.shutil, "rmtree", side_effect=failure):
+            assert restarted.cleanup() is False
+        assert directory.exists()
+        assert restarted.cleanup() is True
+        assert not directory.exists()
+
+    def test_scratch_launch_refuses_symlinked_script(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            KimiCliProvider,
+            "_managed_scratch_root",
+            staticmethod(lambda: tmp_path / f"cao_kimi_{os.getuid()}"),
+        )
+        provider = KimiCliProvider("review-script-link", "s", "w")
+        directory = Path(provider._ensure_shell_safe_dir())
+        outside = tmp_path / "untouched"
+        outside.write_text("keep")
+        (directory / "kimi-launch.sh").symlink_to(outside)
+        with pytest.raises(OSError):
+            provider._materialize_launch_command("synthetic-secret")
+        assert outside.read_text() == "keep"
+
+    @pytest.mark.parametrize("current", ["", "idle"])
+    @pytest.mark.parametrize("status_probe", [None, "buffer", "screen"])
+    def test_hostile_stale_history_cannot_confirm_new_dispatch(
+        self, monkeypatch, current, status_probe
+    ):
+        from cli_agent_orchestrator.services import terminal_service as ts
+
+        idle = _fixture("kimi_code_0431_01_fresh_startup_idle.txt")
+        history = _fixture("kimi_code_0431_04_post_answer_idle.txt") + "\n" + idle
+        provider = KimiCliProvider("review-stale-history", "s", "w")
+        provider._dialect = kimi_cli_module.KimiDialect.CODE
+        provider.mark_input_received()
+        backend = MagicMock()
+        backend.get_history.return_value = history
+        monkeypatch.setattr(ts, "get_backend", lambda: backend)
+        monkeypatch.setattr(kimi_cli_module, "get_backend", lambda: backend)
+        monkeypatch.setattr(
+            ts, "get_terminal_metadata", lambda _: {"tmux_session": "s", "tmux_window": "w"}
+        )
+        monkeypatch.setattr(ts.status_monitor, "get_buffer", lambda _: idle if current else "")
+        if status_probe == "buffer":
+            provider.get_status(history)
+        elif status_probe == "screen":
+            provider.get_status_from_screen(kt.strip_sgr(history).splitlines())
+        assert ts._worker_is_started_direct(provider.terminal_id, provider) is False
+        assert provider._execution_observed is False
+        send = MagicMock()
+        monkeypatch.setattr(ts, "send_input", send)
+        monkeypatch.setattr(ts, "_message_visible_in_box", lambda *_: False)
+        assert ts.redeliver_dropped_message(provider.terminal_id, "new task", 1, provider) is False
+        send.assert_called_once()
+
+    def test_hostile_temp_root_drift_cleans_original_script(self, tmp_path, monkeypatch):
+        root_a, root_b = tmp_path / "rootA", tmp_path / "rootB"
+        root_a.mkdir()
+        root_b.mkdir()
+        monkeypatch.setenv("TMPDIR", str(root_a))
+        monkeypatch.setattr(kimi_cli_module, "shell_safe_temp_root", lambda: str(root_a))
+        provider = KimiCliProvider("review-root-drift", "s", "w")
+        provider._dialect = kimi_cli_module.KimiDialect.LEGACY
+        provider._materialize_launch_command("kimi --mcp-config synthetic-test-secret")
+        script = Path(provider._shell_safe_dir) / "kimi-launch.sh"
+        assert "synthetic-test-secret" in script.read_text()
+        monkeypatch.setenv("TMPDIR", str(root_b))
+        monkeypatch.setattr(kimi_cli_module, "shell_safe_temp_root", lambda: str(root_b))
+        restarted = KimiCliProvider("review-root-drift", "s", "w")
+        restarted._dialect = kimi_cli_module.KimiDialect.LEGACY
+        assert restarted._temp_dir is None
+        assert restarted.cleanup() is True
+        assert not script.exists()
+
+    def test_fixed_scratch_root_preserves_install_and_terminal_namespaces(
+        self, tmp_path, monkeypatch
+    ):
+        first_home, second_home = tmp_path / "install-a", tmp_path / "install-b"
+        monkeypatch.setattr(kimi_cli_module, "CAO_HOME_DIR", first_home)
+        first = KimiCliProvider("same-terminal", "s", "w")
+        neighbor = KimiCliProvider("other-terminal", "s", "w")
+        first_path = Path(first._ensure_temp_dir())
+        neighbor_path = Path(neighbor._ensure_temp_dir())
+        monkeypatch.setattr(kimi_cli_module, "CAO_HOME_DIR", second_home)
+        other_install = KimiCliProvider("same-terminal", "s", "w")
+        other_path = Path(other_install._ensure_temp_dir())
+        assert first_path.parent == neighbor_path.parent == other_path.parent
+        assert first_path.parent == Path("/tmp").resolve() / f"cao_kimi_{os.getuid()}"
+        assert len({first_path, neighbor_path, other_path}) == 3
+        assert other_install.cleanup() is True
+        assert first_path.exists() and neighbor_path.exists()
+        monkeypatch.setattr(kimi_cli_module, "CAO_HOME_DIR", first_home)
+        assert first.cleanup() is True
+        assert neighbor_path.exists()
+        assert neighbor.cleanup() is True
+
+    @pytest.mark.parametrize(
+        "dialect", [kimi_cli_module.KimiDialect.LEGACY, kimi_cli_module.KimiDialect.CODE]
+    )
+    @pytest.mark.parametrize("new_activity", [False, True])
+    def test_post_clear_settled_redraw_requires_new_activity(
+        self, monkeypatch, dialect, new_activity
+    ):
+        from cli_agent_orchestrator.services import terminal_service as ts
+        from cli_agent_orchestrator.services.status_monitor import StatusMonitor
+
+        provider = KimiCliProvider("review-redraw", "s", "w")
+        provider._dialect = dialect
+        monitor = StatusMonitor()
+        old = "\n".join(
+            [
+                (
+                    _user("✨ Previous task")
+                    if dialect is kimi_cli_module.KimiDialect.CODE
+                    else "💫 Previous task"
+                ),
+                "",
+                _thinking("Previous reasoning"),
+                "● Used search_docs · MCP/helpdesk",
+                "private old payload",
+                _answer("Previous final answer."),
+                _footer() if dialect is kimi_cli_module.KimiDialect.CODE else "💫",
+            ]
+        )
+        activity = (
+            "\x1b[38;5;111m⠙ Thinking… 1s · 4 tokens\x1b[0m"
+            if dialect is kimi_cli_module.KimiDialect.CODE
+            else "🌑"
+        )
+        provider.mark_input_received()
+        assert provider.has_execution_evidence(activity + "\n") is True
+        monitor._buffers[provider.terminal_id] = old
+        backend = MagicMock()
+        backend.get_history.return_value = old
+
+        def paste_or_drop(*args, **kwargs):
+            assert monitor.get_buffer(provider.terminal_id) == ""
+            assert provider._execution_observed is False
+            # The previous screen is repainted AFTER clear/mark. A successful
+            # fast turn additionally emits live activity followed by completion.
+            monitor._buffers[provider.terminal_id] = old + (
+                "\n" + activity + "\n" + _answer("New final answer.") if new_activity else ""
+            )
+
+        backend.send_keys.side_effect = paste_or_drop
+        monkeypatch.setattr(ts, "status_monitor", monitor)
+        monkeypatch.setattr(ts, "get_backend", lambda: backend)
+        monkeypatch.setattr(
+            ts, "get_terminal_metadata", lambda _: {"tmux_session": "s", "tmux_window": "w"}
+        )
+        monkeypatch.setattr(ts.provider_manager, "get_provider", lambda _: provider)
+        monkeypatch.setattr(ts, "inject_memory_context", lambda message, *_: message)
+        monkeypatch.setattr(ts, "update_last_active", lambda _: None)
+        assert ts.send_input(provider.terminal_id, "New task") is True
+        assert ts._worker_is_started_direct(provider.terminal_id, provider) is new_activity
+        assert provider._execution_observed is new_activity
+        resend = MagicMock()
+        monkeypatch.setattr(ts, "send_input", resend)
+        monkeypatch.setattr(ts, "_message_visible_in_box", lambda *_: False)
+        assert (
+            ts.redeliver_dropped_message(provider.terminal_id, "New task", 1, provider)
+            is new_activity
+        )
+        assert resend.call_count == (0 if new_activity else 1)
+        backend.get_history.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "dialect", [kimi_cli_module.KimiDialect.LEGACY, kimi_cli_module.KimiDialect.CODE]
+    )
+    @pytest.mark.parametrize(
+        "old",
+        [
+            _answer("Old final answer"),
+            "● Used search_docs · MCP/helpdesk\nold payload",
+            _thinking("Old reasoning"),
+            _user("✨ Old submitted task"),
+        ],
+    )
+    def test_redrawn_transcript_channels_are_not_activity(self, dialect, old):
+        provider = KimiCliProvider("review-old-channels", "s", "w")
+        provider._dialect = dialect
+        provider.mark_input_received()
+        assert provider.has_execution_evidence(old) is False
+        assert provider.has_execution_evidence(old + "\n") is False
+        assert provider._execution_observed is False
+
+    @pytest.mark.parametrize(
+        "dialect", [kimi_cli_module.KimiDialect.LEGACY, kimi_cli_module.KimiDialect.CODE]
+    )
+    @pytest.mark.parametrize("boundary", ["mark", "epoch"])
+    def test_activity_is_scoped_to_execution_generation(self, dialect, boundary):
+        provider = KimiCliProvider("review-generations", "s", "w")
+        provider._dialect = dialect
+        provider.notify_status_buffer_reset(1)
+        provider.mark_input_received()
+        activity = (
+            "⠙ Thinking… 1s · 4 tokens" if dialect is kimi_cli_module.KimiDialect.CODE else "🌑"
+        )
+        settled = _answer("Identical answer in consecutive turns.")
+        assert provider._awaiting_turn is True
+        assert provider._turn_activity_seen is False
+        assert provider.has_execution_evidence(settled) is False
+        assert provider.has_execution_evidence(activity + "\n") is True
+        assert provider._turn_activity_seen is True
+        assert provider.has_execution_evidence(settled) is True
+        provider.notify_status_buffer_reset(1)  # An unchanged epoch is not a reset.
+        assert provider.has_execution_evidence("") is True
+        if boundary == "mark":
+            provider.mark_input_received()
+        else:
+            provider.notify_status_buffer_reset(2)
+        assert provider._awaiting_turn is True
+        assert provider._turn_activity_seen is False
+        assert provider.has_execution_evidence(settled) is False
+        assert provider.has_execution_evidence(activity + "\n" + settled) is True
+
+    @pytest.mark.parametrize(
+        "dialect", [kimi_cli_module.KimiDialect.LEGACY, kimi_cli_module.KimiDialect.CODE]
+    )
+    def test_fast_turn_raw_cursor_frames_preserve_activity(self, dialect):
+        provider = KimiCliProvider("review-raw-fast", "s", "w")
+        provider._dialect = dialect
+        provider.mark_input_received()
+        label = (
+            "Thinking… 1s · 4 tokens"
+            if dialect is kimi_cli_module.KimiDialect.CODE
+            else "Using Shell (pwd)"
+        )
+        raw = "\x1b[1G\x1b[2K\x1b[38;5;111m⠙ " + label + "\x1b[0m"
+        raw += "\r\x1b[2K" + _answer("Completed before the first probe.")
+        assert provider.has_execution_evidence(raw) is True
+
+    @pytest.mark.parametrize(
+        "dialect", [kimi_cli_module.KimiDialect.LEGACY, kimi_cli_module.KimiDialect.CODE]
+    )
+    @pytest.mark.parametrize(
+        "old",
+        [
+            _answer("⠙ Thinking… is an example, not activity"),
+            _answer("Example:") + "\n```text\n⠙ Thinking… 1s · 4 tokens\n```",
+            "● Used search_docs · MCP/helpdesk\n   ⠙ Thinking… from a captured log",
+            _thinking("Example:")
+            + "\n"
+            + _reasoning_continuation("⠙ Thinking… from a captured log"),
+        ],
+    )
+    def test_quoted_processing_in_settled_content_is_not_activity(self, dialect, old):
+        provider = KimiCliProvider("review-quoted-activity", "s", "w")
+        provider._dialect = dialect
+        provider.mark_input_received()
+        assert provider.has_execution_evidence(old) is False
+        assert provider.has_execution_evidence(old + "\n") is False
+
+    @pytest.mark.parametrize("screen", [False, True])
+    def test_generic_status_cannot_import_old_processing_into_generation(self, screen):
+        provider = KimiCliProvider("review-old-spinner", "s", "w")
+        provider._dialect = kimi_cli_module.KimiDialect.CODE
+        provider.mark_input_received()
+        old = "⠙ Thinking… 1s · 4 tokens\n" + _answer("Old final answer.")
+        if screen:
+            provider.get_status_from_screen(kt.strip_sgr(old).splitlines())
+        else:
+            provider.get_status(old)
+        assert provider._turn_activity_seen is False
+        assert provider.has_execution_evidence("") is False
+
+    @pytest.mark.parametrize(
+        "dialect", [kimi_cli_module.KimiDialect.LEGACY, kimi_cli_module.KimiDialect.CODE]
+    )
+    def test_review2_new_submission_displaces_stale_answer_fence(self, monkeypatch, dialect):
+        pane = "\n".join(
+            [
+                _answer("Old example:"),
+                "```text",
+                _user("✨ NEW PRIVATE USER PROMPT"),
+                "● Used search_docs · MCP/helpdesk",
+                "\x1b[2mPRIVATE-TOOL-PAYLOAD\x1b[0m",
+                "\x1b[2m```\x1b[0m",
+                _answer("Done."),
+            ]
+        )
+        assert _last(monkeypatch, pane, dialect)[0] == "● Done."
+
+    def test_review2_partial_quoted_spinner_cannot_latch(self, monkeypatch):
+        from cli_agent_orchestrator.services import terminal_service as ts
+
+        provider = KimiCliProvider("review-partial-fence", "s", "w")
+        provider._dialect = kimi_cli_module.KimiDialect.CODE
+        provider.mark_input_received()
+        monkeypatch.setattr(
+            ts, "get_terminal_metadata", lambda _: {"tmux_session": "s", "tmux_window": "w"}
+        )
+        partial = _answer("Old example:") + "\n```text\n⠙ Thinking… 1s · 4 tokens\n"
+        monkeypatch.setattr(ts.status_monitor, "get_buffer", lambda _: partial)
+        before_close = ts._worker_is_started_direct(provider.terminal_id, provider)
+        partial += "```\n"
+        after_close = ts._worker_is_started_direct(provider.terminal_id, provider)
+        assert (before_close, after_close, provider._execution_observed) == (False, False, False)
+
+    def test_review2_cursor_boundary_preserves_answer_style(self):
+        provider = KimiCliProvider("review-cursor-style", "s", "w")
+        provider._dialect = kimi_cli_module.KimiDialect.CODE
+        provider.mark_input_received()
+        raw = "\x1b[38;5;253m\x1b[1G⠙ Thinking… quoted in an old answer"
+        assert provider.has_execution_evidence(raw) is False
+        assert provider.has_execution_evidence(raw + "\n") is False
+
+    @pytest.mark.parametrize(
+        "dialect", [kimi_cli_module.KimiDialect.LEGACY, kimi_cli_module.KimiDialect.CODE]
+    )
+    @pytest.mark.parametrize("delivery", ["large", "large-burst", "fast", "dropped"])
+    def test_review2_real_monitor_observes_activity_before_eviction(
+        self, monkeypatch, dialect, delivery
+    ):
+        from cli_agent_orchestrator.services import status_monitor as sm
+        from cli_agent_orchestrator.services import terminal_service as ts
+
+        provider = KimiCliProvider("review-monitor-eviction", "s", "w")
+        provider._dialect = dialect
+        monitor = sm.StatusMonitor()
+        assert sm.get_server_settings()["state_buffer_max"] == 32768
+        activity = (
+            "\x1b[38;5;111m⠙ Thinking… 1s · 4 tokens\x1b[0m\n"
+            if dialect is kimi_cli_module.KimiDialect.CODE
+            else "🌑\n"
+        )
+        answer = _answer("Done. " + ("x" * 40000 if delivery.startswith("large") else ""))
+        monitor._buffers[provider.terminal_id] = _answer("Old response")
+        backend = MagicMock()
+
+        def paste_or_drop(*args, **kwargs):
+            assert monitor.get_buffer(provider.terminal_id) == ""
+            assert provider._execution_observed is False
+            if delivery == "large-burst":
+                monitor._process_chunk(provider.terminal_id, activity + answer)
+            else:
+                if delivery != "dropped":
+                    monitor._process_chunk(provider.terminal_id, activity)
+                monitor._process_chunk(provider.terminal_id, answer)
+
+        backend.send_keys.side_effect = paste_or_drop
+        monkeypatch.setattr(ts, "status_monitor", monitor)
+        monkeypatch.setattr(ts, "get_backend", lambda: backend)
+        monkeypatch.setattr(
+            ts, "get_terminal_metadata", lambda _: {"tmux_session": "s", "tmux_window": "w"}
+        )
+        monkeypatch.setattr(ts.provider_manager, "get_provider", lambda _: provider)
+        monkeypatch.setattr(sm.provider_manager, "get_provider", lambda _: provider)
+        # Disable only generic status scheduling: it is deliberately not acceptance evidence.
+        monkeypatch.setattr(monitor, "_schedule_raw_detection", lambda *_: None)
+        monkeypatch.setattr(monitor, "_schedule_screen_detection", lambda *_: None)
+        monkeypatch.setattr(ts, "inject_memory_context", lambda message, *_: message)
+        monkeypatch.setattr(ts, "update_last_active", lambda _: None)
+        assert ts.send_input(provider.terminal_id, "New task") is True
+        if delivery.startswith("large"):
+            assert len(monitor.get_buffer(provider.terminal_id)) == 32768
+            assert activity.strip() not in monitor.get_buffer(provider.terminal_id)
+        accepted = ts._worker_is_started_direct(provider.terminal_id, provider)
+        resend = MagicMock()
+        monkeypatch.setattr(ts, "send_input", resend)
+        monkeypatch.setattr(ts, "_message_visible_in_box", lambda *_: False)
+        result = ts.redeliver_dropped_message(provider.terminal_id, "New task", 1, provider)
+        expected = delivery != "dropped"
+        assert (accepted, result, resend.call_count) == (expected, expected, 0 if expected else 1)
+
+    @pytest.mark.parametrize(
+        "raw, expected",
+        [
+            ("\x1b[38;5;111m\x1b[1G⠙ Thinking… live", True),
+            ("\x1b[38;5;253mold\r⠙ Thinking… quoted", False),
+            ("\x1b[38;5;253mold\r\x1b[38;5;111m⠙ Thinking… live", True),
+            ("\x1b[38;5;253mold\r\x1b[0m⠙ Thinking… live", True),
+            ("\x1b[38;5;253mold\r\x1b[39m⠙ Thinking… live", True),
+            ("\x1b[38;5;244m● \x1b[3mold\r⠙ Thinking… quoted", False),
+        ],
+    )
+    def test_review2_cursor_style_inheritance_and_reset(self, raw, expected):
+        provider = KimiCliProvider("review-style-controls", "s", "w")
+        provider._dialect = kimi_cli_module.KimiDialect.CODE
+        provider.mark_input_received()
+        # Include a row boundary so both acceptance and style rejection are
+        # tested after the streaming row is eligible for classification.
+        assert provider.has_execution_evidence(raw + "\n") is expected
+
+    @pytest.mark.parametrize("fence", ["```text", "~~~~text"])
+    def test_review2_unclosed_fence_ends_at_positive_submission(self, fence):
+        provider = KimiCliProvider("review-fence-generation", "s", "w")
+        provider._dialect = kimi_cli_module.KimiDialect.CODE
+        provider.mark_input_received()
+        old = _answer("Old example:") + "\n" + fence + "\n⠙ Thinking… quoted\n"
+        assert provider.has_execution_evidence(old) is False
+        current = old + _user("✨ New task") + "\n⠙ Thinking… 1s · 4 tokens\n"
+        assert provider.has_execution_evidence(current) is True
+
+    @pytest.mark.parametrize("quoted", [False, True])
+    def test_review2_real_monitor_chunk_boundaries_do_not_change_ownership(
+        self, monkeypatch, quoted
+    ):
+        from cli_agent_orchestrator.services import status_monitor as sm
+
+        provider = KimiCliProvider("review-chunk-boundaries", "s", "w")
+        provider._dialect = kimi_cli_module.KimiDialect.CODE
+        monitor = sm.StatusMonitor()
+        monkeypatch.setattr(sm.provider_manager, "get_provider", lambda _: provider)
+        monkeypatch.setattr(monitor, "_schedule_raw_detection", lambda *_: None)
+        monkeypatch.setattr(monitor, "_schedule_screen_detection", lambda *_: None)
+        monitor.clear_rolling_buffer(provider.terminal_id, provider)
+        provider.mark_input_received()
+        raw = (
+            _answer("Old example:") + "\n```text\n⠙ Thinking… 1s · 4 tokens\n"
+            if quoted
+            else "\x1b[38;5;253m\x1b[1G⠙ Thinking… quoted in an old answer\n"
+        )
+        for character in raw:
+            monitor._process_chunk(provider.terminal_id, character)
+            assert provider._execution_observed is False
+        if quoted:
+            monitor._process_chunk(provider.terminal_id, "```\n")
+            assert provider._execution_observed is False
+        monitor._process_chunk(provider.terminal_id, "\x1b[0m⠙ Thinking… 2s · 8 tokens\n")
+        assert provider._execution_observed is True
+
+    @pytest.mark.parametrize("private", ["fence", "tool"])
+    def test_review2_evicted_ownership_is_ambiguous_and_cannot_authorize_resend(
+        self, monkeypatch, private
+    ):
+        from cli_agent_orchestrator.services import status_monitor as sm
+        from cli_agent_orchestrator.services import terminal_service as ts
+
+        provider = KimiCliProvider("review-evicted-ownership", "s", "w")
+        provider._dialect = kimi_cli_module.KimiDialect.CODE
+        monitor = sm.StatusMonitor()
+        monkeypatch.setattr(sm.provider_manager, "get_provider", lambda _: provider)
+        monkeypatch.setattr(monitor, "_schedule_raw_detection", lambda *_: None)
+        monkeypatch.setattr(monitor, "_schedule_screen_detection", lambda *_: None)
+        monkeypatch.setattr(ts, "status_monitor", monitor)
+        monkeypatch.setattr(
+            ts, "get_terminal_metadata", lambda _: {"tmux_session": "s", "tmux_window": "w"}
+        )
+        monkeypatch.setattr(ts, "_message_visible_in_box", lambda *_: False)
+        resend = MagicMock()
+        monkeypatch.setattr(ts, "send_input", resend)
+        monitor.clear_rolling_buffer(provider.terminal_id, provider)
+        provider.mark_input_received()
+        prefix = (
+            _answer("Old example:") + "\n```text\n"
+            if private == "fence"
+            else "● Used search_docs · MCP/helpdesk\n"
+        )
+        monitor._process_chunk(provider.terminal_id, prefix + "payload\n" * 5000)
+        monitor._process_chunk(provider.terminal_id, "\n⠙ Thinking… quoted\n")
+        assert ts._worker_is_started_direct(provider.terminal_id, provider) is False
+        assert provider.execution_evidence_ambiguous is True
+        assert ts.redeliver_dropped_message(provider.terminal_id, "New task", 1, provider) is False
+        resend.assert_not_called()
+        monitor.clear_rolling_buffer(provider.terminal_id, provider)
+        provider.mark_input_received()
+        assert provider.execution_evidence_ambiguous is False
+        assert ts.redeliver_dropped_message(provider.terminal_id, "New task", 1, provider) is False
+        resend.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "dialect", [kimi_cli_module.KimiDialect.LEGACY, kimi_cli_module.KimiDialect.CODE]
+    )
+    @pytest.mark.parametrize(
+        "row",
+        [
+            "⠧ MCP Servers: 0/1 connected",
+            "⠋ Loading configuration...",
+            "⠏ Restoring conversation...",
+            "⠦ custom-service (connecting)",
+        ],
+    )
+    @pytest.mark.parametrize("delivery", ["split-slot", "characters"])
+    def test_review3_real_monitor_split_boot_cannot_certify_execution(
+        self, monkeypatch, dialect, row, delivery
+    ):
+        from cli_agent_orchestrator.services import status_monitor as sm
+        from cli_agent_orchestrator.services import terminal_service as ts
+
+        provider = KimiCliProvider("review-split-boot", "s", "w")
+        provider._dialect = dialect
+        monitor = sm.StatusMonitor()
+        monkeypatch.setattr(sm.provider_manager, "get_provider", lambda _: provider)
+        monkeypatch.setattr(monitor, "_schedule_raw_detection", lambda *_: None)
+        monkeypatch.setattr(monitor, "_schedule_screen_detection", lambda *_: None)
+        monkeypatch.setattr(ts, "status_monitor", monitor)
+        monkeypatch.setattr(
+            ts, "get_terminal_metadata", lambda _: {"tmux_session": "s", "tmux_window": "w"}
+        )
+        monitor.clear_rolling_buffer(provider.terminal_id, provider)
+        provider.mark_input_received()
+        chunks = [row[:2], row[2:], "\n"] if delivery == "split-slot" else list(row + "\n")
+        observed = []
+        for chunk in chunks:
+            monitor._process_chunk(provider.terminal_id, chunk)
+            observed.append(
+                (
+                    ts._worker_is_started_direct(provider.terminal_id, provider),
+                    provider._turn_activity_seen,
+                    provider._execution_observed,
+                )
+            )
+        assert kt.classify_line(row) is kt.KimiLineKind.BOOT_CHROME
+        # Record the entire sequence: later boot classification cannot undo an
+        # earlier irreversible acceptance, including through the direct probe.
+        assert observed == [(False, False, False)] * len(chunks)
+        assert provider.execution_evidence_ambiguous is False
+        resend = MagicMock()
+        monkeypatch.setattr(ts, "send_input", resend)
+        monkeypatch.setattr(ts, "_message_visible_in_box", lambda *_: False)
+        assert ts.redeliver_dropped_message(provider.terminal_id, "New task", 1, provider) is False
+        resend.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "dialect, row",
+        [
+            (kimi_cli_module.KimiDialect.CODE, "⠙ Thinking… 1s · 4 tokens"),
+            (kimi_cli_module.KimiDialect.LEGACY, "⠼ Using Shell (pwd)"),
+            (kimi_cli_module.KimiDialect.LEGACY, "🌑"),
+        ],
+    )
+    @pytest.mark.parametrize("boundary", ["\n", "\r", "\x1b[1G"])
+    def test_review3_real_monitor_split_processing_waits_for_row_boundary(
+        self, monkeypatch, dialect, row, boundary
+    ):
+        from cli_agent_orchestrator.services import status_monitor as sm
+        from cli_agent_orchestrator.services import terminal_service as ts
+
+        provider = KimiCliProvider("review-split-processing", "s", "w")
+        provider._dialect = dialect
+        monitor = sm.StatusMonitor()
+        monkeypatch.setattr(sm.provider_manager, "get_provider", lambda _: provider)
+        monkeypatch.setattr(monitor, "_schedule_raw_detection", lambda *_: None)
+        monkeypatch.setattr(monitor, "_schedule_screen_detection", lambda *_: None)
+        monkeypatch.setattr(ts, "status_monitor", monitor)
+        monkeypatch.setattr(
+            ts, "get_terminal_metadata", lambda _: {"tmux_session": "s", "tmux_window": "w"}
+        )
+        monitor.clear_rolling_buffer(provider.terminal_id, provider)
+        provider.mark_input_received()
+        raw = "\x1b[38;5;111m" + row + "\x1b[0m" + boundary
+        for character in raw[:-1]:
+            monitor._process_chunk(provider.terminal_id, character)
+            assert ts._worker_is_started_direct(provider.terminal_id, provider) is False
+            assert provider._turn_activity_seen is False
+            assert provider._execution_observed is False
+        monitor._process_chunk(provider.terminal_id, raw[-1])
+        assert ts._worker_is_started_direct(provider.terminal_id, provider) is True
+        assert provider._turn_activity_seen is True
+        assert provider._execution_observed is True
+        monitor._process_chunk(provider.terminal_id, _answer("Done. " + "x" * 40000))
+        assert ts._worker_is_started_direct(provider.terminal_id, provider) is True
+        resend = MagicMock()
+        monkeypatch.setattr(ts, "send_input", resend)
+        monkeypatch.setattr(ts, "_message_visible_in_box", lambda *_: False)
+        assert ts.redeliver_dropped_message(provider.terminal_id, "New task", 1, provider) is True
+        resend.assert_not_called()
+        monitor.clear_rolling_buffer(provider.terminal_id, provider)
+        provider.mark_input_received()
+        assert ts._worker_is_started_direct(provider.terminal_id, provider) is False

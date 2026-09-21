@@ -444,10 +444,10 @@ class TestWorkerIsStartedDirect:
         ):
             assert ts._worker_is_started_direct("t1", provider) is False
 
-    def test_kimi_code_settled_pane_proves_initial_task_started(self):
+    def test_kimi_code_current_buffer_proves_initial_task_started(self):
         """Regression: a fast Kimi turn may never update the cached status edge.
 
-        Deferred init must use the provider's live pane before deciding the paste
+        Deferred init must use current-dispatch bytes before deciding the paste
         was dropped; otherwise it re-sends the already-executed initial task and
         eventually tears the terminal down.
         """
@@ -477,8 +477,94 @@ class TestWorkerIsStartedDirect:
             ),
             patch.object(ts, "get_backend") as service_backend,
             patch("cli_agent_orchestrator.providers.kimi_cli.get_backend") as kimi_backend,
+            patch.object(
+                ts.status_monitor, "get_buffer", return_value="⠙ Thinking… 1s · 4 tokens\n" + ready
+            ),
         ):
             service_backend.return_value.get_history.return_value = ready
             kimi_backend.return_value.get_history.return_value = ready
             assert ts._worker_is_started_direct("t1", provider) is True
             assert provider.get_status(ready) is TerminalStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("accepted", [False, True])
+async def test_kimi_confirmation_requires_execution_even_when_cached_status_says_started(accepted):
+    from pathlib import Path
+
+    from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider, KimiDialect
+
+    fixtures = Path(__file__).parents[1] / "providers" / "fixtures"
+    idle = (fixtures / "kimi_code_0431_01_fresh_startup_idle.txt").read_text()
+    completed = (fixtures / "kimi_code_0431_04_post_answer_idle.txt").read_text()
+    provider = KimiCliProvider("t1", "s1", "w1")
+    provider._dialect = KimiDialect.CODE
+    provider.mark_input_received()
+    backend = MagicMock()
+    backend.get_history.return_value = completed  # Previous turn remains in scrollback.
+    current_buffer = MagicMock()
+    if accepted:
+        # First bytes are still idle; give the new turn time to start.
+        current_buffer.side_effect = [idle, "⠙ Thinking… 1s · 4 tokens\n" + completed]
+    else:
+        current_buffer.return_value = idle
+    with (
+        patch.object(
+            ts, "get_terminal_metadata", return_value={"tmux_session": "s1", "tmux_window": "w1"}
+        ),
+        patch.object(ts, "get_backend", return_value=backend),
+        patch.object(ts.status_monitor, "get_buffer", current_buffer),
+        patch.object(ts, "wait_until_status", new=AsyncMock(return_value=True)),
+        patch.object(ts, "_DEFERRED_SUBMIT_CONFIRM_TIMEOUT", 8.0 if accepted else 0.0),
+        patch.object(ts.asyncio, "sleep", new=AsyncMock()) as sleep,
+        patch.object(ts, "_message_visible_in_box", return_value=False),
+        patch.object(ts, "send_input") as send,
+    ):
+        assert (
+            await ts._confirm_worker_started_or_resubmit(
+                "t1", "Run the task", None, None, None, provider
+            )
+            is accepted
+        )
+    if accepted:
+        sleep.assert_awaited_once_with(0.5)
+        send.assert_not_called()
+    else:
+        assert send.call_count == ts._DEFERRED_SUBMIT_MAX_RESUBMITS
+
+
+@pytest.mark.parametrize(
+    "current",
+    ["", "⠙ Thinking… 1s · 4 tokens\n", "⠙ Thinking… 1s · 4 tokens\n● Finished the new task."],
+)
+def test_kimi_send_input_bounds_execution_evidence_to_new_bytes(monkeypatch, current):
+    from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider, KimiDialect
+    from cli_agent_orchestrator.services.status_monitor import StatusMonitor
+
+    monitor = StatusMonitor()
+    provider = KimiCliProvider("review-dispatch-boundary", "s", "w")
+    provider._dialect = KimiDialect.CODE
+    old = "● Finished the previous task."
+    monitor._buffers[provider.terminal_id] = old
+    provider.mark_input_received()
+    assert provider.has_execution_evidence("⠙ Thinking… 1s · 4 tokens\n" + old) is True
+    backend = MagicMock()
+    backend.get_history.return_value = old
+
+    def accept_paste(*args, **kwargs):
+        assert monitor.get_buffer(provider.terminal_id) == ""
+        assert provider._execution_observed is False
+        monitor._buffers[provider.terminal_id] = current
+
+    backend.send_keys.side_effect = accept_paste
+    monkeypatch.setattr(ts, "status_monitor", monitor)
+    monkeypatch.setattr(ts, "get_backend", lambda: backend)
+    monkeypatch.setattr(
+        ts, "get_terminal_metadata", lambda _: {"tmux_session": "s", "tmux_window": "w"}
+    )
+    monkeypatch.setattr(ts.provider_manager, "get_provider", lambda _: provider)
+    monkeypatch.setattr(ts, "inject_memory_context", lambda message, *_: message)
+    monkeypatch.setattr(ts, "update_last_active", lambda _: None)
+    assert ts.send_input(provider.terminal_id, "Run the new task") is True
+    assert ts._worker_is_started_direct(provider.terminal_id, provider) is bool(current)
+    backend.get_history.assert_not_called()

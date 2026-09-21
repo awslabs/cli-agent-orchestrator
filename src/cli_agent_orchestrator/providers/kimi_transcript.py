@@ -43,6 +43,8 @@ import enum
 import re
 from typing import List, Optional, Sequence, Set, Tuple
 
+from cli_agent_orchestrator.utils.text import strip_terminal_escapes
+
 # ---------------------------------------------------------------------------
 # SGR-only stripping. Mirrors kimi_cli.ANSI_CODE_PATTERN on purpose: consumers
 # that already hold a clean line can pass it straight in, and the module keeps
@@ -429,7 +431,7 @@ _TOOL_VERBS = r"(?:Running a command|Calling|Using|Used|Read|Write|Edit|Search|F
 # The styled form: the renderer draws either the verb or the identifier in the
 # tool-name style. Both measured orders are accepted.
 TOOL_CALL_RE = re.compile(
-    r"^\s*(?:\x1b\[[0-9;]*m)*[•●]?[^\S\n]*(?:"
+    r"^\s*(?:\x1b\[[0-9;]*m)*[•●]?(?:[^\S\n]|\x1b\[[0-9;]*m)*(?:"
     + _TOOL_NAME_STYLE
     + _TOOL_VERBS
     + r"|"
@@ -454,6 +456,7 @@ TOOL_CALL_CLEAN_RE = re.compile(
     r"^\s*[•●]\s*(?:"
     + r"Running a command"
     + _TOOL_DETAIL_SEP
+    + r"\$[^\S\n]+\S"
     + r"|(?:Used|Using|Calling)[^\S\n]+"
     + _TOOL_IDENTIFIER
     + r"(?:"
@@ -919,6 +922,69 @@ def strip_sgr(line: str) -> str:
     return _SGR_RE.sub("", line)
 
 
+def normalize_activity_rows(output: str) -> str:
+    """Normalize raw cursor frames without losing inherited SGR ownership.
+
+    Cursor movement creates logical rows for transient-activity detection, but
+    does not reset terminal graphics. Materialize the effective foreground and
+    text attributes at each row's first graphic, after any leading SGR changes.
+    This is a status transcript, not a reconstruction for public extraction.
+    """
+    parts = re.split(r"(\x1b\[[0-9;]*m)", output)
+    normalized = "".join(
+        part if i % 2 else strip_terminal_escapes(part) for i, part in enumerate(parts)
+    )
+    styles: dict[int, str] = {}
+    result: List[str] = []
+    visible = False
+    for token in re.split(r"(\x1b\[[0-9;]*m|\n)", normalized):
+        if token == "\n":
+            result.append(token)
+            visible = False
+            continue
+        match = _SGR_PARAMS_RE.fullmatch(token)
+        if match:
+            params = [int(p or "0") for p in match.group(1).split(";")]
+            index = 0
+            while index < len(params):
+                code = params[index]
+                size = 1
+                if code in (38, 48, 58) and index + 1 < len(params):
+                    size = {5: 3, 2: 5}.get(params[index + 1], 1)
+                value = ";".join(str(p) for p in params[index : index + size])
+                index += size
+                if code == 0:
+                    styles.clear()
+                elif code in (39, 49, 59):
+                    styles.pop({39: 38, 49: 48, 59: 58}[code], None)
+                elif code in (22, 23, 24, 25, 27, 28, 29):
+                    for key in {
+                        22: (1, 2),
+                        23: (3,),
+                        24: (4,),
+                        25: (5, 6),
+                        27: (7,),
+                        28: (8,),
+                        29: (9,),
+                    }[code]:
+                        styles.pop(key, None)
+                else:
+                    key = (
+                        38
+                        if 30 <= code <= 38 or 90 <= code <= 97
+                        else 48 if 40 <= code <= 48 or 100 <= code <= 107 else code
+                    )
+                    styles[key] = value
+            if visible:
+                result.append(token)
+            continue
+        if token.strip() and not visible:
+            result.extend("\x1b[" + value + "m" for value in styles.values())
+            visible = True
+        result.append(token)
+    return "".join(result)
+
+
 def foreground_color_indices(raw_line: str) -> Set[int]:
     """The 256-colour foreground indices a row is drawn in.
 
@@ -1246,8 +1312,8 @@ COMPOSER_FRAME_COLOR_INDEX = 240
 _FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
 
 
-def _quoted_row_indices(clean_lines: Sequence[str]) -> Set[int]:
-    """Row indices inside a *closed* Markdown code fence."""
+def _quoted_row_indices(clean_lines: Sequence[str], *, include_unclosed: bool = False) -> Set[int]:
+    """Quoted rows; execution probes also quarantine an unfinished fence."""
 
     quoted: Set[int] = set()
     opener: Optional[int] = None
@@ -1266,6 +1332,8 @@ def _quoted_row_indices(clean_lines: Sequence[str]) -> Set[int]:
             quoted.update(range(opener, index + 1))
             opener = None
 
+    if include_unclosed and opener is not None:
+        quoted.update(range(opener, len(clean_lines)))
     return quoted
 
 
@@ -1552,7 +1620,13 @@ def is_tool_call_row(raw_line: str, clean_line: Optional[str] = None) -> bool:
 
     raw = raw_line or ""
     clean = strip_sgr(raw) if clean_line is None else clean_line
-    return bool(TOOL_CALL_RE.search(raw) or TOOL_CALL_CLEAN_RE.search(clean))
+    if TOOL_CALL_RE.search(raw):
+        return True
+    # When styling is available, a renderer-owned answer bullet wins over the
+    # textual fallback. Real styled tools carry the tool-name style above.
+    if FINAL_ANSWER_BULLET_STYLE_RE.search(raw):
+        return False
+    return bool(TOOL_CALL_CLEAN_RE.search(clean))
 
 
 def classify_line(
@@ -1636,6 +1710,8 @@ def classify_rows(
     raw_lines: Sequence[str],
     clean_lines: Optional[Sequence[str]] = None,
     semantics: SpinnerSemantics = SpinnerSemantics.LEGACY,
+    *,
+    include_unclosed_fences: bool = False,
 ) -> List[KimiLineKind]:
     """Classify a whole transcript, in sequence.
 
@@ -1712,8 +1788,29 @@ def classify_rows(
     in_user_echo = False
     echo_absorbing_prose = False
     in_reasoning = False
+    # A fence cannot pair its opener with a closer from another submission.
+    # Execution probes also quarantine unfinished fences: later bytes may close
+    # them, but an acceptance latch cannot be revoked once it has fired.
+    quoted: Set[int] = set()
+    boundaries = (
+        [0]
+        + [
+            i
+            for i, (raw, clean) in enumerate(zip(raws, cleans))
+            if i and is_user_input_start(raw, clean, semantics)
+        ]
+        + [len(cleans)]
+    )
+    for start, end in zip(boundaries, boundaries[1:]):
+        quoted.update(
+            start + i
+            for i in _quoted_row_indices(
+                cleans[start:end], include_unclosed=include_unclosed_fences
+            )
+        )
+    in_answer_fence = False
 
-    for raw, clean, kind in zip(raws, cleans, kinds):
+    for index, (raw, clean, kind) in enumerate(zip(raws, cleans, kinds)):
         stripped = clean.strip()
 
         # --- submitted user message: a positive submission starts the block,
@@ -1732,12 +1829,22 @@ def classify_rows(
             and USER_INPUT_COLOR_INDEX not in foreground_color_indices(raw)
         )
         if starts_submission:
+            in_answer_fence = False
             in_user_echo = True
             echo_absorbing_prose = True
             in_tool_block = False
             in_reasoning = False
             result.append(KimiLineKind.USER_INPUT)
             continue
+        # A fence opened by the answer owns its contents, including quoted tool
+        # headers. A fence inside private tool/reasoning output cannot acquire
+        # public ownership or release that block (B1/B3).
+        if in_answer_fence:
+            result.append(KimiLineKind.CONTENT)
+            if _FENCE_RE.match(clean):
+                in_answer_fence = index + 1 in quoted
+            continue
+
         if in_user_echo:
             # Positive evidence: the submitted message's own styling. It survives
             # a blank line, because a submission may have several paragraphs and
@@ -1767,6 +1874,17 @@ def classify_rows(
         # answer row before this one.
         if kind is KimiLineKind.USER_INPUT:
             kind = KimiLineKind.CONTENT
+
+        if (
+            index in quoted
+            and index - 1 not in quoted
+            and _FENCE_RE.match(clean)
+            and not in_tool_block
+            and not in_reasoning
+        ):
+            in_answer_fence = True
+            result.append(KimiLineKind.CONTENT)
+            continue
 
         # --- tool output: opens on a positive tool header, and while it is open it
         #     *owns* its rows. This is resolved before any candidate channel
@@ -1823,6 +1941,8 @@ def classify_rows(
 def classify_lines(
     script_output: str,
     semantics: SpinnerSemantics = SpinnerSemantics.LEGACY,
+    *,
+    include_unclosed_fences: bool = False,
 ) -> List[Tuple[str, str, KimiLineKind]]:
     """Classify every row of ``script_output``, in sequence.
 
@@ -1834,7 +1954,9 @@ def classify_lines(
 
     raw_lines = (script_output or "").split("\n")
     clean_lines = [strip_sgr(raw) for raw in raw_lines]
-    kinds = classify_rows(raw_lines, clean_lines, semantics)
+    kinds = classify_rows(
+        raw_lines, clean_lines, semantics, include_unclosed_fences=include_unclosed_fences
+    )
     return [(raw, clean, kind) for raw, clean, kind in zip(raw_lines, clean_lines, kinds)]
 
 
