@@ -1156,7 +1156,9 @@ async def _drive_process_remote(
         )
 
     # Record the op so cancel_script_run can relay a CANCEL_SCRIPT for it. The
-    # op_id is minted here and reused as the command's correlation id.
+    # op_id is minted here and passed to send_command as the command's own
+    # correlation id: the bridge indexes the subprocess under the op_id it
+    # receives, so a cancel naming anything else reaches nothing.
     import uuid as _uuid
 
     op_id = _uuid.uuid4().hex
@@ -1174,6 +1176,7 @@ async def _drive_process_remote(
                 "term_grace": WORKFLOW_SCRIPT_TERM_GRACE,
             },
             timeout=wait_timeout,
+            op_id=op_id,
         )
     except RuntimeUnavailableError:
         await _reconcile_orphans(record.run_id)

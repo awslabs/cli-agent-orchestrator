@@ -74,14 +74,25 @@ class RuntimeConnection:
         payload: dict,
         terminal_id: Optional[str] = None,
         timeout: float = DEFAULT_COMMAND_TIMEOUT,
+        op_id: Optional[str] = None,
     ) -> CommandResultFrame:
         """Send one correlated command and wait for its retained result.
 
         A timeout here means the RESPONSE is missing, not that the work did
         not happen — callers must treat it as unknown, never resubmit the same
         work blindly (#745).
+
+        ``op_id`` lets a caller that must later *refer* to this operation mint the
+        identity itself. The remote script driver is the case that needs it: it
+        records ``(runtime_id, op_id)`` on the run so ``cancel_script_run`` can
+        relay ``CANCEL_SCRIPT(target_op_id=...)``, and the bridge indexes the
+        subprocess under the op_id of the command it received. When this method
+        minted its own, those were two different UUIDs and the cancel named an
+        operation the runtime had never seen: the signal reached nothing and the
+        script ran to completion while the record journalled CANCELLED (review
+        finding 1 on #802). Everything else passes nothing and gets a fresh id.
         """
-        op_id = uuid.uuid4().hex
+        op_id = op_id or uuid.uuid4().hex
         frame = CommandFrame(
             op_id=op_id, terminal_id=terminal_id, type=command_type, payload=payload
         )
