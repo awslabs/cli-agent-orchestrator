@@ -31,7 +31,7 @@ from typing import Dict, Optional
 
 import websockets
 
-from cli_agent_orchestrator.clients.database import init_db
+from cli_agent_orchestrator.clients.database import init_runtime_db
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -894,7 +894,11 @@ async def _amain() -> None:
         )
 
     setup_logging()
-    init_db()
+    # The RUNTIME initializer, not ``init_db``: this process executes panes and
+    # owns no orchestration state, so it creates the pane-local tables
+    # ``terminal_service`` writes and leaves the control plane's schemas to the
+    # server (Copilot review on #802, finding 5).
+    init_runtime_db()
     loop = asyncio.get_running_loop()
     bus.set_loop(loop)
 

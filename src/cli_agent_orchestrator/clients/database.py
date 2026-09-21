@@ -630,6 +630,47 @@ def init_db() -> None:
     _migrate_add_terminal_owner()
 
 
+# The only tables an execution-only runtime writes to. ``terminal_service`` —
+# everything ``cao-bridge`` runs — imports exactly these three: the pane row it
+# creates, the inbox row a worker's callback writes, and the idempotency mapping
+# that makes a retried create idempotent. Nothing on that path reads or writes a
+# workflow, memory, vault, flow or handoff-result table.
+RUNTIME_TABLE_NAMES = ("terminals", "inbox", "idempotency_keys")
+
+
+def init_runtime_db() -> None:
+    """Create only the tables an execution-only runtime actually uses (#745).
+
+    ``init_db`` is the CONTROL-PLANE initializer: it creates every table and runs
+    the full migration registry — workflow journals, memory, the vault, handoff
+    results. A ``cao-bridge`` pod runs none of that. Calling it there contradicted
+    the execution-only boundary in two ways that matter beyond tidiness:
+
+    - it left a worker-local SQLite file holding empty orchestration schemas, so a
+      pod's database looked like a place orchestration state could live, and
+      anything that later read it would be reading a second, non-authoritative
+      copy of state the server owns;
+    - every pod ran every migration on its own fresh file at startup, which is
+      work with no reader, and a migration written against real central data has
+      no business executing in an execution pod at all.
+
+    What a runtime does need is the pane bookkeeping ``terminal_service`` keeps
+    locally: the ``terminals`` row for panes on THIS host, the ``inbox`` row a
+    worker callback writes, and the ``idempotency_keys`` mapping. Those are
+    node-local by definition — the pane exists on this host and nowhere else — so
+    they are created here, with the ``terminals`` migrations that keep an older
+    pod's file loadable and nothing else (Copilot review on #802, finding 5).
+    """
+    tables = [Base.metadata.tables[name] for name in RUNTIME_TABLE_NAMES]
+    Base.metadata.create_all(bind=engine, tables=tables)
+    _restrict_db_file_permissions()
+    # Only the ``terminals`` migrators: a runtime that is upgraded in place keeps
+    # a file written by an older image, and these add the columns the pane row
+    # gained. Each is an idempotent, PRAGMA-guarded ALTER on ``terminals``.
+    _migrate_terminals_schema()
+    _migrate_add_terminal_owner()
+
+
 def _restrict_db_file_permissions() -> None:
     """Chmod the SQLite file (+ -wal/-shm siblings if present) to 0o600.
 
