@@ -199,6 +199,11 @@ TMUX_KEY_PATTERN = re.compile(
     r"^(?:Up|Down|Left|Right|Enter|Tab|Escape|Space|[A-Za-z0-9]|[CMS]-[A-Za-z0-9])$"
 )
 GRAPH_PROJECTION_TIMEOUT_S = 90.0
+#: Shape of a terminal id (mirrors ``models.terminal.TerminalId``). Used to tell
+#: an id-shaped ``sender_id`` — which must name a real terminal — from an
+#: operator label like "operator", which names no terminal and cannot stand in
+#: for one.
+_TERMINAL_ID_RE = re.compile(r"^[a-f0-9]{8}$")
 
 
 async def flow_daemon():
@@ -7317,13 +7322,29 @@ async def create_inbox_message_endpoint(
     """Create inbox message and attempt immediate delivery."""
     # ``sender_id`` is an agent-supplied query param, and the delivery-time owner
     # gate (#745) resolves whether a held message may be delivered from that
-    # sender's owner. Left unvalidated, a revoked owner's agent could name any
-    # other live terminal as sender and slip past the gate it is constrained by
-    # (guojing1217 on #802). On the central server every real terminal has a row,
-    # so requiring one ties the attribution to something the caller cannot
-    # invent. (The runtime-local callback path writes via create_inbox_message
-    # directly, where the supervisor sender legitimately has no local row.)
-    if not await asyncio.to_thread(get_terminal_metadata, sender_id):
+    # sender's owner. Left entirely unvalidated, a caller could name a terminal
+    # id that does not exist and have it attributed anyway (guojing1217 on #802).
+    #
+    # Only a TERMINAL-SHAPED sender is required to exist. Operator surfaces post
+    # a label rather than an id (``app_tools`` sends "operator", which has no
+    # terminal context at all), and such a label cannot impersonate any
+    # terminal's owner: the owner lookup finds nothing and the message is
+    # attributed to no principal, which is exactly the pre-existing unowned
+    # behaviour. Requiring a row for those would break the operator path.
+    #
+    # This does NOT make the sender unforgeable — a caller naming another LIVE
+    # terminal's real id still passes. Closing that needs the sender derived from
+    # trusted caller identity, and this route has none to derive from: the
+    # MCP->API calls carry only the auth token, no caller-terminal header. The
+    # broker gateway already binds it correctly for worker callbacks (it replaces
+    # sender_id with the authenticated lease identity), so the gap is the direct
+    # central caller. Tracked as a follow-up rather than guessed at here.
+    #
+    # (The runtime-local callback path writes via create_inbox_message directly,
+    # where the supervisor sender legitimately has no local row.)
+    if _TERMINAL_ID_RE.fullmatch(sender_id) and not await asyncio.to_thread(
+        get_terminal_metadata, sender_id
+    ):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Sender terminal '{sender_id}' not found",

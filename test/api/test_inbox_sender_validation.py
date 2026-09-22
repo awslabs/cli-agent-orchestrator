@@ -14,17 +14,39 @@ from unittest.mock import MagicMock, patch
 
 
 class TestTheSenderMustBeARealTerminal:
-    def test_a_forged_sender_is_rejected_with_404(self, client):
+    def test_an_id_shaped_sender_that_does_not_exist_is_rejected_with_404(self, client):
         with patch(
             "cli_agent_orchestrator.api.main.get_terminal_metadata", return_value=None
         ) as meta:
             resp = client.post(
                 "/terminals/abcdef12/inbox/messages",
-                params={"sender_id": "ghost-sender", "message": "hi"},
+                params={"sender_id": "deadbeef", "message": "hi"},
             )
         assert resp.status_code == 404
         assert "Sender terminal" in resp.json()["detail"]
-        meta.assert_called_once_with("ghost-sender")
+        meta.assert_called_once_with("deadbeef")
+
+    def test_an_operator_label_is_allowed_and_never_looked_up(self, client):
+        """Operator surfaces post a LABEL, not an id — ``app_tools`` sends
+        "operator", which has no terminal context at all. Requiring a row for it
+        would 404 the whole operator path, and it cannot impersonate a terminal's
+        owner: the owner lookup finds nothing, so the message is attributed to no
+        principal (the pre-existing unowned behaviour)."""
+        msg = SimpleNamespace(
+            id=1, sender_id="operator", receiver_id="abcdef12", created_at=datetime.now()
+        )
+        with (
+            patch("cli_agent_orchestrator.api.main.get_terminal_metadata") as meta,
+            patch("cli_agent_orchestrator.api.main.create_inbox_message", return_value=msg),
+            patch("cli_agent_orchestrator.api.main.inbox_service.deliver_pending"),
+        ):
+            resp = client.post(
+                "/terminals/abcdef12/inbox/messages",
+                params={"sender_id": "operator", "message": "hi"},
+            )
+        assert resp.status_code == 200
+        # A non-id label is never a terminal lookup.
+        meta.assert_not_called()
 
     def test_a_real_sender_is_accepted_and_enqueued(self, client):
         msg = SimpleNamespace(

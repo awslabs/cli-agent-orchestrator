@@ -680,14 +680,16 @@ class TestCreateInboxMessageEndpoint:
             assert response.status_code == 404
 
     def test_create_inbox_message_rejects_a_forged_sender(self, client):
-        """A sender that names no real terminal is refused before enqueue (#802)."""
+        """An id-shaped sender naming no real terminal is refused before enqueue
+        (#802). Operator LABELS (e.g. "operator") are a separate, allowed case —
+        see test_inbox_sender_validation.py."""
         with (
             patch("cli_agent_orchestrator.api.main.get_terminal_metadata", return_value=None),
             patch("cli_agent_orchestrator.api.main.create_inbox_message") as mock_create,
         ):
             response = client.post(
                 "/terminals/abcd1234/inbox/messages",
-                params={"sender_id": "ghost", "message": "hello"},
+                params={"sender_id": "beefcafe", "message": "hello"},
             )
             assert response.status_code == 404
             assert "Sender terminal" in response.json()["detail"]
