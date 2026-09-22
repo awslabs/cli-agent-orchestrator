@@ -447,3 +447,55 @@ someone else). Deriving the sender server-side from the caller's identity is the
 right shape, but it depends on the gateway auth model this PR does not otherwise
 touch. Filing it as a follow-up rather than shipping a check that could drop valid
 inbox deliveries. Flagging clearly so it is a decision, not an omission.
+
+# Replies to the eighth review round on #802
+
+Three more Copilot follow-ups, all real and all fixed in `1d992728`.
+
+---
+
+## Reply to `api/main.py:3650` — remote caller misrouted to local on placement failure
+
+(comment id `4070130429`)
+
+Correct. `runtime_for_terminal()` returns `None` both for a genuinely-local
+caller and for a remote one whose placement lookup transiently failed (the
+fail-closed change earlier this round has it swallow `PlacementUnavailableError`
+and return `None`), so this branch could create the worker in the central
+container for a caller that lives in a runtime. It now gates on `is_remote()`,
+which fails closed to `True` on an unreadable placement: if the caller is remote
+(or unknown) but the runtime cannot be resolved, it raises a retryable 503 rather
+than falling through to the local path. Test added for that exact state.
+
+---
+
+## Reply to `api/main.py:7758` — pre-script written at umask then narrowed
+
+(comment id `4070130483`)
+
+Correct, and it was my own regression: I wrote the uploaded pre-script with
+`write_text` then `chmod(0o700)`, the same publish-then-narrow window the earlier
+`write_owner_only` work existed to close. Fixed by giving `write_owner_only` an
+owner-only `mode` parameter (masked to `0o700`, so a caller cannot widen past the
+owner triad) and using it here: the body is owner-only from the first byte via
+`mkstemp` + `os.fchmod` before `os.replace`, never group/other-readable at any
+instant. Tests: `mode=0o700` yields exactly `0o700`, and a `0o755` request is
+masked to `0o700`.
+
+---
+
+## Reply to `utils/terminal.py:233` — registry read unsynchronized across threads
+
+(comment id `4070130514`)
+
+Correct. `effective_status` runs in a worker thread (`asyncio.to_thread`) while
+the channel loop mutates the registry on the event-loop thread, so `get_status`'s
+liveness-check-then-read could straddle a disconnect and return a stale
+COMPLETED, and cross-thread iterations could raise on dict mutation. Added a
+`threading.RLock` guarding the in-memory routing/status reads and writes
+(`get_status`, `set_status`, `register`, `unregister`, `bind`/`unbind`,
+`reconcile_hello`, `record_position`, `remote_terminal_ids`, `list_runtimes`).
+DB I/O (the placement lookup) is deliberately kept OUT of the lock so a
+worker-thread read never blocks the event loop. A concurrency test hammers
+`get_status`/`remote_terminal_ids`/`list_runtimes` against register/unregister
+churn and asserts no raise and no stale value.
