@@ -506,6 +506,75 @@ export interface RunSummaryRow {
   current_step_id: string | null
 }
 
+// ── Workflow catalog + run-with-inputs (issue #789, PR A) ────────────────────
+// CONSUMED shapes over routes already on main: the spec index (`GET
+// /workflows`), the parsed spec (`GET /workflows/{name}` — WorkflowSpec or
+// ScriptSpec, both carrying the same `inputs` declaration map), the async
+// submit spine (`POST /workflows/runs:submit`, 202), and the plan-approval
+// pair (`GET /workflows/runs/{id}/plan`, `POST /workflows/plans/approve`).
+
+/** A typed run-time input declaration (models/workflow.py InputDecl). */
+export interface WorkflowInputDecl {
+  type: 'string' | 'int' | 'bool' | 'path'
+  required: boolean
+  default: string | number | boolean | null
+}
+
+/** One row of the spec index (`GET /workflows`, WorkflowIndexRow). */
+export interface WorkflowIndexRow {
+  name: string
+  source_path: string
+  mode: string
+  /** null for a script-tier (.py) workflow, whose steps are dynamic. */
+  step_count: number | null
+  description: string
+  indexed_at: string
+}
+
+/**
+ * The parsed spec for one workflow (`GET /workflows/{name}`). The server
+ * serializes either a YAML `WorkflowSpec` or a script `ScriptSpec` with no
+ * discriminator field; both carry the same `inputs` map, which is all the run
+ * form reads. `steps` exists only on the YAML tier, `path`/`source` only on
+ * the script tier.
+ */
+export interface WorkflowDetail {
+  name: string
+  description?: string
+  mode?: string
+  inputs: Record<string, WorkflowInputDecl>
+  steps?: unknown[]
+  path?: string
+}
+
+/** The 202 body from `POST /workflows/runs:submit` (run durably journaled). */
+export interface WorkflowSubmitAccepted {
+  run_id: string
+  state: string
+  links: Record<string, string>
+}
+
+/** A run's plan identity + approval state (`GET /workflows/runs/{id}/plan`). */
+export interface WorkflowRunPlan {
+  run_id: string
+  tier: string
+  /** null for a YAML run, or a script run whose manifest freeze failed. */
+  plan_id: string | null
+  /** null exactly when plan_id is null — "no plan" is not "unapproved". */
+  approved: boolean | null
+  approved_at?: string | null
+  approved_by?: string | null
+}
+
+/** The outcome of `POST /workflows/plans/approve` (idempotent, cao:admin). */
+export interface PlanApprovalOutcome {
+  plan_id: string
+  approved: boolean
+  changed: boolean
+  approved_at: string
+  approved_by: string
+}
+
 // ── Agent Plugins (Agent Plugins 1.0.0) ──────────────────────────────────────
 // Distinct from CAO's event-plugin system, which has no web surface.
 
@@ -804,6 +873,51 @@ export const api = {
   // (fetchJSON returns undefined). Idempotent server-side (unknown id -> 204).
   deleteWorkflowRun: (runId: string) =>
     fetchJSON<void>(`/workflows/runs/${encodeURIComponent(runId)}`, { method: 'DELETE' }),
+
+  // ── Workflow catalog + run-with-inputs (issue #789, PR A) ──────────────────
+
+  // Spec index, rebuilt from the files on disk (FR-2.1). Read scope.
+  listWorkflows: () => fetchJSON<WorkflowIndexRow[]>('/workflows'),
+
+  // Parsed spec for one name — the run form's source of input declarations.
+  // 404 unknown name, 409 tier collision, 400 unparseable spec.
+  getWorkflow: (name: string) =>
+    fetchJSON<WorkflowDetail>(`/workflows/${encodeURIComponent(name)}`),
+
+  // The async submit spine — 202 the instant the run is durably journaled,
+  // never the blocking POST /workflows/runs (a long run would hold the HTTP
+  // request open for its whole life). Errors the form branches on: 400 input
+  // validation / malformed run_id, 404 unknown workflow, 409 run-id collision,
+  // 422 script lint findings, 403 plan approval required OR missing scope
+  // (distinguished by detail text), 503 approval store unavailable.
+  submitWorkflowRun: (nameOrPath: string, inputs: Record<string, string | number | boolean>) =>
+    fetchJSON<WorkflowSubmitAccepted>('/workflows/runs:submit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name_or_path: nameOrPath, inputs }),
+    }),
+
+  // Read-only plan identity + approval state for an existing run.
+  getWorkflowRunPlan: (runId: string) =>
+    fetchJSON<WorkflowRunPlan>(`/workflows/runs/${encodeURIComponent(runId)}/plan`),
+
+  // The human approval act (cao:admin only — deliberately narrower than every
+  // sibling workflow route; this UI renders the existing human route and adds
+  // no approval path an agent could call). Idempotent: `changed: false` means
+  // the plan was already approved and reports the original grant.
+  approveWorkflowPlan: (planId: string) =>
+    fetchJSON<PlanApprovalOutcome>('/workflows/plans/approve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ plan_id: planId }),
+    }),
+
+  // Delete a workflow's spec file and index row (FR-2.4, cao:admin).
+  deleteWorkflow: (name: string) =>
+    fetchJSON<{ success: boolean; name: string }>(
+      `/workflows/${encodeURIComponent(name)}`,
+      { method: 'DELETE' },
+    ),
 
   // U5 terminal offset-range read — the bytes produced around a selected event
   // (FR-7.3). Called by SyncedTerminalPane only when an event carries non-null
