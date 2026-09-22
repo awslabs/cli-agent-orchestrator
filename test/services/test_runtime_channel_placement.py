@@ -343,10 +343,19 @@ class TestARuntimeCannotClaimAnotherRuntimesTerminal:
         assert fresh.claim_terminal(TID, "worker-1") is True
 
     def test_an_unbound_terminal_with_no_row_yet_is_claimable(self, fresh, rows):
-        # Local terminals and pre-placement races have no durable owner: allow.
+        # An absent row is a phantom id with no pane to hijack, and the window a
+        # tracked launch/reconcile binds through before its row commits: allow.
         rows["row"] = None
         assert fresh.claim_terminal(TID, "worker-1") is True
         assert fresh._terminal_runtime[TID] == "worker-1"
+
+    def test_a_confirmed_local_terminal_cannot_be_claimed(self, fresh, rows):
+        # A row that exists but names NO runtime is a local pane; a runtime
+        # claiming it would redirect that pane's routing (Copilot follow-up on
+        # #802). Distinct from the absent-row case above.
+        rows["row"] = _row(runtime_id=None)
+        assert fresh.claim_terminal(TID, "worker-1") is False
+        assert TID not in fresh._terminal_runtime
 
     def test_the_binding_does_not_flap_when_an_imposter_speaks_last(self, fresh, rows):
         # The EKS symptom: routing flipped to whoever spoke most recently.

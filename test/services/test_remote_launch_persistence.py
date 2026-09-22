@@ -120,3 +120,26 @@ async def test_a_teardown_that_itself_fails_does_not_mask_the_launch_error(wired
     with pytest.raises(HTTPException) as exc:
         await launch_remote_terminal(RUNTIME, body, owner_id=None)
     assert exc.value.status_code == 500
+
+
+@pytest.mark.asyncio
+async def test_a_teardown_reporting_failure_is_logged_not_taken_as_success(
+    wired, monkeypatch, caplog
+):
+    """send_command returns a non-OK outcome for a runtime-side teardown failure
+    rather than raising, so the leak must not be reported as cleaned up when the
+    agent may still be running (Copilot follow-up on #802)."""
+    import logging
+
+    monkeypatch.setattr(
+        rc_api, "db_create_terminal", MagicMock(side_effect=RuntimeError("db down"))
+    )
+    failed_teardown = SimpleNamespace(outcome=CommandOutcome.FAILED, payload={}, op_id="op-td")
+    wired.conn.send_command = AsyncMock(side_effect=[_launch_result(), failed_teardown])
+
+    body = CreateRemoteTerminalBody(agent_profile="developer")
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(HTTPException) as exc:
+            await launch_remote_terminal(RUNTIME, body, owner_id=None)
+    assert exc.value.status_code == 500
+    assert any("did not confirm cleanup" in r.message for r in caplog.records)

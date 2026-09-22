@@ -331,6 +331,13 @@ async def runtime_channel(ws: WebSocket) -> None:
                     {"data": raw.decode("utf-8", errors="replace")},
                 )
             elif isinstance(frame, GapFrame):
+                # A GapFrame advances the resume watermark and republishes a loss,
+                # so it needs the same ownership fence as the other inbound
+                # terminal frames — otherwise a shared-token runtime could forge a
+                # gap for a terminal it does not own and make the server discard or
+                # report output that was never its (Copilot follow-up on #802).
+                if not runtime_registry.claim_terminal(frame.terminal_id, runtime_id):
+                    continue
                 logger.warning(
                     "output gap for remote terminal %s [%s, %s)",
                     frame.terminal_id,
@@ -519,9 +526,26 @@ async def launch_remote_terminal(
             runtime_id,
         )
         try:
-            await conn.send_command(
+            td = await conn.send_command(
                 CommandType.TEARDOWN, {}, timeout=TEARDOWN_TIMEOUT, terminal_id=info["id"]
             )
+            # send_command does NOT raise on a runtime-side teardown FAILURE — it
+            # returns a result frame with a non-OK outcome. Treating that as
+            # success would report the leak as cleaned up when the agent is still
+            # running (Copilot follow-up on #802), so check the outcome and the
+            # deleted/absent confirmation the teardown path uses.
+            cleaned = td.outcome == CommandOutcome.OK and (
+                td.payload.get("deleted") or td.payload.get("absent")
+            )
+            if not cleaned:
+                logger.error(
+                    "compensating teardown of leaked terminal %s did not confirm cleanup: "
+                    "outcome=%s payload=%s — the agent may still be running on %s",
+                    info.get("id"),
+                    td.outcome,
+                    td.payload,
+                    runtime_id,
+                )
         except Exception:
             logger.exception("compensating teardown of leaked terminal %s failed", info.get("id"))
         raise HTTPException(

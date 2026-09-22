@@ -75,6 +75,24 @@ def build_forward_headers() -> dict:
     return headers
 
 
+def resolve_shared_endpoint_url() -> str:
+    """The shared endpoint URL, required to be explicit for this shim.
+
+    ``shared_endpoint_url()`` falls back to the local bind host — correct for its
+    same-host callers, but for this shim that fallback silently points at
+    ``http://127.0.0.1:<port>`` and reintroduces the per-agent, in-pod MCP server
+    the shim exists to remove (Copilot follow-up on #802). The module contract is
+    that a missing URL is fatal, so require ``CAO_MCP_HTTP_URL`` explicitly here
+    and fail closed, the same posture as the missing token.
+    """
+    if not os.environ.get("CAO_MCP_HTTP_URL", "").strip():
+        raise SystemExit(
+            f"{SHIM_NAME} requires CAO_MCP_HTTP_URL to name the shared MCP endpoint; "
+            "refusing to start against a local fallback address"
+        )
+    return shared_endpoint_url()
+
+
 def build_proxy(url: str, headers: dict):
     """A stdio MCP server whose entire tool surface is the remote endpoint's."""
     from fastmcp import Client, FastMCP
@@ -92,7 +110,7 @@ def main():
         stream=sys.stderr,
         level=os.environ.get("CAO_LOG_LEVEL", "WARNING").upper(),
     )
-    url = shared_endpoint_url()
+    url = resolve_shared_endpoint_url()
     headers = build_forward_headers()
     logger.info("%s forwarding stdio to %s", SHIM_NAME, url)
     build_proxy(url, headers).run()

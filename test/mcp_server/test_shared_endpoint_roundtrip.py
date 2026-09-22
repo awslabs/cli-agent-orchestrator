@@ -340,6 +340,17 @@ class TestStdioForwardingShim:
         assert proc.returncode != 0
         assert "CAO_RUNTIME_TOKEN" in proc.stderr
 
+    def test_the_shim_refuses_to_start_without_a_shared_url(self, monkeypatch):
+        """A missing URL is fatal too — never a quiet fallback to the local bind
+        address, which would reintroduce the per-agent in-pod server this shim
+        removes (Copilot follow-up on #802)."""
+        from cli_agent_orchestrator.mcp_server import stdio_bridge
+
+        monkeypatch.setenv("CAO_RUNTIME_TOKEN", "tok")
+        monkeypatch.delenv("CAO_MCP_HTTP_URL", raising=False)
+        with pytest.raises(SystemExit, match="CAO_MCP_HTTP_URL"):
+            stdio_bridge.resolve_shared_endpoint_url()
+
     def test_the_shim_command_resolves_without_depending_on_path(self):
         """Bundled like cao-mcp-server, so it needs the same resolution.
 

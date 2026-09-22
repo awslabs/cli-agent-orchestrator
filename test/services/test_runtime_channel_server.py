@@ -383,6 +383,46 @@ class TestChannelEndpoint:
             assert runtime_registry.runtime_for_terminal(TID) == "worker-1"
         runtime_registry.unbind_terminal(TID)
 
+    def test_a_gapframe_for_an_unowned_terminal_is_dropped(self, channel_client):
+        """A GapFrame advances the watermark and reports a loss, so it needs the
+        same ownership fence as the other frames: a runtime must not be able to
+        forge a gap for a terminal it does not own (Copilot follow-up on #802)."""
+        from cli_agent_orchestrator.runtime_channel.protocol import GapFrame
+        from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
+
+        runtime_registry.bind_terminal(TID, "worker-1")
+        runtime_registry.record_position(TID, "capture", 500)
+        try:
+            headers = {"Host": "localhost", "X-CAO-Runtime-Token": "test-runtime-token"}
+            with channel_client.websocket_connect("/runtime/channel", headers=headers) as ws:
+                ws.send_text(_hello(runtime_id="worker-2"))
+                decode_frame(ws.receive_text())
+                ws.send_text(
+                    encode_frame(
+                        GapFrame(
+                            terminal_id=TID,
+                            stream=StreamName.CAPTURE,
+                            generation=0,
+                            from_pos=0,
+                            to_pos=999,
+                        )
+                    )
+                )
+                # Sync so the gap frame is processed before we assert.
+                ws.send_text(
+                    encode_frame(
+                        CommandResultFrame(
+                            op_id="sync-gap", terminal_id=TID, outcome=CommandOutcome.OK
+                        )
+                    )
+                )
+                assert decode_frame(ws.receive_text()).op_id == "sync-gap"
+            # The forged gap neither moved the watermark nor stole routing.
+            assert runtime_registry.resume_position(TID, "capture") == 500
+            assert runtime_registry.runtime_for_terminal(TID) == "worker-1"
+        finally:
+            runtime_registry.unbind_terminal(TID)
+
     def test_a_hello_claiming_anothers_terminal_is_dropped_from_resume(self, channel_client):
         """The reproduced hijack (guojing1217 on #802): a second runtime's hello
         names a terminal launched on the first. The server must refuse the claim,

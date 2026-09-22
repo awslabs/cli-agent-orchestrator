@@ -277,13 +277,19 @@ class RuntimeChannelRegistry:
 
         * the terminal is already bound here to this same runtime — a
           continuation, the common case for every frame after the first;
-        * it is unbound in memory and the durable central row either names this
-          runtime or does not exist yet — the restarted-server recovery path,
-          where the launching runtime's own hello re-establishes the binding;
+        * the durable central row names this runtime — the restarted-server
+          recovery path, where the launching runtime's own hello re-establishes
+          the binding;
+        * no central row exists at all — a phantom id with no pane and no output
+          to hijack, and the window a tracked launch/reconcile binds through
+          before its row is committed.
 
-        and refused otherwise. A refused claim leaves the existing binding
-        untouched and is logged with both ids. Returns ``True`` when the
-        terminal is bound to ``runtime_id`` on return, ``False`` when refused.
+        A row that exists but names NO runtime is a confirmed-LOCAL terminal, and
+        a runtime claiming it would redirect a real local pane's routing/status;
+        that is refused, distinct from the no-row case (Copilot follow-up on
+        #802). So is a row naming a different runtime, and an unreadable row. A
+        refused claim leaves the existing binding untouched and is logged.
+        Returns ``True`` when bound to ``runtime_id`` on return, else ``False``.
         """
         current = self._terminal_runtime.get(terminal_id)
         if current == runtime_id:
@@ -297,7 +303,7 @@ class RuntimeChannelRegistry:
             )
             return False
         try:
-            placement = self._placement_from_the_central_row(terminal_id)
+            state, placement = self._placement_state(terminal_id)
         except PlacementUnavailableError:
             # Cannot confirm ownership: refuse rather than bind on a claim the
             # durable row would have adjudicated. The runtime retries its hello.
@@ -307,12 +313,19 @@ class RuntimeChannelRegistry:
                 terminal_id,
             )
             return False
-        if placement is not None and placement != runtime_id:
+        if state == "named" and placement != runtime_id:
             logger.warning(
                 "runtime %s tried to claim terminal %s placed on %s; refusing",
                 runtime_id,
                 terminal_id,
                 placement,
+            )
+            return False
+        if state == "local":
+            logger.warning(
+                "runtime %s tried to claim terminal %s, which is a local terminal; refusing",
+                runtime_id,
+                terminal_id,
             )
             return False
         self.bind_terminal(terminal_id, runtime_id)
@@ -345,7 +358,10 @@ class RuntimeChannelRegistry:
         created, and ``is_remote`` is on the status-poll path.
 
         Returns ``None`` for a confirmed-local terminal (a row with no
-        ``runtime_id``) and the runtime id for a confirmed-remote one. Raises
+        ``runtime_id``) AND for an absent row, and the runtime id for a
+        confirmed-remote one — the distinction absent-vs-local is exposed by
+        :meth:`_placement_state`, which ``claim_terminal`` needs and this
+        (``is_remote``/``runtime_for_terminal``) does not. Raises
         :class:`PlacementUnavailableError` when the row cannot be read: that is
         an UNKNOWN placement, distinct from a confirmed-local one, and callers
         must not collapse the two — answering "local" on a transient read
@@ -353,8 +369,24 @@ class RuntimeChannelRegistry:
         own tmux for a terminal that may be remote (guojing1217 on #802). The
         failure is never cached, so a later read can still learn the truth.
         """
+        _state, runtime_id = self._placement_state(terminal_id)
+        return runtime_id
+
+    def _placement_state(self, terminal_id: str) -> Tuple[str, Optional[str]]:
+        """Placement per the durable row, distinguishing absent from local.
+
+        ``("named", runtime_id)`` — the row places it on that runtime;
+        ``("local", None)`` — the row exists but names no runtime (a local pane);
+        ``("absent", None)`` — no row at all.
+
+        Only a successful read is cached (a terminal's placement is fixed at
+        creation); an absent row is not cached, so a row written moments later —
+        a tracked launch, a reconcile — is seen. Raises
+        :class:`PlacementUnavailableError` on a read failure.
+        """
         if terminal_id in self._recovered_placement:
-            return self._recovered_placement[terminal_id]
+            runtime_id = self._recovered_placement[terminal_id]
+            return ("named", runtime_id) if runtime_id is not None else ("local", None)
         try:
             from cli_agent_orchestrator.clients.database import get_terminal_metadata
 
@@ -362,14 +394,13 @@ class RuntimeChannelRegistry:
         except Exception as exc:  # noqa: BLE001 — surfaced as an unknown placement
             logger.warning("placement lookup for terminal %s failed: %s", terminal_id, exc)
             raise PlacementUnavailableError(str(exc)) from exc
-        runtime_id = None
-        if row:
-            metadata = row.get("metadata") or {}
-            value = metadata.get("runtime_id")
-            runtime_id = str(value) if value else None
-        if row is not None:
-            self._recovered_placement[terminal_id] = runtime_id
-        return runtime_id
+        if row is None:
+            return ("absent", None)
+        metadata = row.get("metadata") or {}
+        value = metadata.get("runtime_id")
+        runtime_id = str(value) if value else None
+        self._recovered_placement[terminal_id] = runtime_id
+        return ("named", runtime_id) if runtime_id is not None else ("local", None)
 
     def is_remote(self, terminal_id: str) -> bool:
         """Whether this terminal executes in a runtime rather than on this host.
