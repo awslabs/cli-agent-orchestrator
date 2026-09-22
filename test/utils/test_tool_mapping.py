@@ -62,6 +62,60 @@ class TestResolveAllowedTools:
         assert result == ["*"]
 
 
+class TestExplicitAllowedToolsIsTheWholeList:
+    """Regression for #772: an explicit allowedTools does not get MCP refs appended.
+
+    The append exists so that declaring a server in ``mcpServers`` is enough to use
+    it. Applied to an explicit ``allowedTools`` it also meant the operator could not
+    withhold one, and ``--allowed-tools`` never got the append, so the two spellings
+    ``docs/tool-restrictions.md`` calls priority 2 and 3 resolved to different
+    policies from the same list.
+    """
+
+    def test_a_declared_server_is_not_added_to_an_explicit_list(self):
+        result = resolve_allowed_tools(["fs_read"], None, ["cao-mcp-server"])
+        assert result == ["fs_read"]
+
+    def test_the_same_holds_when_a_role_is_also_set(self):
+        """``allowedTools`` outranks ``role``, so the role must not reintroduce it."""
+        result = resolve_allowed_tools(["fs_read"], "developer", ["cao-mcp-server"])
+        assert result == ["fs_read"]
+
+    def test_naming_the_server_still_grants_it(self):
+        """The supported way to keep the grant is to write it in the list."""
+        result = resolve_allowed_tools(["fs_read", "@cao-mcp-server"], None, ["cao-mcp-server"])
+        assert result == ["fs_read", "@cao-mcp-server"]
+
+    def test_an_empty_list_denies_everything(self):
+        """``allowedTools: []`` is a deny-all and used to resolve to one grant."""
+        assert resolve_allowed_tools([], None, ["cao-mcp-server"]) == []
+
+    def test_the_cli_and_the_profile_agree_on_the_same_list(self):
+        """The disagreement in #772.
+
+        ``cli/commands/launch.py`` assigns ``list(allowed_tools)`` for
+        ``--allowed-tools`` and never calls this function, so the CLI spelling was
+        already unappended. Matching it here is what makes the two priorities
+        express one policy.
+        """
+        written_by_the_operator = ["fs_read", "execute_bash"]
+        via_cli = list(written_by_the_operator)
+        via_profile = resolve_allowed_tools(written_by_the_operator, None, ["cao-mcp-server"])
+        assert via_profile == via_cli
+
+    def test_the_role_branch_still_appends(self):
+        """Unchanged: a role default is CAO's list, not the operator's."""
+        result = resolve_allowed_tools(None, "supervisor", ["my-server"])
+        assert "@my-server" in result
+
+    def test_the_no_role_fallback_still_appends(self):
+        result = resolve_allowed_tools(None, None, ["my-server"])
+        assert "@my-server" in result
+
+    def test_an_explicit_wildcard_is_still_untouched(self):
+        assert resolve_allowed_tools(["*"], None, ["cao-mcp-server"]) == ["*"]
+
+
 class TestGetDisallowedTools:
     """Tests for get_disallowed_tools."""
 

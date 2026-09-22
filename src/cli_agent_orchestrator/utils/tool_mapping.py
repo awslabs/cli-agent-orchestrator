@@ -137,7 +137,15 @@ def resolve_allowed_tools(
     2. Role-based defaults (built-in or custom from settings.json)
     3. Unrestricted ["*"] (backward compatible — no role/allowedTools = no restrictions)
 
-    MCP server names from the profile are appended as @server_name.
+    MCP server names are appended as ``@server_name`` to a list CAO chose, so
+    declaring a server in ``mcpServers`` is enough to use it. They are NOT
+    appended to an explicit ``profile_allowed_tools``: that list is the
+    operator's complete spec, and appending to it meant a profile could not
+    withhold a server it had to declare in order to configure (issue #772).
+    ``cli/commands/launch.py`` never routed ``--allowed-tools`` through here, so
+    the two spellings ``docs/tool-restrictions.md`` calls priority 2 and 3
+    resolved the same list to different policies, the lower-priority one being
+    the more permissive. An operator who wants the grant names it in the list.
     """
     if profile_allowed_tools is not None:
         allowed = list(profile_allowed_tools)
@@ -158,8 +166,9 @@ def resolve_allowed_tools(
 
         allowed = list(ROLE_TOOL_DEFAULTS["developer"])
 
-    # Append MCP server tools if not already present
-    if mcp_server_names and "*" not in allowed:
+    # Append MCP server tools if not already present. Skipped for an explicit
+    # allowedTools, which is the operator's own list and outranks this default.
+    if mcp_server_names and profile_allowed_tools is None and "*" not in allowed:
         for server_name in mcp_server_names:
             tool_ref = f"@{server_name}"
             if tool_ref not in allowed:
