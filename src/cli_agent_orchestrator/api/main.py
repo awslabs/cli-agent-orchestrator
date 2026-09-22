@@ -4009,6 +4009,15 @@ async def send_terminal_input(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except HTTPException:
+        # remote_terminal_command maps a disconnected runtime to 503 (and 502/504
+        # for other remote failures) INSIDE this try. Without this re-raise the
+        # catch-all below rewraps that 503 as a 500 with the status stringified
+        # into the detail, so a client, a supervisor retry policy or a 5xx alarm
+        # cannot tell "executor pod is rolling, retry" from "the server broke" —
+        # during a routine bridge rollout every in-flight input became a 500
+        # (guojing1217 on #802). delete_terminal already does this.
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -4048,6 +4057,10 @@ async def send_terminal_key(
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except HTTPException:
+        # Preserve the 503/502/504 that remote_terminal_command raises for a
+        # disconnected/failed runtime (guojing1217 on #802); see send_input.
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -4086,6 +4099,10 @@ async def get_terminal_output(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except HTTPException:
+        # Preserve the 503/502/504 that remote_terminal_command raises for a
+        # disconnected/failed runtime (guojing1217 on #802); see send_input.
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
