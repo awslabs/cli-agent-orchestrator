@@ -344,13 +344,18 @@ def extract_principal_from_token(token: str) -> Principal:
         return LOCAL_PRINCIPAL
 
     claims = _verify_token(token)
-    subject = str(claims.get("sub", "")).strip()
-    if not subject:
-        raise PrincipalError("token carries no 'sub' claim to own work with")
-    issuer = str(claims.get("iss", "")).strip()
-    if not issuer:
-        raise PrincipalError("token carries no verified 'iss' claim to scope ownership to")
-    return Principal(subject=subject, issuer=issuer)
+    # Require an actual string, not just a truthy value: str(claims.get(...))
+    # would coerce a malformed JSON claim — null, a list, an object — into an
+    # owner id like "None" or "[1, 2]", and that value becomes the canonical
+    # principal revocation and ownership checks key on (Copilot review on #802).
+    # Fail closed on anything that is not a non-empty string.
+    subject = claims.get("sub")
+    if not isinstance(subject, str) or not subject.strip():
+        raise PrincipalError("token carries no string 'sub' claim to own work with")
+    issuer = claims.get("iss")
+    if not isinstance(issuer, str) or not issuer.strip():
+        raise PrincipalError("token carries no string 'iss' claim to scope ownership to")
+    return Principal(subject=subject.strip(), issuer=issuer.strip())
 
 
 def get_scopes_for_local_token() -> List[str]:

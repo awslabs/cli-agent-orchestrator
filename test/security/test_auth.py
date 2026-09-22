@@ -568,6 +568,29 @@ def test_token_without_iss_is_refused_rather_than_localised(monkeypatch, rsa_key
         auth.extract_principal_from_token("token")
 
 
+@pytest.mark.parametrize("bad_sub", [None, ["a", "b"], {"x": 1}, 123])
+def test_a_non_string_sub_is_refused_not_coerced(monkeypatch, rsa_key, bad_sub):
+    """str(sub) would turn null/list/object into an owner id like "None" or
+    "[1, 2]" — the canonical principal revocation keys on (Copilot review on
+    #802). A non-string claim must fail closed."""
+    from cli_agent_orchestrator.security.principal import PrincipalError
+
+    _enable_auth(monkeypatch, rsa_key)
+    monkeypatch.setattr(auth, "_verify_token", lambda _t: {"sub": bad_sub, "iss": ISSUER})
+    with pytest.raises(PrincipalError, match="sub"):
+        auth.extract_principal_from_token("token")
+
+
+@pytest.mark.parametrize("bad_iss", [None, ["a"], {"x": 1}, 7])
+def test_a_non_string_iss_is_refused_not_coerced(monkeypatch, rsa_key, bad_iss):
+    from cli_agent_orchestrator.security.principal import PrincipalError
+
+    _enable_auth(monkeypatch, rsa_key)
+    monkeypatch.setattr(auth, "_verify_token", lambda _t: {"sub": "auth0|abc", "iss": bad_iss})
+    with pytest.raises(PrincipalError, match="iss"):
+        auth.extract_principal_from_token("token")
+
+
 def test_principal_ignores_a_sub_outside_the_signature(monkeypatch, rsa_key):
     """Only the signed claim counts.
 
