@@ -683,3 +683,33 @@ propagating it through the MCP server — new trust surface, not a local change.
 I've written that reasoning into the code at the check itself so it is explicit
 rather than implied, and filed it as a follow-up. A caller naming another live
 terminal's real id still passes; I'm not claiming otherwise.
+
+# Reply to the twelfth review round on #802
+
+## Reply to `api/main.py:7326` — operator sender label 404s
+
+(comment id `4071165335`)
+
+Already fixed, in `999f132c` — the comment was written against the previous
+commit. You and I found the same thing independently: requiring every
+`sender_id` to name a terminal row broke the operator-facing MCP path, where
+`app_tools` sends the default `sender_id="operator"`.
+
+The check now applies only to a terminal-shaped sender (`^[a-f0-9]{8}$`), so an
+operator label passes without a lookup, which is your "separate
+operator/non-terminal sender path". A label cannot impersonate a terminal's
+owner: the owner lookup finds nothing and the message is attributed to no
+principal — the pre-existing unowned behaviour.
+
+On the second half ("derive/validate the caller identity"): that is the deeper
+fix and it is not available on this route today — the MCP→API calls carry only
+the auth token, no caller-terminal header — so it needs caller-identity
+propagation and a decision about who may assert it. The broker gateway already
+binds it correctly for worker callbacks (it overwrites `sender_id` with the
+authenticated lease identity), so the remaining gap is the direct central
+caller. That reasoning is now written into the code at the check itself, and
+filed as a follow-up.
+
+Tests: `test_inbox_sender_validation.py` pins both arms — an operator label is
+accepted and never looked up, and an id-shaped sender that does not exist is
+still 404.
