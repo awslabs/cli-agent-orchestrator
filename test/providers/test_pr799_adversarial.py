@@ -2834,6 +2834,45 @@ class TestPR799CurrentMaintainerReview:
         expected = "\n".join(kt.strip_sgr(row).strip() for row in body)
         assert ts.get_output("review-prose", ts.OutputMode.LAST) == expected
 
+    @pytest.mark.parametrize(
+        "dialect", [kimi_cli_module.KimiDialect.LEGACY, kimi_cli_module.KimiDialect.CODE]
+    )
+    @pytest.mark.parametrize("fence", ["```", "~~~~"])
+    def test_public_last_preserves_fence_on_first_answer_bullet(self, monkeypatch, dialect, fence):
+        """Reviewer round 4: the renderer prefix must not hide a leading fence."""
+
+        from cli_agent_orchestrator.services import terminal_service as ts
+
+        provider = KimiCliProvider("review-leading-fence", "s", "w")
+        provider._dialect = dialect
+        opener = (
+            _answer(fence + "text")
+            if dialect is kimi_cli_module.KimiDialect.CODE
+            else f"• {fence}text"
+        )
+        submission = (
+            _user("✨ Explain the log format")
+            if dialect is kimi_cli_module.KimiDialect.CODE
+            else "💫 Explain the log format"
+        )
+        body = [
+            opener,
+            "● Used docs.search · MCP/manuals",
+            fence,
+            "This is a quoted example, not an executed tool.",
+        ]
+        pane = "\n".join([submission, "", *body, ""])
+        backend = MagicMock()
+        backend.get_history.return_value = pane
+        monkeypatch.setattr(ts, "get_backend", lambda: backend)
+        monkeypatch.setattr(
+            ts, "get_terminal_metadata", lambda _: {"tmux_session": "s", "tmux_window": "w"}
+        )
+        monkeypatch.setattr(ts.status_monitor, "get_buffer", lambda _: pane)
+        monkeypatch.setattr(ts.provider_manager, "get_provider", lambda _: provider)
+        expected = "\n".join(kt.strip_sgr(row).strip() for row in body)
+        assert ts.get_output("review-leading-fence", ts.OutputMode.LAST) == expected
+
     def test_restart_removes_legacy_launch_script(self, tmp_path, monkeypatch):
         monkeypatch.setattr(kimi_cli_module, "CAO_HOME_DIR", tmp_path / "cao")
         monkeypatch.setattr(kimi_cli_module, "shell_safe_temp_root", lambda: str(tmp_path))
@@ -2883,10 +2922,17 @@ class TestPR799CurrentMaintainerReview:
         ],
     )
     def test_genuine_execution_prevents_resend(self, monkeypatch, fixture, dialect):
+        from cli_agent_orchestrator.services import status_monitor as sm
         from cli_agent_orchestrator.services import terminal_service as ts
 
         provider = KimiCliProvider("review-real", "s", "w")
         provider._dialect = dialect
+        monitor = sm.StatusMonitor()
+        monkeypatch.setattr(sm.provider_manager, "get_provider", lambda _: provider)
+        monkeypatch.setattr(monitor, "_schedule_raw_detection", lambda *_: None)
+        monkeypatch.setattr(monitor, "_schedule_screen_detection", lambda *_: None)
+        monkeypatch.setattr(ts, "status_monitor", monitor)
+        monitor.clear_rolling_buffer(provider.terminal_id, provider)
         provider.mark_input_received()
         backend = MagicMock()
         backend.get_history.return_value = _fixture("kimi_code_0431_01_fresh_startup_idle.txt")
@@ -2896,7 +2942,7 @@ class TestPR799CurrentMaintainerReview:
             "⠙ Thinking… 1s · 4 tokens" if dialect is kimi_cli_module.KimiDialect.CODE else "🌑"
         )
         current = activity + "\n" + _fixture(fixture)
-        monkeypatch.setattr(ts.status_monitor, "get_buffer", lambda _: current)
+        monitor._process_chunk(provider.terminal_id, current)
         monkeypatch.setattr(ts, "get_backend", lambda: backend)
         monkeypatch.setattr(
             ts, "get_terminal_metadata", lambda _: {"tmux_session": "s", "tmux_window": "w"}

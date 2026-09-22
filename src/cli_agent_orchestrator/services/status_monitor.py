@@ -1045,6 +1045,28 @@ class StatusMonitor:
         with self._lock:
             return self._buffers.get(terminal_id, "")
 
+    def probe_execution_evidence(self, terminal_id: str, provider) -> bool:
+        """Atomically inspect current-generation execution evidence.
+
+        Kimi's execution-evidence parser is stateful: recognizing a live
+        processing row latches acceptance on the provider.  Sampling the
+        rolling buffer with :meth:`get_buffer` and invoking that parser after
+        releasing this lock leaves a generation race: a new ``send_input`` can
+        clear the buffer/reset the provider epoch between the two operations,
+        after which the stale probe can certify old bytes as activity for the
+        new turn.
+
+        Keep the buffer snapshot and the provider latch mutation under the same
+        lock used by :meth:`clear_rolling_buffer` and :meth:`_process_chunk`.
+        An old probe may finish before a reset, or a reset may win first, but
+        they cannot straddle the generation boundary.
+        """
+        checker = getattr(provider, "has_execution_evidence", None)
+        if not callable(checker):
+            return False
+        with self._lock:
+            return checker(self._buffers.get(terminal_id, "")) is True
+
 
 # Module-level singleton
 status_monitor = StatusMonitor()

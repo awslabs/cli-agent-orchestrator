@@ -1337,6 +1337,38 @@ def _quoted_row_indices(clean_lines: Sequence[str], *, include_unclosed: bool = 
     return quoted
 
 
+def _answer_fence_scan_text(
+    raw_line: str,
+    clean_line: str,
+    kind: KimiLineKind,
+    semantics: SpinnerSemantics,
+) -> str:
+    """Return the Markdown-fence view of an answer row.
+
+    Kimi's renderer prefixes the first answer row with its own response bullet.
+    When the model's answer itself begins with a code fence the transcript is
+    therefore ``● ```text`` / ``• ```text`` rather than a fence at column zero.
+    The bullet is UI ownership, not model Markdown, and must not hide the fence
+    from the quoted-row scan; otherwise a quoted ``Used ... · MCP/...`` row is
+    promoted to a real tool header and the public answer is lost.
+
+    Only a row already classified as a final-answer bullet is eligible.  CODE
+    additionally requires the measured colour-253 renderer style; legacy's
+    escape-free response bullet is the historical positive answer marker.  Tool
+    and reasoning bullets classify differently and are never stripped here.
+    """
+    if kind is not KimiLineKind.FINAL_BULLET:
+        return clean_line
+    if semantics is SpinnerSemantics.CODE and not FINAL_ANSWER_BULLET_STYLE_RE.search(
+        raw_line or ""
+    ):
+        return clean_line
+    match = BULLET_ANY_RE.match(clean_line or "")
+    if match is None:
+        return clean_line
+    return clean_line[match.end() :]
+
+
 def _has_evidenced_composer(raw_lines: Sequence[str], clean_lines: Sequence[str]) -> bool:
     """True when these rows contain a frame edge drawn in the composer colour."""
 
@@ -1802,11 +1834,13 @@ def classify_rows(
         + [len(cleans)]
     )
     for start, end in zip(boundaries, boundaries[1:]):
+        fence_scan_lines = [
+            _answer_fence_scan_text(raws[i], cleans[i], kinds[i], semantics)
+            for i in range(start, end)
+        ]
         quoted.update(
             start + i
-            for i in _quoted_row_indices(
-                cleans[start:end], include_unclosed=include_unclosed_fences
-            )
+            for i in _quoted_row_indices(fence_scan_lines, include_unclosed=include_unclosed_fences)
         )
     in_answer_fence = False
 
@@ -1878,7 +1912,7 @@ def classify_rows(
         if (
             index in quoted
             and index - 1 not in quoted
-            and _FENCE_RE.match(clean)
+            and _FENCE_RE.match(_answer_fence_scan_text(raw, clean, kind, semantics))
             and not in_tool_block
             and not in_reasoning
         ):

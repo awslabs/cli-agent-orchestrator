@@ -1761,7 +1761,11 @@ def _worker_is_started_direct(terminal_id: str, provider) -> bool:
         if not session_name or not window_name:
             return False
         if getattr(provider, "requires_execution_evidence", False) is True:
-            return provider.has_execution_evidence(status_monitor.get_buffer(terminal_id)) is True
+            # The evidence parser mutates a provider-side acceptance latch.  It
+            # must therefore run atomically with the StatusMonitor buffer epoch
+            # reset performed by send_input; sampling with get_buffer() and
+            # mutating later lets an old in-flight probe certify a newer turn.
+            return status_monitor.probe_execution_evidence(terminal_id, provider)
         output = get_backend().get_history(session_name, window_name, tail_lines=200)
         status = provider.get_status(output)
     except Exception:
