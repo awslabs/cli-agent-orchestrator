@@ -2556,6 +2556,12 @@ def delete_terminals_by_ids(terminal_ids: List[str]) -> int:
 def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> InboxMessage:
     """Create inbox message with status=MessageStatus.PENDING.
 
+    Validates the receiver only. Sender validation belongs to the central
+    enqueue endpoint (see ``create_inbox_message_endpoint``), not here: on a
+    runtime's local database a legitimate sender — the supervisor that dispatched
+    the work — has no local row, so requiring one here would break the
+    cross-node callback path.
+
     Raises:
         ValueError: If the receiver terminal does not exist.
     """

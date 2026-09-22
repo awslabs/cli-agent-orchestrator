@@ -7287,6 +7287,19 @@ async def create_inbox_message_endpoint(
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
     """Create inbox message and attempt immediate delivery."""
+    # ``sender_id`` is an agent-supplied query param, and the delivery-time owner
+    # gate (#745) resolves whether a held message may be delivered from that
+    # sender's owner. Left unvalidated, a revoked owner's agent could name any
+    # other live terminal as sender and slip past the gate it is constrained by
+    # (guojing1217 on #802). On the central server every real terminal has a row,
+    # so requiring one ties the attribution to something the caller cannot
+    # invent. (The runtime-local callback path writes via create_inbox_message
+    # directly, where the supervisor sender legitimately has no local row.)
+    if not await asyncio.to_thread(get_terminal_metadata, sender_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Sender terminal '{sender_id}' not found",
+        )
     try:
         inbox_msg = create_inbox_message(
             sender_id,
