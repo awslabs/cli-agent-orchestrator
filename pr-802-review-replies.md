@@ -499,3 +499,16 @@ DB I/O (the placement lookup) is deliberately kept OUT of the lock so a
 worker-thread read never blocks the event loop. A concurrency test hammers
 `get_status`/`remote_terminal_ids`/`list_runtimes` against register/unregister
 churn and asserts no raise and no stale value.
+
+# Reply to the ninth review round on #802
+
+## Reply to `security/auth.py:350` — non-string sub/iss coerced
+
+(comment id `4070265201`)
+
+Correct. Fixed in `86bcdeff`. `str(claims.get("sub"/"iss"))` would coerce a
+malformed claim (`null`, a list, an object) into an owner id like `"None"` or
+`"[1, 2]"` — a value that then becomes the canonical principal revocation and
+ownership checks key on. Both `sub` and `iss` now require a non-empty string via
+an `isinstance` check and fail closed otherwise. Parametrized tests cover
+null/list/dict/int for each.
