@@ -1196,6 +1196,15 @@ class CreateFlowRequest(BaseModel):
     # UNCONDITIONAL one. Both are preserved here instead of dropped.
     engine: Optional[KiroEngine] = None
     script: Optional[str] = None
+    # The pre-script's CONTENTS, not a path. A relative ``script`` cannot survive
+    # the trip to a shared server (the flow file stays on the client, so the
+    # server resolves the name against its own flows dir), and the server refuses
+    # an absolute one as an arbitrary-file-execution vector — leaving no path a
+    # remote ``cao schedule add --script`` could send (guojing1217 on #802). The
+    # client reads the file it can see and sends the bytes; the server writes its
+    # own copy beside the flow and runs that. Preferred over ``script`` when both
+    # are present.
+    script_body: Optional[str] = None
 
     @field_validator("name")
     @classmethod
@@ -7735,7 +7744,20 @@ async def create_flow(
         # as before.
         if body.engine is not None:
             frontmatter_data["engine"] = body.engine.value
-        if body.script:
+        if body.script_body is not None:
+            # The client sent the pre-script's contents. Write our own copy beside
+            # the flow and point the frontmatter at that bare filename, so the
+            # relative-path resolution in execute_flow finds it in the flows dir —
+            # the whole point, since the client's path never resolves here. The
+            # name derives from the flow name (already validated free of '/',
+            # '\\', '..'), so it is a safe filename in this directory. Owner-only
+            # executable: it is the operator's own code, run via its shebang.
+            script_name = f"{body.name}.pre-script"
+            script_file = flows_dir / script_name
+            script_file.write_text(body.script_body)
+            script_file.chmod(0o700)
+            frontmatter_data["script"] = script_name
+        elif body.script:
             frontmatter_data["script"] = body.script
         frontmatter = yaml.safe_dump(frontmatter_data, sort_keys=False)
         file_content = "---\n" + frontmatter + "---\n" + body.prompt_template

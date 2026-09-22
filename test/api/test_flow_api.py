@@ -188,6 +188,36 @@ class TestCreateFlow:
             assert post.metadata["engine"] == "v2"
             assert post.metadata["script"] == "poll.py"
 
+    def test_create_flow_writes_uploaded_script_body_beside_the_flow(
+        self, client, sample_flow, tmp_path, monkeypatch
+    ):
+        """The client uploads the pre-script's CONTENTS (a path cannot survive the
+        trip to a shared server). The server writes its own copy beside the flow
+        and points the frontmatter at that bare filename, which the relative-path
+        resolution in execute_flow then finds (guojing1217 on #802)."""
+        monkeypatch.setattr("cli_agent_orchestrator.api.main.CAO_HOME_DIR", tmp_path)
+        with patch("cli_agent_orchestrator.api.main.flow_service") as mock_svc:
+            mock_svc.add_flow.return_value = sample_flow
+            response = client.post(
+                "/flows",
+                json={
+                    "name": "test-flow",
+                    "schedule": "0 * * * *",
+                    "agent_profile": "developer",
+                    "provider": "kiro_cli",
+                    "prompt_template": "Do work.",
+                    "script_body": "#!/usr/bin/env python3\nprint('{\"execute\": true}')\n",
+                },
+            )
+        assert response.status_code == 201
+        script_file = tmp_path / "flows" / "test-flow.pre-script"
+        assert script_file.exists()
+        assert "print(" in script_file.read_text()
+        # Owner-only executable — the operator's own code, run via its shebang.
+        assert (script_file.stat().st_mode & 0o777) == 0o700
+        post = frontmatter.loads((tmp_path / "flows" / "test-flow.flow.md").read_text())
+        assert post.metadata["script"] == "test-flow.pre-script"
+
     def test_create_flow_rejects_absolute_prescript_path(self, client, tmp_path, monkeypatch):
         """An absolute or traversing pre-script path over HTTP would let a caller
         run any file on the server — reject it (do not weaken validation)."""

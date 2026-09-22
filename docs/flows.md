@@ -114,15 +114,16 @@ that is named but not connected fails the run as well: once you have said where
 this code runs, "run it on the server after all" is not a fallback, it is the
 outcome the setting exists to prevent. Retry the run when the runtime is back.
 
-`script:` must be reachable from wherever it runs. Registering a flow against a
-shared server (`CAO_API_BASE_URL`) sends the parsed fields, not the file, so a
-relative path — which resolves beside the flow file locally — is refused at
-`cao schedule add` time rather than failing inside a scheduled run hours later.
-Use an absolute path that exists **on the server**. That holds even with
-`CAO_SCRIPT_RUNTIME` set: the server reads the file and sends its *contents* to
-the runtime, so the runtime never needs a copy — but the server does need the
-original. A path that exists only inside the runtime fails the run with
-`Script not found` before anything is dispatched.
+`script:` is resolved **on the client**, at `cao schedule add` time: a relative
+path resolves beside the flow file, an absolute one is taken as-is, and either
+way the file is read there. Registering against a shared server
+(`CAO_API_BASE_URL`) then uploads the pre-script's *contents*, not a path — the
+flow file never travels, so a path would be meaningless on the server, and an
+absolute server path is refused as an arbitrary-file execution vector. The
+server writes its own copy beside the flow and runs that (or, with
+`CAO_SCRIPT_RUNTIME` set, forwards the contents to the runtime, which never
+needs a copy either). A missing script is reported at `cao schedule add` time,
+while you are watching, rather than failing inside a scheduled run hours later.
 
 ### Where the agent runs
 

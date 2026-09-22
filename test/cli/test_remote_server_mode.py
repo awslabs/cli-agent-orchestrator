@@ -74,7 +74,11 @@ class TestScheduleRemote:
         method, url = req.call_args[0]
         assert (method, url) == ("get", f"{REMOTE}/flows")
 
-    def test_add_parses_client_file_and_posts_fields(self, remote_env, tmp_path):
+    def test_add_uploads_the_pre_script_contents(self, remote_env, tmp_path):
+        """A relative pre-script resolves against the flow file HERE, and its
+        contents are uploaded — a path would be meaningless on the server, which
+        never sees this checkout (guojing1217 on #802)."""
+        (tmp_path / "check.py").write_text("#!/usr/bin/env python3\nprint('{\"execute\": true}')\n")
         flow_file = tmp_path / "nightly.md"
         flow_file.write_text(
             "---\n"
@@ -82,7 +86,7 @@ class TestScheduleRemote:
             'schedule: "0 2 * * *"\n'
             "agent_profile: developer\n"
             "engine: v2\n"
-            "script: /opt/cao/check.py\n"
+            "script: check.py\n"
             "---\n"
             "Do the nightly things.\n"
         )
@@ -100,34 +104,53 @@ class TestScheduleRemote:
         body = req.call_args.kwargs["json"]
         # Engine and pre-script preserved, never silently dropped (#745).
         assert body["engine"] == "v2"
-        assert body["script"] == "/opt/cao/check.py"
+        assert "script" not in body  # a path is not sent; the contents are
+        assert "print(" in body["script_body"]
         assert body["prompt_template"].strip() == "Do the nightly things."
 
-    def test_add_refuses_a_relative_pre_script(self, remote_env, tmp_path):
-        """The flow file stays here; a path relative to it means nothing there.
-
-        The server writes its own copy of the flow under its flows directory, so
-        `check.py` would be looked for beside that copy — not beside this file.
-        Registering anyway defers the error to a scheduled run minutes later, or,
-        if something does sit at that name on the server, runs the wrong code
-        without saying so (Copilot review on #802, finding 10).
-        """
+    def test_add_uploads_an_absolute_pre_scripts_contents_too(self, remote_env, tmp_path):
+        script = tmp_path / "abs_check.py"
+        script.write_text("#!/usr/bin/env python3\nprint('ok')\n")
         flow_file = tmp_path / "nightly.md"
         flow_file.write_text(
             "---\n"
             "name: nightly\n"
             'schedule: "0 2 * * *"\n'
             "agent_profile: developer\n"
-            "script: check.py\n"
+            f"script: {script}\n"
+            "---\n"
+            "Do the nightly things.\n"
+        )
+        created = {
+            "name": "nightly",
+            "schedule": "0 2 * * *",
+            "agent_profile": "developer",
+            "next_run": "2026-09-21T02:00:00",
+        }
+        with patch.object(
+            remote_server.requests, "request", return_value=_response(created)
+        ) as req:
+            result = CliRunner().invoke(schedule, ["add", str(flow_file)])
+        assert result.exit_code == 0, result.output
+        assert "print('ok')" in req.call_args.kwargs["json"]["script_body"]
+
+    def test_add_reports_a_missing_pre_script_before_registering(self, remote_env, tmp_path):
+        """Reading the file here surfaces a missing script while a human watches,
+        instead of deferring the error to a scheduled run minutes later."""
+        flow_file = tmp_path / "nightly.md"
+        flow_file.write_text(
+            "---\n"
+            "name: nightly\n"
+            'schedule: "0 2 * * *"\n'
+            "agent_profile: developer\n"
+            "script: nonexistent.py\n"
             "---\n"
             "Do the nightly things.\n"
         )
         with patch.object(remote_server.requests, "request") as req:
             result = CliRunner().invoke(schedule, ["add", str(flow_file)])
         assert result.exit_code != 0
-        assert "relative path" in result.output
-        assert "absolute path" in result.output
-        # Refused before anything was registered.
+        assert "not found" in result.output
         req.assert_not_called()
 
     def test_add_without_a_pre_script_is_unaffected(self, remote_env, tmp_path):

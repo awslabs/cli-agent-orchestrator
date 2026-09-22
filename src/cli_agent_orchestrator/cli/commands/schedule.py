@@ -31,32 +31,30 @@ def _echo_flow_added(name, schedule_expr, agent_profile, next_run):
     click.echo(f"  Next run: {next_run}")
 
 
-def _remote_script_path(script: str, file_path: str) -> str:
-    """The pre-script path as the server will read it, or refuse to register.
+def _remote_script_body(script: str, file_path: str) -> str:
+    """Read the flow's pre-script here and return its CONTENTS to upload.
 
-    Locally a relative ``script`` resolves against the flow file's own directory.
-    Remotely the flow file does not travel: the server writes its own copy under
-    ``CAO_HOME_DIR/flows``, so the same relative path resolves there instead —
-    against a directory that has never seen the client's checkout. The flow
-    registers cleanly and then fails minutes later inside a scheduled run, with
-    a "Script not found" naming a path the operator never wrote. Worse, if some
-    unrelated file does sit at that name on the server, the schedule silently
-    executes the wrong code.
-
-    So the refusal happens here, while a human is still watching the command.
-    An absolute path is accepted unchanged: it is a claim about the machine that
-    runs the script, which is exactly the claim only the operator can make
-    (Copilot review on #802, finding 10).
+    The flow file does not travel to a shared server — only its parsed fields do
+    — so a path in ``script`` is meaningless there: a relative one resolves
+    against the server's own flows directory (which never saw the client's
+    checkout), and an absolute one the server refuses as an arbitrary-file
+    execution vector. Between them no path could ever register (guojing1217 on
+    #802). So the client reads the file it can actually see — resolving a
+    relative path against the flow file's directory, exactly as a local run
+    would — and sends the bytes; the server writes its own copy beside the flow
+    and runs that. Reading here also surfaces a missing script while a human is
+    still watching the command, rather than minutes later inside a run.
     """
-    if not Path(script).is_absolute():
+    script_path = Path(script)
+    if not script_path.is_absolute():
+        script_path = Path(file_path).resolve().parent / script_path
+    if not script_path.is_file():
         raise click.ClickException(
-            f"Pre-script '{script}' in {file_path} is a relative path, which cannot be "
-            "registered on a shared server: the flow file stays on this machine, so the "
-            "server would resolve it against its own flows directory. Use an absolute "
-            "path that exists where the flow's pre-script runs (the server, or the "
-            "runtime named by CAO_SCRIPT_RUNTIME)."
+            f"Pre-script '{script}' for {file_path} was not found at {script_path}. "
+            "The path is resolved on THIS machine (relative to the flow file), because "
+            "its contents are uploaded to the server rather than a path it could not read."
         )
-    return script
+    return script_path.read_text()
 
 
 def _remote_add(file_path: str) -> None:
@@ -80,7 +78,7 @@ def _remote_add(file_path: str) -> None:
     if metadata.get("engine"):
         body["engine"] = metadata["engine"]
     if metadata.get("script"):
-        body["script"] = _remote_script_path(metadata["script"], file_path)
+        body["script_body"] = _remote_script_body(metadata["script"], file_path)
     flow = api_request("post", "/flows", json=body).json()
     _echo_flow_added(flow["name"], flow["schedule"], flow["agent_profile"], flow.get("next_run"))
 
