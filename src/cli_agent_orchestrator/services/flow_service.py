@@ -31,7 +31,7 @@ from cli_agent_orchestrator.clients.database import (
 )
 from cli_agent_orchestrator.constants import DEFAULT_PROVIDER, PROVIDERS
 from cli_agent_orchestrator.models.flow import Flow
-from cli_agent_orchestrator.models.kiro_engine import KiroEngine, parse_kiro_engine
+from cli_agent_orchestrator.models.kiro_engine import parse_kiro_engine
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.security.principal import Principal, may_start_work
@@ -368,17 +368,10 @@ async def _launch_flow_terminal(
         launch_remote_terminal,
     )
 
-    # LAUNCH carries no engine field, so a flow that asked for a non-default
-    # engine must not be launched remotely: the runtime would start v2 and the
-    # run would look successful while being the wrong agent. Refuse instead of
-    # dropping the field — the same rule the channel applies at hello.
-    if flow.engine is not None and parse_kiro_engine(flow.engine) is not KiroEngine.V2:
-        raise ValueError(
-            f"flow {flow.name} requests engine '{flow.engine}', which a remote "
-            f"launch on runtime '{runtime_id}' cannot carry; run it locally or "
-            f"unset CAO_FLOW_RUNTIME"
-        )
-
+    # LAUNCH now carries the engine (CreateRemoteTerminalBody.engine, forwarded
+    # in the payload and honored by the bridge, persisted centrally by
+    # launch_remote_terminal), so a non-default-engine flow can run remotely —
+    # the earlier blanket refusal here was stale (guojing1217 on #802).
     try:
         return await launch_remote_terminal(
             runtime_id,
@@ -386,6 +379,7 @@ async def _launch_flow_terminal(
                 provider=flow.provider,
                 agent_profile=flow.agent_profile,
                 session_name=session_name,
+                engine=flow.engine,
             ),
             # Server-written, exactly as the HTTP path writes the caller's
             # principal: the owner is never handed to the runtime in the LAUNCH

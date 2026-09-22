@@ -195,7 +195,7 @@ async def test_a_disconnected_flow_runtime_does_not_fall_back_to_this_host(
 
 @pytest.mark.asyncio
 @_patches
-async def test_a_remote_launch_refuses_an_engine_it_cannot_carry(
+async def test_a_non_default_engine_flow_forwards_the_engine_remotely(
     mock_db_get,
     mock_update_times,
     mock_backend,
@@ -205,7 +205,13 @@ async def test_a_remote_launch_refuses_an_engine_it_cannot_carry(
     flow_file,
     monkeypatch,
 ):
-    """LAUNCH has no engine field; a dropped one would silently start v2."""
+    """LAUNCH now carries the engine, so the earlier blanket refusal was stale.
+
+    CreateRemoteTerminalBody.engine is forwarded in the payload, honored by the
+    bridge, and persisted centrally by launch_remote_terminal, so a kas flow can
+    run remotely with the engine it asked for rather than being refused
+    (guojing1217 on #802).
+    """
     monkeypatch.setenv("CAO_FLOW_RUNTIME", RUNTIME)
     flow_file.write_text(
         flow_file.read_text().replace(
@@ -217,10 +223,10 @@ async def test_a_remote_launch_refuses_an_engine_it_cannot_carry(
     launch = _remote_launch()
     monkeypatch.setattr("cli_agent_orchestrator.runtime_channel.api.launch_remote_terminal", launch)
 
-    with pytest.raises(ValueError, match="cannot carry"):
-        await execute_flow("nightly-report")
-    launch.assert_not_called()
-    mock_create_terminal.assert_not_called()
+    assert await execute_flow("nightly-report") is True
+    launch.assert_awaited_once()
+    body = launch.call_args.args[1]
+    assert body.engine == "kas"
 
 
 # --- recycling a session that lives in another pod ---------------------------

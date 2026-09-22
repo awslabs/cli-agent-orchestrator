@@ -417,6 +417,13 @@ async def launch_remote_terminal(
         )
 
     info = result.payload["terminal"]
+    # The engine the caller pinned is forwarded in the LAUNCH payload and
+    # honored by the bridge, so it must be recorded centrally too: reuse
+    # validation and the KAS input gate read the persisted value, and without
+    # it a remote assign/handoff that pinned an engine stored engine=None
+    # (guojing1217 on #802). Prefer the runtime's echo, fall back to the
+    # request.
+    engine = info.get("engine") or body.engine
     # Persist the authoritative registry row centrally. runtime_id is recorded
     # in metadata so the association is inspectable and survives restarts
     # alongside the hello-snapshot rebinding.
@@ -429,19 +436,42 @@ async def launch_remote_terminal(
     # "whose callback is this?") is answered by reading this row, which is the
     # concrete form of #745's rule that agent-supplied IDs alone are not
     # authorization.
-    db_create_terminal(
-        info["id"],
-        info["session_name"],
-        info["name"],
-        info["provider"],
-        agent_profile=info.get("agent_profile"),
-        allowed_tools=info.get("allowed_tools"),
-        shell_command=info.get("shell_command"),
-        caller_id=body.caller_id,
-        working_directory=body.working_directory,
-        metadata={"runtime_id": runtime_id},
-        owner=owner_id,
-    )
+    try:
+        db_create_terminal(
+            info["id"],
+            info["session_name"],
+            info["name"],
+            info["provider"],
+            agent_profile=info.get("agent_profile"),
+            allowed_tools=info.get("allowed_tools"),
+            shell_command=info.get("shell_command"),
+            caller_id=body.caller_id,
+            engine=engine,
+            working_directory=body.working_directory,
+            metadata={"runtime_id": runtime_id},
+            owner=owner_id,
+        )
+    except Exception:
+        # The provider is already running in the runtime, but there is no row and
+        # no binding — nothing can route to it or tear it down, so it is a leaked
+        # pod holding a live model session (guojing1217 on #802). Compensate with
+        # a best-effort TEARDOWN on the same connection; both ids are in hand.
+        # The launch failure is what the caller must see, so re-raise after.
+        logger.exception(
+            "persisting terminal %s failed after launch on %s; tearing it back down",
+            info.get("id"),
+            runtime_id,
+        )
+        try:
+            await conn.send_command(
+                CommandType.TEARDOWN, {}, timeout=TEARDOWN_TIMEOUT, terminal_id=info["id"]
+            )
+        except Exception:
+            logger.exception("compensating teardown of leaked terminal %s failed", info.get("id"))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"launched terminal on '{runtime_id}' but failed to persist it; tore it down",
+        )
     runtime_registry.bind_terminal(info["id"], runtime_id)
     try:
         reported = TerminalStatus(info.get("status", "unknown"))
@@ -459,7 +489,7 @@ async def launch_remote_terminal(
         agent_profile=info.get("agent_profile"),
         caller_id=body.caller_id,
         allowed_tools=info.get("allowed_tools"),
-        engine=None,
+        engine=engine,
         shell_command=info.get("shell_command"),
         group=None,
         metadata={"runtime_id": runtime_id},
