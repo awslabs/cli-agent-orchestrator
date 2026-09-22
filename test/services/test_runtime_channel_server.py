@@ -383,6 +383,36 @@ class TestChannelEndpoint:
             assert runtime_registry.runtime_for_terminal(TID) == "worker-1"
         runtime_registry.unbind_terminal(TID)
 
+    def test_a_hello_does_not_seed_status_for_a_kept_but_unclaimed_terminal(self, channel_client):
+        """reconcile_hello keeps a prior binding for a terminal this hello omits,
+        so keying status seeding on runtime_for_terminal would let a stale
+        statuses entry resurrect it. Only terminals THIS hello bound get seeded
+        (Copilot review on #802)."""
+        from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
+
+        kept = "beef5678"
+        # A binding from a prior hello that this runtime still owns in memory.
+        runtime_registry.bind_terminal(kept, "worker-1")
+        try:
+            headers = {"Host": "localhost", "X-CAO-Runtime-Token": "test-runtime-token"}
+            with channel_client.websocket_connect("/runtime/channel", headers=headers) as ws:
+                # This hello omits `kept` from streams but names it in statuses.
+                ws.send_text(
+                    encode_frame(
+                        HelloFrame(
+                            protocol_version=PROTOCOL_VERSION,
+                            runtime_id="worker-1",
+                            streams=[],
+                            statuses={kept: TerminalStatus.COMPLETED},
+                        )
+                    )
+                )
+                decode_frame(ws.receive_text())
+            # The omitted terminal's status was NOT seeded from the hello.
+            assert runtime_registry.get_status(kept) is not TerminalStatus.COMPLETED
+        finally:
+            runtime_registry.unbind_terminal(kept)
+
     def test_a_gapframe_for_an_unowned_terminal_is_dropped(self, channel_client):
         """A GapFrame advances the watermark and reports a loss, so it needs the
         same ownership fence as the other frames: a runtime must not be able to

@@ -54,6 +54,22 @@ def wired(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_a_disconnected_runtime_launch_is_503_not_404(monkeypatch):
+    """A disconnected runtime is a retryable availability condition, like the
+    command paths — 404 made a bridge rollout look permanently not-found
+    (Copilot review on #802)."""
+    registry = MagicMock()
+    registry.get_runtime.return_value = None
+    monkeypatch.setattr(rc_api, "runtime_registry", registry)
+
+    body = CreateRemoteTerminalBody(agent_profile="developer")
+    with pytest.raises(HTTPException) as exc:
+        await launch_remote_terminal(RUNTIME, body, owner_id=None)
+    assert exc.value.status_code == 503
+    assert "not connected" in exc.value.detail
+
+
+@pytest.mark.asyncio
 async def test_the_pinned_engine_is_persisted(wired, monkeypatch):
     wired.conn.send_command = AsyncMock(return_value=_launch_result())
     created = {}

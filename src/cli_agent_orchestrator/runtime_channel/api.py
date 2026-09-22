@@ -229,6 +229,7 @@ async def runtime_channel(ws: WebSocket) -> None:
     # (or a reconnecting runtime) recovers terminal→runtime associations
     # without persisting live channel state.
     resume: List[StreamPosition] = []
+    bound_this_hello: set = set()
     for stream_pos in hello.streams:
         # A hello names the terminals this runtime says it owns, but the shared
         # token makes that a claim, not a proof: refuse any it does not own and
@@ -236,6 +237,7 @@ async def runtime_channel(ws: WebSocket) -> None:
         # runtime the stream position of a terminal it never launched.
         if not runtime_registry.claim_terminal(stream_pos.terminal_id, runtime_id):
             continue
+        bound_this_hello.add(stream_pos.terminal_id)
         resume.append(
             StreamPosition(
                 terminal_id=stream_pos.terminal_id,
@@ -257,9 +259,12 @@ async def runtime_channel(ws: WebSocket) -> None:
     # Seed the status cache from the same snapshot. Status is pushed on change,
     # so without this a server that restarted while a terminal sat quiescent
     # would answer UNKNOWN until the agent next moved — indefinitely, for an
-    # idle agent. Only terminals this hello actually bound are seeded.
+    # idle agent. Only terminals THIS hello actually bound are seeded: keying on
+    # runtime_for_terminal() would also match terminals reconcile_hello kept
+    # bound from a prior hello but that this one omitted, letting a stale
+    # ``statuses`` entry resurrect their last status (Copilot review on #802).
     for terminal_id, reported in hello.statuses.items():
-        if runtime_registry.runtime_for_terminal(terminal_id) == runtime_id:
+        if terminal_id in bound_this_hello:
             runtime_registry.set_status(terminal_id, reported, conn=conn)
 
     await ws.send_text(
@@ -455,8 +460,13 @@ async def launch_remote_terminal(
     """
     conn = runtime_registry.get_runtime(runtime_id)
     if conn is None:
+        # 503, not 404: a disconnected runtime is a retryable availability
+        # condition, the same one the terminal command paths return 503 for and
+        # the remote-execution contract promises. 404 made a bridge rollout look
+        # like a permanent not-found and denied callers consistent retry
+        # handling (Copilot review on #802).
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=f"runtime '{runtime_id}' is not connected",
         )
     try:
