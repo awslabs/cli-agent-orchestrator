@@ -821,6 +821,37 @@ class TmuxClient:
                     f"{mouse_error} — continuing without wheel scrolling."
                 )
 
+            # Some provider CLIs (e.g. claude_code) rename their own tmux
+            # window directly -- via `tmux rename-window`, not a pty escape
+            # sequence -- to show live status once they finish starting up
+            # (observed: "tech-lead-<id>" -> "✳Claude Code"). This is
+            # NOT gated by automatic-rename/allow-rename (both already off
+            # by default here): those only stop escape-sequence-driven
+            # renames from an unprivileged pane, not an explicit tmux command
+            # from a process that has $TMUX. Every window lookup in this
+            # codebase is keyed by the name CAO chose at creation time, so
+            # that rename mid-startup makes the name vanish and callers see
+            # "Window not found" even though the session and window are both
+            # still alive (confirmed by direct observation: tmux list-windows
+            # shows the renamed window present throughout). Fight back with a
+            # window-renamed hook that renames it right back -- best-effort,
+            # a failure here should not block getting a working session.
+            try:
+                original_window_id = session.windows[0].window_id
+                quoted_name = "'" + window_name.replace("'", "'\\''") + "'"
+                session.windows[0].cmd(
+                    "set-hook",
+                    "-t",
+                    original_window_id,
+                    "window-renamed",
+                    f"rename-window -t {original_window_id} {quoted_name}",
+                )
+            except Exception as rename_hook_error:
+                logger.warning(
+                    f"Could not install anti-rename hook on session {session_name}: "
+                    f"{rename_hook_error} — window may be renamed by its own process."
+                )
+
             logger.info(
                 f"Created tmux session: {session_name} with window: {window_name} in directory: {working_directory}"
             )
@@ -886,6 +917,26 @@ class TmuxClient:
                 kwargs["window_shell"] = window_shell
 
             window = session.new_window(**kwargs)
+
+            # See the matching comment in create_session(): the provider CLI
+            # can rename its own window directly via `tmux rename-window`,
+            # which automatic-rename/allow-rename don't gate. Install the
+            # same anti-rename hook here.
+            try:
+                quoted_name = "'" + window.name.replace("'", "'\\''") + "'"
+                window.cmd(
+                    "set-hook",
+                    "-t",
+                    window.window_id,
+                    "window-renamed",
+                    f"rename-window -t {window.window_id} {quoted_name}",
+                )
+            except Exception as rename_hook_error:
+                logger.warning(
+                    f"Could not install anti-rename hook on window '{window.name}' in "
+                    f"session {session_name}: {rename_hook_error} — window may be "
+                    "renamed by its own process."
+                )
 
             logger.info(
                 f"Created window '{window.name}' in session '{session_name}' in directory: {working_directory}"
