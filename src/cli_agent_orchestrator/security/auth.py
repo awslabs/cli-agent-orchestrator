@@ -331,6 +331,13 @@ def extract_principal_from_token(token: str) -> Principal:
     downgraded to the local principal: an installation with an IdP configured
     has an answer to "who is this", and silently substituting "local" would
     hand a token-holder the single-user owner's work.
+
+    The same reasoning applies to ``iss``. When only ``CAO_AUTH_JWKS_URI`` is
+    configured, ``_verify_token`` does not require an ``iss`` claim, so a
+    verified token can carry none. Defaulting it to ``LOCAL_ISSUER`` minted the
+    canonical id ``cao:local#<sub>`` — colliding with the named local principal
+    and violating the owner contract's issuer#subject identity (Copilot review
+    on #802). A verified issuer is required instead, fail-closed like ``sub``.
     """
 
     if not is_auth_enabled():
@@ -340,7 +347,9 @@ def extract_principal_from_token(token: str) -> Principal:
     subject = str(claims.get("sub", "")).strip()
     if not subject:
         raise PrincipalError("token carries no 'sub' claim to own work with")
-    issuer = str(claims.get("iss", "")).strip() or LOCAL_ISSUER
+    issuer = str(claims.get("iss", "")).strip()
+    if not issuer:
+        raise PrincipalError("token carries no verified 'iss' claim to scope ownership to")
     return Principal(subject=subject, issuer=issuer)
 
 

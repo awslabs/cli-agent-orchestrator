@@ -549,6 +549,25 @@ def test_token_without_sub_is_refused_rather_than_downgraded(monkeypatch, rsa_ke
         auth.extract_principal_from_token(token)
 
 
+def test_token_without_iss_is_refused_rather_than_localised(monkeypatch, rsa_key):
+    """A verified token with no issuer must not be minted as the local owner.
+
+    Defaulting a missing ``iss`` to ``LOCAL_ISSUER`` made the canonical id
+    ``cao:local#<sub>`` — colliding with the named local principal (Copilot
+    review on #802). ``get_authorization_servers`` derives an issuer from any
+    configured IdP, so ``_verify_token`` already pins ``iss`` and this state is
+    not normally reachable; the guard makes the owner path fail closed by
+    construction rather than by relying on that derivation. Patched here to
+    prove the guard directly.
+    """
+    from cli_agent_orchestrator.security.principal import PrincipalError
+
+    _enable_auth(monkeypatch, rsa_key)
+    monkeypatch.setattr(auth, "_verify_token", lambda _t: {"sub": "auth0|abc123"})
+    with pytest.raises(PrincipalError, match="iss"):
+        auth.extract_principal_from_token("token")
+
+
 def test_principal_ignores_a_sub_outside_the_signature(monkeypatch, rsa_key):
     """Only the signed claim counts.
 
