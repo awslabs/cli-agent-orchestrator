@@ -344,3 +344,106 @@ default, matching the example's default-off API posture — sends no header and
 nothing changes. As you note, the runtime-channel token authorizes the WS channel,
 not the HTTP API, so it was never accepted here; this gives the broker an
 explicitly configured central-API credential for when auth is enabled.
+
+# Replies to the seventh review round on #802
+
+Six Copilot follow-ups on the fifth/sixth-round fixes. Four were real gaps in
+those fixes and are closed in `75f0bb99`; two are design-level and I've explained
+the mitigation already in place and proposed them as follow-ups rather than fold
+a half-verified protocol/auth change into this PR.
+
+---
+
+## Reply to `runtime_channel/api.py:333` — GapFrame not fenced
+
+(comment id `4069662218`)
+
+Correct, and a real miss on my part. Fixed in `75f0bb99`. The `GapFrame` branch
+now calls `claim_terminal` before recording the position or publishing the gap,
+exactly like `StreamFrame`/`EventFrame`/`HeartbeatFrame`. Test: a forged gap for
+another runtime's terminal is dropped, and neither the watermark nor the routing
+moves.
+
+---
+
+## Reply to `runtime_channel/api.py:526` — teardown outcome ignored
+
+(comment id `4069662263`)
+
+Correct. Fixed in `75f0bb99`. `send_command` returns a non-OK `CommandResultFrame`
+for a runtime-side teardown failure rather than raising, so the compensating
+teardown now inspects the outcome and requires a `deleted`/`absent` confirmation;
+an unconfirmed cleanup is logged at ERROR ("did not confirm cleanup ... the agent
+may still be running") rather than passed over. The launch failure still surfaces
+as the 500. Test added for the FAILED-outcome path.
+
+---
+
+## Reply to `runtime_channel/registry.py:314` — local terminal claimable
+
+(comment id `4069806722`)
+
+Correct — `_placement_from_the_central_row` returned `None` for both a
+confirmed-local row and an absent one, so `claim_terminal` let a runtime claim an
+existing local terminal. Fixed in `75f0bb99`: a new `_placement_state` returns a
+tri-state (`named` / `local` / `absent`). A `local` row (exists, names no runtime)
+is now refused — claiming it would redirect a real local pane's routing/status —
+while `absent` (a phantom id, or the pre-commit window of a tracked launch) stays
+claimable. Test: a confirmed-local terminal is refused; a no-row id still binds.
+
+---
+
+## Reply to `mcp_server/stdio_bridge.py:96` — URL fallback not fail-closed
+
+(comment id `4069806622`)
+
+Correct. Fixed in `75f0bb99`. The shim now requires `CAO_MCP_HTTP_URL` explicitly
+(`resolve_shared_endpoint_url`, SystemExit otherwise), matching its documented
+"missing URL is fatal" contract. `shared_endpoint_url()` keeps its local-bind
+fallback for its legitimate same-host callers; only the shim, whose whole purpose
+is to forward to a shared endpoint, must fail closed rather than quietly become
+the per-agent in-pod server it removes. Test: the shim refuses to start without a
+shared URL.
+
+---
+
+## Reply to `runtime_channel/api.py:325` — generation not enforced
+
+(comment id `4069806687`)
+
+Fair, and I want to be straight about what is and isn't fixed here. The concrete
+takeover-hijack that `generation` was meant to fence — a different runtime seizing
+a terminal's identity — is now closed by the ownership fence (`claim_terminal`):
+a runtime can only bind a terminal the durable row places on it, so a foreign
+runtime cannot take over routing regardless of generation. What `generation` would
+add on top is disambiguating a *legitimate* reassignment (same terminal id, new
+generation, position reset to 0) from a stale continuation on the watermark path.
+
+Actually advancing and enforcing `generation` at the assignment boundary is a
+protocol change across the runtime and the server (nothing increments it today,
+as the existing comments note), and it interacts with the replay-position and
+status-fencing logic that this PR already reworked twice under review. I'd rather
+land it as a focused follow-up than bolt a half-enforced generation onto the end
+of this PR. Filing it as such; the security-relevant half is covered here.
+
+---
+
+## Reply to `test/api/test_inbox_sender_validation.py:52` — sender not bound to caller
+
+(comment id `4069876635`)
+
+Right that the existence check is necessary but not sufficient: it proves
+`sender_id` names a real terminal, not that the caller is that terminal, so a
+revoked runtime naming a foreign *non-revoked* terminal still passes and the owner
+gate then evaluates the impersonated terminal's owner. It is a strict improvement
+over the previous unvalidated param, and I've kept it.
+
+The full fix — binding `sender_id` to the authenticated/request-scoped caller —
+needs care I don't want to rush in this PR: the callback caller in the broker
+gateway topology authenticates as a forwarded worker identity, not as the sender
+terminal, and a naive "sender.owner must equal caller principal" check would
+reject legitimate cross-owner callbacks (a worker answering a supervisor owned by
+someone else). Deriving the sender server-side from the caller's identity is the
+right shape, but it depends on the gateway auth model this PR does not otherwise
+touch. Filing it as a follow-up rather than shipping a check that could drop valid
+inbox deliveries. Flagging clearly so it is a decision, not an omission.
