@@ -221,6 +221,10 @@ class TestTheSessionEndpointForwardsTheCallersProvider:
 
         with (
             patch(
+                "cli_agent_orchestrator.api.main.runtime_registry.is_remote",
+                return_value=True,
+            ),
+            patch(
                 "cli_agent_orchestrator.api.main.runtime_registry.runtime_for_terminal",
                 return_value="worker-1",
             ),
