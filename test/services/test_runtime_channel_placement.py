@@ -103,16 +103,28 @@ class TestPlacementSurvivesTheServer:
             fresh.is_remote(other)
         assert rows["calls"] == 2
 
-    def test_an_unreadable_database_is_unknown_and_is_not_cached_as_local(self, fresh, rows):
-        """A failed read must not pin the terminal to local execution forever."""
+    def test_an_unreadable_database_is_unknown_and_fails_closed_to_remote(self, fresh, rows):
+        """A failed read must not answer "local" and drive this host's tmux.
+
+        It is treated as remote/unknown (fail closed), never cached, and a later
+        successful read still learns the truth (guojing1217 on #802).
+        """
+        from cli_agent_orchestrator.runtime_channel.registry import PlacementUnavailableError
+
         rows["raise"] = True
-        assert fresh.is_remote(TID) is False
-        assert fresh.is_remote(TID) is False
+        assert fresh.is_remote(TID) is True
+        assert fresh.is_remote(TID) is True
         assert rows["calls"] == 2, "a failure is not an answer worth remembering"
 
+        # The low-level lookup surfaces the distinction rather than hiding it.
+        with pytest.raises(PlacementUnavailableError):
+            fresh._placement_from_the_central_row(TID)
+        # runtime_for_terminal reports the runtime as unknown, not "local".
+        assert fresh.runtime_for_terminal(TID) is None
+
         rows["raise"] = False
-        rows["row"] = _row("worker-1")
-        assert fresh.is_remote(TID) is True
+        rows["row"] = _row(None)  # a real read: this one is genuinely local
+        assert fresh.is_remote(TID) is False
 
     def test_a_live_binding_never_consults_the_database(self, fresh, rows):
         rows["row"] = _row("worker-9")

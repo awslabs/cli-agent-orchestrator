@@ -73,6 +73,15 @@ class RuntimeNotDispatchedError(RuntimeUnavailableError):
     """
 
 
+class PlacementUnavailableError(Exception):
+    """The durable placement row could not be read, so placement is UNKNOWN.
+
+    Distinct from a confirmed-local terminal (``None``): callers must not treat
+    a transient read failure as "local" and drive this host's tmux for a
+    terminal that may be remote (guojing1217 on #802). Never cached.
+    """
+
+
 class RemoteCommandError(Exception):
     """The runtime executed the command and reported a failure."""
 
@@ -278,7 +287,17 @@ class RuntimeChannelRegistry:
                 current,
             )
             return False
-        placement = self._placement_from_the_central_row(terminal_id)
+        try:
+            placement = self._placement_from_the_central_row(terminal_id)
+        except PlacementUnavailableError:
+            # Cannot confirm ownership: refuse rather than bind on a claim the
+            # durable row would have adjudicated. The runtime retries its hello.
+            logger.warning(
+                "runtime %s claim of terminal %s refused: placement unreadable",
+                runtime_id,
+                terminal_id,
+            )
+            return False
         if placement is not None and placement != runtime_id:
             logger.warning(
                 "runtime %s tried to claim terminal %s placed on %s; refusing",
@@ -316,8 +335,14 @@ class RuntimeChannelRegistry:
         answer, as ``None``) because a terminal's placement is fixed when it is
         created, and ``is_remote`` is on the status-poll path.
 
-        Never raises: a database that cannot be read is an unknown placement, and
-        an unknown placement must not be cached as "local".
+        Returns ``None`` for a confirmed-local terminal (a row with no
+        ``runtime_id``) and the runtime id for a confirmed-remote one. Raises
+        :class:`PlacementUnavailableError` when the row cannot be read: that is
+        an UNKNOWN placement, distinct from a confirmed-local one, and callers
+        must not collapse the two — answering "local" on a transient read
+        failure drove status polling and command routing into the controller's
+        own tmux for a terminal that may be remote (guojing1217 on #802). The
+        failure is never cached, so a later read can still learn the truth.
         """
         if terminal_id in self._recovered_placement:
             return self._recovered_placement[terminal_id]
@@ -325,9 +350,9 @@ class RuntimeChannelRegistry:
             from cli_agent_orchestrator.clients.database import get_terminal_metadata
 
             row = get_terminal_metadata(terminal_id)
-        except Exception as exc:  # noqa: BLE001 — placement is best-effort here
+        except Exception as exc:  # noqa: BLE001 — surfaced as an unknown placement
             logger.warning("placement lookup for terminal %s failed: %s", terminal_id, exc)
-            return None
+            raise PlacementUnavailableError(str(exc)) from exc
         runtime_id = None
         if row:
             metadata = row.get("metadata") or {}
@@ -343,16 +368,32 @@ class RuntimeChannelRegistry:
         Deliberately NOT a liveness question: a terminal whose executor is
         disconnected is still remote, and the command path says "runtime X is not
         connected" rather than silently running the work here.
+
+        Fails closed toward remote/unknown when the placement row cannot be
+        read: during a database outage the row is unreadable anyway, so the
+        caller gets a retryable "runtime not connected" / UNKNOWN status rather
+        than the local arm quietly driving this host's tmux for a terminal that
+        may live in a runtime (guojing1217 on #802).
         """
         if terminal_id in self._terminal_runtime:
             return True
-        return self._placement_from_the_central_row(terminal_id) is not None
+        try:
+            return self._placement_from_the_central_row(terminal_id) is not None
+        except PlacementUnavailableError:
+            return True
 
     def runtime_for_terminal(self, terminal_id: str) -> Optional[str]:
         bound = self._terminal_runtime.get(terminal_id)
         if bound is not None:
             return bound
-        return self._placement_from_the_central_row(terminal_id)
+        try:
+            return self._placement_from_the_central_row(terminal_id)
+        except PlacementUnavailableError:
+            # Which runtime is genuinely unknown — not "definitely local". The
+            # command path pairs this with ``is_remote`` (True on the same
+            # error), so the operation routes remote and fails with "runtime not
+            # connected" rather than running here.
+            return None
 
     def remote_terminal_ids(self) -> List[str]:
         """Every terminal bound to a runtime that is currently CONNECTED.
