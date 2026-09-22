@@ -1264,11 +1264,13 @@ class KimiCliProvider(BaseProvider):
         # CAO keeps the prompt-level guarantee for this change: kimi_cli is
         # registered as a soft-enforcement provider and silently upgrading an
         # advisory restriction to a hard one is a separate decision.
-        if self._allowed_tools and "*" not in self._allowed_tools:
+        if self._allowed_tools is not None and "*" not in self._allowed_tools:
             from cli_agent_orchestrator.constants import SECURITY_PROMPT
+            from cli_agent_orchestrator.utils.tool_mapping import (
+                tool_constraint_instruction,
+            )
 
-            tools_list = ", ".join(self._allowed_tools)
-            tool_constraint = f"\nYou only have access to these tools: {tools_list}\n"
+            tool_constraint = f"\n{tool_constraint_instruction(self._allowed_tools)}\n"
             system_prompt = SECURITY_PROMPT + tool_constraint + system_prompt
 
         if not system_prompt.strip():
