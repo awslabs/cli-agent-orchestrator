@@ -4,9 +4,10 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, NamedTuple, Optional, Set
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set
 
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
+from cli_agent_orchestrator.utils.atomic_file import locked_atomic_rewrite
 from cli_agent_orchestrator.utils.paths import normalized_path
 
 logger = logging.getLogger(__name__)
@@ -67,7 +68,7 @@ def _load_or_raise() -> Dict[str, Any]:
         raw = SETTINGS_FILE.read_text()
     except FileNotFoundError:
         return {}  # genuinely absent — defaults are the right answer
-    except OSError as e:  # PermissionError, IsADirectoryError, EIO, ...
+    except (OSError, UnicodeDecodeError) as e:  # PermissionError, EIO, bad bytes, ...
         raise SettingsUnreadableError(SETTINGS_FILE, e) from e
 
     try:
@@ -105,9 +106,62 @@ def settings_readable() -> bool:
 
 
 def _save(data: Dict[str, Any]) -> None:
-    """Save settings to disk."""
+    """Replace settings.json wholesale.
+
+    Not a read-modify-write and not locked; the public writers go through
+    :func:`_mutate` instead. Kept for callers (and tests) that seed a complete
+    file.
+    """
     CAO_HOME_DIR.mkdir(parents=True, exist_ok=True)
     SETTINGS_FILE.write_text(json.dumps(data, indent=2))
+
+
+class _NoWrite(Exception):
+    """Internal: the mutation decided nothing needs persisting."""
+
+
+def _mutate(update: Callable[[Dict[str, Any]], bool]) -> Dict[str, Any]:
+    """Locked, fail-closed read-modify-write of settings.json (#737).
+
+    Every writer used to do ``_load()`` / edit / ``_save()`` with no lock and a
+    lenient load, which has two failure modes with the same outcome, settings
+    silently gone:
+
+    * a file that exists but cannot be read or parsed loads as ``{}``, and the
+      write then persists that empty fallback as the new truth;
+    * two writers that both loaded before either saved each publish their own
+      view, and the later ``write_text`` wins whole.
+
+    ``update`` receives the parsed settings while an inter-process lock is
+    held, mutates them in place, and returns True to persist or False to leave
+    the file untouched. Absent still means ``{}`` (defaults are the right
+    answer), but a present file that cannot be read or parsed raises
+    :class:`SettingsUnreadableError` BEFORE ``update`` runs, so no writer can
+    replace unknown state with its own section. The publish goes through a
+    same-directory temp file and ``os.replace``, so a concurrent reader never
+    sees a partial file. Returns the settings as they stand after the call.
+    """
+    settings: Dict[str, Any] = {}
+
+    def compute(_existing: str) -> str:
+        # Re-read through _load_or_raise rather than trusting ``_existing``:
+        # the helper's own read treats a parent it cannot traverse as absent,
+        # which is exactly the case that has to fail closed here.
+        nonlocal settings
+        settings = _load_or_raise()
+        if not update(settings):
+            raise _NoWrite
+        return json.dumps(settings, indent=2)
+
+    try:
+        locked_atomic_rewrite(SETTINGS_FILE, compute)
+    except _NoWrite:
+        pass
+    except UnicodeDecodeError as e:
+        # The helper reads the file before handing over; undecodable bytes
+        # fail there, ahead of our own read.
+        raise SettingsUnreadableError(SETTINGS_FILE, e) from e
+    return settings
 
 
 def get_agent_dirs() -> Dict[str, str]:
@@ -140,26 +194,29 @@ def set_agent_dirs(dirs: Dict[str, str]) -> Dict[str, str]:
     legacy flat key (``agent_dirs``) for backward compatibility with older
     CAO versions that may still read it.
     """
-    settings = _load()
-    # Read current from nested first, fall back to flat
-    nested = settings.get("agents", {})
-    if isinstance(nested, dict) and "dirs" in nested and isinstance(nested["dirs"], dict):
-        current = nested["dirs"]
-    else:
-        current = settings.get("agent_dirs", {})
-    for provider, path in dirs.items():
-        if provider in _DEFAULTS:
-            current[provider] = path
-    # Write nested format
-    agents_section = settings.get("agents", {})
-    if not isinstance(agents_section, dict):
-        agents_section = {}
-    agents_section["dirs"] = current
-    settings["agents"] = agents_section
-    # Also write flat key for backward compat
-    settings["agent_dirs"] = current
-    _save(settings)
-    logger.info(f"Updated agent directories: {current}")
+
+    def update(settings: Dict[str, Any]) -> bool:
+        # Read current from nested first, fall back to flat
+        nested = settings.get("agents", {})
+        if isinstance(nested, dict) and "dirs" in nested and isinstance(nested["dirs"], dict):
+            current = nested["dirs"]
+        else:
+            current = settings.get("agent_dirs", {})
+        for provider, path in dirs.items():
+            if provider in _DEFAULTS:
+                current[provider] = path
+        # Write nested format
+        agents_section = settings.get("agents", {})
+        if not isinstance(agents_section, dict):
+            agents_section = {}
+        agents_section["dirs"] = current
+        settings["agents"] = agents_section
+        # Also write flat key for backward compat
+        settings["agent_dirs"] = current
+        return True
+
+    settings = _mutate(update)
+    logger.info(f"Updated agent directories: {settings.get('agent_dirs')}")
     return get_agent_dirs()
 
 
@@ -216,18 +273,77 @@ def set_disabled_agent_dirs(dirs: List[str]) -> List[str]:
         if configured is not None and configured not in seen:
             seen.add(configured)
             cleaned.append(configured)
-    settings = _load()
-    # Write nested format
-    agents_section = settings.get("agents", {})
-    if not isinstance(agents_section, dict):
-        agents_section = {}
-    agents_section["disabled_dirs"] = cleaned
-    settings["agents"] = agents_section
-    # Also write flat key for backward compat
-    settings["disabled_agent_dirs"] = cleaned
-    _save(settings)
+
+    def update(settings: Dict[str, Any]) -> bool:
+        # Write nested format
+        agents_section = settings.get("agents", {})
+        if not isinstance(agents_section, dict):
+            agents_section = {}
+        agents_section["disabled_dirs"] = cleaned
+        settings["agents"] = agents_section
+        # Also write flat key for backward compat
+        settings["disabled_agent_dirs"] = cleaned
+        return True
+
+    _mutate(update)
     logger.info(f"Disabled agent dirs: {cleaned}")
     return cleaned
+
+
+# Longest label accepted for a session alias. Long enough for a sentence-style
+# run name, short enough to stay on one line in any listing.
+SESSION_LABEL_MAX_LENGTH = 60
+
+
+def get_session_labels() -> Dict[str, str]:
+    """Operator-assigned friendly names for sessions (session_name -> label)."""
+    settings = _load()
+    labels = settings.get("session_labels", {})
+    return labels if isinstance(labels, dict) else {}
+
+
+def set_session_label(session_name: str, label: str) -> Dict[str, str]:
+    """Set, or clear with an empty/blank label, a session's friendly name.
+
+    Stored separately from the tmux session name so nothing that references
+    the real name (terminals, DB rows, the backend) is disturbed: a pure
+    display alias. Whitespace is trimmed and the label is capped at
+    ``SESSION_LABEL_MAX_LENGTH``. Returns the full label map after the update.
+
+    Setting a label over a settings.json that exists but cannot be read raises
+    :class:`SettingsUnreadableError` and leaves the file untouched. Clearing
+    one in that state is a warning and a no-op instead: session teardown clears
+    unconditionally, nothing can be written safely, and nothing has been lost.
+    """
+    clean = label.strip()[:SESSION_LABEL_MAX_LENGTH]
+
+    def update(settings: Dict[str, Any]) -> bool:
+        labels = settings.get("session_labels", {})
+        if not isinstance(labels, dict):
+            labels = {}
+        if clean:
+            if labels.get(session_name) == clean:
+                return False
+            labels[session_name] = clean
+        elif session_name in labels:
+            del labels[session_name]
+        else:
+            # Nothing to clear: do not rewrite settings.json for a no-op.
+            # Session teardown clears unconditionally, so this is the common
+            # case.
+            return False
+        settings["session_labels"] = labels
+        return True
+
+    try:
+        settings = _mutate(update)
+    except SettingsUnreadableError as e:
+        if clean:
+            raise
+        logger.warning(f"Not clearing label for {session_name}: {e}")
+        return {}
+    labels = settings.get("session_labels", {})
+    return labels if isinstance(labels, dict) else {}
 
 
 # Default server tuning values
@@ -759,38 +875,35 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
         ``workflow_journal_retention_count`` (int ≥ 0) — most-recent run-count
             retention bound (U7; default 100, NFR-SEC-3).
     """
-    settings = _load()
-    memory = settings.get("memory", {})
-    if not isinstance(memory, dict):
-        memory = {}
-
+    # Validate before touching the file, so bad input never takes the lock.
+    new_value: Any
     if key == "enabled":
         if not isinstance(value, bool):
             raise ValueError(f"enabled must be a bool, got {type(value).__name__}")
-        memory[key] = value
+        new_value = value
     elif key == "lint_enabled":
         if not isinstance(value, bool):
             raise ValueError(f"lint_enabled must be a bool, got {type(value).__name__}")
-        memory[key] = value
+        new_value = value
     elif key == "learning_enabled":
         if not isinstance(value, bool):
             raise ValueError(f"learning_enabled must be a bool, got {type(value).__name__}")
-        memory[key] = value
+        new_value = value
     elif key == "instruction_promotion_enabled":
         if not isinstance(value, bool):
             raise ValueError(
                 f"instruction_promotion_enabled must be a bool, got {type(value).__name__}"
             )
-        memory[key] = value
+        new_value = value
     elif key == "flush_threshold":
         fval = float(value)
         if not (0.0 < fval <= 1.0):
             raise ValueError(f"flush_threshold must be between 0.0 and 1.0, got {fval}")
-        memory[key] = fval
+        new_value = fval
     elif key in _WORKFLOW_JOURNAL_BOOL_KEYS:
         if not isinstance(value, bool):
             raise ValueError(f"{key} must be a bool, got {type(value).__name__}")
-        memory[key] = value
+        new_value = value
     elif key in _WORKFLOW_JOURNAL_INT_KEYS:
         # bool is an int subclass — reject it so True/False can't masquerade as 1/0.
         if isinstance(value, bool) or not isinstance(value, int):
@@ -798,13 +911,20 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
         min_value = 1 if key == "workflow_journal_output_cap_bytes" else 0
         if value < min_value:
             raise ValueError(f"{key} must be >= {min_value}, got {value}")
-        memory[key] = value
+        new_value = value
     else:
         raise ValueError(f"Unknown memory setting: {key}")
 
-    settings["memory"] = memory
-    _save(settings)
-    logger.info(f"Updated memory setting: {key}={memory[key]}")
+    def update(settings: Dict[str, Any]) -> bool:
+        memory = settings.get("memory", {})
+        if not isinstance(memory, dict):
+            memory = {}
+        memory[key] = new_value
+        settings["memory"] = memory
+        return True
+
+    _mutate(update)
+    logger.info(f"Updated memory setting: {key}={new_value}")
     return get_memory_settings()
 
 
@@ -835,17 +955,20 @@ def set_extra_agent_dirs(dirs: List[str]) -> List[str]:
     Writes to nested schema (``agents.extra_dirs``) and legacy flat key
     (``extra_agent_dirs``) for backward compatibility.
     """
-    settings = _load()
     extra_agent_dirs = [d for d in dirs if d.strip()]
-    # Write nested format
-    agents_section = settings.get("agents", {})
-    if not isinstance(agents_section, dict):
-        agents_section = {}
-    agents_section["extra_dirs"] = extra_agent_dirs
-    settings["agents"] = agents_section
-    # Also write flat key for backward compat
-    settings["extra_agent_dirs"] = extra_agent_dirs
-    _save(settings)
+
+    def update(settings: Dict[str, Any]) -> bool:
+        # Write nested format
+        agents_section = settings.get("agents", {})
+        if not isinstance(agents_section, dict):
+            agents_section = {}
+        agents_section["extra_dirs"] = extra_agent_dirs
+        settings["agents"] = agents_section
+        # Also write flat key for backward compat
+        settings["extra_agent_dirs"] = extra_agent_dirs
+        return True
+
+    _mutate(update)
     # Prune disabled entries that no longer point at any configured directory —
     # otherwise removing an extra dir leaves a stale disabled entry behind, and
     # re-adding that path later would come back silently pre-disabled.
@@ -925,15 +1048,18 @@ def set_extra_skill_dirs(dirs: List[str]) -> List[str]:
     Writes to nested schema (``skills.extra_dirs``) and legacy flat key
     (``extra_skill_dirs``) for backward compatibility.
     """
-    settings = _load()
     extra_skill_dirs = [d.strip() for d in dirs if isinstance(d, str) and d.strip()]
-    # Write nested format
-    skills_section = settings.get("skills", {})
-    if not isinstance(skills_section, dict):
-        skills_section = {}
-    skills_section["extra_dirs"] = extra_skill_dirs
-    settings["skills"] = skills_section
-    # Also write flat key for backward compat
-    settings["extra_skill_dirs"] = extra_skill_dirs
-    _save(settings)
+
+    def update(settings: Dict[str, Any]) -> bool:
+        # Write nested format
+        skills_section = settings.get("skills", {})
+        if not isinstance(skills_section, dict):
+            skills_section = {}
+        skills_section["extra_dirs"] = extra_skill_dirs
+        settings["skills"] = skills_section
+        # Also write flat key for backward compat
+        settings["extra_skill_dirs"] = extra_skill_dirs
+        return True
+
+    _mutate(update)
     return extra_skill_dirs

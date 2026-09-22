@@ -20,6 +20,17 @@ HTTP errors use standard status codes and generally return a JSON `detail`
 field. Authentication and network behavior depend on server configuration;
 see [Configuration](configuration.md) and [Security](../SECURITY.md).
 
+Handled responses carry an `X-Server-Time` header: the server's wall clock as
+an offset-aware ISO-8601 timestamp (an unhandled-exception 500 raised past the
+middleware stack does not). A browser client that renders relative
+times from server timestamps can measure its clock skew against it once and
+correct for it (WSL2 hosts have been observed hours adrift from the Windows
+browser next to them). The header is listed in `Access-Control-Expose-Headers`,
+so a page on another allowed origin (the Vite dev server, a configured
+`CAO_CORS_ORIGINS` deployment) can read it; without that a browser hides
+non-safelisted headers from `fetch`. It is informational; clients that ignore it are
+unaffected.
+
 ## HTTP route families
 
 ### Health and auth discovery
@@ -133,11 +144,29 @@ See [AG-UI](agui.md) for enablement, event shapes, and privacy boundaries.
 - Template validation and preview require the selected template to include a
   `schema.json` file.
 - `/agents/providers` reports provider availability.
+- Every write to `settings.json` (`POST /settings/*`, the session label
+  endpoint) is a locked read-modify-write published atomically, and it refuses
+  to run over a `settings.json` that exists but cannot be read or parsed: the
+  response is a `500` whose `detail` names the problem (never the server
+  path), and the file is left untouched rather than replaced by the one
+  section being written.
 - `/settings/*` exposes supported agent-directory, skill-directory, and memory
   settings.
 
 See [Agent Profiles](agent-profile.md) and
 [Configuration](configuration.md).
+
+- `GET /fs/dirs?path=` lists the subdirectories of one server-side folder
+  (directory names only, never files or contents; hidden folders after the
+  visible ones) for a folder picker, defaulting to the server user's home.
+  It accepts the same operator-typed spellings `working_directory` accepts
+  (see Sessions and terminals) but never creates anything, and it is
+  read-scope gated like `GET /settings/agent-dirs`. Note what it discloses:
+  child directory names for any path the server user can read, with no root
+  confinement. That is stronger than the existence check `working_directory`
+  already gives a caller, so under an auth-enabled deployment a read-scope
+  token can enumerate the filesystem; confine it to a root if that is your
+  deployment shape.
 
 ### Skills
 
@@ -167,6 +196,28 @@ See [Skills](skills.md) for discovery, installation, and catalog behavior.
   commits — commit and merge/push results before the terminal is deleted if
   they need to be kept. See the MCP `handoff`/`assign` tool descriptions for
   the full behavior.
+- `working_directory` on `POST /sessions` and
+  `POST /sessions/{session_name}/terminals` is normalized at the boundary
+  the way an operator types it into a browser field: surrounding quotes
+  (Explorer's "Copy as path") are stripped, `~` is expanded, and on WSL a
+  Windows drive path (`C:\x\y` or `C:/x/y`) is translated to the interop
+  mount (`/mnt/c/x/y`) when that drive is mounted. A missing directory is
+  created, bounded by a path-length and depth cap and performed only after the
+  request's cheaper validations pass, so a request that is rejected anyway
+  leaves nothing behind; a relative path, an existing non-directory, or an
+  unmounted drive is rejected as a `400` with a plain-language `detail`
+  instead of a `500` from tmux.
+- `POST /sessions/{session_name}/label` prefix-normalizes its name the same
+  way `POST /sessions` does, so `demo` and `cao-demo` address one session.
+- `POST /sessions/{session_name}/label` with `{"label": "..."}` sets a
+  friendly display name for a session (trimmed, capped at 60 characters; an
+  empty string clears it). It is a pure display alias stored in
+  `settings.json`, surfaced as `label` (or `null`) on `GET /sessions` and
+  `GET /sessions/{session_name}`, and cleared when the session is deleted;
+  nothing that references the real tmux session name is affected. Setting a
+  label for a session that does not exist is a `404`; clearing is accepted
+  regardless, since a session killed outside CAO leaves its label behind and
+  this is the only way to remove it.
 - `POST /sessions` accepts optional `group`/`metadata` at creation, opting a
   session's initial terminal into peer discovery (a mid-session worker uses
   `PATCH /terminals/{terminal_id}/group`/`metadata` instead — see below).
