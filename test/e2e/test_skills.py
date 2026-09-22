@@ -269,6 +269,7 @@ class TestOmpSkills:
         _run_skill_injection_test(provider="omp", agent_profile="developer")
 
 
+@pytest.mark.e2e
 class TestGrokCliSkills:
     """E2E runtime skill-catalog injection test for Grok Build CLI."""
 

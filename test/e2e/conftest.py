@@ -30,6 +30,32 @@ import requests
 from cli_agent_orchestrator.constants import API_BASE_URL
 
 
+def pytest_collection_modifyitems(items):
+    """Every test in this directory is an e2e test, marker or no marker.
+
+    The autouse fixture below is session-scoped: it boots a real server
+    subprocess and rewrites ``constants.API_BASE_URL`` for the rest of the
+    session, restoring only at session teardown. So a single unmarked test in
+    here is enough to drag that into a plain ``pytest`` run, where the default
+    ``-m 'not e2e and not integration'`` was supposed to exclude it — and every
+    later test that compares against ``API_BASE_URL`` then sees the fixture's
+    ephemeral port. That is exactly what ``TestGrokCliSkills`` did: one missing
+    decorator failed a test in ``test/mcp_server`` and nothing in the traceback
+    pointed back here. Marking by location closes the class of bug rather than
+    the instance.
+
+    Scoped by path on purpose: a conftest's ``pytest_collection_modifyitems``
+    receives the WHOLE session's items, not just this directory's, so marking
+    unconditionally would deselect the entire suite.
+    """
+    here = Path(__file__).parent.resolve()
+    e2e = pytest.mark.e2e
+    for item in items:
+        item_path = Path(str(getattr(item, "path", item.fspath))).resolve()
+        if here in item_path.parents and "e2e" not in item.keywords:
+            item.add_marker(e2e)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def require_cao_server(cao_server: CaoServer):
     """Delegates to the managed ``cao_server`` subprocess fixture.
