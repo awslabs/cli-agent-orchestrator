@@ -604,3 +604,82 @@ the terminal command paths (and the contract) use 503 for the same retryable
 availability condition, so a bridge rollout read as a permanent not-found. It is
 now 503. Test: a launch against a disconnected runtime is 503 with "not
 connected".
+
+# Follow-up: the two deferred items, revisited
+
+Both were previously deferred with reasoning. One is now implemented; the other
+turned out to be narrower than described, and fixing a regression in my own
+earlier change was the urgent part.
+
+---
+
+## Generation fencing — now implemented (`cc7da8de`)
+
+Supersedes the deferrals on `runtime_channel/registry.py:289`,
+`services/fifo_reader.py:255` and `runtime_channel/api.py:325` (comment ids
+`4070392105`, `4070392143`, `4069806687`).
+
+You were right that this was a real gap, and on reflection it was small enough to
+close properly rather than defer. `generation` was always 0, nothing advanced it,
+and the server never compared it — so a re-armed FIFO reader (offset counter back
+to 0) had its bytes appended contiguously to the previous stream, and every
+resume position and replay afterwards described a transcript that never existed.
+
+Four coordinated pieces:
+
+- **`ReplayBuffer.begin_generation()`** — increments the generation, clears the
+  retained window, restarts numbering at 0. The window goes with the stream it
+  described; replaying those bytes under a new generation would attribute one
+  stream's output to another.
+- **`Bridge._forward_output`** detects the restart from the producer's own
+  signal: the offset counter is monotonic per stream, so a start *behind* the
+  watermark means it restarted. It advances the generation and numbers the new
+  stream from 0 instead of splicing. No gap is invented — nothing was lost, the
+  stream ended.
+- **`registry.record_position(..., generation=)`** — a HIGHER generation SETS the
+  watermark (a new stream's 0 is not a rewind to be ignored by monotonic-max), a
+  LOWER one changes nothing, the same one keeps monotonic-max. New
+  `is_stale_generation()` answers the drop question, and generations are
+  forgotten on unbind/reconcile so a reused id starts clean.
+- **The `StreamFrame`/`GapFrame` handlers** drop stale-generation frames outright,
+  so a dead stream's bytes are never republished, and pass the frame generation
+  through.
+
+`record_position`'s `generation=None` path is untouched, so local bookkeeping and
+existing callers behave exactly as before. Tests cover the buffer transition
+(including one pinning *why* it is needed — `append_at` alone splices), the
+bridge emitting generation 1 at pos 0 after a restarted offset, the registry's
+three fence directions plus forget-on-unbind, and a channel-level test proving a
+stale-generation frame is not republished.
+
+---
+
+## Inbox sender binding — scope corrected, and a regression of mine fixed (`999f132c`)
+
+On `api/main.py:7324` / `test_inbox_sender_validation.py:52` (comment ids
+`4070392004`, `4069876635`).
+
+Digging into this properly turned up two things worth reporting.
+
+**First, a regression I introduced.** My existence check required *every*
+`sender_id` to name a terminal row — but operator surfaces post a label, not an
+id: `app_tools` sends `sender_id="operator"` for `send_message`, which has no
+terminal context at all. That path would have 404'd. No test caught it because
+the `app_tools` HTTP call is mocked. The check now applies only to a
+terminal-shaped sender (`^[a-f0-9]{8}$`), which is the case where a row must
+exist; a label cannot impersonate a terminal's owner anyway, since the owner
+lookup finds nothing and the message is attributed to no principal (the
+pre-existing unowned behaviour). Thanks — chasing your comment is what surfaced
+it.
+
+**Second, the remaining gap is narrower than "bind the sender".** The broker
+gateway already does exactly what you asked for, on the path that matters most:
+`gateway_inbox_message` overwrites `sender_id` with the authenticated lease
+identity ("Never trust the caller's sender_id"). So worker callbacks are already
+bound. What is left is the *direct central caller*, and that route has no trusted
+identity to derive from: the MCP→API calls carry only the auth token, with no
+caller-terminal header. Adding one means deciding who may assert it and
+propagating it through the MCP server — new trust surface, not a local change.
+I've written that reasoning into the code at the check itself so it is explicit
+rather than implied, and filed it as a follow-up. A caller naming another live
+terminal's real id still passes; I'm not claiming otherwise.
