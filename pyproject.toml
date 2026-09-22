@@ -44,7 +44,12 @@ dependencies = [
     "apscheduler>=3.10.4",
     "sqlalchemy>=2.0.0",
     "uvicorn[standard]>=0.24.0",
-    "websockets>=12.0",
+    # >=14.0: the runtime channel (bridge, native attach) passes
+    # additional_headers to websockets.connect, which the new asyncio client
+    # only accepts from 14.0 on — 12/13's legacy client used extra_headers and
+    # would TypeError before connecting, leaving every execution runtime
+    # unavailable (Copilot review on #802).
+    "websockets>=14.0",
     # Upper bound: libtmux 0.53.1 rewrote `neo.parse_output` to zip a fixed
     # 125-name format list against each row's values with `strict=True`, so any
     # row short of 125 values (a pane/session vanishing mid-listing, or a
