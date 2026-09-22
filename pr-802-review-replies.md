@@ -140,3 +140,207 @@ it with a traceback.
 
 New test pins the distinction: a `ValueError("Unknown provider type: typo_cli")` now
 escapes `_process_chunk` rather than being swallowed, and the missing-row case stays quiet.
+
+# Replies to the fifth/sixth review rounds on #802
+
+Fifteen more comments across a Copilot pass and a detailed review by guojing1217
+(several reproduced end to end on EKS). All fixed; commits noted per reply. As
+before, the PAT here cannot post to the PR, so these are paste-ready.
+
+---
+
+## Reply to the terminal-ownership hijack — hello + frame handlers
+
+(comment ids `4068664335`, `4068551547`, `4069096785`, and the metadata half `4065995057`)
+
+Fixed in `b298a8a5`. You are right on every point, including the flap-back on the
+real owner's next heartbeat — that was the tell that nothing adjudicated the claim.
+
+`CAO_RUNTIME_TOKEN` is one fleet-wide secret, so a connected runtime is only ever
+proven to be *some* authorized executor, never the one that owns a given terminal.
+The new `registry.claim_terminal` is the fence every inbound bind now goes through
+(hello resume, `StreamFrame`, `EventFrame`, `HeartbeatFrame`): it binds only when
+the terminal is already this runtime's (a continuation), or is unbound and the
+durable central row either names this runtime or does not exist yet (restart
+recovery). Otherwise it refuses, logs both ids, and leaves the binding untouched —
+and the hello path drops the refused entry from `resume`, so a claiming runtime is
+never handed the stream position of a terminal it never launched. The flap is gone
+because a refused claim does not rebind.
+
+On the metadata vector you flagged alongside it: `update_terminal_metadata` now
+preserves the server-owned `runtime_id` across an agent's whole-dict replace, so
+the placement the fence reads cannot be cleared or repointed through the
+`update_metadata` tool. Moving it to a dedicated column is the cleaner end state
+and is worth a follow-up; preserving the key closes the hole without a migration.
+
+Tests: registry-level fence (unbound-elsewhere refused, owner reclaims after
+restart, a bound terminal is not stealable, no-row is claimable, no flap under an
+imposter speaking last), a channel-level replay of the reproduced hello hijack
+(resume drops the foreign claim, routing stays with the owner), and two database
+tests pinning `runtime_id` preservation.
+
+---
+
+## Reply to `src/cli_agent_orchestrator/api/main.py:3982` — 503 wrapped as 500
+
+(comment id `4068649397`)
+
+Fixed in `aa202634`. Confirmed exactly as you measured: only `delete_terminal`
+re-raised `HTTPException`, so `send_terminal_input`/`key` and `get_terminal_output`
+caught the 503 in their bare `except Exception` and rewrapped it as a 500 with the
+status stringified into the detail.
+
+`except HTTPException: raise` now sits ahead of each catch-all, so all four remote
+arms agree and the PR body's "a disconnected runtime is an explicit 503" is true.
+New test asserts 503 (not a 500-wrapping-503) on input, key and output for a
+disconnected runtime.
+
+---
+
+## Reply to `src/cli_agent_orchestrator/security/auth.py:344` — issuer fallback
+
+(comment id `4065995103`)
+
+Fixed in `d373dba1`. `extract_principal_from_token` now requires a non-empty
+verified `iss`, fail-closed like the `sub` check, rather than defaulting to
+`LOCAL_ISSUER`.
+
+One precision for the record: `get_authorization_servers` derives an issuer from
+any configured IdP — including the origin of a bare `CAO_AUTH_JWKS_URI` — so
+`_verify_token` already pins `iss` whenever auth is on, which made the
+`or LOCAL_ISSUER` fallback effectively unreachable. The change removes the
+reliance on that derivation and makes the owner path fail closed by construction.
+
+---
+
+## Reply to `src/cli_agent_orchestrator/utils/terminal.py:202` — placement fails open
+
+(comment id `4065995141`)
+
+Fixed in `d775d421`. `_placement_from_the_central_row` returned `None` both for a
+confirmed-local terminal and for a transient read failure, so `is_remote` took the
+local arm on a DB blip and drove this host's tmux.
+
+The lookup now raises `PlacementUnavailableError` on a read failure, distinct from
+the `None` that means confirmed-local. `is_remote` fails closed to `True` on it (a
+retryable "not connected" / UNKNOWN beats addressing the wrong local pane — during
+a DB outage the row is unreadable anyway), `runtime_for_terminal` reports the
+runtime as unknown rather than local, and `claim_terminal` refuses a claim it
+cannot adjudicate. The failure is never cached, so a later read still learns the
+truth. The exception is contained in the registry, so `is_remote`/`runtime_for_terminal`
+keep their existing signatures and no caller changes.
+
+---
+
+## Reply to `src/cli_agent_orchestrator/runtime_channel/api.py:424` — engine not persisted
+
+(comment id `4068551561`)
+
+Fixed in `94d6538b`. `body.engine` is now passed to `db_create_terminal` (runtime
+echo preferred, request as fallback) and returned on the `Terminal`, so reuse
+validation and the KAS input gate read the engine that was actually launched.
+
+You were right about the knock-on too: `flow_service` still refused non-default
+remote engines on the "LAUNCH cannot carry engine" grounds, which stopped being
+true when the field was added to `CreateRemoteTerminalBody`. That refusal is gone
+and the engine is forwarded. Test: a `kas` flow now launches remotely with the
+engine set instead of being refused.
+
+---
+
+## Reply to `src/cli_agent_orchestrator/runtime_channel/api.py:421` — leaked pod on persist failure
+
+(comment id `4068551557`)
+
+Fixed in `94d6538b`. If `db_create_terminal` raises after the provider has
+launched, there is no row and no binding — a live agent nothing can route to or
+tear down. The persist is now wrapped: on failure a best-effort `TEARDOWN` goes to
+the same connection for the launched id (both ids in hand, as you noted), and the
+launch failure surfaces as a 500. Tests: the compensating teardown fires for the
+leaked id and never binds, and a teardown that itself fails does not mask the
+launch error.
+
+---
+
+## Reply to `src/cli_agent_orchestrator/services/inbox_service.py:167` — forgeable sender
+
+(comment id `4068551552`)
+
+Fixed in `892f4e52`. `POST /terminals/{receiver}/inbox/messages` now requires
+`sender_id` to name an existing terminal (404 otherwise), so a revoked owner's
+agent can no longer name an arbitrary live terminal as sender to slip past the
+delivery-time owner gate. The check lives at the central endpoint rather than in
+`create_inbox_message`, because on a runtime's local DB a legitimate sender — the
+supervisor that dispatched the work — has no local row, and the cross-node callback
+path writes through that function directly. Tests cover the forged-sender 404 and
+the real-sender accept.
+
+---
+
+## Reply to `src/cli_agent_orchestrator/runtime_channel/registry.py:153` — redelivered result discarded
+
+(comment id `4069096825`)
+
+Fixed in `7d7ad76a`. `resolve` now reports whether the op was pending. On an
+unmatched result the channel reconciles before acking: a successful result
+carrying a terminal payload with no central row is persisted (`metadata.runtime_id`
+set) and bound through the ownership fence, so a LAUNCH result the old server never
+acked no longer orphans a live terminal. `owner` is server state the restart lost
+and is never sent to the runtime, so a reconciled terminal has none — a known
+limitation, far better than a leaked pod. Best-effort, so a failure cannot stall
+the ack into an infinite retry. Non-LAUNCH and already-persisted results are
+unaffected. Test: a redelivered LAUNCH result for an unknown op persists and binds
+the terminal before the ack.
+
+---
+
+## Reply to `src/cli_agent_orchestrator/runtime_channel/api.py:431` — runtime_id in agent-writable metadata
+
+(comment id `4065995057`)
+
+Addressed in `b298a8a5` (see the ownership-hijack reply above). `runtime_id` is now
+preserved across `update_terminal_metadata`'s whole-dict replace, so the routing
+binding cannot be cleared or repointed through the agent-facing tool. I agree the
+durable end state is a server-owned column rather than a metadata key, and the
+ownership fence gives a second reason to move it there; flagging that as a
+follow-up rather than folding a schema migration into this PR.
+
+---
+
+## Reply to `examples/cao-clusters/kubernetes/eks/broker.yaml:95` — placeholder guard blocks deploy
+
+(comment id `4069016103`)
+
+Fixed in `7ae9e4b6`. `deploy.sh`'s guard now excludes comment lines, so the
+commented `arn:aws:iam::<account>:role/<worker-role>` example no longer trips it —
+a YAML comment cannot become a bad image name or an empty CIDR — while the guard
+stays strict for real unrendered values. Kept the example as a comment rather than
+switching to `ACCOUNT`/`WORKER_ROLE`, since the comment-line exclusion is the more
+general fix (a future commented placeholder will not regress it either).
+
+---
+
+## Reply to `examples/cao-clusters/kubernetes/eks/deploy.sh:283` — rollout status on OnDelete
+
+(comment id `4069016118`)
+
+Fixed in `7ae9e4b6`. Confirmed: `cao-server` is `updateStrategy: OnDelete` and
+`kubectl rollout status` rejects any non-RollingUpdate strategy up front with exit
+1, so under `set -euo pipefail` the deploy aborted right after `kubectl apply -k`
+and the later gates never ran. Swapped the server gate to
+`kubectl wait --for=condition=ready pod/cao-server-0`, which is strategy-agnostic.
+The supervisor (RollingUpdate) and the two Deployments keep `rollout status`.
+
+---
+
+## Reply to `examples/cao-clusters/kubernetes/eks/broker.py:125` — unauthenticated GET /runtimes
+
+(comment ids `4069096743`, and the same on line 1841)
+
+Fixed in `7ae9e4b6`. Both `GET /runtimes` reads (`_connected_runtimes` and
+`_central_runtime_terminals`) now send a Bearer from a new
+`CAO_ELASTIC_CENTRAL_API_TOKEN` when set, via `_central_api_headers()`. Unset — the
+default, matching the example's default-off API posture — sends no header and
+nothing changes. As you note, the runtime-channel token authorizes the WS channel,
+not the HTTP API, so it was never accepted here; this gives the broker an
+explicitly configured central-API credential for when auth is enabled.
