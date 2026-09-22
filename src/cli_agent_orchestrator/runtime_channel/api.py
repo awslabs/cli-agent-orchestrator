@@ -181,7 +181,12 @@ async def runtime_channel(ws: WebSocket) -> None:
     # without persisting live channel state.
     resume: List[StreamPosition] = []
     for stream_pos in hello.streams:
-        runtime_registry.bind_terminal(stream_pos.terminal_id, runtime_id)
+        # A hello names the terminals this runtime says it owns, but the shared
+        # token makes that a claim, not a proof: refuse any it does not own and
+        # drop the entry from resume, so the server never hands a claiming
+        # runtime the stream position of a terminal it never launched.
+        if not runtime_registry.claim_terminal(stream_pos.terminal_id, runtime_id):
+            continue
         resume.append(
             StreamPosition(
                 terminal_id=stream_pos.terminal_id,
@@ -246,10 +251,14 @@ async def runtime_channel(ws: WebSocket) -> None:
                 await ws.send_text(encode_frame(AckFrame(op_id=frame.op_id)))
             elif isinstance(frame, StreamFrame):
                 raw = base64.b64decode(frame.data)
-                # A terminal streaming through this channel is de facto
-                # executed by this runtime — keep routing bound even if the
-                # hello snapshot predated the terminal's creation.
-                runtime_registry.bind_terminal(frame.terminal_id, runtime_id)
+                # A terminal streaming through this channel is de facto executed
+                # by this runtime — keep routing bound even if the hello snapshot
+                # predated the terminal's creation. But a shared-token runtime
+                # can just as easily emit a StreamFrame for a terminal it does
+                # not own to republish its output and advance its position; a
+                # refused claim drops the frame rather than rebinding.
+                if not runtime_registry.claim_terminal(frame.terminal_id, runtime_id):
+                    continue
                 if frame.stream == StreamName.ATTACH:
                     # Interactive bytes go to the live attach client, never
                     # the bus; an empty frame is the runtime PTY's EOF.
@@ -294,7 +303,8 @@ async def runtime_channel(ws: WebSocket) -> None:
                     {"data": "", "gap": {"from_pos": frame.from_pos, "to_pos": frame.to_pos}},
                 )
             elif isinstance(frame, EventFrame):
-                runtime_registry.bind_terminal(frame.terminal_id, runtime_id)
+                if not runtime_registry.claim_terminal(frame.terminal_id, runtime_id):
+                    continue
                 if frame.type == EventType.STATUS and frame.status is not None:
                     runtime_registry.set_status(frame.terminal_id, frame.status, conn=conn)
                     bus.publish(
@@ -302,7 +312,8 @@ async def runtime_channel(ws: WebSocket) -> None:
                     )
             elif isinstance(frame, HeartbeatFrame):
                 for stream_pos in frame.streams:
-                    runtime_registry.bind_terminal(stream_pos.terminal_id, runtime_id)
+                    if not runtime_registry.claim_terminal(stream_pos.terminal_id, runtime_id):
+                        continue
                     _note_heartbeat_watermark(behind, stream_pos, runtime_id)
             else:
                 logger.warning("unexpected frame kind from runtime %s: %s", runtime_id, frame.kind)

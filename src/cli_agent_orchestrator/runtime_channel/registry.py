@@ -234,8 +234,61 @@ class RuntimeChannelRegistry:
     # --- terminal routing ---
 
     def bind_terminal(self, terminal_id: str, runtime_id: str) -> None:
+        """Unconditional bind. The server owns this call — it is made once, at
+        creation, by ``POST /runtimes/{id}/terminals`` right after it has
+        written the durable placement row. Inbound channel frames must go
+        through :meth:`claim_terminal` instead, which enforces ownership."""
         self._terminal_runtime[terminal_id] = runtime_id
         self._recovered_placement.pop(terminal_id, None)
+
+    def claim_terminal(self, terminal_id: str, runtime_id: str) -> bool:
+        """A runtime asserts, over the channel, that it owns ``terminal_id``.
+
+        ``CAO_RUNTIME_TOKEN`` is one secret shared by the whole fleet, so a
+        connected runtime is only ever proven to be *some* authorized executor —
+        never proven to be the one that launched this terminal. Binding on that
+        assertion alone let any runtime claim any terminal id: routing, replay
+        position and the next input then followed the claimant, and on the next
+        real owner's heartbeat the binding flapped back, so an operator saw
+        routing change by itself (guojing1217 + Copilot reviews on #802,
+        reproduced on EKS). ``generation`` was meant to fence a takeover but is
+        never advanced, so it cannot tell a takeover from a continuation.
+
+        The bind is therefore allowed only when the claim is consistent with an
+        authority this runtime cannot forge:
+
+        * the terminal is already bound here to this same runtime — a
+          continuation, the common case for every frame after the first;
+        * it is unbound in memory and the durable central row either names this
+          runtime or does not exist yet — the restarted-server recovery path,
+          where the launching runtime's own hello re-establishes the binding;
+
+        and refused otherwise. A refused claim leaves the existing binding
+        untouched and is logged with both ids. Returns ``True`` when the
+        terminal is bound to ``runtime_id`` on return, ``False`` when refused.
+        """
+        current = self._terminal_runtime.get(terminal_id)
+        if current == runtime_id:
+            return True
+        if current is not None:
+            logger.warning(
+                "runtime %s tried to claim terminal %s already bound to %s; refusing",
+                runtime_id,
+                terminal_id,
+                current,
+            )
+            return False
+        placement = self._placement_from_the_central_row(terminal_id)
+        if placement is not None and placement != runtime_id:
+            logger.warning(
+                "runtime %s tried to claim terminal %s placed on %s; refusing",
+                runtime_id,
+                terminal_id,
+                placement,
+            )
+            return False
+        self.bind_terminal(terminal_id, runtime_id)
+        return True
 
     def unbind_terminal(self, terminal_id: str) -> None:
         self._terminal_runtime.pop(terminal_id, None)

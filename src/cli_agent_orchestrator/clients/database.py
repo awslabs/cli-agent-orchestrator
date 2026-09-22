@@ -2102,15 +2102,42 @@ def update_terminal_group(terminal_id: str, group: Optional[List[str]]) -> bool:
         return True
 
 
+#: Metadata keys the server owns and an agent-facing metadata write must not be
+#: able to change or drop. ``runtime_id`` is the durable record of which runtime
+#: a remote terminal was launched on; the runtime-channel binding recovery and
+#: the ownership fence both read it, so an agent that could clear it via
+#: ``update_metadata`` could make a live remote terminal look local or let
+#: another runtime claim it (Copilot review on #802).
+_SERVER_OWNED_METADATA_KEYS = ("runtime_id",)
+
+
 def update_terminal_metadata(terminal_id: str, metadata: Optional[Dict[str, Any]]) -> bool:
-    """Replace a terminal's free-form metadata dict. ``None``/``{}`` clears it."""
+    """Replace a terminal's free-form metadata dict. ``None``/``{}`` clears it.
+
+    Server-owned keys (:data:`_SERVER_OWNED_METADATA_KEYS`) are carried over
+    from the existing row regardless of what the caller sends, so this
+    whole-dict replace cannot strip the routing binding. The creation path
+    writes those keys directly and is unaffected.
+    """
     import json as _json
 
     with SessionLocal() as db:
         terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
         if not terminal:
             return False
-        terminal.metadata_json = _json.dumps(metadata) if metadata else None
+        preserved: Dict[str, Any] = {}
+        if terminal.metadata_json:
+            try:
+                existing = _json.loads(terminal.metadata_json)
+            except (ValueError, TypeError):
+                existing = {}
+            if isinstance(existing, dict):
+                for key in _SERVER_OWNED_METADATA_KEYS:
+                    if key in existing:
+                        preserved[key] = existing[key]
+        merged: Dict[str, Any] = dict(metadata) if metadata else {}
+        merged.update(preserved)
+        terminal.metadata_json = _json.dumps(merged) if merged else None
         db.commit()
         return True
 

@@ -383,6 +383,42 @@ class TestChannelEndpoint:
             assert runtime_registry.runtime_for_terminal(TID) == "worker-1"
         runtime_registry.unbind_terminal(TID)
 
+    def test_a_hello_claiming_anothers_terminal_is_dropped_from_resume(self, channel_client):
+        """The reproduced hijack (guojing1217 on #802): a second runtime's hello
+        names a terminal launched on the first. The server must refuse the claim,
+        leave routing on the real owner, and not hand back its stream position."""
+        from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
+
+        # worker-1 owns TID (as creation would have bound it).
+        runtime_registry.bind_terminal(TID, "worker-1")
+        runtime_registry.record_position(TID, "capture", 7166)
+        try:
+            with channel_client.websocket_connect(
+                "/runtime/channel",
+                headers={"Host": "localhost", "X-CAO-Runtime-Token": "test-runtime-token"},
+            ) as ws:
+                ws.send_text(
+                    _hello(
+                        runtime_id="worker-2",
+                        streams=[
+                            StreamPosition(
+                                terminal_id=TID,
+                                stream=StreamName.CAPTURE,
+                                generation=1,
+                                end_pos=0,
+                            )
+                        ],
+                    )
+                )
+                reply = decode_frame(ws.receive_text())
+                assert isinstance(reply, HelloFrame)
+                # No resume entry: worker-2 is never told TID's position.
+                assert [r for r in reply.resume if r.terminal_id == TID] == []
+            # Routing never moved off the real owner.
+            assert runtime_registry.runtime_for_terminal(TID) == "worker-1"
+        finally:
+            runtime_registry.unbind_terminal(TID)
+
     def test_stream_and_status_republish_to_bus(self, channel_client):
         from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
         from cli_agent_orchestrator.services.event_bus import bus
@@ -866,7 +902,11 @@ class TestAHeartbeatWatermarkTheServerIsBehind:
                 ws.send_text(self._heartbeat(500))
                 self._sync(ws, "sync-hb")
 
-        assert not [r for r in caplog.records if HB_TID in r.message]
+        assert not [
+            r
+            for r in caplog.records
+            if HB_TID in r.message and r.name == "cli_agent_orchestrator.runtime_channel.api"
+        ]
 
     def test_output_arriving_between_heartbeats_clears_the_suspicion(self, channel_client, caplog):
         """Progress is the discriminator: bytes landed, so nothing was lost."""
@@ -891,7 +931,11 @@ class TestAHeartbeatWatermarkTheServerIsBehind:
                 ws.send_text(self._heartbeat(11))
                 self._sync(ws, "sync-hb")
 
-        assert not [r for r in caplog.records if HB_TID in r.message]
+        assert not [
+            r
+            for r in caplog.records
+            if HB_TID in r.message and r.name == "cli_agent_orchestrator.runtime_channel.api"
+        ]
 
     def test_a_heartbeat_the_server_is_level_with_is_silent(self, channel_client, caplog):
         """The steady state, which is every heartbeat on a healthy channel."""
@@ -905,7 +949,11 @@ class TestAHeartbeatWatermarkTheServerIsBehind:
                 ws.send_text(self._heartbeat(0))
                 self._sync(ws, "sync-hb")
 
-        assert not [r for r in caplog.records if HB_TID in r.message]
+        assert not [
+            r
+            for r in caplog.records
+            if HB_TID in r.message and r.name == "cli_agent_orchestrator.runtime_channel.api"
+        ]
 
     def test_a_heartbeat_still_binds_routing(self, channel_client):
         """The behaviour that was already there has to survive the addition."""

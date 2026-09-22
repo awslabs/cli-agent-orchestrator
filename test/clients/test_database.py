@@ -731,6 +731,53 @@ class TestGroupAndMetadata:
         mock_session.commit.assert_called_once()
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_update_terminal_metadata_preserves_server_owned_runtime_id(self, mock_session_class):
+        # An agent-facing whole-dict replace must not be able to drop the
+        # server-owned routing binding (Copilot review on #802): clearing
+        # runtime_id would make a live remote terminal look local or let another
+        # runtime claim it.
+        import json
+
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+
+        mock_terminal = MagicMock()
+        mock_terminal.metadata_json = '{"runtime_id": "worker-1", "task": "old"}'
+        mock_query = MagicMock()
+        mock_query.filter.return_value.first.return_value = mock_terminal
+        mock_session.query.return_value = mock_query
+        mock_session_class.return_value = mock_session
+
+        # The caller sends a dict that omits runtime_id entirely.
+        result = update_terminal_metadata("test123", {"task": "writing tests"})
+
+        assert result is True
+        written = json.loads(mock_terminal.metadata_json)
+        assert written["runtime_id"] == "worker-1"  # carried over, not dropped
+        assert written["task"] == "writing tests"  # the caller's change applied
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_update_terminal_metadata_runtime_id_cannot_be_overwritten(self, mock_session_class):
+        import json
+
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+
+        mock_terminal = MagicMock()
+        mock_terminal.metadata_json = '{"runtime_id": "worker-1"}'
+        mock_query = MagicMock()
+        mock_query.filter.return_value.first.return_value = mock_terminal
+        mock_session.query.return_value = mock_query
+        mock_session_class.return_value = mock_session
+
+        # A caller trying to point routing at another runtime is ignored.
+        update_terminal_metadata("test123", {"runtime_id": "worker-attacker"})
+
+        assert json.loads(mock_terminal.metadata_json)["runtime_id"] == "worker-1"
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_update_terminal_metadata_not_found(self, mock_session_class):
         mock_session = MagicMock()
         mock_session.__enter__ = MagicMock(return_value=mock_session)

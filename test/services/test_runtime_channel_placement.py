@@ -295,3 +295,51 @@ class TestAHelloDoesNotResurrectWhatItDoesNotClaim:
 
         assert fresh.reconcile_hello("worker-1", []) == [TID]
         assert fresh.get_status("cccc3333") is TerminalStatus.PROCESSING
+
+
+class TestARuntimeCannotClaimAnotherRuntimesTerminal:
+    """The shared-token hijack (guojing1217 + Copilot on #802, reproduced on EKS).
+
+    ``CAO_RUNTIME_TOKEN`` is one secret for the whole fleet, so a connected
+    runtime is only ever *some* authorized executor. ``claim_terminal`` is the
+    fence that stops one from binding a terminal it does not own; the channel
+    handlers route every inbound bind through it.
+    """
+
+    OTHER = "cccc3333"
+
+    def test_an_unbound_terminal_placed_elsewhere_cannot_be_claimed(self, fresh, rows):
+        # The durable row names worker-1; a replacement server starts unbound.
+        rows["row"] = _row(runtime_id="worker-1")
+        assert fresh.claim_terminal(TID, "worker-2") is False
+        assert fresh.runtime_for_terminal(TID) == "worker-1"
+
+    def test_the_launching_runtime_reclaims_after_a_restart(self, fresh, rows):
+        rows["row"] = _row(runtime_id="worker-1")
+        assert fresh.claim_terminal(TID, "worker-1") is True
+        assert fresh._terminal_runtime[TID] == "worker-1"
+
+    def test_a_terminal_bound_here_cannot_be_stolen(self, fresh, rows):
+        fresh.bind_terminal(TID, "worker-1")
+        assert fresh.claim_terminal(TID, "worker-2") is False
+        assert fresh.runtime_for_terminal(TID) == "worker-1"
+        # The refusal did not need the database: the live binding is authority.
+        assert rows["calls"] == 0
+
+    def test_the_same_runtime_reasserting_is_a_continuation(self, fresh):
+        fresh.bind_terminal(TID, "worker-1")
+        assert fresh.claim_terminal(TID, "worker-1") is True
+
+    def test_an_unbound_terminal_with_no_row_yet_is_claimable(self, fresh, rows):
+        # Local terminals and pre-placement races have no durable owner: allow.
+        rows["row"] = None
+        assert fresh.claim_terminal(TID, "worker-1") is True
+        assert fresh._terminal_runtime[TID] == "worker-1"
+
+    def test_the_binding_does_not_flap_when_an_imposter_speaks_last(self, fresh, rows):
+        # The EKS symptom: routing flipped to whoever spoke most recently.
+        rows["row"] = _row(runtime_id="worker-1")
+        fresh.bind_terminal(TID, "worker-1")
+        assert fresh.claim_terminal(TID, "worker-2") is False
+        assert fresh.claim_terminal(TID, "worker-1") is True
+        assert fresh.runtime_for_terminal(TID) == "worker-1"
