@@ -113,6 +113,22 @@ def _central_ws_url() -> str:
     return f"{scheme}://{parsed.netloc}/runtime/channel"
 
 
+def _central_api_headers() -> dict[str, str]:
+    """Bearer header for the central HTTP API when it enforces auth.
+
+    ``GET /runtimes`` is scope-gated (SCOPE_READ), so with API auth enabled an
+    unauthenticated call gets 401 — and then every bridge lease times out
+    because no bridge is ever considered usable (Copilot + guojing1217 on #802).
+    The runtime-channel token is a DIFFERENT credential (it authorizes the WS
+    channel, not the HTTP API), so it does not help here. Set
+    ``CAO_ELASTIC_CENTRAL_API_TOKEN`` to a token carrying at least SCOPE_READ;
+    unset (the default, and the default-off API posture this example ships with)
+    sends no header and nothing changes.
+    """
+    token = os.environ.get("CAO_ELASTIC_CENTRAL_API_TOKEN", "").strip()
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
 def _connected_runtimes() -> set[str]:
     """Runtime ids currently dialed into the central server.
 
@@ -122,7 +138,9 @@ def _connected_runtimes() -> set[str]:
     not-ready rather than a verdict.
     """
     try:
-        response = requests.get(f"{_central_url()}/runtimes", timeout=(5, 10))
+        response = requests.get(
+            f"{_central_url()}/runtimes", headers=_central_api_headers(), timeout=(5, 10)
+        )
         response.raise_for_status()
         return set(response.json().get("runtimes", {}))
     except (requests.RequestException, ValueError) as exc:
@@ -1838,7 +1856,9 @@ def _forward_to_worker(
 def _central_runtime_terminals(runtime_id: str) -> set[str]:
     """Terminal ids the central server currently routes to this runtime."""
     try:
-        response = requests.get(f"{_central_url()}/runtimes", timeout=(5, 10))
+        response = requests.get(
+            f"{_central_url()}/runtimes", headers=_central_api_headers(), timeout=(5, 10)
+        )
         response.raise_for_status()
         info = response.json().get("runtimes", {}).get(runtime_id)
     except (requests.RequestException, ValueError) as exc:

@@ -179,7 +179,15 @@ done < <(grep -E '^[[:space:]]*newTag:' "$RENDER/kustomization.yaml" | awk '{pri
 # <immutable-tag> straight through into the applied manifests, where a literal
 # "<immutable-tag>" in an image name surfaces ten minutes later as an
 # ImagePullBackOff, and a literal CIDR surfaces as a policy that matches nothing.
-if grep -rnE '<[a-z][a-z0-9-]*>' "$RENDER" --include='*.yaml'; then
+#
+# Comment lines are excluded: broker.yaml documents the optional worker-IRSA role
+# as a commented `arn:aws:iam::<account>:role/<worker-role>` example, and a YAML
+# comment cannot become a bad image name or an empty CIDR. Without this the guard
+# fired on that example and aborted a clean first deploy of the manifests as
+# shipped (guojing1217 on #802). grep -n prefixes each hit with `file:line:`, so
+# the filter drops hits whose content (after that prefix) is a `#` comment.
+if grep -rnE '<[a-z][a-z0-9-]*>' "$RENDER" --include='*.yaml' \
+     | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#'; then
   echo "error: unrendered placeholders above" >&2
   exit 1
 fi
@@ -277,10 +285,15 @@ kubectl apply -k "$RENDER"
 # for: a worker is a Deployment the broker mints per task, and none is created by
 # this apply at all.
 #
-# `rollout status` on a StatefulSet with updateStrategy OnDelete returns as soon
-# as the pod is Ready (it does not wait for an update it will never perform), so
-# this is still a real readiness gate for the server.
-kubectl -n cao-cluster rollout status statefulset/cao-server --timeout=600s
+# cao-server uses updateStrategy OnDelete (server.yaml), and `kubectl rollout
+# status` rejects any StatefulSet strategy other than RollingUpdate up front with
+# "rollout status is only available for RollingUpdate strategy type" and exit 1 —
+# it does not fall through to a readiness check. Under `set -euo pipefail` that
+# aborts the deploy immediately after `kubectl apply -k`, so the gates below never
+# run and a fleet that is in fact coming up looks like a failed deploy
+# (guojing1217 on #802, measured on a live server StatefulSet). `kubectl wait` is
+# strategy-agnostic and is the readiness gate this actually wants.
+kubectl -n cao-cluster wait --for=condition=ready pod/cao-server-0 --timeout=600s
 # The supervisor's Ready means its runtime channel is established, not just that
 # uvicorn bound a port - the probe is an exec on the marker cao-bridge writes
 # after the hello is accepted. Generous, because it is behind a provider install
