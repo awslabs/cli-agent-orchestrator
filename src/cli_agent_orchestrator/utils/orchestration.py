@@ -26,6 +26,7 @@ import logging
 import os
 import re
 import time
+import uuid
 from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple
 
 import requests
@@ -99,10 +100,36 @@ TERMINAL_CLEANUP_NUDGE_THRESHOLD = 10
 # use max(120.0, init_timeout). At the old 150.0s value, a legitimately-slow
 # (but successful) antigravity init past ~150s got killed client-side here,
 # leaving an orphaned worker terminal with no terminal_id surfaced to the
-# operator to clean it up (no exception handling wraps this call). 240.0
-# clears the highest known floor (antigravity's 180.0) with real headroom;
-# revisit if a future provider's floor exceeds it.
+# operator to clean it up. 240.0 clears the highest known SINGLE floor
+# (antigravity's 180.0) with real headroom.
+#
+# It does NOT clear every provider's real worst case, though (review on PR
+# #773): antigravity's initialize() runs three sequential waits --
+# wait_for_shell(10.0), then the startup-dialog handler and wait_until_status
+# EACH capped at max(180.0, init_timeout) -- so a successful default-settings
+# init can legitimately take up to ~370s; kimi's is similarly additive
+# (~300s). A per-provider-aware constant would have to grow every time a
+# provider's own sequential floor does, and a fixed number can never cover an
+# arbitrarily large `provider_init_timeout` profile override. So this value is
+# left as a headroomed TYPICAL-case budget, not an attempted worst-case
+# ceiling -- the real safety net is `_HANDOFF_CREATE_RECOVERY_TIMEOUT_S`
+# below: a client-side timeout on this call no longer loses the terminal_id
+# (see its use in `_handoff_impl`), so an init slower than even this padded
+# value degrades to "slightly slower response", not "orphaned worker".
 _HANDOFF_CREATE_TIMEOUT_S = 240.0
+
+# Follow-up client-side timeout for the idempotent RETRY issued when the
+# create call above times out (review on PR #773). The terminal's session/
+# window/DB row -- and this call's idempotency mapping -- are committed by
+# cao-server BEFORE provider.initialize() is even awaited (see
+# terminal_service.create_terminal), so by the time our own client-side
+# timeout fires, the terminal this attempt asked for already exists and is
+# already recorded under its idempotency key: a retry with that SAME key
+# resolves to the existing-terminal lookup branch and returns immediately,
+# without waiting out any remaining init time and without creating a second
+# (duplicate) worker. 60.0 only needs to cover that lookup's own round trip,
+# not any part of provider init.
+_HANDOFF_CREATE_RECOVERY_TIMEOUT_S = 60.0
 _TERMINAL_ID_PATTERN = re.compile(r"^[a-f0-9]{8}$")
 
 
@@ -427,9 +454,14 @@ def _create_terminal(
             ``None`` (default) keeps today's behavior (``_mcp_timeout()``,
             30s), which is fine for ``defer_init=True`` (assign's path:
             returns in <2s by design) but too short for a SYNCHRONOUS create
-            that waits out ``provider.initialize()`` (up to ~45s) -- pass an
-            explicit, larger value for that case (see
-            ``_HANDOFF_CREATE_TIMEOUT_S``).
+            that waits out ``provider.initialize()`` -- some providers'
+            own unconditional ready-timeout floors put a successful init well
+            past 300s (see ``_HANDOFF_CREATE_TIMEOUT_S``'s comment) -- pass an
+            explicit, larger value for that case. A client-side timeout on
+            this call is not fatal to the caller either way: the terminal it
+            asked for is already committed server-side by then, so retrying
+            with the same ``idempotency_key`` recovers it (see
+            ``_HANDOFF_CREATE_RECOVERY_TIMEOUT_S``'s use in ``_handoff_impl``).
         defer_init: If True, tell
             cao-server to skip the ``provider.initialize()`` wait and return
             as soon as the tmux window and DB record exist. Provider init
@@ -1238,15 +1270,47 @@ async def _handoff_impl(
         # GET); reassigning ``provider`` to its return value uses whatever it
         # actually persisted on the terminal as the source of truth for the
         # reuse call below, rather than assuming the two resolutions agree.
-        terminal_id, provider = _create_terminal(
-            agent_profile,
-            working_directory,
-            engine=engine,
-            model=model,
-            use_worktree=use_worktree,
-            create_timeout=_HANDOFF_CREATE_TIMEOUT_S,
-            idempotency_key=idempotency_key,
-        )
+        # A key is synthesized here even when the caller passed none (true of
+        # every caller today -- see this function's idempotency_key docstring
+        # note): it is used ONLY as this create call's own retry-safety net
+        # below, never forwarded past this function, so it carries none of
+        # the cross-call submission-dedup risk that note describes.
+        create_key = idempotency_key or uuid.uuid4().hex
+        try:
+            terminal_id, provider = _create_terminal(
+                agent_profile,
+                working_directory,
+                engine=engine,
+                model=model,
+                use_worktree=use_worktree,
+                create_timeout=_HANDOFF_CREATE_TIMEOUT_S,
+                idempotency_key=create_key,
+            )
+        except requests.exceptions.Timeout:
+            # The client gave up waiting on provider.initialize(), but the
+            # terminal's session/window/DB row -- and this call's idempotency
+            # mapping -- were already committed by cao-server BEFORE it even
+            # started that wait (terminal_service.create_terminal). So the
+            # terminal this attempt asked for already exists; retrying with
+            # the SAME key resolves to the existing-terminal lookup branch and
+            # returns it immediately, recovering the terminal_id instead of
+            # leaving an orphaned worker with no id to clean it up with (issue
+            # #931, review on PR #773).
+            logger.warning(
+                "handoff: create timed out after %ss waiting on provider init; "
+                "retrying with the same idempotency key to recover the "
+                "terminal_id it already committed, rather than orphaning it",
+                _HANDOFF_CREATE_TIMEOUT_S,
+            )
+            terminal_id, provider = _create_terminal(
+                agent_profile,
+                working_directory,
+                engine=engine,
+                model=model,
+                use_worktree=use_worktree,
+                create_timeout=_HANDOFF_CREATE_RECOVERY_TIMEOUT_S,
+                idempotency_key=create_key,
+            )
         if on_terminal_id is not None:
             try:
                 on_terminal_id(terminal_id)

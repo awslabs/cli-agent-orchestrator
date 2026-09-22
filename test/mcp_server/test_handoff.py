@@ -906,3 +906,113 @@ class TestHandoffCreateTimeoutCoversProviderFloors:
         assert result.terminal_id == "term-0001"
         assert reported == ["term-0001"]
         assert created_terminal_ids == ["term-0001"]
+
+
+class TestHandoffCreateTimeoutRecovery:
+    """Review on PR #773: raising ``_HANDOFF_CREATE_TIMEOUT_S`` narrows the
+    orphaned-terminal window but cannot close it -- several providers'
+    sequential ready-timeout floors put a successful init above any single
+    fixed constant (antigravity ~370s, kimi ~300s under defaults; a profile's
+    ``provider_init_timeout`` override raises those further). The actual fix
+    is making the create call resilient to ITS OWN client-side timeout: the
+    terminal's session/window/DB row commits server-side before
+    ``provider.initialize()`` is even awaited, so a retry with the same
+    idempotency key recovers the terminal_id instead of losing it."""
+
+    def test_client_timeout_recovers_terminal_id_via_idempotent_retry(self):
+        """A real client-side ``requests.Timeout`` on the first create call
+        (server genuinely slower than the client is willing to wait) must not
+        surface as a bare failure with no terminal_id: the retry, keyed on
+        the same idempotency key generated internally for this call, must
+        hit the server's existing-terminal lookup and recover it -- proving
+        the failure mode from issue #931 / PR #773's review is closed
+        regardless of how the timeout constant is tuned."""
+        import http.server
+        import json
+        import threading
+        import time
+        from urllib.parse import parse_qs, urlsplit
+
+        from cli_agent_orchestrator.utils import orchestration
+
+        committed = {}
+        request_count = {"n": 0}
+        lock = threading.Lock()
+
+        class RecoverableSlowServerHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format, *args):  # noqa: A002 -- matches base signature
+                pass
+
+            def do_POST(self):
+                path, _, query = self.path.partition("?")
+                if path == "/sessions":
+                    key = parse_qs(query).get("idempotency_key", [None])[0]
+                    with lock:
+                        request_count["n"] += 1
+                        existing = committed.get(key)
+                    if existing is None:
+                        # First attempt: commit the terminal (mirroring
+                        # terminal_service.create_terminal persisting the row
+                        # + idempotency mapping BEFORE awaiting
+                        # provider.initialize()), THEN sleep out the
+                        # "initialize" wait -- long enough that the client's
+                        # own timeout gives up first.
+                        terminal_id = "term-recovered"
+                        with lock:
+                            committed[key] = terminal_id
+                        time.sleep(0.6)
+                    else:
+                        # Retry with the same key: the real server's
+                        # idempotency lookup returns immediately without
+                        # re-running (or re-waiting on) anything.
+                        terminal_id = existing
+                    body = json.dumps({"id": terminal_id, "provider": "antigravity_cli"}).encode()
+                    self.send_response(201)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                self.send_response(200)
+                self.end_headers()
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), RecoverableSlowServerHandler)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        old_base_url = orchestration.API_BASE_URL
+        old_timeout = orchestration._HANDOFF_CREATE_TIMEOUT_S
+        old_recovery_timeout = orchestration._HANDOFF_CREATE_RECOVERY_TIMEOUT_S
+        orchestration.API_BASE_URL = f"http://127.0.0.1:{port}"
+        # The server's "initialize" sleep (0.6s) is deliberately longer than
+        # this first-attempt timeout (0.2s) -- a genuine client-side Timeout
+        # must fire -- but the recovery attempt's timeout (2.0s) is generous,
+        # since the retry never has to wait out any remaining init time.
+        orchestration._HANDOFF_CREATE_TIMEOUT_S = 0.2
+        orchestration._HANDOFF_CREATE_RECOVERY_TIMEOUT_S = 2.0
+        os.environ.pop("CAO_TERMINAL_ID", None)
+
+        try:
+            reported = []
+            result = asyncio.run(
+                orchestration._handoff_impl(
+                    "some-agent-profile",
+                    "do the thing",
+                    on_terminal_id=reported.append,
+                    wait=False,
+                )
+            )
+        finally:
+            orchestration.API_BASE_URL = old_base_url
+            orchestration._HANDOFF_CREATE_TIMEOUT_S = old_timeout
+            orchestration._HANDOFF_CREATE_RECOVERY_TIMEOUT_S = old_recovery_timeout
+            server.shutdown()
+            thread.join(timeout=2)
+
+        assert result.success is True
+        assert result.terminal_id == "term-recovered"
+        assert reported == ["term-recovered"]
+        # Exactly two requests hit the server: the timed-out first attempt
+        # and the recovering retry -- not a fresh (duplicate) terminal.
+        assert request_count["n"] == 2
