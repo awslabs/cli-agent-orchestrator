@@ -512,3 +512,65 @@ malformed claim (`null`, a list, an object) into an owner id like `"None"` or
 ownership checks key on. Both `sub` and `iss` now require a non-empty string via
 an `isinstance` check and fail closed otherwise. Parametrized tests cover
 null/list/dict/int for each.
+
+# Replies to the tenth review round on #802
+
+One concrete fix (`c3f7404a`); three re-raises of design-level concerns I'm
+deferring with reasoning rather than rushing a cross-component change into this
+PR.
+
+---
+
+## Reply to `runtime_channel/bridge.py:836` — websockets version floor
+
+(comment id `4070392051`)
+
+Correct and concrete. Fixed in `c3f7404a`. The bridge and native attach pass
+`additional_headers`, which only the new asyncio `websockets.connect` accepts
+(14.0+); 12/13 routed to the legacy client's `extra_headers` and would
+`TypeError` before connecting. Raised the floor to `websockets>=14.0` (installed
+is 15.0.1, so only the declared lower bound moves).
+
+---
+
+## Reply to `api/main.py:7324` — sender not bound to caller (re-raise)
+
+(comment id `4070392004`, same as `4069876635`)
+
+Standing by the earlier reply: the existence check is a strict improvement over
+the previous unvalidated param and I've kept it, but binding `sender_id` to the
+authenticated caller depends on the broker-gateway auth model this PR does not
+touch — the callback caller authenticates as a forwarded worker identity, not as
+the sender terminal, so a naive "sender.owner == caller principal" check would
+reject legitimate cross-owner callbacks and silently drop valid inbox
+deliveries. Deriving the sender server-side from caller context is the right
+shape and I've filed it as a follow-up rather than ship a check I cannot verify
+against that auth model here. Flagging it as a deliberate decision, not an
+oversight.
+
+---
+
+## Reply to `runtime_channel/registry.py:289` and `services/fifo_reader.py:255` — generation never advances
+
+(comment ids `4070392105`, `4070392143`, with `4069806687`)
+
+These three converge on one real gap: `generation` is always 0, nothing advances
+it on a stream restart, and the server does not fence on it — so a replacement
+stream or reused terminal id can be accepted as a continuation of the old one,
+and a reader rearm can splice a new stream onto the old watermark without a
+gap/generation marker.
+
+I'm treating this as a dedicated follow-up rather than folding it into this PR,
+for two reasons. First, the security-relevant half of what generation was meant
+to prevent — a *different runtime* taking over a terminal's identity — is already
+closed by the ownership fence (`claim_terminal`): a foreign runtime cannot bind a
+terminal the durable row does not place on it, regardless of generation. What
+remains is same-runtime stream-restart fencing, a correctness concern, not an
+authorization bypass. Second, a correct fix is a coordinated protocol change
+across the `ReplayBuffer` (carry and reset a generation), `fifo_reader` (advance
+it on rearm/restart), the bridge (stamp frames), and the server registry
+(validate and transition at the boundary) — touching the exact replay/resume and
+watermark logic this PR has already reworked across several review rounds.
+Landing a half-enforced generation on top of that is more likely to introduce
+silent replay corruption than to remove it. It deserves its own change with its
+own test pass, which I've filed.
