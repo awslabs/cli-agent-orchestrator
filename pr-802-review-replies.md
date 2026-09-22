@@ -574,3 +574,33 @@ watermark logic this PR has already reworked across several review rounds.
 Landing a half-enforced generation on top of that is more likely to introduce
 silent replay corruption than to remove it. It deserves its own change with its
 own test pass, which I've filed.
+
+# Replies to the eleventh review round on #802
+
+Both fixed in `2ed7440f`.
+
+---
+
+## Reply to `runtime_channel/api.py:263` — hello resurrects status for an unclaimed terminal
+
+(comment id `4070743769`)
+
+Correct — the invariant was false. `reconcile_hello` deliberately keeps the
+binding for a terminal this hello omits, so keying the status seed on
+`runtime_for_terminal() == runtime_id` also matched those, letting a stale
+`statuses` entry resurrect them. Seeding is now restricted to the set of
+terminals actually claimed in THIS hello's stream loop (`bound_this_hello`), so
+only terminals this hello bound get a status. Test: a hello that omits a
+kept-bound terminal from streams but names it in `statuses` does not seed it.
+
+---
+
+## Reply to `runtime_channel/api.py:460` — launch returns 404 for a disconnected runtime
+
+(comment id `4070743811`)
+
+Correct. `launch_remote_terminal` returned 404 for a disconnected runtime while
+the terminal command paths (and the contract) use 503 for the same retryable
+availability condition, so a bridge rollout read as a permanent not-found. It is
+now 503. Test: a launch against a disconnected runtime is 503 with "not
+connected".
