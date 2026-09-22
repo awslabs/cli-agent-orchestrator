@@ -1151,7 +1151,11 @@ async def create_terminal(
         # only), so a restricted policy on them is advisory, not enforced.
         # Surface that loudly at launch so operators route restricted or
         # write-capable roles to hard-enforcement providers instead.
-        if provider in SOFT_ENFORCEMENT_PROVIDERS and allowed_tools and "*" not in allowed_tools:
+        if (
+            provider in SOFT_ENFORCEMENT_PROVIDERS
+            and allowed_tools is not None
+            and "*" not in allowed_tools
+        ):
             logger.warning(
                 f"Terminal {terminal_id}: provider '{provider}' cannot enforce tool "
                 f"restrictions (soft/prompt-level only) but profile '{agent_profile}' "

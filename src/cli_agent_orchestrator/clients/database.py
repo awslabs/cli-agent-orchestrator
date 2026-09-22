@@ -1827,7 +1827,10 @@ def create_terminal(
             provider=provider,
             agent_profile=agent_profile,
             working_directory=working_directory,
-            allowed_tools=_json.dumps(allowed_tools) if allowed_tools else None,
+            # ``[]`` is an explicit deny-all and must round-trip as ``[]``: a
+            # falsiness test stores it as SQL NULL, and every reader treats
+            # NULL as "nothing resolved", which is unrestricted.
+            allowed_tools=_json.dumps(allowed_tools) if allowed_tools is not None else None,
             shell_command=shell_command,
             caller_id=caller_id,
             engine=engine,

@@ -306,6 +306,25 @@ def get_allowed_tools(provider: str, allowed: List[str]) -> List[str]:
     return sorted(allowed_native)
 
 
+def tool_constraint_instruction(allowed: List[str]) -> str:
+    """The tool sentence injected into a soft-enforcement provider's prompt.
+
+    One rule for the providers in ``SOFT_ENFORCEMENT_PROVIDERS``, which have no
+    native restriction mechanism and carry their policy as prompt text. Six
+    call sites wrote this sentence by hand and five of them built it by joining
+    the list, so an empty ``allowed`` produced "You only have access to these
+    tools: " with nothing after the colon. An empty list is a deliberate
+    deny-all and has to say so in words.
+
+    Callers own the surrounding whitespace, which differs between them, and are
+    responsible for the ``is not None`` and ``"*"`` checks: this is the wording,
+    not the policy.
+    """
+    if not allowed:
+        return "You may not use any tools. Do not attempt to call one."
+    return f"You only have access to these tools: {', '.join(allowed)}"
+
+
 def format_tool_summary(allowed: List[str]) -> str:
     """Format allowedTools into a human-readable summary for the confirmation prompt.
 

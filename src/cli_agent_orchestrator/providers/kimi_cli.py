@@ -375,11 +375,13 @@ class KimiCliProvider(BaseProvider):
                 # Prepend security constraints for soft enforcement (Kimi CLI has no
                 # native tool restriction mechanism). Only applied when tool
                 # restrictions are active (not unrestricted "*").
-                if self._allowed_tools and "*" not in self._allowed_tools:
+                if self._allowed_tools is not None and "*" not in self._allowed_tools:
                     from cli_agent_orchestrator.constants import SECURITY_PROMPT
+                    from cli_agent_orchestrator.utils.tool_mapping import (
+                        tool_constraint_instruction,
+                    )
 
-                    tools_list = ", ".join(self._allowed_tools)
-                    tool_constraint = f"\nYou only have access to these tools: {tools_list}\n"
+                    tool_constraint = f"\n{tool_constraint_instruction(self._allowed_tools)}\n"
                     system_prompt = SECURITY_PROMPT + tool_constraint + system_prompt
 
                 if system_prompt:

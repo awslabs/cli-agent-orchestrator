@@ -330,7 +330,7 @@ class AntigravityCliProvider(BaseProvider):
             # Soft tool restriction: when the profile is not allowed every tool
             # (e.g. the read-only reviewer), append the security prompt. agy
             # honors a clear instruction not to use disallowed tools.
-            if self._allowed_tools and "*" not in self._allowed_tools:
+            if self._allowed_tools is not None and "*" not in self._allowed_tools:
                 system_prompt = (
                     f"{system_prompt}\n\n{SECURITY_PROMPT}" if system_prompt else SECURITY_PROMPT
                 )

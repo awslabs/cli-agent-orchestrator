@@ -8,6 +8,7 @@ from cli_agent_orchestrator.utils.tool_mapping import (
     get_disallowed_tools,
     granted_mcp_servers,
     resolve_allowed_tools,
+    tool_constraint_instruction,
 )
 
 
@@ -114,6 +115,25 @@ class TestExplicitAllowedToolsIsTheWholeList:
 
     def test_an_explicit_wildcard_is_still_untouched(self):
         assert resolve_allowed_tools(["*"], None, ["cao-mcp-server"]) == ["*"]
+
+
+class TestToolConstraintInstruction:
+    """Regression for the #803 review: the sentence has to hold for an empty list.
+
+    Five soft-enforcement providers built this by joining the allowlist, so a
+    deny-all produced a sentence that named no tools and read as an authoring
+    slip rather than as a restriction.
+    """
+
+    def test_a_deny_all_says_so_in_words(self):
+        assert tool_constraint_instruction([]) == (
+            "You may not use any tools. Do not attempt to call one."
+        )
+
+    def test_a_restricted_policy_keeps_the_existing_wording(self):
+        assert tool_constraint_instruction(["fs_read", "fs_list"]) == (
+            "You only have access to these tools: fs_read, fs_list"
+        )
 
 
 class TestGetDisallowedTools:
