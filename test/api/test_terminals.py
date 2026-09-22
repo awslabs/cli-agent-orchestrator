@@ -608,6 +608,10 @@ class TestCreateInboxMessageEndpoint:
         mock_msg.created_at.isoformat.return_value = "2026-03-13T12:00:00"
 
         with (
+            patch(
+                "cli_agent_orchestrator.api.main.get_terminal_metadata",
+                return_value={"id": "sender1"},
+            ),
             patch("cli_agent_orchestrator.api.main.create_inbox_message") as mock_create,
             patch("cli_agent_orchestrator.api.main.inbox_service") as mock_inbox,
         ):
@@ -639,6 +643,10 @@ class TestCreateInboxMessageEndpoint:
         mock_msg.created_at.isoformat.return_value = "2026-03-13T12:00:00"
 
         with (
+            patch(
+                "cli_agent_orchestrator.api.main.get_terminal_metadata",
+                return_value={"id": "sender1"},
+            ),
             patch("cli_agent_orchestrator.api.main.create_inbox_message") as mock_create,
             patch("cli_agent_orchestrator.api.main.inbox_service") as mock_inbox,
         ):
@@ -654,8 +662,14 @@ class TestCreateInboxMessageEndpoint:
             assert response.json()["success"] is True
 
     def test_create_inbox_message_not_found(self, client):
-        """POST returns 404 when terminal not found."""
-        with patch("cli_agent_orchestrator.api.main.create_inbox_message") as mock_create:
+        """POST returns 404 when the receiver terminal is not found."""
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.get_terminal_metadata",
+                return_value={"id": "sender1"},  # sender exists; the receiver does not
+            ),
+            patch("cli_agent_orchestrator.api.main.create_inbox_message") as mock_create,
+        ):
             mock_create.side_effect = ValueError("Terminal not found")
 
             response = client.post(
@@ -665,9 +679,29 @@ class TestCreateInboxMessageEndpoint:
 
             assert response.status_code == 404
 
+    def test_create_inbox_message_rejects_a_forged_sender(self, client):
+        """A sender that names no real terminal is refused before enqueue (#802)."""
+        with (
+            patch("cli_agent_orchestrator.api.main.get_terminal_metadata", return_value=None),
+            patch("cli_agent_orchestrator.api.main.create_inbox_message") as mock_create,
+        ):
+            response = client.post(
+                "/terminals/abcd1234/inbox/messages",
+                params={"sender_id": "ghost", "message": "hello"},
+            )
+            assert response.status_code == 404
+            assert "Sender terminal" in response.json()["detail"]
+            mock_create.assert_not_called()
+
     def test_create_inbox_message_server_error(self, client):
         """POST returns 500 on internal error."""
-        with patch("cli_agent_orchestrator.api.main.create_inbox_message") as mock_create:
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.get_terminal_metadata",
+                return_value={"id": "sender1"},
+            ),
+            patch("cli_agent_orchestrator.api.main.create_inbox_message") as mock_create,
+        ):
             mock_create.side_effect = Exception("DB error")
 
             response = client.post(
