@@ -367,15 +367,18 @@ def locked_atomic_delete(
         target.unlink()
 
 
-def write_owner_only(target: Path, content: str, encoding: str = "utf-8") -> None:
+def write_owner_only(
+    target: Path, content: str, encoding: str = "utf-8", *, mode: int = 0o600
+) -> None:
     """Publish ``content`` to ``target`` so it is NEVER readable by anyone else.
 
     For files that structurally carry a credential — a provider's MCP config
-    holding ``CAO_RUNTIME_TOKEN`` (#745) — where 0600 is a property of the file's
+    holding ``CAO_RUNTIME_TOKEN`` (#745), or a scheduled flow's pre-script whose
+    body may contain secrets — where owner-only is a property of the file's
     contents rather than a preference the operator may have overridden. That rules
     out both of the patterns used elsewhere here:
 
-    - ``write_text`` then ``chmod(0o600)`` narrows the file only AFTER the whole
+    - ``write_text`` then ``chmod`` narrows the file only AFTER the whole
       credential-bearing body has been flushed at the umask-default mode. On a
       shared host another local account can open it inside that window and keep
       reading through the descriptor afterwards.
@@ -385,10 +388,14 @@ def write_owner_only(target: Path, content: str, encoding: str = "utf-8") -> Non
       inside it.
 
     ``tempfile.mkstemp`` creates the temp at 0600 by construction, so the bytes are
-    owner-only from the first one written; the mode is never widened, and
-    ``os.replace`` publishes atomically. Callers wanting mode preservation want
-    :func:`locked_atomic_write` instead (Copilot review on #802).
+    owner-only from the first one written. ``mode`` (owner-only bits only — pass
+    ``0o700`` for an executable pre-script) is applied to that same descriptor
+    BEFORE the atomic ``os.replace``, so the file is never group/other-readable at
+    any instant; it is masked to the owner triad so a caller cannot accidentally
+    widen it. Callers wanting mode preservation want :func:`locked_atomic_write`
+    instead (Copilot reviews on #802).
     """
+    owner_only_mode = mode & 0o700  # never expose group/other, whatever was passed
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(
         dir=str(target.parent),
@@ -400,6 +407,7 @@ def write_owner_only(target: Path, content: str, encoding: str = "utf-8") -> Non
         with os.fdopen(fd, "w", encoding=encoding) as handle:
             handle.write(content)
             handle.flush()
+            os.fchmod(handle.fileno(), owner_only_mode)
             os.fsync(handle.fileno())
         os.replace(temp_path, target)
     finally:

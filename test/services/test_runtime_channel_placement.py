@@ -364,3 +364,54 @@ class TestARuntimeCannotClaimAnotherRuntimesTerminal:
         assert fresh.claim_terminal(TID, "worker-2") is False
         assert fresh.claim_terminal(TID, "worker-1") is True
         assert fresh.runtime_for_terminal(TID) == "worker-1"
+
+
+class TestGetStatusIsThreadSafeAcrossTheChannelBoundary:
+    """effective_status reads the registry from a worker thread while the channel
+    loop mutates it on the event-loop thread. get_status's compound
+    liveness-check-then-read must not return a stale COMPLETED after a concurrent
+    disconnect, and no cross-thread read may raise on dict mutation (Copilot
+    follow-up on #802)."""
+
+    @staticmethod
+    async def _send(_raw):
+        pass
+
+    def test_hammering_get_status_against_register_churn_never_raises_or_goes_stale(self):
+        import threading
+
+        from cli_agent_orchestrator.models.terminal import TerminalStatus
+
+        reg = RuntimeChannelRegistry()
+        stop = threading.Event()
+        errors = []
+
+        def churn():
+            try:
+                while not stop.is_set():
+                    conn = reg.register("worker-1", self._send)
+                    reg.bind_terminal(TID, "worker-1")
+                    reg.set_status(TID, TerminalStatus.COMPLETED, conn=conn)
+                    reg.unregister("worker-1", conn)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        def poll():
+            try:
+                for _ in range(5000):
+                    # Either a live status or UNKNOWN — never an exception, and
+                    # never a status for a runtime that is not registered.
+                    reg.get_status(TID)
+                    reg.remote_terminal_ids()
+                    reg.list_runtimes()
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        t = threading.Thread(target=churn)
+        t.start()
+        try:
+            poll()
+        finally:
+            stop.set()
+            t.join()
+        assert not errors, f"cross-thread registry access raised: {errors[:3]}"

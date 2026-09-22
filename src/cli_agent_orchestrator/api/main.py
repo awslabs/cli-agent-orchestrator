@@ -184,6 +184,7 @@ from cli_agent_orchestrator.services.workflow_journal import (
 from cli_agent_orchestrator.services.worktree_service import WorktreeError
 from cli_agent_orchestrator.telemetry import init_telemetry, shutdown_telemetry
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
+from cli_agent_orchestrator.utils.atomic_file import write_owner_only
 from cli_agent_orchestrator.utils.logging import install_access_log_redaction, setup_logging
 from cli_agent_orchestrator.utils.skills import (
     SkillNameError,
@@ -3646,7 +3647,25 @@ async def create_terminal_in_session(
         # the request they always sent, every validation above still applies,
         # and placement is decided centrally from the caller's recorded runtime
         # rather than by the agent.
-        caller_runtime = runtime_registry.runtime_for_terminal(caller_id) if caller_id else None
+        # runtime_for_terminal() returns None for a genuinely-local caller AND
+        # for a remote caller whose placement lookup transiently failed, so it
+        # alone cannot decide "launch locally" — doing so would create the worker
+        # in the central container for a caller that actually lives in a runtime
+        # (Copilot follow-up on #802). is_remote() fails closed (True) on an
+        # unreadable placement, so gate on it first: if the caller is remote (or
+        # unknown) but the runtime cannot be resolved, refuse with a retryable
+        # 503 rather than misrouting.
+        caller_runtime = None
+        if caller_id and runtime_registry.is_remote(caller_id):
+            caller_runtime = runtime_registry.runtime_for_terminal(caller_id)
+            if caller_runtime is None:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=(
+                        f"caller '{caller_id}' is remote but its placement is "
+                        "currently unavailable; retry"
+                    ),
+                )
         if caller_runtime is not None:
             from cli_agent_orchestrator.runtime_channel.api import (
                 CreateRemoteTerminalBody,
@@ -7754,8 +7773,12 @@ async def create_flow(
             # executable: it is the operator's own code, run via its shebang.
             script_name = f"{body.name}.pre-script"
             script_file = flows_dir / script_name
-            script_file.write_text(body.script_body)
-            script_file.chmod(0o700)
+            # Owner-only from the first byte: write_text then chmod would flush
+            # the (possibly credential-bearing) body at the umask default first,
+            # leaving a window another local account could read on a shared
+            # server (Copilot follow-up on #802). write_owner_only publishes an
+            # owner-only inode and never widens past 0700.
+            write_owner_only(script_file, body.script_body, mode=0o700)
             frontmatter_data["script"] = script_name
         elif body.script:
             frontmatter_data["script"] = body.script

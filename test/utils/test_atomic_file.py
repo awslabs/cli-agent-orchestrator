@@ -945,6 +945,31 @@ def test_owner_only_ignores_a_permissive_umask(tmp_path: Path) -> None:
     assert stat.S_IMODE(os.stat(target).st_mode) == 0o600
 
 
+def test_owner_only_executable_mode_stays_owner_only(tmp_path: Path) -> None:
+    """A pre-script needs owner execute, but never group/other bits.
+
+    mode=0o700 publishes an owner-only executable inode from the first byte —
+    the flow pre-script write uses this so a credential-bearing body is never
+    world-readable in a chmod-afterward window (Copilot follow-up on #802).
+    """
+    target = tmp_path / "flow.pre-script"
+
+    old_umask = os.umask(0o000)
+    try:
+        write_owner_only(target, "#!/bin/sh\necho hi\n", mode=0o700)
+    finally:
+        os.umask(old_umask)
+
+    assert stat.S_IMODE(os.stat(target).st_mode) == 0o700
+
+
+def test_owner_only_masks_a_caller_that_asks_for_group_or_other_bits(tmp_path: Path) -> None:
+    """Even a caller passing 0o755 gets owner-only: the mask forbids widening."""
+    target = tmp_path / "flow.pre-script"
+    write_owner_only(target, "x", mode=0o755)
+    assert stat.S_IMODE(os.stat(target).st_mode) == 0o700
+
+
 def test_owner_only_creates_the_parent_directory(tmp_path: Path) -> None:
     """Provider config dirs (``~/.antigravity/...``) may not exist on first run."""
     target = tmp_path / "nested" / "deeper" / "mcp.json"

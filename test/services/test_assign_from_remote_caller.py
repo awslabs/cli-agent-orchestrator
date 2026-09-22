@@ -53,6 +53,7 @@ async def _call(**overrides):
 @patch("cli_agent_orchestrator.api.main.terminal_service")
 @patch("cli_agent_orchestrator.api.main.runtime_registry")
 async def test_worker_is_placed_in_the_callers_runtime(mock_registry, mock_service, mock_launch):
+    mock_registry.is_remote.return_value = True
     mock_registry.runtime_for_terminal.return_value = RUNTIME
     mock_launch.return_value = _remote_terminal()
 
@@ -80,6 +81,7 @@ async def test_assigns_deferred_init_contract_survives_the_hop(
 ):
     """assign returns before provider startup finishes, or it blows the calling
     agent's per-tool timeout. The runtime has to be told to do the same."""
+    mock_registry.is_remote.return_value = True
     mock_registry.runtime_for_terminal.return_value = RUNTIME
     mock_launch.return_value = _remote_terminal()
 
@@ -102,6 +104,7 @@ async def test_assigns_deferred_init_contract_survives_the_hop(
 async def test_a_local_caller_still_gets_a_local_window(mock_registry, mock_service, mock_launch):
     """The forwarding is keyed on the caller's recorded runtime, so a
     single-host install -- where nothing is bound to a runtime -- is untouched."""
+    mock_registry.is_remote.return_value = False
     mock_registry.runtime_for_terminal.return_value = None
     mock_service.create_terminal = AsyncMock(return_value=_remote_terminal())
 
@@ -122,6 +125,7 @@ async def test_idempotency_key_is_refused_rather_than_quietly_dropped(
     """Accepting the key here would promise a retry returns the first worker.
     The remote launch has no key table behind it, so a second worker is exactly
     what a retry would get -- say no instead."""
+    mock_registry.is_remote.return_value = True
     mock_registry.runtime_for_terminal.return_value = RUNTIME
 
     with pytest.raises(HTTPException) as exc:
@@ -129,5 +133,27 @@ async def test_idempotency_key_is_refused_rather_than_quietly_dropped(
 
     assert exc.value.status_code == 400
     assert "idempotency_key" in exc.value.detail
+    mock_launch.assert_not_awaited()
+    mock_service.create_terminal.assert_not_called()
+
+
+@pytest.mark.asyncio
+@patch("cli_agent_orchestrator.runtime_channel.api.launch_remote_terminal", new_callable=AsyncMock)
+@patch("cli_agent_orchestrator.api.main.terminal_service")
+@patch("cli_agent_orchestrator.api.main.runtime_registry")
+async def test_a_remote_caller_whose_placement_is_unreadable_is_not_launched_locally(
+    mock_registry, mock_service, mock_launch
+):
+    """runtime_for_terminal returns None both for a local caller and for a remote
+    one whose placement lookup transiently failed. is_remote fails closed to True
+    on the latter, so the endpoint must refuse with 503 rather than create the
+    worker in the central container (Copilot follow-up on #802)."""
+    mock_registry.is_remote.return_value = True  # fail-closed remote/unknown
+    mock_registry.runtime_for_terminal.return_value = None  # but placement unreadable
+
+    with pytest.raises(HTTPException) as exc:
+        await _call()
+
+    assert exc.value.status_code == 503
     mock_launch.assert_not_awaited()
     mock_service.create_terminal.assert_not_called()

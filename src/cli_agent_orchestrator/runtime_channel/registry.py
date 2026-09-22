@@ -16,6 +16,7 @@ terminal.
 
 import asyncio
 import logging
+import threading
 import time
 import uuid
 from typing import Awaitable, Callable, Dict, Iterable, List, Optional, Tuple
@@ -200,6 +201,17 @@ class RuntimeChannelRegistry:
         # has not (yet) seen a hello for. ``None`` means "the row says local", so
         # a local terminal is asked about the database once, not on every poll.
         self._recovered_placement: Dict[str, Optional[str]] = {}
+        # The channel loop mutates the routing/status dicts on the event-loop
+        # thread; effective_status reads them from a worker thread (via
+        # asyncio.to_thread), so a disconnect could land between get_status's
+        # liveness check and its status read and return a stale COMPLETED that
+        # satisfies a wait after the runtime is already gone (Copilot follow-up
+        # on #802). This guards the in-memory (_runtimes, _terminal_runtime,
+        # _status, _incarnations, _positions) reads/writes across that thread
+        # boundary. Reentrant so a guarded method can call another; DB I/O is
+        # kept OUT of the lock so a worker thread's placement read never blocks
+        # the event loop.
+        self._lock = threading.RLock()
 
     # --- runtime lifecycle ---
 
@@ -215,9 +227,10 @@ class RuntimeChannelRegistry:
         # The incarnation of a runtime id: one more executor process (or one more
         # channel from the same one) claiming this identity. Reported state is
         # accepted only from the current incarnation -- see ``set_status``.
-        self._incarnations[runtime_id] = self._incarnations.get(runtime_id, 0) + 1
-        conn.incarnation = self._incarnations[runtime_id]
-        self._runtimes[runtime_id] = conn
+        with self._lock:
+            self._incarnations[runtime_id] = self._incarnations.get(runtime_id, 0) + 1
+            conn.incarnation = self._incarnations[runtime_id]
+            self._runtimes[runtime_id] = conn
         # Capture the loop the channels live on. Command futures are created on
         # it (see RuntimeConnection.send_command), so a caller on a worker thread
         # has no way to dispatch without it — see send_terminal_command_blocking.
@@ -231,23 +244,25 @@ class RuntimeChannelRegistry:
     def unregister(self, runtime_id: str, conn: RuntimeConnection) -> None:
         # Guard against a stale disconnect handler unregistering the NEW
         # connection after a fast reconnect replaced it.
-        if self._runtimes.get(runtime_id) is conn:
-            del self._runtimes[runtime_id]
-            logger.info("runtime channel disconnected: %s", runtime_id)
+        with self._lock:
+            if self._runtimes.get(runtime_id) is conn:
+                del self._runtimes[runtime_id]
+                logger.info("runtime channel disconnected: %s", runtime_id)
         conn.fail_all_pending(f"runtime {runtime_id} channel closed")
 
     def get_runtime(self, runtime_id: str) -> Optional[RuntimeConnection]:
         return self._runtimes.get(runtime_id)
 
     def list_runtimes(self) -> Dict[str, dict]:
-        return {
-            rid: {
-                "connected_at": conn.connected_at,
-                "last_seen": conn.last_seen,
-                "terminals": sorted(t for t, r in self._terminal_runtime.items() if r == rid),
+        with self._lock:
+            return {
+                rid: {
+                    "connected_at": conn.connected_at,
+                    "last_seen": conn.last_seen,
+                    "terminals": sorted(t for t, r in self._terminal_runtime.items() if r == rid),
+                }
+                for rid, conn in self._runtimes.items()
             }
-            for rid, conn in self._runtimes.items()
-        }
 
     # --- terminal routing ---
 
@@ -256,8 +271,9 @@ class RuntimeChannelRegistry:
         creation, by ``POST /runtimes/{id}/terminals`` right after it has
         written the durable placement row. Inbound channel frames must go
         through :meth:`claim_terminal` instead, which enforces ownership."""
-        self._terminal_runtime[terminal_id] = runtime_id
-        self._recovered_placement.pop(terminal_id, None)
+        with self._lock:
+            self._terminal_runtime[terminal_id] = runtime_id
+            self._recovered_placement.pop(terminal_id, None)
 
     def claim_terminal(self, terminal_id: str, runtime_id: str) -> bool:
         """A runtime asserts, over the channel, that it owns ``terminal_id``.
@@ -332,11 +348,12 @@ class RuntimeChannelRegistry:
         return True
 
     def unbind_terminal(self, terminal_id: str) -> None:
-        self._terminal_runtime.pop(terminal_id, None)
-        self._recovered_placement.pop(terminal_id, None)
-        self._status.pop(terminal_id, None)
-        for stream in StreamName:
-            self._positions.pop((terminal_id, stream.value), None)
+        with self._lock:
+            self._terminal_runtime.pop(terminal_id, None)
+            self._recovered_placement.pop(terminal_id, None)
+            self._status.pop(terminal_id, None)
+            for stream in StreamName:
+                self._positions.pop((terminal_id, stream.value), None)
 
     def _placement_from_the_central_row(self, terminal_id: str) -> Optional[str]:
         """The runtime this terminal was launched on, per the persisted row.
@@ -454,8 +471,13 @@ class RuntimeChannelRegistry:
         wrong answer for a liveness question -- ``GET /sessions`` listed a dead
         pod's sessions as active indefinitely (Copilot review on #802, finding
         13). Routing keeps the full map; enumeration gets only the live part.
+
+        Built under the lock: a channel disconnecting on the event-loop thread
+        mid-iteration would otherwise raise "dictionary changed size during
+        iteration" at this worker-thread caller.
         """
-        return [tid for tid, rid in self._terminal_runtime.items() if rid in self._runtimes]
+        with self._lock:
+            return [tid for tid, rid in self._terminal_runtime.items() if rid in self._runtimes]
 
     async def send_terminal_command(
         self,
@@ -544,22 +566,23 @@ class RuntimeChannelRegistry:
         Callers with no connection in hand (the local status monitor's own
         bookkeeping) pass nothing and are unaffected.
         """
-        if conn is not None:
-            current = self._runtimes.get(conn.runtime_id)
-            if current is not conn or conn.incarnation != self._incarnations.get(
-                conn.runtime_id, 0
-            ):
-                logger.warning(
-                    "dropping %s report for terminal %s from superseded incarnation %s of "
-                    "runtime %s (current: %s)",
-                    status.value,
-                    terminal_id,
-                    conn.incarnation,
-                    conn.runtime_id,
-                    self._incarnations.get(conn.runtime_id, 0),
-                )
-                return
-        self._status[terminal_id] = status
+        with self._lock:
+            if conn is not None:
+                current = self._runtimes.get(conn.runtime_id)
+                if current is not conn or conn.incarnation != self._incarnations.get(
+                    conn.runtime_id, 0
+                ):
+                    logger.warning(
+                        "dropping %s report for terminal %s from superseded incarnation %s of "
+                        "runtime %s (current: %s)",
+                        status.value,
+                        terminal_id,
+                        conn.incarnation,
+                        conn.runtime_id,
+                        self._incarnations.get(conn.runtime_id, 0),
+                    )
+                    return
+            self._status[terminal_id] = status
 
     def reconcile_hello(self, runtime_id: str, advertised: Iterable[str]) -> List[str]:
         """Forget state for terminals the runtime's new hello does not claim.
@@ -580,15 +603,16 @@ class RuntimeChannelRegistry:
         caller can log or publish them.
         """
         claimed = set(advertised)
-        stale = [
-            tid
-            for tid, rid in self._terminal_runtime.items()
-            if rid == runtime_id and tid not in claimed
-        ]
-        for tid in stale:
-            self._status.pop(tid, None)
-            for stream in StreamName:
-                self._positions.pop((tid, stream.value), None)
+        with self._lock:
+            stale = [
+                tid
+                for tid, rid in self._terminal_runtime.items()
+                if rid == runtime_id and tid not in claimed
+            ]
+            for tid in stale:
+                self._status.pop(tid, None)
+                for stream in StreamName:
+                    self._positions.pop((tid, stream.value), None)
         if stale:
             logger.warning(
                 "runtime %s reconnected without terminals %s; their cached state is discarded",
@@ -598,17 +622,22 @@ class RuntimeChannelRegistry:
         return stale
 
     def get_status(self, terminal_id: str) -> TerminalStatus:
-        runtime_id = self._terminal_runtime.get(terminal_id)
-        if runtime_id is None or runtime_id not in self._runtimes:
-            # No live channel: the server cannot know. Explicit UNKNOWN beats
-            # a stale last report presented as current (#745 failure posture).
-            return TerminalStatus.UNKNOWN
-        return self._status.get(terminal_id, TerminalStatus.UNKNOWN)
+        # Compound read held under the lock so a concurrent unregister/reconcile
+        # on the event-loop thread cannot land between the liveness check and the
+        # status read and leave a stale value looking current.
+        with self._lock:
+            runtime_id = self._terminal_runtime.get(terminal_id)
+            if runtime_id is None or runtime_id not in self._runtimes:
+                # No live channel: the server cannot know. Explicit UNKNOWN beats
+                # a stale last report presented as current (#745 failure posture).
+                return TerminalStatus.UNKNOWN
+            return self._status.get(terminal_id, TerminalStatus.UNKNOWN)
 
     def record_position(self, terminal_id: str, stream: str, end_pos: int) -> None:
-        key = (terminal_id, stream)
-        if end_pos > self._positions.get(key, 0):
-            self._positions[key] = end_pos
+        with self._lock:
+            key = (terminal_id, stream)
+            if end_pos > self._positions.get(key, 0):
+                self._positions[key] = end_pos
 
     def resume_position(self, terminal_id: str, stream: str) -> int:
         return self._positions.get((terminal_id, stream), 0)
