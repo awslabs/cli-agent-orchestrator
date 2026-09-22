@@ -28,6 +28,7 @@ from pydantic import BaseModel, ConfigDict
 
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
+from cli_agent_orchestrator.clients.database import get_terminal_metadata
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
 from cli_agent_orchestrator.runtime_channel.protocol import (
     PROTOCOL_VERSION,
@@ -146,6 +147,54 @@ def _note_heartbeat_watermark(behind: dict, stream_pos: StreamPosition, runtime_
     behind[key] = (stream_pos.end_pos, stream_pos.generation, recorded)
 
 
+def _reconcile_orphaned_result(frame: CommandResultFrame, runtime_id: str) -> None:
+    """Recover a live terminal from a LAUNCH result redelivered after a restart.
+
+    The runtime retains each result until it is acked, so after the server
+    restarts it redelivers the ones the old process never acknowledged. Most are
+    harmless to drop, but a successful LAUNCH is not: its terminal is running in
+    the runtime, yet the restarted server has no row and no binding for it, so
+    without this it would ack-and-drop and orphan a live agent nothing can route
+    to or tear down (guojing1217 on #802).
+
+    Only a successful result carrying a terminal payload is reconciled, and only
+    when no central row exists yet (a row already present means the old server
+    persisted it before crashing — bind and move on). ``owner`` is server-side
+    state the restart lost and the runtime is never told it, so a reconciled
+    terminal has none; that is a known limitation, and far better than a leaked
+    pod. Best-effort: a failure here must not stop the ack, or the runtime
+    retries forever.
+    """
+    if frame.outcome != CommandOutcome.OK:
+        return
+    info = frame.payload.get("terminal")
+    if not isinstance(info, dict) or not info.get("id"):
+        return
+    terminal_id = info["id"]
+    try:
+        if get_terminal_metadata(terminal_id) is None:
+            db_create_terminal(
+                terminal_id,
+                info["session_name"],
+                info["name"],
+                info["provider"],
+                agent_profile=info.get("agent_profile"),
+                allowed_tools=info.get("allowed_tools"),
+                shell_command=info.get("shell_command"),
+                engine=info.get("engine"),
+                metadata={"runtime_id": runtime_id},
+            )
+            logger.warning(
+                "reconciled orphaned terminal %s from a redelivered LAUNCH result "
+                "on runtime %s (owner unknown after restart)",
+                terminal_id,
+                runtime_id,
+            )
+        runtime_registry.claim_terminal(terminal_id, runtime_id)
+    except Exception:
+        logger.exception("failed to reconcile orphaned terminal %s", terminal_id)
+
+
 @router.websocket("/runtime/channel")
 async def runtime_channel(ws: WebSocket) -> None:
     expected = _expected_token()
@@ -244,10 +293,17 @@ async def runtime_channel(ws: WebSocket) -> None:
                 break
             conn.last_seen = time.time()
             if isinstance(frame, CommandResultFrame):
-                conn.resolve(frame)
-                # Ack unconditionally so the runtime can drop its retained
-                # copy — even for results this process never asked for (they
-                # were retained for a server that has since restarted).
+                matched = conn.resolve(frame)
+                if not matched:
+                    # A result the runtime retained for an op sent before this
+                    # server restarted. A lost LAUNCH result is the one that
+                    # bites: the runtime kept a live terminal, but the restarted
+                    # server never persisted or bound it, so acking-and-dropping
+                    # would orphan a running agent nothing can route to or tear
+                    # down (guojing1217 on #802). Reconcile it before acking.
+                    _reconcile_orphaned_result(frame, runtime_id)
+                # Ack after any reconciliation so the runtime can drop its
+                # retained copy — worker cleanup must not outrun result delivery.
                 await ws.send_text(encode_frame(AckFrame(op_id=frame.op_id)))
             elif isinstance(frame, StreamFrame):
                 raw = base64.b64decode(frame.data)

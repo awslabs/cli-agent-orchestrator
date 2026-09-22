@@ -147,19 +147,28 @@ class RuntimeConnection:
         finally:
             self._pending.pop(op_id, None)
 
-    def resolve(self, result: CommandResultFrame) -> None:
+    def resolve(self, result: CommandResultFrame) -> bool:
+        """Complete the waiting future for ``result.op_id``.
+
+        Returns whether the op was one this process was waiting on. ``False``
+        means the result was retained by the runtime for an op sent before a
+        server restart — the caller may need to reconcile it (a lost LAUNCH
+        leaves a live terminal the restarted server never persisted) before
+        acking, rather than discard it.
+        """
         future = self._pending.get(result.op_id)
-        if future is not None and not future.done():
-            future.set_result(result)
-        elif future is None:
-            # A result for an op this process never sent (e.g. retained from
-            # before a server restart). Logged, not raised: the runtime just
-            # needs its ack, which the endpoint sends regardless.
-            logger.info(
-                "runtime %s delivered result for unknown op %s (server restart?)",
-                self.runtime_id,
-                result.op_id,
-            )
+        if future is not None:
+            if not future.done():
+                future.set_result(result)
+            return True
+        # A result for an op this process never sent (e.g. retained from before
+        # a server restart). Not raised: the runtime needs its ack regardless.
+        logger.info(
+            "runtime %s delivered result for unknown op %s (server restart?)",
+            self.runtime_id,
+            result.op_id,
+        )
+        return False
 
     def fail_all_pending(self, reason: str) -> None:
         for future in self._pending.values():

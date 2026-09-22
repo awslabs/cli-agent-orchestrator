@@ -419,6 +419,54 @@ class TestChannelEndpoint:
         finally:
             runtime_registry.unbind_terminal(TID)
 
+    def test_a_redelivered_launch_result_reconciles_an_orphaned_terminal(
+        self, channel_client, monkeypatch
+    ):
+        """A LAUNCH result the old server never acked would otherwise orphan a
+        live terminal after a restart (guojing1217 on #802): the runtime keeps
+        running it, but the restarted server has no row or binding. It is
+        persisted and bound before the ack, not dropped."""
+        import cli_agent_orchestrator.runtime_channel.api as rc_api
+        from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
+
+        orphan = "beef9999"
+        created = {}
+        monkeypatch.setattr(rc_api, "get_terminal_metadata", lambda tid: None)
+        monkeypatch.setattr(
+            rc_api, "db_create_terminal", lambda *a, **k: created.update({"args": a, "kwargs": k})
+        )
+        headers = {"Host": "localhost", "X-CAO-Runtime-Token": "test-runtime-token"}
+        try:
+            with channel_client.websocket_connect("/runtime/channel", headers=headers) as ws:
+                ws.send_text(_hello())
+                decode_frame(ws.receive_text())
+                ws.send_text(
+                    encode_frame(
+                        CommandResultFrame(
+                            op_id="launch-op-lost",
+                            terminal_id=orphan,
+                            outcome=CommandOutcome.OK,
+                            payload={
+                                "terminal": {
+                                    "id": orphan,
+                                    "session_name": "cao-beef9999",
+                                    "name": "developer-beef",
+                                    "provider": "kiro_cli",
+                                    "agent_profile": "developer",
+                                    "status": "idle",
+                                }
+                            },
+                        )
+                    )
+                )
+                ack = decode_frame(ws.receive_text())
+                assert isinstance(ack, AckFrame) and ack.op_id == "launch-op-lost"
+                assert created["args"][0] == orphan  # persisted
+                assert created["kwargs"]["metadata"] == {"runtime_id": "worker-1"}
+                assert runtime_registry.runtime_for_terminal(orphan) == "worker-1"  # bound
+        finally:
+            runtime_registry.unbind_terminal(orphan)
+
     def test_stream_and_status_republish_to_bus(self, channel_client):
         from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
         from cli_agent_orchestrator.services.event_bus import bus
