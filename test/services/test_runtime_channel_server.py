@@ -413,6 +413,61 @@ class TestChannelEndpoint:
         finally:
             runtime_registry.unbind_terminal(kept)
 
+    def test_a_stream_frame_from_a_stale_generation_is_dropped(self, channel_client):
+        """After a stream restart the server is on a new generation; frames still
+        arriving from the superseded one must not be spliced into the live
+        stream's transcript (Copilot review on #802)."""
+        from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
+        from cli_agent_orchestrator.services.event_bus import bus
+
+        received = []
+        original_publish = bus.publish
+        bus.publish = lambda topic, payload: received.append((topic, payload))
+        headers = {"Host": "localhost", "X-CAO-Runtime-Token": "test-runtime-token"}
+        try:
+            with channel_client.websocket_connect("/runtime/channel", headers=headers) as ws:
+                ws.send_text(_hello())
+                decode_frame(ws.receive_text())
+                # The live stream is generation 1.
+                ws.send_text(
+                    encode_frame(
+                        StreamFrame(
+                            terminal_id=TID,
+                            stream=StreamName.CAPTURE,
+                            generation=1,
+                            pos=0,
+                            data=base64.b64encode(b"new stream").decode(),
+                        )
+                    )
+                )
+                # A straggler from the dead generation 0.
+                ws.send_text(
+                    encode_frame(
+                        StreamFrame(
+                            terminal_id=TID,
+                            stream=StreamName.CAPTURE,
+                            generation=0,
+                            pos=500,
+                            data=base64.b64encode(b"ghost bytes").decode(),
+                        )
+                    )
+                )
+                ws.send_text(
+                    encode_frame(
+                        CommandResultFrame(
+                            op_id="sync-gen", terminal_id=TID, outcome=CommandOutcome.OK
+                        )
+                    )
+                )
+                assert decode_frame(ws.receive_text()).op_id == "sync-gen"
+        finally:
+            bus.publish = original_publish
+            runtime_registry.unbind_terminal(TID)
+
+        published = [p["data"] for _t, p in received if "data" in p]
+        assert "new stream" in published
+        assert "ghost bytes" not in published, "a stale-generation frame must not republish"
+
     def test_a_gapframe_for_an_unowned_terminal_is_dropped(self, channel_client):
         """A GapFrame advances the watermark and reports a loss, so it needs the
         same ownership fence as the other frames: a runtime must not be able to

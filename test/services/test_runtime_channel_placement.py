@@ -415,3 +415,57 @@ class TestGetStatusIsThreadSafeAcrossTheChannelBoundary:
             stop.set()
             t.join()
         assert not errors, f"cross-thread registry access raised: {errors[:3]}"
+
+
+class TestTheServerFencesOnStreamGeneration:
+    """Positions are only comparable within one generation.
+
+    When the runtime re-arms a reader it starts a new generation numbered from 0.
+    Monotonic-max alone ignored that 0 as a rewind, so the server kept a
+    watermark from a stream that no longer existed and resumed the new one at the
+    wrong offset; and frames still arriving from the superseded stream were mixed
+    into the live one's transcript (Copilot review on #802).
+    """
+
+    def test_a_new_generation_resets_the_watermark_instead_of_being_ignored(self, fresh):
+        fresh.record_position(TID, "capture", 5000, generation=0)
+        assert fresh.resume_position(TID, "capture") == 5000
+
+        # The reader re-armed: a new stream, numbered from 0.
+        fresh.record_position(TID, "capture", 6, generation=1)
+        assert fresh.resume_position(TID, "capture") == 6
+
+    def test_a_stale_generation_is_recognised_and_changes_nothing(self, fresh):
+        fresh.record_position(TID, "capture", 6, generation=1)
+        assert fresh.is_stale_generation(TID, "capture", 0) is True
+
+        fresh.record_position(TID, "capture", 9999, generation=0)
+        assert fresh.resume_position(TID, "capture") == 6, "the dead stream cannot advance it"
+
+    def test_the_live_generation_is_not_stale(self, fresh):
+        fresh.record_position(TID, "capture", 6, generation=1)
+        assert fresh.is_stale_generation(TID, "capture", 1) is False
+        assert fresh.is_stale_generation(TID, "capture", 2) is False
+
+    def test_an_unseen_stream_is_never_stale(self, fresh):
+        """Nothing known yet: the first frame establishes the generation."""
+        assert fresh.is_stale_generation(TID, "capture", 0) is False
+        assert fresh.is_stale_generation(TID, "capture", 7) is False
+
+    def test_the_same_generation_keeps_monotonic_max(self, fresh):
+        fresh.record_position(TID, "capture", 100, generation=0)
+        fresh.record_position(TID, "capture", 50, generation=0)
+        assert fresh.resume_position(TID, "capture") == 100
+
+    def test_generation_is_forgotten_with_the_binding(self, fresh):
+        fresh.record_position(TID, "capture", 6, generation=3)
+        fresh.unbind_terminal(TID)
+        # A recreated terminal reusing the id starts clean, not fenced against a
+        # generation from a stream that is gone.
+        assert fresh.is_stale_generation(TID, "capture", 0) is False
+
+    def test_a_position_without_a_generation_skips_the_fence(self, fresh):
+        """Local bookkeeping passes no generation and must be unaffected."""
+        fresh.record_position(TID, "capture", 10, generation=2)
+        fresh.record_position(TID, "capture", 20)
+        assert fresh.resume_position(TID, "capture") == 20

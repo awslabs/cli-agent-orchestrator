@@ -303,6 +303,37 @@ class TestTheBridgeReportsWhatTheBusDropped:
         assert [p.end_pos for p in positions] == [19]
 
     @pytest.mark.asyncio
+    async def test_a_restarted_producer_offset_advances_the_generation(self, wired):
+        """A re-armed reader restarts its offset at 0. Without a generation
+        transition the bridge appended those bytes contiguously and the server
+        saw one spliced stream; the frames must instead carry a new generation
+        with positions numbered from 0 (Copilot review on #802)."""
+        bridge, sent = wired
+        await self._forward(
+            bridge,
+            [
+                self._event("first stream", 0),
+                # The reader was stopped and re-armed: offset counter back to 0.
+                self._event("second", 0),
+            ],
+        )
+
+        streams = [f for f in sent if isinstance(f, StreamFrame)]
+        assert [f.generation for f in streams] == [0, 1], "the restart is a new generation"
+        assert [f.pos for f in streams] == [0, 0], "the new stream is numbered from 0"
+        assert base64.b64decode(streams[-1].data) == b"second"
+        # No gap is invented for the restart: nothing was lost, the stream ended.
+        assert [f for f in sent if isinstance(f, GapFrame)] == []
+
+    @pytest.mark.asyncio
+    async def test_the_watermark_after_a_restart_describes_only_the_new_stream(self, wired):
+        bridge, _ = wired
+        await self._forward(bridge, [self._event("first stream", 0), self._event("second", 0)])
+        positions = bridge._stream_positions()
+        assert [p.end_pos for p in positions] == [len(b"second")]
+        assert [p.generation for p in positions] == [1]
+
+    @pytest.mark.asyncio
     async def test_an_unbroken_stream_reports_no_gap(self, wired):
         bridge, sent = wired
         await self._forward(
@@ -324,3 +355,50 @@ class TestTheBridgeReportsWhatTheBusDropped:
         )
         assert [f for f in sent if isinstance(f, GapFrame)] == []
         assert [f.pos for f in sent] == [0, 3]
+
+
+class TestAStreamRestartStartsANewGeneration:
+    """A re-armed reader is a NEW stream, not a rewind of the old one.
+
+    ``fifo_reader`` resets its producer offset to 0 when a reader is stopped and
+    re-armed, but the bridge kept the same buffer at generation 0, and
+    ``append_at`` treats an offset behind the watermark as bytes to append
+    contiguously. That spliced a new stream onto the old one, so every resume
+    position and replay afterwards described a transcript that never existed
+    (Copilot review on #802). ``begin_generation`` is the transition that makes
+    the restart visible.
+    """
+
+    def test_begin_generation_restarts_numbering_and_drops_the_old_window(self):
+        buf = ReplayBuffer(max_bytes=1024)
+        buf.append_at(0, b"old stream")
+        assert buf.end_pos == 10
+        assert buf.generation == 0
+
+        assert buf.begin_generation() == 1
+        assert buf.generation == 1
+        # Numbering starts over, and the previous stream's bytes are not
+        # replayable under the new generation.
+        assert buf.end_pos == 0
+        assert buf.window_start == 0
+        assert buf.replay_from(0) == []
+
+    def test_the_new_streams_bytes_are_numbered_from_zero(self):
+        buf = ReplayBuffer(max_bytes=1024)
+        buf.append_at(0, b"old stream")
+        buf.begin_generation()
+
+        gap, pos = buf.append_at(0, b"new")
+        assert gap is None, "position 0 of a new generation is not a hole"
+        assert pos == 0
+        assert buf.replay_from(0) == [(0, b"new")]
+
+    def test_without_the_transition_a_restart_would_splice(self):
+        """Pins WHY the transition is needed: append_at alone appends
+        contiguously, which is exactly the splice being prevented."""
+        buf = ReplayBuffer(max_bytes=1024)
+        buf.append_at(0, b"old stream")
+
+        gap, pos = buf.append_at(0, b"new")  # no generation transition
+        assert gap is None
+        assert pos == 10, "the stale offset is ignored and the bytes are spliced"

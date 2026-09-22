@@ -52,6 +52,33 @@ class ReplayBuffer:
     def generation(self) -> int:
         return self._generation
 
+    def begin_generation(self) -> int:
+        """Declare the previous byte stream over and start numbering from 0.
+
+        The producer's offset counter is per-stream and monotonic, so an offset
+        BEHIND this buffer's watermark means the counter restarted: the FIFO
+        reader was stopped and re-armed, or the pane was re-created, and the
+        bytes now arriving belong to a different stream that happens to reuse the
+        terminal id. Appending them contiguously (what ``append_at`` does for a
+        stale offset on its own) splices the new stream onto the old one, so
+        every resume position and replay afterwards describes a transcript that
+        never existed (Copilot review on #802).
+
+        ``generation`` is the protocol's fence for exactly this, and this is the
+        transition that advances it: consumers compare generations and treat a
+        higher one as a new stream rather than a continuation, instead of being
+        told position 0 of a fresh stream is a rewind of the old one.
+
+        Returns the new generation. The retained window is dropped with the
+        stream it described -- replaying those bytes under the new generation
+        would attribute one stream's output to another.
+        """
+        self._generation += 1
+        self._chunks.clear()
+        self._retained = 0
+        self._end_pos = 0
+        return self._generation
+
     @property
     def end_pos(self) -> int:
         """Watermark: position just past the last byte ever appended."""

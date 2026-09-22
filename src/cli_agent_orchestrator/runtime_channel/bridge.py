@@ -188,7 +188,26 @@ class Bridge:
                     # stream is gap-checked.
                     gap, pos = None, buf.append(raw)
                 else:
-                    gap, pos = buf.append_at(int(offset), raw)
+                    start = int(offset)
+                    if start < buf.end_pos:
+                        # The producer's offset counter is monotonic per stream,
+                        # so a start BEHIND the watermark means it restarted: the
+                        # FIFO reader was re-armed, or the pane re-created, and
+                        # these bytes are a NEW stream reusing the terminal id.
+                        # Appending them contiguously would splice the two into a
+                        # transcript that never existed, so advance the generation
+                        # — the protocol's fence for precisely this — and number
+                        # the new stream from 0 (Copilot review on #802).
+                        logger.warning(
+                            "terminal %s restarted its output stream at offset %s "
+                            "(watermark was %s); starting generation %s",
+                            terminal_id,
+                            start,
+                            buf.end_pos,
+                            buf.generation + 1,
+                        )
+                        buf.begin_generation()
+                    gap, pos = buf.append_at(start, raw)
                 if gap is not None:
                     logger.warning(
                         "dropped output for terminal %s: [%s, %s) never reached the channel",

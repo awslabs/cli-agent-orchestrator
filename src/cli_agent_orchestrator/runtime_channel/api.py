@@ -325,8 +325,26 @@ async def runtime_channel(ws: WebSocket) -> None:
                     # the bus; an empty frame is the runtime PTY's EOF.
                     runtime_registry.deliver_attach(frame.terminal_id, raw if raw else None)
                     continue
+                # A frame from a SUPERSEDED generation belongs to a stream this
+                # server has already moved past: drop it rather than splice its
+                # bytes into the live stream's transcript (Copilot review on
+                # #802). record_position then fences the other direction — a
+                # higher generation resets the watermark instead of being read as
+                # a rewind of the old stream.
+                if runtime_registry.is_stale_generation(
+                    frame.terminal_id, frame.stream.value, frame.generation
+                ):
+                    logger.warning(
+                        "dropping stream frame for terminal %s from stale generation %s",
+                        frame.terminal_id,
+                        frame.generation,
+                    )
+                    continue
                 runtime_registry.record_position(
-                    frame.terminal_id, frame.stream.value, frame.pos + len(raw)
+                    frame.terminal_id,
+                    frame.stream.value,
+                    frame.pos + len(raw),
+                    generation=frame.generation,
                 )
                 # Republish onto the existing in-process bus with the exact
                 # payload shape the local FIFO reader uses, so bus-contract
@@ -342,6 +360,17 @@ async def runtime_channel(ws: WebSocket) -> None:
                 # gap for a terminal it does not own and make the server discard or
                 # report output that was never its (Copilot follow-up on #802).
                 if not runtime_registry.claim_terminal(frame.terminal_id, runtime_id):
+                    continue
+                # Same generation fence as StreamFrame: a gap declared by a
+                # superseded stream says nothing about the live one.
+                if runtime_registry.is_stale_generation(
+                    frame.terminal_id, frame.stream.value, frame.generation
+                ):
+                    logger.warning(
+                        "dropping gap frame for terminal %s from stale generation %s",
+                        frame.terminal_id,
+                        frame.generation,
+                    )
                     continue
                 logger.warning(
                     "output gap for remote terminal %s [%s, %s)",
@@ -364,7 +393,10 @@ async def runtime_channel(ws: WebSocket) -> None:
                     # past bytes that may yet arrive, so it is deliberately left
                     # to the generation path (Copilot review on #802).
                     runtime_registry.record_position(
-                        frame.terminal_id, frame.stream.value, frame.to_pos
+                        frame.terminal_id,
+                        frame.stream.value,
+                        frame.to_pos,
+                        generation=frame.generation,
                     )
                 bus.publish(
                     f"terminal.{frame.terminal_id}.output",

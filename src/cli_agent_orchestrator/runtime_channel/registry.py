@@ -189,6 +189,10 @@ class RuntimeChannelRegistry:
         # Returned to the runtime on hello so it can replay what this server
         # missed while disconnected (bounded by the runtime's replay window).
         self._positions: Dict[Tuple[str, str], int] = {}
+        # Last stream generation seen per (terminal, stream). Positions are only
+        # comparable within one generation, so this is what lets record_position
+        # tell a new stream numbered from 0 from a rewind of the old one.
+        self._generations: Dict[Tuple[str, str], int] = {}
         # Live interactive-attach clients by terminal (#776).
         self._attach_sinks: Dict[str, "asyncio.Queue"] = {}
         # The loop the channel connections belong to, captured at register().
@@ -354,6 +358,7 @@ class RuntimeChannelRegistry:
             self._status.pop(terminal_id, None)
             for stream in StreamName:
                 self._positions.pop((terminal_id, stream.value), None)
+                self._generations.pop((terminal_id, stream.value), None)
 
     def _placement_from_the_central_row(self, terminal_id: str) -> Optional[str]:
         """The runtime this terminal was launched on, per the persisted row.
@@ -613,6 +618,7 @@ class RuntimeChannelRegistry:
                 self._status.pop(tid, None)
                 for stream in StreamName:
                     self._positions.pop((tid, stream.value), None)
+                    self._generations.pop((tid, stream.value), None)
         if stale:
             logger.warning(
                 "runtime %s reconnected without terminals %s; their cached state is discarded",
@@ -633,9 +639,55 @@ class RuntimeChannelRegistry:
                 return TerminalStatus.UNKNOWN
             return self._status.get(terminal_id, TerminalStatus.UNKNOWN)
 
-    def record_position(self, terminal_id: str, stream: str, end_pos: int) -> None:
+    def is_stale_generation(self, terminal_id: str, stream: str, generation: int) -> bool:
+        """Whether a frame's generation is BEHIND the stream's current one.
+
+        Positions are only comparable within one generation. When the runtime
+        re-arms a reader (or a terminal id is reused) it begins a new generation
+        numbered from 0; frames still arriving from the superseded stream carry
+        the old generation and must be dropped rather than mixed into the new
+        stream's transcript (Copilot review on #802).
+        """
+        with self._lock:
+            known = self._generations.get((terminal_id, stream))
+            return known is not None and generation < known
+
+    def record_position(
+        self, terminal_id: str, stream: str, end_pos: int, generation: Optional[int] = None
+    ) -> None:
+        """Advance the consumed watermark for one (terminal, stream).
+
+        ``generation`` fences a stream RESTART:
+
+        - a HIGHER generation is a new stream, so the watermark is SET to its
+          position rather than max'd against the old stream's — a new stream
+          numbered from 0 would otherwise read as a rewind and be ignored,
+          leaving the server resuming the new stream at a dead stream's offset;
+        - a LOWER generation is a stale frame and changes nothing (callers should
+          drop such frames outright via :meth:`is_stale_generation`);
+        - the SAME generation keeps the monotonic-max behaviour.
+
+        ``generation=None`` (local bookkeeping, tests) skips the fence entirely.
+        """
         with self._lock:
             key = (terminal_id, stream)
+            if generation is not None:
+                known = self._generations.get(key)
+                if known is not None and generation < known:
+                    return
+                if known is None:
+                    self._generations[key] = generation
+                elif generation > known:
+                    self._generations[key] = generation
+                    logger.info(
+                        "terminal %s %s advanced to generation %s; watermark reset to %s",
+                        terminal_id,
+                        stream,
+                        generation,
+                        end_pos,
+                    )
+                    self._positions[key] = end_pos
+                    return
             if end_pos > self._positions.get(key, 0):
                 self._positions[key] = end_pos
 
