@@ -5,6 +5,7 @@ Publisher: terminal.{id}.output
 
 import logging
 import os
+import re
 import select
 import threading
 import time
@@ -52,6 +53,50 @@ _COALESCE_MAX_BYTES = 64 * 1024
 # fakes. terminal_service wires the real backend calls at create_reader time.
 PaneProbe = Callable[[], str]  # returns the live pane content (tmux capture-pane tail)
 RearmPipe = Callable[[], None]  # re-attaches pipe-pane (stop then start, NOT a bare toggle)
+FifoBufferProbe = Callable[[], str]  # returns the FIFO-fed StatusMonitor buffer tail
+# returns the FIFO side already rendered through the same pyte screen the
+# status pipeline composites, or None when that screen is not active
+FifoScreenProbe = Callable[[], Optional[str]]
+
+# CSI/OSC/other escape sequences as tmux pipe-pane emits them (SGR runs,
+# cursor movement, erase-line redraws, window-title changes)
+_ANSI_ESCAPE_RE = re.compile(
+    r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_]"
+)
+
+
+def _normalize_stream_text(text: str) -> str:
+    """Reduce raw pipe-pane bytes toward the pane's rendered text shape.
+
+    Approximate by design: a mismatch only withholds a re-baseline, so the
+    worst case is a stall caught one cycle later, never a healthy re-arm.
+    """
+    stripped = _ANSI_ESCAPE_RE.sub("", text).replace("\r\n", "\n")
+    # a bare CR mid-line rewrites that line: keep only the post-CR fragment
+    return "\n".join(line.rsplit("\r", 1)[-1] for line in stripped.split("\n"))
+
+
+def _strip_ws(text: str) -> str:
+    return "".join(text.split())
+
+
+def _fifo_reached_frame(screen_text: Optional[str], pane_text: str, fifo_buffer: str) -> bool:
+    """Has the FIFO side reached the live pane's current frame?
+
+    Rendered-to-rendered against the pyte screen when active; otherwise the
+    normalized raw-stream comparison above.
+    """
+    if screen_text is not None:
+        # capture-pane -e decorates the pane tail with the same escape classes
+        # the screen already rendered away, and tmux soft-wraps where the
+        # wider pyte grid does not, so neither escapes nor any whitespace
+        # boundary can carry signal: compare both sides fully stripped. A
+        # residual mismatch only withholds a re-baseline (safe direction).
+        pane = _strip_ws(_ANSI_ESCAPE_RE.sub("", pane_text))
+        if not pane:
+            return True
+        return _strip_ws(screen_text).endswith(pane)
+    return _normalize_stream_text(fifo_buffer).endswith(_normalize_stream_text(pane_text))
 
 
 class FifoManager:
@@ -129,6 +174,8 @@ class FifoManager:
         # register these; herdr and callers that pass none are never watched).
         self._pane_probe: Dict[str, PaneProbe] = {}
         self._rearm: Dict[str, RearmPipe] = {}
+        self._fifo_buffer_probe: Dict[str, FifoBufferProbe] = {}
+        self._fifo_screen_probe: Dict[str, FifoScreenProbe] = {}
         # Per-terminal watchdog bookkeeping: (last_pane_content, last_check_monotonic,
         # consecutive_diverging_checks). The full tail string (not a hash) is
         # stored so an accidental hash collision can never mask a real stall.
@@ -153,6 +200,8 @@ class FifoManager:
         terminal_id: str,
         pane_probe: Optional[PaneProbe] = None,
         rearm: Optional[RearmPipe] = None,
+        fifo_buffer_probe: Optional[FifoBufferProbe] = None,
+        fifo_screen_probe: Optional[FifoScreenProbe] = None,
     ) -> None:
         """Create FIFO and start reader thread.
 
@@ -160,6 +209,8 @@ class FifoManager:
         (tmux) callers. When both are given, the terminal is enrolled in the
         liveness watchdog (issue #388). Callers that omit them (or backends
         without pipe-pane) get exactly the old behavior — no watchdog.
+        ``fifo_buffer_probe``/``fifo_screen_probe`` refine the health
+        comparison in ``_fifo_reached_frame``.
         """
         fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
 
@@ -187,9 +238,12 @@ class FifoManager:
             self._last_data_at[terminal_id] = now
             self._registered_at[terminal_id] = now
             self._ever_delivered[terminal_id] = False
-            if enroll:
+            if pane_probe is not None and rearm is not None:
                 self._pane_probe[terminal_id] = pane_probe
                 self._rearm[terminal_id] = rearm
+                self._fifo_buffer_probe[terminal_id] = fifo_buffer_probe
+            if fifo_screen_probe is not None:
+                self._fifo_screen_probe[terminal_id] = fifo_screen_probe
             thread.start()
 
         if enroll:
@@ -213,6 +267,8 @@ class FifoManager:
             # the watchdog stops probing a gone pane.
             self._pane_probe.pop(terminal_id, None)
             self._rearm.pop(terminal_id, None)
+            self._fifo_buffer_probe.pop(terminal_id, None)
+            self._fifo_screen_probe.pop(terminal_id, None)
             self._liveness.pop(terminal_id, None)
             self._last_data_at.pop(terminal_id, None)
             self._rearm_failures.pop(terminal_id, None)
@@ -467,6 +523,8 @@ class FifoManager:
         rearm = self._rearm.get(terminal_id)
         if probe is None or rearm is None:
             return
+        fifo_buffer_probe = self._fifo_buffer_probe.get(terminal_id)
+        fifo_screen_probe = self._fifo_screen_probe.get(terminal_id)
 
         # probe() is a slow tmux `capture-pane` call — deliberately made
         # without holding self._lock so it never blocks stop_reader() (or
@@ -492,6 +550,8 @@ class FifoManager:
                 if failures >= PIPE_LIVENESS_MAX_PROBE_FAILURES:
                     self._pane_probe.pop(terminal_id, None)
                     self._rearm.pop(terminal_id, None)
+                    self._fifo_buffer_probe.pop(terminal_id, None)
+                    self._fifo_screen_probe.pop(terminal_id, None)
                     self._liveness.pop(terminal_id, None)
                     self._rearm_failures.pop(terminal_id, None)
                     self._registered_at.pop(terminal_id, None)
@@ -517,6 +577,7 @@ class FifoManager:
                     PIPE_LIVENESS_MAX_PROBE_FAILURES,
                 )
             return
+        fifo_buffer = fifo_buffer_probe() if fifo_buffer_probe is not None else ""
         now = time.monotonic()
 
         do_rearm = False
@@ -573,6 +634,8 @@ class FifoManager:
                     cold_start_give_up = True
                     self._pane_probe.pop(terminal_id, None)
                     self._rearm.pop(terminal_id, None)
+                    self._fifo_buffer_probe.pop(terminal_id, None)
+                    self._fifo_screen_probe.pop(terminal_id, None)
                     self._liveness.pop(terminal_id, None)
                     self._rearm_failures.pop(terminal_id, None)
                     self._registered_at.pop(terminal_id, None)
@@ -602,12 +665,27 @@ class FifoManager:
                 else:
                     baseline_content, last_check_at, strikes = prev
 
-                    # Did the reader deliver anything since the previous check?
-                    fifo_advanced = last_data_at >= last_check_at
+                    screen_text = None
+                    if fifo_screen_probe is not None:
+                        try:
+                            screen_text = fifo_screen_probe()
+                        except Exception:
+                            logger.debug(
+                                "fifo screen probe for %s failed; using raw-buffer comparison",
+                                terminal_id,
+                                exc_info=True,
+                            )
+                            screen_text = None
+                    if screen_text is not None or fifo_buffer_probe is not None:
+                        frame_reached = _fifo_reached_frame(screen_text, content, fifo_buffer)
+                    else:
+                        # no FIFO-side evidence: the #388 bytes-arrived heuristic
+                        frame_reached = True
+                    fifo_advanced = last_data_at >= last_check_at and frame_reached
 
                     if fifo_advanced:
-                        # Healthy: the pipe is confirmed delivering. Re-baseline
-                        # to the current pane content and clear strikes.
+                        # Healthy: the FIFO reached the live pane frame. Re-baseline
+                        # to that content and clear strikes.
                         self._liveness[terminal_id] = (content, now, 0)
                     else:
                         # FIFO silent since the last check. Compare against the
@@ -717,6 +795,8 @@ class FifoManager:
                 if give_up:
                     self._pane_probe.pop(terminal_id, None)
                     self._rearm.pop(terminal_id, None)
+                    self._fifo_buffer_probe.pop(terminal_id, None)
+                    self._fifo_screen_probe.pop(terminal_id, None)
                     self._liveness.pop(terminal_id, None)
                     self._rearm_failures.pop(terminal_id, None)
                     self._registered_at.pop(terminal_id, None)
