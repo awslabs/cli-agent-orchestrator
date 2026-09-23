@@ -592,6 +592,62 @@ class TestChannelEndpoint:
         finally:
             runtime_registry.unbind_terminal(orphan)
 
+    def test_a_failed_reconcile_leaves_the_result_unacked(self, channel_client, monkeypatch):
+        """The ack is what lets the runtime drop its only retained copy of the
+        result (Copilot review on #802). Acking a reconcile that FAILED would
+        therefore orphan the live terminal permanently — the redelivery on the
+        next reconnect is the recovery path, so the result must stay unacked.
+
+        A later sync frame proves the channel is still being read: the failure
+        withholds one ack, it does not wedge the connection.
+        """
+        import cli_agent_orchestrator.runtime_channel.api as rc_api
+
+        orphan = "beef8888"
+        monkeypatch.setattr(rc_api, "get_terminal_metadata", lambda tid: None)
+
+        def boom(*a, **k):
+            raise RuntimeError("volume not writable")
+
+        monkeypatch.setattr(rc_api, "db_create_terminal", boom)
+        headers = {"Host": "localhost", "X-CAO-Runtime-Token": "test-runtime-token"}
+        with channel_client.websocket_connect("/runtime/channel", headers=headers) as ws:
+            ws.send_text(_hello())
+            decode_frame(ws.receive_text())
+            ws.send_text(
+                encode_frame(
+                    CommandResultFrame(
+                        op_id="launch-op-unpersistable",
+                        terminal_id=orphan,
+                        outcome=CommandOutcome.OK,
+                        payload={
+                            "terminal": {
+                                "id": orphan,
+                                "session_name": "cao-beef8888",
+                                "name": "developer-beef8888",
+                                "provider": "kiro_cli",
+                            }
+                        },
+                    )
+                )
+            )
+            # An unmatched result with no terminal payload needs no reconciliation,
+            # so it is still acked: the next frame read back must be ITS ack, which
+            # is only true if the failed one produced none.
+            ws.send_text(
+                encode_frame(
+                    CommandResultFrame(
+                        op_id="sync-after-failure",
+                        terminal_id=TID,
+                        outcome=CommandOutcome.OK,
+                        payload={},
+                    )
+                )
+            )
+            ack = decode_frame(ws.receive_text())
+            assert isinstance(ack, AckFrame)
+            assert ack.op_id == "sync-after-failure"
+
     def test_stream_and_status_republish_to_bus(self, channel_client):
         from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
         from cli_agent_orchestrator.services.event_bus import bus

@@ -1222,7 +1222,7 @@ class TestARemoteWorkerInheritsItsCallersOwner:
             "cli_agent_orchestrator.clients.database.get_terminal_metadata",
             lambda tid: {"id": tid, "owner": "auth0|supervisor-owner"},
         )
-        assert step_mod._caller_owner_id("sup12345") == "auth0|supervisor-owner"
+        assert step_mod.caller_owner_id("sup12345") == "auth0|supervisor-owner"
 
     def test_an_unknown_owner_stays_unknown(self, monkeypatch):
         """No row, or a row with no owner: unknown is not revoked, and inventing
@@ -1233,8 +1233,8 @@ class TestARemoteWorkerInheritsItsCallersOwner:
             "cli_agent_orchestrator.clients.database.get_terminal_metadata",
             lambda tid: None,
         )
-        assert step_mod._caller_owner_id("sup12345") is None
-        assert step_mod._caller_owner_id(None) is None
+        assert step_mod.caller_owner_id("sup12345") is None
+        assert step_mod.caller_owner_id(None) is None
 
     def test_a_failed_lookup_does_not_break_the_step(self, monkeypatch):
         from cli_agent_orchestrator.services import agent_step as step_mod
@@ -1243,4 +1243,4 @@ class TestARemoteWorkerInheritsItsCallersOwner:
             raise RuntimeError("database unreachable")
 
         monkeypatch.setattr("cli_agent_orchestrator.clients.database.get_terminal_metadata", boom)
-        assert step_mod._caller_owner_id("sup12345") is None
+        assert step_mod.caller_owner_id("sup12345") is None

@@ -951,3 +951,43 @@ state-seed blocks it does not otherwise touch. I have left those alone rather th
 widen the diff, but they have the same latent fragility if this image is ever
 built by a builder that does not strip such lines — worth a follow-up if you want
 the file uniform.
+
+# Replies to the eighteenth review round on #802
+
+**`api/main.py:3728` — worker owner resolved from the wrong principal.** Correct,
+and it is the same bug as the previous round's `agent_step.py:752` one wearing
+different clothes, which is why it survived: I fixed the run-step path and left
+the REST path reading `principal.id`. Through the shared MCP/stdio bridge the
+request's principal is the server's own `CAO_AUTH_LOCAL_TOKEN`, not the agent
+named by `caller_id`, so every worker a local agent asked for was stamped with the
+server's identity. That is worse than no owner: revoking the caller left its
+workers delivering, because the row said they belonged to the server.
+
+The owner is now `caller_owner_id(caller_id) or principal.id` — the caller's own
+server-written `terminals.owner` column when a caller is named, and the
+authenticated principal only for a directly-authenticated request with no caller.
+`caller_owner_id` is the same function the run-step path uses, promoted from
+private to shared rather than reimplemented, so the two paths cannot drift again.
+It reads the `terminals` column and never the agent-writable metadata bag. An
+unresolvable caller falls back to the request principal rather than to `None`,
+which is the narrower of the two failure modes: a request that genuinely has no
+caller is still attributed, and a caller whose row cannot be read is no worse off
+than before this PR.
+
+**`runtime_channel/api.py:326` — a failed reconcile was still acked.** Right, and
+this one inverts the guarantee the reconciler exists for. The ack is what lets the
+runtime drop its only retained copy of the result; acking a reconcile that threw
+meant the redelivery never came again, so the exact case the code was added to
+recover — a live terminal with no central row — became permanent instead of
+transient. My "best-effort, a failure must not stop the ack" comment had the
+trade-off backwards: I was protecting against a retry loop that cannot happen,
+since redelivery is driven by reconnects, not by a hot retry.
+
+`_reconcile_orphaned_result` now returns whether it is safe to ack, and the ack is
+sent only when it is. The two early-outs return `True` deliberately: a non-OK
+outcome and a result with no terminal payload need no reconciliation, so
+withholding their acks would wedge unrelated traffic. Only a successful LAUNCH
+whose persist-or-bind actually failed goes unacked, and the log line now says so.
+Covered by `test_a_failed_reconcile_leaves_the_result_unacked`, which also asserts
+that a following frame is still acked — the failure withholds one ack, it does not
+stop the channel being read.

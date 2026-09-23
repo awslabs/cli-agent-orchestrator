@@ -468,7 +468,7 @@ async def resolve_effective_working_directory(
     return working_directory
 
 
-def _caller_owner_id(caller_id: Optional[str]) -> Optional[str]:
+def caller_owner_id(caller_id: Optional[str]) -> Optional[str]:
     """The canonical owner id recorded for ``caller_id``, or ``None`` if unknown.
 
     Read from the server's own ``terminals.owner`` column — never from the
@@ -777,7 +777,7 @@ async def run_agent_step(
                 # from anything the agent presented, and deliberately NOT included
                 # in the LAUNCH payload: an identity handed to an executor is an
                 # identity it could re-present.
-                owner_id=_caller_owner_id(caller_id),
+                owner_id=caller_owner_id(caller_id),
             )
         else:
             # create_terminal already runs provider.initialize() (which waits for

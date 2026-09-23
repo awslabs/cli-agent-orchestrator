@@ -140,6 +140,7 @@ from cli_agent_orchestrator.services import (
 )
 from cli_agent_orchestrator.services.agent_step import (
     StepExecutionError,
+    caller_owner_id,
     resolve_effective_working_directory,
     run_agent_step,
 )
@@ -3674,6 +3675,17 @@ async def create_terminal_in_session(
         # unreadable placement, so gate on it first: if the caller is remote (or
         # unknown) but the runtime cannot be resolved, refuse with a retryable
         # 503 rather than misrouting.
+        # Whose work this worker is. NOT principal.id when a caller is named:
+        # through the shared MCP/stdio bridge the request's principal is the
+        # SERVER's own local token, not the agent that asked for the worker, so
+        # persisting it attributed the worker to the operator/service principal
+        # and revoking the real caller would never gate its deferred work
+        # (Copilot review on #802). Read from the caller's own server-written row,
+        # the same resolution the run-step path uses, and fall back to the
+        # request principal only when there is no caller or it has no recorded
+        # owner.
+        worker_owner = caller_owner_id(caller_id) or principal.id
+
         caller_runtime = None
         if caller_id and runtime_registry.is_remote(caller_id):
             caller_runtime = runtime_registry.runtime_for_terminal(caller_id)
@@ -3725,7 +3737,7 @@ async def create_terminal_in_session(
                     engine=(getattr(engine, "value", engine) if engine else None),
                     use_worktree=use_worktree,
                 ),
-                owner_id=principal.id,
+                owner_id=worker_owner,
             )
 
         result = await terminal_service.create_terminal(
@@ -3744,7 +3756,7 @@ async def create_terminal_in_session(
             model=model,
             use_worktree=use_worktree,
             idempotency_key=idempotency_key,
-            owner=principal.id,
+            owner=worker_owner,
         )
         return result
     except HTTPException:

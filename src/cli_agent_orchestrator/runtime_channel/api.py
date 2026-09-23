@@ -148,7 +148,7 @@ def _note_heartbeat_watermark(behind: dict, stream_pos: StreamPosition, runtime_
     behind[key] = (stream_pos.end_pos, stream_pos.generation, recorded)
 
 
-def _reconcile_orphaned_result(frame: CommandResultFrame, runtime_id: str) -> None:
+def _reconcile_orphaned_result(frame: CommandResultFrame, runtime_id: str) -> bool:
     """Recover a live terminal from a LAUNCH result redelivered after a restart.
 
     The runtime retains each result until it is acked, so after the server
@@ -163,14 +163,20 @@ def _reconcile_orphaned_result(frame: CommandResultFrame, runtime_id: str) -> No
     persisted it before crashing — bind and move on). ``owner`` is server-side
     state the restart lost and the runtime is never told it, so a reconciled
     terminal has none; that is a known limitation, and far better than a leaked
-    pod. Best-effort: a failure here must not stop the ack, or the runtime
-    retries forever.
+    pod.
+
+    Returns whether it is safe to ACK. A reconciliation that FAILED must not be
+    acked: the ack is what lets the runtime drop its only retained copy of the
+    result, so acking a failure would leave an untracked agent running with
+    nothing able to route to or tear it down (Copilot review on #802). Leaving it
+    unacked costs a re-delivery on the next reconnect — bounded by reconnects,
+    not a hot loop — and that retry is the durable recovery path.
     """
     if frame.outcome != CommandOutcome.OK:
-        return
+        return True
     info = frame.payload.get("terminal")
     if not isinstance(info, dict) or not info.get("id"):
-        return
+        return True
     terminal_id = info["id"]
     try:
         if get_terminal_metadata(terminal_id) is None:
@@ -193,7 +199,13 @@ def _reconcile_orphaned_result(frame: CommandResultFrame, runtime_id: str) -> No
             )
         runtime_registry.claim_terminal(terminal_id, runtime_id)
     except Exception:
-        logger.exception("failed to reconcile orphaned terminal %s", terminal_id)
+        logger.exception(
+            "failed to reconcile orphaned terminal %s; NOT acking so the runtime "
+            "keeps its retained result and a later reconnect can retry",
+            terminal_id,
+        )
+        return False
+    return True
 
 
 @router.websocket("/runtime/channel")
@@ -313,6 +325,7 @@ async def runtime_channel(ws: WebSocket) -> None:
             conn.last_seen = time.time()
             if isinstance(frame, CommandResultFrame):
                 matched = conn.resolve(frame)
+                safe_to_ack = True
                 if not matched:
                     # A result the runtime retained for an op sent before this
                     # server restarted. A lost LAUNCH result is the one that
@@ -320,10 +333,13 @@ async def runtime_channel(ws: WebSocket) -> None:
                     # server never persisted or bound it, so acking-and-dropping
                     # would orphan a running agent nothing can route to or tear
                     # down (guojing1217 on #802). Reconcile it before acking.
-                    _reconcile_orphaned_result(frame, runtime_id)
-                # Ack after any reconciliation so the runtime can drop its
-                # retained copy — worker cleanup must not outrun result delivery.
-                await ws.send_text(encode_frame(AckFrame(op_id=frame.op_id)))
+                    safe_to_ack = _reconcile_orphaned_result(frame, runtime_id)
+                # Ack only once any reconciliation SUCCEEDED: the ack is what lets
+                # the runtime drop its retained copy, and dropping it after a
+                # failed reconcile would orphan a live agent for good. Worker
+                # cleanup must not outrun result delivery either way.
+                if safe_to_ack:
+                    await ws.send_text(encode_frame(AckFrame(op_id=frame.op_id)))
             elif isinstance(frame, StreamFrame):
                 raw = base64.b64decode(frame.data)
                 # A terminal streaming through this channel is de facto executed
