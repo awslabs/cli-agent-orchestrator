@@ -172,10 +172,18 @@ class FifoManager:
         (review finding 3 on #802).
         """
         offset_bytes = len(text.encode("utf-8", errors="replace"))
+        # Assign the offset AND publish inside one critical section. Two threads
+        # feed this — the reader thread and the watchdog's rearm replay — so with
+        # the publish outside the lock they could take offsets 0 and N and then
+        # publish N first. The consumer reads a backwards offset as a producer
+        # that restarted its count, which is now a GENERATION RESTART on the
+        # bridge: it would splice a new stream onto the old one although nothing
+        # restarted (Copilot review on #802). ``bus.publish`` never blocks — the
+        # queue is bounded and drops when full — so the section stays short.
         with self._lock:
             offset = self._published_bytes.get(terminal_id, 0)
             self._published_bytes[terminal_id] = offset + offset_bytes
-        bus.publish(f"terminal.{terminal_id}.output", {"data": text, "offset": offset})
+            bus.publish(f"terminal.{terminal_id}.output", {"data": text, "offset": offset})
 
     def create_reader(
         self,

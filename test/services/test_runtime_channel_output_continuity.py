@@ -402,3 +402,42 @@ class TestAStreamRestartStartsANewGeneration:
         gap, pos = buf.append_at(0, b"new")  # no generation transition
         assert gap is None
         assert pos == 10, "the stale offset is ignored and the bytes are spliced"
+
+
+class TestOffsetOrderMatchesPublishOrder:
+    """Two threads publish here; a reordered pair now costs a generation.
+
+    ``_publish_output`` assigned the offset under the lock and published outside
+    it, so the reader thread and the watchdog's rearm replay could take offsets 0
+    and N and publish N first. Since a backwards offset is a GENERATION RESTART
+    on the bridge, that reordering would splice a new stream onto the old one
+    although nothing restarted (Copilot review on #802).
+    """
+
+    def test_concurrent_publishers_never_emit_a_backwards_offset(self, tmp_path, monkeypatch):
+        import threading
+
+        monkeypatch.setattr("cli_agent_orchestrator.services.fifo_reader.FIFO_DIR", tmp_path)
+        manager = FifoManager()
+        seen: list = []
+        seen_lock = threading.Lock()
+
+        def record(topic, payload):
+            # Capture publish ORDER, which is what the consumer sees.
+            with seen_lock:
+                seen.append(payload["offset"])
+
+        with patch("cli_agent_orchestrator.services.fifo_reader.bus.publish", side_effect=record):
+
+            def hammer():
+                for _ in range(150):
+                    manager._publish_output(TID, "abcd")
+
+            threads = [threading.Thread(target=hammer) for _ in range(4)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        assert seen == sorted(seen), "a later offset was published before an earlier one"
+        assert len(seen) == 600
