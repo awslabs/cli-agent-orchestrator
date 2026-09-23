@@ -882,3 +882,43 @@ stream whose new end position equals the old watermark emits no replay frame, so
 nothing carried the new generation to the registry. hello now establishes it via
 `record_position`, which also resets the watermark, so the resume reply reads the
 new generation's position rather than the dead stream's.
+
+# Replies to the sixteenth review round on #802
+
+Four comments, all fixed in `141a5e74`. Three are consequences of earlier fixes in
+this PR, which is worth saying plainly — tightening the registry's error contract
+moved the problem up into the HTTP layer, and you caught it there.
+
+**`api/main.py:1243` — `subdir/check.sh` still accepted.** Correct: the validator
+rejected only a leading `/`, and `execute_flow` joins the value to the server's
+flows directory and executes it, so a shared caller could select a pre-existing
+server file or traverse a symlinked subdirectory instead of the body it uploaded.
+Now a bare filename — no separators, no `..` — with `script_body` as the upload
+path, which is what the contract documents.
+
+**`runtime_channel/api.py:527` and `:655` — 503 for an ambiguous outcome.**
+Correct, and these are the direct consequence of `b4a5e5dc`: once the registry
+reserves `RuntimeUnavailableError` for "the frame's fate is unknown", mapping it to
+503 advertises a retry that can start a second agent while the first is already
+launching. 503 is now reserved for the provably-not-dispatched subclass and an
+ambiguous outcome returns 504 — the same answer the timeout arm beside it already
+gave, for the same reason. Tests pin both directions on the command path.
+
+**`api/main.py:7355` — existence is not authorization.** Agreed, and you have
+raised this often enough that I went looking for a trusted signal rather than
+deferring again. There is one whenever auth is enabled: the authenticated
+principal. The endpoint now refuses a sender terminal owned by a different
+principal (403), which closes exactly the case you describe — an authenticated
+caller naming another live terminal to have the owner gate read that terminal's
+principal.
+
+What it does not do, and I want to be precise rather than claim more than I fixed:
+with auth OFF there is no identity to bind to, so the check is inert there. That is
+not a regression — it is the same posture the rest of the ownership layer has in
+the default-off configuration — but it does mean "derive the sender from caller
+identity" is only fully true for an authenticated deployment. The broker gateway
+already overwrites `sender_id` with the authenticated lease identity for worker
+callbacks, so between the two the remaining gap is a single-user local install
+with auth off, where every principal is the same one anyway. An unowned sender
+stays allowed on purpose: it predates ownership or is operator-created, and it
+confers no other identity.
