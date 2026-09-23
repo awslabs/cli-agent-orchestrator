@@ -845,3 +845,40 @@ superseded stream could overwrite the live status and settle a waiter.
 `set_status` now takes an optional generation and reuses `is_stale_generation`,
 so both paths share one definition of stale; `generation=None` is untouched for
 the local status monitor's own bookkeeping.
+
+# Replies to the fifteenth review round on #802
+
+Four comments, all correct, all fixed in `3193d719`.
+
+**`registry.py:325` — a deleted terminal could be resurrected.** Right, and the
+mechanism is exactly as described: `claim_terminal` allows a no-row id through for
+the window a tracked launch binds in, but after a delete there is also no row, so a
+FIFO/status event queued before TEARDOWN hit that branch and rebound the id.
+Deletes now tombstone the id and a claim for a tombstoned id is refused. The
+tombstone is opt-in (`unbind_terminal(deleted=True)`, passed only by the real
+delete paths) because plain unbind is *also* how cached state is reset — a hello
+that no longer claims a terminal, test cleanup — and tombstoning that would refuse
+a later legitimate claim for the same id. Your "explicit in-flight launch
+reservation" would be tighter still; the tombstone closes the reported hole
+without adding a reservation lifecycle to this PR.
+
+**`registry.py:445` — placement cache unsynchronised.** Correct. Cache reads and
+writes now take the lock, and — following your second sentence — the result is
+re-checked against the tombstones before it is published, so a row deleted while
+the read was in flight cannot be cached as a live placement. The DB read itself
+stays outside the lock deliberately: a worker thread's read must not block the
+event loop servicing the channel.
+
+**`api.py:692` — attach hangs on runtime disconnect.** Correct. `unregister` now
+EOFs (`deliver_attach(..., None)` semantics) and clears the attach sinks for every
+terminal that runtime was executing, so the relay's downstream task completes
+instead of waiting on `sink.get()` until the client gives up. It deliberately does
+NOT do this when the handler is a superseded one — the live connection owns those
+sinks by then, and closing them would cut off a working relay.
+
+**`api.py:247` — hello never established the generation.** Correct, and this was
+the gap that made the rest of the generation fencing incomplete: a restarted
+stream whose new end position equals the old watermark emits no replay frame, so
+nothing carried the new generation to the registry. hello now establishes it via
+`record_position`, which also resets the watermark, so the resume reply reads the
+new generation's position rather than the dead stream's.
