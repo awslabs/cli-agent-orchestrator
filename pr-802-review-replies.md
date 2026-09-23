@@ -713,3 +713,97 @@ filed as a follow-up.
 Tests: `test_inbox_sender_validation.py` pins both arms — an operator label is
 accepted and never looked up, and an id-shaped sender that does not exist is
 still 404.
+
+# Replies to the twelfth/thirteenth review rounds on #802
+
+Eight comments, several on code from the previous rounds. Six fixed; two are
+real and deferred with reasoning rather than patched badly.
+
+---
+
+## Fixed
+
+**`examples/.../Dockerfile:259` — region baked at build time** (`91d108a6`).
+Correct and mine. A `RUN` line evaluates `${AWS_REGION}` in the BUILDER, while
+the manifests inject the real region at pod runtime, so an opt-in codex image
+deployed anywhere else would talk to the wrong region. The key is now omitted
+entirely and codex's AWS SDK chain resolves `AWS_REGION` from the pod
+environment, which is where the answer lives.
+
+**`protocol.py:154` — `data` not strictly base64** (`91d108a6`). Correct, and the
+consequence is exactly as described: `b64decode` without `validate=True` drops
+out-of-alphabet characters, so a corrupted payload could decode to fewer bytes —
+even zero — while the handler advanced the watermark by `pos + len(raw)`. The
+server would then resume past bytes it never received, with the runtime no longer
+able to replay or report them. Now validated at the protocol boundary so the
+frame is rejected instead.
+
+**`api/main.py:7339` — any non-terminal label bypassed the owner gate**
+(`91d108a6`). You are right that shape was the wrong discriminator: an arbitrary
+label resolves to no owner and `may_start_work(None)` permits delivery, so
+`sender_id=forged` walked past the gate. Replaced with a closed allowlist
+(`_OPERATOR_SENDER_LABELS = {"operator"}`) — the operator surface keeps working
+and there is no unowned-by-choice escape hatch. Test added for the forged label.
+
+**`session_service.py:307` — remote session deleted without remote TEARDOWN**
+(`c257d036`). Correct and serious: the row was the agent's only handle, so
+deleting it while `dismantle_terminal_runtime` touched only local state leaked an
+agent nothing could reach. Remote terminals now get a TEARDOWN over the channel
+first, through the registry's blocking path (`delete_session` is synchronous). A
+teardown failure still drops the row, on the same reasoning
+`remote_delete_terminal` applies to an `absent` report — a row pointing at an
+unreachable runtime is one nobody can act on — but it is logged loudly.
+
+**`cli/commands/info.py:46` — shared token sent to a localhost URL**
+(`e6b06278`). Correct. Now built with `server_base_url()`, so the address and the
+token cannot disagree.
+
+**`fifo_reader.py:178` — offset assigned under the lock, published outside**
+(`420b014f`). Correct, and it interacts badly with the generation work from this
+same round: a reordered pair reads as a backwards offset, which is now a
+generation restart, which would splice a new stream onto the old one although
+nothing restarted. Publication moved inside the critical section (`bus.publish`
+never blocks — bounded queue, drops when full). New test runs four threads
+through it concurrently and asserts publish order is monotonic in the offsets.
+
+---
+
+## Deferred, with reasoning
+
+**`runtime_channel/api.py:185` — reconciled orphan row has `owner=None`**
+(comment `4078392941`)
+
+The analysis is right: the reconciliation I added for a redelivered LAUNCH result
+cannot know the original owner — by design it is never sent to the runtime — so
+the recovered row gets `owner=None`, and `may_start_work(None)` treats that as
+allowed. Your suggested shape (persist an op_id→owner record before dispatch and
+recover it here) is the correct fix and I am not going to fake it with a sentinel
+owner, because inventing an identity for a row that will be read by ownership and
+revocation checks is worse than the gap it papers over.
+
+Worth stating what the exposure actually is, so the priority is honest: reaching
+it needs a server crash between dispatch and persist, AND the original owner to
+have been revoked in the interim. The alternative — failing the orphaned launch
+closed — trades a leaked agent nothing can route to or tear down for a narrower
+authorization gap, which is not obviously the better end of the trade. It wants
+the op_id→owner journal, and that is its own change with its own test pass.
+Filed.
+
+**`runtime_channel/api.py:355` — watermark advances before the bus dispatch**
+(comment `4079417517`)
+
+Also correct, and the sharpest of the eight: the channel's gap protocol only
+covers the runtime→server hop. Once the server records the position and hands the
+event to the in-process `EventBus`, a full subscriber queue drops it, and the next
+reconnect resumes past those bytes with nothing able to report the loss. So
+remote output can still go missing at the server boundary, which is exactly the
+class of silent loss the rest of this work exists to remove.
+
+Fixing it properly means a per-consumer delivery watermark (or a loss-aware
+handoff) so the server's consumed position reflects what subscribers actually
+received, not what it forwarded — a change to the bus contract that every
+consumer (LogWriter, AG-UI, inbox) shares. I am not going to bolt that onto this
+PR after the replay/resume path has already been reworked across several rounds;
+the risk of introducing a new silent-loss path while closing this one is real.
+Filed as the follow-up it deserves, and called out in the PR body rather than
+left implicit.
