@@ -387,6 +387,38 @@ def get_session(session_name: str) -> Dict:
         raise
 
 
+def _teardown_remote_terminal(terminal_id: str) -> bool:
+    """Tear a REMOTE terminal down in its own runtime. Returns whether it was remote.
+
+    ``delete_session`` is synchronous, so this goes through the registry's
+    blocking command path (the same one inbox delivery uses from a worker
+    thread) rather than the async ``remote_delete_terminal``.
+
+    A failure here is deliberately NOT fatal: the caller still drops the row, on
+    the same reasoning ``remote_delete_terminal`` applies to an ``absent``
+    report — a row pointing at a runtime that cannot be reached is a row nobody
+    can act on, and keeping it makes the id permanently un-deletable. The
+    failure is logged loudly because the agent may still be alive.
+    """
+    from cli_agent_orchestrator.runtime_channel.protocol import CommandType
+    from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
+
+    if not runtime_registry.is_remote(terminal_id):
+        return False
+    try:
+        runtime_registry.send_terminal_command_blocking(terminal_id, CommandType.TEARDOWN, {})
+    except Exception as exc:  # noqa: BLE001 — see docstring
+        logger.warning(
+            "remote teardown of terminal %s failed (%s); its agent may still be "
+            "running in its runtime, but the central row is being removed",
+            terminal_id,
+            exc,
+        )
+    else:
+        runtime_registry.unbind_terminal(terminal_id)
+    return True
+
+
 def delete_session(session_name: str, registry: PluginRegistry | None = None) -> Dict:
     """Delete session and cleanup, reconciling tmux and the registry atomically.
 
@@ -555,9 +587,20 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
             row_delete_failed: List[Tuple[str, Dict]] = []
             for terminal_id, metadata in captured:
                 try:
-                    runtime_released = terminal_service.dismantle_terminal_runtime(
-                        terminal_id, metadata, kill_window=False
-                    )
+                    if _teardown_remote_terminal(terminal_id):
+                        # A remote terminal's pane, provider and tmux session all
+                        # live in its runtime. dismantle_terminal_runtime only
+                        # touches LOCAL FIFO/status/provider state and local tmux,
+                        # so running it alone deleted the row here and left the
+                        # agent running there — a leaked agent nobody can reach,
+                        # since the row was its only handle (Copilot review on
+                        # #802). The runtime has now been told to tear it down, so
+                        # fall through to the row delete below.
+                        runtime_released = True
+                    else:
+                        runtime_released = terminal_service.dismantle_terminal_runtime(
+                            terminal_id, metadata, kill_window=False
+                        )
                 except Exception as e:
                     logger.warning(f"Failed to cleanup terminal {terminal_id}: {e}")
                     runtime_released = True

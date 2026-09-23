@@ -1497,3 +1497,55 @@ class TestListSessionsRemoteRuntimes:
         backend.get_pane_working_directory.assert_called_once_with(
             "cao-local", "developer-aaaaaaaa"
         )
+
+
+class TestDeletingARemoteSessionTearsItDownInItsRuntime:
+    """A remote terminal's pane, provider and tmux all live in its runtime.
+
+    ``dismantle_terminal_runtime`` only touches LOCAL state, so running it alone
+    deleted the central row and left the agent running in its pod — a leaked
+    agent whose only handle was the row just removed (Copilot review on #802).
+    """
+
+    def test_a_remote_terminal_gets_a_teardown_command(self, monkeypatch):
+        from cli_agent_orchestrator.runtime_channel.protocol import CommandType
+        from cli_agent_orchestrator.services import session_service as svc
+
+        registry = MagicMock()
+        registry.is_remote.return_value = True
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.runtime_channel.registry.runtime_registry", registry
+        )
+
+        assert svc._teardown_remote_terminal("abcd1234") is True
+        registry.send_terminal_command_blocking.assert_called_once()
+        args = registry.send_terminal_command_blocking.call_args.args
+        assert args[0] == "abcd1234" and args[1] == CommandType.TEARDOWN
+        registry.unbind_terminal.assert_called_once_with("abcd1234")
+
+    def test_a_local_terminal_is_left_to_the_local_path(self, monkeypatch):
+        from cli_agent_orchestrator.services import session_service as svc
+
+        registry = MagicMock()
+        registry.is_remote.return_value = False
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.runtime_channel.registry.runtime_registry", registry
+        )
+
+        assert svc._teardown_remote_terminal("abcd1234") is False
+        registry.send_terminal_command_blocking.assert_not_called()
+
+    def test_an_unreachable_runtime_still_reports_remote(self, monkeypatch):
+        """The row is dropped anyway: a row pointing at an unreachable runtime is
+        one nobody can act on, and keeping it makes the id un-deletable."""
+        from cli_agent_orchestrator.services import session_service as svc
+
+        registry = MagicMock()
+        registry.is_remote.return_value = True
+        registry.send_terminal_command_blocking.side_effect = RuntimeError("not connected")
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.runtime_channel.registry.runtime_registry", registry
+        )
+
+        assert svc._teardown_remote_terminal("abcd1234") is True
+        registry.unbind_terminal.assert_not_called()
