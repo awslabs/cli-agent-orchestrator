@@ -103,6 +103,40 @@ RUN if [ "${INSTALL_CLAUDE_CODE}" != "1" ]; then \
     && claude --version; \
     fi
 
+# --- Provider CLI: codex (opt in) ---------------------------------------------
+#
+# Codex qualifies under the same rule as Claude Code: public npm, and it reaches
+# Bedrock through the standard AWS SDK credential chain, so the pod's projected
+# web-identity token authenticates it with no human and no secret to mount. That
+# is selected by config rather than a flag — `model_provider = "amazon-bedrock"`
+# in ~/.codex/config.toml, written below — because codex's own default is the
+# OpenAI endpoint, which no pod here can log in to.
+#
+# Kept opt-in and OFF by default so the default image stays the size it was.
+# Enable with:
+#
+#     --build-arg INSTALL_CODEX=1
+#
+# Node is already present from the Claude Code stage; when that stage is skipped
+# (BASE_PROVIDER_IMAGE) this installs NodeSource itself, so the two are
+# independent.
+ARG INSTALL_CODEX=0
+ARG CODEX_VERSION=0.153.4
+ARG CODEX_BEDROCK_MODEL=openai.gpt-oss-120b-1:0
+RUN if [ "${INSTALL_CODEX}" != "1" ]; then \
+      echo "skipping codex install (INSTALL_CODEX=${INSTALL_CODEX})"; \
+    else \
+    if ! command -v npm >/dev/null 2>&1; then \
+      curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
+      && apt-get install -y --no-install-recommends nodejs; \
+    fi \
+    && npm install -g "@openai/codex@${CODEX_VERSION}" \
+    && npm cache clean --force \
+    && rm -rf /var/lib/apt/lists/* \
+    # Fail the build here rather than at pod startup if the CLI is unusable.
+    && codex --version; \
+    fi
+
 # --- Provider CLI: kiro-cli (opt in) ------------------------------------------
 #
 #   docker build -f examples/cao-clusters/kubernetes/eks/Dockerfile \
@@ -197,6 +231,30 @@ RUN mkdir -p /home/cao/workspace
 # restart.
 RUN printf '{\n  "hasCompletedOnboarding": true\n}\n' > /home/cao/.claude.json \
     && chmod 600 /home/cao/.claude.json
+
+# Point codex at Bedrock, and mark this workspace trusted.
+#
+# Only written when codex is installed. Two settings, both load-bearing:
+#
+# * ``model_provider = "amazon-bedrock"`` — codex's default is the OpenAI
+#   endpoint, which no pod here can log in to. With this it uses the standard AWS
+#   SDK chain, so the projected web-identity token authenticates it exactly as it
+#   does Claude Code, with nothing to mount.
+# * ``trust_level = "trusted"`` for the workspace — otherwise codex opens with
+#   "Do you trust the contents of this directory?" and waits. CAO's codex startup
+#   handler can answer that dialog, but a disposable pod should not spend a
+#   round-trip on a question whose answer is fixed at build time.
+#
+# Same reasoning as the Claude Code file above: container filesystem, so it has
+# to be baked in rather than seeded into a running pod.
+ARG INSTALL_CODEX
+ARG CODEX_BEDROCK_MODEL
+RUN if [ "${INSTALL_CODEX}" = "1" ]; then \
+      mkdir -p /home/cao/.codex \
+      && printf 'model = "%s"\nmodel_provider = "amazon-bedrock"\n\n[model_providers.amazon-bedrock.aws]\nregion = "%s"\n\n[projects."/home/cao/workspace"]\ntrust_level = "trusted"\n' \
+           "${CODEX_BEDROCK_MODEL}" "${AWS_REGION:-us-east-1}" > /home/cao/.codex/config.toml \
+      && chmod 600 /home/cao/.codex/config.toml; \
+    fi
 
 # --- Pre-initialized state seed ------------------------------------------------
 #
