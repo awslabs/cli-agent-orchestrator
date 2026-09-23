@@ -1086,6 +1086,20 @@ class CodexProvider(BaseProvider):
                     env_vars = cfg.get("env_vars", [])
                     if "CAO_TERMINAL_ID" not in env_vars:
                         env_vars = list(env_vars) + ["CAO_TERMINAL_ID"]
+                    # The MCP child also has to know WHERE the CAO API is. It
+                    # resolves that from CAO_API_HOST/CAO_API_PORT (or
+                    # CAO_MEMORY_API_URL) and otherwise defaults to
+                    # 127.0.0.1:9889 — so on any server that is not on the
+                    # default local port, every assign/handoff failed with
+                    # "the calling terminal could not be resolved ... Connection
+                    # refused". In an execution-only runtime (#745) the API is not
+                    # on localhost at all, which is precisely the topology this
+                    # work exists for. Forward the names when they are set, the
+                    # same three claude_code forwards; unset means unchanged
+                    # local behaviour.
+                    for var in ("CAO_API_HOST", "CAO_API_PORT", "CAO_MEMORY_API_URL"):
+                        if var not in env_vars and os.environ.get(var):
+                            env_vars = list(env_vars) + [var]
                     env_vars_toml = "[" + ", ".join(_toml_scalar(v) for v in env_vars) + "]"
                     command_parts.extend(["-c", f"{prefix}.env_vars={env_vars_toml}"])
                     # Set a generous tool timeout for MCP calls like handoff, which
@@ -1281,38 +1295,35 @@ class CodexProvider(BaseProvider):
         return True
 
     @staticmethod
-    def _shows_codex_ui(clean_output: str) -> bool:
-        """Whether the pane tail still shows codex's own TUI.
+    def _pane_returned_to_shell(clean_output: str) -> bool:
+        """Whether the pane's bottom line is a shell prompt again.
 
-        Positive evidence that the process is alive and rendering: either its
-        footer chrome ("? for shortcuts", "context left", the model/cwd status
-        bar) or a bare idle ``›`` prompt. Used to refuse the
-        pane-command-says-shell exit inference, which is wrong whenever codex is
-        a node shim — tmux then reports the shell for the whole session.
+        Positive evidence that codex is gone, as opposed to the mere absence of
+        evidence that it is running. Required before inferring an exit from
+        tmux's pane-command report, which cannot carry that inference on its
+        own for two different reasons:
 
-        Tail-scoped for the same reason the idle checks are: the launch command
-        and boot banner scroll away, and only the live frame at the bottom says
-        anything about now.
+        * A node-shim install (``/opt/homebrew/bin/codex`` is
+          ``#!/usr/bin/env node``, how npm/homebrew ship it) makes tmux report
+          the SHELL for the entire session, so the report matches the baseline
+          while codex is perfectly healthy. Inferring an exit from it put every
+          terminal in ERROR and made ``send_input`` refuse with 409.
+        * Even with corroboration from "does the tail look like codex", there is
+          a window right after launch — ``_initialized`` is set, the command line
+          is on screen, the TUI has not painted yet — with no codex chrome to
+          find. A ``handoff`` polling during that window saw ERROR and failed the
+          worker, while the same terminal reached ``completed`` moments later.
 
-        The LAST non-empty line decides first. After a real exit the pane's
-        bottom line is the shell prompt again, while codex's own ``›`` prompt and
-        footer are still sitting in the scrollback just above it — so a plain
-        "does any tail line look like codex" test would read a genuinely dead
-        pane as alive. A bottom line that is a shell prompt therefore wins,
-        whatever is above it.
+        Asking instead for the shell prompt closes both: it is absent during
+        init and present after a real exit. Safe for a native install too —
+        there tmux reports ``codex`` while it runs, so this branch is only
+        reached once it has actually exited, and the prompt is there.
         """
         lines = [line for line in clean_output.splitlines() if line.strip()]
         if not lines:
             return False
-        # A shell prompt as the bottom line: the pane is back to the shell.
-        if re.search(r"[%$#]\s*$", lines[-1]):
-            return False
-        return any(
-            re.search(TUI_FOOTER_PATTERN, line)
-            or re.match(IDLE_PROMPT_STRICT_PATTERN, line)
-            or re.match(USER_PREFIX_PATTERN, line)
-            for line in lines[-IDLE_PROMPT_TAIL_LINES:]
-        )
+        # Ends in a shell prompt sigil, with nothing typed after it.
+        return bool(re.search(r"[%$#]\s*$", lines[-1]))
 
     def get_status(self, output: str) -> TerminalStatus:
         # Native status (herdr): trust the backend's agent state when available;
@@ -1347,17 +1358,17 @@ class CodexProvider(BaseProvider):
         # terminal went ERROR seconds after launch and ``send_input`` refused
         # with 409, which breaks assign/handoff entirely for that install.
         #
-        # So require corroboration from the buffer: codex's own TUI (its footer
-        # chrome or an idle ``›`` prompt) is positive evidence the process is
-        # alive and rendering, whatever tmux reports about the foreground
-        # command. Only when the pane is back to the baseline shell AND shows
-        # none of codex's UI is it really gone. ``kiro_cli`` already orders its
-        # equivalent check after the idle-prompt detection for the same reason.
+        # So require POSITIVE evidence from the buffer that the shell is back —
+        # a shell prompt on the bottom line — rather than inferring an exit
+        # from the command report alone. See _pane_returned_to_shell for why
+        # the weaker "no codex chrome in the tail" test is not enough: it
+        # misfires in the window between launch and the first painted frame,
+        # which a handoff poll lands in.
         if self._initialized and self.shell_baseline:
             current_cmd = get_backend().get_pane_current_command(
                 self.session_name, self.window_name
             )
-            if current_cmd == self.shell_baseline and not self._shows_codex_ui(clean_output):
+            if current_cmd == self.shell_baseline and self._pane_returned_to_shell(clean_output):
                 return TerminalStatus.ERROR
 
         # Search for user messages, excluding the Codex TUI footer when present.

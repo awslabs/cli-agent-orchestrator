@@ -4177,6 +4177,23 @@ class TestCodexProviderExitDetection:
         assert provider.get_status(output) != TerminalStatus.ERROR
 
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_the_window_before_the_first_painted_frame_is_not_an_exit(self, mock_tmux):
+        """Right after launch the command line is on screen and the TUI has not
+        painted, so there is no codex chrome to find. A handoff polling in that
+        window saw ERROR and failed a worker that reached `completed` moments
+        later, so absence-of-chrome must not be read as an exit."""
+        mock_tmux.return_value.get_native_status.return_value = None
+        mock_tmux.return_value.get_pane_current_command.return_value = "zsh"
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider._initialized = True
+        provider.shell_baseline = "zsh"
+        # Bottom line is the launch command, not a prompt: nothing has exited.
+        output = "% codex --yolo --no-alt-screen -c check_for_update_on_startup=false\n"
+
+        assert provider.get_status(output) != TerminalStatus.ERROR
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
     def test_a_shell_prompt_below_stale_codex_chrome_is_still_an_exit(self, mock_tmux):
         """The inverse: after a real exit the codex prompt and footer are still in
         the scrollback, with the shell prompt beneath them. The bottom line wins,
