@@ -1239,10 +1239,18 @@ class CreateFlowRequest(BaseModel):
         """
         if v is None or v == "":
             return v
-        if v.startswith("/") or "\\" in v or ".." in v:
+        # A BARE filename, not a relative path. Rejecting only a leading "/" let
+        # "subdir/check.sh" through, and execute_flow joins that to the server's
+        # flows directory and executes it — so a shared caller could select a
+        # pre-existing server file (or traverse a symlinked subdirectory) instead
+        # of the script body it uploaded (Copilot review on #802). The upload path
+        # (``script_body``) is what callers should use; this field stays only for a
+        # filename already sitting in the flows directory.
+        if "/" in v or "\\" in v or ".." in v:
             raise ValueError(
-                "Flow script must be a relative filename inside the flows directory "
-                "(no absolute path, no '..', no '\\')"
+                "Flow script must be a bare filename inside the flows directory "
+                "(no path separators, no '..'); upload the script with "
+                "'script_body' instead"
             )
         if any(ord(ch) < 32 or ord(ch) == 127 for ch in v):
             raise ValueError("Flow script must not contain control characters")
@@ -7324,6 +7332,7 @@ async def create_inbox_message_endpoint(
     sender_id: str,
     message: str,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+    principal: Principal = Depends(get_current_principal),
 ) -> Dict:
     """Create inbox message and attempt immediate delivery."""
     # ``sender_id`` is an agent-supplied query param, and the delivery-time owner
@@ -7360,6 +7369,27 @@ async def create_inbox_message_endpoint(
                 "recognized operator label"
             ),
         )
+
+    # Existence is not authorization: a caller could still name ANOTHER live
+    # terminal and have the owner gate evaluate that terminal's principal
+    # (Copilot review on #802, raised repeatedly). When an authenticated identity
+    # IS available, bind the two: a sender terminal owned by somebody else is
+    # refused. This is the strongest check this route can make today — with auth
+    # off there is no identity to bind to, and the broker gateway already
+    # overwrites sender_id with the authenticated lease identity before it gets
+    # here, so the remaining unbound case is an authenticated caller naming a
+    # terminal it does not own, which is exactly what this rejects.
+    if is_auth_enabled() and sender_id not in _OPERATOR_SENDER_LABELS:
+        sender_row = await asyncio.to_thread(get_terminal_metadata, sender_id)
+        sender_owner = (sender_row or {}).get("owner")
+        if sender_owner and sender_owner != principal.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    f"sender '{sender_id}' is owned by another principal; a message "
+                    "may only be sent as a terminal you own"
+                ),
+            )
     try:
         inbox_msg = create_inbox_message(
             sender_id,

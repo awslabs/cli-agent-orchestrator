@@ -53,6 +53,7 @@ from cli_agent_orchestrator.runtime_channel.registry import (
     LAUNCH_TIMEOUT,
     TEARDOWN_TIMEOUT,
     RemoteCommandError,
+    RuntimeNotDispatchedError,
     RuntimeUnavailableError,
     runtime_registry,
 )
@@ -523,8 +524,20 @@ async def launch_remote_terminal(
         result = await conn.send_command(
             CommandType.LAUNCH, body.model_dump(exclude_none=True), timeout=LAUNCH_TIMEOUT
         )
-    except RuntimeUnavailableError as e:
+    except RuntimeNotDispatchedError as e:
+        # PROVABLY nothing on the wire, so a retry cannot duplicate the launch:
+        # 503, the retryable signal.
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
+    except RuntimeUnavailableError as e:
+        # The base class means the frame's fate is UNKNOWN — the channel can close
+        # after the bytes are written. Answering 503 invited a retry that starts a
+        # SECOND agent while the first is already running, which is the same
+        # duplicate-work hazard the timeout arm below exists to avoid (Copilot
+        # review on #802). Report unknown instead.
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail=f"launch on runtime '{runtime_id}' has an unknown outcome: {e}",
+        )
     except TimeoutError:
         # The response is missing; the launch may or may not have happened.
         # Report unknown rather than retrying into a duplicate worker (#745).
@@ -651,8 +664,15 @@ async def remote_terminal_command(
         result = await runtime_registry.send_terminal_command(
             terminal_id, command_type, payload, timeout=timeout
         )
-    except RuntimeUnavailableError as e:
+    except RuntimeNotDispatchedError as e:
+        # Nothing was sent: safe to retry, so keep the retryable 503.
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
+    except RuntimeUnavailableError as e:
+        # Frame may already have been delivered — unknown, not retryable.
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail=(f"remote operation on terminal '{terminal_id}' has an unknown outcome: {e}"),
+        )
     except TimeoutError:
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,

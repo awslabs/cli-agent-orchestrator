@@ -58,3 +58,49 @@ class TestADisconnectedRuntimeIs503OnEveryArm:
         resp = client.post(f"/terminals/{self.TID}/input", params={"message": "hi"})
         assert resp.status_code != 500
         assert "500" not in resp.json()["detail"]
+
+
+class TestAnAmbiguousSendIsNotAdvertisedAsRetryable:
+    """503 invites a retry; an unknown outcome must not.
+
+    ``RuntimeUnavailableError`` (the base) means the frame may already have been
+    delivered — the channel can close after the bytes are written. Answering 503
+    there let a client retry a LAUNCH that was already executing and start a
+    SECOND agent (Copilot review on #802). Only the provably-not-dispatched
+    subclass keeps 503.
+    """
+
+    TID = "76550a9e"
+
+    def test_an_ambiguous_command_failure_is_504_not_503(self, client):
+        from cli_agent_orchestrator.runtime_channel.registry import RuntimeUnavailableError
+
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.runtime_registry.is_remote",
+                return_value=True,
+            ),
+            patch(
+                "cli_agent_orchestrator.runtime_channel.registry.runtime_registry.send_terminal_command",
+                side_effect=RuntimeUnavailableError("closed mid-send; fate unknown"),
+            ),
+        ):
+            resp = client.post(f"/terminals/{self.TID}/input", params={"message": "hi"})
+        assert resp.status_code == 504
+        assert "unknown outcome" in resp.json()["detail"]
+
+    def test_a_provable_non_dispatch_stays_503(self, client):
+        from cli_agent_orchestrator.runtime_channel.registry import RuntimeNotDispatchedError
+
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.runtime_registry.is_remote",
+                return_value=True,
+            ),
+            patch(
+                "cli_agent_orchestrator.runtime_channel.registry.runtime_registry.send_terminal_command",
+                side_effect=RuntimeNotDispatchedError("channel already closed"),
+            ),
+        ):
+            resp = client.post(f"/terminals/{self.TID}/input", params={"message": "hi"})
+        assert resp.status_code == 503
