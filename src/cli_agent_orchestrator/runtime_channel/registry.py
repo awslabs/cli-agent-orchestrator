@@ -103,6 +103,10 @@ class RuntimeConnection:
         # Set by the registry at register(); 0 means "never registered", which is
         # what an unregistered connection built directly in a test has.
         self.incarnation = 0
+        # Set the moment the registry knows this channel is gone (disconnect, or
+        # superseded by a reconnect). It is the ONLY basis on which a send
+        # failure may be reported as "never dispatched" — see send_command.
+        self.closed = False
 
     async def send_command(
         self,
@@ -135,14 +139,28 @@ class RuntimeConnection:
         future: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending[op_id] = future
         try:
+            if self.closed:
+                # Provably nothing on the wire: the registry had already declared
+                # this channel gone before the attempt. This is the ONLY case that
+                # may claim non-dispatch, because it is the only one that can.
+                raise RuntimeNotDispatchedError(
+                    f"channel to runtime {self.runtime_id} was already closed; "
+                    f"{command_type.value} was not sent"
+                )
             try:
                 await self._send_text(encode_frame(frame))
             except Exception as exc:  # noqa: BLE001 — transport failure, any kind
-                # The frame did not go out, so nothing ran. Saying so lets a
-                # caller retry safely; the wait below, once entered, can only
-                # ever produce "unknown".
-                raise RuntimeNotDispatchedError(
-                    f"could not send {command_type.value} to runtime {self.runtime_id}: {exc}"
+                # A send raising does NOT prove the frame never went out: the
+                # connection can close after the bytes are written and before the
+                # await returns. Classifying that as non-dispatch let inbox
+                # delivery retry an input the runtime may already have typed,
+                # duplicating a delegated result — the exact failure
+                # RuntimeNotDispatchedError exists to prevent (Copilot review on
+                # #802). Unknown is the honest answer, and the retryable subclass
+                # is reserved for the provable case above.
+                raise RuntimeUnavailableError(
+                    f"send of {command_type.value} to runtime {self.runtime_id} failed "
+                    f"with the frame's fate unknown: {exc}"
                 ) from exc
             return await asyncio.wait_for(future, timeout=timeout)
         finally:
@@ -226,6 +244,7 @@ class RuntimeChannelRegistry:
         if existing is not None:
             # A reconnect superseding a half-open connection: fail the old
             # channel's waiters rather than leaving them to time out.
+            existing.closed = True
             existing.fail_all_pending(f"runtime {runtime_id} reconnected on a new channel")
         conn = RuntimeConnection(runtime_id, send_text)
         # The incarnation of a runtime id: one more executor process (or one more
@@ -252,6 +271,7 @@ class RuntimeChannelRegistry:
             if self._runtimes.get(runtime_id) is conn:
                 del self._runtimes[runtime_id]
                 logger.info("runtime channel disconnected: %s", runtime_id)
+        conn.closed = True
         conn.fail_all_pending(f"runtime {runtime_id} channel closed")
 
     def get_runtime(self, runtime_id: str) -> Optional[RuntimeConnection]:

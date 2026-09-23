@@ -264,13 +264,34 @@ class TestTheChannelSaysWhetherItSent:
     """
 
     @pytest.mark.asyncio
-    async def test_a_transport_that_refuses_the_frame_is_not_dispatched(self):
-        async def send_text(_raw):
-            raise ConnectionResetError("websocket is closed")
+    async def test_an_already_closed_channel_is_provably_not_dispatched(self):
+        """The only case that may claim non-dispatch: the registry had already
+        declared the channel gone, so nothing could have been written."""
+        sent = []
+
+        async def send_text(raw):
+            sent.append(raw)
 
         conn = RuntimeConnection("cao-supervisor-0", send_text)
+        conn.closed = True
         with pytest.raises(RuntimeNotDispatchedError):
             await conn.send_command(CommandType.INPUT, {"message": "757"}, timeout=5.0)
+        assert not sent, "a closed channel must not even attempt the send"
+
+    @pytest.mark.asyncio
+    async def test_a_send_that_raises_is_unknown_not_safely_retryable(self):
+        """A send raising does NOT prove the frame never left: the connection can
+        close after the bytes are written and before the await returns. Claiming
+        non-dispatch there let the inbox retry an input the runtime may already
+        have typed, duplicating a delegated result (Copilot review on #802)."""
+
+        async def send_text(_raw):
+            raise ConnectionResetError("closed mid-send; fate of the frame unknown")
+
+        conn = RuntimeConnection("cao-supervisor-0", send_text)
+        with pytest.raises(RuntimeUnavailableError) as exc:
+            await conn.send_command(CommandType.INPUT, {"message": "757"}, timeout=5.0)
+        assert not isinstance(exc.value, RuntimeNotDispatchedError)
 
     @pytest.mark.asyncio
     async def test_a_channel_lost_after_the_frame_went_out_is_only_unavailable(self):
