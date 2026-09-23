@@ -89,6 +89,12 @@ RUN apt-get update \
 # mutable provider version can break an otherwise unchanged cluster. Version
 # 2.1.250 fails before its first Bedrock request with `O is not defined`;
 # 2.1.235 was validated against this example's Bedrock configuration.
+# The trailing `<cli> --version` is a build-time smoke test: a CLI that cannot
+# even report its version fails the build here rather than at pod startup. It is
+# NOT a comment inside the RUN — a `#` line inside a backslash-continued RUN is
+# joined into one shell command by some builders, which comments out the rest of
+# it (the version check and the closing `fi`) and either breaks the build or
+# silently drops the check (Copilot review on #802).
 ARG INSTALL_CLAUDE_CODE=1
 ARG CLAUDE_CODE_VERSION=2.1.235
 RUN if [ "${INSTALL_CLAUDE_CODE}" != "1" ]; then \
@@ -99,7 +105,6 @@ RUN if [ "${INSTALL_CLAUDE_CODE}" != "1" ]; then \
     && npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
     && npm cache clean --force \
     && rm -rf /var/lib/apt/lists/* \
-    # Fail the build here rather than at pod startup if the CLI is unusable.
     && claude --version; \
     fi
 
@@ -120,6 +125,8 @@ RUN if [ "${INSTALL_CLAUDE_CODE}" != "1" ]; then \
 # Node is already present from the Claude Code stage; when that stage is skipped
 # (BASE_PROVIDER_IMAGE) this installs NodeSource itself, so the two are
 # independent.
+# Same build-time smoke test as the Claude Code block, and the same reason the
+# explanation sits out here rather than inside the RUN.
 ARG INSTALL_CODEX=0
 ARG CODEX_VERSION=0.153.4
 # The model id must exist on the bedrock-mantle (OpenAI-compatible) endpoint
@@ -137,7 +144,6 @@ RUN if [ "${INSTALL_CODEX}" != "1" ]; then \
     && npm install -g "@openai/codex@${CODEX_VERSION}" \
     && npm cache clean --force \
     && rm -rf /var/lib/apt/lists/* \
-    # Fail the build here rather than at pod startup if the CLI is unusable.
     && codex --version; \
     fi
 

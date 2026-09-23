@@ -468,6 +468,27 @@ async def resolve_effective_working_directory(
     return working_directory
 
 
+def _caller_owner_id(caller_id: Optional[str]) -> Optional[str]:
+    """The canonical owner id recorded for ``caller_id``, or ``None`` if unknown.
+
+    Read from the server's own ``terminals.owner`` column — never from the
+    agent-writable metadata bag, and never from anything the caller presented.
+    ``None`` (no row, no owner recorded, an unparseable value) stays None:
+    unknown is not revoked, and inventing an owner would be worse than the gap.
+    """
+    if not caller_id:
+        return None
+    try:
+        from cli_agent_orchestrator.clients.database import get_terminal_metadata
+
+        row = get_terminal_metadata(caller_id)
+    except Exception as exc:  # noqa: BLE001 — ownership inheritance is best-effort
+        logger.warning("could not read owner for caller %s: %s", caller_id, exc)
+        return None
+    owner = (row or {}).get("owner")
+    return str(owner) if owner else None
+
+
 async def run_agent_step(
     provider: str,
     agent: str,
@@ -748,8 +769,15 @@ async def run_agent_step(
                     model=model,
                     use_worktree=use_worktree,
                 ),
-                # Server-written: the owner is never handed to the executor.
-                owner_id=None,
+                # Server-written and INHERITED FROM THE CALLER. Passing None
+                # persisted the worker centrally with no owner, so its callback
+                # was "unknown" to the owner/revocation gate and work dispatched
+                # by a revoked caller would deliver instead of being held
+                # (Copilot review on #802). Read from the caller's own row, never
+                # from anything the agent presented, and deliberately NOT included
+                # in the LAUNCH payload: an identity handed to an executor is an
+                # identity it could re-present.
+                owner_id=_caller_owner_id(caller_id),
             )
         else:
             # create_terminal already runs provider.initialize() (which waits for

@@ -1204,3 +1204,43 @@ class TestAHandoffFromARemoteCallerLandsInItsRuntime:
         )
         with pytest.raises(RuntimeError, match="placement is currently unavailable"):
             step_mod._caller_runtime("sup12345")
+
+
+class TestARemoteWorkerInheritsItsCallersOwner:
+    """A worker persisted with no owner is "unknown" to the revocation gate.
+
+    The remote handoff path passed owner_id=None, so the central row for a worker
+    created on a caller's behalf had no principal — and its later callback was
+    treated as unowned, letting work dispatched by a REVOKED caller deliver
+    instead of being held (Copilot review on #802).
+    """
+
+    def test_the_owner_comes_from_the_callers_own_row(self, monkeypatch):
+        from cli_agent_orchestrator.services import agent_step as step_mod
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+            lambda tid: {"id": tid, "owner": "auth0|supervisor-owner"},
+        )
+        assert step_mod._caller_owner_id("sup12345") == "auth0|supervisor-owner"
+
+    def test_an_unknown_owner_stays_unknown(self, monkeypatch):
+        """No row, or a row with no owner: unknown is not revoked, and inventing
+        an owner would be worse than the gap."""
+        from cli_agent_orchestrator.services import agent_step as step_mod
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+            lambda tid: None,
+        )
+        assert step_mod._caller_owner_id("sup12345") is None
+        assert step_mod._caller_owner_id(None) is None
+
+    def test_a_failed_lookup_does_not_break_the_step(self, monkeypatch):
+        from cli_agent_orchestrator.services import agent_step as step_mod
+
+        def boom(_tid):
+            raise RuntimeError("database unreachable")
+
+        monkeypatch.setattr("cli_agent_orchestrator.clients.database.get_terminal_metadata", boom)
+        assert step_mod._caller_owner_id("sup12345") is None
