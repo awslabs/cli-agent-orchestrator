@@ -1,5 +1,6 @@
 """Tests for the CAO operations MCP server."""
 
+import os
 from typing import TypedDict
 from unittest.mock import MagicMock, patch
 
@@ -1055,12 +1056,13 @@ class TestTerminalMonitoringTools:
         }
 
 
-def test_main_runs_mcp_server() -> None:
-    """The module main entry point should call mcp.run()."""
+def test_main_runs_mcp_server_over_stdio_only() -> None:
+    """main() pins the transport; FASTMCP_TRANSPORT in the environment must not win."""
     with patch("cli_agent_orchestrator.ops_mcp_server.server.mcp.run") as mock_run:
-        main()
+        with patch.dict(os.environ, {"FASTMCP_TRANSPORT": "http"}):
+            main()
 
-    mock_run.assert_called_once_with()
+    mock_run.assert_called_once_with(transport="stdio")
 
 
 def test_plugin_mcp_surfaces_are_registered_on_ops_server() -> None:

@@ -117,6 +117,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with 401 on the remote node; the token is documented as this node's
   loopback credential only.
 
+- **Both MCP servers now pin `transport="stdio"`.** FastMCP otherwise honours
+  `FASTMCP_TRANSPORT` from the environment, and an `http` value would have
+  turned a stdio tool into a loopback listener with no MCP-level auth in front
+  of its API hop.
+
 ### Changed
 
 - `list_outcomes` clamps `limit` to 200 client-side; the service already clamped

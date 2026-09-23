@@ -2842,7 +2842,9 @@ register_mcp_server_surfaces(mcp)
 
 def main():
     """Main entry point for the MCP server."""
-    mcp.run()
+    # Pinned: FASTMCP_TRANSPORT in the pane environment must not turn the
+    # per-terminal stdio server into a network listener.
+    mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":
