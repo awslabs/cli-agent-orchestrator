@@ -1,0 +1,19 @@
+Welcome to Devin CLI
+
+> explain this codebase
+
+# Overview
+
+This is a CLI agent orchestrator that provides a unified interface
+for multiple AI coding assistants.
+
+## Supported providers
+
+1. Claude Code
+2. Codex
+3. Copilot CLI
+
+────────────────────────────────────────
+#
+────────────────────────────────────────
+Mode: chat  Model: devin-v1
