@@ -122,7 +122,11 @@ RUN if [ "${INSTALL_CLAUDE_CODE}" != "1" ]; then \
 # independent.
 ARG INSTALL_CODEX=0
 ARG CODEX_VERSION=0.153.4
-ARG CODEX_BEDROCK_MODEL=openai.gpt-oss-120b-1:0
+# The model id must exist on the bedrock-mantle (OpenAI-compatible) endpoint
+# codex uses, which is a different surface from bedrock:InvokeModel. A wrong
+# id fails at first request with `404 The model '<id>' does not exist`, not
+# at build time, so this default is one verified against that endpoint.
+ARG CODEX_BEDROCK_MODEL=openai.gpt-5.6-sol
 RUN if [ "${INSTALL_CODEX}" != "1" ]; then \
       echo "skipping codex install (INSTALL_CODEX=${INSTALL_CODEX})"; \
     else \
