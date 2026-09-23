@@ -238,6 +238,7 @@ CAO translates `allowedTools` into each provider's native restriction mechanism:
 | Antigravity CLI | Soft | Security system prompt (no native mechanism) |
 | OMP | Soft | Security system prompt (no native mechanism) |
 | MiniMax Code | Soft | Security bootstrap prompt (no native mechanism) |
+| Devin CLI | Soft | Security constraint prompt via `--prompt-file`; `--allowed-tools` is auto-approval only, not a deny mechanism |
 | Kiro CLI | Hard (install time) | `tools` (what the agent can use at all) is written at install time from the resolved `allowedTools`; `--trust-all-tools` only suppresses prompts for the tools that remain; launch-time `--allowed-tools` and role overrides do not change it. A profile installed before this change still carries `tools: ["*"]` until reinstalled, and the launch gate warns |
 | Hermes | None | Launched `--yolo --accept-hooks`; restrict tools inside the Hermes profile |
 | Cursor CLI | None | Launched `--force`; `allowedTools` is not applied |
