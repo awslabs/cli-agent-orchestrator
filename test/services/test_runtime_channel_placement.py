@@ -469,3 +469,44 @@ class TestTheServerFencesOnStreamGeneration:
         fresh.record_position(TID, "capture", 10, generation=2)
         fresh.record_position(TID, "capture", 20)
         assert fresh.resume_position(TID, "capture") == 20
+
+
+class TestStatusIsFencedOnGenerationToo:
+    """A status report from a superseded stream must not settle the current one.
+
+    Stream positions were fenced on generation but ``set_status`` ignored it, so a
+    delayed EventFrame from the old generation could overwrite the live status and
+    satisfy a waiter — the exact thing the protocol's generation contract forbids
+    (Copilot review on #802).
+    """
+
+    @staticmethod
+    async def _send(_raw):
+        pass
+
+    def test_a_stale_generation_status_is_dropped(self, fresh):
+        conn = fresh.register("worker-1", self._send)
+        fresh.bind_terminal(TID, "worker-1")
+        # The live stream is generation 1.
+        fresh.record_position(TID, "capture", 10, generation=1)
+        fresh.set_status(TID, TerminalStatus.PROCESSING, conn=conn, generation=1)
+        assert fresh.get_status(TID) is TerminalStatus.PROCESSING
+
+        # A straggler from generation 0 must not settle anything.
+        fresh.set_status(TID, TerminalStatus.COMPLETED, conn=conn, generation=0)
+        assert fresh.get_status(TID) is TerminalStatus.PROCESSING
+
+    def test_the_live_generation_still_applies(self, fresh):
+        conn = fresh.register("worker-1", self._send)
+        fresh.bind_terminal(TID, "worker-1")
+        fresh.record_position(TID, "capture", 10, generation=2)
+        fresh.set_status(TID, TerminalStatus.COMPLETED, conn=conn, generation=2)
+        assert fresh.get_status(TID) is TerminalStatus.COMPLETED
+
+    def test_callers_without_a_generation_are_unaffected(self, fresh):
+        """The local status monitor passes none and must keep working."""
+        conn = fresh.register("worker-1", self._send)
+        fresh.bind_terminal(TID, "worker-1")
+        fresh.record_position(TID, "capture", 10, generation=5)
+        fresh.set_status(TID, TerminalStatus.IDLE, conn=conn)
+        assert fresh.get_status(TID) is TerminalStatus.IDLE

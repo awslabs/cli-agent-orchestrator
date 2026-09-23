@@ -575,6 +575,8 @@ class RuntimeChannelRegistry:
         terminal_id: str,
         status: TerminalStatus,
         conn: Optional[RuntimeConnection] = None,
+        generation: Optional[int] = None,
+        stream: str = StreamName.CAPTURE.value,
     ) -> None:
         """Record what a runtime says this terminal is doing.
 
@@ -592,6 +594,20 @@ class RuntimeChannelRegistry:
         bookkeeping) pass nothing and are unaffected.
         """
         with self._lock:
+            if generation is not None and self.is_stale_generation(terminal_id, stream, generation):
+                # Status is fenced the same way stream positions are: a report
+                # from a superseded stream/assignment must not settle the current
+                # one. Without this a delayed EventFrame from the old generation
+                # could overwrite the live status and satisfy a waiter, which the
+                # protocol's generation contract exists to forbid (Copilot review
+                # on #802).
+                logger.warning(
+                    "dropping %s report for terminal %s from stale generation %s",
+                    status.value,
+                    terminal_id,
+                    generation,
+                )
+                return
             if conn is not None:
                 current = self._runtimes.get(conn.runtime_id)
                 if current is not conn or conn.incarnation != self._incarnations.get(

@@ -406,7 +406,12 @@ async def runtime_channel(ws: WebSocket) -> None:
                 if not runtime_registry.claim_terminal(frame.terminal_id, runtime_id):
                     continue
                 if frame.type == EventType.STATUS and frame.status is not None:
-                    runtime_registry.set_status(frame.terminal_id, frame.status, conn=conn)
+                    runtime_registry.set_status(
+                        frame.terminal_id,
+                        frame.status,
+                        conn=conn,
+                        generation=frame.generation,
+                    )
                     bus.publish(
                         f"terminal.{frame.terminal_id}.status", {"status": frame.status.value}
                     )
