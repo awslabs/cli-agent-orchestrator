@@ -58,6 +58,7 @@ import sys
 import threading
 import time
 import uuid
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
@@ -438,6 +439,23 @@ def _seed_home_passthrough(home_dir: Path) -> None:
 
     Naming the entries is the caller's decision on purpose. This fixture does not
     guess at credential locations, and no default value here mentions one.
+
+    Entries may be NESTED paths, and for a directory this fixture also seeds into
+    they have to be. This function runs after the seeders above, and an entry
+    whose destination already exists is skipped (deliberately — a seeded file
+    must win over a symlink that would redirect writes into the developer's real
+    HOME). ``.aws`` is exactly that case: ``_seed_packaged_skills`` has already
+    created ``$HOME/.aws/cli-agent-orchestrator/skills``, so passing ``.aws``
+    silently does NOTHING and the provider still cannot read its credentials.
+    Name the files instead — ``.aws/credentials:.aws/config`` — which symlinks
+    them inside the fixture's own ``.aws`` and leaves the seeded tree intact.
+
+    Concretely, for the Bedrock-backed codex CLI:
+
+        CAO_E2E_HOME_PASSTHROUGH=.codex:.aws/credentials:.aws/config
+
+    With ``.aws`` (the directory) the credential load fails intermittently and
+    handoff/send_message tests fail; with the two files they pass.
     """
     spec = os.environ.get("CAO_E2E_HOME_PASSTHROUGH", "").strip()
     real_home = os.environ.get("HOME")
@@ -449,9 +467,22 @@ def _seed_home_passthrough(home_dir: Path) -> None:
             continue
         source = Path(real_home) / rel
         if not source.exists():
+            warnings.warn(
+                f"CAO_E2E_HOME_PASSTHROUGH: {rel} does not exist under the real HOME; ignoring",
+                stacklevel=2,
+            )
             continue
         dest = home_dir / rel
         if dest.exists() or dest.is_symlink():
+            # Say so rather than skipping in silence: this is the trap above, and
+            # a passthrough that quietly does nothing looks like a provider that
+            # cannot authenticate.
+            warnings.warn(
+                f"CAO_E2E_HOME_PASSTHROUGH: {rel} already exists in the isolated HOME "
+                f"(seeded by this fixture), so it was NOT linked to the real one. "
+                f"Name the files inside it instead, e.g. {rel}/<file>.",
+                stacklevel=2,
+            )
             continue
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.symlink_to(source.resolve())
