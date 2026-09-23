@@ -922,3 +922,32 @@ callbacks, so between the two the remaining gap is a single-user local install
 with auth off, where every principal is the same one anyway. An unowned sender
 stays allowed on purpose: it predates ownership or is operator-created, and it
 confers no other identity.
+
+# Replies to the seventeenth review round on #802
+
+**`agent_step.py:752` — remote worker persisted with no owner** (`e6e59234`).
+Correct, and mine: I wrote `owner_id=None` with a comment about the owner being
+server-written, which was the right instinct applied to the wrong value. The
+worker's row had no principal, so its callback was unknown to the owner gate and
+work from a revoked caller would deliver rather than be held. The owner is now
+read from the caller's own `terminals.owner` column — never from the
+agent-writable metadata bag — and still deliberately kept out of the LAUNCH
+payload, since an identity handed to an executor is one it could re-present. An
+unresolvable owner stays `None`: unknown is not revoked, and inventing one would
+be worse than the gap.
+
+**`Dockerfile:141` — `#` inside a backslash-continued RUN** (`e6e59234`). Fixed,
+and worth being precise about the severity rather than just agreeing. The comments
+are now above the `RUN` instead of inside it, for exactly the reason you give. But
+it is builder-dependent and does not bite with the builder this example is
+actually built by: if the comment were joined into the shell command it would
+swallow `&& codex --version; \` *and the closing `fi`*, leaving the `if`
+unterminated — and today's kaniko builds of this Dockerfile succeed, which they
+could not if that happened. So this is a portability improvement, not a repair of
+a broken build.
+
+Two further instances of the same pattern predate this PR, in the kiro-install and
+state-seed blocks it does not otherwise touch. I have left those alone rather than
+widen the diff, but they have the same latent fragility if this image is ever
+built by a builder that does not strip such lines — worth a follow-up if you want
+the file uniform.
