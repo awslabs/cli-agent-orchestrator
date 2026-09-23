@@ -682,11 +682,17 @@ class Bridge:
         with tempfile.TemporaryDirectory(prefix="cao-bridge-script-") as tmp:
             executable_mode = mode == "executable"
             script_path = os.path.join(tmp, "prescript" if executable_mode else "workflow.py")
-            with open(script_path, "w") as f:
+            # Owner-only FROM THE FIRST BYTE. The file carries the caller's
+            # code — which can embed secrets — into a pod that may host other
+            # work, and `open()` then `chmod` publishes the whole body at the
+            # umask default first: another local account can open it inside that
+            # window and keep reading through the descriptor after the narrowing,
+            # which a test asserting only the FINAL mode cannot catch (Copilot
+            # review on #802). os.open with the mode up front closes the window.
+            script_mode = 0o700 if executable_mode else 0o600
+            fd = os.open(script_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, script_mode)
+            with os.fdopen(fd, "w") as f:
                 f.write(script_body)
-            # Owner-only: the file carries the caller's code into a pod that may
-            # host other work, and it never needs to be readable by anyone else.
-            os.chmod(script_path, 0o700 if executable_mode else 0o600)
             argv = [script_path] if executable_mode else [sys.executable, script_path]
             try:
                 proc = await asyncio.create_subprocess_exec(

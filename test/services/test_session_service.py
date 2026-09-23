@@ -1499,6 +1499,11 @@ class TestListSessionsRemoteRuntimes:
         )
 
 
+from types import SimpleNamespace  # noqa: E402
+
+from cli_agent_orchestrator.runtime_channel.protocol import CommandOutcome  # noqa: E402
+
+
 class TestDeletingARemoteSessionTearsItDownInItsRuntime:
     """A remote terminal's pane, provider and tmux all live in its runtime.
 
@@ -1517,6 +1522,9 @@ class TestDeletingARemoteSessionTearsItDownInItsRuntime:
             "cli_agent_orchestrator.runtime_channel.registry.runtime_registry", registry
         )
 
+        registry.send_terminal_command_blocking.return_value = SimpleNamespace(
+            outcome=CommandOutcome.OK, payload={"deleted": True}
+        )
         assert svc._teardown_remote_terminal("abcd1234") is True
         registry.send_terminal_command_blocking.assert_called_once()
         args = registry.send_terminal_command_blocking.call_args.args
@@ -1532,12 +1540,12 @@ class TestDeletingARemoteSessionTearsItDownInItsRuntime:
             "cli_agent_orchestrator.runtime_channel.registry.runtime_registry", registry
         )
 
-        assert svc._teardown_remote_terminal("abcd1234") is False
+        assert svc._teardown_remote_terminal("abcd1234") is None
         registry.send_terminal_command_blocking.assert_not_called()
 
-    def test_an_unreachable_runtime_still_reports_remote(self, monkeypatch):
-        """The row is dropped anyway: a row pointing at an unreachable runtime is
-        one nobody can act on, and keeping it makes the id un-deletable."""
+    def test_an_unreachable_runtime_defers_instead_of_dropping_the_row(self, monkeypatch):
+        """The row is the only handle on a possibly-live agent, so an unconfirmed
+        teardown must defer rather than delete it (Copilot review on #802)."""
         from cli_agent_orchestrator.services import session_service as svc
 
         registry = MagicMock()
@@ -1547,5 +1555,20 @@ class TestDeletingARemoteSessionTearsItDownInItsRuntime:
             "cli_agent_orchestrator.runtime_channel.registry.runtime_registry", registry
         )
 
-        assert svc._teardown_remote_terminal("abcd1234") is True
+        assert svc._teardown_remote_terminal("abcd1234") is False
+        registry.unbind_terminal.assert_not_called()
+
+    def test_an_unconfirmed_outcome_also_defers(self, monkeypatch):
+        """A runtime that answers without deleted/absent has not confirmed."""
+        from cli_agent_orchestrator.services import session_service as svc
+
+        registry = MagicMock()
+        registry.is_remote.return_value = True
+        registry.send_terminal_command_blocking.return_value = SimpleNamespace(
+            outcome=CommandOutcome.FAILED, payload={}
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.runtime_channel.registry.runtime_registry", registry
+        )
+        assert svc._teardown_remote_terminal("abcd1234") is False
         registry.unbind_terminal.assert_not_called()

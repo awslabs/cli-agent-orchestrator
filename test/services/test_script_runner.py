@@ -1400,3 +1400,55 @@ async def test_remote_script_runtime_disconnected_is_unknown_failed(
     result = await script_runner._drive_process(record, str(script), build_env("run-gone", "1", {}))
     assert result.state == RunState.FAILED
     assert any("not connected" in w for w in result.warnings)
+
+
+class TestTheBridgeNeverPublishesScriptBytesWorldReadable:
+    """The script body is the caller's code and can embed secrets.
+
+    ``open()`` then ``chmod`` flushes the whole body at the umask default first,
+    so another local account in the same pod can open it inside that window and
+    keep reading through the descriptor after the narrowing — an exposure a test
+    asserting only the FINAL mode cannot see (Copilot review on #802). The file
+    is created with its mode up front instead.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode,expected", [("executable", 0o700), ("python", 0o600)])
+    async def test_the_file_is_owner_only_at_every_instant(self, mode, expected, monkeypatch):
+        import os
+        import stat
+
+        from cli_agent_orchestrator.runtime_channel.bridge import Bridge
+        from cli_agent_orchestrator.runtime_channel.protocol import CommandFrame, CommandType
+
+        seen_modes = []
+        real_fdopen = os.fdopen
+
+        def spying_fdopen(fd, *a, **kw):
+            # The mode the inode ALREADY has, before a single byte is written.
+            seen_modes.append(stat.S_IMODE(os.fstat(fd).st_mode))
+            return real_fdopen(fd, *a, **kw)
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.runtime_channel.bridge.os.fdopen", spying_fdopen
+        )
+
+        bridge = Bridge("ws://unused", "worker-x", "tok")
+        frame = CommandFrame(
+            op_id="op-mode",
+            type=CommandType.RUN_SCRIPT,
+            terminal_id=None,
+            payload={
+                "script": "#!/bin/sh\necho hi\n" if mode == "executable" else "print('hi')\n",
+                "env": {},
+                "timeout": 5,
+                "mode": mode,
+            },
+        )
+        await bridge._execute(frame)
+
+        assert seen_modes, "the script file was never created through os.fdopen"
+        assert seen_modes[0] == expected, (
+            f"script inode was {oct(seen_modes[0])} before any write; "
+            f"expected {oct(expected)} from creation"
+        )
