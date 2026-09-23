@@ -15,6 +15,7 @@ terminal.
 """
 
 import asyncio
+from collections import OrderedDict
 import logging
 import threading
 import time
@@ -36,6 +37,10 @@ logger = logging.getLogger(__name__)
 # (tens of seconds for a cold CLI). Terminal-scoped commands pass a tighter
 # per-call timeout at the call site.
 DEFAULT_COMMAND_TIMEOUT = 60.0
+
+# How many deleted terminal ids to remember. Only needs to outlive the frames
+# already queued for a terminal when its TEARDOWN lands.
+_TOMBSTONE_MAX = 512
 
 # Per-operation deadlines. They live beside the registry rather than in the HTTP
 # layer because non-HTTP senders need them too: terminal_service routes a remote
@@ -211,6 +216,13 @@ class RuntimeChannelRegistry:
         # comparable within one generation, so this is what lets record_position
         # tell a new stream numbered from 0 from a rewind of the old one.
         self._generations: Dict[Tuple[str, str], int] = {}
+        # Terminal ids whose rows this process deleted. A FIFO/status event queued
+        # before TEARDOWN can arrive after the row is gone, and the no-row branch
+        # of claim_terminal would treat that id as a harmless phantom and REBIND
+        # it — so the server would list and route a terminal it had just deleted
+        # (Copilot review on #802). Bounded: ids are only useful until the
+        # in-flight frames for them drain.
+        self._tombstones: "OrderedDict[str, float]" = OrderedDict()
         # Live interactive-attach clients by terminal (#776).
         self._attach_sinks: Dict[str, "asyncio.Queue"] = {}
         # The loop the channel connections belong to, captured at register().
@@ -271,6 +283,33 @@ class RuntimeChannelRegistry:
             if self._runtimes.get(runtime_id) is conn:
                 del self._runtimes[runtime_id]
                 logger.info("runtime channel disconnected: %s", runtime_id)
+            else:
+                # A superseded handler: the live connection owns the attach sinks
+                # now, so closing them here would cut off a working relay.
+                conn.closed = True
+                conn.fail_all_pending(f"runtime {runtime_id} channel closed")
+                return
+            # EOF every interactive attach bound to a terminal this runtime was
+            # executing. The relay's downstream task awaits sink.get() forever,
+            # and the bridge drops sends on a closed channel, so without this
+            # neither side of the relay ever completes and the browser/native
+            # attach hangs until the CLIENT gives up (Copilot review on #802).
+            orphaned = [
+                tid
+                for tid in list(self._attach_sinks)
+                if self._terminal_runtime.get(tid) == runtime_id
+            ]
+            for tid in orphaned:
+                sink = self._attach_sinks.pop(tid, None)
+                if sink is not None:
+                    sink.put_nowait(None)
+        if orphaned:
+            logger.info(
+                "closed %d interactive attach(es) for disconnected runtime %s: %s",
+                len(orphaned),
+                runtime_id,
+                sorted(orphaned),
+            )
         conn.closed = True
         conn.fail_all_pending(f"runtime {runtime_id} channel closed")
 
@@ -320,9 +359,11 @@ class RuntimeChannelRegistry:
         * the durable central row names this runtime — the restarted-server
           recovery path, where the launching runtime's own hello re-establishes
           the binding;
-        * no central row exists at all — a phantom id with no pane and no output
-          to hijack, and the window a tracked launch/reconcile binds through
-          before its row is committed.
+        * no central row exists at all AND the id was not deleted by this
+          process — a phantom with no pane and no output to hijack, plus the
+          window a tracked launch/reconcile binds through before its row is
+          committed. A DELETED id is tombstoned and refused, so a frame queued
+          before TEARDOWN cannot resurrect routing for it.
 
         A row that exists but names NO runtime is a confirmed-LOCAL terminal, and
         a runtime claiming it would redirect a real local pane's routing/status;
@@ -331,6 +372,15 @@ class RuntimeChannelRegistry:
         refused claim leaves the existing binding untouched and is logged.
         Returns ``True`` when bound to ``runtime_id`` on return, else ``False``.
         """
+        if terminal_id in self._tombstones:
+            # Deleted here. A straggler frame must not resurrect it through the
+            # no-row branch below.
+            logger.warning(
+                "runtime %s tried to claim terminal %s after it was deleted; refusing",
+                runtime_id,
+                terminal_id,
+            )
+            return False
         current = self._terminal_runtime.get(terminal_id)
         if current == runtime_id:
             return True
@@ -371,8 +421,19 @@ class RuntimeChannelRegistry:
         self.bind_terminal(terminal_id, runtime_id)
         return True
 
-    def unbind_terminal(self, terminal_id: str) -> None:
+    def unbind_terminal(self, terminal_id: str, deleted: bool = False) -> None:
+        """Drop routing state for a terminal.
+
+        ``deleted=True`` additionally TOMBSTONES the id, and only the real delete
+        paths pass it. Unbinding alone is also used to reset cached state (a
+        hello that no longer claims a terminal, test cleanup), and tombstoning
+        that would refuse a later legitimate claim for the same id.
+        """
         with self._lock:
+            if deleted:
+                self._tombstones[terminal_id] = time.time()
+                while len(self._tombstones) > _TOMBSTONE_MAX:
+                    self._tombstones.popitem(last=False)
             self._terminal_runtime.pop(terminal_id, None)
             self._recovered_placement.pop(terminal_id, None)
             self._status.pop(terminal_id, None)
@@ -426,9 +487,19 @@ class RuntimeChannelRegistry:
         a tracked launch, a reconcile — is seen. Raises
         :class:`PlacementUnavailableError` on a read failure.
         """
-        if terminal_id in self._recovered_placement:
-            runtime_id = self._recovered_placement[terminal_id]
-            return ("named", runtime_id) if runtime_id is not None else ("local", None)
+        # Cache reads/writes take the lock: this runs on worker threads
+        # (is_remote / runtime_for_terminal) while unbind_terminal and hello
+        # reconciliation mutate the same map on the channel loop. Unsynchronised,
+        # a teardown could delete the row and pop the cache and an in-flight
+        # lookup could then repopulate the OLD runtime id, leaving later
+        # status/input calls routing a removed terminal as remote (Copilot review
+        # on #802).
+        with self._lock:
+            if terminal_id in self._recovered_placement:
+                runtime_id = self._recovered_placement[terminal_id]
+                return ("named", runtime_id) if runtime_id is not None else ("local", None)
+        # The DB read stays OUTSIDE the lock: a worker thread's read must not
+        # block the event loop that has to service the channel.
         try:
             from cli_agent_orchestrator.clients.database import get_terminal_metadata
 
@@ -441,7 +512,13 @@ class RuntimeChannelRegistry:
         metadata = row.get("metadata") or {}
         value = metadata.get("runtime_id")
         runtime_id = str(value) if value else None
-        self._recovered_placement[terminal_id] = runtime_id
+        with self._lock:
+            # Re-check under the lock before publishing: the row may have been
+            # deleted while this read was in flight, and caching a placement for a
+            # terminal that no longer exists is exactly the stale routing above.
+            if terminal_id in self._tombstones:
+                return ("absent", None)
+            self._recovered_placement[terminal_id] = runtime_id
         return ("named", runtime_id) if runtime_id is not None else ("local", None)
 
     def is_remote(self, terminal_id: str) -> bool:

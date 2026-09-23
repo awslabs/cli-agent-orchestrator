@@ -1529,7 +1529,7 @@ class TestDeletingARemoteSessionTearsItDownInItsRuntime:
         registry.send_terminal_command_blocking.assert_called_once()
         args = registry.send_terminal_command_blocking.call_args.args
         assert args[0] == "abcd1234" and args[1] == CommandType.TEARDOWN
-        registry.unbind_terminal.assert_called_once_with("abcd1234")
+        registry.unbind_terminal.assert_called_once_with("abcd1234", deleted=True)
 
     def test_a_local_terminal_is_left_to_the_local_path(self, monkeypatch):
         from cli_agent_orchestrator.services import session_service as svc

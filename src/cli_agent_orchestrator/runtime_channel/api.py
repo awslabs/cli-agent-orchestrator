@@ -238,6 +238,19 @@ async def runtime_channel(ws: WebSocket) -> None:
         if not runtime_registry.claim_terminal(stream_pos.terminal_id, runtime_id):
             continue
         bound_this_hello.add(stream_pos.terminal_id)
+        # ESTABLISH the advertised generation, rather than only echoing it back.
+        # A restarted stream whose new end position happens to equal the old
+        # watermark emits no replay frame, so nothing else would ever carry the
+        # new generation to the registry and the server would stay on the old one
+        # — then accept a delayed old-generation frame as current (Copilot review
+        # on #802). record_position resets the watermark when the generation
+        # advances, so resume below reads the NEW generation's position.
+        runtime_registry.record_position(
+            stream_pos.terminal_id,
+            stream_pos.stream.value,
+            0,
+            generation=stream_pos.generation,
+        )
         resume.append(
             StreamPosition(
                 terminal_id=stream_pos.terminal_id,
@@ -756,5 +769,7 @@ async def remote_delete_terminal(terminal_id: str) -> bool:
     absent = bool(result.payload.get("absent", False))
     if deleted or absent:
         db_delete_terminal(terminal_id)
-        runtime_registry.unbind_terminal(terminal_id)
+        # deleted=True tombstones the id so a frame queued before this TEARDOWN
+        # cannot rebind routing for a terminal that no longer exists.
+        runtime_registry.unbind_terminal(terminal_id, deleted=True)
     return deleted or absent

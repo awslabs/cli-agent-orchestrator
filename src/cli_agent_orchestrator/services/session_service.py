@@ -436,7 +436,7 @@ def _teardown_remote_terminal(terminal_id: str) -> Optional[bool]:
             payload,
         )
         return False
-    runtime_registry.unbind_terminal(terminal_id)
+    runtime_registry.unbind_terminal(terminal_id, deleted=True)
     return True
 
 

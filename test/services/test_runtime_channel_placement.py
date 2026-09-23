@@ -510,3 +510,80 @@ class TestStatusIsFencedOnGenerationToo:
         fresh.record_position(TID, "capture", 10, generation=5)
         fresh.set_status(TID, TerminalStatus.IDLE, conn=conn)
         assert fresh.get_status(TID) is TerminalStatus.IDLE
+
+
+class TestADeletedTerminalIsNotResurrected:
+    """A frame queued before TEARDOWN must not rebind a deleted terminal.
+
+    ``claim_terminal`` allows a no-row id through, for the window a tracked launch
+    binds in. But after ``remote_delete_terminal`` there is also no row, so a
+    FIFO/status event already in flight hit that same branch and REBOUND the id —
+    and the server then listed and routed a terminal it had just deleted (Copilot
+    review on #802).
+    """
+
+    @staticmethod
+    async def _send(_raw):
+        pass
+
+    def test_a_straggler_frame_cannot_rebind_a_deleted_id(self, fresh, rows):
+        rows["row"] = None  # the row is gone, as after a delete
+        fresh.bind_terminal(TID, "worker-1")
+        fresh.unbind_terminal(TID, deleted=True)
+
+        assert fresh.claim_terminal(TID, "worker-1") is False
+        assert fresh.runtime_for_terminal(TID) is None
+        assert fresh.remote_terminal_ids() == []
+
+    def test_a_plain_unbind_still_allows_a_later_claim(self, fresh, rows):
+        """Unbind is also used to reset cached state (a hello that no longer
+        claims a terminal, test cleanup); tombstoning that would refuse a later
+        legitimate claim for the same id."""
+        rows["row"] = None
+        fresh.bind_terminal(TID, "worker-1")
+        fresh.unbind_terminal(TID)
+
+        assert fresh.claim_terminal(TID, "worker-1") is True
+
+    def test_a_lookup_in_flight_during_a_delete_is_not_cached(self, fresh, rows):
+        """The placement read happens outside the lock, so the row can vanish
+        mid-read; publishing it would leave a removed terminal routed as remote."""
+        rows["row"] = _row("worker-1")
+
+        # Simulate the delete landing while the DB read is in flight.
+        original = rows["row"]
+
+        def get_terminal_metadata(terminal_id):
+            fresh.unbind_terminal(terminal_id, deleted=True)
+            return original
+
+        monkey = get_terminal_metadata
+        import cli_agent_orchestrator.clients.database as db_mod
+
+        prev = db_mod.get_terminal_metadata
+        db_mod.get_terminal_metadata = monkey
+        try:
+            assert fresh.is_remote(TID) is False, "a deleted terminal is not remote"
+        finally:
+            db_mod.get_terminal_metadata = prev
+
+
+class TestAHelloEstablishesTheGeneration:
+    """Echoing the advertised generation back is not the same as adopting it.
+
+    A restarted stream whose new end position happens to equal the old watermark
+    emits no replay frame, so nothing else would carry the new generation to the
+    registry: the server stayed on the OLD one and would accept a delayed
+    old-generation frame as current (Copilot review on #802).
+    """
+
+    def test_adopting_the_hello_generation_fences_the_old_one(self, fresh):
+        # The old stream reached 500 at generation 0.
+        fresh.record_position(TID, "capture", 500, generation=0)
+        assert fresh.resume_position(TID, "capture") == 500
+
+        # A hello advertising generation 1 establishes it (what the handler does).
+        fresh.record_position(TID, "capture", 0, generation=1)
+        assert fresh.resume_position(TID, "capture") == 0, "new stream starts over"
+        assert fresh.is_stale_generation(TID, "capture", 0) is True
+        assert fresh.is_stale_generation(TID, "capture", 1) is False

@@ -102,7 +102,7 @@ class TestWhatTheServerDoesWithIt:
 
         assert await remote_delete_terminal(TERMINAL) is True
         db_delete.assert_called_once_with(TERMINAL)
-        registry.unbind_terminal.assert_called_once_with(TERMINAL)
+        registry.unbind_terminal.assert_called_once_with(TERMINAL, deleted=True)
 
     @pytest.mark.asyncio
     async def test_an_unknown_outcome_leaves_the_row_alone(self, monkeypatch):
