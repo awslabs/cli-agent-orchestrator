@@ -807,3 +807,41 @@ PR after the replay/resume path has already been reworked across several rounds;
 the risk of introducing a new silent-loss path while closing this one is real.
 Filed as the follow-up it deserves, and called out in the PR body rather than
 left implicit.
+
+# Replies to the fourteenth review round on #802
+
+Four comments, all on code from the previous round, all correct, all fixed.
+
+**`registry.py:144` — a send exception is not proof of non-dispatch** (`b4a5e5dc`).
+Right, and this is the duplicate-delivery hazard the subclass exists to prevent:
+the connection can close after the bytes are written and before the await
+returns, so classifying every send failure as retryable let inbox delivery resend
+an input the runtime may already have typed. `RuntimeConnection` now carries a
+`closed` flag, set by the registry at the two points it KNOWS the channel is gone
+(unregister, and supersede on reconnect); a pre-send check on that flag is the
+only path that may claim non-dispatch, because it is the only one that can prove
+it. An exception during the attempt is now the unknown parent.
+
+**`session_service.py:401` — unconfirmed teardown still deleted the row**
+(`be4b3c80`). You are right and this corrects my own previous commit: I traded
+away the wrong thing. The row is the only routing and cleanup handle on that
+agent, so dropping it unconfirmed leaves the agent alive with nothing able to
+reach it. `_teardown_remote_terminal` now returns None/True/False for
+local/confirmed/unconfirmed, and `delete_session` treats unconfirmed exactly as
+it already treats a deferred local release: keep the row, report the session as
+not fully deleted, let a retry finish. That also makes it consistent with the
+flow-recycling path you pointed at.
+
+**`bridge.py:689` — script body written before its mode narrowed** (`be4b3c80`).
+Correct, same publish-then-narrow class as the config writes earlier in this PR,
+and your point that a final-mode test cannot see the window is exactly why the
+new test measures the inode's mode *inside* `fdopen`, before any byte is written,
+rather than asserting the end state. Created with
+`os.open(..., 0o700/0o600)` up front.
+
+**`api.py:409` — EventFrame.generation ignored by set_status** (`8e2bad15`).
+Correct: positions were fenced and status was not, so a delayed report from a
+superseded stream could overwrite the live status and settle a waiter.
+`set_status` now takes an optional generation and reuses `is_stale_generation`,
+so both paths share one definition of stale; `generation=None` is untouched for
+the local status monitor's own bookkeeping.
