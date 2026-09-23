@@ -14,6 +14,17 @@ from unittest.mock import MagicMock, patch
 
 
 class TestTheSenderMustBeARealTerminal:
+    def test_an_arbitrary_label_is_refused_not_treated_as_unowned(self, client):
+        """A label outside the closed operator set must not slip through as
+        "attributed to no principal" — that was a way for a revoked agent to skip
+        the delivery-time owner gate entirely (Copilot review on #802)."""
+        with patch("cli_agent_orchestrator.api.main.get_terminal_metadata", return_value=None):
+            resp = client.post(
+                "/terminals/abcdef12/inbox/messages",
+                params={"sender_id": "forged", "message": "hi"},
+            )
+        assert resp.status_code == 404
+
     def test_an_id_shaped_sender_that_does_not_exist_is_rejected_with_404(self, client):
         with patch(
             "cli_agent_orchestrator.api.main.get_terminal_metadata", return_value=None
@@ -23,7 +34,7 @@ class TestTheSenderMustBeARealTerminal:
                 params={"sender_id": "deadbeef", "message": "hi"},
             )
         assert resp.status_code == 404
-        assert "Sender terminal" in resp.json()["detail"]
+        assert "neither an existing terminal" in resp.json()["detail"]
         meta.assert_called_once_with("deadbeef")
 
     def test_an_operator_label_is_allowed_and_never_looked_up(self, client):

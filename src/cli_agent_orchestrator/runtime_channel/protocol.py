@@ -22,7 +22,9 @@ import json
 from enum import Enum
 from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+import base64
+
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator
 
 from cli_agent_orchestrator.models.terminal import TerminalId, TerminalStatus
 
@@ -153,10 +155,30 @@ class StreamFrame(_FrameBase):
     pos: int = Field(ge=0)
     data: str  # base64-encoded raw bytes
 
+    @field_validator("data")
+    @classmethod
+    def _must_be_strict_base64(cls, v: str) -> str:
+        """Reject a malformed payload HERE rather than absorbing it downstream.
+
+        ``base64.b64decode`` without ``validate=True`` silently discards
+        characters outside the alphabet, so a corrupted value could decode to
+        FEWER bytes — even zero — while the handler still advanced the consumed
+        watermark by ``pos + len(raw)``. The server would then resume past bytes
+        it never received and the runtime could no longer replay or report them:
+        an invalid frame turning into silent, unrecoverable loss (Copilot review
+        on #802). Failing the frame keeps the stream's own gap protocol as the
+        only way bytes go missing.
+        """
+        import binascii
+
+        try:
+            base64.b64decode(v, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError(f"data is not valid base64: {exc}") from exc
+        return v
+
     @property
     def end_pos(self) -> int:
-        import base64
-
         return self.pos + len(base64.b64decode(self.data))
 
 

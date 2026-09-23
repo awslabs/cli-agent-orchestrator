@@ -204,6 +204,12 @@ GRAPH_PROJECTION_TIMEOUT_S = 90.0
 #: operator label like "operator", which names no terminal and cannot stand in
 #: for one.
 _TERMINAL_ID_RE = re.compile(r"^[a-f0-9]{8}$")
+#: Sender labels that name no terminal and are accepted anyway, for surfaces that
+#: genuinely have no terminal context (the operator/app tool surface posts
+#: "operator"). A CLOSED set on purpose: any label outside it is refused, so an
+#: agent cannot invent one to be attributed to no principal and thereby skip the
+#: delivery-time owner gate.
+_OPERATOR_SENDER_LABELS = frozenset({"operator"})
 
 
 async def flow_daemon():
@@ -7325,12 +7331,14 @@ async def create_inbox_message_endpoint(
     # sender's owner. Left entirely unvalidated, a caller could name a terminal
     # id that does not exist and have it attributed anyway (guojing1217 on #802).
     #
-    # Only a TERMINAL-SHAPED sender is required to exist. Operator surfaces post
-    # a label rather than an id (``app_tools`` sends "operator", which has no
-    # terminal context at all), and such a label cannot impersonate any
-    # terminal's owner: the owner lookup finds nothing and the message is
-    # attributed to no principal, which is exactly the pre-existing unowned
-    # behaviour. Requiring a row for those would break the operator path.
+    # Every sender must be EITHER an existing terminal OR one of a small, closed
+    # set of operator labels (``_OPERATOR_SENDER_LABELS``). Allowing any
+    # non-terminal-shaped string was not enough: the owner lookup finds nothing
+    # for an arbitrary label, and ``may_start_work(None)`` permits delivery, so a
+    # revoked agent could pass ``sender_id=forged`` and walk straight past the
+    # gate that constrains it (Copilot review on #802). Closing the set keeps the
+    # operator path — ``app_tools`` sends "operator", which has no terminal
+    # context at all — without leaving an unowned-by-choice escape hatch.
     #
     # This does NOT make the sender unforgeable — a caller naming another LIVE
     # terminal's real id still passes. Closing that needs the sender derived from
@@ -7342,12 +7350,15 @@ async def create_inbox_message_endpoint(
     #
     # (The runtime-local callback path writes via create_inbox_message directly,
     # where the supervisor sender legitimately has no local row.)
-    if _TERMINAL_ID_RE.fullmatch(sender_id) and not await asyncio.to_thread(
+    if sender_id not in _OPERATOR_SENDER_LABELS and not await asyncio.to_thread(
         get_terminal_metadata, sender_id
     ):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Sender terminal '{sender_id}' not found",
+            detail=(
+                f"Sender '{sender_id}' is neither an existing terminal nor a "
+                "recognized operator label"
+            ),
         )
     try:
         inbox_msg = create_inbox_message(

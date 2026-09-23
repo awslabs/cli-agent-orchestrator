@@ -692,7 +692,7 @@ class TestCreateInboxMessageEndpoint:
                 params={"sender_id": "beefcafe", "message": "hello"},
             )
             assert response.status_code == 404
-            assert "Sender terminal" in response.json()["detail"]
+            assert "neither an existing terminal" in response.json()["detail"]
             mock_create.assert_not_called()
 
     def test_create_inbox_message_server_error(self, client):

@@ -244,6 +244,14 @@ RUN printf '{\n  "hasCompletedOnboarding": true\n}\n' > /home/cao/.claude.json \
 #   endpoint, which no pod here can log in to. With this it uses the standard AWS
 #   SDK chain, so the projected web-identity token authenticates it exactly as it
 #   does Claude Code, with nothing to mount.
+# The AWS REGION is deliberately NOT written here. A `RUN` line is evaluated at
+# BUILD time, so `${AWS_REGION}` would bake whatever the builder had (or the
+# us-east-1 default) into the image, while the manifests inject the real region
+# into the pod at RUNTIME — an opt-in codex image deployed to any other region
+# would then send Bedrock requests to the wrong one (Copilot review on #802).
+# Omitting the key lets codex's AWS SDK chain resolve AWS_REGION from the pod
+# environment, which is where the answer actually lives.
+#
 # * ``trust_level = "trusted"`` for the workspace — otherwise codex opens with
 #   "Do you trust the contents of this directory?" and waits. CAO's codex startup
 #   handler can answer that dialog, but a disposable pod should not spend a
@@ -255,8 +263,8 @@ ARG INSTALL_CODEX
 ARG CODEX_BEDROCK_MODEL
 RUN if [ "${INSTALL_CODEX}" = "1" ]; then \
       mkdir -p /home/cao/.codex \
-      && printf 'model = "%s"\nmodel_provider = "amazon-bedrock"\n\n[model_providers.amazon-bedrock.aws]\nregion = "%s"\n\n[projects."/home/cao/workspace"]\ntrust_level = "trusted"\n' \
-           "${CODEX_BEDROCK_MODEL}" "${AWS_REGION:-us-east-1}" > /home/cao/.codex/config.toml \
+      && printf 'model = "%s"\nmodel_provider = "amazon-bedrock"\n\n[projects."/home/cao/workspace"]\ntrust_level = "trusted"\n' \
+           "${CODEX_BEDROCK_MODEL}" > /home/cao/.codex/config.toml \
       && chmod 600 /home/cao/.codex/config.toml; \
     fi
 
