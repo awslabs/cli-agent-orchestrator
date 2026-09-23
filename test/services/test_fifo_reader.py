@@ -1,5 +1,6 @@
 """Tests for the FIFO reader manager."""
 
+import errno
 import os
 import threading
 import time
@@ -14,6 +15,30 @@ from cli_agent_orchestrator.services.fifo_reader import FifoManager
 pytestmark = pytest.mark.skipif(
     not hasattr(os, "mkfifo"), reason="FIFOs require a POSIX platform (os.mkfifo)"
 )
+
+
+def _open_fifo_writer(fifo_path, timeout: float = 5.0) -> int:
+    """Open the FIFO's write end, waiting for the reader to have opened its end.
+
+    A FIFO opened ``O_WRONLY | O_NONBLOCK`` fails with ENXIO ("Device not
+    configured") while no reader holds the read end. The reader thread here opens
+    in a loop and REOPENS between writers, so a test that writes immediately
+    after ``create_reader`` — or immediately after the previous writer closed —
+    races that open and fails intermittently (~1 run in 3 on macOS). The race is
+    in the test's timing, not in the reader: retry until the read end is there.
+    """
+    # Deliberately attempt-counted rather than clock-based: one test patches
+    # ``time.monotonic`` to instrument the reader's locked section, and a helper
+    # that called it would trip that instrumentation from the test thread.
+    attempts = max(1, int(timeout / 0.01))
+    for remaining in range(attempts, 0, -1):
+        try:
+            return os.open(fifo_path, os.O_WRONLY | os.O_NONBLOCK)
+        except OSError as exc:
+            if exc.errno != errno.ENXIO or remaining == 1:
+                raise
+            time.sleep(0.01)
+    raise AssertionError("unreachable")
 
 
 class TestStopReader:
@@ -90,7 +115,7 @@ class TestReaderThreadLifecycle:
         fifo_path = tmp_path / "term-race.fifo"
 
         # Writer attaches and detaches, like tmux tearing down pipe-pane.
-        wfd = os.open(fifo_path, os.O_WRONLY | os.O_NONBLOCK)
+        wfd = _open_fifo_writer(fifo_path)
         os.close(wfd)
 
         thread = self._thread(manager, "term-race")
@@ -112,7 +137,7 @@ class TestReaderThreadLifecycle:
         fifo_path = tmp_path / "term-data.fifo"
 
         for payload in (b"first", b"second"):
-            wfd = os.open(fifo_path, os.O_WRONLY | os.O_NONBLOCK)
+            wfd = _open_fifo_writer(fifo_path)
             os.write(wfd, payload)
             os.close(wfd)
             # Wait for the reader's select loop to pick the chunk up.
@@ -195,7 +220,7 @@ class TestReaderLoopCoalescing:
 
             # Simulate spinner-frame bursts: 10 tiny writes within one window,
             # separated by short pauses that mimic ~100Hz TUI redraws.
-            wfd = os.open(fifo_path, os.O_WRONLY | os.O_NONBLOCK)
+            wfd = _open_fifo_writer(fifo_path)
             try:
                 for i in range(10):
                     os.write(wfd, f"frame-{i}".encode())
@@ -255,7 +280,7 @@ class TestReaderLoopCoalescing:
 
             # One write, then long silence — the coalesce timer must trigger
             # a flush without needing a follow-up write.
-            wfd = os.open(fifo_path, os.O_WRONLY | os.O_NONBLOCK)
+            wfd = _open_fifo_writer(fifo_path)
             try:
                 os.write(wfd, b"lonely-chunk")
                 # Wait well beyond the coalesce window.
@@ -863,7 +888,7 @@ class TestColdStartStallDetection:
                 assert manager._ever_delivered.get("term-e2e") is False
 
             fifo_path = tmp_path / "term-e2e.fifo"
-            wfd = os.open(fifo_path, os.O_WRONLY | os.O_NONBLOCK)
+            wfd = _open_fifo_writer(fifo_path)
             os.write(wfd, b"real bytes")
             os.close(wfd)
 
@@ -1017,7 +1042,7 @@ class TestConcurrencyRaces:
             reader.start()
             time.sleep(0.1)  # let the reader open its fds
 
-            wfd = os.open(fifo_path, os.O_WRONLY | os.O_NONBLOCK)
+            wfd = _open_fifo_writer(fifo_path)
             try:
                 os.write(wfd, b"x")
                 assert entered_write_section.wait(timeout=2.0), (
