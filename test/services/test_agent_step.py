@@ -8,6 +8,7 @@ success.
 
 import asyncio
 import threading
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1137,3 +1138,69 @@ class TestOutputExtractionTeardown:
         m_out.assert_called_once_with("reuse99", OutputMode.LAST)
         m_delete.assert_not_called()
         m_exit.assert_not_called()
+
+
+class TestAHandoffFromARemoteCallerLandsInItsRuntime:
+    """#745: the step's terminal belongs where the CALLER runs.
+
+    ``assign`` reaches the runtime because it goes through
+    ``POST /sessions/{name}/terminals``, which is runtime-aware. ``run_agent_step``
+    called ``terminal_service.create_terminal`` directly, so a handoff issued by a
+    supervisor executing in a runtime tried to add a window to a session that only
+    exists in that pod — reproduced on EKS as
+    ``Failed to create terminal: Session 'cao-eks-assign-...' not found`` while the
+    three assigns in the same run succeeded.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_worker_is_launched_on_the_callers_runtime(self, monkeypatch):
+        import cli_agent_orchestrator.runtime_channel.api as rc_api
+        from cli_agent_orchestrator.services import agent_step as step_mod
+
+        registry = MagicMock()
+        registry.is_remote.return_value = True
+        registry.runtime_for_terminal.return_value = "cao-supervisor-0"
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.runtime_channel.registry.runtime_registry", registry
+        )
+
+        captured = {}
+
+        async def fake_launch(runtime_id, body, owner_id):
+            captured["runtime_id"] = runtime_id
+            captured["body"] = body
+            return SimpleNamespace(id="wrk00001")
+
+        monkeypatch.setattr(rc_api, "launch_remote_terminal", fake_launch)
+
+        local = MagicMock()
+        monkeypatch.setattr(step_mod.terminal_service, "create_terminal", local)
+
+        assert step_mod._caller_runtime("sup12345") == "cao-supervisor-0"
+
+        # The local create path must not be taken for a remote caller.
+        local.assert_not_called()
+
+    def test_a_local_caller_still_creates_here(self, monkeypatch):
+        from cli_agent_orchestrator.services import agent_step as step_mod
+
+        registry = MagicMock()
+        registry.is_remote.return_value = False
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.runtime_channel.registry.runtime_registry", registry
+        )
+        assert step_mod._caller_runtime("loc12345") is None
+        assert step_mod._caller_runtime(None) is None
+
+    def test_a_remote_caller_with_unreadable_placement_refuses(self, monkeypatch):
+        """Better to fail the step than to start the worker in the wrong container."""
+        from cli_agent_orchestrator.services import agent_step as step_mod
+
+        registry = MagicMock()
+        registry.is_remote.return_value = True  # fail-closed remote/unknown
+        registry.runtime_for_terminal.return_value = None  # placement unreadable
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.runtime_channel.registry.runtime_registry", registry
+        )
+        with pytest.raises(RuntimeError, match="placement is currently unavailable"):
+            step_mod._caller_runtime("sup12345")

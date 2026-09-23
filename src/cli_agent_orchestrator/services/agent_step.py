@@ -83,6 +83,32 @@ def _is_remote(terminal_id: str) -> bool:
     return runtime_registry.is_remote(terminal_id)
 
 
+def _caller_runtime(caller_id: Optional[str]) -> Optional[str]:
+    """The runtime the CALLER executes in, or ``None`` when it is local.
+
+    Gated on ``is_remote`` first, which fails closed to remote/unknown when the
+    placement row cannot be read: ``runtime_for_terminal`` alone returns ``None``
+    both for a genuinely local caller and for a remote one whose lookup just
+    failed, and treating the second as local is what sends a worker into the
+    wrong container. A remote caller whose runtime cannot be resolved raises
+    rather than silently degrading to a local create.
+    """
+    if not caller_id:
+        return None
+
+    from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
+
+    if not runtime_registry.is_remote(caller_id):
+        return None
+    runtime_id = runtime_registry.runtime_for_terminal(caller_id)
+    if runtime_id is None:
+        raise RuntimeError(
+            f"caller '{caller_id}' executes in a runtime but its placement is "
+            "currently unavailable; refusing to create the step's terminal locally"
+        )
+    return runtime_id
+
+
 async def _validate_reused_terminal(
     terminal_id: str,
     requested_provider: str,
@@ -688,21 +714,59 @@ async def run_agent_step(
         # path.
         new_session = session_name is None
 
-        # create_terminal already runs provider.initialize() (which waits for
-        # IDLE); a failure raises (ValueError/TimeoutError) and propagates.
-        terminal = await terminal_service.create_terminal(
-            provider,
-            agent,
-            session_name=session_name,
-            new_session=new_session,
-            working_directory=working_directory,
-            allowed_tools=allowed_tools,
-            caller_id=caller_id,
-            env_vars=env_vars,
-            engine=engine,
-            model=model,
-            use_worktree=use_worktree,
-        )
+        # #745: the caller may be an agent executing in a runtime rather than in
+        # this container. Its tmux session lives THERE, so creating the step's
+        # terminal here fails with "Session '<name>' not found" — and that is
+        # exactly what a handoff from a remote supervisor did: assign goes
+        # through POST /sessions/{name}/terminals, which is runtime-aware, while
+        # this path called the local service directly and so was not. Reproduced
+        # on EKS: the three assigns succeeded and the report_generator handoff
+        # failed on the missing session. The worker also belongs in the same
+        # runtime as the agent that asked for it, beside the session it joins.
+        caller_runtime = _caller_runtime(caller_id)
+        if caller_runtime is not None:
+            from cli_agent_orchestrator.runtime_channel.api import (
+                CreateRemoteTerminalBody,
+                launch_remote_terminal,
+            )
+
+            terminal = await launch_remote_terminal(
+                caller_runtime,
+                CreateRemoteTerminalBody(
+                    # The caller's own provider, NOT one resolved against this
+                    # container's profile store — the agent runs off the
+                    # runtime's own `cao install` (review finding 8 on #802).
+                    provider=provider,
+                    agent_profile=agent,
+                    session_name=session_name,
+                    new_session=new_session,
+                    working_directory=working_directory,
+                    allowed_tools=allowed_tools,
+                    caller_id=caller_id,
+                    env_vars=env_vars,
+                    engine=str(engine) if engine is not None else None,
+                    model=model,
+                    use_worktree=use_worktree,
+                ),
+                # Server-written: the owner is never handed to the executor.
+                owner_id=None,
+            )
+        else:
+            # create_terminal already runs provider.initialize() (which waits for
+            # IDLE); a failure raises (ValueError/TimeoutError) and propagates.
+            terminal = await terminal_service.create_terminal(
+                provider,
+                agent,
+                session_name=session_name,
+                new_session=new_session,
+                working_directory=working_directory,
+                allowed_tools=allowed_tools,
+                caller_id=caller_id,
+                env_vars=env_vars,
+                engine=engine,
+                model=model,
+                use_worktree=use_worktree,
+            )
         terminal_id = terminal.id
 
         # BR-31: make the terminal this call just made visible to U4's orphan
