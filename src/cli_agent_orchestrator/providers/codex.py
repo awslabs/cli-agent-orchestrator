@@ -1280,6 +1280,40 @@ class CodexProvider(BaseProvider):
         self._initialized = True
         return True
 
+    @staticmethod
+    def _shows_codex_ui(clean_output: str) -> bool:
+        """Whether the pane tail still shows codex's own TUI.
+
+        Positive evidence that the process is alive and rendering: either its
+        footer chrome ("? for shortcuts", "context left", the model/cwd status
+        bar) or a bare idle ``›`` prompt. Used to refuse the
+        pane-command-says-shell exit inference, which is wrong whenever codex is
+        a node shim — tmux then reports the shell for the whole session.
+
+        Tail-scoped for the same reason the idle checks are: the launch command
+        and boot banner scroll away, and only the live frame at the bottom says
+        anything about now.
+
+        The LAST non-empty line decides first. After a real exit the pane's
+        bottom line is the shell prompt again, while codex's own ``›`` prompt and
+        footer are still sitting in the scrollback just above it — so a plain
+        "does any tail line look like codex" test would read a genuinely dead
+        pane as alive. A bottom line that is a shell prompt therefore wins,
+        whatever is above it.
+        """
+        lines = [line for line in clean_output.splitlines() if line.strip()]
+        if not lines:
+            return False
+        # A shell prompt as the bottom line: the pane is back to the shell.
+        if re.search(r"[%$#]\s*$", lines[-1]):
+            return False
+        return any(
+            re.search(TUI_FOOTER_PATTERN, line)
+            or re.match(IDLE_PROMPT_STRICT_PATTERN, line)
+            or re.match(USER_PREFIX_PATTERN, line)
+            for line in lines[-IDLE_PROMPT_TAIL_LINES:]
+        )
+
     def get_status(self, output: str) -> TerminalStatus:
         # Native status (herdr): trust the backend's agent state when available;
         # on herdr the buffer is never fed, so buffer parsing can't leave UNKNOWN.
@@ -1293,23 +1327,38 @@ class CodexProvider(BaseProvider):
         if not output:
             return TerminalStatus.UNKNOWN
 
-        # Detect when the codex process has exited and the pane is back to a
-        # bare shell. The pane's current command will revert to the shell
-        # (e.g. "zsh") that was running before we launched codex. Returning
-        # ERROR prevents the inbox service from typing a queued message into
-        # the shell — which would execute it as arbitrary commands.
-        if self._initialized and self.shell_baseline:
-            current_cmd = get_backend().get_pane_current_command(
-                self.session_name, self.window_name
-            )
-            if current_cmd == self.shell_baseline:
-                return TerminalStatus.ERROR
-
         # Strip the RAW pipe-pane escapes (cursor positioning, in-place redraws),
         # not just SGR colour codes — otherwise cursor sequences survive and the
         # idle ``›`` prompt / structural checks below misfire on the raw stream.
         clean_output = strip_terminal_escapes(output)
         tail_output = "\n".join(clean_output.splitlines()[-25:])
+
+        # Detect when the codex process has exited and the pane is back to a
+        # bare shell. The pane's current command will revert to the shell
+        # (e.g. "zsh") that was running before we launched codex. Returning
+        # ERROR prevents the inbox service from typing a queued message into
+        # the shell — which would execute it as arbitrary commands.
+        #
+        # The tmux command report alone is NOT sufficient evidence of an exit.
+        # When codex is installed as a node shim — ``/opt/homebrew/bin/codex`` is
+        # a ``#!/usr/bin/env node`` script, which is how npm/homebrew install it —
+        # tmux keeps reporting the pane's command as the SHELL for the whole
+        # session, so this check fired against a perfectly healthy codex: every
+        # terminal went ERROR seconds after launch and ``send_input`` refused
+        # with 409, which breaks assign/handoff entirely for that install.
+        #
+        # So require corroboration from the buffer: codex's own TUI (its footer
+        # chrome or an idle ``›`` prompt) is positive evidence the process is
+        # alive and rendering, whatever tmux reports about the foreground
+        # command. Only when the pane is back to the baseline shell AND shows
+        # none of codex's UI is it really gone. ``kiro_cli`` already orders its
+        # equivalent check after the idle-prompt detection for the same reason.
+        if self._initialized and self.shell_baseline:
+            current_cmd = get_backend().get_pane_current_command(
+                self.session_name, self.window_name
+            )
+            if current_cmd == self.shell_baseline and not self._shows_codex_ui(clean_output):
+                return TerminalStatus.ERROR
 
         # Search for user messages, excluding the Codex TUI footer when present.
         # The TUI footer (idle prompt hint like "› Summarize recent commits" +
