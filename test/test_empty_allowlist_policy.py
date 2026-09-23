@@ -8,6 +8,7 @@ them treats as unrestricted. The resolver assertion cannot see any of this, beca
 each widening happens after the resolver returns.
 """
 
+import logging
 import shlex
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -172,6 +173,28 @@ class TestSoftProvidersKeepAZeroToolInstruction:
             command = provider._build_command()
         assert self.NO_TOOLS in shlex.split(command)[4]
 
+    def test_kimi_code_markdown_agent_emits_it(self):
+        """#799 added a second Kimi path with its own copy of the guard.
+
+        `_render_markdown_agent` is not reached by `_build_kimi_command`, so the
+        legacy-path test below says nothing about it.
+        """
+        from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider
+
+        profile = MagicMock(model=None, system_prompt="Custom.", mcpServers=None)
+        provider = KimiCliProvider("t", "s", "w", agent_profile="dev", allowed_tools=[])
+        rendered = provider._render_markdown_agent(profile)
+        assert rendered is not None
+        assert self.NO_TOOLS in rendered
+
+    def test_kimi_code_markdown_agent_keeps_the_existing_wording(self):
+        from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider
+
+        profile = MagicMock(model=None, system_prompt="Custom.", mcpServers=None)
+        provider = KimiCliProvider("t", "s", "w", agent_profile="dev", allowed_tools=["fs_read"])
+        rendered = provider._render_markdown_agent(profile)
+        assert "You only have access to these tools: fs_read" in rendered
+
     def test_kimi_emits_it(self):
         from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider
 
@@ -187,6 +210,38 @@ class TestSoftProvidersKeepAZeroToolInstruction:
             assert self.NO_TOOLS in system_md.read_text(encoding="utf-8")
         finally:
             provider.cleanup()
+
+
+class TestHermesWarnsOnADenyAll:
+    """Hermes has no restriction mechanism, so the warning is the whole story.
+
+    It is not in ``SOFT_ENFORCEMENT_PROVIDERS`` and was not in the review, but it
+    carried the same guard, so a deny-all passed without telling the operator that
+    nothing enforces it.
+    """
+
+    WARNING = "no CAO-native tool restriction flag"
+
+    @staticmethod
+    def _warnings(allowed, caplog):
+        from cli_agent_orchestrator.providers.hermes import HermesProvider
+
+        provider = HermesProvider("t", "s", "w", allowed_tools=allowed)
+        with caplog.at_level(logging.WARNING):
+            provider._build_hermes_command()
+        return [r for r in caplog.records if TestHermesWarnsOnADenyAll.WARNING in r.getMessage()]
+
+    def test_a_deny_all_warns(self, caplog):
+        assert self._warnings([], caplog)
+
+    def test_a_restricted_policy_still_warns(self, caplog):
+        assert self._warnings(["fs_read"], caplog)
+
+    def test_an_unrestricted_policy_does_not_warn(self, caplog):
+        assert not self._warnings(["*"], caplog)
+
+    def test_an_unresolved_policy_does_not_warn(self, caplog):
+        assert not self._warnings(None, caplog)
 
 
 class TestNoPolicyGuardTestsTheListForTruth:
