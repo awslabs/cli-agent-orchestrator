@@ -707,6 +707,18 @@ Resources:
               - bedrock:InvokeModel
               - bedrock:InvokeModelWithResponseStream
             Resource: "*"
+          # codex does NOT use the invoke API. It speaks OpenAI's Responses
+          # protocol, which Bedrock exposes at `/openai/v1/responses` behind a
+          # separate action in its own service prefix. Granting
+          # `bedrock:InvokeModel` and stopping there produces an AccessDenied
+          # naming `bedrock-mantle:CreateInference`, which does not appear in
+          # any Bedrock policy example and reads like a typo rather than a
+          # missing grant. Harmless on the Claude-only path: nothing calls it.
+          - Sid: InvokeOpenAiResponsesApi
+            Effect: Allow
+            Action:
+              - bedrock-mantle:CreateInference
+            Resource: "*"
           # Claude Code probes inference profiles during startup.
           - Sid: ReadModelCatalogue
             Effect: Allow

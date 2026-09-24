@@ -41,8 +41,10 @@ case "$MODE" in
     ;;
   kiro)
     ;;
+  codex)
+    ;;
   *)
-    echo "error: mode must be 'bedrock' or 'kiro' (got '$MODE')" >&2
+    echo "error: mode must be 'bedrock', 'kiro' or 'codex' (got '$MODE')" >&2
     exit 1
     ;;
 esac
@@ -128,6 +130,19 @@ if [ "$MODE" = "kiro" ]; then
 
 components:
   - components/kiro
+EOF
+fi
+
+# codex mode needs no stack-output guard, because it adds no secret to project:
+# it reaches Bedrock through the same Pod Identity association as the default.
+# What it does need is an image built with --build-arg INSTALL_CODEX=1, and that
+# cannot be checked from here — the tag is opaque. A tag without codex in it
+# fails at the first launch with "codex was not found", not at deploy time.
+if [ "$MODE" = "codex" ]; then
+  cat >>"$RENDER/kustomization.yaml" <<'EOF'
+
+components:
+  - components/codex
 EOF
 fi
 

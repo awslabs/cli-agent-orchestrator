@@ -396,6 +396,21 @@ Code from public registries and carries `entrypoint.sh`, which runs
 `cao init`, installs the profiles named in `CAO_INSTALL_PROFILES`, and execs
 `cao-server`. Nothing out-of-tree is required to reproduce it.
 
+To run the codex provider on this fleet, add codex to the server image. It is
+opt-in because it adds a Node runtime and ~200MB to an image most deployments do
+not need it in:
+
+```bash
+docker buildx build --platform linux/arm64 \
+  -f examples/cao-clusters/kubernetes/eks/Dockerfile \
+  --build-arg INSTALL_CODEX=1 \
+  -t "${REGISTRY}/cao-server:${TAG}" --push .
+```
+
+One image can serve both providers — Claude Code is always installed and codex
+is added alongside it — so this is the tag to build if you intend to deploy
+either mode from the same build.
+
 ECR tags are `IMMUTABLE` in both repositories, deliberately: a mutable `latest`
 once left a cluster running a build that predated a fix while the manifests
 advertised it, with nothing to indicate the mismatch.
@@ -445,6 +460,17 @@ than at deploy time:
   and workers rely on Pod Identity as before. The role's trust policy needs
   `sts:AssumeRoleWithWebIdentity` from the cluster's OIDC provider, conditioned
   on `:aud = sts.amazonaws.com` and `:sub = system:serviceaccount:<ns>:<sa>`.
+
+codex on Bedrock is the same story with one addition, and it is not a Bedrock
+action at all. codex speaks OpenAI's Responses protocol, which Bedrock serves at
+`/openai/v1/responses` behind **`bedrock-mantle:CreateInference`** — a different
+service prefix from `bedrock:InvokeModel`. `AgentBedrockPolicy` grants it, so
+nothing extra is needed here, but it is worth knowing why: an account whose
+policy was copied from a Claude-only example denies codex with an action name
+that appears in no Bedrock documentation, which reads like a typo rather than a
+missing grant. The model id must also be one that endpoint serves
+(`CODEX_BEDROCK_MODEL`, default `openai.gpt-5.6-sol`) — a Claude id there fails
+as a model error, not a permissions one.
 
 Everything below is for a provider that authenticates with a key instead.
 
@@ -513,7 +539,19 @@ examples/cao-clusters/kubernetes/eks/deploy.sh cao-workshop "${TAG}"
 
 # Alternate image built for Kiro:
 examples/cao-clusters/kubernetes/eks/deploy.sh cao-workshop "${TAG}" kiro
+
+# codex on Bedrock, from a tag built with --build-arg INSTALL_CODEX=1:
+examples/cao-clusters/kubernetes/eks/deploy.sh cao-workshop "${TAG}" codex
 ```
+
+`codex` mode is a Bedrock mode, not an API-key one: codex signs its own requests
+from the same Pod Identity association Claude Code uses, so it needs no secret
+and keeps the Pod Identity egress rule that `kiro` mode removes. It differs in
+the API it calls, and that is the one thing to get right in IAM — see
+[Provider credentials](#provider-credentials). Unlike `kiro`, the mode cannot be
+validated at deploy time: whether the tag actually contains codex is invisible
+from the tag, so a plain image deployed in `codex` mode fails at the first
+launch with `codex was not found` rather than at `deploy.sh`.
 
 That is the whole deploy. Do not hand-edit the manifests — `deploy.sh` renders
 `<account-id>`, `<region>`, `<filesystem-id>`, `<access-point-id>` and

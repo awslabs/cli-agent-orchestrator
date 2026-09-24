@@ -1,0 +1,28 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: cao-supervisor
+  namespace: cao-cluster
+spec:
+  template:
+    spec:
+      containers:
+        - name: cao-node
+          env:
+            - name: CAO_INSTALL_PROFILES
+              value: "code_supervisor:codex"
+            # AWS_REGION stays: it is how codex's SDK resolves the Bedrock
+            # endpoint, since the image writes no region into config.toml.
+            # Everything below is Claude Code's, and codex ignores it — but
+            # ANTHROPIC_MODEL left in place has confused every reader of a
+            # codex pod's env so far, so it goes.
+            - name: CLAUDE_CODE_USE_BEDROCK
+              $patch: delete
+            - name: ANTHROPIC_MODEL
+              $patch: delete
+            - name: ANTHROPIC_DEFAULT_OPUS_MODEL
+              $patch: delete
+            - name: ANTHROPIC_DEFAULT_SONNET_MODEL
+              $patch: delete
+            - name: ANTHROPIC_DEFAULT_HAIKU_MODEL
+              $patch: delete
