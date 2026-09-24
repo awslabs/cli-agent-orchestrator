@@ -29,6 +29,19 @@ class TestSpawnModeRouting:
         client.create_window.assert_not_called()
         assert client.create_pane.call_args.args[:4] == ("ses", "fleet", "coder-3", "tid")
 
+    def test_the_configured_layout_reaches_the_client(self, client):
+        backend = TmuxBackend(client=client, spawn_mode="pane", pane_layout="even-vertical")
+
+        backend.create_window("ses", "coder-3", "tid")
+
+        assert client.create_pane.call_args.kwargs["pane_layout"] == "even-vertical"
+
+    def test_the_default_layout_is_tiled(self, client):
+        """It holds the most panes, which is what a fleet needs."""
+        TmuxBackend(client=client, spawn_mode="pane").create_window("ses", "coder-3", "tid")
+
+        assert client.create_pane.call_args.kwargs["pane_layout"] == "tiled"
+
 
 class TestFallbackIsNarrow:
     def test_a_full_host_window_falls_back_to_a_window(self, client):

@@ -37,6 +37,27 @@ logger = logging.getLogger(__name__)
 # isolated from each other here. Treat it as a label, not a credential.
 TERMINAL_MARK_OPTION = "@cao_terminal"
 
+# How a pane-mode window is re-arranged after each spawn, and the split that
+# feeds it. The split direction is not separately configurable because
+# ``select-layout`` overrides it — splitting sideways and then laying out
+# ``even-vertical`` leaves stacked panes either way. It still has to match the
+# layout's axis, because tmux refuses a split for want of room along the axis
+# being split, not the one the layout settles on.
+PANE_LAYOUTS: Dict[str, PaneDirection] = {
+    "tiled": PaneDirection.Below,
+    "even-vertical": PaneDirection.Below,
+    "even-horizontal": PaneDirection.Right,
+    "none": PaneDirection.Below,
+}
+
+# Leaves tmux's own split behaviour alone: each split halves the pane it came
+# from, so the window fills after a handful of agents. Chosen by someone who
+# arranges panes themselves, not a default.
+NO_RELAYOUT = "none"
+
+# Holds the most panes of the four, which is what a fleet needs.
+DEFAULT_PANE_LAYOUT = "tiled"
+
 
 class PaneSpawnUnavailable(RuntimeError):
     """This session cannot take another pane right now — spawn a window instead."""
@@ -1136,17 +1157,27 @@ class TmuxClient:
         working_directory: str,
         window_shell: Optional[str],
         pane_env: Dict[str, str],
+        pane_layout: str = DEFAULT_PANE_LAYOUT,
     ) -> Pane:
-        """Split the host window and return the new pane, re-tiling what is there.
+        """Split the host window and return the new pane, re-arranging what is there.
 
         A window only holds so many panes before tmux refuses for want of space,
         and it says so with a plain ``LibTmuxException``. That is a reason to put
-        this terminal in a window of its own, not to fail the spawn.
+        this terminal in a window of its own, not to fail the spawn. How many it
+        holds depends on the layout, so the fallback fires sooner for some than
+        for others.
         """
+        direction = PANE_LAYOUTS.get(pane_layout)
+        if direction is None:
+            # A bare KeyError here reaches the caller's log as the name alone.
+            raise ValueError(
+                f"Unknown pane layout '{pane_layout}'; expected one of "
+                f"{', '.join(sorted(PANE_LAYOUTS))}"
+            )
         kwargs: dict = {
             "start_directory": working_directory,
             "environment": pane_env,
-            "direction": PaneDirection.Below,
+            "direction": direction,
         }
         if window_shell:
             kwargs["shell"] = window_shell
@@ -1159,8 +1190,9 @@ class TmuxClient:
                 f"tmux has no room for another pane in '{host_window.name}'"
             ) from e
         # Successive splits halve the last pane and leave the window unreadable
-        # past a handful of agents; tiled re-balances them.
-        host_window.select_layout("tiled")
+        # past a handful of agents; a layout re-balances them.
+        if pane_layout != NO_RELAYOUT:
+            host_window.select_layout(pane_layout)
         return pane
 
     def create_pane(
@@ -1172,6 +1204,7 @@ class TmuxClient:
         working_directory: Optional[str] = None,
         window_shell: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
+        pane_layout: str = DEFAULT_PANE_LAYOUT,
     ) -> str:
         """Split ``host_window_name`` and return the new terminal's name.
 
@@ -1207,7 +1240,7 @@ class TmuxClient:
                 )
             else:
                 pane = self._split_host_window(
-                    host_window, working_directory, window_shell, pane_env
+                    host_window, working_directory, window_shell, pane_env, pane_layout
                 )
             pane.set_option(TERMINAL_MARK_OPTION, terminal_name)
 

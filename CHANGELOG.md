@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `terminal.pane_layout` chooses how a pane-mode window is arranged after each
+  spawn: `tiled` (default, unchanged behaviour), `even-vertical`,
+  `even-horizontal`, or `none` to leave tmux's own splitting alone. The split
+  direction follows the layout rather than being configured separately, because
+  `select-layout` overrides the direction a pane was split in. Each layout holds
+  a different number of agents before the window is full, and the terminal that
+  does not fit still falls back to a window of its own (#74)
 - `terminal.spawn_mode: "pane"` puts every terminal `assign` / `handoff` creates
   into one tmux window as a pane, re-tiled after each spawn, so a supervisor
   watches the whole fleet at once instead of cycling through a window per agent.

@@ -217,6 +217,9 @@ CAO's default backend is [tmux](tmux.md). [herdr](https://herdr.dev/) is an expe
   `assign` / `handoff` lands. See [Watching a fleet in one window](#watching-a-fleet-in-one-window).
 - `pane_window`: the window `spawn_mode: "pane"` shares (default `"cao-agents"`).
   The first pane terminal in a session creates it; nothing has to exist first.
+- `pane_layout`: how that window is re-arranged after each spawn — `"tiled"`
+  (default), `"even-vertical"`, `"even-horizontal"`, or `"none"`. See
+  [Choosing a layout](#choosing-a-layout).
 
 Select a backend for a single run without touching `settings.json`:
 
@@ -239,10 +242,48 @@ fleet grows.
 {
   "terminal": {
     "spawn_mode": "pane",
-    "pane_window": "cao-agents"
+    "pane_window": "cao-agents",
+    "pane_layout": "tiled"
   }
 }
 ```
+
+#### Choosing a layout
+
+`pane_layout` names the arrangement, not the split. There is no separate
+split-direction setting because `select-layout` overrides the direction a pane
+was split in: split sideways, lay out `even-vertical`, and the panes are stacked
+regardless. The split still follows the layout's axis, because tmux refuses a
+split for want of room along the axis being *split* rather than the one the
+layout settles on.
+
+| `pane_layout` | Arrangement | Use when |
+|---|---|---|
+| `tiled` (default) | grid, re-balanced each spawn | watching a fleet — it holds the most panes |
+| `even-vertical` | full-width rows | output is wide; reading long lines matters more than agent count |
+| `even-horizontal` | full-height columns | following a few agents' scrollback side by side |
+| `none` | tmux's own behaviour — each split halves the last pane | you arrange the window yourself |
+
+The layout also decides how many agents fit before the window is full, and the
+one that does not fit becomes a window of its own with a warning. `tiled` holds
+by far the most, because it grows in both directions; `even-vertical` and
+`even-horizontal` are bounded by the rows or columns a pane needs along one
+axis; `none` is the lowest of all, since each split halves the pane it came from.
+
+That ceiling is lower than it looks on a small terminal and it is not a fixed
+number -- it moves with the window size, the tmux version, and anything in
+`tmux.conf` that costs a row, such as the status line or pane borders. Measure
+it for a given setup rather than trusting a figure:
+
+```bash
+tmux new-session -d -s cap -x 80 -y 24
+while tmux split-window -v -t cap 2>/dev/null; do tmux select-layout -t cap even-vertical; done
+tmux list-panes -t cap | wc -l
+tmux kill-session -t cap
+```
+
+`tiled` is the default because a fleet is what pane mode is for; the others trade
+capacity for a shape that suits fewer agents.
 
 A terminal that shares a window cannot be identified by that window's name, so
 each pane carries its terminal name in the `@cao_terminal` pane option and
