@@ -172,12 +172,15 @@ cp -R "$K8S_DIR"/. "$RENDER/"
 # edit in the throwaway rendered copy means the checked-in root remains the
 # Bedrock default while kiro mode is still one deploy command, not a sequence of
 # hand-edits that can omit half the provider switch.
-if [ "$MODE" = "kiro" ]; then
-  cat >>"$RENDER/kustomization.yaml" <<'EOF'
+# Collected into ONE `components:` block, because the provider mode and the
+# credential mode are independent switches that can both be on. Emitting a
+# second `components:` key instead silently DROPS the first: duplicate mapping
+# keys are last-one-wins, so `codex` plus projected credentials deployed the
+# credentials and a Claude Code supervisor, with no error anywhere. Measured.
+COMPONENTS=()
 
-components:
-  - components/kiro
-EOF
+if [ "$MODE" = "kiro" ]; then
+  COMPONENTS+=("components/kiro")
 fi
 
 # codex mode needs no stack-output guard, because it adds no secret to project:
@@ -186,11 +189,21 @@ fi
 # cannot be checked from here — the tag is opaque. A tag without codex in it
 # fails at the first launch with "codex was not found", not at deploy time.
 if [ "$MODE" = "codex" ]; then
-  cat >>"$RENDER/kustomization.yaml" <<'EOF'
+  COMPONENTS+=("components/codex")
+fi
 
-components:
-  - components/codex
-EOF
+# Projected web-identity credentials, for a cluster that injects neither Pod
+# Identity nor IRSA.
+if [ -n "${CAO_AGENT_IRSA_ROLE_ARN:-}" ]; then
+  echo "  agent creds projected web identity as ${CAO_AGENT_IRSA_ROLE_ARN##*/}"
+  COMPONENTS+=("components/irsa-projected")
+fi
+
+if [ ${#COMPONENTS[@]} -gt 0 ]; then
+  printf '\ncomponents:\n' >>"$RENDER/kustomization.yaml"
+  for c in "${COMPONENTS[@]}"; do
+    printf '  - %s\n' "$c" >>"$RENDER/kustomization.yaml"
+  done
 fi
 
 # LC_ALL=C and the -i.bak form keep this working on both GNU and BSD sed.
@@ -205,6 +218,7 @@ find "$RENDER" -name '*.yaml' -print0 | while IFS= read -r -d '' f; do
     -e "s|<filesystem-id>|$FS_ID|g" \
     -e "s|<access-point-id>|$AP_ID|g" \
     -e "s|<vpc-cidr>|$VPC_CIDR|g" \
+    -e "s|<irsa-role-arn>|${CAO_AGENT_IRSA_ROLE_ARN:-}|g" \
     "$f"
   rm -f "$f.bak"
 done

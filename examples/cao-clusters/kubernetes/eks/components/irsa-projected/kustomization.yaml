@@ -1,0 +1,25 @@
+# Projected web-identity credentials for the server and supervisor pods.
+#
+# The default path gives the agent pods AWS credentials through EKS Pod Identity
+# associations, which the CloudFormation template creates. A cluster this repo
+# did not provision has no such associations, and on some clusters neither
+# injector runs at all: annotating the service account does nothing because the
+# IRSA webhook is absent, and the Pod Identity agent injects nothing either. The
+# pod then has no credentials and every model call fails with an error that names
+# the NODE role, which reads like a Bedrock problem rather than a missing
+# association.
+#
+# A projected `serviceAccountToken` volume needs no webhook and no addon — the
+# kubelet mints the token — so it works on any cluster with an OIDC provider
+# registered. deploy.sh enables this component when CAO_AGENT_IRSA_ROLE_ARN is
+# set, and renders the ARN into <irsa-role-arn>.
+#
+# The role's trust policy needs sts:AssumeRoleWithWebIdentity from the cluster's
+# OIDC provider, conditioned on `:aud = sts.amazonaws.com` and a `:sub` matching
+# `system:serviceaccount:cao-cluster:cao-*`. The broker has the equivalent switch
+# for the worker pods it mints: CAO_ELASTIC_WORKER_IRSA_ROLE_ARN.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+patches:
+  - path: server-irsa.yaml
+  - path: supervisor-irsa.yaml

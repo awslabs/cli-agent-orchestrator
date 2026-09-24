@@ -497,8 +497,27 @@ Resources:
         # expects it.
         AuthenticationMode: API_AND_CONFIG_MAP
         # Grants cluster-admin to whoever deploys this stack, so kubectl works
-        # immediately afterwards with no extra wiring.
-        BootstrapClusterCreatorAdminPermissions: true
+        # immediately afterwards with no extra wiring — but ONLY when no explicit
+        # admin principal was named.
+        #
+        # EKS creates a real access entry for the creator when this is true, and
+        # `ClusterAdminAccessEntry` below creates one for
+        # `ClusterAdminPrincipalArn`. When those are the same principal — which is
+        # what the README's own snippet produces for anyone deploying as
+        # themselves — the second one collides with the first and the stack fails
+        # partway through with `The specified access entry resource is already in
+        # use on this cluster` (409 AlreadyExists), after the VPC, the cluster and
+        # the KMS key are already built. Measured on a real deploy, not inferred.
+        #
+        # Turning bootstrap off whenever an explicit principal is given leaves
+        # exactly one entry in both cases: the explicit one. In the Workshop
+        # Studio case that is the participant role rather than the provisioning
+        # role, which is the whole point of the parameter; deploying as yourself
+        # grants the same admin by the same route.
+        BootstrapClusterCreatorAdminPermissions: !If
+          - HasClusterAdminPrincipal
+          - false
+          - true
       # `secrets` is the only resource EKS supports here.
       EncryptionConfig:
         - Resources:

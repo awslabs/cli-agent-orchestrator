@@ -593,11 +593,77 @@ transformer rewrites container `image:` fields and not an image name sitting in 
 env var. Without it the supervisor would move to a new tag while the broker kept
 minting workers on the old one.
 
+## Deploying onto an existing cluster
+
+The stack above is one way to get a cluster, not the only one. To deploy onto a
+cluster you already have, pass `-` as the stack name and supply the six values
+`deploy.sh` would otherwise read from stack outputs. Verified end to end on an
+unrelated EKS cluster — including both `examples/assign` runs below.
+
+```bash
+export AWS_REGION=us-east-1
+export CAO_CLUSTER_NAME=my-cluster
+export CAO_VPC_CIDR="$(aws ec2 describe-vpcs --vpc-ids "$VPC" \
+  --query 'Vpcs[0].CidrBlock' --output text)"
+
+# 1. Three ECR repositories, and the images pushed to them (see Build).
+for r in cao-server cao-worker-broker cao-fleet-panel; do
+  aws ecr create-repository --repository-name "$r" --image-tag-mutability IMMUTABLE
+done
+export CAO_SERVER_REPO_URI="${ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com/cao-server"
+export CAO_BROKER_REPO_URI="${ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com/cao-worker-broker"
+export CAO_PANEL_REPO_URI="${ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com/cao-fleet-panel"
+
+# 2. An EFS filesystem with an access point, and a mount target in every AZ the
+#    nodes run in. The workspace is mounted by the server, the supervisor AND
+#    every worker pod, so it has to be ReadWriteMany — EBS cannot serve it.
+export CAO_WORKSPACE_HANDLE="fs-xxxx::fsap-xxxx"
+
+# 3. Credentials for the agent pods, if the cluster injects none (see below).
+export CAO_AGENT_IRSA_ROLE_ARN="arn:aws:iam::${ACCOUNT}:role/my-cao-bedrock-role"
+
+examples/cao-clusters/kubernetes/eks/deploy.sh - "${TAG}" bedrock
+```
+
+Four cluster-side prerequisites the stack normally covers, each of which fails in
+a way that does not name the real cause:
+
+- **The EFS CSI driver must actually be running.** `kubectl get csidrivers`
+  showing `efs.csi.aws.com` is not enough: a `CSIDriver` object can outlive the
+  addon that created it. The symptom is the server and supervisor sitting in
+  `ContainerCreating` with `driver name efs.csi.aws.com not found in the list of
+  registered CSI drivers` — visible only in the pod's events, with no failing
+  pod to draw attention. Confirm with `kubectl -n kube-system get pods -l
+  app=efs-csi-node`, and install with
+  `aws eks create-addon --addon-name aws-efs-csi-driver`.
+- **A `gp3` StorageClass** for the server's state volume. `storageclass-gp3.yaml`
+  creates it, so a cluster with only `gp2` is fine — but the EBS CSI driver has
+  to be present for that class to bind.
+- **Credentials for the agent pods.** The default path relies on EKS Pod Identity
+  associations that this template creates and your cluster will not have. Worse,
+  some clusters inject nothing at all: annotating the service account with
+  `eks.amazonaws.com/role-arn` does nothing when the IRSA webhook is absent, and
+  the Pod Identity agent injects nothing without an association. Setting
+  `CAO_AGENT_IRSA_ROLE_ARN` adds a projected `serviceAccountToken` volume to the
+  server and supervisor instead, which the kubelet mints with no webhook
+  involved. Pair it with `CAO_ELASTIC_WORKER_IRSA_ROLE_ARN` on the broker for the
+  worker pods it leases. The role needs the Bedrock grants from
+  `AgentBedrockPolicy` and a trust policy accepting
+  `sts:AssumeRoleWithWebIdentity` from the cluster's OIDC provider, conditioned
+  on `:aud = sts.amazonaws.com` and `:sub` matching
+  `system:serviceaccount:cao-cluster:cao-*`.
+- **Anthropic's First Time Use form and model entitlements**, exactly as on the
+  stack path — these are account-level, not cluster-level.
+
 ## Verify
 
 ```bash
 kubectl -n cao-cluster get pvc,pod,job,service,networkpolicy
-kubectl -n cao-cluster rollout status statefulset/cao-server
+# NOT `rollout status` for cao-server: that StatefulSet is updateStrategy
+# OnDelete, and rollout status supports only RollingUpdate — it exits non-zero
+# with "rollout status is only available for RollingUpdate strategy type" on a
+# perfectly healthy server. Wait on the pod instead.
+kubectl -n cao-cluster wait --for=condition=ready pod/cao-server-0 --timeout=300s
 kubectl -n cao-cluster rollout status statefulset/cao-supervisor
 kubectl -n cao-cluster rollout status deployment/cao-worker-broker
 kubectl -n cao-cluster rollout status deployment/cao-fleet-panel
@@ -1132,7 +1198,14 @@ sibling windows in one tmux session inside `cao-supervisor-0`, not in the server
 container.
 
 Verified on this cluster with Claude Code on Bedrock; the transcript at the end of
-this section is from that run.
+this section is from that run. Also verified with codex on Bedrock, with one
+change that matters: **codex needs the working directory to be a trusted one.**
+The image marks `/home/cao/workspace` trusted and nothing else, so a codex run
+with `working_directory` under `CAO_HOME_DIR` stops at `Not inside a trusted
+directory` before doing any work. Stage the dataset under `/home/cao/workspace`
+and launch there instead — it is the EFS mount, writable in the supervisor pod,
+and the demo is otherwise identical. Claude Code has no such constraint, which is
+why the steps below use the `CAO_HOME_DIR` path.
 
 **Step 1 — stage the three profiles in both pods.** The runtime needs them because
 the provider reads the profile when it starts the pane; the *server* needs them
