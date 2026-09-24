@@ -1,7 +1,7 @@
 """Enforcement of the caller's effective allowed-tools policy for CAO's MCP tools (#671).
 
-``assign`` and ``handoff`` mint a new agent identity under a caller-chosen
-profile. The provider-native restrictions built by ``utils/tool_mapping`` can
+``assign``, ``handoff`` and ``assign_elastic`` mint a new agent identity under
+a caller-chosen profile. The provider-native restrictions built by ``utils/tool_mapping`` can
 never cover them: ``get_disallowed_tools`` skips every ``@``-prefixed entry
 because MCP server references have no native tool names.
 
@@ -19,7 +19,7 @@ where the caller is a human operator and no agent allowlist applies.
 """
 
 import os
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import requests
@@ -228,6 +228,84 @@ class TestToolsRefuse:
             ):
                 result = await server.assign(agent_profile="developer", message="do work")
         assert result == {"success": True}
+        impl.assert_called_once()
+
+
+class TestAssignElastic:
+    """``assign_elastic`` is the fifth MCP route into ``_assign_impl``.
+
+    It landed in #693, before the guard in #769, and launches a worker under a
+    caller-chosen ``agent_profile`` exactly as ``assign`` does, on a pod the
+    broker provisions for it. A caller that ``assign`` refuses must not be able
+    to reach the same launch here, and must not get a worker leased either.
+    """
+
+    @staticmethod
+    def _broker(monkeypatch):
+        monkeypatch.setenv("CAO_ELASTIC_BROKER_URL", "http://broker:9890")
+        monkeypatch.setenv("CAO_ELASTIC_BROKER_TOKEN", "broker-token")
+
+    @pytest.mark.asyncio
+    async def test_refuses_before_leasing_a_worker(self, monkeypatch):
+        self._broker(monkeypatch)
+        with patch.dict(os.environ, BOUND):
+            with (
+                patch.object(
+                    server, "_get_terminal_context_from_env", return_value=_ctx(["fs_read"])
+                ),
+                patch.object(server, "_current_terminal_id", return_value="a1b2c3d4"),
+                patch.object(server.requests, "post") as post,
+                patch.object(server, "_assign_impl") as impl,
+            ):
+                result = await server.assign_elastic(agent_profile="developer", message="do work")
+        assert result["success"] is False
+        assert result["elastic"] is True
+        assert "@cao-mcp-server" in result["message"]
+        post.assert_not_called()
+        impl.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_fails_closed_when_the_caller_cannot_be_resolved(self, monkeypatch):
+        self._broker(monkeypatch)
+        with patch.dict(os.environ, BOUND):
+            with (
+                patch.object(server, "_get_terminal_context_from_env", return_value=None),
+                patch.object(server, "_current_terminal_id", return_value="a1b2c3d4"),
+                patch.object(server.requests, "post") as post,
+            ):
+                result = await server.assign_elastic(agent_profile="developer", message="do work")
+        assert result["success"] is False
+        assert "CAO_TERMINAL_ID" in result["message"]
+        post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_runs_for_a_granted_caller(self, monkeypatch):
+        self._broker(monkeypatch)
+        lease = Mock()
+        lease.raise_for_status.return_value = None
+        lease.json.return_value = {
+            "worker_id": "deadbeef",
+            "target_host": "cao-worker-deadbeef.ns.svc.cluster.local",
+            "working_directory": "/home/cao/workspace/workers/deadbeef",
+            "session_name": "cao-worker-deadbeef",
+        }
+        with patch.dict(os.environ, BOUND):
+            with (
+                patch.object(
+                    server,
+                    "_get_terminal_context_from_env",
+                    return_value=_ctx(["fs_read", "@cao-mcp-server"]),
+                ),
+                patch.object(server, "_current_terminal_id", return_value="a1b2c3d4"),
+                patch.object(server.requests, "post", return_value=lease) as post,
+                patch.object(
+                    server, "_assign_impl", return_value={"success": True, "terminal_id": "w1"}
+                ) as impl,
+            ):
+                result = await server.assign_elastic(agent_profile="developer", message="do work")
+        assert result["success"] is True
+        assert result["worker_id"] == "deadbeef"
+        post.assert_called_once()
         impl.assert_called_once()
 
 
