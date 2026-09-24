@@ -76,11 +76,27 @@ The security prompt is advisory-only — Devin CLI does not have native CLI-leve
 
 When launched with an agent profile (e.g., `--agents code_supervisor`), CAO:
 
-1. Loads the profile from the agent store
+1. Loads the profile from the agent store (merged with installed agent-plugin MCP servers via `with_plugin_mcp`)
 2. Extracts the system prompt from the Markdown content
 3. Passes it via a temporary `--prompt-file` (for system prompt injection)
-4. Injects MCP servers via temporary `--config` if the profile defines `mcpServers`
+4. Writes MCP servers to `.devin/mcp_config.local.json` in the terminal's working directory if the merged profile defines `mcpServers`
 5. Passes `CAO_TERMINAL_ID` to MCP servers for inbox integration
+
+### MCP Server Delivery
+
+Since Devin CLI v3000.3, MCP servers are discovered only from the dedicated
+`mcp_config` files — `--config` overrides the main settings file and ignores
+`mcpServers` there. The provider therefore writes the merged profile and
+agent-plugin servers into `<working_directory>/.devin/mcp_config.local.json`,
+the documented gitignored local-scope file that outranks the user and project
+files.
+
+`CAO_TERMINAL_ID` is emitted as a `${env:CAO_TERMINAL_ID}` reference rather than
+a literal. Devin expands `${env:VAR}` entries when spawning each server, and the
+pane environment carries the real value — so several terminals sharing one
+working directory (and one config file) still deliver their own terminal id to
+their own servers. The entries the provider added are removed again when the
+terminal is cleaned up.
 
 ### Launch Command
 
@@ -88,10 +104,10 @@ The provider builds the command via `_build_command()`:
 
 ```
 # Unrestricted mode (allowedTools: ["*"])
-devin --permission-mode dangerous --respect-workspace-trust false [--prompt-file "..."] [--config "..."]
+devin --permission-mode dangerous --respect-workspace-trust false [--prompt-file "..."]
 
 # Restricted mode (allowedTools: ["tool1", "tool2"])
-devin --prompt-file "..." [--config "..."]
+devin --prompt-file "..."
 ```
 
 ### Tool Restrictions

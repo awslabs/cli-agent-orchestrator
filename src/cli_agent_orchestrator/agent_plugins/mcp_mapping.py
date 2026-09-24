@@ -119,6 +119,10 @@ PROVIDER_TRANSPORTS: Dict[str, frozenset] = {
     "omp": _ALL_TRANSPORTS,
     "grok_cli": _ALL_TRANSPORTS,
     "mcode": _ALL_TRANSPORTS,
+    # ``devin_cli``'s dedicated ``mcp_config*.json`` schema carries both shapes:
+    # ``command``/``args``/``env`` stdio entries and ``url``/``transport``
+    # (``"http"|"sse"``) remotes — see ``DevinCliProvider._DEVIN_TRANSPORTS``.
+    "devin_cli": _ALL_TRANSPORTS,
     # No MCP delivery path at all. An empty set, not stdio-only: these providers
     # build no MCP configuration whatsoever, so reporting a *skip* per server is
     # the honest answer and "stdio is deliverable" would be a false claim. The
@@ -178,6 +182,8 @@ PROVIDER_CWD_DELIVERY: Dict[str, str] = {
     "cursor_cli": "shim",
     "copilot_cli": "shim",
     "omp": "shim",
+    # Devin's ``mcp_config`` schema has no stdio working-directory field.
+    "devin_cli": "shim",
     "hermes": "none",
     "mock_cli": "none",
 }
