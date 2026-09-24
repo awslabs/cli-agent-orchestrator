@@ -26,6 +26,7 @@ import logging
 import os
 import re
 import time
+import uuid
 from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple
 
 import requests
@@ -352,14 +353,13 @@ def _resolve_child_allowed_tools(
     Returns:
         Comma-separated string of allowed tools, or None for unrestricted.
     """
+    from cli_agent_orchestrator.agent_plugins.mcp_delivery import grantable_server_names
     from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
     from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
 
     try:
         child_profile = load_agent_profile(child_profile_name)
-        mcp_server_names = (
-            list(child_profile.mcpServers.keys()) if child_profile.mcpServers else None
-        )
+        mcp_server_names = grantable_server_names(child_profile)
         child_allowed = resolve_allowed_tools(
             child_profile.allowedTools, child_profile.role, mcp_server_names
         )
@@ -873,6 +873,14 @@ def _extract_error_detail(response: requests.Response, fallback: str) -> str:
     return fallback
 
 
+# Server-side ready-wait (up to 120s) plus slack, added to the caller's step
+# timeout to get the HTTP read budget. Named rather than inlined because the
+# resulting budget (timeout + this) is what decides whether the pending/job_id
+# branch is reachable at all under a given provider's tools/call deadline -- see
+# the Timeout branch in _run_step_and_build_result. No message quotes 180.
+_CLIENT_TIMEOUT_HEADROOM = 180
+
+
 async def _run_step_and_build_result(
     payload: Dict[str, Any],
     agent_profile: str,
@@ -907,6 +915,12 @@ async def _run_step_and_build_result(
     is the name quoted back to the operator in the remote-cleanup hints below.
     """
     known_terminal_id: Optional[str] = payload.get("reuse_terminal_id")
+    # Read off the payload for the same reason ``reuse_terminal_id`` is: the
+    # caller owns it, and this helper only needs it to describe what it just
+    # POSTed. Present only on the default single-call path (issue #447) --
+    # absent on the early-terminal-id path, which already reported a real
+    # terminal_id to the caller and so needs no separate discovery key.
+    job_id: Optional[str] = payload.get("job_id")
     # Allow the full step time plus the server-side ready-wait (up to 120s)
     # plus headroom; the server enforces the per-step timeout internally.
     #
@@ -914,7 +928,7 @@ async def _run_step_and_build_result(
     # node would consume the FULL read budget (~timeout+180s) just failing
     # to connect. Local calls keep the plain timeout (localhost connect
     # cannot black-hole meaningfully) so their behavior is unchanged.
-    client_timeout = float(timeout) + 180.0
+    client_timeout = float(timeout) + _CLIENT_TIMEOUT_HEADROOM
     request_timeout: Any = (
         (REMOTE_CONNECT_TIMEOUT, client_timeout) if target_host else client_timeout
     )
@@ -927,6 +941,37 @@ async def _run_step_and_build_result(
         )
     except requests.Timeout:
         timeout_msg = f"Handoff timed out after {timeout} seconds"
+        if job_id:
+            # The transport died, but the step may still be running (or have
+            # already finished) server-side. The server persists the result in
+            # handoff_results under this job_id BEFORE the terminal is torn
+            # down, so it is retrievable (issue #447 / PR #453 review finding 3 --
+            # naming the tool, not a bare "GET /handoff-results/{job_id}",
+            # because the supervisor LLM has no base URL and no token to build
+            # that request itself).
+            #
+            # THIS BRANCH IS NOT FULL COVERAGE, and the row outliving the
+            # transport is not the same as this message reaching anyone. The HTTP
+            # read budget set above is timeout + _CLIENT_TIMEOUT_HEADROOM (default
+            # 600 + 180 = 780s), while several providers cap a single
+            # tools/call at ~600s (Codex, Kimi, MiniMax). For an MCP-supervisor
+            # caller on those providers the PROVIDER deadline usually fires
+            # first, so ``requests.Timeout`` is never raised here and this
+            # pending/job_id result is never returned -- the supervisor sees its
+            # own tool-call timeout with no job_id in hand. Closing that gap
+            # (surfacing the job_id before the call can be pre-empted) is
+            # tracked separately in #715; it is NOT fixed here.
+            # ``target_host`` is quoted here when set because the row lives in
+            # THAT node's database (PR #453 review, haofeif): the retrieval tool
+            # defaults to the supervisor's own node, so a remote job retrieved
+            # without it answers a false not-found.
+            retrieval_args = f"job_id={job_id}"
+            if target_host:
+                retrieval_args += f", target_host='{target_host}'"
+            timeout_msg += (
+                f". The job may still be running server-side; retrieve the "
+                f"result with the get_handoff_result tool, {retrieval_args}"
+            )
         if target_host and not known_terminal_id:
             # Client-side timeout on a fresh remote create: the step may still
             # be running and its terminal id is unknown here, so it cannot be
@@ -939,6 +984,8 @@ async def _run_step_and_build_result(
             )
         return HandoffResult(
             success=False,
+            pending=True if job_id else None,
+            job_id=job_id,
             message=timeout_msg,
             output=None,
             terminal_id=known_terminal_id,
@@ -1185,6 +1232,15 @@ async def _handoff_impl(
             # and tool inheritance. Byte-for-byte the original single-seam
             # behavior (BR-8) -- this is what the MCP tool always takes.
             shaped_message = _shape_handoff_message(provider, message)
+            # Minted HERE, before the POST, so the key exists on the client even
+            # if the response never arrives (issue #447). The server records the
+            # result under it; client-side generation is what makes it available
+            # to the Timeout branch in ``_run_step_and_build_result``. This does
+            # NOT deduplicate execution -- a retry with the same job_id would
+            # still run a second step. Only the default single-call path needs
+            # it: the early-terminal-id path already hands back a real
+            # terminal_id, which is its own discovery handle.
+            job_id = uuid.uuid4().hex
             payload: Dict[str, Any] = {
                 "provider": provider,
                 "agent": agent_profile,
@@ -1192,6 +1248,7 @@ async def _handoff_impl(
                 "teardown": True,
                 "timeout": float(timeout),
                 "use_worktree": use_worktree,
+                "job_id": job_id,
             }
             if ctx.session_name:
                 payload["session_name"] = ctx.session_name

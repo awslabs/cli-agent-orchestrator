@@ -41,10 +41,14 @@ _GATED_ROUTES = [
     ("GET", "/agents/profiles"),
     ("GET", "/agents/profiles/{name}"),
     ("GET", "/agents/profiles/{name}/source"),
+    ("GET", "/agents/profiles/search"),
+    ("GET", "/agents/providers"),
     ("GET", "/sessions"),
     ("GET", "/sessions/{session_name}"),
+    ("GET", "/sessions/{session_name}/terminals"),
     ("GET", "/terminals/{terminal_id}"),
     ("GET", "/terminals/{terminal_id}/output"),
+    ("GET", "/terminals/{terminal_id}/working-directory"),
     ("GET", "/terminals/{terminal_id}/memory-context"),
     ("GET", "/terminals/{terminal_id}/inbox/messages"),
     ("GET", "/skills/{name}"),
@@ -55,6 +59,8 @@ _GATED_ROUTES = [
     ("POST", "/workflows/validate"),
     ("GET", "/memory"),
     ("GET", "/memory/{key}"),
+    ("GET", "/settings/skill-dirs"),
+    ("GET", "/settings/memory"),
 ]
 
 
@@ -64,10 +70,14 @@ def _sample_requests():
         ("GET", "/agents/profiles", {}),
         ("GET", "/agents/profiles/sample", {}),
         ("GET", "/agents/profiles/sample/source", {}),
+        ("GET", "/agents/profiles/search", {"params": {"q": "sample"}}),
+        ("GET", "/agents/providers", {}),
         ("GET", "/sessions", {}),
         ("GET", "/sessions/sample-session", {}),
+        ("GET", "/sessions/sample-session/terminals", {}),
         ("GET", f"/terminals/{TERMINAL_ID}", {}),
         ("GET", f"/terminals/{TERMINAL_ID}/output", {}),
+        ("GET", f"/terminals/{TERMINAL_ID}/working-directory", {}),
         ("GET", f"/terminals/{TERMINAL_ID}/memory-context", {}),
         ("GET", f"/terminals/{TERMINAL_ID}/inbox/messages", {}),
         ("GET", "/skills/sample", {}),
@@ -78,6 +88,8 @@ def _sample_requests():
         ("POST", "/workflows/validate", {"json": {"path": "sample.yaml"}}),
         ("GET", "/memory", {}),
         ("GET", "/memory/sample-key", {}),
+        ("GET", "/settings/skill-dirs", {}),
+        ("GET", "/settings/memory", {}),
     ]
 
 

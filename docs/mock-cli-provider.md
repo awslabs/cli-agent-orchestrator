@@ -52,6 +52,7 @@ Orchestration-layer tests that previously needed a real provider can now run in 
 - **Production code never sees `mock_cli`.** The binary isn't installed to PATH outside pytest. The provider is registered but inert unless someone explicitly passes `--provider mock_cli`.
 - **It doesn't validate provider correctness.** Real CLIs change between versions; the captured-fixture replay tests in `test/providers/fixtures/*_output.txt` are what catches regex drift for the real providers. `mock_cli` validates the *orchestrator's* behavior, not the providers'.
 - **It still uses real tmux and a real subprocess.** This is intentional — the unit tests that just mock `tmux_client.get_history` already exist; `mock_cli` enables the next layer up (tests that exercise real tmux + real subprocess + the inbox/watchdog wiring) at zero auth cost.
+- **It has no MCP path.** `mock_cli` writes no MCP configuration, so MCP servers declared by installed [agent plugins](agent-plugins.md) are not delivered to it and `cao install --provider mock_cli` reports each one (`mcp.provider_unsupported`). Agent-plugin *skills* are delivered normally, which is what the orchestrator-level tests need.
 
 ## CI strategy summary
 

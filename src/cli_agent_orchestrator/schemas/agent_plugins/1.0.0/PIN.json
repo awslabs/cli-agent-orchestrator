@@ -1,0 +1,21 @@
+{
+  "specification": "Agent Plugins",
+  "version": "1.0.0",
+  "specification_url": "https://agent-plugins.org/specification",
+  "specification_repository": "https://github.com/agentplugins/agent-plugins-spec",
+  "specification_commit": "b78a4f162d92c4b09ee205a11f59a6187926d947",
+  "pin_policy": "Pinned to the schema bytes agent-plugins.org currently serves for this version, recorded here by sha256 and by the upstream commit they were taken from. CAO does not track upstream: re-vendoring is a deliberate act (`make refresh-agent-plugins-schemas`) that changes these hashes in a reviewable commit. A `make check-agent-plugins-schemas` failure therefore means the vendored bytes changed, NOT that upstream moved -- investigate the local change before updating the pin. Section 5.2 forbids retrieving a schema while loading a plugin, so these bytes are the only schemas CAO ever validates against.",
+  "source_base_url": "https://agent-plugins.org/schemas/1.0.0/",
+  "files": {
+    "plugin.schema.json": {
+      "url": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+      "schema_id": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+      "sha256": "0a4aad95ce337878ad38802ebf0daa3fde76abe3f65400c86bcbb1ec0b3ab883"
+    },
+    "mcp.schema.json": {
+      "url": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+      "schema_id": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+      "sha256": "6539175bfcdf43085855183e86da40ea94b166547a72b47ae9a0a390516d3acb"
+    }
+  }
+}

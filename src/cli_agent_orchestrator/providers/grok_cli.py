@@ -32,20 +32,38 @@ from typing import Any, Literal, Optional
 
 import psutil
 
+from cli_agent_orchestrator.agent_plugins.mcp_delivery import with_plugin_mcp as _with_plugin_mcp
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
+from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 from cli_agent_orchestrator.utils.terminal import wait_for_shell
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
+from cli_agent_orchestrator.utils.tool_mapping import granted_mcp_servers
 
 logger = logging.getLogger(__name__)
 
 
 class ProviderError(Exception):
     """Exception raised for Grok CLI provider-specific errors."""
+
+
+#: CAO transport name → the ``type`` value Grok's TOML expects.
+#:
+#: The two vocabularies differ: CAO (and the Agent Plugins ``mcp.json`` schema)
+#: uses the MCP spec's ``streamable-http``, while Grok names the same transport
+#: ``http``. Translating rather than passing the value straight through is what
+#: lets ``grok_cli`` be listed as carrying all transports: without this map a
+#: plugin's perfectly valid ``streamable-http`` server reached
+#: ``_render_mcp_config`` and raised, taking terminal creation down with it.
+GROK_URL_TRANSPORTS: dict[str, str] = {
+    "streamable-http": "http",
+    "http": "http",
+    "sse": "sse",
+}
 
 
 # Render-stable current-turn signals from Grok Build 1.0.0.
@@ -220,7 +238,9 @@ class GrokCliProvider(BaseProvider):
         if self._agent_profile is None:
             return None
         try:
-            return load_agent_profile(self._agent_profile)
+            return _with_plugin_mcp(
+                load_agent_profile(self._agent_profile), ProviderType.GROK_CLI.value
+            )
         except Exception:
             return None
 
@@ -228,7 +248,9 @@ class GrokCliProvider(BaseProvider):
         if self._agent_profile is None:
             return None
         try:
-            return load_agent_profile(self._agent_profile)
+            return _with_plugin_mcp(
+                load_agent_profile(self._agent_profile), ProviderType.GROK_CLI.value
+            )
         except FileNotFoundError:
             raise
         except Exception as exc:
@@ -320,15 +342,17 @@ class GrokCliProvider(BaseProvider):
             if config.get("url"):
                 transport = config.get("type")
                 if transport is not None:
-                    if transport not in {"http", "sse"}:
+                    rendered = GROK_URL_TRANSPORTS.get(transport)
+                    if rendered is None:
                         raise ProviderError(
                             f"MCP server '{name}' has unsupported URL transport "
-                            f"{transport!r}; Grok supports 'http' and 'sse'"
+                            f"{transport!r}; Grok supports "
+                            f"{', '.join(repr(k) for k in sorted(GROK_URL_TRANSPORTS))}"
                         )
                     # Grok defaults an untyped URL to HTTP.  SSE requires an
                     # explicit type, so preserve the profile transport rather
                     # than silently changing an SSE server into HTTP.
-                    lines.append(f"type = {_toml_string(transport)}")
+                    lines.append(f"type = {_toml_string(rendered)}")
                 lines.append(f"url = {_toml_string(config['url'])}")
             elif config.get("command"):
                 lines.append(f"command = {_toml_string(config['command'])}")
@@ -368,27 +392,31 @@ class GrokCliProvider(BaseProvider):
 
         Grok's ``MCPTool(server__*)`` permission language accepts a pattern.
         Never interpolate an arbitrary ``@...`` CAO entry into that pattern:
-        only a conventional server name that is actually configured for this
-        profile (or CAO's built-in orchestration server) may grant MCP access.
-        ``@builtin`` is a CAO vocabulary marker, not an MCP server reference.
-        Unknown or malformed entries remain denied by the enclosing dontAsk
-        policy instead of widening it.
+        a CAO entry is expanded against the server names actually configured for
+        this profile (plus CAO's built-in orchestration server) by the shared
+        ``tool_mapping.granted_mcp_servers`` rule, and only a resulting CONCRETE
+        name that is also a conventional server identifier may grant MCP access.
+        So ``@plugin-*`` — which ``docs/agent-plugins.md`` documents and which
+        this site used to deny by requiring an exact literal — grants
+        ``MCPTool(plugin-tools__*)`` when that server is configured and nothing at
+        all when it is not. The pattern itself never reaches Grok's permission
+        language, and ``@builtin`` is CAO vocabulary rather than an MCP server
+        reference. Unknown or malformed entries remain denied by the enclosing
+        dontAsk policy instead of widening it.
+
+        The matching rule is shared with OpenCode's ``agent.<id>.tools`` grant in
+        ``services/install_service.py`` on purpose: two hand-written matchers are
+        how the documented glob came to work on neither.
         """
         configured = {"cao-mcp-server"}
         if isinstance(mcp_servers, dict):
             configured.update(name for name in mcp_servers if isinstance(name, str))
 
-        return sorted(
-            {
-                name
-                for tool_ref in allowed_tools
-                if isinstance(tool_ref, str)
-                and tool_ref.startswith("@")
-                and (name := tool_ref[1:]) != "builtin"
-                and _MCP_SERVER_REF.fullmatch(name)
-                and name in configured
-            }
-        )
+        return [
+            name
+            for name in granted_mcp_servers(allowed_tools, configured)
+            if _MCP_SERVER_REF.fullmatch(name)
+        ]
 
     @staticmethod
     def _atomic_write_private(path: Path, content: str) -> None:

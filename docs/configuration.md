@@ -150,6 +150,7 @@ Timeouts and buffer sizes used by the CAO runtime. All values have safe defaults
 | `compile_mode` | `"llm"` | `llm` or `append`. `append` skips the LLM wiki-compiler entirely. |
 | `flush_threshold` | `0.85` | Context-usage fraction that triggers a memory flush. |
 | `compile_timeout_s` | `120.0` | Wall-clock timeout for the wiki compile call. |
+| `vault` | `{}` | Validated Obsidian vault source configuration. `CAO_MEMORY_VAULT_ENABLED=false` can disable it but cannot enable an absent or file-disabled configuration. |
 | `learning_enabled` | `false` | Opt-in switch for workflow self-learning (outcome capture via `report_outcome` / `/outcomes`). Requires `enabled=true` — a disabled memory subsystem forces learning off. Env override: `CAO_MEMORY_LEARNING_ENABLED`. See [Self-Learning](self-learning.md). |
 | `instruction_promotion_enabled` | `false` | Opt-in switch for promoting reinforced lessons into agent profile files (`cao memory promote --apply`). Requires `learning_enabled=true` (promotion ⊂ learning ⊂ memory). Env override: `CAO_MEMORY_INSTRUCTION_PROMOTION_ENABLED`. ⚠️ Promoted lesson text is agent-generated: review every promote diff as an untrusted-instruction change before applying — see [Self-Learning](self-learning.md#phase-2--instruction-promotion). |
 | `workflow_journal_capture_output` | `false` | ⚠️ **Security-relevant opt-in, but narrower than it sounds — read the note below this table.** Governs exactly two surfaces: the **event log's** output digest, and the **diagnostics bundle's** output excerpts. Turning it ON adds step output text to those two. It does **not** control the `workflow_run_step` projection, which retains output unconditionally either way. Retained text is size-capped (below) and cleaned through the shared `audit_log` sanitizer — transport hygiene (control-character stripping, size limiting), **not** secret redaction: a credential in a step's output is retained verbatim. |
@@ -168,10 +169,10 @@ Timeouts and buffer sizes used by the CAO runtime. All values have safe defaults
 >
 > That retained text is served, in full, by `GET /workflows/runs/{run_id}`. Its only
 > protection is a scope requirement (`cao:read`/`cao:write`/`cao:admin`), and that
-> requirement is **inert unless you enable authentication**: with `CAO_AUTH_ENABLED`
-> unset — the default — the dependency returns the full scope set and enforces
-> nothing. A default local CAO server therefore serves step output and error text to
-> anything that can reach its port.
+> requirement is **inert unless you enable authentication**: with no IdP and no
+> `CAO_AUTH_LOCAL_TOKEN` configured — the default — the dependency returns the full
+> scope set and enforces nothing. A default local CAO server therefore serves step
+> output and error text to anything that can reach its port.
 >
 > Practical consequences:
 >
@@ -185,6 +186,17 @@ Timeouts and buffer sizes used by the CAO runtime. All values have safe defaults
 > - An earlier revision of this table claimed the journal stored "execution metadata
 >   only … never prompt text or step output" when the flag was off. That was wrong in
 >   the security-relevant direction and is corrected above.
+
+#### Obsidian vault
+
+`memory.vault` is an optional, file-defined configuration for one managed
+Obsidian vault. It defines the vault root, mappings from vault-relative folders
+to memory scopes, and the CAO-owned managed folder. The environment variable
+`CAO_MEMORY_VAULT_ENABLED` can only disable that configuration; it cannot
+configure a root, folder mapping, or scope.
+
+See [Obsidian Vault](obsidian-vault.md) for the complete configuration example,
+limits, secret-gate behavior, safety model, and maintenance commands.
 
 ### Terminal backend (`terminal`)
 
@@ -290,13 +302,21 @@ Default-off. See [../src/cli_agent_orchestrator/ext_apps/apps.py](../src/cli_age
 
 > **`auth.*` keys in `settings.json` are schema-only and have no runtime effect yet.** `security/auth.py` is the actual authentication *enforcement* boundary (not a UX gate) and is deliberately kept on direct `os.getenv` reads in this PR, to avoid changing security-critical resolution behavior. Only the env vars below are honored.
 
-Default-off OAuth 2.1 auth core; see [security/auth.py](../src/cli_agent_orchestrator/security/auth.py). Auth activates only when `CAO_AUTH_JWKS_URI` (or `AUTH0_DOMAIN`) is set.
+Default-off auth core; see [security/auth.py](../src/cli_agent_orchestrator/security/auth.py). Auth activates in one of two opt-in modes:
+
+- **IdP mode** — `CAO_AUTH_JWKS_URI` (or `AUTH0_DOMAIN`) is set. Bearer tokens are RS256 JWTs verified against the IdP's JWKS (signature, issuer, audience, expiry); scopes come from the token's claims.
+- **Local-token mode** — no IdP, but `CAO_AUTH_LOCAL_TOKEN` is set. Every request to a scope-gated route, the PTY WebSocket handshake and the AG-UI stream must present that value as a bearer (`Authorization: Bearer <token>`, or the documented query parameter where a header cannot be set); the value is compared after trimming surrounding whitespace, and a blank value leaves auth off. A match grants the full scope set; a missing or different token is refused with HTTP 401 (close code 4401 on the WebSocket). The comparison is constant-time. This is the single-operator control for a workstation shared with other local users or agents: one exported variable both switches enforcement on and is the credential CAO's own clients (the MCP servers and orchestration helpers) forward, so nothing else needs configuring. Two things follow from that design. It is **all-or-nothing**: a shared secret carries no claims, so a match grants every scope and there is no read-only local token; use an IdP when you need `cao:read` without `cao:write`. And the credential is **inherited by every agent pane**: the server copies its `CAO_*` environment into each new tmux pane so the in-pane `cao-mcp-server` can authenticate its own calls, which means any agent process can read `CAO_AUTH_LOCAL_TOKEN`. That grants an agent no API access it did not already have (the default posture is unauthenticated), but it does turn the token into something a compromised agent can exfiltrate. Rotate it if an agent pane is ever exposed to untrusted input you would not want holding a write credential.
+
+> **Default posture.** With none of the three variables set, the API performs no authentication or authorization at all: every scope dependency returns the full scope set and never inspects the request. The server binds to loopback by default, so the trust boundary is *the host*, not *the user* — any other process or local account on the machine can reach every endpoint, including keystroke injection into agent terminals. That is intentional for a single-user workstation and it is why the local-token mode exists for anything else. A few routes stay open in every mode because they carry no session or terminal state: `/health`, the API documentation (`/docs`, `/redoc`, `/openapi.json`), the OAuth discovery document, the agent-profile schema and template metadata and their validate/preview endpoints, and the static topology-widget assets.
+>
+> Two clients do not yet present a bearer in **either** auth mode and therefore cannot be used against an auth-enabled server without further work: the bundled Web UI, and the `cao` CLI's own HTTP calls (`cao launch`, `cao session`, `cao terminal`, `cao workflow`, `cao info`, `cao shutdown`). The `cao agent` subcommands, the MCP servers and the workflow orchestration helpers do forward `CAO_AUTH_LOCAL_TOKEN`.
 
 | Env var | Description |
 |---------|--------------|
-| `CAO_AUTH_JWKS_URI` | Generic IdP JWKS endpoint. |
-| `CAO_AUTH_AUDIENCE` | Expected token audience. |
-| `CAO_AUTH_ISSUER` | Issuer advertised by the RFC 9728 PRM endpoint. |
+| `CAO_AUTH_JWKS_URI` | Generic IdP JWKS endpoint (IdP mode). |
+| `CAO_AUTH_AUDIENCE` | Expected token audience (IdP mode). |
+| `CAO_AUTH_ISSUER` | Issuer advertised by the RFC 9728 PRM endpoint (IdP mode). |
+| `CAO_AUTH_LOCAL_TOKEN` | Alone: the shared-secret bearer that activates local-token mode. With an IdP: the machine JWT CAO's own clients forward on internal calls. Generate with `openssl rand -hex 32`; treat it as a write credential. |
 
 ### Logging (`logging`)
 
@@ -322,6 +342,7 @@ Every `CAO_*` variable below maps 1:1 to a `settings.json` key and is resolved t
 | `CAO_MEMORY_ENABLED` | `memory.enabled` | bool |
 | `CAO_MEMORY_COMPILE_MODE` | `memory.compile_mode` | str (`llm`/`append`) |
 | `CAO_MEMORY_FLUSH_THRESHOLD` | `memory.flush_threshold` | float |
+| `CAO_MEMORY_VAULT_ENABLED` | `memory.vault.enabled` | bool (disable-only) |
 | `CAO_MCP_REQUEST_TIMEOUT` | `server.mcp_request_timeout` | int |
 | `CAO_EVENT_BUS_MAX_QUEUE_SIZE` | `server.event_bus_max_queue_size` | int |
 | `CAO_PROVIDER_INIT_TIMEOUT` | `server.provider_init_timeout` | int |

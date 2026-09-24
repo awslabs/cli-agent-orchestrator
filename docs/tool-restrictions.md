@@ -246,6 +246,8 @@ Priority (highest to lowest):
 
 Note: `--auto-approve` is **not** in this priority chain — it only controls whether the confirmation prompt is shown, not what restrictions are applied.
 
+Note: MCP servers a profile declares in `mcpServers` are added to the resolved list automatically at levels 4 and 5 only. At levels 2 and 3 the list you write is the list you get, so a profile that declares a server and also sets `allowedTools` has to name `@<server>` for it to be granted. That is what lets a profile configure a server without granting it, and it keeps `--allowed-tools` and `allowedTools` resolving the same list to the same policy.
+
 Examples:
 
 ```bash

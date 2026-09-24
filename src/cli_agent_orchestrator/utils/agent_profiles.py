@@ -4,7 +4,7 @@ import logging
 import re
 from importlib import resources
 from pathlib import Path
-from typing import Dict, List, Set
+from typing import Dict, List, Optional, Set
 
 import frontmatter
 

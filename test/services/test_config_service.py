@@ -135,6 +135,66 @@ class TestGetConfig:
         assert cfg.apps.enabled is False
         assert cfg.logging.level == "INFO"
 
+    def test_vault_env_var_can_disable_but_not_enable(
+        self, _isolated_settings, monkeypatch, tmp_path
+    ):
+        vault = {
+            "enabled": False,
+            "vaults": [
+                {
+                    "id": "primary",
+                    "root": str(tmp_path),
+                    "managed_folder": "CAO",
+                    "mappings": [
+                        {
+                            "folder": "CAO",
+                            "scope": "agent",
+                            "scope_id": "writer",
+                            "writable": True,
+                        }
+                    ],
+                }
+            ],
+        }
+        _isolated_settings["settings"].write_text(json.dumps({"memory": {"vault": vault}}))
+
+        monkeypatch.setenv("CAO_MEMORY_VAULT_ENABLED", "true")
+        assert ConfigService.get("memory.vault.enabled") is False
+
+        vault["enabled"] = True
+        _isolated_settings["settings"].write_text(json.dumps({"memory": {"vault": vault}}))
+        monkeypatch.setenv("CAO_MEMORY_VAULT_ENABLED", "false")
+        assert ConfigService.get("memory.vault.enabled") is False
+        assert ConfigService.get("memory.vault")["enabled"] is False
+
+    def test_list_disables_invalid_vault_without_hiding_other_settings(
+        self, _isolated_settings, caplog
+    ):
+        _isolated_settings["settings"].write_text(
+            json.dumps(
+                {
+                    "memory": {
+                        "vault": {
+                            "enabled": True,
+                            "vaults": [{"id": "primary", "root": "/missing-vault"}],
+                        }
+                    },
+                    "terminal": {"backend": "herdr"},
+                }
+            )
+        )
+
+        values = ConfigService.list_all()
+
+        assert values["memory.vault"] == {
+            "enabled": False,
+            "max_recall_body_chars": 4096,
+            "vaults": [],
+        }
+        assert values["memory.vault.enabled"] is False
+        assert values["terminal.backend"] == "herdr"
+        assert caplog.text.count("Invalid vault configuration disabled") == 1
+
 
 class TestSetAndPath:
     def test_set_persists_and_get_reads_it_back(self, _isolated_settings):

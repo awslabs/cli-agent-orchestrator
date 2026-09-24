@@ -382,6 +382,69 @@ class TmuxClient:
         # building its targets from its arguments, as it always did.
         self.pane_mode = pane_mode
 
+    def _set_server_exit_empty_off(self) -> None:
+        """Keep the tmux server alive across a transient zero-session moment.
+
+        By default tmux terminates its whole server process the instant the last
+        session closes (``exit-empty on``). During a mass teardown — many sessions
+        ending near-simultaneously — that races CAO creating the next session
+        against the server vanishing: a momentary "no sessions" window tears the
+        entire server down, taking every other session's panes with it at once
+        (harness-control#845, the whole-server-death incident). ``exit-empty off``
+        keeps the server up through an empty moment.
+
+        This is the backend belt (HOME-independent, applies to whatever uid runs
+        cao-server); a HOME ``.tmux.conf`` set is the ops-side complement. Set on
+        every session-create rather than cached on the client: it is a cheap,
+        idempotent server option, and setting it each time means it survives even
+        if the tmux server is ever externally killed and recreated.
+
+        ``server.cmd`` does NOT start a server for an arbitrary command — only
+        commands like ``new-session`` that create something do. On a clean
+        socket, ``set-option`` alone shells out to a tmux client that finds no
+        server, prints ``error connecting ...`` to stderr and returns status 1;
+        libtmux's ``tmux_cmd`` (0.51.x) captures that as a normal
+        :class:`libtmux.common.tmux_cmd` result rather than raising, so a bare
+        ``try/except`` around it never observes the failure. The option is then
+        never actually in force until *something else* starts the server —
+        typically the next ``new_session()`` call, which starts a fresh server
+        with the tmux-default ``exit-empty on``. That gap was reported and
+        reproduced against this exact code path (PR review, harness-control#845
+        follow-up): after the very first ``create_session()`` on a clean
+        socket, ``show-options -s exit-empty`` still read ``on``.
+
+        Two single ``server.cmd()`` calls (``start-server`` then
+        ``set-option``) do not close the gap either: with no sessions yet,
+        the server tmux just started evaluates ``exit-empty on`` and exits
+        again before the second, separate client process connects. The fix is
+        to start the server and set the option in the SAME tmux invocation —
+        ``start-server ; set-option ...`` — so the option is applied before
+        tmux's own empty-check can tear the just-started server back down.
+        ``;`` is passed as a literal argv token (no shell involved — libtmux's
+        ``tmux_cmd`` calls ``subprocess.Popen`` with the argument list
+        directly), which is exactly how tmux's own command-chaining syntax is
+        meant to be invoked from code. This is idempotent against an
+        already-running server (with or without existing sessions): tmux
+        treats ``start-server`` there as a no-op and simply applies the
+        ``set-option``.
+
+        Best-effort: a failure here must never block a session launch. Because
+        libtmux does not raise for this failure mode, the result's own
+        ``returncode`` is checked explicitly rather than relying on a caught
+        exception.
+        """
+        try:
+            result = self.server.cmd("start-server", ";", "set-option", "-s", "exit-empty", "off")
+        except Exception:
+            logger.warning("failed to set tmux server option 'exit-empty off'", exc_info=True)
+            return
+
+        if result.returncode != 0:
+            logger.warning(
+                "failed to set tmux server option 'exit-empty off': %s",
+                "; ".join(result.stderr) or f"tmux exited {result.returncode}",
+            )
+
     # ── libtmux listing boundary ─────────────────────────────────────────
     #
     # Every read that makes libtmux shell out to `list-sessions` /
@@ -817,6 +880,11 @@ class TmuxClient:
     ) -> str:
         """Create detached tmux session with initial window and return window name."""
         try:
+            # Ensure the server won't die on a transient empty moment during a
+            # mass teardown (harness-control#845). Runs before new_session, and
+            # starts the server if it isn't up yet.
+            self._set_server_exit_empty_off()
+
             working_directory = self._resolve_and_validate_working_directory(working_directory)
 
             # Only pass essential env vars to avoid tmux "command too long"
@@ -916,6 +984,37 @@ class TmuxClient:
                     f"{mouse_error} — continuing without wheel scrolling."
                 )
 
+            # Some provider CLIs (e.g. claude_code) rename their own tmux
+            # window directly -- via `tmux rename-window`, not a pty escape
+            # sequence -- to show live status once they finish starting up
+            # (observed: "tech-lead-<id>" -> "✳Claude Code"). This is
+            # NOT gated by automatic-rename/allow-rename (both already off
+            # by default here): those only stop escape-sequence-driven
+            # renames from an unprivileged pane, not an explicit tmux command
+            # from a process that has $TMUX. Every window lookup in this
+            # codebase is keyed by the name CAO chose at creation time, so
+            # that rename mid-startup makes the name vanish and callers see
+            # "Window not found" even though the session and window are both
+            # still alive (confirmed by direct observation: tmux list-windows
+            # shows the renamed window present throughout). Fight back with a
+            # window-renamed hook that renames it right back -- best-effort,
+            # a failure here should not block getting a working session.
+            try:
+                original_window_id = session.windows[0].window_id
+                quoted_name = "'" + window_name.replace("'", "'\\''") + "'"
+                session.windows[0].cmd(
+                    "set-hook",
+                    "-t",
+                    original_window_id,
+                    "window-renamed",
+                    f"rename-window -t {original_window_id} {quoted_name}",
+                )
+            except Exception as rename_hook_error:
+                logger.warning(
+                    f"Could not install anti-rename hook on session {session_name}: "
+                    f"{rename_hook_error} — window may be renamed by its own process."
+                )
+
             logger.info(
                 f"Created tmux session: {session_name} with window: {window_name} in directory: {working_directory}"
             )
@@ -981,6 +1080,26 @@ class TmuxClient:
                 kwargs["window_shell"] = window_shell
 
             window = session.new_window(**kwargs)
+
+            # See the matching comment in create_session(): the provider CLI
+            # can rename its own window directly via `tmux rename-window`,
+            # which automatic-rename/allow-rename don't gate. Install the
+            # same anti-rename hook here.
+            try:
+                quoted_name = "'" + window.name.replace("'", "'\\''") + "'"
+                window.cmd(
+                    "set-hook",
+                    "-t",
+                    window.window_id,
+                    "window-renamed",
+                    f"rename-window -t {window.window_id} {quoted_name}",
+                )
+            except Exception as rename_hook_error:
+                logger.warning(
+                    f"Could not install anti-rename hook on window '{window.name}' in "
+                    f"session {session_name}: {rename_hook_error} — window may be "
+                    "renamed by its own process."
+                )
 
             logger.info(
                 f"Created window '{window.name}' in session '{session_name}' in directory: {working_directory}"

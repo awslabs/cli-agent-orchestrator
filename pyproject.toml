@@ -81,6 +81,17 @@ dependencies = [
     # other way: `pyjwt[crypto]` itself only requires `cryptography>=3.4`, so a bare
     # `uv lock --upgrade-package` would drift back down on the next unrelated relock.
     "cryptography>=50.0.0",
+    # Floor on the TRANSITIVE `anyio` that `httpx`/`starlette` pull in, for exactly the
+    # reason recorded above `cryptography`. Two advisories affect the 4.11.0 the lockfile
+    # had resolved: CVE-2026-63374 (CRITICAL) and CVE-2026-64847 (MEDIUM), both fixed in
+    # 4.14.2. Trivy's gate is repo-wide and blocking, so an unpatched transitive dep fails
+    # CI on `main` and on every open PR rather than merely appearing in the Security tab.
+    #
+    # Declared as a DIRECT floor for the same reason `cryptography` is: no dependent
+    # expresses a floor this high (`httpx` requires `anyio>=3.0`), so a bare relock drifts
+    # back down. Note this is the ROOT lockfile — `examples/fleet/panel/uv.lock` was bumped
+    # separately in 9cecfc3b and does not constrain this one.
+    "anyio>=4.14.2",
     "jsonschema>=4.25",
     "jinja2>=3.1.0",
     # Obsidian graph sink (Issue #348) imports yaml at module top; declare it

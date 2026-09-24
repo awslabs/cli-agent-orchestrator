@@ -23,9 +23,41 @@ Status Detection Strategy:
     - PROCESSING: No prompt at bottom (response is streaming)
     - COMPLETED: Prompt at bottom + response content after last user input
     - ERROR: Error message patterns or empty output
+
+Two dialects, one provider id
+-----------------------------
+The public provider identifier stays ``kimi_cli`` for backward compatibility,
+but the CLI it drives has forked into two incompatible TUIs:
+
+``KimiDialect.LEGACY`` — MoonshotAI ``kimi-cli``. Emoji prompt, YAML agent file,
+``--mcp-config`` JSON injection, ``--yolo`` meaning "never ask", ``•`` U+2022
+bullets, a per-directory single-instance lock worked around with a temp cwd.
+
+``KimiDialect.CODE`` — Kimi Code (``agent-core-v2``). No emoji prompt, boxed
+composer, Markdown agent file with ``${base_prompt}``, **no MCP CLI flag at
+all**, ``--auto`` meaning "never ask" (``--yolo`` was redefined to "ask when
+needed"), ``●`` U+25CF bullets, a braille working indicator, and no per-directory
+lock — so the temp cwd is both unnecessary and actively harmful.
+
+The dialect is resolved from the *capabilities* of the resolved binary, never
+from a version string (see ``KimiDialect`` / ``_probe_dialect``), and an
+unrecognised or self-contradictory capability signature fails closed rather than
+silently taking the legacy path.
+
+Row-level semantics for both dialects live in
+:mod:`cli_agent_orchestrator.providers.kimi_transcript`; per-worker
+``KIMI_CODE_HOME`` construction lives in
+:mod:`cli_agent_orchestrator.providers.kimi_runtime_home`. That home is built at
+a managed path derived from the terminal id
+(``CAO_HOME_DIR/providers/kimi_code/<sha256(terminal_id)>/kimi-home``) rather
+than in a random scratch directory, so a terminal deleted after a cao-server
+restart can still have its copied credentials removed — see the managed-location
+section on :class:`KimiCliProvider`.
 """
 
 import asyncio
+import enum
+import hashlib
 import json
 import logging
 import os
@@ -33,22 +65,58 @@ import re
 import shlex
 import shutil
 import stat
+import string
 import tempfile
 import threading
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
+from cli_agent_orchestrator.agent_plugins.mcp_delivery import with_plugin_mcp as _with_plugin_mcp
 from cli_agent_orchestrator.backends.registry import get_backend
+from cli_agent_orchestrator.constants import CAO_HOME_DIR
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.providers import kimi_transcript as kt
+from cli_agent_orchestrator.providers.base import (
+    BaseProvider,
+    OutputExtractionError,
+    OutputExtractionRejected,
+)
+from cli_agent_orchestrator.providers.kimi_runtime_home import (
+    KIMI_TRANSPORTS,
+    RUNTIME_HOME_DIR_NAME,
+    KimiCodeRuntimeHomeBuilder,
+    RuntimeHomeError,
+    kimi_agent_name,
+    resolve_source_home,
+)
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
+
+# Portable Agent Plugins `type` -> FastMCP `transport`, applied by the legacy
+# `--mcp-config` builder below and by the Kimi Code runtime `mcp.json` builder.
+# Both share one mapping so the two dialects cannot drift.
+# See `kimi_runtime_home.KIMI_TRANSPORTS` for the measured rationale.
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
+
+#: Kinds that must never be republished as an agent's message. A response region
+#: holding one of these and no publishable answer is a deliberate refusal, not a
+#: capture that fell short — the raw-transcript fallback would republish exactly
+#: this content, so the refusal must not be retried into it. Chrome and user
+#: echoes are deliberately absent: a region of pure chrome means the anchor
+#: missed the answer, and a wider capture may still have it.
+_NON_PUBLISHABLE_KINDS = frozenset(
+    {
+        kt.KimiLineKind.THINKING_BULLET,
+        kt.KimiLineKind.TOOL_CALL,
+        kt.KimiLineKind.TOOL_CHROME,
+    }
+)
 
 # Serializes concurrent _ensure_mcp_timeout() read-modify-writes to
 # ~/.kimi/config.toml -- after the async conversion (issue #494),
@@ -65,6 +133,402 @@ class ProviderError(Exception):
     """Exception raised for Kimi CLI provider-specific errors."""
 
     pass
+
+
+class UnsupportedKimiError(ProviderError):
+    """The resolved ``kimi`` binary has an unrecognised capability signature.
+
+    Raised instead of guessing a dialect. A wrong guess is not a degraded
+    experience — the two dialects disagree about the MCP mechanism entirely, so
+    taking the legacy path against a Kimi Code binary would launch a worker with
+    no MCP servers at all and no error to explain why. Failing closed here is the
+    only outcome that cannot silently mis-configure a terminal.
+    """
+
+
+class KimiDialect(enum.Enum):
+    """Which Kimi TUI a resolved binary implements."""
+
+    LEGACY = "legacy"
+    CODE = "code"
+    UNKNOWN = "unknown"
+
+
+def restore_kimi_dialect(value: Optional[str]) -> Optional[KimiDialect]:
+    """Parse a persisted Kimi runtime variant, failing closed on bad state.
+
+    ``None`` is the only legacy-row case: terminals created before dialect
+    persistence simply have no recoverable variant and continue using the
+    historical fallback.  Once a value is present it must name a launchable
+    dialect; persisting/restoring ``UNKNOWN`` would silently guess semantics for
+    a terminal whose CLI family was never established.
+    """
+
+    if value is None:
+        return None
+    try:
+        dialect = KimiDialect(value)
+    except ValueError as exc:
+        raise UnsupportedKimiError(f"Unsupported persisted Kimi dialect: {value!r}") from exc
+    if dialect is KimiDialect.UNKNOWN:
+        raise UnsupportedKimiError("Cannot restore an UNKNOWN Kimi dialect")
+    return dialect
+
+
+# =============================================================================
+# Dialect detection — capability signature
+# =============================================================================
+#
+# Detection is capability-based on purpose. Kimi Code is 0.43.1 today, but the
+# only stable statement about it is which options it accepts; a version-string
+# test would need editing on every release and would be wrong for a backport.
+#
+# Flags are matched as whole option tokens so ``--auto`` can never match
+# ``--auto-approve`` and ``--mcp-config`` can never match a longer word.
+def _has_cli_flag(help_text: str, flag: str) -> bool:
+    """True when ``help_text`` lists ``flag`` as a standalone CLI option."""
+
+    return (
+        re.search(
+            r"(?:^|[\s,(])" + re.escape(flag) + r"(?=[\s,=<]|$)",
+            help_text,
+            re.MULTILINE,
+        )
+        is not None
+    )
+
+
+#: Legacy-only: the MCP CLI injection Kimi Code removed. Its presence is the
+#: single decisive legacy marker, because CAO's legacy path depends on it.
+LEGACY_CAPABILITY_FLAGS = ("--mcp-config", "--mcp-config-file")
+
+#: Kimi-Code-only markers. All three must be present.
+CODE_CAPABILITY_FLAGS = ("--auto", "--agent-file", "--output-format")
+
+
+def classify_kimi_capabilities(help_text: str) -> Tuple[KimiDialect, Dict[str, bool]]:
+    """Classify a ``kimi --help`` dump into a :class:`KimiDialect`.
+
+    Returns the dialect and the observed flag map (for error messages and
+    tests). The decision table is total:
+
+    ==================  ==============  ==================================
+    legacy MCP flag     code markers    result
+    ==================  ==============  ==================================
+    yes                 no              ``LEGACY``
+    no                  yes             ``CODE``
+    yes                 yes             ``UNKNOWN`` (contradictory)
+    no                  no              ``UNKNOWN`` (unrecognised)
+    ==================  ==============  ==================================
+    """
+
+    observed: Dict[str, bool] = {}
+    for flag in LEGACY_CAPABILITY_FLAGS + CODE_CAPABILITY_FLAGS:
+        observed[flag] = _has_cli_flag(help_text, flag)
+
+    legacy_sig = any(observed[flag] for flag in LEGACY_CAPABILITY_FLAGS)
+    code_sig = all(observed[flag] for flag in CODE_CAPABILITY_FLAGS)
+
+    if legacy_sig and not code_sig:
+        return KimiDialect.LEGACY, observed
+    if code_sig and not legacy_sig:
+        return KimiDialect.CODE, observed
+    return KimiDialect.UNKNOWN, observed
+
+
+def _describe_capabilities(observed: Dict[str, bool]) -> str:
+    return " ".join(f"{flag}={'yes' if seen else 'no'}" for flag, seen in observed.items())
+
+
+# ---------------------------------------------------------------------------
+# Launch-scoped environment for the Kimi Code path
+# ---------------------------------------------------------------------------
+
+#: MCP tool-call timeout. Carries CAO's legacy intent (600 s) unchanged, moved
+#: from a shared ``~/.kimi/config.toml`` mutation to a launch-scoped env binding.
+#: Kimi Code reads this as the global ``[mcp] toolTimeoutMs`` default.
+KIMI_MCP_TOOL_TIMEOUT_MS = 600_000
+
+#: MCP startup timeout. There is no legacy value to preserve (legacy CAO had no
+#: startup knob), so this is a deliberate new bound: 2x Kimi Code's own 30 s
+#: default, enough for a cold ``cao-mcp-server`` import, small enough that a
+#: genuinely hung server still fails within a minute instead of pinning init.
+KIMI_MCP_STARTUP_TIMEOUT_MS = 60_000
+
+#: Auto-update suppression. N workers each performing their own CDN check — and
+#: potentially self-installing — is the fan-out risk A0 records. Both names are
+#: set because the shared updater reads the legacy alias too.
+KIMI_NO_AUTO_UPDATE_ENV = {
+    "KIMI_CODE_NO_AUTO_UPDATE": "1",
+    "KIMI_CLI_NO_AUTO_UPDATE": "1",
+}
+
+#: Ambient capabilities removed from the launch environment.
+#:
+#: The extractor's palette is *measured*: reasoning is 244, the final-answer
+#: bullet 253, submitted input 222 (`USER_INPUT_COLOR_INDEX`). When the inherited
+#: environment advertises 24-bit colour, the TUI emits ``38;2;r;g;b`` instead of
+#: ``38;5;n`` — reproduced live on Kimi Code 2.0.2 with the host's
+#: ``COLORTERM=truecolor``: the answer bullet renders ``38;2;224;224;224``, a
+#: near-grey that :func:`kimi_transcript.is_thinking_styled` reads as reasoning
+#: (its documented fail-closed direction), the answer colour 253 never appears,
+#: and ``mode=last`` degrades to the raw-transcript fallback. The user echo moves
+#: to ``38;2;255;203;107`` in the same switch, so submission continuation styling
+#: is lost too.
+#:
+#: ``TERM`` is already pinned for the same class of reason (Kimi exits under
+#: ``TERM=tmux-256color``); this removes the capability that would otherwise
+#: change the renderer's palette out from under the measured constants. Unsetting
+#: is stricter than an empty value: some renderers test for the *presence* of the
+#: variable.
+KIMI_PALETTE_ENV_UNSET = ("COLORTERM",)
+
+#: The braille indicator slot the renderer puts on its boot/progress rows
+#: (`⠋ Loading configuration...`). A boot-chrome row ends the response region
+#: only when it carries this slot or styling — see `_locate_response_region`.
+_SPINNER_SLOT_RE = re.compile(r"[\u2800-\u28ff]")
+
+
+def _after_last_echo(scope_kinds: List[kt.KimiLineKind]) -> List[kt.KimiLineKind]:
+    """The rows belonging to the newest turn.
+
+    A capture can hold several turns. The last user-input echo marks where the
+    current turn begins, so only rows from there on may be used as evidence
+    about *this* turn's outcome. With no echo at all the whole capture is the
+    scope — there is nothing to divide by.
+    """
+
+    last_echo = -1
+    for index, kind in enumerate(scope_kinds):
+        if kind is kt.KimiLineKind.USER_INPUT:
+            last_echo = index
+    return scope_kinds[last_echo + 1 :]
+
+
+#: The boot banner rows, which name themselves rather than relying on the spinner
+#: slot. Used with `_SPINNER_SLOT_RE` to decide whether a `BOOT_CHROME` row is
+#: really boot chrome when an answer is being extracted.
+_BOOT_BANNER_RE = re.compile(r"Welcome to Kimi Code|MCP Servers:\s*\d|MCP server \"")
+
+#: A3-5 — explicit opt-in for answering Kimi Code's workspace-trust dialog.
+#:
+#: Measured against Kimi Code 0.43.1 (A3-5 probe, see
+#: ``reports/kimi_code_compat/A3-REVIEW-FIX-REPORT.md``): choosing *Don't trust*
+#: **exits the process immediately** (exit 0) — there is no restricted TUI, no
+#: turn, nothing. So trust is not optional for a working terminal.
+#:
+#: But *granting* trust is a security decision, because trusting a folder:
+#:
+#: * starts that repository's project MCP servers — arbitrary commands read
+#:   straight out of the checkout (``.mcp.json`` and ``.kimi-code/mcp.json``
+#:   are both discovered), and
+#: * loads that repository's project ``AGENTS.md``, i.e. instructions.
+#:
+#: A worker launched in a folder the operator does not control would otherwise
+#: execute that folder's commands with no human in the loop. That decision
+#: belongs to the operator, not to the provider, so CAO does **not** grant trust
+#: by default: it refuses to answer the dialog and fails the terminal with an
+#: actionable error. Set ``CAO_KIMI_CODE_TRUST_WORKSPACE=1`` in the cao-server
+#: environment to let CAO answer it.
+#:
+#: Note this is CAO's own policy knob and is deliberately **not** exported to
+#: Kimi — Kimi has no corresponding setting (0.43.1 exposes no ``--trust`` flag).
+#:
+#: This is the *broad* control: it lets CAO grant trust to any folder a terminal
+#: is launched in. The narrower, preferred control is to trust one repository in
+#: normal Kimi and let the worker inherit it (A4) — the runtime home snapshots
+#: the real ``KIMI_CODE_HOME`` trust store, so an already-trusted folder never
+#: reaches this dialog in the first place.
+KIMI_TRUST_OPT_IN_ENV = "CAO_KIMI_CODE_TRUST_WORKSPACE"
+
+#: Values of :data:`KIMI_TRUST_OPT_IN_ENV` that mean "yes". Matching is
+#: case-insensitive and whitespace-trimmed; every other value — including unset,
+#: ``""``, ``0`` and ``false`` — means "do not grant". Failing closed on an
+#: unrecognised value is intentional: a typo must not silently enable trust.
+KIMI_TRUST_OPT_IN_TRUE = frozenset({"1", "true", "yes", "on"})
+
+
+def kimi_trust_opt_in(environ: Optional[Mapping[str, str]] = None) -> bool:
+    """Whether the operator has opted in to granting workspace trust (A3-5).
+
+    ``environ`` is injectable so tests can assert the policy without mutating
+    the process environment.
+    """
+
+    env = os.environ if environ is None else environ
+    return env.get(KIMI_TRUST_OPT_IN_ENV, "").strip().lower() in KIMI_TRUST_OPT_IN_TRUE
+
+
+#: Seconds to wait for the launch shell to report its ``kimi`` resolution.
+KIMI_PROBE_TIMEOUT_SECONDS = 20.0
+
+#: Last line the probe command writes into the probe file. Its presence proves
+#: the `--help` dump finished; the pane is never consulted (it echoes the typed
+#: command, which would match this marker before the command even ran).
+KIMI_PROBE_END_MARKER = "CAO-KIMI-PROBE-END"
+
+#: The shell the probe program and the launch line are handed to, chosen
+#: explicitly and absolutely. Both are POSIX and contain constructs a non-POSIX
+#: pane shell cannot parse — ``fish`` rejects ``${`` outright ("${ is not a valid
+#: variable"), so a fish pane never wrote the completion marker and a working
+#: Kimi Code binary was classified UNKNOWN. The pane's own shell must therefore
+#: only ever parse a shell-agnostic invocation; the POSIX text runs in this child
+#: shell, which inherits the pane's environment (PATH, HOME, KIMI_CODE_HOME) so
+#: ``command -v kimi`` still observes exactly what the launched ``kimi`` sees.
+KIMI_COMPATIBLE_SHELL = "/bin/sh"
+
+#: Characters that every shell we can meet (POSIX sh, bash, zsh, fish, csh)
+#: treats as an ordinary literal. A token built only from these needs no quoting
+#: at all, and that is the only transport that is provably identical across
+#: shells: POSIX quoting is *not* fish quoting. ``'\''`` — the POSIX idiom for an
+#: embedded apostrophe — ends the string early in fish when a backslash precedes
+#: the apostrophe ("Unexpected end of string, quotes are not balanced", exit
+#: 127), and ``\\`` means one backslash in fish but two in POSIX sh. Reproduced
+#: with a probe path of ``/tmp/back\'quote/kimi-probe.txt``.
+SHELL_SAFE_CHARS = frozenset(string.ascii_letters + string.digits + "_-./:=+,@%")
+
+
+def is_shell_safe_token(value: str) -> bool:
+    """True when ``value`` can be typed into any shell without quoting."""
+
+    return bool(value) and all(char in SHELL_SAFE_CHARS for char in value)
+
+
+def shell_safe_temp_root() -> str:
+    """A temp root whose path needs no quoting in any shell.
+
+    The operator's temp root is used when it is already safe, which is the normal
+    case. Otherwise ``/tmp`` is used: a dynamic value that cannot be transported
+    safely must not be transported at all, and falling back keeps the probe and
+    the launch working on a hostile ``TMPDIR`` instead of failing on it.
+    """
+
+    for candidate in (tempfile.gettempdir(), "/tmp"):
+        try:
+            resolved = os.path.realpath(candidate)
+        except OSError:  # pragma: no cover - defensive
+            continue
+        if os.path.isdir(resolved) and is_shell_safe_token(resolved):
+            return resolved
+    return "/tmp"
+
+
+#: Body of the POSIX probe program. It is written to a file (never typed at the
+#: pane) so the pane shell has nothing to parse but safe tokens. ``$1`` is the
+#: probe file, passed as a positional parameter rather than interpolated, so no
+#: dynamic value ever becomes shell syntax.
+KIMI_PROBE_PROGRAM = (
+    "{ printf 'CAO_KIMI_BIN=%s\\n' \"$(command -v kimi 2>/dev/null)\"; "
+    "printf 'CAO_KIMI_HOME=%s\\n' \"${KIMI_CODE_HOME:-$HOME/.kimi-code}\"; "
+    "kimi --help 2>&1; "
+    "printf '\\n%s\\n' '" + KIMI_PROBE_END_MARKER + '\'; } > "$1" 2>&1'
+)
+
+
+def build_kimi_probe_command(script_path: str, probe_path: str) -> str:
+    """The exact command typed into the pane to run the capability probe.
+
+    Every token is drawn from the shell-safe alphabet *by construction*, so the
+    pane's shell — whatever it is — parses the same command and has nothing to
+    expand, split or unquote. The POSIX program lives in ``script_path`` and is
+    executed by an explicitly selected ``/bin/sh``, with the probe file passed as
+    a positional parameter.
+    """
+
+    if not is_shell_safe_token(script_path) or not is_shell_safe_token(probe_path):
+        raise ValueError(
+            "Kimi probe paths must be shell-safe (see is_shell_safe_token); "
+            f"got script={script_path!r} probe={probe_path!r}"
+        )
+    return " ".join((KIMI_COMPATIBLE_SHELL, script_path, probe_path))
+
+
+def build_kimi_launch_command(script_path: str) -> str:
+    """The exact command typed into the pane to launch Kimi.
+
+    The launch line itself is POSIX (it quotes the operator's own paths, model
+    names and binary), so it is written to ``script_path`` and handed to
+    ``/bin/sh``. The pane shell sees only this fixed, quote-free invocation.
+    """
+
+    if not is_shell_safe_token(script_path):
+        raise ValueError(f"Kimi launch script path must be shell-safe; got {script_path!r}")
+    return " ".join((KIMI_COMPATIBLE_SHELL, script_path))
+
+
+#: Successful probes only, keyed by binary identity. A failed probe is never
+#: cached — an UNKNOWN verdict must not become sticky, or a transient PATH or
+#: filesystem problem at boot would permanently disable the provider for this
+#: process.
+_KIMI_DIALECT_CACHE: Dict[Tuple[str, int, int], Tuple[KimiDialect, Dict[str, bool]]] = {}
+_KIMI_DIALECT_CACHE_LOCK = threading.Lock()
+
+
+def _binary_identity(path: str) -> Optional[Tuple[str, int, int]]:
+    """Return ``(path, mtime_ns, size)`` for a resolved binary, or None."""
+
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    return (path, info.st_mtime_ns, info.st_size)
+
+
+def _cached_dialect(binary: str) -> Optional[Tuple[KimiDialect, Dict[str, bool]]]:
+    identity = _binary_identity(binary)
+    if identity is None:
+        return None
+    with _KIMI_DIALECT_CACHE_LOCK:
+        return _KIMI_DIALECT_CACHE.get(identity)
+
+
+def _cache_dialect(binary: str, dialect: KimiDialect, observed: Dict[str, bool]) -> None:
+    """Cache a *successful* classification keyed on the binary's identity."""
+
+    if dialect is KimiDialect.UNKNOWN:
+        return
+    identity = _binary_identity(binary)
+    if identity is None:
+        return
+    with _KIMI_DIALECT_CACHE_LOCK:
+        _KIMI_DIALECT_CACHE[identity] = (dialect, dict(observed))
+
+
+def reset_dialect_cache() -> None:
+    """Drop cached classifications. Used by tests and by config reload paths."""
+
+    with _KIMI_DIALECT_CACHE_LOCK:
+        _KIMI_DIALECT_CACHE.clear()
+
+
+def _read_text_or_empty(path: str) -> str:
+    """Read a file that another process may still be writing, or return "".
+
+    A missing file, a permission problem, or a decode failure all mean "no
+    usable content yet" for the probe poll, which has its own deadline. Reading
+    a file that is mid-write is safe here: the caller only proceeds once the
+    end marker is present, and the marker is written last.
+    """
+
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+@dataclass
+class KimiProbeResult:
+    """Outcome of the launch-shell capability probe.
+
+    ``binary`` is the absolute path the launch shell resolved and the exact path
+    the launch command reuses, which is what makes "probe and exec are the same
+    executable" a property of the code rather than a hope.
+    """
+
+    dialect: KimiDialect
+    binary: str
+    source_home: Path
+    observed: Dict[str, bool] = field(default_factory=dict)
 
 
 # =============================================================================
@@ -95,7 +559,11 @@ IDLE_PROMPT_PATTERN_LOG = r"[✨💫]"
 
 # Kimi welcome banner, shown once during startup inside a bordered box.
 # Used to detect successful initialization without needing to wait for prompt.
-WELCOME_BANNER_PATTERN = r"Welcome to Kimi Code CLI!"
+# Alternation, not replacement: Kimi Code renamed the product line, so the
+# banner now reads "Welcome to Kimi Code!" while legacy builds still print
+# "Welcome to Kimi Code CLI!". Deliberately NOT a dialect detector — a banner is
+# cosmetic text and the two dialects are separated by capability (A1.1).
+WELCOME_BANNER_PATTERN = r"Welcome to Kimi Code(?: CLI)?!"
 
 # Startup upgrade-reminder dialog. When a newer kimi-cli is available, kimi
 # renders an interactive menu ("[Enter] Upgrade now  [q] Not now  [s] Skip
@@ -123,18 +591,25 @@ USER_INPUT_BOX_END_PATTERN = r"╰─"
 # input that never reaches an ``@`` (quadratic backtracking, CWE-1333).
 PROMPT_WITH_INPUT_PATTERN = r"[✨💫][^\S\n]+\S"
 
-# Response/thinking bullet pattern: ``•`` (U+2022) at the start of a line.
-# Both thinking (internal monologue) and response (final answer) use this marker.
-# To distinguish them in extraction, check ANSI styling in raw output:
-# - Thinking: gray italic (\x1b[38;5;244m• ... \x1b[3m\x1b[38;5;244m)
-# - Response: plain ``•`` without ANSI color prefix
-RESPONSE_BULLET_PATTERN = r"^•\s"
+# Response/thinking bullet pattern: ``•`` (U+2022) or ``●`` (U+25CF) at the
+# start of a line. Both thinking (internal monologue) and response (final answer)
+# use the same glyph within a dialect, so styling — not the character — is what
+# separates them in extraction:
+# - Thinking (legacy): gray italic (\x1b[38;5;244m• ... \x1b[3m)
+# - Thinking (Kimi Code): \x1b[38;5;244m● \x1b[3m…  (same gray, U+25CF glyph)
+# - Response: \x1b[38;5;253m● \x1b[39m… (Kimi Code) / bare ``•`` (legacy)
+# Anchored at column 0 to match its historical contract; leading-whitespace
+# tolerant matching, and the "bullet plus payload" rule, are provided by the
+# shared classifier (`kimi_transcript.is_response_marker_line` /
+# `BULLET_ANY_RE`), which is what every status path now consumes.
+RESPONSE_BULLET_PATTERN = r"^[•●]\s"
 
 # Thinking bullet detection in raw (ANSI-preserved) output.
-# Thinking lines use gray color (38;5;244) before the bullet character.
-# This pattern distinguishes thinking from actual response content
-# when extracting messages from terminal output.
-THINKING_BULLET_RAW_PATTERN = r"\x1b\[38;5;244m\s*•"
+# Thinking lines are drawn in gray (38;5;244) before the bullet character.
+# Both dialects' glyphs are accepted: the glyph changed between Kimi releases
+# (``•`` -> ``●``) but the styling did not, which is why keying on the style is
+# what actually survives a release.
+THINKING_BULLET_RAW_PATTERN = r"\x1b\[38;5;244m\s*[•●]"
 
 # Kimi TUI status bar at the bottom of the screen.
 # Format: "HH:MM  [yolo]  agent (model, thinking)  ctrl-x: toggle mode  context: X.X%"
@@ -155,18 +630,29 @@ STATUS_BAR_PATTERN = r"\d+:\d+\s+.*(?:agent|shell)\s*\("
 # buffer from every "agent(" in it — quadratic backtracking (CWE-1333) on output
 # an agent can put on screen at will.
 NEW_TUI_STATUS_PATTERN = r"context:\s*\d+(?:\.\d+)?%|agent\s*\([^)●]{0,80}●"
-# Live working indicator: the new TUI animates a braille spinner
-# ("⠧ Thinking… 5s · 220 tokens", "⠹ Using handoff({...})") and a moon-phase
-# thinking glyph (🌑…🌘) that are cleared when the turn finishes. Any such
-# glyph means a turn-in-flight FRAME was rendered; freshness relative to the
-# last response bullet decides whether the turn is still going (see
-# get_status).
-NEW_TUI_SPINNER_PATTERN = r"[⠁-⣿]|[🌑🌒🌓🌔🌕🌖🌗🌘]"
+# Live working indicator: a braille glyph (U+2800-U+28FF). Kimi Code 0.43.1
+# animates "⠙ working…" and clears it when the turn finishes.
+#
+# Moon phases (U+1F311-U+1F318) were previously included here. They must NOT be:
+# the current TUI rotates an idle *tip* row through the same slot
+# ("🌕 · Tip: ctrl-s to add guidance…"), so treating a moon glyph as work reads a
+# settled terminal as PROCESSING (A0 defect D1; fixtures 05 and 09 both exhibit
+# it). The tip row is positively excluded by kimi_transcript.is_idle_tip_line,
+# and a bare moon row with no tip suffix is still accepted as work because that
+# shape is the *legacy* processing glyph and the fail-safe direction for an
+# ambiguous frame is "still working".
+NEW_TUI_SPINNER_PATTERN = r"[\u2800-\u28ff]"
+# Moon-phase glyphs, kept as a named pattern so the exclusion is explicit and
+# testable rather than an absence.
+NEW_TUI_MOON_TIP_PATTERN = r"[\U0001F311-\U0001F318]"
 # Boot/MCP chrome also renders braille glyphs while the terminal is genuinely
 # idle at the welcome screen ("⠧ MCP Servers: 0/1 connected", "⠦ cao-mcp-server
 # (connecting)", "⠋ Resolving dependencies..."). Those must NOT count as a
 # live turn-in-flight spinner or a freshly-booted terminal would never read
-# IDLE.
+# IDLE. The decision now lives in the shared classifier, which identifies those
+# rows structurally (whole-row anchoring) rather than by substring, so an answer
+# that merely quotes them is not chrome. Kept as a documented pattern for the
+# shapes it names; nothing gates on it.
 NEW_TUI_BOOT_CHROME_PATTERN = re.compile(
     r"MCP Servers|\(connecting\)|Resolving dependencies|connecting to mcp servers"
     r"|Loading configuration|Loading agent|Restoring conversation",
@@ -174,24 +660,44 @@ NEW_TUI_BOOT_CHROME_PATTERN = re.compile(
 )
 
 
-def _is_live_turn_spinner_line(line: str) -> bool:
-    """True when ``line`` carries a live turn-in-flight spinner glyph."""
-    return bool(
-        re.search(NEW_TUI_SPINNER_PATTERN, line) and not NEW_TUI_BOOT_CHROME_PATTERN.search(line)
-    )
+def _is_live_turn_spinner_line(
+    line: str,
+    semantics: "kt.SpinnerSemantics" = kt.SpinnerSemantics.LEGACY,
+) -> bool:
+    """True when ``line`` carries a live turn-in-flight spinner glyph.
+
+    Delegates to the shared transcript classifier so boot chrome, the idle
+    rotating tip row, and the dialect split between a bare moon (the legacy
+    working glyph) and a braille indicator (the Kimi Code working glyph) are all
+    resolved in exactly one place (see
+    :mod:`cli_agent_orchestrator.providers.kimi_transcript`).
+
+    ``semantics`` defaults to the legacy rules so a caller that has not resolved
+    a dialect keeps the historical behaviour.
+    """
+    # The caller may hand in a raw, ANSI-bearing row, so the escape-free form has
+    # to be derived rather than assumed: the indicator is identified by its
+    # position at the row's prefix, and a leading colour sequence would hide it.
+    return kt.is_live_spinner_line(kt.strip_sgr(line), line, semantics)
 
 
-# A response/thinking bullet ("• …") at line start. Its presence means a turn
-# has produced output — used to latch "input received" on the new TUI (the
-# welcome banner / update nag contain no "•", so this won't false-trigger at
-# init).
-ANY_BULLET_PATTERN = r"(?m)^\s*•"
-# Same bullet, tested against a single already-split line. Spelled out here rather
-# than inline as `re.match(r"\s*•", line)` so the ^ anchor and the horizontal-only
-# whitespace class are explicit: without them the leading-whitespace run reads as
-# rescannable from every position in it (CWE-1333). `re.match` already anchored in
-# practice, so this is precision, not a live fix.
-BULLET_LINE_PATTERN = re.compile(r"^[^\S\n]*•")
+# Response markers.
+#
+# There is deliberately no locally-defined bullet regex here any more. The
+# previous pair — `ANY_BULLET_PATTERN = r"(?m)^[^\S\n]*[•●]"` and
+# `BULLET_LINE_PATTERN = re.compile(r"^[^\S\n]*[•●]")` — matched a bare bullet
+# with nothing after it, so a narrow terminal that wrapped the status bar into a
+# row beginning `●)` or `•)` was read as assistant output. That latched
+# "input received" on an idle terminal and reported COMPLETED: the PR #664
+# narrow-terminal defect class, reintroduced next to the classifier that had
+# already been fixed for it.
+#
+# All status paths now go through the shared helpers
+# `kimi_transcript.is_response_marker_line` / `has_response_marker`, which
+# require a bullet *plus a payload*. `BULLET_LINE_PATTERN` is kept as an alias to
+# the single shared definition so the status paths and the ReDoS regression test
+# keep pointing at one pattern.
+BULLET_LINE_PATTERN = kt.BULLET_ANY_RE
 
 # Generic error patterns for detecting failure states in terminal output.
 ERROR_PATTERN = (
@@ -223,8 +729,14 @@ class KimiCliProvider(BaseProvider):
     # the prompt marker.
     _KIMI_PROMPT_RE = re.compile(r"(?:\w{1,32}@[\w.\-]{1,64})?[✨💫][^\S\n]{1,4}\S")
     # Response/thinking markers used to bound a user message line. Matches
-    # the same ``• `` bullet the IDLE/PROCESSING path uses.
-    _KIMI_RESPONSE_MARKER_RE = re.compile(r"^•\s")
+    # the same bullets the IDLE/PROCESSING path uses, in both dialects.
+    _KIMI_RESPONSE_MARKER_RE = re.compile(r"^[•●]\s")
+
+    @property
+    def allow_raw_transcript_fallback(self) -> bool:
+        """Kimi raw panes contain channels that LAST must never publish."""
+
+        return False
 
     def __init__(
         self,
@@ -244,6 +756,9 @@ class KimiCliProvider(BaseProvider):
         self._model = model
         # Track temp directory for cleanup (created when agent profile needs temp files)
         self._temp_dir: Optional[str] = None
+        # Shell-safe scratch directory for the artifacts typed at the pane (the
+        # probe program and the launch script). See _ensure_shell_safe_dir.
+        self._shell_safe_dir: Optional[str] = None
         # Latching flag: set True when user input box (╭─) is detected in ANY
         # get_status() call. Persists even after the box scrolls out of the
         # tmux capture window (200 lines). This is needed because:
@@ -252,6 +767,11 @@ class KimiCliProvider(BaseProvider):
         # Without this, get_status() returns IDLE instead of COMPLETED after
         # the agent finishes processing, causing handoff to time out.
         self._has_received_input = False
+        self._execution_observed = False
+        self._awaiting_turn = False
+        self._turn_activity_seen = False
+        self.execution_evidence_ambiguous = False
+        self._status_buffer_epoch = 0
         # Wallclock of the last send_input() dispatch (terminal_service calls
         # mark_input_received). Used by the newest-TUI status path: right
         # after a paste, the TUI repaints the ready chrome (status bar) before
@@ -262,6 +782,37 @@ class KimiCliProvider(BaseProvider):
         # output). A short dispatch grace bridges the gap until the first
         # spinner frame arrives.
         self._last_dispatch_time = 0.0
+
+        # --- dialect state (Kimi Code compatibility) -------------------------
+        # Resolved by _probe_dialect() during initialize(), from the capabilities
+        # of the binary the *launch shell* resolves. Stays None until then, and
+        # None means "legacy": _build_kimi_command() is the legacy builder and is
+        # also called directly by tests and by no-probe callers.
+        self._dialect: Optional[KimiDialect] = None
+        # Absolute path of the resolved binary, reused verbatim for the launch so
+        # the probe and the exec provably refer to the same file (PR #664's bug
+        # was probing one PATH and launching from another).
+        self._kimi_binary: Optional[str] = None
+        # Effective source KIMI_CODE_HOME, captured by the same launch-shell probe.
+        self._kimi_source_home: Optional[Path] = None
+        # Per-worker runtime home builder (Kimi Code only).
+        self._runtime_home_builder: Optional[KimiCodeRuntimeHomeBuilder] = None
+        # Latched once the workspace-trust dialog has been answered, so its
+        # lingering text cannot cause a second keypress.
+        self._trust_handled = False
+
+    @property
+    def runtime_variant(self) -> Optional[str]:
+        """Resolved launch dialect to persist with terminal lifecycle metadata."""
+
+        if self._dialect in (KimiDialect.LEGACY, KimiDialect.CODE):
+            return self._dialect.value
+        return None
+
+    def restore_runtime_variant(self, value: Optional[str]) -> None:
+        """Restore the launch dialect for an already-running terminal."""
+
+        self._dialect = restore_kimi_dialect(value)
 
     @property
     def paste_enter_count(self) -> int:
@@ -279,6 +830,19 @@ class KimiCliProvider(BaseProvider):
         """
         super().mark_input_received()
         self._has_received_input = True
+        self._begin_execution_generation()
+
+    def _begin_execution_generation(self) -> None:
+        self._awaiting_turn = True
+        self._turn_activity_seen = False
+        self.execution_evidence_ambiguous = False
+        self._execution_observed = False
+
+    def notify_status_buffer_reset(self, epoch: int) -> None:
+        """A new buffer generation still awaits actual activity, not a redraw."""
+        if epoch > self._status_buffer_epoch:
+            self._status_buffer_epoch = epoch
+            self._begin_execution_generation()
 
     def _try_load_profile(self):
         """Best-effort profile load for timeout resolution only.
@@ -294,11 +858,733 @@ class KimiCliProvider(BaseProvider):
         if self._agent_profile is None:
             return None
         try:
-            return load_agent_profile(self._agent_profile)
+            return _with_plugin_mcp(load_agent_profile(self._agent_profile), "kimi_cli")
         except Exception:
             return None
 
-    def _build_kimi_command(self) -> str:
+    # =====================================================================
+    # Kimi Code compatibility: dialect probe
+    # =====================================================================
+
+    @staticmethod
+    def _managed_scratch_root() -> Path:
+        """Fixed private POSIX root; TMPDIR must never decide secret ownership."""
+        return Path("/tmp").resolve() / f"cao_kimi_{os.getuid()}"
+
+    def _managed_scratch_dir(self) -> Path:
+        # Namespace by CAO home as well as terminal id: separate installations
+        # using the same temp root must not own one another's launch artifacts.
+        identity = f"{CAO_HOME_DIR.absolute()}\0{self.terminal_id}"
+        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        return self._managed_scratch_root() / digest
+
+    def _is_managed_scratch_dir(self, directory: Path) -> bool:
+        """Validate exact ownership; only the leaf may be an unlinkable symlink."""
+        root = self._managed_scratch_root()
+        if directory != self._managed_scratch_dir() or directory.parent != root:
+            return False
+        if root.name != f"cao_kimi_{os.getuid()}":
+            return False
+        try:
+            if any(parent.is_symlink() for parent in (root, *root.parents)):
+                return False
+            for path in (root, directory):
+                if path == directory and path.is_symlink():
+                    continue
+                if path.exists():
+                    info = path.stat()
+                    if (
+                        not stat.S_ISDIR(info.st_mode)
+                        or info.st_uid != os.getuid()
+                        or info.st_mode & 0o077
+                    ):
+                        return False
+            return True
+        except OSError:
+            return False
+
+    def _ensure_managed_scratch(self) -> str:
+        directory = self._managed_scratch_dir()
+        if not self._is_managed_scratch_dir(directory) or directory.is_symlink():
+            raise ProviderError(f"Refusing unsafe Kimi scratch directory: {directory}")
+        directory.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        directory.mkdir(mode=0o700, exist_ok=True)
+        return str(directory)
+
+    def _ensure_temp_dir(self, prefix: str = "cao_kimi_") -> str:
+        """Return isolated scratch recoverable from terminal identity after restart."""
+        if not self._temp_dir:
+            self._temp_dir = self._ensure_managed_scratch()
+        return self._temp_dir
+
+    def _remove_managed_scratch(self) -> bool:
+        directory = self._managed_scratch_dir()
+        if not self._is_managed_scratch_dir(directory):
+            logger.warning("Refusing to remove non-managed Kimi scratch %s", directory)
+            return False
+        try:
+            if directory.is_symlink():
+                directory.unlink()
+            else:
+                shutil.rmtree(directory)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning("Failed to remove Kimi scratch %s: %s", directory, exc)
+            return False
+        return not os.path.lexists(directory)
+
+    # =====================================================================
+    # Kimi Code runtime home: deterministic managed location
+    # =====================================================================
+    #
+    # The runtime home holds a snapshot of the operator's credentials, MCP
+    # configuration and Kimi state, so it must not live in a random scratch
+    # directory whose path exists only in the live provider instance. After a
+    # cao-server restart the provider is rebuilt from database metadata — where
+    # ``provider_variant`` is the only Kimi state persisted — the old temp path
+    # is unrecoverable, ``cleanup()`` becomes a no-op, and the copied credentials
+    # stay on disk forever. Naming the directory deterministically from the
+    # terminal id (mirroring ``minimax_code`` and ``grok_cli``) lets cleanup
+    # recover it with neither a database column nor a persisted free-form path.
+
+    @staticmethod
+    def _managed_runtime_root() -> Path:
+        """Return the only directory containing CAO-owned Kimi Code homes."""
+
+        return CAO_HOME_DIR / "providers" / "kimi_code"
+
+    def _managed_terminal_dir(self) -> Path:
+        """Return this terminal's deterministic managed Kimi Code directory.
+
+        ``CAO_HOME_DIR`` is read from the module global on every call rather
+        than captured at import, so the path a home is built under is the same
+        path cleanup later validates, including with a relocated/test CAO home.
+        """
+
+        digest = hashlib.sha256(self.terminal_id.encode("utf-8")).hexdigest()
+        return self._managed_runtime_root() / digest
+
+    def _managed_runtime_home(self) -> Path:
+        """Return this terminal's managed Kimi Code runtime home."""
+
+        return self._managed_terminal_dir() / RUNTIME_HOME_DIR_NAME
+
+    def _is_managed_terminal_dir(self, directory: Path) -> bool:
+        """Return whether ``directory`` is this terminal's deterministic dir.
+
+        ``cleanup()`` must be usable on a provider recreated after a
+        cao-server restart, where nothing in memory names the runtime home, so
+        the terminal id has to identify CAO's managed directory on its own. Do
+        not turn that recovery path into a general recursive-delete primitive:
+        the target must be *exactly* the deterministic child of CAO's managed
+        Kimi Code root, because ``Path`` equality is lexical and a "somewhere
+        below the root" test would let a crafted path delete outside CAO state.
+        Every managed ancestor must additionally be a real directory rather than
+        a symlink that redirects the delete, and any doubt — or an ``OSError``
+        while inspecting — returns ``False``.
+        """
+
+        root = self._managed_runtime_root()
+        if directory != self._managed_terminal_dir() or directory.parent != root:
+            return False
+        if root.name != "kimi_code" or root.parent.name != "providers":
+            return False
+        try:
+            if any(
+                ancestor.is_symlink() for ancestor in (CAO_HOME_DIR, root.parent, root, directory)
+            ):
+                return False
+            # Defense in depth for platform-specific path normalization: the
+            # parent must resolve to this exact non-symlink managed root.
+            return directory.parent.resolve(strict=False) == root.resolve(strict=False)
+        except OSError:
+            return False
+
+    def _is_managed_runtime_home(self, home: Path) -> bool:
+        """Return whether ``home`` is this terminal's managed runtime home.
+
+        The home itself is deliberately allowed to be a symlink so cleanup can
+        unlink it without following its target — the same property that keeps a
+        linked credential path from being written through.
+        """
+
+        return home.name == RUNTIME_HOME_DIR_NAME and self._is_managed_terminal_dir(home.parent)
+
+    def _ensure_shell_safe_dir(self) -> str:
+        """Keep probe/launch scripts in this terminal's recoverable safe path.
+
+        A caller-supplied scratch path may hold an agent file, but never decides
+        the location of credential-bearing launch scripts or cleanup targets.
+        """
+        if self._shell_safe_dir is None:
+            self._shell_safe_dir = self._ensure_managed_scratch()
+        return self._shell_safe_dir
+
+    @staticmethod
+    def _write_private_script(directory: str, name: str, body: str) -> str:
+        """Write an executable helper script and return its path."""
+
+        path = os.path.join(directory, name)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o700)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            os.fchmod(handle.fileno(), 0o700)
+            handle.write(body)
+        return path
+
+    def _materialize_launch_command(self, command: str) -> str:
+        """Move a POSIX launch line into a script and return the pane command.
+
+        The launch line quotes the operator's own paths, model names and resolved
+        binary, so it is POSIX text that an arbitrary pane shell must not be
+        asked to parse. It is written to a CAO-owned script and handed to
+        ``/bin/sh``; the pane receives a fixed invocation built only from
+        shell-safe characters.
+        """
+
+        directory = self._ensure_shell_safe_dir()
+        script = self._write_private_script(
+            directory,
+            "kimi-launch.sh",
+            "#!/bin/sh\n# CAO-managed launch line (POSIX). Do not edit.\nexec /bin/sh -c "
+            + shlex.quote(command)
+            + "\n",
+        )
+        return build_kimi_launch_command(script)
+
+    @staticmethod
+    def _dialect_failure_reason(observed: Dict[str, bool]) -> str:
+        legacy_sig = any(observed[flag] for flag in LEGACY_CAPABILITY_FLAGS)
+        code_sig = all(observed[flag] for flag in CODE_CAPABILITY_FLAGS)
+        if legacy_sig and code_sig:
+            return (
+                "capability signature is self-contradictory: the binary advertises "
+                "legacy MCP CLI injection and the Kimi Code option set at once"
+            )
+        return "capability signature is unrecognised: neither dialect's markers are present"
+
+    def _unsupported_message(self, binary: str, observed: Dict[str, bool], reason: str) -> str:
+        """Build the fail-closed error text (never contains credentials)."""
+
+        return (
+            f"Unsupported Kimi CLI build: could not determine dialect for {binary!r}.\n"
+            f"  resolved binary : {binary}\n"
+            f"  detected flags  : {_describe_capabilities(observed)}\n"
+            f"  reason          : {reason}\n"
+            "  CAO requires a build that is either legacy kimi-cli "
+            "(advertises --mcp-config) or Kimi Code "
+            "(advertises --auto + --agent-file + --output-format). "
+            "Refusing to guess, because the two dialects use incompatible MCP "
+            "mechanisms and a wrong guess would launch this worker with no MCP "
+            "servers and no error."
+        )
+
+    async def _probe_kimi_environment(self) -> "KimiProbeResult":
+        """Resolve the binary, its capabilities, and the effective source home.
+
+        Everything is resolved by the **launch shell** — the tmux pane's own
+        shell, which is the shell that will exec ``kimi`` — not by the
+        cao-server process. PR #664's bug was exactly this divergence: the
+        server probed one ``PATH`` while the pane launched from another, so the
+        dialect decided at init did not describe the binary that actually ran.
+
+        The pane is asked for three things in one command, all redirected into a
+        file the CAO process reads afterwards (so ``kimi --help`` never floods
+        the pane):
+
+        * ``CAO_KIMI_BIN`` — ``command -v kimi`` as the launch shell sees it,
+        * ``CAO_KIMI_HOME`` — the effective ``KIMI_CODE_HOME`` in that same shell,
+        * the full ``--help`` text, which is the capability signature.
+
+        The command is a POSIX program handed to an explicitly selected shell
+        (:data:`KIMI_PROBE_SHELL`), not typed at the pane's interactive shell —
+        see :func:`build_kimi_probe_command`. The program is still *resolved in*
+        the pane's environment, so the probe and the launch agree even when the
+        pane runs a shell that cannot parse the program itself.
+
+        The returned absolute path is then used verbatim for the launch, so
+        probe and exec provably refer to the same file.
+
+        Raises:
+            UnsupportedKimiError: the probe could not complete, resolved no
+                absolute binary, or produced an unrecognised/contradictory
+                capability signature. Never falls back to the legacy dialect.
+        """
+
+        probe_dir = await asyncio.to_thread(self._ensure_shell_safe_dir)
+        probe_path = os.path.join(probe_dir, "kimi-probe.txt")
+
+        # The program is POSIX and contains `${VAR:-default}` and `$(...)`. It is
+        # written to a file and handed to an explicitly selected shell instead of
+        # being typed at the pane, because the pane's shell is the operator's
+        # choice: `fish` cannot parse either construct, so it would fail before
+        # writing the completion marker and a working Kimi Code binary would be
+        # classified UNKNOWN. The command typed at the pane is built only from
+        # shell-safe characters, so no shell has to quote, split or expand
+        # anything — POSIX quoting is not fish quoting, and a probe path
+        # containing a backslash-before-apostrophe broke `shlex.quote` under fish.
+        #
+        # This shell is a child of the pane shell, so PATH/HOME/KIMI_CODE_HOME —
+        # and therefore `command -v kimi` — are exactly what the launched `kimi`
+        # will see.
+        #
+        # The completion signal is read from the FILE, never from the pane. The
+        # pane is unusable for this: `send_keys` types the script as literal
+        # text, so the terminal echoes the whole command line -- including
+        # whatever sentinel string it contains -- *before* the command has run.
+        # Polling the pane for that string therefore matched instantly and the
+        # probe read a half-written file, classifying a perfectly good Kimi Code
+        # binary as UNKNOWN. The end marker is written by the shell as the last
+        # thing it does, so its presence in the file means the dump is complete.
+        script_path = await asyncio.to_thread(
+            self._write_private_script, probe_dir, "kimi-probe.sh", KIMI_PROBE_PROGRAM + "\n"
+        )
+        probe_script = build_kimi_probe_command(script_path, probe_path)
+
+        await asyncio.to_thread(
+            get_backend().send_keys, self.session_name, self.window_name, probe_script
+        )
+
+        deadline = time.monotonic() + KIMI_PROBE_TIMEOUT_SECONDS
+        text = ""
+        while time.monotonic() < deadline:
+            text = await asyncio.to_thread(_read_text_or_empty, probe_path)
+            if KIMI_PROBE_END_MARKER in text:
+                break
+            await asyncio.sleep(0.25)
+
+        if KIMI_PROBE_END_MARKER not in text:
+            raise UnsupportedKimiError(
+                f"Unsupported Kimi CLI build: the launch shell did not answer the "
+                f"capability probe within {KIMI_PROBE_TIMEOUT_SECONDS:.0f}s.\n"
+                f"  probe file      : {probe_path}\n"
+                f"  bytes written   : {len(text)}\n"
+                "  CAO resolves the kimi binary inside the launch shell so that the "
+                "probed and the launched executable are provably the same file; it "
+                "will not fall back to the legacy dialect when that resolution fails."
+            )
+
+        binary = ""
+        source_home_raw = ""
+        help_lines: List[str] = []
+        for line in text.splitlines():
+            if line.startswith("CAO_KIMI_BIN="):
+                binary = line[len("CAO_KIMI_BIN=") :].strip()
+            elif line.startswith("CAO_KIMI_HOME="):
+                source_home_raw = line[len("CAO_KIMI_HOME=") :].strip()
+            elif line.strip() == KIMI_PROBE_END_MARKER:
+                continue
+            else:
+                help_lines.append(line)
+
+        if not binary or not os.path.isabs(binary):
+            raise UnsupportedKimiError(
+                f"Unsupported Kimi CLI build: the launch shell did not resolve "
+                f"'kimi' to an absolute path (got {binary!r}).\n"
+                "  Ensure 'kimi' is a real executable on the launch shell's PATH "
+                "(a shell function or alias cannot be probed or launched reliably)."
+            )
+
+        dialect, observed = classify_kimi_capabilities("\n".join(help_lines))
+        if dialect is KimiDialect.UNKNOWN:
+            raise UnsupportedKimiError(
+                self._unsupported_message(binary, observed, self._dialect_failure_reason(observed))
+            )
+
+        # Cache only a successful classification, keyed on the binary's identity.
+        # A failure above is never cached, so a transient probe problem cannot
+        # permanently disable this provider for the process.
+        await asyncio.to_thread(_cache_dialect, binary, dialect, observed)
+
+        self._dialect = dialect
+        self._kimi_binary = binary
+        self._kimi_source_home = resolve_source_home(source_home_raw)
+        logger.info(
+            "kimi_dialect_resolved terminal=%s dialect=%s binary=%s source_home=%s flags=%s",
+            self.terminal_id,
+            dialect.value,
+            binary,
+            self._kimi_source_home,
+            _describe_capabilities(observed),
+        )
+        return KimiProbeResult(
+            dialect=dialect,
+            binary=binary,
+            source_home=self._kimi_source_home,
+            observed=observed,
+        )
+
+    async def _resolve_dialect(self) -> "KimiProbeResult":
+        """Return the dialect for this terminal, probing once per binary.
+
+        A cached verdict short-circuits the pane round-trip, but the cache key
+        includes the binary's ``mtime`` and size, so a binary replaced in place is
+        re-probed automatically.
+        """
+
+        cached = None
+        if self._kimi_binary:
+            cached = _cached_dialect(self._kimi_binary)
+        if cached is not None:
+            dialect, observed = cached
+            self._dialect = dialect
+            logger.debug(
+                "kimi_dialect_cached terminal=%s dialect=%s", self.terminal_id, dialect.value
+            )
+            return KimiProbeResult(
+                dialect=dialect,
+                binary=self._kimi_binary or "kimi",
+                source_home=resolve_source_home(None),
+                observed=dict(observed),
+            )
+        return await self._probe_kimi_environment()
+
+    # =====================================================================
+    # Kimi Code compatibility: launch command
+    # =====================================================================
+
+    def _render_markdown_agent(self, profile: Any) -> Optional[str]:
+        """Render the launch-only Markdown agent file, or None when empty.
+
+        Kimi Code replaced the legacy YAML agent file (``agent: extend: default``
+        + ``system_prompt_path``) with a Markdown file whose body may interpolate
+        ``${base_prompt}``. Emitting ``${base_prompt}`` **before** CAO's own text
+        is what keeps Kimi's base system prompt intact and appends CAO's
+        instructions to it, instead of replacing the whole prompt (the
+        #664-class failure).
+        """
+
+        system_prompt = ""
+        if profile is not None and profile.system_prompt is not None:
+            system_prompt = profile.system_prompt
+        system_prompt = self._apply_skill_prompt(system_prompt)
+
+        # Prepend security constraints for soft enforcement. Kimi Code's
+        # `tools`/`disallowedTools` frontmatter could enforce this natively, but
+        # CAO keeps the prompt-level guarantee for this change: kimi_cli is
+        # registered as a soft-enforcement provider and silently upgrading an
+        # advisory restriction to a hard one is a separate decision.
+        if self._allowed_tools is not None and "*" not in self._allowed_tools:
+            from cli_agent_orchestrator.constants import SECURITY_PROMPT
+            from cli_agent_orchestrator.utils.tool_mapping import (
+                tool_constraint_instruction,
+            )
+
+            tool_constraint = f"\n{tool_constraint_instruction(self._allowed_tools)}\n"
+            system_prompt = SECURITY_PROMPT + tool_constraint + system_prompt
+
+        if not system_prompt.strip():
+            return None
+
+        name = kimi_agent_name(self.terminal_id)
+        description = json.dumps(f"CAO launch-scoped agent for terminal {self.terminal_id}"[:200])
+        return (
+            "---\n"
+            f"name: {name}\n"
+            f"description: {description}\n"
+            "---\n"
+            "\n"
+            "${base_prompt}\n"
+            "\n"
+            f"{system_prompt}\n"
+        )
+
+    def _build_kimi_code_command(self) -> str:
+        """Build the Kimi Code launch command.
+
+        Contract (frozen by A1.2/A1.3/A1.4/A1.5/A1.6):
+
+        * **No ``cd``.** The CAO terminal's own working directory is Kimi's cwd,
+          which is what restores git-root resolution, repository ``AGENTS.md``
+          discovery, project MCP discovery and a stable session namespace. The
+          legacy temp-cwd workaround exists to dodge a per-directory lock that
+          A0 proved does not exist in Kimi Code.
+        * ``KIMI_CODE_HOME`` points at this worker's runtime home, so each worker
+          gets its own ``mcp.json`` and arbitrary per-profile MCP surfaces stay
+          isolated. That home is the terminal's deterministic managed directory
+          (``CAO_HOME_DIR/providers/kimi_code/<terminal digest>/kimi-home``), not
+          a random scratch path, so a terminal deleted after a cao-server restart
+          can still have its copied credentials removed.
+        * ``CAO_TERMINAL_ID`` is exported for the Kimi process: Kimi Code's stdio
+          MCP children inherit the parent environment, so one export reaches
+          every server (including user-level ones) without per-server injection.
+        * MCP timeouts travel as launch-scoped env bindings, never as a mutation
+          of the user's ``config.toml``.
+        * Auto-update is disabled for every CAO-managed worker, so N workers do
+          not each poll the CDN and self-install.
+        * ``--auto`` (never ask), not ``--yolo`` (ask when needed): CAO workers
+          must run unattended.
+        """
+
+        binary = self._kimi_binary
+        if not binary:
+            raise ProviderError(
+                "Kimi Code launch requires a resolved binary; "
+                "_probe_kimi_environment() must run first."
+            )
+
+        profile = None
+        if self._agent_profile is not None:
+            try:
+                # The plugin-augmented profile, exactly as the legacy builder
+                # consumes it. Both dialects re-read the profile at launch (the
+                # documented reason `with_plugin_mcp` exists at all), so the
+                # Kimi Code path must pass through the same seam: without this
+                # the merged `mcp.json` is built from the profile alone and every
+                # installed plugin's MCP servers are silently missing from this
+                # dialect. Each call re-reads, so there is nothing to double-merge.
+                profile = _with_plugin_mcp(load_agent_profile(self._agent_profile), "kimi_cli")
+            except Exception as e:
+                raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
+
+        temp_dir = self._ensure_temp_dir()
+        source_home = self._kimi_source_home or resolve_source_home(None)
+
+        # The runtime home is CAO-managed state, not scratch: it belongs at the
+        # terminal's deterministic managed path so cleanup can find it again
+        # after a restart (see the managed-location section above). Validating
+        # here rather than trusting the derivation keeps the builder parent and
+        # the cleanup target provably the same directory, and a refusal is an
+        # error — silently building outside CAO state would reintroduce the leak.
+        terminal_dir = self._managed_terminal_dir()
+        if not self._is_managed_terminal_dir(terminal_dir):
+            raise ProviderError(
+                f"Refusing to build a Kimi Code runtime home outside the managed "
+                f"Kimi Code directory: {terminal_dir}"
+            )
+        if terminal_dir.exists():
+            # A previous lifecycle can be interrupted between build and cleanup
+            # (crash, SIGKILL, restart), leaving a home that already carries the
+            # operator's credentials, MCP configuration and trust records. The
+            # new worker must not inherit any of it, so the validated directory
+            # is reset first. The recursive delete is restricted to exactly the
+            # path validated above and never follows the link case, which
+            # `_is_managed_terminal_dir` already refused.
+            try:
+                shutil.rmtree(terminal_dir)
+            except OSError as exc:
+                raise ProviderError(
+                    f"Failed to reset Kimi Code runtime directory {terminal_dir}: {exc}"
+                ) from exc
+
+        mcp_servers = profile.mcpServers if profile is not None else None
+        builder = KimiCodeRuntimeHomeBuilder(source_home, terminal_dir)
+        try:
+            runtime = builder.build(mcp_servers)
+        except RuntimeHomeError as exc:
+            raise ProviderError(f"Failed to build Kimi Code runtime home: {exc}") from exc
+        self._runtime_home_builder = builder
+
+        command_parts = ["env"]
+        for name in KIMI_PALETTE_ENV_UNSET:
+            command_parts.extend(["-u", name])
+        command_parts.extend(
+            [
+                f"KIMI_CODE_HOME={runtime.home}",
+                f"CAO_TERMINAL_ID={self.terminal_id}",
+                "TERM=xterm-256color",
+                f"KIMI_MCP_TOOL_TIMEOUT_MS={KIMI_MCP_TOOL_TIMEOUT_MS}",
+                f"KIMI_MCP_STARTUP_TIMEOUT_MS={KIMI_MCP_STARTUP_TIMEOUT_MS}",
+            ]
+        )
+        for key, value in KIMI_NO_AUTO_UPDATE_ENV.items():
+            command_parts.append(f"{key}={value}")
+
+        command_parts.extend([binary, "--auto"])
+
+        # self._model is an explicit per-call override (handoff/assign's own
+        # `model` parameter) and wins over the profile's static model field.
+        resolved_model = self._model or (profile.model if profile is not None else None)
+        if resolved_model:
+            command_parts.extend(["--model", resolved_model])
+
+        agent_markdown = self._render_markdown_agent(profile)
+        if agent_markdown is not None:
+            agent_path = os.path.join(temp_dir, "kimi-code-agent.md")
+            with open(agent_path, "w", encoding="utf-8") as handle:
+                handle.write(agent_markdown)
+            os.chmod(agent_path, 0o600)
+            command_parts.extend(["--agent-file", agent_path])
+
+        # Deliberately no `cd`: the tmux window already sits in the CAO project
+        # cwd, and that is exactly the working directory Kimi Code must keep.
+        return shlex.join(command_parts)
+
+    # =====================================================================
+    # Kimi Code compatibility: workspace trust
+    # =====================================================================
+
+    @staticmethod
+    def _normalise_workspace(path: str) -> str:
+        """Normalise a workspace path for comparison (realpath, no trailing /)."""
+
+        try:
+            resolved = os.path.realpath(path)
+        except OSError:  # pragma: no cover - defensive
+            resolved = path
+        return resolved.rstrip("/") or "/"
+
+    async def _handle_trust_dialog(self, output: str) -> bool:
+        """Answer Kimi Code's workspace-trust dialog for this terminal's folder.
+
+        Kimi Code raises this dialog for **any** untrusted cwd, even when the
+        repository declares no project MCP servers, and its default selection is
+        *Trust this folder*. Blindly sending Enter therefore silently grants
+        project-MCP trust to whatever folder the terminal launched in — which is
+        precisely why this handler is positive-identification only:
+
+        * the exact dialog must be present (title + navigation hint + a
+          recognised option set), and
+        * the workspace the dialog names must equal the pane's actual working
+          directory, and
+        * the selection must be readable.
+
+        If the selection is already *Trust this folder* it is accepted. Otherwise
+        CAO navigates deterministically, re-reads the pane, and only then accepts.
+        Every other outcome — unknown layout, unreadable selection, mismatched
+        workspace — fails closed without sending a key.
+
+        A3-5: answering at all additionally requires the operator's explicit
+        opt-in (:func:`kimi_trust_opt_in`). This method never grants project
+        trust on its own initiative — see the module-level note on
+        :data:`KIMI_TRUST_OPT_IN_ENV` for the evidence behind that.
+
+        A4: this handler is only reached for a folder the operator has *not*
+        already trusted. A worker's runtime home inherits the trust records from
+        the real ``KIMI_CODE_HOME`` (see
+        :class:`~cli_agent_orchestrator.providers.kimi_runtime_home.KimiCodeRuntimeHomeBuilder`),
+        so a folder already trusted in normal Kimi produces no dialog here at
+        all. That is what makes pre-trusting one repository — rather than
+        setting the server-wide opt-in — a real answer to this error.
+
+        Returns True when the dialog was handled (so the caller can reset its
+        idle timer), False when no trust dialog is on screen. Raises
+        :class:`ProviderError` when a dialog is present but must not be answered.
+        """
+
+        if self._trust_handled:
+            return False
+
+        rows = output.split("\n")
+        dialog = kt.detect_trust_dialog(rows)
+        if dialog is None:
+            return False
+
+        # A3-5 — the security gate. Kimi Code will not run without trust
+        # (choosing "Don't trust" exits the process), so the only question is
+        # *who decides*. Answering it here means CAO starts the launched
+        # folder's project MCP servers and loads its project AGENTS.md, so the
+        # decision is the operator's, and it must be explicit. Refusing here is
+        # loud and actionable rather than silent; it fires only when a dialog is
+        # actually on screen, so an already-trusted folder is unaffected.
+        if not kimi_trust_opt_in():
+            raise ProviderError(
+                "Kimi Code is asking to trust this folder and CAO will not "
+                "answer it. Trusting a folder starts that repository's project "
+                "MCP servers and loads its project AGENTS.md, so the decision "
+                "belongs to you.\n"
+                f"  folder: {dialog.workspace or '<unreadable>'}\n"
+                "  option A (preferred, this one workspace): run `kimi` in that "
+                "folder with your normal KIMI_CODE_HOME and choose "
+                "'Trust this folder'. CAO inherits the decision, so the prompt "
+                "will not come back for it.\n"
+                f"  option B (broader, every workspace): set "
+                f"{KIMI_TRUST_OPT_IN_ENV}=1 in the cao-server environment and "
+                "restart cao-server. This lets CAO grant trust to whatever "
+                "folder a terminal is launched in, including folders you have "
+                "not reviewed."
+            )
+
+        pane_cwd = None
+        try:
+            pane_cwd = await asyncio.to_thread(
+                get_backend().get_pane_working_directory, self.session_name, self.window_name
+            )
+        except Exception as exc:  # noqa: BLE001 - backend may not implement it
+            logger.debug(
+                "kimi_trust_pane_cwd_unavailable terminal=%s err=%s", self.terminal_id, exc
+            )
+
+        if not pane_cwd or not dialog.workspace:
+            raise ProviderError(
+                "Kimi Code workspace-trust dialog detected but the target folder "
+                "could not be verified, so CAO will not answer it.\n"
+                f"  dialog workspace: {dialog.workspace!r}\n"
+                f"  pane workspace  : {pane_cwd!r}"
+            )
+
+        if self._normalise_workspace(pane_cwd) != self._normalise_workspace(dialog.workspace):
+            raise ProviderError(
+                "Kimi Code workspace-trust dialog is asking about a folder other "
+                "than this terminal's working directory; refusing to answer it.\n"
+                f"  dialog workspace: {dialog.workspace}\n"
+                f"  pane workspace  : {pane_cwd}"
+            )
+
+        if dialog.selected_option is None:
+            raise ProviderError(
+                "Kimi Code workspace-trust dialog detected but no selection marker "
+                f"({kt.TRUST_SELECT_MARKER!r}) could be read; refusing to guess."
+            )
+
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        if dialog.selected_option != kt.TRUST_OPTION_TRUST:
+            target_index = dialog.options.index(kt.TRUST_OPTION_TRUST)
+            current_index = dialog.selected_index
+            if current_index is None or current_index == target_index:
+                raise ProviderError(
+                    "Kimi Code workspace-trust dialog selection could not be "
+                    "navigated deterministically; refusing to guess."
+                )
+            delta = current_index - target_index
+            key = "Up" if delta > 0 else "Down"
+            logger.info(
+                "kimi_trust_navigating terminal=%s from=%s to=%s presses=%d",
+                self.terminal_id,
+                dialog.selected_option,
+                kt.TRUST_OPTION_TRUST,
+                abs(delta),
+            )
+            status_monitor.notify_input_sent(self.terminal_id)
+            for _ in range(abs(delta)):
+                await asyncio.to_thread(
+                    get_backend().send_special_key, self.session_name, self.window_name, key
+                )
+                await asyncio.sleep(0.2)
+
+            verified = False
+            for _ in range(4):
+                await asyncio.sleep(0.3)
+                fresh = await asyncio.to_thread(
+                    get_backend().get_history, self.session_name, self.window_name
+                )
+                if not isinstance(fresh, str):
+                    continue
+                recheck = kt.detect_trust_dialog(fresh.split("\n"))
+                if recheck is not None and recheck.selected_option == kt.TRUST_OPTION_TRUST:
+                    verified = True
+                    break
+            if not verified:
+                raise ProviderError(
+                    "Kimi Code workspace-trust dialog did not move to "
+                    f"'{kt.TRUST_OPTION_TRUST}' after deterministic navigation; "
+                    "refusing to send Enter."
+                )
+
+        logger.info(
+            "kimi_trust_accepting terminal=%s workspace=%s",
+            self.terminal_id,
+            dialog.workspace,
+        )
+        status_monitor.notify_input_sent(self.terminal_id)
+        await asyncio.to_thread(
+            get_backend().send_special_key, self.session_name, self.window_name, "Enter"
+        )
+        self._trust_handled = True
+        return True
+
+    def _build_kimi_command(self, binary: Optional[str] = None) -> str:
         """Build Kimi CLI command with agent profile and MCP config if provided.
 
         Returns properly escaped shell command string for tmux send_keys.
@@ -316,19 +1602,25 @@ class KimiCliProvider(BaseProvider):
 
         The --yolo flag auto-approves all tool actions, which is required for
         non-interactive operation in CAO-managed tmux sessions.
+
+        Args:
+            binary: Absolute path of the ``kimi`` executable resolved by the
+                launch-shell probe. ``initialize()`` always passes it, so the
+                launched file is provably the probed file. The default keeps the
+                bare ``kimi`` token for direct callers and tests, preserving this
+                builder's historical output byte-for-byte.
         """
-        command_parts = ["kimi", "--yolo"]
+        command_parts = [binary or "kimi", "--yolo"]
 
         # Always create a temp directory for this instance.
         # Kimi CLI v1.20.0+ has a per-directory single-instance lock, so each
         # provider instance needs its own working directory.
-        if not self._temp_dir:
-            self._temp_dir = tempfile.mkdtemp(prefix="cao_kimi_")
+        temp_dir = self._ensure_temp_dir()
 
         profile = None
         if self._agent_profile is not None:
             try:
-                profile = load_agent_profile(self._agent_profile)
+                profile = _with_plugin_mcp(load_agent_profile(self._agent_profile), "kimi_cli")
             except Exception as e:
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
 
@@ -351,16 +1643,18 @@ class KimiCliProvider(BaseProvider):
                 # Prepend security constraints for soft enforcement (Kimi CLI has no
                 # native tool restriction mechanism). Only applied when tool
                 # restrictions are active (not unrestricted "*").
-                if self._allowed_tools and "*" not in self._allowed_tools:
+                if self._allowed_tools is not None and "*" not in self._allowed_tools:
                     from cli_agent_orchestrator.constants import SECURITY_PROMPT
+                    from cli_agent_orchestrator.utils.tool_mapping import (
+                        tool_constraint_instruction,
+                    )
 
-                    tools_list = ", ".join(self._allowed_tools)
-                    tool_constraint = f"\nYou only have access to these tools: {tools_list}\n"
+                    tool_constraint = f"\n{tool_constraint_instruction(self._allowed_tools)}\n"
                     system_prompt = SECURITY_PROMPT + tool_constraint + system_prompt
 
                 if system_prompt:
                     # Write the system prompt as a markdown file
-                    prompt_file = os.path.join(self._temp_dir, "system.md")
+                    prompt_file = os.path.join(temp_dir, "system.md")
                     with open(prompt_file, "w") as f:
                         f.write(system_prompt)
 
@@ -373,7 +1667,7 @@ class KimiCliProvider(BaseProvider):
                         "  extend: default\n"
                         "  system_prompt_path: ./system.md\n"
                     )
-                    agent_file = os.path.join(self._temp_dir, "agent.yaml")
+                    agent_file = os.path.join(temp_dir, "agent.yaml")
                     with open(agent_file, "w") as f:
                         f.write(agent_yaml)
 
@@ -409,6 +1703,18 @@ class KimiCliProvider(BaseProvider):
                             env["CAO_TERMINAL_ID"] = self.terminal_id
                             mcp_config[server_name]["env"] = env
 
+                        # Select the declared protocol explicitly rather than
+                        # letting FastMCP infer it from the URL path. `cwd` is
+                        # untouched -- `StdioMCPServer.cwd` honours it.
+                        entry = mcp_config[server_name]
+                        declared = entry.get("type")
+                        translated = (
+                            KIMI_TRANSPORTS.get(declared) if isinstance(declared, str) else None
+                        )
+                        if translated is not None:
+                            entry["transport"] = translated
+                            del entry["type"]
+
                     command_parts.extend(["--mcp-config", json.dumps(mcp_config)])
 
             except Exception as e:
@@ -417,9 +1723,13 @@ class KimiCliProvider(BaseProvider):
                     f"'{self._agent_profile}': {e}"
                 )
 
-        # cd to unique temp dir (per-directory lock) + set TERM for tmux compatibility
+        # cd to unique temp dir (per-directory lock) + set TERM for tmux
+        # compatibility, and drop the ambient 24-bit capability that would move
+        # the renderer off the palette the extractor was measured against
+        # (see KIMI_PALETTE_ENV_UNSET).
         kimi_cmd = shlex.join(command_parts)
-        return f"cd {shlex.quote(self._temp_dir)} && TERM=xterm-256color {kimi_cmd}"
+        unset = " ".join(f"-u {shlex.quote(name)}" for name in KIMI_PALETTE_ENV_UNSET)
+        return f"cd {shlex.quote(temp_dir)} && env {unset} TERM=xterm-256color {kimi_cmd}"
 
     @classmethod
     def _ensure_mcp_timeout(cls) -> None:
@@ -492,13 +1802,19 @@ class KimiCliProvider(BaseProvider):
     async def _handle_startup_dialog(
         self, idle_gap: Optional[float] = None, outer_timeout: Optional[float] = None
     ) -> None:
-        """Dismiss kimi's startup upgrade-reminder dialog if it appears.
+        """Dismiss kimi's startup dialogs if they appear.
+
+        Two dialog classes are handled here:
+
+        1. The upgrade-reminder dialog (both dialects): polls the pane for the
+           interactive "[s] Skip reminders for version X" menu and answers 's' so
+           kimi can proceed to its ready prompt.
+        2. The Kimi Code workspace-trust dialog (``KimiDialect.CODE`` only),
+           delegated to :meth:`_handle_trust_dialog`, which positively
+           identifies the dialog and the folder before sending any key.
 
         Mirrors ClaudeCodeProvider._handle_startup_prompts (once PR #451 lands):
-        polls the pane for the interactive "[s] Skip reminders for version X"
-        menu and answers 's' so kimi can proceed to its ready prompt. Exits
-        early if kimi is already ready (no newer version → no dialog), so a
-        no-update start isn't delayed.
+        exits early if kimi is already ready (no dialog → no delay).
 
         issue #494: this is a real coroutine, not sync code called from an
         async caller. This method is awaited directly from initialize(), which
@@ -553,6 +1869,18 @@ class KimiCliProvider(BaseProvider):
             )
             if output:
                 clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
+                # Kimi Code raises a workspace-trust dialog for ANY untrusted
+                # cwd, even with no project MCP files, and its default selection
+                # is "Trust this folder". Answer it only through the positive
+                # identification in _handle_trust_dialog — never a blind Enter —
+                # and only when the operator has opted in (A3-5); otherwise that
+                # method raises instead of granting.
+                if self._dialect is KimiDialect.CODE and not self._trust_handled:
+                    if await self._handle_trust_dialog(output):
+                        any_prompt_handled = True
+                        last_prompt_time = time.monotonic()  # reset idle timer
+                        await asyncio.sleep(0.5)
+                        continue
                 # Answer the upgrade dialog once; its text lingers in the buffer
                 # after dismissal, so the flag stops a re-answer on later polls.
                 if not upgrade_dismissed and re.search(UPGRADE_PROMPT_PATTERN, clean_output):
@@ -624,8 +1952,24 @@ class KimiCliProvider(BaseProvider):
         if not await wait_for_shell(self.terminal_id, timeout=init_timeout):
             raise TimeoutError(f"Shell initialization timed out after {init_timeout}s")
 
+        # Resolve the dialect from the launch shell's own `kimi`. This runs
+        # BEFORE the launch because the two dialects need different commands
+        # (different MCP mechanism, different agent file format, different
+        # cwd contract). A failure here raises UnsupportedKimiError and the
+        # terminal is not launched at all — never a silent legacy fallback.
+        probe = await self._resolve_dialect()
+
         # Build properly escaped command string
-        command = await asyncio.to_thread(self._build_kimi_command)
+        if probe.dialect is KimiDialect.CODE:
+            command = await asyncio.to_thread(self._build_kimi_code_command)
+        else:
+            command = await asyncio.to_thread(self._build_kimi_command, probe.binary)
+
+        # The launch line is POSIX text that quotes the operator's own paths,
+        # model names and resolved binary. Hand it to /bin/sh via a CAO-owned
+        # script so the pane's shell — which may be fish, zsh, or anything else —
+        # never has to parse POSIX quoting it may not share.
+        command = await asyncio.to_thread(self._materialize_launch_command, command)
 
         # Send Kimi command to the tmux window
         await asyncio.to_thread(
@@ -649,6 +1993,23 @@ class KimiCliProvider(BaseProvider):
 
         self._initialized = True
         return True
+
+    def _spinner_semantics(self) -> "kt.SpinnerSemantics":
+        """The spinner rules for the dialect this terminal resolved to.
+
+        A0 measured that a bare moon phase means "working" on the legacy TUI but
+        appears only in Kimi Code's *idle* rotating tip, where the live indicator
+        is braille. Reading a moon as work under Kimi Code would pin a settled
+        terminal at PROCESSING (and would drop a legitimate `🌕` line out of an
+        answer), so the two dialects must not share one rule.
+
+        Falls back to the legacy rules when no dialect has been resolved yet —
+        the same default the classifier uses, so an un-probed terminal behaves
+        exactly as it did before this change.
+        """
+        if self._dialect is KimiDialect.CODE:
+            return kt.SpinnerSemantics.CODE
+        return kt.SpinnerSemantics.LEGACY
 
     def get_status(self, output: str) -> TerminalStatus:
         """Get Kimi CLI status by analyzing terminal output.
@@ -701,13 +2062,18 @@ class KimiCliProvider(BaseProvider):
         # tokens") that is cleared on completion. Gate on the new-TUI markers so
         # legacy (emoji-prompt) builds keep the path below unchanged.
         if re.search(NEW_TUI_STATUS_PATTERN, clean_output):
-            # A "•" bullet appears only once a turn produces output (thinking or
-            # response); the welcome banner / update nag have none. Latch it so a
-            # long response that scrolls the bullets out of the rolling buffer
-            # still reads COMPLETED rather than IDLE. Crucially, nothing latches
-            # at init, so a freshly-launched terminal reads IDLE (not COMPLETED),
-            # avoiding a premature-completion race when the first task is sent.
-            if re.search(ANY_BULLET_PATTERN, clean_output):
+            # A response bullet appears only once a turn produces output
+            # (thinking or response); the welcome banner / update nag have none.
+            # Latch it so a long response that scrolls the bullets out of the
+            # rolling buffer still reads COMPLETED rather than IDLE. Crucially,
+            # nothing latches at init, so a freshly-launched terminal reads IDLE
+            # (not COMPLETED), avoiding a premature-completion race when the
+            # first task is sent.
+            #
+            # The shared helper requires a bullet *plus a payload*, so a wrapped
+            # status-bar fragment (`●)`) does not latch a terminal that never
+            # received input (A3-1).
+            if kt.has_response_marker(clean_output):
                 self._has_received_input = True
 
             # PROCESSING vs ready. A spinner-vs-status-bar position compare is
@@ -731,12 +2097,13 @@ class KimiCliProvider(BaseProvider):
             #   window (a finished turn always ends with bullets as the
             #   freshest non-chrome content).
             lines = clean_output.splitlines()
+            semantics = self._spinner_semantics()
             last_spinner = max(
-                (i for i, line in enumerate(lines) if _is_live_turn_spinner_line(line)),
+                (i for i, line in enumerate(lines) if _is_live_turn_spinner_line(line, semantics)),
                 default=-1,
             )
             last_bullet = max(
-                (i for i, line in enumerate(lines) if BULLET_LINE_PATTERN.match(line)),
+                (i for i, line in enumerate(lines) if kt.is_response_marker_line(line)),
                 default=-1,
             )
             spinner_in_tail = last_spinner >= 0 and last_spinner >= len(lines) - 15
@@ -770,7 +2137,10 @@ class KimiCliProvider(BaseProvider):
                         tail_lines=25,
                         strip_escapes=True,
                     )
-                    if any(_is_live_turn_spinner_line(line) for line in pane_tail.splitlines()):
+                    if any(
+                        _is_live_turn_spinner_line(line, semantics)
+                        for line in pane_tail.splitlines()
+                    ):
                         return TerminalStatus.PROCESSING
                 except Exception:
                     # Pane unavailable (deleted window, backend hiccup) —
@@ -844,6 +2214,61 @@ class KimiCliProvider(BaseProvider):
     # Opt in to pyte rendered-screen detection (gated by CAO_PYTE_STATUS).
     supports_screen_detection = True
 
+    supports_direct_status_probe = True
+    requires_execution_evidence = True
+
+    def has_execution_evidence(self, current_turn_output: str) -> bool:
+        """Accept only transient activity observed in the awaiting generation.
+
+        Like MiniMax's stale-redraw guard, a fresh byte-buffer epoch does not
+        make retained completion current. Kimi has no distinct completion ID:
+        answers, tool calls, reasoning and submitted prompts can all be redrawn
+        from an older turn. None establish activity, even after buffer clear.
+
+        Callers supply post-clear bytes, including the monitor observation
+        before rolling-buffer eviction. A live spinner
+        (including legacy's processing indicator) proves activity; retaining it
+        accepts processing followed by completion in one burst or later probes.
+        Generic status/capture-pane parsing never updates this state.
+        """
+        if not self._awaiting_turn:
+            return self._execution_observed
+
+        # Pipe-pane emits cursor positioning and carriage-return redraws, not
+        # just capture-pane rows. Normalize those into logical lines while
+        # retaining SGR: answer styling and private/fenced ownership must still
+        # prevent quoted spinner text from claiming activity.
+        if self.execution_evidence_ambiguous:
+            return False
+        rows = kt.normalize_activity_rows(current_turn_output)
+        # A pipe chunk can end anywhere in a row: even a bare spinner may
+        # still grow into boot chrome or an idle tip. Only completed logical
+        # rows can establish irreversible activity. Normalization preserves
+        # newline, carriage-return redraw and cursor-to-row-start boundaries;
+        # SGR changes and end-of-chunk are not row boundaries. The monitor
+        # retains the unfinished suffix and supplies it again with later bytes.
+        rows = rows.rpartition("\n")[0]
+        kinds = kt.classify_lines(rows, self._spinner_semantics(), include_unclosed_fences=True)
+        if any(kind is kt.KimiLineKind.LIVE_SPINNER for _, _, kind in kinds):
+            self._turn_activity_seen = True
+        if self._turn_activity_seen:
+            self._execution_observed = True
+            self._awaiting_turn = False
+        return self._execution_observed
+
+    def observe_execution_output(self, output: str, epoch: int, *, truncated: bool) -> None:
+        """Observe generation bytes under the monitor lock, BEFORE eviction.
+
+        Never parse a cropped suffix as a new transcript: its missing prefix
+        could own a quoted spinner. If we lose context before seeing activity,
+        leave acceptance unconfirmed and disallow an unsafe full resend.
+        """
+        if epoch != self._status_buffer_epoch or not self._awaiting_turn:
+            return
+        self.has_execution_evidence(output)
+        if truncated and not self._execution_observed:
+            self.execution_evidence_ambiguous = True
+
     def get_status_from_screen(self, screen_lines: List[str]) -> TerminalStatus:
         """Detect status from a pyte-composited viewport (escape-free rows).
 
@@ -868,40 +2293,37 @@ class KimiCliProvider(BaseProvider):
         # the connecting state as PROCESSING so init waits for a real ready
         # prompt.
         #
-        # Scan only NON-bullet lines. This boot chrome renders in the status-bar
-        # / spinner region (braille-prefixed status lines, the "connecting to mcp
-        # servers" progress line), never as a "•" response bullet. Searching the
-        # whole composited screen would re-strand a genuinely COMPLETED turn as
-        # PROCESSING whenever its response text merely MENTIONS "(connecting)" /
-        # "connecting to mcp servers" — plausible in an MCP orchestrator — and
-        # since the boot gate precedes the ready check and re-fires on every
-        # settled frame, the inbox (delivers only on IDLE/COMPLETED) would then
-        # never deliver to that terminal.
-        if any(
-            re.search(r"connecting to mcp servers|\(connecting\)", ln, re.IGNORECASE)
-            for ln in rows
-            if not re.match(r"\s*•", ln)
-        ):
+        # Two things changed here (A3-2 / A3-3):
+        #
+        # * The row shape is matched STRUCTURALLY by the shared classifier
+        #   (`MCP_BOOT_ROW_RE`, whole-row anchored) instead of by a substring
+        #   search. A substring search gated on plain assistant prose —
+        #   "connecting to mcp servers is only a phrase" is an answer line.
+        # * Response rows are excluded through the shared bullet semantics,
+        #   which cover both dialects' glyphs. The previous `re.match(r"\s*•")`
+        #   excluded only the legacy `•`, so a Kimi Code answer whose `●` row
+        #   mentioned the boot chrome re-stranded a genuinely COMPLETED terminal
+        #   at PROCESSING on every settled frame — and since the boot gate
+        #   precedes the ready check, the inbox (delivers only on IDLE/COMPLETED)
+        #   then never delivered to that terminal.
+        if any(kt.MCP_BOOT_ROW_RE.match(ln) for ln in rows if not kt.is_response_marker_line(ln)):
             return TerminalStatus.PROCESSING
 
         # Newest "Kimi Code" TUI: readiness is the status bar / context footer.
         if re.search(NEW_TUI_STATUS_PATTERN, joined):
-            if any(_is_live_turn_spinner_line(ln) for ln in tail):
+            semantics = self._spinner_semantics()
+            if any(_is_live_turn_spinner_line(ln, semantics) for ln in tail):
                 return TerminalStatus.PROCESSING
             if re.search(ERROR_PATTERN, joined, re.MULTILINE):
                 return TerminalStatus.ERROR
             return (
-                TerminalStatus.COMPLETED
-                if re.search(ANY_BULLET_PATTERN, joined)
-                else TerminalStatus.IDLE
+                TerminalStatus.COMPLETED if kt.has_response_marker(joined) else TerminalStatus.IDLE
             )
 
         # Legacy emoji-prompt TUI: bare ✨/💫 prompt visible at the bottom.
         if any(re.search(IDLE_PROMPT_PATTERN, ln) for ln in tail):
             return (
-                TerminalStatus.COMPLETED
-                if re.search(ANY_BULLET_PATTERN, joined)
-                else TerminalStatus.IDLE
+                TerminalStatus.COMPLETED if kt.has_response_marker(joined) else TerminalStatus.IDLE
             )
 
         if re.search(ERROR_PATTERN, joined, re.MULTILINE):
@@ -947,24 +2369,80 @@ class KimiCliProvider(BaseProvider):
         raw_lines = script_output.split("\n")
         clean_lines = clean_output.split("\n")
 
+        # Strategy 0 (layout-driven, Kimi Code): the newest TUI renders the
+        # transcript ABOVE a persistent composer, so "everything after the last
+        # input box" anchors on the composer and extracts the STATUS FOOTER as
+        # the answer. Measured on the 0.43.1 captures: the legacy rule returns
+        # `A0 Gemini 2.5 Flash thinking  <dir>  master [±]  shift-tab to Plan
+        # mode …` — 173 characters of pure chrome — for a completed turn whose
+        # real answer is `STEP 1 … A0-FIXTURE-DONE.`.
+        #
+        # The layout is self-describing, so the region is located from the
+        # classifier's own row kinds instead of from box-drawing positions:
+        # start after the last USER_INPUT echo (its wrapped continuation rows
+        # included), end where the composer, a dialog, or the status footer
+        # begins. Returns None when the pane shows no echo at all (legacy
+        # emoji-prompt TUIs, boot screens), which keeps the historical rules
+        # below in sole charge of those shapes.
+        #
+        # Kinds are computed ONCE for the whole capture by the shared
+        # sequence-aware classifier. The extractor must not re-derive context
+        # from a slice: a tool-payload row carries no marker of its own, so the
+        # header that identifies it has to be in scope (D6).
+        row_kinds = kt.classify_rows(raw_lines, clean_lines, self._spinner_semantics())
+        layout_region = self._locate_response_region(row_kinds, raw_lines)
+        if layout_region is not None:
+            layout_start, layout_end = layout_region
+            return self._collect_response_text(
+                raw_lines, clean_lines, layout_start, layout_end, row_kinds
+            )
+
         # Strategy 1: Find the last user input box end line (╰─) — pre-v1.20.0
+        #
+        # A *legacy* anchor, kept for the legacy dialect only. `╰─` is a text
+        # shape, and Kimi Code draws the same border in its own private payload
+        # and around its own composer — reproduced: a shallow CODE capture of
+        # `dim payload / ╰──╯ / dim payload / colour-253 answer` published
+        # `PRIVATE_PAYLOAD\n● PUBLIC` through both the extractor and
+        # `get_output(LAST)`, and the wide and undimmed spellings did the same.
+        # The defect is the anchor's *authority*, not one glyph spelling. CODE
+        # has its own dialect, its own current-turn region
+        # (`_locate_response_region`), its own submission evidence (Strategy 2,
+        # colour-checked) and its own retryable unanchored fallback, so a legacy
+        # text anchor must not establish a submitted-turn boundary there.
         box_end_idx = None
-        # Only consider box-end lines that come AFTER the welcome banner.
-        # The welcome banner itself has ╰─, so we skip it by finding the
-        # welcome banner line first.
-        welcome_idx = 0
-        for i, line in enumerate(clean_lines):
-            if re.search(WELCOME_BANNER_PATTERN, line):
-                welcome_idx = i
-        for i in range(welcome_idx + 1, len(clean_lines)):
-            if re.search(USER_INPUT_BOX_END_PATTERN, clean_lines[i]):
-                box_end_idx = i
+        if self._dialect is not KimiDialect.CODE:
+            # Only consider box-end lines that come AFTER the welcome banner.
+            # The welcome banner itself has ╰─, so we skip it by finding the
+            # welcome banner line first.
+            welcome_idx = 0
+            for i, line in enumerate(clean_lines):
+                if re.search(WELCOME_BANNER_PATTERN, line):
+                    welcome_idx = i
+            for i in range(welcome_idx + 1, len(clean_lines)):
+                if re.search(USER_INPUT_BOX_END_PATTERN, clean_lines[i]):
+                    box_end_idx = i
 
         # Strategy 2: Find the last prompt-with-input line — v1.20.0+
+        #
+        # The pattern is a *text* anchor, and its text is exactly what Kimi Code
+        # draws private payload with: a dimmed `✨ …` row inside tool output
+        # ANSI-strips to the same shape as a real submission. Under CODE the
+        # renderer marks a submission with its own colour, so a match that is not
+        # a positively identified submission is not an anchor — reproduced, a
+        # shallow capture of `ESC[2m✨ …` + dimmed payload published the payload
+        # after a single fetch. With no qualifying anchor the capture falls
+        # through to `_extract_without_input_box`, which demands renderer-evidenced
+        # answer text and otherwise lets the caller widen.
         prompt_input_idx = None
         for i, line in enumerate(clean_lines):
-            if re.search(PROMPT_WITH_INPUT_PATTERN, line):
-                prompt_input_idx = i
+            if not re.search(PROMPT_WITH_INPUT_PATTERN, line):
+                continue
+            if self._dialect is KimiDialect.CODE and not kt.is_user_input_start(
+                raw_lines[i], line, kt.SpinnerSemantics.CODE
+            ):
+                continue
+            prompt_input_idx = i
 
         # Choose the best anchor: the LATEST marker wins. The newest "Kimi
         # Code" TUI draws decorative ╰─ boxes during boot (its own welcome box
@@ -981,7 +2459,7 @@ class KimiCliProvider(BaseProvider):
             response_start = prompt_input_idx + 1
         else:
             # Neither marker found — long response scrolled everything out
-            return self._extract_without_input_box(raw_lines, clean_lines)
+            return self._extract_without_input_box(raw_lines, clean_lines, row_kinds)
 
         # Find where the response ends: the next bare idle prompt
         # (legacy/v1.20 TUIs), or the newest-TUI footer chrome — the
@@ -1012,38 +2490,253 @@ class KimiCliProvider(BaseProvider):
         ]
 
         if not all_response_lines:
-            raise ValueError("Empty Kimi CLI response - no content found after input")
+            # The anchor landed on nothing. That is a missed anchor — retryable —
+            # unless the capture itself holds content that must never be
+            # republished, in which case escalating would only reach the raw
+            # fallback with that content inside it.
+            self._reject_private_content(row_kinds, has_answers=False)
+            raise OutputExtractionError(
+                "Empty Kimi CLI response - no content found after the input marker"
+            )
 
-        # Filter out thinking bullets and status bar lines.
-        # Thinking bullets have gray ANSI color (38;5;244) in the raw output.
-        filtered_lines = []
-        for i in range(response_start, response_end):
-            raw_line = raw_lines[i] if i < len(raw_lines) else ""
+        return self._collect_response_text(
+            raw_lines, clean_lines, response_start, response_end, row_kinds
+        )
+
+    @staticmethod
+    def _locate_response_region(
+        kinds: List[kt.KimiLineKind],
+        raw_lines: Optional[List[str]] = None,
+    ) -> Optional[Tuple[int, int]]:
+        """Locate the response region from row kinds alone.
+
+        Returns ``(start, end)`` as a half-open slice, or ``None`` when the pane
+        carries no user-input echo (in which case there is nothing to anchor on
+        and the caller falls back to the historical box/prompt rules).
+
+        The end anchor is the first row after the echo that belongs to the
+        ready frame, a dialog, or the footer — in the Kimi Code layout the
+        composer sits *below* the transcript, so the transcript's own end is
+        exactly where that chrome starts. Falling through to end-of-capture
+        keeps a pane whose composer was pushed out of the capture window
+        working.
+
+        ``BOOT_CHROME`` is the one anchor that also needs to be *shaped* like boot
+        chrome. Its weakest escape-free form is bare prose — `Loading
+        configuration...` — and an answer that quotes one (a shell heredoc was
+        the reproduced case) would otherwise end the region and truncate the
+        answer at that line. The renderer draws its boot rows with the spinner
+        slot and its own colour, so a row anchors only when it carries the
+        braille indicator glyph or an SGR sequence. The other anchors are already
+        confirmed structurally: a composer needs its frame, a dialog needs the
+        whole dialog, and the footer is measured text.
+        """
+
+        echo_idx = -1
+        for index, kind in enumerate(kinds):
+            if kind is kt.KimiLineKind.USER_INPUT:
+                echo_idx = index
+        if echo_idx < 0:
+            return None
+
+        end_anchors = (
+            kt.KimiLineKind.READY_INPUT_FRAME,
+            kt.KimiLineKind.APPROVAL_DIALOG,
+            kt.KimiLineKind.TRUST_DIALOG,
+            kt.KimiLineKind.STATUS_FOOTER,
+        )
+        for index in range(echo_idx + 1, len(kinds)):
+            kind = kinds[index]
+            if kind is kt.KimiLineKind.BOOT_CHROME:
+                raw = raw_lines[index] if raw_lines and index < len(raw_lines) else ""
+                if not KimiCliProvider._boot_chrome_is_shaped(raw, kt.strip_sgr(raw)):
+                    continue
+            elif kind not in end_anchors:
+                continue
+            return echo_idx + 1, index
+        return echo_idx + 1, len(kinds)
+
+    def _classify_response_region(
+        self,
+        raw_lines: List[str],
+        clean_lines: List[str],
+        start: int,
+        end: int,
+        kinds: Optional[List[kt.KimiLineKind]] = None,
+    ) -> Tuple[List[str], List[kt.KimiLineKind]]:
+        """Classify the candidate rows of a response region.
+
+        Returns the assistant-visible text (only rows the shared classifier
+        places in ``ANSWER_KINDS``) alongside every non-blank row's kind, so the
+        caller can tell "nothing was recognised" apart from "everything was
+        reasoning".
+
+        ``kinds`` is the whole-capture result of the shared sequence-aware
+        classifier (``classify_rows``); the region is a *slice* of it. Passing
+        the full-sequence kinds is what lets a tool payload row inside the
+        region be recognised as payload rather than as an indented prose
+        continuation. It is computed here only when the caller had no
+        whole-capture kinds to give.
+        """
+
+        if kinds is None:
+            kinds = kt.classify_rows(raw_lines, clean_lines, self._spinner_semantics())
+
+        # ``mode=LAST`` means the settled answer for this turn, not every
+        # publishable assistant sentence that happened during it.  Kimi Code may
+        # render a short assistant preamble ("I'll call the tool …") before a
+        # tool header, then render the actual answer after the tool finishes.
+        # Treating the whole region as one answer returned both rows.  When a
+        # tool was used, the final response segment therefore begins *after the
+        # last tool call*.  A turn with no tool call keeps the historical
+        # behaviour and may legitimately contain several answer bullets/lines.
+        last_tool_index: Optional[int] = None
+        for i in range(start, end):
+            if i < len(kinds) and kinds[i] is kt.KimiLineKind.TOOL_CALL:
+                last_tool_index = i
+
+        publish_start = start if last_tool_index is None else last_tool_index + 1
+
+        answers: List[str] = []
+        region_kinds: List[kt.KimiLineKind] = []
+        for i in range(start, end):
             clean_line = clean_lines[i] if i < len(clean_lines) else ""
-
-            # Skip empty lines
-            if not clean_line.strip():
+            kind = kinds[i] if i < len(kinds) else kt.KimiLineKind.BLANK
+            if kind is kt.KimiLineKind.BLANK:
                 continue
+            if kind is kt.KimiLineKind.BOOT_CHROME and not self._boot_chrome_is_shaped(
+                raw_lines[i] if i < len(raw_lines) else "", clean_line
+            ):
+                # Inside the response region a boot *message* that the renderer
+                # did not draw as boot chrome — no spinner slot, no styling — is
+                # answer text. The reproduced case is a shell heredoc whose body
+                # is `Loading configuration...`, which was dropped from the
+                # extracted script. Real boot rows carry the slot and colour.
+                kind = kt.KimiLineKind.CONTENT
+            region_kinds.append(kind)
+            if i >= publish_start and kind in kt.ANSWER_KINDS:
+                answers.append(clean_line.strip())
+        return answers, region_kinds
 
-            # Skip thinking bullets (identified by gray ANSI color in raw output)
-            if re.search(THINKING_BULLET_RAW_PATTERN, raw_line):
-                continue
+    #: True when a boot-chrome row is drawn as boot chrome: it carries the
+    #: renderer's braille indicator slot or is one of the banner rows. Generic
+    #: styling is *not* enough — a syntax-highlighted code line inside an answer
+    #: is styled too, and a highlighted `Loading configuration...` in a shell
+    #: heredoc was reproduced truncating the script. The boot *message* rows are
+    #: the ones the renderer draws in the spinner slot; the banner rows name
+    #: themselves.
+    @staticmethod
+    def _boot_chrome_is_shaped(raw_line: str, clean_line: str = "") -> bool:
+        return bool(
+            _SPINNER_SLOT_RE.search(raw_line or "") or _BOOT_BANNER_RE.search(clean_line or "")
+        )
 
-            # Skip status bar lines
-            if re.search(STATUS_BAR_PATTERN, clean_line):
-                continue
+    @staticmethod
+    def _reject_private_content(scope_kinds: List[kt.KimiLineKind], *, has_answers: bool) -> None:
+        """Refuse when a capture holds non-publishable content and no answer.
 
-            filtered_lines.append(clean_line.strip())
+        Fail closed on content that must never be republished as an agent's
+        message: private reasoning, and tool-execution plumbing. If the capture
+        holds such a row and the located region holds no publishable answer, the
+        only safe outcome is a refusal — the raw-transcript fallback would
+        republish exactly that content.
 
-        if not filtered_lines:
-            # If all lines were filtered as thinking, fall back to returning
-            # all content. This handles edge cases where the response format
-            # doesn't match expected patterns.
-            return "\n".join(all_response_lines).strip()
+        The decision is made on **content**, and on the whole capture rather than
+        on the located region:
 
-        return "\n".join(filtered_lines).strip()
+        * a chrome row alongside the reasoning used to defeat the old "every row
+          is a thinking bullet" test, and a composer frame could put the reasoning
+          *outside* the located region entirely; both let the retryable error
+          degrade the public path to the raw pane, which contains the reasoning
+          that should have been refused;
+        * conversely, a capture that holds no non-publishable content is not a
+          refusal at all. It is a capture that did not reach far enough — the
+          anchor landed past the answer, or the submitted echo scrolled out — and
+          a wider capture may still hold the answer, so the caller must be free to
+          escalate.
 
-    def _extract_without_input_box(self, raw_lines: list, clean_lines: list) -> str:
+        A capture that holds a positively drawn answer bullet — an
+        ``FINAL_BULLET``, the renderer's own colour-253 ``●`` — is exempt: the
+        region missed it and a wider capture may still hold it, so the caller
+        escalates instead of failing. What is *not* evidence is the answer-kind
+        catch-all. An earlier version exempted any ``ANSWER_KIND``, and
+        answer-shaped is not the same as answer: the shell preamble, the boot
+        banner and the footer's own continuation row all classify as ``CONTENT``.
+        Reproduced on the live 0.43.1/2.0.2 captures: a turn showing the reasoning
+        row plus the trailing ``context: N%`` footer therefore refused nothing,
+        raised the retryable error, exhausted the escalation and published the
+        reasoning inside the raw pane. A publishable answer *in the region* is
+        what makes publication legitimate, and that is exactly
+        :func:`_collect_response_text`'s ``answers`` list.
+
+        Raised as :class:`OutputExtractionRejected` rather than the retryable
+        :class:`OutputExtractionError`, so it is never retried and never replaced
+        by the raw pane.
+        """
+
+        if has_answers:
+            # A real answer is published; the other content is simply excluded.
+            return
+
+        # Every decision below is about the *current* turn.  Scrollback can hold
+        # old reasoning/tool output indefinitely; using the whole capture as
+        # refusal evidence makes a shallow current capture non-retryable merely
+        # because a previous turn was private.  The last positively identified
+        # user echo is the turn boundary already used by response location, so
+        # keep the security decision on the same scope.
+        turn_kinds = _after_last_echo(scope_kinds)
+
+        if any(kind is kt.KimiLineKind.FINAL_BULLET for kind in turn_kinds):
+            # A positively drawn answer bullet *within this turn* means the
+            # capture did not reach far enough, not that the turn produced no
+            # answer: the region missed it and a wider capture may still hold it,
+            # so the caller escalates instead of failing. The scope matters — an
+            # answer bullet from an earlier turn must not exempt a reasoning-only
+            # turn now, which would escalate into the raw pane and disclose the
+            # previous turn's reasoning. Only the answer bullet is exempt; plain
+            # ``CONTENT`` is not evidence, because the shell preamble, the boot
+            # banner and the footer's continuation row all classify that way.
+            return
+        if any(kind in _NON_PUBLISHABLE_KINDS for kind in turn_kinds):
+            raise OutputExtractionRejected(
+                "Kimi returned no final answer for this turn: the capture held only "
+                "reasoning and/or tool-execution output. Refusing to return that "
+                "content as the response."
+            )
+
+    def _collect_response_text(
+        self,
+        raw_lines: List[str],
+        clean_lines: List[str],
+        start: int,
+        end: int,
+        kinds: Optional[List[kt.KimiLineKind]] = None,
+    ) -> str:
+        """Filter a response region down to its assistant-visible text."""
+
+        answers, region_kinds = self._classify_response_region(
+            raw_lines, clean_lines, start, end, kinds
+        )
+        self._reject_private_content(
+            kinds if kinds is not None else region_kinds, has_answers=bool(answers)
+        )
+        if not answers:
+            # No private content was identified either, so this is the retryable
+            # case: the region held only chrome and echoes, which usually means
+            # the anchor did not reach the answer. A wider capture may still have
+            # it, so the caller escalates instead of failing here.
+            raise OutputExtractionError(
+                "No extractable content in Kimi CLI output: every candidate line in "
+                "the response region was TUI chrome or a user echo."
+            )
+        return "\n".join(answers).strip()
+
+    def _extract_without_input_box(
+        self,
+        raw_lines: list,
+        clean_lines: list,
+        kinds: Optional[List[kt.KimiLineKind]] = None,
+    ) -> str:
         """Fallback extraction when user input box has scrolled out of capture.
 
         For long responses (>200 lines), the user input box (╭─/╰─) and early
@@ -1054,6 +2747,7 @@ class KimiCliProvider(BaseProvider):
         Args:
             raw_lines: Raw output split by newlines (ANSI preserved)
             clean_lines: ANSI-stripped output split by newlines
+            kinds: whole-capture result of the shared sequence-aware classifier
 
         Returns:
             Extracted response text
@@ -1068,33 +2762,49 @@ class KimiCliProvider(BaseProvider):
                 prompt_idx = i
                 break
 
-        # Collect content from start to prompt, filtering out TUI chrome
-        filtered_lines = []
-        for i in range(0, prompt_idx):
-            raw_line = raw_lines[i] if i < len(raw_lines) else ""
-            clean_line = clean_lines[i] if i < len(clean_lines) else ""
+        # Kimi Code can expose private continuation rows after their owning
+        # header has scrolled out. Without a submitted-message anchor, arbitrary
+        # leading content is therefore ambiguous — including content that merely
+        # *looks* like an answer bullet. Tool payload is drawn dim and routinely
+        # starts with the answer's bullet, so an unstyled `●` row is not
+        # evidence: reproduced, a shallow capture of
+        # `ESC[2m● PRIVATE_TOOL_PAYLOAD` + a colour-253 answer published the
+        # payload. The marker must carry the renderer's own answer colour, and
+        # otherwise the failure stays retryable so the caller can widen.
+        start_idx = 0
+        if self._dialect is KimiDialect.CODE:
+            final_markers = [
+                index
+                for index in range(prompt_idx)
+                if index < len(raw_lines)
+                and kt.FINAL_ANSWER_BULLET_STYLE_RE.search(raw_lines[index])
+            ]
+            if not final_markers:
+                raise OutputExtractionError(
+                    "Kimi Code capture has no submitted-message anchor or renderer-evidenced "
+                    "final-answer marker; widening is required before channel ownership is known."
+                )
+            start_idx = final_markers[0]
 
-            if not clean_line.strip():
-                continue
+        # Collect content from the proven response boundary through the shared
+        # classifier, so thinking filtering here cannot drift from the main path.
+        answers, region_kinds = self._classify_response_region(
+            raw_lines, clean_lines, start_idx, prompt_idx, kinds
+        )
+        self._reject_private_content(
+            kinds if kinds is not None else region_kinds, has_answers=bool(answers)
+        )
 
-            # Skip thinking bullets
-            if re.search(THINKING_BULLET_RAW_PATTERN, raw_line):
-                continue
+        if not answers:
+            # Reached only when no input marker was found anywhere in the capture,
+            # so this is the "capture too shallow / marker missing" case, not a
+            # refusal about content that was found: it stays retryable.
+            raise OutputExtractionError(
+                "No extractable content in Kimi CLI output (input box scrolled out): "
+                "every candidate line was TUI chrome, a user echo, or reasoning."
+            )
 
-            # Skip status bar
-            if re.search(STATUS_BAR_PATTERN, clean_line):
-                continue
-
-            # Skip welcome banner lines
-            if re.search(WELCOME_BANNER_PATTERN, clean_line):
-                continue
-
-            filtered_lines.append(clean_line.strip())
-
-        if not filtered_lines:
-            raise ValueError("No extractable content in Kimi CLI output (input box scrolled out)")
-
-        return "\n".join(filtered_lines).strip()
+        return "\n".join(answers).strip()
 
     def exit_cli(self) -> str:
         """Get the command to exit Kimi CLI.
@@ -1178,18 +2888,80 @@ class KimiCliProvider(BaseProvider):
             )
             return {}
 
-    def cleanup(self) -> None:
+    def _remove_managed_runtime_home(self) -> bool:
+        """Remove the managed Kimi Code runtime home and prove it is gone.
+
+        ``False`` is a retryable outcome rather than an exception: the caller
+        keeps the terminal's lifecycle metadata so a later DELETE can finish the
+        removal. ``True`` is only returned after the home's absence is
+        re-checked, because a success that leaves the operator's copied
+        credentials on disk is the exact leak this path closes.
+        """
+
+        home = self._managed_runtime_home()
+        if not self._is_managed_runtime_home(home):
+            logger.warning("Refusing to remove non-managed Kimi Code home %s", home)
+            return False
+        try:
+            # ``rmtree`` refuses a symlink root, which is safe but would leave
+            # the managed entry behind. Unlinking the link itself never follows
+            # its target, so a home replaced by a symlink is still removed
+            # without touching whatever it points at.
+            if home.is_symlink():
+                home.unlink()
+            else:
+                shutil.rmtree(home)
+        except FileNotFoundError:
+            # Already absent: the goal state is reached.
+            return True
+        except OSError as exc:
+            logger.warning("Failed to remove Kimi Code runtime home %s: %s", home, exc)
+            return False
+        # Best effort: the terminal directory is CAO-owned and empty once its
+        # home is gone, but a concurrent build for the same terminal may still
+        # be writing there, so a failed empty ``rmdir`` is not an error.
+        try:
+            home.parent.rmdir()
+        except OSError:
+            pass
+        return not home.exists()
+
+    def cleanup(self) -> bool:
         """Clean up Kimi CLI provider resources.
 
-        Removes any temporary files created for agent profiles
-        and resets the initialization state. MCP timeout is NOT restored
-        because multiple Kimi instances may share the config file concurrently.
-        """
-        # Remove temp directory if it was created for agent profile
-        if self._temp_dir:
-            if os.path.exists(self._temp_dir):
-                shutil.rmtree(self._temp_dir, ignore_errors=True)
-            self._temp_dir = None
+        Returns ``True`` only when nothing CAO-managed remains on disk for this
+        terminal.
 
+        The managed-home removal is **not** gated on the dialect. Kimi Code
+        copies the operator's credentials, MCP configuration and Kimi state into
+        a deterministic managed directory, and that is exactly why the path is
+        derived from the terminal id: the provider object is rebuilt from
+        terminal metadata after a cao-server restart, where ``_temp_dir`` is
+        ``None`` and nothing in memory names the directory. Two concrete
+        lifecycle reasons mean the directory can exist while the dialect is
+        unknown or legacy — ``initialize()`` materialises the home before the
+        service persists ``provider_variant`` (a crash in that window leaves a
+        credential-bearing home on a NULL-variant row), and a terminal
+        re-launched under the other dialect keeps the home its earlier CODE
+        launch created. Attempting the removal unconditionally is not a dialect
+        guess: no behaviour is inferred from it, the target is this terminal's
+        own validated path, and the call is a no-op returning ``True`` when no
+        such home exists.
+
+        Scratch includes legacy MCP credentials in kimi-launch.sh, so its
+        removal is also mandatory and recoverable from terminal identity.
+        MCP timeout is not restored because multiple instances share it.
+        """
+        scratch_removed = self._remove_managed_scratch()
+        home_removed = self._remove_managed_runtime_home()
+        if scratch_removed:
+            self._temp_dir = None
+            self._shell_safe_dir = None
         self._initialized = False
         self._has_received_input = False
+        self._execution_observed = False
+        self._awaiting_turn = False
+        self._turn_activity_seen = False
+        self.execution_evidence_ambiguous = False
+        self._status_buffer_epoch = 0
+        return scratch_removed and home_removed

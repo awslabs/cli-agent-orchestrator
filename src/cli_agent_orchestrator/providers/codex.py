@@ -9,6 +9,8 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from cli_agent_orchestrator.agent_plugins.mcp_delivery import with_plugin_mcp as _with_plugin_mcp
+from cli_agent_orchestrator.agent_plugins.mcp_mapping import CODEX_BARE_KEY
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -387,7 +389,10 @@ def _toml_scalar(value: Any) -> str:
 # (mcp_servers.my.srv.command → mcp_servers['my']['srv'], not
 # mcp_servers['my.srv']), so codex would never find the server.
 _CODEX_CONFIG_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
-_CODEX_BARE_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+# One definition, shared with the mapping-time gate that isolates a name Codex
+# cannot express, so the gate and this serializer cannot drift (the same shape
+# already used for MiniMax's `_PLUGIN_SERVER_NAME`).
+_CODEX_BARE_KEY_PATTERN = CODEX_BARE_KEY
 
 
 def _validate_config_key(key: Any, *, source: str, allow_dots: bool = False) -> str:
@@ -880,7 +885,7 @@ class CodexProvider(BaseProvider):
         profile = None
         if self._agent_profile is not None:
             try:
-                profile = load_agent_profile(self._agent_profile)
+                profile = _with_plugin_mcp(load_agent_profile(self._agent_profile), "codex")
             except Exception as e:
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
 
@@ -939,11 +944,13 @@ class CodexProvider(BaseProvider):
             # Prepend security constraints for soft enforcement (Codex has no
             # native tool restriction mechanism). Only applied when tool
             # restrictions are active (not unrestricted "*").
-            if self._allowed_tools and "*" not in self._allowed_tools:
+            if self._allowed_tools is not None and "*" not in self._allowed_tools:
                 from cli_agent_orchestrator.constants import SECURITY_PROMPT
+                from cli_agent_orchestrator.utils.tool_mapping import (
+                    tool_constraint_instruction,
+                )
 
-                tools_list = ", ".join(self._allowed_tools)
-                tool_constraint = f"\nYou only have access to these tools: {tools_list}\n"
+                tool_constraint = f"\n{tool_constraint_instruction(self._allowed_tools)}\n"
                 system_prompt = SECURITY_PROMPT + tool_constraint + system_prompt
 
             if system_prompt:
@@ -1049,12 +1056,31 @@ class CodexProvider(BaseProvider):
                     if "args" in cfg:
                         args_toml = "[" + ", ".join(_toml_scalar(a) for a in cfg["args"]) + "]"
                         command_parts.extend(["-c", f"{prefix}.args={args_toml}"])
+                    # Codex documents `mcp_servers.<id>.cwd` ("Working directory for
+                    # the MCP stdio server process"), so the plugin's directory is
+                    # carried natively here rather than through the /bin/sh shim the
+                    # formats without such a field need. Reported by review
+                    # 5222539218 on #584 (item 4).
+                    if isinstance(cfg.get("cwd"), str) and cfg["cwd"]:
+                        command_parts.extend(["-c", f"{prefix}.cwd={_toml_scalar(cfg['cwd'])}"])
                     if "env" in cfg and cfg["env"]:
-                        for env_key, env_val in cfg["env"].items():
-                            _validate_config_key(env_key, source="mcpServers env")
-                            command_parts.extend(
-                                ["-c", f"{prefix}.env.{env_key}={_toml_scalar(str(env_val))}"]
-                            )
+                        # ONE inline table with QUOTED keys, not one override per key.
+                        #
+                        # The env map lives on the VALUE side of `-c key=value`, which
+                        # Codex parses as a TOML value (it wraps the raw text as
+                        # `_x_ = <raw>`), so an inline table is accepted and a quoted
+                        # key is expressible. Emitting `…env.LOG.LEVEL=` instead put a
+                        # schema-valid key into the PATH, where the dot nests it wrongly
+                        # and `_validate_config_key` raised -- aborting the whole launch
+                        # over one environment variable. Reported by review 5222539218
+                        # on #584 (item 6). `_toml_scalar` renders a TOML basic string,
+                        # which is the same grammar a quoted key uses, so it escapes the
+                        # key safely too. Also drops the per-server override count.
+                        pairs = ", ".join(
+                            f"{_toml_scalar(str(env_key))} = {_toml_scalar(str(env_val))}"
+                            for env_key, env_val in cfg["env"].items()
+                        )
+                        command_parts.extend(["-c", f"{prefix}.env={{ {pairs} }}"])
                     # Forward CAO_TERMINAL_ID so MCP servers (e.g. cao-mcp-server)
                     # can identify the current session for handoff/assign operations.
                     # Codex does not forward env vars to MCP subprocesses by default;

@@ -209,7 +209,7 @@ class TestForgetDeletesSqliteRow:
         )
 
         result = _run(svc.forget(key="del-me", scope="global", terminal_context=ctx))
-        assert result is True
+        assert result.action == "deleted"
 
         from sqlalchemy.orm import sessionmaker
 
@@ -221,7 +221,7 @@ class TestForgetDeletesSqliteRow:
     def test_forget_returns_false_for_missing(self, svc):
         ctx = _make_ctx()
         result = _run(svc.forget(key="nonexistent", scope="global", terminal_context=ctx))
-        assert result is False
+        assert result.action == "absent"
 
 
 # ===========================================================================

@@ -9,16 +9,24 @@ import { MemoryPanel } from './components/MemoryPanel'
 import { ProfilesPanel } from './components/ProfilesPanel'
 import { SettingsPanel } from './components/SettingsPanel'
 import { WorkflowsPanel } from './components/WorkflowsPanel'
+import { PluginsPanel } from './components/PluginsPanel'
+import { PLUGINS_TAB_ENABLED } from './featureFlags'
 import { CaoMark } from './components/CaoMark'
-import { Bot, Home, Clock, Settings, Brain, Workflow, CheckCircle, XCircle, Info, Wifi, WifiOff, Package } from 'lucide-react'
+import { Bot, Home, Clock, Settings, Brain, Workflow, Puzzle, CheckCircle, XCircle, Info, Wifi, WifiOff, Package } from 'lucide-react'
 
-type TabKey = 'home' | 'profiles' | 'agents' | 'flows' | 'settings' | 'memory' | 'workflows'
+type TabKey = 'home' | 'profiles' | 'agents' | 'flows' | 'settings' | 'memory' | 'workflows' | 'plugins'
 
 // Profiles sits between Home and Agents (#510): browsing/authoring profiles
 // precedes launching agents, and AgentPanel stays the launch picker. This was
 // a one-time Alt+N renumbering of the tabs after it; Workflows + Memory remain
 // appended last (Memory is conditional, so keeping it last stops the numbering
 // of the always-visible tabs shifting with the memory backend's status).
+//
+// Plugins is appended after them, always. Alt+N numbers the VISIBLE tabs in
+// array order, so inserting anywhere but the end renumbers every shortcut after
+// the insertion point — which is why Memory, then Workflows, then Plugins each
+// went last rather than into a "logical" slot. (Agent Plugins, not the
+// event-plugin system — see docs/agent-plugins.md.)
 const TABS: { key: TabKey; label: string; icon: React.ReactNode }[] = [
   { key: 'home', label: 'Home', icon: <Home size={16} /> },
   { key: 'profiles', label: 'Profiles', icon: <Package size={16} /> },
@@ -27,6 +35,7 @@ const TABS: { key: TabKey; label: string; icon: React.ReactNode }[] = [
   { key: 'settings', label: 'Settings', icon: <Settings size={16} /> },
   { key: 'memory', label: 'Memory', icon: <Brain size={16} /> },
   { key: 'workflows', label: 'Workflows', icon: <Workflow size={16} /> },
+  { key: 'plugins', label: 'Plugins', icon: <Puzzle size={16} /> },
 ]
 
 function Snackbar() {
@@ -83,7 +92,12 @@ export default function App() {
   // rather than silently ignoring clicks.
   const navLocked = useStore(s => s.navLockCount > 0)
 
-  const visibleTabs = TABS.filter(t => t.key !== 'memory' || memoryEnabled)
+  // Two independent gates, both fail-closed. Memory is a runtime capability
+  // check; Plugins is the build-time M1 gate (Requirement 16.5) and mirrors
+  // `hidden=True` on the Click group and `Policy::Hidden` on the TUI rows.
+  const visibleTabs = TABS.filter(
+    t => (t.key !== 'memory' || memoryEnabled) && (t.key !== 'plugins' || PLUGINS_TAB_ENABLED)
+  )
 
   useEffect(() => {
     fetchSessions()
@@ -186,6 +200,7 @@ export default function App() {
             {tab === 'settings' && <SettingsPanel />}
             {tab === 'memory' && <MemoryPanel />}
             {tab === 'workflows' && <WorkflowsPanel />}
+            {tab === 'plugins' && PLUGINS_TAB_ENABLED && <PluginsPanel />}
           </Suspense>
         </ErrorBoundary>
       </main>

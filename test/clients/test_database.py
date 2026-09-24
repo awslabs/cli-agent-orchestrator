@@ -1693,6 +1693,7 @@ class TestTerminalsSchemaMigration:
             rows = conn.execute("SELECT id, caller_id, working_directory FROM terminals").fetchall()
         assert "caller_id" in columns
         assert "working_directory" in columns
+        assert "provider_variant" in columns
         assert rows == [("abc12345", None, None)], "existing rows must get NULL metadata values"
 
     def test_migration_is_idempotent(self, tmp_path, monkeypatch):
@@ -1723,6 +1724,7 @@ class TestTerminalsSchemaMigration:
         assert columns.count("caller_id") == 1
         assert columns.count("working_directory") == 1
         assert columns.count("allowed_tools") == 1
+        assert columns.count("provider_variant") == 1
 
     def test_group_and_metadata_columns_added_to_legacy_table(self, tmp_path, monkeypatch):
         """#432: a pre-existing terminals table (predating group/metadata) gains both
@@ -1873,6 +1875,7 @@ class TestTerminalsSchemaMigration:
                 assert row is not None
                 assert row["group"] is None, "pre-migration rows must read group as NULL"
                 assert row["metadata"] is None, "pre-migration rows must read metadata as NULL"
+                assert row["provider_variant"] is None
 
             # Original pre-migration data must survive untouched.
             assert aaaa["tmux_session"] == "cao-sess-1"
@@ -1893,6 +1896,7 @@ class TestTerminalsSchemaMigration:
             columns = [row[1] for row in conn.execute("PRAGMA table_info(terminals)")]
         assert columns.count("group") == 1
         assert columns.count("metadata") == 1
+        assert columns.count("provider_variant") == 1
 
 
 class TestTerminalMetadataRoundTrip:

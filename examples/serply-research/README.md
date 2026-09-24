@@ -58,7 +58,7 @@ cao install examples/serply-research/serply_researcher.md \
   --env SERPLY_API_KEY=your-serply-api-key
 
 # 2. Launch it
-cao launch serply_researcher
+cao launch --agents serply_researcher
 ```
 
 To rotate the key later, use `cao env set SERPLY_API_KEY new-value`. There is

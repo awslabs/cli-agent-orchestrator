@@ -1,0 +1,50 @@
+export KIMI_CODE_HOME=<A0DIR>/kimi-home-A
+[<USER>@<HOST> project]$ export KIMI_CODE_HOME=<A0DIR>/kimi-home-A
+[<USER>@<HOST> project]$ TERM=xterm-256color kimi
+
+ [38;5;111m╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮[39m
+ [38;5;111m│[39m                                                                                                                                                                                                    [38;5;111m│[39m
+ [38;5;111m│[39m  [38;5;111m▐█▛█▛█▌[39m  [1m[38;5;111mWelcome to Kimi Code![0m                                                                                                                                                                    [38;5;111m│[39m
+ [38;5;111m│[39m  [38;5;111m▐█████▌[39m  [38;5;244mSend /help for help information.[39m                                                                                                                                                         [38;5;111m│[39m
+ [38;5;111m│[39m                                                                                                                                                                                                    [38;5;111m│[39m
+ [38;5;111m│[39m  [1m[38;5;244mDirectory: [0m<A0DIR>/project                                                                                                                                               [38;5;111m│[39m
+ [38;5;111m│[39m  [1m[38;5;244mSession:   [0msession_<UUID>                                                                                                                                           [38;5;111m│[39m
+ [38;5;111m│[39m  [1m[38;5;244mModel:     [0mA0 Gemini 2.5 Flash                                                                                                                                                                    [38;5;111m│[39m
+ [38;5;111m│[39m  [1m[38;5;244mVersion:   [0m<KIMI_VERSION>                                                                                                                                                                                 [38;5;111m│[39m
+ [38;5;111m│[39m  [1m[38;5;244mMCP:       [0m1 connected                                                                                                                                                                            [38;5;111m│[39m
+ [38;5;111m│[39m                                                                                                                                                                                                    [38;5;111m│[39m
+ [38;5;111m╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯[39m
+
+ [1m[38;5;111m✦ Try Kimi Code Web UI[0m [1m[38;5;255m- clearer task progress, visual sessions & settings management[0m
+   [38;5;244mRun /web to continue your session in the browser[39m
+
+   [38;5;244mNo session yet — one will be created on your first message.[39m
+   [38;5;215mtmux extended-keys is off. Modified Enter keys may not work. Add `set -g extended-keys on` to ~/.tmux.conf and restart tmux.[39m
+   [38;5;114mMCP server "a0probe" connected · 1 tool (stdio)[39m
+
+ [1m[38;5;222m✨ List the numbers 1 to 5, one per line, each prefixed with the word STEP. Then on a final line reply exactly A0-FIXTURE-DONE.[0m
+
+ [38;5;244m● [3m**Generating Fixture List**[0m
+
+   [2m… (3 more lines, ctrl+o to expand)[0m
+
+ [38;5;253m● [39mSTEP 1
+   STEP 2
+   STEP 3
+   STEP 4
+   STEP 5
+   A0-FIXTURE-DONE.
+
+ [38;5;240m╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮[39m
+ [38;5;240m│[39m > [7m [0m                                                                                                                                                                                                [38;5;240m│[39m
+ [38;5;240m╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯[39m
+ [38;5;253mA0 Gemini 2.5 Flash thinking[39m  [38;5;244m<A0DIR>/project[39m  [38;5;244mmaster [±][39m                       [38;5;242mshift-tab to Plan mode to review the approach before Kimi edits files. | /model: switch model[39m
+                                                                                                                                                                               [38;5;253mcontext: 2% (14.8k/977k)[39m
+
+
+
+
+
+
+
+
