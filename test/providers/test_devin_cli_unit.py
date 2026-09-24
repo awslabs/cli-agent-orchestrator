@@ -1,5 +1,6 @@
 """Unit tests for Devin CLI provider."""
 
+import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -277,9 +278,11 @@ class TestDevinCliToolRestrictions:
         """Security constraint is prepended before the profile system prompt."""
         mock_profile = MagicMock()
         mock_profile.system_prompt = "You are a helpful assistant."
+        mock_profile.mcpServers = None
+        mock_profile.container = None
 
         with patch(
-            "cli_agent_orchestrator.utils.agent_profiles.load_agent_profile",
+            "cli_agent_orchestrator.providers.devin_cli.load_agent_profile",
             return_value=mock_profile,
         ):
             provider = DevinCliProvider(
@@ -350,3 +353,109 @@ class TestDevinCliProviderRegistration:
         assert "fs_read" in mapping
         assert "fs_write" in mapping
         assert "fs_list" in mapping
+
+
+class TestDevinCliMcpDelivery:
+    """MCP servers are delivered via ``.devin/mcp_config.local.json``.
+
+    Devin CLI >= v3000.3 discovers servers only from the dedicated mcp_config
+    files; ``--config`` overrides the main settings file and cannot carry them.
+    """
+
+    def _provider_in(self, tmp_path, monkeypatch):
+        workdir = tmp_path / "repo"
+        workdir.mkdir()
+        monkeypatch.setattr(DevinCliProvider, "_terminal_workdir", lambda self: workdir)
+        return DevinCliProvider("test1234", "test-session", "window-0"), workdir
+
+    def test_stdio_server_written_to_project_local_config(self, tmp_path, monkeypatch):
+        provider, workdir = self._provider_in(tmp_path, monkeypatch)
+
+        provider._deliver_mcp_servers(
+            {
+                "tools": {
+                    "type": "stdio",
+                    "command": "demo-server",
+                    "args": ["--serve"],
+                    "env": {"API_KEY": "k"},
+                }
+            }
+        )
+
+        config_path = workdir / ".devin" / "mcp_config.local.json"
+        entry = json.loads(config_path.read_text())["mcpServers"]["tools"]
+        assert entry["command"] == "demo-server"
+        assert entry["args"] == ["--serve"]
+        assert entry["env"]["API_KEY"] == "k"
+        assert "type" not in entry
+        # Per-terminal identity via env expansion, not a literal value.
+        assert entry["env"]["CAO_TERMINAL_ID"] == "${env:CAO_TERMINAL_ID}"
+        provider.cleanup()
+
+    def test_streamable_http_translates_to_devin_http(self, tmp_path, monkeypatch):
+        provider, workdir = self._provider_in(tmp_path, monkeypatch)
+
+        provider._deliver_mcp_servers(
+            {"remote": {"type": "streamable-http", "url": "https://mcp.example/x"}}
+        )
+
+        config_path = workdir / ".devin" / "mcp_config.local.json"
+        entry = json.loads(config_path.read_text())["mcpServers"]["remote"]
+        assert entry["url"] == "https://mcp.example/x"
+        assert entry["transport"] == "http"
+        assert "type" not in entry
+        provider.cleanup()
+
+    def test_merges_with_existing_local_config(self, tmp_path, monkeypatch):
+        provider, workdir = self._provider_in(tmp_path, monkeypatch)
+        config_path = workdir / ".devin" / "mcp_config.local.json"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(json.dumps({"mcpServers": {"user-server": {"command": "mine"}}}))
+
+        provider._deliver_mcp_servers({"tools": {"type": "stdio", "command": "demo"}})
+
+        servers = json.loads(config_path.read_text())["mcpServers"]
+        assert "user-server" in servers
+        assert "tools" in servers
+
+        # Cleanup removes only the entries this provider delivered.
+        provider.cleanup()
+        servers = json.loads(config_path.read_text())["mcpServers"]
+        assert servers == {"user-server": {"command": "mine"}}
+
+    def test_cleanup_removes_config_file_when_only_owned_entries(self, tmp_path, monkeypatch):
+        provider, workdir = self._provider_in(tmp_path, monkeypatch)
+        config_path = workdir / ".devin" / "mcp_config.local.json"
+
+        provider._deliver_mcp_servers({"tools": {"type": "stdio", "command": "demo"}})
+        assert config_path.exists()
+
+        provider.cleanup()
+        assert not config_path.exists()
+        assert not config_path.parent.exists()
+
+    def test_build_command_delivers_profile_mcp_servers(self, tmp_path, monkeypatch):
+        provider, workdir = self._provider_in(tmp_path, monkeypatch)
+        provider._agent_profile = "my-agent"
+
+        mock_profile = MagicMock()
+        mock_profile.system_prompt = ""
+        mock_profile.mcpServers = {"tools": {"type": "stdio", "command": "demo"}}
+        mock_profile.container = None
+
+        with patch(
+            "cli_agent_orchestrator.providers.devin_cli.load_agent_profile",
+            return_value=mock_profile,
+        ):
+            provider._build_command()
+
+        config_path = workdir / ".devin" / "mcp_config.local.json"
+        assert "tools" in json.loads(config_path.read_text())["mcpServers"]
+        provider.cleanup()
+
+    def test_no_mcp_config_without_profile_servers(self, tmp_path, monkeypatch):
+        provider, workdir = self._provider_in(tmp_path, monkeypatch)
+        provider._build_command()
+
+        assert not (workdir / ".devin" / "mcp_config.local.json").exists()
+        provider.cleanup()

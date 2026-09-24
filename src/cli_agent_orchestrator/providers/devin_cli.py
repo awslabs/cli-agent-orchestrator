@@ -11,10 +11,12 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
+from cli_agent_orchestrator.agent_plugins.mcp_delivery import with_plugin_mcp as _with_plugin_mcp
 from cli_agent_orchestrator.constants import SECURITY_PROMPT
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 
@@ -83,7 +85,8 @@ class DevinCliProvider(BaseProvider):
         self._initialized = False
         self._agent_profile = agent_profile
         self._temp_prompt_file: Optional[str] = None
-        self._temp_config_file: Optional[str] = None
+        self._mcp_config_path: Optional[Path] = None
+        self._mcp_owned_servers: set = set()
         self._cached_profile: Optional[AgentProfile] = None
 
     def _load_profile(self) -> Optional[AgentProfile]:
@@ -98,10 +101,10 @@ class DevinCliProvider(BaseProvider):
         if self._cached_profile is not None:
             return self._cached_profile
 
-        from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
-
         try:
-            self._cached_profile = load_agent_profile(self._agent_profile)
+            self._cached_profile = _with_plugin_mcp(
+                load_agent_profile(self._agent_profile), "devin_cli"
+            )
         except Exception as e:
             logger.warning(
                 "Failed to load agent profile '%s': %s",
@@ -132,7 +135,7 @@ class DevinCliProvider(BaseProvider):
 
     def _cleanup_temp_files(self) -> None:
         """Clean up any existing temporary files before creating new ones."""
-        for attr in ("_temp_prompt_file", "_temp_config_file"):
+        for attr in ("_temp_prompt_file",):
             path = getattr(self, attr)
             if path:
                 try:
@@ -178,14 +181,6 @@ class DevinCliProvider(BaseProvider):
             if fd is not None:
                 os.close(fd)
 
-    def _write_config_file(self, base_config: dict) -> None:
-        """Write the merged Devin config to a temporary file and store the path."""
-        self._temp_config_file = self._write_temp_file(
-            json.dumps(base_config, indent=2),
-            prefix="cao_devin_config_",
-            suffix=".json",
-        )
-
     def _write_prompt_file(self, content: str) -> None:
         """Write prompt content to a temporary file and store the path."""
         self._temp_prompt_file = self._write_temp_file(
@@ -194,35 +189,96 @@ class DevinCliProvider(BaseProvider):
             suffix=".md",
         )
 
-    def _load_user_config(self) -> dict:
-        """Load the user's existing Devin config or create a minimal one."""
-        user_config_path = Path.home() / ".config" / "devin" / "config.json"
-        if user_config_path.exists():
+    def _terminal_workdir(self) -> Path:
+        """The directory Devin launches in — where it discovers ``.devin/`` config."""
+        try:
+            from cli_agent_orchestrator.clients import database as _db
+
+            metadata = _db.get_terminal_metadata(self.terminal_id) or {}
+            workdir = metadata.get("working_directory")
+            if workdir:
+                return Path(workdir)
+        except Exception as exc:
+            logger.debug("Could not resolve working directory for %s: %s", self.terminal_id, exc)
+        return Path.cwd()
+
+    def _deliver_mcp_servers(self, mcp_servers: dict) -> None:
+        """Write profile/plugin MCP servers to ``.devin/mcp_config.local.json``.
+
+        Since Devin CLI v3000.3, MCP servers are discovered only from the
+        dedicated ``mcp_config`` files (user ``~/.config/devin/mcp_config.json``,
+        project ``.devin/mcp_config.json``, local ``.devin/mcp_config.local.json``);
+        ``--config`` overrides the main settings file and ignores ``mcpServers``
+        there (verified against 3000.11.3). The local project file is the
+        supported per-workspace delivery path — it is gitignored by convention
+        and outranks the other two scopes.
+
+        ``CAO_TERMINAL_ID`` is emitted as a ``${env:...}`` reference, which Devin
+        expands from the spawned server's environment — the pane environment
+        carries the real value, so one shared file still stamps each terminal's
+        own identity into its own servers.
+        """
+        config_path = self._terminal_workdir() / ".devin" / "mcp_config.local.json"
+
+        base: dict = {}
+        if config_path.is_file():
             try:
-                data = json.loads(user_config_path.read_text())
-                if isinstance(data, dict):
-                    return data
-            except (json.JSONDecodeError, OSError):
-                pass
-        # Minimal config to skip the first-run wizard
-        return {
-            "shell": {"setup_complete": True},
-            "theme_mode": "dark",
-        }
+                loaded = json.loads(config_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    base = loaded
+            except (json.JSONDecodeError, OSError) as e:
+                logger.warning("Could not read existing %s: %s", config_path, e)
+
+        self._merge_mcp_servers(base, mcp_servers)
+
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(base, indent=2) + "\n", encoding="utf-8")
+        os.chmod(config_path, 0o600)
+        self._mcp_config_path = config_path
+        self._mcp_owned_servers = set(mcp_servers)
+
+    def _cleanup_mcp_config(self) -> None:
+        """Remove this terminal's entries from the delivered MCP config file."""
+        config_path = self._mcp_config_path
+        if config_path is None:
+            return
+        try:
+            data = json.loads(config_path.read_text(encoding="utf-8"))
+            servers = data.get("mcpServers")
+            if isinstance(servers, dict):
+                for name in self._mcp_owned_servers:
+                    servers.pop(name, None)
+                if servers:
+                    config_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+                else:
+                    config_path.unlink(missing_ok=True)
+                    try:
+                        config_path.parent.rmdir()
+                    except OSError:
+                        pass
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning("Failed to clean MCP config %s: %s", config_path, e)
+        finally:
+            self._mcp_config_path = None
+            self._mcp_owned_servers = set()
+
+    # CAO ``streamable-http`` maps to Devin's ``http`` transport; ``sse`` and
+    # ``http`` pass through unchanged (``mcp_config`` accepts ``"http"|"sse"``).
+    _DEVIN_TRANSPORTS = {"streamable-http": "http", "http": "http", "sse": "sse"}
 
     def _normalize_mcp_server_for_devin(self, resolved: dict) -> dict:
-        """Translate a CAO MCP server config into Devin CLI's config-file schema.
+        """Translate a CAO MCP server config into Devin CLI's ``mcp_config`` schema.
 
-        Devin CLI config files (``~/.config/devin/config.json`` / ``--config``)
-        expect ``command``/``args``/``env`` for stdio servers and ``url``/
-        ``transport`` for remote servers.  CAO-specific keys such as ``type``
-        and ``timeout`` are dropped to avoid confusing the CLI.
+        Devin's dedicated ``mcp_config*.json`` files expect ``command``/``args``/
+        ``env`` for stdio servers and ``url``/``transport`` for remote servers.
+        CAO-specific keys such as ``type`` and ``timeout`` are dropped to avoid
+        confusing the CLI.
         """
         normalized: dict = {}
         if resolved.get("url"):
             normalized["url"] = resolved["url"]
             transport = resolved.get("transport") or resolved.get("type") or "http"
-            normalized["transport"] = transport
+            normalized["transport"] = self._DEVIN_TRANSPORTS.get(transport, transport)
             if resolved.get("headers"):
                 normalized["headers"] = dict(resolved["headers"])
             for key in ("oauthClientId", "oauthClientSecret", "oauthResource"):
@@ -235,13 +291,16 @@ class DevinCliProvider(BaseProvider):
             if resolved.get("args"):
                 normalized["args"] = list(resolved["args"])
 
-        env = resolved.get("env") or {}
-        if not isinstance(env, dict):
-            env = {}
-        if "CAO_TERMINAL_ID" not in env:
-            env["CAO_TERMINAL_ID"] = self.terminal_id
-        if env:
-            normalized["env"] = env
+            env = resolved.get("env") or {}
+            if not isinstance(env, dict):
+                env = {}
+            if "CAO_TERMINAL_ID" not in env:
+                # An ${env:...} reference rather than a literal: the pane
+                # environment carries the real value, so one shared config file
+                # still delivers each terminal's own id to its own servers.
+                env["CAO_TERMINAL_ID"] = "${env:CAO_TERMINAL_ID}"
+            if env:
+                normalized["env"] = env
 
         if resolved.get("disabled"):
             normalized["disabled"] = True
@@ -249,7 +308,7 @@ class DevinCliProvider(BaseProvider):
         return normalized
 
     def _merge_mcp_servers(self, base_config: dict, mcp_servers: dict) -> None:
-        """Merge profile MCP servers into existing config."""
+        """Merge profile MCP servers into a ``{"mcpServers": {...}}`` document."""
         # Ensure mcpServers is a dict in base_config
         if not isinstance(base_config.get("mcpServers"), dict):
             base_config["mcpServers"] = {}
@@ -313,13 +372,12 @@ class DevinCliProvider(BaseProvider):
                     assert self._temp_prompt_file is not None
                     command_parts.extend(["--prompt-file", self._temp_prompt_file])
 
-            # Add MCP config if present
+            # Deliver MCP servers through the dedicated project-local file.
+            # Since Devin CLI v3000.3, ``--config`` overrides the main settings
+            # file and cannot carry ``mcpServers`` — only the dedicated
+            # ``mcp_config`` files are consulted.
             if profile.mcpServers:
-                base_config = self._load_user_config()
-                self._merge_mcp_servers(base_config, profile.mcpServers)
-
-                self._write_config_file(base_config)
-                command_parts.extend(["--config", self._temp_config_file])
+                self._deliver_mcp_servers(profile.mcpServers)
 
         # For containerized profiles, translate host temp-file paths to guest paths.
         if (
@@ -329,7 +387,7 @@ class DevinCliProvider(BaseProvider):
             and profile.container.path_maps
         ):
             for i, part in enumerate(command_parts):
-                if i > 0 and command_parts[i - 1] in ("--prompt-file", "--config"):
+                if i > 0 and command_parts[i - 1] in ("--prompt-file",):
                     command_parts[i] = self._translate_path(part, profile)
 
         return shlex.join(command_parts)
@@ -372,9 +430,11 @@ class DevinCliProvider(BaseProvider):
             self._initialized = True
             return True
         finally:
-            # Prompt/config temp files have been consumed by the Devin CLI on
-            # successful initialization (or the launch was aborted); remove them
-            # to avoid leaving security constraints or MCP server credentials on disk.
+            # The prompt temp file has been consumed by the Devin CLI on
+            # successful initialization (or the launch was aborted); remove it
+            # to avoid leaving security constraints on disk. The delivered MCP
+            # config persists for the life of the session — Devin re-reads it
+            # when spawning servers — and is removed by cleanup().
             self._cleanup_temp_files()
 
     @staticmethod
@@ -536,5 +596,6 @@ class DevinCliProvider(BaseProvider):
         return "/exit"
 
     def cleanup(self) -> None:
-        """Clean up temp files."""
+        """Clean up temp files and delivered MCP config entries."""
         self._cleanup_temp_files()
+        self._cleanup_mcp_config()

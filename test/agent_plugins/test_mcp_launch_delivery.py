@@ -188,7 +188,7 @@ LAUNCH_CASES: dict[str, _LaunchCase] = {
 
 #: Delivering providers covered by a bespoke test in this file instead, because
 #: their artifact is not a command string.
-BESPOKE_LAUNCH_CASES = frozenset({"copilot_cli", "antigravity_cli"})
+BESPOKE_LAUNCH_CASES = frozenset({"copilot_cli", "antigravity_cli", "devin_cli"})
 
 #: Delivering providers that persist MCP config at ``cao install`` time and never
 #: re-read the profile at launch, so there is no launch artifact to inspect.
@@ -264,6 +264,7 @@ _PROVIDER_MODULE_VALUES = {
     "codex": "codex",
     "copilot_cli": "copilot_cli",
     "cursor_cli": "cursor_cli",
+    "devin_cli": "devin_cli",
     "grok_cli": "grok_cli",
     "kimi_cli": "kimi_cli",
     "minimax_code": "mcode",
@@ -463,6 +464,38 @@ class TestTheLaunchCommandCarriesThePluginServer:
         assert any(key.startswith(PLUGIN_SERVER) for key in written), (
             f"antigravity wrote {sorted(written)} — no plugin server reached " f"mcp_config.json"
         )
+
+    def test_devin_writes_the_plugin_server_into_the_project_local_mcp_config(
+        self, installed_plugin, monkeypatch, tmp_path
+    ):
+        """Devin discovers MCP servers only from dedicated ``mcp_config`` files.
+
+        ``--config`` cannot carry ``mcpServers`` on Devin >= v3000.3, so the
+        artifact under test is the ``.devin/mcp_config.local.json`` the provider
+        writes into the terminal's launch directory.
+        """
+        from cli_agent_orchestrator.providers import devin_cli as mod
+
+        workdir = tmp_path / "repo"
+        workdir.mkdir()
+        monkeypatch.setattr(mod, "load_agent_profile", lambda _name: _profile_stub())
+        monkeypatch.setattr(mod.DevinCliProvider, "_terminal_workdir", lambda self: workdir)
+
+        provider = mod.DevinCliProvider("tid-devin", "sess", "win", "worker")
+        try:
+            provider._build_command()
+            config_path = workdir / ".devin" / "mcp_config.local.json"
+            written = json.loads(config_path.read_text(encoding="utf-8"))["mcpServers"]
+        finally:
+            provider.cleanup()
+
+        assert PLUGIN_SERVER in written, (
+            f"devin wrote {sorted(written)} — no plugin server reached "
+            f".devin/mcp_config.local.json"
+        )
+        # Per-terminal identity must survive a shared config file: emitted as an
+        # env reference the pane's own CAO_TERMINAL_ID resolves at spawn.
+        assert written[PLUGIN_SERVER]["env"]["CAO_TERMINAL_ID"] == "${env:CAO_TERMINAL_ID}"
 
 
 class TestGrokCarriesAnHttpPluginServer:
