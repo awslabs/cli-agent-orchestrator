@@ -7200,10 +7200,12 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
       request ``Host`` or in the trusted set (CWE-1385 cross-site WebSocket
       hijacking guard);
     * when the HTTP auth layer is enabled (``AUTH0_DOMAIN`` /
-      ``CAO_AUTH_JWKS_URI`` set — see :func:`is_auth_enabled`), the handshake
-      must carry a valid bearer token granting ``cao:write`` or ``cao:admin``.
-      Keystroke injection is RCE; ``cao:read`` is not enough. HTTP
-      ``POST /terminals/{id}/input`` already requires write.
+      ``CAO_AUTH_JWKS_URI`` set, or a standalone ``CAO_AUTH_LOCAL_TOKEN`` — see
+      :func:`is_auth_enabled`), the handshake must carry a valid bearer token
+      granting ``cao:write`` or ``cao:admin``. Keystroke injection is RCE;
+      ``cao:read`` is not enough. HTTP ``POST /terminals/{id}/input`` already
+      requires write. In local-token mode the bearer must equal the configured
+      token, which carries the full scope set.
 
     Token scheme: browsers cannot set request headers on a WebSocket
     handshake, so the token is accepted from either ``Authorization: Bearer
@@ -7225,12 +7227,17 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
     # A literal ``*`` in the allowlist disables the IP check (Codespaces /
     # devcontainers / remote setups where the WS client originates from an
     # IP the operator cannot enumerate ahead of time).
+    #
+    # A missing peer address fails CLOSED. The pinned uvicorn never produces
+    # one on this path: it populates ``client`` for every TCP connection, and
+    # its proxy-headers middleware rewrites the peer to a ``(host, port)``
+    # tuple even for empty or garbage forwarded values, never to ``None``. So
+    # ``None`` means some other ASGI server or middleware left the peer unset,
+    # and an unattributable peer is precisely the one this allowlist must not
+    # admit by accident. Operators who genuinely cannot enumerate peers have
+    # the ``*`` opt-out above.
     client_host = websocket.client.host if websocket.client else None
-    if (
-        "*" not in WS_ALLOWED_CLIENTS
-        and client_host is not None
-        and client_host not in WS_ALLOWED_CLIENTS
-    ):
+    if "*" not in WS_ALLOWED_CLIENTS and client_host not in WS_ALLOWED_CLIENTS:
         await websocket.close(code=4003, reason="WebSocket access is restricted to allowed clients")
         return
 

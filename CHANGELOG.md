@@ -16,6 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **a PTY WebSocket handshake with no peer address skipped the client-IP allowlist.**
+  `/terminals/{id}/ws` checked `client_host not in WS_ALLOWED_CLIENTS` only when a
+  peer address was present, so a `None` peer passed instead of failing closed. Not
+  reachable on a default install: the pinned uvicorn populates the peer for every
+  TCP connection and its proxy-headers middleware never rewrites it to `None`, so
+  this guards against other ASGI servers or middleware that leave the peer unset.
+  An unattributable peer is now refused with 4003 unless the explicit `*` opt-out
+  is set.
+
 - **enabling `CAO_MEMORY_API_URL` rejected memory keys that work without it.**
   The `/internal/memory/store` and `/forget` routes validated the wire `key` as
   the strict `MemoryKey` (`^[a-z0-9-]{1,60}$`), while the MCP tools have always
