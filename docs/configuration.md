@@ -276,14 +276,16 @@ number -- it moves with the window size, the tmux version, and anything in
 it for a given setup rather than trusting a figure:
 
 ```bash
-# -L runs this on a private tmux server, so it cannot reach the sessions you are
-# working in, and nothing past the && runs unless the session was created here.
-tmux -L cao-cap new-session -d -s cap -x 80 -y 24 && {
-  while tmux -L cao-cap split-window -v -t cap 2>/dev/null; do
-    tmux -L cao-cap select-layout -t cap even-vertical >/dev/null
+# -L keeps this off the server your own sessions live on; the name is unique to
+# this run, nothing past the && happens unless this run created the session, and
+# the cleanup names that session rather than tearing the server down.
+s="cao-cap-$$"
+tmux -L cao-cap new-session -d -s "$s" -x 80 -y 24 && {
+  while tmux -L cao-cap split-window -v -t "$s" 2>/dev/null; do
+    tmux -L cao-cap select-layout -t "$s" even-vertical >/dev/null
   done
-  tmux -L cao-cap list-panes -t cap | wc -l
-  tmux -L cao-cap kill-server
+  tmux -L cao-cap list-panes -t "$s" | wc -l
+  tmux -L cao-cap kill-session -t "$s"
 }
 ```
 
