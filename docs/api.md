@@ -288,7 +288,8 @@ than calling these routes directly.
 
 All five reads above (inspect, events, compare, diagnostics, and the run list)
 require a `cao:read`, `cao:write`, or `cao:admin` scope **when authentication is
-enabled**. With `CAO_AUTH_ENABLED` unset — the default — that check is inert.
+enabled**. With no IdP and no `CAO_AUTH_LOCAL_TOKEN` configured — the default —
+that check is inert.
 
 See [Workflows](workflows.md).
 
@@ -336,11 +337,13 @@ full read/write access to that terminal's PTY, including command input.
 
 ### Authentication
 
-Authentication is enabled when `CAO_AUTH_JWKS_URI` or `AUTH0_DOMAIN` is set.
-In that mode, the handshake requires a valid bearer token granting
+Authentication is enabled when `CAO_AUTH_JWKS_URI` or `AUTH0_DOMAIN` is set
+(IdP mode), or when `CAO_AUTH_LOCAL_TOKEN` is set on its own (local-token
+mode). In IdP mode the handshake requires a valid bearer token granting
 `cao:write` **or** `cao:admin`, matching `POST /terminals/{terminal_id}/input`.
 These are existing CAO scopes; `cao:read` alone does not permit interactive
-PTY access.
+PTY access. In local-token mode the bearer must equal `CAO_AUTH_LOCAL_TOKEN`
+exactly; a match carries the full scope set.
 
 Send the token in the `Authorization` bearer header, or in the `token` query
 parameter for clients that cannot set that header. An extracted header token
@@ -348,8 +351,9 @@ takes precedence over the query parameter. Passing the Origin check does not
 supply a bearer token; the client must provide it. Keep token-bearing URLs out
 of logs and use TLS for remote connections.
 
-With neither authentication-enabling variable set, no token is required.
-The client-IP and Origin restrictions still apply in both modes. See the
+With none of the authentication-enabling variables set, no token is required
+and any caller that reaches the port has full PTY access.
+The client-IP and Origin restrictions still apply in every mode. See the
 [authentication configuration](configuration.md#auth-auth--env-var-only).
 
 ### Client access boundary
@@ -357,7 +361,11 @@ The client-IP and Origin restrictions still apply in both modes. See the
 By default, only loopback clients identified as `127.0.0.1`, `::1`, or
 `localhost` are allowed. `CAO_WS_ALLOWED_CLIENTS` adds comma-separated client
 IP addresses or hostnames to that allowlist. A literal `*` disables the
-client-IP restriction.
+client-IP restriction. A handshake whose peer address cannot be determined is refused unless `*` is
+set: an unattributable peer fails closed, it does not skip the check. The
+pinned uvicorn never leaves the peer unset (its proxy-headers middleware
+rewrites it to a host/port pair even for empty or malformed forwarded values),
+so this guards against other ASGI servers or middleware, not a default deployment.
 
 Adding clients or using `*` widens who can reach the PTY handshake; it does
 not bypass authentication when enabled. With authentication disabled,

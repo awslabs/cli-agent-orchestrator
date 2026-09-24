@@ -144,10 +144,11 @@ pull-model equivalent.
   **404 unless `CAO_MCP_APPS_ENABLED` is set**, and the `event_log_publisher`
   observer no-ops while disabled — so a CAO with the surface off retains no
   fleet event history and exposes no event timeline.
-- **Default posture.** With `CAO_MCP_APPS_ENABLED=true` but no IdP configured, the
-  surface (including `submit_command` mutations) inherits CAO's unauthenticated,
-  localhost-only trust model — keep it on a trusted loopback host and configure an
-  IdP before exposing it more widely; the server logs a startup warning in this state.
+- **Default posture.** With `CAO_MCP_APPS_ENABLED=true` but no credential configured
+  (no IdP and no `CAO_AUTH_LOCAL_TOKEN`), the surface (including `submit_command`
+  mutations) inherits CAO's unauthenticated, localhost-only trust model — keep it on
+  a trusted loopback host and configure an IdP or a standalone `CAO_AUTH_LOCAL_TOKEN`
+  before exposing it more widely; the server logs a startup warning in this state.
 
 ## Configuration
 
@@ -155,19 +156,24 @@ pull-model equivalent.
 |---|---|---|
 | `CAO_MCP_APPS_ENABLED` | `false` | Master switch for the entire surface. |
 | `CAO_MCP_APPS_STATIC_DIR` | — | Override the built `apps_static/` location. |
-| `AUTH0_DOMAIN` / `CAO_AUTH_JWKS_URI` | — | Enable the auth layer (IdP). |
-| `CAO_AUTH_AUDIENCE`, `CAO_AUTH_ISSUER` | — | Token audience / issuer for validation + PRM. |
-| `CAO_AUTH_LOCAL_TOKEN` | — | Service token the MCP server forwards on its internal calls to the CAO API when auth is enabled (see H3 below). Required for auth-enabled mutation. |
+| `AUTH0_DOMAIN` / `CAO_AUTH_JWKS_URI` | — | Enable the auth layer (IdP mode). |
+| `CAO_AUTH_AUDIENCE`, `CAO_AUTH_ISSUER` | — | Token audience / issuer for validation + PRM (IdP mode). |
+| `CAO_AUTH_LOCAL_TOKEN` | — | Set alone: enables the auth layer as a shared-secret bearer every caller must present. Set with an IdP: the service JWT the MCP server forwards on its internal calls to the CAO API (see H3 below). Required for auth-enabled mutation in both modes. |
 
 ### Auth-enabled mutation (`CAO_AUTH_LOCAL_TOKEN`)
 
-When the auth layer is enabled (`AUTH0_DOMAIN` / `CAO_AUTH_JWKS_URI` set), the
-MCP server reaches Backplane state over loopback HTTP to the FastAPI app, and
-those mutation endpoints now *enforce* scope. The internal hop therefore needs a
-credential: provision a **machine token** from the same IdP, scoped with the
-permissions the surface needs (`cao:write` / `cao:admin`), and set it as
-`CAO_AUTH_LOCAL_TOKEN`. The MCP server attaches it as
+When the auth layer is enabled, the MCP server reaches Backplane state over
+loopback HTTP to the FastAPI app, and those mutation endpoints now *enforce*
+scope. The internal hop therefore needs a credential, which is always
+`CAO_AUTH_LOCAL_TOKEN`; the MCP server attaches it as
 `Authorization: Bearer <token>` on its internal `submit_command` / read calls.
+
+- **IdP mode** (`AUTH0_DOMAIN` / `CAO_AUTH_JWKS_URI` set): provision a **machine
+  token** from the same IdP, scoped with the permissions the surface needs
+  (`cao:write` / `cao:admin`), and set it as `CAO_AUTH_LOCAL_TOKEN`.
+- **Local-token mode** (`CAO_AUTH_LOCAL_TOKEN` set, no IdP): the variable is the
+  credential itself. Export the same value in the environment of `cao-server`
+  and of every client that must reach it; a match grants the full scope set.
 
 If auth is enabled but `CAO_AUTH_LOCAL_TOKEN` is unset, `submit_command` returns
 a structured, actionable error (`{"success": false, "error": "auth enabled but

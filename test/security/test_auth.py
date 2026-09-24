@@ -5,8 +5,10 @@ JWKS cache TTL / reuse-on-unreachable / fetch-when-empty behavior, 401 mapping
 on invalid/expired tokens, and the default-off full-scope-set guarantee.
 """
 
+import hmac
 import time
 from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock
 
 import jwt
 import pytest
@@ -509,3 +511,146 @@ def test_jwks_cache_reuses_within_max_staleness(monkeypatch):
     cache._fetched_at = datetime.now(timezone.utc) - timedelta(minutes=1)
     state["fail"] = True
     assert cache.get_client("https://idp/jwks") is first
+
+
+# --- standalone local token (issue #706) ----------------------------------
+
+LOCAL_TOKEN = "s3cret-local-token"
+
+
+def test_local_token_alone_enables_auth(monkeypatch):
+    """``CAO_AUTH_LOCAL_TOKEN`` with no IdP switches enforcement on (issue #706).
+
+    Before this the variable was read only once an IdP was configured, so on a
+    default install it did nothing while the reference docs described it as a
+    working local bearer token.
+    """
+    monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", LOCAL_TOKEN)
+    assert auth.is_auth_enabled() is True
+    assert auth.is_local_token_mode() is True
+    assert auth.is_idp_configured() is False
+    # No JWT machinery is involved: nothing to resolve, no audience to pin, no
+    # authorization server to advertise.
+    assert auth.get_jwks_uri() is None
+    assert auth.get_expected_audience() is None
+    assert auth.get_authorization_servers() == []
+
+
+def test_local_token_whitespace_only_stays_disabled(monkeypatch):
+    """A blank value is 'unset': the default-off posture must not flip on a stray space."""
+    monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", "   ")
+    assert auth.is_auth_enabled() is False
+    assert auth.is_local_token_mode() is False
+    assert auth.extract_scopes_from_token("anything") == auth.FULL_SCOPE_SET
+
+
+def test_local_token_mode_matching_token_grants_full_scopes(monkeypatch):
+    monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", LOCAL_TOKEN)
+    assert auth.extract_scopes_from_token(LOCAL_TOKEN) == auth.FULL_SCOPE_SET
+
+
+@pytest.mark.parametrize(
+    "presented",
+    ["", "wrong", LOCAL_TOKEN[:-1], LOCAL_TOKEN + "x", LOCAL_TOKEN.upper(), " " + LOCAL_TOKEN],
+)
+def test_local_token_mode_mismatch_fails_closed(monkeypatch, presented):
+    """Anything but the exact configured value raises (mapped to 401 by callers)."""
+    monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", LOCAL_TOKEN)
+    with pytest.raises(jwt.InvalidTokenError):
+        auth.extract_scopes_from_token(presented)
+
+
+def test_local_token_mode_never_consults_jwks(monkeypatch):
+    """Local-token mode is a shared-secret compare; the JWKS cache must stay untouched."""
+    monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", LOCAL_TOKEN)
+
+    def _boom(uri):  # noqa: ANN001
+        raise AssertionError("JWKS must not be consulted in local-token mode")
+
+    monkeypatch.setattr(auth.get_jwks_cache(), "get_client", _boom)
+    assert auth.extract_scopes_from_token(LOCAL_TOKEN) == auth.FULL_SCOPE_SET
+    with pytest.raises(jwt.InvalidTokenError):
+        auth.extract_scopes_from_token("wrong")
+
+
+@pytest.mark.asyncio
+async def test_get_current_scopes_local_token_missing_header_is_401(monkeypatch):
+    monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", LOCAL_TOKEN)
+    with pytest.raises(HTTPException) as exc:
+        await auth.get_current_scopes(authorization=None)
+    assert exc.value.status_code == 401
+    assert exc.value.headers["WWW-Authenticate"] == "Bearer"
+
+
+@pytest.mark.asyncio
+async def test_get_current_scopes_local_token_wrong_is_401(monkeypatch):
+    monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", LOCAL_TOKEN)
+    with pytest.raises(HTTPException) as exc:
+        await auth.get_current_scopes(authorization="Bearer wrong")
+    assert exc.value.status_code == 401
+    # The detail names the variable, never the configured value.
+    assert LOCAL_TOKEN not in str(exc.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_get_current_scopes_local_token_match_grants_full(monkeypatch):
+    monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", LOCAL_TOKEN)
+    scopes = await auth.get_current_scopes(authorization=f"Bearer {LOCAL_TOKEN}")
+    assert scopes == auth.FULL_SCOPE_SET
+
+
+@pytest.mark.asyncio
+async def test_require_any_scope_enforces_in_local_token_mode(monkeypatch):
+    """The authorization layer is live too: a matching token holds every scope,
+    a missing token never reaches the scope check, and the scope check itself
+    still runs -- a requirement outside the granted set is 403 even for the
+    operator's own token. (Removing the scope check survived the first version
+    of this test; found by the #706 review.)"""
+    monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", LOCAL_TOKEN)
+    dep = auth.require_any_scope(auth.SCOPE_ADMIN)
+    granted = await auth.get_current_scopes(authorization=f"Bearer {LOCAL_TOKEN}")
+    assert await dep(scopes=granted) == auth.FULL_SCOPE_SET
+    with pytest.raises(HTTPException) as exc:
+        await auth.get_current_scopes(authorization=None)
+    assert exc.value.status_code == 401
+    unsatisfiable = auth.require_any_scope("cao:not-a-real-scope")
+    with pytest.raises(HTTPException) as exc:
+        await unsatisfiable(scopes=granted)
+    assert exc.value.status_code == 403
+
+
+def test_local_token_compare_is_constant_time(monkeypatch):
+    """Pin the comparator, not just the verdict: ``==`` on two strings gives the
+    same answers as ``hmac.compare_digest`` and would pass every other test here
+    while leaking the token byte by byte through response timing."""
+    monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", LOCAL_TOKEN)
+    spy = MagicMock(wraps=hmac.compare_digest)
+    monkeypatch.setattr(auth.hmac, "compare_digest", spy)
+    assert auth.extract_scopes_from_token(LOCAL_TOKEN) == list(auth.FULL_SCOPE_SET)
+    spy.assert_called_once()
+    presented, expected = spy.call_args.args
+    assert isinstance(presented, bytes) and isinstance(expected, bytes)
+    assert presented == expected == LOCAL_TOKEN.encode("utf-8")
+
+
+def test_local_token_with_idp_is_idp_mode(monkeypatch, rsa_key):
+    """When an IdP is configured the local token is a forwarded JWT, not a shared
+    secret: the IdP wins and the raw string is NOT accepted as a bearer."""
+    _enable_auth(monkeypatch, rsa_key)
+    monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", LOCAL_TOKEN)
+    assert auth.is_idp_configured() is True
+    assert auth.is_local_token_mode() is False
+    assert auth.is_auth_enabled() is True
+    with pytest.raises(jwt.PyJWTError):
+        auth.extract_scopes_from_token(LOCAL_TOKEN)
+    token = _make_token(rsa_key, _base_claims({"scope": "cao:read"}))
+    assert auth.extract_scopes_from_token(token) == ["cao:read"]
+
+
+def test_local_token_mode_internal_hop_helpers(monkeypatch):
+    """CAO's own clients forward the token and see no misconfiguration: the one
+    variable is both the enable switch and the credential."""
+    monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", LOCAL_TOKEN)
+    assert auth.get_local_bearer() == LOCAL_TOKEN
+    assert auth.local_auth_misconfig_error() is None
+    assert auth.get_scopes_for_local_token() == auth.FULL_SCOPE_SET

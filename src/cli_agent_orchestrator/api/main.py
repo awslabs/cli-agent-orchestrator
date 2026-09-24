@@ -124,6 +124,7 @@ from cli_agent_orchestrator.security.auth import (
     get_authorization_servers,
     get_current_scopes,
     is_auth_enabled,
+    is_idp_configured,
     require_any_scope,
 )
 from cli_agent_orchestrator.services import (
@@ -1564,11 +1565,20 @@ async def oauth_protected_resource_metadata():
     Advertises the resource audience, the authorization server(s), the supported
     scopes (``cao:read``/``cao:write``/``cao:admin``), and the supported bearer
     methods so OAuth clients can discover how to obtain access. Returns HTTP 404
-    when auth is disabled (default-off), so the localhost-only posture is
-    byte-for-byte unchanged.
+    when no IdP is configured: default-off keeps its previous response
+    byte-for-byte (status and detail), and local-token mode
+    (``CAO_AUTH_LOCAL_TOKEN`` alone) answers 404 with a detail naming what is
+    missing, since there is no authorization server to advertise.
     """
-    if not is_auth_enabled():
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="auth disabled")
+    if not is_idp_configured():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                "auth disabled"
+                if not is_auth_enabled()
+                else "no OAuth authorization server configured"
+            ),
+        )
 
     audience = (
         os.getenv("CAO_AUTH_AUDIENCE", "").strip()
@@ -1786,7 +1796,8 @@ async def agui_stream(
     _require_agui_enabled()
 
     # Auth: query-parameter token (EventSource can't set headers). Default-off
-    # (no AUTH0_DOMAIN / CAO_AUTH_JWKS_URI) grants the full scope set.
+    # (no AUTH0_DOMAIN / CAO_AUTH_JWKS_URI / CAO_AUTH_LOCAL_TOKEN) grants the
+    # full scope set.
     if is_auth_enabled():
         if not access_token:
             raise HTTPException(
@@ -5511,8 +5522,9 @@ async def get_workflow_run_endpoint(
     here is not. It therefore carries the same read-or-better gate as
     ``/diagnostics``, ``/events`` and ``/compare``: a FULL-route gate, not a
     per-field split, because a field split would still return ``output_json`` to
-    an unscoped caller. Default-off is unchanged — with ``CAO_AUTH_ENABLED``
-    unset the dependency returns the full scope set and enforces nothing.
+    an unscoped caller. Default-off is unchanged — with no IdP and no
+    ``CAO_AUTH_LOCAL_TOKEN`` configured the dependency returns the full scope set
+    and enforces nothing.
     Consequence for #505: its CLI/MCP status/result clients read this route (plus
     ``/events`` and ``/compare``) and must present a token carrying
     ``cao:read``/``cao:write``/``cao:admin`` once auth is enabled.
@@ -5536,8 +5548,9 @@ async def get_workflow_run_endpoint(
        ``{{steps.<id>.output.<field>}}`` templating read them back. So with capture
        at its default OFF, this route still returns step output and error verbatim.
     2. The ONLY protection is the scope dependency above, and it is INERT in the
-       default deployment: with ``CAO_AUTH_ENABLED`` unset, ``require_any_scope``
-       returns the full scope set and enforces nothing. A local CAO server therefore
+       default deployment: with no IdP and no ``CAO_AUTH_LOCAL_TOKEN`` configured,
+       ``require_any_scope`` returns the full scope set and enforces nothing. A
+       local CAO server therefore
        serves step output and error text to any caller that can reach the port.
 
     Deliberately documented rather than further gated: stripping the fields removes

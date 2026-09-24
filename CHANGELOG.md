@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`CAO_AUTH_LOCAL_TOKEN` now works on its own** (#706). Setting it with no IdP
+  configured switches the auth layer on in a local-token mode: every scope-gated
+  route, the PTY WebSocket handshake and the AG-UI stream must present exactly that
+  value as a bearer, compared in constant time, and anything else is refused with
+  401. Previously the variable was read only when an IdP was already configured, so
+  on a default install it did nothing, while the environment-variable reference
+  described it as a working local bearer token. Opt-in: with none of the three auth
+  variables set, behavior is unchanged. The default-unauthenticated posture is now
+  spelled out in `docs/configuration.md`, along with two consequences of turning
+  the mode on: the `cao` CLI and the bundled Web UI send no bearer yet, and the
+  token is inherited by every agent pane's environment.
+
 - Profiles tab in the Web UI: browse, search, create (from template with live
   preview, or from scratch via a schema-driven form), edit, clone, and delete
   agent profiles over the profile management APIs, with validate-before-save

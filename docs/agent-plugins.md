@@ -64,7 +64,7 @@ manifest `description`:
 |---|---|
 | **`uv` on `PATH`** | The packaged MCP server is launched via `uvx`. The specification allows only a single `command` token, so the package cannot bundle a launcher. |
 | **A CAO API server at `http://127.0.0.1:9889`** (`cao-server`) | Every operator tool is an HTTP call to that server. |
-| **`CAO_AUTH_LOCAL_TOKEN`, only when the CAO API has authentication enabled** | Every tool is a scope-gated HTTP call. The server attaches that token as `Authorization: Bearer …`, read from the environment of whatever client launched it — the package itself stores no credential. The client must also export the same `AUTH0_DOMAIN` / `CAO_AUTH_JWKS_URI` the API uses, so the server can tell the auth layer is on. With authentication disabled nothing is sent and no variable is needed. |
+| **`CAO_AUTH_LOCAL_TOKEN`, only when the CAO API has authentication enabled** | Every tool is a scope-gated HTTP call. The server attaches that token as `Authorization: Bearer …`, read from the environment of whatever client launched it — the package itself stores no credential. In IdP mode the client must also export the same `AUTH0_DOMAIN` / `CAO_AUTH_JWKS_URI` the API uses, so the server can tell the auth layer is on; in local-token mode the token alone is enough, because the same variable both enables auth and is the credential. With authentication disabled nothing is sent and no variable is needed. |
 
 **The posture is localhost-only.** `SERVER_HOST` defaults to `127.0.0.1`, the
 package never reaches a remote endpoint, and nothing in it opens a listening
