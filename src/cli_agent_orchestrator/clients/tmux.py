@@ -1167,17 +1167,10 @@ class TmuxClient:
         holds depends on the layout, so the fallback fires sooner for some than
         for others.
         """
-        direction = PANE_LAYOUTS.get(pane_layout)
-        if direction is None:
-            # A bare KeyError here reaches the caller's log as the name alone.
-            raise ValueError(
-                f"Unknown pane layout '{pane_layout}'; expected one of "
-                f"{', '.join(sorted(PANE_LAYOUTS))}"
-            )
         kwargs: dict = {
             "start_directory": working_directory,
             "environment": pane_env,
-            "direction": direction,
+            "direction": PANE_LAYOUTS[pane_layout],
         }
         if window_shell:
             kwargs["shell"] = window_shell
@@ -1214,6 +1207,14 @@ class TmuxClient:
         every later lookup relies on.
         """
         try:
+            if pane_layout not in PANE_LAYOUTS:
+                # Checked here rather than at the split: the first terminal in a
+                # session opens the host window instead of splitting it, and a bad
+                # layout must not be accepted for one spawn and refused for the next.
+                raise ValueError(
+                    f"Unknown pane layout '{pane_layout}'; expected one of "
+                    f"{', '.join(sorted(PANE_LAYOUTS))}"
+                )
             working_directory = self._resolve_and_validate_working_directory(working_directory)
 
             session = self._find_session(session_name)

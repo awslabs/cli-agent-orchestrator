@@ -558,6 +558,9 @@ class ConfigService:
             terminal=TerminalConfig(
                 backend=_get_value("terminal.backend", default="tmux"),
                 herdr_session=_get_value("terminal.herdr_session", default="cao"),
+                spawn_mode=_get_value("terminal.spawn_mode", default="window"),
+                pane_window=_get_value("terminal.pane_window", default="cao-agents"),
+                pane_layout=_get_value("terminal.pane_layout", default="tiled"),
             ),
             apps=AppsConfig(
                 enabled=_get_value("apps.enabled", default=False),

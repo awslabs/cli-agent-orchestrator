@@ -377,6 +377,7 @@ Every `CAO_*` variable below maps 1:1 to a `settings.json` key and is resolved t
 | `CAO_HERDR_SESSION` | `terminal.herdr_session` | str |
 | `CAO_TERMINAL_SPAWN_MODE` | `terminal.spawn_mode` | str |
 | `CAO_TERMINAL_PANE_WINDOW` | `terminal.pane_window` | str |
+| `CAO_TERMINAL_PANE_LAYOUT` | `terminal.pane_layout` | str |
 | `CAO_MCP_APPS_ENABLED` | `apps.enabled` | bool |
 | `CAO_MCP_APPS_STATIC_DIR` | `apps.static_dir` | str |
 | `CAO_LOG_LEVEL` | `logging.level` | str |

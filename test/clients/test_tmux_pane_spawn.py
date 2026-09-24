@@ -249,6 +249,18 @@ class TestCreatePane:
                 "ses", "cao-agents", "coder-3", "tid", str(tmp_path), pane_layout="grid"
             )
 
+    def test_an_unknown_layout_is_refused_before_the_host_window_exists(self, tmux, tmp_path):
+        """The first terminal opens the host window instead of splitting it. Validating at
+        the split would accept a bad layout for that one spawn and refuse the next."""
+        session = session_with(panes=[], window=None)
+        tmux.server.sessions.get.return_value = session
+
+        with pytest.raises(ValueError, match="even-vertical"):
+            tmux.create_pane(
+                "ses", "cao-agents", "coder-3", "tid", str(tmp_path), pane_layout="grid"
+            )
+        session.new_window.assert_not_called()
+
     def test_carries_the_terminal_id_into_the_pane_environment(self, tmux, tmp_path):
         _, host_window = self._session(tmux)
 
