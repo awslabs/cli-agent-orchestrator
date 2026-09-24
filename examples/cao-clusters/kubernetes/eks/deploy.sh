@@ -23,9 +23,15 @@
 # Usage:
 #   examples/cao-clusters/kubernetes/eks/deploy.sh [stack-name] [image-tag] [mode]
 #
-# Modes: bedrock (default), kiro.
+# Modes: bedrock (default), kiro, codex.
 # Defaults: stack cao-workshop, tag taken from kustomization.yaml, mode bedrock.
 # Honours the usual AWS_PROFILE / AWS_REGION environment.
+#
+# Pass `-` as the stack name to deploy onto a cluster this repo's template did
+# not create, supplying the stack's six values through the environment instead:
+#
+#   CAO_SERVER_REPO_URI  CAO_BROKER_REPO_URI  CAO_PANEL_REPO_URI
+#   CAO_WORKSPACE_HANDLE (fs-<id>::fsap-<id>)  CAO_CLUSTER_NAME  CAO_VPC_CIDR
 #
 # Rendering happens into a temporary directory; this source directory is never
 # modified, so a failed run leaves nothing to clean up and `git status` stays
@@ -65,19 +71,59 @@ REGION="$(aws configure get region || true)"
 [ -n "${AWS_REGION:-}" ] && REGION="$AWS_REGION"
 [ -n "$REGION" ] || { echo "error: no region — set AWS_REGION" >&2; exit 1; }
 
-echo "reading outputs from stack '$STACK' in $REGION"
-REPO="$(out ServerRepositoryUri)"
-BROKER_REPO="$(out WorkerBrokerRepositoryUri)"
-PANEL_REPO="$(out PanelRepositoryUri)"
-HANDLE="$(out WorkspaceVolumeHandle)"
-CLUSTER="$(out ClusterName)"
-VPC_CIDR="$(out VpcCidrBlock)"
+# Existing-cluster mode. Pass `-` as the stack name and supply the six values the
+# stack would otherwise have produced.
+#
+# This exists because the stack is not the only way to get a cluster, and until
+# now it was the only way to run this script: every input came from
+# `describe-stacks`, so deploying onto a cluster somebody else built had no
+# documented path at all. The manifests never cared where the values came from.
+#
+# Everything the fleet needs from the environment is in these six. See
+# "Deploying onto an existing cluster" in the README for how to obtain each.
+if [ "$STACK" = "-" ] || [ "$STACK" = "none" ]; then
+  echo "existing-cluster mode: reading inputs from the environment"
+  REPO="${CAO_SERVER_REPO_URI:-}"
+  BROKER_REPO="${CAO_BROKER_REPO_URI:-}"
+  PANEL_REPO="${CAO_PANEL_REPO_URI:-}"
+  HANDLE="${CAO_WORKSPACE_HANDLE:-}"
+  CLUSTER="${CAO_CLUSTER_NAME:-}"
+  VPC_CIDR="${CAO_VPC_CIDR:-}"
+  missing=""
+  for v in CAO_SERVER_REPO_URI CAO_BROKER_REPO_URI CAO_PANEL_REPO_URI \
+           CAO_WORKSPACE_HANDLE CAO_CLUSTER_NAME CAO_VPC_CIDR; do
+    eval "val=\${$v:-}"
+    [ -n "$val" ] || missing="$missing $v"
+  done
+  if [ -n "$missing" ]; then
+    echo "error: existing-cluster mode needs:$missing" >&2
+    exit 1
+  fi
+  # The same shape the stack output has, checked here because a handle without
+  # the access point mounts the filesystem root instead of the subdirectory and
+  # every pod then shares one uid-mapped tree.
+  case "$HANDLE" in
+    fs-*::fsap-*) ;;
+    *)
+      echo "error: CAO_WORKSPACE_HANDLE must be 'fs-<id>::fsap-<id>' (got '$HANDLE')" >&2
+      exit 1
+      ;;
+  esac
+else
+  echo "reading outputs from stack '$STACK' in $REGION"
+  REPO="$(out ServerRepositoryUri)"
+  BROKER_REPO="$(out WorkerBrokerRepositoryUri)"
+  PANEL_REPO="$(out PanelRepositoryUri)"
+  HANDLE="$(out WorkspaceVolumeHandle)"
+  CLUSTER="$(out ClusterName)"
+  VPC_CIDR="$(out VpcCidrBlock)"
+fi
 
 # The Kiro overlay includes external-secret.yaml, whose remote key is
 # intentionally fixed to the documented name. Catch a Bedrock-mode stack, or a
 # differently named provider secret, before kubectl reaches an ExternalSecret
 # that can never become Ready.
-if [ "$MODE" = "kiro" ]; then
+if [ "$MODE" = "kiro" ] && [ "$STACK" != "-" ] && [ "$STACK" != "none" ]; then
   PROVIDER_SECRET="$(out ProviderSecretName)"
   if [ -z "$PROVIDER_SECRET" ] || [ "$PROVIDER_SECRET" = "None" ]; then
     echo "error: kiro mode requires the stack parameter ProviderSecretName=cao/provider-credentials" >&2
@@ -92,7 +138,8 @@ fi
 # An output that resolves to the empty string means the stack exists but is not
 # the stack these manifests expect — fail here rather than applying manifests
 # with a literal "<account-id>" in the image name, which surfaces much later as
-# an ImagePullBackOff.
+# an ImagePullBackOff. Existing-cluster mode has already checked the same six,
+# so this loop is a no-op there rather than a second source of truth.
 for pair in "ServerRepositoryUri=$REPO" "WorkerBrokerRepositoryUri=$BROKER_REPO" \
             "PanelRepositoryUri=$PANEL_REPO" \
             "WorkspaceVolumeHandle=$HANDLE" "ClusterName=$CLUSTER" \
