@@ -712,6 +712,13 @@ async def assign_elastic(
     arrived, and records which happened. Query ``GET /workers`` on the broker
     when a delegation reports success and produces no artifact.
     """
+    # Checked before the broker is asked for a lease, so a refused caller never
+    # gets a worker provisioned on its behalf. For a bound caller this resolves
+    # the terminal context over blocking HTTP, so it runs off the event loop for
+    # the same reason as the broker POST below.
+    denied = await asyncio.to_thread(_tool_denied_reason, "assign_elastic")
+    if denied:
+        return {"success": False, "terminal_id": None, "elastic": True, "message": denied}
     try:
         callback_terminal_id = _current_terminal_id()
         if not callback_terminal_id:
@@ -1452,9 +1459,10 @@ def _caller_effective_allowed_tools(context: Dict[str, Any]) -> Optional[List[st
 def _tool_denied_reason(tool_name: str) -> Optional[str]:
     """Reason the calling terminal's allowlist bars ``tool_name``, or None to allow.
 
-    ``assign`` and ``handoff`` spawn a terminal under a caller-chosen
-    ``agent_profile``, so an agent reaching them can mint a new identity with
-    its own memory scope under any profile installed on the box (#671). The
+    ``assign``, ``handoff`` and ``assign_elastic`` spawn a terminal under a
+    caller-chosen ``agent_profile``, so an agent reaching them can mint a new
+    identity with its own memory scope under any profile installed on the box
+    (#671). The
     provider-native restrictions built by ``utils/tool_mapping`` cannot cover
     that: ``get_disallowed_tools`` skips every ``@``-prefixed entry because MCP
     server references have no native tool names, so CAO's own MCP surface is
