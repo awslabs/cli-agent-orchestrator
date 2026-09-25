@@ -412,3 +412,69 @@ class TestReconnectBackoff:
         )
 
         assert delays == [0.01, 0.01, 0.01, 0.01], "a working channel resets the backoff"
+
+
+class TestTheSendGateOpensAfterTheHandshake:
+    """Non-handshake frames must be sent once the channel is established.
+
+    The gate that stops the forwarding tasks writing during hello/replay is only
+    half the contract; the other half is that it OPENS. Shipped with a `clear()`
+    and a check but no `set()`, every command result and every forwarded chunk was
+    silently skipped: commands arrived, the work happened, and nothing came back.
+    The server reported 504 "unknown outcome" for a launch that had in fact
+    succeeded — measured on a live cluster, and invisible to the whole suite
+    because every other test here asserts on frames sent WITH handshake=True.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_result_reaches_the_wire_after_the_handshake(self):
+        bridge = _bridge()
+        ws = _FakeWS(
+            HelloFrame(
+                protocol_version=PROTOCOL_VERSION,
+                runtime_id="server",
+            )
+        )
+        await bridge._serve(ws)
+        assert bridge._ready.is_set(), "the gate must be open once established"
+
+        before = len(ws.sent)
+        await bridge._send(
+            CommandResultFrame(
+                op_id="op-1",
+                terminal_id=TID,
+                outcome=CommandOutcome.OK,
+                payload={"success": True},
+            )
+        )
+        assert len(ws.sent) == before + 1, "an ordinary send after the handshake was dropped"
+
+    @pytest.mark.asyncio
+    async def test_a_send_before_the_handshake_is_skipped(self):
+        """The other half: the gate is shut until _serve opens it."""
+        bridge = _bridge()
+        bridge._ws = _FakeWS(HelloFrame(protocol_version=PROTOCOL_VERSION, runtime_id="server"))
+        assert not bridge._ready.is_set()
+
+        before = len(bridge._ws.sent)
+        await bridge._send(
+            CommandResultFrame(
+                op_id="op-early",
+                terminal_id=TID,
+                outcome=CommandOutcome.OK,
+                payload={},
+            )
+        )
+        assert len(bridge._ws.sent) == before, "a pre-handshake send must not reach the wire"
+
+    @pytest.mark.asyncio
+    async def test_the_hello_itself_is_not_gated(self):
+        """Otherwise the handshake could never happen at all."""
+        bridge = _bridge()
+        ws = _FakeWS(HelloFrame(protocol_version=PROTOCOL_VERSION, runtime_id="server"))
+        await bridge._serve(ws)
+        kinds = [f.kind for f in ws.sent]
+        assert kinds, "no frames were sent during _serve"
+        assert (
+            kinds[0] == HelloFrame(protocol_version=PROTOCOL_VERSION, runtime_id="x").kind
+        ), f"hello must be the FIRST frame on the connection, got {kinds}"

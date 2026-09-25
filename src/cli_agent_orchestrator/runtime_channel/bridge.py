@@ -883,6 +883,14 @@ class Bridge:
         # opened but failed version negotiation is not a working runtime. The
         # reconnect backoff reads the same flag for the same reason.
         self._established = True
+        # Open the send gate HERE, at the same point and for the same reason. It
+        # is what lets the forwarding tasks — and every command result — reach the
+        # wire; until this line they are skipped by `_send`, so forgetting it
+        # silences the runtime completely: commands arrive, work happens, and no
+        # result ever comes back. The server then reports a 504 unknown outcome
+        # for a launch that in fact succeeded, which is the worst combination
+        # available. Measured on a live cluster.
+        self._ready.set()
         mark_channel_ready()
         async for raw in ws:
             frame: Frame = decode_frame(raw)
@@ -928,6 +936,10 @@ class Bridge:
                 reason = f"lost ({e})"
             finally:
                 self._ws = None
+                # Shut the send gate with the connection. The forwarding tasks
+                # outlive every attempt, so leaving it open would let them write
+                # into the next socket before its hello.
+                self._ready.clear()
                 clear_channel_ready()
             if self._established:
                 # A channel that actually worked starts the next backoff over;
