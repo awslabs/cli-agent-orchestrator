@@ -45,6 +45,9 @@ USER_INPUT_PATTERN = r"^>\s+\S"
 # Devin shows a "#" prompt when idle and waiting for input
 IDLE_PROMPT_PATTERN = r"^[\s]*#[\s]*$"
 
+# Sentinel marking "no prior entry under this name" in _mcp_owned_servers.
+_PRIOR_ABSENT = object()
+
 # Processing state indicators (take priority over the fixed `#` prompt)
 PROCESSING_PATTERNS = [
     r"Running tools",
@@ -86,7 +89,11 @@ class DevinCliProvider(BaseProvider):
         self._agent_profile = agent_profile
         self._temp_prompt_file: Optional[str] = None
         self._mcp_config_path: Optional[Path] = None
-        self._mcp_owned_servers: set = set()
+        # name -> (entry we wrote, entry that was there before — _PRIOR_ABSENT
+        # when the name did not exist). Ownership cannot be inferred from the
+        # name alone on a shared file, so both halves are recorded.
+        self._mcp_owned_servers: dict = {}
+        self._mcp_file_preexisted: bool = False
         self._cached_profile: Optional[AgentProfile] = None
 
     def _load_profile(self) -> Optional[AgentProfile]:
@@ -221,7 +228,8 @@ class DevinCliProvider(BaseProvider):
         config_path = self._terminal_workdir() / ".devin" / "mcp_config.local.json"
 
         base: dict = {}
-        if config_path.is_file():
+        self._mcp_file_preexisted = config_path.is_file()
+        if self._mcp_file_preexisted:
             try:
                 loaded = json.loads(config_path.read_text(encoding="utf-8"))
                 if isinstance(loaded, dict):
@@ -229,38 +237,89 @@ class DevinCliProvider(BaseProvider):
             except (json.JSONDecodeError, OSError) as e:
                 logger.warning("Could not read existing %s: %s", config_path, e)
 
+        existing = base.get("mcpServers")
+        prior_servers = dict(existing) if isinstance(existing, dict) else {}
         self._merge_mcp_servers(base, mcp_servers)
 
         config_path.parent.mkdir(parents=True, exist_ok=True)
         config_path.write_text(json.dumps(base, indent=2) + "\n", encoding="utf-8")
         os.chmod(config_path, 0o600)
         self._mcp_config_path = config_path
-        self._mcp_owned_servers = set(mcp_servers)
+        delivered = base["mcpServers"]
+        for name in mcp_servers:
+            if name in delivered:
+                self._mcp_owned_servers[name] = (
+                    delivered[name],
+                    prior_servers.get(name, _PRIOR_ABSENT),
+                )
+
+    @staticmethod
+    def _is_cao_owned_entry(entry: object) -> bool:
+        """Whether an MCP entry was written by CAO (it carries our env marker)."""
+        return isinstance(entry, dict) and "CAO_TERMINAL_ID" in (entry.get("env") or {})
+
+    def _has_live_siblings(self, workdir: Path) -> bool:
+        """Whether another live CAO terminal launches in ``workdir``.
+
+        A sibling's MCP entries in the shared file can be byte-identical to
+        ours, so the file must be left alone while one is alive — entry values
+        carry no per-terminal identity by which to split ownership.
+        """
+        try:
+            from cli_agent_orchestrator.clients import database as _db
+
+            terminals = _db.list_all_terminals()
+        except Exception as exc:
+            logger.debug("Could not list terminals for %s: %s", self.terminal_id, exc)
+            return False
+        target = str(workdir)
+        return any(
+            isinstance(t, dict)
+            and t.get("terminal_id") != self.terminal_id
+            and t.get("working_directory") == target
+            for t in terminals
+        )
 
     def _cleanup_mcp_config(self) -> None:
-        """Remove this terminal's entries from the delivered MCP config file."""
+        """Restore the delivered MCP config to what it was before this terminal.
+
+        Removes entries this terminal created and restores entries it
+        overwrote — an operator-authored server under a name we reused must
+        come back, not vanish with our cleanup. An entry someone else rewrote
+        since delivery is left alone: it is no longer ours to restore. While
+        another live terminal shares the working directory the file is left
+        untouched entirely, because its entries may be serving the sibling.
+        """
         config_path = self._mcp_config_path
-        if config_path is None:
+        owned = self._mcp_owned_servers
+        self._mcp_config_path = None
+        self._mcp_owned_servers = {}
+        if config_path is None or not owned:
             return
         try:
             data = json.loads(config_path.read_text(encoding="utf-8"))
             servers = data.get("mcpServers")
-            if isinstance(servers, dict):
-                for name in self._mcp_owned_servers:
+            if not isinstance(servers, dict):
+                return
+            if self._has_live_siblings(config_path.parent.parent):
+                return
+            for name, (written, prior) in owned.items():
+                if servers.get(name) != written:
+                    continue
+                if prior is _PRIOR_ABSENT or self._is_cao_owned_entry(prior):
                     servers.pop(name, None)
-                if servers:
-                    config_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
                 else:
-                    config_path.unlink(missing_ok=True)
-                    try:
-                        config_path.parent.rmdir()
-                    except OSError:
-                        pass
+                    servers[name] = prior
+            if servers or self._mcp_file_preexisted:
+                config_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+            else:
+                config_path.unlink(missing_ok=True)
+                try:
+                    config_path.parent.rmdir()
+                except OSError:
+                    pass
         except (OSError, json.JSONDecodeError) as e:
             logger.warning("Failed to clean MCP config %s: %s", config_path, e)
-        finally:
-            self._mcp_config_path = None
-            self._mcp_owned_servers = set()
 
     # CAO ``streamable-http`` maps to Devin's ``http`` transport; ``sse`` and
     # ``http`` pass through unchanged (``mcp_config`` accepts ``"http"|"sse"``).
