@@ -6,7 +6,7 @@ import logging
 import re
 import time
 import uuid
-from typing import Callable, Optional, Union
+from typing import Any, Callable, Mapping, Optional, Union
 
 import requests
 
@@ -244,9 +244,21 @@ def poll_until_done(
     timeout: float,
     polling_interval: float = 1.0,
     idle_stable_polls: int = 3,
-    read_status: Optional[Callable[[str], Optional[str]]] = None,
+    read_terminal: Optional[Callable[[str], Optional[Mapping[str, Any]]]] = None,
+    min_turn: Optional[int] = None,
 ) -> None:
     """Poll terminal status until the agent is done, errored, or timeout.
+
+    ``min_turn`` is the turn number ``POST /terminals/{id}/input`` returned for the
+    message being waited on. Given one, no "done" signal is honoured until the
+    server reports ``turn_completed >= min_turn`` — the difference between "the
+    terminal looks ready" and "the turn I sent has finished" (#735). Without it this
+    function can only judge the terminal's current frame, and a completion marker on
+    that frame usually belongs to the PREVIOUS turn: the caller then returns in a
+    few seconds and prints the previous answer, or a half-rendered frame of the turn
+    still running. Pass it wherever the turn number is available; it is optional
+    only so callers that never dispatched the input (or talk to a server too old to
+    report a turn) keep working on the frame-shaped heuristic below.
 
     Two "done" signals, treated differently:
 
@@ -266,12 +278,13 @@ def poll_until_done(
       against a momentary idle flap mid-turn. The COMPLETED path is byte-for-byte
       unchanged.
 
-    ``read_status`` overrides only WHERE the status is read from, returning the
-    same string ``GET /terminals/{id}`` puts in its ``status`` field. It exists so
-    a terminal on a remote node - a `cao worker` reached through a cluster broker -
-    is judged done by exactly this logic rather than by a second copy of it. The
-    IDLE-versus-COMPLETED reasoning above is provider behaviour, not transport
-    behaviour, so it must not be duplicated per transport.
+    ``read_terminal`` overrides only WHERE the reading comes from, returning the
+    same payload ``GET /terminals/{id}`` does (``status``, and ``turn_completed``
+    when the server reports it). It exists so a terminal on a remote node - a
+    `cao worker` reached through a cluster broker - is judged done by exactly this
+    logic rather than by a second copy of it. The IDLE-versus-COMPLETED reasoning
+    above is provider behaviour, not transport behaviour, so it must not be
+    duplicated per transport.
 
     Raises click.ClickException on error, timeout, or request failure.
     """
@@ -290,14 +303,34 @@ def poll_until_done(
                 f"Timed out after {int(elapsed)}s waiting for terminal {terminal_id}"
             )
         try:
-            if read_status is not None:
-                status = read_status(terminal_id)
+            if read_terminal is not None:
+                payload = read_terminal(terminal_id) or {}
             else:
                 # Per-request timeout so a stalled server/network can't block past
                 # the outer timeout budget (matches wait_until_terminal_status).
                 resp = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=5.0)
                 resp.raise_for_status()
-                status = resp.json().get("status")
+                payload = resp.json()
+            status = payload.get("status")
+            # The turn gate, ahead of every "done" test below. ERROR is deliberately
+            # NOT gated: a provider process that exited is a fact about the terminal,
+            # not about a turn, and waiting for a turn that can no longer finish
+            # would just burn the timeout.
+            turn_completed = payload.get("turn_completed") if min_turn is not None else None
+            # A server that does not report the field at all leaves it None; fall back
+            # to the frame heuristic below rather than hanging forever against an
+            # older server (or a worker node that has not been upgraded).
+            if turn_completed is not None and status != TerminalStatus.ERROR.value:
+                if turn_completed < min_turn:
+                    # Our turn is still in flight, whatever the frame shows.
+                    consecutive_idle = 0
+                    time.sleep(polling_interval)
+                    continue
+                # The server has confirmed OUR turn finished. That is strictly better
+                # evidence than a PROCESSING sighting, so it satisfies the "has the
+                # agent started?" gate the IDLE path below needs — a turn short enough
+                # that no poll ever caught it working must still be allowed to finish.
+                observed_working = True
             if status == TerminalStatus.COMPLETED.value:
                 return
             if status == TerminalStatus.ERROR.value:

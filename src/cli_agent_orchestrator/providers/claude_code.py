@@ -1324,6 +1324,27 @@ class ClaudeCodeProvider(BaseProvider):
         return 2.0
 
     @property
+    def assume_processing_on_dispatch(self) -> bool:
+        """Claude Code's Ink TUI leaves the finished turn on screen after a submit.
+
+        The composited frame right after a paste still shows the previous turn's
+        response and completion summary, plus the input box — which is exactly what a
+        finished turn looks like. Until the new turn draws its first spinner, roughly
+        a second later, every reader that does not know about turns (InboxService,
+        send_input's own busy check, the web UI) sees the old turn's ready status and
+        treats it as this one's.
+
+        Publishing PROCESSING at dispatch closes that window for those readers.
+        ``turn_completed`` is the durable answer for readers that can ask (#735); this
+        property is what makes the cheap answer right too. It is only safe now that a
+        ready reading from an unsettled frame can no longer overwrite PROCESSING — see
+        StatusMonitor._apply_detection_locked — because the very next frame after the
+        paste is that stale ready one, and before the guard it would simply have
+        reverted this.
+        """
+        return True
+
+    @property
     def accepts_input_while_processing(self) -> bool:
         """Claude Code's Ink TUI buffers pasted input during processing.
 

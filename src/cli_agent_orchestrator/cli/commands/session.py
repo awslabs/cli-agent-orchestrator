@@ -237,18 +237,28 @@ def send(session_name, message, terminal_id, is_async, timeout):
             params={"message": message},
         )
         response.raise_for_status()
+        # The turn this message started. Waiting on it is what makes "done" mean
+        # "my message finished" rather than "the screen looks finished" (#735).
+        sent_turn = response.json().get("turn")
     except requests.exceptions.RequestException as e:
         raise click.ClickException(f"Failed to connect to cao-server: {e}")
+    except ValueError:
+        sent_turn = None  # non-JSON body from an unexpected proxy; fall back below
 
     if is_async:
         click.echo(f"Message sent to terminal {target_id}")
         return
 
-    time.sleep(3)
     effective_timeout = timeout if timeout is not None else _DEFAULT_SEND_TIMEOUT
     interrupted = False
     try:
-        poll_until_done(target_id, effective_timeout)
+        # No flat pre-sleep: it was only ever a guess at how long the previous
+        # turn's completion marker stays on screen, and the turn gate answers that
+        # exactly. Kept for servers that report no turn, where the guess is still
+        # the only thing standing between the poller and a stale marker.
+        if sent_turn is None:
+            time.sleep(3)
+        poll_until_done(target_id, effective_timeout, min_turn=sent_turn)
     except KeyboardInterrupt:
         interrupted = True
 
