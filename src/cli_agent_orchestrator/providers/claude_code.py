@@ -476,8 +476,12 @@ class ClaudeCodeProvider(BaseProvider):
                         mcp_config[server_name] = server_config.model_dump(exclude_none=True)
 
                     # Resolve the bundled cao-mcp-server console script to a
-                    # PATH-independent invocation.
-                    mcp_config[server_name] = resolve_mcp_server_config(mcp_config[server_name])
+                    # PATH-independent invocation. persisted=True: this dict is
+                    # serialized to <terminal_id>.mcp.json below, so the token is
+                    # left out and inherited from this process instead.
+                    mcp_config[server_name] = resolve_mcp_server_config(
+                        mcp_config[server_name], persisted=True
+                    )
 
                     env = mcp_config[server_name].get("env", {})
                     if "CAO_TERMINAL_ID" not in env:
@@ -494,11 +498,12 @@ class ClaudeCodeProvider(BaseProvider):
                 tmp_dir = CAO_HOME_DIR / "tmp"
                 tmp_dir.mkdir(parents=True, exist_ok=True)
                 mcp_file = tmp_dir / f"{self.terminal_id}.mcp.json"
-                # Owner-only from the first byte. The env above can carry
-                # CAO_RUNTIME_TOKEN — resolve_mcp_server_config hands the
-                # bundled server the channel credential — so this file
-                # structurally holds a secret, and `write_text` then `chmod`
-                # publishes the whole body at the umask default first: another
+                # Owner-only from the first byte. The channel token is no longer
+                # written here — the resolver above is called with persisted=True
+                # and the shim inherits CAO_RUNTIME_TOKEN from this process — but
+                # the file still carries the endpoint and the whole tool surface,
+                # and the mode matters for its own sake: `write_text` then `chmod`
+                # publishes the whole body at the umask default first, so another
                 # local account can open it inside that window and keep reading
                 # through the descriptor after the narrowing. The name is
                 # deterministic per terminal, so an inode left 0644 by an older

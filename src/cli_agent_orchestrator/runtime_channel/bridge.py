@@ -652,6 +652,23 @@ class Bridge:
             loop.remove_reader(state["master_fd"])
         except (ValueError, OSError):
             pass
+        # Send the EOF frame BEFORE cancelling the pump that would have sent it.
+        # An empty ATTACH StreamFrame is how the server's relay learns the PTY is
+        # gone: `deliver_attach(id, None)` is what `_downstream()` breaks on.
+        # Cancelling first meant that frame was never written, so on a TEARDOWN
+        # the relay parked on `sink.get()` forever — and `unbind_terminal(...,
+        # deleted=True)` then removed the binding, so no later disconnect sweep
+        # could find the sink either. Only a client keystroke ended it, by raising
+        # out of the upstream half (Copilot review on #802).
+        await self._send(
+            StreamFrame(
+                terminal_id=terminal_id,
+                stream=StreamName.ATTACH,
+                generation=0,
+                pos=0,
+                data="",
+            )
+        )
         task = state.get("task")
         if task is not None:
             task.cancel()
@@ -836,17 +853,30 @@ class Bridge:
                     resume.terminal_id,
                     buf.end_pos,
                 )
-                buf.begin_generation()
+                # Read the OLD watermark and report the gap in the OLD generation,
+                # BEFORE the new one starts. Order is the whole correctness of this
+                # block: `begin_generation()` zeroes `end_pos`, so building the gap
+                # after it produced `from_pos=0` stamped with the NEW generation —
+                # and the server's higher-generation branch in `record_position`
+                # SETS the watermark from a gap's `to_pos`, so the fresh generation
+                # inherited exactly the impossible position this code exists to
+                # escape. Live frames at 0..N then never advanced it and every
+                # later reconnect re-entered here, calling `begin_generation()`
+                # again and discarding the retained window each time — a one-off
+                # mismatch turned into recurring real output loss. Found by review
+                # of the first version of this fix.
+                stale_end = buf.end_pos
                 await self._send(
                     GapFrame(
                         terminal_id=resume.terminal_id,
                         stream=StreamName.CAPTURE,
                         generation=buf.generation,
-                        from_pos=buf.end_pos,
+                        from_pos=stale_end,
                         to_pos=resume.end_pos,
                     ),
                     handshake=True,
                 )
+                buf.begin_generation()
                 start = buf.end_pos
             # Gaps and bytes come back interleaved in stream order and are sent
             # that way: a hole the live path could not report (the channel was

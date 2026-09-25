@@ -603,6 +603,11 @@ class DispatchJournalModel(Base):
     # without this there is no way back to the run whose step is still RUNNING.
     run_id = Column(String, nullable=True)
     step_id = Column(String, nullable=True)
+    # For LAUNCH: the engine the caller asked for. The runtime's result payload
+    # does not echo it, so without this a terminal reconciled after a restart was
+    # persisted with engine=None even though it was launched engine-pinned -- and
+    # reuse validation and the input gate both read that column.
+    engine = Column(String, nullable=True)
     # "dispatched" until a result is applied, then "settled". A dispatched entry
     # found after a restart is an operation whose outcome this server never saw.
     state = Column(String, nullable=False, default="dispatched")
@@ -636,6 +641,10 @@ def init_db() -> None:
     """Initialize database tables and apply schema migrations."""
     _migrate_project_aliases_schema()
     Base.metadata.create_all(bind=engine)
+    # Must run straight after create_all: create_all adds a missing TABLE but
+    # never a missing COLUMN, and a journal table from an earlier revision of
+    # this branch lacks `engine`, which breaks every read of it.
+    _migrate_dispatch_journal()
     _restrict_db_file_permissions()
     _migrate_terminals_schema()
     _migrate_add_access_count()
@@ -925,6 +934,41 @@ def _migrate_memory_source_kind() -> None:
     except Exception as e:
         logger.error(f"Memory source_kind migration failed: {e}")
         raise
+
+
+def _migrate_dispatch_journal() -> None:
+    """Add later ``dispatch_journal`` columns to a table created without them.
+
+    ``Base.metadata.create_all`` creates a MISSING table but never ALTERs an
+    existing one, so a database built by an earlier revision of this branch has
+    ``dispatch_journal`` without ``engine`` — and then every read of the journal
+    fails with ``no such column``, which takes the whole remote launch path down
+    with it. Fresh databases already have the column from the model.
+
+    Idempotent: PRAGMA gate, then ALTER only what is missing.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            present = {
+                row[1] for row in conn.execute("PRAGMA table_info(dispatch_journal)").fetchall()
+            }
+            if not present:
+                # No such table yet; create_all will build it complete.
+                return
+            for column, ddl in (
+                ("engine", "ALTER TABLE dispatch_journal ADD COLUMN engine VARCHAR"),
+                ("run_id", "ALTER TABLE dispatch_journal ADD COLUMN run_id VARCHAR"),
+                ("step_id", "ALTER TABLE dispatch_journal ADD COLUMN step_id VARCHAR"),
+            ):
+                if column not in present:
+                    conn.execute(ddl)
+                    logger.info("Migration: added %s column to dispatch_journal", column)
+    except Exception as e:
+        logger.debug(f"Migration check for dispatch_journal failed: {e}")
 
 
 def _migrate_add_access_count() -> None:
@@ -2082,6 +2126,7 @@ def record_dispatch(
     owner: Optional[str] = None,
     run_id: Optional[str] = None,
     step_id: Optional[str] = None,
+    engine: Optional[str] = None,
 ) -> None:
     """Journal an operation BEFORE its frame is sent to a runtime.
 
@@ -2103,6 +2148,7 @@ def record_dispatch(
                     owner=owner,
                     run_id=run_id,
                     step_id=step_id,
+                    engine=engine,
                     state="dispatched",
                 )
             )
@@ -2113,6 +2159,7 @@ def record_dispatch(
             row.owner = owner
             row.run_id = run_id
             row.step_id = step_id
+            row.engine = engine
             row.state = "dispatched"
             row.settled_at = None
         db.commit()
@@ -2138,6 +2185,7 @@ def get_dispatch_record(op_id: str) -> Optional[dict]:
             "owner": row.owner,
             "run_id": row.run_id,
             "step_id": row.step_id,
+            "engine": row.engine,
             "state": cast(str, row.state),
         }
 
@@ -2250,10 +2298,18 @@ _SERVER_OWNED_METADATA_KEYS = ("runtime_id",)
 def update_terminal_metadata(terminal_id: str, metadata: Optional[Dict[str, Any]]) -> bool:
     """Replace a terminal's free-form metadata dict. ``None``/``{}`` clears it.
 
-    Server-owned keys (:data:`_SERVER_OWNED_METADATA_KEYS`) are carried over
-    from the existing row regardless of what the caller sends, so this
-    whole-dict replace cannot strip the routing binding. The creation path
+    Server-owned keys (:data:`_SERVER_OWNED_METADATA_KEYS`) are DROPPED from the
+    caller's dict and then restored from the existing row, so this whole-dict
+    replace can neither strip nor set the routing binding. The creation path
     writes those keys directly and is unaffected.
+
+    The drop is the half that was missing. Carrying the old value over protects a
+    row that already HAS a placement, but it left injection open: a row with no
+    ``runtime_id`` kept whatever the caller supplied, and this metadata bag is
+    agent-writable through ``PATCH /terminals/{id}/metadata``. Naming a runtime on
+    a purely LOCAL terminal made its row read as remote — ``is_remote`` true,
+    ``runtime_for_terminal`` returning the injected id — so that runtime could
+    claim a pane it never launched and receive its input (Copilot review on #802).
     """
     import json as _json
 
@@ -2271,7 +2327,18 @@ def update_terminal_metadata(terminal_id: str, metadata: Optional[Dict[str, Any]
                 for key in _SERVER_OWNED_METADATA_KEYS:
                     if key in existing:
                         preserved[key] = existing[key]
-        merged: Dict[str, Any] = dict(metadata) if metadata else {}
+        # Strip first: a server-owned key the caller supplied is never honoured,
+        # whether or not the row already carries one.
+        merged: Dict[str, Any] = {
+            k: v for k, v in (metadata or {}).items() if k not in _SERVER_OWNED_METADATA_KEYS
+        }
+        rejected = sorted(set(metadata or {}) & set(_SERVER_OWNED_METADATA_KEYS))
+        if rejected:
+            logger.warning(
+                "ignoring server-owned metadata key(s) %s supplied for terminal %s",
+                ", ".join(rejected),
+                terminal_id,
+            )
         merged.update(preserved)
         terminal.metadata_json = _json.dumps(merged) if merged else None
         db.commit()

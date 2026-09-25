@@ -299,10 +299,17 @@ class RuntimeChannelRegistry:
             # and the bridge drops sends on a closed channel, so without this
             # neither side of the relay ever completes and the browser/native
             # attach hangs until the CLIENT gives up (Copilot review on #802).
+            # `_terminal_runtime` alone is not the routing answer: an attach can
+            # be opened for a terminal reachable only through the recovered
+            # placement (a hello that omitted it, post-restart), and
+            # `send_terminal_command` accepts that route. Keying the sweep on the
+            # in-memory binding alone therefore left those sinks un-EOFed on
+            # disconnect (Copilot review on #802).
             orphaned = [
                 tid
                 for tid in list(self._attach_sinks)
                 if self._terminal_runtime.get(tid) == runtime_id
+                or self._recovered_placement.get(tid) == runtime_id
             ]
             for tid in orphaned:
                 sink = self._attach_sinks.pop(tid, None)
@@ -439,6 +446,14 @@ class RuntimeChannelRegistry:
                 self._tombstones[terminal_id] = time.time()
                 while len(self._tombstones) > _TOMBSTONE_MAX:
                     self._tombstones.popitem(last=False)
+            # EOF any live attach before the binding disappears. Once this method
+            # returns there is nothing left tying the terminal to a runtime, so no
+            # later disconnect sweep can find its sink -- and the relay's
+            # downstream task waits on sink.get() forever. A TEARDOWN of an
+            # attached terminal hung exactly this way (Copilot review on #802).
+            sink = self._attach_sinks.pop(terminal_id, None)
+            if sink is not None:
+                sink.put_nowait(None)
             self._terminal_runtime.pop(terminal_id, None)
             self._recovered_placement.pop(terminal_id, None)
             self._status.pop(terminal_id, None)

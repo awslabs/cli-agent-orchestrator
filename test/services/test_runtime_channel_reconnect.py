@@ -478,3 +478,56 @@ class TestTheSendGateOpensAfterTheHandshake:
         assert (
             kinds[0] == HelloFrame(protocol_version=PROTOCOL_VERSION, runtime_id="x").kind
         ), f"hello must be the FIRST frame on the connection, got {kinds}"
+
+
+class TestAResumePastTheWatermarkDoesNotPoisonTheNewGeneration:
+    """The gap must be reported in the OLD generation, before the new one starts.
+
+    The first version of this fix called ``begin_generation()`` and then built the
+    GapFrame — but ``begin_generation()`` zeroes ``end_pos``, so the frame carried
+    ``from_pos=0`` stamped with the NEW generation. On the server,
+    ``record_position``'s higher-generation branch SETS the watermark from a gap's
+    ``to_pos``, so the fresh generation inherited the very impossible position the
+    code exists to escape: live frames at 0..N never advanced it, and every later
+    reconnect re-entered the same branch, calling ``begin_generation()`` again and
+    discarding the retained window — one mismatch becoming recurring output loss.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_gap_names_the_old_watermark_and_generation(self):
+        bridge = _bridge()
+        buf = bridge._buffer_for(TID)
+        buf.append(b"twelve bytes")
+        stale_end = buf.end_pos
+        old_generation = buf.generation
+        impossible = stale_end + 500
+
+        ws = _FakeWS(
+            HelloFrame(
+                protocol_version=PROTOCOL_VERSION,
+                runtime_id="server",
+                resume=[
+                    StreamPosition(
+                        terminal_id=TID,
+                        stream=StreamName.CAPTURE,
+                        generation=old_generation,
+                        end_pos=impossible,
+                    )
+                ],
+            )
+        )
+        await bridge._serve(ws)
+
+        gaps = ws.frames_of(GapFrame)
+        assert len(gaps) == 1, f"expected exactly one gap, got {gaps}"
+        gap = gaps[0]
+        # from_pos is the OLD watermark, not 0 — proving it was read before the
+        # generation was restarted.
+        assert gap.from_pos == stale_end
+        assert gap.to_pos == impossible
+        # And it is stamped with the OLD generation, so the server cannot apply
+        # to_pos as the NEW generation's watermark.
+        assert gap.generation == old_generation
+        # The buffer did restart, which is the other half of the recovery.
+        assert buf.generation == old_generation + 1
+        assert buf.end_pos == 0

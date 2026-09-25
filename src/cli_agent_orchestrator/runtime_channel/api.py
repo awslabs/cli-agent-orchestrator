@@ -347,7 +347,12 @@ def _persist_reconciled_terminal(info: dict, runtime_id: str, record: dict, op_i
                 agent_profile=info.get("agent_profile"),
                 allowed_tools=info.get("allowed_tools"),
                 shell_command=info.get("shell_command"),
-                engine=info.get("engine"),
+                # The bridge's LAUNCH result payload carries no `engine` key, so
+                # `info` cannot supply it; the journal recorded what was asked for
+                # at dispatch. Without this an engine-pinned terminal recovered
+                # after a restart was persisted as engine=None, which is what reuse
+                # validation and the input gate read (Copilot review on #802).
+                engine=record.get("engine") or info.get("engine"),
                 # The owner comes from the journal, which recorded it at dispatch
                 # and never told the runtime. Previously this wrote no owner at
                 # all, and an unowned row passes the revocation gate.
@@ -817,6 +822,9 @@ async def launch_remote_terminal(
             CommandType.LAUNCH.value,
             runtime_id,
             owner=owner_id,
+            # The runtime's result payload does not echo `engine`, so the journal
+            # is the only place a reconcile after a restart can read it from.
+            engine=body.engine,
         )
     except Exception:
         # A launch that cannot be journalled must not happen: its result would be

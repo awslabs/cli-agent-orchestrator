@@ -630,3 +630,80 @@ class TestAHelloEstablishesTheGeneration:
         assert fresh.resume_position(TID, "capture") == 0, "new stream starts over"
         assert fresh.is_stale_generation(TID, "capture", 0) is True
         assert fresh.is_stale_generation(TID, "capture", 1) is False
+
+
+class TestServerOwnedMetadataCannotBeInjected:
+    """A placement may not be SET through the agent-writable metadata bag.
+
+    Carrying the old value over protects a row that already has a placement, but
+    it left injection open: a row with no ``runtime_id`` kept whatever the caller
+    supplied, and this bag is writable through ``PATCH
+    /terminals/{id}/metadata``. Naming a runtime on a purely LOCAL terminal made
+    its row read as remote, so that runtime could claim a pane it never launched
+    and receive its input (Copilot review on #802).
+
+    Driven against a real sqlite file bound to this test only. An earlier version
+    of these tests called ``importlib.reload`` on the database module to point it
+    at a tmp_path, which swapped the module object out from under every other
+    module holding a reference to it and failed 10 unrelated tests later in the
+    session — the tests passed alone and broke the suite.
+    """
+
+    @staticmethod
+    def _isolated_db(tmp_path):
+        """A private engine/session bound to one file, with the real schema."""
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from cli_agent_orchestrator.clients import database as db
+
+        eng = create_engine(f"sqlite:///{tmp_path}/t.db")
+        db.Base.metadata.create_all(bind=eng)
+        return eng, sessionmaker(bind=eng)
+
+    def _update(self, tmp_path, monkeypatch, existing_metadata, sent):
+        """Create a row with ``existing_metadata``, then update it with ``sent``."""
+        import json
+
+        from cli_agent_orchestrator.clients import database as db
+
+        eng, Session = self._isolated_db(tmp_path)
+        monkeypatch.setattr(db, "SessionLocal", Session)
+        with Session() as s:
+            s.add(
+                db.TerminalModel(
+                    id=TID,
+                    tmux_session="cao-aaaa1111",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    metadata_json=json.dumps(existing_metadata) if existing_metadata else None,
+                )
+            )
+            s.commit()
+
+        db.update_terminal_metadata(TID, sent)
+
+        with Session() as s:
+            row = s.query(db.TerminalModel).filter(db.TerminalModel.id == TID).first()
+            return json.loads(row.metadata_json) if row.metadata_json else {}
+
+    def test_a_caller_cannot_add_a_runtime_id(self, tmp_path, monkeypatch):
+        stored = self._update(
+            tmp_path, monkeypatch, None, {"runtime_id": "attacker-runtime", "ok": "kept"}
+        )
+        assert "runtime_id" not in stored, "an injected placement was honoured"
+        assert stored["ok"] == "kept", "unrelated keys must survive"
+
+    def test_a_caller_cannot_overwrite_an_existing_runtime_id(self, tmp_path, monkeypatch):
+        stored = self._update(
+            tmp_path, monkeypatch, {"runtime_id": "worker-1"}, {"runtime_id": "worker-elsewhere"}
+        )
+        assert stored["runtime_id"] == "worker-1"
+
+    def test_an_existing_runtime_id_is_still_preserved(self, tmp_path, monkeypatch):
+        """The original protection must not regress under the new strip."""
+        stored = self._update(
+            tmp_path, monkeypatch, {"runtime_id": "worker-1"}, {"unrelated": "value"}
+        )
+        assert stored["runtime_id"] == "worker-1"
+        assert stored["unrelated"] == "value"

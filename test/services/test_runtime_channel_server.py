@@ -1355,3 +1355,72 @@ class TestAHeartbeatWatermarkTheServerIsBehind:
             self._sync(ws, "sync-hb")
 
             assert runtime_registry.runtime_for_terminal(HB_TID) == "worker-1"
+
+
+class TestAReconciledTerminalKeepsItsEngine:
+    """The engine comes from the journal, because the runtime never echoes it.
+
+    ``_persist_reconciled_terminal`` read ``info.get("engine")``, but ``info`` is
+    the bridge's LAUNCH result payload, which carries no ``engine`` key at all — so
+    a terminal recovered after a restart was persisted with ``engine=None`` even
+    though it had been launched engine-pinned, and reuse validation and the input
+    gate both read that column (Copilot review on #802).
+    """
+
+    def test_the_journalled_engine_is_persisted(self, channel_client, monkeypatch):
+        import cli_agent_orchestrator.runtime_channel.api as rc_api
+        from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
+
+        orphan = "abcdef01"
+        created = {}
+        monkeypatch.setattr(rc_api, "get_terminal_metadata", lambda tid: None)
+        monkeypatch.setattr(
+            rc_api, "db_create_terminal", lambda *a, **k: created.update({"kwargs": k})
+        )
+        monkeypatch.setattr(
+            rc_api,
+            "get_dispatch_record",
+            lambda op_id: {
+                "op_id": op_id,
+                "command_type": "launch",
+                "runtime_id": "worker-1",
+                "terminal_id": None,
+                "owner": "alice",
+                "run_id": None,
+                "step_id": None,
+                "engine": "v2",
+                "state": "dispatched",
+            },
+        )
+        monkeypatch.setattr(rc_api, "settle_dispatch", lambda op_id: None)
+        headers = {"Host": "localhost", "X-CAO-Runtime-Token": "test-runtime-token"}
+        try:
+            with channel_client.websocket_connect("/runtime/channel", headers=headers) as ws:
+                ws.send_text(_hello())
+                decode_frame(ws.receive_text())
+                ws.send_text(
+                    encode_frame(
+                        CommandResultFrame(
+                            op_id="launch-engine-pinned",
+                            terminal_id=orphan,
+                            outcome=CommandOutcome.OK,
+                            # Exactly what the bridge sends: no engine key.
+                            payload={
+                                "terminal": {
+                                    "id": orphan,
+                                    "session_name": "cao-abcdef01",
+                                    "name": "developer",
+                                    "provider": "kiro_cli",
+                                }
+                            },
+                        )
+                    )
+                )
+                ack = decode_frame(ws.receive_text())
+                assert isinstance(ack, AckFrame)
+                assert created["kwargs"]["engine"] == "v2", (
+                    "the engine must come from the dispatch journal, since the "
+                    "runtime's result payload does not carry it"
+                )
+        finally:
+            runtime_registry.unbind_terminal(orphan)

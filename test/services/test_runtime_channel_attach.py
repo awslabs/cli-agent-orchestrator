@@ -241,3 +241,84 @@ async def test_server_relay_reports_unconnected_runtime_as_4010():
     with patch.object(runtime_registry, "send_terminal_command", side_effect=refuse):
         await relay_remote_attach(ws, "abcd1234")
     assert ws.closed is not None and ws.closed[0] == 4010
+
+
+class TestAnAttachIsEndedWhenItsTerminalGoes:
+    """A teardown must EOF the attach, not leave the relay parked.
+
+    ``_downstream()`` waits on ``sink.get()`` and breaks on ``None``. Two paths
+    failed to deliver that None, so an attached terminal being torn down hung the
+    relay until the CLIENT gave up (Copilot review on #802):
+
+    * the bridge cancelled the pump task BEFORE it could send the terminating
+      empty ATTACH frame, and
+    * ``unbind_terminal`` removed the binding, so no later disconnect sweep could
+      find the sink either.
+    """
+
+    def test_unbind_eofs_a_live_attach(self):
+        import asyncio
+
+        from cli_agent_orchestrator.runtime_channel.registry import RuntimeChannelRegistry
+
+        registry = RuntimeChannelRegistry()
+        sink: asyncio.Queue = asyncio.Queue()
+        registry.bind_terminal("t-attached", "worker-1")
+        registry.bind_attach("t-attached", sink)
+
+        registry.unbind_terminal("t-attached", deleted=True)
+
+        assert sink.get_nowait() is None, "the relay was never told the PTY is gone"
+
+    def test_the_disconnect_sweep_covers_a_recovered_placement(self, monkeypatch):
+        """An attach can be open for a terminal routed only by the durable row."""
+        import asyncio
+
+        from cli_agent_orchestrator.runtime_channel.registry import RuntimeChannelRegistry
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+            lambda tid: {"id": tid, "metadata": {"runtime_id": "worker-1"}},
+        )
+        registry = RuntimeChannelRegistry()
+
+        async def _send(_raw):
+            pass
+
+        conn = registry.register("worker-1", _send)
+        # Routed via the recovered placement only — no bind_terminal call.
+        assert registry.runtime_for_terminal("t-recovered") == "worker-1"
+        sink: asyncio.Queue = asyncio.Queue()
+        registry.bind_attach("t-recovered", sink)
+
+        registry.unregister("worker-1", conn)
+
+        assert sink.get_nowait() is None, "a recovered-placement attach was left hanging"
+
+    def test_an_unrelated_runtimes_attach_is_untouched(self, monkeypatch):
+        import asyncio
+
+        from cli_agent_orchestrator.runtime_channel.registry import RuntimeChannelRegistry
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+            lambda tid: None,
+        )
+        registry = RuntimeChannelRegistry()
+
+        async def _send(_raw):
+            pass
+
+        conn_a = registry.register("worker-1", _send)
+        registry.register("worker-2", _send)
+        registry.bind_terminal("t-a", "worker-1")
+        registry.bind_terminal("t-b", "worker-2")
+        sink_a: asyncio.Queue = asyncio.Queue()
+        sink_b: asyncio.Queue = asyncio.Queue()
+        registry.bind_attach("t-a", sink_a)
+        registry.bind_attach("t-b", sink_b)
+
+        registry.unregister("worker-1", conn_a)
+
+        assert sink_a.get_nowait() is None
+        assert sink_b.empty(), "worker-2's attach must be unaffected"
