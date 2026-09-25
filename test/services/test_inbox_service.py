@@ -9,7 +9,10 @@ import pytest
 from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.constants import INBOX_RECONCILE_GRACE_SECONDS
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
-from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.models.terminal import (
+    TerminalCaptureUnavailableError,
+    TerminalStatus,
+)
 from cli_agent_orchestrator.services.inbox_service import InboxService
 
 
@@ -202,6 +205,35 @@ class TestDeliverPending:
         mock_get.return_value = [_make_message()]
         mock_monitor.get_status.return_value = TerminalStatus.IDLE
         mock_term_svc.send_input.side_effect = TerminalNotFoundError("s:w")
+
+        svc = InboxService()
+        svc.deliver_pending("term-1")
+
+        # Final status is PENDING (reset after the optimistic DELIVERED), never FAILED.
+        assert mock_update.call_args_list[-1] == call(1, MessageStatus.PENDING)
+        assert call(1, MessageStatus.FAILED) not in mock_update.call_args_list
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_capture_refusal_leaves_message_pending(
+        self, mock_get, mock_monitor, mock_term_svc, mock_update
+    ):
+        """A TerminalCaptureUnavailableError during send leaves the message
+        PENDING, not FAILED.
+
+        The provider's pre-send transcript capture refused the dispatch
+        before typing anything (issue #739 review: the generic ProviderError
+        terminally failed an otherwise valid delivery). Like an unresolvable
+        pane, nothing was sent, so the message must return to PENDING for the
+        reconcile sweep — never FAILED.
+        """
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_term_svc.send_input.side_effect = TerminalCaptureUnavailableError(
+            "pre-send transcript capture failed"
+        )
 
         svc = InboxService()
         svc.deliver_pending("term-1")
