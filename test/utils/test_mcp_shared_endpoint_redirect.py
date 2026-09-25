@@ -156,7 +156,7 @@ class TestOnlyTheBundledCommand:
         assert _is_shim(command, args), (command, args)
 
 
-class TestTheTokenReachesOnlyCaosOwnChild:
+class TestTheTokenIsWrittenOnlyForCaosOwnChild:
     """Two providers build the child env by hand instead of taking the resolver's.
 
     `resolve_mcp_server_config` has always gated the forwarding env on the command,
@@ -165,6 +165,14 @@ class TestTheTokenReachesOnlyCaosOwnChild:
     runtime — to third-party MCP servers CAO does not ship, for no purpose. Where
     the provider persists its config, it also writes that secret into a file whose
     author never expected to hold one (Copilot review on #802, findings 2 and 9).
+
+    Scope, because the original name of this class ("ReachesOnlyCaosOwnChild")
+    claimed more than any assertion here shows: every test below is about what is
+    WRITTEN into a config entry. A third-party MCP child still INHERITS the token
+    from the provider's pane environment, which `TmuxClient.create_session`
+    populates from every non-blocked `CAO_*` variable. That is a real gap and it is
+    documented in `shared_endpoint_child_env`; do not read these tests as proof of
+    runtime isolation (Copilot review on #802).
     """
 
     def test_the_helper_is_silent_for_a_third_party_command(self, shared_endpoint):

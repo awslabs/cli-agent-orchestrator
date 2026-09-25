@@ -422,11 +422,14 @@ class TestChannelEndpoint:
 
         received = []
         original_publish = bus.publish
-        original_deliver = bus.deliver_now
+        original_deliver = bus.deliver_with_loss_markers
         bus.publish = lambda topic, payload: received.append((topic, payload))
         # Output frames go through deliver_now so the handler can see drops; a
         # capture that patched only publish stopped seeing them. 0 = delivered.
-        bus.deliver_now = lambda topic, payload: (received.append((topic, payload)), 0)[1]
+        bus.deliver_with_loss_markers = lambda topic, payload, *, lost=None: (
+            received.append((topic, payload)),
+            0,
+        )[1]
         headers = {"Host": "localhost", "X-CAO-Runtime-Token": "test-runtime-token"}
         try:
             with channel_client.websocket_connect("/runtime/channel", headers=headers) as ws:
@@ -466,7 +469,7 @@ class TestChannelEndpoint:
                 assert decode_frame(ws.receive_text()).op_id == "sync-gen"
         finally:
             bus.publish = original_publish
-            bus.deliver_now = original_deliver
+            bus.deliver_with_loss_markers = original_deliver
             runtime_registry.unbind_terminal(TID)
 
         published = [p["data"] for _t, p in received if "data" in p]
@@ -611,7 +614,9 @@ class TestChannelEndpoint:
                 ack = decode_frame(ws.receive_text())
                 assert isinstance(ack, AckFrame) and ack.op_id == "launch-op-lost"
                 assert created["args"][0] == orphan  # persisted
-                assert created["kwargs"]["metadata"] == {"runtime_id": "worker-1"}
+                # server_metadata, not metadata: placement is server-owned, and
+                # caller-supplied copies of these keys are stripped at creation.
+                assert created["kwargs"]["server_metadata"] == {"runtime_id": "worker-1"}
                 # The owner comes from the journal, not from nothing: an unowned
                 # row passes the revocation gate, which is what made the earlier
                 # version of this recovery unsafe.
@@ -809,9 +814,12 @@ class TestChannelEndpoint:
         # The TestClient runs the app in its own event loop; capture publishes
         # by patching is heavier than just recording what publish is given.
         original_publish = bus.publish
-        original_deliver = bus.deliver_now
+        original_deliver = bus.deliver_with_loss_markers
         bus.publish = lambda topic, data: received.append((topic, data))
-        bus.deliver_now = lambda topic, data: (received.append((topic, data)), 0)[1]
+        bus.deliver_with_loss_markers = lambda topic, data, *, lost=None: (
+            received.append((topic, data)),
+            0,
+        )[1]
         try:
             with channel_client.websocket_connect(
                 "/runtime/channel",
@@ -858,7 +866,7 @@ class TestChannelEndpoint:
                 assert runtime_registry.get_status(TID) == TerminalStatus.COMPLETED
         finally:
             bus.publish = original_publish
-            bus.deliver_now = original_deliver
+            bus.deliver_with_loss_markers = original_deliver
 
         assert (f"terminal.{TID}.output", {"data": "hello from worker"}) in received
         assert (f"terminal.{TID}.status", {"status": "completed"}) in received
@@ -883,9 +891,12 @@ class TestChannelEndpoint:
 
         received = []
         original_publish = bus.publish
-        original_deliver = bus.deliver_now
+        original_deliver = bus.deliver_with_loss_markers
         bus.publish = lambda topic, data: received.append((topic, data))
-        bus.deliver_now = lambda topic, data: (received.append((topic, data)), 0)[1]
+        bus.deliver_with_loss_markers = lambda topic, data, *, lost=None: (
+            received.append((topic, data)),
+            0,
+        )[1]
         headers = {"Host": "localhost", "X-CAO-Runtime-Token": "test-runtime-token"}
         try:
             with channel_client.websocket_connect("/runtime/channel", headers=headers) as old:
@@ -933,7 +944,7 @@ class TestChannelEndpoint:
                     assert isinstance(ack, AckFrame) and ack.op_id == "sync-op"
         finally:
             bus.publish = original_publish
-            bus.deliver_now = original_deliver
+            bus.deliver_with_loss_markers = original_deliver
 
         topics = [(t, d) for t, d in received if t == f"terminal.{TID}.output"]
         assert (f"terminal.{TID}.output", {"data": "live output"}) in topics
@@ -1134,9 +1145,12 @@ class TestABoundedGapIsConsumed:
 
         received = []
         original_publish = bus.publish
-        original_deliver = bus.deliver_now
+        original_deliver = bus.deliver_with_loss_markers
         bus.publish = lambda topic, data: received.append((topic, data))
-        bus.deliver_now = lambda topic, data: (received.append((topic, data)), 0)[1]
+        bus.deliver_with_loss_markers = lambda topic, data, *, lost=None: (
+            received.append((topic, data)),
+            0,
+        )[1]
         try:
             with channel_client.websocket_connect("/runtime/channel", headers=self.HEADERS) as ws:
                 ws.send_text(_hello())
@@ -1145,7 +1159,7 @@ class TestABoundedGapIsConsumed:
                 self._sync(ws, "sync-published")
         finally:
             bus.publish = original_publish
-            bus.deliver_now = original_deliver
+            bus.deliver_with_loss_markers = original_deliver
 
         assert (
             f"terminal.{GAP_TID}.output",

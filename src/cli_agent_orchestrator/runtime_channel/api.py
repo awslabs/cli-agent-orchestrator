@@ -357,7 +357,9 @@ def _persist_reconciled_terminal(info: dict, runtime_id: str, record: dict, op_i
                 # and never told the runtime. Previously this wrote no owner at
                 # all, and an unowned row passes the revocation gate.
                 owner=record.get("owner"),
-                metadata={"runtime_id": runtime_id},
+                # server_metadata, not metadata: placement is server-owned and
+                # caller-supplied copies of these keys are stripped at creation.
+                server_metadata={"runtime_id": runtime_id},
             )
             logger.warning(
                 "reconciled orphaned terminal %s from a redelivered LAUNCH result "
@@ -603,36 +605,39 @@ async def runtime_channel(ws: WebSocket) -> None:
                 # payload shape the local FIFO reader uses, so bus-contract
                 # consumers (LogWriter, AG-UI, inbox) work unchanged.
                 #
-                # Delivery FIRST, watermark second, and the watermark only moves
-                # over bytes a subscriber actually took. The order used to be the
-                # other way with a fire-and-forget publish, so a burst that
-                # overflowed a LogWriter/AG-UI/inbox queue was counted as consumed:
-                # the runtime was told those bytes had landed, the reconnect had
-                # nothing left to replay, and a bounded overflow became permanent
-                # loss (Copilot review on #802).
-                dropped = bus.deliver_now(
+                # Loss is reported PER SUBSCRIBER, and the watermark always
+                # advances. Three earlier shapes of this were wrong, each for the
+                # same structural reason — the bus is a shared, bounded,
+                # fire-and-forget fanout, so no single decision derived from an
+                # aggregate is right for every subscriber:
+                #
+                #  * advancing silently: a dropped chunk was recorded as received
+                #    and became unrecoverable;
+                #  * holding the watermark back: the reconnect replays the range to
+                #    EVERY subscriber, duplicating output for those that took it —
+                #    and with two consecutive drops the second call moved the
+                #    watermark past the first loss anyway;
+                #  * broadcasting a gap marker: it tells subscribers that received
+                #    the bytes they lost them, is published fire-and-forget, and can
+                #    be dropped by the very queue that is full — so the one
+                #    subscriber needing it is the least likely to get it.
+                #
+                # `deliver_with_loss_markers` owes the marker to the specific queue
+                # that refused, and hands it over on the next put that queue
+                # accepts. Nothing is replayed, nothing is duplicated, and the loss
+                # is visible to exactly the consumer that suffered it (Copilot
+                # reviews on #802).
+                dropped = bus.deliver_with_loss_markers(
                     f"terminal.{frame.terminal_id}.output",
                     {"data": raw.decode("utf-8", errors="replace")},
+                    lost={
+                        "from_pos": frame.pos,
+                        "to_pos": frame.pos + len(raw),
+                        # Positions restart at 0 on a re-armed stream, so a pending
+                        # range must not be widened across that boundary.
+                        "generation": frame.generation,
+                    },
                 )
-                # The watermark advances either way, and a drop is REPORTED rather
-                # than replayed.
-                #
-                # Holding the watermark back on a drop was the obvious move and it
-                # is wrong: the bus is shared, so a replay on reconnect re-sends
-                # those bytes to EVERY subscriber, including the ones that accepted
-                # the first copy. A slow AG-UI queue would therefore corrupt the
-                # LogWriter's transcript with duplicated output — trading silent
-                # loss for silent corruption, which is worse, because a duplicate
-                # is indistinguishable from real repeated output (Copilot
-                # follow-up on #802). Per-subscriber positions would allow a
-                # targeted redelivery; the bus has none, and inventing them here
-                # would be a second delivery mechanism beside the one every local
-                # consumer already uses.
-                #
-                # So the loss is made explicit instead, in the shape the gap path
-                # already uses: an empty `data` with a `gap` range. Consumers that
-                # handle a GapFrame's loss handle this identically, and nothing
-                # receives a byte twice.
                 runtime_registry.record_position(
                     frame.terminal_id,
                     frame.stream.value,
@@ -642,19 +647,13 @@ async def runtime_channel(ws: WebSocket) -> None:
                 if dropped:
                     logger.warning(
                         "%s subscriber queue(s) dropped output for terminal %s "
-                        "[%s, %s); reporting it as a gap rather than replaying, "
-                        "which would duplicate for the subscribers that accepted it",
+                        "[%s, %s); each is owed a gap marker on its next accepted "
+                        "event, and the watermark advances so nothing is replayed "
+                        "to the subscribers that did receive it",
                         dropped,
                         frame.terminal_id,
                         frame.pos,
                         frame.pos + len(raw),
-                    )
-                    bus.publish(
-                        f"terminal.{frame.terminal_id}.output",
-                        {
-                            "data": "",
-                            "gap": {"from_pos": frame.pos, "to_pos": frame.pos + len(raw)},
-                        },
                     )
             elif isinstance(frame, GapFrame):
                 # A GapFrame advances the resume watermark and republishes a loss,
@@ -701,9 +700,19 @@ async def runtime_channel(ws: WebSocket) -> None:
                         frame.to_pos,
                         generation=frame.generation,
                     )
-                bus.publish(
+                # Drop-aware, like the StreamFrame arm: the watermark has already
+                # advanced over this range, so a marker lost to a full queue is a
+                # range nobody will ever hear about. Converting only the
+                # StreamFrame arm left exactly the reported defect here (Copilot
+                # review on #802).
+                bus.deliver_with_loss_markers(
                     f"terminal.{frame.terminal_id}.output",
                     {"data": "", "gap": {"from_pos": frame.from_pos, "to_pos": frame.to_pos}},
+                    lost={
+                        "from_pos": frame.from_pos,
+                        "to_pos": (frame.to_pos if frame.to_pos is not None else frame.from_pos),
+                        "generation": frame.generation,
+                    },
                 )
             elif isinstance(frame, EventFrame):
                 if not runtime_registry.claim_terminal(frame.terminal_id, runtime_id):
@@ -718,6 +727,19 @@ async def runtime_channel(ws: WebSocket) -> None:
                     bus.publish(
                         f"terminal.{frame.terminal_id}.status", {"status": frame.status.value}
                     )
+                    # A status change is the one reliable signal that a stream may
+                    # have stopped producing. Hand over any loss marker still owed
+                    # for this terminal's output now, while a consumer is still
+                    # listening — otherwise a chunk dropped as the LAST output stays
+                    # owed forever and its range is never reported.
+                    outstanding = bus.flush_owed(f"terminal.{frame.terminal_id}.output")
+                    if outstanding:
+                        logger.warning(
+                            "%s gap marker(s) for terminal %s are still undelivered "
+                            "after a status change; their subscriber queues are full",
+                            outstanding,
+                            frame.terminal_id,
+                        )
             elif isinstance(frame, HeartbeatFrame):
                 for stream_pos in frame.streams:
                     if not runtime_registry.claim_terminal(stream_pos.terminal_id, runtime_id):
@@ -902,7 +924,9 @@ async def launch_remote_terminal(
             caller_id=body.caller_id,
             engine=engine,
             working_directory=body.working_directory,
-            metadata={"runtime_id": runtime_id},
+            # server_metadata, not metadata: placement is server-owned and
+            # caller-supplied copies of these keys are stripped at creation.
+            server_metadata={"runtime_id": runtime_id},
             owner=owner_id,
         )
     except Exception:

@@ -366,7 +366,11 @@ def test_extension_root_merges_mcp_without_overriding_explicit_terminal_id(tmp_p
     assert config["custom"]["env"] == {"CAO_TERMINAL_ID": "explicit"}
     assert config["remote"] == {"type": "http", "url": "https://mcp.example.test"}
     assert resolve.call_count == 3
-    assert all(call.kwargs["persisted"] is False for call in resolve.call_args_list)
+    # persisted=True now, deliberately: `.mcp.json` is written to disk and re-read
+    # by `omp --extension` at launch, so the channel token must not be serialized
+    # into it (Copilot review on #802). This asserted False, which encoded the
+    # secret-at-rest hole as intent.
+    assert all(call.kwargs["persisted"] is True for call in resolve.call_args_list)
     assert stat.S_IMODE((extension_dir / "index.js").stat().st_mode) == 0o600
     assert stat.S_IMODE((extension_dir / ".mcp.json").stat().st_mode) == 0o600
 

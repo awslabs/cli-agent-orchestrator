@@ -314,7 +314,7 @@ class RuntimeChannelRegistry:
             for tid in orphaned:
                 sink = self._attach_sinks.pop(tid, None)
                 if sink is not None:
-                    sink.put_nowait(None)
+                    self._eof_sink(sink)
         if orphaned:
             logger.info(
                 "closed %d interactive attach(es) for disconnected runtime %s: %s",
@@ -453,7 +453,7 @@ class RuntimeChannelRegistry:
             # attached terminal hung exactly this way (Copilot review on #802).
             sink = self._attach_sinks.pop(terminal_id, None)
             if sink is not None:
-                sink.put_nowait(None)
+                self._eof_sink(sink)
             self._terminal_runtime.pop(terminal_id, None)
             self._recovered_placement.pop(terminal_id, None)
             self._status.pop(terminal_id, None)
@@ -774,6 +774,15 @@ class RuntimeChannelRegistry:
                 if rid == runtime_id and tid not in claimed
             ]
             for tid in stale:
+                # A reconnect that no longer claims this terminal has abandoned it,
+                # so any attach client still bound to it will never receive another
+                # byte. Without this its relay parks on sink.get() forever: the
+                # binding is deliberately kept (so commands fail explicitly rather
+                # than looking unknown), which means no disconnect sweep will reach
+                # it either (Copilot review on #802).
+                abandoned_sink = self._attach_sinks.pop(tid, None)
+                if abandoned_sink is not None:
+                    self._eof_sink(abandoned_sink)
                 self._status.pop(tid, None)
                 for stream in StreamName:
                     self._positions.pop((tid, stream.value), None)
@@ -871,10 +880,11 @@ class RuntimeChannelRegistry:
         and now belongs to *sink*, which is why the displaced relay must not go
         on to close it (see :meth:`unbind_attach`).
         """
-        previous = self._attach_sinks.get(terminal_id)
-        self._attach_sinks[terminal_id] = sink
+        with self._lock:
+            previous = self._attach_sinks.get(terminal_id)
+            self._attach_sinks[terminal_id] = sink
         if previous is not None and previous is not sink:
-            previous.put_nowait(None)
+            self._eof_sink(previous)
             return True
         return False
 
@@ -886,17 +896,47 @@ class RuntimeChannelRegistry:
         PTY it would close is now the replacement's, so an unconditional close
         in the old relay's ``finally`` killed a live attach (finding 4).
         """
-        if self._attach_sinks.get(terminal_id) is sink:
-            del self._attach_sinks[terminal_id]
-            return True
-        return False
+        with self._lock:
+            if self._attach_sinks.get(terminal_id) is sink:
+                del self._attach_sinks[terminal_id]
+                return True
+            return False
 
     def deliver_attach(self, terminal_id: str, data: Optional[bytes]) -> bool:
-        sink = self._attach_sinks.get(terminal_id)
+        with self._lock:
+            sink = self._attach_sinks.get(terminal_id)
         if sink is None:
             return False
         sink.put_nowait(data)
         return True
+
+    def _eof_sink(self, sink: "asyncio.Queue") -> None:
+        """Wake a relay's downstream task with the EOF sentinel, from any thread.
+
+        ``asyncio.Queue`` is not thread-safe, and these sinks belong to the channel
+        loop while some callers are worker threads — ``session_service.delete_session``
+        runs under ``asyncio.to_thread`` and reaches ``unbind_terminal``. A direct
+        ``put_nowait`` there sets a future from a foreign thread and does not
+        reliably wake a sleeping loop, so the relay could still park (Copilot review
+        on #802). Hop onto the owning loop when there is one and we are not already
+        on it.
+        """
+        loop = self._loop
+        if loop is not None and not self._on_loop(loop):
+            try:
+                loop.call_soon_threadsafe(sink.put_nowait, None)
+                return
+            except RuntimeError:
+                # Loop already closed; nothing is waiting on the sink either.
+                return
+        sink.put_nowait(None)
+
+    @staticmethod
+    def _on_loop(loop) -> bool:
+        try:
+            return asyncio.get_running_loop() is loop
+        except RuntimeError:
+            return False
 
 
 runtime_registry = RuntimeChannelRegistry()

@@ -1987,6 +1987,55 @@ def _migrate_terminals_schema() -> None:
         logger.warning(f"Migration check for terminals schema failed: {e}")
 
 
+def _creation_metadata(
+    caller_metadata: Optional[Dict[str, Any]], server_metadata: Optional[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """Merge caller metadata with server-owned keys, letting only the server set those.
+
+    ``update_terminal_metadata`` strips :data:`_SERVER_OWNED_METADATA_KEYS` from a
+    caller's dict, but CREATION did not, and it is reachable with the same
+    ``SCOPE_WRITE`` that the PATCH route needs: ``POST /sessions`` forwards
+    ``body.metadata`` through ``session_service`` and ``terminal_service`` to here
+    unfiltered, validated for size only. So a caller could create a terminal in
+    THIS host's tmux whose durable row names a runtime, which makes
+    ``_placement_state`` answer ``("named", <that runtime>)`` — ``is_remote`` true,
+    ``runtime_for_terminal`` pointing at it, and ``claim_terminal`` accepting its
+    claim on a local pane. Closing the update path alone left the same hole one
+    endpoint over (Copilot review on #802).
+
+    ``server_metadata`` is the privileged channel, keyword-only and set only by the
+    two launch paths that legitimately record placement. It is applied AFTER the
+    strip, so it cannot be spoofed through the request body.
+    """
+    merged = {
+        k: v for k, v in (caller_metadata or {}).items() if k not in _SERVER_OWNED_METADATA_KEYS
+    }
+    rejected = sorted(set(caller_metadata or {}) & set(_SERVER_OWNED_METADATA_KEYS))
+    if rejected:
+        logger.warning(
+            "ignoring server-owned metadata key(s) %s supplied at terminal creation",
+            ", ".join(rejected),
+        )
+    merged.update(server_metadata or {})
+    return merged
+
+
+def _creation_metadata_json(
+    caller_metadata: Optional[Dict[str, Any]], server_metadata: Optional[Dict[str, Any]]
+) -> Optional[str]:
+    """Serialize creation metadata, preserving NULL for "none at all".
+
+    Kept separate from :func:`_creation_metadata` because the obvious inline form,
+    ``_json.dumps(...) or None``, is wrong: ``dumps({})`` is ``"{}"``, which is
+    truthy, so a terminal created with no metadata started storing an empty object
+    where the column had always been NULL.
+    """
+    import json as _json
+
+    merged = _creation_metadata(caller_metadata, server_metadata)
+    return _json.dumps(merged) if merged else None
+
+
 def create_terminal(
     terminal_id: str,
     tmux_session: str,
@@ -2000,6 +2049,7 @@ def create_terminal(
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
     working_directory: Optional[str] = None,
+    server_metadata: Optional[Dict[str, Any]] = None,
     idempotency_key: Optional[str] = None,
     request_fingerprint: Optional[str] = None,
     owner: Optional[str] = None,
@@ -2042,7 +2092,7 @@ def create_terminal(
             caller_id=caller_id,
             engine=engine,
             group=_json.dumps(group) if group else None,
-            metadata_json=_json.dumps(metadata) if metadata else None,
+            metadata_json=_creation_metadata_json(metadata, server_metadata),
             owner=owner,
         )
         db.add(terminal)

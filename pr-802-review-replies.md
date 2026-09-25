@@ -991,3 +991,90 @@ whose persist-or-bind actually failed goes unacked, and the log line now says so
 Covered by `test_a_failed_reconcile_leaves_the_result_unacked`, which also asserts
 that a following frame is still acked — the failure withholds one ack, it does not
 stop the channel being read.
+
+# Replies to the high-severity sweep on #802
+
+Every High finding in the latest overview was re-verified against HEAD one at a
+time rather than assumed from an earlier round, because three of my previous
+"fixed" claims turned out to be wrong. Twenty were confirmed by quoting the code
+that fixes them. Two were still live and are fixed below, along with five residual
+defects the verification turned up in the same code — three of them introduced by
+my own earlier fixes.
+
+**`4061732183` — runtime token persisted in provider configuration.** Fifth round
+on this one, and the reason it kept coming back is that I fixed call sites I could
+think of instead of enumerating them. `grok_cli` (`config.toml`), `minimax_code`
+(`servers.mcp.json`) and `omp` (`.mcp.json`, which passed `persisted=False`
+explicitly) were all still writing the channel token to disk. All three now pass
+`persisted=True`.
+
+What should stop the recurrence is not the three edits but
+`test/providers/test_no_persisted_runtime_token.py`: it builds each provider's
+config with a shared endpoint configured and asserts the token's VALUE does not
+appear in the serialized bytes, while the endpoint still does. A new provider that
+forgets the flag fails there without anyone remembering to add a case for it.
+
+**`4065995057` — protect runtime binding from metadata updates.** The previous fix
+closed `PATCH /terminals/{id}/metadata` and I reported it done. It was half the
+surface: `POST /sessions` carries `body.metadata` through `session_service` and
+`terminal_service` into `create_terminal` unfiltered, under the same `SCOPE_WRITE`,
+validated for size only. So the same attack worked one endpoint over — create a
+terminal in the server's own tmux whose durable row names a runtime, and
+`_placement_state` answers `("named", <that runtime>)`, which makes `is_remote`
+true and lets that runtime's `claim_terminal` succeed against a local pane.
+
+Server-owned keys are now stripped at creation too, and the two launch paths that
+legitimately record placement use a keyword-only `server_metadata` argument applied
+after the strip, so it cannot be reached through a request body. The
+reviewer's preferred option — a server-owned `terminals.runtime_id` column — is
+the better end state and I have not done it; this closes the hole without a schema
+change, and the privileged-kwarg split makes the eventual column move mechanical.
+
+**`4102444585` / `4102853985` / `4102444541` — gap markers and the watermark.**
+Three findings, one cause, and two wrong attempts from me before this. The bus is a
+shared, bounded, fire-and-forget fanout, so every decision derived from an
+AGGREGATE drop count is wrong for somebody: holding the watermark back replays the
+range to subscribers that already took it, and broadcasting a gap marker both
+misinforms those subscribers and can be dropped by the very queue that is full.
+
+Loss is now owed to the specific queue that refused and delivered on the next put
+that queue accepts. Three things the review caught in my first version of that:
+the marker was keyed by queue alone, and since every real consumer subscribes once
+to `terminal.*.output` and routes by topic, terminal A's loss arrived stamped as
+terminal B's — misreporting B and never reporting A. The GapFrame arm was not
+converted at all, so it still advanced the watermark and published
+fire-and-forget. And an owed range widened across a generation boundary, where
+positions restart at 0. All three are fixed; the map is keyed `(queue, topic)`,
+carries the generation, is bounded, and `flush_owed` is called on a status change
+so a chunk dropped as the LAST output of a stream is still reported.
+
+**`4102853940` — provider processes inherit the runtime token.** Accepted, and it
+undercuts the premise of the fix above it, so I want to be exact rather than quietly
+narrow the claim. `TmuxClient.create_session` forwards every non-blocked `CAO_*`
+variable into the provider's pane, so a third-party MCP child inherits
+`CAO_RUNTIME_TOKEN` whatever the config file says.
+
+The two options you gave are mutually exclusive as things stand: the shim can
+receive the token from the config file or from the inherited environment, and
+removing both leaves it no way to authenticate. Withholding it from the pane and
+injecting it per-entry puts it back on disk, which is the finding above. So I took
+the second option — the docstring and the test class (renamed from
+"ReachesOnlyCaosOwnChild") now state plainly that this reduces exposure at rest and
+is NOT an isolation boundary. Real isolation needs the shim to fetch its own
+credential rather than be handed one, which is a design change I have not made.
+
+**`4102853862` — untrusted caller_id bypasses ownership checks.** Correct, and it
+was mine from earlier the same day: I made the worker inherit its owner from
+`caller_id`'s row to fix a different finding, and inheriting from a REQUEST
+parameter is not authorization. A caller with write scope could name another
+principal's terminal and get a worker attributed to it, placed beside it. The
+caller's owner is now bound to the request principal before either use, the same
+way the inbox route binds `sender_id`; the test for it fails without the check,
+which I verified by reverting it.
+
+**Three residual defects in the attach path**, found while verifying `4081548399`
+rather than reported: `unbind_terminal` called `put_nowait` on a loop-owned
+`asyncio.Queue` from a worker thread (`delete_session` runs under `to_thread`), so
+the EOF could fail to wake the relay; `_attach_sinks` was the one registry map
+outside the lock; and a reconnect whose hello abandoned a terminal never EOFed its
+sink, so that client parked forever. All three fixed.

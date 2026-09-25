@@ -3684,7 +3684,30 @@ async def create_terminal_in_session(
         # the same resolution the run-step path uses, and fall back to the
         # request principal only when there is no caller or it has no recorded
         # owner.
-        worker_owner = caller_owner_id(caller_id) or principal.id
+        #
+        # But `caller_id` comes from the REQUEST, so it cannot be authorization on
+        # its own. Inheriting an arbitrary named terminal's owner let a caller with
+        # write scope attribute a worker to somebody else — and, on the remote arm
+        # below, place it beside that principal's terminal — which walks straight
+        # through the ownership boundary and the revocation decision the owner
+        # column exists to carry (Copilot review on #802). So bind the two first,
+        # exactly as the inbox route binds `sender_id`: with auth on, a caller
+        # terminal owned by a different principal is refused rather than inherited.
+        #
+        # With auth off there is no identity to bind to and this is inert, which is
+        # the same acknowledged posture as the inbox check; the broker gateway
+        # overwrites the caller identity for worker callbacks, so the remaining
+        # unbound case is a single-principal local install.
+        caller_owner = caller_owner_id(caller_id)
+        if is_auth_enabled() and caller_owner and caller_owner != principal.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    f"caller '{caller_id}' is owned by another principal; a worker "
+                    "may only be created on behalf of a terminal you own"
+                ),
+            )
+        worker_owner = caller_owner or principal.id
 
         caller_runtime = None
         if caller_id and runtime_registry.is_remote(caller_id):

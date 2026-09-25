@@ -106,7 +106,9 @@ async def test_the_owner_is_not_written_into_the_agent_writable_metadata(
 
     terminal = await create_remote_terminal("worker-1", _body(), principal=OWNER)
 
-    assert mock_create.call_args.kwargs["metadata"] == {"runtime_id": "worker-1"}
+    # server_metadata: placement is server-owned and travels through the
+    # privileged keyword-only channel, so a caller-supplied copy is stripped.
+    assert mock_create.call_args.kwargs["server_metadata"] == {"runtime_id": "worker-1"}
     assert "owner" not in terminal.metadata
 
 

@@ -183,6 +183,23 @@ def shared_endpoint_child_env(*, persisted: bool = False) -> dict:
     config — in Kiro's agent JSON and Cursor's plugin.json at the default umask,
     so mode 0644 (Copilot review on #802). A secret that is redundant at rest
     should not be at rest.
+
+    WHAT THIS IS NOT. It is not an isolation boundary, and the per-command gate in
+    :func:`shared_endpoint_child_env_for` is not either. Both only decide what is
+    WRITTEN. ``TmuxClient.create_session`` forwards every non-blocked ``CAO_*``
+    variable from the server's environment into the provider's pane
+    (``clients/tmux.py``), so the provider process — and therefore any MCP child
+    it spawns, third-party ones included — inherits ``CAO_RUNTIME_TOKEN`` anyway.
+
+    So the honest claim is narrow: these two rules reduce the credential's
+    exposure AT REST and keep it out of files a third-party server's author never
+    expected to hold a secret. They do not stop a third-party MCP server from
+    reading the token out of its own environment. Real isolation needs the token
+    withheld from the pane and delivered to the shim alone — which the MCP
+    config's per-entry ``env`` is the only existing channel for, and that puts it
+    back on disk. Closing that properly means the shim fetching its own
+    credential rather than being handed one; until then this is a reduction, not
+    a boundary (Copilot review on #802).
     """
     url = shared_endpoint_url()
     if not url:

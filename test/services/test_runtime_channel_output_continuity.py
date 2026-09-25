@@ -443,6 +443,191 @@ class TestOffsetOrderMatchesPublishOrder:
         assert len(seen) == 600
 
 
+class TestLossIsReportedToTheSubscriberThatLostIt:
+    """Per-subscriber loss markers, because aggregates are wrong for somebody.
+
+    ``publish`` is fire-and-forget, so the channel handler could not see a refused
+    put at all. Making it visible was only half the problem: the bus is a shared
+    bounded fanout, so holding the watermark back duplicates output for the
+    subscribers that DID accept, and broadcasting a gap marker both misinforms
+    those subscribers and can be dropped by the very queue that is full.
+
+    So the marker is owed to the specific queue that refused and delivered on the
+    next put it accepts (Copilot reviews on #802).
+    """
+
+    @staticmethod
+    def _bus_with(*queues):
+        import asyncio
+
+        from cli_agent_orchestrator.services.event_bus import EventBus
+
+        bus = EventBus()
+        bus._loop = asyncio.new_event_loop()
+        with bus._lock:
+            bus._exact["terminal.t1.output"] = list(queues)
+        return bus
+
+    def test_the_refusing_queue_is_owed_a_marker_and_gets_it_when_it_drains(self):
+        import asyncio
+
+        full: asyncio.Queue = asyncio.Queue(maxsize=1)
+        bus = self._bus_with(full)
+
+        assert (
+            bus.deliver_with_loss_markers(
+                "terminal.t1.output", {"data": "first"}, lost={"from_pos": 0, "to_pos": 5}
+            )
+            == 0
+        )
+        # Queue is full now; this delivery is refused and a marker is owed.
+        assert (
+            bus.deliver_with_loss_markers(
+                "terminal.t1.output", {"data": "second"}, lost={"from_pos": 5, "to_pos": 11}
+            )
+            == 1
+        )
+
+        full.get_nowait()  # the consumer drains one event
+
+        # Next delivery: the owed marker arrives FIRST, then the new payload.
+        bus.deliver_with_loss_markers(
+            "terminal.t1.output", {"data": "third"}, lost={"from_pos": 11, "to_pos": 16}
+        )
+        marker = full.get_nowait()
+        assert marker["data"]["gap"] == {"from_pos": 5, "to_pos": 11}
+        assert marker["data"]["data"] == ""
+
+    def test_a_healthy_subscriber_is_never_told_it_lost_anything(self):
+        """The bug in broadcasting: it misinforms the subscribers that were fine."""
+        import asyncio
+
+        full: asyncio.Queue = asyncio.Queue(maxsize=1)
+        healthy: asyncio.Queue = asyncio.Queue()
+        bus = self._bus_with(full, healthy)
+
+        bus.deliver_with_loss_markers(
+            "terminal.t1.output", {"data": "a"}, lost={"from_pos": 0, "to_pos": 1}
+        )
+        bus.deliver_with_loss_markers(
+            "terminal.t1.output", {"data": "b"}, lost={"from_pos": 1, "to_pos": 2}
+        )
+
+        seen = []
+        while not healthy.empty():
+            seen.append(healthy.get_nowait())
+        assert all("gap" not in e["data"] for e in seen), f"healthy subscriber got a gap: {seen}"
+        assert [e["data"]["data"] for e in seen] == ["a", "b"]
+
+    def test_consecutive_drops_widen_one_range_rather_than_skipping_the_first(self):
+        """The two-consecutive-drops bug: the earlier loss must not be forgotten."""
+        import asyncio
+
+        full: asyncio.Queue = asyncio.Queue(maxsize=1)
+        bus = self._bus_with(full)
+
+        bus.deliver_with_loss_markers(
+            "terminal.t1.output", {"data": "fills it"}, lost={"from_pos": 0, "to_pos": 8}
+        )
+        bus.deliver_with_loss_markers(
+            "terminal.t1.output", {"data": "lost-1"}, lost={"from_pos": 8, "to_pos": 14}
+        )
+        bus.deliver_with_loss_markers(
+            "terminal.t1.output", {"data": "lost-2"}, lost={"from_pos": 14, "to_pos": 20}
+        )
+
+        full.get_nowait()
+        bus.deliver_with_loss_markers(
+            "terminal.t1.output", {"data": "ok"}, lost={"from_pos": 20, "to_pos": 22}
+        )
+        marker = full.get_nowait()
+        # BOTH dropped ranges, as one range — not just the later one.
+        assert marker["data"]["gap"] == {"from_pos": 8, "to_pos": 20}
+
+    def test_the_marker_is_not_re_delivered_once_taken(self):
+        """Delivered once, then forgotten — not re-sent on every later event.
+
+        Sized so the flushed marker AND the payload both fit once the consumer
+        drains; with a maxsize of 1 the marker itself fills the queue, the payload
+        is then legitimately refused, and a NEW range is owed — which is correct
+        behaviour, not a re-delivery, and made the first version of this test
+        assert the wrong thing.
+        """
+        import asyncio
+
+        q: asyncio.Queue = asyncio.Queue(maxsize=2)
+        bus = self._bus_with(q)
+
+        # Fill it, then lose a range.
+        bus.deliver_with_loss_markers(
+            "terminal.t1.output", {"data": "a"}, lost={"from_pos": 0, "to_pos": 1}
+        )
+        bus.deliver_with_loss_markers(
+            "terminal.t1.output", {"data": "b"}, lost={"from_pos": 1, "to_pos": 2}
+        )
+        assert (
+            bus.deliver_with_loss_markers(
+                "terminal.t1.output", {"data": "lost"}, lost={"from_pos": 2, "to_pos": 6}
+            )
+            == 1
+        )
+
+        # Drain fully, so the marker and the next payload both have room.
+        while not q.empty():
+            q.get_nowait()
+
+        bus.deliver_with_loss_markers(
+            "terminal.t1.output", {"data": "c"}, lost={"from_pos": 6, "to_pos": 7}
+        )
+        drained = []
+        while not q.empty():
+            drained.append(q.get_nowait())
+        gaps = [e for e in drained if "gap" in e["data"]]
+        assert len(gaps) == 1, f"expected exactly one marker, got {drained}"
+        assert gaps[0]["data"]["gap"] == {"from_pos": 2, "to_pos": 6}
+
+        # Nothing further is owed, so a later event carries no marker.
+        bus.deliver_with_loss_markers(
+            "terminal.t1.output", {"data": "d"}, lost={"from_pos": 7, "to_pos": 8}
+        )
+        rest = []
+        while not q.empty():
+            rest.append(q.get_nowait())
+        assert all("gap" not in e["data"] for e in rest), f"marker re-delivered: {rest}"
+
+    def test_unsubscribing_drops_the_owed_marker(self):
+        """An owed entry must not outlive its subscriber.
+
+        It holds a reference to the queue, so leaving it behind pins a dead
+        subscriber's queue forever; and the map is keyed by ``id(queue)``, which
+        CPython reuses after collection, so a stale entry could hand a future queue
+        at the same address a gap it never suffered.
+        """
+        import asyncio
+
+        from cli_agent_orchestrator.services.event_bus import EventBus
+
+        bus = EventBus()
+        bus._loop = asyncio.new_event_loop()
+        q: asyncio.Queue = asyncio.Queue(maxsize=1)
+        with bus._lock:
+            bus._exact["terminal.t1.output"] = [q]
+
+        bus.deliver_with_loss_markers(
+            "terminal.t1.output", {"data": "a"}, lost={"from_pos": 0, "to_pos": 1}
+        )
+        assert (
+            bus.deliver_with_loss_markers(
+                "terminal.t1.output", {"data": "b"}, lost={"from_pos": 1, "to_pos": 2}
+            )
+            == 1
+        )
+        assert len(bus._owed_loss) == 1
+
+        bus.unsubscribe("terminal.t1.output", q)
+        assert bus._owed_loss == {}, "an owed marker outlived its subscriber"
+
+
 class TestADroppedChunkStaysReplayable:
     """A subscriber that could not take the bytes must not advance the watermark.
 

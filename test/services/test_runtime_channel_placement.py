@@ -707,3 +707,47 @@ class TestServerOwnedMetadataCannotBeInjected:
         )
         assert stored["runtime_id"] == "worker-1"
         assert stored["unrelated"] == "value"
+
+
+class TestPlacementCannotBeSetAtCreationEither:
+    """Closing the PATCH path left the same hole one endpoint over.
+
+    ``update_terminal_metadata`` strips server-owned keys, but CREATION did not —
+    and it is reachable with the same ``SCOPE_WRITE``: ``POST /sessions`` forwards
+    ``body.metadata`` through session_service and terminal_service to
+    ``create_terminal`` unfiltered, validated for size only. A caller could
+    therefore create a terminal in THIS host's tmux whose durable row named a
+    runtime, which makes ``_placement_state`` answer ``("named", <runtime>)`` and
+    lets that runtime claim a local pane it never launched (Copilot review on #802).
+
+    ``server_metadata`` is the privileged channel the two real launch paths use; it
+    is applied after the strip, so it cannot be spoofed through a request body.
+    """
+
+    def test_a_caller_supplied_runtime_id_is_stripped(self):
+        from cli_agent_orchestrator.clients.database import _creation_metadata
+
+        merged = _creation_metadata({"runtime_id": "worker-attacker", "keep": "me"}, None)
+        assert "runtime_id" not in merged
+        assert merged["keep"] == "me"
+
+    def test_the_server_channel_can_still_record_placement(self):
+        from cli_agent_orchestrator.clients.database import _creation_metadata
+
+        merged = _creation_metadata({"keep": "me"}, {"runtime_id": "worker-1"})
+        assert merged["runtime_id"] == "worker-1"
+        assert merged["keep"] == "me"
+
+    def test_the_server_channel_wins_over_a_spoofed_value(self):
+        """Both supplied: the caller's copy is dropped before the server's applies."""
+        from cli_agent_orchestrator.clients.database import _creation_metadata
+
+        merged = _creation_metadata(
+            {"runtime_id": "worker-attacker"}, {"runtime_id": "worker-real"}
+        )
+        assert merged["runtime_id"] == "worker-real"
+
+    def test_no_metadata_at_all_stays_empty(self):
+        from cli_agent_orchestrator.clients.database import _creation_metadata
+
+        assert _creation_metadata(None, None) == {}
