@@ -1533,10 +1533,20 @@ class TestLiveTurnIsNotDemotedByAnUnsettledFrame:
         mock_get_backend.return_value = _backend(event_inbox=False)
         sm = self._monitor()
         sm._buffers["t1"] = "raw redraw soup"
-        sm._bursting["t1"] = True  # still streaming -> nothing read here is settled
-        sm._detect_registered = lambda tid, buf: TerminalStatus.COMPLETED
+        sm._bursting["t1"] = True  # still streaming -> a screen read here is unsettled
+        # A SCREEN-calibrated provider: its mid-burst verdicts are the unsettled
+        # kind. (A raw-calibrated provider's verdicts are settled by design and
+        # exempt from this refusal — see the raw-calibrated tests in the grok
+        # suite.)
+        provider = MagicMock()
+        provider.supports_screen_detection = True
+        provider.get_status_from_screen.return_value = TerminalStatus.COMPLETED
+        sm._screens["t1"] = (MagicMock(display=["stale completed box"]), MagicMock())
 
-        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        with patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as mock_pm:
+            mock_pm.get_provider.return_value = provider
+            with patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", True):
+                assert sm.get_status("t1") == TerminalStatus.PROCESSING
         assert sm._last_status["t1"] == TerminalStatus.PROCESSING
 
     @patch("cli_agent_orchestrator.backends.registry.get_backend")
@@ -1840,3 +1850,162 @@ class TestActivityIsNoticedWhileATurnIsUnseen:
         sm._schedule_raw_detection("t1", "another chunk")
 
         assert seen == []
+
+
+class TestCapturePaneReturnHonorsTheTurnGuard:
+    """A confirmed ready capture the latch REFUSED must not be handed to the caller.
+
+    PR #812 review (haofeif): the cheap-buffer branch of get_status() was fixed to
+    return what the latch accepted, but the capture-pane fallback still executed
+    ``return fresh_capture`` after ``_apply_detection_locked`` — so a dispatch with
+    assumed processing and no observed activity let the second eligible capture of
+    the RETAINED ready pane reach the API, `cao session send`'s pre-send check and
+    InboxService, while the latch itself stayed at PROCESSING and the turn at (1, 0).
+    Exactly the stale ready verdict the guard exists to refuse.
+    """
+
+    def _dispatched_quiet_monitor(self):
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.COMPLETED
+        sm.notify_input_sent("t1", assume_processing=True)
+        sm.notify_input_delivered("t1")
+        with sm._lock:
+            # The stale-PROCESSING quiet gate: buffer long quiet, so the capture
+            # fallback is eligible.
+            sm._buffer_changed_at["t1"] = time.monotonic() - (STALE_PROCESSING_BUFFER_QUIET_S + 1)
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        return sm
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_a_refused_capture_verdict_is_not_returned(self, mock_get_backend):
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        sm = self._dispatched_quiet_monitor()
+        # A two-read-confirmed capture of the retained pre-dispatch COMPLETED pane.
+        sm._fresh_capture_pane_status = lambda tid, gen: TerminalStatus.COMPLETED
+
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        assert sm.turn_state("t1") == (1, 0)
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_an_accepted_capture_verdict_still_returns_and_closes(self, mock_get_backend):
+        """Guard against over-tightening: once the turn was seen working, the
+        capture escape must keep doing its #558 job."""
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        sm = self._dispatched_quiet_monitor()
+        sm._apply_detection("t1", TerminalStatus.PROCESSING, settled=False)  # seen working
+        sm._fresh_capture_pane_status = lambda tid, gen: TerminalStatus.COMPLETED
+
+        assert sm.get_status("t1") == TerminalStatus.COMPLETED
+        assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+        assert sm.turn_state("t1") == (1, 1)
+
+
+class TestClearedBufferEvidenceIsPinnedToItsTurn:
+    """Cleared-buffer evidence closes only the turn whose dispatch cleared it.
+
+    The evidence-turn is pinned when a raw verdict's context is read and
+    revalidated under the lock that closes the turn: a new dispatch
+    (notify_input_sent plus clear_rolling_buffer, microseconds apart in
+    send_input) can slip between the two, and turn N's bytes must never close
+    turn N+1 — that would return before N+1's agent ever saw the prompt, the
+    #728 shape. Same pin-then-revalidate rule as the capture path's generation.
+    """
+
+    def _dispatch(self, sm, provider):
+        sm.notify_input_sent("t1")
+        sm.clear_rolling_buffer("t1", provider)
+        sm.notify_input_delivered("t1")
+
+    def test_evidence_from_a_previous_turn_cannot_close_the_next(self):
+        sm = StatusMonitor()
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        self._dispatch(sm, provider)  # turn 1
+        with patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as pm:
+            pm.get_provider.return_value = provider
+            _, pinned = sm._raw_verdict_context("t1", provider)
+        assert pinned == 1
+
+        self._dispatch(sm, provider)  # turn 2 slips in before the apply
+
+        sm._apply_detection("t1", TerminalStatus.COMPLETED, cleared_buffer_turn=pinned)
+        assert sm.turn_state("t1") == (2, 0)
+
+    def test_evidence_pinned_to_the_current_turn_closes_it(self):
+        sm = StatusMonitor()
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        self._dispatch(sm, provider)
+        with patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as pm:
+            pm.get_provider.return_value = provider
+            _, pinned = sm._raw_verdict_context("t1", provider)
+
+        sm._apply_detection("t1", TerminalStatus.COMPLETED, cleared_buffer_turn=pinned)
+        assert sm.turn_state("t1") == (1, 1)
+
+    def test_a_turn_dispatched_without_a_clear_gets_no_bypass(self):
+        """Provider init keystrokes and send_special_key open turns without
+        clearing the buffer; their ready verdicts keep the conservative gate."""
+        sm = StatusMonitor()
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        sm.notify_input_sent("t1")  # no clear_rolling_buffer
+        with patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as pm:
+            pm.get_provider.return_value = provider
+            _, pinned = sm._raw_verdict_context("t1", provider)
+        assert pinned is None
+
+        sm._apply_detection("t1", TerminalStatus.COMPLETED, cleared_buffer_turn=pinned)
+        assert sm.turn_state("t1") == (1, 0)
+
+
+class TestQuietTerminalCannotHoldATurnOpenForever:
+    """The poll itself closes an unseen turn once the backstop expires.
+
+    The backstop used to be evaluated only when a detection verdict arrived. A
+    screen-path terminal that goes quiet right after a dispatch produces none —
+    cached status is ready, so even the re-check doesn't run — and the turn stayed
+    open forever while the CLI waiter sat out its whole 300s timeout
+    (PR #812 review, finding 1's second half).
+    """
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_before_the_backstop_the_gate_holds(self, mock_get_backend):
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.COMPLETED  # previous turn's, retained
+        sm.notify_input_sent("t1")
+        sm.notify_input_delivered("t1")
+
+        assert sm.get_status("t1") == TerminalStatus.COMPLETED
+        assert sm.turn_state("t1") == (1, 0)  # still open: the reading is stale
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_after_the_backstop_the_poll_closes_the_turn(self, mock_get_backend):
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.COMPLETED
+        sm.notify_input_sent("t1")
+        sm.notify_input_delivered("t1")
+        with sm._lock:
+            sm._turn_delivered_at["t1"] = time.monotonic() - (TURN_START_BACKSTOP_S + 1)
+
+        assert sm.get_status("t1") == TerminalStatus.COMPLETED
+        assert sm.turn_state("t1") == (1, 1)
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_a_turn_seen_working_is_not_closed_from_a_stale_cache(self, mock_get_backend):
+        """Once started, completion must come from a real settled verdict — the
+        cached ready value predates the turn and is exactly what #735 returned."""
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.COMPLETED
+        sm.notify_input_sent("t1")
+        sm.notify_input_delivered("t1")
+        with sm._lock:
+            sm._turn_started["t1"] = True
+            sm._turn_delivered_at["t1"] = time.monotonic() - (TURN_START_BACKSTOP_S + 1)
+
+        assert sm.get_status("t1") == TerminalStatus.COMPLETED
+        assert sm.turn_state("t1") == (1, 0)
