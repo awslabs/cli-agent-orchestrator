@@ -446,15 +446,18 @@ class TestOffsetOrderMatchesPublishOrder:
 class TestADroppedChunkStaysReplayable:
     """A subscriber that could not take the bytes must not advance the watermark.
 
-    The resume position means "bytes this server has received". It was advanced
-    before the payload was handed to the bus, and ``publish`` is fire-and-forget
-    over ``call_soon_threadsafe``, so a full LogWriter/AG-UI/inbox queue became a
-    log line while the watermark said the bytes had landed. The runtime then had
-    nothing to replay on reconnect, and a bounded overflow — the exact case the
-    replay buffer exists for — became permanent loss (Copilot review on #802).
+    ``publish`` is fire-and-forget over ``call_soon_threadsafe``, so a full
+    LogWriter/AG-UI/inbox queue became a log line and nothing else: the channel
+    handler could not know a subscriber had refused the bytes.
+
+    ``deliver_now`` reports the count. The handler uses it to REPORT the loss as a
+    gap, not to hold the watermark back — the bus is shared, so a replay would
+    re-send those bytes to the subscribers that accepted the first copy and
+    duplicate their output (Copilot follow-up on #802). What these tests pin is
+    the reporting primitive: the count is accurate per refusing subscriber.
     """
 
-    def test_a_full_subscriber_queue_leaves_the_watermark_behind(self):
+    def test_a_full_subscriber_queue_is_reported_not_replayed(self):
         import asyncio
 
         from cli_agent_orchestrator.services.event_bus import EventBus

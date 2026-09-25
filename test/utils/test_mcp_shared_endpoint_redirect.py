@@ -189,11 +189,21 @@ class TestTheTokenReachesOnlyCaosOwnChild:
         assert RUNTIME_TOKEN_ENV not in translated.get("environment", {})
         assert SHARED_ENDPOINT_URL_ENV not in translated.get("environment", {})
 
-    def test_opencode_still_gives_caos_own_server_the_token(self, shared_endpoint):
+    def test_opencode_gives_caos_own_server_the_endpoint_but_not_the_token(self, shared_endpoint):
+        """``opencode.json`` is read at a later launch, so it is a persisted form.
+
+        This asserted the token WAS written here, which is what the persisted
+        contract forbids: the shim inherits CAO_RUNTIME_TOKEN from the process
+        that launches it, so a copy in the file is a credential at rest for no
+        gain (Copilot follow-up on #802). The endpoint still belongs there —
+        without it the shim has nowhere to dial.
+        """
         from cli_agent_orchestrator.utils.opencode_config import translate_mcp_server_config
 
         translated = translate_mcp_server_config({"command": CAO_MCP_SERVER_COMMAND, "args": []})
-        assert translated["environment"][RUNTIME_TOKEN_ENV] == "runtime-token-value"
+        assert translated["environment"][SHARED_ENDPOINT_URL_ENV] == ENDPOINT
+        assert RUNTIME_TOKEN_ENV not in translated["environment"]
+        assert "runtime-token-value" not in json.dumps(translated)
 
 
 class TestProvidersInheritIt:

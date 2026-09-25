@@ -609,32 +609,47 @@ async def runtime_channel(ws: WebSocket) -> None:
                     f"terminal.{frame.terminal_id}.output",
                     {"data": raw.decode("utf-8", errors="replace")},
                 )
+                # The watermark advances either way, and a drop is REPORTED rather
+                # than replayed.
+                #
+                # Holding the watermark back on a drop was the obvious move and it
+                # is wrong: the bus is shared, so a replay on reconnect re-sends
+                # those bytes to EVERY subscriber, including the ones that accepted
+                # the first copy. A slow AG-UI queue would therefore corrupt the
+                # LogWriter's transcript with duplicated output — trading silent
+                # loss for silent corruption, which is worse, because a duplicate
+                # is indistinguishable from real repeated output (Copilot
+                # follow-up on #802). Per-subscriber positions would allow a
+                # targeted redelivery; the bus has none, and inventing them here
+                # would be a second delivery mechanism beside the one every local
+                # consumer already uses.
+                #
+                # So the loss is made explicit instead, in the shape the gap path
+                # already uses: an empty `data` with a `gap` range. Consumers that
+                # handle a GapFrame's loss handle this identically, and nothing
+                # receives a byte twice.
+                runtime_registry.record_position(
+                    frame.terminal_id,
+                    frame.stream.value,
+                    frame.pos + len(raw),
+                    generation=frame.generation,
+                )
                 if dropped:
-                    # Leave the watermark BEHIND this chunk so the next reconnect
-                    # replays it. The generation is still recorded — position is
-                    # monotonic, so naming the chunk's start is a no-op when the
-                    # watermark is already past it — because generation bookkeeping
-                    # fences a stream restart and must not be skipped just because
-                    # one chunk was not delivered.
                     logger.warning(
-                        "%s subscriber(s) dropped output for terminal %s at %s; not "
-                        "advancing the resume watermark, so a reconnect replays it",
+                        "%s subscriber queue(s) dropped output for terminal %s "
+                        "[%s, %s); reporting it as a gap rather than replaying, "
+                        "which would duplicate for the subscribers that accepted it",
                         dropped,
                         frame.terminal_id,
                         frame.pos,
-                    )
-                    runtime_registry.record_position(
-                        frame.terminal_id,
-                        frame.stream.value,
-                        frame.pos,
-                        generation=frame.generation,
-                    )
-                else:
-                    runtime_registry.record_position(
-                        frame.terminal_id,
-                        frame.stream.value,
                         frame.pos + len(raw),
-                        generation=frame.generation,
+                    )
+                    bus.publish(
+                        f"terminal.{frame.terminal_id}.output",
+                        {
+                            "data": "",
+                            "gap": {"from_pos": frame.pos, "to_pos": frame.pos + len(raw)},
+                        },
                     )
             elif isinstance(frame, GapFrame):
                 # A GapFrame advances the resume watermark and republishes a loss,

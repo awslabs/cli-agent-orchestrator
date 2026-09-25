@@ -1014,12 +1014,20 @@ def test_only_caos_own_entry_is_given_the_channel_token(tmp_path, monkeypatch):
 
     ours = servers["cao-mcp-server-new-tid"]["env"]
     theirs = servers["third-party-new-tid"]["env"]
-    assert ours[RUNTIME_TOKEN_ENV] == "runtime-token-value"
+    # Our own entry gets the endpoint. It does NOT get the token: this file is
+    # written to disk and re-read at every launch, and the shim inherits the token
+    # from the process that starts it, so a copy here is a credential at rest for
+    # no gain. This originally asserted the token WAS present, which is the
+    # persisted-config hole (Copilot follow-up on #802).
     assert ours[SHARED_ENDPOINT_URL_ENV] == "http://cao-server:9891/mcp"
+    assert RUNTIME_TOKEN_ENV not in ours
+    # And the third-party entry gets neither, which is the original finding.
     assert RUNTIME_TOKEN_ENV not in theirs
     assert SHARED_ENDPOINT_URL_ENV not in theirs
     # It still gets what it has always got, so nothing is broken by the gate.
     assert theirs["CAO_TERMINAL_ID"] == "new-tid"
+    # Nowhere in the file at all, not just absent from these two entries.
+    assert "runtime-token-value" not in cfg.read_text()
     assert servers["third-party-new-tid"]["command"] == "my-own-mcp"
 
 

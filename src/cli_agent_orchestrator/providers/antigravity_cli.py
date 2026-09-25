@@ -438,7 +438,11 @@ class AntigravityCliProvider(BaseProvider):
                 # server that is not ours, which is launched as declared and
                 # must not be handed the channel token (this loop covers every
                 # profile/plugin entry, not just the bundled one).
-                env.update(shared_endpoint_child_env_for(cfg.get("command", "")))
+                # persisted=True for the same reason as OpenCode: this entry is
+                # written to a config file Antigravity re-reads at every launch,
+                # so the endpoint is persisted and the token is inherited from
+                # the launching process instead of stored (Copilot on #802).
+                env.update(shared_endpoint_child_env_for(cfg.get("command", ""), persisted=True))
                 entry["env"] = env
                 # Antigravity documents `cwd` ("Working directory for `stdio`
                 # servers."), so an agent plugin's directory is carried natively.

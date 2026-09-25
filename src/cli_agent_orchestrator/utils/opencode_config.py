@@ -183,7 +183,12 @@ def translate_mcp_server_config(cao_config: Dict[str, Any]) -> Dict[str, Any]:
     # and plugin entry, and ``opencode.json`` is written to disk, so an
     # unconditional merge would persist the channel token beside third-party
     # commands (Copilot review on #802, finding 9).
-    environment.update(shared_endpoint_child_env_for(cao_config.get("command", "")))
+    # persisted=True: this dict is serialized into ``opencode.json``, which
+    # OpenCode reads at every later launch. The endpoint belongs there; the
+    # channel token does not, because the shim inherits it from the process that
+    # launches it and a second copy on disk is a credential at rest for no gain
+    # (Copilot follow-up on #802).
+    environment.update(shared_endpoint_child_env_for(cao_config.get("command", ""), persisted=True))
     if environment:
         result["environment"] = environment
     # Emitted only when the source actually has one: an invented `cwd` would
