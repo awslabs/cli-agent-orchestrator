@@ -19,6 +19,7 @@ where the caller is a human operator and no agent allowlist applies.
 """
 
 import os
+import threading
 from unittest.mock import Mock, patch
 
 import pytest
@@ -307,6 +308,29 @@ class TestAssignElastic:
         assert result["worker_id"] == "deadbeef"
         post.assert_called_once()
         impl.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_resolves_the_caller_off_the_event_loop(self, monkeypatch):
+        # For a bound caller the guard reaches ``_get_terminal_context_from_env``,
+        # which makes blocking HTTP calls. On the loop thread it would stall every
+        # other placement in a fan-out until those calls returned.
+        self._broker(monkeypatch)
+        loop_thread = threading.get_ident()
+        seen = []
+
+        def ctx():
+            seen.append(threading.get_ident())
+            return _ctx(["fs_read"])
+
+        with patch.dict(os.environ, BOUND):
+            with (
+                patch.object(server, "_get_terminal_context_from_env", side_effect=ctx),
+                patch.object(server.requests, "post") as post,
+            ):
+                result = await server.assign_elastic(agent_profile="developer", message="do work")
+        assert result["success"] is False
+        assert seen and loop_thread not in seen
+        post.assert_not_called()
 
 
 class TestThroughTheRealContextHelper:

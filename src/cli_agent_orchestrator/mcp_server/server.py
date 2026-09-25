@@ -713,8 +713,10 @@ async def assign_elastic(
     when a delegation reports success and produces no artifact.
     """
     # Checked before the broker is asked for a lease, so a refused caller never
-    # gets a worker provisioned on its behalf.
-    denied = _tool_denied_reason("assign_elastic")
+    # gets a worker provisioned on its behalf. For a bound caller this resolves
+    # the terminal context over blocking HTTP, so it runs off the event loop for
+    # the same reason as the broker POST below.
+    denied = await asyncio.to_thread(_tool_denied_reason, "assign_elastic")
     if denied:
         return {"success": False, "terminal_id": None, "elastic": True, "message": denied}
     try:
