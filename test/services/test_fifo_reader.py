@@ -356,6 +356,14 @@ class TestPipeLivenessWatchdog:
         pane = {"content": "prompt\nline0"}
         fifo_buffer = {"content": "prompt\r\n\x1b[32mline0\x1b[0m"}
         rearm_calls: list = []
+        calls = {"n": 0}
+
+        def _flaky():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("pyte mid-redraw")
+            return None
+
         self._enroll(
             manager,
             "term",
@@ -364,6 +372,7 @@ class TestPipeLivenessWatchdog:
             last_data_at=time.monotonic(),
             fifo_buffer=fifo_buffer,
         )
+        manager._fifo_screen_probe["term"] = _flaky
 
         manager._check_pipe_liveness("term")
         strikes = []
@@ -682,12 +691,93 @@ class TestPipeLivenessWatchdog:
             assert manager._watchdog_thread is not None
             assert manager._watchdog_thread.is_alive()
 
+            # no FIFO probes supplied: bytes-arrived alone decides health
+            manager._liveness["term-enroll"] = ("line0", time.monotonic() - 5, 0)
+            manager._last_data_at["term-enroll"] = time.monotonic()
+            manager._check_pipe_liveness("term-enroll")
+            assert manager._liveness["term-enroll"][2] == 0
+
             manager.stop_reader("term-enroll")
             assert "term-enroll" not in manager._pane_probe
             assert "term-enroll" not in manager._rearm
             assert "term-enroll" not in manager._liveness
         finally:
             manager.stop_watchdog()
+
+    def test_screen_probe_compares_rendered_to_rendered(self, tmp_path, monkeypatch):
+        """A composited pyte screen decides health rendered-to-rendered."""
+        monkeypatch.setattr(fr, "PIPE_LIVENESS_STALL_CHECKS", 2)
+        manager = self._manager(tmp_path, monkeypatch)
+        # the pane wraps at its width; the pyte grid is far wider, so the
+        # same frame must match across different line boundaries
+        pane = {"content": "a long line the pane wraps\nacross two rows"}
+        screen = {"content": "scrollback\na long line the pane wraps across two rows"}
+        rearm_calls: list = []
+        self._enroll(
+            manager,
+            "term",
+            pane,
+            rearm_calls,
+            last_data_at=time.monotonic(),
+            fifo_buffer={"content": "raw bytes that match nothing"},
+        )
+        manager._fifo_screen_probe["term"] = lambda: screen["content"]
+
+        manager._check_pipe_liveness("term")  # baseline
+        pane["content"] = "a long line the pane wraps\nacross two rows now"
+        screen["content"] = "scrollback\na long line the pane wraps across two rows now"
+        manager._last_data_at["term"] = time.monotonic()
+        manager._check_pipe_liveness("term")
+
+        assert manager._liveness["term"][2] == 0, "screen match must re-baseline"
+        assert rearm_calls == []
+
+    def test_screen_probe_matches_styled_and_soft_wrapped_pane(self, tmp_path, monkeypatch):
+        """A pane tail with escapes and a soft wrap still matches the screen."""
+        monkeypatch.setattr(fr, "PIPE_LIVENESS_STALL_CHECKS", 2)
+        manager = self._manager(tmp_path, monkeypatch)
+        # capture-pane -e: escapes on rows, pane wraps at 80 cols (80 + 40)
+        # while the pyte grid keeps the whole 120-char row
+        pane = {"content": "prompt"}
+        screen = {"content": "scrollback\nprompt"}
+        rearm_calls: list = []
+        self._enroll(manager, "term", pane, rearm_calls, last_data_at=time.monotonic())
+        manager._fifo_screen_probe["term"] = lambda: screen["content"]
+
+        manager._check_pipe_liveness("term")  # baseline
+        long = "x" * 120
+        pane["content"] = "\x1b[32m" + long[:80] + "\x1b[0m\n" + long[80:]
+        screen["content"] = "scrollback\n" + long
+        manager._last_data_at["term"] = time.monotonic()
+        manager._check_pipe_liveness("term")
+
+        assert manager._liveness["term"][2] == 0, "soft wrap must not break the match"
+        assert rearm_calls == []
+
+    def test_screen_probe_stale_frame_still_accumulates_strikes(self, tmp_path, monkeypatch):
+        """Bytes arrived but the screen never reached the pane's new frame."""
+        monkeypatch.setattr(fr, "PIPE_LIVENESS_STALL_CHECKS", 2)
+        manager = self._manager(tmp_path, monkeypatch)
+        pane = {"content": "prompt\nline0"}
+        screen = {"content": "prompt\nline0"}
+        rearm_calls: list = []
+        self._enroll(
+            manager,
+            "term",
+            pane,
+            rearm_calls,
+            last_data_at=time.monotonic(),
+        )
+        manager._fifo_screen_probe["term"] = lambda: screen["content"]
+
+        manager._check_pipe_liveness("term")  # baseline
+        pane["content"] = "prompt\nline9"  # pane settled on a frame the screen never saw
+        manager._last_data_at["term"] = time.monotonic()  # burst bytes arrived in-interval
+        manager._check_pipe_liveness("term")
+        manager._last_data_at["term"] = time.monotonic()
+        manager._check_pipe_liveness("term")
+
+        assert rearm_calls == [True], "stale rendered frame is a stall"
 
     def test_create_reader_without_callbacks_is_not_watched(self, tmp_path, monkeypatch):
         """Backward compat: callers that omit probe/rearm (or backends without
