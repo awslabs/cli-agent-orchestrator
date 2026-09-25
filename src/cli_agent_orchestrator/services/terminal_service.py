@@ -2288,8 +2288,10 @@ def send_input(
     sender_id: str | None = None,
     orchestration_type: OrchestrationType | None = None,
     frozen_memory: str | None = None,
-) -> bool:
-    """Send input to terminal via tmux paste buffer.
+) -> int:
+    """Send input to terminal via tmux paste buffer. Returns the turn number the
+    dispatch opened (always >= 1, so it remains truthy for callers that only ask
+    "did it send").
 
     Uses bracketed paste mode (-p) to bypass TUI hotkey handling. The number
     of Enter keys sent after pasting is determined by the provider's
@@ -2364,9 +2366,9 @@ def send_input(
         # the genuine PROCESSING signal that arrives once the agent starts
         # working on the new message.
         if provider and provider.assume_processing_on_dispatch is True:
-            status_monitor.notify_input_sent(terminal_id, assume_processing=True)
+            turn = status_monitor.notify_input_sent(terminal_id, assume_processing=True)
         else:
-            status_monitor.notify_input_sent(terminal_id)
+            turn = status_monitor.notify_input_sent(terminal_id)
 
         # Clear ONLY the rolling byte buffer BEFORE sending keys, so stale idle
         # prompts from BEFORE the input can't trigger a false COMPLETED
@@ -2404,8 +2406,9 @@ def send_input(
         )
 
         # The turn's keystrokes have now cleared send_keys' submit delay, so the
-        # agent has actually been handed the prompt. TURN_START_GRACE_S is measured
-        # from here rather than from notify_input_sent above (#735).
+        # agent has actually been handed the prompt. The turn-start backstop
+        # (TURN_START_BACKSTOP_S) is measured from here rather than from
+        # notify_input_sent above (#735).
         status_monitor.notify_input_delivered(terminal_id)
 
         update_last_active(terminal_id)
@@ -2438,7 +2441,12 @@ def send_input(
                         traceparent=inject_traceparent(),
                     ),
                 )
-        return True
+        # The exact turn this dispatch opened (notify_input_sent's return), so the
+        # API can hand the caller the number for THIS message. Re-deriving it after
+        # the fact from turn_state() reported a concurrent dispatch's higher number
+        # and made that sender wait on — and then read — someone else's turn
+        # (PR #812 review). Truthy, so bool-style callers are unaffected.
+        return turn
 
     except Exception as e:
         logger.error(f"Failed to send input to terminal {terminal_id}: {e}")

@@ -237,11 +237,18 @@ def send(session_name, message, terminal_id, is_async, timeout):
             params={"message": message},
         )
         response.raise_for_status()
-        # The turn this message started. Waiting on it is what makes "done" mean
-        # "my message finished" rather than "the screen looks finished" (#735).
-        sent_turn = response.json().get("turn")
     except requests.exceptions.RequestException as e:
         raise click.ClickException(f"Failed to connect to cao-server: {e}")
+
+    # The turn this message started. Waiting on it is what makes "done" mean
+    # "my message finished" rather than "the screen looks finished" (#735).
+    # Parsed OUTSIDE the request try-block: requests' JSONDecodeError subclasses
+    # RequestException (via InvalidJSONError) ahead of ValueError, so inside that
+    # block the RequestException clause caught it first and a DELIVERED message
+    # was reported as "Failed to connect" — inviting a retry that pastes a
+    # duplicate prompt into a working agent (PR #812 review).
+    try:
+        sent_turn = response.json().get("turn")
     except ValueError:
         sent_turn = None  # non-JSON body from an unexpected proxy; fall back below
 

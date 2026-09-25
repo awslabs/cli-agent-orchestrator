@@ -571,7 +571,8 @@ def test_kimi_send_input_bounds_execution_evidence_to_new_bytes(monkeypatch, cur
     monkeypatch.setattr(ts.provider_manager, "get_provider", lambda _: provider)
     monkeypatch.setattr(ts, "inject_memory_context", lambda message, *_: message)
     monkeypatch.setattr(ts, "update_last_active", lambda _: None)
-    assert ts.send_input(provider.terminal_id, "Run the new task") is True
+    # send_input returns the turn its dispatch opened (#735/#812): first send == 1.
+    assert ts.send_input(provider.terminal_id, "Run the new task") == 1
     assert ts._worker_is_started_direct(provider.terminal_id, provider) is bool(current)
     backend.get_history.assert_not_called()
 

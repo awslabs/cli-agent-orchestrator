@@ -1303,7 +1303,10 @@ class TestSendTerminalInput:
     def test_send_input_success(self, client):
         """POST /terminals/{id}/input sends message successfully."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
-            mock_svc.send_input.return_value = True
+            # send_input returns the turn its dispatch opened (#735/#812); the
+            # endpoint must report THAT exact number, not one re-derived after the
+            # dispatch, which under a concurrent send named the other sender's turn.
+            mock_svc.send_input.return_value = 4
 
             response = client.post(
                 "/terminals/abcd1234/input",
@@ -1313,6 +1316,7 @@ class TestSendTerminalInput:
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
+        assert data["turn"] == 4
         mock_svc.send_input.assert_called_once_with(
             "abcd1234",
             "hello world",

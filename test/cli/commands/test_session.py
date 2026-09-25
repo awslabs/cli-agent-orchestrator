@@ -617,3 +617,32 @@ class TestSendSync:
         runner.invoke(session, ["send", "cao-test", "question"])
 
         mock_exit.assert_any_call(130)
+
+    @patch("cli_agent_orchestrator.cli.commands.session.poll_until_done")
+    @patch("cli_agent_orchestrator.cli.commands.session.time.sleep")
+    @patch("cli_agent_orchestrator.cli.commands.session.requests.post")
+    @patch("cli_agent_orchestrator.cli.commands.session.requests.get")
+    def test_a_delivered_message_with_a_non_json_body_is_not_a_connection_failure(
+        self, mock_get, mock_post, mock_sleep, mock_poll, runner
+    ):
+        """requests' JSONDecodeError subclasses RequestException AHEAD of ValueError,
+        so parsing inside the request try-block reported a DELIVERED message as
+        'Failed to connect' — inviting a retry that pastes a duplicate prompt into a
+        working agent (PR #812 review). A non-JSON 200 (proxy) must instead fall
+        back to the pre-turn behaviour: sleep, then the frame-heuristic poll."""
+        resolve_resp = MagicMock(status_code=200, json=lambda: [{"id": "abc12345"}])
+        status_resp = MagicMock(status_code=200)
+        status_resp.json.return_value = {"status": "idle"}
+        output_resp = MagicMock(status_code=200)
+        output_resp.json.return_value = {"output": "the answer"}
+        mock_get.side_effect = [resolve_resp, status_resp, output_resp]
+        post_resp = MagicMock(status_code=200)
+        post_resp.json.side_effect = requests.exceptions.JSONDecodeError("x", "not json", 0)
+        mock_post.return_value = post_resp
+
+        result = runner.invoke(session, ["send", "cao-test", "hello"])
+
+        assert result.exit_code == 0
+        assert "Failed to connect" not in result.output
+        mock_sleep.assert_called_once_with(3)  # legacy fallback engaged
+        assert mock_poll.call_args.kwargs["min_turn"] is None

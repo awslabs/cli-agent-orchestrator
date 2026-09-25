@@ -102,6 +102,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   three pass there now, against one out of two before. Providers calibrated for
   the raw stream are unaffected.
 
+  The waiter itself: once the server confirms the sent turn finished, the wait
+  ends immediately — the current frame may already belong to a newer queued turn
+  (InboxService delivers the instant a turn closes), and requiring it to also
+  look done would block the waiter on other people's work. A server whose
+  reported `turn` is lower than the caller's `min_turn` has lost its in-memory
+  counters (restart); the waiter detects that and falls back to the frame
+  heuristic instead of burning its whole timeout. `POST /terminals/{id}/input`
+  reports the exact turn its own dispatch opened (`send_input` now returns it),
+  so a concurrent sender can never be handed the other sender's number. And a
+  non-JSON 200 from a proxy on that POST falls back to the legacy wait instead
+  of mislabelling a delivered message as a connection failure.
+
+  Known limits, deliberately unchanged here: the in-process step waiter
+  (`services/agent_step.py`) and the server-side `wait_until_status` still judge
+  frames, not turns — the same deferred follow-up — and on event-inbox (herdr)
+  backends a turn faster than the poll interval pays the 60s backstop, because a
+  native ready reading right after a dispatch is indistinguishable from the
+  pre-pickup idle state.
+
 - **a PTY WebSocket handshake with no peer address skipped the client-IP allowlist.**
   `/terminals/{id}/ws` checked `client_host not in WS_ALLOWED_CLIENTS` only when a
   peer address was present, so a `None` peer passed instead of failing closed. Not

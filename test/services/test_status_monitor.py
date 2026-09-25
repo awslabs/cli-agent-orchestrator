@@ -1922,9 +1922,8 @@ class TestClearedBufferEvidenceIsPinnedToItsTurn:
         provider = MagicMock()
         provider.supports_screen_detection = False
         self._dispatch(sm, provider)  # turn 1
-        with patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as pm:
-            pm.get_provider.return_value = provider
-            _, pinned = sm._raw_verdict_context("t1", provider)
+        with sm._lock:
+            pinned = sm._pin_cleared_turn_locked("t1")
         assert pinned == 1
 
         self._dispatch(sm, provider)  # turn 2 slips in before the apply
@@ -1937,9 +1936,8 @@ class TestClearedBufferEvidenceIsPinnedToItsTurn:
         provider = MagicMock()
         provider.supports_screen_detection = False
         self._dispatch(sm, provider)
-        with patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as pm:
-            pm.get_provider.return_value = provider
-            _, pinned = sm._raw_verdict_context("t1", provider)
+        with sm._lock:
+            pinned = sm._pin_cleared_turn_locked("t1")
 
         sm._apply_detection("t1", TerminalStatus.COMPLETED, cleared_buffer_turn=pinned)
         assert sm.turn_state("t1") == (1, 1)
@@ -1951,13 +1949,37 @@ class TestClearedBufferEvidenceIsPinnedToItsTurn:
         provider = MagicMock()
         provider.supports_screen_detection = False
         sm.notify_input_sent("t1")  # no clear_rolling_buffer
-        with patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as pm:
-            pm.get_provider.return_value = provider
-            _, pinned = sm._raw_verdict_context("t1", provider)
+        with sm._lock:
+            pinned = sm._pin_cleared_turn_locked("t1")
         assert pinned is None
 
         sm._apply_detection("t1", TerminalStatus.COMPLETED, cleared_buffer_turn=pinned)
         assert sm.turn_state("t1") == (1, 0)
+
+    def test_a_stale_pin_through_the_pipeline_cannot_close_the_new_turn(self):
+        """The pipeline passes the pin alongside the buffer it was snapshotted
+        with (_process_chunk pins inside the same lock that composes the buffer);
+        if a new dispatch lands before the verdict applies, revalidation refuses.
+        This drives _schedule_raw_detection with the stale pin exactly as
+        _process_chunk would have passed it (PR #812 self-review: the pin used to
+        be taken in a LATER lock acquisition, where it vouched for the new turn
+        with the old turn's bytes)."""
+        sm = StatusMonitor()
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        self._dispatch(sm, provider)  # turn 1; buffer snapshot + pin happen here
+        with sm._lock:
+            stale_pin = sm._pin_cleared_turn_locked("t1")
+        self._dispatch(sm, provider)  # turn 2 races in before the verdict applies
+
+        with patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as pm:
+            provider.get_status.return_value = TerminalStatus.COMPLETED
+            pm.get_provider.return_value = provider
+            sm._schedule_raw_detection(
+                "t1", "turn 1's completed bytes", provider, cleared_buffer_turn=stale_pin
+            )
+
+        assert sm.turn_state("t1") == (2, 0)
 
 
 class TestQuietTerminalCannotHoldATurnOpenForever:

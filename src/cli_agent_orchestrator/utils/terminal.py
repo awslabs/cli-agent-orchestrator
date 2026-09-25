@@ -252,13 +252,23 @@ def poll_until_done(
     ``min_turn`` is the turn number ``POST /terminals/{id}/input`` returned for the
     message being waited on. Given one, no "done" signal is honoured until the
     server reports ``turn_completed >= min_turn`` — the difference between "the
-    terminal looks ready" and "the turn I sent has finished" (#735). Without it this
-    function can only judge the terminal's current frame, and a completion marker on
-    that frame usually belongs to the PREVIOUS turn: the caller then returns in a
-    few seconds and prints the previous answer, or a half-rendered frame of the turn
-    still running. Pass it wherever the turn number is available; it is optional
-    only so callers that never dispatched the input (or talk to a server too old to
-    report a turn) keep working on the frame-shaped heuristic below.
+    terminal looks ready" and "the turn I sent has finished" (#735) — and the wait
+    ends the MOMENT the server confirms it: the current frame may already belong to
+    a newer turn someone else queued (InboxService delivers the instant a turn
+    closes), and requiring the frame to also look done would block this waiter on
+    other people's work and then hand back their answer (PR #812 review). Without a
+    turn this function can only judge the terminal's current frame, and a completion
+    marker on that frame usually belongs to the PREVIOUS turn: the caller then
+    returns in a few seconds and prints the previous answer, or a half-rendered
+    frame of the turn still running. Pass it wherever the turn number is available;
+    it is optional only so callers that never dispatched the input (or talk to a
+    server too old to report a turn) keep working on the frame heuristic below.
+
+    A server whose reported ``turn`` is LOWER than ``min_turn`` has lost the
+    counters this number came from (cao-server restarted; the counters are
+    in-memory): the POST that returned ``min_turn`` proves the counter was already
+    at least that high. The gate would otherwise spin for the whole timeout, so it
+    falls back to the frame heuristic for the rest of the wait (PR #812 review).
 
     Two "done" signals, treated differently:
 
@@ -321,16 +331,23 @@ def poll_until_done(
             # to the frame heuristic below rather than hanging forever against an
             # older server (or a worker node that has not been upgraded).
             if turn_completed is not None and status != TerminalStatus.ERROR.value:
-                if turn_completed < min_turn:
+                server_turn = payload.get("turn")
+                if server_turn is not None and server_turn < min_turn:
+                    # The server's counter is BELOW the number it handed us at the
+                    # POST: the counters were reset (server restart), so this gate
+                    # can never be satisfied. Frame heuristic from here on.
+                    min_turn = None
+                elif turn_completed >= min_turn:
+                    # The server confirmed OUR turn finished — done, now. The frame
+                    # checks below describe the CURRENT frame, which may already be
+                    # a newer queued turn's; waiting for it to look done would block
+                    # on other people's work and return their answer.
+                    return
+                else:
                     # Our turn is still in flight, whatever the frame shows.
                     consecutive_idle = 0
                     time.sleep(polling_interval)
                     continue
-                # The server has confirmed OUR turn finished. That is strictly better
-                # evidence than a PROCESSING sighting, so it satisfies the "has the
-                # agent started?" gate the IDLE path below needs — a turn short enough
-                # that no poll ever caught it working must still be allowed to finish.
-                observed_working = True
             if status == TerminalStatus.COMPLETED.value:
                 return
             if status == TerminalStatus.ERROR.value:
