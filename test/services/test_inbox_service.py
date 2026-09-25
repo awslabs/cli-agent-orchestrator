@@ -2,6 +2,7 @@
 
 import asyncio
 from datetime import datetime
+from subprocess import CalledProcessError
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
@@ -10,7 +11,11 @@ from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.constants import INBOX_RECONCILE_GRACE_SECONDS
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.services.inbox_service import InboxService
+from cli_agent_orchestrator.services.inbox_service import (
+    _LOUD_ERROR_EVERY_N_ATTEMPTS,
+    InboxService,
+)
+from cli_agent_orchestrator.services.terminal_service import TerminalInputBlockedError
 
 
 def _make_message(id=1, receiver_id="term-1", message="hello", status=MessageStatus.PENDING):
@@ -140,7 +145,18 @@ class TestDeliverPending:
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
-    def test_marks_failed_on_send_error(self, mock_get, mock_monitor, mock_term_svc, mock_update):
+    def test_leaves_pending_not_failed_on_send_error(
+        self, mock_get, mock_monitor, mock_term_svc, mock_update
+    ):
+        """A send failure resets the message to PENDING, never FAILED.
+
+        Previously a generic send error (e.g. a stale-tmux-window paste-buffer
+        returning a non-zero exit -> CalledProcessError) was marked FAILED and
+        never retried by any path (get_pending_messages and the reconcile sweep
+        both query PENDING only), silently losing the coordination message while
+        the sender had already been told delivery succeeded (harness-control#921).
+        It must instead go back to PENDING so the reconcile sweep re-attempts it.
+        """
         mock_get.return_value = [_make_message()]
         mock_monitor.get_status.return_value = TerminalStatus.IDLE
         mock_term_svc.send_input.side_effect = RuntimeError("tmux error")
@@ -148,15 +164,9 @@ class TestDeliverPending:
         svc = InboxService()
         svc.deliver_pending("term-1")
 
-        # Status is set to DELIVERED before send_input (#164), then reset to
-        # FAILED when the send raises.
-        mock_update.assert_has_calls(
-            [
-                call(1, MessageStatus.DELIVERED),
-                call(1, MessageStatus.FAILED),
-            ]
-        )
-        assert mock_update.call_count == 2
+        # Optimistic DELIVERED before send (#164), then reset to PENDING (not FAILED).
+        assert mock_update.call_args_list[-1] == call(1, MessageStatus.PENDING)
+        assert call(1, MessageStatus.FAILED) not in mock_update.call_args_list
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
@@ -261,6 +271,141 @@ class TestDeliverPending:
 
         assert mock_term_svc.send_input.call_count == 1
         assert store["status"] == MessageStatus.DELIVERED
+
+
+class TestFailedDeliveryStaysRetriable:
+    """Reliability of inbox delivery under a stale/unreachable tmux target.
+
+    Root cause fixed here: a delivery failure (classically a stale or renamed
+    tmux window making the underlying tmux paste-buffer command return a
+    non-zero exit -> ``CalledProcessError``) used to hit the generic handler
+    that marked the message FAILED. FAILED messages are never retried by the
+    reconcile sweep or any fast path (both query PENDING only), so the
+    coordination message was silently lost while the sender had already been
+    told delivery succeeded (harness-control#921). The fix keeps every failed
+    delivery PENDING (retriable) and self-heals via the reconcile sweep once
+    the terminal becomes reachable again.
+    """
+
+    def _idle_single_message(self, mock_get, mock_monitor, msg_id=1):
+        mock_get.return_value = [_make_message(id=msg_id)]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_stale_window_paste_failure_stays_pending(
+        self, mock_get, mock_monitor, mock_term_svc, mock_update
+    ):
+        """The exact reported case: paste-buffer into a stale window -> non-zero exit."""
+        self._idle_single_message(mock_get, mock_monitor)
+        mock_term_svc.send_input.side_effect = CalledProcessError(
+            1, ["tmux", "paste-buffer", "-b", "cao_x", "-t", "cao-s:win-810f"]
+        )
+
+        svc = InboxService()
+        svc.deliver_pending("term-1")
+
+        assert mock_update.call_args_list[-1] == call(1, MessageStatus.PENDING)
+        assert call(1, MessageStatus.FAILED) not in mock_update.call_args_list
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_reconcile_redelivers_after_transient_stale_window(
+        self, mock_get, mock_monitor, mock_term_svc, mock_update
+    ):
+        """A message left PENDING by a stale window is delivered on a later sweep.
+
+        First deliver_pending (window stale) -> stays PENDING. When the terminal
+        becomes reachable again, the next deliver_pending (reconcile-driven)
+        delivers it. This is the self-heal the whole fix is about.
+        """
+        self._idle_single_message(mock_get, mock_monitor)
+        svc = InboxService()
+
+        # Cycle 1: stale window, both in-cycle attempts fail.
+        mock_term_svc.send_input.side_effect = CalledProcessError(1, ["tmux", "paste-buffer"])
+        svc.deliver_pending("term-1")
+        assert mock_update.call_args_list[-1] == call(1, MessageStatus.PENDING)
+
+        # Cycle 2: window reachable again -> delivered, no further PENDING reset.
+        mock_term_svc.send_input.side_effect = None
+        mock_update.reset_mock()
+        svc.deliver_pending("term-1")
+        mock_update.assert_called_once_with(1, MessageStatus.DELIVERED)
+        # Retry counter cleared on success.
+        assert 1 not in svc._delivery_attempts
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_terminal_input_blocked_stays_pending(
+        self, mock_get, mock_monitor, mock_term_svc, mock_update
+    ):
+        """A provider briefly in ERROR (TerminalInputBlockedError) is retriable."""
+        self._idle_single_message(mock_get, mock_monitor)
+        mock_term_svc.send_input.side_effect = TerminalInputBlockedError("provider in ERROR")
+
+        svc = InboxService()
+        svc.deliver_pending("term-1")
+
+        assert mock_update.call_args_list[-1] == call(1, MessageStatus.PENDING)
+        assert call(1, MessageStatus.FAILED) not in mock_update.call_args_list
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_in_cycle_retry_recovers_transient_failure(
+        self, mock_get, mock_monitor, mock_term_svc, mock_update
+    ):
+        """A single transient failure recovers within the same delivery cycle.
+
+        The second in-cycle attempt re-resolves the target (send_input re-reads
+        metadata) and succeeds, so the message is DELIVERED without ever being
+        reset to PENDING.
+        """
+        self._idle_single_message(mock_get, mock_monitor)
+        mock_term_svc.send_input.side_effect = [RuntimeError("one-shot glitch"), None]
+
+        svc = InboxService()
+        svc.deliver_pending("term-1")
+
+        assert mock_term_svc.send_input.call_count == 2
+        mock_update.assert_called_once_with(1, MessageStatus.DELIVERED)
+        assert call(1, MessageStatus.PENDING) not in mock_update.call_args_list
+
+    @patch("cli_agent_orchestrator.services.inbox_service.logger")
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_loud_error_after_n_attempts_but_never_dropped(
+        self, mock_get, mock_monitor, mock_term_svc, mock_update, mock_logger
+    ):
+        """After N failed cycles: a LOUD error fires, yet the message stays PENDING.
+
+        Observability without loss: an unreachable terminal is surfaced via
+        logger.error, but the message is never moved to a non-retriable state.
+        """
+        self._idle_single_message(mock_get, mock_monitor)
+        mock_term_svc.send_input.side_effect = RuntimeError("stale forever")
+
+        svc = InboxService()
+        # Drive exactly _LOUD_ERROR_EVERY_N_ATTEMPTS failing reconcile cycles.
+        for _ in range(_LOUD_ERROR_EVERY_N_ATTEMPTS):
+            svc.deliver_pending("term-1")
+
+        assert svc._delivery_attempts[1] == _LOUD_ERROR_EVERY_N_ATTEMPTS
+        # Loud error emitted at the Nth attempt; never marked FAILED.
+        assert mock_logger.error.called
+        assert call(1, MessageStatus.FAILED) not in mock_update.call_args_list
+        # Still PENDING and retriable after the loud escalation.
+        assert mock_update.call_args_list[-1] == call(1, MessageStatus.PENDING)
 
 
 class TestEagerInboxDelivery:
