@@ -2213,6 +2213,14 @@ def record_dispatch(
             row.state = "dispatched"
             row.settled_at = None
         db.commit()
+    # Opportunistic, and deliberately after the commit so a prune failure cannot
+    # roll back the journal entry the caller depends on.
+    try:
+        pruned = prune_dispatch_journal()
+        if pruned:
+            logger.debug("pruned %d settled dispatch journal entries", pruned)
+    except Exception:  # noqa: BLE001
+        logger.debug("dispatch journal prune skipped", exc_info=True)
 
 
 def get_dispatch_record(op_id: str) -> Optional[dict]:
@@ -2238,6 +2246,40 @@ def get_dispatch_record(op_id: str) -> Optional[dict]:
             "engine": row.engine,
             "state": cast(str, row.state),
         }
+
+
+# How long a SETTLED journal entry is kept. It has no reader once settled — the
+# orphan path only consults entries for results it has not applied — so this is
+# purely an audit window. Unsettled entries are never pruned by age: one of those
+# IS an operation whose outcome was never seen, which is exactly what the journal
+# exists to preserve.
+_DISPATCH_JOURNAL_SETTLED_TTL_SECS = 24 * 3600
+
+
+def prune_dispatch_journal() -> int:
+    """Delete settled journal entries older than the audit window; return the count.
+
+    One row is written per dispatched operation, so without pruning the table grows
+    for the life of the server's volume. Called opportunistically from
+    :func:`record_dispatch` rather than from a background task, so there is no new
+    thread and no new failure mode: a prune that fails leaves rows behind, which is
+    the status quo, not a broken launch.
+    """
+    from datetime import timedelta
+
+    cutoff = datetime.now() - timedelta(seconds=_DISPATCH_JOURNAL_SETTLED_TTL_SECS)
+    with SessionLocal() as db:
+        deleted = (
+            db.query(DispatchJournalModel)
+            .filter(
+                DispatchJournalModel.state == "settled",
+                DispatchJournalModel.settled_at.isnot(None),
+                DispatchJournalModel.settled_at < cutoff,
+            )
+            .delete(synchronize_session=False)
+        )
+        db.commit()
+        return int(deleted or 0)
 
 
 def settle_dispatch(op_id: str) -> None:

@@ -1438,3 +1438,70 @@ class TestAReconciledTerminalKeepsItsEngine:
                 )
         finally:
             runtime_registry.unbind_terminal(orphan)
+
+
+class TestTheDispatchJournalDoesNotGrowForever:
+    """Settled entries are pruned; unsettled ones never are.
+
+    Every dispatched operation writes a row, so without pruning the table grows for
+    the life of the server's volume — observed on the cluster, where every entry
+    still read `dispatched` after a successful run because only the orphan path
+    settled them.
+
+    An UNSETTLED entry is never pruned by age, deliberately: one of those is an
+    operation whose outcome this server never saw, which is the thing the journal
+    exists to preserve.
+    """
+
+    @staticmethod
+    def _db(tmp_path, monkeypatch):
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from cli_agent_orchestrator.clients import database as db
+
+        eng = create_engine(f"sqlite:///{tmp_path}/j.db")
+        db.Base.metadata.create_all(bind=eng)
+        monkeypatch.setattr(db, "SessionLocal", sessionmaker(bind=eng))
+        return db
+
+    def test_a_settled_entry_past_the_window_is_pruned(self, tmp_path, monkeypatch):
+        from datetime import datetime, timedelta
+
+        db = self._db(tmp_path, monkeypatch)
+        db.record_dispatch("old-op", "launch", "worker-1", owner="alice")
+        db.settle_dispatch("old-op")
+
+        # Age it past the audit window.
+        with db.SessionLocal() as s:
+            row = s.query(db.DispatchJournalModel).filter_by(op_id="old-op").first()
+            row.settled_at = datetime.now() - timedelta(
+                seconds=db._DISPATCH_JOURNAL_SETTLED_TTL_SECS + 60
+            )
+            s.commit()
+
+        assert db.prune_dispatch_journal() == 1
+        assert db.get_dispatch_record("old-op") is None
+
+    def test_an_unsettled_entry_is_never_pruned(self, tmp_path, monkeypatch):
+        """The one row that must survive: an outcome nobody applied."""
+        from datetime import datetime, timedelta
+
+        db = self._db(tmp_path, monkeypatch)
+        db.record_dispatch("lost-op", "launch", "worker-1", owner="alice")
+
+        with db.SessionLocal() as s:
+            row = s.query(db.DispatchJournalModel).filter_by(op_id="lost-op").first()
+            row.created_at = datetime.now() - timedelta(days=30)
+            s.commit()
+
+        assert db.prune_dispatch_journal() == 0
+        assert db.get_dispatch_record("lost-op")["state"] == "dispatched"
+
+    def test_a_recently_settled_entry_is_kept_for_audit(self, tmp_path, monkeypatch):
+        db = self._db(tmp_path, monkeypatch)
+        db.record_dispatch("fresh-op", "launch", "worker-1")
+        db.settle_dispatch("fresh-op")
+
+        assert db.prune_dispatch_journal() == 0
+        assert db.get_dispatch_record("fresh-op")["state"] == "settled"

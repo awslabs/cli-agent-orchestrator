@@ -968,6 +968,15 @@ async def launch_remote_terminal(
             detail=f"launched terminal on '{runtime_id}' but failed to persist it; tore it down",
         )
     runtime_registry.bind_terminal(info["id"], runtime_id)
+    # The outcome has been applied: row written, routing bound. Settle the journal
+    # entry so it is no longer an operation whose result this server never saw.
+    #
+    # Without this the happy path never settles, which is not just untidy
+    # bookkeeping: one row accumulates per launch, forever, on the server's volume,
+    # and a restart auditing the journal cannot tell a genuinely unresolved
+    # operation from thousands of completed ones. Observed on the cluster, where
+    # every entry read `dispatched` after a successful run.
+    _settle_quietly(op_id)
     try:
         reported = TerminalStatus(info.get("status", "unknown"))
     except ValueError:
