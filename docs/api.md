@@ -159,6 +159,23 @@ See [Skills](skills.md) for discovery, installation, and catalog behavior.
   server setting, 32KB by default, see [Configuration](configuration.md)),
   not unbounded scrollback. Long sessions are truncated to the tail; use the
   on-disk terminal log for complete history.
+- **To wait for a message you sent, wait on its turn — not on `status`** (#735).
+  `POST /terminals/{terminal_id}/input` returns `{"success": true, "turn": N}`,
+  and `GET /terminals/{terminal_id}` reports `turn` (dispatches so far) alongside
+  `turn_completed` (the highest turn observed to have finished). Poll until
+  `turn_completed >= N`.
+
+  `status` answers a different question: it describes the terminal's *current
+  frame*. For the first seconds after a dispatch that frame is still the previous
+  turn — its response, its completion summary and the input box — which is
+  indistinguishable from a finished turn, so a caller that treats a `completed` or
+  `idle` reading as "my message is done" gets the previous answer, and
+  `?mode=last` then returns the previous turn's response block to match. Sleeping
+  first does not fix it; it only changes how often you lose.
+
+  `turn_completed < turn` means a turn is in flight whatever `status` shows. Both
+  fields are live-only and absent for a terminal read from persistence. A server
+  that omits them is older than this contract.
 - Terminal creation accepts `use_worktree` (bool, default `false`, issue #100
   Phase 1): provisions an isolated `git worktree` on its own branch instead of
   sharing `working_directory` as given, requiring the resolved directory to be

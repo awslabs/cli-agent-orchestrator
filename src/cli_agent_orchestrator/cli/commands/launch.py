@@ -348,11 +348,18 @@ def launch(
                 timeout=request_timeout,
             )
             response.raise_for_status()
-            time.sleep(3)
+            try:
+                sent_turn = response.json().get("turn")
+            except ValueError:
+                sent_turn = None
             if is_async:
                 click.echo(f"Message sent to {terminal['name']}. Running in background.")
                 return
-            poll_until_done(terminal["id"], timeout=300)
+            # See `cao session send`: wait for the turn this input started, and keep
+            # the flat sleep only where the server cannot name one (#735).
+            if sent_turn is None:
+                time.sleep(3)
+            poll_until_done(terminal["id"], timeout=300, min_turn=sent_turn)
             request_timeout = get_server_settings()["mcp_request_timeout"]
             output_resp = requests.get(
                 f"{API_BASE_URL}/terminals/{terminal['id']}/output",

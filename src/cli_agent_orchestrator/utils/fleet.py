@@ -172,8 +172,14 @@ class FleetClient:
         payload = self.node_get(worker_id, f"terminals/{terminal_id}/output", {"mode": "last"})
         return payload.get("output") if isinstance(payload, dict) else None
 
-    def send_input(self, worker_id: str, terminal_id: str, message: str) -> None:
-        self.node_post(worker_id, f"terminals/{terminal_id}/input", {"message": message})
+    def send_input(self, worker_id: str, terminal_id: str, message: str) -> Optional[int]:
+        """Deliver a message and return the turn it started, when the node names one.
+
+        None from a node too old to report a turn, which the waiter treats as "fall
+        back to the frame heuristic" rather than as an error (#735).
+        """
+        payload = self.node_post(worker_id, f"terminals/{terminal_id}/input", {"message": message})
+        return payload.get("turn") if isinstance(payload, dict) else None
 
     def sole_terminal(self, worker_id: str) -> dict[str, Any]:
         """The worker's one terminal.

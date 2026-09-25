@@ -106,6 +106,24 @@ class Terminal(BaseModel):
     status: Optional[TerminalStatus] = Field(
         None, description="Current terminal status (live only)"
     )
+    turn: Optional[int] = Field(
+        default=None,
+        description=(
+            "Inputs dispatched to this terminal so far (live only). POST "
+            "/terminals/{id}/input returns the turn it started, so a caller can "
+            "name the turn it is waiting for."
+        ),
+    )
+    turn_completed: Optional[int] = Field(
+        default=None,
+        description=(
+            "Highest turn observed to have FINISHED (live only). turn_completed < "
+            "turn means a turn is still in flight whatever `status` shows -- status "
+            "describes the terminal's current frame, which after a dispatch is still "
+            "the PREVIOUS turn's until the new one renders. Wait on this, not on "
+            "status alone (#735)."
+        ),
+    )
     last_active: Optional[datetime] = Field(None, description="Last active timestamp")
 
 

@@ -3897,7 +3897,14 @@ async def send_terminal_input(
             sender_id=sender_id,
             orchestration_type=orchestration_type,
         )
-        return {"success": success}
+        # Name the turn this input started (#735), so a caller can wait for ITS turn
+        # to finish rather than for the terminal to look ready — after a dispatch the
+        # status still describes the previous turn until the new one renders.
+        # Read after the dispatch: a concurrent send to the same terminal could have
+        # bumped it further, and reporting the higher number only ever makes a waiter
+        # wait longer, never finish early.
+        turn, _ = status_monitor.turn_state(terminal_id)
+        return {"success": success, "turn": turn}
     except TerminalInputBlockedError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:

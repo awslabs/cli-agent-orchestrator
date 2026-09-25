@@ -161,20 +161,22 @@ def send(worker_id, message, is_async, timeout):
     """Send a message to a worker's agent and print its reply."""
     client = FleetClient.from_env()
     terminal_id = client.sole_terminal(worker_id)["id"]
-    client.send_input(worker_id, terminal_id, message)
+    sent_turn = client.send_input(worker_id, terminal_id, message)
     if is_async:
         click.echo(f"Message sent to worker {worker_id} (terminal {terminal_id})")
         return
 
-    time.sleep(3)
+    if sent_turn is None:
+        time.sleep(3)
     interrupted = False
     try:
-        # Same done-detection as a local send, reading status through the broker.
+        # Same done-detection as a local send, reading through the broker.
         # Duplicating that logic here would mean a kiro worker looked hung.
         poll_until_done(
             terminal_id,
             timeout if timeout is not None else _DEFAULT_SEND_TIMEOUT,
-            read_status=lambda tid: client.terminal_status(worker_id, tid),
+            read_terminal=lambda tid: client.terminal(worker_id, tid),
+            min_turn=sent_turn,
         )
     except KeyboardInterrupt:
         interrupted = True
@@ -248,13 +250,15 @@ def attach(worker_id):
             return
         if message.strip() in {"exit", "quit"}:
             return
-        client.send_input(worker_id, terminal_id, message)
-        time.sleep(3)
+        sent_turn = client.send_input(worker_id, terminal_id, message)
+        if sent_turn is None:
+            time.sleep(3)
         try:
             poll_until_done(
                 terminal_id,
                 _DEFAULT_SEND_TIMEOUT,
-                read_status=lambda tid: client.terminal_status(worker_id, tid),
+                read_terminal=lambda tid: client.terminal(worker_id, tid),
+                min_turn=sent_turn,
             )
         except KeyboardInterrupt:
             # Stop waiting on this turn, keep the session. The agent is still

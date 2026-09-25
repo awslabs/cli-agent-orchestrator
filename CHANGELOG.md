@@ -35,6 +35,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`cao session send` could return the previous turn's answer, or a half-drawn
+  frame of the turn still running** (#735, the same symptom as #407 on a different
+  caller). Status describes the terminal's current frame, and for the first seconds
+  after a dispatch that frame is still the previous turn — its response, its
+  completion summary and the input box, which is exactly what a finished turn looks
+  like. Nothing correlated either the status read or `?mode=last` with the message
+  just posted; a flat `time.sleep(3)` was the only thing in between. Measured on
+  claude_code 2.1.282, three trials out of three: the send returned in ~7.1s and
+  printed either the previous turn's answer or a live spinner line, while the real
+  answer arrived ~29s in. Because the send returned early, a scripted loop then
+  pasted its next prompt into a working agent, which batches them — five sends
+  produced one answer and lost four tasks with no error reported.
+
+  Three things were wrong and all three are fixed:
+
+  - `POST /terminals/{id}/input` now returns the **`turn`** it started, and
+    `GET /terminals/{id}` reports **`turn`** and **`turn_completed`**.
+    `poll_until_done` takes `min_turn` and honours no "done" signal until the
+    server confirms that turn finished, so `cao session send`, `cao worker
+    send`/`attach` and `cao launch --initial-message` wait for the message they
+    sent rather than for the screen to look idle. The flat three-second sleep is
+    gone from all four (it remains only when talking to a server old enough not to
+    report a turn).
+  - `StatusMonitor.get_status()` re-checked a stuck-PROCESSING terminal with the
+    **raw-stream** detector even for providers registered with the pyte screen
+    detector. An Ink-style TUI redraws in place, so after escape-stripping the live
+    spinner arrives as fragments (`'✢ g'`, `' Leavenin'`, `'✳ 2'`) that no spinner
+    pattern matches, while the response marker from earlier in the turn matches
+    cleanly — a working agent parsed as COMPLETED. Over one 22-second turn, 41
+    samples of the rolling buffer taken while a spinner was on screen: `idle` twice,
+    `completed` twice. The re-check now routes to the detector the provider is
+    registered with, as `_fresh_capture_pane_status` already did.
+  - the sticky-status latch refused ready → busy but not busy → ready, so one such
+    reading overwrote a live PROCESSING and then stuck: in one traced 28-second turn
+    the screen detector returned PROCESSING thirty-one times and every one was
+    discarded. A ready reading may now end a turn only from a frame that had stopped
+    changing, and only once the turn has been seen working (bounded by a 3s grace so
+    a turn too short to observe still completes). `claude_code` also now sets
+    `assume_processing_on_dispatch`, which no provider had ever set, so readers that
+    cannot ask about turns — InboxService, `send_input`'s own busy check, the web UI
+    — no longer see the old turn's ready status as this one's.
+
+  With `CAO_PYTE_STATUS=false` a provider calibrated for the rendered screen is
+  forced onto a stream it cannot read, so its end-of-turn verdict now waits for
+  output to actually stop. That costs about three seconds per turn in that
+  non-default mode and was the only way to make it correct; three trials out of
+  three pass there now, against one out of two before.
+
 - **a PTY WebSocket handshake with no peer address skipped the client-IP allowlist.**
   `/terminals/{id}/ws` checked `client_host not in WS_ALLOWED_CLIENTS` only when a
   peer address was present, so a `None` peer passed instead of failing closed. Not

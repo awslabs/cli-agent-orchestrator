@@ -663,3 +663,132 @@ class TestPollUntilDone:
             g.return_value = self._resp("error")
             with pytest.raises(click.ClickException):
                 poll_until_done("abcd1234", timeout=60, polling_interval=0)
+
+
+class TestPollUntilDoneTurnGate:
+    """`min_turn`: "did MY send finish", not "does the terminal look ready" (#735).
+
+    Every test above judges the terminal's CURRENT frame. That frame is the problem:
+    for the first seconds after a dispatch it still shows the previous turn -- its
+    response, its completion summary, and the input box -- which is indistinguishable
+    from a finished turn. Measured on claude_code, `cao session send` returned in 7s
+    and printed the previous turn's answer three times out of three. The turn number
+    the server hands back from POST /terminals/{id}/input is what makes the question
+    answerable, so these tests pin that it is actually honoured.
+    """
+
+    def _resp(self, status, turn_completed=None, **extra):
+        m = MagicMock()
+        m.raise_for_status.return_value = None
+        body = {"status": status, **extra}
+        if turn_completed is not None:
+            body["turn_completed"] = turn_completed
+        m.json.return_value = body
+        return m
+
+    def test_completed_is_ignored_until_the_sent_turn_completes(self):
+        """The exact reproduction: COMPLETED on screen, belonging to turn 1."""
+        from cli_agent_orchestrator.utils.terminal import poll_until_done
+
+        seq = [
+            self._resp("completed", turn_completed=1),  # previous turn's marker
+            self._resp("completed", turn_completed=1),  # still not ours
+            self._resp("completed", turn_completed=2),  # now it is
+        ]
+        with (
+            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
+        ):
+            g.side_effect = seq
+            poll_until_done("abcd1234", timeout=60, polling_interval=0, min_turn=2)
+            assert g.call_count == 3
+
+    def test_stable_idle_is_ignored_until_the_sent_turn_completes(self):
+        """The same gate on the IDLE path, which three stale reads would satisfy."""
+        from cli_agent_orchestrator.utils.terminal import poll_until_done
+
+        seq = [self._resp("idle", turn_completed=4)] * 5 + [
+            self._resp("idle", turn_completed=5)
+        ] * 3
+        with (
+            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
+        ):
+            g.side_effect = seq
+            poll_until_done("abcd1234", timeout=60, polling_interval=0, min_turn=5)
+            # All eight consumed: the five stale idles accumulated nothing toward
+            # idle_stable_polls, so the window had to be earned again from our own
+            # turn's readings. IDLE stays ambiguous after the gate opens, so the
+            # stable window is still required -- the gate adds a condition, it does
+            # not replace one.
+            assert g.call_count == 8
+
+    def test_a_turn_never_seen_working_still_returns(self):
+        """A turn short enough that no poll caught it working must not hang.
+
+        `turn_completed` reaching min_turn is stronger evidence than a PROCESSING
+        sighting, so it has to satisfy the "has the agent started?" gate the IDLE
+        path needs. Without this the fix would trade a wrong answer for a hang.
+        """
+        from cli_agent_orchestrator.utils.terminal import poll_until_done
+
+        seq = [self._resp("idle", turn_completed=1)] * 3
+        with (
+            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
+        ):
+            g.side_effect = seq
+            poll_until_done("abcd1234", timeout=60, polling_interval=0, min_turn=1)
+            assert g.call_count == 3
+
+    def test_a_server_that_reports_no_turn_falls_back_to_the_frame_heuristic(self):
+        """An older server (or an un-upgraded worker node) must not hang."""
+        from cli_agent_orchestrator.utils.terminal import poll_until_done
+
+        with (
+            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
+        ):
+            g.return_value = self._resp("completed")  # no turn_completed key at all
+            poll_until_done("abcd1234", timeout=60, polling_interval=0, min_turn=9)
+            assert g.call_count == 1
+
+    def test_error_is_not_gated_on_the_turn(self):
+        """A dead provider is a fact about the terminal, not about a turn.
+
+        Gating ERROR would spend the whole timeout waiting for a turn that can
+        never finish, and report a timeout instead of the real cause.
+        """
+        import click
+
+        from cli_agent_orchestrator.utils.terminal import poll_until_done
+
+        with (
+            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
+        ):
+            g.return_value = self._resp("error", turn_completed=0)
+            with pytest.raises(click.ClickException, match="ERROR"):
+                poll_until_done("abcd1234", timeout=60, polling_interval=0, min_turn=1)
+
+    def test_the_gate_applies_to_a_remote_read_too(self):
+        """`cao worker send` reads through the broker; it gets the same guarantee."""
+        from cli_agent_orchestrator.utils.terminal import poll_until_done
+
+        readings = iter(
+            [
+                {"status": "completed", "turn_completed": 2},
+                {"status": "completed", "turn_completed": 3},
+            ]
+        )
+        with patch("cli_agent_orchestrator.utils.terminal.time.sleep"):
+            poll_until_done(
+                "abcd1234",
+                timeout=60,
+                polling_interval=0,
+                read_terminal=lambda _tid: next(readings),
+                min_turn=3,
+            )
+        # Both readings consumed: the first was the previous turn's.
+        with pytest.raises(StopIteration):
+            next(readings)

@@ -550,6 +550,11 @@ def test_buffer_clear_generation_accepts_coalesced_identical_completion():
         # While cached PROCESSING, get_status performs a direct settled
         # recheck; pin the successful state through the same code path too.
         monitor._last_status["test-terminal"] = TerminalStatus.PROCESSING
+        # Cached PROCESSING only ever arises from a PROCESSING verdict, and such a
+        # verdict also records that the dispatched turn was seen working (#735).
+        # Setting _last_status alone would model a state the monitor cannot be in,
+        # and the recheck would then decline to end a turn it has no evidence began.
+        monitor._turn_started["test-terminal"] = True
         assert monitor.get_status("test-terminal") == TerminalStatus.COMPLETED
 
 

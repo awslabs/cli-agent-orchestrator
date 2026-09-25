@@ -2149,6 +2149,11 @@ def get_terminal(terminal_id: str) -> Dict:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
         status = status_monitor.get_status(terminal_id).value
+        # Read the turn counters AFTER the status: get_status can itself settle a
+        # turn (its PROCESSING re-check applies what it finds), so reading them
+        # first would report a turn as unfinished in the same response that
+        # reports it ready.
+        turn, turn_completed = status_monitor.turn_state(terminal_id)
 
         return {
             "id": metadata["id"],
@@ -2162,6 +2167,8 @@ def get_terminal(terminal_id: str) -> Dict:
             "group": metadata.get("group"),
             "metadata": metadata.get("metadata"),
             "status": status,
+            "turn": turn,
+            "turn_completed": turn_completed,
             "last_active": metadata["last_active"],
         }
 
@@ -2395,6 +2402,11 @@ def send_input(
             force_bracketed_paste=True,
             submit_delay=provider.paste_submit_delay if provider else 0.3,
         )
+
+        # The turn's keystrokes have now cleared send_keys' submit delay, so the
+        # agent has actually been handed the prompt. TURN_START_GRACE_S is measured
+        # from here rather than from notify_input_sent above (#735).
+        status_monitor.notify_input_delivered(terminal_id)
 
         update_last_active(terminal_id)
         logger.info(f"Sent input to terminal: {terminal_id}")
