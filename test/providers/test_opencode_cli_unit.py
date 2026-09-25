@@ -67,6 +67,22 @@ class TestRegexPatterns:
         # No duration suffix → not a full completion marker
         assert not re.search(COMPLETION_MARKER_PATTERN, "▣  Build · Big Pickle")
 
+    def test_completion_marker_pattern_matches_agent_name_with_spaces(self):
+        # #806: OpenCode prints the agent's display name, which may contain spaces.
+        assert re.search(
+            COMPLETION_MARKER_PATTERN,
+            "▣  Sisyphus - Ultraworker · GLM-4-Plus (OpenAI-compatible) · 45.0s",
+        )
+        assert re.search(COMPLETION_MARKER_PATTERN, "▣  Code Reviewer · Big Pickle · 1m 8s")
+
+    def test_completion_marker_pattern_stays_on_one_line(self):
+        # A stray ▣ on an earlier line must not start a match that runs on to the
+        # next line's separator, or the marker's start moves up into the response.
+        text = "     ▣ first item\n     ▣  Build · Big Pickle · 3.1s"
+        matches = list(re.finditer(COMPLETION_MARKER_PATTERN, text))
+        assert len(matches) == 1
+        assert "\n" not in matches[0].group(0)
+
     def test_processing_footer_pattern_matches_esc_interrupt(self):
         assert re.search(PROCESSING_FOOTER_PATTERN, "⬝⬝⬝⬝  esc interrupt   ctrl+p commands")
 
@@ -223,6 +239,20 @@ class TestGetStatusFromScreen:
                 [
                     "Hello from OpenCode",
                     "▣  Build · Big Pickle · 7.2s",
+                    "tab agents  ctrl+p commands  • OpenCode",
+                ]
+            )
+            == TerminalStatus.COMPLETED
+        )
+
+    def test_completion_marker_with_spaced_agent_name_returns_completed(self):
+        provider = make_provider()
+
+        assert (
+            provider.get_status_from_screen(
+                [
+                    "Hello from OpenCode",
+                    "▣  Sisyphus - Ultraworker · GLM-4-Plus (OpenAI-compatible) · 45.0s",
                     "tab agents  ctrl+p commands  • OpenCode",
                 ]
             )
