@@ -135,6 +135,19 @@ class TestGetConfig:
         assert cfg.apps.enabled is False
         assert cfg.logging.level == "INFO"
 
+    def test_terminal_pane_fields_are_resolved_not_defaulted(self, _isolated_settings, monkeypatch):
+        """A field the model carries but never populates reads as a default that is a lie."""
+        _isolated_settings["settings"].write_text(
+            json.dumps({"terminal": {"spawn_mode": "pane", "pane_window": "fleet"}})
+        )
+        monkeypatch.setenv("CAO_TERMINAL_PANE_LAYOUT", "even-vertical")
+
+        cfg = ConfigService.get_config()
+
+        assert cfg.terminal.spawn_mode == "pane"
+        assert cfg.terminal.pane_window == "fleet"
+        assert cfg.terminal.pane_layout == "even-vertical"
+
     def test_vault_env_var_can_disable_but_not_enable(
         self, _isolated_settings, monkeypatch, tmp_path
     ):

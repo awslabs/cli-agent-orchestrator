@@ -48,6 +48,10 @@ class BackendFactory:
                 SPAWN_MODES,
                 TmuxBackend,
             )
+            from cli_agent_orchestrator.clients.tmux import (
+                DEFAULT_PANE_LAYOUT,
+                PANE_LAYOUTS,
+            )
 
             spawn_mode = ConfigService.get("terminal.spawn_mode", default="window")
             if spawn_mode not in SPAWN_MODES:
@@ -57,9 +61,18 @@ class BackendFactory:
                 )
                 spawn_mode = "window"
 
+            pane_layout = ConfigService.get("terminal.pane_layout", default=DEFAULT_PANE_LAYOUT)
+            if pane_layout not in PANE_LAYOUTS:
+                logger.warning(
+                    f"Unknown terminal.pane_layout '{pane_layout}'; expected one of "
+                    f"{', '.join(sorted(PANE_LAYOUTS))}. Falling back to '{DEFAULT_PANE_LAYOUT}'."
+                )
+                pane_layout = DEFAULT_PANE_LAYOUT
+
             return TmuxBackend(
                 spawn_mode=spawn_mode,
                 pane_window=ConfigService.get("terminal.pane_window", default=DEFAULT_PANE_WINDOW),
+                pane_layout=pane_layout,
             )
         elif backend_name == "herdr":
             from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend

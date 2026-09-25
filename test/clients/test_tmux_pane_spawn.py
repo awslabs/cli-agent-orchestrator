@@ -10,6 +10,7 @@ delivered to whichever pane happens to be focused.
 from unittest.mock import MagicMock, patch
 
 import pytest
+from libtmux.constants import PaneDirection
 from libtmux.exc import LibTmuxException
 
 from cli_agent_orchestrator.clients.tmux import TERMINAL_MARK_OPTION
@@ -204,6 +205,61 @@ class TestCreatePane:
         tmux.create_pane("ses", "cao-agents", "coder-3", "tid", str(tmp_path))
 
         host_window.select_layout.assert_called_once_with("tiled")
+
+    @pytest.mark.parametrize("layout", ["even-vertical", "even-horizontal"])
+    def test_applies_the_requested_layout(self, tmux, tmp_path, layout):
+        _, host_window = self._session(tmux)
+
+        tmux.create_pane("ses", "cao-agents", "coder-3", "tid", str(tmp_path), pane_layout=layout)
+
+        host_window.select_layout.assert_called_once_with(layout)
+
+    def test_none_leaves_the_arrangement_alone(self, tmux, tmp_path):
+        """The one layout chosen by someone who arranges the window themselves."""
+        _, host_window = self._session(tmux)
+
+        tmux.create_pane("ses", "cao-agents", "coder-3", "tid", str(tmp_path), pane_layout="none")
+
+        host_window.select_layout.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("layout", "direction"),
+        [
+            ("tiled", PaneDirection.Below),
+            ("even-vertical", PaneDirection.Below),
+            ("even-horizontal", PaneDirection.Right),
+            ("none", PaneDirection.Below),
+        ],
+    )
+    def test_the_split_follows_the_layout_axis(self, tmux, tmp_path, layout, direction):
+        """tmux refuses a split for want of room along the axis being split, not
+        the one the layout settles on -- so a mismatch caps the window early."""
+        _, host_window = self._session(tmux)
+
+        tmux.create_pane("ses", "cao-agents", "coder-3", "tid", str(tmp_path), pane_layout=layout)
+
+        assert host_window.split.call_args.kwargs["direction"] is direction
+
+    def test_an_unknown_layout_says_which_names_exist(self, tmux, tmp_path):
+        """The factory validates config; a direct caller gets a message, not a KeyError."""
+        self._session(tmux)
+
+        with pytest.raises(ValueError, match="even-vertical"):
+            tmux.create_pane(
+                "ses", "cao-agents", "coder-3", "tid", str(tmp_path), pane_layout="grid"
+            )
+
+    def test_an_unknown_layout_is_refused_before_the_host_window_exists(self, tmux, tmp_path):
+        """The first terminal opens the host window instead of splitting it. Validating at
+        the split would accept a bad layout for that one spawn and refuse the next."""
+        session = session_with(panes=[], window=None)
+        tmux.server.sessions.get.return_value = session
+
+        with pytest.raises(ValueError, match="even-vertical"):
+            tmux.create_pane(
+                "ses", "cao-agents", "coder-3", "tid", str(tmp_path), pane_layout="grid"
+            )
+        session.new_window.assert_not_called()
 
     def test_carries_the_terminal_id_into_the_pane_environment(self, tmux, tmp_path):
         _, host_window = self._session(tmux)

@@ -207,3 +207,28 @@ class TestSpawnModeWiring:
 
         assert backend._spawn_mode == "window"
         assert "panes" in caplog.text
+
+    def test_default_layout_is_tiled(self, _isolated_settings):
+        assert BackendFactory.create()._pane_layout == "tiled"
+
+    def test_settings_file_selects_a_layout(self, _isolated_settings):
+        _isolated_settings.write_text(
+            json.dumps({"terminal": {"spawn_mode": "pane", "pane_layout": "even-vertical"}})
+        )
+
+        assert BackendFactory.create()._pane_layout == "even-vertical"
+
+    def test_env_var_selects_a_layout(self, _isolated_settings, monkeypatch):
+        monkeypatch.setenv("CAO_TERMINAL_PANE_LAYOUT", "even-horizontal")
+
+        assert BackendFactory.create()._pane_layout == "even-horizontal"
+
+    def test_an_unknown_layout_falls_back_to_tiled_and_says_so(self, _isolated_settings, caplog):
+        """An unchecked name reaches the client, which refuses the spawn outright."""
+        _isolated_settings.write_text(json.dumps({"terminal": {"pane_layout": "even-vertikal"}}))
+
+        with caplog.at_level("WARNING"):
+            backend = BackendFactory.create()
+
+        assert backend._pane_layout == "tiled"
+        assert "even-vertikal" in caplog.text

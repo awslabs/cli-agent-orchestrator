@@ -9,7 +9,11 @@ import logging
 from typing import Dict, List, Optional
 
 from cli_agent_orchestrator.backends.base import TerminalBackend, TerminalBackendError
-from cli_agent_orchestrator.clients.tmux import PaneSpawnUnavailable, TmuxClient
+from cli_agent_orchestrator.clients.tmux import (
+    DEFAULT_PANE_LAYOUT,
+    PaneSpawnUnavailable,
+    TmuxClient,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,12 +34,14 @@ class TmuxBackend(TerminalBackend):
         client: Optional[TmuxClient] = None,
         spawn_mode: str = "window",
         pane_window: str = DEFAULT_PANE_WINDOW,
+        pane_layout: str = DEFAULT_PANE_LAYOUT,
     ) -> None:
         """Initialize with an optional TmuxClient (defaults to module singleton).
 
         ``spawn_mode="pane"`` puts every terminal after the first into
         ``pane_window`` as a pane, so a supervisor watches its whole fleet in
-        one view instead of one window per agent.
+        one view instead of one window per agent. ``pane_layout`` is how that
+        window is re-arranged after each spawn.
         """
         if client is None:
             if spawn_mode == "pane":
@@ -50,6 +56,7 @@ class TmuxBackend(TerminalBackend):
         self._client = client
         self._spawn_mode = spawn_mode
         self._pane_window = pane_window
+        self._pane_layout = pane_layout
 
     # --- Session lifecycle ---
 
@@ -102,6 +109,7 @@ class TmuxBackend(TerminalBackend):
                         working_directory,
                         window_shell,
                         extra_env=extra_env,
+                        pane_layout=self._pane_layout,
                     )
                 except PaneSpawnUnavailable as e:
                     # Only this case falls back: tmux has no room for another
