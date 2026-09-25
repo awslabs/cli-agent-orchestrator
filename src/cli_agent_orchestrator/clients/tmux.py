@@ -1370,7 +1370,10 @@ class TmuxClient:
             # Validate session and window names to prevent command injection
             validated_session = validate_tmux_name(session_name, "session_name")
             validated_window = validate_tmux_name(window_name, "window_name")
-            target = f"{validated_session}:{validated_window}"
+            # Same resolution as the paste path: in pane mode the window_name
+            # is the terminal's @cao_terminal mark, not a tmux window, so the
+            # literal-key commands must target the resolved pane id.
+            target = self._send_target(validated_session, validated_window)
             # A pane sitting in copy mode consumes send-keys through the mode's
             # key table instead of delivering them — cancel any active mode
             # first, same as the paste-buffer path below (#654).

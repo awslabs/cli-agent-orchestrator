@@ -95,8 +95,12 @@ files.
 a literal. Devin expands `${env:VAR}` entries when spawning each server, and the
 pane environment carries the real value — so several terminals sharing one
 working directory (and one config file) still deliver their own terminal id to
-their own servers. The entries the provider added are removed again when the
-terminal is cleaned up.
+their own servers.
+
+Cleanup is ownership-aware: on terminal teardown the provider removes only the
+entries it wrote, restores any pre-existing operator entry it overwrote, leaves
+entries rewritten by a later writer untouched, and leaves the whole file alone
+while another live terminal shares the working directory.
 
 ### Launch Command
 

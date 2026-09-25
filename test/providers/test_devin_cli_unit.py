@@ -366,6 +366,7 @@ class TestDevinCliMcpDelivery:
         workdir = tmp_path / "repo"
         workdir.mkdir()
         monkeypatch.setattr(DevinCliProvider, "_terminal_workdir", lambda self: workdir)
+        monkeypatch.setattr(DevinCliProvider, "_has_live_siblings", lambda self, wd: False)
         return DevinCliProvider("test1234", "test-session", "window-0"), workdir
 
     def test_stdio_server_written_to_project_local_config(self, tmp_path, monkeypatch):
@@ -433,6 +434,64 @@ class TestDevinCliMcpDelivery:
         provider.cleanup()
         assert not config_path.exists()
         assert not config_path.parent.exists()
+
+    def test_cleanup_restores_a_preexisting_same_named_entry(self, tmp_path, monkeypatch):
+        """An operator server we overwrote at launch must come back."""
+        provider, workdir = self._provider_in(tmp_path, monkeypatch)
+        config_path = workdir / ".devin" / "mcp_config.local.json"
+        config_path.parent.mkdir(parents=True)
+        operator_entry = {"command": "operator-version", "env": {"TOKEN": "t"}}
+        config_path.write_text(json.dumps({"mcpServers": {"tools": operator_entry}}))
+
+        provider._deliver_mcp_servers({"tools": {"type": "stdio", "command": "demo"}})
+        provider.cleanup()
+
+        servers = json.loads(config_path.read_text())["mcpServers"]
+        assert servers == {"tools": operator_entry}
+
+    def test_cleanup_leaves_an_entry_rewritten_since_delivery(self, tmp_path, monkeypatch):
+        """A name someone else rewrote after our delivery is not ours to remove."""
+        provider, workdir = self._provider_in(tmp_path, monkeypatch)
+        config_path = workdir / ".devin" / "mcp_config.local.json"
+
+        provider._deliver_mcp_servers({"tools": {"type": "stdio", "command": "demo"}})
+        doc = json.loads(config_path.read_text())
+        doc["mcpServers"]["tools"] = {"command": "rewritten"}
+        config_path.write_text(json.dumps(doc))
+
+        provider.cleanup()
+        servers = json.loads(config_path.read_text())["mcpServers"]
+        assert servers == {"tools": {"command": "rewritten"}}
+
+    def test_cleanup_leaves_the_file_while_a_sibling_terminal_lives(self, tmp_path, monkeypatch):
+        """Two same-profile terminals in one dir share identical entries."""
+        provider, workdir = self._provider_in(tmp_path, monkeypatch)
+        config_path = workdir / ".devin" / "mcp_config.local.json"
+
+        provider._deliver_mcp_servers({"tools": {"type": "stdio", "command": "demo"}})
+        monkeypatch.setattr(DevinCliProvider, "_has_live_siblings", lambda self, wd: True)
+        provider.cleanup()
+
+        servers = json.loads(config_path.read_text())["mcpServers"]
+        assert "tools" in servers
+
+    def test_cleanup_does_not_restore_another_terminals_entry(self, tmp_path, monkeypatch):
+        """A prior CAO-written entry collapses away rather than resurrecting."""
+        provider, workdir = self._provider_in(tmp_path, monkeypatch)
+        config_path = workdir / ".devin" / "mcp_config.local.json"
+        config_path.parent.mkdir(parents=True)
+        # As left by an earlier CAO terminal that exited without cleanup.
+        cao_prior = {
+            "command": "demo",
+            "env": {"CAO_TERMINAL_ID": "${env:CAO_TERMINAL_ID}"},
+        }
+        config_path.write_text(json.dumps({"mcpServers": {"tools": cao_prior}}))
+
+        provider._deliver_mcp_servers({"tools": {"type": "stdio", "command": "demo"}})
+        provider.cleanup()
+
+        servers = json.loads(config_path.read_text())["mcpServers"]
+        assert servers == {}
 
     def test_build_command_delivers_profile_mcp_servers(self, tmp_path, monkeypatch):
         provider, workdir = self._provider_in(tmp_path, monkeypatch)
