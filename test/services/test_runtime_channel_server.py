@@ -422,7 +422,11 @@ class TestChannelEndpoint:
 
         received = []
         original_publish = bus.publish
+        original_deliver = bus.deliver_now
         bus.publish = lambda topic, payload: received.append((topic, payload))
+        # Output frames go through deliver_now so the handler can see drops; a
+        # capture that patched only publish stopped seeing them. 0 = delivered.
+        bus.deliver_now = lambda topic, payload: (received.append((topic, payload)), 0)[1]
         headers = {"Host": "localhost", "X-CAO-Runtime-Token": "test-runtime-token"}
         try:
             with channel_client.websocket_connect("/runtime/channel", headers=headers) as ws:
@@ -462,6 +466,7 @@ class TestChannelEndpoint:
                 assert decode_frame(ws.receive_text()).op_id == "sync-gen"
         finally:
             bus.publish = original_publish
+            bus.deliver_now = original_deliver
             runtime_registry.unbind_terminal(TID)
 
         published = [p["data"] for _t, p in received if "data" in p]
@@ -560,6 +565,25 @@ class TestChannelEndpoint:
         monkeypatch.setattr(
             rc_api, "db_create_terminal", lambda *a, **k: created.update({"args": a, "kwargs": k})
         )
+        # The dispatch journal is now the authority for whether this server ever
+        # asked for the operation, and it carries the owner the launch was made
+        # for. Reconciliation without an entry is refused, so the entry is part of
+        # the scenario rather than incidental setup.
+        monkeypatch.setattr(
+            rc_api,
+            "get_dispatch_record",
+            lambda op_id: {
+                "op_id": op_id,
+                "command_type": "launch",
+                "runtime_id": "worker-1",
+                "terminal_id": None,
+                "owner": "alice",
+                "run_id": None,
+                "step_id": None,
+                "state": "dispatched",
+            },
+        )
+        monkeypatch.setattr(rc_api, "settle_dispatch", lambda op_id: None)
         headers = {"Host": "localhost", "X-CAO-Runtime-Token": "test-runtime-token"}
         try:
             with channel_client.websocket_connect("/runtime/channel", headers=headers) as ws:
@@ -588,9 +612,122 @@ class TestChannelEndpoint:
                 assert isinstance(ack, AckFrame) and ack.op_id == "launch-op-lost"
                 assert created["args"][0] == orphan  # persisted
                 assert created["kwargs"]["metadata"] == {"runtime_id": "worker-1"}
+                # The owner comes from the journal, not from nothing: an unowned
+                # row passes the revocation gate, which is what made the earlier
+                # version of this recovery unsafe.
+                assert created["kwargs"]["owner"] == "alice"
                 assert runtime_registry.runtime_for_terminal(orphan) == "worker-1"  # bound
         finally:
             runtime_registry.unbind_terminal(orphan)
+
+    def test_a_result_for_an_undispatched_op_creates_nothing(self, channel_client, monkeypatch):
+        """A runtime cannot invent an operation and be believed.
+
+        ``RuntimeConnection.resolve`` answers False for any op_id it does not hold
+        in memory, which after a restart is every op_id — so "unmatched" said
+        nothing about whether this server ever asked. A shared-token runtime could
+        therefore fabricate a result naming any terminal id and have it persisted,
+        placed on itself, and (the row being unowned) permitted to work. The
+        dispatch journal is now consulted, and no entry means nothing is created.
+
+        The frame is still ACKED: there is nothing to recover, and withholding the
+        ack would only make the runtime redeliver a frame no operation asked for,
+        forever.
+        """
+        import cli_agent_orchestrator.runtime_channel.api as rc_api
+        from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
+
+        forged = "cafe1234"
+        created = {}
+        monkeypatch.setattr(rc_api, "get_terminal_metadata", lambda tid: None)
+        monkeypatch.setattr(
+            rc_api, "db_create_terminal", lambda *a, **k: created.update({"args": a, "kwargs": k})
+        )
+        monkeypatch.setattr(rc_api, "get_dispatch_record", lambda op_id: None)
+        headers = {"Host": "localhost", "X-CAO-Runtime-Token": "test-runtime-token"}
+        try:
+            with channel_client.websocket_connect("/runtime/channel", headers=headers) as ws:
+                ws.send_text(_hello())
+                decode_frame(ws.receive_text())
+                ws.send_text(
+                    encode_frame(
+                        CommandResultFrame(
+                            op_id="never-dispatched",
+                            terminal_id=forged,
+                            outcome=CommandOutcome.OK,
+                            payload={
+                                "terminal": {
+                                    "id": forged,
+                                    "session_name": "cao-cafe1234",
+                                    "name": "attacker",
+                                    "provider": "kiro_cli",
+                                }
+                            },
+                        )
+                    )
+                )
+                ack = decode_frame(ws.receive_text())
+                assert isinstance(ack, AckFrame) and ack.op_id == "never-dispatched"
+                assert created == {}, "a forged result must not persist a terminal"
+                assert runtime_registry.runtime_for_terminal(forged) is None
+        finally:
+            runtime_registry.unbind_terminal(forged)
+
+    def test_a_result_from_the_wrong_runtime_creates_nothing(self, channel_client, monkeypatch):
+        """The journal names which runtime was asked; another one answering it is
+        not describing our operation."""
+        import cli_agent_orchestrator.runtime_channel.api as rc_api
+        from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
+
+        stolen = "dead5678"
+        created = {}
+        monkeypatch.setattr(rc_api, "get_terminal_metadata", lambda tid: None)
+        monkeypatch.setattr(
+            rc_api, "db_create_terminal", lambda *a, **k: created.update({"args": a, "kwargs": k})
+        )
+        monkeypatch.setattr(
+            rc_api,
+            "get_dispatch_record",
+            lambda op_id: {
+                "op_id": op_id,
+                "command_type": "launch",
+                # Dispatched to a DIFFERENT runtime than the one connecting here.
+                "runtime_id": "worker-elsewhere",
+                "terminal_id": None,
+                "owner": "alice",
+                "run_id": None,
+                "step_id": None,
+                "state": "dispatched",
+            },
+        )
+        headers = {"Host": "localhost", "X-CAO-Runtime-Token": "test-runtime-token"}
+        try:
+            with channel_client.websocket_connect("/runtime/channel", headers=headers) as ws:
+                ws.send_text(_hello())
+                decode_frame(ws.receive_text())
+                ws.send_text(
+                    encode_frame(
+                        CommandResultFrame(
+                            op_id="dispatched-elsewhere",
+                            terminal_id=stolen,
+                            outcome=CommandOutcome.OK,
+                            payload={
+                                "terminal": {
+                                    "id": stolen,
+                                    "session_name": "cao-dead5678",
+                                    "name": "developer",
+                                    "provider": "kiro_cli",
+                                }
+                            },
+                        )
+                    )
+                )
+                ack = decode_frame(ws.receive_text())
+                assert isinstance(ack, AckFrame)
+                assert created == {}
+                assert runtime_registry.runtime_for_terminal(stolen) is None
+        finally:
+            runtime_registry.unbind_terminal(stolen)
 
     def test_a_failed_reconcile_leaves_the_result_unacked(self, channel_client, monkeypatch):
         """The ack is what lets the runtime drop its only retained copy of the
@@ -610,6 +747,20 @@ class TestChannelEndpoint:
             raise RuntimeError("volume not writable")
 
         monkeypatch.setattr(rc_api, "db_create_terminal", boom)
+        monkeypatch.setattr(
+            rc_api,
+            "get_dispatch_record",
+            lambda op_id: {
+                "op_id": op_id,
+                "command_type": "launch",
+                "runtime_id": "worker-1",
+                "terminal_id": None,
+                "owner": "alice",
+                "run_id": None,
+                "step_id": None,
+                "state": "dispatched",
+            },
+        )
         headers = {"Host": "localhost", "X-CAO-Runtime-Token": "test-runtime-token"}
         with channel_client.websocket_connect("/runtime/channel", headers=headers) as ws:
             ws.send_text(_hello())
@@ -658,7 +809,9 @@ class TestChannelEndpoint:
         # The TestClient runs the app in its own event loop; capture publishes
         # by patching is heavier than just recording what publish is given.
         original_publish = bus.publish
+        original_deliver = bus.deliver_now
         bus.publish = lambda topic, data: received.append((topic, data))
+        bus.deliver_now = lambda topic, data: (received.append((topic, data)), 0)[1]
         try:
             with channel_client.websocket_connect(
                 "/runtime/channel",
@@ -705,6 +858,7 @@ class TestChannelEndpoint:
                 assert runtime_registry.get_status(TID) == TerminalStatus.COMPLETED
         finally:
             bus.publish = original_publish
+            bus.deliver_now = original_deliver
 
         assert (f"terminal.{TID}.output", {"data": "hello from worker"}) in received
         assert (f"terminal.{TID}.status", {"status": "completed"}) in received
@@ -729,7 +883,9 @@ class TestChannelEndpoint:
 
         received = []
         original_publish = bus.publish
+        original_deliver = bus.deliver_now
         bus.publish = lambda topic, data: received.append((topic, data))
+        bus.deliver_now = lambda topic, data: (received.append((topic, data)), 0)[1]
         headers = {"Host": "localhost", "X-CAO-Runtime-Token": "test-runtime-token"}
         try:
             with channel_client.websocket_connect("/runtime/channel", headers=headers) as old:
@@ -777,6 +933,7 @@ class TestChannelEndpoint:
                     assert isinstance(ack, AckFrame) and ack.op_id == "sync-op"
         finally:
             bus.publish = original_publish
+            bus.deliver_now = original_deliver
 
         topics = [(t, d) for t, d in received if t == f"terminal.{TID}.output"]
         assert (f"terminal.{TID}.output", {"data": "live output"}) in topics
@@ -977,7 +1134,9 @@ class TestABoundedGapIsConsumed:
 
         received = []
         original_publish = bus.publish
+        original_deliver = bus.deliver_now
         bus.publish = lambda topic, data: received.append((topic, data))
+        bus.deliver_now = lambda topic, data: (received.append((topic, data)), 0)[1]
         try:
             with channel_client.websocket_connect("/runtime/channel", headers=self.HEADERS) as ws:
                 ws.send_text(_hello())
@@ -986,6 +1145,7 @@ class TestABoundedGapIsConsumed:
                 self._sync(ws, "sync-published")
         finally:
             bus.publish = original_publish
+            bus.deliver_now = original_deliver
 
         assert (
             f"terminal.{GAP_TID}.output",

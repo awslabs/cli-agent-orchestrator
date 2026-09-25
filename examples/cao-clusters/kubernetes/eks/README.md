@@ -432,6 +432,38 @@ _STATIC = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
 An installed wheel does not preserve that layout, so the panel would start and
 then serve 404 for every asset.
 
+### The control-plane image
+
+The central server runs a **different image** from the executors, built from the
+same Dockerfile with the execution backend left out:
+
+```bash
+docker buildx build --platform linux/arm64 \
+  -f examples/cao-clusters/kubernetes/eks/Dockerfile \
+  --build-arg INSTALL_EXECUTION_BACKEND=0 \
+  -t "${REGISTRY}/cao-control-plane:${TAG}" --push .
+```
+
+`INSTALL_EXECUTION_BACKEND=0` omits tmux and the provider CLI, and it overrides
+`INSTALL_CLAUDE_CODE` rather than sitting beside it, so the two cannot disagree.
+What remains is CAO, `curl` for the healthcheck and the CA certificates.
+
+The server does not need either: it routes every operation over the runtime
+channel and executes nothing itself. Shipping the executor image there put the
+execution backend and a provider CLI inside the one pod that holds the database
+and the broker credentials, so an accidental local execution path could run model
+code beside the state the whole boundary exists to separate it from. Two
+defaults made that reachable rather than theoretical, and both are fixed here:
+the shared image, and `CAO_SCRIPT_RUNTIME`/`CAO_FLOW_RUNTIME` being unset, which
+made workflow scripts and scheduled flows execute in the server container. They
+are now set in `server.yaml` to the supervisor runtime.
+
+`deploy.sh` reads the extra repository from the stack's
+`ControlPlaneRepositoryUri` output, or `CAO_CONTROL_PLANE_REPO_URI` in
+existing-cluster mode. Both fall back to the executor image when absent, so a
+deployment that has not split its images yet keeps working and the split is
+opt-in.
+
 ## Provider credentials
 
 Claude Code on Bedrock is the default and needs no credential plumbing at all:
@@ -607,11 +639,12 @@ export CAO_VPC_CIDR="$(aws ec2 describe-vpcs --vpc-ids "$VPC" \
   --query 'Vpcs[0].CidrBlock' --output text)"
 
 # 1. Three ECR repositories, and the images pushed to them (see Build).
-for r in cao-server cao-worker-broker cao-fleet-panel; do
+for r in cao-server cao-control-plane cao-worker-broker cao-fleet-panel; do
   aws ecr create-repository --repository-name "$r" --image-tag-mutability IMMUTABLE
 done
 export CAO_SERVER_REPO_URI="${ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com/cao-server"
 export CAO_BROKER_REPO_URI="${ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com/cao-worker-broker"
+export CAO_CONTROL_PLANE_REPO_URI="${ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com/cao-control-plane"
 export CAO_PANEL_REPO_URI="${ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com/cao-fleet-panel"
 
 # 2. An EFS filesystem with an access point, and a mount target in every AZ the

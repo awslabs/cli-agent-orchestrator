@@ -216,6 +216,11 @@ class RuntimeChannelRegistry:
         # comparable within one generation, so this is what lets record_position
         # tell a new stream numbered from 0 from a rewind of the old one.
         self._generations: Dict[Tuple[str, str], int] = {}
+        # Generation watermark for STATUS reports, tracked separately from the
+        # position watermark above. A status can be the first frame of a new
+        # generation, so it cannot be fenced by a position that does not exist
+        # yet; see set_status.
+        self._status_generations: Dict[Tuple[str, str], int] = {}
         # Terminal ids whose rows this process deleted. A FIFO/status event queued
         # before TEARDOWN can arrive after the row is gone, and the no-row branch
         # of claim_terminal would treat that id as a harmless phantom and REBIND
@@ -440,6 +445,7 @@ class RuntimeChannelRegistry:
             for stream in StreamName:
                 self._positions.pop((terminal_id, stream.value), None)
                 self._generations.pop((terminal_id, stream.value), None)
+                self._status_generations.pop((terminal_id, stream.value), None)
 
     def _placement_from_the_central_row(self, terminal_id: str) -> Optional[str]:
         """The runtime this terminal was launched on, per the persisted row.
@@ -671,7 +677,24 @@ class RuntimeChannelRegistry:
         bookkeeping) pass nothing and are unaffected.
         """
         with self._lock:
-            if generation is not None and self.is_stale_generation(terminal_id, stream, generation):
+            # Status carries its OWN generation watermark, separate from the
+            # stream position one. A STATUS EventFrame can legitimately be the
+            # first frame of a new generation the server sees — nothing requires a
+            # capture chunk to precede it — so fencing status against
+            # `_generations` alone left a hole: `is_stale_generation` answers False
+            # whenever no position has been recorded yet, and accepting a higher
+            # generation here never recorded it. A generation-1 COMPLETED followed
+            # by a delayed generation-0 PROCESSING was therefore accepted in that
+            # order, and `get_status` handed a waiter the stale verdict (Copilot
+            # review on #802).
+            #
+            # Both fences apply: behind the stream's generation, or behind a status
+            # generation already accepted for this terminal.
+            key = (terminal_id, stream)
+            if generation is not None and (
+                self.is_stale_generation(terminal_id, stream, generation)
+                or generation < self._status_generations.get(key, generation)
+            ):
                 # Status is fenced the same way stream positions are: a report
                 # from a superseded stream/assignment must not settle the current
                 # one. Without this a delayed EventFrame from the old generation
@@ -700,6 +723,14 @@ class RuntimeChannelRegistry:
                         self._incarnations.get(conn.runtime_id, 0),
                     )
                     return
+            # Record the generation this status was accepted at, so the next
+            # report from an older one is refused. Only advances: a status may
+            # arrive before any position for its generation, and that is exactly
+            # the case the stream watermark cannot fence.
+            if generation is not None:
+                self._status_generations[key] = max(
+                    generation, self._status_generations.get(key, generation)
+                )
             self._status[terminal_id] = status
 
     def reconcile_hello(self, runtime_id: str, advertised: Iterable[str]) -> List[str]:
@@ -732,6 +763,7 @@ class RuntimeChannelRegistry:
                 for stream in StreamName:
                     self._positions.pop((tid, stream.value), None)
                     self._generations.pop((tid, stream.value), None)
+                    self._status_generations.pop((tid, stream.value), None)
         if stale:
             logger.warning(
                 "runtime %s reconnected without terminals %s; their cached state is discarded",

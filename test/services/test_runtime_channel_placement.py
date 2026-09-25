@@ -511,6 +511,49 @@ class TestStatusIsFencedOnGenerationToo:
         fresh.set_status(TID, TerminalStatus.IDLE, conn=conn)
         assert fresh.get_status(TID) is TerminalStatus.IDLE
 
+    def test_a_status_fences_without_any_position_for_its_generation(self, fresh):
+        """The hole the position watermark cannot cover.
+
+        Every test above seeds the generation with ``record_position`` first, and
+        that is what made this pass while the real ordering did not. A STATUS
+        EventFrame can be the FIRST frame of a new generation — nothing requires a
+        capture chunk to precede it — and in that case ``is_stale_generation`` has
+        no entry to compare against and answers False for everything. Accepting
+        the higher generation without recording it meant the next straggler from
+        generation 0 was accepted too, overwriting a COMPLETED with a stale
+        PROCESSING and satisfying a waiter with it (Copilot review on #802).
+        """
+        conn = fresh.register("worker-1", self._send)
+        fresh.bind_terminal(TID, "worker-1")
+
+        # No record_position anywhere: generation 1 arrives as a status first.
+        fresh.set_status(TID, TerminalStatus.COMPLETED, conn=conn, generation=1)
+        assert fresh.get_status(TID) is TerminalStatus.COMPLETED
+
+        fresh.set_status(TID, TerminalStatus.PROCESSING, conn=conn, generation=0)
+        assert fresh.get_status(TID) is TerminalStatus.COMPLETED
+
+    def test_the_first_status_of_a_generation_is_adopted(self, fresh):
+        """Fencing must not become "refuse everything unseen"."""
+        conn = fresh.register("worker-1", self._send)
+        fresh.bind_terminal(TID, "worker-1")
+        fresh.set_status(TID, TerminalStatus.PROCESSING, conn=conn, generation=3)
+        assert fresh.get_status(TID) is TerminalStatus.PROCESSING
+        # And a later generation still wins.
+        fresh.set_status(TID, TerminalStatus.COMPLETED, conn=conn, generation=4)
+        assert fresh.get_status(TID) is TerminalStatus.COMPLETED
+
+    def test_status_generation_is_forgotten_with_the_terminal(self, fresh):
+        """An id reused after unbind must not inherit the old fence."""
+        conn = fresh.register("worker-1", self._send)
+        fresh.bind_terminal(TID, "worker-1")
+        fresh.set_status(TID, TerminalStatus.COMPLETED, conn=conn, generation=7)
+        fresh.unbind_terminal(TID)
+
+        fresh.bind_terminal(TID, "worker-1")
+        fresh.set_status(TID, TerminalStatus.PROCESSING, conn=conn, generation=0)
+        assert fresh.get_status(TID) is TerminalStatus.PROCESSING
+
 
 class TestADeletedTerminalIsNotResurrected:
     """A frame queued before TEARDOWN must not rebind a deleted terminal.

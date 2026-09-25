@@ -169,20 +169,42 @@ class EventBus:
         else:
             self._drop_counts[topic] = count
 
-    def _dispatch(self, topic: str, data: dict) -> None:
-        """Route event to matching subscriber queues.
+    def deliver_now(self, topic: str, data: dict) -> int:
+        """Dispatch on the CALLING thread and report how many subscribers dropped it.
+
+        For a publisher that owns a durable watermark and must not advance it past
+        bytes nobody received. ``publish`` cannot answer that: it hands the event
+        to the loop with ``call_soon_threadsafe`` and returns before any queue is
+        touched, so a full queue became a log line and nothing else. The runtime
+        channel handler advanced its resume position on that basis, which told the
+        runtime those bytes had landed and made them unreplayable — a bounded,
+        recoverable overflow turned into permanent loss (Copilot review on #802).
+
+        Only safe from the loop thread, which is where the channel handler already
+        runs; ``_record_drop``'s bookkeeping assumes single-threaded access.
+        Returns 0 when every subscriber took the event.
+        """
+        return self._dispatch(topic, data)
+
+    def _dispatch(self, topic: str, data: dict) -> int:
+        """Route event to matching subscriber queues; return the number of drops.
 
         Runs on the asyncio loop thread (via ``call_soon_threadsafe``), so
         drop-count bookkeeping in ``_record_drop`` is single-threaded and
         does not need its own lock.
+
+        The return value is ignored by ``publish`` (a fire-and-forget callback has
+        nowhere to put it) and used by ``deliver_now``.
         """
         event = {"topic": topic, "data": data}
+        dropped = 0
         with self._lock:
             # O(1) exact match lookup
             for q in self._exact.get(topic, []):
                 try:
                     q.put_nowait(event)
                 except asyncio.QueueFull:
+                    dropped += 1
                     self._record_drop(topic)
 
             # Wildcard pattern matching
@@ -192,7 +214,9 @@ class EventBus:
                         try:
                             q.put_nowait(event)
                         except asyncio.QueueFull:
+                            dropped += 1
                             self._record_drop(topic)
+        return dropped
 
 
 bus = EventBus()

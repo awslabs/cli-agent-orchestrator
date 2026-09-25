@@ -130,14 +130,40 @@ class Bridge:
         # Whether the current attempt got past the hello exchange. Read by the
         # reconnect loop to decide if the backoff earned a reset.
         self._established = False
+        # Gate for every non-handshake send. Shut until the hello exchange AND
+        # the replay have finished, so the long-lived forwarding tasks cannot
+        # write into a connection that is still negotiating or still catching up.
+        self._ready = asyncio.Event()
 
     # --- outbound plumbing ---
 
-    async def _send(self, frame) -> None:
-        """Send if connected; silently skip otherwise (the replay buffer and
-        unacked-result map are what survive the disconnection, not the send)."""
+    async def _send(self, frame, *, handshake: bool = False) -> None:
+        """Send if connected AND past the handshake; silently skip otherwise.
+
+        Skipping is safe, and is the point: the replay buffer and the
+        unacked-result map are what survive a disconnection, not the send.
+
+        ``handshake`` is for the frames that ARE the hello exchange and its
+        replay — they must go out while the gate is still shut. Everything else
+        waits, because the forwarding tasks are started once and live across
+        reconnects (``run`` never cancels them), so without this gate they keep
+        writing into a socket that has not negotiated yet. Three things went
+        wrong, in increasing order of severity: a live chunk at the resume offset
+        was sent and then replayed again, duplicating output and advancing the
+        server's watermark out of order; the watermark could move before the
+        replay that was supposed to fill it; and since the hello itself used a
+        bare ``ws.send`` that took no lock, a StreamFrame could be the FIRST
+        frame on the connection, which is a protocol violation rather than a
+        duplicate (Copilot review on #802).
+
+        Capture keeps buffering while the gate is shut — it is the buffer that
+        makes a gated frame recoverable, so the gate belongs on the send and not
+        on ``_forward_output``.
+        """
         ws = self._ws
         if ws is None:
+            return
+        if not handshake and not self._ready.is_set():
             return
         async with self._send_lock:
             try:
@@ -751,15 +777,21 @@ class Bridge:
 
     async def _serve(self, ws) -> None:
         self._ws = ws
-        await ws.send(
-            encode_frame(
-                HelloFrame(
-                    protocol_version=PROTOCOL_VERSION,
-                    runtime_id=self._runtime_id,
-                    streams=self._stream_positions(),
-                    statuses=self._terminal_statuses(),
-                )
-            )
+        # Shut for this attempt before the socket is visible to _send. Cleared
+        # here rather than only in `run`'s finally so a reconnect cannot inherit
+        # the previous attempt's open gate.
+        self._ready.clear()
+        # Through _send, not a bare ws.send: the bare form took no lock, so a
+        # concurrent forwarded frame could interleave with — or precede — the
+        # hello on the same connection.
+        await self._send(
+            HelloFrame(
+                protocol_version=PROTOCOL_VERSION,
+                runtime_id=self._runtime_id,
+                streams=self._stream_positions(),
+                statuses=self._terminal_statuses(),
+            ),
+            handshake=True,
         )
         server_hello = decode_frame(await ws.recv())
         if not isinstance(server_hello, HelloFrame):
@@ -773,7 +805,7 @@ class Bridge:
         # Re-deliver results the server never acked, then replay stream bytes
         # from the server's resume positions (or emit an explicit gap).
         for result in list(self._unacked.values()):
-            await self._send(result)
+            await self._send(result, handshake=True)
         for resume in server_hello.resume:
             buf = self._buffers.get(resume.terminal_id)
             if buf is None:
@@ -784,17 +816,36 @@ class Bridge:
                 # happen legitimately — a pane recovered under an id whose
                 # earlier stream this server had consumed, so its position
                 # belongs to a buffer that no longer exists — but it is never
-                # ordinary, and `replay_from` would raise on it. Clamp so the
-                # reconnect proceeds, and SAY SO: silently substituting a
-                # different position leaves the server believing it is current
-                # on a stream it is not (Copilot review on #802, finding 12).
+                # ordinary, and `replay_from` would raise on it.
+                #
+                # Logging and clamping was not enough. `replay_from(end_pos)`
+                # returns nothing, so no bytes and no gap were sent, the
+                # generation never moved, and the server kept its impossible
+                # watermark: the next live frame then arrived BELOW that
+                # watermark in the same generation, indistinguishable from a
+                # rewind (Copilot review on #802). What actually happened is
+                # that this is a different stream wearing the same id, so say
+                # exactly that — a new generation makes the server's old
+                # position inapplicable by construction rather than by
+                # arithmetic, and the gap names the range nobody can supply.
                 logger.warning(
                     "server resume position %s for terminal %s is past this "
-                    "runtime's watermark %s; replaying from the watermark "
+                    "runtime's watermark %s; starting a new generation "
                     "(stream restarted under a reused id?)",
                     resume.end_pos,
                     resume.terminal_id,
                     buf.end_pos,
+                )
+                buf.begin_generation()
+                await self._send(
+                    GapFrame(
+                        terminal_id=resume.terminal_id,
+                        stream=StreamName.CAPTURE,
+                        generation=buf.generation,
+                        from_pos=buf.end_pos,
+                        to_pos=resume.end_pos,
+                    ),
+                    handshake=True,
                 )
                 start = buf.end_pos
             # Gaps and bytes come back interleaved in stream order and are sent
@@ -811,7 +862,8 @@ class Bridge:
                             generation=buf.generation,
                             from_pos=item.from_pos,
                             to_pos=item.to_pos,
-                        )
+                        ),
+                        handshake=True,
                     )
                     continue
                 pos, chunk = item
@@ -822,7 +874,8 @@ class Bridge:
                         generation=buf.generation,
                         pos=pos,
                         data=base64.b64encode(chunk).decode(),
-                    )
+                    ),
+                    handshake=True,
                 )
 
         logger.info("runtime channel established to %s", self._server_url)

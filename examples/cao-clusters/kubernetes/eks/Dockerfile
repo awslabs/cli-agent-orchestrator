@@ -55,17 +55,28 @@ USER root
 # tmux >= 3.3 required by CAO (bookworm ships 3.3a). git for agent workspaces,
 # curl for healthchecks, procps for provider process detection.
 #
-# Unconditional, unlike the provider layer below: CAO needs all five whatever
-# provider runs. That does assume a Debian-family base — an apt-less
-# BASE_PROVIDER_IMAGE fails here, loudly, which is better than a node that
-# starts and then cannot open a tmux session.
+# INSTALL_EXECUTION_BACKEND=0 builds a CONTROL-PLANE image: no tmux, no provider
+# CLI, so the pod that holds the database and the broker credentials cannot run a
+# model or open a session even if something tries. The central server never needs
+# either — it routes over the runtime channel and executes nothing — so shipping
+# them there put the execution backend inside the one pod the whole remote
+# boundary exists to keep clean (Copilot review on #802).
+#
+# curl and ca-certificates stay in both variants: the healthcheck needs curl and
+# TLS needs the certificates. git and procps go with the backend — both exist for
+# agent workspaces and provider process detection.
+#
+# This does assume a Debian-family base — an apt-less BASE_PROVIDER_IMAGE fails
+# here, loudly, which is better than a node that starts and then cannot open a
+# tmux session.
+ARG INSTALL_EXECUTION_BACKEND=1
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        tmux \
-        git \
-        curl \
-        ca-certificates \
-        procps \
+    && if [ "${INSTALL_EXECUTION_BACKEND}" = "1" ]; then \
+         apt-get install -y --no-install-recommends \
+           tmux git curl ca-certificates procps; \
+       else \
+         apt-get install -y --no-install-recommends curl ca-certificates; \
+       fi \
     && rm -rf /var/lib/apt/lists/*
 
 # --- Provider CLI: Claude Code (default; opt out for another provider) --------
@@ -95,9 +106,18 @@ RUN apt-get update \
 # joined into one shell command by some builders, which comments out the rest of
 # it (the version check and the closing `fi`) and either breaks the build or
 # silently drops the check (Copilot review on #802).
+#
+# A control-plane build (INSTALL_EXECUTION_BACKEND=0) skips this layer too, no
+# matter what INSTALL_CLAUDE_CODE says: a provider CLI in the pod that holds the
+# database and the broker credentials is the thing the split exists to remove,
+# and leaving it switchable by a second, independent flag would let one be set
+# without the other.
 ARG INSTALL_CLAUDE_CODE=1
 ARG CLAUDE_CODE_VERSION=2.1.235
-RUN if [ "${INSTALL_CLAUDE_CODE}" != "1" ]; then \
+ARG INSTALL_EXECUTION_BACKEND
+RUN if [ "${INSTALL_EXECUTION_BACKEND}" = "0" ]; then \
+      echo "control-plane image: no provider CLI"; \
+    elif [ "${INSTALL_CLAUDE_CODE}" != "1" ]; then \
       echo "skipping Claude Code install; provider comes from BASE_PROVIDER_IMAGE"; \
     else \
     curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \

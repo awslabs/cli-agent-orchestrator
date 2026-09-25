@@ -58,7 +58,7 @@ spec:
         fsGroupChangePolicy: OnRootMismatch
       containers:
         - name: cao-node
-          image: <server-image>:latest
+          image: <control-plane-image>:latest
           ports:
             - name: http
               containerPort: 9889
@@ -114,6 +114,24 @@ spec:
             # was destroying a worker three seconds from ready.
             - name: CAO_ELASTIC_WORKER_READY_WAIT
               value: "120"
+            # Where a workflow script and a scheduled flow's agent RUN. Unset,
+            # both execute in this container — beside the database, in the pod
+            # that holds the broker credentials — which is the one thing the
+            # remote-execution boundary exists to prevent. The README documented
+            # these as optional, so the shipped default was local execution
+            # (Copilot review on #802).
+            #
+            # Now that the server runs a control-plane image with no tmux, an
+            # unset value fails rather than quietly executing: the safer failure,
+            # but still a failure. Naming the supervisor runtime makes the default
+            # correct instead — scripts and flows are relayed to an executor over
+            # the runtime channel, the same path an agent launch takes. The value
+            # matches the supervisor's CAO_BRIDGE_RUNTIME_ID, which is its pod
+            # name.
+            - name: CAO_SCRIPT_RUNTIME
+              value: cao-supervisor-0
+            - name: CAO_FLOW_RUNTIME
+              value: cao-supervisor-0
           volumeMounts:
             - name: state
               mountPath: /home/cao/.cao
@@ -171,7 +189,7 @@ spec:
         # it can only call a tool that runs in this pod, under this pod's
         # identity, having already proved it holds the runtime token.
         - name: cao-mcp
-          image: <server-image>:latest
+          image: <control-plane-image>:latest
           # Wait for the server before binding: both processes open the same
           # database, and only the server migrates it. Without this the endpoint
           # can win the race on a first start, find no schema, and crash-loop
@@ -229,6 +247,24 @@ spec:
               value: "http://cao-server.cao-cluster.svc.cluster.local:9889"
             - name: CAO_ELASTIC_WORKER_READY_WAIT
               value: "120"
+            # Where a workflow script and a scheduled flow's agent RUN. Unset,
+            # both execute in this container — beside the database, in the pod
+            # that holds the broker credentials — which is the one thing the
+            # remote-execution boundary exists to prevent. The README documented
+            # these as optional, so the shipped default was local execution
+            # (Copilot review on #802).
+            #
+            # Now that the server runs a control-plane image with no tmux, an
+            # unset value fails rather than quietly executing: the safer failure,
+            # but still a failure. Naming the supervisor runtime makes the default
+            # correct instead — scripts and flows are relayed to an executor over
+            # the runtime channel, the same path an agent launch takes. The value
+            # matches the supervisor's CAO_BRIDGE_RUNTIME_ID, which is its pod
+            # name.
+            - name: CAO_SCRIPT_RUNTIME
+              value: cao-supervisor-0
+            - name: CAO_FLOW_RUNTIME
+              value: cao-supervisor-0
           volumeMounts:
             - name: state
               mountPath: /home/cao/.cao

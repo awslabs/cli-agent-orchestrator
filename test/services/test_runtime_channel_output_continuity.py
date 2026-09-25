@@ -441,3 +441,58 @@ class TestOffsetOrderMatchesPublishOrder:
 
         assert seen == sorted(seen), "a later offset was published before an earlier one"
         assert len(seen) == 600
+
+
+class TestADroppedChunkStaysReplayable:
+    """A subscriber that could not take the bytes must not advance the watermark.
+
+    The resume position means "bytes this server has received". It was advanced
+    before the payload was handed to the bus, and ``publish`` is fire-and-forget
+    over ``call_soon_threadsafe``, so a full LogWriter/AG-UI/inbox queue became a
+    log line while the watermark said the bytes had landed. The runtime then had
+    nothing to replay on reconnect, and a bounded overflow — the exact case the
+    replay buffer exists for — became permanent loss (Copilot review on #802).
+    """
+
+    def test_a_full_subscriber_queue_leaves_the_watermark_behind(self):
+        import asyncio
+
+        from cli_agent_orchestrator.services.event_bus import EventBus
+
+        bus = EventBus()
+        bus._loop = asyncio.new_event_loop()
+        q = asyncio.Queue(maxsize=1)
+        with bus._lock:
+            bus._exact["terminal.t1.output"] = [q]
+
+        assert bus.deliver_now("terminal.t1.output", {"data": "first"}) == 0
+        # Queue is now full; the next delivery is refused and REPORTED.
+        assert bus.deliver_now("terminal.t1.output", {"data": "second"}) == 1
+
+    def test_delivery_to_every_subscriber_reports_zero(self):
+        import asyncio
+
+        from cli_agent_orchestrator.services.event_bus import EventBus
+
+        bus = EventBus()
+        bus._loop = asyncio.new_event_loop()
+        with bus._lock:
+            bus._exact["terminal.t1.output"] = [asyncio.Queue(), asyncio.Queue()]
+
+        assert bus.deliver_now("terminal.t1.output", {"data": "x"}) == 0
+
+    def test_each_refusing_subscriber_is_counted(self):
+        """Two full queues are two drops, not one — the caller logs the number."""
+        import asyncio
+
+        from cli_agent_orchestrator.services.event_bus import EventBus
+
+        bus = EventBus()
+        bus._loop = asyncio.new_event_loop()
+        full_a, full_b = asyncio.Queue(maxsize=1), asyncio.Queue(maxsize=1)
+        full_a.put_nowait({"pre": "filled"})
+        full_b.put_nowait({"pre": "filled"})
+        with bus._lock:
+            bus._exact["terminal.t1.output"] = [full_a, full_b]
+
+        assert bus.deliver_now("terminal.t1.output", {"data": "x"}) == 2

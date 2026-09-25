@@ -524,7 +524,11 @@ class CursorCliProvider(BaseProvider):
         # this layout can be tweaked without touching the rest of
         # the provider.
         manifest = {"mcpServers": servers}
-        (plugin_dir / "plugin.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        # Owner-only, for the same reason as Kiro's agent JSON: this is CAO's
+        # resolved MCP block, and write_text left it at the umask default (0644).
+        from cli_agent_orchestrator.utils.atomic_file import write_owner_only
+
+        write_owner_only(plugin_dir / "plugin.json", json.dumps(manifest, indent=2))
         self._register_tmp_path(plugin_dir)
         return str(plugin_dir)
 

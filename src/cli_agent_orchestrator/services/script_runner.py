@@ -1163,6 +1163,28 @@ async def _drive_process_remote(
 
     op_id = _uuid.uuid4().hex
     record.remote_script = (runtime_id, op_id)
+    # Journal the dispatch with the run it belongs to, BEFORE sending. If this
+    # process dies before the result arrives, the runtime redelivers it to the
+    # replacement server, which has no driver waiting for it and no other way
+    # back to this run — so the step stayed RUNNING forever while the script had
+    # actually finished (Copilot review on #802). The journal is that way back.
+    try:
+        from cli_agent_orchestrator.clients.database import record_dispatch
+
+        record_dispatch(
+            op_id,
+            CommandType.RUN_SCRIPT.value,
+            runtime_id,
+            run_id=record.run_id,
+            step_id=getattr(record, "step_id", None),
+        )
+    except Exception:  # noqa: BLE001
+        # Non-fatal: a script that runs without a journal entry is the behaviour
+        # that shipped before this, and refusing to run the step would be a
+        # worse failure than losing the post-restart recovery path.
+        logger.warning(
+            "could not journal RUN_SCRIPT dispatch for run %s", record.run_id, exc_info=True
+        )
     # Bound the wait past the script's own wall-clock timeout so a runtime that
     # honours the timeout answers first; a missing answer is treated as unknown.
     wait_timeout = WORKFLOW_SCRIPT_TIMEOUT + WORKFLOW_SCRIPT_TERM_GRACE + 30.0

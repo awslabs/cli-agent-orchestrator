@@ -65,15 +65,25 @@ images:
   # ImagePullBackOffs while deploy.sh reported the correct URIs it had read and
   # then not used.
   #
-  # deploy.sh rewrites EVERY `newTag:` line to the tag it is given, so all three
+  # deploy.sh rewrites EVERY `newTag:` line to the tag it is given, so all four
   # images below always move together. They are built from the same commit by
   # the same CodeBuild run, so a split tag would only ever mean a mistake.
   - name: <server-image>
-    # Built from Dockerfile, which installs Claude Code from public npm
-    # and carries the entrypoint that runs `cao init`, installs the profiles
-    # named in CAO_INSTALL_PROFILES, and then execs either cao-server or
-    # cao-bridge depending on CAO_NODE_MODE. One image serves both roles, which
-    # is why the server and the executors can never be on split tags.
+    # The EXECUTOR image, built from Dockerfile: Claude Code from public npm,
+    # tmux, and the entrypoint that runs `cao init`, installs the profiles named
+    # in CAO_INSTALL_PROFILES and execs cao-bridge. Used by supervisor.yaml.
+    newTag: 2.4.1-el1
+  - name: <control-plane-image>
+    # The CENTRAL SERVER image, built from the same Dockerfile with
+    # --build-arg INSTALL_EXECUTION_BACKEND=0: no tmux and no provider CLI.
+    #
+    # A separate key because the two roles have genuinely different contents, and
+    # one key could not express that. Shipping the executor image to the server
+    # pod put a provider CLI and the execution backend in the one pod holding the
+    # database and the broker credentials — so an accidental local execution path
+    # there could run model code beside the state it is meant to be separated
+    # from (Copilot review on #802). The server routes over the runtime channel
+    # and executes nothing, so it needs neither.
     newTag: 2.4.1-el1
   - name: <broker-image>
     # Built from Dockerfile.broker.

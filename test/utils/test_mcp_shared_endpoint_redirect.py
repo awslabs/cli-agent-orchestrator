@@ -327,3 +327,46 @@ class TestAProfileCannotRedirectTheShimOrItsToken:
                 }
             )
         assert SHARED_ENDPOINT_URL_ENV in caplog.text
+
+
+class TestThePersistedFormCarriesNoToken:
+    """A config file read at a later launch must not hold the channel token.
+
+    The shim inherits CAO_RUNTIME_TOKEN from the process that launches it — the
+    agent's own pod carries it for its runtime channel — so a copy in the
+    provider's config file added nothing and put the credential on disk. It
+    reached Kiro's agent JSON and Cursor's plugin.json at the umask default, mode
+    0644 (Copilot review on #802). The endpoint URL stays: it is deployment
+    configuration, not a secret, and the shim cannot find the server without it.
+    """
+
+    def test_persisted_keeps_the_endpoint_and_drops_the_token(self, shared_endpoint):
+        resolved = resolve_mcp_server_config(
+            {"command": CAO_MCP_SERVER_COMMAND, "args": []}, persisted=True
+        )
+        assert resolved["env"][SHARED_ENDPOINT_URL_ENV] == ENDPOINT
+        assert RUNTIME_TOKEN_ENV not in resolved["env"]
+
+    def test_the_live_form_still_carries_the_token(self, shared_endpoint):
+        """Not persisted means launched right now, which is the case that needs it."""
+        resolved = resolve_mcp_server_config({"command": CAO_MCP_SERVER_COMMAND, "args": []})
+        assert resolved["env"][RUNTIME_TOKEN_ENV] == "runtime-token-value"
+
+    def test_no_token_anywhere_in_the_persisted_entry(self, shared_endpoint):
+        """Not just the env key — the value must not appear in the serialized form."""
+        import json
+
+        resolved = resolve_mcp_server_config(
+            {"command": CAO_MCP_SERVER_COMMAND, "args": []}, persisted=True
+        )
+        assert "runtime-token-value" not in json.dumps(resolved)
+
+    def test_the_per_command_helper_honours_persisted(self, shared_endpoint):
+        from cli_agent_orchestrator.utils.mcp_resolution import shared_endpoint_child_env_for
+
+        env = shared_endpoint_child_env_for(CAO_MCP_SERVER_COMMAND, persisted=True)
+        assert env[SHARED_ENDPOINT_URL_ENV] == ENDPOINT
+        assert RUNTIME_TOKEN_ENV not in env
+
+        live = shared_endpoint_child_env_for(CAO_MCP_SERVER_COMMAND)
+        assert live[RUNTIME_TOKEN_ENV] == "runtime-token-value"

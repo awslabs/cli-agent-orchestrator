@@ -158,7 +158,7 @@ def shared_endpoint_url() -> str:
     return os.environ.get(SHARED_ENDPOINT_URL_ENV, "").strip()
 
 
-def shared_endpoint_child_env() -> dict:
+def shared_endpoint_child_env(*, persisted: bool = False) -> dict:
     """Env a forwarded MCP child needs, for callers that build env themselves.
 
     Exactly two things the profile cannot know: which endpoint to dial and the
@@ -170,18 +170,33 @@ def shared_endpoint_child_env() -> dict:
     new secret in the agent's reach either way: the pod that runs the agent
     already carries ``CAO_RUNTIME_TOKEN`` in its environment, because that is
     what its runtime channel authenticates with.
+
+    ``persisted`` omits the TOKEN, and only the token. Set it when the result is
+    written to a config file the provider reads at a later launch. The endpoint
+    URL still goes in — it is deployment configuration, not a credential, and the
+    shim cannot find the server without it.
+
+    The token is left out because it does not need to be there: the shim inherits
+    it from the process environment of the pod that launches it, which carries
+    ``CAO_RUNTIME_TOKEN`` for its own runtime channel. Writing it into the file
+    as well added nothing and put the channel credential on disk in provider
+    config — in Kiro's agent JSON and Cursor's plugin.json at the default umask,
+    so mode 0644 (Copilot review on #802). A secret that is redundant at rest
+    should not be at rest.
     """
     url = shared_endpoint_url()
     if not url:
         return {}
     env = {SHARED_ENDPOINT_URL_ENV: url}
+    if persisted:
+        return env
     token = os.environ.get(RUNTIME_TOKEN_ENV, "").strip()
     if token:
         env[RUNTIME_TOKEN_ENV] = token
     return env
 
 
-def shared_endpoint_child_env_for(command: str) -> dict:
+def shared_endpoint_child_env_for(command: str, *, persisted: bool = False) -> dict:
     """:func:`shared_endpoint_child_env`, but only for the entry it belongs to.
 
     *command* is the entry's command **as declared**, before resolution. The
@@ -199,7 +214,7 @@ def shared_endpoint_child_env_for(command: str) -> dict:
     """
     if command not in _BUNDLED_COMMANDS:
         return {}
-    return shared_endpoint_child_env()
+    return shared_endpoint_child_env(persisted=persisted)
 
 
 def resolve_mcp_server_config(config: dict, *, persisted: bool = False) -> dict:
@@ -237,7 +252,7 @@ def resolve_mcp_server_config(config: dict, *, persisted: bool = False) -> dict:
     # deployment actually defines are overridden, and an override is logged so a
     # profile that tries is visible rather than silently ignored.
     if resolved.get("command") == CAO_MCP_SERVER_COMMAND:
-        extra = shared_endpoint_child_env()
+        extra = shared_endpoint_child_env(persisted=persisted)
         if extra:
             profile_env = dict(resolved.get("env") or {})
             clobbered = sorted(

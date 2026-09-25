@@ -21,6 +21,7 @@ import hmac
 import logging
 import os
 import time
+import uuid
 from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, status
@@ -28,7 +29,12 @@ from pydantic import BaseModel, ConfigDict
 
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
-from cli_agent_orchestrator.clients.database import get_terminal_metadata
+from cli_agent_orchestrator.clients.database import (
+    get_dispatch_record,
+    get_terminal_metadata,
+    record_dispatch,
+    settle_dispatch,
+)
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
 from cli_agent_orchestrator.runtime_channel.protocol import (
     PROTOCOL_VERSION,
@@ -148,7 +154,7 @@ def _note_heartbeat_watermark(behind: dict, stream_pos: StreamPosition, runtime_
     behind[key] = (stream_pos.end_pos, stream_pos.generation, recorded)
 
 
-def _reconcile_orphaned_result(frame: CommandResultFrame, runtime_id: str) -> bool:
+async def _reconcile_orphaned_result(frame: CommandResultFrame, runtime_id: str) -> bool:
     """Recover a live terminal from a LAUNCH result redelivered after a restart.
 
     The runtime retains each result until it is acked, so after the server
@@ -158,12 +164,11 @@ def _reconcile_orphaned_result(frame: CommandResultFrame, runtime_id: str) -> bo
     without this it would ack-and-drop and orphan a live agent nothing can route
     to or tear down (guojing1217 on #802).
 
-    Only a successful result carrying a terminal payload is reconciled, and only
-    when no central row exists yet (a row already present means the old server
-    persisted it before crashing — bind and move on). ``owner`` is server-side
-    state the restart lost and the runtime is never told it, so a reconciled
-    terminal has none; that is a known limitation, and far better than a leaked
-    pod.
+    A successful LAUNCH is reconciled only when no central row exists yet (a row
+    already present means the old server persisted it before crashing — bind and
+    move on). ``owner`` comes from the dispatch journal, which recorded it when
+    the command was sent and never told the runtime; a reconciled terminal is
+    therefore owned by whoever asked for it, not unowned.
 
     Returns whether it is safe to ACK. A reconciliation that FAILED must not be
     acked: the ack is what lets the runtime drop its only retained copy of the
@@ -171,12 +176,166 @@ def _reconcile_orphaned_result(frame: CommandResultFrame, runtime_id: str) -> bo
     nothing able to route to or tear it down (Copilot review on #802). Leaving it
     unacked costs a re-delivery on the next reconnect — bounded by reconnects,
     not a hot loop — and that retry is the durable recovery path.
+
+    The dispatch journal is the authority for everything here.
+    ``RuntimeConnection.resolve`` answers False for any op_id it does not hold in
+    memory, which after a restart is every op_id, so "unmatched" alone said
+    nothing about whether this server ever asked for the operation. Without the
+    journal a shared-token runtime could fabricate a result naming an arbitrary
+    terminal id and have it persisted, placed on itself, and — since the row was
+    written with no owner, and ``may_start_work(None)`` is allowed — permitted to
+    work. The row this function wrote was the only thing authorizing the claim it
+    then made (Copilot review on #802).
     """
-    if frame.outcome != CommandOutcome.OK:
-        return True
     info = frame.payload.get("terminal")
-    if not isinstance(info, dict) or not info.get("id"):
+    has_terminal = isinstance(info, dict) and bool(info.get("id"))
+
+    record = None
+    try:
+        record = get_dispatch_record(frame.op_id)
+    except Exception:
+        # Provenance is MANDATORY only when applying this result would create or
+        # destroy state; otherwise the journal is an optimisation and an unreadable
+        # one must not withhold the ack.
+        #
+        # Getting that backwards wedged the channel: a frame carrying no terminal
+        # at all — a result whose caller has simply gone away — went unacked
+        # because the journal could not be read, and since an unreadable journal
+        # stays unreadable, redelivery hit the same wall forever. Nothing was at
+        # stake in those frames to justify it.
+        logger.exception("could not read the dispatch journal for op %s", frame.op_id)
+        return not has_terminal
+    if record is None:
+        # Not ours. Nothing to recover, and nothing to create: acking discards a
+        # result no operation asked for, which is the correct outcome for a forged
+        # or foreign frame. Withholding the ack instead would only make a runtime
+        # redeliver it forever.
+        logger.warning(
+            "discarding result for op %s from runtime %s: no dispatch on record "
+            "(forged frame, or a result for another server's database)",
+            frame.op_id,
+            runtime_id,
+        )
         return True
+    if record["runtime_id"] != runtime_id:
+        # The journal says a different runtime was asked. A result for it from
+        # this one cannot be trusted to describe our operation.
+        logger.warning(
+            "discarding result for op %s: dispatched to runtime %s, answered by %s",
+            frame.op_id,
+            record["runtime_id"],
+            runtime_id,
+        )
+        return True
+
+    command_type = record["command_type"]
+
+    # A LAUNCH that FAILED may still have created a pane before failing, and the
+    # runtime is the only party that can confirm either way. Acking such a result
+    # unexamined was the hole: it contradicted this function's own contract and
+    # left exactly the untracked terminal the contract forbids (Copilot review on
+    # #802). Ask for a teardown and ack only once the runtime confirms the id is
+    # gone or was never there.
+    if frame.outcome != CommandOutcome.OK:
+        if command_type == CommandType.LAUNCH.value and has_terminal:
+            return await _confirm_failed_launch_left_nothing(frame, info["id"], runtime_id)
+        # Any other failed operation created no terminal to orphan. Settle the
+        # journal so a restart does not report it as an outcome never seen.
+        _settle_quietly(frame.op_id)
+        return True
+
+    if command_type == CommandType.LAUNCH.value:
+        if not has_terminal:
+            _settle_quietly(frame.op_id)
+            return True
+        return _persist_reconciled_terminal(info, runtime_id, record, frame.op_id)
+
+    # A successful non-LAUNCH result with no in-memory waiter: the caller that
+    # would have applied it is gone. RUN_SCRIPT is the one that matters — its
+    # background driver owned a durable run record, and dropping the result left
+    # that journal RUNNING forever while the script had in fact finished (Copilot
+    # review on #802). The outcome cannot be applied to a future nobody holds, so
+    # record it as an outcome that arrived without an owner and settle it, rather
+    # than acking into silence.
+    if command_type == CommandType.RUN_SCRIPT.value:
+        _reconcile_orphaned_script_run(frame, record)
+    _settle_quietly(frame.op_id)
+    return True
+
+
+def _reconcile_orphaned_script_run(frame: CommandResultFrame, record: dict) -> None:
+    """Settle the durable run a redelivered RUN_SCRIPT result belongs to.
+
+    The in-memory driver that owned this run died with the previous server
+    process, so there is no future to resolve and nothing applies the outcome.
+    Acking and dropping it left the run's journal ``running`` forever even though
+    the script had finished — the workflow was stuck on a step that was already
+    done (Copilot review on #802).
+
+    The result is recorded as FAILED rather than as the script's own exit status,
+    deliberately. Its stdout/stderr and exit code went to a driver that no longer
+    exists, so the step's real outcome cannot be reconstructed; claiming
+    ``completed`` on the strength of the frame's outcome alone would assert a
+    result nobody captured. FAILED with an explicit reason is the honest terminal
+    state, and it unblocks the run so it can be retried.
+
+    ``settle_run_state_if_running`` is conditional, so a run the engine already
+    settled by some other path is left exactly as it is.
+    """
+    run_id = record.get("run_id")
+    if not run_id:
+        logger.warning(
+            "orphaned RUN_SCRIPT result for op %s has no run in the journal; " "nothing to settle",
+            frame.op_id,
+        )
+        return
+    try:
+        from datetime import datetime, timezone
+
+        from cli_agent_orchestrator.models.workflow_runtime import RunState
+        from cli_agent_orchestrator.services import workflow_journal
+
+        settled = workflow_journal.settle_run_state_if_running(
+            run_id,
+            RunState.FAILED.value,
+            datetime.now(timezone.utc).isoformat(),
+        )
+        if settled:
+            logger.warning(
+                "settled run %s as FAILED from a redelivered RUN_SCRIPT result (op %s): "
+                "the script finished with outcome %s but the driver that owned the run "
+                "is gone, so its output could not be applied",
+                run_id,
+                frame.op_id,
+                frame.outcome.value,
+            )
+        else:
+            logger.info(
+                "run %s was already terminal when its RUN_SCRIPT result was redelivered "
+                "(op %s); left as it is",
+                run_id,
+                frame.op_id,
+            )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "could not settle run %s from redelivered RUN_SCRIPT result", run_id, exc_info=True
+        )
+
+
+def _settle_quietly(op_id: str) -> None:
+    """Settle a journal entry, treating a failure as non-fatal.
+
+    A journal that cannot be updated is a bookkeeping problem, not a reason to
+    withhold an ack for work that is genuinely finished.
+    """
+    try:
+        settle_dispatch(op_id)
+    except Exception:  # noqa: BLE001
+        logger.warning("could not settle dispatch journal for op %s", op_id, exc_info=True)
+
+
+def _persist_reconciled_terminal(info: dict, runtime_id: str, record: dict, op_id: str) -> bool:
+    """Write the central row for a terminal recovered from a redelivered LAUNCH."""
     terminal_id = info["id"]
     try:
         if get_terminal_metadata(terminal_id) is None:
@@ -189,13 +348,18 @@ def _reconcile_orphaned_result(frame: CommandResultFrame, runtime_id: str) -> bo
                 allowed_tools=info.get("allowed_tools"),
                 shell_command=info.get("shell_command"),
                 engine=info.get("engine"),
+                # The owner comes from the journal, which recorded it at dispatch
+                # and never told the runtime. Previously this wrote no owner at
+                # all, and an unowned row passes the revocation gate.
+                owner=record.get("owner"),
                 metadata={"runtime_id": runtime_id},
             )
             logger.warning(
                 "reconciled orphaned terminal %s from a redelivered LAUNCH result "
-                "on runtime %s (owner unknown after restart)",
+                "on runtime %s (owner %s, from the dispatch journal)",
                 terminal_id,
                 runtime_id,
+                record.get("owner"),
             )
         runtime_registry.claim_terminal(terminal_id, runtime_id)
     except Exception:
@@ -205,6 +369,66 @@ def _reconcile_orphaned_result(frame: CommandResultFrame, runtime_id: str) -> bo
             terminal_id,
         )
         return False
+    _settle_quietly(op_id)
+    return True
+
+
+async def _confirm_failed_launch_left_nothing(
+    frame: CommandResultFrame, terminal_id: str, runtime_id: str
+) -> bool:
+    """Tear down the pane a failed LAUNCH may have created, before acking it.
+
+    The runtime is the only party that can say whether the id exists there, and
+    its TEARDOWN answer distinguishes the two cases: ``absent`` or ``deleted``
+    means nothing is running under that id and the result is safe to drop, while
+    anything else means a session may still be alive and the result must stay
+    retained for another attempt.
+    """
+    conn = runtime_registry.get_runtime(runtime_id)
+    if conn is None:
+        logger.warning(
+            "failed LAUNCH %s left terminal %s unconfirmed and runtime %s is gone; "
+            "keeping the result for a later reconnect",
+            frame.op_id,
+            terminal_id,
+            runtime_id,
+        )
+        return False
+    try:
+        td = await conn.send_command(
+            CommandType.TEARDOWN, {}, terminal_id=terminal_id, timeout=TEARDOWN_TIMEOUT
+        )
+    except Exception:
+        logger.exception(
+            "could not confirm teardown of terminal %s after failed LAUNCH %s; "
+            "keeping the result retained",
+            terminal_id,
+            frame.op_id,
+        )
+        return False
+    settled = td.outcome == CommandOutcome.OK and (
+        td.payload.get("deleted") or td.payload.get("absent")
+    )
+    if not settled:
+        logger.error(
+            "terminal %s may still be running after failed LAUNCH %s (teardown said "
+            "%s); NOT acking, so the result survives for another attempt",
+            terminal_id,
+            frame.op_id,
+            td.payload,
+        )
+        return False
+    # Nothing is running under that id. Drop any central row the failed launch
+    # left behind, then let the result go.
+    try:
+        if get_terminal_metadata(terminal_id) is not None:
+            db_delete_terminal(terminal_id)
+        runtime_registry.unbind_terminal(terminal_id, deleted=True)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "teardown of %s confirmed but central cleanup failed", terminal_id, exc_info=True
+        )
+    _settle_quietly(frame.op_id)
     return True
 
 
@@ -333,7 +557,7 @@ async def runtime_channel(ws: WebSocket) -> None:
                     # server never persisted or bound it, so acking-and-dropping
                     # would orphan a running agent nothing can route to or tear
                     # down (guojing1217 on #802). Reconcile it before acking.
-                    safe_to_ack = _reconcile_orphaned_result(frame, runtime_id)
+                    safe_to_ack = await _reconcile_orphaned_result(frame, runtime_id)
                 # Ack only once any reconciliation SUCCEEDED: the ack is what lets
                 # the runtime drop its retained copy, and dropping it after a
                 # failed reconcile would orphan a live agent for good. Worker
@@ -370,19 +594,48 @@ async def runtime_channel(ws: WebSocket) -> None:
                         frame.generation,
                     )
                     continue
-                runtime_registry.record_position(
-                    frame.terminal_id,
-                    frame.stream.value,
-                    frame.pos + len(raw),
-                    generation=frame.generation,
-                )
                 # Republish onto the existing in-process bus with the exact
                 # payload shape the local FIFO reader uses, so bus-contract
                 # consumers (LogWriter, AG-UI, inbox) work unchanged.
-                bus.publish(
+                #
+                # Delivery FIRST, watermark second, and the watermark only moves
+                # over bytes a subscriber actually took. The order used to be the
+                # other way with a fire-and-forget publish, so a burst that
+                # overflowed a LogWriter/AG-UI/inbox queue was counted as consumed:
+                # the runtime was told those bytes had landed, the reconnect had
+                # nothing left to replay, and a bounded overflow became permanent
+                # loss (Copilot review on #802).
+                dropped = bus.deliver_now(
                     f"terminal.{frame.terminal_id}.output",
                     {"data": raw.decode("utf-8", errors="replace")},
                 )
+                if dropped:
+                    # Leave the watermark BEHIND this chunk so the next reconnect
+                    # replays it. The generation is still recorded — position is
+                    # monotonic, so naming the chunk's start is a no-op when the
+                    # watermark is already past it — because generation bookkeeping
+                    # fences a stream restart and must not be skipped just because
+                    # one chunk was not delivered.
+                    logger.warning(
+                        "%s subscriber(s) dropped output for terminal %s at %s; not "
+                        "advancing the resume watermark, so a reconnect replays it",
+                        dropped,
+                        frame.terminal_id,
+                        frame.pos,
+                    )
+                    runtime_registry.record_position(
+                        frame.terminal_id,
+                        frame.stream.value,
+                        frame.pos,
+                        generation=frame.generation,
+                    )
+                else:
+                    runtime_registry.record_position(
+                        frame.terminal_id,
+                        frame.stream.value,
+                        frame.pos + len(raw),
+                        generation=frame.generation,
+                    )
             elif isinstance(frame, GapFrame):
                 # A GapFrame advances the resume watermark and republishes a loss,
                 # so it needs the same ownership fence as the other inbound
@@ -536,9 +789,35 @@ async def launch_remote_terminal(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=f"runtime '{runtime_id}' is not connected",
         )
+    # Journal the operation with its owner BEFORE dispatching it. Two things
+    # depend on this record existing first: a result that arrives for an unknown
+    # op_id is refused outright (a runtime cannot invent an operation), and a
+    # LAUNCH redelivered after a restart can be reconciled with the owner it was
+    # made for instead of with none. The owner is deliberately NOT in the payload
+    # below — an identity handed to an executor is one it can re-present.
+    op_id = uuid.uuid4().hex
+    try:
+        record_dispatch(
+            op_id,
+            CommandType.LAUNCH.value,
+            runtime_id,
+            owner=owner_id,
+        )
+    except Exception:
+        # A launch that cannot be journalled must not happen: its result would be
+        # unrecognisable on redelivery, which is the orphan this journal exists to
+        # prevent. Refuse before anything is running.
+        logger.exception("could not journal LAUNCH dispatch for runtime %s", runtime_id)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="cannot record the dispatch journal; launch refused",
+        )
     try:
         result = await conn.send_command(
-            CommandType.LAUNCH, body.model_dump(exclude_none=True), timeout=LAUNCH_TIMEOUT
+            CommandType.LAUNCH,
+            body.model_dump(exclude_none=True),
+            timeout=LAUNCH_TIMEOUT,
+            op_id=op_id,
         )
     except RuntimeNotDispatchedError as e:
         # PROVABLY nothing on the wire, so a retry cannot duplicate the launch:

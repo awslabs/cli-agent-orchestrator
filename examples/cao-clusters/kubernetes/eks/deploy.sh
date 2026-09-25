@@ -30,7 +30,8 @@
 # Pass `-` as the stack name to deploy onto a cluster this repo's template did
 # not create, supplying the stack's six values through the environment instead:
 #
-#   CAO_SERVER_REPO_URI  CAO_BROKER_REPO_URI  CAO_PANEL_REPO_URI
+#   CAO_SERVER_REPO_URI  CAO_CONTROL_PLANE_REPO_URI  CAO_BROKER_REPO_URI
+#   CAO_PANEL_REPO_URI
 #   CAO_WORKSPACE_HANDLE (fs-<id>::fsap-<id>)  CAO_CLUSTER_NAME  CAO_VPC_CIDR
 #
 # Rendering happens into a temporary directory; this source directory is never
@@ -84,6 +85,9 @@ REGION="$(aws configure get region || true)"
 if [ "$STACK" = "-" ] || [ "$STACK" = "none" ]; then
   echo "existing-cluster mode: reading inputs from the environment"
   REPO="${CAO_SERVER_REPO_URI:-}"
+  # Defaults to the executor repo: a deployment that has not split its images
+  # yet still works, and the split is opt-in rather than a breaking change.
+  CONTROL_PLANE_REPO="${CAO_CONTROL_PLANE_REPO_URI:-${CAO_SERVER_REPO_URI:-}}"
   BROKER_REPO="${CAO_BROKER_REPO_URI:-}"
   PANEL_REPO="${CAO_PANEL_REPO_URI:-}"
   HANDLE="${CAO_WORKSPACE_HANDLE:-}"
@@ -112,6 +116,12 @@ if [ "$STACK" = "-" ] || [ "$STACK" = "none" ]; then
 else
   echo "reading outputs from stack '$STACK' in $REGION"
   REPO="$(out ServerRepositoryUri)"
+  CONTROL_PLANE_REPO="$(out ControlPlaneRepositoryUri)"
+  # A stack that predates the split has no such output; the executor image is
+  # then used for both, which is the old behaviour and still correct.
+  if [ -z "$CONTROL_PLANE_REPO" ] || [ "$CONTROL_PLANE_REPO" = "None" ]; then
+    CONTROL_PLANE_REPO="$REPO"
+  fi
   BROKER_REPO="$(out WorkerBrokerRepositoryUri)"
   PANEL_REPO="$(out PanelRepositoryUri)"
   HANDLE="$(out WorkspaceVolumeHandle)"
@@ -158,7 +168,8 @@ cat <<EOF
   cluster     $CLUSTER
   vpc cidr    $VPC_CIDR
   mode        $MODE
-  images      $REPO:$TAG
+  images      $REPO:$TAG (executor)
+              $CONTROL_PLANE_REPO:$TAG (control plane)
               $BROKER_REPO:$TAG
               $PANEL_REPO:$TAG
   workspace   $FS_ID / $AP_ID
@@ -210,6 +221,7 @@ fi
 find "$RENDER" -name '*.yaml' -print0 | while IFS= read -r -d '' f; do
   LC_ALL=C sed -i.bak \
     -e "s|<server-image>|$REPO|g" \
+    -e "s|<control-plane-image>|$CONTROL_PLANE_REPO|g" \
     -e "s|<broker-image>|$BROKER_REPO|g" \
     -e "s|<panel-image>|$PANEL_REPO|g" \
     -e "s|<account-id>|$ACCOUNT|g" \

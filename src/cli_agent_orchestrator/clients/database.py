@@ -559,6 +559,57 @@ class IdempotencyKeyModel(Base):
     created_at = Column(DateTime, default=datetime.now)
 
 
+class DispatchJournalModel(Base):
+    """What this server sent to a runtime, so a redelivered result can be trusted.
+
+    The runtime retains each command result until it is acked and redelivers the
+    unacked ones after the server restarts. Reconciling one of those means writing
+    a central row for a terminal this process never launched, and until this table
+    existed there was nothing to check it against: ``RuntimeConnection.resolve``
+    answers False for ANY unknown ``op_id``, so a shared-token runtime could
+    fabricate a result frame naming an arbitrary terminal id and the server would
+    persist it, place it on that runtime, and — because the reconciled row had no
+    owner, and ``may_start_work(None)`` is permitted — let it do work. The row it
+    had just written was the only thing authorizing the claim (Copilot review on
+    #802).
+
+    So the operation is journalled BEFORE the frame goes out, and the journal is
+    the authority afterwards: no entry for an op_id means this server never
+    dispatched it, and nothing about it is believed.
+
+    Deliberately NOT in ``RUNTIME_TABLE_NAMES``: this is the control plane's
+    record of what it asked for. An executor has no use for it and must not be
+    able to write one.
+
+    ``owner`` is the principal the dispatch was made on behalf of. It is recorded
+    here rather than carried in the LAUNCH payload precisely so it never reaches
+    the runtime — an identity handed to an executor is one the executor can
+    re-present.
+    """
+
+    __tablename__ = "dispatch_journal"
+
+    op_id = Column(String, primary_key=True)
+    command_type = Column(String, nullable=False)
+    runtime_id = Column(String, nullable=False)
+    # Known for commands about an existing terminal; None for a LAUNCH, whose
+    # terminal id is minted by the runtime and arrives in the result.
+    terminal_id = Column(String, nullable=True)
+    # None is a legitimate value (an unauthenticated local install has no
+    # principal) and is distinct from "no journal entry at all".
+    owner = Column(String, nullable=True)
+    # For RUN_SCRIPT: the durable workflow run this operation belongs to. A
+    # redelivered script result has no in-memory driver left to apply it, and
+    # without this there is no way back to the run whose step is still RUNNING.
+    run_id = Column(String, nullable=True)
+    step_id = Column(String, nullable=True)
+    # "dispatched" until a result is applied, then "settled". A dispatched entry
+    # found after a restart is an operation whose outcome this server never saw.
+    state = Column(String, nullable=False, default="dispatched")
+    created_at = Column(DateTime, default=datetime.now)
+    settled_at = Column(DateTime, nullable=True)
+
+
 def _ensure_db_dir() -> None:
     """Create the DB dir owner-only (0o700).
 
@@ -2020,6 +2071,91 @@ def get_idempotency_record(key: str) -> Optional[IdempotencyRecord]:
             terminal_id=cast(str, row.terminal_id),
             request_fingerprint=cast(str, row.request_fingerprint),
         )
+
+
+def record_dispatch(
+    op_id: str,
+    command_type: str,
+    runtime_id: str,
+    *,
+    terminal_id: Optional[str] = None,
+    owner: Optional[str] = None,
+    run_id: Optional[str] = None,
+    step_id: Optional[str] = None,
+) -> None:
+    """Journal an operation BEFORE its frame is sent to a runtime.
+
+    Must happen before the send, not after: a result that arrives for an op_id
+    with no entry is treated as not-ours, so journalling afterwards would make
+    every fast result unrecognisable. Idempotent on re-dispatch of the same
+    op_id (the script driver mints its own and may retry), so a repeat is an
+    update rather than an ``IntegrityError``.
+    """
+    with SessionLocal() as db:
+        row = db.query(DispatchJournalModel).filter(DispatchJournalModel.op_id == op_id).first()
+        if row is None:
+            db.add(
+                DispatchJournalModel(
+                    op_id=op_id,
+                    command_type=command_type,
+                    runtime_id=runtime_id,
+                    terminal_id=terminal_id,
+                    owner=owner,
+                    run_id=run_id,
+                    step_id=step_id,
+                    state="dispatched",
+                )
+            )
+        else:
+            row.command_type = command_type
+            row.runtime_id = runtime_id
+            row.terminal_id = terminal_id
+            row.owner = owner
+            row.run_id = run_id
+            row.step_id = step_id
+            row.state = "dispatched"
+            row.settled_at = None
+        db.commit()
+
+
+def get_dispatch_record(op_id: str) -> Optional[dict]:
+    """The journal entry for ``op_id``, or ``None`` if this server never sent it.
+
+    ``None`` is the security-relevant answer: it means no dispatch of this
+    operation is on record, so a result claiming to answer it is either forged or
+    belongs to a database this process is not using. Callers must not create
+    state from such a result.
+    """
+    with SessionLocal() as db:
+        row = db.query(DispatchJournalModel).filter(DispatchJournalModel.op_id == op_id).first()
+        if row is None:
+            return None
+        return {
+            "op_id": cast(str, row.op_id),
+            "command_type": cast(str, row.command_type),
+            "runtime_id": cast(str, row.runtime_id),
+            "terminal_id": row.terminal_id,
+            "owner": row.owner,
+            "run_id": row.run_id,
+            "step_id": row.step_id,
+            "state": cast(str, row.state),
+        }
+
+
+def settle_dispatch(op_id: str) -> None:
+    """Mark a journalled operation as one whose outcome has been applied.
+
+    Settling is what stops a later redelivery of the same result from being
+    reconciled twice, and what distinguishes "we never saw the outcome" from
+    "we handled it" for anything auditing the journal after a restart.
+    """
+    with SessionLocal() as db:
+        row = db.query(DispatchJournalModel).filter(DispatchJournalModel.op_id == op_id).first()
+        if row is None:
+            return
+        row.state = "settled"
+        row.settled_at = datetime.now()
+        db.commit()
 
 
 def delete_idempotency_key(key: str, expected_terminal_id: str) -> bool:
