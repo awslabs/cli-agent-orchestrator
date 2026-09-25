@@ -115,14 +115,23 @@ _ACTIVE_STATUSES = frozenset(
 #     6), because pressing Enter redraws the composer, so "the frame changed" is
 #     satisfied within 0.5s by the dispatch itself rather than by an answer.
 #
-# What the measurements did establish is that the seen-working signal is reliable:
-# 28 of 28 real turns, every one between 2.27s and 2.48s after delivery, with no
-# misses. The only turn never seen working is a provider's own init keystrokes,
-# which never "work" and which nothing waits on. So a turn now closes ONLY on
-# observed activity followed by a settled ready reading, and this value exists just
-# so a pathological terminal reports something instead of burning the caller's whole
-# 300s timeout. 60s is deliberately far outside any real turn's reach: if it ever
-# fires, the honest answer is that something is wrong with the terminal.
+# What the measurements did establish is which EVIDENCE is reliable. A turn closes
+# on a settled ready reading plus either of two facts, neither of them a timer:
+# the agent was seen working since the dispatch (28 of 28 measured claude_code
+# turns, every one 2.27-2.48s after delivery), or the reading came from the
+# rolling buffer that the dispatch itself CLEARED, so everything the detector
+# judged arrived after the dispatch — the case a fast raw-provider reply needs,
+# because its working marker and answer can arrive as one coalesced chunk that
+# never samples as busy (PR #812 review; see _note_turn_progress_locked).
+#
+# This value exists just so a pathological terminal — no observed activity, no
+# cleared-buffer evidence — reports something instead of burning the caller's
+# whole 300s timeout. It is evaluated when a settled ready reading arrives, and,
+# for a terminal that has gone completely silent (ready cache, no verdicts at
+# all), by get_status() itself on each poll — polling is the one thing a waiter
+# is guaranteed to do. 60s is deliberately far outside any real turn's reach: if
+# it ever fires for a real send, the honest answer is that something is wrong
+# with the terminal.
 TURN_START_BACKSTOP_S = 60.0
 
 
@@ -231,6 +240,18 @@ class StatusMonitor:
         # (notify_input_delivered, i.e. after send_keys' submit delay), or None
         # when nothing has been dispatched yet. Only TURN_START_BACKSTOP_S reads it.
         self._turn_delivered_at: Dict[str, Optional[float]] = {}
+        # Whether the rolling byte buffer was cleared for the CURRENT turn (set by
+        # clear_rolling_buffer, reset by notify_input_sent). This is what makes a
+        # raw-buffer verdict current-turn evidence: with the buffer cleared at
+        # dispatch, everything a raw detector judges arrived after the dispatch, so
+        # its settled ready verdict may close the turn even when no separate
+        # PROCESSING was ever sampled — a fast reply can arrive as ONE chunk holding
+        # both the working marker and the answer (grok and kiro both parse such a
+        # chunk as COMPLETED). Turns opened without a clear (provider init
+        # keystrokes, send_special_key) keep the conservative gate. Retained
+        # sources — the pyte screen, a pane capture — never get this bypass: they
+        # still show the previous turn after a dispatch, which is the #735 defect.
+        self._turn_buffer_cleared: Dict[str, bool] = {}
 
     async def run(self) -> None:
         """Subscribe to output events and detect status changes.
@@ -316,7 +337,7 @@ class StatusMonitor:
             # (catches PROCESSING transition), then waits for output to settle
             # before re-detecting (catches IDLE/COMPLETED without running costly
             # regex on every single chunk during bursts).
-            self._schedule_raw_detection(terminal_id, buffer)
+            self._schedule_raw_detection(terminal_id, buffer, provider)
             return
 
         self._schedule_screen_detection(terminal_id, provider)
@@ -328,6 +349,7 @@ class StatusMonitor:
         *,
         settled: bool = True,
         observed: bool = True,
+        cleared_buffer_turn: Optional[int] = None,
     ) -> None:
         """Apply the sticky-latch rules to a freshly detected status and publish
         on change. Shared by the raw and pyte detection paths.
@@ -350,10 +372,26 @@ class StatusMonitor:
         ``observed`` distinguishes a reading of the terminal from an assumption
         about it (notify_input_sent's assume_processing). Only readings count as
         turn progress.
+
+        ``cleared_buffer_turn`` is the turn whose dispatch CLEARED the raw rolling
+        buffer, when the verdict was derived from that buffer (see
+        _raw_verdict_context, which pins it). Everything such a verdict judged
+        arrived after that turn's dispatch, so a ready reading is current-turn
+        evidence and may close the turn without a separately sampled busy status —
+        a fast reply can arrive as one coalesced chunk. The number is revalidated
+        against the live turn counter under the latch's lock, so evidence computed
+        from turn N's bytes can never close a turn N+1 that raced in. Retained
+        sources — the pyte screen, a pane capture — must always pass None: they
+        still show the previous turn right after a dispatch, which is the #735
+        defect itself.
         """
         with self._lock:
             changed = self._apply_detection_locked(
-                terminal_id, detected, settled=settled, observed=observed
+                terminal_id,
+                detected,
+                settled=settled,
+                observed=observed,
+                cleared_buffer_turn=cleared_buffer_turn,
             )
         if changed:
             # Publish outside the lock — subscribers must never be able to
@@ -368,6 +406,7 @@ class StatusMonitor:
         *,
         settled: bool = True,
         observed: bool = True,
+        cleared_buffer_turn: Optional[int] = None,
     ) -> bool:
         """Sticky-latch core of _apply_detection. Caller MUST hold self._lock.
 
@@ -380,6 +419,14 @@ class StatusMonitor:
         """
         last = self._last_status.get(terminal_id)
 
+        # Revalidate the pinned evidence turn under THIS lock: if a new dispatch
+        # slipped in since the verdict's context was read, the evidence describes
+        # the previous turn and must not close (or unlatch) the new one.
+        from_cleared_buffer = (
+            cleared_buffer_turn is not None
+            and cleared_buffer_turn == self._turn.get(terminal_id, 0)
+        )
+
         # Turn bookkeeping runs on the VERDICT, before any early return, because a
         # verdict that leaves the latched status alone is still evidence about the
         # turn. Two cases need it: a repeated PROCESSING (already latched, so the
@@ -387,7 +434,9 @@ class StatusMonitor:
         # ready status is byte-identical to the previous turn's (COMPLETED after
         # COMPLETED) — the case that would otherwise never close.
         if observed:
-            self._note_turn_progress_locked(terminal_id, detected, settled)
+            self._note_turn_progress_locked(
+                terminal_id, detected, settled, from_cleared_buffer=from_cleared_buffer
+            )
 
         # UNKNOWN is "no signal", not a state: never let it overwrite a known
         # status. Mid-turn the screen can momentarily show neither a spinner
@@ -459,7 +508,11 @@ class StatusMonitor:
                     "while PROCESSING (frame was still changing when read)"
                 )
                 return False
-            if self._turn_unstarted_locked(terminal_id):
+            # A cleared-buffer verdict is exempt from the seen-working requirement:
+            # it was derived entirely from post-dispatch output, so it cannot be the
+            # previous turn's frame (PR #812 review — a fast reply may arrive as one
+            # coalesced chunk and never sample as busy).
+            if not from_cleared_buffer and self._turn_unstarted_locked(terminal_id):
                 logger.debug(
                     f"_apply_detection [{terminal_id}]: ignoring {detected.value} while "
                     "PROCESSING (the dispatched turn has not been seen to start yet)"
@@ -495,27 +548,43 @@ class StatusMonitor:
         return time.monotonic() - delivered < TURN_START_BACKSTOP_S
 
     def _note_turn_progress_locked(
-        self, terminal_id: str, detected: TerminalStatus, settled: bool
+        self,
+        terminal_id: str,
+        detected: TerminalStatus,
+        settled: bool,
+        *,
+        from_cleared_buffer: bool = False,
     ) -> None:
         """Advance the turn state from one detection verdict. Caller holds the lock.
 
         Answers "has the turn that was dispatched finished?" without appealing to
         frame shape, which cannot distinguish this turn's completion marker from the
-        last one's. A turn closes on the conjunction of two independent facts:
+        last one's. A turn closes on a SETTLED ready reading plus either of two
+        kinds of current-turn evidence:
 
-        1. the agent was seen working since the dispatch (``_turn_started``), and
-        2. a ready status was read from a SETTLED frame.
+        1. the agent was seen working since the dispatch (``_turn_started``), or
+        2. the verdict was derived from the rolling buffer that send_input CLEARED
+           at dispatch (``from_cleared_buffer``) — everything the detector judged
+           arrived after the dispatch, so the reading cannot be the previous
+           turn's frame. This is what lets a fast reply that arrives as one
+           coalesced working+answer chunk close its turn: such a reply never
+           samples as busy, and requiring a separately observed busy status made
+           it hang behind the gate with nothing left to re-evaluate the backstop
+           (PR #812 review). Staleness of post-clear content — a TUI re-emitting
+           the old completion — is the provider's own contract (grok's buffer
+           epochs, kiro's input_received flag), the same contract the base
+           revision relied on.
 
-        (1) is what a completion marker alone can never establish — a marker the
-        previous turn left is still on screen, and is what #407/#735 both returned.
-        (2) keeps a mid-repaint frame (where an Ink TUI has cleared the transcript
-        and not yet redrawn it) from ending a turn it merely interrupted.
+        Evidence (1) is what a completion marker alone can never establish for a
+        RETAINED source (the pyte screen, a pane capture) — the marker the previous
+        turn left is still on screen, and is what #407/#735 both returned. The
+        settled requirement keeps a mid-repaint frame from ending a turn it merely
+        interrupted.
 
-        There is deliberately NO escape for a turn that simply looks finished. Three
-        attempts at one — a short grace, an activity probe, a frame hash — each failed
-        in measurement; see TURN_START_BACKSTOP_S. The seen-working signal was reliable
-        in every trial (28 of 28 real turns, 2.27-2.48s), so the backstop exists only
-        so a broken terminal reports something eventually.
+        There is deliberately no TIMED escape. Three attempts at one — a short
+        grace, an activity probe, a frame hash — each failed in measurement; see
+        TURN_START_BACKSTOP_S. The backstop exists only so a broken terminal
+        reports something eventually.
         """
         if detected in _ACTIVE_STATUSES:
             self._turn_started[terminal_id] = True
@@ -528,17 +597,24 @@ class StatusMonitor:
         turn = self._turn.get(terminal_id, 0)
         if turn == 0 or self._turn_done.get(terminal_id, 0) >= turn:
             return
-        if self._turn_unstarted_locked(terminal_id):
-            # Still inside the window where a settled frame can only be the previous
-            # turn's. Shares the predicate with the latch guard in
+        if not from_cleared_buffer and self._turn_unstarted_locked(terminal_id):
+            # Still inside the window where a settled RETAINED frame can only be the
+            # previous turn's. Shares the predicate with the latch guard in
             # _apply_detection_locked so the two cannot disagree about when a turn
             # became closable.
             return
-        if not self._turn_started.get(terminal_id, False):
-            logger.warning(
+        if not self._turn_started.get(terminal_id, False) and not from_cleared_buffer:
+            # Alarming only for a real send (its dispatch cleared the buffer, so it
+            # had two ways to close and used neither). Provider init and special-key
+            # turns never clear, never "work", and reach the backstop routinely.
+            log = (
+                logger.warning
+                if self._turn_buffer_cleared.get(terminal_id, False)
+                else logger.debug
+            )
+            log(
                 f"_note_turn_progress [{terminal_id}]: closing turn {turn} at the "
-                f"backstop on a settled {detected.value} — it was never seen working. "
-                "No ordinary turn reaches this; suspect the terminal or its provider."
+                f"backstop on a settled {detected.value} — it was never seen working."
             )
         self._turn_done[terminal_id] = turn
 
@@ -716,7 +792,47 @@ class StatusMonitor:
         else:
             self._spawn_tracked(loop, _detect_and_apply())
 
-    def _schedule_raw_detection(self, terminal_id: str, buffer: str) -> None:
+    def _raw_verdict_context(self, terminal_id: str, provider=None) -> Tuple[bool, Optional[int]]:
+        """(raw_calibrated, cleared_buffer_turn) for a raw-buffer verdict.
+
+        The one place that decides how much a raw-buffer reading is worth, shared
+        by the per-chunk path, the quiescence callback and get_status()'s re-check
+        so the three cannot drift (the drift between the pipeline and the re-check
+        is what #735 measured).
+
+        ``raw_calibrated``: the provider's detector is built for the live byte
+        stream (no ``supports_screen_detection``), so its verdicts are settled by
+        definition — the non-silence completion path kiro-style TUIs need, since
+        their post-answer cursor refreshes can outrun the quiescence window forever
+        (PR #812 review). A screen-calibrated provider read on the raw path is the
+        #735 misparse and stays unsettled mid-stream.
+
+        ``cleared_buffer_turn``: the turn whose dispatch cleared the rolling
+        buffer, or None when the current turn's buffer was never cleared. A
+        verdict from that buffer is post-dispatch evidence FOR THAT TURN ONLY.
+        The number is pinned here, under the lock, and revalidated at apply time
+        (see _apply_detection_locked): a new dispatch — notify_input_sent plus
+        clear_rolling_buffer, microseconds apart in send_input — can slip in
+        between this read and the apply, and evidence computed from turn N's
+        bytes must never close turn N+1. Same pin-then-revalidate shape as the
+        capture path's generation check.
+        """
+        if provider is None:
+            try:
+                provider = provider_manager.get_provider(terminal_id)
+            except Exception:
+                provider = None
+        raw_calibrated = provider is not None and not getattr(
+            provider, "supports_screen_detection", False
+        )
+        with self._lock:
+            if self._turn_buffer_cleared.get(terminal_id, False):
+                cleared_buffer_turn: Optional[int] = self._turn.get(terminal_id, 0)
+            else:
+                cleared_buffer_turn = None
+        return raw_calibrated, cleared_buffer_turn
+
+    def _schedule_raw_detection(self, terminal_id: str, buffer: str, provider=None) -> None:
         """Edge-debounce detection on the raw rolling buffer.
 
         Detects on every chunk while the terminal is in a ready/armed state
@@ -734,10 +850,16 @@ class StatusMonitor:
         thread's (nonexistent) loop.
         """
         loop = self._loop or self._running_loop()
+        raw_calibrated, cleared_turn = self._raw_verdict_context(terminal_id, provider)
+
         if loop is None:
             # No loop ever captured (unit tests / offline replay): detect
             # inline and skip the debounce timer.
-            self._apply_detection(terminal_id, self._detect_status(terminal_id, buffer))
+            self._apply_detection(
+                terminal_id,
+                self._detect_status(terminal_id, buffer),
+                cleared_buffer_turn=cleared_turn,
+            )
             return
 
         with self._lock:
@@ -752,8 +874,7 @@ class StatusMonitor:
             # path that left NO verdict at all — the quiescence deferral below waits
             # for output to stop, which a live turn never does — so the turn was never
             # observed working and every send waited out the backstop instead
-            # (measured: 64s sends against 31s turns). These verdicts are unsettled, so
-            # they can only report work STARTING, never end a turn.
+            # (measured: 64s sends against 31s turns).
             turn_unstarted = self._turn_unstarted_locked(terminal_id)
         self._cancel_quiesce_handle(handle)
 
@@ -767,10 +888,21 @@ class StatusMonitor:
             or turn_unstarted
         ):
             detected = self._detect_status(terminal_id, buffer)
-            # Per-chunk / rising-edge read of a stream that is still arriving:
-            # settled=False. This branch exists to catch work STARTING, and the
-            # quiescence callback below is what catches it finishing.
-            self._apply_detection(terminal_id, detected, settled=False)
+            # A raw-CALIBRATED detector's verdicts are settled by definition: the
+            # live stream is the input it was built for, and the base revision
+            # applied its per-chunk verdicts directly. Marking them unsettled here
+            # extended #735's screen-soup restriction to providers it never applied
+            # to, and cost a coalesced fast reply its only completion verdict
+            # (PR #812 review). A screen-calibrated provider read on the raw path
+            # (CAO_PYTE_STATUS=false) keeps settled=False mid-stream — its raw
+            # verdicts are the misparse #735 measured — and completes at the
+            # (deferred) quiescence edge below.
+            self._apply_detection(
+                terminal_id,
+                detected,
+                settled=raw_calibrated,
+                cleared_buffer_turn=cleared_turn,
+            )
 
         self._arm_quiesce_timer(loop, terminal_id, self._on_raw_quiescent)
 
@@ -880,13 +1012,19 @@ class StatusMonitor:
             self._quiesce_handle.pop(terminal_id, None)
             buffer = self._buffers.get(terminal_id, "")
 
+        _, cleared_turn = self._raw_verdict_context(terminal_id)
+
         async def _detect_and_apply() -> None:
             detected = await asyncio.to_thread(self._detect_status, terminal_id, buffer)
-            self._apply_detection(terminal_id, detected)
+            self._apply_detection(terminal_id, detected, cleared_buffer_turn=cleared_turn)
 
         loop = self._loop or self._running_loop()
         if loop is None:
-            self._apply_detection(terminal_id, self._detect_status(terminal_id, buffer))
+            self._apply_detection(
+                terminal_id,
+                self._detect_status(terminal_id, buffer),
+                cleared_buffer_turn=cleared_turn,
+            )
         else:
             self._spawn_tracked(loop, _detect_and_apply())
 
@@ -952,6 +1090,9 @@ class StatusMonitor:
             turn = self._turn.get(terminal_id, 0) + 1
             self._turn[terminal_id] = turn
             self._turn_started[terminal_id] = False
+            # False until clear_rolling_buffer runs for this turn (send_input calls
+            # it right after this method); init/special-key turns never set it.
+            self._turn_buffer_cleared[terminal_id] = False
             # Stamped here and RE-stamped by notify_input_delivered with the accurate
             # post-send_keys time. Stamping now rather than leaving it None matters
             # because most callers are provider init/launch keystrokes that never
@@ -1017,6 +1158,10 @@ class StatusMonitor:
             self._buffers[terminal_id] = ""
             epoch = self._buffer_epochs.get(terminal_id, 0) + 1
             self._buffer_epochs[terminal_id] = epoch
+            # From here on, every byte in the rolling buffer arrived after this
+            # turn's dispatch — the fact that lets a raw-buffer ready verdict count
+            # as current-turn evidence (see _note_turn_progress_locked).
+            self._turn_buffer_cleared[terminal_id] = True
             if provider is not None:
                 provider.notify_status_buffer_reset(epoch)
 
@@ -1031,27 +1176,6 @@ class StatusMonitor:
         except Exception as e:
             logger.error(f"Error detecting status for {terminal_id}: {e}")
             return TerminalStatus.UNKNOWN
-
-    def _detect_registered(self, terminal_id: str, buffer: str) -> TerminalStatus:
-        """Detect with whichever detector this terminal's pipeline actually uses.
-
-        ``_process_chunk`` picks between the composited pyte screen and the raw byte
-        stream per provider; any other code re-deriving status must make the SAME
-        choice or it is feeding a detector an input shape it was never calibrated
-        for. Kept as one predicate so the two cannot drift.
-        """
-        try:
-            provider = provider_manager.get_provider(terminal_id)
-        except Exception:
-            provider = None
-        use_screen = (
-            CAO_PYTE_STATUS
-            and provider is not None
-            and getattr(provider, "supports_screen_detection", False)
-        )
-        if use_screen:
-            return self._detect_screen(terminal_id, provider)
-        return self._detect_status(terminal_id, buffer)
 
     def clear_terminal(self, terminal_id: str) -> None:
         """Free buffer and status for a deleted terminal."""
@@ -1071,6 +1195,7 @@ class StatusMonitor:
             self._turn_done.pop(terminal_id, None)
             self._turn_started.pop(terminal_id, None)
             self._turn_delivered_at.pop(terminal_id, None)
+            self._turn_buffer_cleared.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
 
@@ -1158,6 +1283,35 @@ class StatusMonitor:
             else:
                 buffer = ""
                 bursting = False
+                # Backstop liveness for a QUIET terminal (PR #812 review): the
+                # backstop is otherwise only evaluated when a detection verdict
+                # arrives, and a terminal whose cached status is already ready
+                # produces none — the pipeline is silent and the re-check below
+                # only runs for cached PROCESSING. A dispatched turn that was
+                # never seen working would then stay open past the backstop with
+                # nothing left to close it, and a turn-aware waiter would sit out
+                # its whole timeout. Polling is the one thing such a waiter is
+                # guaranteed to do, so the poll itself closes the turn once the
+                # backstop has expired, from the already-settled cached status.
+                if cached in _TURN_END_STATUSES:
+                    turn = self._turn.get(terminal_id, 0)
+                    if (
+                        turn
+                        and self._turn_done.get(terminal_id, 0) < turn
+                        and not self._turn_started.get(terminal_id, False)
+                        and not self._turn_unstarted_locked(terminal_id)
+                    ):
+                        log = (
+                            logger.warning
+                            if self._turn_buffer_cleared.get(terminal_id, False)
+                            else logger.debug
+                        )
+                        log(
+                            f"get_status [{terminal_id}]: closing turn {turn} at the "
+                            f"backstop from cached {cached.value} — no activity was "
+                            "ever observed and the terminal went quiet."
+                        )
+                        self._turn_done[terminal_id] = turn
 
         if cached == TerminalStatus.PROCESSING and buffer:
             # Route to the detector this provider is REGISTERED with, exactly as
@@ -1168,13 +1322,39 @@ class StatusMonitor:
             # no spinner pattern can match, while the response marker and prompt from
             # earlier in the turn match cleanly — a working agent parses as COMPLETED.
             # That verdict, applied from this read path, is the defect #735 measured.
-            fresh = self._detect_registered(terminal_id, buffer)
+            try:
+                provider = provider_manager.get_provider(terminal_id)
+            except Exception:
+                provider = None
+            use_screen = (
+                CAO_PYTE_STATUS
+                and provider is not None
+                and getattr(provider, "supports_screen_detection", False)
+            )
+            raw_calibrated, cleared_turn = self._raw_verdict_context(terminal_id, provider)
+            if use_screen:
+                fresh = self._detect_screen(terminal_id, provider)
+                # A pyte screen read mid-burst is a half-drawn frame; a retained
+                # screen is never post-dispatch evidence.
+                settled, cleared_turn = (not bursting), None
+            else:
+                fresh = self._detect_status(terminal_id, buffer)
+                # A raw-calibrated detector is built for the live stream, so its
+                # verdict needs no stream silence — this is the #558 escape for a
+                # TUI whose post-answer refreshes outrun the quiescence window
+                # forever, which an unconditional `not bursting` here removed
+                # (PR #812 review). Screen-calibrated providers read raw
+                # (CAO_PYTE_STATUS=false) keep the mid-stream restriction.
+                settled = True if raw_calibrated else (not bursting)
             logger.debug(
                 f"get_status [{terminal_id}]: cached=PROCESSING, "
-                f"fresh={fresh.value}, buffer_len={len(buffer)}, bursting={bursting}"
+                f"fresh={fresh.value}, buffer_len={len(buffer)}, bursting={bursting}, "
+                f"settled={settled}, cleared_turn={cleared_turn}"
             )
             if fresh != TerminalStatus.PROCESSING and fresh != TerminalStatus.UNKNOWN:
-                self._apply_detection(terminal_id, fresh, settled=not bursting)
+                self._apply_detection(
+                    terminal_id, fresh, settled=settled, cleared_buffer_turn=cleared_turn
+                )
                 # Report what the latch ACCEPTED, not what this read proposed. A
                 # verdict refused as unsettled must not be handed to the caller
                 # either — that would put the rejected status back on the wire and
@@ -1235,6 +1415,18 @@ class StatusMonitor:
                             )
                             if apply_ok:
                                 changed = self._apply_detection_locked(terminal_id, fresh_capture)
+                                # Read back what the latch ACCEPTED inside the same
+                                # critical section. The turn guard can refuse a
+                                # confirmed ready capture (dispatch assumed
+                                # processing, agent not yet seen working): the pane
+                                # is RETAINED state, so what it shows is the
+                                # previous turn. Returning fresh_capture regardless
+                                # handed exactly that refused stale verdict to the
+                                # API, the pre-send busy check and InboxService
+                                # while the latch stayed PROCESSING (PR #812
+                                # review) — the same rule the cheap-buffer branch
+                                # above already applies.
+                                latched_capture = self._last_status.get(terminal_id)
                         if apply_ok:
                             if changed:
                                 bus.publish(
@@ -1245,6 +1437,8 @@ class StatusMonitor:
                                     f"Terminal {terminal_id} status changed: "
                                     f"{fresh_capture.value}"
                                 )
+                            if latched_capture is not None:
+                                return latched_capture
                             return fresh_capture
                         logger.debug(
                             f"get_status [{terminal_id}]: fresh capture-pane result "

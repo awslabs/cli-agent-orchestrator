@@ -550,12 +550,92 @@ def test_buffer_clear_generation_accepts_coalesced_identical_completion():
         # While cached PROCESSING, get_status performs a direct settled
         # recheck; pin the successful state through the same code path too.
         monitor._last_status["test-terminal"] = TerminalStatus.PROCESSING
-        # Cached PROCESSING only ever arises from a PROCESSING verdict, and such a
-        # verdict also records that the dispatched turn was seen working (#735).
-        # Setting _last_status alone would model a state the monitor cannot be in,
-        # and the recheck would then decline to end a turn it has no evidence began.
-        monitor._turn_started["test-terminal"] = True
         assert monitor.get_status("test-terminal") == TerminalStatus.COMPLETED
+
+
+def test_coalesced_completion_closes_the_dispatched_turn():
+    """A reply whose processing and completion arrive in ONE chunk must close its turn.
+
+    Grok explicitly supports a FIFO chunk that carries both the current processing
+    marker and the finished answer (the coalesced test above), so a valid fast reply
+    need not ever produce a separate PROCESSING verdict. #812's first cut required a
+    separately sampled busy status before a settled ready reading could close the
+    turn; this replay left ``status=completed, turn=1, turn_completed=0`` and — the
+    terminal being quiet and the cached status ready — nothing ever re-evaluated, so
+    the advertised backstop never ran and the turn-aware CLI waiter timed out at its
+    own 300s instead of returning the finished reply (PR #812 review, haofeif).
+
+    The buffer was cleared at dispatch, so everything the detector judged arrived
+    AFTER the dispatch: a ready verdict from it is current-turn evidence, and the
+    provider's own generation guards (the neighbouring tests) own the staleness risk.
+    """
+
+    provider = make_provider()
+    monitor = StatusMonitor()
+    completed = _completed_turn("repeat exactly", "same response")
+    coalesced = f"Waiting for response…\nEsc:cancel\n{completed}"
+
+    with patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as manager:
+        manager.get_provider.return_value = provider
+
+        # Warm turn, exactly as a real session starts.
+        provider.mark_input_received()
+        monitor._process_chunk("test-terminal", completed)
+        assert monitor._last_status["test-terminal"] == TerminalStatus.COMPLETED
+
+        # A real dispatch: the same order terminal_service.send_input uses.
+        monitor.notify_input_sent("test-terminal")
+        monitor.clear_rolling_buffer("test-terminal", provider)
+        provider.mark_input_received()
+        monitor.notify_input_delivered("test-terminal")
+
+        monitor._process_chunk("test-terminal", coalesced)
+
+        assert monitor._last_status["test-terminal"] == TerminalStatus.COMPLETED
+        # The turn the dispatch opened is CLOSED — this is what the CLI waits on.
+        assert monitor.turn_state("test-terminal") == (1, 1)
+
+
+def test_completion_reaches_a_poller_while_refreshes_prevent_quiescence():
+    """Non-work TUI redraws must not stop a raw-calibrated provider completing.
+
+    A raw TUI can keep emitting cursor/control refreshes after the answer is
+    finished, faster than the quiescence window, so the pipeline never re-detects.
+    get_status()'s cheap re-check exists for exactly this (#558). #812's first cut
+    marked every re-check taken mid-burst as unsettled, which the new busy->ready
+    guard then refused — every public read stayed PROCESSING and ``turn_completed``
+    stayed behind, forever (PR #812 review, haofeif). A raw-calibrated detector is
+    calibrated for the live stream, so its ready verdicts do not need stream
+    silence to be trustworthy; that is the non-silence completion path.
+    """
+
+    provider = make_provider()
+    monitor = StatusMonitor()
+    monitor._loop = MagicMock()  # production shape: timers armed, never fired here
+    monitor._arm_quiesce_timer = lambda *a, **k: None
+    monitor._cancel_quiesce_handle = lambda *a, **k: None
+    completed = _completed_turn("long question", "the finished answer")
+
+    with patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as manager:
+        manager.get_provider.return_value = provider
+
+        monitor.notify_input_sent("test-terminal")
+        monitor.clear_rolling_buffer("test-terminal", provider)
+        provider.mark_input_received()
+        monitor.notify_input_delivered("test-terminal")
+
+        # The turn IS seen working: a separately observed busy frame.
+        monitor._process_chunk("test-terminal", "Waiting for response…\nEsc:cancel")
+        assert monitor._last_status["test-terminal"] == TerminalStatus.PROCESSING
+
+        # The finished answer arrives, followed by refreshes that keep the stream
+        # bursting; the quiescence timer therefore never fires (never called here).
+        monitor._process_chunk("test-terminal", "\n" + completed)
+        assert monitor._bursting["test-terminal"] is True
+
+        # A poller must still get the completion, and the turn must close.
+        assert monitor.get_status("test-terminal") == TerminalStatus.COMPLETED
+        assert monitor.turn_state("test-terminal") == (1, 1)
 
 
 def test_buffer_clear_generation_rejects_stale_identical_completion_without_activity():

@@ -70,18 +70,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - the sticky-status latch refused ready → busy but not busy → ready, so one such
     reading overwrote a live PROCESSING and then stuck: in one traced 28-second turn
     the screen detector returned PROCESSING thirty-one times and every one was
-    discarded. A ready reading may now end a turn only from a frame that had stopped
-    changing, and only once the turn has been seen working (bounded by a 3s grace so
-    a turn too short to observe still completes). `claude_code` also now sets
-    `assume_processing_on_dispatch`, which no provider had ever set, so readers that
-    cannot ask about turns — InboxService, `send_input`'s own busy check, the web UI
-    — no longer see the old turn's ready status as this one's.
+    discarded. A ready reading from a RETAINED source (the pyte screen, a pane
+    capture) may now end a turn only from a frame that had stopped changing, and
+    only once the turn has been seen working — a retained frame right after a
+    dispatch still shows the previous turn, which is the defect itself.
+    `claude_code` also now sets `assume_processing_on_dispatch`, which no provider
+    had ever set, so readers that cannot ask about turns — InboxService,
+    `send_input`'s own busy check, the web UI — no longer see the old turn's ready
+    status as this one's.
+
+  The seen-working requirement deliberately does NOT apply to verdicts from the
+  raw rolling buffer, because `send_input` clears that buffer at dispatch:
+  everything a raw detector judges arrived after the dispatch, so its settled
+  ready verdict is current-turn evidence, pinned to the turn whose dispatch
+  cleared the buffer and revalidated under the latch's lock. This is what lets a
+  fast reply that arrives as one coalesced working+answer chunk — which grok and
+  kiro both parse as COMPLETED, and which therefore never samples as busy — close
+  its turn instead of hanging behind the gate. For the same reason a
+  raw-calibrated detector's verdicts count as settled without waiting for stream
+  silence: the live stream is the input it was built for, and a kiro-style TUI's
+  post-answer cursor refreshes can outrun the quiescence window forever, leaving
+  `get_status()`'s re-check as the only completion path. A quiet terminal cannot
+  hold a turn open forever either: the poll itself closes a never-seen-working
+  turn once the 60s backstop expires. And ERROR is exempt from all turn guards —
+  it reports a dead provider, not a finished turn.
 
   With `CAO_PYTE_STATUS=false` a provider calibrated for the rendered screen is
   forced onto a stream it cannot read, so its end-of-turn verdict now waits for
   output to actually stop. That costs about three seconds per turn in that
   non-default mode and was the only way to make it correct; three trials out of
-  three pass there now, against one out of two before.
+  three pass there now, against one out of two before. Providers calibrated for
+  the raw stream are unaffected.
 
 - **a PTY WebSocket handshake with no peer address skipped the client-IP allowlist.**
   `/terminals/{id}/ws` checked `client_host not in WS_ALLOWED_CLIENTS` only when a

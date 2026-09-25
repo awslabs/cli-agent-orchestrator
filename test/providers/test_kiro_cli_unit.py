@@ -451,6 +451,33 @@ class TestKiroCliProviderStatusDetection:
 
         assert status == TerminalStatus.COMPLETED
 
+    def test_coalesced_working_and_completed_chunk_closes_the_dispatched_turn(self):
+        """Kiro parses one chunk holding 'Kiro is working' plus the finished answer
+        as COMPLETED — a fast reply with no separate PROCESSING verdict. That
+        completion must close the dispatched turn, or the turn-aware CLI waiter
+        introduced for #735 hangs on a finished reply (PR #812 review, haofeif).
+        """
+        from cli_agent_orchestrator.services.status_monitor import StatusMonitor
+
+        completed = load_fixture("kiro_cli_completed_output.txt")
+        coalesced = " Kiro is working\n" + completed
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        # The coalesced chunk itself must parse COMPLETED, or this test tests nothing.
+        assert provider.get_status(coalesced) == TerminalStatus.COMPLETED
+
+        monitor = StatusMonitor()
+        with patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as manager:
+            manager.get_provider.return_value = provider
+            monitor.notify_input_sent("test1234")
+            monitor.clear_rolling_buffer("test1234", provider)
+            provider.mark_input_received()
+            monitor.notify_input_delivered("test1234")
+
+            monitor._process_chunk("test1234", coalesced)
+
+            assert monitor._last_status["test1234"] == TerminalStatus.COMPLETED
+            assert monitor.turn_state("test1234") == (1, 1)
+
     def test_get_status_processing(self):
         """Test PROCESSING status detection."""
         output = load_fixture("kiro_cli_processing_output.txt")
