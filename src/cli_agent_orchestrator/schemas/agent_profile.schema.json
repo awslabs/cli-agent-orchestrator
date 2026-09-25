@@ -3,7 +3,9 @@
   "title": "CAO Agent Profile Frontmatter",
   "description": "Validates the YAML frontmatter of a CAO agent profile .md file.",
   "type": "object",
-  "required": ["name"],
+  "required": [
+    "name"
+  ],
   "properties": {
     "name": {
       "type": "string",
@@ -17,13 +19,19 @@
     },
     "capabilities": {
       "type": "array",
-      "items": {"type": "string", "maxLength": 128},
+      "items": {
+        "type": "string",
+        "maxLength": 128
+      },
       "maxItems": 32,
       "description": "Short capability statements used by profile discovery (e.g. 'query dynamodb tables')."
     },
     "tags": {
       "type": "array",
-      "items": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$"},
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9_-]{1,64}$"
+      },
       "maxItems": 32,
       "description": "Keyword tags used by profile discovery (e.g. 'sqs', 'monitoring')."
     },
@@ -37,12 +45,17 @@
     },
     "engine": {
       "type": "string",
-      "enum": ["v2", "kas"],
+      "enum": [
+        "v2",
+        "kas"
+      ],
       "description": "Kiro engine selection."
     },
     "allowedTools": {
       "type": "array",
-      "items": {"type": "string"},
+      "items": {
+        "type": "string"
+      },
       "description": "CAO tool vocabulary allowlist."
     },
     "mcpServers": {
@@ -52,26 +65,56 @@
         "type": "object",
         "description": "One MCP server. A command-launched server sets 'command'; a remote server sets 'url', with 'type' naming its transport (for example 'http' or 'sse'). At least one of the two is required.",
         "properties": {
-          "type": {"type": "string"},
-          "command": {"type": "string"},
-          "args": {"type": "array", "items": {"type": "string"}},
-          "env": {"type": "object", "additionalProperties": {"type": "string"}},
-          "timeout": {"type": "integer"},
-          "url": {"type": "string"}
+          "type": {
+            "type": "string"
+          },
+          "command": {
+            "type": "string"
+          },
+          "args": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "env": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "timeout": {
+            "type": "integer"
+          },
+          "url": {
+            "type": "string"
+          }
         },
         "anyOf": [
-          {"required": ["command"]},
-          {"required": ["url"]}
+          {
+            "required": [
+              "command"
+            ]
+          },
+          {
+            "required": [
+              "url"
+            ]
+          }
         ]
       }
     },
     "tools": {
       "type": "array",
-      "items": {"type": "string"}
+      "items": {
+        "type": "string"
+      }
     },
     "toolAliases": {
       "type": "object",
-      "additionalProperties": {"type": "string"}
+      "additionalProperties": {
+        "type": "string"
+      }
     },
     "toolsSettings": {
       "type": "object"
@@ -81,7 +124,13 @@
     },
     "permissionMode": {
       "type": "string",
-      "enum": ["default", "acceptEdits", "plan", "auto", "bypassPermissions"]
+      "enum": [
+        "default",
+        "acceptEdits",
+        "plan",
+        "auto",
+        "bypassPermissions"
+      ]
     },
     "native_agent": {
       "type": "string"
@@ -107,7 +156,9 @@
     },
     "skills": {
       "type": "array",
-      "items": {"type": "string"}
+      "items": {
+        "type": "string"
+      }
     },
     "container": {
       "type": "object",
@@ -119,10 +170,19 @@
           "items": {
             "type": "object",
             "properties": {
-              "host": {"type": "string", "minLength": 1},
-              "guest": {"type": "string", "minLength": 1}
+              "host": {
+                "type": "string",
+                "minLength": 1
+              },
+              "guest": {
+                "type": "string",
+                "minLength": 1
+              }
             },
-            "required": ["host", "guest"]
+            "required": [
+              "host",
+              "guest"
+            ]
           }
         }
       }
@@ -132,12 +192,21 @@
       "minimum": 1,
       "description": "Per-profile override, in seconds, for provider initialization. Replaces the server-wide provider_init_timeout as the hard outer cap for this profile."
     },
+    "env": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      },
+      "description": "Extra environment variables injected into this agent's terminal at launch (e.g. {\"CLAUDE_CONFIG_DIR\": \"~/.claude-b\"}). Consumed by CAO at terminal creation; not passed through to provider JSON."
+    },
     "prompt": {
       "type": "string"
     },
     "resources": {
       "type": "array",
-      "items": {"type": "string"}
+      "items": {
+        "type": "string"
+      }
     },
     "hooks": {
       "type": "object"
