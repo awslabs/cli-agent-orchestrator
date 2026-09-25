@@ -182,6 +182,7 @@ class TerminalBackend(ABC):
         enter_count: int = 1,
         force_bracketed_paste: bool = False,
         submit_delay: float = 0.3,
+        use_paste_buffer: bool = True,
     ) -> None:
         """Send text input to a window.
 
@@ -201,6 +202,8 @@ class TerminalBackend(ABC):
             submit_delay: Seconds to wait after pasting before sending Enter, so
                 a TUI (e.g. Claude Code's Ink renderer) finishes processing the
                 paste before submission. Backends without a paste step may ignore.
+            use_paste_buffer: If False, send literal keys instead of using a
+                paste buffer. Backends without a paste-buffer concept may ignore.
         """
         ...
 

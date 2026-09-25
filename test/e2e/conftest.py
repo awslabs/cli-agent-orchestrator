@@ -208,6 +208,38 @@ def require_minimax_code(require_cao_server: CaoServer):
             shutil.copy2(source, target)
 
 
+@pytest.fixture()
+def require_devin(require_cao_server: CaoServer):
+    """Skip unless Devin CLI is installed; links its config into the isolated HOME."""
+    if not _cli_available("devin"):
+        pytest.skip("devin CLI not installed; see docs/devin-cli.md for installation")
+
+    # The managed e2e server deliberately redirects HOME to isolate CAO state.
+    # Devin CLI keeps its config/auth under ~/.config/devin and state under
+    # ~/.local/share/devin; link both into the disposable HOME so the launched
+    # CLI can reuse the developer's authentication without copying credential
+    # contents into test artifacts.
+    for rel in (".config/devin", ".local/share/devin"):
+        source = Path.home() / rel
+        if source.exists():
+            target = require_cao_server.home_dir / rel
+            target.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+            if not target.exists():
+                target.symlink_to(source, target_is_directory=source.is_dir())
+
+    # Orchestration e2e tests use the repository's assign example profiles.
+    # Seed copies into the same disposable CAO home so the managed server can
+    # resolve them without reading or modifying the developer's real store.
+    repo_root = Path(__file__).resolve().parents[2]
+    isolated_store = require_cao_server.home_dir / ".aws" / "cli-agent-orchestrator" / "agent-store"
+    isolated_store.mkdir(parents=True, mode=0o700, exist_ok=True)
+    for profile_name in ("analysis_supervisor", "data_analyst", "report_generator"):
+        source = repo_root / "examples" / "assign" / f"{profile_name}.md"
+        target = isolated_store / f"{profile_name}.md"
+        if not target.exists():
+            shutil.copy2(source, target)
+
+
 def create_terminal(
     provider: str,
     agent_profile: str,

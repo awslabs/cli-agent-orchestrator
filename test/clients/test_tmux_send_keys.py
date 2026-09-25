@@ -186,6 +186,80 @@ class TestSendKeys:
         load_call = payload_calls(mock_subprocess)[0]
         assert len(load_call[1]["input"]) == 50000
 
+    def test_send_keys_without_paste_buffer(self, client, mock_subprocess):
+        """When use_paste_buffer=False, uses send-keys -l instead of paste-buffer."""
+        client.send_keys("sess", "win", "hello", use_paste_buffer=False)
+
+        calls = payload_calls(mock_subprocess)
+        # send-keys -l (literal send); '--' prevents payloads starting with '-' being parsed as options.
+        assert calls[0] == call(
+            ["tmux", "send-keys", "-l", "-t", "sess:win", "--", "hello"],
+            check=True,
+        )
+        # send-keys Enter
+        assert calls[1] == call(
+            ["tmux", "send-keys", "-t", "sess:win", "C-m"],
+            check=True,
+        )
+
+    def test_send_keys_without_paste_buffer_chunks_large_message(self, client, mock_subprocess):
+        """Literal sends chunk above the tmux command-message ceiling.
+
+        tmux rejects a single oversized command message ("command too long",
+        ~16 KB on tmux 3.4), so a 50,000-byte payload must arrive as several
+        send-keys -l calls whose concatenation reproduces the message.
+        """
+        msg = "X" * 50000
+        client.send_keys("sess", "win", msg, use_paste_buffer=False)
+
+        calls = payload_calls(mock_subprocess)
+        literal_calls = [c for c in calls if c[0][0][2] == "-l"]
+        assert len(literal_calls) > 1
+        for c in literal_calls:
+            assert len(c[0][0][-1].encode("utf-8")) <= 8000
+        assert "".join(c[0][0][-1] for c in literal_calls) == msg
+        # Enter is still emitted once, after all chunks.
+        assert calls[-1] == call(
+            ["tmux", "send-keys", "-t", "sess:win", "C-m"],
+            check=True,
+        )
+
+    def test_send_keys_without_paste_buffer_chunks_on_character_boundary(
+        self, client, mock_subprocess
+    ):
+        """Chunk boundaries never split a multi-byte UTF-8 character."""
+        # 'é' is 2 bytes; a naive byte cut at the limit could bisect it.
+        msg = "X" * 7999 + "é" + "Y" * 8000
+        client.send_keys("sess", "win", msg, use_paste_buffer=False)
+
+        literal_calls = [c for c in payload_calls(mock_subprocess) if c[0][0][2] == "-l"]
+        assert len(literal_calls) > 1
+        assert "".join(c[0][0][-1] for c in literal_calls) == msg
+
+    def test_send_keys_without_paste_buffer_resolves_pane_target(self, mock_subprocess):
+        """In pane mode the literal path must target the resolved pane id.
+
+        ``terminal.spawn_mode=pane`` gives every terminal the same window name
+        (the host window), with the terminal's own name living on the pane's
+        ``@cao_terminal`` mark — addressing ``session:window_name`` then fails
+        with ``can't find window``, or worse lands in a sibling pane.
+        """
+        with patch("cli_agent_orchestrator.clients.tmux.libtmux"):
+            client = TmuxClient(pane_mode=True)
+        with patch.object(client, "_send_target", return_value="%4") as send_target:
+            client.send_keys("sess", "coder-3", "hello", use_paste_buffer=False)
+
+        send_target.assert_called_once_with("sess", "coder-3")
+        calls = payload_calls(mock_subprocess)
+        assert calls[0] == call(
+            ["tmux", "send-keys", "-l", "-t", "%4", "--", "hello"],
+            check=True,
+        )
+        assert calls[1] == call(
+            ["tmux", "send-keys", "-t", "%4", "C-m"],
+            check=True,
+        )
+
 
 class TestSendKeysNoHandCraftedMarkersOnModernTmux:
     """Regression tests for issue #413 (tmux >= 3.7).

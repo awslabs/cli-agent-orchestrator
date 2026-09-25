@@ -387,6 +387,30 @@ def _tmux_server_liveness(socket_path: str) -> str:
     return _SERVER_UNKNOWN
 
 
+# tmux caps a single client command message (argv payload included): measured
+# on tmux 3.4, an 8000-byte ``send-keys -l`` payload passes while 16500 fails
+# with "command too long". Literal sends are chunked well under that ceiling.
+_SEND_KEYS_LITERAL_CHUNK_BYTES = 8000
+
+
+def _literal_key_chunks(text: str, limit: int = _SEND_KEYS_LITERAL_CHUNK_BYTES):
+    """Yield ``text`` in slices whose UTF-8 encoding stays under ``limit`` bytes.
+
+    ``send-keys -l`` cannot split a multi-byte character across two invocations,
+    so chunks are cut on character boundaries rather than at a raw byte offset.
+    """
+    start = 0
+    size = 0
+    for i, ch in enumerate(text):
+        width = len(ch.encode("utf-8"))
+        if size + width > limit:
+            yield text[start:i]
+            start, size = i, 0
+        size += width
+    if start < len(text):
+        yield text[start:]
+
+
 class TmuxClient:
     """Simplified tmux client for basic operations."""
 
@@ -1312,6 +1336,7 @@ class TmuxClient:
         enter_count: int = 1,
         force_bracketed_paste: bool = False,
         submit_delay: float = 0.3,
+        use_paste_buffer: bool = True,
     ) -> None:
         """Send keys to window using tmux paste-buffer for instant delivery.
 
@@ -1365,7 +1390,51 @@ class TmuxClient:
                 into a receiving TUI). Do NOT set for shell commands sent
                 to bash during initialization (bash 4.x would receive the
                 literal escape sequences on tmux < 3.7).
+            submit_delay: Seconds to wait after pasting before sending Enter.
+                Some TUIs need time to process bracketed-paste end sequences.
+            use_paste_buffer: If False, use send-keys instead of paste-buffer.
+                Some CLIs (e.g., Devin CLI) don't support paste-buffer for user input.
         """
+        # If paste-buffer is disabled, use send-keys instead (for user input)
+        if not use_paste_buffer:
+            logger.info(
+                f"send_keys (via send-keys): {session_name}:{window_name} - keys length: {len(keys)}"
+            )
+            logger.debug(f"send_keys (via send-keys): {session_name}:{window_name} - keys: {keys}")
+            # Validate session and window names to prevent command injection
+            validated_session = validate_tmux_name(session_name, "session_name")
+            validated_window = validate_tmux_name(window_name, "window_name")
+            # Same resolution as the paste path: in pane mode the window_name
+            # is the terminal's @cao_terminal mark, not a tmux window, so the
+            # literal-key commands must target the resolved pane id.
+            target = self._send_target(validated_session, validated_window)
+            # A pane sitting in copy mode consumes send-keys through the mode's
+            # key table instead of delivering them — cancel any active mode
+            # first, same as the paste-buffer path below (#654).
+            subprocess.run(
+                ["tmux", "send-keys", "-t", target, "-X", "cancel"],
+                check=False,
+                capture_output=True,
+            )
+            # Send the text literally, then emit C-m separately for each Enter.
+            # tmux rejects a single oversized command message, so the payload is
+            # chunked on character boundaries; each send-keys -l appends without
+            # submitting. Use '--' so a payload beginning with '-' is not parsed
+            # as an option.
+            for chunk in _literal_key_chunks(keys):
+                subprocess.run(
+                    ["tmux", "send-keys", "-l", "-t", target, "--", chunk],
+                    check=True,
+                )
+            for i in range(enter_count):
+                subprocess.run(
+                    ["tmux", "send-keys", "-t", target, "C-m"],
+                    check=True,
+                )
+                if i < enter_count - 1:
+                    time.sleep(0.1)
+            return
+
         # Defence-in-depth: re-validate at the sink even though callers
         # validate at the API/MCP boundary. Both halves flow into a
         # tmux subprocess argument (-t target), and tmux itself parses

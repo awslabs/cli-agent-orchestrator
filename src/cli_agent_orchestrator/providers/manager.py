@@ -12,6 +12,7 @@ from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
 from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
 from cli_agent_orchestrator.providers.cursor_cli import CursorCliProvider
+from cli_agent_orchestrator.providers.devin_cli import DevinCliProvider
 from cli_agent_orchestrator.providers.grok_cli import GrokCliProvider
 from cli_agent_orchestrator.providers.hermes import HermesProvider
 from cli_agent_orchestrator.providers.kimi_cli import (
@@ -183,6 +184,15 @@ class ProviderManager:
                     skill_prompt=skill_prompt,
                     model=model,
                 )
+            elif provider_type == ProviderType.DEVIN_CLI.value:
+                provider = DevinCliProvider(
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    agent_profile,
+                    allowed_tools,
+                    skill_prompt=skill_prompt,
+                )
             # --- Credentials-free mock provider (test/CI infrastructure) ---
             elif provider_type == ProviderType.MOCK_CLI.value:
                 provider = MockCliProvider(
@@ -255,7 +265,7 @@ class ProviderManager:
                 "CAO can resolve and store the active Kimi CLI dialect."
             )
 
-        # Create provider on-demand
+        # Create provider on-demand, restoring the persisted tool restrictions.
         provider = self.create_provider(
             metadata["provider"],
             terminal_id,
@@ -264,6 +274,7 @@ class ProviderManager:
             metadata["agent_profile"],
             engine=persisted_engine,
             provider_variant=metadata.get("provider_variant"),
+            allowed_tools=metadata.get("allowed_tools"),
         )
         # Restore shell_command baseline from DB so get_status() can detect kiro exit.
         # The terminal already exists in the DB, so its CLI has long since
