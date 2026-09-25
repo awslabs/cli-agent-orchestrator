@@ -707,28 +707,21 @@ class TestPollUntilDoneTurnGate:
         """The same gate on the IDLE path, which three stale reads would satisfy."""
         from cli_agent_orchestrator.utils.terminal import poll_until_done
 
-        seq = [self._resp("idle", turn_completed=4)] * 5 + [
-            self._resp("idle", turn_completed=5)
-        ] * 3
+        seq = [self._resp("idle", turn_completed=4)] * 5 + [self._resp("idle", turn_completed=5)]
         with (
             patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
             patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
         ):
             g.side_effect = seq
             poll_until_done("abcd1234", timeout=60, polling_interval=0, min_turn=5)
-            # All eight consumed: the five stale idles accumulated nothing toward
-            # idle_stable_polls, so the window had to be earned again from our own
-            # turn's readings. IDLE stays ambiguous after the gate opens, so the
-            # stable window is still required -- the gate adds a condition, it does
-            # not replace one.
-            assert g.call_count == 8
+            # The five stale idles satisfy nothing; the FIRST reading that confirms
+            # our turn finished returns immediately — the server's confirmation IS
+            # "done", and the frame may already belong to a newer queued turn.
+            assert g.call_count == 6
 
     def test_a_turn_never_seen_working_still_returns(self):
-        """A turn short enough that no poll caught it working must not hang.
-
-        `turn_completed` reaching min_turn is stronger evidence than a PROCESSING
-        sighting, so it has to satisfy the "has the agent started?" gate the IDLE
-        path needs. Without this the fix would trade a wrong answer for a hang.
+        """A turn short enough that no poll caught it working must not hang:
+        the server's confirmation is sufficient on its own, first reading.
         """
         from cli_agent_orchestrator.utils.terminal import poll_until_done
 
@@ -739,7 +732,47 @@ class TestPollUntilDoneTurnGate:
         ):
             g.side_effect = seq
             poll_until_done("abcd1234", timeout=60, polling_interval=0, min_turn=1)
-            assert g.call_count == 3
+            assert g.call_count == 1
+
+    def test_confirmation_returns_even_while_a_newer_turn_is_running(self):
+        """Once the server confirms OUR turn finished, the waiter must not block on
+        the terminal looking done: InboxService delivers the next queued message the
+        instant a turn closes, so the frame reads PROCESSING for someone else's work
+        — and waiting it out would eventually hand back their answer
+        (PR #812 review)."""
+        from cli_agent_orchestrator.utils.terminal import poll_until_done
+
+        seq = [
+            self._resp("processing", turn_completed=1, turn=2),  # ours, in flight
+            self._resp("processing", turn_completed=2, turn=3),  # ours done; next queued
+        ]
+        with (
+            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
+        ):
+            g.side_effect = seq
+            poll_until_done("abcd1234", timeout=60, polling_interval=0, min_turn=2)
+            assert g.call_count == 2
+
+    def test_a_counter_reset_falls_back_to_the_frame_heuristic(self):
+        """cao-server's turn counters are in-memory. After a restart they read 0,
+        so `turn_completed >= min_turn` can never be satisfied and the gate would
+        burn the caller's whole timeout. The POST that returned min_turn proves the
+        counter was at least that high, so a server turn BELOW min_turn is proof of
+        a reset — fall back to the frame heuristic (PR #812 review)."""
+        from cli_agent_orchestrator.utils.terminal import poll_until_done
+
+        seq = [
+            self._resp("completed", turn_completed=0, turn=0),  # restarted server
+        ]
+        with (
+            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
+        ):
+            g.side_effect = seq
+            poll_until_done("abcd1234", timeout=60, polling_interval=0, min_turn=5)
+            # Heuristic path: COMPLETED returns immediately, same reading.
+            assert g.call_count == 1
 
     def test_a_server_that_reports_no_turn_falls_back_to_the_frame_heuristic(self):
         """An older server (or an un-upgraded worker node) must not hang."""

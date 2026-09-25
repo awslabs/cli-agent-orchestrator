@@ -2066,9 +2066,13 @@ class TestSendInput:
         mock_provider.paste_enter_count = 2
         mock_provider.paste_submit_delay = 0.3
 
+        mock_status_monitor.notify_input_sent.return_value = 7
+
         result = send_input("test1234", "test message")
 
-        assert result is True
+        # send_input returns the exact turn its dispatch opened (#812 review):
+        # the number notify_input_sent produced, not a re-derived one.
+        assert result == 7
         mock_tmux.send_keys.assert_called_once_with(
             "cao-session",
             "developer-abcd",
@@ -2227,9 +2231,11 @@ class TestSendInput:
         mock_provider.paste_enter_count = 1
         mock_provider.paste_submit_delay = 0.3
 
+        mock_status_monitor.notify_input_sent.return_value = 3
+
         result = send_input("test1234", "1")
 
-        assert result is True
+        assert result == 3
         mock_tmux.send_keys.assert_called_once_with(
             "cao-session",
             "developer-abcd",

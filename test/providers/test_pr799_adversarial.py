@@ -3239,7 +3239,8 @@ class TestPR799CurrentMaintainerReview:
         monkeypatch.setattr(ts.provider_manager, "get_provider", lambda _: provider)
         monkeypatch.setattr(ts, "inject_memory_context", lambda message, *_: message)
         monkeypatch.setattr(ts, "update_last_active", lambda _: None)
-        assert ts.send_input(provider.terminal_id, "New task") is True
+        # send_input returns the turn its dispatch opened (#735/#812): first send == 1.
+        assert ts.send_input(provider.terminal_id, "New task") == 1
         assert ts._worker_is_started_direct(provider.terminal_id, provider) is new_activity
         assert provider._execution_observed is new_activity
         resend = MagicMock()
@@ -3439,7 +3440,8 @@ class TestPR799CurrentMaintainerReview:
         monkeypatch.setattr(monitor, "_schedule_screen_detection", lambda *_: None)
         monkeypatch.setattr(ts, "inject_memory_context", lambda message, *_: message)
         monkeypatch.setattr(ts, "update_last_active", lambda _: None)
-        assert ts.send_input(provider.terminal_id, "New task") is True
+        # send_input returns the turn its dispatch opened (#735/#812): first send == 1.
+        assert ts.send_input(provider.terminal_id, "New task") == 1
         if delivery.startswith("large"):
             assert len(monitor.get_buffer(provider.terminal_id)) == 32768
             assert activity.strip() not in monitor.get_buffer(provider.terminal_id)

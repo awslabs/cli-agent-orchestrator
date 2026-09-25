@@ -636,7 +636,9 @@ class TestMessagePluginEvents:
             orchestration_type=orchestration_type,
         )
 
-        assert delivered is True
+        # send_input returns the turn its dispatch opened (#735/#812);
+        # truthiness is the delivery signal (the monitor is mocked here).
+        assert delivered
         assert call_order[-1] == "dispatch"
         event_type, event = registry.dispatch.await_args.args
         assert event_type == "post_send_message"
