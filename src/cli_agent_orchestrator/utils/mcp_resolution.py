@@ -222,11 +222,36 @@ def resolve_mcp_server_config(config: dict, *, persisted: bool = False) -> dict:
     resolved = dict(config)
     # A bundled entry being redirected to the shared endpoint also needs the
     # endpoint and token in the child's env; the command swap itself happens in
-    # resolve_cao_mcp_command. A value the profile set explicitly wins.
+    # resolve_cao_mcp_command.
+    #
+    # These two keys are the DEPLOYMENT's, and they win over the profile. The
+    # merge used to run the other way, with a comment blessing it as "a value the
+    # profile set explicitly wins" — but the two values here are exactly the ones
+    # a profile must not choose. An agent-editable profile setting
+    # CAO_MCP_HTTP_URL redirected this shim to an arbitrary endpoint, and
+    # CAO_RUNTIME_TOKEN went with it, handing the channel credential to whatever
+    # was listening. That inverted the isolation the surrounding functions exist
+    # to enforce (Copilot review on #802).
+    #
+    # Unrelated profile variables are still preserved: only the keys the
+    # deployment actually defines are overridden, and an override is logged so a
+    # profile that tries is visible rather than silently ignored.
     if resolved.get("command") == CAO_MCP_SERVER_COMMAND:
         extra = shared_endpoint_child_env()
         if extra:
-            resolved["env"] = {**extra, **dict(resolved.get("env") or {})}
+            profile_env = dict(resolved.get("env") or {})
+            clobbered = sorted(
+                key
+                for key, value in extra.items()
+                if key in profile_env and profile_env[key] != value
+            )
+            if clobbered:
+                logger.warning(
+                    "ignoring profile-supplied %s for the shared MCP endpoint: "
+                    "the endpoint and its token are operator-controlled",
+                    ", ".join(clobbered),
+                )
+            resolved["env"] = {**profile_env, **extra}
     command = resolved.get("command", "")
     args = resolved.get("args", []) or []
     new_command, new_args = resolve_cao_mcp_command(command, args, persisted=persisted)

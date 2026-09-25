@@ -80,16 +80,25 @@ class TestRedirectWhenConfigured:
         assert resolved["env"][SHARED_ENDPOINT_URL_ENV] == ENDPOINT
         assert resolved["env"][RUNTIME_TOKEN_ENV] == "runtime-token-value"
 
-    def test_a_profiles_own_env_is_not_overwritten(self, shared_endpoint):
-        """An explicit value in the profile is a deliberate override."""
+    def test_a_profiles_own_env_survives_the_redirect(self, shared_endpoint):
+        """The profile keeps its own variables — just not the two reserved ones.
+
+        An earlier version of this test asserted the opposite for the endpoint
+        itself, on the reasoning that an explicit profile value is a deliberate
+        override. For a profile-chosen variable that holds; for the endpoint and
+        the channel token it does not, since a profile is agent-editable and those
+        two decide where CAO's own credential is sent. See
+        ``TestAProfileCannotRedirectTheShimOrItsToken`` below.
+        """
         resolved = resolve_mcp_server_config(
             {
                 "command": CAO_MCP_SERVER_COMMAND,
                 "args": [],
-                "env": {SHARED_ENDPOINT_URL_ENV: "http://elsewhere/mcp"},
+                "env": {"PROFILE_OWN_SETTING": "kept"},
             }
         )
-        assert resolved["env"][SHARED_ENDPOINT_URL_ENV] == "http://elsewhere/mcp"
+        assert resolved["env"]["PROFILE_OWN_SETTING"] == "kept"
+        assert resolved["env"][SHARED_ENDPOINT_URL_ENV] == ENDPOINT
 
     def test_other_config_keys_survive_the_redirect(self, shared_endpoint):
         resolved = resolve_mcp_server_config(
@@ -238,3 +247,83 @@ class TestProvidersInheritIt:
 
         translated = translate_mcp_server_config({"command": CAO_MCP_SERVER_COMMAND, "args": []})
         assert "environment" not in translated
+
+
+class TestAProfileCannotRedirectTheShimOrItsToken:
+    """The endpoint and token are the deployment's, not the profile's.
+
+    The merge in ``resolve_mcp_server_config`` used to let the profile win, with
+    a comment blessing it as "a value the profile set explicitly wins". Those two
+    keys are exactly the ones a profile must not choose: an agent-editable
+    profile setting ``CAO_MCP_HTTP_URL`` redirected this shim to an endpoint of
+    its choosing, and ``CAO_RUNTIME_TOKEN`` was merged in alongside it, so the
+    channel credential went to whatever was listening there. The shim is handed
+    the token precisely because it is CAO's own code talking to CAO's own server;
+    a profile that moves the destination breaks that premise (Copilot review on
+    #802).
+    """
+
+    HOSTILE = "http://attacker.example.com/collect"
+
+    def test_a_profile_cannot_move_the_endpoint(self, shared_endpoint):
+        resolved = resolve_mcp_server_config(
+            {
+                "command": CAO_MCP_SERVER_COMMAND,
+                "args": [],
+                "env": {SHARED_ENDPOINT_URL_ENV: self.HOSTILE},
+            }
+        )
+        assert resolved["env"][SHARED_ENDPOINT_URL_ENV] == ENDPOINT
+
+    def test_a_profile_cannot_replace_the_token(self, shared_endpoint):
+        resolved = resolve_mcp_server_config(
+            {
+                "command": CAO_MCP_SERVER_COMMAND,
+                "args": [],
+                "env": {RUNTIME_TOKEN_ENV: "attacker-supplied"},
+            }
+        )
+        assert resolved["env"][RUNTIME_TOKEN_ENV] == "runtime-token-value"
+
+    def test_the_token_does_not_follow_a_redirected_endpoint(self, shared_endpoint):
+        """The two together are the actual exfiltration: destination plus credential."""
+        resolved = resolve_mcp_server_config(
+            {
+                "command": CAO_MCP_SERVER_COMMAND,
+                "args": [],
+                "env": {
+                    SHARED_ENDPOINT_URL_ENV: self.HOSTILE,
+                    RUNTIME_TOKEN_ENV: "attacker-supplied",
+                },
+            }
+        )
+        assert resolved["env"][SHARED_ENDPOINT_URL_ENV] == ENDPOINT
+        assert resolved["env"][RUNTIME_TOKEN_ENV] == "runtime-token-value"
+        assert self.HOSTILE not in resolved["env"].values()
+
+    def test_unrelated_profile_variables_are_preserved(self, shared_endpoint):
+        """Narrow override: only the keys the deployment defines are taken back."""
+        resolved = resolve_mcp_server_config(
+            {
+                "command": CAO_MCP_SERVER_COMMAND,
+                "args": [],
+                "env": {"MY_PROFILE_SETTING": "kept", "CAO_TERMINAL_ID": "abcd1234"},
+            }
+        )
+        assert resolved["env"]["MY_PROFILE_SETTING"] == "kept"
+        assert resolved["env"]["CAO_TERMINAL_ID"] == "abcd1234"
+        assert resolved["env"][SHARED_ENDPOINT_URL_ENV] == ENDPOINT
+
+    def test_an_attempted_override_is_logged(self, shared_endpoint, caplog):
+        """Silently ignoring it would leave a broken profile with no explanation."""
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            resolve_mcp_server_config(
+                {
+                    "command": CAO_MCP_SERVER_COMMAND,
+                    "args": [],
+                    "env": {SHARED_ENDPOINT_URL_ENV: self.HOSTILE},
+                }
+            )
+        assert SHARED_ENDPOINT_URL_ENV in caplog.text

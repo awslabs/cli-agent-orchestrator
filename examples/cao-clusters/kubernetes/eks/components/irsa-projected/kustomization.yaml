@@ -1,25 +1,32 @@
-# Projected web-identity credentials for the server and supervisor pods.
+# Projected web-identity credentials for the SUPERVISOR pod only.
 #
-# The default path gives the agent pods AWS credentials through EKS Pod Identity
-# associations, which the CloudFormation template creates. A cluster this repo
-# did not provision has no such associations, and on some clusters neither
-# injector runs at all: annotating the service account does nothing because the
-# IRSA webhook is absent, and the Pod Identity agent injects nothing either. The
-# pod then has no credentials and every model call fails with an error that names
-# the NODE role, which reads like a Bedrock problem rather than a missing
-# association.
+# The default path gives the execution pods AWS credentials through EKS Pod
+# Identity associations, which the CloudFormation template creates. A cluster
+# this repo did not provision has no such associations, and on some clusters
+# neither injector runs at all: annotating the service account does nothing
+# because the IRSA webhook is absent, and the Pod Identity agent injects nothing
+# either. The pod then has no credentials and every model call fails with an
+# error that names the NODE role, which reads like a Bedrock problem rather than
+# a missing association.
 #
 # A projected `serviceAccountToken` volume needs no webhook and no addon — the
 # kubelet mints the token — so it works on any cluster with an OIDC provider
 # registered. deploy.sh enables this component when CAO_AGENT_IRSA_ROLE_ARN is
 # set, and renders the ARN into <irsa-role-arn>.
 #
+# NOT applied to cao-server, deliberately. The server is the control plane: no
+# provider CLI runs there, it makes exactly one outbound call (the broker's lease
+# API), and its base manifest carries no AWS credentials at all. An earlier
+# version of this component patched it too, which handed the pod holding the
+# database a model-invocation role it never uses — a privilege expansion with no
+# caller behind it (Copilot review on #802). If the server ever does need AWS
+# access, it needs its own narrowly scoped role, not the agents' one.
+#
 # The role's trust policy needs sts:AssumeRoleWithWebIdentity from the cluster's
 # OIDC provider, conditioned on `:aud = sts.amazonaws.com` and a `:sub` matching
-# `system:serviceaccount:cao-cluster:cao-*`. The broker has the equivalent switch
-# for the worker pods it mints: CAO_ELASTIC_WORKER_IRSA_ROLE_ARN.
+# the supervisor's service account. The broker has the equivalent switch for the
+# worker pods it mints: CAO_ELASTIC_WORKER_IRSA_ROLE_ARN.
 apiVersion: kustomize.config.k8s.io/v1alpha1
 kind: Component
 patches:
-  - path: server-irsa.yaml
   - path: supervisor-irsa.yaml
