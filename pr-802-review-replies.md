@@ -1078,3 +1078,62 @@ rather than reported: `unbind_terminal` called `put_nowait` on a loop-owned
 the EOF could fail to wake the relay; `_attach_sinks` was the one registry map
 outside the lock; and a reconnect whose hello abandoned a terminal never EOFed its
 sink, so that client parked forever. All three fixed.
+
+# Replies: placement atomicity and the inherited working directory
+
+**`4104866574` — lock placement reads and routing decisions atomically.** Correct,
+and worth saying that an earlier verification pass of mine looked at this exact
+code and cleared it, on the grounds that `is_remote` and `runtime_for_terminal`
+are each a single atomic dict lookup. That was true and beside the point: callers
+ask BOTH, in sequence, from worker threads while the channel loop binds and
+unbinds the same map. A bind landing between the two calls makes a terminal look
+remote and then yield no runtime; an unbind routes a deleted terminal on stale
+placement.
+
+Both fast-path reads now take the lock, and `placement()` returns
+`(is_remote, runtime_id)` from one acquisition, deriving both answers from a single
+durable-row read rather than reading the row twice. The two call sites that
+actually pair the questions use it. The DB read stays outside the lock
+deliberately — holding it across I/O would let one slow query stall the channel
+loop, and a binding appearing meanwhile only makes the answer more remote, never
+less. One test drives the interleaving and asserts the impossible pair
+`(remote, None)` never escapes.
+
+**`4111169205` — resolve caller working directory before remote launch.** Correct,
+and it is a consequence of the control-plane image split added in this PR rather
+than a pre-existing bug: once the server runs without tmux,
+`GET /terminals/{caller}/working-directory` cannot answer at all, because it
+queries the local backend unconditionally. The value then reached the remote launch
+as `None` and the bridge used its own process cwd, so a worker could start outside
+the caller's checkout and `use_worktree` could select the wrong repository.
+
+Fixed at both ends. `get_working_directory` no longer probes local tmux for a
+REMOTE terminal — that is the same mistake the placement findings were about — and
+returns the recorded launch directory instead; for a local terminal it still
+prefers the live pane, since the agent may have `cd`'d, but a backend failure falls
+back rather than reporting "no directory". And the forward site inherits the
+caller's recorded cwd when one is omitted.
+
+The recorded value is the trusted one you suggested persisting, and it turned out
+to already exist: `terminals.working_directory` is written by the launch paths and
+was simply never read. An explicit cwd is never overridden, and an unreadable
+caller row degrades to the previous behaviour rather than refusing the launch.
+
+**On the shape of this review cycle.** Five of my fixes in this PR were wrong or
+incomplete and generated follow-up findings: the persisted token took five rounds
+because I fixed the helper instead of enumerating its call sites; the handshake
+send-gate shipped with no `set()`, so every command result was silently dropped
+until a live cluster run surfaced it as a 504; the resume-generation fix read a
+position after the call that zeroed it and turned one-off output loss into
+recurring loss; the gap/watermark area took three attempts because each derived a
+decision from an aggregate drop count on a shared fanout; and a comment asserted
+token isolation that the tmux environment forwarding contradicts.
+
+The common cause is that I reasoned about each change rather than proving the
+changed code runs and enumerating what else touches it — and a green suite gave me
+false confidence in all five cases. Two habits now applied: no fix claimed without
+first proving the test fails without it, and for any shared helper or default
+argument, every call site enumerated before calling it fixed. On the gap/watermark
+area specifically I should have stopped after the first attempt and said that the
+bus has no per-consumer delivery tracking, so making loss observable is a design
+decision rather than a patch.

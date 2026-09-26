@@ -164,3 +164,72 @@ async def test_a_remote_caller_whose_placement_is_unreadable_is_not_launched_loc
     assert exc.value.status_code == 503
     mock_launch.assert_not_awaited()
     mock_service.create_terminal.assert_not_called()
+
+
+@pytest.mark.asyncio
+@patch("cli_agent_orchestrator.runtime_channel.api.launch_remote_terminal", new_callable=AsyncMock)
+@patch("cli_agent_orchestrator.api.main.terminal_service")
+@patch("cli_agent_orchestrator.api.main.runtime_registry")
+@patch("cli_agent_orchestrator.api.main.get_terminal_metadata")
+async def test_an_omitted_cwd_inherits_the_callers_recorded_directory(
+    mock_meta, mock_registry, mock_service, mock_launch
+):
+    """Forwarding None let the bridge use its own process cwd.
+
+    The worker then started outside the caller's checkout, where `use_worktree`
+    can select the wrong repository. The MCP path used to resolve this through
+    `GET /terminals/{caller}/working-directory`, which asks local tmux and fails on
+    a control-plane server that has none (Copilot review on #802).
+    """
+    mock_registry.is_remote.return_value = True
+    mock_registry.runtime_for_terminal.return_value = RUNTIME
+    mock_registry.placement.return_value = (True, RUNTIME)
+    mock_launch.return_value = _remote_terminal()
+    mock_meta.return_value = {"working_directory": "/home/cao/checkout"}
+
+    await _call(working_directory=None)
+
+    body = mock_launch.call_args.args[1]
+    assert body.working_directory == "/home/cao/checkout"
+
+
+@pytest.mark.asyncio
+@patch("cli_agent_orchestrator.runtime_channel.api.launch_remote_terminal", new_callable=AsyncMock)
+@patch("cli_agent_orchestrator.api.main.terminal_service")
+@patch("cli_agent_orchestrator.api.main.runtime_registry")
+@patch("cli_agent_orchestrator.api.main.get_terminal_metadata")
+async def test_an_explicit_cwd_is_not_overridden_by_the_callers(
+    mock_meta, mock_registry, mock_service, mock_launch
+):
+    """Inheritance is for the OMITTED case only."""
+    mock_registry.is_remote.return_value = True
+    mock_registry.runtime_for_terminal.return_value = RUNTIME
+    mock_registry.placement.return_value = (True, RUNTIME)
+    mock_launch.return_value = _remote_terminal()
+    mock_meta.return_value = {"working_directory": "/home/cao/checkout"}
+
+    await _call(working_directory="/explicit/path")
+
+    body = mock_launch.call_args.args[1]
+    assert body.working_directory == "/explicit/path"
+
+
+@pytest.mark.asyncio
+@patch("cli_agent_orchestrator.runtime_channel.api.launch_remote_terminal", new_callable=AsyncMock)
+@patch("cli_agent_orchestrator.api.main.terminal_service")
+@patch("cli_agent_orchestrator.api.main.runtime_registry")
+@patch("cli_agent_orchestrator.api.main.get_terminal_metadata")
+async def test_an_unreadable_caller_row_does_not_block_the_launch(
+    mock_meta, mock_registry, mock_service, mock_launch
+):
+    """Losing the inherited cwd is a worse default, not a reason to refuse work."""
+    mock_registry.is_remote.return_value = True
+    mock_registry.runtime_for_terminal.return_value = RUNTIME
+    mock_registry.placement.return_value = (True, RUNTIME)
+    mock_launch.return_value = _remote_terminal()
+    mock_meta.side_effect = RuntimeError("database unreachable")
+
+    await _call(working_directory=None)
+
+    body = mock_launch.call_args.args[1]
+    assert body.working_directory is None

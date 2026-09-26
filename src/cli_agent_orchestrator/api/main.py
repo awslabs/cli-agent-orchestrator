@@ -3726,6 +3726,27 @@ async def create_terminal_in_session(
                         "currently unavailable; retry"
                     ),
                 )
+        # An OMITTED working directory must not travel to the runtime as None: the
+        # bridge would then use its own process cwd and start the worker outside
+        # the caller's checkout, where `use_worktree` can pick the wrong repository.
+        # The shared MCP path used to resolve this through
+        # GET /terminals/{caller}/working-directory, which asks local tmux and
+        # therefore fails on a control-plane server that has none (Copilot review on
+        # #802). Inherit the caller's RECORDED launch directory instead — server
+        # state, not something the agent can rewrite.
+        remote_working_directory = working_directory
+        if remote_working_directory is None and caller_id:
+            try:
+                caller_row = await asyncio.to_thread(get_terminal_metadata, caller_id)
+                remote_working_directory = (caller_row or {}).get("working_directory")
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "could not read the recorded working directory for caller %s; "
+                    "the runtime will choose its own",
+                    caller_id,
+                    exc_info=True,
+                )
+
         if caller_runtime is not None:
             from cli_agent_orchestrator.runtime_channel.api import (
                 CreateRemoteTerminalBody,
@@ -3756,7 +3777,7 @@ async def create_terminal_in_session(
                     agent_profile=agent_profile,
                     session_name=session_name,
                     new_session=False,
-                    working_directory=working_directory,
+                    working_directory=remote_working_directory,
                     model=model,
                     caller_id=caller_id,
                     allowed_tools=allowed_tools_list,

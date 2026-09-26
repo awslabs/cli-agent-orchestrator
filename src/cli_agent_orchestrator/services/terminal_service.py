@@ -2245,10 +2245,36 @@ def get_working_directory(terminal_id: str) -> Optional[str]:
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
-        working_dir = get_backend().get_pane_working_directory(
-            metadata["tmux_session"], metadata["tmux_window"]
-        )
-        return working_dir
+        # A REMOTE terminal's pane lives in its executor, not here. Probing local
+        # tmux for it is the same mistake the placement findings were about, and on
+        # a control-plane server there is no tmux at all — so this raised, the
+        # shared MCP path saw the failure as "no working directory", and an
+        # assign/handoff forwarded `None`. The bridge then used its own process cwd,
+        # starting the worker outside the caller's checkout, where `use_worktree`
+        # can select the wrong repository (Copilot review on #802).
+        #
+        # The launch-time cwd is already persisted on the row, which is the trusted
+        # value for exactly this: it is what the server recorded when it placed the
+        # terminal, and no agent can rewrite it.
+        from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
+
+        if runtime_registry.is_remote(terminal_id):
+            return metadata.get("working_directory")
+
+        try:
+            return get_backend().get_pane_working_directory(
+                metadata["tmux_session"], metadata["tmux_window"]
+            )
+        except Exception:
+            # The live pane is the better answer when it is available (the agent may
+            # have cd'd), but a backend that cannot answer must not turn into "no
+            # directory" — fall back to what the row recorded.
+            logger.warning(
+                "could not read the live pane cwd for %s; using the recorded " "launch directory",
+                terminal_id,
+                exc_info=True,
+            )
+            return metadata.get("working_directory")
 
     except Exception as e:
         logger.error(f"Failed to get working directory for terminal {terminal_id}: {e}")
