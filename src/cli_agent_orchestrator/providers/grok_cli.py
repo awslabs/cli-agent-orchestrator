@@ -32,20 +32,38 @@ from typing import Any, Literal, Optional
 
 import psutil
 
+from cli_agent_orchestrator.agent_plugins.mcp_delivery import with_plugin_mcp as _with_plugin_mcp
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
+from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 from cli_agent_orchestrator.utils.terminal import wait_for_shell
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
+from cli_agent_orchestrator.utils.tool_mapping import granted_mcp_servers
 
 logger = logging.getLogger(__name__)
 
 
 class ProviderError(Exception):
     """Exception raised for Grok CLI provider-specific errors."""
+
+
+#: CAO transport name → the ``type`` value Grok's TOML expects.
+#:
+#: The two vocabularies differ: CAO (and the Agent Plugins ``mcp.json`` schema)
+#: uses the MCP spec's ``streamable-http``, while Grok names the same transport
+#: ``http``. Translating rather than passing the value straight through is what
+#: lets ``grok_cli`` be listed as carrying all transports: without this map a
+#: plugin's perfectly valid ``streamable-http`` server reached
+#: ``_render_mcp_config`` and raised, taking terminal creation down with it.
+GROK_URL_TRANSPORTS: dict[str, str] = {
+    "streamable-http": "http",
+    "http": "http",
+    "sse": "sse",
+}
 
 
 # Render-stable current-turn signals from Grok Build 1.0.0.
@@ -97,6 +115,33 @@ ERROR_PATTERN = re.compile(
     r"Unknown model|Model .* (?:not found|unavailable))",
     re.IGNORECASE | re.MULTILINE,
 )
+# Footers grok 1.0.13 draws beneath a selectable picker.  Deliberately kept out
+# of ``WAITING_USER_PATTERN``: that branch is ordered only against completion
+# and ready evidence, and these shapes are also what the usage-limit picker
+# prints, so a picker an erase/redraw already replaced could report
+# WAITING_USER_ANSWER over a live turn.  ``get_status`` classifies them through
+# its own check, ordered against newer processing evidence too.
+PICKER_ANSWER_FOOTER_PATTERN = re.compile(r"(?:Tab:next answer|Enter:submit)", re.IGNORECASE)
+# Any footer that proves a picker was drawn in the frame -- the 1.0.13 shapes
+# plus the ``n/m:select`` footer ``WAITING_USER_PATTERN`` already knows.  Used
+# below only as the structural companion of the usage-limit refusal line.
+PICKER_FOOTER_PATTERN = re.compile(
+    r"(?:Tab:next answer|Enter:submit|\d+/\d+:select)", re.IGNORECASE
+)
+# Usage-limit refusal (grok 1.0.13).  It is not an ``Error:`` line; it is drawn
+# inside the picker box that offers "Upgrade tier" / "Buy more credits" /
+# "Try Again":
+#
+#     ┃  You hit your weekly limit.
+#     ┃  1 (○) Upgrade tier      Upgrade to a higher tier for more usage
+#     ┃  ↑/↓ navigate · y copy                                    Enter:submit
+#     Tab:next answer  │  Esc:scrollback  │  Shift+x:dismiss
+#
+# Requiring the box glyph on the refusal line keeps ordinary assistant prose
+# that quotes the sentence from matching; ``get_status`` additionally requires
+# a ``PICKER_FOOTER_PATTERN`` footer after the line, so only a drawn picker is
+# classified, and orders the whole structure against every newer status signal.
+USAGE_LIMIT_PATTERN = re.compile(r"┃[ \t]*You hit your weekly limit", re.IGNORECASE)
 
 _STATUS_TAIL_CHARS = 8192
 _COMPLETION_TO_READY_MAX_CHARS = 4096
@@ -193,7 +238,9 @@ class GrokCliProvider(BaseProvider):
         if self._agent_profile is None:
             return None
         try:
-            return load_agent_profile(self._agent_profile)
+            return _with_plugin_mcp(
+                load_agent_profile(self._agent_profile), ProviderType.GROK_CLI.value
+            )
         except Exception:
             return None
 
@@ -201,7 +248,9 @@ class GrokCliProvider(BaseProvider):
         if self._agent_profile is None:
             return None
         try:
-            return load_agent_profile(self._agent_profile)
+            return _with_plugin_mcp(
+                load_agent_profile(self._agent_profile), ProviderType.GROK_CLI.value
+            )
         except FileNotFoundError:
             raise
         except Exception as exc:
@@ -293,15 +342,17 @@ class GrokCliProvider(BaseProvider):
             if config.get("url"):
                 transport = config.get("type")
                 if transport is not None:
-                    if transport not in {"http", "sse"}:
+                    rendered = GROK_URL_TRANSPORTS.get(transport)
+                    if rendered is None:
                         raise ProviderError(
                             f"MCP server '{name}' has unsupported URL transport "
-                            f"{transport!r}; Grok supports 'http' and 'sse'"
+                            f"{transport!r}; Grok supports "
+                            f"{', '.join(repr(k) for k in sorted(GROK_URL_TRANSPORTS))}"
                         )
                     # Grok defaults an untyped URL to HTTP.  SSE requires an
                     # explicit type, so preserve the profile transport rather
                     # than silently changing an SSE server into HTTP.
-                    lines.append(f"type = {_toml_string(transport)}")
+                    lines.append(f"type = {_toml_string(rendered)}")
                 lines.append(f"url = {_toml_string(config['url'])}")
             elif config.get("command"):
                 lines.append(f"command = {_toml_string(config['command'])}")
@@ -341,27 +392,31 @@ class GrokCliProvider(BaseProvider):
 
         Grok's ``MCPTool(server__*)`` permission language accepts a pattern.
         Never interpolate an arbitrary ``@...`` CAO entry into that pattern:
-        only a conventional server name that is actually configured for this
-        profile (or CAO's built-in orchestration server) may grant MCP access.
-        ``@builtin`` is a CAO vocabulary marker, not an MCP server reference.
-        Unknown or malformed entries remain denied by the enclosing dontAsk
-        policy instead of widening it.
+        a CAO entry is expanded against the server names actually configured for
+        this profile (plus CAO's built-in orchestration server) by the shared
+        ``tool_mapping.granted_mcp_servers`` rule, and only a resulting CONCRETE
+        name that is also a conventional server identifier may grant MCP access.
+        So ``@plugin-*`` — which ``docs/agent-plugins.md`` documents and which
+        this site used to deny by requiring an exact literal — grants
+        ``MCPTool(plugin-tools__*)`` when that server is configured and nothing at
+        all when it is not. The pattern itself never reaches Grok's permission
+        language, and ``@builtin`` is CAO vocabulary rather than an MCP server
+        reference. Unknown or malformed entries remain denied by the enclosing
+        dontAsk policy instead of widening it.
+
+        The matching rule is shared with OpenCode's ``agent.<id>.tools`` grant in
+        ``services/install_service.py`` on purpose: two hand-written matchers are
+        how the documented glob came to work on neither.
         """
         configured = {"cao-mcp-server"}
         if isinstance(mcp_servers, dict):
             configured.update(name for name in mcp_servers if isinstance(name, str))
 
-        return sorted(
-            {
-                name
-                for tool_ref in allowed_tools
-                if isinstance(tool_ref, str)
-                and tool_ref.startswith("@")
-                and (name := tool_ref[1:]) != "builtin"
-                and _MCP_SERVER_REF.fullmatch(name)
-                and name in configured
-            }
-        )
+        return [
+            name
+            for name in granted_mcp_servers(allowed_tools, configured)
+            if _MCP_SERVER_REF.fullmatch(name)
+        ]
 
     @staticmethod
     def _atomic_write_private(path: Path, content: str) -> None:
@@ -709,9 +764,50 @@ class GrokCliProvider(BaseProvider):
         last_completion = completion_matches[-1].start() if completion_matches else -1
         last_error = max((match.start() for match in ERROR_PATTERN.finditer(tail)), default=-1)
 
+        # The usage-limit refusal counts only as part of a picker that is still
+        # drawn: the boxed refusal line must be followed by one of the picker's
+        # own footers in the same frame.
+        last_picker_footer = max(
+            (match.start() for match in PICKER_FOOTER_PATTERN.finditer(tail)), default=-1
+        )
+        last_limit_picker = max(
+            (
+                match.start()
+                for match in USAGE_LIMIT_PATTERN.finditer(tail)
+                if match.end() <= last_picker_footer
+            ),
+            default=-1,
+        )
+        last_picker_answer = max(
+            (match.start() for match in PICKER_ANSWER_FOOTER_PATTERN.finditer(tail)), default=-1
+        )
+
         # Pickers/login are bottom-of-screen blocking surfaces. Position guards
         # keep a dismissed prompt retained in scrollback from pinning status.
+        #
+        # The limit picker is checked ahead of WAITING and PROCESSING, but only
+        # while it is the newest evidence in the tail. Grok reads an append-only
+        # raw FIFO buffer and ``strip_terminal_escapes`` drops erase sequences
+        # without removing the text they erased, so a picker that ``ESC[2J``,
+        # ``ESC[H ESC[J`` or an ordinary redraw has already replaced still reads
+        # as a full picker here -- as does a transcript that quotes one. Only
+        # position tells the two apart, so this is ordered against
+        # last_processing as well as last_completion/last_ready. The real
+        # refusal still wins: the stale "Waiting for response…"/"Esc:cancel"
+        # marker belongs to the turn that hit the limit and therefore sits
+        # BEFORE the picker in the buffer.
+        if last_limit_picker > max(last_completion, last_ready, last_processing):
+            return TerminalStatus.ERROR
+
         if last_waiting > max(last_completion, last_ready):
+            return TerminalStatus.WAITING_USER_ANSWER
+
+        # The footer shapes 1.0.13 added, classified separately from the branch
+        # above so upstream's footers keep their existing ordering. A picker is
+        # only waiting on the user while nothing newer has been drawn over it,
+        # so these are ordered against last_processing for the same append-only
+        # reason as the limit picker.
+        if last_picker_answer > max(last_completion, last_ready, last_processing):
             return TerminalStatus.WAITING_USER_ANSWER
 
         if last_processing > last_completion:

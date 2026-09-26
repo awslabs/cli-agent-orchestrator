@@ -44,6 +44,30 @@ class OutputExtractionError(ValueError):
     Subclasses ``ValueError`` so existing ``except ValueError`` callers keep
     working; the API boundary catches this narrower type first so an extraction
     failure is not reported as 404 Not Found (issue #570).
+
+    This is the *retryable* half of the extraction contract: the response marker
+    was not found, so a wider capture may still succeed. A refusal to publish
+    content that was actually found is :class:`OutputExtractionRejected`.
+    """
+
+
+class OutputExtractionRejected(OutputExtractionError):
+    """A deliberate refusal to publish extracted content.
+
+    Raised when the extractor *found* the response region and refused to publish
+    what was in it — the turn produced only private reasoning, or every candidate
+    row was chrome, a user echo, or reasoning.
+
+    The distinction is a security boundary, not a taxonomy nicety. A missing
+    marker is worth retrying with a wider capture and may legitimately degrade to
+    a labelled raw-transcript fallback. A deliberate rejection must do neither:
+    the raw pane contains the very content that was refused, so substituting it
+    silently republishes private reasoning as the agent's answer. Callers that
+    escalate or fall back on :class:`OutputExtractionError` must re-raise this
+    subtype unchanged.
+
+    Subclasses :class:`OutputExtractionError` so existing callers that handle the
+    broader type keep working and the API boundary still maps it away from 404.
     """
 
 
@@ -179,6 +203,37 @@ class BaseProvider(ABC):
     # this False — their COMPLETED/IDLE split is not screen-detectable.
     supports_direct_status_probe: bool = False
 
+    # Opt-in for the mid-burst PROCESSING probe (StatusMonitor._midburst_processing_probe).
+    # Set True ONLY alongside a probe_processing_from_screen() override that is
+    # side-effect free. The probe runs on a HALF-DRAWN frame, off the two edges
+    # the screen path is otherwise restricted to, and its verdict is discarded
+    # unless it says PROCESSING — so a detector that commits turn bookkeeping
+    # while deciding (minimax_code's completion identity/epoch and _awaiting_turn,
+    # grok_cli's _turn_activity_seen) would have that bookkeeping applied from a
+    # frame the monitor then throws away. Providers that leave this False are
+    # never probed: the terminal keeps the status the edges give it.
+    supports_midburst_processing_probe: bool = False
+
+    def probe_processing_from_screen(self, screen_lines: List[str]) -> bool:
+        """Report whether this half-drawn frame shows the agent actively working.
+
+        A pure observation, called only when ``supports_midburst_processing_probe``
+        is True: it MUST NOT mutate provider state, because the monitor ignores
+        everything it says except True, and the frame it sees is mid-redraw
+        rather than settled.
+
+        Answer True only on POSITIVE evidence of work — a drawn spinner or
+        progress row — never on the absence of a ready prompt. A partial redraw
+        routinely erases the composer while the previous response is still on
+        screen, and a settled detector reasonably calls that PROCESSING; here it
+        is not, and a True there spends the monitor's dispatch arm on a frame
+        that shows no new turn (see CodexProvider). Leave every other verdict to
+        the rising edge and quiescence, which see whole frames.
+
+        Default: False — no provider is probed unless it opts in.
+        """
+        return False
+
     def get_status_from_screen(self, screen_lines: List[str]) -> TerminalStatus:
         """Detect status from a pyte-rendered screen (composited viewport).
 
@@ -280,6 +335,19 @@ class BaseProvider(ABC):
         with re-capture between attempts.  Default is 0 (no retries).
         """
         return 0
+
+    @property
+    def allow_raw_transcript_fallback(self) -> bool:
+        """Whether LAST output may degrade to the provider raw terminal pane.
+
+        The historical service behavior is permissive because several providers
+        have no private sub-channels in their rendered transcript. Providers
+        whose pane can contain non-publishable channels must override this to
+        False. Extraction retries still widen normally; only the raw-pane
+        substitution after exhaustion is disabled.
+        """
+
+        return True
 
     @abstractmethod
     def extract_last_message_from_script(self, script_output: str) -> str:

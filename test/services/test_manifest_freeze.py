@@ -181,7 +181,13 @@ def test_an_unavailable_snapshot_reaches_the_gate_without_a_plan_id(monkeypatch)
     approved_manifest = manifest_freeze.build_manifest_json(source_hash="abc123", inputs={"k": "v"})
     assert approved_manifest is not None
     approved_plan_id = json.loads(approved_manifest)["plan_id"]
-    monkeypatch.setattr(approval_store, "is_approved", lambda plan_id: plan_id == approved_plan_id)
+    monkeypatch.setattr(
+        approval_store,
+        "approval_state",
+        lambda plan_id: (
+            approval_store.APPROVED if plan_id == approved_plan_id else approval_store.ABSENT
+        ),
+    )
     approval_gate.ensure_plan_approved(tier="script", manifest_json=approved_manifest)
 
     unavailable_manifest = manifest_freeze.build_manifest_json(

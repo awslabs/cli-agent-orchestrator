@@ -92,11 +92,20 @@ If the agent profile includes `mcpServers`, CAO injects each MCP server into Cod
 
 For example, the `code_supervisor` profile includes the `cao-mcp-server` which provides `handoff` and `send_message` tools. This allows the supervisor agent to delegate work to Developer and Reviewer agents through CAO's multi-agent orchestration.
 
+CAO passes each server's environment as **one TOML inline table with quoted keys**
+(`-c mcp_servers.<name>.env={ "LOG.LEVEL" = "info" }`) rather than one override per key.
+Codex parses the value side of `-c key=value` as TOML, so any environment key an
+[agent plugin](agent-plugins.md) may legally declare is expressible there. The server
+*name* is different: it becomes a segment of the override's dotted **path**, so a name
+that is not a bare TOML key (`^[A-Za-z0-9_-]+$`) would nest the entry under the wrong
+table. An agent-plugin server with such a name is not delivered to Codex and is
+reported as `mcp.server_name_unsupported`; that agent plugin's other servers are unaffected.
+
 CAO also sets `tool_timeout_sec=600.0` (10 minutes) for each MCP server to allow long-running operations like handoff. **Important**: The value must be a TOML float (`600.0`, not `600`) because Codex deserializes this field via `Option<f64>`. A TOML integer is silently rejected, falling back to the 60-second default.
 
 ### Memory Injection
 
-When CAO's memory system is enabled, the built-in `codex_memory` plugin auto-injects
+When CAO's memory system is enabled, the built-in `codex_memory` event plugin auto-injects
 relevant memories into the project on terminal creation. On `post_create_terminal` for a
 `codex` terminal, it writes a delimited block into `<cwd>/AGENTS.md` — the file Codex CLI
 reads from the working directory as project instructions:
@@ -111,10 +120,10 @@ reads from the working directory as project instructions:
 <!-- cao-memory:end -->
 ```
 
-Because `AGENTS.md` is a user-authored, repo-root file, the plugin owns **only** the
+Because `AGENTS.md` is a user-authored, repo-root file, the event plugin owns **only** the
 delimited block and replaces it in place on each run — any hand-written content around it
-is preserved (the same approach as the Claude Code `CLAUDE.md` plugin, not Kiro's
-whole-file ownership). The plugin is observer-only: it runs after the terminal is created,
+is preserved (the same approach as the Claude Code `CLAUDE.md` event plugin, not Kiro's
+whole-file ownership). The event plugin is observer-only: it runs after the terminal is created,
 logs-and-skips on any error, and never crashes `cao-server`. It writes nothing when memory
 is disabled or there are no relevant memories. See [memory.md](memory.md) for the full
 memory system.
@@ -315,7 +324,7 @@ PY
 - Exiting a Codex terminal uses `/exit` (`POST /terminals/{terminal_id}/exit`).
 - **Handoff message context**: `_handoff_impl()` prepends a `[CAO Handoff]` prefix to the task message so the worker agent knows this is a blocking handoff. Without this, Codex agents proactively try to use `send_message` to notify the supervisor, which fails because the worker doesn't have the supervisor's terminal ID. The prefix tells the agent to simply output results and finish — the orchestrator captures the response automatically.
 - **TUI footer handling** (`--no-alt-screen` mode): Codex always renders a TUI footer at the bottom, even during processing. The footer format varies by version: v0.110 and earlier use `› [suggestion hint]` + `? for shortcuts` + `N% context left`; v0.111+ (PR #13202) use `› [suggestion hint]` + `model · N% left · path`. `TUI_FOOTER_PATTERN` detects both formats, and `_compute_tui_footer_cutoff()` finds the precise start of the footer area. Both `get_status()` and `extract_last_message_from_script()` use this cutoff to exclude footer lines from user-message matching — preventing false IDLE and extraction contamination.
-- **TUI progress spinner**: During processing, Codex shows `• [text] (Ns • esc to interrupt)` inline. The `•` would falsely match `ASSISTANT_PREFIX_PATTERN`, and the TUI `›` hint would match idle prompt — triggering false COMPLETED. `TUI_PROGRESS_PATTERN` detects the spinner and returns PROCESSING before the COMPLETED check.
+- **TUI progress spinner**: During processing, Codex shows `• [text] (Ns • esc to interrupt)` inline. The `•` would falsely match `ASSISTANT_PREFIX_PATTERN`, and the TUI `›` hint would match idle prompt — triggering false COMPLETED. `TUI_PROGRESS_PATTERN` detects the spinner and returns PROCESSING before the COMPLETED check. codex-cli 0.153.x alternates the leading glyph between `•` and `◦` as the spinner animates, so the pattern accepts either; a frame that lands on the hollow glyph used to read IDLE.
 
 ### Status Values
 

@@ -4,6 +4,7 @@ Covers initialization, status detection, message extraction, command building,
 pattern matching, and cleanup — targeting >90% code coverage.
 """
 
+import json
 import os
 import re
 import tempfile
@@ -13,6 +14,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.providers.base import OutputExtractionError
 from cli_agent_orchestrator.providers.kimi_cli import (
     ANSI_CODE_PATTERN,
     ERROR_PATTERN,
@@ -25,6 +27,8 @@ from cli_agent_orchestrator.providers.kimi_cli import (
     USER_INPUT_BOX_START_PATTERN,
     WELCOME_BANNER_PATTERN,
     KimiCliProvider,
+    KimiDialect,
+    KimiProbeResult,
     ProviderError,
 )
 
@@ -34,6 +38,40 @@ FIXTURES_DIR = Path(__file__).parent / "fixtures"
 def _read_fixture(name: str) -> str:
     """Read a test fixture file."""
     return (FIXTURES_DIR / name).read_text()
+
+
+def _launch_line(sent_command: str) -> str:
+    """The POSIX launch line that the pane command will actually run.
+
+    ``initialize`` types a shell-neutral ``/bin/sh <script>`` invocation at the
+    pane, because POSIX quoting is not fish quoting (a path with a
+    backslash-before-apostrophe made ``shlex.quote`` produce a string fish
+    rejects). The launch line itself therefore lives in the script, and that is
+    what the assertions below describe.
+    """
+
+    argv = sent_command.split()
+    assert argv[0] == "/bin/sh", sent_command
+    assert len(argv) == 2, sent_command
+    return Path(argv[1]).read_text(encoding="utf-8")
+
+
+def _legacy_probe_result(binary: str = "/usr/local/bin/kimi") -> KimiProbeResult:
+    """A probe result describing a legacy ``kimi-cli`` install.
+
+    The legacy command-building tests below target the *launch command* that
+    the legacy dialect produces, not the capability probe that selects the
+    dialect. Stubbing the probe keeps those assertions exact (one ``send_keys``,
+    ``cd``, ``TERM=xterm-256color``, ``--yolo``, ``--agent-file``,
+    ``--mcp-config``); the probe itself has dedicated coverage in
+    ``TestKimiDialectDetection``.
+    """
+    return KimiProbeResult(
+        dialect=KimiDialect.LEGACY,
+        binary=binary,
+        source_home=Path("/home/user/.kimi"),
+        observed={"mcp-config": True, "mcp-config-file": False, "auto": False},
+    )
 
 
 # =============================================================================
@@ -50,6 +88,21 @@ class TestKimiCliProviderInitialization:
         # that path has its own tests. Stub it so command-send/timeout tests stay
         # fast and independent of the (mocked) get_history return type.
         with patch.object(KimiCliProvider, "_handle_startup_dialog", return_value=None):
+            yield
+
+    @pytest.fixture(autouse=True)
+    def _stub_legacy_probe(self):
+        # initialize() first resolves the dialect by asking the launch shell to
+        # dump `kimi --help`. That probe needs a real pane and has dedicated
+        # coverage in TestKimiDialectDetection; stubbing it here pins these
+        # tests to the legacy launch command they were written to assert.
+        # Without this the mocked backend never returns the probe sentinel and
+        # every test in this class would fail with UnsupportedKimiError.
+        with patch.object(
+            KimiCliProvider,
+            "_resolve_dialect",
+            return_value=_legacy_probe_result(),
+        ):
             yield
 
     @pytest.mark.asyncio
@@ -119,8 +172,9 @@ class TestKimiCliProviderInitialization:
         # Verify kimi command includes --agent-file
         call_args = mock_tmux.return_value.send_keys.call_args
         command = call_args[0][2]
-        assert "--agent-file" in command
-        assert "--yolo" in command
+        launch_line = _launch_line(command)
+        assert "--agent-file" in launch_line
+        assert "--yolo" in launch_line
 
         # Cleanup temp files
         provider.cleanup()
@@ -168,9 +222,10 @@ class TestKimiCliProviderInitialization:
 
         call_args = mock_tmux.return_value.send_keys.call_args
         command = call_args[0][2]
-        assert "--mcp-config" in command
+        launch_line = _launch_line(command)
+        assert "--mcp-config" in launch_line
         # No --config flag in command (breaks OAuth authentication)
-        assert "--config" not in command
+        assert "--config" not in launch_line
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.kimi_cli.wait_until_status")
@@ -188,9 +243,10 @@ class TestKimiCliProviderInitialization:
 
         call_args = mock_tmux.return_value.send_keys.call_args
         command = call_args[0][2]
-        assert "cd " in command
-        assert "TERM=xterm-256color" in command
-        assert "kimi --yolo" in command
+        launch_line = _launch_line(command)
+        assert "cd " in launch_line
+        assert "TERM=xterm-256color" in launch_line
+        assert "kimi --yolo" in launch_line
         provider.cleanup()
 
 
@@ -507,10 +563,16 @@ class TestKimiCliProviderMessageExtraction:
         assert "Python" in result
         assert "paradigm" in result.lower()
 
-    def test_extract_message_all_thinking_falls_back(self):
-        """Test fallback when all lines are filtered as thinking."""
+    def test_extract_message_all_thinking_raises(self):
+        """A response region that is entirely reasoning is an extraction failure.
+
+        This replaces the old "fall back to returning the thinking content"
+        contract. Returning reasoning as the answer is worse than failing: the
+        caller cannot tell the two apart, so chain handoffs, ``assign`` results
+        and memory writes would silently record the agent's private scratchpad
+        as its reply (issue #570's bug class, one layer deeper).
+        """
         provider = KimiCliProvider("term-1", "session-1", "window-1")
-        # All bullets are thinking (gray ANSI) — should fall back to returning all content
         output = (
             "╭──────────────────╮\n"
             "│ analyze this       │\n"
@@ -519,9 +581,40 @@ class TestKimiCliProviderMessageExtraction:
             "\x1b[38;5;244m• \x1b[39m\x1b[3m\x1b[38;5;244mI see several patterns.\x1b[0m\n"
             "user@my-app💫\n"
         )
+        with pytest.raises(OutputExtractionError):
+            provider.extract_last_message_from_script(output)
+
+    def test_extract_message_all_thinking_never_returns_reasoning(self):
+        """The failure must not carry the reasoning text in its message."""
+        provider = KimiCliProvider("term-1", "session-1", "window-1")
+        output = (
+            "╭──────────────────╮\n"
+            "│ analyze this       │\n"
+            "╰──────────────────╯\n"
+            "\x1b[38;5;244m• \x1b[39m\x1b[3m\x1b[38;5;244mLet me analyze the code.\x1b[0m\n"
+            "\x1b[38;5;244m• \x1b[39m\x1b[3m\x1b[38;5;244mI see several patterns.\x1b[0m\n"
+            "user@my-app💫\n"
+        )
+        with pytest.raises(OutputExtractionError) as excinfo:
+            provider.extract_last_message_from_script(output)
+        message = str(excinfo.value)
+        assert "analyze the code" not in message
+        assert "several patterns" not in message
+
+    def test_extract_message_thinking_plus_answer_returns_answer(self):
+        """One non-thinking bullet is enough to settle the answer."""
+        provider = KimiCliProvider("term-1", "session-1", "window-1")
+        output = (
+            "╭──────────────────╮\n"
+            "│ analyze this       │\n"
+            "╰──────────────────╯\n"
+            "\x1b[38;5;244m• \x1b[39m\x1b[3m\x1b[38;5;244mLet me analyze the code.\x1b[0m\n"
+            "• The answer is 391.\n"
+            "user@my-app💫\n"
+        )
         result = provider.extract_last_message_from_script(output)
-        # Should return the thinking content as fallback
-        assert "analyze" in result.lower() or "pattern" in result.lower()
+        assert "391" in result
+        assert "analyze the code" not in result
 
     def test_extract_message_with_status_bar_filtered(self):
         """Test that status bar lines are filtered from extracted content."""
@@ -993,7 +1086,7 @@ class TestKimiCliProviderMisc:
     def test_cleanup_removes_temp_dir(self):
         """Test cleanup removes temporary directory and its contents."""
         provider = KimiCliProvider("term-1", "session-1", "window-1")
-        provider._temp_dir = tempfile.mkdtemp(prefix="cao_kimi_test_")
+        provider._ensure_temp_dir()
         temp_path = provider._temp_dir  # Save path before cleanup resets it
 
         # Create a file in temp dir to verify it's removed
@@ -1250,6 +1343,11 @@ class TestKimiCodeDispatchGrace:
         provider.mark_input_received()
         assert provider.get_status(self.NEW_TUI_READY_CHROME) == TerminalStatus.PROCESSING
 
+    def test_kimi_opts_into_deferred_init_direct_status_probe(self):
+        """A cache miss must be recoverable without re-pasting the task."""
+
+        assert KimiCliProvider.supports_direct_status_probe is True
+
     def test_grace_expires_to_completed_when_pane_clear(self):
         import time as _time
 
@@ -1359,3 +1457,160 @@ class TestKimiScreenDetection:
     def test_torn_down_shell_is_unknown(self):
         screen = ["Bye!", "rkram@host:/tmp/x$"]
         assert self._p().get_status_from_screen(screen) == TerminalStatus.UNKNOWN
+
+
+class TestKimiTransportTranslation:
+    """Reported by review 5222539218 on #584 (item 5).
+
+    Kimi 1.20.0 pins ``fastmcp==2.12.5`` and feeds each ``--mcp-config`` document to
+    ``fastmcp.mcp_config.MCPConfig``. ``RemoteMCPServer`` has no ``type`` field, so a
+    portable ``type`` is an ignored extra; when ``transport`` is absent FastMCP calls
+    ``infer_transport_type_from_url``, which returns ``"sse"`` iff the URL *path*
+    matches ``/sse(/|\\?|&|$)`` and ``"http"`` otherwise. An SSE server published at
+    ``/events`` was therefore started as Streamable HTTP, and a Streamable HTTP
+    server published at ``/sse`` was started as SSE -- the declared protocol was
+    decided by URL spelling. Writing ``transport`` explicitly selects it.
+    """
+
+    @staticmethod
+    def _mcp_doc(command: str) -> dict:
+        """Return the JSON document Kimi is handed after ``--mcp-config``."""
+        import shlex
+
+        tokens = shlex.split(command)
+        document = json.loads(tokens[tokens.index("--mcp-config") + 1])
+        assert isinstance(document, dict)
+        return document
+
+    def _build(self, tmp_path, servers):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = servers
+        with patch(
+            "cli_agent_orchestrator.providers.kimi_cli.load_agent_profile",
+            return_value=mock_profile,
+        ):
+            provider = KimiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
+            with patch(
+                "cli_agent_orchestrator.providers.kimi_cli.Path.home", return_value=tmp_path
+            ):
+                return self._mcp_doc(provider._build_kimi_command())
+
+    def test_streamable_http_becomes_transport_http(self, tmp_path):
+        """The portable spelling maps to FastMCP's ``http``, and ``type`` is removed.
+
+        The URL path is ``/sse`` precisely so inference would have chosen wrong.
+        """
+        doc = self._build(tmp_path, {"s": {"type": "streamable-http", "url": "https://x/sse"}})
+        assert doc["s"]["transport"] == "http"
+        assert "type" not in doc["s"]
+
+    def test_sse_becomes_transport_sse(self, tmp_path):
+        """An SSE server on a non-``/sse`` path is still started as SSE."""
+        doc = self._build(tmp_path, {"s": {"type": "sse", "url": "https://x/events"}})
+        assert doc["s"]["transport"] == "sse"
+        assert "type" not in doc["s"]
+
+    def test_http_alias_becomes_transport_http(self, tmp_path):
+        doc = self._build(tmp_path, {"s": {"type": "http", "url": "https://x/events"}})
+        assert doc["s"]["transport"] == "http"
+
+    def test_stdio_carries_transport_stdio_and_cwd(self, tmp_path):
+        """``cwd`` survives: FastMCP's ``StdioMCPServer`` honours it."""
+        doc = self._build(tmp_path, {"s": {"type": "stdio", "command": "srv", "cwd": "/p"}})
+        assert doc["s"]["transport"] == "stdio"
+        assert doc["s"]["cwd"] == "/p"
+
+    def test_an_entry_without_a_type_is_left_for_fastmcp_to_infer(self, tmp_path):
+        """Profile entries are unchanged: the mapper only ever emits ``type`` itself.
+
+        ``_map_entry`` always sets ``type`` for a plugin server, so a type-less entry
+        can only have come from a hand-written profile, where adding a ``transport``
+        CAO never asked for would be a behaviour change beyond this finding.
+        """
+        doc = self._build(tmp_path, {"s": {"command": "srv"}})
+        assert "transport" not in doc["s"]
+
+    def test_an_unknown_type_is_left_untouched(self, tmp_path):
+        """An unrecognised spelling is passed through rather than guessed at."""
+        doc = self._build(tmp_path, {"s": {"type": "websocket", "url": "https://x/ws"}})
+        assert "transport" not in doc["s"]
+        assert doc["s"]["type"] == "websocket"
+
+
+class TestKimiScreenDetectionA3:
+    """A3 regressions on the rendered-screen path.
+
+    ``get_status_from_screen`` receives escape-free pyte-composited rows, so any
+    rule that depends on ANSI styling cannot apply here. These cases pin the
+    behaviour that must hold *without* styling: the shared bullet semantics
+    (A3-1), the shared boot-row shape (A3-3) and the dialect spinner rules
+    (A3-4).
+    """
+
+    def _code(self):
+        provider = KimiCliProvider("test123", "test-session", "window-0")
+        provider._dialect = KimiDialect.CODE
+        return provider
+
+    def test_wrapped_bullet_fragment_is_idle_not_completed(self):
+        """A3-1 on the screen path.
+
+        On a narrow terminal the status bar wraps, so a row can begin with a
+        bare ``●`` followed by punctuation. The old ``re.match(r"\\s*•")``
+        exclusion did not cover ``●`` at all, and a glyph-only bullet test
+        latched this idle terminal as COMPLETED.
+        """
+
+        screen = [
+            "Welcome to Kimi Code!",
+            "●)",
+            "agent (kimi-k2.6 ●)",
+            "context: 100%",
+        ]
+        assert self._code().get_status_from_screen(screen) == TerminalStatus.IDLE
+
+    def test_bare_bullet_without_payload_is_not_a_response(self):
+        screen = ["●", "agent (kimi-k2.6 ●)", "context: 100%"]
+        assert self._code().get_status_from_screen(screen) == TerminalStatus.IDLE
+
+    def test_kimi_code_bullet_mentioning_boot_chrome_is_completed(self):
+        """A3-3 — the boot gate must cover ``●``, not just the legacy ``•``.
+
+        The gate previously excluded only ``•``, so a Kimi Code answer whose
+        ``●`` row quoted the boot chrome re-stranded a genuinely finished
+        terminal at PROCESSING on every settled frame — and the inbox, which
+        delivers only on IDLE/COMPLETED, then never delivered to it.
+        """
+
+        screen = [
+            "✨ How does kimi boot?",
+            "● It logs 'connecting to mcp servers' until the MCP servers are ready.",
+            "── input ──────────────",
+            "yolo  agent (Kimi-k2.6 ●)  /tmp/x",
+            "context: 4.0% (10.4k/262.1k)",
+        ]
+        assert self._code().get_status_from_screen(screen) == TerminalStatus.COMPLETED
+
+    def test_standalone_moon_line_does_not_force_processing(self):
+        """A3-4 — under CODE semantics a moon is not evidence of work."""
+
+        screen = [
+            "✨ Show me the moon phases",
+            "● The phases are:",
+            "🌕",
+            "● That is all.",
+            "context: 2% (18.5k/977k)",
+        ]
+        assert self._code().get_status_from_screen(screen) == TerminalStatus.COMPLETED
+
+    def test_braille_spinner_is_still_processing_under_code(self):
+        screen = [
+            "✨ Analyze the data",
+            "● Working through it.",
+            "⠹ Using handoff({...})",
+            "yolo  agent (Kimi-k2.6 ●)  /tmp/x",
+            "context: 1% (9.8k/977k)",
+        ]
+        assert self._code().get_status_from_screen(screen) == TerminalStatus.PROCESSING

@@ -110,6 +110,17 @@ env GROK_SUBAGENTS=0 GROK_WORKFLOWS=0 GROK_GOAL=0 \
   combination was verified against Grok Build 1.0.0; recheck it after a Grok
   upgrade because these controls are not all shown by `grok --help`.
 - A single Enter submits bracketed-paste input. `/quit` exits the session.
+- A usage-limit picker (`You hit your weekly limit.` drawn inside the picker box,
+  with `Upgrade tier` / `Buy more credits` / `Try Again` options and a
+  `Tab:next answer` footer) is classified as ERROR instead of leaving the
+  terminal on the stale PROCESSING marker of the turn that hit the limit. A
+  waiting `handoff` then fails as soon as the picker is seen, with the generic
+  "worker errored"/terminal-ERROR message; the picker's own text is not
+  propagated to the caller. Other pickers of the same shape (`Tab:next answer`,
+  `Enter:submit`) read as WAITING_USER_ANSWER. Both classifications require the
+  picker to be the newest thing on screen: status is read from an append-only
+  raw buffer, so a picker a later frame erased or a transcript that quotes one
+  loses to the newer processing frame and the turn keeps running.
 
 ### Native workflow opt-in
 
@@ -144,9 +155,14 @@ CAO creates a private Grok home for every terminal and launches Grok with
 generated config atomically with mode `0600`. It does not run `grok mcp add`
 and does not modify the user's `~/.grok/config.toml`.
 
-The isolated config contains the profile's MCP servers. CAO injects the
-terminal-specific `CAO_TERMINAL_ID` into stdio MCP server environments so
-`cao-mcp-server` can route `assign`, `handoff`, and `send_message` correctly.
+The isolated config contains the profile's MCP servers, plus any declared by
+installed [agent plugins](agent-plugins.md) — merged at launch time and
+recomputed on every terminal creation rather than persisted, so the paths never
+go stale. Grok names the streamable-HTTP transport `http`, so CAO writes a
+`streamable-http` server as `type = "http"`; `sse` is preserved as `sse`. CAO
+injects the terminal-specific `CAO_TERMINAL_ID` into stdio MCP server
+environments so `cao-mcp-server` can route `assign`, `handoff`, and
+`send_message` correctly.
 Existing login state is reused without copying credential contents into CAO
 logs or the repository. Generated state is removed when the terminal is
 cleaned up.
@@ -161,6 +177,12 @@ user's privileges; selecting No quits Grok. If that screen is detected, CAO
 fails startup with an actionable error. Review and remove project-local
 configuration such as `.mcp.json` or `.grok/` before launching the CAO
 terminal, or use standalone Grok when you intentionally want to trust it.
+
+
+### Agent-plugin MCP working directory
+
+Its MCP config format has no working-directory key (checked against the vendor's own MCP documentation, 2026-09-16), so CAO carries an agent plugin's declared `cwd` by launching the server through `/bin/sh -c 'cd -- "$1" && shift && exec "$@"'`. `exec` replaces the shell, the environment passes through, and argument boundaries survive because each argument stays a separate argv element. On a host with no `/bin/sh` such a server is skipped with `mcp.cwd_unsupported` rather than started in the wrong directory.
+See [Agent Plugins](agent-plugins.md) for the full per-provider table.
 
 ## Tool Restrictions
 
@@ -210,8 +232,9 @@ restrictions. Do not substitute `--yolo` when validating supervisor safety.
 
 - The provider targets Grok Build's interactive TUI and currently requires the
   tmux backend. Headless `-p` and ACP modes are not CAO transports.
-- TUI parsing is calibrated against Grok Build 1.0.0. A future layout change
-  may require updated status and extraction fixtures.
+- TUI parsing is calibrated against Grok Build 1.0.0; the usage-limit picker
+  fixture was captured on 1.0.13. A future layout change may require updated
+  status and extraction fixtures.
 - CAO reuses existing Grok authentication. Complete interactive login first;
   CAO does not drive account or device-code login screens.
 - Per-tool MCP gating is not available. `@cao-mcp-server` does not selectively

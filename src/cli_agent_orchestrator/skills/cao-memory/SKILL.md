@@ -99,6 +99,12 @@ memory_forget(key="widgets-database", scope="project")
 Use this when a stored fact becomes outdated or was wrong. Prefer correcting (re-store with
 the same key) over leaving stale facts in memory.
 
+For native memory, forgetting removes the CAO-managed topic file. For vault-backed memory,
+it removes CAO's derived index entry and leaves the vault note in place for the operator to
+edit or delete in Obsidian. The `memory_forget` result's `action` is authoritative; its
+legacy `deleted` boolean means CAO completed the forget operation, not that the vault file
+was removed. Inspect `path` when the action reports vault deindexing.
+
 ## Auto-injection (already happening)
 
 On launch, CAO writes the most relevant memories for this working directory into the file

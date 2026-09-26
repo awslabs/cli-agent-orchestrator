@@ -14,6 +14,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the unknown-role fallback to unrestricted `["*"]`. It now resolves to this
   allowlist. `execute_bash` is still a full shell, so withholding `fs_write`
   and `web_fetch` is a category restriction, not a sandbox. (#746)
+- `terminal.pane_layout` chooses how a pane-mode window is arranged after each
+  spawn: `tiled` (default, unchanged behaviour), `even-vertical`,
+  `even-horizontal`, or `none` to leave tmux's own splitting alone. The split
+  direction follows the layout rather than being configured separately, because
+  `select-layout` overrides the direction a pane was split in. Each layout holds
+  a different number of agents before the window is full, and the terminal that
+  does not fit still falls back to a window of its own (#74)
+- `terminal.spawn_mode: "pane"` puts every terminal `assign` / `handoff` creates
+  into one tmux window as a pane, re-tiled after each spawn, so a supervisor
+  watches the whole fleet at once instead of cycling through a window per agent.
+  The window is named by `terminal.pane_window` (default `cao-agents`) and the
+  first pane terminal in a session creates it; when tmux has no room for another
+  pane, that terminal falls back to a window of its own. Default is unchanged
+  (`window`), and window mode addresses terminals exactly as before (#74, #73)
+- **`CAO_AUTH_LOCAL_TOKEN` now works on its own** (#706). Setting it with no IdP
+  configured switches the auth layer on in a local-token mode: every scope-gated
+  route, the PTY WebSocket handshake and the AG-UI stream must present exactly that
+  value as a bearer, compared in constant time, and anything else is refused with
+  401. Previously the variable was read only when an IdP was already configured, so
+  on a default install it did nothing, while the environment-variable reference
+  described it as a working local bearer token. Opt-in: with none of the three auth
+  variables set, behavior is unchanged. The default-unauthenticated posture is now
+  spelled out in `docs/configuration.md`, along with two consequences of turning
+  the mode on: the `cao` CLI and the bundled Web UI send no bearer yet, and the
+  token is inherited by every agent pane's environment.
 
 - Profiles tab in the Web UI: browse, search, create (from template with live
   preview, or from scratch via a schema-driven form), edit, clone, and delete
@@ -21,6 +46,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   surfacing bounded findings and the truncation-marker contract (#510)
 
 ### Fixed
+
+- **a PTY WebSocket handshake with no peer address skipped the client-IP allowlist.**
+  `/terminals/{id}/ws` checked `client_host not in WS_ALLOWED_CLIENTS` only when a
+  peer address was present, so a `None` peer passed instead of failing closed. Not
+  reachable on a default install: the pinned uvicorn populates the peer for every
+  TCP connection and its proxy-headers middleware never rewrites it to `None`, so
+  this guards against other ASGI servers or middleware that leave the peer unset.
+  An unattributable peer is now refused with 4003 unless the explicit `*` opt-out
+  is set.
+
+- **The terminal WebSocket's `?token=` query parameter reached uvicorn's logs
+  in clear.** Two gaps: the redaction filter only knew `access_token` and
+  `ticket`, and it was attached only to `uvicorn.access`, while uvicorn writes
+  the WebSocket handshake line (`"WebSocket /terminals/<id>/ws?token=…"
+  [accepted]`, and the `403` variant) on `uvicorn.error`, which a filter on a
+  sibling logger never sees. With authentication enabled every web-viewer
+  attach therefore wrote the `cao:write`-scoped JWT to stderr. `token` is now
+  redacted and the filter is attached to both loggers. The filter also decodes
+  percent-encoded parameter names before deciding: the server accepts
+  `?%61ccess_token=<JWT>` exactly like `?access_token=`, and uvicorn logs the
+  raw bytes.
+- **Six read routes lacked the `cao:read` gate their siblings carry:**
+  `GET /agents/profiles/search`, `GET /agents/providers` (which provider
+  binaries exist on the host), `GET /sessions/{name}/terminals`,
+  `GET /terminals/{id}/working-directory`, `GET /settings/skill-dirs` and
+  `GET /settings/memory`. With authentication enabled they answered without a
+  token. No change with authentication off (the default). The read-gating
+  structural test now covers them; the only GETs left open are `/health`, the
+  OAuth discovery document, the static profile schema/template metadata and the
+  AG-UI stream, which carries its own credential.
 
 - **enabling `CAO_MEMORY_API_URL` rejected memory keys that work without it.**
   The `/internal/memory/store` and `/forget` routes validated the wire `key` as

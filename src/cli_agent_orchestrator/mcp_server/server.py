@@ -15,6 +15,7 @@ from cli_agent_orchestrator.constants import (
     API_BASE_URL,
     DISCOVERY_TOOL_MARKER,
     ELASTIC_CALLBACK_URL_ENV,
+    HANDOFF_RESULTS_ROUTE,
     WORKFLOW_EVENTS_CONNECT_TIMEOUT,
     WORKFLOW_EVENTS_MCP_MAX_EVENTS,
     WORKFLOW_EVENTS_MCP_MAX_SECONDS,
@@ -24,6 +25,7 @@ from cli_agent_orchestrator.constants import (
 )
 from cli_agent_orchestrator.mcp_server import utils as mcp_utils
 from cli_agent_orchestrator.mcp_server.models import HandoffResult
+from cli_agent_orchestrator.mcp_server.utils import _auth_headers
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.models.workflow_runtime import ReturnAck, parse_decision
 from cli_agent_orchestrator.services.elastic_worker_gateway import (
@@ -48,6 +50,7 @@ from cli_agent_orchestrator.utils.orchestration import (
     _extract_error_detail,
     _handoff_impl,
     _mcp_timeout,
+    _resolve_target_base_url,
     _send_message_impl,
 )
 from cli_agent_orchestrator.utils.workflow_events import parse_sse_frames
@@ -364,6 +367,9 @@ if ENABLE_WORKING_DIRECTORY:
         Returns:
             HandoffResult with success status, message, and agent output
         """
+        denied = _tool_denied_reason("handoff")
+        if denied:
+            return HandoffResult(success=False, message=denied, output=None, terminal_id=None)
         return await _handoff_impl(
             agent_profile,
             message,
@@ -455,6 +461,9 @@ else:
         Returns:
             HandoffResult with success status, message, and agent output
         """
+        denied = _tool_denied_reason("handoff")
+        if denied:
+            return HandoffResult(success=False, message=denied, output=None, terminal_id=None)
         return await _handoff_impl(
             agent_profile,
             message,
@@ -578,6 +587,9 @@ if ENABLE_WORKING_DIRECTORY:
         ),
         target_host: Optional[str] = Field(default=None, description=_target_host_field_desc),
     ) -> Dict[str, Any]:
+        denied = _tool_denied_reason("assign")
+        if denied:
+            return {"success": False, "error": denied}
         return _assign_impl(
             agent_profile,
             message,
@@ -613,6 +625,9 @@ else:
         ),
         target_host: Optional[str] = Field(default=None, description=_target_host_field_desc),
     ) -> Dict[str, Any]:
+        denied = _tool_denied_reason("assign")
+        if denied:
+            return {"success": False, "error": denied}
         return _assign_impl(
             agent_profile,
             message,
@@ -636,7 +651,7 @@ def _elastic_broker_config() -> Tuple[str, str]:
 
 
 # How long the elastic path waits for a freshly leased worker to answer through
-# its Service. The broker returns a lease as soon as the Job and Service objects
+# its Service. The broker returns a lease as soon as the workload and Service objects
 # exist, so this covers the worker's whole boot plus endpoint propagation - and it
 # is the ONE place that wait now happens, instead of once in the broker (on pod
 # readiness) and then implicitly again here (on a connect timeout, unretried).
@@ -683,11 +698,11 @@ async def assign_elastic(
     engine: Optional[str] = Field(default=None, description="Optional Kiro engine override"),
     model: Optional[str] = Field(default=None, description=_model_field_desc),
 ) -> Dict[str, Any]:
-    """Provision one Kubernetes Job and assign one task to it.
+    """Provision one elastic worker and assign one task to it.
 
     The worker must call ``complete_assignment`` exactly once after producing
     its final result. That tool durably delivers the callback before releasing
-    this worker's Job.
+    this worker.
 
     A successful return means the task was PLACED, not that it finished - the
     result arrives later through the supervisor's inbox. So a worker that dies
@@ -819,7 +834,7 @@ async def send_message(
 async def complete_assignment(
     message: str = Field(description="Final result to deliver to the assigning supervisor"),
 ) -> Dict[str, Any]:
-    """Deliver an elastic worker's final result, then release its Kubernetes Job."""
+    """Deliver an elastic worker's final result, then release the worker itself."""
     worker_id = os.environ.get("CAO_ELASTIC_WORKER_ID", "").strip()
     broker_url = os.environ.get("CAO_ELASTIC_BROKER_URL", "").strip().rstrip("/")
     release_token = os.environ.get("CAO_ELASTIC_RELEASE_TOKEN", "").strip()
@@ -977,6 +992,98 @@ def delete_terminal(
     if not isinstance(target_host, str) or not target_host.strip():
         target_host = None
     return _delete_terminal_impl(terminal_id, target_host=target_host)
+
+
+@mcp.tool()
+def get_handoff_result(
+    job_id: str = Field(
+        description=(
+            "The job_id returned by handoff when pending=True (transport timed "
+            "out but the job may still be running or already finished server-side)."
+        )
+    ),
+    target_host: Optional[str] = Field(
+        default=None,
+        description=(
+            "Remote CAO node that ran the handoff (same format as "
+            "assign/handoff target_host: DNS name, host:port, or URL). Required "
+            "when the pending handoff was placed remotely -- the result row lives "
+            "in THAT node's database, not this one, so omitting it returns a "
+            "false not-found. Omit for local handoffs (behavior unchanged)."
+        ),
+    ),
+) -> Dict[str, Any]:
+    """Retrieve a durably persisted handoff result by job_id (issue #447).
+
+    Call this when a prior ``handoff`` call returned ``pending=True`` — the
+    transport timed out before the result arrived, but the work continues
+    server-side under ``job_id``. Poll this tool until ``state`` is no longer
+    ``"running"``.
+
+    Two things the request needs beyond the id, both mirroring
+    ``delete_terminal`` (PR #453 review, haofeif):
+
+    - The internal ``Authorization`` header. The retrieval endpoint is
+      scope-gated, so without it an auth-enabled deployment answers 401 to a
+      caller legitimately holding the job_id.
+    - ``target_host``. ``handoff(target_host=...)`` runs the step on that node
+      and persists the row in ITS database, so the supervisor's own base URL has
+      no such row.
+
+    Args:
+        job_id: The job_id from the pending handoff result.
+        target_host: Node that ran the handoff; omit for local.
+
+    Returns:
+        Dict with ``success``, ``state`` ("running"|"completed"|"error"),
+        ``terminal_id``, ``last_message`` (populated when completed), and
+        ``error_message`` (populated when errored). ``success=False`` with a
+        ``message`` when the job_id is unknown or the request failed.
+    """
+    # Direct (non-MCP) invocation gets pydantic's FieldInfo as the default rather
+    # than None. Normalized here in the tool wrapper for the same reason
+    # delete_terminal does it there: the leak is an artifact of FastMCP's Field
+    # default, so it belongs to server.py.
+    if not isinstance(target_host, str) or not target_host.strip():
+        target_host = None
+    location = f" on node {target_host}" if target_host else ""
+    try:
+        base_url = _resolve_target_base_url(target_host) if target_host else API_BASE_URL
+        path = HANDOFF_RESULTS_ROUTE.format(job_id=job_id)
+        response = requests.get(
+            f"{base_url}{path}",
+            headers=_auth_headers() or None,
+            # A black-holed remote node must fail on CONNECT rather than burn the
+            # full read budget; a local read keeps its single scalar timeout so
+            # default-path behavior is unchanged.
+            timeout=(REMOTE_CONNECT_TIMEOUT, _mcp_timeout()) if target_host else _mcp_timeout(),
+        )
+        response.raise_for_status()
+        data = response.json()
+        return {
+            "success": True,
+            "state": data.get("state"),
+            "terminal_id": data.get("terminal_id"),
+            "last_message": data.get("last_message"),
+            "error_message": data.get("error_message"),
+        }
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code == 404:
+            return {
+                "success": False,
+                "message": (
+                    f"No handoff result found for job_id {job_id}{location}"
+                    + (
+                        ""
+                        if target_host
+                        else ". If the handoff was placed on a remote node, retry "
+                        "with target_host set to that node."
+                    )
+                ),
+            }
+        return {"success": False, "message": f"Failed to retrieve handoff result: {str(e)}"}
+    except Exception as e:
+        return {"success": False, "message": f"Failed to retrieve handoff result: {str(e)}"}
 
 
 def _own_terminal_id_or_error(action: str) -> Union[str, Dict[str, Any]]:
@@ -1267,6 +1374,7 @@ def _get_terminal_context_from_env() -> Optional[Dict[str, Any]]:
             "session_name": meta["session_name"],
             "provider": meta["provider"],
             "agent_profile": meta.get("agent_profile"),
+            "allowed_tools": meta.get("allowed_tools"),
         }
         # Try to get working directory for project scope resolution. Same header
         # reasoning as above — best-effort, so a failure degrades project scope
@@ -1311,6 +1419,100 @@ def _caller_has_store_lesson_capability(caller_profile: Optional[str]) -> bool:
     except Exception as e:  # noqa: BLE001 — authz check fails closed
         logger.warning(f"store_lesson capability lookup failed for {caller_profile!r}: {e}")
         return False
+
+
+CAO_MCP_SERVER_SELECTOR = "@cao-mcp-server"
+
+
+def _caller_effective_allowed_tools(context: Dict[str, Any]) -> Optional[List[str]]:
+    """Effective CAO allowlist for the calling terminal, or None if unresolvable.
+
+    Mirrors ``create_terminal``: a recorded ``allowed_tools`` IS the effective
+    list, while ``None`` means "resolve from the agent profile" rather than
+    "unrestricted", so the profile goes through the same
+    ``resolve_allowed_tools`` the launch path uses.
+    """
+    recorded = context.get("allowed_tools")
+    if recorded is not None:
+        return list(recorded)
+
+    profile_name = context.get("agent_profile")
+    if not profile_name:
+        return None
+
+    from cli_agent_orchestrator.agent_plugins.mcp_delivery import grantable_server_names
+    from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+    from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
+
+    profile = load_agent_profile(profile_name)
+    mcp_server_names = grantable_server_names(profile)
+    return resolve_allowed_tools(profile.allowedTools, profile.role, mcp_server_names)
+
+
+def _tool_denied_reason(tool_name: str) -> Optional[str]:
+    """Reason the calling terminal's allowlist bars ``tool_name``, or None to allow.
+
+    ``assign`` and ``handoff`` spawn a terminal under a caller-chosen
+    ``agent_profile``, so an agent reaching them can mint a new identity with
+    its own memory scope under any profile installed on the box (#671). The
+    provider-native restrictions built by ``utils/tool_mapping`` cannot cover
+    that: ``get_disallowed_tools`` skips every ``@``-prefixed entry because MCP
+    server references have no native tool names, so CAO's own MCP surface is
+    unreachable from that mechanism by construction.
+
+    The authorization model here is the one CAO already has, not a second one.
+    The effective list is the terminal's recorded ``allowed_tools``, or the
+    profile resolution that ``None`` stands for, and these operations are
+    granted by the documented ``@cao-mcp-server`` server selector or by ``*``.
+    Bare tool names are provider-native vocabulary and never name an MCP tool.
+
+    Fails closed. An unset ``CAO_TERMINAL_ID`` is the supported operator
+    context (``cao assign`` and ``cao handoff`` run with no caller identity)
+    and allows. Once the caller claims an identity every failure to resolve it
+    denies: a malformed ID, an unreachable or unauthorized cao-server, a
+    terminal that is not registered, an unreadable profile.
+
+    ``None`` from ``_get_terminal_context_from_env`` is NOT proof of an
+    operator context. That helper also returns ``None`` for a malformed
+    ``CAO_TERMINAL_ID`` (which ``_current_terminal_id`` itself calls a hard
+    error) and from its trailing ``except Exception``. So boundness is
+    established here from the environment rather than inferred from the
+    absence of an exception.
+    """
+    if not os.environ.get("CAO_TERMINAL_ID"):
+        return None
+
+    try:
+        context = _get_terminal_context_from_env()
+    except Exception as e:  # noqa: BLE001  (an unknown result must not dispatch)
+        logger.warning(f"authorization lookup failed for '{tool_name}': {e}")
+        return f"cannot authorize '{tool_name}': the calling terminal could not be resolved ({e})"
+
+    if context is None:
+        return (
+            f"cannot authorize '{tool_name}': CAO_TERMINAL_ID is set but the calling "
+            "terminal could not be resolved"
+        )
+
+    try:
+        allowed = _caller_effective_allowed_tools(context)
+    except Exception as e:  # noqa: BLE001  (an unknown result must not dispatch)
+        logger.warning(f"allowlist resolution failed for '{tool_name}': {e}")
+        return (
+            f"cannot authorize '{tool_name}': the caller's allowed tools could not "
+            f"be resolved ({e})"
+        )
+
+    if allowed is None:
+        return f"cannot authorize '{tool_name}': the caller's allowed tools could not be resolved"
+
+    if "*" in allowed or CAO_MCP_SERVER_SELECTOR in allowed:
+        return None
+
+    return (
+        f"'{tool_name}' is not permitted: the calling terminal's allowed tools do not "
+        f"include '{CAO_MCP_SERVER_SELECTOR}'"
+    )
 
 
 @mcp.tool()
@@ -1473,6 +1675,14 @@ async def memory_recall(
             if remote_memory_url()
             else await MemoryService().recall(**kwargs)
         )
+        # Curated recall is inserted verbatim into another terminal's context.
+        # Keep its vault/native scope set aligned with the deterministic builder:
+        # agent-scoped memories are explicit-recall-only in this release.
+        from cli_agent_orchestrator.services.vault.reader import MEMORY_MANAGER_PROFILE
+
+        if (terminal_context or {}).get("agent_profile") == MEMORY_MANAGER_PROFILE:
+            injectable_scopes = {"session", "project", "global"}
+            memories = [memory for memory in memories if memory.scope in injectable_scopes]
         return {
             "success": True,
             "memories": [
@@ -1482,7 +1692,20 @@ async def memory_recall(
                     "memory_type": m.memory_type,
                     "scope": m.scope,
                     "tags": m.tags,
-                    "file_path": m.file_path,
+                    "file_path": (
+                        getattr(m, "source_path", None)
+                        if getattr(m, "source_kind", "native") == "vault"
+                        else m.file_path
+                    ),
+                    "source_kind": getattr(m, "source_kind", "native"),
+                    "source_path": getattr(m, "source_path", None),
+                    "indexed_at": (
+                        m.indexed_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+                        if getattr(m, "indexed_at", None)
+                        else None
+                    ),
+                    "index_freshness": getattr(m, "index_freshness", None),
+                    "content_truncated": bool(getattr(m, "content_truncated", False)),
                     "updated_at": m.updated_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 }
                 for m in memories
@@ -1507,7 +1730,8 @@ async def memory_forget(
 ) -> Dict[str, Any]:
     """Remove a memory by key and scope.
 
-    Deletes the wiki topic file and removes the entry from index.md.
+    Deletes native memory files or deindexes vault-backed memory without
+    deleting the underlying vault note.
     """
     from cli_agent_orchestrator.services.memory_gateway import forget_memory, remote_memory_url
     from cli_agent_orchestrator.services.memory_service import MemoryService
@@ -1529,7 +1753,9 @@ async def memory_forget(
         )
         return {
             "success": True,
-            "deleted": deleted,
+            "deleted": bool(deleted),
+            "action": deleted.action,
+            "path": deleted.path,
             "key": key,
             "scope": scope,
         }

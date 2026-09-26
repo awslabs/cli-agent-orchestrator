@@ -15,14 +15,47 @@ from typing import Optional
 
 from libtmux.exc import LibTmuxException
 
+from cli_agent_orchestrator.agent_plugins.mcp_delivery import with_plugin_mcp as _with_plugin_mcp
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
+from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_cao_mcp_command
 from cli_agent_orchestrator.utils.terminal import wait_for_shell
 
 logger = logging.getLogger(__name__)
+
+#: CAO transport name -> the ``type`` value Copilot CLI's MCP config expects.
+#:
+#: Copilot's documented vocabulary is ``local``/``stdio`` for a command-based
+#: server, ``http`` for Streamable HTTP, and ``sse`` for the legacy transport
+#: (https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-mcp-servers).
+#: CAO and the Agent Plugins ``mcp.json`` schema use the MCP specification's
+#: ``streamable-http``, which Copilot has no case for, so the value has to be
+#: translated rather than passed through — the same defect class as
+#: ``GROK_URL_TRANSPORTS`` (review 3) and ``KIMI_TRANSPORTS`` (review 5222539218
+#: item 5), both on #584. Found by self-audit; Copilot was the site both of those
+#: rounds missed.
+#:
+#: ``stdio`` maps to itself deliberately. The vendor documents ``Local`` and
+#: ``STDIO`` as working the same way and recommends ``stdio`` for configurations
+#: shared with VS Code, the cloud agent, and other MCP clients, so rewriting it to
+#: ``local`` would trade a portable spelling for a Copilot-only one and fix
+#: nothing. Only ``streamable-http`` actually changes here.
+#:
+#: Only these spellings translate. An absent or unrecognised ``type`` is left
+#: alone: ``_map_entry`` always emits ``type`` for a plugin server, so a type-less
+#: entry came from a hand-written profile — or is CAO's own in-session server,
+#: which carries no ``type`` and works because Copilot infers a command-based
+#: server from ``command``. Inventing one would be a behaviour change beyond this
+#: finding, which is the same boundary ``KIMI_TRANSPORTS`` draws.
+COPILOT_TRANSPORTS: dict[str, str] = {
+    "stdio": "stdio",
+    "streamable-http": "http",
+    "http": "http",
+    "sse": "sse",
+}
 
 ANSI_CODE_PATTERN = r"\x1b\[[0-?]*[ -/]*[@-~]"
 OSC_PATTERN = r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"
@@ -173,7 +206,9 @@ class CopilotCliProvider(BaseProvider):
 
         # Apply tool restrictions via --deny-tool flags.
         # --deny-tool takes precedence over --allow-all.
-        if self._allowed_tools and "*" not in self._allowed_tools:
+        # A present-but-empty list is deny-all (same as Grok). A falsy check
+        # used to skip --deny-tool entirely for allowed_tools=[].
+        if self._allowed_tools is not None and "*" not in self._allowed_tools:
             from cli_agent_orchestrator.utils.tool_mapping import get_disallowed_tools
 
             disallowed = get_disallowed_tools("copilot_cli", self._allowed_tools)
@@ -196,6 +231,38 @@ class CopilotCliProvider(BaseProvider):
                 "env": {"CAO_TERMINAL_ID": self.terminal_id},
             }
         }
+
+        # Agent Plugins: this runtime config is the only MCP configuration Copilot
+        # reads, so a plugin server absent here is a plugin server Copilot never
+        # sees. Review on #584 found it hardcoded to cao-mcp-server alone, which
+        # meant plugin MCP delivery silently did not reach this provider at all.
+        if self._agent_profile is not None:
+            try:
+                profile = _with_plugin_mcp(load_agent_profile(self._agent_profile), "copilot_cli")
+            except Exception as exc:
+                # Never block a launch on plugin delivery.
+                logger.warning(
+                    "Could not load profile '%s' for Copilot MCP config: %s",
+                    self._agent_profile,
+                    exc,
+                )
+                profile = None
+
+            for name, cfg in ((profile.mcpServers if profile else None) or {}).items():
+                if name in merged_servers:
+                    # CAO's own in-session server is not replaceable by a plugin.
+                    continue
+                entry = dict(cfg) if isinstance(cfg, dict) else cfg.model_dump(exclude_none=True)
+                declared = entry.get("type")
+                translated = COPILOT_TRANSPORTS.get(declared) if isinstance(declared, str) else None
+                if translated is not None:
+                    entry["type"] = translated
+                env = dict(entry.get("env", {}))
+                env.setdefault("CAO_TERMINAL_ID", self.terminal_id)
+                entry["env"] = env
+                entry.setdefault("disabled", False)
+                merged_servers[name] = entry
+
         return json.dumps({"mcpServers": merged_servers}, ensure_ascii=False)
 
     def _send_enter(self) -> None:

@@ -35,7 +35,7 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-from cli_agent_orchestrator.constants import API_BASE_URL, MCP_REQUEST_TIMEOUT
+from cli_agent_orchestrator.constants import API_BASE_URL
 from cli_agent_orchestrator.ext_apps import (
     AGENT_RESOURCE_URI,
     DASHBOARD_RESOURCE_URI,
@@ -59,6 +59,7 @@ from cli_agent_orchestrator.services.ui_state_service import (
     build_agent_detail_snapshot,
     build_dashboard_snapshot,
 )
+from cli_agent_orchestrator.utils.orchestration import _mcp_timeout
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +124,7 @@ def _get_json(path: str, **params: Any) -> Any:
         f"{API_BASE_URL}{path}",
         params=params or None,
         headers=_auth_headers() or None,
-        timeout=MCP_REQUEST_TIMEOUT,
+        timeout=_mcp_timeout(),
     )
     response.raise_for_status()
     return response.json()
@@ -152,7 +153,7 @@ def _post_json(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
         f"{API_BASE_URL}{path}",
         params={k: v for k, v in (params or {}).items() if v is not None} or None,
         headers=_auth_headers() or None,
-        timeout=MCP_REQUEST_TIMEOUT,
+        timeout=_mcp_timeout(),
     )
     response.raise_for_status()
     try:
@@ -167,7 +168,7 @@ def _delete_json(path: str) -> Any:
     response = requests.delete(
         f"{API_BASE_URL}{path}",
         headers=_auth_headers() or None,
-        timeout=MCP_REQUEST_TIMEOUT,
+        timeout=_mcp_timeout(),
     )
     response.raise_for_status()
     try:

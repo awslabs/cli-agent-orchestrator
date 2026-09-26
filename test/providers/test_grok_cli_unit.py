@@ -120,6 +120,206 @@ def test_stale_permission_and_error_before_current_ready_are_ignored():
     assert make_provider().get_status(output) == TerminalStatus.IDLE
 
 
+def _limit_picker() -> str:
+    """Build the boxed usage-limit picker as captured on grok 1.0.13."""
+
+    return (
+        "  ┃  You hit your weekly limit.\n"
+        "  ┃\n"
+        "  ┃  1 (○) Upgrade tier      Upgrade to a higher tier for more usage\n"
+        "  ┃  2 (○) Buy more credits  Purchase credits to keep using Grok Build\n"
+        "  ┃  3 (○) Try Again         Resubmit the last prompt once you have usage again\n"
+        "  ┃\n"
+        "  ┃  ↑/↓ navigate · y copy                                                Enter:submit\n"
+        "  ┃\n"
+        "  Tab:next answer  │  Esc:scrollback  │  Shift+x:dismiss\n"
+    )
+
+
+def _raw_limit_picker() -> str:
+    """The same picker as grok writes it to the pipe-pane FIFO.
+
+    Cursor-positioned cells and SGR runs, not pre-rendered text, so callers
+    exercise ``strip_terminal_escapes`` the way ``StatusMonitor`` does.
+    """
+
+    return (
+        "\x1b[30;1H\x1b[38;5;203m┃\x1b[6G\x1b[1mYou hit your weekly limit.\x1b[0m"
+        "\x1b[31;1H\x1b[38;5;203m┃\x1b[0m"
+        "\x1b[32;1H\x1b[38;5;203m┃\x1b[6G\x1b[0m1 (○) Upgrade tier"
+        "\x1b[32GUpgrade to a higher tier for more usage"
+        "\x1b[33;1H\x1b[38;5;203m┃\x1b[6G\x1b[0m2 (○) Buy more credits"
+        "\x1b[32GPurchase credits to keep using Grok Build"
+        "\x1b[34;1H\x1b[38;5;203m┃\x1b[6G\x1b[0m3 (○) Try Again"
+        "\x1b[32GResubmit the last prompt once you have usage again"
+        "\x1b[35;1H\x1b[38;5;203m┃\x1b[6G\x1b[2m↑/↓ navigate · y copy"
+        "\x1b[70GEnter:submit\x1b[0m"
+        "\x1b[36;1H\x1b[2mTab:next answer\x1b[22G│\x1b[25GEsc:scrollback"
+        "\x1b[42G│\x1b[45GShift+x:dismiss\x1b[0m"
+    )
+
+
+def _raw_generic_picker() -> str:
+    """A picker with the same 1.0.13 footers but no usage-limit refusal."""
+
+    return (
+        "\x1b[30;1H\x1b[38;5;203m┃\x1b[6G\x1b[1mPick an option\x1b[0m"
+        "\x1b[31;1H\x1b[38;5;203m┃\x1b[6G\x1b[0m1 (○) Option A"
+        "\x1b[32;1H\x1b[38;5;203m┃\x1b[6G\x1b[0m2 (○) Option B"
+        "\x1b[33;1H\x1b[38;5;203m┃\x1b[6G\x1b[2m↑/↓ navigate · y copy"
+        "\x1b[70GEnter:submit\x1b[0m"
+        "\x1b[34;1H\x1b[2mTab:next answer\x1b[22G│\x1b[25GEsc:scrollback"
+        "\x1b[42G│\x1b[45GShift+x:dismiss\x1b[0m"
+    )
+
+
+def _raw_processing_frame() -> str:
+    """The spinner redraw grok emits while a turn is actually running."""
+
+    return (
+        "\x1b[40;1H\x1b[2m⠦\x1b[4GWaiting for response… 0.7s\x1b[0m"
+        "\x1b[49;1H\x1b[2mShift+Tab:mode\x1b[20G│\x1b[23GEsc:cancel\x1b[0m"
+    )
+
+
+def test_weekly_limit_picker_after_stale_waiting_is_error():
+    """grok 1.0.13's weekly-limit picker classifies as ERROR so a blocking
+    handoff fails immediately instead of reporting PROCESSING until timeout.
+
+    Guards the issue #756 regression: the stale "Waiting for response…"/
+    "Esc:cancel" PROCESSING marker left by the turn that hit the limit still
+    precedes the picker in the buffer, and the picker's own footer
+    ("Tab:next answer"/"Enter:submit") also matches WAITING_USER_PATTERN, so
+    this pane previously reported PROCESSING indefinitely.
+    """
+    output = "Waiting for response…\nEsc:cancel\n" + _limit_picker()
+    assert make_provider().get_status(output) == TerminalStatus.ERROR
+
+
+def test_generic_picker_with_tab_next_answer_is_waiting_user_answer():
+    """A picker of the same shape but without the limit refusal stays
+    WAITING_USER_ANSWER.
+
+    Guards against the limit-picker ERROR check widening into "any picker
+    carrying a Tab:next answer / Enter:submit footer is an error".
+    """
+    picker = (
+        "  ┃  Pick an option\n"
+        "  ┃\n"
+        "  ┃  1 (○) Option A\n"
+        "  ┃  2 (○) Option B\n"
+        "  ┃\n"
+        "  ┃  ↑/↓ navigate · y copy                                                Enter:submit\n"
+        "  ┃\n"
+        "  Tab:next answer  │  Esc:scrollback  │  Shift+x:dismiss\n"
+    )
+    assert make_provider().get_status(picker) == TerminalStatus.WAITING_USER_ANSWER
+
+
+def test_raw_limit_picker_after_stale_processing_is_error():
+    """The captured picker still classifies as ERROR when fed as a raw frame.
+
+    Positive control for the recency ordering added below: the picker is the
+    newest structure in the append-only buffer, so the stale
+    "Waiting for response…"/"Esc:cancel" marker of the turn that hit the limit
+    must not pull the pane back to PROCESSING.
+    """
+    output = _raw_processing_frame() + _raw_limit_picker()
+    assert make_provider().get_status(output) == TerminalStatus.ERROR
+
+
+def test_limit_picker_erased_by_clear_screen_before_processing_is_processing():
+    """A limit picker that ``ESC[2J ESC[H`` erased must not beat the frame that
+    replaced it.
+
+    Guards the P2 review finding: the raw FIFO buffer is append-only and
+    ``strip_terminal_escapes`` drops the erase sequence without removing the
+    picker text, so the boxed refusal and its own footer still match here. Only
+    position distinguishes them, so the limit-picker ERROR check is ordered
+    against ``last_processing``; base (pre-PR) behavior for this frame is
+    PROCESSING and this must match it.
+    """
+    output = _raw_limit_picker() + "\x1b[2J\x1b[H" + _raw_processing_frame()
+    assert make_provider().get_status(output) == TerminalStatus.PROCESSING
+
+
+def test_limit_picker_erased_by_home_and_erase_to_end_before_processing_is_processing():
+    """Same regression as above for the home-plus-erase-to-end redraw form.
+
+    ``ESC[H ESC[J`` clears from the cursor to the end of the screen instead of
+    clearing the whole screen; both leave the erased picker in the raw buffer,
+    so both must fall through to the newer processing frame.
+    """
+    output = _raw_limit_picker() + "\x1b[H\x1b[J" + _raw_processing_frame()
+    assert make_provider().get_status(output) == TerminalStatus.PROCESSING
+
+
+def test_quoted_limit_picker_panel_before_processing_is_processing():
+    """A full boxed-panel quotation of the refusal cannot abort a live turn.
+
+    Guards the review's second reproduction: an assistant answer that reprints
+    the whole panel -- box glyphs, options and picker footers -- satisfies the
+    structural check, so the ERROR branch must still lose to the processing
+    evidence that follows it.
+    """
+    output = (
+        "     ❯ Show me exactly what grok prints when the quota runs out.\n\n"
+        "    It draws this panel:\n\n" + _limit_picker() + "\n" + _raw_processing_frame()
+    )
+    assert make_provider().get_status(output) == TerminalStatus.PROCESSING
+
+
+def test_generic_picker_erased_before_processing_is_processing():
+    """An erased ordinary picker must not report WAITING_USER_ANSWER over a
+    live turn either.
+
+    Guards the companion half of the P2 finding: the 1.0.13 footers
+    ("Tab:next answer"/"Enter:submit") are classified through their own check
+    ordered against ``last_processing`` rather than being added to
+    ``WAITING_USER_PATTERN``, whose branch is gated only against completion and
+    ready evidence.
+    """
+    output = _raw_generic_picker() + "\x1b[2J\x1b[H" + _raw_processing_frame()
+    assert make_provider().get_status(output) == TerminalStatus.PROCESSING
+
+
+def test_old_error_then_current_processing_is_processing():
+    """A stale "Error:" line must not abort a turn that is still running.
+
+    Guards the ordering of the generic ERROR check against newer processing
+    evidence: an earlier error followed by a live "Waiting for response…"/
+    "Esc:cancel" frame is PROCESSING, not ERROR.
+    """
+    output = "Error: transient tool failure\n" + "⠦ Waiting for response… 0.7s\nEsc:cancel\n"
+    assert make_provider().get_status(output) == TerminalStatus.PROCESSING
+
+
+def test_quoted_weekly_limit_prose_without_picker_is_processing():
+    """Assistant prose quoting the limit sentence must not classify as ERROR.
+
+    Guards the structural anchor on the limit pattern: only the boxed picker
+    line (plus a picker footer after it) counts, never an arbitrary transcript
+    substring during a working turn.
+    """
+    output = (
+        "     ❯ What does grok print once the quota runs out?\n\n"
+        '    It answers with "You hit your weekly limit." and offers three choices.\n\n'
+        "    ⠦ Waiting for response… 0.7s\n"
+        "  Shift+Tab:mode  │  Esc:cancel\n"
+    )
+    assert make_provider().get_status(output) == TerminalStatus.PROCESSING
+
+
+def test_old_error_then_current_ready_footer_is_idle():
+    """A stale "Error:" line followed by a current ready footer stays IDLE.
+
+    Guards the unchanged base behavior for the plain old-error case that has
+    no picker and no newer processing marker.
+    """
+    output = "Error: old transient error\n" + load_fixture("grok_cli_idle.txt")
+    assert make_provider().get_status(output) == TerminalStatus.IDLE
+
+
 def test_old_idle_then_current_processing_is_processing():
     output = load_fixture("grok_cli_idle.txt") + "\n" + load_fixture("grok_cli_processing.txt")
     assert make_provider().get_status(output) == TerminalStatus.PROCESSING
@@ -640,6 +840,126 @@ def test_restricted_command_allows_only_valid_configured_mcp_servers(tmp_path):
         for candidate in allowed
     )
     provider.cleanup()
+
+
+# ---------------------------------------------------------------------------
+# Documented ``@glob`` grants (docs/agent-plugins.md:207, example at :225).
+#
+# ``_permitted_mcp_server_refs`` converted each ``@...`` entry to one exact
+# server name and required that literal to be configured, so the ``@plugin-*``
+# the documentation tells an operator to write resolved to nothing and the
+# launch command carried no ``MCPTool(...)`` rule at all. Asserted on the
+# command string rather than the resolver's return value, because the command
+# is the artifact that decides what Grok actually permits.
+# ---------------------------------------------------------------------------
+
+
+def _grok_mcp_rules(provider, profile, tmp_path) -> set[str]:
+    """Return the ``MCPTool(...)`` rules in the launch command Grok is given."""
+
+    with (
+        patch("cli_agent_orchestrator.providers.grok_cli.CAO_HOME_DIR", tmp_path),
+        patch("cli_agent_orchestrator.providers.grok_cli.shutil.which", return_value="/bin/grok"),
+        patch(
+            "cli_agent_orchestrator.providers.grok_cli.load_agent_profile",
+            return_value=profile,
+        ),
+    ):
+        parts = shlex.split(provider._build_grok_command())
+    try:
+        return {
+            parts[index + 1]
+            for index, part in enumerate(parts)
+            if part == "--allow" and parts[index + 1].startswith("MCPTool(")
+        }
+    finally:
+        provider.cleanup()
+
+
+def _plugin_profile(**extra) -> AgentProfile:
+    """A profile whose configured servers include a plugin-delivered one."""
+
+    servers = {
+        "plugin-tools": {"command": "plugin-tools-mcp"},
+        "other-tools": {"command": "other-tools-mcp"},
+    }
+    servers.update(extra.pop("mcpServers", {}))
+    return _profile(mcpServers=servers, **extra)
+
+
+def test_grok_honors_a_documented_glob_mcp_grant(tmp_path):
+    """``@plugin-*`` must reach the launch command as the concrete server's rule."""
+
+    provider = make_provider(agent_profile="grok-worker", allowed_tools=["fs_read", "@plugin-*"])
+
+    rules = _grok_mcp_rules(provider, _plugin_profile(), tmp_path)
+
+    assert "MCPTool(plugin-tools__*)" in rules, (
+        f"the documented @plugin-* grant authorized nothing; Grok was launched with "
+        f"{sorted(rules)} (docs/agent-plugins.md:207)"
+    )
+
+
+def test_grok_glob_grant_does_not_reach_a_non_matching_server(tmp_path):
+    """The glob is a filter, not a switch: a sibling server stays denied."""
+
+    provider = make_provider(agent_profile="grok-worker", allowed_tools=["fs_read", "@plugin-*"])
+
+    rules = _grok_mcp_rules(provider, _plugin_profile(), tmp_path)
+
+    assert "MCPTool(other-tools__*)" not in rules
+
+
+def test_grok_glob_grant_is_case_sensitive(tmp_path):
+    """``@PLUGIN-*`` must not match ``plugin-tools`` on any platform.
+
+    ``fnmatch.fnmatch`` case-folds wherever ``os.path.normcase`` does, which
+    would silently widen the grant on a case-insensitive host. The rule uses
+    ``fnmatchcase``.
+    """
+
+    provider = make_provider(agent_profile="grok-worker", allowed_tools=["fs_read", "@PLUGIN-*"])
+
+    rules = _grok_mcp_rules(provider, _plugin_profile(), tmp_path)
+
+    assert "MCPTool(plugin-tools__*)" not in rules
+    assert not any(rule.startswith("MCPTool(plugin") for rule in rules), sorted(rules)
+
+
+def test_grok_glob_grant_never_invents_an_unconfigured_server(tmp_path):
+    """A pattern matching nothing configured must not be interpolated raw.
+
+    The pattern is expanded against the concrete configured names only. A rule
+    built from the pattern itself would hand Grok ``MCPTool(ghost-*__*)`` and
+    authorize whatever later answered to it.
+    """
+
+    provider = make_provider(
+        agent_profile="grok-worker",
+        allowed_tools=["fs_read", "@cao-mcp-server", "@ghost-*"],
+    )
+
+    rules = _grok_mcp_rules(provider, _plugin_profile(), tmp_path)
+
+    assert rules == {"MCPTool(cao-mcp-server__*)"}, sorted(rules)
+
+
+def test_grok_exact_and_star_grants_are_unchanged(tmp_path):
+    """The controls: exact membership still works and ``"*"`` is untouched."""
+
+    exact = make_provider(agent_profile="grok-worker", allowed_tools=["fs_read", "@plugin-tools"])
+    assert "MCPTool(plugin-tools__*)" in _grok_mcp_rules(exact, _plugin_profile(), tmp_path)
+
+    unrestricted = make_provider(allowed_tools=["*"])
+    with (
+        patch("cli_agent_orchestrator.providers.grok_cli.CAO_HOME_DIR", tmp_path),
+        patch("cli_agent_orchestrator.providers.grok_cli.shutil.which", return_value="/bin/grok"),
+    ):
+        parts = shlex.split(unrestricted._build_grok_command())
+    # "*" takes the unrestricted branch, which emits no permission rules at all.
+    assert "--always-approve" in parts
+    assert not any(part.startswith("MCPTool(") for part in parts)
+    unrestricted.cleanup()
 
 
 def test_web_capability_omits_disable_flag(tmp_path):
@@ -1216,3 +1536,59 @@ def test_atomic_write_repairs_existing_permissive_mode(tmp_path):
     make_provider()._atomic_write_private(target, "new\n")
     assert target.read_text(encoding="utf-8") == "new\n"
     assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
+def test_streamable_http_is_written_as_grok_http():
+    """Reproduced by review 3 on #584: CAO and Grok name the same transport differently.
+
+    The Agent Plugins ``mcp.json`` schema and CAO's mapper use the MCP spec's
+    ``streamable-http``; Grok's TOML calls it ``http``. Before the alias, wiring
+    Grok into plugin delivery meant a schema-valid plugin server raised
+    ``ProviderError`` out of ``_render_mcp_config`` — during terminal creation,
+    so the whole agent failed to launch rather than losing one tool.
+    """
+    rendered = make_provider()._render_mcp_config(
+        {"remote": {"url": "https://mcp.example.invalid", "type": "streamable-http"}}
+    )
+    assert 'type = "http"' in rendered
+    assert "streamable-http" not in rendered
+
+
+def test_sse_is_still_written_as_sse():
+    """SSE requires an explicit type in Grok, so it must not collapse to http."""
+    rendered = make_provider()._render_mcp_config(
+        {"remote": {"url": "https://mcp.example.invalid", "type": "sse"}}
+    )
+    assert 'type = "sse"' in rendered
+
+
+def test_the_profile_load_is_wrapped_in_plugin_delivery(tmp_path, monkeypatch):
+    """The launch-time seam: Grok must see installed plugins' MCP servers.
+
+    Asserted on the provider key as well as the call, because the key selects the
+    transport row — passing the module name instead of the ``ProviderType`` value
+    would silently fall through to the stdio-only default.
+    """
+    from cli_agent_orchestrator.models.provider import ProviderType
+
+    calls = []
+
+    def spy(profile, provider=None):
+        calls.append((profile, provider))
+        return profile
+
+    monkeypatch.setattr("cli_agent_orchestrator.providers.grok_cli.CAO_HOME_DIR", tmp_path)
+    monkeypatch.setattr("cli_agent_orchestrator.providers.grok_cli._with_plugin_mcp", spy)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.grok_cli.load_agent_profile",
+        lambda _name: _profile(),
+    )
+
+    provider = make_provider(agent_profile="analyst")
+    with patch(
+        "cli_agent_orchestrator.providers.grok_cli.shutil.which", return_value="/usr/bin/grok"
+    ):
+        provider._build_grok_command()
+
+    assert calls, "grok built its command without passing the profile through plugin delivery"
+    assert all(provider_key == ProviderType.GROK_CLI.value for _, provider_key in calls), calls

@@ -365,8 +365,8 @@ def get_max_terminals() -> Optional[int]:
     Counts TRACKED terminals, meaning rows in the terminals table, not probed
     liveness: a terminal row is only removed by an explicit ``delete_terminal``,
     so a terminal whose process died without cleanup still occupies a slot. That
-    is harmless in the topology the cap exists for (a worker pod is a disposable
-    Job, so its rows die with it) but an operator who sets ``server.max_terminals``
+    is harmless in the topology the cap exists for (a worker pod is disposable and
+    its state is an emptyDir, so its rows die with it) but an operator who sets ``server.max_terminals``
     on a long-lived node may have to delete a stale row by hand. Deliberately not
     probed here: this check runs before anything is allocated precisely so it can
     stay cheap, and per-row liveness probing would put tmux calls in that path.
@@ -422,6 +422,9 @@ def get_memory_settings() -> Dict[str, Any]:
         saved = {}
     result = dict(defaults)
     result.update(saved)
+    # Vault config has cross-field safety invariants and is intentionally
+    # available only through get_vault_config().
+    result.pop("vault", None)
 
     # Env-var overlay: CAO_MEMORY_ENABLED beats settings.json
     env_enabled = os.environ.get("CAO_MEMORY_ENABLED")
@@ -462,6 +465,25 @@ def get_memory_settings() -> Dict[str, Any]:
 
     result["lint_enabled"] = is_memory_lint_enabled(settings=settings)
     return result
+
+
+def get_vault_config():
+    """Load the validated ``memory.vault`` object with a disable-only env gate."""
+    from cli_agent_orchestrator.services.vault.config import VaultConfig
+
+    settings = _load()
+    memory = settings.get("memory", {})
+    raw_vault = memory.get("vault", {}) if isinstance(memory, dict) else {}
+    if not isinstance(raw_vault, dict):
+        raise ValueError("memory.vault must be an object")
+    config = VaultConfig.model_validate(raw_vault)
+
+    # This operational override may only reduce exposure. In particular, an
+    # env value of true never enables a file-disabled or absent configuration.
+    raw_env = os.environ.get("CAO_MEMORY_VAULT_ENABLED")
+    if raw_env is not None and raw_env.strip().lower() in _BOOL_FALSE_VALUES:
+        config.enabled = False
+    return config
 
 
 def _coerce_optional_bool(value: Any, *, label: str) -> Optional[bool]:
@@ -858,6 +880,43 @@ def get_extra_skill_dirs() -> List[str]:
     if not isinstance(dirs, list):
         return []
     return [d.strip() for d in dirs if isinstance(d, str) and d.strip()]
+
+
+def get_skill_projection_mode() -> str:
+    """How Agent-Plugin skills are materialized into the global skill store.
+
+    ``"symlink"`` (default) links each projected skill at
+    ``SKILLS_DIR/<name>``; ``"copy"`` copies the content instead, for
+    environments where symlink creation is unsupported (Windows without
+    Developer Mode or elevation). Copy mode re-copies on every projection
+    rebuild, so it is correct but not free.
+
+    Reads ``skills.projection_mode``, alongside the existing
+    ``skills.extra_dirs``. Any unrecognized value falls back to ``"symlink"``
+    rather than raising — a hand-edited ``settings.json`` must not be able to
+    break plugin installation.
+    """
+    settings = _load()
+    nested = settings.get("skills", {})
+    mode = nested.get("projection_mode") if isinstance(nested, dict) else None
+    if isinstance(mode, str) and mode.strip().lower() in ("symlink", "copy"):
+        return mode.strip().lower()
+    return "symlink"
+
+
+def set_skill_projection_mode(mode: str) -> str:
+    """Set the Agent-Plugin skill projection mode (``"symlink"`` or ``"copy"``)."""
+    normalized = (mode or "").strip().lower()
+    if normalized not in ("symlink", "copy"):
+        raise ValueError(f"projection_mode must be 'symlink' or 'copy', got {mode!r}")
+    settings = _load()
+    skills_section = settings.get("skills", {})
+    if not isinstance(skills_section, dict):
+        skills_section = {}
+    skills_section["projection_mode"] = normalized
+    settings["skills"] = skills_section
+    _save(settings)
+    return normalized
 
 
 def set_extra_skill_dirs(dirs: List[str]) -> List[str]:

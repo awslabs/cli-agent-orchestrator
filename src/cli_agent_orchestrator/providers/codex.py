@@ -9,6 +9,8 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from cli_agent_orchestrator.agent_plugins.mcp_delivery import with_plugin_mcp as _with_plugin_mcp
+from cli_agent_orchestrator.agent_plugins.mcp_mapping import CODEX_BARE_KEY
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -71,7 +73,10 @@ ERROR_PATTERN = r"^(?:Error:|ERROR:|Traceback \(most recent call last\):|panic:)
 # v0.136+: "model · path" (the "N% left" segment was removed)
 # The "·\s+[~/]" alternative anchors on the path component of the footer,
 # which is shared across v0.111 and v0.136 status bars.
-TUI_FOOTER_PATTERN = r"(?:\?\s+for shortcuts|context left|\d+%\s+left|·\s+[~/])"
+# The percentage is \d{1,3} rather than \d+: it is 0-100, and an unbounded \d+
+# made the unanchored search rescan every digit run that never reaches a "%" —
+# quadratic backtracking (CWE-1333) on a screenful of digits.
+TUI_FOOTER_PATTERN = r"(?:\?\s+for shortcuts|context left|\d{1,3}%\s+left|·\s+[~/])"
 # Codex TUI progress spinner: "• Working (0s • esc to interrupt)",
 # "• Working (1m 00s ...)", "• Working (1h 00m 00s ...)", or dynamic
 # prefixes such as "• Starting script creation (10s • esc to interrupt)".
@@ -79,7 +84,19 @@ TUI_FOOTER_PATTERN = r"(?:\?\s+for shortcuts|context left|\d+%\s+left|·\s+[~/])
 # Appears inline with --no-alt-screen when the agent is actively processing.
 # Must be checked before COMPLETED to avoid false positives (the • matches
 # ASSISTANT_PREFIX_PATTERN and the TUI footer › matches idle prompt).
-TUI_PROGRESS_PATTERN = r"•[^\n]*\((?:(?:\d+h\s+)?\d+m\s+)?\d+s\s*•\s*esc to interrupt\)"
+#
+# codex-cli 0.153.4 (live acceptance capture, 2026-09-08) alternates the
+# leading glyph between the solid bullet "•" (U+2022) and the hollow bullet
+# "◦" (U+25E6) as the spinner animates -- a frame landing on "◦Applying both
+# edits(52s • esc to interrupt)" previously failed to match (the pattern only
+# accepted "•"), and with --no-alt-screen the composer hint ("» Ask Codex to
+# do anything") plus the model/path footer can be rendered on that SAME line
+# as the spinner (e.g. "•Applying both edits(43s • esc to interrupt)»Ask
+# Codex to do anything gpt-6-astra ultra · ~/path"), with no space required
+# between the bullet and the following text either way. [^\n]* already
+# tolerates zero-or-more characters before the "(", so the only gap was the
+# glyph itself.
+TUI_PROGRESS_PATTERN = r"[•◦][^\n]*\((?:(?:\d+h\s+)?\d+m\s+)?\d+s\s*•\s*esc to interrupt\)"
 
 # Workspace trust/approval prompt shown when Codex opens a new directory.
 # Two known variants:
@@ -122,7 +139,13 @@ LOGIN_MENU_FOOTER = TRUST_PROMPT_FOOTER
 # A blind Enter would run a GLOBAL npm install that swaps the codex binary under
 # every other running CAO worker. We suppress with -c check_for_update_on_startup=false
 # at launch AND detect+dismiss with '3'+Enter as defense-in-depth.
-UPDATE_DIALOG_PATTERN = r"Update available!\s+\S+\s+->\s+\S+"
+# The two operands are version strings, so they are spelled out as [\w.+-]+ rather
+# than \S+: `\s+\S+` leaves the separator/operand boundary re-guessable on the
+# whitespace characters outside ASCII (e.g. U+00A0, which the TUI does use for
+# padding), which reads as quadratic backtracking (CWE-1333). CPython's own \s/\S
+# are Unicode-aware and never walked it; the explicit class is what the dialog
+# actually contains either way.
+UPDATE_DIALOG_PATTERN = r"Update available!\s+[\w.+-]+\s+->\s+[\w.+-]+"
 UPDATE_DIALOG_MENU_PATTERN = r"Skip until next version"
 UPDATE_DIALOG_FOOTER = TRUST_PROMPT_FOOTER
 STARTUP_PROMPT_BOTTOM_LINES = 15
@@ -366,7 +389,10 @@ def _toml_scalar(value: Any) -> str:
 # (mcp_servers.my.srv.command → mcp_servers['my']['srv'], not
 # mcp_servers['my.srv']), so codex would never find the server.
 _CODEX_CONFIG_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
-_CODEX_BARE_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+# One definition, shared with the mapping-time gate that isolates a name Codex
+# cannot express, so the gate and this serializer cannot drift (the same shape
+# already used for MiniMax's `_PLUGIN_SERVER_NAME`).
+_CODEX_BARE_KEY_PATTERN = CODEX_BARE_KEY
 
 
 def _validate_config_key(key: Any, *, source: str, allow_dots: bool = False) -> str:
@@ -792,6 +818,14 @@ class CodexProvider(BaseProvider):
     # the live frame rather than stale redraw history.
     supports_screen_detection = True
 
+    # Codex is the provider the mid-burst probe exists for: 0.153 redraws its
+    # spinner about once a second for the whole turn, so the screen never goes
+    # quiescent and the rising edge composites before the spinner draws. Opting
+    # in is safe because this detector is a pure function of the frame —
+    # get_status() reads patterns and returns, it commits no turn bookkeeping —
+    # so a probed frame the monitor discards leaves nothing behind.
+    supports_midburst_processing_probe = True
+
     def __init__(
         self,
         terminal_id: str,
@@ -851,7 +885,7 @@ class CodexProvider(BaseProvider):
         profile = None
         if self._agent_profile is not None:
             try:
-                profile = load_agent_profile(self._agent_profile)
+                profile = _with_plugin_mcp(load_agent_profile(self._agent_profile), "codex")
             except Exception as e:
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
 
@@ -910,11 +944,13 @@ class CodexProvider(BaseProvider):
             # Prepend security constraints for soft enforcement (Codex has no
             # native tool restriction mechanism). Only applied when tool
             # restrictions are active (not unrestricted "*").
-            if self._allowed_tools and "*" not in self._allowed_tools:
+            if self._allowed_tools is not None and "*" not in self._allowed_tools:
                 from cli_agent_orchestrator.constants import SECURITY_PROMPT
+                from cli_agent_orchestrator.utils.tool_mapping import (
+                    tool_constraint_instruction,
+                )
 
-                tools_list = ", ".join(self._allowed_tools)
-                tool_constraint = f"\nYou only have access to these tools: {tools_list}\n"
+                tool_constraint = f"\n{tool_constraint_instruction(self._allowed_tools)}\n"
                 system_prompt = SECURITY_PROMPT + tool_constraint + system_prompt
 
             if system_prompt:
@@ -1020,12 +1056,31 @@ class CodexProvider(BaseProvider):
                     if "args" in cfg:
                         args_toml = "[" + ", ".join(_toml_scalar(a) for a in cfg["args"]) + "]"
                         command_parts.extend(["-c", f"{prefix}.args={args_toml}"])
+                    # Codex documents `mcp_servers.<id>.cwd` ("Working directory for
+                    # the MCP stdio server process"), so the plugin's directory is
+                    # carried natively here rather than through the /bin/sh shim the
+                    # formats without such a field need. Reported by review
+                    # 5222539218 on #584 (item 4).
+                    if isinstance(cfg.get("cwd"), str) and cfg["cwd"]:
+                        command_parts.extend(["-c", f"{prefix}.cwd={_toml_scalar(cfg['cwd'])}"])
                     if "env" in cfg and cfg["env"]:
-                        for env_key, env_val in cfg["env"].items():
-                            _validate_config_key(env_key, source="mcpServers env")
-                            command_parts.extend(
-                                ["-c", f"{prefix}.env.{env_key}={_toml_scalar(str(env_val))}"]
-                            )
+                        # ONE inline table with QUOTED keys, not one override per key.
+                        #
+                        # The env map lives on the VALUE side of `-c key=value`, which
+                        # Codex parses as a TOML value (it wraps the raw text as
+                        # `_x_ = <raw>`), so an inline table is accepted and a quoted
+                        # key is expressible. Emitting `…env.LOG.LEVEL=` instead put a
+                        # schema-valid key into the PATH, where the dot nests it wrongly
+                        # and `_validate_config_key` raised -- aborting the whole launch
+                        # over one environment variable. Reported by review 5222539218
+                        # on #584 (item 6). `_toml_scalar` renders a TOML basic string,
+                        # which is the same grammar a quoted key uses, so it escapes the
+                        # key safely too. Also drops the per-server override count.
+                        pairs = ", ".join(
+                            f"{_toml_scalar(str(env_key))} = {_toml_scalar(str(env_val))}"
+                            for env_key, env_val in cfg["env"].items()
+                        )
+                        command_parts.extend(["-c", f"{prefix}.env={{ {pairs} }}"])
                     # Forward CAO_TERMINAL_ID so MCP servers (e.g. cao-mcp-server)
                     # can identify the current session for handoff/assign operations.
                     # Codex does not forward env vars to MCP subprocesses by default;
@@ -1437,6 +1492,35 @@ class CodexProvider(BaseProvider):
         if not rows:
             return TerminalStatus.UNKNOWN
         return self.get_status("\n".join(rows))
+
+    def probe_processing_from_screen(self, screen_lines: list[str]) -> bool:
+        """Report whether a half-drawn Codex frame shows a working turn.
+
+        Positive evidence only: the progress row must actually be drawn. The
+        normal detector answers PROCESSING for two different reasons — a
+        detected spinner, and the catch-all at the end of get_status for a frame
+        that simply has no idle composer at the bottom. The second is right for
+        settled detection but wrong here, because a partial redraw that erases
+        the composer while the previous response is still on screen carries no
+        evidence of new work; taken as busy it consumes the monitor's dispatch
+        arm, after which the restored old completion latches and the genuine
+        spinner that follows is refused.
+
+        Requiring TUI_PROGRESS_PATTERN first, then keeping only a PROCESSING
+        verdict from the full detector, means the trust prompt, login menu,
+        approval dialog and error guards still get the final say on a frame that
+        does contain a spinner, without inheriting the no-composer fallback.
+
+        Pure: it matches patterns against the text it is handed and touches no
+        turn bookkeeping, so a verdict the monitor discards changes nothing.
+        """
+        rows = [line.rstrip() for line in screen_lines if line.strip()]
+        if not rows:
+            return False
+        frame = "\n".join(rows)
+        if not re.search(TUI_PROGRESS_PATTERN, frame, re.MULTILINE):
+            return False
+        return self.get_status(frame) == TerminalStatus.PROCESSING
 
     def extract_current_composer(self, rendered_pane: str) -> Optional[str]:
         """Return Codex's bottom composer without admitting transcript prompts."""

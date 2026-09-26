@@ -114,3 +114,30 @@ class TestStoreCapEviction:
         assert store.get("r", "a") is not None
         assert store.get("r", "b") is None
         assert store.get("r", "c") is not None
+
+    def test_delete_drops_only_the_named_key(self):
+        store = StepOutputStore()
+
+        def _rec(step):
+            return StepOutputRecord(
+                run_id="r", step_id=step, output={}, validated=True, state=StepState.COMPLETED
+            )
+
+        store.put("r", "a", _rec("a"))
+        store.put("r", "b", _rec("b"))
+
+        store.delete("r", "a")
+
+        assert store.get("r", "a") is None
+        assert store.get("r", "b") is not None
+        assert len(store) == 1
+
+    def test_delete_of_an_absent_key_is_a_noop(self):
+        """A caller releasing a slot must not have to know whether anything landed in it.
+
+        The single-step replay (#640) deletes its derived key unconditionally after
+        reading it back, and a step that emitted nothing never created the entry.
+        """
+        store = StepOutputStore()
+        store.delete("r", "never-existed")  # must not raise
+        assert len(store) == 0

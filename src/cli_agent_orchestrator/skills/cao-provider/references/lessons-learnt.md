@@ -30,7 +30,7 @@ def paste_enter_count(self) -> int:
 
 **Problem:** CLI tools frequently update their TUI. Kiro CLI changed from `[agent] >` to `agent · model · ◔ N%` with `ask a question, or describe a task` as the idle indicator. The old regex stopped matching.
 
-**Fix:** 
+**Fix:**
 - Build detection for multiple prompt formats (old and new)
 - Use fallback patterns: check the primary pattern first, then fall back to alternatives
 - Consider adding a `--legacy-ui` flag if the CLI supports it
@@ -118,7 +118,7 @@ unset_cmd = (
 2. Role-based defaults from `constants.py` (`supervisor` → `["@cao-mcp-server", "fs_read", "fs_list"]`, `developer` → `["@builtin", "fs_*", "execute_bash", "web_fetch", "@cao-mcp-server"]`, `reviewer` → `["@builtin", "fs_read", "fs_list", "@cao-mcp-server"]`, `workflow_scout` → `["@builtin", "fs_read", "execute_bash", "@cao-mcp-server"]`)
 3. Custom roles from `settings.json` (user-defined bundles)
 4. Developer defaults when `role` and `allowedTools` are both omitted. An unrecognized `role` raises `ValueError` instead of falling open to unrestricted `["*"]`.
-5. MCP server names appended as `@server_name`
+5. MCP server names appended as `@server_name` when CAO chose the list. An explicit `allowedTools` list is left as written.
 
 **Fix:** When building your provider's `_build_command()`, always check `self._allowed_tools` and apply restrictions. The resolution is already done by the time your provider receives the list — you just need to enforce it via CLI flags, agent JSON, or system prompt.
 

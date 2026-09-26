@@ -698,8 +698,14 @@ class TestInstallSkillCatalogBaking:
         assert agent_json["prompt"] == "Build things"
         assert "Available Skills" not in agent_json["prompt"]
         skill_resources = [r for r in agent_json["resources"] if r.startswith("skill://")]
-        assert len(skill_resources) == 1
-        assert skill_resources[0].endswith("/**/SKILL.md")
+        # Two globs. `*/SKILL.md` is what guarantees a projected agent-plugin
+        # skill (a symlink into the plugin store) is found whatever `**` means to
+        # Kiro's glob; `**/SKILL.md` keeps Kiro's native nested-directory support.
+        assert len(skill_resources) == 2
+        assert [r.rsplit("/skills", 1)[-1] for r in skill_resources] == [
+            "/**/SKILL.md",
+            "/*/SKILL.md",
+        ]
 
     def test_install_kiro_keeps_prompt_clean_with_skill_resources(
         self, install_workspace: dict
@@ -723,7 +729,7 @@ class TestInstallSkillCatalogBaking:
         assert agent_json["prompt"] == "Build things"
         assert "Available Skills" not in agent_json["prompt"]
         skill_resources = [r for r in agent_json["resources"] if r.startswith("skill://")]
-        assert len(skill_resources) == 1
+        assert len(skill_resources) == 2
 
     def test_install_kiro_omits_prompt_field_when_profile_prompt_is_empty(
         self, install_workspace: dict
@@ -742,7 +748,7 @@ class TestInstallSkillCatalogBaking:
         agent_json = json.loads(agent_path.read_text())
         assert "prompt" not in agent_json
         skill_resources = [r for r in agent_json["resources"] if r.startswith("skill://")]
-        assert len(skill_resources) == 1
+        assert len(skill_resources) == 2
 
     def test_install_non_ascii_prompt_round_trips_through_refresh_without_byte_drift(
         self, install_workspace: dict

@@ -59,6 +59,28 @@ A single-page dashboard for managing CLI Agent Orchestrator sessions, agents, fl
 
 In development mode, Vite proxies API requests (`/sessions`, `/terminals`, `/agents`, `/flows`, `/settings`, `/health`) to `cao-server` on port 9889 (configured in `vite.config.ts`).
 
+### Serving under a path prefix
+
+By default the UI is served at the root of its origin. To serve it under a
+sub-path instead — behind a reverse proxy that multiplexes several apps onto one
+hostname, for example — build with Vite's `--base`:
+
+```bash
+npm run build -- --base=/cao/
+```
+
+The proxy is expected to strip the prefix before forwarding, so `cao-server`
+needs no configuration and its routes are unchanged. Use an absolute prefix with
+a trailing slash; a relative base such as `./` cannot work, because the app has
+to build absolute API URLs at runtime.
+
+`--base` alone would not be enough: it rewrites the asset references baked into
+`index.html` and the bundle, but not URLs the app assembles at runtime. Those
+are the three transports in `api.ts` — `fetchJSON` for REST, `terminalSocketUrl`
+for the xterm WebSocket, `eventStreamUrl` for the workflow event stream — which
+all read the same `BASE`, derived from `import.meta.env.BASE_URL`. A default
+build leaves `BASE` empty, so those URLs are unchanged.
+
 ## Pages and Components
 
 ### Home (`DashboardHome.tsx`)

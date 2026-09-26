@@ -1,0 +1,8 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "agent-plugins-example",
+  "version": "1.0.0",
+  "description": "A copyable reference package and migration guide for Agent Plugins v1.0.0.",
+  "license": "MIT",
+  "keywords": ["agent-plugins", "example", "migration", "skills"]
+}

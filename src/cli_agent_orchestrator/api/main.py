@@ -52,12 +52,15 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from cli_agent_orchestrator.backends import TerminalBackendError, TerminalNotFoundError
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 from cli_agent_orchestrator.backends.registry import get_backend
+from cli_agent_orchestrator.cli.commands.agent_plugin import UNTRUSTED_CONTENT_WARNING
 from cli_agent_orchestrator.cli.commands.init import seed_default_skills
 from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
+    get_handoff_result,
     get_inbox_messages,
     get_terminal_metadata,
     init_db,
+    upsert_handoff_result,
 )
 from cli_agent_orchestrator.constants import (
     ALLOWED_HOSTS,
@@ -65,6 +68,7 @@ from cli_agent_orchestrator.constants import (
     CAO_HOME_DIR,
     CORS_ORIGINS,
     DEFAULT_PROVIDER,
+    HANDOFF_RESULTS_ROUTE,
     INBOX_POLLING_INTERVAL,
     INBOX_RECONCILE_INTERVAL,
     MODEL_ID_MAX_LEN,
@@ -120,6 +124,7 @@ from cli_agent_orchestrator.security.auth import (
     get_authorization_servers,
     get_current_scopes,
     is_auth_enabled,
+    is_idp_configured,
     require_any_scope,
 )
 from cli_agent_orchestrator.services import (
@@ -586,6 +591,28 @@ class RunStepRequest(BaseModel):
         default=None, description="Explicit Kiro engine for this child step"
     )
 
+    job_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Caller-generated opaque identifier for this job (issue #447). "
+            "When present, the server persists state and result under this key "
+            "so the caller can retrieve the result via GET /handoff-results/{job_id} "
+            "if the transport times out before the response arrives. "
+            "Must be a 32-character lowercase hex string (uuid4().hex)."
+        ),
+    )
+
+    @field_validator("job_id")
+    @classmethod
+    def _validate_job_id(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        if not re.fullmatch(r"[0-9a-f]{32}", v):
+            raise ValueError(
+                "job_id must be a 32-character lowercase hex string (e.g. uuid4().hex)"
+            )
+        return v
+
 
 class RunStepResponse(BaseModel):
     """Response wrapping an ``AgentStepResult`` from ``run_agent_step``.
@@ -668,6 +695,19 @@ class ResumeRunRequest(BaseModel):
             "step_id -> 'rerun' (re-execute) | 'skip' (use the stored result). "
             "Applied before the script is spawned; an unknown step id or value is a "
             "400 and applies nothing at all."
+        ),
+    )
+
+
+class StepReplayRequest(BaseModel):
+    """Request body for ``POST /workflows/runs/{run_id}/steps/{step_id}:replay`` (#640)."""
+
+    prompt_override: Optional[str] = Field(
+        default=None,
+        description=(
+            "Replacement prompt TEMPLATE for this one replay; {{workflow.inputs.*}} and "
+            "{{steps.*.output.*}} references in it still resolve against the recorded "
+            "run. Omit to reuse the snapshotted step prompt."
         ),
     )
 
@@ -1123,6 +1163,11 @@ class MemorySummary(BaseModel):
     tags: str
     created_at: datetime
     updated_at: datetime
+    source_kind: str = "native"
+    source_path: Optional[str] = None
+    indexed_at: Optional[datetime] = None
+    index_freshness: Optional[str] = None
+    content_truncated: bool = False
 
 
 class MemoryDetail(MemorySummary):
@@ -1520,11 +1565,20 @@ async def oauth_protected_resource_metadata():
     Advertises the resource audience, the authorization server(s), the supported
     scopes (``cao:read``/``cao:write``/``cao:admin``), and the supported bearer
     methods so OAuth clients can discover how to obtain access. Returns HTTP 404
-    when auth is disabled (default-off), so the localhost-only posture is
-    byte-for-byte unchanged.
+    when no IdP is configured: default-off keeps its previous response
+    byte-for-byte (status and detail), and local-token mode
+    (``CAO_AUTH_LOCAL_TOKEN`` alone) answers 404 with a detail naming what is
+    missing, since there is no authorization server to advertise.
     """
-    if not is_auth_enabled():
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="auth disabled")
+    if not is_idp_configured():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                "auth disabled"
+                if not is_auth_enabled()
+                else "no OAuth authorization server configured"
+            ),
+        )
 
     audience = (
         os.getenv("CAO_AUTH_AUDIENCE", "").strip()
@@ -1742,7 +1796,8 @@ async def agui_stream(
     _require_agui_enabled()
 
     # Auth: query-parameter token (EventSource can't set headers). Default-off
-    # (no AUTH0_DOMAIN / CAO_AUTH_JWKS_URI) grants the full scope set.
+    # (no AUTH0_DOMAIN / CAO_AUTH_JWKS_URI / CAO_AUTH_LOCAL_TOKEN) grants the
+    # full scope set.
     if is_auth_enabled():
         if not access_token:
             raise HTTPException(
@@ -2252,6 +2307,7 @@ def _resolve_template_name(template: str) -> str:
 async def search_agent_profiles_endpoint(
     q: str = Query(description="Free-text capability keywords, e.g. 'monitor sqs'"),
     limit: int = Query(default=PROFILE_SEARCH_DEFAULT_LIMIT, ge=1, le=100),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> List[Dict]:
     """Rank installed agent profiles against ``q``.
 
@@ -2699,7 +2755,9 @@ async def get_agent_profile_source_endpoint(
 
 
 @app.get("/agents/providers")
-async def list_providers_endpoint() -> List[Dict]:
+async def list_providers_endpoint(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> List[Dict]:
     """List available providers with installation status."""
     import shutil
 
@@ -2753,7 +2811,9 @@ class AgentDirsUpdate(BaseModel):
 
 
 @app.get("/settings/memory")
-async def get_memory_settings_endpoint() -> Dict:
+async def get_memory_settings_endpoint(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
     """Return whether the memory subsystem is enabled (for UI feature discovery).
 
     ``settings_readable`` is additive: False means the two flags above are
@@ -2803,7 +2863,9 @@ async def set_agent_dirs_endpoint(
 
 
 @app.get("/settings/skill-dirs")
-async def get_skill_dirs_endpoint() -> Dict:
+async def get_skill_dirs_endpoint(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
     """Get the global skill store path and user-added extra skill directories."""
     from cli_agent_orchestrator.constants import SKILLS_DIR
     from cli_agent_orchestrator.services.settings_service import get_extra_skill_dirs
@@ -2866,6 +2928,255 @@ async def get_skill_content(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to load skill: {str(e)}",
         )
+
+
+# =============================================================================
+# Agent Plugins (Agent Plugins 1.0.0) — NOT the event-plugin system
+# =============================================================================
+# Added inline next to the /skills and /settings/skill-dirs handlers because
+# api/main.py is flat (no routers package). Naming is unresolved maintainer
+# decision M1; per requirements.md 16.5 this surface must not ship to end users
+# before that is settled, so every route below is gated on
+# CAO_AGENT_PLUGINS_ENABLED (default off) and 404s without it — the routes are
+# constructed but not executable, mirroring the AG-UI gate above. The scope
+# dependencies are authorization, not the gate: they are a no-op when auth is
+# disabled.
+
+
+def _require_plugins_enabled() -> None:
+    """Raise 404 when the agent-plugin surface is disabled (default-off).
+
+    Requirement 16.5's ship-gate. Shares one predicate with the CLI group so the
+    two surfaces cannot disagree about whether the surface is live.
+
+    Applied as a **route dependency**, not as the handler's first statement, and
+    that distinction is the gate: FastAPI validates the request body and solves
+    the scope dependency *before* the handler body runs, so an in-body check still
+    answered a malformed payload with 422 and an unauthorized caller with 401/403 —
+    both of which disclose that the gated route exists. A route-level dependency is
+    solved first, so every request to a disabled surface gets the same 404 an
+    unregistered path would (verified for a malformed body and for a failing auth
+    dependency). "First in the handler" is not "first in the request".
+    """
+
+    from cli_agent_orchestrator.agent_plugins.gate import agent_plugins_surface_enabled
+
+    if not agent_plugins_surface_enabled():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="agent plugin surface disabled",
+        )
+
+
+class PluginInstallRequest(BaseModel):
+    """Body for ``POST /plugins`` and ``POST /plugins/validate``."""
+
+    source: str
+    kind: Optional[str] = None
+    """``"path"`` or ``"git"``. Inferred from the source string when omitted."""
+
+    ref: Optional[str] = None
+    subdir: Optional[str] = None
+    force: bool = False
+
+
+def _plugin_source(body: "PluginInstallRequest"):
+    """Build a PluginSource, reusing the CLI's source-kind detection.
+
+    Shared rather than reimplemented so a source string that installs from the
+    CLI installs identically from the panel.
+    """
+    from cli_agent_orchestrator.agent_plugins.models import PluginSource
+    from cli_agent_orchestrator.cli.commands.agent_plugin import _looks_like_git
+
+    if body.kind == "git" or (body.kind != "path" and _looks_like_git(body.source)):
+        kind: Literal["path", "git"] = "git"
+    else:
+        kind = "path"
+    return PluginSource(kind=kind, location=body.source, ref=body.ref, subdir=body.subdir)
+
+
+def _with_untrusted_warning(payload: Dict) -> Dict:
+    """Attach the untrusted-content warning to an agent-plugin response.
+
+    Every response describing a plugin carries it — list, install, validate, and
+    the 422 body for an unloadable install — so a client cannot render an install
+    affordance without having been handed the text to show beside it. Requirement
+    22.1 puts the obligation on CAO, and a warning present only on the *list*
+    response is satisfiable by a client that never calls list.
+
+    That the unloadable-install 422 carries it too is the case worth stating:
+    "this plugin is not loadable" is exactly the moment a user is deciding whether
+    to try a different source, which is a decision about trust.
+    """
+    return {**payload, "untrusted_content_warning": UNTRUSTED_CONTENT_WARNING}
+
+
+@app.get("/plugins", dependencies=[Depends(_require_plugins_enabled)])
+async def list_agent_plugins(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """List installed agent plugins with findings and projected skill names.
+
+    Also reports, per plugin, which live sessions reference a skill it provides,
+    so a client can render the removal warning *before* the operator commits to
+    a DELETE.
+
+    Read-scope gated when auth is enabled, following ``GET /settings/agent-dirs``
+    and for a strictly larger version of its reason. That route is gated because it
+    discloses local filesystem layout; this one discloses that **plus** live
+    operational state: every plugin's original source path or repository URL, and
+    per plugin the terminal IDs, session names, profile names, and skill names of
+    running work. The read floor rather than write/admin, because read-only
+    callers — the web panel, a status script — are exactly who this is for.
+    """
+    from cli_agent_orchestrator.agent_plugins.installer import affected_sessions_by_plugin
+    from cli_agent_orchestrator.agent_plugins.store import InstalledPluginStore
+
+    store = InstalledPluginStore()
+    # Deliberately does NOT sweep dangling projections. This is a GET a panel
+    # polls, and `sweep_dangling_projections` mutates the filesystem — a read
+    # route that deletes things is both surprising and, on the event loop, a
+    # per-poll directory walk. The sweep still runs where it belongs: on every
+    # projection rebuild, i.e. install and removal. Read paths already tolerate a
+    # dangling link on their own (`list_skills()` gates on `is_dir()` and
+    # `SKILL.md is_file()`, both False rather than raising for a broken link), so
+    # nothing here depends on having swept first.
+    # One live-state walk for the whole response. Calling `affected_sessions`
+    # per record re-enumerated sessions, terminals and profiles for every plugin —
+    # identical work each time, on a route a panel polls.
+    affected_by_plugin = affected_sessions_by_plugin(store=store)
+
+    plugins = []
+    for record in store.list_installed():
+        entry = record.to_dict()
+        entry["affected_sessions"] = [
+            session.to_dict() for session in affected_by_plugin.get(record.name, [])
+        ]
+        plugins.append(entry)
+
+    return _with_untrusted_warning({"plugins": plugins})
+
+
+@app.post(
+    "/plugins",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(_require_plugins_enabled)],
+)
+async def install_agent_plugin(
+    body: PluginInstallRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Install an agent plugin from a local path or a git URL."""
+    from cli_agent_orchestrator.agent_plugins.installer import (
+        PluginBusyError,
+        PluginInstallError,
+        install,
+    )
+
+    try:
+        # Offloaded: a git source can block in `subprocess.run` for up to 300s and a
+        # large local source blocks in `copytree`. Run on the event loop, that window
+        # is one where the server serves no health/session request and runs no status
+        # or inbox task. `asyncio.to_thread` is the convention already used throughout
+        # this module.
+        outcome = await asyncio.to_thread(install, _plugin_source(body), force=body.force)
+    except PluginBusyError as exc:
+        # 409, not 400: nothing is wrong with the request -- it collided with
+        # another lifecycle operation and is safe to retry verbatim. Placed BEFORE
+        # the PluginInstallError branch because it subclasses it; the wider handler
+        # would otherwise answer 400 and tell the operator to change their request.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    except PluginInstallError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to install agent plugin: {exc}",
+        )
+
+    if not outcome.installed:
+        # A plugin that is not loadable is the caller's input being wrong, not a
+        # server fault: return the full report so the panel can render every
+        # finding rather than a bare error string.
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=_with_untrusted_warning(outcome.to_dict()),
+        )
+    return _with_untrusted_warning(outcome.to_dict())
+
+
+@app.post("/plugins/validate", dependencies=[Depends(_require_plugins_enabled)])
+async def validate_agent_plugin(
+    body: PluginInstallRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Validate a plugin source without installing it.
+
+    Scope-gated despite installing nothing, unlike the other ``/validate``
+    endpoints, which are pure computation over a document the caller already
+    supplied. This one **resolves the source first**: a git source is cloned and
+    a path source is copied into staging. That is real outbound network and disk
+    work performed on the caller's behalf, so exempting it on the strength of the
+    shared ``/validate`` suffix would be reading the name rather than the
+    behaviour.
+    """
+    from cli_agent_orchestrator.agent_plugins.installer import PluginInstallError, validate_source
+
+    try:
+        # Offloaded for the same reason as the install path: validating a source
+        # resolves it first, which clones or copies before any parsing happens.
+        report = await asyncio.to_thread(validate_source, _plugin_source(body))
+    except PluginInstallError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to validate agent plugin: {exc}",
+        )
+    return _with_untrusted_warning(report.to_dict())
+
+
+@app.delete("/plugins/{name}", dependencies=[Depends(_require_plugins_enabled)])
+async def uninstall_agent_plugin(
+    name: str,
+    purge_data: bool = False,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Uninstall an agent plugin.
+
+    The response reports which live sessions referenced a skill this plugin
+    provided. Note that reporting is all this endpoint can do — the
+    warn-and-confirm gate itself belongs to the client, which must render that
+    information and wait for the operator *before* issuing the DELETE.
+    """
+    from cli_agent_orchestrator.agent_plugins.installer import (
+        PluginBusyError,
+        PluginInstallError,
+        uninstall,
+    )
+
+    try:
+        # Offloaded: removal walks the store and rebuilds the skill projection,
+        # both synchronous filesystem work.
+        outcome = await asyncio.to_thread(uninstall, name, purge_data=purge_data)
+    except PluginBusyError as exc:
+        # 409, not 400: nothing is wrong with the request -- it collided with
+        # another lifecycle operation and is safe to retry verbatim. Placed BEFORE
+        # the PluginInstallError branch because it subclasses it; the wider handler
+        # would otherwise answer 400 and tell the operator to change their request.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    except PluginInstallError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to uninstall agent plugin: {exc}",
+        )
+    # Deliberately NOT warned: removal is the safe direction, and a warning about
+    # installing untrusted content beside a successful uninstall is noise that
+    # trains operators to ignore the text where it matters.
+    return outcome.to_dict()
 
 
 @app.post("/sessions", response_model=Terminal, status_code=status.HTTP_201_CREATED)
@@ -3328,7 +3639,10 @@ async def create_terminal_in_session(
 
 
 @app.get("/sessions/{session_name}/terminals")
-async def list_terminals_in_session(session_name: str) -> List[Dict]:
+async def list_terminals_in_session(
+    session_name: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> List[Dict]:
     """List a session's terminals, oldest first.
 
     The order is significant and part of this endpoint's contract: **index 0 is
@@ -3544,7 +3858,10 @@ async def get_terminal_memory_context(
 
 
 @app.get("/terminals/{terminal_id}/working-directory", response_model=WorkingDirectoryResponse)
-async def get_terminal_working_directory(terminal_id: TerminalId) -> WorkingDirectoryResponse:
+async def get_terminal_working_directory(
+    terminal_id: TerminalId,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> WorkingDirectoryResponse:
     """Get the current working directory of a terminal's pane."""
     try:
         working_directory = terminal_service.get_working_directory(terminal_id)
@@ -3724,6 +4041,57 @@ def _schedule_elastic_terminal_ended(
         background_tasks.add_task(_notify_elastic_terminal_ended, terminal_id)
 
 
+async def _record_job_state(job_id: Optional[str], state: str, **fields: Any) -> None:
+    """Best-effort ``handoff_results`` write for a run-step call (issue #447).
+
+    No-op when the caller supplied no ``job_id`` — durability is opt-in, so a
+    request without one behaves exactly as it did before this existed. A write
+    failure is logged and swallowed: durability bookkeeping must never turn a
+    step's own outcome into a different one.
+
+    EVERY terminal exit of ``run_step`` that can follow the ``state="running"``
+    write must reach this, or the job is stranded at "running" until the
+    retention sweep deletes the row and a caller polling
+    ``GET /handoff-results`` after a transport timeout never learns the step
+    ended (PR #453 review, blocking). A new ``except`` arm on that route is
+    incomplete without a call here.
+
+    Off the loop for the same reason ``run_agent_step``'s completed-write is
+    (PR #453 review nit): the write is SQLite I/O, and the handler is async.
+
+    MODULE-LEVEL ON PURPOSE, not nested in ``run_step`` beside ``_settle_step``:
+    every arm that persists needs the same guard, and inlining it nine times
+    would both duplicate it and spend the route body's ``logger``-call budget
+    that ``run-step-replay-branch`` SR-7 pins to the two step-bookkeeping
+    guards. Nothing here closes over request state, so there is no reason for it
+    to live inside the route.
+    """
+    if not job_id:
+        return
+    try:
+        await asyncio.to_thread(upsert_handoff_result, job_id, state, **fields)
+    except Exception as exc:  # noqa: BLE001 — durability is best-effort; never fail the step
+        # PREFIX ONLY, never the whole id (PR #453 review finding 4): job_id is the
+        # SOLE retrieval capability for a row that can carry worker prompts and
+        # output, so a full id in the server log escalates any log reader to that
+        # worker's result. Eight hex chars is enough to correlate this line with a
+        # job_id its legitimate holder already has, and 96 bits short of guessing one.
+        #
+        # EXCEPTION CLASS NAME ONLY -- no ``exc_info``, no ``str(exc)``. A
+        # SQLAlchemy DBAPI error stringifies its bound parameters
+        # (``[parameters: ('<job_id>', 'running', ...)]``), so either one would
+        # reprint in full the id the line above deliberately truncates, defeating
+        # the whole point of the prefix. The class name still separates the cases
+        # an operator acts on differently (OperationalError = locked/unwritable DB,
+        # IntegrityError = key collision) without echoing any row content.
+        logger.warning(
+            "run_step: failed to persist job_id_prefix=%s as %s (%s)",
+            job_id[:8],
+            state,
+            type(exc).__name__,
+        )
+
+
 @app.post(
     TERMINALS_RUN_STEP_ROUTE,
     response_model=RunStepResponse,
@@ -3773,7 +4141,20 @@ async def run_step(
 
     The plugin registry is threaded so teardown's ``post_kill_terminal`` hooks
     fire (parity with the DELETE endpoint).
+
+    Durability (issue #447): when the caller supplies a ``job_id``, the handler
+    records state="running" at request start. On success, ``run_agent_step``
+    itself persists state="completed" BETWEEN extraction and teardown (not
+    here, and not after it returns) — the terminal being torn down is the only
+    other place the result lives, so persistence must land before that
+    happens, not merely before the HTTP response. On failure, this handler
+    persists state="error". A caller that misses the response due to an
+    MCP-transport timeout can retrieve the result via
+    ``GET /handoff-results/{job_id}`` at any point thereafter. Requests without
+    a ``job_id`` behave exactly as before (no persistence overhead).
     """
+    job_id = body.job_id  # None when the caller omits it (backward-compatible)
+
     # BR-31: for a script-tier run-step call, record the live terminal into the
     # shared ScriptRunRecord's step_states as soon as it exists, so U4's orphan sweep
     # can tear it down if the subprocess dies mid-call. No-op for YAML/handoff
@@ -3864,6 +4245,12 @@ async def run_step(
             )
         except KeyError as e:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+
+    # Mark the job as in-progress before the long-running substrate starts.
+    # This is best-effort; a failure here must not block execution. Placed
+    # AFTER the generation fence above so a fenced-out (stale-generation)
+    # call never leaves a job_id stuck at "running" with no terminal state.
+    await _record_job_state(job_id, "running")
 
     # ---- issue #583, unit ``run-step-replay-branch``: the replay branch ----------
     #
@@ -4042,6 +4429,7 @@ async def run_step(
             on_step_terminal_ready=on_step_terminal_ready,
             model=body.model,
             use_worktree=body.use_worktree,
+            job_id=job_id,
         )
         # Success -> transition the script step RUNNING->COMPLETED (no-op for
         # non-script callers). Before building the response so a settle failure
@@ -4057,6 +4445,12 @@ async def run_step(
             teardown=body.teardown,
             reuse_terminal_id=body.reuse_terminal_id,
         )
+
+        # NOTE (issue #447 / PR #453 review): the "completed" persist happens
+        # INSIDE run_agent_step, between extraction and teardown — not here.
+        # Persisting only after this call returns would run after the terminal
+        # (the only other copy of the result) has already been torn down,
+        # contradicting the "persist result, then tear down" requirement.
         return RunStepResponse(
             terminal_id=result.terminal_id,
             last_message=result.last_message,
@@ -4108,6 +4502,7 @@ async def run_step(
         # rather than regex-scraping the message (the future engine reads it too).
         # Transition the script step RUNNING->FAILED (no-op for non-script callers).
         _settle_step(e.terminal_id, str(e))
+        await _record_job_state(job_id, "error", terminal_id=e.terminal_id, error_message=str(e))
         code = status.HTTP_502_BAD_GATEWAY if e.kind == "error" else status.HTTP_504_GATEWAY_TIMEOUT
         raise HTTPException(
             status_code=code,
@@ -4134,6 +4529,7 @@ async def run_step(
         # status code for this exact failure instead of silently falling
         # through to the generic kind-less 500 below.
         _settle_step(None, str(e))
+        await _record_job_state(job_id, "error", error_message=str(e))
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             detail={"message": str(e), "kind": "timeout", "terminal_id": None},
@@ -4142,6 +4538,7 @@ async def run_step(
         # Ordered before the ValueError arm they subclass: an engine rejection is
         # a bad request, not an unknown terminal.
         _settle_step(None, str(e))
+        await _record_job_state(job_id, "error", error_message=str(e))
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except OutputExtractionError as e:
         # Also ordered before the ValueError arm it subclasses. The terminal and
@@ -4150,24 +4547,29 @@ async def run_step(
         # endpoint's documented contract above ("any other failure -> 500",
         # plain-string detail, no ``kind``), not 404 (issue #570).
         _settle_step(None, str(e))
+        await _record_job_state(job_id, "error", error_message=str(e))
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
     except TerminalLimitError as e:
         # The node is at its tracked-terminal cap (CAO_MAX_TERMINALS) — surfaced
         # as 429 so a step scheduler can retry on a different node instead of
         # reading a kind-less 500.
         _settle_step(None, str(e))
+        await _record_job_state(job_id, "error", error_message=str(e))
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
     except ValueError as e:
         # Unknown terminal / bad input surfaced by the terminal layer.
+        await _record_job_state(job_id, "error", error_message=str(e))
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except WorktreeError as e:
         # use_worktree=true against a working_directory that isn't a git repo,
         # or the 'git worktree add' itself failed -- a client-input problem
         # (bad/missing repo), not a server crash.
         _settle_step(None, str(e))
+        await _record_job_state(job_id, "error", error_message=str(e))
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:
         _settle_step(None, str(e))
+        await _record_job_state(job_id, "error", error_message=str(e))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to run step: {str(e)}",
@@ -4796,6 +5198,8 @@ async def start_workflow_run_endpoint(
                 status_code=422,
                 detail={"findings": workflow_spec_service.render_findings(e.findings)},
             )
+        except approval_gate.PlanApprovalUnavailableError as e:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
         except approval_gate.PlanApprovalRequiredError as e:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
         except KeyError as e:
@@ -4965,6 +5369,8 @@ async def submit_workflow_run_endpoint(
         )
         try:
             approval_gate.ensure_plan_approved(tier="script", manifest_json=manifest_json)
+        except approval_gate.PlanApprovalUnavailableError as e:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
         except approval_gate.PlanApprovalRequiredError as e:
             # 403, distinct from this endpoint's 409 (run_id collision) and 422 (lint / corrupt), so a
             # caller can tell "needs approval" from "the run broke".
@@ -5129,8 +5535,9 @@ async def get_workflow_run_endpoint(
     here is not. It therefore carries the same read-or-better gate as
     ``/diagnostics``, ``/events`` and ``/compare``: a FULL-route gate, not a
     per-field split, because a field split would still return ``output_json`` to
-    an unscoped caller. Default-off is unchanged — with ``CAO_AUTH_ENABLED``
-    unset the dependency returns the full scope set and enforces nothing.
+    an unscoped caller. Default-off is unchanged — with no IdP and no
+    ``CAO_AUTH_LOCAL_TOKEN`` configured the dependency returns the full scope set
+    and enforces nothing.
     Consequence for #505: its CLI/MCP status/result clients read this route (plus
     ``/events`` and ``/compare``) and must present a token carrying
     ``cao:read``/``cao:write``/``cao:admin`` once auth is enabled.
@@ -5154,8 +5561,9 @@ async def get_workflow_run_endpoint(
        ``{{steps.<id>.output.<field>}}`` templating read them back. So with capture
        at its default OFF, this route still returns step output and error verbatim.
     2. The ONLY protection is the scope dependency above, and it is INERT in the
-       default deployment: with ``CAO_AUTH_ENABLED`` unset, ``require_any_scope``
-       returns the full scope set and enforces nothing. A local CAO server therefore
+       default deployment: with no IdP and no ``CAO_AUTH_LOCAL_TOKEN`` configured,
+       ``require_any_scope`` returns the full scope set and enforces nothing. A
+       local CAO server therefore
        serves step output and error text to any caller that can reach the port.
 
     Deliberately documented rather than further gated: stripping the fields removes
@@ -6186,6 +6594,7 @@ async def get_workflow_run_result_endpoint(
         for s in steps
     ]
     error_kind = _resolve_error_kind(row, steps)
+    run_error = getattr(row, "error", None)
     result = WorkflowRunResult(
         run_id=row.run_id,
         workflow_name=row.workflow_name,
@@ -6194,6 +6603,7 @@ async def get_workflow_run_result_endpoint(
         started_at=row.started_at,
         finished_at=row.finished_at,
         kind=error_kind,
+        warnings=[run_error] if run_error else [],
     )
     body = result.model_dump()
 
@@ -6353,6 +6763,8 @@ async def resume_workflow_run_endpoint(
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'"
             )
+        except approval_gate.PlanApprovalUnavailableError as e:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
         except approval_gate.PlanApprovalRequiredError as e:
             # issue #583 Bolt 2, ``approval-gate``: 403, and it must be caught HERE rather than left
             # to the arms below. ``PlanApprovalRequiredError`` is deliberately not a ``ValueError``
@@ -6394,6 +6806,62 @@ async def resume_workflow_run_endpoint(
     except workflow_service.WorkflowEngineError as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
     return result.model_dump()
+
+
+@app.post("/workflows/runs/{run_id}/steps/{step_id}:replay")
+async def replay_workflow_step_endpoint(
+    run_id: str,
+    step_id: str,
+    body: Optional[StepReplayRequest] = None,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Re-execute ONE step of a recorded run and return its live result (issue #640).
+
+    Write-scoped because it creates a terminal and runs an agent — but READ-ONLY
+    with respect to the run it replays: the service writes no journal row and emits
+    no event for ``run_id``, so a completed or failed run can be re-probed step by
+    step, repeatedly, without disturbing what it recorded.
+
+    The step's prompt is resolved from the run's own journal (spec snapshot,
+    resolved inputs, predecessor outputs); an optional ``prompt_override`` replaces
+    the prompt TEMPLATE while keeping that resolution.
+
+    Error taxonomy mirrors the resume route: unknown run or unknown step -> 404, an
+    undeserializable spec snapshot -> 422, a script-tier run, an empty
+    ``prompt_override``, or a prompt that cannot be resolved from the recorded
+    predecessors -> 400. A step that FAILS is a 200 whose body carries ``error`` /
+    ``error_kind`` (a failed step is data, not a transport fault).
+
+    **The immutability guarantee has an audit consequence, accepted deliberately.**
+    Writing no journal row and emitting no event is what makes replay safe on a
+    recorded run — and it also means a replay execution is INVISIBLE to anything
+    treating the journal or event stream as the execution audit log, and is not
+    gated by plan approval (which gates run *starts*). That is consistent with CAO's
+    local single-operator model; the service logs each replay at INFO, which is the
+    trail. A deployment that needs replays audited should read those logs, not the
+    journal.
+    """
+    from cli_agent_orchestrator.services import workflow_service
+
+    try:
+        return await workflow_service.replay_single_step(
+            run_id,
+            step_id,
+            prompt_override=body.prompt_override if body is not None else None,
+        )
+    except KeyError as e:
+        # The service distinguishes "unknown run" from "unknown step" in the message;
+        # surface it rather than flattening both to the run-scoped default.
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e.args[0]) if e.args else f"unknown run '{run_id}'",
+        )
+    except workflow_service.ResumeCorruptError as e:
+        # 422 by literal code, matching the resume route's note on the ``status``
+        # alias drifting across Starlette versions in the CI matrix.
+        raise HTTPException(status_code=422, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 
 # ── graph layer (U4, Issue #348) ────────────────────────────────────────
@@ -6542,6 +7010,64 @@ async def export_graph_endpoint(
         )
 
     return {"written_files": written_files, "sink": body.sink, "dest": body.dest}
+
+
+@app.get(
+    HANDOFF_RESULTS_ROUTE,
+    summary="Retrieve a durable handoff step result (issue #447)",
+    description=(
+        "Returns the persisted state and result for a handoff job identified by "
+        "``job_id`` (generated by the MCP client and passed to ``POST /terminals/run-step`` "
+        "in the ``job_id`` field). Use this to recover a result that was not delivered "
+        "over the original request because the MCP transport timed out. "
+        "Possible ``state`` values: ``running`` (step still in progress), "
+        "``completed`` (result in ``last_message``), ``error`` (failure in ``error_message``)."
+    ),
+)
+async def get_handoff_result_endpoint(
+    job_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Retrieve a durable handoff step result by job_id (issue #447).
+
+    Returns the persisted record when found; 404 when the job_id is unknown
+    (either the caller never sent a job_id, or the record has been purged by
+    the retention sweep). Scope-gated (PR #453 review finding 4): ``last_message``
+    can carry worker output (prompts/secrets), so this follows the same
+    ``require_any_scope`` posture as other content-serving GETs (``/events``,
+    ``/memory/export``) rather than staying open. A no-op when auth is
+    disabled (the default) — ``require_any_scope`` only enforces when an IdP
+    is configured.
+    """
+    try:
+        record = get_handoff_result(job_id)
+    except Exception as exc:  # noqa: BLE001 — see the leak note below
+        # A storage failure must never hand the job_id to the ASGI error logger.
+        # This handler has no generic exception handler above it, so an escaping
+        # SQLAlchemy DBAPI error (a locked SQLite file being the realistic case)
+        # reaches uvicorn's ServerErrorMiddleware, which logs the whole traceback
+        # to ``uvicorn.error`` -- and that traceback prints the bound parameters,
+        # ``[parameters: ('<job_id>',)]``. The access-log filter in
+        # ``utils/logging.py`` scrubs the request PATH and never sees this
+        # surface, so the read path needs its own guard even though the write
+        # path is already covered (PR #453 review, read-error path).
+        # EXCEPTION CLASS NAME ONLY, and ``from None`` so nothing downstream can
+        # walk ``__cause__``/``__context__`` back to the parameter-bearing error.
+        logger.error(
+            "get_handoff_result: lookup failed for job_id_prefix=%s (%s)",
+            job_id[:8],
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Handoff result lookup failed; the record may still exist, retry shortly",
+        ) from None
+    if record is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Handoff result not found for job_id '{job_id}'",
+        )
+    return record
 
 
 @app.delete("/terminals/{terminal_id}")
@@ -6700,10 +7226,12 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
       request ``Host`` or in the trusted set (CWE-1385 cross-site WebSocket
       hijacking guard);
     * when the HTTP auth layer is enabled (``AUTH0_DOMAIN`` /
-      ``CAO_AUTH_JWKS_URI`` set — see :func:`is_auth_enabled`), the handshake
-      must carry a valid bearer token granting ``cao:write`` or ``cao:admin``.
-      Keystroke injection is RCE; ``cao:read`` is not enough. HTTP
-      ``POST /terminals/{id}/input`` already requires write.
+      ``CAO_AUTH_JWKS_URI`` set, or a standalone ``CAO_AUTH_LOCAL_TOKEN`` — see
+      :func:`is_auth_enabled`), the handshake must carry a valid bearer token
+      granting ``cao:write`` or ``cao:admin``. Keystroke injection is RCE;
+      ``cao:read`` is not enough. HTTP ``POST /terminals/{id}/input`` already
+      requires write. In local-token mode the bearer must equal the configured
+      token, which carries the full scope set.
 
     Token scheme: browsers cannot set request headers on a WebSocket
     handshake, so the token is accepted from either ``Authorization: Bearer
@@ -6725,12 +7253,17 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
     # A literal ``*`` in the allowlist disables the IP check (Codespaces /
     # devcontainers / remote setups where the WS client originates from an
     # IP the operator cannot enumerate ahead of time).
+    #
+    # A missing peer address fails CLOSED. The pinned uvicorn never produces
+    # one on this path: it populates ``client`` for every TCP connection, and
+    # its proxy-headers middleware rewrites the peer to a ``(host, port)``
+    # tuple even for empty or garbage forwarded values, never to ``None``. So
+    # ``None`` means some other ASGI server or middleware left the peer unset,
+    # and an unattributable peer is precisely the one this allowlist must not
+    # admit by accident. Operators who genuinely cannot enumerate peers have
+    # the ``*`` opt-out above.
     client_host = websocket.client.host if websocket.client else None
-    if (
-        "*" not in WS_ALLOWED_CLIENTS
-        and client_host is not None
-        and client_host not in WS_ALLOWED_CLIENTS
-    ):
+    if "*" not in WS_ALLOWED_CLIENTS and client_host not in WS_ALLOWED_CLIENTS:
         await websocket.close(code=4003, reason="WebSocket access is restricted to allowed clients")
         return
 
@@ -7314,7 +7847,48 @@ def _to_memory_summary(mem, base_dir: Path) -> MemorySummary:
         tags=mem.tags,
         created_at=mem.created_at,
         updated_at=mem.updated_at,
+        source_kind=getattr(mem, "source_kind", "native"),
+        source_path=getattr(mem, "source_path", None),
+        indexed_at=getattr(mem, "indexed_at", None),
+        index_freshness=getattr(mem, "index_freshness", None),
+        content_truncated=bool(getattr(mem, "content_truncated", False)),
     )
+
+
+@app.get("/memory/vault/status")
+async def vault_status_endpoint(
+    vault_id: Optional[str] = None,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Return the existing read-only, content-free vault status projection."""
+    from cli_agent_orchestrator.services.settings_service import get_vault_config
+    from cli_agent_orchestrator.services.vault.binding import VaultConfigUnavailableError
+    from cli_agent_orchestrator.services.vault.status import get_vault_status
+
+    try:
+        config = get_vault_config()
+    except (VaultConfigUnavailableError, ValueError):
+        return {"configured": False, "vaults": []}
+    if not config.enabled:
+        return {"configured": False, "vaults": []}
+
+    return {
+        "configured": True,
+        "vaults": [
+            {
+                "vault_id": item.vault_id,
+                "status_counts": dict(item.status_counts),
+                "finding_counts": dict(item.finding_counts),
+                "warnings": list(item.warnings),
+                "recall_counters": dict(item.recall_counters),
+                "process_local_unmapped_project_writes": item.process_local_unmapped_project_writes,
+                "process_local_unmapped_project_identities": item.process_local_unmapped_project_identities,
+                "process_local_non_writable_write_refusals": item.process_local_non_writable_write_refusals,
+                "process_local_secret_gate_write_refusals": item.process_local_secret_gate_write_refusals,
+            }
+            for item in get_vault_status(config, vault_id=vault_id)
+        ],
+    }
 
 
 @app.get("/memory", response_model=List[MemorySummary])
@@ -7680,12 +8254,17 @@ async def delete_memory_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to delete memory: {str(e)}",
         )
-    if not deleted:
+    if deleted.action == "absent":
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Memory '{key}' not found in scope '{scope.value}'",
         )
-    return {"success": True}
+    return {
+        "success": True,
+        "action": deleted.action,
+        "path": deleted.path,
+        "source_kind": deleted.source_kind,
+    }
 
 
 @app.delete("/memory")
@@ -7725,7 +8304,12 @@ async def clear_memories_endpoint(
         try:
             # session/agent results carry scope_id natively; project results
             # need the query param (their recalled scope_id is None).
-            if await svc.forget(key=mem.key, scope=scope.value, scope_id=mem.scope_id or scope_id):
+            result = await svc.forget(
+                key=mem.key,
+                scope=scope.value,
+                scope_id=mem.scope_id or scope_id,
+            )
+            if result.action in {"deleted", "deindexed", "deleted_and_deindexed"}:
                 deleted_count += 1
         except MemoryDisabledError:
             raise HTTPException(
@@ -7915,9 +8499,11 @@ def main():
     # literal ``*`` is honoured and disables the check (matches the
     # existing CAO_WS_ALLOWED_CLIENTS="*" semantics).
     forwarded_ips = "*" if "*" in TRUSTED_FORWARDER_IPS else ",".join(TRUSTED_FORWARDER_IPS)
-    # Credential query params (``?access_token=``) are scrubbed from uvicorn's
-    # access log by ``install_access_log_redaction()``, installed in the app
-    # lifespan so both ``cao-server`` and ``uvicorn ...:app`` are covered.
+    # Credential query params (``?access_token=``, the WebSocket ``?token=``) are
+    # scrubbed from uvicorn's request logs -- ``uvicorn.access`` for HTTP and
+    # ``uvicorn.error`` for WebSocket handshakes -- by
+    # ``install_access_log_redaction()``, installed in the app lifespan so both
+    # ``cao-server`` and ``uvicorn ...:app`` are covered.
     uvicorn.run(
         app,
         host=host,
