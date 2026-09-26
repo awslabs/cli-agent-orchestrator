@@ -146,6 +146,23 @@ jobs:
           npm run build
           # vite.config.ts writes directly to ../src/cli_agent_orchestrator/web_ui/
 
+      # Issue #610: the `web_ui/**` artifacts glob in pyproject.toml is a hatchling
+      # force-include — and hatchling treats a glob matching nothing as a SILENT no-op
+      # (the same D1 failure mode `build_tui.py` guards for the TUI binary). If `npm run
+      # build` above failed or silently produced nothing, cibuildwheel would still build
+      # and publish a wheel — just one with no dashboard, so `GET /` 404s for every
+      # operator (v2.4.1 shipped exactly this). Failing HERE, before the wheel is built,
+      # turns that silent gap into a loud CI failure.
+      - name: Verify Web UI build produced index.html
+        shell: bash
+        run: |
+          if [ ! -f src/cli_agent_orchestrator/web_ui/index.html ]; then
+            echo "src/cli_agent_orchestrator/web_ui/index.html is missing after 'npm run build'."
+            echo "hatchling's web_ui/** artifacts glob would silently match nothing and this"
+            echo "wheel would ship with no dashboard (issue #610). Check the Vite build log above."
+            exit 1
+          fi
+
       # macOS and Windows have no build container, so cibuildwheel's `before-build` runs on
       # the host and needs cargo on PATH. Linux builds inside the manylinux container, where
       # `[tool.cibuildwheel.linux] before-all` installs rustup instead — installing it here
@@ -231,6 +248,20 @@ jobs:
         run: |
           npm ci
           npm run build
+
+      # Issue #610: same guard as `build-wheels`, needed independently here because the
+      # sdist is built by a separate job with its own (possibly silently-failed) web build.
+      # hatchling's `web_ui/**` artifacts glob force-includes gitignored build output, and
+      # treats a glob matching nothing as a silent no-op — so a broken/skipped `npm run
+      # build` would still produce and publish a source distribution with no dashboard.
+      - name: Verify Web UI build produced index.html
+        run: |
+          if [ ! -f src/cli_agent_orchestrator/web_ui/index.html ]; then
+            echo "src/cli_agent_orchestrator/web_ui/index.html is missing after 'npm run build'."
+            echo "hatchling's web_ui/** artifacts glob would silently match nothing and this"
+            echo "sdist would ship with no dashboard (issue #610). Check the Vite build log above."
+            exit 1
+          fi
 
       - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v4.2.0
 
