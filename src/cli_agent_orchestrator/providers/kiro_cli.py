@@ -18,8 +18,8 @@ The provider detects the following terminal states:
 """
 
 import asyncio
-import logging
 import hashlib
+import logging
 import re
 import shlex
 import time
