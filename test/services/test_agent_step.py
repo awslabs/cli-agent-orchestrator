@@ -1160,6 +1160,7 @@ class TestAHandoffFromARemoteCallerLandsInItsRuntime:
         registry = MagicMock()
         registry.is_remote.return_value = True
         registry.runtime_for_terminal.return_value = "cao-supervisor-0"
+        registry.placement.return_value = (True, "cao-supervisor-0")
         monkeypatch.setattr(
             "cli_agent_orchestrator.runtime_channel.registry.runtime_registry", registry
         )
@@ -1186,6 +1187,7 @@ class TestAHandoffFromARemoteCallerLandsInItsRuntime:
 
         registry = MagicMock()
         registry.is_remote.return_value = False
+        registry.placement.return_value = (False, None)
         monkeypatch.setattr(
             "cli_agent_orchestrator.runtime_channel.registry.runtime_registry", registry
         )
@@ -1199,6 +1201,7 @@ class TestAHandoffFromARemoteCallerLandsInItsRuntime:
         registry = MagicMock()
         registry.is_remote.return_value = True  # fail-closed remote/unknown
         registry.runtime_for_terminal.return_value = None  # placement unreadable
+        registry.placement.return_value = (True, None)
         monkeypatch.setattr(
             "cli_agent_orchestrator.runtime_channel.registry.runtime_registry", registry
         )

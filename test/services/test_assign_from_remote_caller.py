@@ -55,6 +55,9 @@ async def _call(**overrides):
 async def test_worker_is_placed_in_the_callers_runtime(mock_registry, mock_service, mock_launch):
     mock_registry.is_remote.return_value = True
     mock_registry.runtime_for_terminal.return_value = RUNTIME
+    mock_registry.placement.return_value = (True, RUNTIME)
+    # placement() answers both in one read; the pair must agree with the two above.
+    mock_registry.placement.return_value = (True, RUNTIME)
     mock_launch.return_value = _remote_terminal()
 
     terminal = await _call()
@@ -83,6 +86,7 @@ async def test_assigns_deferred_init_contract_survives_the_hop(
     agent's per-tool timeout. The runtime has to be told to do the same."""
     mock_registry.is_remote.return_value = True
     mock_registry.runtime_for_terminal.return_value = RUNTIME
+    mock_registry.placement.return_value = (True, RUNTIME)
     mock_launch.return_value = _remote_terminal()
 
     body = MagicMock()
@@ -106,6 +110,7 @@ async def test_a_local_caller_still_gets_a_local_window(mock_registry, mock_serv
     single-host install -- where nothing is bound to a runtime -- is untouched."""
     mock_registry.is_remote.return_value = False
     mock_registry.runtime_for_terminal.return_value = None
+    mock_registry.placement.return_value = (False, None)
     mock_service.create_terminal = AsyncMock(return_value=_remote_terminal())
 
     await _call()
@@ -127,6 +132,7 @@ async def test_idempotency_key_is_refused_rather_than_quietly_dropped(
     what a retry would get -- say no instead."""
     mock_registry.is_remote.return_value = True
     mock_registry.runtime_for_terminal.return_value = RUNTIME
+    mock_registry.placement.return_value = (True, RUNTIME)
 
     with pytest.raises(HTTPException) as exc:
         await _call(idempotency_key="retry-1")
@@ -150,6 +156,7 @@ async def test_a_remote_caller_whose_placement_is_unreadable_is_not_launched_loc
     worker in the central container (Copilot follow-up on #802)."""
     mock_registry.is_remote.return_value = True  # fail-closed remote/unknown
     mock_registry.runtime_for_terminal.return_value = None  # but placement unreadable
+    mock_registry.placement.return_value = (True, None)
 
     with pytest.raises(HTTPException) as exc:
         await _call()

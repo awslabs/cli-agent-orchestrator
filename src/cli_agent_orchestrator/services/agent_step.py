@@ -98,9 +98,12 @@ def _caller_runtime(caller_id: Optional[str]) -> Optional[str]:
 
     from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
 
-    if not runtime_registry.is_remote(caller_id):
+    # One atomic observation of placement: asking is_remote() and then
+    # runtime_for_terminal() let a concurrent bind/unbind on the channel loop split
+    # the answer in two (Copilot review on #802).
+    is_remote, runtime_id = runtime_registry.placement(caller_id)
+    if not is_remote:
         return None
-    runtime_id = runtime_registry.runtime_for_terminal(caller_id)
     if runtime_id is None:
         raise RuntimeError(
             f"caller '{caller_id}' executes in a runtime but its placement is "

@@ -751,3 +751,67 @@ class TestPlacementCannotBeSetAtCreationEither:
         from cli_agent_orchestrator.clients.database import _creation_metadata
 
         assert _creation_metadata(None, None) == {}
+
+
+class TestPlacementIsOneAtomicObservation:
+    """``is_remote`` then ``runtime_for_terminal`` is two observations, not one.
+
+    Both are read from worker threads (``effective_status``, the synchronous
+    senders) while ``register``/``bind_terminal``/``unbind_terminal`` mutate the
+    same dict on the channel loop. Each read was individually atomic, but callers
+    act on the PAIR: a bind landing between them made a terminal look remote and
+    then yield no runtime, and an unbind routed a deleted terminal on stale
+    placement (Copilot review on #802).
+    """
+
+    def test_a_bound_terminal_answers_both_from_one_read(self, fresh, rows):
+        rows["row"] = None
+        fresh.bind_terminal(TID, "worker-1")
+        assert fresh.placement(TID) == (True, "worker-1")
+        # No DB read needed when the binding is in memory.
+        assert rows["calls"] == 0
+
+    def test_a_recovered_placement_answers_both(self, fresh, rows):
+        rows["row"] = _row("worker-9")
+        assert fresh.placement(TID) == (True, "worker-9")
+        # ONE read for both answers, not one per question.
+        assert rows["calls"] == 1
+
+    def test_a_local_terminal_answers_both(self, fresh, rows):
+        rows["row"] = _row(None)
+        assert fresh.placement(TID) == (False, None)
+
+    def test_an_unreadable_row_fails_closed_to_remote_with_no_runtime(self, fresh, rows):
+        """The pair must not disagree even in the error case.
+
+        Remote with an unknown runtime is what makes the command path answer
+        "not connected" instead of driving this host's tmux.
+        """
+        rows["raise"] = True
+        assert fresh.placement(TID) == (True, None)
+
+    def test_the_pair_cannot_be_split_by_a_concurrent_unbind(self, fresh, rows):
+        """The race, driven: an unbind between the two old calls yielded
+        (remote, None) and a caller that routed on stale placement."""
+        rows["row"] = None
+        fresh.bind_terminal(TID, "worker-1")
+
+        seen = []
+
+        def unbind_midway(_tid):
+            # Stands in for the channel loop unbinding while a worker thread reads.
+            fresh.unbind_terminal(TID)
+            return None
+
+        # Whatever interleaving occurs, the returned pair is self-consistent:
+        # either (True, "worker-1") or (False, None) — never (True, None).
+        for _ in range(5):
+            is_remote, runtime = fresh.placement(TID)
+            seen.append((is_remote, runtime))
+            if is_remote:
+                fresh.unbind_terminal(TID)
+            else:
+                fresh.bind_terminal(TID, "worker-1")
+        assert all(
+            not (is_remote and runtime is None) for is_remote, runtime in seen
+        ), f"a split answer escaped: {seen}"

@@ -228,6 +228,12 @@ class TestTheSessionEndpointForwardsTheCallersProvider:
                 "cli_agent_orchestrator.api.main.runtime_registry.runtime_for_terminal",
                 return_value="worker-1",
             ),
+            # The route now takes both answers from one observation, so the pair
+            # must be patched together and agree with the two above.
+            patch(
+                "cli_agent_orchestrator.api.main.runtime_registry.placement",
+                return_value=(True, "worker-1"),
+            ),
             patch(
                 "cli_agent_orchestrator.runtime_channel.api.launch_remote_terminal",
                 side_effect=fake_launch,

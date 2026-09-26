@@ -3710,9 +3710,15 @@ async def create_terminal_in_session(
         worker_owner = caller_owner or principal.id
 
         caller_runtime = None
-        if caller_id and runtime_registry.is_remote(caller_id):
-            caller_runtime = runtime_registry.runtime_for_terminal(caller_id)
-            if caller_runtime is None:
+        if caller_id:
+            # One atomic observation, not is_remote() then runtime_for_terminal():
+            # these are read from a worker thread while the channel loop binds and
+            # unbinds the same map, so a bind landing between the two calls made a
+            # caller look remote and then yield no runtime, and an unbind routed a
+            # deleted terminal on stale placement (Copilot review on #802).
+            caller_is_remote, caller_placement = runtime_registry.placement(caller_id)
+            caller_runtime = caller_placement if caller_is_remote else None
+            if caller_is_remote and caller_runtime is None:
                 raise HTTPException(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     detail=(

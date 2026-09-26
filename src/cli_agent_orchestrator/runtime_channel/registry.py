@@ -555,15 +555,21 @@ class RuntimeChannelRegistry:
         than the local arm quietly driving this host's tmux for a terminal that
         may live in a runtime (guojing1217 on #802).
         """
-        if terminal_id in self._terminal_runtime:
-            return True
+        with self._lock:
+            if terminal_id in self._terminal_runtime:
+                return True
+        # The DB read stays OUTSIDE the lock deliberately: holding it across I/O
+        # would let one slow query stall the channel loop. It is also safe to be
+        # outside, because a binding appearing meanwhile only makes the answer
+        # MORE remote, never less.
         try:
             return self._placement_from_the_central_row(terminal_id) is not None
         except PlacementUnavailableError:
             return True
 
     def runtime_for_terminal(self, terminal_id: str) -> Optional[str]:
-        bound = self._terminal_runtime.get(terminal_id)
+        with self._lock:
+            bound = self._terminal_runtime.get(terminal_id)
         if bound is not None:
             return bound
         try:
@@ -574,6 +580,36 @@ class RuntimeChannelRegistry:
             # error), so the operation routes remote and fails with "runtime not
             # connected" rather than running here.
             return None
+
+    def placement(self, terminal_id: str) -> Tuple[bool, Optional[str]]:
+        """``(is_remote, runtime_id)`` decided from ONE observation of the state.
+
+        ``is_remote`` and ``runtime_for_terminal`` are each atomic on their own, but
+        callers ask them in sequence and act on the pair — and the two questions are
+        answered from worker threads while ``register``/``bind_terminal``/
+        ``unbind_terminal`` mutate the same dict on the channel loop. A bind landing
+        between the two calls made a terminal look remote and then produce no
+        runtime; an unbind landing between them routed a deleted terminal on stale
+        placement (Copilot review on #802).
+
+        Callers that route should prefer this over the two separate reads. The pair
+        is taken under one acquisition of the lock, so it is internally consistent
+        even if the world changes immediately afterwards — which is all any caller
+        can have, and strictly better than a pair that was never consistent.
+        """
+        with self._lock:
+            bound = self._terminal_runtime.get(terminal_id)
+            if bound is not None:
+                return True, bound
+        # No in-memory binding: fall back to the durable row, once, and derive both
+        # answers from that single read rather than reading it twice.
+        try:
+            placed = self._placement_from_the_central_row(terminal_id)
+        except PlacementUnavailableError:
+            # Unknown, so fail closed to remote with no runtime: the command path
+            # then reports "not connected" instead of driving local tmux.
+            return True, None
+        return placed is not None, placed
 
     def remote_terminal_ids(self) -> List[str]:
         """Every terminal bound to a runtime that is currently CONNECTED.
