@@ -74,6 +74,11 @@ class TestResolveAllowedTools:
         with pytest.raises(ValueError, match="Unknown role 'Supervisor'"):
             resolve_allowed_tools(None, "Supervisor")
 
+    def test_explicit_tools_with_unknown_role_are_honored(self):
+        """Explicit allowedTools short-circuit role lookup and do not raise."""
+        result = resolve_allowed_tools(["fs_read"], "bogus_role")
+        assert result == ["fs_read"]
+
 
 class TestGetDisallowedTools:
     """Tests for get_disallowed_tools."""

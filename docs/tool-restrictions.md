@@ -45,7 +45,9 @@ role: supervisor
 | `supervisor` | `@cao-mcp-server`, `fs_read`, `fs_list` | Orchestrate workers + read files for context |
 | `developer` | `@builtin`, `fs_*`, `execute_bash`, `web_fetch`, `@cao-mcp-server` | Full access: read, write, execute, fetch, orchestrate |
 | `reviewer` | `@builtin`, `fs_read`, `fs_list`, `@cao-mcp-server` | Read-only: review code, no writes, execution, or network |
-| `workflow_scout` | `@builtin`, `fs_read`, `execute_bash`, `@cao-mcp-server` | Locate existing workflow specs (`cao workflow list` / `get`); no writes or network |
+| `workflow_scout` | `@builtin`, `fs_read`, `execute_bash`, `@cao-mcp-server` | Locate existing workflow specs (`cao workflow list` / `get`). Withholds `fs_write` and `web_fetch`; `execute_bash` is still a full shell |
+
+`workflow_scout` finds existing specs (`cao workflow list` / `cao workflow get`) so an authoring agent can extend them instead of duplicating them. The allowlist withholds the file-write category (`fs_write`) and the web-fetch category (`web_fetch`). It still grants `execute_bash`, which maps to a full shell (`Bash`, `shell`, or `run_shell_command`, depending on the provider). A permitted shell command can write files and reach the network. The profile prompt asks the scout to stay read-only; that is a convention, not a sandbox.
 
 #### Custom Roles
 
@@ -225,6 +227,8 @@ Priority (highest to lowest):
 ```
 
 Note: `--auto-approve` is **not** in this priority chain — it only controls whether the confirmation prompt is shown, not what restrictions are applied.
+
+An unrecognized `role` raises `ValueError` at install, launch, and delegation. It does not fall open to `["*"]`. Define the name under `agents.roles`, or omit `role` for developer defaults. An explicit `allowedTools` list is applied and does not raise.
 
 Examples:
 
