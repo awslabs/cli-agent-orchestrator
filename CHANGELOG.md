@@ -82,11 +82,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The seen-working requirement deliberately does NOT apply to a settled ready
   verdict from the raw rolling buffer when two facts hold together: `send_input`
   cleared that buffer at dispatch (so everything the detector judged arrived
-  after the dispatch), AND the same buffer carries the provider's own working
-  marker (`raw_buffer_shows_turn_activity`, implemented for grok and kiro,
-  fail-closed for everyone else). Arrival time alone is not enough — a TUI can
-  re-emit its retained old answer into the fresh buffer, and kiro's detector
-  accepts that replay; the working marker is what a bare replay cannot contain.
+  after the dispatch), AND the provider itself rejects replayed completions
+  (`owns_completion_identity` — declared by grok, whose buffer epochs already
+  did this, and now kiro; fail-closed for everyone else). Arrival time alone is
+  not enough — a TUI can re-emit its retained old answer into the fresh buffer.
+  A word-match for the provider's working markers was tried in between and is
+  not sufficient either: a completed answer can QUOTE the working words, and
+  content matching cannot tell a live progress event from a quotation. So kiro's
+  detector now owns the rejection by response identity, the way grok's does: it
+  remembers the last completed response it reported, freezes that at dispatch
+  (from its own cache — the rolling buffer is already cleared by then), and
+  reports a byte-identical post-dispatch completion as still-processing unless
+  it saw the turn working. Identity only ever vetoes replays; a different
+  response is never itself evidence of completion, truncated extractions make
+  no identity decision in either direction, and an identical fast answer whose
+  turn was never observed working conservatively stays open — resolving at the
+  waiter's timeout rather than with a possibly-wrong answer, the same trade
+  grok makes.
   The evidence is pinned to its turn in the same critical section as the buffer
   snapshot, and an observation whose pin no longer matches the live turn is
   discarded outright — closing neither latch nor turn — so a read that straddles

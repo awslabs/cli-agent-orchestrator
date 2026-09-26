@@ -1932,8 +1932,10 @@ class TestClearedBufferEvidenceIsPinnedToItsTurn:
         assert sm.turn_state("t1") == (2, 0)
 
     def test_evidence_pinned_to_the_current_turn_closes_it(self):
-        """The bypass needs BOTH facts: ownership (the pin matches) and activity
-        evidence in the same buffer (round 5 split them into separate values)."""
+        """The bypass needs BOTH facts: ownership (the pin matches) and an
+        identity-guarded provider — one whose detector rejects replayed
+        completions itself, so this COMPLETED cannot be a re-emitted old answer
+        (round 6 replaced the forgeable word predicate with that capability)."""
         sm = StatusMonitor()
         provider = MagicMock()
         provider.supports_screen_detection = False
@@ -1942,13 +1944,15 @@ class TestClearedBufferEvidenceIsPinnedToItsTurn:
             pinned = sm._pin_cleared_turn_locked("t1")
 
         sm._apply_detection(
-            "t1", TerminalStatus.COMPLETED, cleared_buffer_turn=pinned, activity_evidence=True
+            "t1", TerminalStatus.COMPLETED, cleared_buffer_turn=pinned, identity_guarded=True
         )
         assert sm.turn_state("t1") == (1, 1)
 
     def test_ownership_alone_is_not_eligibility(self):
-        """A correctly-pinned observation with NO activity evidence keeps the
-        conservative gate — arrival time is not proof the turn rendered it."""
+        """A correctly-pinned observation from a provider WITHOUT replay
+        rejection keeps the conservative gate — arrival time is not proof the
+        turn rendered it, and such a provider cannot tell a re-emitted old
+        answer from a new one."""
         sm = StatusMonitor()
         provider = MagicMock()
         provider.supports_screen_detection = False
@@ -1957,7 +1961,7 @@ class TestClearedBufferEvidenceIsPinnedToItsTurn:
             pinned = sm._pin_cleared_turn_locked("t1")
 
         sm._apply_detection(
-            "t1", TerminalStatus.COMPLETED, cleared_buffer_turn=pinned, activity_evidence=False
+            "t1", TerminalStatus.COMPLETED, cleared_buffer_turn=pinned, identity_guarded=False
         )
         assert sm.turn_state("t1") == (1, 0)
 
@@ -2127,8 +2131,9 @@ class TestOwnershipSurvivesAMissingActivityMarker:
         sm = StatusMonitor()
         provider = MagicMock()
         provider.supports_screen_detection = False
-        # The marker was evicted from turn 1's window: no activity evidence.
-        provider.raw_buffer_shows_turn_activity.return_value = False
+        # A MagicMock provider is not identity-guarded (`owns_completion_identity`
+        # is compared with `is True`), so nothing here is bypass-eligible — which
+        # is the point: ownership must protect the turn on its own.
         provider.get_status.return_value = TerminalStatus.COMPLETED
         # Turn 1: dispatched, seen working, legitimately finished.
         sm.notify_input_sent("t1")

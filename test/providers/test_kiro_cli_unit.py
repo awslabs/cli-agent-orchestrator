@@ -451,6 +451,115 @@ class TestKiroCliProviderStatusDetection:
 
         assert status == TerminalStatus.COMPLETED
 
+    # ---- PR #812 round-6 matrix: provider-owned replay rejection ----------
+    # The reviewer-specified four cases for kiro's response-identity veto
+    # (review discussion r4110464050). Identity REJECTS replays; it is never
+    # positive evidence of completion.
+
+    def _monitor_with_warm_reply(self, completed):
+        """A session that has already produced ``completed``, then dispatches."""
+        from cli_agent_orchestrator.services.status_monitor import StatusMonitor
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        monitor = StatusMonitor()
+        manager = patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+        mock_pm = manager.start()
+        mock_pm.get_provider.return_value = provider
+        # Warm turn: the provider REPORTS this completion, caching its identity.
+        provider.mark_input_received()
+        monitor._process_chunk("test1234", completed)
+        assert monitor._last_status["test1234"] == TerminalStatus.COMPLETED
+        # A real dispatch boundary, in send_input's order.
+        monitor.notify_input_sent("test1234")
+        monitor.clear_rolling_buffer("test1234", provider)
+        provider.mark_input_received()
+        monitor.notify_input_delivered("test1234")
+        return monitor, provider, manager
+
+    def test_matrix_a_quoted_marker_replay_is_rejected(self):
+        """Case (a): a replayed old answer must not close the new turn even when
+        that answer QUOTES the working words — word matching cannot distinguish a
+        live progress event from a quotation (the round-5 finding). Identity can:
+        a replay is byte-identical to the baseline by definition."""
+        completed = load_fixture("kiro_cli_completed_output.txt").replace(
+            "This response includes multiple paragraphs",
+            'The literal "Thinking..." occurs in the saved response. '
+            "It also quotes Kiro is working. This response includes multiple paragraphs",
+        )
+        # Preconditions: the doctored answer still parses as a completion on its
+        # own, and carries both quoted markers.
+        probe = KiroCliProvider("probe123", "s", "w", "developer")
+        assert probe.get_status(completed) == TerminalStatus.COMPLETED
+        assert "Thinking..." in completed and "Kiro is working" in completed
+
+        monitor, provider, manager = self._monitor_with_warm_reply(completed)
+        try:
+            monitor._process_chunk("test1234", completed)  # the identical replay
+            assert provider.get_status(completed) == TerminalStatus.PROCESSING
+            assert monitor.turn_state("test1234") == (1, 0)
+        finally:
+            manager.stop()
+
+    def test_matrix_b_a_genuinely_different_coalesced_reply_completes(self):
+        """Case (b): a new, different answer — even one arriving coalesced with no
+        separately sampled busy status — closes its turn."""
+        completed = load_fixture("kiro_cli_completed_output.txt")
+        different = completed.replace(
+            "Here is a comprehensive response", "Here is an entirely new response"
+        )
+        monitor, provider, manager = self._monitor_with_warm_reply(completed)
+        try:
+            monitor._process_chunk("test1234", different)
+            assert monitor.turn_state("test1234") == (1, 1)
+            assert monitor._last_status["test1234"] == TerminalStatus.COMPLETED
+        finally:
+            manager.stop()
+
+    def test_matrix_c_an_identical_reply_after_observed_work_completes(self):
+        """Case (c): a legitimately identical NEW answer completes once the turn
+        was seen working — identity rejection is scoped to unobserved turns, so
+        "the user asked the same question again" is not punished."""
+        completed = load_fixture("kiro_cli_completed_output.txt")
+        monitor, provider, manager = self._monitor_with_warm_reply(completed)
+        try:
+            monitor._process_chunk("test1234", " Kiro is working\n")  # observed busy
+            assert monitor._last_status["test1234"] == TerminalStatus.PROCESSING
+            monitor._process_chunk("test1234", completed)  # identical answer
+            assert monitor.turn_state("test1234") == (1, 1)
+            assert monitor._last_status["test1234"] == TerminalStatus.COMPLETED
+        finally:
+            manager.stop()
+
+    def test_matrix_d_an_identical_unobserved_reply_stays_conservatively_open(self):
+        """Case (d), the explicit conservative outcome: an identical fast answer
+        whose turn was never seen working is indistinguishable from a replay, so
+        the provider keeps reporting PROCESSING and the turn stays open — it
+        resolves at the waiter's own timeout, not with a possibly-wrong answer.
+        The same trade grok makes for its stale-identical case; deliberately NOT
+        another content-word exception."""
+        completed = load_fixture("kiro_cli_completed_output.txt")
+        monitor, provider, manager = self._monitor_with_warm_reply(completed)
+        try:
+            monitor._process_chunk("test1234", completed)  # identical, no busy frame
+            assert provider.get_status(completed) == TerminalStatus.PROCESSING
+            assert monitor.turn_state("test1234") == (1, 0)
+        finally:
+            manager.stop()
+
+    def test_identity_makes_no_decision_on_truncated_extraction(self):
+        """Round-6 guidance: incomplete/truncated extraction stays out of the
+        identity decision — no veto (cannot prove a replay) and no cache update
+        (must not poison the baseline)."""
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        completed = load_fixture("kiro_cli_completed_output.txt")
+        provider.mark_input_received()
+        assert provider.get_status(completed) == TerminalStatus.COMPLETED
+        cached = provider._accepted_response_identity
+        assert cached is not None
+        # A buffer whose response cannot be cleanly extracted yields no identity.
+        assert provider._response_identity("") is None
+        assert provider._accepted_response_identity == cached
+
     def test_a_replayed_old_reply_after_clear_does_not_close_the_new_turn(self):
         """Kiro's TUI can re-emit its RETAINED old answer after clear_rolling_buffer;
         those bytes arrived after the dispatch but were rendered by the PREVIOUS

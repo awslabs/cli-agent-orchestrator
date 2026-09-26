@@ -19,6 +19,7 @@ The provider detects the following terminal states:
 
 import asyncio
 import logging
+import hashlib
 import re
 import shlex
 import time
@@ -197,6 +198,19 @@ class KiroCliProvider(BaseProvider):
         super().__init__(terminal_id, session_name, window_name, allowed_tools)
         self._initialized = False
         self._input_received = False
+        # Response-identity state for provider-owned replay rejection (#735,
+        # PR #812 round 6 design). _accepted_response_identity is the identity
+        # of the last completed response this provider REPORTED as COMPLETED
+        # (i.e. the one the monitor accepted); _baseline_response_identity is
+        # that value frozen at dispatch — send_input clears the rolling buffer
+        # BEFORE mark_input_received, so the baseline must come from this cache,
+        # never from the (already empty) buffer. _turn_activity_seen records
+        # whether this provider itself classified any post-dispatch frame as
+        # working — the fact that distinguishes a legitimately identical NEW
+        # answer from a replay.
+        self._accepted_response_identity: Optional[str] = None
+        self._baseline_response_identity: Optional[str] = None
+        self._turn_activity_seen = False
         self._agent_profile = agent_profile
         self._engine = resolve_kiro_engine(persisted=engine)
         self._model = model
@@ -235,6 +249,11 @@ class KiroCliProvider(BaseProvider):
         """Track that input was sent, enabling separator-free completion detection."""
         super().mark_input_received()
         self._input_received = True
+        # Freeze the replay baseline for the turn being dispatched, and forget
+        # the previous turn's activity. See __init__ for why the baseline comes
+        # from the cache rather than the (cleared) rolling buffer.
+        self._baseline_response_identity = self._accepted_response_identity
+        self._turn_activity_seen = False
 
     @property
     def extraction_tail_lines(self) -> int:
@@ -458,21 +477,81 @@ class KiroCliProvider(BaseProvider):
             timeout=remaining,
         )
 
-    def raw_buffer_shows_turn_activity(self, buffer: str) -> bool:
-        """Live-progress evidence for the StatusMonitor's cleared-buffer bypass.
-
-        TUI_PROCESSING_PATTERN is the same working evidence get_status honours
-        ('Kiro is working' / 'Thinking...'). A genuine coalesced fast reply
-        carries it in the same chunk as the answer; a re-emitted old reply after
-        clear_rolling_buffer does not — which is exactly the replay that closed a
-        new turn with the previous answer (PR #812 review, round 2).
-        """
-        # Strip ANSI first, exactly as get_status does before matching the same
-        # pattern — a live stream wraps these markers in colour codes.
-        clean = re.sub(ANSI_CODE_PATTERN, "", buffer or "")
-        return bool(re.search(TUI_PROCESSING_PATTERN, clean))
+    # Replay rejection is owned here: get_status vetoes a post-dispatch
+    # completion whose extracted response is identical to the frozen baseline
+    # when the turn was never seen working (see get_status/_response_identity).
+    owns_completion_identity = True
 
     def get_status(self, output: str) -> TerminalStatus:
+        """Classify the buffer, with provider-owned replay rejection (#735).
+
+        Kiro's TUI can re-emit its RETAINED previous answer after the monitor
+        clears the rolling buffer at dispatch; the classifier below honestly
+        parses that replay as COMPLETED. A replay is byte-identical to the
+        answer this provider last reported, so it is rejected by IDENTITY, the
+        way grok's buffer epochs already do: after a dispatch, a COMPLETED whose
+        extracted response matches the frozen baseline — and whose turn this
+        provider never saw working — is reported as PROCESSING instead
+        (PR #812 review, round 6 design, haofeif).
+
+        Identity is deliberately a veto, never positive evidence: a DIFFERENT
+        response does not certify completion, it merely fails to prove a replay
+        — the classifier's own completion checks still decide. The identity
+        covers only the extracted response body (extract_last_message_from_
+        script strips chrome and prompts and raises on a truncated response, so
+        incomplete extractions make no identity decision in either direction).
+        A legitimately identical new answer after OBSERVED work completes
+        normally; an identical fast answer with no observed work is
+        indistinguishable from a replay and conservatively stays PROCESSING —
+        the same trade grok makes for its stale-identical case.
+        """
+        verdict = self._classify_status(output)
+        if not self._input_received:
+            return verdict
+        if verdict in (TerminalStatus.PROCESSING, TerminalStatus.WAITING_USER_ANSWER):
+            self._turn_activity_seen = True
+            return verdict
+        if verdict == TerminalStatus.COMPLETED:
+            identity = self._response_identity(output)
+            if (
+                identity is not None
+                and not self._turn_activity_seen
+                and self._baseline_response_identity is not None
+                and identity == self._baseline_response_identity
+            ):
+                logger.info(
+                    "kiro_cli [%s]: completed response is identical to the pre-dispatch "
+                    "baseline with no observed work — treating as a replayed old answer, "
+                    "reporting PROCESSING",
+                    self.terminal_id,
+                )
+                return TerminalStatus.PROCESSING
+            if identity is not None:
+                self._accepted_response_identity = identity
+        return verdict
+
+    def _response_identity(self, output: str) -> Optional[str]:
+        """Identity of the buffer's final response body, or None for no decision.
+
+        Reuses the extraction path (green arrow → final prompt, chrome and
+        control sequences stripped), collapses whitespace so cosmetic reflow
+        does not defeat the comparison, and answers None — no identity decision
+        — when the buffer is empty or extraction reports the response
+        incomplete/truncated, exactly as the round-6 guidance requires.
+        """
+        try:
+            buffer = self._resolve_buffer(output)
+            if not buffer:
+                return None
+            message = self.extract_last_message_from_script(buffer)
+        except Exception:
+            return None
+        normalized = " ".join(message.split())
+        if not normalized:
+            return None
+        return hashlib.sha256(normalized.encode("utf-8", "replace")).hexdigest()[:16]
+
+    def _classify_status(self, output: str) -> TerminalStatus:
         """Get Kiro CLI status by analyzing terminal output.
 
         Status detection logic (in priority order):
