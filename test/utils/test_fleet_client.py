@@ -301,7 +301,14 @@ class TestProxiedRoutes:
         container's access log. OPN310's Appendix C tells readers never to send
         a secret this way; if this ever becomes a body, that warning is stale.
         """
-        args = self._capture(client, lambda c: c.send_input("w1", "t1", "hello"))
+        # A dict payload: send_input now validates the acknowledgement shape and
+        # raises on anything else (PR #812 review, round 3).
+        with patch(
+            "cli_agent_orchestrator.utils.fleet.requests.request",
+            return_value=_response(payload={"success": True, "turn": 1}),
+        ) as request:
+            client.send_input("w1", "t1", "hello")
+        args = request.call_args
         assert args.args[0] == "POST"
         assert args.args[1] == "http://broker:9890/workers/w1/api/terminals/t1/input"
         assert args.kwargs["params"] == {"message": "hello"}
@@ -399,3 +406,21 @@ class TestFollowLogs:
                 client.follow_logs("w1")
 
         assert "no such worker" in exc.value.format_message()
+
+
+class TestSendInputAcknowledgement:
+    """A non-JSON acknowledgement from a worker node is unconfirmed delivery, not
+    an old node: FleetClient.send_input must raise distinctly rather than hand the
+    waiter a None that quietly means "legacy wait" (PR #812 review, round 3 — the
+    same rule as the local `cao session send`)."""
+
+    def test_a_non_json_node_reply_raises(self):
+        client = FleetClient("http://broker:9890", "tok")
+        with patch.object(client, "node_post", return_value=None):
+            with pytest.raises(click.ClickException, match="UNCONFIRMED"):
+                client.send_input("w1", "t1", "hello")
+
+    def test_a_json_reply_without_a_turn_is_an_old_node(self):
+        client = FleetClient("http://broker:9890", "tok")
+        with patch.object(client, "node_post", return_value={"success": True}):
+            assert client.send_input("w1", "t1", "hello") is None

@@ -244,13 +244,26 @@ def send(session_name, message, terminal_id, is_async, timeout):
     # "my message finished" rather than "the screen looks finished" (#735).
     # Parsed OUTSIDE the request try-block: requests' JSONDecodeError subclasses
     # RequestException (via InvalidJSONError) ahead of ValueError, so inside that
-    # block the RequestException clause caught it first and a DELIVERED message
-    # was reported as "Failed to connect" — inviting a retry that pastes a
-    # duplicate prompt into a working agent (PR #812 review).
+    # block the RequestException clause caught it first (PR #812 review).
+    #
+    # A non-JSON 200 is NOT delivery: requests follows redirects, so a gateway
+    # can refuse the POST with a 303 to a sign-in page whose HTML 200 passes
+    # raise_for_status with zero messages accepted. Treating that as sent — or
+    # quietly falling back to the legacy wait — reports success for a message
+    # the server never saw (PR #812 review, round 3). Delivery is unconfirmed
+    # either way, so fail with a distinct error and no retry advice; a blind
+    # resend could paste a duplicate prompt into a working agent. The legacy
+    # wait remains only for a VALID JSON acknowledgement from an older server
+    # that simply does not name a turn.
     try:
         sent_turn = response.json().get("turn")
     except ValueError:
-        sent_turn = None  # non-JSON body from an unexpected proxy; fall back below
+        raise click.ClickException(
+            f"cao-server returned a non-JSON acknowledgement for the send to "
+            f"terminal {target_id} (a proxy or sign-in page may have intercepted "
+            "the request). Delivery is UNCONFIRMED — inspect the terminal (`cao "
+            f"session status {session_name}`) before deciding whether to resend."
+        )
 
     if is_async:
         click.echo(f"Message sent to terminal {target_id}")

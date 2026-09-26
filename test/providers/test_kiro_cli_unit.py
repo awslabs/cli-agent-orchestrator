@@ -451,6 +451,37 @@ class TestKiroCliProviderStatusDetection:
 
         assert status == TerminalStatus.COMPLETED
 
+    def test_a_replayed_old_reply_after_clear_does_not_close_the_new_turn(self):
+        """Kiro's TUI can re-emit its RETAINED old answer after clear_rolling_buffer;
+        those bytes arrived after the dispatch but were rendered by the PREVIOUS
+        turn. Treating every post-clear ready verdict as current-turn evidence
+        closed the new turn as (1, 1) before any work happened, releasing the
+        waiter with the old reply (PR #812 review, round 2). Clearing proves when
+        bytes arrived, not which turn rendered them: the bypass needs activity
+        evidence in the same buffer, which a bare replay has none of.
+        """
+        from cli_agent_orchestrator.services.status_monitor import StatusMonitor
+
+        completed = load_fixture("kiro_cli_completed_output.txt")
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+
+        monitor = StatusMonitor()
+        with patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as manager:
+            manager.get_provider.return_value = provider
+            # Warm turn on screen, then a real dispatch boundary.
+            provider.mark_input_received()
+            monitor._process_chunk("test1234", completed)
+            monitor.notify_input_sent("test1234")
+            monitor.clear_rolling_buffer("test1234", provider)
+            provider.mark_input_received()
+            monitor.notify_input_delivered("test1234")
+
+            # The TUI re-emits ONLY the identical old reply — no working marker,
+            # no new answer.
+            monitor._process_chunk("test1234", completed)
+
+            assert monitor.turn_state("test1234") == (1, 0)
+
     def test_coalesced_working_and_completed_chunk_closes_the_dispatched_turn(self):
         """Kiro parses one chunk holding 'Kiro is working' plus the finished answer
         as COMPLETED — a fast reply with no separate PROCESSING verdict. That

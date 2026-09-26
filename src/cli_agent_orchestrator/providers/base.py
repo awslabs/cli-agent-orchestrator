@@ -214,6 +214,22 @@ class BaseProvider(ABC):
     # never probed: the terminal keeps the status the edges give it.
     supports_midburst_processing_probe: bool = False
 
+    def raw_buffer_shows_turn_activity(self, buffer: str) -> bool:
+        """Whether this RAW rolling buffer contains provider-recognizable evidence
+        that an agent turn actually RAN — a working/thinking/progress marker.
+
+        Consulted by the StatusMonitor before it lets a post-clear ready verdict
+        close the dispatched turn without a separately sampled busy status (#735,
+        PR #812): send_input clears the buffer at dispatch, so its bytes arrived
+        after the dispatch, but a TUI can re-emit its RETAINED previous answer
+        into the fresh buffer — arrival time proves nothing about which turn
+        rendered the content. A live working marker in the same buffer does. A
+        pure observation over the text it is handed; it must not mutate provider
+        state. Default False — fail closed: providers that do not declare their
+        markers keep the conservative seen-working gate.
+        """
+        return False
+
     def probe_processing_from_screen(self, screen_lines: List[str]) -> bool:
         """Report whether this half-drawn frame shows the agent actively working.
 
