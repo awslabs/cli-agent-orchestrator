@@ -390,7 +390,11 @@ SERVER_PORT = int(os.environ.get("CAO_API_PORT", "9889"))
 SERVER_VERSION = "0.1.0"
 
 
-API_BASE_URL = f"http://{SERVER_HOST}:{SERVER_PORT}"
+# CAO_API_BASE_URL selects a remote shared server explicitly (#745); when it
+# is unset the CLI targets the local host/port exactly as before.
+API_BASE_URL = os.environ.get("CAO_API_BASE_URL", "").strip().rstrip("/") or (
+    f"http://{SERVER_HOST}:{SERVER_PORT}"
+)
 
 # Default timeout (seconds) for HTTP calls to the CAO API server.
 MCP_REQUEST_TIMEOUT = 30

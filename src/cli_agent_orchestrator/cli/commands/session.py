@@ -10,6 +10,7 @@ import requests
 
 from cli_agent_orchestrator.constants import API_BASE_URL
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.utils.remote_server import auth_headers
 from cli_agent_orchestrator.utils.terminal import poll_until_done
 
 # Default poll timeout for sync send (seconds). Pass --timeout to override.
@@ -17,26 +18,30 @@ _DEFAULT_SEND_TIMEOUT = 300
 
 
 def _get_sessions():
-    response = requests.get(f"{API_BASE_URL}/sessions")
+    response = requests.get(f"{API_BASE_URL}/sessions", headers=auth_headers())
     response.raise_for_status()
     return response.json()
 
 
 def _get_terminals(session_name):
-    response = requests.get(f"{API_BASE_URL}/sessions/{quote(session_name, safe='')}/terminals")
+    response = requests.get(
+        f"{API_BASE_URL}/sessions/{quote(session_name, safe='')}/terminals", headers=auth_headers()
+    )
     response.raise_for_status()
     return response.json()
 
 
 def _get_terminal(terminal_id):
-    response = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}")
+    response = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}", headers=auth_headers())
     response.raise_for_status()
     return response.json()
 
 
 def _get_terminal_output(terminal_id):
     response = requests.get(
-        f"{API_BASE_URL}/terminals/{terminal_id}/output", params={"mode": "last"}
+        f"{API_BASE_URL}/terminals/{terminal_id}/output",
+        params={"mode": "last"},
+        headers=auth_headers(),
     )
     response.raise_for_status()
     return response.json()
@@ -222,7 +227,7 @@ def send(session_name, message, terminal_id, is_async, timeout):
             conductor, _ = _resolve_conductor(session_name)
             target_id = conductor["id"]
 
-        status_resp = requests.get(f"{API_BASE_URL}/terminals/{target_id}")
+        status_resp = requests.get(f"{API_BASE_URL}/terminals/{target_id}", headers=auth_headers())
         status_resp.raise_for_status()
         current_status = status_resp.json().get("status")
         # "completed" is a valid pre-send state: the terminal has finished its
@@ -235,6 +240,7 @@ def send(session_name, message, terminal_id, is_async, timeout):
         response = requests.post(
             f"{API_BASE_URL}/terminals/{target_id}/input",
             params={"message": message},
+            headers=auth_headers(),
         )
         response.raise_for_status()
     except requests.exceptions.RequestException as e:
@@ -256,6 +262,7 @@ def send(session_name, message, terminal_id, is_async, timeout):
         output_resp = requests.get(
             f"{API_BASE_URL}/terminals/{target_id}/output",
             params={"mode": "last"},
+            headers=auth_headers(),
         )
         output_resp.raise_for_status()
         output = output_resp.json().get("output", "")

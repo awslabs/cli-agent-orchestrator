@@ -12,6 +12,7 @@ import requests
 
 from cli_agent_orchestrator.constants import API_BASE_URL, SESSION_PREFIX
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.utils.remote_server import auth_headers
 
 logger = logging.getLogger(__name__)
 
@@ -176,27 +177,52 @@ async def wait_for_shell(
     return False
 
 
+def effective_status(terminal_id: str) -> "TerminalStatus":
+    """The status of any terminal, wherever its pane actually lives (#745).
+
+    ``StatusMonitor`` is a LOCAL detector: it reads a rolling buffer fed by this
+    process's FIFO reader and, on its fallbacks, shells out to this host's tmux.
+    For a terminal in an execution runtime none of that describes the right
+    machine — the buffer is empty and the answer is a permanent ``UNKNOWN``. The
+    runtime derives status beside its own pane and pushes it over the channel, so
+    for a remote terminal the registry's last reported status IS the status; the
+    review finding this closes is a step that timed out while its worker had
+    reported COMPLETED minutes earlier (finding 4 on #802).
+
+    The same routing decision the service seams already make one by one
+    (``terminal_service.get_terminal``, ``InboxService.deliver_pending``), in the
+    one form the polling waits can share. Blocking (both arms may do I/O) —
+    callers on the event loop hand it to ``asyncio.to_thread``.
+    """
+    from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
+    from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+    if runtime_registry.is_remote(terminal_id):
+        return runtime_registry.get_status(terminal_id)
+    return status_monitor.get_status(terminal_id)
+
+
 async def wait_until_status(
     terminal_id: str,
     target_status: "TerminalStatus | set[TerminalStatus]",
     timeout: float = 30.0,
     polling_interval: float = 1.0,
 ) -> bool:
-    """Wait until terminal reaches target status by polling status_monitor.
+    """Wait until terminal reaches target status by polling its status source.
 
-    status_monitor.get_status() is backend-aware: for pipe-pane backends (tmux)
-    it returns the pushed pipeline status, and for event-inbox backends (herdr)
-    it derives status on demand from the provider's native status. So this poll
-    works for both backends without special-casing here.
+    ``effective_status`` is backend-aware AND location-aware: for pipe-pane
+    backends (tmux) it returns the pushed pipeline status, for event-inbox
+    backends (herdr) it derives status on demand from the provider's native
+    status, and for a terminal that lives in an execution runtime it reads what
+    that runtime reported over the channel. So this poll works for all three
+    without special-casing here.
 
-    get_status() is no longer purely in-memory: for a terminal stuck in PROCESSING it can
+    The read is not purely in-memory: for a terminal stuck in PROCESSING it can
     shell out to a real tmux capture-pane subprocess (the stale-PROCESSING fallback in
     status_monitor.py), and on herdr it shells out to the herdr CLI. Offload each poll via
     asyncio.to_thread so that blocking I/O can't fork/exec on the shared event loop —
     matches the pattern GET /terminals/{id} (api/main.py) uses for the identical hazard.
     """
-    from cli_agent_orchestrator.services.status_monitor import status_monitor
-
     targets = target_status if isinstance(target_status, set) else {target_status}
     target_str = ", ".join(s.value for s in targets)
     logger.info(
@@ -204,7 +230,7 @@ async def wait_until_status(
     )
     start = time.time()
     while time.time() - start < timeout:
-        current = await asyncio.to_thread(status_monitor.get_status, terminal_id)
+        current = await asyncio.to_thread(effective_status, terminal_id)
         if current in targets:
             logger.info(f"wait_until_status [{terminal_id}]: reached {current.value}")
             return True
@@ -229,7 +255,7 @@ def sync_backend_from_server() -> None:
     from cli_agent_orchestrator.backends.registry import set_backend
 
     try:
-        resp = requests.get(f"{API_BASE_URL}/health", timeout=2.0)
+        resp = requests.get(f"{API_BASE_URL}/health", timeout=2.0, headers=auth_headers())
         resp.raise_for_status()
         data = resp.json()
         backend_name = data.get("terminal_backend")
@@ -295,7 +321,9 @@ def poll_until_done(
             else:
                 # Per-request timeout so a stalled server/network can't block past
                 # the outer timeout budget (matches wait_until_terminal_status).
-                resp = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=5.0)
+                resp = requests.get(
+                    f"{API_BASE_URL}/terminals/{terminal_id}", timeout=5.0, headers=auth_headers()
+                )
                 resp.raise_for_status()
                 status = resp.json().get("status")
             if status == TerminalStatus.COMPLETED.value:
@@ -365,7 +393,9 @@ def wait_until_terminal_status(
     while time.time() - start_time < timeout:
         poll_count += 1
         try:
-            response = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=5.0)
+            response = requests.get(
+                f"{API_BASE_URL}/terminals/{terminal_id}", timeout=5.0, headers=auth_headers()
+            )
             if response.status_code == 200:
                 current_status = response.json().get("status")
                 last_seen = current_status

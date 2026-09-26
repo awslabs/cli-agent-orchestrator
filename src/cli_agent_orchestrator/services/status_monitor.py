@@ -18,7 +18,7 @@ from cli_agent_orchestrator.constants import (
     PYTE_SCREEN_ROWS,
 )
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.providers.manager import provider_manager
+from cli_agent_orchestrator.providers.manager import TerminalNotFoundError, provider_manager
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.event import terminal_id_from_topic
@@ -192,9 +192,28 @@ class StatusMonitor:
             try:
                 event = await queue.get()
                 terminal_id = terminal_id_from_topic(event["topic"])
+                if self._belongs_to_a_runtime(terminal_id):
+                    # A remote terminal's status is its runtime's own verdict,
+                    # pushed over the channel and held in the registry (#745).
+                    # The server republishes the bytes for history and browsers;
+                    # scanning them here to reach a second opinion would burn the
+                    # server on every executor's pane and could disagree with the
+                    # only process that can actually see the pane.
+                    continue
                 await asyncio.to_thread(self._process_chunk, terminal_id, event["data"]["data"])
             except Exception as e:
                 logger.exception(f"Error in StatusMonitor: {e}")
+
+    @staticmethod
+    def _belongs_to_a_runtime(terminal_id: str) -> bool:
+        """Is this terminal owned by an execution runtime rather than this host?
+
+        In a bridge process the registry is empty, so this is False there and the
+        runtime keeps deriving status for its own panes exactly as before.
+        """
+        from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
+
+        return runtime_registry.is_remote(terminal_id)
 
     def _process_chunk(self, terminal_id: str, chunk: str) -> None:
         """Append chunk to the rolling buffer and (re)detect status.
@@ -209,7 +228,25 @@ class StatusMonitor:
           resumed) and at quiescence (output stopped) — see
           _schedule_screen_detection.
         """
-        provider = provider_manager.get_provider(terminal_id)
+        try:
+            provider = provider_manager.get_provider(terminal_id)
+        except TerminalNotFoundError:
+            # No registry row for this id. Bytes can legitimately arrive on
+            # either side of a row's life: a remote launch republishes a pane's
+            # first output before the central row lands, and a terminal can be
+            # deleted with its last chunk still in flight. There is nothing to
+            # attribute the chunk to and nothing wrong, so this must not be a
+            # logged exception - it was three tracebacks per remote launch.
+            #
+            # Narrowly this exception, not every ValueError: get_provider also
+            # raises one when the row EXISTS and the provider refused to be
+            # built (unknown provider type, kiro profile without an agent). That
+            # terminal is local, its status buffer would have stayed empty and
+            # its last status unset, and the misconfiguration would never have
+            # been logged (Copilot review on #802). It now falls through to the
+            # caller's handler, which logs it.
+            logger.debug("status chunk for unknown terminal %s ignored", terminal_id)
+            return
         use_screen = (
             CAO_PYTE_STATUS
             and provider is not None

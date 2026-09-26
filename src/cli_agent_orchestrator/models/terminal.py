@@ -106,6 +106,13 @@ class Terminal(BaseModel):
     status: Optional[TerminalStatus] = Field(
         None, description="Current terminal status (live only)"
     )
+    # Server-written, never agent-written — unlike ``metadata`` above. Exposed on
+    # reads because an operator deciding whether to stop a running agent needs to
+    # see whose work it is; ``may_stop_work`` stays true for a revoked owner, and
+    # that authority is unusable if ownership is invisible (#745).
+    owner: Optional[str] = Field(
+        None, description="Canonical principal id this terminal's work belongs to"
+    )
     last_active: Optional[datetime] = Field(None, description="Last active timestamp")
 
 

@@ -12,6 +12,7 @@ from cli_agent_orchestrator.constants import (
     SERVER_PORT,
     SESSION_PREFIX,
 )
+from cli_agent_orchestrator.utils.remote_server import auth_headers
 
 
 @click.command()
@@ -40,9 +41,20 @@ def info():
 
         if session_name and session_name.startswith(SESSION_PREFIX):
             try:
-                # Call API to get session details
-                url = f"http://{SERVER_HOST}:{SERVER_PORT}/sessions/{session_name}"
-                response = requests.get(url)
+                # Call API to get session details.
+                #
+                # server_base_url(), not the local host/port: with
+                # CAO_API_BASE_URL set this command was building a LOCALHOST url
+                # and then attaching the shared server's bearer token to it, so
+                # any unrelated process listening on that port received the
+                # credential — and the command reported local state while
+                # claiming to describe the shared server (Copilot review on
+                # #802). One resolver for both, so the token and the address
+                # cannot disagree.
+                from cli_agent_orchestrator.utils.remote_server import server_base_url
+
+                url = f"{server_base_url()}/sessions/{session_name}"
+                response = requests.get(url, headers=auth_headers())
 
                 if response.status_code == 200:
                     data = response.json()

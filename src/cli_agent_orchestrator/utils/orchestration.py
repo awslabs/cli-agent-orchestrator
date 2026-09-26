@@ -100,12 +100,16 @@ def _current_terminal_id() -> Optional[str]:
     """Return a valid CAO terminal ID from the calling process's environment, if configured.
 
     The canonical resolver for "who is calling" -- shared by the MCP tools
-    (via ``CAO_TERMINAL_ID`` in the MCP subprocess's env) and the ``cao
-    agent`` CLI commands (via the same env var in the invoking shell). Same
-    validation either way: an unset var means "no caller identity available"
-    (``None``), a malformed one is a hard error, never silently ignored.
+    and the ``cao agent`` CLI commands. Resolution prefers a per-request caller
+    identity (set by the shared HTTP MCP endpoint's middleware, #745) and falls
+    back to ``CAO_TERMINAL_ID`` in the process env (the stdio MCP subprocess and
+    the invoking CLI shell). Same validation either way: an unset value means
+    "no caller identity available" (``None``), a malformed one is a hard error,
+    never silently ignored.
     """
-    terminal_id = os.environ.get("CAO_TERMINAL_ID")
+    from cli_agent_orchestrator.mcp_server.caller_context import resolve_caller_terminal_id
+
+    terminal_id = resolve_caller_terminal_id()
     if not terminal_id:
         return None
     if not _TERMINAL_ID_PATTERN.fullmatch(terminal_id):
@@ -252,7 +256,9 @@ def _wait_remote_ready(base_url: str, timeout: float) -> None:
     while True:
         attempt += 1
         try:
-            response = requests.get(f"{base_url}/health", timeout=(2.0, 5.0))
+            response = requests.get(
+                f"{base_url}/health", timeout=(2.0, 5.0), headers=_auth_headers() or None
+            )
             if response.status_code < 400:
                 if attempt > 1:
                     logger.info("Remote node %s answered /health on attempt %d", base_url, attempt)
@@ -298,6 +304,7 @@ def _resolve_remote_provider(base_url: str, agent_profile: str) -> str:
         response = requests.get(
             f"{base_url}/agents/profiles/{agent_profile}",
             timeout=(REMOTE_CONNECT_TIMEOUT, _mcp_timeout()),
+            headers=_auth_headers() or None,
         )
     except requests.RequestException as exc:
         raise ValueError(
@@ -332,6 +339,7 @@ def _cleanup_remote_terminal(base_url: str, terminal_id: str) -> bool:
         response = requests.delete(
             f"{base_url}/terminals/{terminal_id}",
             timeout=(REMOTE_CONNECT_TIMEOUT, _mcp_timeout()),
+            headers=_auth_headers() or None,
         )
         if response.status_code == 404:
             return True
@@ -630,8 +638,9 @@ def _send_direct_input(
             "message": message,
             # "supervisor" fallback is safe here: sender_id is a display label
             # for plugin event emission, never a routable callback address
-            # (unlike the hard-error paths added for issue #284).
-            "sender_id": os.environ.get("CAO_TERMINAL_ID", "supervisor"),
+            # (unlike the hard-error paths added for issue #284). Resolved via
+            # the shared per-request/env resolver (#745) rather than the raw env.
+            "sender_id": _current_terminal_id() or "supervisor",
             "orchestration_type": orchestration_type,
         },
         headers=_auth_headers() or None,
@@ -1471,6 +1480,7 @@ def _assign_remote(
             },
         },
         timeout=(REMOTE_CONNECT_TIMEOUT, _mcp_timeout()),
+        headers=_auth_headers() or None,
     )
     if response.status_code >= 400:
         # Surface the remote node's JSON detail (e.g. a 429 "Terminal limit
@@ -1529,6 +1539,142 @@ def _assign_remote(
 
 
 # Implementation function for assign
+def _wait_runtime_connected(runtime_id: str, wait_seconds: float) -> None:
+    """Wait for an execution-only runtime to dial the central server (#745).
+
+    The bridge-worker analogue of ``_wait_remote_ready``: a bridge pod has no
+    HTTP /health to poll, so "usable" means its runtime channel is registered —
+    observable in this server's own ``GET /runtimes``. Raises TimeoutError with
+    the same caller-facing semantics as the /health wait.
+    """
+    deadline = time.monotonic() + wait_seconds
+    poll = 0.5
+    last_error: Optional[str] = None
+    while time.monotonic() < deadline:
+        try:
+            response = requests.get(
+                f"{API_BASE_URL}/runtimes", timeout=(5, 10), headers=_auth_headers() or None
+            )
+            response.raise_for_status()
+            if runtime_id in response.json().get("runtimes", {}):
+                return
+            last_error = "not yet connected"
+        except requests.RequestException as exc:
+            last_error = str(exc)
+        time.sleep(poll)
+        poll = min(poll * 1.5, 3.0)
+    raise TimeoutError(
+        f"runtime {runtime_id!r} did not connect to the central server within "
+        f"{wait_seconds:.0f}s ({last_error})"
+    )
+
+
+def _assign_bridge(
+    *,
+    agent_profile: str,
+    worker_message: str,
+    current_terminal_id: str,
+    runtime_id: str,
+    provider: Optional[str],
+    working_directory: Optional[str],
+    engine: Optional[str],
+    model: Optional[str],
+    use_worktree: bool,
+    ready_wait_seconds: float = 0.0,
+    callback_url: Optional[str] = None,
+    remote_session_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Create an assign worker on an execution-only bridge runtime (#745).
+
+    The worker pod runs ``cao-bridge``, not a cao-server: THIS node owns the
+    terminal row and routes launch/input/output over the runtime channel, so
+    the create call goes to our own ``POST /runtimes/{runtime_id}/terminals``
+    instead of a per-worker Service. Results route back exactly as in the
+    remote path — via injected ``CAO_CALLBACK_URL``/``CAO_CALLBACK_TERMINAL_ID``
+    — except the callback URL may simply be this server's advertised address,
+    because the worker's MCP tools already dial the central API.
+    """
+    if engine is not None:
+        return {
+            "success": False,
+            "terminal_id": None,
+            "message": (
+                "Assignment failed: engine selection is not supported on the "
+                "bridge launch path yet; omit engine or use a server-mode worker."
+            ),
+        }
+    if use_worktree:
+        return {
+            "success": False,
+            "terminal_id": None,
+            "message": (
+                "Assignment failed: use_worktree is not supported together with "
+                "a bridge runtime (no worktree provisioning on the channel)."
+            ),
+        }
+    advertised_url = (callback_url or os.environ.get(ADVERTISED_URL_ENV) or API_BASE_URL).rstrip(
+        "/"
+    )
+    if ready_wait_seconds > 0:
+        _wait_runtime_connected(runtime_id, ready_wait_seconds)
+
+    body: Dict[str, Any] = {
+        "agent_profile": agent_profile,
+        "initial_message": worker_message,
+        "env_vars": {
+            CALLBACK_URL_ENV: advertised_url,
+            CALLBACK_TERMINAL_ID_ENV: current_terminal_id,
+        },
+    }
+    # An explicit provider from the caller travels; "unset" stays unset so the
+    # worker pod resolves it from its own installed profile. The previous
+    # ``provider or ""`` sent an empty string, which is neither — the runtime
+    # took it as the provider name and the launch failed there (review finding 8
+    # on #802).
+    if provider:
+        body["provider"] = provider
+    if remote_session_name:
+        body["session_name"] = remote_session_name
+    if working_directory:
+        body["working_directory"] = working_directory
+    if model is not None:
+        body["model"] = model
+
+    # LAUNCH waits for provider init on the runtime, so allow the channel's
+    # full launch budget rather than the ordinary MCP call timeout.
+    response = requests.post(
+        f"{API_BASE_URL}/runtimes/{runtime_id}/terminals",
+        json=body,
+        timeout=(REMOTE_CONNECT_TIMEOUT, 300),
+        headers=_auth_headers() or None,
+    )
+    if response.status_code >= 400:
+        detail = _extract_error_detail(response, f"status {response.status_code}")
+        return {
+            "success": False,
+            "terminal_id": None,
+            "runtime_id": runtime_id,
+            "message": f"Assignment failed on runtime {runtime_id}: {detail}",
+        }
+    data = response.json()
+    terminal_id = data["id"]
+    session_name = data.get("session_name")
+    return {
+        "success": True,
+        "terminal_id": terminal_id,
+        "runtime_id": runtime_id,
+        "session_name": session_name,
+        "message": (
+            f"Task assigned to {agent_profile} on runtime {runtime_id} "
+            f"(terminal: {terminal_id}"
+            + (f", session: {session_name}" if session_name else "")
+            + "). The task was delivered after the worker initialized; results "
+            f"will arrive via send_message. Cleanup when finished: "
+            f"delete_terminal('{terminal_id}')."
+        ),
+    }
+
+
 def _assign_impl(
     agent_profile: str,
     message: str,
@@ -1540,6 +1686,8 @@ def _assign_impl(
     ready_wait_seconds: float = 0.0,
     callback_url: Optional[str] = None,
     remote_session_name: Optional[str] = None,
+    runtime_id: Optional[str] = None,
+    provider: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Implementation of assign logic.
 
@@ -1596,6 +1744,22 @@ def _assign_impl(
             )
         else:
             worker_message = message
+
+        if runtime_id:
+            return _assign_bridge(
+                agent_profile=agent_profile,
+                worker_message=worker_message,
+                current_terminal_id=current_terminal_id,
+                runtime_id=runtime_id,
+                provider=provider,
+                working_directory=working_directory,
+                engine=engine,
+                model=model,
+                use_worktree=use_worktree,
+                ready_wait_seconds=ready_wait_seconds,
+                callback_url=callback_url,
+                remote_session_name=remote_session_name,
+            )
 
         if target_host:
             return _assign_remote(

@@ -57,6 +57,15 @@ class TerminalModel(Base):
     # MetaData object on every mapped class; the DB column itself is still
     # literally named "metadata" per #432's design.
     metadata_json = Column("metadata", Text, nullable=True)
+    # Canonical principal id of whoever's work this terminal is doing (#745).
+    # Its OWN column rather than a key in ``metadata`` above, which is written by
+    # the running agent itself through the ``update_metadata`` MCP tool: an
+    # identity kept in an agent-writable bag is an identity the agent can forge,
+    # and this value is read to decide whether work may still be started. Only
+    # the server writes it, at creation. NULL = not recorded (a row predating the
+    # column), which reads as unknown, not as the local user. Added to existing
+    # DBs by ``_migrate_add_terminal_owner``.
+    owner = Column(String, nullable=True)
     last_active = Column(DateTime, default=datetime.now)
 
     # ORDERING CONTRACT: the two session-scoped reads -- ``list_terminals_by_session``
@@ -462,6 +471,12 @@ class FlowModel(Base):
     last_run = Column(DateTime, nullable=True)
     next_run = Column(DateTime, nullable=True)
     enabled = Column(Boolean, default=True)
+    # The principal that registered this schedule, as its canonical id (#745).
+    # A flow fires long after the request that created it returned, so without
+    # this the dispatch has no owner to check and the work silently becomes the
+    # server's own. NULL = registered before this column existed; migrated onto
+    # existing DBs by ``_migrate_add_flow_owner``.
+    owner = Column(String, nullable=True)
 
 
 class HandoffResultModel(Base):
@@ -544,6 +559,62 @@ class IdempotencyKeyModel(Base):
     created_at = Column(DateTime, default=datetime.now)
 
 
+class DispatchJournalModel(Base):
+    """What this server sent to a runtime, so a redelivered result can be trusted.
+
+    The runtime retains each command result until it is acked and redelivers the
+    unacked ones after the server restarts. Reconciling one of those means writing
+    a central row for a terminal this process never launched, and until this table
+    existed there was nothing to check it against: ``RuntimeConnection.resolve``
+    answers False for ANY unknown ``op_id``, so a shared-token runtime could
+    fabricate a result frame naming an arbitrary terminal id and the server would
+    persist it, place it on that runtime, and — because the reconciled row had no
+    owner, and ``may_start_work(None)`` is permitted — let it do work. The row it
+    had just written was the only thing authorizing the claim (Copilot review on
+    #802).
+
+    So the operation is journalled BEFORE the frame goes out, and the journal is
+    the authority afterwards: no entry for an op_id means this server never
+    dispatched it, and nothing about it is believed.
+
+    Deliberately NOT in ``RUNTIME_TABLE_NAMES``: this is the control plane's
+    record of what it asked for. An executor has no use for it and must not be
+    able to write one.
+
+    ``owner`` is the principal the dispatch was made on behalf of. It is recorded
+    here rather than carried in the LAUNCH payload precisely so it never reaches
+    the runtime — an identity handed to an executor is one the executor can
+    re-present.
+    """
+
+    __tablename__ = "dispatch_journal"
+
+    op_id = Column(String, primary_key=True)
+    command_type = Column(String, nullable=False)
+    runtime_id = Column(String, nullable=False)
+    # Known for commands about an existing terminal; None for a LAUNCH, whose
+    # terminal id is minted by the runtime and arrives in the result.
+    terminal_id = Column(String, nullable=True)
+    # None is a legitimate value (an unauthenticated local install has no
+    # principal) and is distinct from "no journal entry at all".
+    owner = Column(String, nullable=True)
+    # For RUN_SCRIPT: the durable workflow run this operation belongs to. A
+    # redelivered script result has no in-memory driver left to apply it, and
+    # without this there is no way back to the run whose step is still RUNNING.
+    run_id = Column(String, nullable=True)
+    step_id = Column(String, nullable=True)
+    # For LAUNCH: the engine the caller asked for. The runtime's result payload
+    # does not echo it, so without this a terminal reconciled after a restart was
+    # persisted with engine=None even though it was launched engine-pinned -- and
+    # reuse validation and the input gate both read that column.
+    engine = Column(String, nullable=True)
+    # "dispatched" until a result is applied, then "settled". A dispatched entry
+    # found after a restart is an operation whose outcome this server never saw.
+    state = Column(String, nullable=False, default="dispatched")
+    created_at = Column(DateTime, default=datetime.now)
+    settled_at = Column(DateTime, nullable=True)
+
+
 def _ensure_db_dir() -> None:
     """Create the DB dir owner-only (0o700).
 
@@ -570,6 +641,10 @@ def init_db() -> None:
     """Initialize database tables and apply schema migrations."""
     _migrate_project_aliases_schema()
     Base.metadata.create_all(bind=engine)
+    # Must run straight after create_all: create_all adds a missing TABLE but
+    # never a missing COLUMN, and a journal table from an earlier revision of
+    # this branch lacks `engine`, which breaks every read of it.
+    _migrate_dispatch_journal()
     _restrict_db_file_permissions()
     _migrate_terminals_schema()
     _migrate_add_access_count()
@@ -607,6 +682,53 @@ def init_db() -> None:
     # Appended LAST (issue #447, ``handoff_results``). Its own new table, no shared
     # columns with anything above, so registry order is immaterial here too.
     _migrate_add_handoff_results()
+    # Appended LAST (#745). One nullable column each on ``flows`` and
+    # ``terminals``; touches no table above, so registry order is immaterial here
+    # too. ``_migrate_terminals_schema`` runs first and adds its own columns, but
+    # the two do not overlap and each ALTER is guarded by its own PRAGMA read.
+    _migrate_add_flow_owner()
+    _migrate_add_terminal_owner()
+
+
+# The only tables an execution-only runtime writes to. ``terminal_service`` —
+# everything ``cao-bridge`` runs — imports exactly these three: the pane row it
+# creates, the inbox row a worker's callback writes, and the idempotency mapping
+# that makes a retried create idempotent. Nothing on that path reads or writes a
+# workflow, memory, vault, flow or handoff-result table.
+RUNTIME_TABLE_NAMES = ("terminals", "inbox", "idempotency_keys")
+
+
+def init_runtime_db() -> None:
+    """Create only the tables an execution-only runtime actually uses (#745).
+
+    ``init_db`` is the CONTROL-PLANE initializer: it creates every table and runs
+    the full migration registry — workflow journals, memory, the vault, handoff
+    results. A ``cao-bridge`` pod runs none of that. Calling it there contradicted
+    the execution-only boundary in two ways that matter beyond tidiness:
+
+    - it left a worker-local SQLite file holding empty orchestration schemas, so a
+      pod's database looked like a place orchestration state could live, and
+      anything that later read it would be reading a second, non-authoritative
+      copy of state the server owns;
+    - every pod ran every migration on its own fresh file at startup, which is
+      work with no reader, and a migration written against real central data has
+      no business executing in an execution pod at all.
+
+    What a runtime does need is the pane bookkeeping ``terminal_service`` keeps
+    locally: the ``terminals`` row for panes on THIS host, the ``inbox`` row a
+    worker callback writes, and the ``idempotency_keys`` mapping. Those are
+    node-local by definition — the pane exists on this host and nowhere else — so
+    they are created here, with the ``terminals`` migrations that keep an older
+    pod's file loadable and nothing else (Copilot review on #802, finding 5).
+    """
+    tables = [Base.metadata.tables[name] for name in RUNTIME_TABLE_NAMES]
+    Base.metadata.create_all(bind=engine, tables=tables)
+    _restrict_db_file_permissions()
+    # Only the ``terminals`` migrators: a runtime that is upgraded in place keeps
+    # a file written by an older image, and these add the columns the pane row
+    # gained. Each is an idempotent, PRAGMA-guarded ALTER on ``terminals``.
+    _migrate_terminals_schema()
+    _migrate_add_terminal_owner()
 
 
 def _restrict_db_file_permissions() -> None:
@@ -814,6 +936,41 @@ def _migrate_memory_source_kind() -> None:
         raise
 
 
+def _migrate_dispatch_journal() -> None:
+    """Add later ``dispatch_journal`` columns to a table created without them.
+
+    ``Base.metadata.create_all`` creates a MISSING table but never ALTERs an
+    existing one, so a database built by an earlier revision of this branch has
+    ``dispatch_journal`` without ``engine`` — and then every read of the journal
+    fails with ``no such column``, which takes the whole remote launch path down
+    with it. Fresh databases already have the column from the model.
+
+    Idempotent: PRAGMA gate, then ALTER only what is missing.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            present = {
+                row[1] for row in conn.execute("PRAGMA table_info(dispatch_journal)").fetchall()
+            }
+            if not present:
+                # No such table yet; create_all will build it complete.
+                return
+            for column, ddl in (
+                ("engine", "ALTER TABLE dispatch_journal ADD COLUMN engine VARCHAR"),
+                ("run_id", "ALTER TABLE dispatch_journal ADD COLUMN run_id VARCHAR"),
+                ("step_id", "ALTER TABLE dispatch_journal ADD COLUMN step_id VARCHAR"),
+            ):
+                if column not in present:
+                    conn.execute(ddl)
+                    logger.info("Migration: added %s column to dispatch_journal", column)
+    except Exception as e:
+        logger.debug(f"Migration check for dispatch_journal failed: {e}")
+
+
 def _migrate_add_access_count() -> None:
     """Add access_count and last_accessed_at columns to memory_metadata if missing.
 
@@ -886,6 +1043,54 @@ def _migrate_add_related_keys() -> None:
                 logger.info("Migration: added related_keys column to memory_metadata")
     except Exception as e:
         logger.debug(f"Migration check for related_keys failed: {e}")
+
+
+def _migrate_add_flow_owner() -> None:
+    """Add the ``owner`` column to ``flows`` if missing (#745).
+
+    Same idempotent ALTER pattern as ``_migrate_add_related_keys``. Nullable
+    with no backfill on purpose: a flow registered before this column existed
+    has an owner nobody recorded, and inventing one — the local principal, say —
+    would assert something untrue about who a scheduled agent runs for. NULL
+    reads as "unknown", which the revocation gate treats as not-revoked, so
+    existing schedules keep firing across the upgrade.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            cursor = conn.execute("PRAGMA table_info(flows)")
+            columns = {row[1] for row in cursor.fetchall()}
+            if columns and "owner" not in columns:
+                conn.execute("ALTER TABLE flows ADD COLUMN owner TEXT")
+                logger.info("Migration: added owner column to flows")
+    except Exception as e:
+        logger.debug(f"Migration check for flow owner failed: {e}")
+
+
+def _migrate_add_terminal_owner() -> None:
+    """Add the ``owner`` column to ``terminals`` if missing (#745).
+
+    Same idempotent, nullable, no-backfill pattern as
+    ``_migrate_add_flow_owner``, and for the same reason: the owner of a terminal
+    that already existed is not knowable now, and writing the local principal
+    into those rows would be a claim rather than a record.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            cursor = conn.execute("PRAGMA table_info(terminals)")
+            columns = {row[1] for row in cursor.fetchall()}
+            if columns and "owner" not in columns:
+                conn.execute("ALTER TABLE terminals ADD COLUMN owner TEXT")
+                logger.info("Migration: added owner column to terminals")
+    except Exception as e:
+        logger.debug(f"Migration check for terminal owner failed: {e}")
 
 
 def _migrate_memory_relationships() -> None:
@@ -1782,6 +1987,55 @@ def _migrate_terminals_schema() -> None:
         logger.warning(f"Migration check for terminals schema failed: {e}")
 
 
+def _creation_metadata(
+    caller_metadata: Optional[Dict[str, Any]], server_metadata: Optional[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """Merge caller metadata with server-owned keys, letting only the server set those.
+
+    ``update_terminal_metadata`` strips :data:`_SERVER_OWNED_METADATA_KEYS` from a
+    caller's dict, but CREATION did not, and it is reachable with the same
+    ``SCOPE_WRITE`` that the PATCH route needs: ``POST /sessions`` forwards
+    ``body.metadata`` through ``session_service`` and ``terminal_service`` to here
+    unfiltered, validated for size only. So a caller could create a terminal in
+    THIS host's tmux whose durable row names a runtime, which makes
+    ``_placement_state`` answer ``("named", <that runtime>)`` — ``is_remote`` true,
+    ``runtime_for_terminal`` pointing at it, and ``claim_terminal`` accepting its
+    claim on a local pane. Closing the update path alone left the same hole one
+    endpoint over (Copilot review on #802).
+
+    ``server_metadata`` is the privileged channel, keyword-only and set only by the
+    two launch paths that legitimately record placement. It is applied AFTER the
+    strip, so it cannot be spoofed through the request body.
+    """
+    merged = {
+        k: v for k, v in (caller_metadata or {}).items() if k not in _SERVER_OWNED_METADATA_KEYS
+    }
+    rejected = sorted(set(caller_metadata or {}) & set(_SERVER_OWNED_METADATA_KEYS))
+    if rejected:
+        logger.warning(
+            "ignoring server-owned metadata key(s) %s supplied at terminal creation",
+            ", ".join(rejected),
+        )
+    merged.update(server_metadata or {})
+    return merged
+
+
+def _creation_metadata_json(
+    caller_metadata: Optional[Dict[str, Any]], server_metadata: Optional[Dict[str, Any]]
+) -> Optional[str]:
+    """Serialize creation metadata, preserving NULL for "none at all".
+
+    Kept separate from :func:`_creation_metadata` because the obvious inline form,
+    ``_json.dumps(...) or None``, is wrong: ``dumps({})`` is ``"{}"``, which is
+    truthy, so a terminal created with no metadata started storing an empty object
+    where the column had always been NULL.
+    """
+    import json as _json
+
+    merged = _creation_metadata(caller_metadata, server_metadata)
+    return _json.dumps(merged) if merged else None
+
+
 def create_terminal(
     terminal_id: str,
     tmux_session: str,
@@ -1795,10 +2049,16 @@ def create_terminal(
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
     working_directory: Optional[str] = None,
+    server_metadata: Optional[Dict[str, Any]] = None,
     idempotency_key: Optional[str] = None,
     request_fingerprint: Optional[str] = None,
+    owner: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record.
+
+    ``owner`` is the canonical principal id of whoever this terminal's work is
+    for (#745), written by the server only -- see the column comment on
+    ``TerminalModel.owner`` for why it is not a ``metadata`` key.
 
     ``idempotency_key``, when given, is persisted in the SAME ``SessionLocal``
     session as the terminal row -- one ``commit()``, so SQLite's single-writer
@@ -1832,7 +2092,8 @@ def create_terminal(
             caller_id=caller_id,
             engine=engine,
             group=_json.dumps(group) if group else None,
-            metadata_json=_json.dumps(metadata) if metadata else None,
+            metadata_json=_creation_metadata_json(metadata, server_metadata),
+            owner=owner,
         )
         db.add(terminal)
         if idempotency_key:
@@ -1869,6 +2130,7 @@ def create_terminal(
             # returns {"group": None}, an API-consistency gap.
             "group": group if group else None,
             "metadata": metadata if metadata else None,
+            "owner": terminal.owner,
         }
 
 
@@ -1903,6 +2165,137 @@ def get_idempotency_record(key: str) -> Optional[IdempotencyRecord]:
             terminal_id=cast(str, row.terminal_id),
             request_fingerprint=cast(str, row.request_fingerprint),
         )
+
+
+def record_dispatch(
+    op_id: str,
+    command_type: str,
+    runtime_id: str,
+    *,
+    terminal_id: Optional[str] = None,
+    owner: Optional[str] = None,
+    run_id: Optional[str] = None,
+    step_id: Optional[str] = None,
+    engine: Optional[str] = None,
+) -> None:
+    """Journal an operation BEFORE its frame is sent to a runtime.
+
+    Must happen before the send, not after: a result that arrives for an op_id
+    with no entry is treated as not-ours, so journalling afterwards would make
+    every fast result unrecognisable. Idempotent on re-dispatch of the same
+    op_id (the script driver mints its own and may retry), so a repeat is an
+    update rather than an ``IntegrityError``.
+    """
+    with SessionLocal() as db:
+        row = db.query(DispatchJournalModel).filter(DispatchJournalModel.op_id == op_id).first()
+        if row is None:
+            db.add(
+                DispatchJournalModel(
+                    op_id=op_id,
+                    command_type=command_type,
+                    runtime_id=runtime_id,
+                    terminal_id=terminal_id,
+                    owner=owner,
+                    run_id=run_id,
+                    step_id=step_id,
+                    engine=engine,
+                    state="dispatched",
+                )
+            )
+        else:
+            row.command_type = command_type
+            row.runtime_id = runtime_id
+            row.terminal_id = terminal_id
+            row.owner = owner
+            row.run_id = run_id
+            row.step_id = step_id
+            row.engine = engine
+            row.state = "dispatched"
+            row.settled_at = None
+        db.commit()
+    # Opportunistic, and deliberately after the commit so a prune failure cannot
+    # roll back the journal entry the caller depends on.
+    try:
+        pruned = prune_dispatch_journal()
+        if pruned:
+            logger.debug("pruned %d settled dispatch journal entries", pruned)
+    except Exception:  # noqa: BLE001
+        logger.debug("dispatch journal prune skipped", exc_info=True)
+
+
+def get_dispatch_record(op_id: str) -> Optional[dict]:
+    """The journal entry for ``op_id``, or ``None`` if this server never sent it.
+
+    ``None`` is the security-relevant answer: it means no dispatch of this
+    operation is on record, so a result claiming to answer it is either forged or
+    belongs to a database this process is not using. Callers must not create
+    state from such a result.
+    """
+    with SessionLocal() as db:
+        row = db.query(DispatchJournalModel).filter(DispatchJournalModel.op_id == op_id).first()
+        if row is None:
+            return None
+        return {
+            "op_id": cast(str, row.op_id),
+            "command_type": cast(str, row.command_type),
+            "runtime_id": cast(str, row.runtime_id),
+            "terminal_id": row.terminal_id,
+            "owner": row.owner,
+            "run_id": row.run_id,
+            "step_id": row.step_id,
+            "engine": row.engine,
+            "state": cast(str, row.state),
+        }
+
+
+# How long a SETTLED journal entry is kept. It has no reader once settled — the
+# orphan path only consults entries for results it has not applied — so this is
+# purely an audit window. Unsettled entries are never pruned by age: one of those
+# IS an operation whose outcome was never seen, which is exactly what the journal
+# exists to preserve.
+_DISPATCH_JOURNAL_SETTLED_TTL_SECS = 24 * 3600
+
+
+def prune_dispatch_journal() -> int:
+    """Delete settled journal entries older than the audit window; return the count.
+
+    One row is written per dispatched operation, so without pruning the table grows
+    for the life of the server's volume. Called opportunistically from
+    :func:`record_dispatch` rather than from a background task, so there is no new
+    thread and no new failure mode: a prune that fails leaves rows behind, which is
+    the status quo, not a broken launch.
+    """
+    from datetime import timedelta
+
+    cutoff = datetime.now() - timedelta(seconds=_DISPATCH_JOURNAL_SETTLED_TTL_SECS)
+    with SessionLocal() as db:
+        deleted = (
+            db.query(DispatchJournalModel)
+            .filter(
+                DispatchJournalModel.state == "settled",
+                DispatchJournalModel.settled_at.isnot(None),
+                DispatchJournalModel.settled_at < cutoff,
+            )
+            .delete(synchronize_session=False)
+        )
+        db.commit()
+        return int(deleted or 0)
+
+
+def settle_dispatch(op_id: str) -> None:
+    """Mark a journalled operation as one whose outcome has been applied.
+
+    Settling is what stops a later redelivery of the same result from being
+    reconciled twice, and what distinguishes "we never saw the outcome" from
+    "we handled it" for anything auditing the journal after a restart.
+    """
+    with SessionLocal() as db:
+        row = db.query(DispatchJournalModel).filter(DispatchJournalModel.op_id == op_id).first()
+        if row is None:
+            return
+        row.state = "settled"
+        row.settled_at = datetime.now()
+        db.commit()
 
 
 def delete_idempotency_key(key: str, expected_terminal_id: str) -> bool:
@@ -1967,6 +2360,7 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "engine": terminal.engine or ("v2" if terminal.provider == "kiro_cli" else None),
             "group": group,
             "metadata": metadata,
+            "owner": terminal.owner,
             "last_active": terminal.last_active,
         }
 
@@ -1984,15 +2378,61 @@ def update_terminal_group(terminal_id: str, group: Optional[List[str]]) -> bool:
         return True
 
 
+#: Metadata keys the server owns and an agent-facing metadata write must not be
+#: able to change or drop. ``runtime_id`` is the durable record of which runtime
+#: a remote terminal was launched on; the runtime-channel binding recovery and
+#: the ownership fence both read it, so an agent that could clear it via
+#: ``update_metadata`` could make a live remote terminal look local or let
+#: another runtime claim it (Copilot review on #802).
+_SERVER_OWNED_METADATA_KEYS = ("runtime_id",)
+
+
 def update_terminal_metadata(terminal_id: str, metadata: Optional[Dict[str, Any]]) -> bool:
-    """Replace a terminal's free-form metadata dict. ``None``/``{}`` clears it."""
+    """Replace a terminal's free-form metadata dict. ``None``/``{}`` clears it.
+
+    Server-owned keys (:data:`_SERVER_OWNED_METADATA_KEYS`) are DROPPED from the
+    caller's dict and then restored from the existing row, so this whole-dict
+    replace can neither strip nor set the routing binding. The creation path
+    writes those keys directly and is unaffected.
+
+    The drop is the half that was missing. Carrying the old value over protects a
+    row that already HAS a placement, but it left injection open: a row with no
+    ``runtime_id`` kept whatever the caller supplied, and this metadata bag is
+    agent-writable through ``PATCH /terminals/{id}/metadata``. Naming a runtime on
+    a purely LOCAL terminal made its row read as remote — ``is_remote`` true,
+    ``runtime_for_terminal`` returning the injected id — so that runtime could
+    claim a pane it never launched and receive its input (Copilot review on #802).
+    """
     import json as _json
 
     with SessionLocal() as db:
         terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
         if not terminal:
             return False
-        terminal.metadata_json = _json.dumps(metadata) if metadata else None
+        preserved: Dict[str, Any] = {}
+        if terminal.metadata_json:
+            try:
+                existing = _json.loads(terminal.metadata_json)
+            except (ValueError, TypeError):
+                existing = {}
+            if isinstance(existing, dict):
+                for key in _SERVER_OWNED_METADATA_KEYS:
+                    if key in existing:
+                        preserved[key] = existing[key]
+        # Strip first: a server-owned key the caller supplied is never honoured,
+        # whether or not the row already carries one.
+        merged: Dict[str, Any] = {
+            k: v for k, v in (metadata or {}).items() if k not in _SERVER_OWNED_METADATA_KEYS
+        }
+        rejected = sorted(set(metadata or {}) & set(_SERVER_OWNED_METADATA_KEYS))
+        if rejected:
+            logger.warning(
+                "ignoring server-owned metadata key(s) %s supplied for terminal %s",
+                ", ".join(rejected),
+                terminal_id,
+            )
+        merged.update(preserved)
+        terminal.metadata_json = _json.dumps(merged) if merged else None
         db.commit()
         return True
 
@@ -2264,6 +2704,46 @@ def list_terminals_in_sessions(tmux_sessions: List[str]) -> List[Dict[str, Any]]
         ]
 
 
+def list_terminals_by_ids(terminal_ids: List[str]) -> List[Dict[str, Any]]:
+    """List the given terminals in one query, ordered by ``rowid``.
+
+    The by-id counterpart of ``list_terminals_in_sessions``: the caller knows
+    terminal ids and needs the sessions they belong to. ``list_all_terminals``
+    would answer too, but its cost scales with the whole table including rows
+    for sessions that no longer exist (see ``list_terminals_in_sessions``),
+    while this stays proportional to the ids asked for.
+
+    Ordered by ``rowid`` for the same reason as its sibling -- creation order,
+    so a caller grouping these rows gets a deterministic order rather than
+    whatever the query plan plans. Ids absent from the table are simply not
+    returned, so a caller passing stale ids gets a short list, not an error.
+
+    Returns an empty list without querying when given no ids.
+    """
+    if not terminal_ids:
+        return []
+    with SessionLocal() as db:
+        terminals = (
+            db.query(TerminalModel)
+            .filter(TerminalModel.id.in_(terminal_ids))
+            .order_by(literal_column("terminals.rowid"))
+            .all()
+        )
+        return [
+            {
+                "id": t.id,
+                "tmux_session": t.tmux_session,
+                "tmux_window": t.tmux_window,
+                "provider": t.provider,
+                "agent_profile": t.agent_profile,
+                "working_directory": t.working_directory,
+                "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
+                "last_active": t.last_active,
+            }
+            for t in terminals
+        ]
+
+
 def list_all_terminals() -> List[Dict[str, Any]]:
     """List all terminals."""
     with SessionLocal() as db:
@@ -2370,6 +2850,12 @@ def delete_terminals_by_ids(terminal_ids: List[str]) -> int:
 
 def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> InboxMessage:
     """Create inbox message with status=MessageStatus.PENDING.
+
+    Validates the receiver only. Sender validation belongs to the central
+    enqueue endpoint (see ``create_inbox_message_endpoint``), not here: on a
+    runtime's local database a legitimate sender — the supervisor that dispatched
+    the work — has no local row, so requiring one here would break the
+    cross-node callback path.
 
     Raises:
         ValueError: If the receiver terminal does not exist.
@@ -2612,8 +3098,14 @@ def create_flow(
     provider: str,
     script: str,
     next_run: datetime,
+    owner: Optional[str] = None,
 ) -> Flow:
-    """Create flow record."""
+    """Create flow record.
+
+    ``owner`` is the canonical principal id of whoever registered the schedule
+    (#745). Optional so every existing caller is unchanged; the HTTP and CLI
+    registration paths pass it.
+    """
     with SessionLocal() as db:
         flow = FlowModel(
             name=name,
@@ -2623,6 +3115,7 @@ def create_flow(
             provider=provider,
             script=script,
             next_run=next_run,
+            owner=owner,
         )
         db.add(flow)
         db.commit()
@@ -2638,6 +3131,7 @@ def create_flow(
             next_run=flow.next_run,
             enabled=flow.enabled,
             prompt_template=None,
+            owner=flow.owner,
         )
 
 
@@ -2658,6 +3152,7 @@ def get_flow(name: str) -> Optional[Flow]:
             next_run=flow.next_run,
             enabled=flow.enabled,
             prompt_template=None,
+            owner=flow.owner,
         )
 
 
@@ -2677,6 +3172,7 @@ def list_flows() -> List[Flow]:
                 next_run=f.next_run,
                 enabled=f.enabled,
                 prompt_template=None,
+                owner=f.owner,
             )
             for f in flows
         ]
@@ -2734,6 +3230,7 @@ def get_flows_to_run() -> List[Flow]:
                 next_run=f.next_run,
                 enabled=f.enabled,
                 prompt_template=None,
+                owner=f.owner,
             )
             for f in flows
         ]

@@ -304,7 +304,10 @@ class MiniMaxCodeProvider(BaseProvider):
             if isinstance(raw_config, dict)
             else raw_config.model_dump(exclude_none=True)
         )
-        config = resolve_mcp_server_config(config)
+        # persisted=True: `_serialize_server`'s result is written to
+        # `servers.mcp.json`, which MiniMax reads at launch, so the endpoint is
+        # persisted and the token is inherited (Copilot review on #802).
+        config = resolve_mcp_server_config(config, persisted=True)
         command = config.get("command")
         url = config.get("url")
         if not command and isinstance(url, str) and url:

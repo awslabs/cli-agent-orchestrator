@@ -1,0 +1,533 @@
+"""Bridge-side handshake and reconnect recovery (#745).
+
+Two claims of the boundary contract had implementations but no test:
+
+- A PROTOCOL_VERSION mismatch is rejected at hello, on BOTH sides, before any
+  command is accepted. Every other test builds its hello from the same
+  ``PROTOCOL_VERSION`` constant, so the rejection arm never ran.
+- What survives a dropped channel is the unacked-result map and the replay
+  buffer, so a reconnect re-delivers retained results and resumes the stream
+  from the server's position (or says explicitly that bytes were lost). The
+  server side and the pure buffer were tested; the bridge's own resume arm,
+  which is what actually has to re-send, was not.
+"""
+
+import asyncio
+import base64
+from types import SimpleNamespace
+
+import pytest
+
+from cli_agent_orchestrator.runtime_channel.bridge import Bridge
+from cli_agent_orchestrator.runtime_channel.protocol import (
+    PROTOCOL_VERSION,
+    CommandFrame,
+    CommandOutcome,
+    CommandResultFrame,
+    CommandType,
+    GapFrame,
+    HelloFrame,
+    StreamFrame,
+    StreamName,
+    StreamPosition,
+    decode_frame,
+    encode_frame,
+)
+
+TID = "abcd1234"
+
+
+class _FakeWS:
+    """The bridge's view of a channel: send, one recv for the server hello,
+    then async iteration over whatever the server sends next."""
+
+    def __init__(self, server_hello, inbound=()):
+        self.sent = []
+        self._server_hello = server_hello
+        self._inbound = list(inbound)
+
+    async def send(self, raw):
+        self.sent.append(decode_frame(raw))
+
+    async def recv(self):
+        return encode_frame(self._server_hello)
+
+    def __aiter__(self):
+        async def gen():
+            for item in self._inbound:
+                yield item
+
+        return gen()
+
+    def frames_of(self, cls):
+        return [f for f in self.sent if isinstance(f, cls)]
+
+
+def _bridge():
+    return Bridge("ws://server/runtime/channel", "worker-1", "tok")
+
+
+def _retained():
+    return CommandResultFrame(
+        op_id="op-1",
+        terminal_id=TID,
+        outcome=CommandOutcome.OK,
+        payload={"retained": True},
+    )
+
+
+class TestProtocolVersionGate:
+    @pytest.mark.asyncio
+    async def test_bridge_refuses_a_server_on_another_version(self):
+        bridge = _bridge()
+        # A command is queued behind the hello: if the gate leaks, it runs.
+        command = encode_frame(
+            CommandFrame(op_id="op-9", terminal_id=TID, type=CommandType.INPUT, payload={})
+        )
+        ws = _FakeWS(
+            HelloFrame(protocol_version=PROTOCOL_VERSION + 1, runtime_id="server"),
+            inbound=[command],
+        )
+        # Bounded: if the gate leaks, the queued command runs for real, and an
+        # unbounded await would hang the suite rather than failing it.
+        with pytest.raises(ValueError, match="protocol version mismatch"):
+            await asyncio.wait_for(bridge._serve(ws), timeout=10)
+        assert ws.frames_of(CommandResultFrame) == [], "no command may be executed after a mismatch"
+
+    @pytest.mark.asyncio
+    async def test_bridge_refuses_a_non_hello_answer(self):
+        bridge = _bridge()
+        ws = _FakeWS(CommandResultFrame(op_id="x", outcome=CommandOutcome.OK, payload={}))
+        with pytest.raises(ValueError, match="did not answer hello with hello"):
+            await bridge._serve(ws)
+
+    def test_server_closes_a_mismatched_hello_before_registering(self, monkeypatch):
+        monkeypatch.setenv("CAO_RUNTIME_TOKEN", "test-runtime-token")
+        from fastapi.testclient import TestClient
+
+        from cli_agent_orchestrator.api.main import app
+        from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
+
+        client = TestClient(app, base_url="http://localhost")
+        with client.websocket_connect(
+            "/runtime/channel",
+            headers={"Host": "localhost", "X-CAO-Runtime-Token": "test-runtime-token"},
+        ) as ws:
+            ws.send_text(
+                encode_frame(
+                    HelloFrame(
+                        protocol_version=PROTOCOL_VERSION + 1,
+                        runtime_id="worker-mismatch",
+                        streams=[],
+                    )
+                )
+            )
+            # The server answers with its own version so the runtime can log what
+            # it disagreed with, then closes.
+            reply = decode_frame(ws.receive_text())
+            assert reply.protocol_version == PROTOCOL_VERSION
+            # Asserted BEFORE reading again, deliberately: a regressed gate
+            # registers the runtime and then waits for commands, so THIS is what
+            # fails fast. Reading first would block forever on an open socket.
+            assert "worker-mismatch" not in runtime_registry.list_runtimes()
+            # Already queued by the close above, so this does not block.
+            closed = ws.receive()
+        assert closed["type"] == "websocket.close"
+        assert closed["code"] == 1002
+
+
+class TestReconnectRecovery:
+    @pytest.mark.asyncio
+    async def test_unacked_results_are_redelivered_after_the_handshake(self):
+        bridge = _bridge()
+        bridge._unacked["op-1"] = _retained()
+        ws = _FakeWS(HelloFrame(protocol_version=PROTOCOL_VERSION, runtime_id="server"))
+
+        await bridge._serve(ws)
+
+        results = ws.frames_of(CommandResultFrame)
+        assert [r.op_id for r in results] == ["op-1"]
+        assert results[0].payload == {"retained": True}
+        # Still retained: only the server's ack clears it, so a channel that
+        # drops again re-delivers rather than losing the outcome.
+        assert "op-1" in bridge._unacked
+
+    @pytest.mark.asyncio
+    async def test_stream_resumes_from_the_servers_position_not_from_zero(self):
+        bridge = _bridge()
+        buf = bridge._buffer_for(TID)
+        buf.append(b"already-consumed")
+        resume_at = buf.end_pos
+        buf.append(b"missed-this")
+        ws = _FakeWS(
+            HelloFrame(
+                protocol_version=PROTOCOL_VERSION,
+                runtime_id="server",
+                resume=[
+                    StreamPosition(
+                        terminal_id=TID,
+                        stream=StreamName.CAPTURE,
+                        generation=buf.generation,
+                        end_pos=resume_at,
+                    )
+                ],
+            )
+        )
+
+        await bridge._serve(ws)
+
+        replayed = ws.frames_of(StreamFrame)
+        assert [base64.b64decode(f.data) for f in replayed] == [b"missed-this"]
+        assert ws.frames_of(GapFrame) == [], "nothing was evicted, so nothing was lost"
+
+    @pytest.mark.asyncio
+    async def test_eviction_is_reported_as_an_explicit_gap(self):
+        bridge = _bridge()
+        from cli_agent_orchestrator.runtime_channel.replay_buffer import ReplayBuffer
+
+        # A window too small to hold what the server still needs: the bytes are
+        # genuinely gone, and silence here would read as "nothing happened".
+        bridge._buffers[TID] = ReplayBuffer(max_bytes=8)
+        buf = bridge._buffers[TID]
+        buf.append(b"aaaaaaaa")
+        buf.append(b"bbbbbbbb")
+        ws = _FakeWS(
+            HelloFrame(
+                protocol_version=PROTOCOL_VERSION,
+                runtime_id="server",
+                resume=[
+                    StreamPosition(
+                        terminal_id=TID,
+                        stream=StreamName.CAPTURE,
+                        generation=buf.generation,
+                        end_pos=0,
+                    )
+                ],
+            )
+        )
+
+        await bridge._serve(ws)
+
+        gaps = ws.frames_of(GapFrame)
+        assert len(gaps) == 1
+        assert gaps[0].terminal_id == TID
+        assert gaps[0].from_pos == 0 and gaps[0].to_pos > 0
+
+    @pytest.mark.asyncio
+    async def test_hello_advertises_current_positions(self):
+        bridge = _bridge()
+        bridge._buffer_for(TID).append(b"12345")
+        ws = _FakeWS(HelloFrame(protocol_version=PROTOCOL_VERSION, runtime_id="server"))
+
+        await bridge._serve(ws)
+
+        hello = ws.frames_of(HelloFrame)[0]
+        assert hello.runtime_id == "worker-1"
+        advertised = {(s.terminal_id, s.end_pos) for s in hello.streams}
+        assert (TID, 5) in advertised
+
+    @pytest.mark.asyncio
+    async def test_a_terminal_the_server_does_not_know_is_not_replayed(self):
+        bridge = _bridge()
+        ws = _FakeWS(
+            HelloFrame(
+                protocol_version=PROTOCOL_VERSION,
+                runtime_id="server",
+                resume=[
+                    StreamPosition(
+                        terminal_id="ffff9999",
+                        stream=StreamName.CAPTURE,
+                        generation=0,
+                        end_pos=0,
+                    )
+                ],
+            )
+        )
+
+        await asyncio.wait_for(bridge._serve(ws), timeout=5)
+
+        assert ws.frames_of(StreamFrame) == []
+        assert ws.frames_of(GapFrame) == []
+
+    @pytest.mark.asyncio
+    async def test_a_pane_that_has_emitted_nothing_is_still_advertised(self):
+        """`_buffers` is this runtime's record of which panes it owns.
+
+        The hello snapshot is built from it, so a terminal that had not produced
+        a byte yet — a provider still starting, an agent sitting idle at its
+        prompt — was absent from the snapshot, and a server that restarted in
+        that window neither rebound its routing nor learned its status. LAUNCH now
+        opens the buffer, which reports end_pos 0: exactly true (Copilot review on
+        #802, finding 11).
+        """
+        from unittest.mock import AsyncMock, patch
+
+        from cli_agent_orchestrator.services import terminal_service
+
+        bridge = _bridge()
+        launched = SimpleNamespace(
+            id="beef0001",
+            name="agent-0",
+            provider="kiro_cli",
+            session_name="cao-1234",
+            agent_profile="developer",
+            allowed_tools=None,
+            shell_command=None,
+            status="initializing",
+        )
+        with patch.object(terminal_service, "create_terminal", AsyncMock(return_value=launched)):
+            outcome, payload, _ = await bridge._execute(
+                CommandFrame(
+                    op_id="op-launch",
+                    type=CommandType.LAUNCH,
+                    terminal_id=None,
+                    payload={"provider": "kiro_cli", "agent_profile": "developer"},
+                )
+            )
+        assert outcome == CommandOutcome.OK
+
+        ws = _FakeWS(HelloFrame(protocol_version=PROTOCOL_VERSION, runtime_id="server"))
+        await bridge._serve(ws)
+
+        hello = ws.frames_of(HelloFrame)[0]
+        assert ("beef0001", 0) in {(s.terminal_id, s.end_pos) for s in hello.streams}
+
+    @pytest.mark.asyncio
+    async def test_a_resume_position_past_this_runtimes_buffer_is_clamped(self, caplog):
+        """The server asks to resume from further on than this runtime ever got.
+
+        `replay_from` raises for a position past its end, which would abort the
+        handshake in a loop. Clamping to the watermark keeps the channel coming
+        up, but it means the server's bookkeeping and this runtime's disagree —
+        a stream restarted under a reused terminal id — so it is logged rather
+        than silently corrected (Copilot review on #802, finding 12).
+        """
+        import logging
+
+        bridge = _bridge()
+        bridge._buffer_for(TID).append(b"12345")
+        ws = _FakeWS(
+            HelloFrame(
+                protocol_version=PROTOCOL_VERSION,
+                runtime_id="server",
+                resume=[
+                    StreamPosition(
+                        terminal_id=TID,
+                        stream=StreamName.CAPTURE,
+                        generation=0,
+                        end_pos=9999,
+                    )
+                ],
+            )
+        )
+
+        with caplog.at_level(logging.WARNING):
+            await asyncio.wait_for(bridge._serve(ws), timeout=5)
+
+        assert "past this runtime's watermark" in caplog.text
+        # Clamped, so the handshake completed and nothing was re-sent as new.
+        assert ws.frames_of(StreamFrame) == []
+
+
+class TestReconnectBackoff:
+    """What the retry delay is allowed to reset on (#745).
+
+    Found on the cluster: two executors left on an older ``PROTOCOL_VERSION``
+    retried once a second for hours. The backoff was reset as soon as
+    ``websockets.connect`` returned, and a version mismatch is raised after that
+    point, so the growth could never happen for the one failure that is
+    permanent. The pod is correctly never Ready either way — the cost is log
+    volume against a server that has already refused it.
+    """
+
+    @staticmethod
+    async def _delays_over(monkeypatch, tmp_path, server_hello, attempts):
+        """Run the reconnect loop for ``attempts`` connections; return the
+        delays it waited between them."""
+        import cli_agent_orchestrator.runtime_channel.bridge as bridge_mod
+
+        # Private marker path: this drives the real run loop, which announces
+        # readiness on an established channel.
+        monkeypatch.setenv(bridge_mod.READY_FILE_ENV, str(tmp_path / "bridge-connected"))
+        # Scaled down so the assertions are about the shape of the growth, not
+        # about waiting for it.
+        monkeypatch.setattr(bridge_mod, "RECONNECT_BACKOFF_INITIAL", 0.01)
+        monkeypatch.setattr(bridge_mod, "RECONNECT_BACKOFF_MAX", 10.0)
+
+        bridge = _bridge()
+        connects = []
+        delays = []
+
+        class _Conn:
+            async def __aenter__(self):
+                return _FakeWS(server_hello)
+
+            async def __aexit__(self, *exc):
+                return False
+
+        def fake_connect(*a, **k):
+            connects.append(True)
+            if len(connects) >= attempts:
+                # Last attempt: the loop exits after this iteration instead of
+                # reconnecting forever.
+                bridge._stop.set()
+            return _Conn()
+
+        monkeypatch.setattr(bridge_mod.websockets, "connect", fake_connect)
+        real_wait_for = asyncio.wait_for
+
+        async def recording_wait_for(awaitable, timeout=None):
+            delays.append(timeout)
+            return await real_wait_for(awaitable, timeout=timeout)
+
+        monkeypatch.setattr(asyncio, "wait_for", recording_wait_for)
+        await real_wait_for(bridge.run(), timeout=10)
+        assert len(connects) == attempts
+        return delays
+
+    @pytest.mark.asyncio
+    async def test_a_channel_that_never_gets_past_hello_backs_off(self, monkeypatch, tmp_path):
+        delays = await self._delays_over(
+            monkeypatch,
+            tmp_path,
+            HelloFrame(protocol_version=PROTOCOL_VERSION + 1, runtime_id="server"),
+            attempts=4,
+        )
+
+        assert delays == [0.01, 0.02, 0.04, 0.08], "each refused hello must wait longer"
+
+    @pytest.mark.asyncio
+    async def test_a_channel_that_worked_starts_over(self, monkeypatch, tmp_path):
+        """The reset still has to happen for the case it was written for.
+
+        A runtime whose server restarted, or whose network blinked, established
+        a channel before losing it — that one must come back promptly rather
+        than inheriting a delay from an earlier outage.
+        """
+        delays = await self._delays_over(
+            monkeypatch,
+            tmp_path,
+            HelloFrame(protocol_version=PROTOCOL_VERSION, runtime_id="server"),
+            attempts=4,
+        )
+
+        assert delays == [0.01, 0.01, 0.01, 0.01], "a working channel resets the backoff"
+
+
+class TestTheSendGateOpensAfterTheHandshake:
+    """Non-handshake frames must be sent once the channel is established.
+
+    The gate that stops the forwarding tasks writing during hello/replay is only
+    half the contract; the other half is that it OPENS. Shipped with a `clear()`
+    and a check but no `set()`, every command result and every forwarded chunk was
+    silently skipped: commands arrived, the work happened, and nothing came back.
+    The server reported 504 "unknown outcome" for a launch that had in fact
+    succeeded — measured on a live cluster, and invisible to the whole suite
+    because every other test here asserts on frames sent WITH handshake=True.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_result_reaches_the_wire_after_the_handshake(self):
+        bridge = _bridge()
+        ws = _FakeWS(
+            HelloFrame(
+                protocol_version=PROTOCOL_VERSION,
+                runtime_id="server",
+            )
+        )
+        await bridge._serve(ws)
+        assert bridge._ready.is_set(), "the gate must be open once established"
+
+        before = len(ws.sent)
+        await bridge._send(
+            CommandResultFrame(
+                op_id="op-1",
+                terminal_id=TID,
+                outcome=CommandOutcome.OK,
+                payload={"success": True},
+            )
+        )
+        assert len(ws.sent) == before + 1, "an ordinary send after the handshake was dropped"
+
+    @pytest.mark.asyncio
+    async def test_a_send_before_the_handshake_is_skipped(self):
+        """The other half: the gate is shut until _serve opens it."""
+        bridge = _bridge()
+        bridge._ws = _FakeWS(HelloFrame(protocol_version=PROTOCOL_VERSION, runtime_id="server"))
+        assert not bridge._ready.is_set()
+
+        before = len(bridge._ws.sent)
+        await bridge._send(
+            CommandResultFrame(
+                op_id="op-early",
+                terminal_id=TID,
+                outcome=CommandOutcome.OK,
+                payload={},
+            )
+        )
+        assert len(bridge._ws.sent) == before, "a pre-handshake send must not reach the wire"
+
+    @pytest.mark.asyncio
+    async def test_the_hello_itself_is_not_gated(self):
+        """Otherwise the handshake could never happen at all."""
+        bridge = _bridge()
+        ws = _FakeWS(HelloFrame(protocol_version=PROTOCOL_VERSION, runtime_id="server"))
+        await bridge._serve(ws)
+        kinds = [f.kind for f in ws.sent]
+        assert kinds, "no frames were sent during _serve"
+        assert (
+            kinds[0] == HelloFrame(protocol_version=PROTOCOL_VERSION, runtime_id="x").kind
+        ), f"hello must be the FIRST frame on the connection, got {kinds}"
+
+
+class TestAResumePastTheWatermarkDoesNotPoisonTheNewGeneration:
+    """The gap must be reported in the OLD generation, before the new one starts.
+
+    The first version of this fix called ``begin_generation()`` and then built the
+    GapFrame — but ``begin_generation()`` zeroes ``end_pos``, so the frame carried
+    ``from_pos=0`` stamped with the NEW generation. On the server,
+    ``record_position``'s higher-generation branch SETS the watermark from a gap's
+    ``to_pos``, so the fresh generation inherited the very impossible position the
+    code exists to escape: live frames at 0..N never advanced it, and every later
+    reconnect re-entered the same branch, calling ``begin_generation()`` again and
+    discarding the retained window — one mismatch becoming recurring output loss.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_gap_names_the_old_watermark_and_generation(self):
+        bridge = _bridge()
+        buf = bridge._buffer_for(TID)
+        buf.append(b"twelve bytes")
+        stale_end = buf.end_pos
+        old_generation = buf.generation
+        impossible = stale_end + 500
+
+        ws = _FakeWS(
+            HelloFrame(
+                protocol_version=PROTOCOL_VERSION,
+                runtime_id="server",
+                resume=[
+                    StreamPosition(
+                        terminal_id=TID,
+                        stream=StreamName.CAPTURE,
+                        generation=old_generation,
+                        end_pos=impossible,
+                    )
+                ],
+            )
+        )
+        await bridge._serve(ws)
+
+        gaps = ws.frames_of(GapFrame)
+        assert len(gaps) == 1, f"expected exactly one gap, got {gaps}"
+        gap = gaps[0]
+        # from_pos is the OLD watermark, not 0 — proving it was read before the
+        # generation was restarted.
+        assert gap.from_pos == stale_end
+        assert gap.to_pos == impossible
+        # And it is stamped with the OLD generation, so the server cannot apply
+        # to_pos as the NEW generation's watermark.
+        assert gap.generation == old_generation
+        # The buffer did restart, which is the other half of the recovery.
+        assert buf.generation == old_generation + 1
+        assert buf.end_pos == 0

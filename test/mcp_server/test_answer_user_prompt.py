@@ -25,7 +25,7 @@ class TestAnswerUserPrompt:
 
         assert result["success"] is True
         mock_requests.get.assert_called_once_with(
-            f"{API_BASE_URL}/terminals/abcd1234", timeout=_mcp_timeout()
+            f"{API_BASE_URL}/terminals/abcd1234", timeout=_mcp_timeout(), headers=None
         )
         mock_requests.post.assert_called_once_with(
             f"{API_BASE_URL}/terminals/abcd1234/input",
@@ -34,6 +34,7 @@ class TestAnswerUserPrompt:
                 "sender_id": "supervisor",
             },
             timeout=_mcp_timeout(),
+            headers=None,
         )
 
     @patch("cli_agent_orchestrator.mcp_server.server.requests")

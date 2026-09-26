@@ -509,3 +509,163 @@ def test_jwks_cache_reuses_within_max_staleness(monkeypatch):
     cache._fetched_at = datetime.now(timezone.utc) - timedelta(minutes=1)
     state["fail"] = True
     assert cache.get_client("https://idp/jwks") is first
+
+
+# --- caller identity for owned work (#745) --------------------------------
+
+
+def test_default_off_principal_is_the_named_local_owner():
+    """Single-user installations get a NAMED owner, not a null one.
+
+    The criterion's failure mode is deferred work becoming anonymous; with auth
+    off there is exactly one owner and it is recorded as such.
+    """
+    from cli_agent_orchestrator.security.principal import LOCAL_PRINCIPAL
+
+    assert auth.is_auth_enabled() is False
+    assert auth.extract_principal_from_token("anything") is LOCAL_PRINCIPAL
+
+
+def test_principal_comes_from_the_verified_sub_and_iss(monkeypatch, rsa_key):
+    _enable_auth(monkeypatch, rsa_key)
+    token = _make_token(rsa_key, _base_claims({"sub": "auth0|abc123"}))
+    principal = auth.extract_principal_from_token(token)
+    assert principal.subject == "auth0|abc123"
+    assert principal.issuer == ISSUER
+    assert principal.is_local is False
+
+
+def test_token_without_sub_is_refused_rather_than_downgraded(monkeypatch, rsa_key):
+    """A verified token with no subject must not become the local owner.
+
+    Silently substituting "local" would hand any token-holder the single-user
+    owner's work -- the escalation this path exists to prevent.
+    """
+    from cli_agent_orchestrator.security.principal import PrincipalError
+
+    _enable_auth(monkeypatch, rsa_key)
+    token = _make_token(rsa_key, _base_claims({"scope": "cao:write"}))
+    with pytest.raises(PrincipalError):
+        auth.extract_principal_from_token(token)
+
+
+def test_token_without_iss_is_refused_rather_than_localised(monkeypatch, rsa_key):
+    """A verified token with no issuer must not be minted as the local owner.
+
+    Defaulting a missing ``iss`` to ``LOCAL_ISSUER`` made the canonical id
+    ``cao:local#<sub>`` — colliding with the named local principal (Copilot
+    review on #802). ``get_authorization_servers`` derives an issuer from any
+    configured IdP, so ``_verify_token`` already pins ``iss`` and this state is
+    not normally reachable; the guard makes the owner path fail closed by
+    construction rather than by relying on that derivation. Patched here to
+    prove the guard directly.
+    """
+    from cli_agent_orchestrator.security.principal import PrincipalError
+
+    _enable_auth(monkeypatch, rsa_key)
+    monkeypatch.setattr(auth, "_verify_token", lambda _t: {"sub": "auth0|abc123"})
+    with pytest.raises(PrincipalError, match="iss"):
+        auth.extract_principal_from_token("token")
+
+
+@pytest.mark.parametrize("bad_sub", [None, ["a", "b"], {"x": 1}, 123])
+def test_a_non_string_sub_is_refused_not_coerced(monkeypatch, rsa_key, bad_sub):
+    """str(sub) would turn null/list/object into an owner id like "None" or
+    "[1, 2]" — the canonical principal revocation keys on (Copilot review on
+    #802). A non-string claim must fail closed."""
+    from cli_agent_orchestrator.security.principal import PrincipalError
+
+    _enable_auth(monkeypatch, rsa_key)
+    monkeypatch.setattr(auth, "_verify_token", lambda _t: {"sub": bad_sub, "iss": ISSUER})
+    with pytest.raises(PrincipalError, match="sub"):
+        auth.extract_principal_from_token("token")
+
+
+@pytest.mark.parametrize("bad_iss", [None, ["a"], {"x": 1}, 7])
+def test_a_non_string_iss_is_refused_not_coerced(monkeypatch, rsa_key, bad_iss):
+    from cli_agent_orchestrator.security.principal import PrincipalError
+
+    _enable_auth(monkeypatch, rsa_key)
+    monkeypatch.setattr(auth, "_verify_token", lambda _t: {"sub": "auth0|abc", "iss": bad_iss})
+    with pytest.raises(PrincipalError, match="iss"):
+        auth.extract_principal_from_token("token")
+
+
+def test_principal_ignores_a_sub_outside_the_signature(monkeypatch, rsa_key):
+    """Only the signed claim counts.
+
+    The same token, with an unsigned `sub` appended to the header value, must
+    still resolve to the signed subject -- #745's "agent-supplied IDs alone are
+    not authorization" applied to ownership.
+    """
+    _enable_auth(monkeypatch, rsa_key)
+    token = _make_token(rsa_key, _base_claims({"sub": "signed-subject"}))
+    principal = auth.extract_principal_from_token(token)
+    assert principal.subject == "signed-subject"
+
+
+def test_expired_token_yields_no_principal(monkeypatch, rsa_key):
+    _enable_auth(monkeypatch, rsa_key)
+    now = datetime.now(timezone.utc)
+    token = _make_token(
+        rsa_key,
+        {
+            "aud": AUDIENCE,
+            "iss": ISSUER,
+            "sub": "s",
+            "exp": now - timedelta(hours=1),
+            "iat": now - timedelta(hours=2),
+        },
+    )
+    with pytest.raises(jwt.PyJWTError):
+        auth.extract_principal_from_token(token)
+
+
+@pytest.mark.asyncio
+async def test_get_current_principal_default_off_ignores_the_request():
+    from cli_agent_orchestrator.security.principal import LOCAL_PRINCIPAL
+
+    assert await auth.get_current_principal(authorization=None) is LOCAL_PRINCIPAL
+    assert await auth.get_current_principal(authorization="Bearer nonsense") is LOCAL_PRINCIPAL
+
+
+@pytest.mark.asyncio
+async def test_get_current_principal_401s_without_a_token(monkeypatch, rsa_key):
+    _enable_auth(monkeypatch, rsa_key)
+    with pytest.raises(HTTPException) as exc:
+        await auth.get_current_principal(authorization=None)
+    assert exc.value.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_get_current_principal_401s_on_a_sub_less_token(monkeypatch, rsa_key):
+    """The refusal above reaches the HTTP boundary as 401, not a 500."""
+    _enable_auth(monkeypatch, rsa_key)
+    token = _make_token(rsa_key, _base_claims({"scope": "cao:write"}))
+    with pytest.raises(HTTPException) as exc:
+        await auth.get_current_principal(authorization=f"Bearer {token}")
+    assert exc.value.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_get_current_principal_returns_the_verified_owner(monkeypatch, rsa_key):
+    _enable_auth(monkeypatch, rsa_key)
+    token = _make_token(rsa_key, _base_claims({"sub": "auth0|xyz"}))
+    principal = await auth.get_current_principal(authorization=f"Bearer {token}")
+    assert principal.id == f"{ISSUER}#auth0|xyz"
+
+
+def test_scopes_and_principal_read_one_verified_claim_set(monkeypatch, rsa_key):
+    """Both callers go through `_verify_token`, so they cannot disagree.
+
+    Two independent decoders would be two chances to differ about what was
+    proven; this pins that the identity path and the scope path share one.
+    """
+    _enable_auth(monkeypatch, rsa_key)
+    token = _make_token(rsa_key, _base_claims({"sub": "s", "scope": "cao:read"}))
+    calls = []
+    real = auth._verify_token
+    monkeypatch.setattr(auth, "_verify_token", lambda t: (calls.append(t), real(t))[1])
+    assert auth.extract_scopes_from_token(token) == ["cao:read"]
+    assert auth.extract_principal_from_token(token).subject == "s"
+    assert calls == [token, token]

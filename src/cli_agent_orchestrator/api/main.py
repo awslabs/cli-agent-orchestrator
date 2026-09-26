@@ -122,10 +122,12 @@ from cli_agent_orchestrator.security.auth import (
     _extract_bearer,
     extract_scopes_from_token,
     get_authorization_servers,
+    get_current_principal,
     get_current_scopes,
     is_auth_enabled,
     require_any_scope,
 )
+from cli_agent_orchestrator.security.principal import Principal
 from cli_agent_orchestrator.services import (
     approval_gate,
     approval_provenance,
@@ -138,6 +140,7 @@ from cli_agent_orchestrator.services import (
 )
 from cli_agent_orchestrator.services.agent_step import (
     StepExecutionError,
+    caller_owner_id,
     resolve_effective_working_directory,
     run_agent_step,
 )
@@ -157,6 +160,10 @@ from cli_agent_orchestrator.services.install_service import InstallResult, insta
 from cli_agent_orchestrator.services.log_writer import log_writer
 from cli_agent_orchestrator.services.profile_search import (
     DEFAULT_LIMIT as PROFILE_SEARCH_DEFAULT_LIMIT,
+)
+from cli_agent_orchestrator.services.server_owner import (
+    acquire_server_ownership,
+    release_server_ownership,
 )
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
@@ -178,6 +185,7 @@ from cli_agent_orchestrator.services.workflow_journal import (
 from cli_agent_orchestrator.services.worktree_service import WorktreeError
 from cli_agent_orchestrator.telemetry import init_telemetry, shutdown_telemetry
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
+from cli_agent_orchestrator.utils.atomic_file import write_owner_only
 from cli_agent_orchestrator.utils.logging import install_access_log_redaction, setup_logging
 from cli_agent_orchestrator.utils.skills import (
     SkillNameError,
@@ -192,6 +200,17 @@ TMUX_KEY_PATTERN = re.compile(
     r"^(?:Up|Down|Left|Right|Enter|Tab|Escape|Space|[A-Za-z0-9]|[CMS]-[A-Za-z0-9])$"
 )
 GRAPH_PROJECTION_TIMEOUT_S = 90.0
+#: Shape of a terminal id (mirrors ``models.terminal.TerminalId``). Used to tell
+#: an id-shaped ``sender_id`` — which must name a real terminal — from an
+#: operator label like "operator", which names no terminal and cannot stand in
+#: for one.
+_TERMINAL_ID_RE = re.compile(r"^[a-f0-9]{8}$")
+#: Sender labels that name no terminal and are accepted anyway, for surfaces that
+#: genuinely have no terminal context (the operator/app tool surface posts
+#: "operator"). A CLOSED set on purpose: any label outside it is refused, so an
+#: agent cannot invent one to be attributed to no principal and thereby skip the
+#: delivery-time owner gate.
+_OPERATOR_SENDER_LABELS = frozenset({"operator"})
 
 
 async def flow_daemon():
@@ -1183,6 +1202,22 @@ class CreateFlowRequest(BaseModel):
     agent_profile: str
     provider: str = "kiro_cli"
     prompt_template: str
+    # #745: the flow file format supports an optional Kiro engine and a
+    # conditional pre-script (``script``), and the Flow model carries both.
+    # This HTTP model used to omit them, so registering a flow through HTTP
+    # silently dropped the pre-script — turning a CONDITIONAL launch into an
+    # UNCONDITIONAL one. Both are preserved here instead of dropped.
+    engine: Optional[KiroEngine] = None
+    script: Optional[str] = None
+    # The pre-script's CONTENTS, not a path. A relative ``script`` cannot survive
+    # the trip to a shared server (the flow file stays on the client, so the
+    # server resolves the name against its own flows dir), and the server refuses
+    # an absolute one as an arbitrary-file-execution vector — leaving no path a
+    # remote ``cao schedule add --script`` could send (guojing1217 on #802). The
+    # client reads the file it can see and sends the bytes; the server writes its
+    # own copy beside the flow and runs that. Preferred over ``script`` when both
+    # are present.
+    script_body: Optional[str] = None
 
     @field_validator("name")
     @classmethod
@@ -1190,6 +1225,36 @@ class CreateFlowRequest(BaseModel):
         """Prevent path traversal — flow name becomes a filename."""
         if "/" in v or "\\" in v or ".." in v:
             raise ValueError("Flow name must not contain '/', '\\', or '..'")
+        return v
+
+    @field_validator("script")
+    @classmethod
+    def validate_script(cls, v: Optional[str]) -> Optional[str]:
+        """Preserve the pre-script, but do NOT accept an arbitrary server path.
+
+        ``execute_flow`` resolves a relative ``script`` against the flow file's
+        own directory and runs it with ``subprocess.run``. Over HTTP that makes
+        an absolute path or a traversal a way to execute any file on the server,
+        so restrict the HTTP create path to a bare relative filename inside the
+        flows directory. Reject rather than weaken (#745).
+        """
+        if v is None or v == "":
+            return v
+        # A BARE filename, not a relative path. Rejecting only a leading "/" let
+        # "subdir/check.sh" through, and execute_flow joins that to the server's
+        # flows directory and executes it — so a shared caller could select a
+        # pre-existing server file (or traverse a symlinked subdirectory) instead
+        # of the script body it uploaded (Copilot review on #802). The upload path
+        # (``script_body``) is what callers should use; this field stays only for a
+        # filename already sitting in the flows directory.
+        if "/" in v or "\\" in v or ".." in v:
+            raise ValueError(
+                "Flow script must be a bare filename inside the flows directory "
+                "(no path separators, no '..'); upload the script with "
+                "'script_body' instead"
+            )
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in v):
+            raise ValueError("Flow script must not contain control characters")
         return v
 
     @field_validator("schedule", "agent_profile", "provider")
@@ -1278,6 +1343,10 @@ async def lifespan(app: FastAPI):
         init_telemetry(OTEL_SERVICE_NAME)
     except Exception:
         logger.warning("OTel telemetry init failed; continuing", exc_info=True)
+    # Claim exclusive ownership of the state directory BEFORE opening it. A
+    # second server on the same state refuses to serve rather than racing the
+    # first through a rolling update or a manual pod replacement (#745).
+    acquire_server_ownership()
     init_db()
     _seed_default_skills_at_startup()
     _reconcile_memory_at_startup()
@@ -1422,6 +1491,10 @@ async def lifespan(app: FastAPI):
         shutdown_telemetry()
     except Exception:
         logger.warning("Error shutting down OTel telemetry", exc_info=True)
+    # Free the state directory for the next owner. The kernel would do this
+    # when the process exits anyway; releasing here means a rollout's incoming
+    # server does not have to wait for the outgoing one to be reaped.
+    release_server_ownership()
     logger.info("Shutting down CLI Agent Orchestrator server...")
 
 
@@ -1460,6 +1533,16 @@ app = FastAPI(
     version=SERVER_VERSION,
     lifespan=lifespan,
 )
+
+# Remote execution runtime channel (#745). Additive surface; the WebSocket
+# endpoint fails closed unless CAO_RUNTIME_TOKEN is configured, so a purely
+# local installation exposes no anonymous execution channel.
+from cli_agent_orchestrator.runtime_channel import api as runtime_channel_api
+from cli_agent_orchestrator.runtime_channel.api import router as runtime_channel_router
+from cli_agent_orchestrator.runtime_channel.protocol import CommandType as RuntimeCommandType
+from cli_agent_orchestrator.runtime_channel.registry import RemoteCommandError, runtime_registry
+
+app.include_router(runtime_channel_router)
 
 # Methods whose request could change server state. The Origin check only
 # guards these — GET/HEAD/OPTIONS stay open (reads leak nothing stateful, and
@@ -3178,6 +3261,7 @@ async def create_session(
     resume_session_id: Optional[str] = None,
     body: Optional[CreateSessionBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+    principal: Principal = Depends(get_current_principal),
 ) -> Terminal:
     """Create a new session with exactly one terminal.
 
@@ -3290,6 +3374,8 @@ async def create_session(
             resume_session_id=resume_session_id,
             group=body.group if body else None,
             metadata=body.metadata if body else None,
+            # Whose work this session is, taken from the verified token (#745).
+            owner=principal.id,
         )
 
         if memory_manager and str(memory_manager).lower() in ("true", "1", "yes"):
@@ -3332,6 +3418,10 @@ async def create_session(
                         working_directory=working_directory,
                         registry=registry,
                         idempotency_key=sidecar_idempotency_key,
+                        # Same owner as the primary it serves: the sidecar is
+                        # spawned in a background task, after this request's
+                        # principal would otherwise be out of scope (#745).
+                        owner=principal.id,
                     )
                 except Exception as e:
                     logger.warning(f"Failed to spawn memory_manager sidecar: {e}")
@@ -3471,6 +3561,7 @@ async def create_terminal_in_session(
     idempotency_key: Optional[str] = None,
     body: Optional[CreateTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+    principal: Principal = Depends(get_current_principal),
 ) -> Terminal:
     """Create additional terminal in existing session.
 
@@ -3567,6 +3658,117 @@ async def create_terminal_in_session(
                     ),
                 )
 
+        # #745: the caller may be an agent executing in a runtime, not in this
+        # container. Its tmux session lives there, so adding a window locally
+        # would fail ("Session '<name>' not found") — and the worker belongs in
+        # the SAME runtime as the agent that asked for it anyway. Forwarding
+        # here, in the one endpoint MCP assign/handoff already call, keeps a
+        # single orchestration implementation: tool, CLI and HTTP clients send
+        # the request they always sent, every validation above still applies,
+        # and placement is decided centrally from the caller's recorded runtime
+        # rather than by the agent.
+        # runtime_for_terminal() returns None for a genuinely-local caller AND
+        # for a remote caller whose placement lookup transiently failed, so it
+        # alone cannot decide "launch locally" — doing so would create the worker
+        # in the central container for a caller that actually lives in a runtime
+        # (Copilot follow-up on #802). is_remote() fails closed (True) on an
+        # unreadable placement, so gate on it first: if the caller is remote (or
+        # unknown) but the runtime cannot be resolved, refuse with a retryable
+        # 503 rather than misrouting.
+        # Whose work this worker is. NOT principal.id when a caller is named:
+        # through the shared MCP/stdio bridge the request's principal is the
+        # SERVER's own local token, not the agent that asked for the worker, so
+        # persisting it attributed the worker to the operator/service principal
+        # and revoking the real caller would never gate its deferred work
+        # (Copilot review on #802). Read from the caller's own server-written row,
+        # the same resolution the run-step path uses, and fall back to the
+        # request principal only when there is no caller or it has no recorded
+        # owner.
+        #
+        # But `caller_id` comes from the REQUEST, so it cannot be authorization on
+        # its own. Inheriting an arbitrary named terminal's owner let a caller with
+        # write scope attribute a worker to somebody else — and, on the remote arm
+        # below, place it beside that principal's terminal — which walks straight
+        # through the ownership boundary and the revocation decision the owner
+        # column exists to carry (Copilot review on #802). So bind the two first,
+        # exactly as the inbox route binds `sender_id`: with auth on, a caller
+        # terminal owned by a different principal is refused rather than inherited.
+        #
+        # With auth off there is no identity to bind to and this is inert, which is
+        # the same acknowledged posture as the inbox check; the broker gateway
+        # overwrites the caller identity for worker callbacks, so the remaining
+        # unbound case is a single-principal local install.
+        caller_owner = caller_owner_id(caller_id)
+        if is_auth_enabled() and caller_owner and caller_owner != principal.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    f"caller '{caller_id}' is owned by another principal; a worker "
+                    "may only be created on behalf of a terminal you own"
+                ),
+            )
+        worker_owner = caller_owner or principal.id
+
+        caller_runtime = None
+        if caller_id:
+            # One atomic observation, not is_remote() then runtime_for_terminal():
+            # these are read from a worker thread while the channel loop binds and
+            # unbinds the same map, so a bind landing between the two calls made a
+            # caller look remote and then yield no runtime, and an unbind routed a
+            # deleted terminal on stale placement (Copilot review on #802).
+            caller_is_remote, caller_placement = runtime_registry.placement(caller_id)
+            caller_runtime = caller_placement if caller_is_remote else None
+            if caller_is_remote and caller_runtime is None:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=(
+                        f"caller '{caller_id}' is remote but its placement is "
+                        "currently unavailable; retry"
+                    ),
+                )
+        if caller_runtime is not None:
+            from cli_agent_orchestrator.runtime_channel.api import (
+                CreateRemoteTerminalBody,
+                launch_remote_terminal,
+            )
+
+            if idempotency_key is not None:
+                # The remote launch records the central row itself and has no
+                # key/fingerprint table behind it, so accepting the key would
+                # promise retry safety this path does not yet provide. Say so
+                # instead of dropping the guarantee silently.
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        "idempotency_key is not supported when the caller executes in a "
+                        f"remote runtime (caller '{caller_id}' runs on '{caller_runtime}')"
+                    ),
+                )
+            return await launch_remote_terminal(
+                caller_runtime,
+                CreateRemoteTerminalBody(
+                    # The caller's own ``provider``, NOT ``resolved_provider``:
+                    # that was resolved against this container's profile store,
+                    # and the agent is about to run in the runtime's, off a
+                    # different `cao install` (review finding 8 on #802). Unset
+                    # stays unset so the runtime answers for itself.
+                    provider=provider,
+                    agent_profile=agent_profile,
+                    session_name=session_name,
+                    new_session=False,
+                    working_directory=working_directory,
+                    model=model,
+                    caller_id=caller_id,
+                    allowed_tools=allowed_tools_list,
+                    defer_init=defer_init,
+                    initial_message=initial_message,
+                    initial_message_orchestration_type=(orch_type.value if orch_type else None),
+                    engine=(getattr(engine, "value", engine) if engine else None),
+                    use_worktree=use_worktree,
+                ),
+                owner_id=worker_owner,
+            )
+
         result = await terminal_service.create_terminal(
             provider=resolved_provider,
             agent_profile=agent_profile,
@@ -3583,6 +3785,7 @@ async def create_terminal_in_session(
             model=model,
             use_worktree=use_worktree,
             idempotency_key=idempotency_key,
+            owner=worker_owner,
         )
         return result
     except HTTPException:
@@ -3861,6 +4064,20 @@ async def send_terminal_input(
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
     try:
+        # Remote terminal (#745): the provider, tmux socket and status monitor
+        # live in the runtime — route the whole send_input there.
+        if runtime_registry.is_remote(terminal_id):
+            result = await runtime_channel_api.remote_terminal_command(
+                terminal_id,
+                RuntimeCommandType.INPUT,
+                {
+                    "message": message,
+                    "sender_id": sender_id,
+                    "orchestration_type": orchestration_type.value if orchestration_type else None,
+                },
+                timeout=runtime_channel_api.INPUT_TIMEOUT,
+            )
+            return {"success": bool(result.payload.get("success", False))}
         # send_input is blocking tmux I/O (bracketed paste + key sends). Run it
         # off the event loop so a slow tmux call can't freeze every other
         # request — including /health and concurrent assign/handoff. Same
@@ -3874,10 +4091,21 @@ async def send_terminal_input(
             orchestration_type=orchestration_type,
         )
         return {"success": success}
+    except RemoteCommandError as e:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
     except TerminalInputBlockedError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except HTTPException:
+        # remote_terminal_command maps a disconnected runtime to 503 (and 502/504
+        # for other remote failures) INSIDE this try. Without this re-raise the
+        # catch-all below rewraps that 503 as a 500 with the status stringified
+        # into the detail, so a client, a supervisor retry policy or a 5xx alarm
+        # cannot tell "executor pod is rolling, retry" from "the server broke" —
+        # during a routine bridge rollout every in-flight input became a 500
+        # (guojing1217 on #802). delete_terminal already does this.
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -3902,11 +4130,25 @@ async def send_terminal_key(
         )
 
     try:
+        if runtime_registry.is_remote(terminal_id):
+            result = await runtime_channel_api.remote_terminal_command(
+                terminal_id,
+                RuntimeCommandType.SPECIAL_KEY,
+                {"key": key},
+                timeout=runtime_channel_api.INPUT_TIMEOUT,
+            )
+            return {"success": bool(result.payload.get("success", False))}
         # Blocking tmux send-keys — off the loop.
         success = await asyncio.to_thread(terminal_service.send_special_key, terminal_id, key)
         return {"success": success}
+    except RemoteCommandError as e:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except HTTPException:
+        # Preserve the 503/502/504 that remote_terminal_command raises for a
+        # disconnected/failed runtime (guojing1217 on #802); see send_input.
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -3921,11 +4163,21 @@ async def get_terminal_output(
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> TerminalOutputResponse:
     try:
+        if runtime_registry.is_remote(terminal_id):
+            result = await runtime_channel_api.remote_terminal_command(
+                terminal_id,
+                RuntimeCommandType.EXTRACT,
+                {"mode": mode.value},
+                timeout=runtime_channel_api.EXTRACT_TIMEOUT,
+            )
+            return TerminalOutputResponse(output=result.payload.get("output", ""), mode=mode)
         # get_output does a blocking tmux capture-pane plus provider regex
         # extraction over the scrollback — run it off the loop so a large
         # transcript can't stall the whole server.
         output = await asyncio.to_thread(terminal_service.get_output, terminal_id, mode)
         return TerminalOutputResponse(output=output, mode=mode)
+    except RemoteCommandError as e:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
     except OutputExtractionError as e:
         # Ordered before the ValueError arm it subclasses, same as run_step: the
         # terminal and the route both resolved -- only the response marker was
@@ -3935,6 +4187,10 @@ async def get_terminal_output(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except HTTPException:
+        # Preserve the 503/502/504 that remote_terminal_command raises for a
+        # disconnected/failed runtime (guojing1217 on #802); see send_input.
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -4948,6 +5204,23 @@ async def _run_in_background(
 
     try:
         async with _get_drive_semaphore():
+            # #745: a cancellation durably accepted while this admitted run
+            # waited on capacity must make it ineligible for dispatch. Before
+            # this recheck, the script tier verified cancellation only after
+            # its subprocess exited (script_runner._drive_process), so user
+            # code could start after CANCELLED was already journaled. Recheck
+            # the existing record/journal state at the execution boundary —
+            # no re-admission, no new run row. Once dispatch proceeds, the
+            # existing requested/stopped/failed/unknown semantics apply.
+            journal_row = workflow_journal.get_run(run_id)
+            if getattr(record, "cancelled", False) or (
+                journal_row is not None and journal_row.state == RunState.CANCELLED.value
+            ):
+                logger.info(
+                    "background workflow run '%s' was cancelled while queued; not dispatching",
+                    run_id,
+                )
+                return
             if tier == "yaml":
                 await workflow_service.start_run_prepared(record)
             else:
@@ -7052,6 +7325,17 @@ async def delete_terminal(
 ) -> Dict:
     """Delete a terminal."""
     try:
+        if runtime_registry.is_remote(terminal_id):
+            try:
+                success = await runtime_channel_api.remote_delete_terminal(terminal_id)
+            except RemoteCommandError as e:
+                raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
+            if not success:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"remote cleanup deferred for terminal '{terminal_id}'; retry delete",
+                )
+            return {"success": True}
         # delete_terminal is fully synchronous: blocking tmux kills, a
         # full-history scrollback snapshot capture, and DB writes. Off the
         # loop so a stalled tmux/FIFO op bounds its blast radius to this one
@@ -7089,8 +7373,64 @@ async def create_inbox_message_endpoint(
     sender_id: str,
     message: str,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+    principal: Principal = Depends(get_current_principal),
 ) -> Dict:
     """Create inbox message and attempt immediate delivery."""
+    # ``sender_id`` is an agent-supplied query param, and the delivery-time owner
+    # gate (#745) resolves whether a held message may be delivered from that
+    # sender's owner. Left entirely unvalidated, a caller could name a terminal
+    # id that does not exist and have it attributed anyway (guojing1217 on #802).
+    #
+    # Every sender must be EITHER an existing terminal OR one of a small, closed
+    # set of operator labels (``_OPERATOR_SENDER_LABELS``). Allowing any
+    # non-terminal-shaped string was not enough: the owner lookup finds nothing
+    # for an arbitrary label, and ``may_start_work(None)`` permits delivery, so a
+    # revoked agent could pass ``sender_id=forged`` and walk straight past the
+    # gate that constrains it (Copilot review on #802). Closing the set keeps the
+    # operator path — ``app_tools`` sends "operator", which has no terminal
+    # context at all — without leaving an unowned-by-choice escape hatch.
+    #
+    # This does NOT make the sender unforgeable — a caller naming another LIVE
+    # terminal's real id still passes. Closing that needs the sender derived from
+    # trusted caller identity, and this route has none to derive from: the
+    # MCP->API calls carry only the auth token, no caller-terminal header. The
+    # broker gateway already binds it correctly for worker callbacks (it replaces
+    # sender_id with the authenticated lease identity), so the gap is the direct
+    # central caller. Tracked as a follow-up rather than guessed at here.
+    #
+    # (The runtime-local callback path writes via create_inbox_message directly,
+    # where the supervisor sender legitimately has no local row.)
+    if sender_id not in _OPERATOR_SENDER_LABELS and not await asyncio.to_thread(
+        get_terminal_metadata, sender_id
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                f"Sender '{sender_id}' is neither an existing terminal nor a "
+                "recognized operator label"
+            ),
+        )
+
+    # Existence is not authorization: a caller could still name ANOTHER live
+    # terminal and have the owner gate evaluate that terminal's principal
+    # (Copilot review on #802, raised repeatedly). When an authenticated identity
+    # IS available, bind the two: a sender terminal owned by somebody else is
+    # refused. This is the strongest check this route can make today — with auth
+    # off there is no identity to bind to, and the broker gateway already
+    # overwrites sender_id with the authenticated lease identity before it gets
+    # here, so the remaining unbound case is an authenticated caller naming a
+    # terminal it does not own, which is exactly what this rejects.
+    if is_auth_enabled() and sender_id not in _OPERATOR_SENDER_LABELS:
+        sender_row = await asyncio.to_thread(get_terminal_metadata, sender_id)
+        sender_owner = (sender_row or {}).get("owner")
+        if sender_owner and sender_owner != principal.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    f"sender '{sender_id}' is owned by another principal; a message "
+                    "may only be sent as a terminal you own"
+                ),
+            )
     try:
         inbox_msg = create_inbox_message(
             sender_id,
@@ -7307,6 +7647,16 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
         await websocket.close(code=4004, reason="Terminal not found")
         return
 
+    # Remote terminal (#745/#776): the tmux socket lives in the runtime pod,
+    # so the PTY subprocess is spawned THERE and its bytes are relayed over
+    # the runtime channel. Same client-facing protocol as the local branch
+    # below; a disconnected runtime closes 4010 rather than false-attaching.
+    if runtime_registry.is_remote(terminal_id):
+        from cli_agent_orchestrator.runtime_channel.api import relay_remote_attach
+
+        await relay_remote_attach(websocket, terminal_id)
+        return
+
     # Defence-in-depth: re-validate the names from the DB before they
     # flow into a tmux subprocess argument. The POST /sessions handler
     # now validates user-supplied session_name, but pre-existing rows
@@ -7490,6 +7840,7 @@ async def get_flow(
 async def create_flow(
     body: CreateFlowRequest,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+    principal: Principal = Depends(get_current_principal),
 ) -> Flow:
     """Create a new flow.
 
@@ -7504,20 +7855,44 @@ async def create_flow(
 
         # Serialize via yaml.safe_dump so a multi-line value becomes a quoted
         # scalar rather than injecting a new frontmatter key.
-        frontmatter = yaml.safe_dump(
-            {
-                "name": body.name,
-                "schedule": body.schedule,
-                "agent_profile": body.agent_profile,
-                "provider": body.provider,
-            },
-            sort_keys=False,
-        )
+        frontmatter_data = {
+            "name": body.name,
+            "schedule": body.schedule,
+            "agent_profile": body.agent_profile,
+            "provider": body.provider,
+        }
+        # Preserve the optional engine and pre-script rather than dropping them
+        # (#745). Only emit when set, so a flow without them serializes exactly
+        # as before.
+        if body.engine is not None:
+            frontmatter_data["engine"] = body.engine.value
+        if body.script_body is not None:
+            # The client sent the pre-script's contents. Write our own copy beside
+            # the flow and point the frontmatter at that bare filename, so the
+            # relative-path resolution in execute_flow finds it in the flows dir —
+            # the whole point, since the client's path never resolves here. The
+            # name derives from the flow name (already validated free of '/',
+            # '\\', '..'), so it is a safe filename in this directory. Owner-only
+            # executable: it is the operator's own code, run via its shebang.
+            script_name = f"{body.name}.pre-script"
+            script_file = flows_dir / script_name
+            # Owner-only from the first byte: write_text then chmod would flush
+            # the (possibly credential-bearing) body at the umask default first,
+            # leaving a window another local account could read on a shared
+            # server (Copilot follow-up on #802). write_owner_only publishes an
+            # owner-only inode and never widens past 0700.
+            write_owner_only(script_file, body.script_body, mode=0o700)
+            frontmatter_data["script"] = script_name
+        elif body.script:
+            frontmatter_data["script"] = body.script
+        frontmatter = yaml.safe_dump(frontmatter_data, sort_keys=False)
         file_content = "---\n" + frontmatter + "---\n" + body.prompt_template
 
         file_path.write_text(file_content)
 
-        return flow_service.add_flow(str(file_path))
+        # Record who this schedule belongs to while the request still says so
+        # (#745): the daemon that fires it minutes from now has no caller.
+        return flow_service.add_flow(str(file_path), owner=principal.id)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:

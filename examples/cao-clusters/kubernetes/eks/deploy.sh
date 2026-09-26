@@ -23,9 +23,16 @@
 # Usage:
 #   examples/cao-clusters/kubernetes/eks/deploy.sh [stack-name] [image-tag] [mode]
 #
-# Modes: bedrock (default), kiro.
+# Modes: bedrock (default), kiro, codex.
 # Defaults: stack cao-workshop, tag taken from kustomization.yaml, mode bedrock.
 # Honours the usual AWS_PROFILE / AWS_REGION environment.
+#
+# Pass `-` as the stack name to deploy onto a cluster this repo's template did
+# not create, supplying the stack's six values through the environment instead:
+#
+#   CAO_SERVER_REPO_URI  CAO_CONTROL_PLANE_REPO_URI  CAO_BROKER_REPO_URI
+#   CAO_PANEL_REPO_URI
+#   CAO_WORKSPACE_HANDLE (fs-<id>::fsap-<id>)  CAO_CLUSTER_NAME  CAO_VPC_CIDR
 #
 # Rendering happens into a temporary directory; this source directory is never
 # modified, so a failed run leaves nothing to clean up and `git status` stays
@@ -41,8 +48,10 @@ case "$MODE" in
     ;;
   kiro)
     ;;
+  codex)
+    ;;
   *)
-    echo "error: mode must be 'bedrock' or 'kiro' (got '$MODE')" >&2
+    echo "error: mode must be 'bedrock', 'kiro' or 'codex' (got '$MODE')" >&2
     exit 1
     ;;
 esac
@@ -63,19 +72,68 @@ REGION="$(aws configure get region || true)"
 [ -n "${AWS_REGION:-}" ] && REGION="$AWS_REGION"
 [ -n "$REGION" ] || { echo "error: no region — set AWS_REGION" >&2; exit 1; }
 
-echo "reading outputs from stack '$STACK' in $REGION"
-REPO="$(out ServerRepositoryUri)"
-BROKER_REPO="$(out WorkerBrokerRepositoryUri)"
-PANEL_REPO="$(out PanelRepositoryUri)"
-HANDLE="$(out WorkspaceVolumeHandle)"
-CLUSTER="$(out ClusterName)"
-VPC_CIDR="$(out VpcCidrBlock)"
+# Existing-cluster mode. Pass `-` as the stack name and supply the six values the
+# stack would otherwise have produced.
+#
+# This exists because the stack is not the only way to get a cluster, and until
+# now it was the only way to run this script: every input came from
+# `describe-stacks`, so deploying onto a cluster somebody else built had no
+# documented path at all. The manifests never cared where the values came from.
+#
+# Everything the fleet needs from the environment is in these six. See
+# "Deploying onto an existing cluster" in the README for how to obtain each.
+if [ "$STACK" = "-" ] || [ "$STACK" = "none" ]; then
+  echo "existing-cluster mode: reading inputs from the environment"
+  REPO="${CAO_SERVER_REPO_URI:-}"
+  # Defaults to the executor repo: a deployment that has not split its images
+  # yet still works, and the split is opt-in rather than a breaking change.
+  CONTROL_PLANE_REPO="${CAO_CONTROL_PLANE_REPO_URI:-${CAO_SERVER_REPO_URI:-}}"
+  BROKER_REPO="${CAO_BROKER_REPO_URI:-}"
+  PANEL_REPO="${CAO_PANEL_REPO_URI:-}"
+  HANDLE="${CAO_WORKSPACE_HANDLE:-}"
+  CLUSTER="${CAO_CLUSTER_NAME:-}"
+  VPC_CIDR="${CAO_VPC_CIDR:-}"
+  missing=""
+  for v in CAO_SERVER_REPO_URI CAO_BROKER_REPO_URI CAO_PANEL_REPO_URI \
+           CAO_WORKSPACE_HANDLE CAO_CLUSTER_NAME CAO_VPC_CIDR; do
+    eval "val=\${$v:-}"
+    [ -n "$val" ] || missing="$missing $v"
+  done
+  if [ -n "$missing" ]; then
+    echo "error: existing-cluster mode needs:$missing" >&2
+    exit 1
+  fi
+  # The same shape the stack output has, checked here because a handle without
+  # the access point mounts the filesystem root instead of the subdirectory and
+  # every pod then shares one uid-mapped tree.
+  case "$HANDLE" in
+    fs-*::fsap-*) ;;
+    *)
+      echo "error: CAO_WORKSPACE_HANDLE must be 'fs-<id>::fsap-<id>' (got '$HANDLE')" >&2
+      exit 1
+      ;;
+  esac
+else
+  echo "reading outputs from stack '$STACK' in $REGION"
+  REPO="$(out ServerRepositoryUri)"
+  CONTROL_PLANE_REPO="$(out ControlPlaneRepositoryUri)"
+  # A stack that predates the split has no such output; the executor image is
+  # then used for both, which is the old behaviour and still correct.
+  if [ -z "$CONTROL_PLANE_REPO" ] || [ "$CONTROL_PLANE_REPO" = "None" ]; then
+    CONTROL_PLANE_REPO="$REPO"
+  fi
+  BROKER_REPO="$(out WorkerBrokerRepositoryUri)"
+  PANEL_REPO="$(out PanelRepositoryUri)"
+  HANDLE="$(out WorkspaceVolumeHandle)"
+  CLUSTER="$(out ClusterName)"
+  VPC_CIDR="$(out VpcCidrBlock)"
+fi
 
 # The Kiro overlay includes external-secret.yaml, whose remote key is
 # intentionally fixed to the documented name. Catch a Bedrock-mode stack, or a
 # differently named provider secret, before kubectl reaches an ExternalSecret
 # that can never become Ready.
-if [ "$MODE" = "kiro" ]; then
+if [ "$MODE" = "kiro" ] && [ "$STACK" != "-" ] && [ "$STACK" != "none" ]; then
   PROVIDER_SECRET="$(out ProviderSecretName)"
   if [ -z "$PROVIDER_SECRET" ] || [ "$PROVIDER_SECRET" = "None" ]; then
     echo "error: kiro mode requires the stack parameter ProviderSecretName=cao/provider-credentials" >&2
@@ -90,7 +148,8 @@ fi
 # An output that resolves to the empty string means the stack exists but is not
 # the stack these manifests expect — fail here rather than applying manifests
 # with a literal "<account-id>" in the image name, which surfaces much later as
-# an ImagePullBackOff.
+# an ImagePullBackOff. Existing-cluster mode has already checked the same six,
+# so this loop is a no-op there rather than a second source of truth.
 for pair in "ServerRepositoryUri=$REPO" "WorkerBrokerRepositoryUri=$BROKER_REPO" \
             "PanelRepositoryUri=$PANEL_REPO" \
             "WorkspaceVolumeHandle=$HANDLE" "ClusterName=$CLUSTER" \
@@ -109,7 +168,8 @@ cat <<EOF
   cluster     $CLUSTER
   vpc cidr    $VPC_CIDR
   mode        $MODE
-  images      $REPO:$TAG
+  images      $REPO:$TAG (executor)
+              $CONTROL_PLANE_REPO:$TAG (control plane)
               $BROKER_REPO:$TAG
               $PANEL_REPO:$TAG
   workspace   $FS_ID / $AP_ID
@@ -123,18 +183,45 @@ cp -R "$K8S_DIR"/. "$RENDER/"
 # edit in the throwaway rendered copy means the checked-in root remains the
 # Bedrock default while kiro mode is still one deploy command, not a sequence of
 # hand-edits that can omit half the provider switch.
-if [ "$MODE" = "kiro" ]; then
-  cat >>"$RENDER/kustomization.yaml" <<'EOF'
+# Collected into ONE `components:` block, because the provider mode and the
+# credential mode are independent switches that can both be on. Emitting a
+# second `components:` key instead silently DROPS the first: duplicate mapping
+# keys are last-one-wins, so `codex` plus projected credentials deployed the
+# credentials and a Claude Code supervisor, with no error anywhere. Measured.
+COMPONENTS=()
 
-components:
-  - components/kiro
-EOF
+if [ "$MODE" = "kiro" ]; then
+  COMPONENTS+=("components/kiro")
+fi
+
+# codex mode needs no stack-output guard, because it adds no secret to project:
+# it reaches Bedrock through the same Pod Identity association as the default.
+# What it does need is an image built with --build-arg INSTALL_CODEX=1, and that
+# cannot be checked from here — the tag is opaque. A tag without codex in it
+# fails at the first launch with "codex was not found", not at deploy time.
+if [ "$MODE" = "codex" ]; then
+  COMPONENTS+=("components/codex")
+fi
+
+# Projected web-identity credentials, for a cluster that injects neither Pod
+# Identity nor IRSA.
+if [ -n "${CAO_AGENT_IRSA_ROLE_ARN:-}" ]; then
+  echo "  agent creds projected web identity as ${CAO_AGENT_IRSA_ROLE_ARN##*/}"
+  COMPONENTS+=("components/irsa-projected")
+fi
+
+if [ ${#COMPONENTS[@]} -gt 0 ]; then
+  printf '\ncomponents:\n' >>"$RENDER/kustomization.yaml"
+  for c in "${COMPONENTS[@]}"; do
+    printf '  - %s\n' "$c" >>"$RENDER/kustomization.yaml"
+  done
 fi
 
 # LC_ALL=C and the -i.bak form keep this working on both GNU and BSD sed.
 find "$RENDER" -name '*.yaml' -print0 | while IFS= read -r -d '' f; do
   LC_ALL=C sed -i.bak \
     -e "s|<server-image>|$REPO|g" \
+    -e "s|<control-plane-image>|$CONTROL_PLANE_REPO|g" \
     -e "s|<broker-image>|$BROKER_REPO|g" \
     -e "s|<panel-image>|$PANEL_REPO|g" \
     -e "s|<account-id>|$ACCOUNT|g" \
@@ -143,6 +230,7 @@ find "$RENDER" -name '*.yaml' -print0 | while IFS= read -r -d '' f; do
     -e "s|<filesystem-id>|$FS_ID|g" \
     -e "s|<access-point-id>|$AP_ID|g" \
     -e "s|<vpc-cidr>|$VPC_CIDR|g" \
+    -e "s|<irsa-role-arn>|${CAO_AGENT_IRSA_ROLE_ARN:-}|g" \
     "$f"
   rm -f "$f.bak"
 done
@@ -179,7 +267,15 @@ done < <(grep -E '^[[:space:]]*newTag:' "$RENDER/kustomization.yaml" | awk '{pri
 # <immutable-tag> straight through into the applied manifests, where a literal
 # "<immutable-tag>" in an image name surfaces ten minutes later as an
 # ImagePullBackOff, and a literal CIDR surfaces as a policy that matches nothing.
-if grep -rnE '<[a-z][a-z0-9-]*>' "$RENDER" --include='*.yaml'; then
+#
+# Comment lines are excluded: broker.yaml documents the optional worker-IRSA role
+# as a commented `arn:aws:iam::<account>:role/<worker-role>` example, and a YAML
+# comment cannot become a bad image name or an empty CIDR. Without this the guard
+# fired on that example and aborted a clean first deploy of the manifests as
+# shipped (guojing1217 on #802). grep -n prefixes each hit with `file:line:`, so
+# the filter drops hits whose content (after that prefix) is a `#` comment.
+if grep -rnE '<[a-z][a-z0-9-]*>' "$RENDER" --include='*.yaml' \
+     | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#'; then
   echo "error: unrendered placeholders above" >&2
   exit 1
 fi
@@ -203,6 +299,18 @@ else
     --from-literal="token=$(openssl rand -hex 24)"
 fi
 
+# The runtime-channel token, on the same terms. Shared by the central server and
+# every execution pod: the server accepts a bridge only with it, and a bridge
+# refuses to start without it, so a regenerated token would silently strand every
+# running executor - hence kept across runs like the two above.
+if kubectl -n cao-cluster get secret cao-runtime-token >/dev/null 2>&1; then
+  echo "runtime token already present, keeping it"
+else
+  echo "minting runtime token"
+  kubectl -n cao-cluster create secret generic cao-runtime-token \
+    --from-literal="token=$(openssl rand -hex 24)"
+fi
+
 # The panel token, on the same terms. Not optional: panel.yaml reads it through a
 # secretKeyRef with no `optional: true`, so a missing secret stops the pod at
 # CreateContainerConfigError rather than starting it unauthenticated. Kept across
@@ -215,12 +323,69 @@ else
     --from-literal="token=$(openssl rand -hex 24)"
 fi
 
+# The pre-#745 layout cannot be upgraded in place, and kubectl's error for that
+# is two screens of field diffs. Both objects below changed in ways Kubernetes
+# forbids updating:
+#
+#   * the supervisor StatefulSet dropped its `volumeClaimTemplates` (its state is
+#     an emptyDir now - nothing there needs to outlive the pod);
+#   * the supervisor Service became headless, and `spec.clusterIP` is immutable.
+#
+# Deleting them is the operator's call, not this script's: the StatefulSet may be
+# running an agent mid-task, and its old `state-cao-supervisor-0` PVC holds the
+# only copy of the conversation this topology used to keep there. So say exactly
+# what to run and stop.
+LEGACY=""
+if [ -n "$(kubectl -n cao-cluster get statefulset cao-supervisor \
+             -o jsonpath='{.spec.volumeClaimTemplates}' 2>/dev/null)" ]; then
+  LEGACY="statefulset/cao-supervisor"
+fi
+if [ "$(kubectl -n cao-cluster get service cao-supervisor \
+          -o jsonpath='{.spec.clusterIP}' 2>/dev/null)" != "None" ] &&
+   kubectl -n cao-cluster get service cao-supervisor >/dev/null 2>&1; then
+  LEGACY="${LEGACY:+$LEGACY }service/cao-supervisor"
+fi
+if [ -n "$LEGACY" ]; then
+  cat >&2 <<MSG
+error: this namespace still runs the pre-#745 single-node layout, which cannot be
+       updated in place. Finish or drain any running task, then:
+
+         kubectl -n cao-cluster delete $LEGACY
+
+       The old state PVC is left alone deliberately. Nothing in the new layout
+       reads it, so keep it until you are sure you want it gone:
+
+         kubectl -n cao-cluster get pvc state-cao-supervisor-0
+
+       Re-run this script afterwards.
+MSG
+  exit 1
+fi
+
 echo "applying"
 kubectl apply -k "$RENDER"
 
-# The supervisor is a StatefulSet here, not a Deployment, and there is no worker
-# workload to wait for: a worker is a Deployment the broker mints per task, and
-# none is created by this apply at all.
+# The server first: a bridge cannot become Ready until the server it dials
+# answers, so waiting on the supervisor before the server would just spend the
+# supervisor's timeout watching a backoff loop.
+#
+# Both are StatefulSets, not Deployments, and there is no worker workload to wait
+# for: a worker is a Deployment the broker mints per task, and none is created by
+# this apply at all.
+#
+# cao-server uses updateStrategy OnDelete (server.yaml), and `kubectl rollout
+# status` rejects any StatefulSet strategy other than RollingUpdate up front with
+# "rollout status is only available for RollingUpdate strategy type" and exit 1 —
+# it does not fall through to a readiness check. Under `set -euo pipefail` that
+# aborts the deploy immediately after `kubectl apply -k`, so the gates below never
+# run and a fleet that is in fact coming up looks like a failed deploy
+# (guojing1217 on #802, measured on a live server StatefulSet). `kubectl wait` is
+# strategy-agnostic and is the readiness gate this actually wants.
+kubectl -n cao-cluster wait --for=condition=ready pod/cao-server-0 --timeout=600s
+# The supervisor's Ready means its runtime channel is established, not just that
+# uvicorn bound a port - the probe is an exec on the marker cao-bridge writes
+# after the hello is accepted. Generous, because it is behind a provider install
+# and two Bedrock warm-ups.
 kubectl -n cao-cluster rollout status statefulset/cao-supervisor --timeout=900s
 kubectl -n cao-cluster rollout status deployment/cao-worker-broker --timeout=300s
 kubectl -n cao-cluster rollout status deployment/cao-fleet-panel --timeout=300s

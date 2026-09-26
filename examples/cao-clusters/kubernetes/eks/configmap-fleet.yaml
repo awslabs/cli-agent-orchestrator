@@ -2,16 +2,23 @@
 #
 # JOINTLY OWNED, which is unusual enough to state plainly:
 #
-#   * This file supplies the entries that are always there -- the supervisor.
+#   * This file supplies the entry that is always there -- the central server.
 #   * The broker adds and removes the `role: worker` entries at runtime, because
 #     elastic workers are created on demand with generated ids that nothing can
 #     enumerate ahead of time. See `_update_fleet_config` in broker.py.
 #
 # So the live object normally differs from this file, and that is expected rather
-# than drift. Re-running `kubectl apply -k k8s` resets it to just the supervisor;
+# than drift. Re-running `kubectl apply -k k8s` resets it to just the server;
 # the broker republishes each worker on its next lease, but workers already
 # running at that moment disappear from the panel until they are released. Avoid
 # re-applying while a fleet is busy.
+#
+# One entry, and it is the central server rather than the supervisor (#745).
+# Every terminal in the fleet - the supervisor's and each worker's - is owned and
+# served by cao-server, so that is the only host with an API to probe; the
+# execution pods have no inbound port at all. The `role: worker` entries the
+# broker adds in bridge mode therefore name the same host, which is what makes
+# each worker's terminals visible without a per-worker Service.
 #
 # The panel re-reads this file on every /api/fleet request, so edits need no
 # restart. A mounted ConfigMap refreshes on the kubelet's sync period, so a
@@ -29,9 +36,9 @@ data:
       "port": 9889,
       "machines": [
         {
-          "name": "supervisor",
-          "host": "cao-supervisor.cao-cluster.svc.cluster.local",
-          "label": "Supervisor",
+          "name": "server",
+          "host": "cao-server.cao-cluster.svc.cluster.local",
+          "label": "Central server",
           "role": "supervisor"
         }
       ]

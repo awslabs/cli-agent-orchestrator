@@ -24,6 +24,7 @@ from cli_agent_orchestrator.constants import (
     WORKFLOW_RUN_REQUEST_TIMEOUT,
 )
 from cli_agent_orchestrator.mcp_server import utils as mcp_utils
+from cli_agent_orchestrator.mcp_server.caller_context import resolve_caller_terminal_id
 from cli_agent_orchestrator.mcp_server.models import HandoffResult
 from cli_agent_orchestrator.mcp_server.utils import _auth_headers
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -109,7 +110,9 @@ def _send_user_prompt_answer(terminal_id: str, answer: str) -> Dict[str, Any]:
 
     try:
         status_response = requests.get(
-            f"{API_BASE_URL}/terminals/{terminal_id}", timeout=_mcp_timeout()
+            f"{API_BASE_URL}/terminals/{terminal_id}",
+            timeout=_mcp_timeout(),
+            headers=_auth_headers() or None,
         )
         status_response.raise_for_status()
         terminal = status_response.json()
@@ -134,9 +137,10 @@ def _send_user_prompt_answer(terminal_id: str, answer: str) -> Dict[str, Any]:
             f"{API_BASE_URL}/terminals/{terminal_id}/input",
             params={
                 "message": answer,
-                "sender_id": os.environ.get("CAO_TERMINAL_ID", "supervisor"),
+                "sender_id": resolve_caller_terminal_id() or "supervisor",
             },
             timeout=_mcp_timeout(),
+            headers=_auth_headers() or None,
         )
         response.raise_for_status()
         return {
@@ -165,6 +169,7 @@ def _try_send_hermes_prompt_answer(terminal_id: str, answer: str) -> Optional[Di
         f"{API_BASE_URL}/terminals/{terminal_id}/output",
         params={"mode": "full"},
         timeout=_mcp_timeout(),
+        headers=_auth_headers() or None,
     )
     output_response.raise_for_status()
     output = output_response.json().get("output", "")
@@ -210,6 +215,7 @@ def _send_terminal_key(terminal_id: str, key: str) -> None:
         f"{API_BASE_URL}/terminals/{terminal_id}/key",
         params={"key": key},
         timeout=_mcp_timeout(),
+        headers=_auth_headers() or None,
     )
     response.raise_for_status()
 
@@ -219,9 +225,10 @@ def _send_terminal_input(terminal_id: str, message: str) -> None:
         f"{API_BASE_URL}/terminals/{terminal_id}/input",
         params={
             "message": message,
-            "sender_id": os.environ.get("CAO_TERMINAL_ID", "supervisor"),
+            "sender_id": resolve_caller_terminal_id() or "supervisor",
         },
         timeout=_mcp_timeout(),
+        headers=_auth_headers() or None,
     )
     response.raise_for_status()
 
@@ -229,7 +236,9 @@ def _send_terminal_input(terminal_id: str, message: str) -> None:
 def _load_skill_impl(name: str) -> Union[str, Dict[str, Any]]:
     """Fetch a skill body from cao-server and return content or a structured error."""
     try:
-        response = requests.get(f"{API_BASE_URL}/skills/{name}", timeout=_mcp_timeout())
+        response = requests.get(
+            f"{API_BASE_URL}/skills/{name}", timeout=_mcp_timeout(), headers=_auth_headers() or None
+        )
         response.raise_for_status()
         return response.json()["content"]
     except requests.HTTPError as exc:
@@ -771,18 +780,37 @@ async def assign_elastic(
         # then posts the task to it, both blocking. This is the longer of the two
         # blocks, so threading only the broker call above would have left the
         # serialisation almost entirely in place.
-        result = await asyncio.to_thread(
-            _assign_impl,
-            agent_profile,
-            worker_message,
-            str(lease["working_directory"]),
-            engine=engine,
-            model=model,
-            target_host=str(lease["target_host"]),
-            ready_wait_seconds=_elastic_ready_wait(),
-            callback_url=os.environ.get(ELASTIC_CALLBACK_URL_ENV) or None,
-            remote_session_name=str(lease["session_name"]),
-        )
+        # A bridge-mode lease (#745) names a runtime the CENTRAL server routes
+        # to over the channel — no per-worker Service or cao-server exists, so
+        # the launch goes through POST /runtimes/{id}/terminals instead of the
+        # worker's own /sessions.
+        if lease.get("mode") == "bridge":
+            result = await asyncio.to_thread(
+                _assign_impl,
+                agent_profile,
+                worker_message,
+                str(lease["working_directory"]),
+                engine=engine,
+                model=model,
+                runtime_id=str(lease["runtime_id"]),
+                provider=lease.get("provider"),
+                ready_wait_seconds=_elastic_ready_wait(),
+                callback_url=os.environ.get(ELASTIC_CALLBACK_URL_ENV) or None,
+                remote_session_name=str(lease["session_name"]),
+            )
+        else:
+            result = await asyncio.to_thread(
+                _assign_impl,
+                agent_profile,
+                worker_message,
+                str(lease["working_directory"]),
+                engine=engine,
+                model=model,
+                target_host=str(lease["target_host"]),
+                ready_wait_seconds=_elastic_ready_wait(),
+                callback_url=os.environ.get(ELASTIC_CALLBACK_URL_ENV) or None,
+                remote_session_name=str(lease["session_name"]),
+            )
         result["worker_id"] = worker_id
         result["elastic"] = True
         if not result.get("success"):
@@ -900,7 +928,7 @@ async def emit_ui(
     Returns:
         Dict with the emitted event id and component name.
     """
-    terminal_id = os.getenv("CAO_TERMINAL_ID")
+    terminal_id = resolve_caller_terminal_id()
     response = requests.post(
         f"{API_BASE_URL}/agui/v1/emit_ui",
         json={
@@ -909,6 +937,7 @@ async def emit_ui(
             "terminal_id": terminal_id,
         },
         timeout=_mcp_timeout(),
+        headers=_auth_headers() or None,
     )
     if response.status_code == 400:
         raise ValueError(_extract_error_detail(response, "invalid UI intent"))
@@ -1094,7 +1123,7 @@ def _own_terminal_id_or_error(action: str) -> Union[str, Dict[str, Any]]:
     model could set — the same trust mechanism ``send_message``/``handoff``
     already rely on (#432).
     """
-    own_terminal_id = os.environ.get("CAO_TERMINAL_ID")
+    own_terminal_id = resolve_caller_terminal_id()
     if not own_terminal_id:
         return {
             "success": False,
@@ -1123,7 +1152,9 @@ def _require_discovery_marker(own_terminal_id: str, action: str) -> Optional[Dic
     """
     try:
         response = requests.get(
-            f"{API_BASE_URL}/terminals/{own_terminal_id}", timeout=_mcp_timeout()
+            f"{API_BASE_URL}/terminals/{own_terminal_id}",
+            timeout=_mcp_timeout(),
+            headers=_auth_headers() or None,
         )
         response.raise_for_status()
         allowed_tools = response.json().get("allowed_tools")
@@ -1173,6 +1204,7 @@ def _list_siblings_impl(depth: Optional[int], cross_session: bool = False) -> Di
             f"{API_BASE_URL}/terminals/{own_terminal_id}/siblings",
             params=params,
             timeout=_mcp_timeout(),
+            headers=_auth_headers() or None,
         )
         response.raise_for_status()
         return {"success": True, "siblings": response.json()}
@@ -1198,6 +1230,7 @@ def _update_metadata_impl(metadata: Dict[str, Any]) -> Dict[str, Any]:
             f"{API_BASE_URL}/terminals/{own_terminal_id}/metadata",
             json={"metadata": metadata},
             timeout=_mcp_timeout(),
+            headers=_auth_headers() or None,
         )
         response.raise_for_status()
         return {"success": True, "metadata": response.json().get("metadata")}
@@ -1479,7 +1512,7 @@ def _tool_denied_reason(tool_name: str) -> Optional[str]:
     established here from the environment rather than inferred from the
     absence of an exception.
     """
-    if not os.environ.get("CAO_TERMINAL_ID"):
+    if not resolve_caller_terminal_id():
         return None
 
     try:
@@ -2011,15 +2044,33 @@ async def store_lesson(
         # terminal_id) still identify the actual caller.
         lesson_context = {**terminal_context, "agent_profile": target}
 
-        service = MemoryService()
-        memory = await service.store(
-            content=content,
-            scope="agent",
-            memory_type="feedback",
-            key=key,
-            tags=tags or "",
-            terminal_context=lesson_context,
+        # In a remote runtime (CAO_MEMORY_API_URL set, #745) the write goes
+        # through the gateway — a direct MemoryService write would land in the
+        # pod's throwaway local store, silently divergent from the central one.
+        from cli_agent_orchestrator.services.memory_gateway import (
+            remote_memory_url,
+            store_memory,
         )
+
+        if remote_memory_url():
+            memory = await store_memory(
+                content=content,
+                scope="agent",
+                memory_type="feedback",
+                key=key,
+                tags=tags or "",
+                terminal_context=lesson_context,
+            )
+        else:
+            service = MemoryService()
+            memory = await service.store(
+                content=content,
+                scope="agent",
+                memory_type="feedback",
+                key=key,
+                tags=tags or "",
+                terminal_context=lesson_context,
+            )
         return {
             "success": True,
             "key": memory.key,
@@ -2095,6 +2146,7 @@ async def workflow_return(
             f"{API_BASE_URL}/workflows/runs/{run_id}/steps/{step_id}/output",
             json=payload,
             timeout=_mcp_timeout(),
+            headers=_auth_headers() or None,
         )
     except requests.RequestException as e:
         return ReturnAck(
@@ -2172,6 +2224,7 @@ async def workflow_run(
             f"{API_BASE_URL}/workflows/runs",
             json=payload,
             timeout=WORKFLOW_RUN_REQUEST_TIMEOUT,
+            headers=_auth_headers() or None,
         )
     except requests.RequestException as e:
         return {"ok": False, "error": f"could not reach cao-server: {e}"}
@@ -2259,6 +2312,7 @@ async def workflow_resume(
             f"{API_BASE_URL}/workflows/runs/{run_id}/resume",
             json={"decisions": dict(supplied)} if supplied else None,
             timeout=WORKFLOW_RUN_REQUEST_TIMEOUT,
+            headers=_auth_headers() or None,
         )
     except requests.RequestException as e:
         return {"ok": False, "error": f"could not reach cao-server: {e}"}
@@ -2291,6 +2345,7 @@ async def workflow_cancel(
         response = requests.post(
             f"{API_BASE_URL}/workflows/runs/{run_id}/cancel",
             timeout=_mcp_timeout(),
+            headers=_auth_headers() or None,
         )
     except requests.RequestException as e:
         return {"ok": False, "error": f"could not reach cao-server: {e}"}
@@ -2356,6 +2411,7 @@ async def workflow_start(
             f"{API_BASE_URL}/workflows/runs:submit",
             json=payload,
             timeout=_mcp_timeout(),
+            headers=_auth_headers() or None,
         )
     except requests.RequestException as e:
         return {"ok": False, "error": f"could not reach cao-server: {e}"}
@@ -2409,6 +2465,7 @@ async def workflow_plan_approval(
         response = requests.get(
             f"{API_BASE_URL}/workflows/runs/{run_id}/plan",
             timeout=_mcp_timeout(),
+            headers=_auth_headers() or None,
         )
     except requests.RequestException as e:
         return {"ok": False, "error": f"could not reach cao-server: {e}"}
@@ -2445,6 +2502,7 @@ async def workflow_status(
         response = requests.get(
             f"{API_BASE_URL}/workflows/runs/{run_id}",
             timeout=_mcp_timeout(),
+            headers=_auth_headers() or None,
         )
     except requests.RequestException as e:
         return {"ok": False, "error": f"could not reach cao-server: {e}"}
@@ -2485,6 +2543,7 @@ async def workflow_result(
         response = requests.get(
             f"{API_BASE_URL}/workflows/runs/{run_id}/result",
             timeout=_mcp_timeout(),
+            headers=_auth_headers() or None,
         )
     except requests.RequestException as e:
         return {"ok": False, "error": f"could not reach cao-server: {e}"}
@@ -2518,6 +2577,7 @@ async def workflow_list(
             f"{API_BASE_URL}/workflows/runs",
             params=params,
             timeout=_mcp_timeout(),
+            headers=_auth_headers() or None,
         )
     except requests.RequestException as e:
         return {"ok": False, "error": f"could not reach cao-server: {e}"}
@@ -2555,6 +2615,7 @@ async def workflow_wait(
             response = requests.get(
                 f"{API_BASE_URL}/workflows/runs/{run_id}",
                 timeout=_mcp_timeout(),
+                headers=_auth_headers() or None,
             )
         except requests.RequestException as e:
             return {"ok": False, "error": f"could not reach cao-server: {e}"}
@@ -2581,6 +2642,7 @@ async def workflow_wait(
         result_response = requests.get(
             f"{API_BASE_URL}/workflows/runs/{run_id}/result",
             timeout=_mcp_timeout(),
+            headers=_auth_headers() or None,
         )
     except requests.RequestException as e:
         return {"ok": False, "error": f"could not reach cao-server: {e}"}
@@ -2619,7 +2681,11 @@ def _classify_events_404(run_id: str, detail: str) -> tuple:
     than asserting a server capability it could not verify.
     """
     try:
-        probe = requests.get(f"{API_BASE_URL}/workflows/runs/{run_id}", timeout=_mcp_timeout())
+        probe = requests.get(
+            f"{API_BASE_URL}/workflows/runs/{run_id}",
+            timeout=_mcp_timeout(),
+            headers=_auth_headers() or None,
+        )
     except requests.RequestException:
         return detail, False
     if probe.status_code == 200:
@@ -2833,8 +2899,29 @@ register_mcp_server_surfaces(mcp)
 
 
 def main():
-    """Main entry point for the MCP server."""
-    mcp.run()
+    """Main entry point for the MCP server.
+
+    Transport is selected by ``CAO_MCP_TRANSPORT`` (default ``stdio`` — one
+    process per agent, identity from the process env, unchanged). Set it to
+    ``http`` for the shared Streamable HTTP endpoint (#745): one process serves
+    many agents, authenticated per request with a shared runtime token and a
+    per-request caller identity.
+
+    A stdio-only provider reaches the shared endpoint through
+    ``cao-mcp-stdio-bridge`` (see ``stdio_bridge.py``): point the provider's
+    configured command at the shim and the ``CAO_TERMINAL_ID`` it already
+    injects becomes the per-request caller identity. Shipped profiles still
+    declare plain ``cao-mcp-server``, so stdio hosting remains the default and
+    the shared endpoint is opt-in per deployment.
+    """
+    transport = os.environ.get("CAO_MCP_TRANSPORT", "stdio").strip().lower()
+    if transport == "http":
+        from cli_agent_orchestrator.mcp_server.http_hosting import build_http_app
+
+        app, host, port = build_http_app(mcp)
+        app.run(transport="http", host=host, port=port)
+    else:
+        mcp.run()
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ Both must produce the same ordered terminal-layer calls (create -> readiness
 wait -> send_input -> completion poll -> get_output LAST -> delete). No latency
 assertion (Q7=A): equivalence is proven functionally, not by timing.
 
-Completion is a ``status_monitor.get_status`` poll (issue #409a: a post-input
+Completion is an ``effective_status`` poll (issue #409a: a post-input
 IDLE is a valid completion signal alongside COMPLETED), NOT a second
 ``wait_until_status`` call — the recorder captures that poll as ``"poll"``.
 """
@@ -72,7 +72,7 @@ class _SequenceRecorder:
             patch(f"{_STEP}.terminal_service.get_output", side_effect=_get_output),
             patch(f"{_STEP}.terminal_service.delete_terminal", side_effect=_delete),
             patch(f"{_STEP}.wait_until_status", new=AsyncMock(side_effect=_wait)),
-            patch(f"{_STEP}.status_monitor.get_status", side_effect=_poll),
+            patch(f"{_STEP}.effective_status", side_effect=_poll),
         ]
 
     def kinds(self):
@@ -104,7 +104,7 @@ class TestEngineHandoffEquivalence:
             "create",
             "wait",  # readiness
             "send_input",
-            "poll",  # completion (status_monitor.get_status; issue #409a)
+            "poll",  # completion (effective_status; issue #409a)
             "get_output",
             "delete",
         ]

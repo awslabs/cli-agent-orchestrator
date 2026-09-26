@@ -12,6 +12,11 @@ import click
 from cli_agent_orchestrator.constants import MEMORY_ARCHIVE_DEFAULT_FORMAT
 from cli_agent_orchestrator.models.memory import MemoryScope, MemoryType
 from cli_agent_orchestrator.services.memory_service import MemoryDisabledError, MemoryService
+from cli_agent_orchestrator.utils.remote_server import (
+    api_request,
+    is_remote_server,
+    require_local,
+)
 
 
 def _get_memory_service() -> MemoryService:
@@ -68,6 +73,7 @@ def memory():
 )
 def repair_cmd(do_apply, receipt_id):
     """Reconcile surviving canonical topics into SQLite and index.md."""
+    require_local("cao memory repair")
     from cli_agent_orchestrator.services.memory_reconciliation import (
         MemoryReconciliationError,
         MemoryReconciliationService,
@@ -384,22 +390,50 @@ def list_memories(scope, memory_type, scan_all):
     By default shows global memories and memories for the current working directory.
     Use --all to show memories across all projects.
     """
-    svc = _get_memory_service()
-    try:
-        terminal_context = {"cwd": os.path.realpath(os.getcwd())}
-        memories = _run_async(
-            svc.recall(
-                scope=scope,
-                memory_type=memory_type,
-                limit=100,
-                terminal_context=terminal_context,
-                scan_all=scan_all,
+    if is_remote_server():
+        # The server has no client cwd: listing is scan-all by definition.
+        params = {"limit": 100}
+        if scope:
+            params["scope"] = scope
+        if memory_type:
+            params["type"] = memory_type
+        rows = [
+            (
+                m["key"],
+                m["scope"],
+                m["memory_type"],
+                m["tags"] or "",
+                m["updated_at"][:16].replace("T", " "),
             )
-        )
-    except Exception as e:
-        raise click.ClickException(str(e))
+            for m in api_request("get", "/memory", params=params).json()
+        ]
+    else:
+        svc = _get_memory_service()
+        try:
+            terminal_context = {"cwd": os.path.realpath(os.getcwd())}
+            memories = _run_async(
+                svc.recall(
+                    scope=scope,
+                    memory_type=memory_type,
+                    limit=100,
+                    terminal_context=terminal_context,
+                    scan_all=scan_all,
+                )
+            )
+        except Exception as e:
+            raise click.ClickException(str(e))
+        rows = [
+            (
+                mem.key,
+                mem.scope,
+                mem.memory_type,
+                mem.tags if mem.tags else "",
+                mem.updated_at.strftime("%Y-%m-%d %H:%M"),
+            )
+            for mem in memories
+        ]
 
-    if not memories:
+    if not rows:
         click.echo("No memories found.")
         return
 
@@ -408,10 +442,8 @@ def list_memories(scope, memory_type, scan_all):
     click.echo(header)
     click.echo("-" * len(header))
 
-    for mem in memories:
-        updated = mem.updated_at.strftime("%Y-%m-%d %H:%M")
-        tags = mem.tags if mem.tags else ""
-        click.echo(f"{mem.key:<30} {mem.scope:<10} {mem.memory_type:<12} {tags:<20} {updated}")
+    for key, mem_scope, mem_type, tags, updated in rows:
+        click.echo(f"{key:<30} {mem_scope:<10} {mem_type:<12} {tags:<20} {updated}")
 
 
 @memory.command()
@@ -425,6 +457,18 @@ def list_memories(scope, memory_type, scan_all):
 def show(key, scope):
     """Display full content of a memory."""
     _validate_key(key)
+    if is_remote_server():
+        params = {"scope": scope} if scope else {}
+        m = api_request("get", f"/memory/{key}", params=params).json()
+        click.echo(f"Key:     {m['key']}")
+        click.echo(f"Scope:   {m['scope']}")
+        click.echo(f"Type:    {m['memory_type']}")
+        click.echo(f"Tags:    {m['tags'] or '(none)'}")
+        click.echo(f"Created: {m['created_at'][:19].replace('T', ' ')}")
+        click.echo(f"Updated: {m['updated_at'][:19].replace('T', ' ')}")
+        click.echo()
+        click.echo(m["content"])
+        return
     svc = _get_memory_service()
     try:
         memories = _run_async(
@@ -464,16 +508,33 @@ def show(key, scope):
     default="project",
     help="Scope of the memory to delete (default: project).",
 )
+@click.option(
+    "--scope-id",
+    default=None,
+    help="Explicit scope id (required for non-global scopes against a shared server).",
+)
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt.")
-def delete(key, scope, yes):
+def delete(key, scope, scope_id, yes):
     """Delete a memory by key."""
     _validate_key(key)
     if not yes:
         click.confirm(f"Delete memory '{key}'?", abort=True)
 
+    if is_remote_server():
+        # The server has no client cwd for scope resolution: non-global scopes
+        # need an explicit scope_id (the server rejects the call otherwise).
+        params = {"scope": scope}
+        if scope_id:
+            params["scope_id"] = scope_id
+        api_request("delete", f"/memory/{key}", params=params)
+        click.echo(f"Deleted memory '{key}' (scope: {scope}).")
+        return
+
     svc = _get_memory_service()
     try:
-        deleted = _run_async(svc.forget(key=key, scope=scope, terminal_context=_cwd_context()))
+        deleted = _run_async(
+            svc.forget(key=key, scope=scope, terminal_context=_cwd_context(), scope_id=scope_id)
+        )
     except Exception as e:
         raise click.ClickException(str(e))
 
@@ -496,11 +557,24 @@ def delete(key, scope, yes):
     required=True,
     help="Scope to clear (required). One of: global, project, session, agent, federated.",
 )
+@click.option(
+    "--scope-id",
+    default=None,
+    help="Explicit scope id (shared-server mode: targets one project/session/agent).",
+)
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt.")
-def clear(scope, yes):
+def clear(scope, scope_id, yes):
     """Clear all memories for a given scope. Requires --scope."""
     if not yes:
         click.confirm(f"Clear all {scope}-scoped memories?", abort=True)
+
+    if is_remote_server():
+        params = {"scope": scope}
+        if scope_id:
+            params["scope_id"] = scope_id
+        result = api_request("delete", "/memory", params=params).json()
+        click.echo(f"Cleared {result.get('deleted_count', 0)} {scope}-scoped memory(ies).")
+        return
 
     svc = _get_memory_service()
     ctx = _cwd_context()
@@ -558,6 +632,7 @@ def lint_cmd(scope, out_format):
       1  one or more error-severity issues found
       2  CLI / project resolution failure (handled by Click)
     """
+    require_local("cao memory lint")
     import json as _json
 
     from cli_agent_orchestrator.services import settings_service
@@ -661,6 +736,7 @@ def compact_cmd(scope, key):
     (claude / codex / kiro-cli); requires no API key. Compiles run one at a
     time and can take a minute or two each.
     """
+    require_local("cao memory compact")
     if key is not None:
         key = _validate_key(key)
 
@@ -735,6 +811,7 @@ def heal_cmd(scope, do_apply, aggressive, issue_type, out_format):
     poison_frequency healing additionally requires --aggressive.
     graph_density is flag-only and never mutated.
     """
+    require_local("cao memory heal")
     import json as _json
 
     from cli_agent_orchestrator.services import settings_service, wiki_healer
@@ -893,6 +970,25 @@ def export_cmd(fmt, scope, output, include_private, include_history, redact, pru
             f"scope '{scope}' holds private working state; pass --include-private to export it"
         )
 
+    if is_remote_server():
+        # The server streams a tarball; directory output and prune are
+        # client-filesystem semantics it does not support.
+        if prune:
+            require_local("cao memory export --prune")
+        if not output.endswith(".tar.gz"):
+            raise click.ClickException(
+                "shared-server export writes a .tar.gz archive; pass -o <file>.tar.gz"
+            )
+        params = {"scope": scope, "format": fmt}
+        if include_history:
+            params["include_history"] = "true"
+        if redact:
+            params["redact"] = "true"
+        resp = api_request("get", "/memory/export", params=params)
+        Path(output).write_bytes(resp.content)
+        click.echo(f"Exported scope '{scope}' to {output}")
+        return
+
     svc = _get_memory_service()
     scope_id = _resolve_export_scope_id(svc, scope)
 
@@ -969,6 +1065,7 @@ def export_cmd(fmt, scope, output, include_private, include_history, redact, pru
 )
 def import_cmd(path, fmt, scope, conflict, dry_run):
     """Import an archive bundle directory into a memory scope."""
+    require_local("cao memory import")
     svc = _get_memory_service()
     try:
         report = svc.import_memories(
@@ -1087,6 +1184,7 @@ def promote_cmd(agent_name, do_apply, min_recalls, profile_path):
     delimited '## Learned Patterns' block. Dry-run by DEFAULT — pass --apply
     to mutate. Requires memory.instruction_promotion_enabled=true.
     """
+    require_local("cao memory promote")
     from cli_agent_orchestrator.services.learned_patterns import MAX_LESSONS
     from cli_agent_orchestrator.services.promotion_service import (
         DEFAULT_MIN_ACCESS_COUNT,
@@ -1162,6 +1260,7 @@ def _resolve_cli_scope_id(svc, scope: str):
 @memory.group(name="relationships")
 def relationships():
     """Inspect and curate typed memory relationships (issue #511)."""
+    require_local("cao memory relationships")
 
 
 @relationships.command(name="list")

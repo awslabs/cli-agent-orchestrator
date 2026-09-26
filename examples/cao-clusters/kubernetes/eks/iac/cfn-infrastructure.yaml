@@ -497,8 +497,27 @@ Resources:
         # expects it.
         AuthenticationMode: API_AND_CONFIG_MAP
         # Grants cluster-admin to whoever deploys this stack, so kubectl works
-        # immediately afterwards with no extra wiring.
-        BootstrapClusterCreatorAdminPermissions: true
+        # immediately afterwards with no extra wiring — but ONLY when no explicit
+        # admin principal was named.
+        #
+        # EKS creates a real access entry for the creator when this is true, and
+        # `ClusterAdminAccessEntry` below creates one for
+        # `ClusterAdminPrincipalArn`. When those are the same principal — which is
+        # what the README's own snippet produces for anyone deploying as
+        # themselves — the second one collides with the first and the stack fails
+        # partway through with `The specified access entry resource is already in
+        # use on this cluster` (409 AlreadyExists), after the VPC, the cluster and
+        # the KMS key are already built. Measured on a real deploy, not inferred.
+        #
+        # Turning bootstrap off whenever an explicit principal is given leaves
+        # exactly one entry in both cases: the explicit one. In the Workshop
+        # Studio case that is the participant role rather than the provisioning
+        # role, which is the whole point of the parameter; deploying as yourself
+        # grants the same admin by the same route.
+        BootstrapClusterCreatorAdminPermissions: !If
+          - HasClusterAdminPrincipal
+          - false
+          - true
       # `secrets` is the only resource EKS supports here.
       EncryptionConfig:
         - Resources:
@@ -706,6 +725,18 @@ Resources:
             Action:
               - bedrock:InvokeModel
               - bedrock:InvokeModelWithResponseStream
+            Resource: "*"
+          # codex does NOT use the invoke API. It speaks OpenAI's Responses
+          # protocol, which Bedrock exposes at `/openai/v1/responses` behind a
+          # separate action in its own service prefix. Granting
+          # `bedrock:InvokeModel` and stopping there produces an AccessDenied
+          # naming `bedrock-mantle:CreateInference`, which does not appear in
+          # any Bedrock policy example and reads like a typo rather than a
+          # missing grant. Harmless on the Claude-only path: nothing calls it.
+          - Sid: InvokeOpenAiResponsesApi
+            Effect: Allow
+            Action:
+              - bedrock-mantle:CreateInference
             Resource: "*"
           # Claude Code probes inference profiles during startup.
           - Sid: ReadModelCatalogue
@@ -960,6 +991,63 @@ Resources:
   # server image is a ~310 MiB arm64 build carrying a provider CLI, the broker is
   # python:3.12-slim plus one file. Same tag in both, always, since one CodeBuild
   # run builds both from one commit.
+  # The CENTRAL SERVER's image, built from the same Dockerfile with
+  # INSTALL_EXECUTION_BACKEND=0: no tmux, no provider CLI. A separate repository
+  # because the two images have genuinely different contents and ECR tags here are
+  # IMMUTABLE, so they cannot share a name. Keeping the execution backend out of
+  # the pod that holds the database and the broker credentials is the point
+  # (Copilot review on #802).
+  ControlPlaneRepository:
+    Type: AWS::ECR::Repository
+    # CKV_AWS_136 wants EncryptionConfiguration with a KMS CMK. Suppressed rather
+    # than implemented, unlike the etcd key above, and the difference is the
+    # threat: this repository holds images built from a public git repo and public
+    # package registries, so there is no secret material in it. A CMK would mean
+    # granting kms:Decrypt on the IMAGE PULL path, and a missing grant there
+    # surfaces as ImagePullBackOff on a pod that pulled fine yesterday.
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_136
+            comment: >-
+              Repository holds images built from public sources and is already
+              encrypted at rest with AES256. A CMK would add a kms:Decrypt grant
+              to the image-pull path for no confidentiality gain.
+    Properties:
+      RepositoryName: !Sub "${NamePrefix}-control-plane"
+      ImageTagMutability: IMMUTABLE
+      # Without this the stack cannot be deleted. ECR refuses to drop a repository
+      # that still holds images, and the build steps in README.md push one here, so
+      # a delete-stack ALWAYS hits `cannot be deleted because it still contains
+      # images` and leaves the stack DELETE_FAILED - taking the VPC with it,
+      # because the subnets fail alongside it. Observed on the first teardown of
+      # the workshop twin of this template.
+      EmptyOnDelete: true
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Expire untagged images after 14 days",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 14
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+  # The broker image, from Dockerfile.broker. A separate repository rather
+  # than a second tag in the one above, because the two images share nothing: the
+  # server image is a ~310 MiB arm64 build carrying a provider CLI, the broker is
+  # python:3.12-slim plus one file. Same tag in both, always, since one CodeBuild
+  # run builds both from one commit.
   WorkerBrokerRepository:
     Type: AWS::ECR::Repository
     # Same CKV_AWS_136 reasoning as ServerRepository above.
@@ -1163,6 +1251,13 @@ Outputs:
   ServerRepositoryUri:
     Description: Push the CAO server image here, and use it in ../kustomization.yaml.
     Value: !GetAtt ServerRepository.RepositoryUri
+
+  ControlPlaneRepositoryUri:
+    Description: >-
+      Push the control-plane image here (built with
+      --build-arg INSTALL_EXECUTION_BACKEND=0). ../deploy.sh reads this and falls
+      back to the executor image when this output is absent.
+    Value: !GetAtt ControlPlaneRepository.RepositoryUri
 
   WorkerBrokerRepositoryUri:
     Description: Push the worker-broker image here. ../deploy.sh reads this.

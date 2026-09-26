@@ -33,10 +33,9 @@ from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStat
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
 from cli_agent_orchestrator.services import frozen_run_memory, terminal_service
-from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_fingerprint import StepCallFields, compute
 from cli_agent_orchestrator.services.terminal_service import OutputMode
-from cli_agent_orchestrator.utils.terminal import wait_until_status
+from cli_agent_orchestrator.utils.terminal import effective_status, wait_until_status
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +70,46 @@ _IDLE_STABLE_POLLS = 3
 # startup latency — tune them together.
 _PROMPT_PICKUP_GRACE = 8.0
 _PROMPT_REDELIVER_MAX = 3
+
+
+def _is_remote(terminal_id: str) -> bool:
+    """Does this terminal's pane live in an execution runtime rather than here?
+
+    Imported lazily and wrapped so the step path has one name for the question
+    and the registry stays out of this module's import graph.
+    """
+    from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
+
+    return runtime_registry.is_remote(terminal_id)
+
+
+def _caller_runtime(caller_id: Optional[str]) -> Optional[str]:
+    """The runtime the CALLER executes in, or ``None`` when it is local.
+
+    Gated on ``is_remote`` first, which fails closed to remote/unknown when the
+    placement row cannot be read: ``runtime_for_terminal`` alone returns ``None``
+    both for a genuinely local caller and for a remote one whose lookup just
+    failed, and treating the second as local is what sends a worker into the
+    wrong container. A remote caller whose runtime cannot be resolved raises
+    rather than silently degrading to a local create.
+    """
+    if not caller_id:
+        return None
+
+    from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
+
+    # One atomic observation of placement: asking is_remote() and then
+    # runtime_for_terminal() let a concurrent bind/unbind on the channel loop split
+    # the answer in two (Copilot review on #802).
+    is_remote, runtime_id = runtime_registry.placement(caller_id)
+    if not is_remote:
+        return None
+    if runtime_id is None:
+        raise RuntimeError(
+            f"caller '{caller_id}' executes in a runtime but its placement is "
+            "currently unavailable; refusing to create the step's terminal locally"
+        )
+    return runtime_id
 
 
 async def _validate_reused_terminal(
@@ -163,10 +202,15 @@ async def _wait_for_completion(
     *,
     prompt: Optional[str] = None,
 ) -> None:
-    """Wait for a post-input step to settle, polling ``status_monitor`` (issue #409).
+    """Wait for a post-input step to settle, polling ``effective_status`` (issue #409).
 
     Called strictly AFTER the prompt has been sent, so IDLE here can never be the
     pre-input readiness IDLE the caller already waited past.
+
+    The poll goes through ``effective_status``, not ``status_monitor``, so a step
+    driving a terminal in an execution runtime reads the status that runtime
+    reported rather than a local detector's permanent UNKNOWN (#745, review
+    finding 4 on #802).
 
     Completion signals (issue #409a):
 
@@ -225,7 +269,7 @@ async def _wait_for_completion(
 
         # Off the event loop — get_status() can shell out to a real tmux capture-pane
         # subprocess (status_monitor.py's stale-PROCESSING fallback) or a herdr CLI call.
-        current = await asyncio.to_thread(status_monitor.get_status, terminal_id)
+        current = await asyncio.to_thread(effective_status, terminal_id)
         if current == TerminalStatus.ERROR:
             raise StepExecutionError(
                 f"terminal {terminal_id} reached ERROR status",
@@ -259,9 +303,7 @@ async def _wait_for_completion(
         if time.monotonic() >= deadline:
             # Defensive: a terminal that flipped to ERROR right at the deadline is
             # a crash, not a slow run (preserve the kind="error" vs "timeout" split).
-            if (
-                await asyncio.to_thread(status_monitor.get_status, terminal_id)
-            ) == TerminalStatus.ERROR:
+            if (await asyncio.to_thread(effective_status, terminal_id)) == TerminalStatus.ERROR:
                 raise StepExecutionError(
                     f"terminal {terminal_id} reached ERROR status",
                     kind="error",
@@ -287,6 +329,13 @@ async def _wait_for_completion(
         # duplicate a task the worker already ran. Probe-capable providers
         # keep the full re-send; the rest keep the bare-Enter recovery,
         # which cannot duplicate a task.
+        #
+        # Never for a remote terminal: every branch of the helper is local tmux
+        # I/O — capture-pane to see whether the text is still in the composer, a
+        # direct probe of the pane's process — against a socket this host does
+        # not own. It would read another pane or raise, and "the text is not
+        # visible" is exactly the condition that triggers the full re-send, so a
+        # remote worker's task could be typed twice (#745).
         if (
             prompt is not None
             and not delivery_verified
@@ -294,6 +343,7 @@ async def _wait_for_completion(
             and current == TerminalStatus.IDLE
             and redeliveries < _PROMPT_REDELIVER_MAX
             and time.monotonic() - last_send >= _PROMPT_PICKUP_GRACE
+            and not _is_remote(terminal_id)
         ):
             redeliveries += 1
             last_send = time.monotonic()
@@ -419,6 +469,27 @@ async def resolve_effective_working_directory(
             exc,
         )
     return working_directory
+
+
+def caller_owner_id(caller_id: Optional[str]) -> Optional[str]:
+    """The canonical owner id recorded for ``caller_id``, or ``None`` if unknown.
+
+    Read from the server's own ``terminals.owner`` column — never from the
+    agent-writable metadata bag, and never from anything the caller presented.
+    ``None`` (no row, no owner recorded, an unparseable value) stays None:
+    unknown is not revoked, and inventing an owner would be worse than the gap.
+    """
+    if not caller_id:
+        return None
+    try:
+        from cli_agent_orchestrator.clients.database import get_terminal_metadata
+
+        row = get_terminal_metadata(caller_id)
+    except Exception as exc:  # noqa: BLE001 — ownership inheritance is best-effort
+        logger.warning("could not read owner for caller %s: %s", caller_id, exc)
+        return None
+    owner = (row or {}).get("owner")
+    return str(owner) if owner else None
 
 
 async def run_agent_step(
@@ -667,21 +738,66 @@ async def run_agent_step(
         # path.
         new_session = session_name is None
 
-        # create_terminal already runs provider.initialize() (which waits for
-        # IDLE); a failure raises (ValueError/TimeoutError) and propagates.
-        terminal = await terminal_service.create_terminal(
-            provider,
-            agent,
-            session_name=session_name,
-            new_session=new_session,
-            working_directory=working_directory,
-            allowed_tools=allowed_tools,
-            caller_id=caller_id,
-            env_vars=env_vars,
-            engine=engine,
-            model=model,
-            use_worktree=use_worktree,
-        )
+        # #745: the caller may be an agent executing in a runtime rather than in
+        # this container. Its tmux session lives THERE, so creating the step's
+        # terminal here fails with "Session '<name>' not found" — and that is
+        # exactly what a handoff from a remote supervisor did: assign goes
+        # through POST /sessions/{name}/terminals, which is runtime-aware, while
+        # this path called the local service directly and so was not. Reproduced
+        # on EKS: the three assigns succeeded and the report_generator handoff
+        # failed on the missing session. The worker also belongs in the same
+        # runtime as the agent that asked for it, beside the session it joins.
+        caller_runtime = _caller_runtime(caller_id)
+        if caller_runtime is not None:
+            from cli_agent_orchestrator.runtime_channel.api import (
+                CreateRemoteTerminalBody,
+                launch_remote_terminal,
+            )
+
+            terminal = await launch_remote_terminal(
+                caller_runtime,
+                CreateRemoteTerminalBody(
+                    # The caller's own provider, NOT one resolved against this
+                    # container's profile store — the agent runs off the
+                    # runtime's own `cao install` (review finding 8 on #802).
+                    provider=provider,
+                    agent_profile=agent,
+                    session_name=session_name,
+                    new_session=new_session,
+                    working_directory=working_directory,
+                    allowed_tools=allowed_tools,
+                    caller_id=caller_id,
+                    env_vars=env_vars,
+                    engine=str(engine) if engine is not None else None,
+                    model=model,
+                    use_worktree=use_worktree,
+                ),
+                # Server-written and INHERITED FROM THE CALLER. Passing None
+                # persisted the worker centrally with no owner, so its callback
+                # was "unknown" to the owner/revocation gate and work dispatched
+                # by a revoked caller would deliver instead of being held
+                # (Copilot review on #802). Read from the caller's own row, never
+                # from anything the agent presented, and deliberately NOT included
+                # in the LAUNCH payload: an identity handed to an executor is an
+                # identity it could re-present.
+                owner_id=caller_owner_id(caller_id),
+            )
+        else:
+            # create_terminal already runs provider.initialize() (which waits for
+            # IDLE); a failure raises (ValueError/TimeoutError) and propagates.
+            terminal = await terminal_service.create_terminal(
+                provider,
+                agent,
+                session_name=session_name,
+                new_session=new_session,
+                working_directory=working_directory,
+                allowed_tools=allowed_tools,
+                caller_id=caller_id,
+                env_vars=env_vars,
+                engine=engine,
+                model=model,
+                use_worktree=use_worktree,
+            )
         terminal_id = terminal.id
 
         # BR-31: make the terminal this call just made visible to U4's orphan
@@ -784,9 +900,7 @@ async def run_agent_step(
     # Clean up a terminal owned by this call if output extraction fails. Reused
     # terminals remain owned by the caller.
     try:
-        last_message = await asyncio.to_thread(
-            terminal_service.get_output, terminal_id, OutputMode.LAST
-        )
+        last_message = await _extract_last_message(terminal_id)
     except BaseException:
         if teardown and created_here:
             await _best_effort_teardown(terminal_id, registry)
@@ -825,6 +939,33 @@ async def run_agent_step(
     return result
 
 
+async def _extract_last_message(terminal_id: str) -> str:
+    """The step's answer: the last agent message from the pane that produced it.
+
+    Local extraction is a tmux capture-pane plus the provider's regex over the
+    scrollback. For a terminal in an execution runtime that scrollback is in
+    another pod, so the EXTRACT command asks the runtime to run the same
+    provider-specific extraction beside its own pane — the identical routing
+    ``GET /terminals/{id}/output`` already does, now on the in-process step path
+    too, which previously returned this host's empty capture (#745, review
+    finding 4 on #802).
+    """
+    if _is_remote(terminal_id):
+        from cli_agent_orchestrator.runtime_channel import api as runtime_channel_api
+        from cli_agent_orchestrator.runtime_channel.protocol import CommandType
+
+        result = await runtime_channel_api.remote_terminal_command(
+            terminal_id,
+            CommandType.EXTRACT,
+            {"mode": OutputMode.LAST.value},
+            timeout=runtime_channel_api.EXTRACT_TIMEOUT,
+        )
+        return result.payload.get("output", "")
+    # Blocking tmux capture plus regex over a potentially large transcript —
+    # seconds for a long conversation — so keep it off the loop.
+    return await asyncio.to_thread(terminal_service.get_output, terminal_id, OutputMode.LAST)
+
+
 async def _best_effort_teardown(terminal_id: str, registry: Optional[PluginRegistry]) -> None:
     """Exit-then-delete a terminal this call created — best-effort (never raises).
 
@@ -833,7 +974,25 @@ async def _best_effort_teardown(terminal_id: str, registry: Optional[PluginRegis
     never turn a settled step (success OR cancellation) into a failure. Shared by
     the success teardown and the cancellation path (issue #409b) so a cancelled
     step reclaims its terminal exactly the way a successful one does.
+
+    A remote terminal is torn down over the channel instead: the tmux session and
+    the pane's provider live in the runtime, so the local sequence would send a
+    graceful exit into nothing and then delete the central row while the worker
+    kept running — a leaked pod holding a model session. TEARDOWN in the runtime
+    also drops the row and the routing binding when it settles.
     """
+    if _is_remote(terminal_id):
+        try:
+            from cli_agent_orchestrator.runtime_channel.api import remote_delete_terminal
+
+            await remote_delete_terminal(terminal_id)
+        except Exception as exc:  # noqa: BLE001 — teardown is best-effort, as below
+            logger.warning(
+                "run_agent_step: failed to tear down remote terminal %s after settle: %s",
+                terminal_id,
+                exc,
+            )
+        return
     try:
         # Graceful CLI shutdown before kill_window (e.g. "/exit" for Claude Code,
         # C-d for others). Off the loop: exit_terminal_cli is blocking tmux I/O.

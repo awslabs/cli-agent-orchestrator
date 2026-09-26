@@ -686,9 +686,17 @@ def install_agent(
                 model=profile.model,
             )
             agent_file = KIRO_AGENTS_DIR / f"{safe_filename}.json"
-            agent_file.write_text(
+            # Owner-only. This file holds the resolved MCP server block, which is
+            # CAO's forwarding configuration for the shared endpoint; the channel
+            # token is no longer written into it (see shared_endpoint_child_env's
+            # `persisted`), but the endpoint and the whole tool surface are still
+            # not something to leave world-readable on a shared host. write_text
+            # used the default umask, so this was 0644 (Copilot review on #802).
+            from cli_agent_orchestrator.utils.atomic_file import write_owner_only
+
+            write_owner_only(
+                agent_file,
                 kiro_agent_config.model_dump_json(indent=2, exclude_none=True),
-                encoding="utf-8",
             )
 
         elif provider == ProviderType.COPILOT_CLI.value:

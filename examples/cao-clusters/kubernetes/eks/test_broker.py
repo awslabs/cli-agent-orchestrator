@@ -18,6 +18,7 @@ a throwaway environment:
 Exits non-zero on the first failing expectation, and prints a PASS/FAIL line per
 check.
 """
+
 import json
 import os
 import sys
@@ -26,21 +27,23 @@ import types
 from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock, patch
 
-os.environ.update({
-    "CAO_ELASTIC_WORKER_IMAGE": "111122223333.dkr.ecr.us-east-1.amazonaws.com/cao-server:2.4.1-cc3",
-    "CAO_ELASTIC_BROKER_TOKEN": "test-token",
-    "CAO_SUPERVISOR_API_URL": "http://cao-supervisor:9889",
-    "CLAUDE_CODE_USE_BEDROCK": "1",
-    "AWS_REGION": "us-east-1",
-    "ANTHROPIC_MODEL": "global.anthropic.claude-opus-4-6-v1",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL": "global.anthropic.claude-opus-4-6-v1",
-    "ANTHROPIC_DEFAULT_SONNET_MODEL": "global.anthropic.claude-opus-4-6-v1",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
-    "CAO_PROVIDER_INIT_TIMEOUT": "180",
-    "CAO_MCP_REQUEST_TIMEOUT": "240",
-    "CAO_ELASTIC_REAPER_INTERVAL": "1",
-    "CAO_ELASTIC_COMPLETION_TIMEOUT": "3",
-})
+os.environ.update(
+    {
+        "CAO_ELASTIC_WORKER_IMAGE": "111122223333.dkr.ecr.us-east-1.amazonaws.com/cao-server:2.4.1-cc3",
+        "CAO_ELASTIC_BROKER_TOKEN": "test-token",
+        "CAO_SUPERVISOR_API_URL": "http://cao-supervisor:9889",
+        "CLAUDE_CODE_USE_BEDROCK": "1",
+        "AWS_REGION": "us-east-1",
+        "ANTHROPIC_MODEL": "global.anthropic.claude-opus-4-6-v1",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": "global.anthropic.claude-opus-4-6-v1",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": "global.anthropic.claude-opus-4-6-v1",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+        "CAO_PROVIDER_INIT_TIMEOUT": "180",
+        "CAO_MCP_REQUEST_TIMEOUT": "240",
+        "CAO_ELASTIC_REAPER_INTERVAL": "1",
+        "CAO_ELASTIC_COMPLETION_TIMEOUT": "3",
+    }
+)
 
 from kubernetes import client as k8s
 from kubernetes import config as k8s_config
@@ -78,8 +81,9 @@ STATE["log_calls"] = []
 
 def _fake_pod(name, labels):
     STATE["pod_seq"] += 1
-    conditions = ([k8s.V1PodCondition(type="Ready", status="True")]
-                  if STATE["new_pods_ready"] else [])
+    conditions = (
+        [k8s.V1PodCondition(type="Ready", status="True")] if STATE["new_pods_ready"] else []
+    )
     return k8s.V1Pod(
         metadata=k8s.V1ObjectMeta(
             name=f"{name}-{STATE['pod_seq']:05d}",
@@ -193,43 +197,66 @@ env = {e["name"]: e.get("value") for e in spec["containers"][0]["env"]}
 
 check("deployment serializes to a dict", isinstance(wire, dict))
 annotations = wire["metadata"]["annotations"]
-check("deployment persists the authorized callback receiver",
-      annotations["cao.aws/callback-terminal-id"] == "abc12345")
-check("deployment persists the authorized memory session",
-      annotations["cao.aws/session-name"] == "cao-worker-deadbeef")
-check("deployment persists the authorized memory profile",
-      annotations["cao.aws/agent-profile"] == "developer")
+check(
+    "deployment persists the authorized callback receiver",
+    annotations["cao.aws/callback-terminal-id"] == "abc12345",
+)
+check(
+    "deployment persists the authorized memory session",
+    annotations["cao.aws/session-name"] == "cao-worker-deadbeef",
+)
+check(
+    "deployment persists the authorized memory profile",
+    annotations["cao.aws/agent-profile"] == "developer",
+)
 # The annotations are read back off the workload by _require_release_token, so
 # putting them on the template instead would 401 every worker callback.
-check("lease claims are on the workload, not the pod template",
-      not (wire["spec"]["template"]["metadata"].get("annotations") or {}),
-      json.dumps(wire["spec"]["template"]["metadata"]))
+check(
+    "lease claims are on the workload, not the pod template",
+    not (wire["spec"]["template"]["metadata"].get("annotations") or {}),
+    json.dumps(wire["spec"]["template"]["metadata"]),
+)
 
 # --- 1b. the Deployment-shaped fields the Job did not have ----------------
 check("exactly one replica", wire["spec"]["replicas"] == 1, str(wire["spec"].get("replicas")))
-check("selector matches the worker id label",
-      wire["spec"]["selector"]["matchLabels"] == {"cao.aws/worker-id": "deadbeef"},
-      json.dumps(wire["spec"].get("selector")))
+check(
+    "selector matches the worker id label",
+    wire["spec"]["selector"]["matchLabels"] == {"cao.aws/worker-id": "deadbeef"},
+    json.dumps(wire["spec"].get("selector")),
+)
 # RollingUpdate would briefly run two pods sharing one working directory on the
 # RWX workspace volume, with the Service balancing across both.
-check("update strategy is Recreate", wire["spec"]["strategy"]["type"] == "Recreate",
-      json.dumps(wire["spec"].get("strategy")))
-check("restartPolicy is Always, the only value a Deployment accepts",
-      spec["restartPolicy"] == "Always", spec.get("restartPolicy"))
+check(
+    "update strategy is Recreate",
+    wire["spec"]["strategy"]["type"] == "Recreate",
+    json.dumps(wire["spec"].get("strategy")),
+)
+check(
+    "restartPolicy is Always, the only value a Deployment accepts",
+    spec["restartPolicy"] == "Always",
+    spec.get("restartPolicy"),
+)
 # The one Job property with no home on a Deployment at all. Setting it does not
 # merely fail to work: the API server refuses the Deployment with
 # `activeDeadlineSeconds in ReplicaSet is not Supported` (422), so a worker
 # carrying it cannot be created. Found on a live cluster, because the fake
 # apps_api below accepts any body -- which is exactly why this assertion is
 # phrased as an absence and pinned here.
-check("no activeDeadlineSeconds on the pod (a ReplicaSet template forbids it)",
-      "activeDeadlineSeconds" not in spec,
-      str(spec.get("activeDeadlineSeconds")))
-check("no Job-only fields survive",
-      not any(k in wire["spec"] for k in ("backoffLimit", "ttlSecondsAfterFinished")),
-      json.dumps(sorted(wire["spec"])))
-check("default provider is claude_code", env["CAO_INSTALL_PROFILES"] == "developer:claude_code",
-      env.get("CAO_INSTALL_PROFILES"))
+check(
+    "no activeDeadlineSeconds on the pod (a ReplicaSet template forbids it)",
+    "activeDeadlineSeconds" not in spec,
+    str(spec.get("activeDeadlineSeconds")),
+)
+check(
+    "no Job-only fields survive",
+    not any(k in wire["spec"] for k in ("backoffLimit", "ttlSecondsAfterFinished")),
+    json.dumps(sorted(wire["spec"])),
+)
+check(
+    "default provider is claude_code",
+    env["CAO_INSTALL_PROFILES"] == "developer:claude_code",
+    env.get("CAO_INSTALL_PROFILES"),
+)
 # A credential must never be a literal in the workload body - the broker's Role has
 # no `secrets`, and a value here would end up in etcd and in
 # `kubectl get deployment -o yaml`.
@@ -238,52 +265,87 @@ check("no provider credential inlined in the workload", "KIRO_API_KEY" not in en
 # The optional flag is the load-bearing half: without it the Bedrock path, which
 # creates no such Secret, would hold every worker in CreateContainerConfigError.
 env_from = spec["containers"][0].get("envFrom") or []
-check("provider credentials come from envFrom",
-      any(s.get("secretRef", {}).get("name") == "cao-provider-credentials" for s in env_from),
-      env_from)
-check("provider credential secret is optional",
-      all(s["secretRef"].get("optional") is True for s in env_from if "secretRef" in s),
-      env_from)
+check(
+    "provider credentials come from envFrom",
+    any(s.get("secretRef", {}).get("name") == "cao-provider-credentials" for s in env_from),
+    env_from,
+)
+check(
+    "provider credential secret is optional",
+    all(s["secretRef"].get("optional") is True for s in env_from if "secretRef" in s),
+    env_from,
+)
 check("bedrock flag forwarded", env.get("CLAUDE_CODE_USE_BEDROCK") == "1")
 check("region forwarded", env.get("AWS_REGION") == "us-east-1")
-check("all four model tiers pinned",
-      all(env.get(k) for k in ("ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
-                               "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL")))
-check("both timeouts forwarded",
-      env.get("CAO_PROVIDER_INIT_TIMEOUT") == "180" and env.get("CAO_MCP_REQUEST_TIMEOUT") == "240")
+check(
+    "all four model tiers pinned",
+    all(
+        env.get(k)
+        for k in (
+            "ANTHROPIC_MODEL",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        )
+    ),
+)
+check(
+    "both timeouts forwarded",
+    env.get("CAO_PROVIDER_INIT_TIMEOUT") == "180" and env.get("CAO_MCP_REQUEST_TIMEOUT") == "240",
+)
 check("max terminals still 1", env.get("CAO_MAX_TERMINALS") == "1")
-check("worker memory uses the authenticated broker gateway",
-      env.get("CAO_MEMORY_API_URL") == "http://cao-worker-broker:9890",
-      env.get("CAO_MEMORY_API_URL"))
-check("worker warms its providers in the background",
-      env.get("CAO_WARM_PROVIDER") == "background", env.get("CAO_WARM_PROVIDER"))
+check(
+    "worker memory uses the authenticated broker gateway",
+    env.get("CAO_MEMORY_API_URL") == "http://cao-worker-broker:9890",
+    env.get("CAO_MEMORY_API_URL"),
+)
+check(
+    "worker warms its providers in the background",
+    env.get("CAO_WARM_PROVIDER") == "background",
+    env.get("CAO_WARM_PROVIDER"),
+)
 check("worker SA is cao-elastic-worker", spec["serviceAccountName"] == "cao-elastic-worker")
 check("SA token not automounted", spec["automountServiceAccountToken"] is False)
 
 aa = spec["affinity"]["podAntiAffinity"]
-check("anti-affinity is preferred only",
-      "preferredDuringSchedulingIgnoredDuringExecution" in aa
-      and "requiredDuringSchedulingIgnoredDuringExecution" not in aa, json.dumps(aa)[:200])
+check(
+    "anti-affinity is preferred only",
+    "preferredDuringSchedulingIgnoredDuringExecution" in aa
+    and "requiredDuringSchedulingIgnoredDuringExecution" not in aa,
+    json.dumps(aa)[:200],
+)
 terms = aa["preferredDuringSchedulingIgnoredDuringExecution"]
 check("two anti-affinity terms", len(terms) == 2, str(len(terms)))
-check("term 1 avoids the supervisor at weight 100",
-      terms[0]["weight"] == 100
-      and terms[0]["podAffinityTerm"]["labelSelector"]["matchLabels"]["app.kubernetes.io/name"]
-      == "cao-supervisor")
-check("term 2 spreads workers",
-      terms[1]["podAffinityTerm"]["labelSelector"]["matchLabels"]["app.kubernetes.io/name"]
-      == "cao-elastic-worker")
-check("topologyKey is hostname on both",
-      all(t["podAffinityTerm"]["topologyKey"] == "kubernetes.io/hostname" for t in terms))
+check(
+    "term 1 avoids the supervisor at weight 100",
+    terms[0]["weight"] == 100
+    and terms[0]["podAffinityTerm"]["labelSelector"]["matchLabels"]["app.kubernetes.io/name"]
+    == "cao-supervisor",
+)
+check(
+    "term 2 spreads workers",
+    terms[1]["podAffinityTerm"]["labelSelector"]["matchLabels"]["app.kubernetes.io/name"]
+    == "cao-elastic-worker",
+)
+check(
+    "topologyKey is hostname on both",
+    all(t["podAffinityTerm"]["topologyKey"] == "kubernetes.io/hostname" for t in terms),
+)
 probe = spec["containers"][0]["readinessProbe"]
 # The probe is the only thing standing between "the server answered" and "the
 # Service has an endpoint", and every second of initialDelay is a second of every
 # delegation a participant watches. /health is a constant-time dict return, so
 # probing from t=0 every second costs the pod nothing it can measure.
-check("readiness probe starts immediately", probe["initialDelaySeconds"] == 0,
-      str(probe.get("initialDelaySeconds")))
-check("readiness probe polls every second", probe["periodSeconds"] == 1,
-      str(probe.get("periodSeconds")))
+check(
+    "readiness probe starts immediately",
+    probe["initialDelaySeconds"] == 0,
+    str(probe.get("initialDelaySeconds")),
+)
+check(
+    "readiness probe polls every second",
+    probe["periodSeconds"] == 1,
+    str(probe.get("periodSeconds")),
+)
 
 # --- 2. the Service is owned by the Deployment ---------------------------
 try:
@@ -297,11 +359,14 @@ svc = broker._worker_service("deadbeef", workload)
 swire = k8s.ApiClient().sanitize_for_serialization(svc)
 owners = swire["metadata"].get("ownerReferences") or []
 check("service has an ownerReference", len(owners) == 1, json.dumps(swire["metadata"]))
-check("owner is the Deployment by uid",
-      owners and owners[0]["kind"] == "Deployment"
-      and owners[0]["apiVersion"] == "apps/v1"
-      and owners[0]["uid"] == "uid-cao-worker-deadbeef",
-      json.dumps(owners))
+check(
+    "owner is the Deployment by uid",
+    owners
+    and owners[0]["kind"] == "Deployment"
+    and owners[0]["apiVersion"] == "apps/v1"
+    and owners[0]["uid"] == "uid-cao-worker-deadbeef",
+    json.dumps(owners),
+)
 
 # The selector needs BOTH labels, and the redundant-looking one is the load-bearing
 # one. worker-id alone selects the same single pod, but the VPC CNI includes a
@@ -310,10 +375,14 @@ check("owner is the Deployment by uid",
 # a ConnectTimeout on every worker while its pod IP stays reachable — which is why
 # this is asserted here rather than left to the manifest to imply.
 sel = swire["spec"]["selector"]
-check("service selects the worker by id", sel.get("cao.aws/worker-id") == "deadbeef",
-      json.dumps(sel))
-check("service also carries the label networkpolicy.yaml selects on",
-      sel.get("app.kubernetes.io/name") == "cao-elastic-worker", json.dumps(sel))
+check(
+    "service selects the worker by id", sel.get("cao.aws/worker-id") == "deadbeef", json.dumps(sel)
+)
+check(
+    "service also carries the label networkpolicy.yaml selects on",
+    sel.get("app.kubernetes.io/name") == "cao-elastic-worker",
+    json.dumps(sel),
+)
 
 # --- 3. the lease returns before readiness; the reaper owns the deadline --
 #
@@ -348,9 +417,7 @@ with broker._leases_lock:
 # A Deployment exists before its ReplicaSet creates a Pod. Empty Pod lists are
 # normal in that window and must not be called disappearance.
 STATE["create_pods"] = False
-lease_waiting_for_pod = broker.create_worker(
-    worker_request(), "test-token"
-)
+lease_waiting_for_pod = broker.create_worker(worker_request(), "test-token")
 waiting_id = lease_waiting_for_pod.worker_id
 broker._reap_once()
 check(
@@ -401,11 +468,13 @@ reaper_stale_candidate = _fake_pod(
     broker._labels(reaper_race_id),
 )
 
+
 def _list_after_operator_claim(*args, **kwargs):
     with broker._leases_lock:
         broker._leases[reaper_race_id]["pod_uid"] = reaper_winner_uid
         broker._leases[reaper_race_id]["pod_observed_at"] = time.monotonic()
     return types.SimpleNamespace(items=[reaper_stale_candidate])
+
 
 with patch.object(
     broker.core_api,
@@ -428,26 +497,38 @@ w0 = lease0.worker_id
 # Under the old gate this call could not return at all until the pod was Ready,
 # so a pod that never is would have hung here for READY_TIMEOUT.
 check("create does not wait on a pod that is not Ready", _elapsed < 0.5, f"{_elapsed:.2f}s")
-check("the lease is handed back regardless",
-      lease0.target_host == f"cao-worker-{w0}.cao-cluster.svc.cluster.local",
-      lease0.target_host)
-check("readiness is unrecorded until something observes it",
-      broker._leases[w0]["ready_at"] is None)
+check(
+    "the lease is handed back regardless",
+    lease0.target_host == f"cao-worker-{w0}.cao-cluster.svc.cluster.local",
+    lease0.target_host,
+)
+check("readiness is unrecorded until something observes it", broker._leases[w0]["ready_at"] is None)
 
 broker._reap_once()
-check("a not-yet-Ready worker is left alone inside READY_TIMEOUT",
-      broker._leases[w0]["state"] == "leased", json.dumps(broker._leases[w0], default=str))
+check(
+    "a not-yet-Ready worker is left alone inside READY_TIMEOUT",
+    broker._leases[w0]["state"] == "leased",
+    json.dumps(broker._leases[w0], default=str),
+)
 
 with broker._leases_lock:
     broker._leases[w0]["leased_at"] = time.monotonic() - (broker.READY_TIMEOUT + 1)
 broker._reap_once()
-check("reaper fails a worker that never reported Ready",
-      broker._leases[w0]["state"] == "failed", broker._leases[w0]["state"])
-check("failed reason names never-Ready, not a completion timeout",
-      "never reported Ready" in (broker._leases[w0]["reason"] or ""),
-      str(broker._leases[w0]["reason"])[:200])
-check("failed worker's deployment is released", f"cao-worker-{w0}" in STATE["deleted_deployments"],
-      str(STATE["deleted_deployments"]))
+check(
+    "reaper fails a worker that never reported Ready",
+    broker._leases[w0]["state"] == "failed",
+    broker._leases[w0]["state"],
+)
+check(
+    "failed reason names never-Ready, not a completion timeout",
+    "never reported Ready" in (broker._leases[w0]["reason"] or ""),
+    str(broker._leases[w0]["reason"])[:200],
+)
+check(
+    "failed worker's deployment is released",
+    f"cao-worker-{w0}" in STATE["deleted_deployments"],
+    str(STATE["deleted_deployments"]),
+)
 
 # Once Ready has been SEEN, the readiness deadline is spent: a worker that goes
 # NotReady later is a completion problem, and must expire rather than fail.
@@ -460,30 +541,41 @@ STATE["pods"][w1].status.conditions = []
 with broker._leases_lock:
     broker._leases[w1]["leased_at"] = time.monotonic() - (broker.READY_TIMEOUT + 1)
 broker._reap_once()
-check("a worker that was once Ready expires rather than fails",
-      broker._leases[w1]["state"] == "expired", broker._leases[w1]["state"])
+check(
+    "a worker that was once Ready expires rather than fails",
+    broker._leases[w1]["state"] == "expired",
+    broker._leases[w1]["state"],
+)
 
 # The old behaviour is still reachable for a fleet whose workers may be the first
 # caller of a model in the account.
 broker.GATE_ON_READY = True
 try:
     lease2 = broker.create_worker(worker_request(), "test-token")
-    check("GATE_ON_READY=1 returns a lease with readiness already recorded",
-          broker._leases[lease2.worker_id]["ready_at"] is not None)
+    check(
+        "GATE_ON_READY=1 returns a lease with readiness already recorded",
+        broker._leases[lease2.worker_id]["ready_at"] is not None,
+    )
 
     STATE["new_pods_ready"] = False
     STATE["new_pods_phase"] = "Succeeded"
     try:
         broker.create_worker(worker_request(), "test-token")
-        check("GATE_ON_READY=1 surfaces a pod that dies before readiness", False,
-              "no error raised")
+        check("GATE_ON_READY=1 surfaces a pod that dies before readiness", False, "no error raised")
     except RuntimeError as exc:
-        check("GATE_ON_READY=1 surfaces a pod that dies before readiness",
-              "ended before readiness" in str(exc), str(exc))
-        _dead = [wid for wid, l in broker._leases.items()
-                 if l["state"] == "failed" and "ended before readiness" in (l["reason"] or "")]
-        check("...and settles that lease failed rather than leaking it", len(_dead) == 1,
-              str(_dead))
+        check(
+            "GATE_ON_READY=1 surfaces a pod that dies before readiness",
+            "ended before readiness" in str(exc),
+            str(exc),
+        )
+        _dead = [
+            wid
+            for wid, l in broker._leases.items()
+            if l["state"] == "failed" and "ended before readiness" in (l["reason"] or "")
+        ]
+        check(
+            "...and settles that lease failed rather than leaking it", len(_dead) == 1, str(_dead)
+        )
 finally:
     broker.GATE_ON_READY = False
     STATE["new_pods_ready"] = True
@@ -502,8 +594,12 @@ finally:
 #   * off the wrong clock. The AGE column is `now - leased_at`, and retention
 #     runs from `settled_at`. A row can show an age well past the hour and still
 #     be present, which makes a count cap the tempting (and wrong) explanation.
-check("settled leases are kept for an hour by default",
-      broker.LEASE_RETENTION == 3600, str(broker.LEASE_RETENTION))
+check(
+    "settled leases are kept for an hour by default",
+    broker.LEASE_RETENTION == 3600,
+    str(broker.LEASE_RETENTION),
+)
+
 
 def _settled(worker_id, *, state, settled_ago, leased_ago=None):
     """Put one synthetic settled lease in the ledger."""
@@ -521,56 +617,62 @@ def _settled(worker_id, *, state, settled_ago, leased_ago=None):
             "provider": "claude_code",
         }
 
+
 _settled("fade0001", state="completed", settled_ago=broker.LEASE_RETENTION - 5)
 _settled("fade0002", state="expired", settled_ago=broker.LEASE_RETENTION + 5)
 # Settled a second ago but leased long before the window: the row that proves
 # which of the two timestamps the prune reads.
-_settled("fade0003", state="released", settled_ago=1,
-         leased_ago=broker.LEASE_RETENTION * 2)
+_settled("fade0003", state="released", settled_ago=1, leased_ago=broker.LEASE_RETENTION * 2)
 # A lease still open, aged past the window. What saves it is that it has no
 # settle time yet, not its state: without that guard a running worker's lease
 # would be deleted out from under it, leaving the pod alive with nothing left
 # that knows it is owed a release.
-_settled("fade0004", state="leased", settled_ago=None,
-         leased_ago=broker.LEASE_RETENTION * 2)
+_settled("fade0004", state="leased", settled_ago=None, leased_ago=broker.LEASE_RETENTION * 2)
 # The same row with a settle time it could not really have. `_settle` writes
 # state and settled_at together under one lock, so nothing reachable is both
 # open and settled - which makes the prune's `state != "leased"` clause pure
 # belt and braces. Pinned anyway, because the clause looks load-bearing and the
 # next reader should not be able to delete it and see a green suite.
-_settled("fade0007", state="leased", settled_ago=broker.LEASE_RETENTION + 5,
-         leased_ago=broker.LEASE_RETENTION * 2)
+_settled(
+    "fade0007",
+    state="leased",
+    settled_ago=broker.LEASE_RETENTION + 5,
+    leased_ago=broker.LEASE_RETENTION * 2,
+)
 
 broker._reap_once()
 
-check("a lease settled inside the window is still readable",
-      "fade0001" in broker._leases)
-check("a lease settled past the window is dropped",
-      "fade0002" not in broker._leases)
-check("retention runs from settled_at, not from leased_at",
-      "fade0003" in broker._leases)
-check("an open lease has no settle time, so no age can prune it",
-      "fade0004" in broker._leases, str(broker._leases.get("fade0004", {}).get("state")))
-check("an open lease survives even if it somehow carries a settle time",
-      "fade0007" in broker._leases)
+check("a lease settled inside the window is still readable", "fade0001" in broker._leases)
+check("a lease settled past the window is dropped", "fade0002" not in broker._leases)
+check("retention runs from settled_at, not from leased_at", "fade0003" in broker._leases)
+check(
+    "an open lease has no settle time, so no age can prune it",
+    "fade0004" in broker._leases,
+    str(broker._leases.get("fade0004", {}).get("state")),
+)
+check(
+    "an open lease survives even if it somehow carries a settle time", "fade0007" in broker._leases
+)
 
 # A `creating` lease has no settle time at all, and `now - None` in that branch
 # would take the reaper thread down with it - after which nothing is reaped.
-_settled("fade0005", state="creating", settled_ago=None,
-         leased_ago=broker.LEASE_RETENTION * 2)
+_settled("fade0005", state="creating", settled_ago=None, leased_ago=broker.LEASE_RETENTION * 2)
 broker._reap_once()
-check("a lease with no settled_at survives the prune rather than crashing it",
-      "fade0005" in broker._leases)
+check(
+    "a lease with no settled_at survives the prune rather than crashing it",
+    "fade0005" in broker._leases,
+)
 
 # One tick can settle a lease and one tick can prune it, but never the same tick:
 # the prune reads settled_at from before this sweep, so a verdict is always
 # readable for a full retention window after it is written.
-_settled("fade0006", state="leased", settled_ago=None,
-         leased_ago=broker.COMPLETION_TIMEOUT + 1)
+_settled("fade0006", state="leased", settled_ago=None, leased_ago=broker.COMPLETION_TIMEOUT + 1)
 broker._reap_once()
-check("a verdict written this tick is not pruned by the same tick",
-      "fade0006" in broker._leases,
-      str(broker._leases.get("fade0006", {}).get("state")))
+check(
+    "a verdict written this tick is not pruned by the same tick",
+    "fade0006" in broker._leases,
+    str(broker._leases.get("fade0006", {}).get("state")),
+)
 
 # And the coupling that makes that clause redundant deserves the pin more than
 # the clause does. `_settle` is the only writer of settled_at anywhere in the
@@ -583,19 +685,30 @@ _settled("fade0008", state="creating", settled_ago=None, leased_ago=1)
 _settled_ok = broker._settle("fade0008", "completed", "done")
 with broker._leases_lock:
     _row = dict(broker._leases["fade0008"])
-check("_settle stamps settled_at and leaves the live set in one critical section",
-      _settled_ok
-      and _row["state"] not in broker._LIVE_LEASE_STATES
-      and _row["settled_at"] is not None,
-      f"{_row['state']} settled_at={_row['settled_at'] is not None}")
-check("a settled lease cannot be settled twice, so the first verdict is the one kept",
-      broker._settle("fade0008", "released", None) is False
-      and broker._leases["fade0008"]["reason"] == "done",
-      str(broker._leases["fade0008"]["reason"]))
+check(
+    "_settle stamps settled_at and leaves the live set in one critical section",
+    _settled_ok
+    and _row["state"] not in broker._LIVE_LEASE_STATES
+    and _row["settled_at"] is not None,
+    f"{_row['state']} settled_at={_row['settled_at'] is not None}",
+)
+check(
+    "a settled lease cannot be settled twice, so the first verdict is the one kept",
+    broker._settle("fade0008", "released", None) is False
+    and broker._leases["fade0008"]["reason"] == "done",
+    str(broker._leases["fade0008"]["reason"]),
+)
 
 with broker._leases_lock:
-    for _wid in ("fade0001", "fade0003", "fade0004", "fade0005", "fade0006",
-                 "fade0007", "fade0008"):
+    for _wid in (
+        "fade0001",
+        "fade0003",
+        "fade0004",
+        "fade0005",
+        "fade0006",
+        "fade0007",
+        "fade0008",
+    ):
         broker._leases.pop(_wid, None)
 
 # --- 4. lease lifecycle over HTTP ---------------------------------------
@@ -612,20 +725,34 @@ with TestClient(broker.app) as c:
     check("create returns a lease", r.status_code == 200, r.text[:300])
     lease = r.json()
     wid = lease["worker_id"]
-    check("deployment created first, then service",
-          f"cao-worker-{wid}" in STATE["deployments"] and f"cao-worker-{wid}" in STATE["services"])
-    check("target_host is the per-worker service FQDN",
-          lease["target_host"] == f"cao-worker-{wid}.cao-cluster.svc.cluster.local",
-          lease["target_host"])
-    check("lease returns its bound session name",
-          lease["session_name"] == f"cao-worker-{wid}", lease["session_name"])
+    check(
+        "deployment created first, then service",
+        f"cao-worker-{wid}" in STATE["deployments"] and f"cao-worker-{wid}" in STATE["services"],
+    )
+    check(
+        "target_host is the per-worker service FQDN",
+        lease["target_host"] == f"cao-worker-{wid}.cao-cluster.svc.cluster.local",
+        lease["target_host"],
+    )
+    check(
+        "lease returns its bound session name",
+        lease["session_name"] == f"cao-worker-{wid}",
+        lease["session_name"],
+    )
 
     r = c.get("/workers", headers=H)
-    check("ledger lists the open lease",
-          r.status_code == 200 and any(w["worker_id"] == wid and w["state"] == "leased"
-                                       and w["workload_present"]
-                                       and w["lease_tracked"]
-                                       for w in r.json()), r.text[:300])
+    check(
+        "ledger lists the open lease",
+        r.status_code == 200
+        and any(
+            w["worker_id"] == wid
+            and w["state"] == "leased"
+            and w["workload_present"]
+            and w["lease_tracked"]
+            for w in r.json()
+        ),
+        r.text[:300],
+    )
 
     # The Deployment inventory remains authoritative when the in-memory ledger
     # is lost in a broker restart.
@@ -734,14 +861,19 @@ with TestClient(broker.app) as c:
     r = c.post(f"/workers/{wid}/complete", headers={"X-CAO-Release-Token": "wrong"})
     check("wrong release token is rejected", r.status_code == 401, str(r.status_code))
 
-    r = c.post(f"/workers/{wid}/complete",
-               headers={"X-CAO-Release-Token": lease["release_token"]})
+    r = c.post(f"/workers/{wid}/complete", headers={"X-CAO-Release-Token": lease["release_token"]})
     check("complete accepted with the right token", r.status_code == 200, r.text[:200])
-    check("completing releases the deployment", f"cao-worker-{wid}" in STATE["deleted_deployments"],
-          str(STATE["deleted_deployments"]))
+    check(
+        "completing releases the deployment",
+        f"cao-worker-{wid}" in STATE["deleted_deployments"],
+        str(STATE["deleted_deployments"]),
+    )
     r = c.get("/workers", headers=H)
-    check("ledger records completion",
-          any(w["worker_id"] == wid and w["state"] == "completed" for w in r.json()), r.text[:300])
+    check(
+        "ledger records completion",
+        any(w["worker_id"] == wid and w["state"] == "completed" for w in r.json()),
+        r.text[:300],
+    )
 
     # --- 5. a one-shot terminal ends, complete never arrives --------------
     r = c.post("/workers", json=worker_payload, headers=H)
@@ -819,9 +951,7 @@ with TestClient(broker.app) as c:
     st = [w for w in c.get("/workers", headers=H).json() if w["worker_id"] == released_id][0]
     check(
         "an operator release is recorded as released, not terminated",
-        r.status_code == 200
-        and st["state"] == "released"
-        and st["reason"] == "released by caller",
+        r.status_code == 200 and st["state"] == "released" and st["reason"] == "released by caller",
         json.dumps(st),
     )
 
@@ -837,12 +967,21 @@ with TestClient(broker.app) as c:
             break
         time.sleep(0.3)
     st = [w for w in c.get("/workers", headers=H).json() if w["worker_id"] == wid2][0]
-    check("reaper marks an early-terminated worker `terminated`", st["state"] == "terminated",
-          json.dumps(st))
-    check("reaper reason names the truth, not a success",
-          st["reason"] and "NOT necessarily done" in st["reason"], str(st.get("reason"))[:200])
-    check("reaper released the squatting deployment", f"cao-worker-{wid2}" in STATE["deleted_deployments"],
-          str(STATE["deleted_deployments"]))
+    check(
+        "reaper marks an early-terminated worker `terminated`",
+        st["state"] == "terminated",
+        json.dumps(st),
+    )
+    check(
+        "reaper reason names the truth, not a success",
+        st["reason"] and "NOT necessarily done" in st["reason"],
+        str(st.get("reason"))[:200],
+    )
+    check(
+        "reaper released the squatting deployment",
+        f"cao-worker-{wid2}" in STATE["deleted_deployments"],
+        str(STATE["deleted_deployments"]),
+    )
 
     # --- 7. completion deadline on a still-healthy pod --------------------
     r = c.post("/workers", json=worker_payload, headers=H)
@@ -866,9 +1005,7 @@ with TestClient(broker.app) as c:
     r = c.post("/workers", json=worker_payload, headers=H)
     restarted_id = r.json()["worker_id"]
     STATE["pods"][restarted_id].status.container_statuses = [
-        k8s.V1ContainerStatus(
-            name="cao-node", image="x", image_id="x", ready=True, restart_count=1
-        )
+        k8s.V1ContainerStatus(name="cao-node", image="x", image_id="x", ready=True, restart_count=1)
     ]
     deadline = time.time() + 12
     while time.time() < deadline:
@@ -877,10 +1014,16 @@ with TestClient(broker.app) as c:
             break
         time.sleep(0.3)
     st = [w for w in c.get("/workers", headers=H).json() if w["worker_id"] == restarted_id][0]
-    check("a restarted container settles the lease as terminated",
-          st["state"] == "terminated", json.dumps(st))
-    check("restart reason says the agent is gone, not that the task finished",
-          st["reason"] and "restarted" in st["reason"], str(st.get("reason"))[:200])
+    check(
+        "a restarted container settles the lease as terminated",
+        st["state"] == "terminated",
+        json.dumps(st),
+    )
+    check(
+        "restart reason says the agent is gone, not that the task finished",
+        st["reason"] and "restarted" in st["reason"],
+        str(st.get("reason"))[:200],
+    )
 
     r = c.post("/workers", json=worker_payload, headers=H)
     replaced_id = r.json()["worker_id"]
@@ -890,12 +1033,12 @@ with TestClient(broker.app) as c:
     observed = time.time() + 6
     while time.time() < observed and broker._leases[replaced_id].get("pod_uid") is None:
         time.sleep(0.1)
-    check("reaper records the first pod's uid",
-          broker._leases[replaced_id].get("pod_uid") is not None)
+    check(
+        "reaper records the first pod's uid", broker._leases[replaced_id].get("pod_uid") is not None
+    )
     # A ReplicaSet replacing the pod: same labels, same Service, new uid, and a
     # brand new emptyDir with no profile store and no session in it.
-    STATE["pods"][replaced_id] = _fake_pod(f"cao-worker-{replaced_id}",
-                                           broker._labels(replaced_id))
+    STATE["pods"][replaced_id] = _fake_pod(f"cao-worker-{replaced_id}", broker._labels(replaced_id))
     deadline = time.time() + 12
     while time.time() < deadline:
         st = [w for w in c.get("/workers", headers=H).json() if w["worker_id"] == replaced_id]
@@ -903,13 +1046,21 @@ with TestClient(broker.app) as c:
             break
         time.sleep(0.3)
     st = [w for w in c.get("/workers", headers=H).json() if w["worker_id"] == replaced_id][0]
-    check("a replacement pod settles the lease as terminated",
-          st["state"] == "terminated", json.dumps(st))
-    check("replacement reason names the empty state volume",
-          st["reason"] and "empty state volume" in st["reason"], str(st.get("reason"))[:200])
-    check("replaced worker's deployment is released",
-          f"cao-worker-{replaced_id}" in STATE["deleted_deployments"],
-          str(STATE["deleted_deployments"]))
+    check(
+        "a replacement pod settles the lease as terminated",
+        st["state"] == "terminated",
+        json.dumps(st),
+    )
+    check(
+        "replacement reason names the empty state volume",
+        st["reason"] and "empty state volume" in st["reason"],
+        str(st.get("reason"))[:200],
+    )
+    check(
+        "replaced worker's deployment is released",
+        f"cao-worker-{replaced_id}" in STATE["deleted_deployments"],
+        str(STATE["deleted_deployments"]),
+    )
 
     # Mid-replacement both pods can match, with the replacement listed first.
     # The original has restarted, so judging the replacement would hide the
@@ -920,9 +1071,7 @@ with TestClient(broker.app) as c:
     while time.time() < observed and broker._leases[rollover_id].get("pod_uid") is None:
         time.sleep(0.1)
     STATE["pods"][rollover_id].status.container_statuses = [
-        k8s.V1ContainerStatus(
-            name="cao-node", image="x", image_id="x", ready=True, restart_count=1
-        )
+        k8s.V1ContainerStatus(name="cao-node", image="x", image_id="x", ready=True, restart_count=1)
     ]
     STATE["extra_pods"][rollover_id] = [
         _fake_pod(f"cao-worker-{rollover_id}", broker._labels(rollover_id))
@@ -941,19 +1090,23 @@ with TestClient(broker.app) as c:
     )
 
     # --- 8. input validation still bounded -------------------------------
-    r = c.post("/workers",
-               json={**worker_payload, "agent_profile": "../../etc/passwd"}, headers=H)
+    r = c.post("/workers", json={**worker_payload, "agent_profile": "../../etc/passwd"}, headers=H)
     check("path-ish profile rejected", r.status_code == 422, str(r.status_code))
     r = c.post("/workers", json={**worker_payload, "provider": "a b"}, headers=H)
     check("provider with a space rejected", r.status_code == 422, str(r.status_code))
-    r = c.post("/workers", json={**worker_payload, "image": "evil:latest"},
-               headers=H)
-    check("caller cannot inject an image",
-          r.status_code in (200, 422)
-          and (r.status_code == 422
-               or STATE["deployments"][f"cao-worker-{r.json()['worker_id']}"]
-               .spec.template.spec.containers[0].image == os.environ["CAO_ELASTIC_WORKER_IMAGE"]),
-          r.text[:200])
+    r = c.post("/workers", json={**worker_payload, "image": "evil:latest"}, headers=H)
+    check(
+        "caller cannot inject an image",
+        r.status_code in (200, 422)
+        and (
+            r.status_code == 422
+            or STATE["deployments"][f"cao-worker-{r.json()['worker_id']}"]
+            .spec.template.spec.containers[0]
+            .image
+            == os.environ["CAO_ELASTIC_WORKER_IMAGE"]
+        ),
+        r.text[:200],
+    )
 
     # --- 10. the operator plane: what `cao worker` can and cannot reach ----
     #
@@ -973,11 +1126,13 @@ with TestClient(broker.app) as c:
             length = int(self.headers.get("content-length") or 0)
             if length:
                 self.rfile.read(length)
-            NODE_CALLS.append({
-                "method": self.command,
-                "path": self.path,
-                "headers": {k.lower(): v for k, v in self.headers.items()},
-            })
+            NODE_CALLS.append(
+                {
+                    "method": self.command,
+                    "path": self.path,
+                    "headers": {k.lower(): v for k, v in self.headers.items()},
+                }
+            )
             body = json.dumps({"ok": True, "path": self.path}).encode()
             self.send_response(200)
             self.send_header("content-type", "application/json")
@@ -1011,33 +1166,49 @@ with TestClient(broker.app) as c:
 
         r = c.get(f"/workers/{pid}/api/sessions", headers=H)
         check("allowlisted GET reaches the worker", r.status_code == 200, r.text[:200])
-        check("proxied path arrives unchanged at the worker",
-              NODE_CALLS[-1]["path"] == "/sessions", NODE_CALLS[-1]["path"])
+        check(
+            "proxied path arrives unchanged at the worker",
+            NODE_CALLS[-1]["path"] == "/sessions",
+            NODE_CALLS[-1]["path"],
+        )
         # The request went to the pod's IP - the Service name does not resolve
         # here, and on EKS it is not covered by the broker's egress rule - but the
         # worker only trusts Host names it was given in CAO_ALLOWED_HOSTS.
-        check("the Host header carries the Service name, not the pod IP",
-              NODE_CALLS[-1]["headers"].get("host")
-              == f"cao-worker-{pid}.cao-cluster.svc.cluster.local",
-              str(NODE_CALLS[-1]["headers"].get("host")))
+        check(
+            "the Host header carries the Service name, not the pod IP",
+            NODE_CALLS[-1]["headers"].get("host")
+            == f"cao-worker-{pid}.cao-cluster.svc.cluster.local",
+            str(NODE_CALLS[-1]["headers"].get("host")),
+        )
         # The one header that must not travel. It is the broker's credential for
         # the broker's own API, and a worker is the pod running an agent.
-        check("broker token is not forwarded to the worker",
-              "x-cao-broker-token" not in NODE_CALLS[-1]["headers"],
-              json.dumps(sorted(NODE_CALLS[-1]["headers"])))
-        check("worker response headers survive the hop",
-              r.headers.get("x-node-hint") == "kept", json.dumps(dict(r.headers)))
+        check(
+            "broker token is not forwarded to the worker",
+            "x-cao-broker-token" not in NODE_CALLS[-1]["headers"],
+            json.dumps(sorted(NODE_CALLS[-1]["headers"])),
+        )
+        check(
+            "worker response headers survive the hop",
+            r.headers.get("x-node-hint") == "kept",
+            json.dumps(dict(r.headers)),
+        )
         # requests decompressed the body already, so both of these would describe
         # bytes that no longer exist.
-        check("content-encoding is not passed through",
-              "content-encoding" not in {k.lower() for k in r.headers}, json.dumps(dict(r.headers)))
+        check(
+            "content-encoding is not passed through",
+            "content-encoding" not in {k.lower() for k in r.headers},
+            json.dumps(dict(r.headers)),
+        )
 
         r = c.get(f"/workers/{pid}/api/sessions/my-session/terminals", headers=H)
         check("a session's terminals are allowlisted", r.status_code == 200, r.text[:200])
         r = c.get(f"/workers/{pid}/api/terminals/abc12345/output?mode=last", headers=H)
         check("terminal output is allowlisted", r.status_code == 200, r.text[:200])
-        check("the query string is forwarded",
-              "mode=last" in NODE_CALLS[-1]["path"], NODE_CALLS[-1]["path"])
+        check(
+            "the query string is forwarded",
+            "mode=last" in NODE_CALLS[-1]["path"],
+            NODE_CALLS[-1]["path"],
+        )
         # Deliberately on the list: `cao worker send` is the verb this plane
         # exists for, and the same token already deletes workers outright.
         r = c.post(f"/workers/{pid}/api/terminals/abc12345/input?message=hi", headers=H)
@@ -1049,14 +1220,16 @@ with TestClient(broker.app) as c:
         r = c.get(f"/workers/{pid}/api/terminals/abc12345/websocket", headers=H)
         check("the pty socket route is refused", r.status_code == 404, r.text[:200])
         r = c.post(f"/workers/{pid}/api/sessions", headers=H)
-        check("a listed path on an unlisted method is refused",
-              r.status_code == 404, r.text[:200])
+        check("a listed path on an unlisted method is refused", r.status_code == 404, r.text[:200])
         # Percent-encoded, because Starlette decodes it back to `..` and the
         # segment pattern would otherwise match it as an ordinary terminal id.
         r = c.get(f"/workers/{pid}/api/terminals/%2e%2e/output", headers=H)
         check("an encoded dot segment is refused", r.status_code == 400, r.text[:200])
-        check("nothing refused ever reached the worker",
-              len(NODE_CALLS) == before, str(len(NODE_CALLS) - before))
+        check(
+            "nothing refused ever reached the worker",
+            len(NODE_CALLS) == before,
+            str(len(NODE_CALLS) - before),
+        )
 
         r = c.get(f"/workers/{pid}/api/sessions")
         check("unauthenticated proxy call is rejected", r.status_code == 401, r.text[:200])
@@ -1065,14 +1238,22 @@ with TestClient(broker.app) as c:
 
         # --- 10b. logs -----------------------------------------------------
         r = c.get(f"/workers/{pid}/logs", headers=H)
-        check("logs return the container output", r.status_code == 200
-              and "boot log of" in r.text, r.text[:200])
-        check("logs are served as text", r.headers["content-type"].startswith("text/plain"),
-              r.headers.get("content-type"))
+        check(
+            "logs return the container output",
+            r.status_code == 200 and "boot log of" in r.text,
+            r.text[:200],
+        )
+        check(
+            "logs are served as text",
+            r.headers["content-type"].startswith("text/plain"),
+            r.headers.get("content-type"),
+        )
         r = c.get(f"/workers/{pid}/logs", params={"tail_lines": 999999}, headers=H)
-        check("tail_lines is capped at the broker's ceiling",
-              STATE["log_calls"][-1]["tail_lines"] == broker._LOG_TAIL_MAX,
-              str(STATE["log_calls"][-1]))
+        check(
+            "tail_lines is capped at the broker's ceiling",
+            STATE["log_calls"][-1]["tail_lines"] == broker._LOG_TAIL_MAX,
+            str(STATE["log_calls"][-1]),
+        )
         r = c.get(f"/workers/{pid}/logs")
         check("unauthenticated log read is rejected", r.status_code == 401, r.text[:200])
 
@@ -1126,9 +1307,7 @@ with TestClient(broker.app) as c:
                 broker._worker_pod(pid)
                 race_refused = False
             except broker.HTTPException as exc:
-                race_refused = (
-                    exc.status_code == 409 and "claimed concurrently" in exc.detail
-                )
+                race_refused = exc.status_code == 409 and "claimed concurrently" in exc.detail
         check(
             "a losing operator pod-identity claim refuses its stale candidate",
             race_refused,
@@ -1141,28 +1320,30 @@ with TestClient(broker.app) as c:
         broker._leases[pid]["state"] = "expired"
         broker._leases[pid]["reason"] = "no completion within 900s"
         r = c.get(f"/workers/{pid}/api/sessions", headers=H)
-        check("a settled survivor remains readable for diagnosis",
-              r.status_code == 200, r.text[:200])
+        check(
+            "a settled survivor remains readable for diagnosis", r.status_code == 200, r.text[:200]
+        )
         r = c.get(f"/workers/{pid}/logs", headers=H)
-        check("logs remain readable for a settled survivor",
-              r.status_code == 200, r.text[:200])
+        check("logs remain readable for a settled survivor", r.status_code == 200, r.text[:200])
         r = c.post(f"/workers/{pid}/api/terminals/abc12345/input?message=hi", headers=H)
-        check("writes to a settled survivor are refused with its verdict",
-              r.status_code == 409
-              and "expired" in r.text
-              and "no completion within 900s" in r.text,
-              r.text[:200])
+        check(
+            "writes to a settled survivor are refused with its verdict",
+            r.status_code == 409 and "expired" in r.text and "no completion within 900s" in r.text,
+            r.text[:200],
+        )
 
         # A settled worker whose pod is ALSO gone answers with the verdict, not
         # with a bare "no pod" that reads as a broken cluster.
         _gone = STATE["pods"].pop(pid)
         try:
             r = c.get(f"/workers/{pid}/api/sessions", headers=H)
-            check("a settled worker with no pod answers with its verdict",
-                  r.status_code == 404
-                  and "expired" in r.text
-                  and "no completion within 900s" in r.text,
-                  r.text[:200])
+            check(
+                "a settled worker with no pod answers with its verdict",
+                r.status_code == 404
+                and "expired" in r.text
+                and "no completion within 900s" in r.text,
+                r.text[:200],
+            )
         finally:
             STATE["pods"][pid] = _gone
 
@@ -1170,8 +1351,7 @@ with TestClient(broker.app) as c:
         # surviving worker is unknown here and all of them are still reachable.
         del broker._leases[pid]
         r = c.get(f"/workers/{pid}/api/sessions", headers=H)
-        check("a worker with no lease row is still reachable",
-              r.status_code == 200, r.text[:200])
+        check("a worker with no lease row is still reachable", r.status_code == 200, r.text[:200])
 
         # A pod that has not been assigned an IP cannot be dialled at all. Saying
         # so beats a five-second connect timeout to nowhere.
@@ -1179,8 +1359,11 @@ with TestClient(broker.app) as c:
         STATE["pods"][pid].status.pod_ip = None
         try:
             r = c.get(f"/workers/{pid}/api/sessions", headers=H)
-            check("a worker with no pod IP is refused, not dialled",
-                  r.status_code == 503 and "pod IP" in r.text, r.text[:200])
+            check(
+                "a worker with no pod IP is refused, not dialled",
+                r.status_code == 503 and "pod IP" in r.text,
+                r.text[:200],
+            )
         finally:
             STATE["pods"][pid].status.pod_ip = _ip
     finally:
@@ -1286,11 +1469,7 @@ with TestClient(broker.app) as c:
             deadline = time.monotonic() + 1.0
             while not upstream.closed.is_set() and time.monotonic() < deadline:
                 await asyncio.sleep(0.01)
-            return (
-                cancel_elapsed < 1.0
-                and upstream.shutdown_called
-                and upstream.closed.is_set()
-            )
+            return cancel_elapsed < 1.0 and upstream.shutdown_called and upstream.closed.is_set()
 
     check(
         "disconnect during log acquisition closes the late response",
@@ -1387,8 +1566,10 @@ with TestClient(broker.app) as c:
     check("health is readable", broker._worker_api_allowed("GET", "health"))
     check("the sessions list is readable", broker._worker_api_allowed("GET", "sessions"))
     check("a terminal is readable", broker._worker_api_allowed("GET", "terminals/abc12345"))
-    check("an inbox is readable",
-          broker._worker_api_allowed("GET", "terminals/abc12345/inbox/messages"))
+    check(
+        "an inbox is readable",
+        broker._worker_api_allowed("GET", "terminals/abc12345/inbox/messages"),
+    )
     check("input is writable", broker._worker_api_allowed("POST", "terminals/abc12345/input"))
     for method, path in [
         ("GET", "internal/memory/recall"),
@@ -1407,15 +1588,22 @@ import subprocess
 
 _env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_DEFAULT_HAIKU_MODEL"}
 _probe = subprocess.run(
-    [sys.executable, "-c",
-     "import kubernetes.config as c; c.load_incluster_config=lambda: None;"
-     "import sys; sys.path.insert(0, %r); import broker"
-     % os.path.dirname(os.path.abspath(__file__))],
-    capture_output=True, text=True, env=_env,
+    [
+        sys.executable,
+        "-c",
+        "import kubernetes.config as c; c.load_incluster_config=lambda: None;"
+        "import sys; sys.path.insert(0, %r); import broker"
+        % os.path.dirname(os.path.abspath(__file__)),
+    ],
+    capture_output=True,
+    text=True,
+    env=_env,
 )
-check("broker refuses to start with a passthrough var unset",
-      _probe.returncode != 0 and "ANTHROPIC_DEFAULT_HAIKU_MODEL" in _probe.stderr,
-      (_probe.stderr or _probe.stdout)[-300:])
+check(
+    "broker refuses to start with a passthrough var unset",
+    _probe.returncode != 0 and "ANTHROPIC_DEFAULT_HAIKU_MODEL" in _probe.stderr,
+    (_probe.stderr or _probe.stdout)[-300:],
+)
 
 # --- 11. the orphan sweep, which replaced activeDeadlineSeconds -----------
 #
@@ -1455,18 +1643,26 @@ with patch.object(broker, "_update_fleet_config"):
     _plant_worker("dddddddd", broker.WORKER_TIMEOUT + 60, pod_age_seconds=1)
     broker._sweep_orphan_workers()
 
-check("orphan sweep deletes a leaseless worker past WORKER_TIMEOUT",
-      "cao-worker-aaaaaaaa" in STATE["deleted_deployments"],
-      json.dumps(STATE["deleted_deployments"]))
-check("orphan sweep takes the worker's Service with it",
-      "cao-worker-aaaaaaaa" in STATE["deleted_svcs"],
-      json.dumps(STATE["deleted_svcs"]))
-check("orphan sweep spares a leaseless worker inside WORKER_TIMEOUT",
-      "cao-worker-bbbbbbbb" not in STATE["deleted_deployments"],
-      json.dumps(STATE["deleted_deployments"]))
-check("replacement pod does not reset an orphaned Deployment's timeout",
-      "cao-worker-dddddddd" in STATE["deleted_deployments"],
-      json.dumps(STATE["deleted_deployments"]))
+check(
+    "orphan sweep deletes a leaseless worker past WORKER_TIMEOUT",
+    "cao-worker-aaaaaaaa" in STATE["deleted_deployments"],
+    json.dumps(STATE["deleted_deployments"]),
+)
+check(
+    "orphan sweep takes the worker's Service with it",
+    "cao-worker-aaaaaaaa" in STATE["deleted_svcs"],
+    json.dumps(STATE["deleted_svcs"]),
+)
+check(
+    "orphan sweep spares a leaseless worker inside WORKER_TIMEOUT",
+    "cao-worker-bbbbbbbb" not in STATE["deleted_deployments"],
+    json.dumps(STATE["deleted_deployments"]),
+)
+check(
+    "replacement pod does not reset an orphaned Deployment's timeout",
+    "cao-worker-dddddddd" in STATE["deleted_deployments"],
+    json.dumps(STATE["deleted_deployments"]),
+)
 
 # The assertion that stops the sweep being a fleet-wide kill switch. A worker with
 # a LIVE lease belongs to the reaper, which can say WHY it released it; the sweep
@@ -1488,9 +1684,355 @@ with patch.object(broker, "_update_fleet_config"):
             "release_token": "rt",
         }
     broker._sweep_orphan_workers()
-check("orphan sweep never touches a worker with a live lease, at any age",
-      "cao-worker-cccccccc" not in STATE["deleted_deployments"],
-      json.dumps(STATE["deleted_deployments"]))
+check(
+    "orphan sweep never touches a worker with a live lease, at any age",
+    "cao-worker-cccccccc" not in STATE["deleted_deployments"],
+    json.dumps(STATE["deleted_deployments"]),
+)
+
+
+# --- 12. bridge mode: execution-only workers (#745) ------------------------
+#
+# CAO_ELASTIC_WORKER_MODE=bridge mints workers that run cao-bridge and dial the
+# central server; no per-worker Service, no worker HTTP API. Mode is read per
+# call, so flipping the env here exercises it without re-importing broker.
+os.environ["CAO_ELASTIC_WORKER_MODE"] = "bridge"
+os.environ["CAO_ELASTIC_CENTRAL_URL"] = "http://cao-supervisor:9889"
+
+bridge_workload = broker._worker_deployment("beadfeed", "rt-b", worker_request())
+bridge_wire = k8s.ApiClient().sanitize_for_serialization(bridge_workload)
+bridge_spec = bridge_wire["spec"]["template"]["spec"]
+bridge_container = bridge_spec["containers"][0]
+bridge_env = {e["name"]: e for e in bridge_container["env"]}
+
+check(
+    "bridge worker runs in bridge mode",
+    bridge_env.get("CAO_NODE_MODE", {}).get("value") == "bridge",
+)
+check(
+    "bridge worker dials the central runtime channel",
+    bridge_env.get("CAO_BRIDGE_SERVER_URL", {}).get("value")
+    == "ws://cao-supervisor:9889/runtime/channel",
+)
+check(
+    "bridge runtime id is the workload name",
+    bridge_env.get("CAO_BRIDGE_RUNTIME_ID", {}).get("value") == "cao-worker-beadfeed",
+)
+check(
+    "bridge runtime token comes from the shared secret",
+    bridge_env.get("CAO_RUNTIME_TOKEN", {}).get("valueFrom", {}).get("secretKeyRef", {}).get("name")
+    == "cao-runtime-token",
+)
+check(
+    "agent-side API points at the central server",
+    bridge_env.get("CAO_API_HOST", {}).get("value") == "cao-supervisor"
+    and bridge_env.get("CAO_API_PORT", {}).get("value") == "9889",
+)
+check(
+    "memory gateway points at the central server, not the broker",
+    bridge_env.get("CAO_MEMORY_API_URL", {}).get("value") == "http://cao-supervisor:9889",
+)
+check(
+    "a bridge worker keeps its own MCP server, not the shared endpoint",
+    # Not an omission: complete_assignment reads the worker's OWN
+    # CAO_ELASTIC_WORKER_ID/_RELEASE_TOKEN, so forwarding a worker's tools to
+    # the server pod would break the result path this topology carries. The
+    # supervisor is the pod that must be forwarded; a worker must not be.
+    "CAO_MCP_HTTP_URL" not in bridge_env,
+    json.dumps(sorted(bridge_env)),
+)
+check(
+    "a bridge worker still gets the identity complete_assignment needs",
+    bridge_env.get("CAO_ELASTIC_WORKER_ID", {}).get("value") == "beadfeed"
+    and bridge_env.get("CAO_ELASTIC_RELEASE_TOKEN", {}).get("value") == "rt-b",
+)
+check(
+    "no server env in a bridge worker",
+    all(
+        k not in bridge_env
+        for k in ("CAO_BIND_HOST", "CAO_ALLOWED_HOSTS", "CAO_MAX_TERMINALS", "CAO_WARM_PROVIDER")
+    ),
+)
+check(
+    "model pins still reach a bridge worker",
+    bridge_env.get("ANTHROPIC_MODEL", {}).get("value") == os.environ["ANTHROPIC_MODEL"],
+)
+check("bridge worker exposes no container port", not bridge_container.get("ports"))
+check(
+    "bridge readiness is a process probe, not HTTP",
+    "exec" in bridge_container["readinessProbe"]
+    and "httpGet" not in bridge_container["readinessProbe"],
+)
+check(
+    "release token still annotated for gateway auth",
+    bridge_wire["metadata"]["annotations"]["cao.aws/release-token"] == "rt-b",
+)
+
+# Lease over HTTP: mode/runtime_id/provider present, and NO Service minted.
+STATE["services"].clear()
+bridge_client = TestClient(broker.app)
+resp = bridge_client.post(
+    "/workers",
+    headers={"X-CAO-Broker-Token": "test-token"},
+    json={"agent_profile": "developer", "callback_terminal_id": "abc12345"},
+)
+check("bridge lease returns 200", resp.status_code == 200, resp.text)
+bridge_lease = resp.json()
+bw = bridge_lease["worker_id"]
+check(
+    "bridge lease carries mode/runtime_id/provider",
+    bridge_lease["mode"] == "bridge"
+    and bridge_lease["runtime_id"] == f"cao-worker-{bw}"
+    and bridge_lease["provider"] == "claude_code",
+    json.dumps(bridge_lease),
+)
+check(
+    "no per-worker Service in bridge mode",
+    not STATE["services"],
+    json.dumps(list(STATE["services"])),
+)
+
+# Operator proxy: scoped central routing. Fake the central server's answers.
+central_runtimes = {
+    "runtimes": {f"cao-worker-{bw}": {"terminals": ["11112222"], "connected_at": 0, "last_seen": 0}}
+}
+
+
+def _fake_central(method, url, **kwargs):
+    m = Mock()
+    m.status_code = 200
+    if url.endswith("/runtimes"):
+        m.json = lambda: central_runtimes
+        m.content = json.dumps(central_runtimes).encode()
+    elif "/terminals/11112222" in url:
+        m.json = lambda: {"id": "11112222", "status": "completed"}
+        m.content = json.dumps({"id": "11112222", "status": "completed"}).encode()
+        m.headers = {"content-type": "application/json"}
+    elif url.endswith(f"/sessions/cao-worker-{bw}"):
+        m.json = lambda: {"name": f"cao-worker-{bw}"}
+        m.content = json.dumps({"name": f"cao-worker-{bw}"}).encode()
+        m.headers = {"content-type": "application/json"}
+    else:
+        m.status_code = 404
+        m.json = lambda: {"detail": "not found"}
+        m.content = b'{"detail": "not found"}'
+        m.headers = {}
+    if not hasattr(m.headers, "items"):
+        m.headers = {}
+    return m
+
+
+with (
+    patch.object(
+        broker.requests, "get", side_effect=lambda url, **kw: _fake_central("get", url, **kw)
+    ),
+    patch.object(broker.requests, "request", side_effect=_fake_central),
+):
+    r = bridge_client.get(f"/workers/{bw}/api/health", headers={"X-CAO-Broker-Token": "test-token"})
+    check(
+        "bridge health is synthetic from channel connectivity",
+        r.status_code == 200 and r.json().get("status") == "ok",
+        r.text,
+    )
+    r = bridge_client.get(
+        f"/workers/{bw}/api/terminals/11112222", headers={"X-CAO-Broker-Token": "test-token"}
+    )
+    check(
+        "owned terminal is proxied to the central server",
+        r.status_code == 200 and r.json().get("id") == "11112222",
+        r.text,
+    )
+    r = bridge_client.get(
+        f"/workers/{bw}/api/terminals/99998888", headers={"X-CAO-Broker-Token": "test-token"}
+    )
+    check("a terminal of another runtime is refused, not proxied", r.status_code == 404, r.text)
+    r = bridge_client.get(
+        f"/workers/{bw}/api/sessions", headers={"X-CAO-Broker-Token": "test-token"}
+    )
+    check(
+        "sessions is scoped to the worker's own session and list-shaped",
+        r.status_code == 200 and r.json() == [{"name": f"cao-worker-{bw}"}],
+        r.text,
+    )
+
+# Reaper in bridge mode: never-connected within READY_TIMEOUT settles failed.
+with (
+    patch.object(broker, "READY_TIMEOUT", 0),
+    patch.object(
+        broker.requests, "get", side_effect=lambda url, **kw: _fake_central("get", url, **kw)
+    ),
+    patch.object(broker, "_update_fleet_config"),
+):
+    with broker._leases_lock:
+        broker._leases["feedf00d"] = {
+            "state": "leased",
+            "reason": None,
+            "leased_at": time.monotonic() - 60,
+            "settled_at": None,
+            "ready_at": None,
+            "pod_observed_at": time.monotonic(),
+            "pod_uid": None,
+            "agent_profile": "developer",
+            "provider": "claude_code",
+            "callback_terminal_id": "abc12345",
+        }
+    STATE["pods"]["feedf00d"] = _fake_pod("cao-worker-feedf00d", broker._labels("feedf00d"))
+    broker._reap_once()
+    with broker._leases_lock:
+        verdict = broker._leases.get("feedf00d", {})
+    check(
+        "bridge reaper fails a lease whose runtime never connected",
+        verdict.get("state") == "failed" and "never connected" in (verdict.get("reason") or ""),
+        json.dumps({k: verdict.get(k) for k in ("state", "reason")}),
+    )
+
+# Cleanup: settle the bridge lease and restore server mode for any later runs.
+bridge_client.delete(f"/workers/{bw}", headers={"X-CAO-Broker-Token": "test-token"})
+os.environ["CAO_ELASTIC_WORKER_MODE"] = "server"
+
+# --- 13. IRSA credential fallback (opt-in; Pod Identity is the default) -------
+#
+# The default must add nothing: a cluster with working Pod Identity should not
+# acquire a second credential path just by upgrading.
+default_spec = k8s.ApiClient().sanitize_for_serialization(
+    broker._worker_deployment("cafed00d", "rt-i", worker_request())
+)["spec"]["template"]["spec"]
+default_env = {e["name"] for e in default_spec["containers"][0]["env"]}
+check(
+    "without an IRSA role the pod carries no web-identity env",
+    not {"AWS_ROLE_ARN", "AWS_WEB_IDENTITY_TOKEN_FILE"} & default_env,
+    sorted(default_env & {"AWS_ROLE_ARN", "AWS_WEB_IDENTITY_TOKEN_FILE"}),
+)
+check(
+    "without an IRSA role the pod carries no token volume",
+    not any(v["name"] == "aws-iam-token" for v in default_spec["volumes"]),
+    [v["name"] for v in default_spec["volumes"]],
+)
+
+with patch.object(broker, "WORKER_IRSA_ROLE_ARN", "arn:aws:iam::1234:role/cao-bedrock"):
+    irsa_spec = k8s.ApiClient().sanitize_for_serialization(
+        broker._worker_deployment("cafebabe", "rt-i2", worker_request())
+    )["spec"]["template"]["spec"]
+irsa_container = irsa_spec["containers"][0]
+irsa_env = {e["name"]: e.get("value") for e in irsa_container["env"]}
+irsa_volume = next((v for v in irsa_spec["volumes"] if v["name"] == "aws-iam-token"), None)
+projection = (irsa_volume or {}).get("projected", {}).get("sources", [{}])[0]
+
+check(
+    "IRSA role reaches the container as AWS_ROLE_ARN",
+    irsa_env.get("AWS_ROLE_ARN") == "arn:aws:iam::1234:role/cao-bedrock",
+    irsa_env.get("AWS_ROLE_ARN"),
+)
+check(
+    "the token file env points at the projected path",
+    irsa_env.get("AWS_WEB_IDENTITY_TOKEN_FILE")
+    == "/var/run/secrets/eks.amazonaws.com/serviceaccount/token",
+    irsa_env.get("AWS_WEB_IDENTITY_TOKEN_FILE"),
+)
+check(
+    "the projected token's audience is STS, never the API server",
+    projection.get("serviceAccountToken", {}).get("audience") == "sts.amazonaws.com",
+    json.dumps(projection),
+)
+check(
+    "the token is mounted read-only where the env says it is",
+    any(
+        m["mountPath"] == "/var/run/secrets/eks.amazonaws.com/serviceaccount"
+        and m.get("readOnly") is True
+        for m in irsa_container["volumeMounts"]
+    ),
+    json.dumps(irsa_container["volumeMounts"]),
+)
+check(
+    "the API-server SA mount stays off even with IRSA projected",
+    irsa_spec.get("automountServiceAccountToken") is False,
+    irsa_spec.get("automountServiceAccountToken"),
+)
+check(
+    "the init container still mounts the workspace, not the token",
+    [m["name"] for m in irsa_spec["initContainers"][0]["volumeMounts"]] == ["workspace"],
+    [m["name"] for m in irsa_spec["initContainers"][0]["volumeMounts"]],
+)
+
+# --- 14. release waits out the worker's own termination grace period --------
+#
+# _release deletes with Foreground propagation, so the Deployment survives until
+# its pod does -- up to the full grace period. A wait chosen independently of
+# that (it used to be a flat 15s against a 30s grace period) is unreachable for
+# any worker that does not exit instantly on SIGTERM, and a bridge worker
+# running a real agent does not: on the cluster a teardown that had in fact
+# removed everything answered HTTP 500 and the lease looked like cleanup_pending.
+
+check(
+    "the deletion wait is bounded by the grace period, not below it",
+    broker.WORKLOAD_DELETION_TIMEOUT > broker.WORKER_TERMINATION_GRACE_SECONDS,
+    f"wait {broker.WORKLOAD_DELETION_TIMEOUT}s vs grace "
+    f"{broker.WORKER_TERMINATION_GRACE_SECONDS}s",
+)
+check(
+    "the pod's grace period is the same one the wait is derived from",
+    k8s.ApiClient().sanitize_for_serialization(
+        broker._worker_deployment("d0d0caca", "rt-g", worker_request())
+    )["spec"]["template"]["spec"]["terminationGracePeriodSeconds"]
+    == broker.WORKER_TERMINATION_GRACE_SECONDS,
+    "pod spec and the wait disagree about the grace period",
+)
+
+
+CLOCK = {"now": 0.0}
+
+
+class _LingeringApps(FakeApps):
+    """A Deployment that vanishes only after its pod's grace period elapses."""
+
+    def __init__(self, linger):
+        self.linger = linger
+        self.deleted_at = None
+
+    def delete_namespaced_deployment(self, name, ns, propagation_policy=None):
+        self.deleted_at = CLOCK["now"]
+
+    def read_namespaced_deployment(self, name, ns):
+        if self.deleted_at is not None and CLOCK["now"] - self.deleted_at >= self.linger:
+            raise k8s.rest.ApiException(status=404)
+        return Mock()
+
+
+_fake_clock = types.SimpleNamespace(
+    monotonic=lambda: CLOCK["now"],
+    # Every wait in _release is a time.sleep, so advancing here runs the poll
+    # loop in simulated time -- no real 45s in the test.
+    sleep=lambda seconds: CLOCK.__setitem__("now", CLOCK["now"] + seconds),
+)
+
+
+def _release_took(linger):
+    """Run _release against a Deployment that lingers `linger` seconds."""
+    CLOCK["now"] = 0.0
+    with (
+        patch.object(broker, "apps_api", _LingeringApps(linger)),
+        patch.object(broker, "time", _fake_clock),
+    ):
+        try:
+            broker._release("abcd1234")
+        except TimeoutError as exc:
+            return None, str(exc)
+    return CLOCK["now"], None
+
+
+elapsed, error = _release_took(broker.WORKER_TERMINATION_GRACE_SECONDS)
+check(
+    "a worker that uses its whole grace period still releases successfully",
+    error is None and elapsed >= broker.WORKER_TERMINATION_GRACE_SECONDS,
+    f"raised {error}" if error else f"returned after {elapsed}s",
+)
+
+elapsed, error = _release_took(broker.WORKLOAD_DELETION_TIMEOUT * 10)
+check(
+    "a workload that never goes away is still reported, not silently accepted",
+    error is not None and "was not deleted" in error,
+    f"returned after {elapsed}s instead of raising",
+)
 
 print()
 print("FAILURES:", FAILS if FAILS else "none")

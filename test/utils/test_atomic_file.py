@@ -34,6 +34,7 @@ from cli_agent_orchestrator.utils.atomic_file import (
     locked_atomic_delete,
     locked_atomic_rewrite,
     locked_atomic_write,
+    write_owner_only,
 )
 
 
@@ -845,3 +846,189 @@ def test_delete_does_not_disturb_the_lock_file_itself(tmp_path: Path) -> None:
     assert not target.exists()
     assert lock_path.exists()
     assert LOCK_DIR in lock_path.parents
+
+
+# --------------------------------------------------------------------------
+# write_owner_only
+#
+# Added for the Copilot review on #802: provider MCP configs structurally carry
+# ``CAO_RUNTIME_TOKEN``, so 0600 is a property of what the file CONTAINS, not an
+# operator preference. The two patterns already in this module are both wrong for
+# that: write_text-then-chmod publishes the credential at the umask default first,
+# and _atomic_publish deliberately preserves an existing (possibly 0644) mode.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file modes")
+def test_owner_only_never_exposes_the_bytes_at_a_wider_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The window a chmod-afterwards write leaves open must not exist here.
+
+    ``os.replace`` is the instant the content becomes reachable under the target's
+    name, and the temp file already holds every byte by then. Asserting the mode at
+    that exact moment is what distinguishes "created owner-only" from "widened
+    open, narrowed later": in the chmod-afterwards shape this observation is 0644
+    with the whole token already on disk.
+    """
+    import cli_agent_orchestrator.utils.atomic_file as atomic_file_module
+
+    target = tmp_path / "mcp.json"
+    observed: list[tuple[int, str]] = []
+    real_replace = atomic_file_module.os.replace
+
+    def spying_replace(src, dst, **kwargs):
+        observed.append(
+            (
+                stat.S_IMODE(os.stat(src).st_mode),
+                Path(src).read_text(encoding="utf-8"),
+            )
+        )
+        return real_replace(src, dst, **kwargs)
+
+    monkeypatch.setattr(atomic_file_module.os, "replace", spying_replace)
+
+    # A permissive umask, so a mode of 0600 can only come from mkstemp's
+    # construction and not from the process default.
+    old_umask = os.umask(0o000)
+    try:
+        write_owner_only(target, '{"token": "s3cret"}')
+    finally:
+        os.umask(old_umask)
+
+    assert len(observed) == 1
+    mode, content = observed[0]
+    assert mode == 0o600, f"content was reachable at {oct(mode)} before the replace"
+    assert "s3cret" in content, "the assertion above is only meaningful once the bytes are there"
+    assert stat.S_IMODE(os.stat(target).st_mode) == 0o600
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file modes")
+def test_owner_only_tightens_a_world_readable_existing_config(tmp_path: Path) -> None:
+    """The case mode preservation gets wrong.
+
+    A config written before this rule, or by another tool, is 0644. Preserving that
+    republishes a runtime token world-readable, so this helper must narrow it. The
+    contrast with ``locked_atomic_write`` below is the whole reason for two helpers.
+    """
+    target = tmp_path / "mcp.json"
+    target.write_text("{}", encoding="utf-8")
+    os.chmod(target, 0o644)
+
+    write_owner_only(target, '{"token": "s3cret"}')
+
+    assert stat.S_IMODE(os.stat(target).st_mode) == 0o600
+    assert target.read_text(encoding="utf-8") == '{"token": "s3cret"}'
+
+    # Same file, the other helper: 0644 survives. Correct for user-authored
+    # files, wrong for anything holding a credential.
+    os.chmod(target, 0o644)
+    locked_atomic_write(target, "{}")
+    assert stat.S_IMODE(os.stat(target).st_mode) == 0o644
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file modes")
+def test_owner_only_ignores_a_permissive_umask(tmp_path: Path) -> None:
+    """0600 is not negotiable by the environment.
+
+    An operator running with ``umask 000`` (or a container image that does) would
+    otherwise publish the token at 0666.
+    """
+    target = tmp_path / "mcp.json"
+
+    old_umask = os.umask(0o000)
+    try:
+        write_owner_only(target, "{}")
+    finally:
+        os.umask(old_umask)
+
+    assert stat.S_IMODE(os.stat(target).st_mode) == 0o600
+
+
+def test_owner_only_executable_mode_stays_owner_only(tmp_path: Path) -> None:
+    """A pre-script needs owner execute, but never group/other bits.
+
+    mode=0o700 publishes an owner-only executable inode from the first byte —
+    the flow pre-script write uses this so a credential-bearing body is never
+    world-readable in a chmod-afterward window (Copilot follow-up on #802).
+    """
+    target = tmp_path / "flow.pre-script"
+
+    old_umask = os.umask(0o000)
+    try:
+        write_owner_only(target, "#!/bin/sh\necho hi\n", mode=0o700)
+    finally:
+        os.umask(old_umask)
+
+    assert stat.S_IMODE(os.stat(target).st_mode) == 0o700
+
+
+def test_owner_only_masks_a_caller_that_asks_for_group_or_other_bits(tmp_path: Path) -> None:
+    """Even a caller passing 0o755 gets owner-only: the mask forbids widening."""
+    target = tmp_path / "flow.pre-script"
+    write_owner_only(target, "x", mode=0o755)
+    assert stat.S_IMODE(os.stat(target).st_mode) == 0o700
+
+
+def test_owner_only_creates_the_parent_directory(tmp_path: Path) -> None:
+    """Provider config dirs (``~/.antigravity/...``) may not exist on first run."""
+    target = tmp_path / "nested" / "deeper" / "mcp.json"
+
+    write_owner_only(target, "{}")
+
+    assert target.read_text(encoding="utf-8") == "{}"
+
+
+def test_owner_only_leaves_no_temp_file_behind(tmp_path: Path) -> None:
+    """A leftover temp would be a second copy of the token on disk."""
+    target = tmp_path / "mcp.json"
+
+    write_owner_only(target, '{"token": "s3cret"}')
+
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["mcp.json"]
+
+
+def test_owner_only_cleans_up_when_the_write_fails(tmp_path: Path) -> None:
+    """A failed publish must not strand a temp file holding the credential."""
+    target = tmp_path / "mcp.json"
+
+    class Exploding:
+        def __str__(self) -> str:
+            raise RuntimeError("serialization blew up")
+
+    with pytest.raises(TypeError):
+        write_owner_only(target, Exploding())  # type: ignore[arg-type]
+
+    assert not target.exists()
+    assert [p.name for p in tmp_path.iterdir()] == []
+
+
+def test_owner_only_replaces_atomically(tmp_path: Path) -> None:
+    """A reader either sees the old config or the new one, never a truncated file.
+
+    Pinned by the mechanism rather than by a race: the target is only ever created
+    by ``os.replace``, so there is no moment at which its name points at a
+    partially-written file.
+    """
+    import cli_agent_orchestrator.utils.atomic_file as atomic_file_module
+
+    target = tmp_path / "mcp.json"
+    target.write_text("OLD", encoding="utf-8")
+    real_replace = atomic_file_module.os.replace
+    seen_during_write: list[str] = []
+
+    def spying_replace(src, dst, **kwargs):
+        # Immediately before publication the target still holds the old content
+        # in full — the new bytes live under the temp name until this call.
+        seen_during_write.append(Path(dst).read_text(encoding="utf-8"))
+        return real_replace(src, dst, **kwargs)
+
+    original = atomic_file_module.os.replace
+    atomic_file_module.os.replace = spying_replace
+    try:
+        write_owner_only(target, "NEW")
+    finally:
+        atomic_file_module.os.replace = original
+
+    assert seen_during_write == ["OLD"]
+    assert target.read_text(encoding="utf-8") == "NEW"

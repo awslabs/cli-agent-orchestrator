@@ -1,16 +1,36 @@
 # Every identity in the namespace, in one file, because the interesting property
-# is the comparison: exactly one of these three can talk to the Kubernetes API,
+# is the comparison: exactly one of these four can talk to the Kubernetes API,
 # and it is the one that runs no agent.
 #
-# All three are also Pod Identity subjects. Pod Identity keys on a (namespace,
-# serviceAccount) pair, so each name here must match an association in
+# The ones that run an agent are also Pod Identity subjects. Pod Identity keys on
+# a (namespace, serviceAccount) pair, so those names must match an association in
 # iac/cfn-infrastructure.yaml - a name that matches nothing is a scheduling success
 # and an auth failure, which reads as a broken model rather than a broken binding.
 ---
-# The supervisor: the pod a participant actually talks to. No Role and no
-# RoleBinding, so it holds no Kubernetes permissions at all. It asks the broker
-# for a worker over HTTP instead, which is the whole point of the broker - the
-# pod running a command-capable agent cannot create pods.
+# The central server: the pod a participant talks to, and the only one with an
+# inbound API. No Role and no RoleBinding, so it holds no Kubernetes permissions
+# at all - it asks the broker for a worker over HTTP, which is the whole point of
+# the broker.
+#
+# Deliberately NOT a Pod Identity subject: no provider CLI is installed here and
+# nothing in this pod calls a model, so it needs no AWS credentials. An
+# association for this name would only widen what a compromised control plane
+# could reach.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cao-server
+  namespace: cao-cluster
+  labels:
+    app.kubernetes.io/name: cao-server
+    app.kubernetes.io/part-of: cao-elastic-fleet
+---
+# The supervisor: an execution-only `cao-bridge` runtime that runs the
+# participant's agent (#745). No Role and no RoleBinding, and now not even an
+# inbound Service - it holds one outbound channel to cao-server and nothing else.
+#
+# It keeps its Pod Identity association, because this is where the provider CLI
+# actually runs and therefore where the Bedrock credentials are needed.
 apiVersion: v1
 kind: ServiceAccount
 metadata:

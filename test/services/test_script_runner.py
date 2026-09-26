@@ -1256,3 +1256,199 @@ async def test_run_script_workflow_prepared_marks_then_clears_active_drive(
     await run_script_workflow_prepared(record, "/tmp/wf.py", build_env("run-prep-live", "1", {}))
     assert observed["live"] is True
     assert "run-prep-live" not in workflow_service._active_drives
+
+
+# ---------------------------------------------------------------------------
+# #745 item 6 — script execution relocated to a remote runtime over the channel
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_remote_script_run_executes_in_runtime_and_completes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """End-to-end: with CAO_SCRIPT_RUNTIME set to a connected runtime, the drive
+    dispatches RUN_SCRIPT over the channel (executed by the REAL bridge
+    subprocess), and the raw outcome flows through the shared finalize path to a
+    COMPLETED run with the sentinel output parsed. No subprocess is spawned on
+    the server host."""
+    from cli_agent_orchestrator.runtime_channel.bridge import Bridge
+    from cli_agent_orchestrator.runtime_channel.protocol import (
+        CommandOutcome,
+        CommandResultFrame,
+        CommandType,
+    )
+    from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
+
+    bridge = Bridge("ws://unused", "worker-live", "tok")
+
+    # A runtime connection whose send_command routes RUN_SCRIPT to the real
+    # bridge executor (a genuine subprocess), mirroring the wire round-trip.
+    class _RoutingConn:
+        runtime_id = "worker-live"
+
+        async def send_command(
+            self, command_type, payload, terminal_id=None, timeout=None, op_id=None
+        ):
+            assert command_type == CommandType.RUN_SCRIPT
+            # The driver mints the op_id and the bridge indexes the subprocess
+            # under it, so the fake honours the one it is handed rather than
+            # inventing a second identity (#802 finding 1).
+            assert op_id, "the caller must name the operation it will later cancel"
+            result = await bridge._run_script(
+                op_id,
+                payload["script"],
+                payload["env"],
+                payload["timeout"],
+                payload["term_grace"],
+            )
+            return CommandResultFrame(op_id=op_id, outcome=CommandOutcome.OK, payload=result)
+
+    conn = _RoutingConn()
+    monkeypatch.setattr(
+        runtime_registry, "get_runtime", lambda rid: conn if rid == "worker-live" else None
+    )
+    monkeypatch.setenv("CAO_SCRIPT_RUNTIME", "worker-live")
+
+    # A real script file the server reads and ships the body of.
+    script = tmp_path / "wf.py"
+    script.write_text('print("ran remotely"); print(\'CAO_WORKFLOW_OUTPUT:{"n": 7}\')\n')
+
+    record = _make_record("run-remote", process=None, generation="1")
+    _seed_script_run("run-remote")
+    from cli_agent_orchestrator.services.workflow_service import run_registry
+
+    run_registry["run-remote"] = record
+
+    env = build_env("run-remote", "1", {})
+    result = await script_runner._drive_process(record, str(script), env)
+
+    assert result.state == RunState.COMPLETED
+    assert result.output == {"n": 7}
+    row = workflow_journal.get_run("run-remote")
+    assert row is not None and row.state == "completed"
+
+
+@pytest.mark.asyncio
+async def test_remote_script_run_nonzero_exit_is_failed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """A remote script that exits nonzero finalizes FAILED, same as local."""
+    from cli_agent_orchestrator.runtime_channel.bridge import Bridge
+    from cli_agent_orchestrator.runtime_channel.protocol import (
+        CommandOutcome,
+        CommandResultFrame,
+        CommandType,
+    )
+    from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
+
+    bridge = Bridge("ws://unused", "worker-live", "tok")
+
+    class _RoutingConn:
+        runtime_id = "worker-live"
+
+        async def send_command(
+            self, command_type, payload, terminal_id=None, timeout=None, op_id=None
+        ):
+            assert op_id, "the caller must name the operation it will later cancel"
+            result = await bridge._run_script(
+                op_id, payload["script"], payload["env"], payload["timeout"], payload["term_grace"]
+            )
+            return CommandResultFrame(op_id=op_id, outcome=CommandOutcome.OK, payload=result)
+
+    conn = _RoutingConn()
+    monkeypatch.setattr(
+        runtime_registry, "get_runtime", lambda rid: conn if rid == "worker-live" else None
+    )
+    monkeypatch.setenv("CAO_SCRIPT_RUNTIME", "worker-live")
+
+    script = tmp_path / "wf.py"
+    script.write_text('import sys; sys.stderr.write("boom"); sys.exit(2)\n')
+
+    record = _make_record("run-remote-fail", process=None, generation="1")
+    _seed_script_run("run-remote-fail")
+    from cli_agent_orchestrator.services.workflow_service import run_registry
+
+    run_registry["run-remote-fail"] = record
+
+    result = await script_runner._drive_process(
+        record, str(script), build_env("run-remote-fail", "1", {})
+    )
+    assert result.state == RunState.FAILED
+
+
+@pytest.mark.asyncio
+async def test_remote_script_runtime_disconnected_is_unknown_failed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """If the configured runtime is gone by drive time, the run FAILS explicitly
+    (outcome unknown) rather than silently running locally or claiming success."""
+    from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
+
+    # _remote_script_runtime returns the id (env set) but get_runtime→None at
+    # drive time simulates a race where it disconnected after selection.
+    monkeypatch.setenv("CAO_SCRIPT_RUNTIME", "worker-gone")
+    monkeypatch.setattr(script_runner, "_remote_script_runtime", lambda: "worker-gone")
+    monkeypatch.setattr(runtime_registry, "get_runtime", lambda rid: None)
+
+    script = tmp_path / "wf.py"
+    script.write_text("print('x')\n")
+    record = _make_record("run-gone", process=None, generation="1")
+    _seed_script_run("run-gone")
+    from cli_agent_orchestrator.services.workflow_service import run_registry
+
+    run_registry["run-gone"] = record
+
+    result = await script_runner._drive_process(record, str(script), build_env("run-gone", "1", {}))
+    assert result.state == RunState.FAILED
+    assert any("not connected" in w for w in result.warnings)
+
+
+class TestTheBridgeNeverPublishesScriptBytesWorldReadable:
+    """The script body is the caller's code and can embed secrets.
+
+    ``open()`` then ``chmod`` flushes the whole body at the umask default first,
+    so another local account in the same pod can open it inside that window and
+    keep reading through the descriptor after the narrowing — an exposure a test
+    asserting only the FINAL mode cannot see (Copilot review on #802). The file
+    is created with its mode up front instead.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode,expected", [("executable", 0o700), ("python", 0o600)])
+    async def test_the_file_is_owner_only_at_every_instant(self, mode, expected, monkeypatch):
+        import os
+        import stat
+
+        from cli_agent_orchestrator.runtime_channel.bridge import Bridge
+        from cli_agent_orchestrator.runtime_channel.protocol import CommandFrame, CommandType
+
+        seen_modes = []
+        real_fdopen = os.fdopen
+
+        def spying_fdopen(fd, *a, **kw):
+            # The mode the inode ALREADY has, before a single byte is written.
+            seen_modes.append(stat.S_IMODE(os.fstat(fd).st_mode))
+            return real_fdopen(fd, *a, **kw)
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.runtime_channel.bridge.os.fdopen", spying_fdopen
+        )
+
+        bridge = Bridge("ws://unused", "worker-x", "tok")
+        frame = CommandFrame(
+            op_id="op-mode",
+            type=CommandType.RUN_SCRIPT,
+            terminal_id=None,
+            payload={
+                "script": "#!/bin/sh\necho hi\n" if mode == "executable" else "print('hi')\n",
+                "env": {},
+                "timeout": 5,
+                "mode": mode,
+            },
+        )
+        await bridge._execute(frame)
+
+        assert seen_modes, "the script file was never created through os.fdopen"
+        assert seen_modes[0] == expected, (
+            f"script inode was {oct(seen_modes[0])} before any write; "
+            f"expected {oct(expected)} from creation"
+        )

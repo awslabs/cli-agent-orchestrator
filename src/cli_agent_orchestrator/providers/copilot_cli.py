@@ -21,7 +21,10 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
-from cli_agent_orchestrator.utils.mcp_resolution import resolve_cao_mcp_command
+from cli_agent_orchestrator.utils.mcp_resolution import (
+    resolve_cao_mcp_command,
+    shared_endpoint_child_env,
+)
 from cli_agent_orchestrator.utils.terminal import wait_for_shell
 
 logger = logging.getLogger(__name__)
@@ -228,7 +231,13 @@ class CopilotCliProvider(BaseProvider):
                 "command": mcp_command,
                 "args": mcp_args,
                 "disabled": False,
-                "env": {"CAO_TERMINAL_ID": self.terminal_id},
+                # The resolver may have swapped in the forwarding shim (#745);
+                # it then needs the endpoint and token in this child's env.
+                # Empty when no shared endpoint is configured.
+                "env": {
+                    "CAO_TERMINAL_ID": self.terminal_id,
+                    **shared_endpoint_child_env(),
+                },
             }
         }
 

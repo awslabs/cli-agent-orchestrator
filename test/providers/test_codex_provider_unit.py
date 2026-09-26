@@ -4154,6 +4154,66 @@ class TestCodexProviderExitDetection:
         assert status == TerminalStatus.ERROR
 
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_a_node_shim_install_is_not_mistaken_for_an_exit(self, mock_tmux):
+        """tmux reports the SHELL for a whole codex session when codex is a node
+        shim (``/opt/homebrew/bin/codex`` is ``#!/usr/bin/env node``, which is how
+        npm/homebrew install it). Inferring an exit from that alone put every
+        terminal in ERROR seconds after launch and made send_input refuse with
+        409, breaking assign/handoff for that install. Codex's own live TUI at the
+        bottom of the pane is the corroboration that overrides the report."""
+        mock_tmux.return_value.get_native_status.return_value = None
+        mock_tmux.return_value.get_pane_current_command.return_value = "zsh"
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider._initialized = True
+        provider.shell_baseline = "zsh"
+        # The real frame from a healthy node-shim codex: idle prompt + status bar.
+        output = (
+            "OpenAI Codex (v0.153.4)\n"
+            "\u203a Ask Codex to do anything\n"
+            "  openai.gpt-5.6-sol xhigh \u00b7 ~/Amazon-WorkDocs/Code/cli-agent-orchestrator\n"
+        )
+
+        assert provider.get_status(output) != TerminalStatus.ERROR
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_the_window_before_the_first_painted_frame_is_not_an_exit(self, mock_tmux):
+        """Right after launch the command line is on screen and the TUI has not
+        painted, so there is no codex chrome to find. A handoff polling in that
+        window saw ERROR and failed a worker that reached `completed` moments
+        later, so absence-of-chrome must not be read as an exit."""
+        mock_tmux.return_value.get_native_status.return_value = None
+        mock_tmux.return_value.get_pane_current_command.return_value = "zsh"
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider._initialized = True
+        provider.shell_baseline = "zsh"
+        # Bottom line is the launch command, not a prompt: nothing has exited.
+        output = "% codex --yolo --no-alt-screen -c check_for_update_on_startup=false\n"
+
+        assert provider.get_status(output) != TerminalStatus.ERROR
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_a_shell_prompt_below_stale_codex_chrome_is_still_an_exit(self, mock_tmux):
+        """The inverse: after a real exit the codex prompt and footer are still in
+        the scrollback, with the shell prompt beneath them. The bottom line wins,
+        or a dead pane would be read as alive and queued input typed into a shell."""
+        mock_tmux.return_value.get_native_status.return_value = None
+        mock_tmux.return_value.get_pane_current_command.return_value = "zsh"
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider._initialized = True
+        provider.shell_baseline = "zsh"
+        output = (
+            "OpenAI Codex (v0.153.4)\n"
+            "\u203a \n"
+            "  ? for shortcuts                     100% context left\n"
+            "haofeif@host cli-agent-orchestrator %\n"
+        )
+
+        assert provider.get_status(output) == TerminalStatus.ERROR
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
     def test_get_status_normal_when_codex_running(self, mock_tmux):
         """Normal status detection when codex is still running (pane command != shell)."""
         mock_tmux.return_value.get_native_status.return_value = None

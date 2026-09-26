@@ -20,15 +20,29 @@ inline:
 
 Any command other than the bare ``cao-mcp-server`` (e.g. a user's custom MCP
 server, or an explicit absolute path) passes through unchanged.
+
+This is also where a bundled entry is redirected to the shared HTTP endpoint
+(#745). When ``CAO_MCP_HTTP_URL`` is set, ``cao-mcp-server`` is replaced by
+``cao-mcp-stdio-bridge`` with the endpoint and token injected into the child
+env. Doing it here rather than in each provider is what lets the shim's promise
+hold literally — no provider code knows the endpoint exists — and it is why an
+agent pod needs no MCP server, and therefore no broker credentials, of its own.
 """
 
 import logging
+import os
 import shutil
 import sys
 from pathlib import Path
 from typing import List, Tuple
 
 logger = logging.getLogger(__name__)
+
+# Set when a shared HTTP MCP endpoint exists for agents to use instead of each
+# starting its own in-pod server (#745). Read here rather than imported from
+# ``mcp_server.http_hosting`` to keep this leaf utility free of that dependency.
+SHARED_ENDPOINT_URL_ENV = "CAO_MCP_HTTP_URL"
+RUNTIME_TOKEN_ENV = "CAO_RUNTIME_TOKEN"
 
 # The bundled orchestration MCP server's console-script name.
 CAO_MCP_SERVER_COMMAND = "cao-mcp-server"
@@ -37,18 +51,35 @@ CAO_MCP_SERVER_COMMAND = "cao-mcp-server"
 # interpreter directly, with no dependency on a script being on PATH.
 CAO_MCP_SERVER_MODULE = "cli_agent_orchestrator.mcp_server.server"
 
-# Console-script filename to look for next to the interpreter. On Windows the
-# script is installed as a .exe wrapper.
-_SCRIPT_FILENAME = (
-    f"{CAO_MCP_SERVER_COMMAND}.exe" if sys.platform == "win32" else CAO_MCP_SERVER_COMMAND
-)
+# The stdio→HTTP forwarding shim (#745). A provider pointed at the shared
+# endpoint declares this instead of ``cao-mcp-server``, and needs the identical
+# PATH-independent resolution: it is bundled the same way and fails the same
+# way when the agent subprocess's PATH does not include the script dir.
+CAO_MCP_STDIO_BRIDGE_COMMAND = "cao-mcp-stdio-bridge"
+CAO_MCP_STDIO_BRIDGE_MODULE = "cli_agent_orchestrator.mcp_server.stdio_bridge"
+
+# Bundled console script → module entrypoint. A command absent from this map is
+# someone else's MCP server and passes through untouched.
+_BUNDLED_COMMANDS = {
+    CAO_MCP_SERVER_COMMAND: CAO_MCP_SERVER_MODULE,
+    CAO_MCP_STDIO_BRIDGE_COMMAND: CAO_MCP_STDIO_BRIDGE_MODULE,
+}
 
 
-def _sibling_script() -> str:
-    """Absolute path to cao-mcp-server next to the running interpreter, or ""."""
+def _script_filename(command: str) -> str:
+    """Console-script filename to look for. Windows installs a .exe wrapper."""
+    return f"{command}.exe" if sys.platform == "win32" else command
+
+
+# Retained for the default command so existing references keep working.
+_SCRIPT_FILENAME = _script_filename(CAO_MCP_SERVER_COMMAND)
+
+
+def _sibling_script(command: str = CAO_MCP_SERVER_COMMAND) -> str:
+    """Absolute path to a bundled script next to the running interpreter, or ""."""
     if not sys.executable:  # frozen/embedded interpreter — Path("") would raise
         return ""
-    sibling = Path(sys.executable).with_name(_SCRIPT_FILENAME)
+    sibling = Path(sys.executable).with_name(_script_filename(command))
     return str(sibling) if sibling.exists() else ""
 
 
@@ -84,11 +115,21 @@ def resolve_cao_mcp_command(
     Returns:
         A ``(command, args)`` tuple.
     """
-    if command != CAO_MCP_SERVER_COMMAND:
+    # When a shared endpoint is configured, the bundled orchestration server
+    # becomes the forwarding shim (#745) — one substitution, before path
+    # resolution, so every caller of this function is consistent. Only the
+    # bundled command is substituted: someone else's MCP server is not ours to
+    # redirect, and an entry already naming the shim needs no change.
+    if command == CAO_MCP_SERVER_COMMAND and shared_endpoint_url():
+        logger.debug("redirecting %s to the shared endpoint via the shim", command)
+        command = CAO_MCP_STDIO_BRIDGE_COMMAND
+
+    module = _BUNDLED_COMMANDS.get(command)
+    if module is None:
         return command, list(args)
 
-    sibling = _sibling_script()
-    on_path = shutil.which(CAO_MCP_SERVER_COMMAND)
+    sibling = _sibling_script(command)
+    on_path = shutil.which(command)
     order = (
         [("PATH", on_path), ("sibling", sibling)]
         if persisted
@@ -109,7 +150,88 @@ def resolve_cao_mcp_command(
     # the server in this tier too.
     interpreter = sys.executable or "python3"
     logger.debug("Resolved %s to module entrypoint via %s", command, interpreter)
-    return interpreter, ["-m", CAO_MCP_SERVER_MODULE, *args]
+    return interpreter, ["-m", module, *args]
+
+
+def shared_endpoint_url() -> str:
+    """The shared HTTP MCP endpoint's URL, or "" when there is none."""
+    return os.environ.get(SHARED_ENDPOINT_URL_ENV, "").strip()
+
+
+def shared_endpoint_child_env(*, persisted: bool = False) -> dict:
+    """Env a forwarded MCP child needs, for callers that build env themselves.
+
+    Exactly two things the profile cannot know: which endpoint to dial and the
+    token to present. Empty dict when no endpoint is configured, so a caller can
+    merge it unconditionally.
+
+    The token is omitted when unset rather than sent empty — the shim's own
+    check then reports it as absent, which is the legible failure. It is not a
+    new secret in the agent's reach either way: the pod that runs the agent
+    already carries ``CAO_RUNTIME_TOKEN`` in its environment, because that is
+    what its runtime channel authenticates with.
+
+    ``persisted`` omits the TOKEN, and only the token. Set it when the result is
+    written to a config file the provider reads at a later launch. The endpoint
+    URL still goes in — it is deployment configuration, not a credential, and the
+    shim cannot find the server without it.
+
+    The token is left out because it does not need to be there: the shim inherits
+    it from the process environment of the pod that launches it, which carries
+    ``CAO_RUNTIME_TOKEN`` for its own runtime channel. Writing it into the file
+    as well added nothing and put the channel credential on disk in provider
+    config — in Kiro's agent JSON and Cursor's plugin.json at the default umask,
+    so mode 0644 (Copilot review on #802). A secret that is redundant at rest
+    should not be at rest.
+
+    WHAT THIS IS NOT. It is not an isolation boundary, and the per-command gate in
+    :func:`shared_endpoint_child_env_for` is not either. Both only decide what is
+    WRITTEN. ``TmuxClient.create_session`` forwards every non-blocked ``CAO_*``
+    variable from the server's environment into the provider's pane
+    (``clients/tmux.py``), so the provider process — and therefore any MCP child
+    it spawns, third-party ones included — inherits ``CAO_RUNTIME_TOKEN`` anyway.
+
+    So the honest claim is narrow: these two rules reduce the credential's
+    exposure AT REST and keep it out of files a third-party server's author never
+    expected to hold a secret. They do not stop a third-party MCP server from
+    reading the token out of its own environment. Real isolation needs the token
+    withheld from the pane and delivered to the shim alone — which the MCP
+    config's per-entry ``env`` is the only existing channel for, and that puts it
+    back on disk. Closing that properly means the shim fetching its own
+    credential rather than being handed one; until then this is a reduction, not
+    a boundary (Copilot review on #802).
+    """
+    url = shared_endpoint_url()
+    if not url:
+        return {}
+    env = {SHARED_ENDPOINT_URL_ENV: url}
+    if persisted:
+        return env
+    token = os.environ.get(RUNTIME_TOKEN_ENV, "").strip()
+    if token:
+        env[RUNTIME_TOKEN_ENV] = token
+    return env
+
+
+def shared_endpoint_child_env_for(command: str, *, persisted: bool = False) -> dict:
+    """:func:`shared_endpoint_child_env`, but only for the entry it belongs to.
+
+    *command* is the entry's command **as declared**, before resolution. The
+    forwarding env is CAO's own: only the bundled server (or an entry already
+    naming the shim) is redirected, so only that child needs the endpoint — and
+    only that child should be handed ``CAO_RUNTIME_TOKEN``. A third-party MCP
+    server declared by an agent profile or plugin is launched unchanged; giving
+    it the channel credential would widen the token's reach to code CAO does not
+    ship, for no purpose, and — where the provider persists its config — write it
+    into a file that server's author never expected to hold a secret.
+
+    Reported by Copilot review on #802 (findings 2 and 9): providers that build
+    a child env by hand merged this unconditionally, while
+    :func:`resolve_mcp_server_config` had always gated it.
+    """
+    if command not in _BUNDLED_COMMANDS:
+        return {}
+    return shared_endpoint_child_env(persisted=persisted)
 
 
 def resolve_mcp_server_config(config: dict, *, persisted: bool = False) -> dict:
@@ -130,6 +252,38 @@ def resolve_mcp_server_config(config: dict, *, persisted: bool = False) -> dict:
     if "command" not in config:
         return dict(config)
     resolved = dict(config)
+    # A bundled entry being redirected to the shared endpoint also needs the
+    # endpoint and token in the child's env; the command swap itself happens in
+    # resolve_cao_mcp_command.
+    #
+    # These two keys are the DEPLOYMENT's, and they win over the profile. The
+    # merge used to run the other way, with a comment blessing it as "a value the
+    # profile set explicitly wins" — but the two values here are exactly the ones
+    # a profile must not choose. An agent-editable profile setting
+    # CAO_MCP_HTTP_URL redirected this shim to an arbitrary endpoint, and
+    # CAO_RUNTIME_TOKEN went with it, handing the channel credential to whatever
+    # was listening. That inverted the isolation the surrounding functions exist
+    # to enforce (Copilot review on #802).
+    #
+    # Unrelated profile variables are still preserved: only the keys the
+    # deployment actually defines are overridden, and an override is logged so a
+    # profile that tries is visible rather than silently ignored.
+    if resolved.get("command") == CAO_MCP_SERVER_COMMAND:
+        extra = shared_endpoint_child_env(persisted=persisted)
+        if extra:
+            profile_env = dict(resolved.get("env") or {})
+            clobbered = sorted(
+                key
+                for key, value in extra.items()
+                if key in profile_env and profile_env[key] != value
+            )
+            if clobbered:
+                logger.warning(
+                    "ignoring profile-supplied %s for the shared MCP endpoint: "
+                    "the endpoint and its token are operator-controlled",
+                    ", ".join(clobbered),
+                )
+            resolved["env"] = {**profile_env, **extra}
     command = resolved.get("command", "")
     args = resolved.get("args", []) or []
     new_command, new_args = resolve_cao_mcp_command(command, args, persisted=persisted)

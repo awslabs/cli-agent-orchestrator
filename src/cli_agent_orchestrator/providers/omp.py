@@ -192,7 +192,11 @@ class OmpProvider(BaseProvider):
                 config = copy.deepcopy(raw_config)
             else:
                 config = raw_config.model_dump(exclude_none=True)
-            config = resolve_mcp_server_config(config, persisted=False)
+            # persisted=True: this dict is serialized into `.mcp.json` below and
+            # read by `omp --extension` at launch. It previously said False
+            # explicitly, which put the channel token on disk for every entry
+            # (Copilot review on #802).
+            config = resolve_mcp_server_config(config, persisted=True)
             if "command" in config:
                 env = dict(config.get("env") or {})
                 if "CAO_TERMINAL_ID" not in env:

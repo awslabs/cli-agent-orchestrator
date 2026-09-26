@@ -23,6 +23,7 @@ from cli_agent_orchestrator.models.terminal import TerminalInputBlockedError, Te
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.atomic_file import write_owner_only
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
@@ -475,22 +476,39 @@ class ClaudeCodeProvider(BaseProvider):
                         mcp_config[server_name] = server_config.model_dump(exclude_none=True)
 
                     # Resolve the bundled cao-mcp-server console script to a
-                    # PATH-independent invocation.
-                    mcp_config[server_name] = resolve_mcp_server_config(mcp_config[server_name])
+                    # PATH-independent invocation. persisted=True: this dict is
+                    # serialized to <terminal_id>.mcp.json below, so the token is
+                    # left out and inherited from this process instead.
+                    mcp_config[server_name] = resolve_mcp_server_config(
+                        mcp_config[server_name], persisted=True
+                    )
 
                     env = mcp_config[server_name].get("env", {})
                     if "CAO_TERMINAL_ID" not in env:
                         env["CAO_TERMINAL_ID"] = self.terminal_id
-                        mcp_config[server_name]["env"] = env
+                    # In an execution-only runtime (#745) the CAO API is not on
+                    # localhost: forward the pod's explicit server address into
+                    # the MCP subprocess. Local mode leaves these unset, so
+                    # nothing is injected and behavior is unchanged.
+                    for var in ("CAO_API_HOST", "CAO_API_PORT", "CAO_MEMORY_API_URL"):
+                        if var not in env and os.environ.get(var):
+                            env[var] = os.environ[var]
+                    mcp_config[server_name]["env"] = env
 
                 tmp_dir = CAO_HOME_DIR / "tmp"
                 tmp_dir.mkdir(parents=True, exist_ok=True)
                 mcp_file = tmp_dir / f"{self.terminal_id}.mcp.json"
-                mcp_file.write_text(json.dumps({"mcpServers": mcp_config}), encoding="utf-8")
-                try:
-                    mcp_file.chmod(0o600)
-                except OSError:
-                    pass
+                # Owner-only from the first byte. The channel token is no longer
+                # written here — the resolver above is called with persisted=True
+                # and the shim inherits CAO_RUNTIME_TOKEN from this process — but
+                # the file still carries the endpoint and the whole tool surface,
+                # and the mode matters for its own sake: `write_text` then `chmod`
+                # publishes the whole body at the umask default first, so another
+                # local account can open it inside that window and keep reading
+                # through the descriptor after the narrowing. The name is
+                # deterministic per terminal, so an inode left 0644 by an older
+                # build is not hypothetical either (Copilot review on #802).
+                write_owner_only(mcp_file, json.dumps({"mcpServers": mcp_config}))
                 command_parts.extend(
                     [
                         "--mcp-config",

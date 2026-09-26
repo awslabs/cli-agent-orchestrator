@@ -55,17 +55,28 @@ USER root
 # tmux >= 3.3 required by CAO (bookworm ships 3.3a). git for agent workspaces,
 # curl for healthchecks, procps for provider process detection.
 #
-# Unconditional, unlike the provider layer below: CAO needs all five whatever
-# provider runs. That does assume a Debian-family base — an apt-less
-# BASE_PROVIDER_IMAGE fails here, loudly, which is better than a node that
-# starts and then cannot open a tmux session.
+# INSTALL_EXECUTION_BACKEND=0 builds a CONTROL-PLANE image: no tmux, no provider
+# CLI, so the pod that holds the database and the broker credentials cannot run a
+# model or open a session even if something tries. The central server never needs
+# either — it routes over the runtime channel and executes nothing — so shipping
+# them there put the execution backend inside the one pod the whole remote
+# boundary exists to keep clean (Copilot review on #802).
+#
+# curl and ca-certificates stay in both variants: the healthcheck needs curl and
+# TLS needs the certificates. git and procps go with the backend — both exist for
+# agent workspaces and provider process detection.
+#
+# This does assume a Debian-family base — an apt-less BASE_PROVIDER_IMAGE fails
+# here, loudly, which is better than a node that starts and then cannot open a
+# tmux session.
+ARG INSTALL_EXECUTION_BACKEND=1
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        tmux \
-        git \
-        curl \
-        ca-certificates \
-        procps \
+    && if [ "${INSTALL_EXECUTION_BACKEND}" = "1" ]; then \
+         apt-get install -y --no-install-recommends \
+           tmux git curl ca-certificates procps; \
+       else \
+         apt-get install -y --no-install-recommends curl ca-certificates; \
+       fi \
     && rm -rf /var/lib/apt/lists/*
 
 # --- Provider CLI: Claude Code (default; opt out for another provider) --------
@@ -89,9 +100,24 @@ RUN apt-get update \
 # mutable provider version can break an otherwise unchanged cluster. Version
 # 2.1.250 fails before its first Bedrock request with `O is not defined`;
 # 2.1.235 was validated against this example's Bedrock configuration.
+# The trailing `<cli> --version` is a build-time smoke test: a CLI that cannot
+# even report its version fails the build here rather than at pod startup. It is
+# NOT a comment inside the RUN — a `#` line inside a backslash-continued RUN is
+# joined into one shell command by some builders, which comments out the rest of
+# it (the version check and the closing `fi`) and either breaks the build or
+# silently drops the check (Copilot review on #802).
+#
+# A control-plane build (INSTALL_EXECUTION_BACKEND=0) skips this layer too, no
+# matter what INSTALL_CLAUDE_CODE says: a provider CLI in the pod that holds the
+# database and the broker credentials is the thing the split exists to remove,
+# and leaving it switchable by a second, independent flag would let one be set
+# without the other.
 ARG INSTALL_CLAUDE_CODE=1
 ARG CLAUDE_CODE_VERSION=2.1.235
-RUN if [ "${INSTALL_CLAUDE_CODE}" != "1" ]; then \
+ARG INSTALL_EXECUTION_BACKEND
+RUN if [ "${INSTALL_EXECUTION_BACKEND}" = "0" ]; then \
+      echo "control-plane image: no provider CLI"; \
+    elif [ "${INSTALL_CLAUDE_CODE}" != "1" ]; then \
       echo "skipping Claude Code install; provider comes from BASE_PROVIDER_IMAGE"; \
     else \
     curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
@@ -99,8 +125,46 @@ RUN if [ "${INSTALL_CLAUDE_CODE}" != "1" ]; then \
     && npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
     && npm cache clean --force \
     && rm -rf /var/lib/apt/lists/* \
-    # Fail the build here rather than at pod startup if the CLI is unusable.
     && claude --version; \
+    fi
+
+# --- Provider CLI: codex (opt in) ---------------------------------------------
+#
+# Codex qualifies under the same rule as Claude Code: public npm, and it reaches
+# Bedrock through the standard AWS SDK credential chain, so the pod's projected
+# web-identity token authenticates it with no human and no secret to mount. That
+# is selected by config rather than a flag — `model_provider = "amazon-bedrock"`
+# in ~/.codex/config.toml, written below — because codex's own default is the
+# OpenAI endpoint, which no pod here can log in to.
+#
+# Kept opt-in and OFF by default so the default image stays the size it was.
+# Enable with:
+#
+#     --build-arg INSTALL_CODEX=1
+#
+# Node is already present from the Claude Code stage; when that stage is skipped
+# (BASE_PROVIDER_IMAGE) this installs NodeSource itself, so the two are
+# independent.
+# Same build-time smoke test as the Claude Code block, and the same reason the
+# explanation sits out here rather than inside the RUN.
+ARG INSTALL_CODEX=0
+ARG CODEX_VERSION=0.153.4
+# The model id must exist on the bedrock-mantle (OpenAI-compatible) endpoint
+# codex uses, which is a different surface from bedrock:InvokeModel. A wrong
+# id fails at first request with `404 The model '<id>' does not exist`, not
+# at build time, so this default is one verified against that endpoint.
+ARG CODEX_BEDROCK_MODEL=openai.gpt-5.6-sol
+RUN if [ "${INSTALL_CODEX}" != "1" ]; then \
+      echo "skipping codex install (INSTALL_CODEX=${INSTALL_CODEX})"; \
+    else \
+    if ! command -v npm >/dev/null 2>&1; then \
+      curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
+      && apt-get install -y --no-install-recommends nodejs; \
+    fi \
+    && npm install -g "@openai/codex@${CODEX_VERSION}" \
+    && npm cache clean --force \
+    && rm -rf /var/lib/apt/lists/* \
+    && codex --version; \
     fi
 
 # --- Provider CLI: kiro-cli (opt in) ------------------------------------------
@@ -161,8 +225,12 @@ RUN if [ "${INSTALL_KIRO_CLI}" = "1" ]; then \
 # user; a bare `useradd` would fail the build on one that does.
 RUN id -u cao >/dev/null 2>&1 || useradd --create-home --shell /bin/bash cao
 
-RUN --mount=from=builder,source=/build/dist,target=/tmp/dist \
-    pip install --no-cache-dir /tmp/dist/*.whl
+# COPY --from rather than BuildKit's `RUN --mount=from=...`: the mount form
+# silently no-ops on non-BuildKit builders (kaniko builds the layer with an
+# EMPTY /tmp/dist and pip fails), and the wheel is small enough that the extra
+# layer costs nothing next to the provider install above.
+COPY --from=builder /build/dist /tmp/dist
+RUN pip install --no-cache-dir /tmp/dist/*.whl && rm -rf /tmp/dist
 
 # Credentials-free mock provider binary for smoke tests (`--provider mock_cli`).
 # Real deployments install an authenticated provider CLI on top of this image.
@@ -193,6 +261,38 @@ RUN mkdir -p /home/cao/workspace
 # restart.
 RUN printf '{\n  "hasCompletedOnboarding": true\n}\n' > /home/cao/.claude.json \
     && chmod 600 /home/cao/.claude.json
+
+# Point codex at Bedrock, and mark this workspace trusted.
+#
+# Only written when codex is installed. Two settings, both load-bearing:
+#
+# * ``model_provider = "amazon-bedrock"`` — codex's default is the OpenAI
+#   endpoint, which no pod here can log in to. With this it uses the standard AWS
+#   SDK chain, so the projected web-identity token authenticates it exactly as it
+#   does Claude Code, with nothing to mount.
+# The AWS REGION is deliberately NOT written here. A `RUN` line is evaluated at
+# BUILD time, so `${AWS_REGION}` would bake whatever the builder had (or the
+# us-east-1 default) into the image, while the manifests inject the real region
+# into the pod at RUNTIME — an opt-in codex image deployed to any other region
+# would then send Bedrock requests to the wrong one (Copilot review on #802).
+# Omitting the key lets codex's AWS SDK chain resolve AWS_REGION from the pod
+# environment, which is where the answer actually lives.
+#
+# * ``trust_level = "trusted"`` for the workspace — otherwise codex opens with
+#   "Do you trust the contents of this directory?" and waits. CAO's codex startup
+#   handler can answer that dialog, but a disposable pod should not spend a
+#   round-trip on a question whose answer is fixed at build time.
+#
+# Same reasoning as the Claude Code file above: container filesystem, so it has
+# to be baked in rather than seeded into a running pod.
+ARG INSTALL_CODEX
+ARG CODEX_BEDROCK_MODEL
+RUN if [ "${INSTALL_CODEX}" = "1" ]; then \
+      mkdir -p /home/cao/.codex \
+      && printf 'model = "%s"\nmodel_provider = "amazon-bedrock"\n\n[projects."/home/cao/workspace"]\ntrust_level = "trusted"\n' \
+           "${CODEX_BEDROCK_MODEL}" > /home/cao/.codex/config.toml \
+      && chmod 600 /home/cao/.codex/config.toml; \
+    fi
 
 # --- Pre-initialized state seed ------------------------------------------------
 #

@@ -1,0 +1,333 @@
+# The one cao-server in the namespace (#745).
+#
+# Everything that used to be "the supervisor's server" lives here: the API, the
+# scheduler, the terminal registry, the SQLite state, and the runtime channel
+# every execution node dials. No agent runs in this pod and no provider CLI is
+# installed in it — it decides, it does not execute.
+#
+# What this buys, stated plainly, is that "where the agent runs" and "who owns
+# the orchestration state" stop being the same question. The supervisor pod and
+# every minted worker are now execution-only `cao-bridge` runtimes with no
+# server, no inbound API and no state of their own, so a pod can be replaced
+# without replacing the conversation.
+#
+# A StatefulSet rather than a Deployment, for two reasons that are not style:
+#   * the state PVC is per pod and must not be shared;
+#   * a Deployment's rolling update would run two servers against that state.
+# `replicas: 1` does NOT prevent the second server by itself — a rolling update
+# overlaps pods by design — so the server also takes an exclusive flock on its
+# state directory at startup (services/server_owner.py) and refuses to serve if
+# another owner holds it. Hence OnDelete below: the operator replaces the pod
+# deliberately rather than having the controller overlap two of them.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: cao-server
+  namespace: cao-cluster
+  labels:
+    app.kubernetes.io/name: cao-server
+    app.kubernetes.io/part-of: cao-elastic-fleet
+spec:
+  serviceName: cao-server
+  replicas: 1
+  # OnDelete, not RollingUpdate. With RollingUpdate the controller starts the
+  # replacement while the outgoing pod is still terminating; the replacement
+  # would then hit the owner lock and CrashLoopBackOff until the old pod
+  # finished, which reads as a broken image rather than as the guard working.
+  # Deliberate replacement is the documented procedure (see README).
+  updateStrategy:
+    type: OnDelete
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cao-server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cao-server
+        app.kubernetes.io/part-of: cao-elastic-fleet
+    spec:
+      serviceAccountName: cao-server
+      # Stated rather than left to the 30s default, because what this pod must
+      # finish on SIGTERM is specific: flush in-flight SQLite writes and let the
+      # kernel drop the owner lock, so the replacement can take it. The lock
+      # needs no grace at all — it dies with the process however the process
+      # dies — which is why this is unhurried rather than long.
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: cao-node
+          image: <control-plane-image>:latest
+          ports:
+            - name: http
+              containerPort: 9889
+          env:
+            - name: CAO_BIND_HOST
+              value: "0.0.0.0"
+            - name: CAO_API_PORT
+              value: "9889"
+            - name: CAO_ALLOWED_HOSTS
+              value: "cao-server,cao-server.cao-cluster.svc.cluster.local,localhost"
+            - name: CAO_ADVERTISED_URL
+              value: "http://cao-server.cao-cluster.svc.cluster.local:9889"
+            # REQUIRED here, unlike on the old single-node topology: without it
+            # the server refuses `cao-bridge` connections on WS /runtime/channel
+            # (fail-closed), and with no runtime connected there is nowhere for
+            # any agent to run. deploy.sh mints this secret.
+            - name: CAO_RUNTIME_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: cao-runtime-token
+                  key: token
+            - name: CAO_HOME_DIR
+              value: /home/cao/.cao/state
+            - name: CAO_PROJECT_ID
+              value: cao-cluster
+            # No CAO_INSTALL_PROFILES and no provider preflight. A remote launch
+            # carries the profile and provider names down the channel and the
+            # BRIDGE resolves them from its own store, so installing a provider
+            # CLI here would only add ~45s of Claude Code cold start to a pod
+            # that never spawns one.
+            - name: CAO_WARM_PROVIDER
+              value: "0"
+            - name: CAO_MCP_REQUEST_TIMEOUT
+              value: "240"
+            # Elastic delegation: the server takes worker leases from the broker
+            # itself now, because it is the component that schedules work.
+            - name: CAO_ELASTIC_BROKER_URL
+              value: http://cao-worker-broker.cao-cluster.svc.cluster.local:9890
+            - name: CAO_ELASTIC_BROKER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: cao-elastic-broker-token
+                  key: token
+            # Bridge workers reach the central API directly for every tool call,
+            # so the broker's narrow callback gateway buys nothing on this path:
+            # point callbacks at the server itself.
+            - name: CAO_ELASTIC_CALLBACK_URL
+              value: "http://cao-server.cao-cluster.svc.cluster.local:9889"
+            # How long a lease waits for a NEW worker to become usable. In
+            # bridge mode "usable" means its runtime channel is registered here,
+            # not that a per-worker Service answers /health — the wait is the
+            # same generous bound for the same reason: the failure it replaces
+            # was destroying a worker three seconds from ready.
+            - name: CAO_ELASTIC_WORKER_READY_WAIT
+              value: "120"
+            # Where a workflow script and a scheduled flow's agent RUN. Unset,
+            # both execute in this container — beside the database, in the pod
+            # that holds the broker credentials — which is the one thing the
+            # remote-execution boundary exists to prevent. The README documented
+            # these as optional, so the shipped default was local execution
+            # (Copilot review on #802).
+            #
+            # Now that the server runs a control-plane image with no tmux, an
+            # unset value fails rather than quietly executing: the safer failure,
+            # but still a failure. Naming the supervisor runtime makes the default
+            # correct instead — scripts and flows are relayed to an executor over
+            # the runtime channel, the same path an agent launch takes. The value
+            # matches the supervisor's CAO_BRIDGE_RUNTIME_ID, which is its pod
+            # name.
+            - name: CAO_SCRIPT_RUNTIME
+              value: cao-supervisor-0
+            - name: CAO_FLOW_RUNTIME
+              value: cao-supervisor-0
+          volumeMounts:
+            - name: state
+              mountPath: /home/cao/.cao
+            # Read-only. The server does not execute anything in the workspace;
+            # it mounts it so relative working directories in a delegation
+            # resolve to the same tree the executors see.
+            - name: workspace
+              mountPath: /home/cao/workspace
+              readOnly: true
+          # No provider warm-up on this pod, so startup is schema migrations and
+          # a uvicorn bind — seconds, not minutes. The startup probe is kept
+          # anyway (and kept short) so a slow first migration does not get
+          # restarted by the liveness probe mid-flight.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 9889
+              httpHeaders:
+                - name: Host
+                  value: localhost
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9889
+              httpHeaders:
+                - name: Host
+                  value: localhost
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9889
+              httpHeaders:
+                - name: Host
+                  value: localhost
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+        # The shared MCP endpoint (#745), in THIS pod rather than a Deployment
+        # of its own. Not a style choice: its tools read and write the same
+        # SQLite state as the server, and that state is on a ReadWriteOnce PVC
+        # which no second pod can mount. Same pod, same volume, one writer set.
+        #
+        # This is also what lets an agent pod hold no broker credentials. The
+        # delegation tools (assign_elastic and friends) resolve the broker from
+        # CAO_ELASTIC_BROKER_URL/_TOKEN, which exist only here — so a
+        # prompt-injected agent cannot ask Kubernetes for a pod even indirectly;
+        # it can only call a tool that runs in this pod, under this pod's
+        # identity, having already proved it holds the runtime token.
+        - name: cao-mcp
+          image: <control-plane-image>:latest
+          # Wait for the server before binding: both processes open the same
+          # database, and only the server migrates it. Without this the endpoint
+          # can win the race on a first start, find no schema, and crash-loop
+          # until the server catches up — which reads as a broken image.
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              until python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:9889/health', timeout=2)" 2>/dev/null; do
+                echo "waiting for cao-server before starting the shared MCP endpoint"
+                sleep 2
+              done
+              exec cao-mcp-server
+          ports:
+            - name: mcp
+              containerPort: 9891
+          env:
+            - name: CAO_MCP_TRANSPORT
+              value: http
+            - name: CAO_MCP_HTTP_HOST
+              value: "0.0.0.0"
+            # Explicit, not the code default (9890): 9890 is the broker's port
+            # everywhere else in this example, and two different services
+            # answering on the same number is a debugging trap.
+            - name: CAO_MCP_HTTP_PORT
+              value: "9891"
+            # Fail-closed: build_http_app refuses to start an unauthenticated
+            # shared endpoint, so this secret is what makes the endpoint exist.
+            - name: CAO_RUNTIME_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: cao-runtime-token
+                  key: token
+            - name: CAO_HOME_DIR
+              value: /home/cao/.cao/state
+            - name: CAO_PROJECT_ID
+              value: cao-cluster
+            # The server is in this pod, so the API it calls is localhost.
+            - name: CAO_API_HOST
+              value: "127.0.0.1"
+            - name: CAO_API_PORT
+              value: "9889"
+            - name: CAO_MCP_REQUEST_TIMEOUT
+              value: "240"
+            # The delegation credentials. Deliberately duplicated from the
+            # server container rather than moved: both need them, and neither
+            # agent pods nor minted workers get them at all.
+            - name: CAO_ELASTIC_BROKER_URL
+              value: http://cao-worker-broker.cao-cluster.svc.cluster.local:9890
+            - name: CAO_ELASTIC_BROKER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: cao-elastic-broker-token
+                  key: token
+            - name: CAO_ELASTIC_CALLBACK_URL
+              value: "http://cao-server.cao-cluster.svc.cluster.local:9889"
+            - name: CAO_ELASTIC_WORKER_READY_WAIT
+              value: "120"
+            # Where a workflow script and a scheduled flow's agent RUN. Unset,
+            # both execute in this container — beside the database, in the pod
+            # that holds the broker credentials — which is the one thing the
+            # remote-execution boundary exists to prevent. The README documented
+            # these as optional, so the shipped default was local execution
+            # (Copilot review on #802).
+            #
+            # Now that the server runs a control-plane image with no tmux, an
+            # unset value fails rather than quietly executing: the safer failure,
+            # but still a failure. Naming the supervisor runtime makes the default
+            # correct instead — scripts and flows are relayed to an executor over
+            # the runtime channel, the same path an agent launch takes. The value
+            # matches the supervisor's CAO_BRIDGE_RUNTIME_ID, which is its pod
+            # name.
+            - name: CAO_SCRIPT_RUNTIME
+              value: cao-supervisor-0
+            - name: CAO_FLOW_RUNTIME
+              value: cao-supervisor-0
+          volumeMounts:
+            - name: state
+              mountPath: /home/cao/.cao
+            - name: workspace
+              mountPath: /home/cao/workspace
+              readOnly: true
+          # A TCP check only. There is no unauthenticated HTTP route to probe:
+          # every MCP call must carry the runtime token, so an HTTP probe would
+          # either need the secret or be answered 401 and restart the pod
+          # forever — the same trap the panel's probe documents.
+          readinessProbe:
+            tcpSocket:
+              port: 9891
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 9891
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: cao-elastic-workspace
+  # SQLite, flock locks and FIFOs — none of which are safe over NFS, so this
+  # stays on EBS and must not be moved to the shared EFS workspace. It is also
+  # the directory the owner lock guards: one volume, one writer.
+  volumeClaimTemplates:
+    - metadata:
+        name: state
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: gp3
+        resources:
+          requests:
+            storage: 2Gi
+---
+# The one address in the fleet. Executors dial this for the runtime channel,
+# the panel probes it, the broker forwards to it, and a participant reaches it
+# through `kubectl port-forward`.
+apiVersion: v1
+kind: Service
+metadata:
+  name: cao-server
+  namespace: cao-cluster
+  labels:
+    app.kubernetes.io/name: cao-server
+    app.kubernetes.io/part-of: cao-elastic-fleet
+spec:
+  selector:
+    app.kubernetes.io/name: cao-server
+  ports:
+    - name: http
+      port: 9889
+      targetPort: 9889
+    # The shared MCP endpoint every agent pod dials instead of starting its own
+    # MCP server. A Service port here is not the thing #745 forbids: what must
+    # not exist is an inbound Service on a pod that RUNS an agent.
+    - name: mcp
+      port: 9891
+      targetPort: 9891

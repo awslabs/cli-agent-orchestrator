@@ -12,6 +12,7 @@ from typing import Dict
 from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.clients.database import (
     get_pending_messages,
+    get_terminal_metadata,
     list_pending_receiver_ids_by_provider,
     list_pending_receiver_ids_older_than,
     update_message_status,
@@ -25,12 +26,47 @@ from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.manager import provider_manager
+from cli_agent_orchestrator.runtime_channel.registry import (
+    RuntimeNotDispatchedError,
+    RuntimeUnavailableError,
+    runtime_registry,
+)
+from cli_agent_orchestrator.security.principal import (
+    Principal,
+    PrincipalError,
+    may_start_work,
+    revocation,
+)
 from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.utils.event import terminal_id_from_topic
 
 logger = logging.getLogger(__name__)
+
+
+def _terminal_owner(terminal_id: str | None) -> Principal | None:
+    """Resolve whose work a terminal's messages are, from the server's own row.
+
+    The owner is read from the ``terminals.owner`` column the server wrote when
+    it accepted the launch — never from the agent-writable ``metadata`` bag, and
+    never from anything the sending agent presented. A worker that could name its
+    own owner could name someone else's (#745).
+
+    ``None`` means unknown: no row, no owner recorded (a terminal created before
+    the column existed), or a value this build cannot parse. Unknown is not
+    revoked — see ``RevocationRegistry.is_revoked``.
+    """
+    if not terminal_id:
+        return None
+    row = get_terminal_metadata(terminal_id)
+    if not row:
+        return None
+    try:
+        return Principal.parse(row.get("owner"))
+    except PrincipalError:
+        logger.warning("terminal %s has an unreadable owner; treating as unknown", terminal_id)
+        return None
 
 
 class InboxService:
@@ -112,7 +148,45 @@ class InboxService:
         if not messages:
             return
 
-        status = status_monitor.get_status(terminal_id)
+        # Owner gate (#745). A queued message is deferred work: it was enqueued
+        # by one request and is typed into a live agent later, so "may this
+        # owner still start work?" is a question for delivery time, not enqueue
+        # time. Held messages stay PENDING rather than becoming FAILED — a
+        # revocation that is later reversed should deliver them, and FAILED
+        # would be a claim about the message that is not true.
+        #
+        # Gated on any_revoked() so the ownership lookup (one DB read per
+        # distinct sender) does not happen at all in the normal case.
+        if revocation.any_revoked():
+            owners: Dict[str | None, Principal | None] = {}
+            allowed = []
+            for message in messages:
+                if message.sender_id not in owners:
+                    owners[message.sender_id] = _terminal_owner(message.sender_id)
+                owner = owners[message.sender_id]
+                if may_start_work(owner):
+                    allowed.append(message)
+                else:
+                    logger.warning(
+                        "Holding message %s for %s: sender %s's owner %s is revoked",
+                        message.id,
+                        terminal_id,
+                        message.sender_id,
+                        owner.id if owner else "?",
+                    )
+            messages = allowed
+            if not messages:
+                return
+
+        # A remote terminal's status is derived in its own runtime and pushed
+        # over the channel; the local detector would probe a tmux socket that
+        # does not exist here and answer for the wrong pane (#745).
+        remote = runtime_registry.is_remote(terminal_id)
+        status = (
+            runtime_registry.get_status(terminal_id)
+            if remote
+            else status_monitor.get_status(terminal_id)
+        )
         if status not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
             # Not ready on the normal path. Eager delivery (#251) lets providers
             # that accept input mid-turn receive messages while PROCESSING or
@@ -147,7 +221,9 @@ class InboxService:
             batch = list(group)
             combined = "\n".join(m.message for m in batch)
             try:
-                if registry is None:
+                if remote:
+                    self._deliver_remote(terminal_id, combined, sender_id)
+                elif registry is None:
                     terminal_service.send_input(terminal_id, combined)
                 else:
                     terminal_service.send_input(
@@ -173,6 +249,51 @@ class InboxService:
                 for message in batch:
                     logger.error(f"Failed to deliver message {message.id} to {terminal_id}: {e}")
                     update_message_status(message.id, MessageStatus.FAILED)
+
+    def _deliver_remote(self, terminal_id: str, message: str, sender_id: str | None) -> None:
+        """Type a delivered message into a terminal that lives in another runtime.
+
+        This is the path a delegated result takes home: an elastic worker calls
+        complete_assignment, the message is queued against the supervisor's
+        terminal on the central server, and the supervisor's pane is in a
+        different pod. A disconnect that happened BEFORE the command was sent is
+        raised as ``TerminalNotFoundError`` so the caller's existing transient
+        branch leaves the message PENDING for the reconcile sweep — a runtime that
+        is reconnecting is exactly the case that must not be marked FAILED.
+
+        A disconnect AFTER dispatch is a different thing wearing the same name.
+        The runtime may already have typed the message into the supervisor's
+        pane; only its acknowledgement was lost. Retrying that delivers the
+        worker's answer to the supervisor twice, which reads as two results for
+        one delegation — worse than a message the operator can see marked FAILED
+        (review finding 6 on #802). So only the not-dispatched case is treated as
+        transient; the unknown case is surfaced as a failure, loudly.
+
+        The routing itself belongs to ``terminal_service.send_input``, which every
+        sender funnels through; what is specific to the inbox is the failure
+        classification. Plugin events fire in the runtime that performs the send
+        (as they do for POST /terminals/{id}/input), so no registry is threaded
+        through here.
+        """
+        try:
+            delivered = terminal_service.send_input(
+                terminal_id,
+                message,
+                sender_id=sender_id,
+                orchestration_type=OrchestrationType.SEND_MESSAGE,
+            )
+        except RuntimeNotDispatchedError as e:
+            raise TerminalNotFoundError(str(e)) from e
+        except RuntimeUnavailableError as e:
+            logger.error(
+                "delivery to remote terminal %s was dispatched but unacknowledged (%s); "
+                "not retrying — the message may already be in the pane",
+                terminal_id,
+                e,
+            )
+            raise
+        if not delivered:
+            raise RuntimeError(f"runtime did not accept input for {terminal_id}")
 
     def poll_opencode_pending_messages(self, registry: PluginRegistry | None = None) -> None:
         """Poll OpenCode terminals for pending inbox messages.

@@ -15,7 +15,11 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Set
 
 from cli_agent_orchestrator.constants import OPENCODE_CONFIG_DIR, OPENCODE_CONFIG_FILE, SKILLS_DIR
-from cli_agent_orchestrator.utils.mcp_resolution import resolve_cao_mcp_command
+from cli_agent_orchestrator.utils.atomic_file import write_owner_only
+from cli_agent_orchestrator.utils.mcp_resolution import (
+    resolve_cao_mcp_command,
+    shared_endpoint_child_env_for,
+)
 from cli_agent_orchestrator.utils.path_validation import flatten_path_separators
 
 logger = logging.getLogger(__name__)
@@ -110,12 +114,23 @@ def read_config() -> Dict[str, Any]:
 
 
 def write_config(data: Dict[str, Any]) -> None:
-    """Persist *data* to ``opencode.json``, creating parent directories as needed."""
-    OPENCODE_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    OPENCODE_CONFIG_FILE.write_text(
-        json.dumps(data, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    """Persist *data* to ``opencode.json``, creating parent directories as needed.
+
+    Owner-only (0600): an ``mcp`` entry's ``environment`` carries credentials —
+    for CAO's own forwarded server that is ``CAO_RUNTIME_TOKEN`` (#745), and a
+    profile may put an API key in any entry. Default umask leaves this
+    world-readable, which on a shared host hands the token to every local
+    account (Copilot review on #802, finding 8). Applied on the existing file
+    too, so an install predating this does not stay open.
+
+    Owner-only from the FIRST byte rather than chmodded after the fact: writing
+    the body and then narrowing the mode leaves a window in which another local
+    account can open the finished credential-bearing file, and a descriptor it
+    obtained there keeps reading long after the chmod. ``write_owner_only``
+    publishes through a temp file that is 0600 by construction (second Copilot
+    review on #802).
+    """
+    write_owner_only(OPENCODE_CONFIG_FILE, json.dumps(data, indent=2) + "\n")
 
 
 def translate_mcp_server_config(cao_config: Dict[str, Any]) -> Dict[str, Any]:
@@ -160,8 +175,22 @@ def translate_mcp_server_config(cao_config: Dict[str, Any]) -> Dict[str, Any]:
         "command": full_command,
         "enabled": True,
     }
-    if "env" in cao_config:
-        result["environment"] = cao_config["env"]
+    environment = dict(cao_config.get("env") or {})
+    # The resolver may have swapped in the forwarding shim (#745), which
+    # needs the endpoint and token here. Empty when none is configured, so
+    # an entry that had no "env" still gets no "environment" key — and empty
+    # for a server that is not ours: this translator runs over every profile
+    # and plugin entry, and ``opencode.json`` is written to disk, so an
+    # unconditional merge would persist the channel token beside third-party
+    # commands (Copilot review on #802, finding 9).
+    # persisted=True: this dict is serialized into ``opencode.json``, which
+    # OpenCode reads at every later launch. The endpoint belongs there; the
+    # channel token does not, because the shim inherits it from the process that
+    # launches it and a second copy on disk is a credential at rest for no gain
+    # (Copilot follow-up on #802).
+    environment.update(shared_endpoint_child_env_for(cao_config.get("command", ""), persisted=True))
+    if environment:
+        result["environment"] = environment
     # Emitted only when the source actually has one: an invented `cwd` would
     # change where a profile-declared server runs, and an empty string is not a
     # directory. OpenCode's `mcp` entries are `additionalProperties: false`, so

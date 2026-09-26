@@ -332,7 +332,11 @@ class GrokCliProvider(BaseProvider):
         for name, raw_server in (mcp_servers or {}).items():
             config = self._server_dict(raw_server)
             if "command" in config:
-                config = resolve_mcp_server_config(config)
+                # persisted=True: the result below is written to a config file the
+                # provider re-reads at every later launch, so only the endpoint is
+                # stored and the shim inherits CAO_RUNTIME_TOKEN from the process
+                # that starts it (Copilot review on #802).
+                config = resolve_mcp_server_config(config, persisted=True)
                 env = dict(config.get("env") or {})
                 env["CAO_TERMINAL_ID"] = self.terminal_id
                 config["env"] = env

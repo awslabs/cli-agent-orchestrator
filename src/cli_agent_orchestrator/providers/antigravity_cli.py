@@ -46,7 +46,6 @@ import os
 import re
 import shlex
 import shutil
-import stat
 import threading
 import time
 from pathlib import Path
@@ -59,7 +58,11 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
-from cli_agent_orchestrator.utils.mcp_resolution import resolve_cao_mcp_command
+from cli_agent_orchestrator.utils.atomic_file import write_owner_only
+from cli_agent_orchestrator.utils.mcp_resolution import (
+    resolve_cao_mcp_command,
+    shared_endpoint_child_env_for,
+)
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
@@ -429,6 +432,17 @@ class AntigravityCliProvider(BaseProvider):
                 }
                 env = dict(cfg.get("env", {}))
                 env["CAO_TERMINAL_ID"] = self.terminal_id
+                # The resolver may have swapped in the forwarding shim
+                # (#745), which needs the endpoint and token here. Empty
+                # when no shared endpoint is configured — and empty for a
+                # server that is not ours, which is launched as declared and
+                # must not be handed the channel token (this loop covers every
+                # profile/plugin entry, not just the bundled one).
+                # persisted=True for the same reason as OpenCode: this entry is
+                # written to a config file Antigravity re-reads at every launch,
+                # so the endpoint is persisted and the token is inherited from
+                # the launching process instead of stored (Copilot on #802).
+                env.update(shared_endpoint_child_env_for(cfg.get("command", ""), persisted=True))
                 entry["env"] = env
                 # Antigravity documents `cwd` ("Working directory for `stdio`
                 # servers."), so an agent plugin's directory is carried natively.
@@ -442,12 +456,16 @@ class AntigravityCliProvider(BaseProvider):
                 servers[unique_key] = entry
                 self._mcp_server_names.append(unique_key)
 
-            tmp_path = path.with_suffix(".json.tmp")
-            with open(tmp_path, "w") as f:
-                json.dump(config, f, indent=2)
-            if path.exists():
-                os.chmod(tmp_path, stat.S_IMODE(os.stat(path).st_mode))
-            os.replace(tmp_path, path)
+            # Owner-only unconditionally, including over a file that already
+            # exists at 0644. The bundled entry's env holds CAO_RUNTIME_TOKEN
+            # when a shared endpoint is configured (#745) and agy re-reads this
+            # path at every later launch, so the token persists here: 0600 is a
+            # property of what the file CONTAINS, not a preference the operator
+            # may have overridden. Preserving the previous mode — as this did —
+            # left a config that predated the rule, or that another tool created
+            # world-readable, handing the control-plane token to every local
+            # account (both Copilot reviews on #802, finding 8).
+            write_owner_only(path, json.dumps(config, indent=2))
 
     def _unregister_mcp_servers(self) -> None:
         """Remove the MCP servers this provider registered.
@@ -487,11 +505,12 @@ class AntigravityCliProvider(BaseProvider):
                         ):
                             continue  # belongs to a different terminal — leave it
                         servers.pop(name, None)
-                    tmp_path = path.with_suffix(".json.tmp")
-                    with open(tmp_path, "w") as f:
-                        json.dump(config, f, indent=2)
-                    os.chmod(tmp_path, stat.S_IMODE(os.stat(path).st_mode))
-                    os.replace(tmp_path, path)
+                    # Same rule as registration: this rewrite removes only THIS
+                    # terminal's entries, so a concurrent terminal's entry — and
+                    # its CAO_RUNTIME_TOKEN — is still in the bytes being
+                    # published. Republishing at the old mode would undo
+                    # registration's 0600 on the way out.
+                    write_owner_only(path, json.dumps(config, indent=2))
             except (json.JSONDecodeError, OSError) as exc:
                 logger.warning("Failed to unregister MCP servers from %s: %s", path, exc)
             finally:

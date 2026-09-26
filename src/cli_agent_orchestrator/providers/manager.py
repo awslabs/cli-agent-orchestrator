@@ -25,6 +25,19 @@ from cli_agent_orchestrator.providers.opencode_cli import OpenCodeCliProvider
 logger = logging.getLogger(__name__)
 
 
+class TerminalNotFoundError(ValueError):
+    """No registry row exists for this terminal id.
+
+    Distinct from every other ``ValueError`` :meth:`ProviderManager.get_provider`
+    can raise — a provider that refused to be constructed (an unknown provider
+    type, a kiro profile with no agent, an unsupported resume) is a
+    configuration fault that must stay visible. Callers that treat "unknown id"
+    as ordinary (the status monitor, which sees bytes on either side of a row's
+    life) can catch this narrowly; everything else keeps catching ``ValueError``
+    and is unchanged, because this IS one (Copilot review on #802).
+    """
+
+
 class ProviderManager:
     """Simplified provider manager with direct mapping."""
 
@@ -208,7 +221,8 @@ class ProviderManager:
             Provider instance
 
         Raises:
-            ValueError: If terminal not found in database or provider creation fails
+            TerminalNotFoundError: If no database row exists for ``terminal_id``.
+            ValueError: If provider creation fails.
         """
         # Check if already exists
         provider = self._providers.get(terminal_id)
@@ -223,7 +237,7 @@ class ProviderManager:
         # Try to create on-demand from database metadata
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
-            raise ValueError(f"Terminal {terminal_id} not found in database")
+            raise TerminalNotFoundError(f"Terminal {terminal_id} not found in database")
 
         persisted_engine = (
             resolve_kiro_engine(persisted=metadata.get("engine"))

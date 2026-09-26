@@ -8,6 +8,7 @@ success.
 
 import asyncio
 import threading
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -44,7 +45,7 @@ def _patch_terminal_layer(
 
     ``ready`` is the bool the readiness ``wait_until_status`` returns (only
     consulted on the created-here path). The post-input completion wait polls
-    ``status_monitor.get_status`` directly (issue #409): pass ``status_sequence``
+    ``effective_status`` directly (issue #409): pass ``status_sequence``
     (a side_effect list of TerminalStatus values, one per poll) to script the
     completion loop, or rely on ``final_status`` as a constant return.
     """
@@ -58,9 +59,9 @@ def _patch_terminal_layer(
     exit_cli = patch(f"{_MODULE}.terminal_service.exit_terminal_cli", return_value=None)
     wait = patch(f"{_MODULE}.wait_until_status", new=AsyncMock(return_value=ready))
     if status_sequence is not None:
-        status = patch(f"{_MODULE}.status_monitor.get_status", side_effect=list(status_sequence))
+        status = patch(f"{_MODULE}.effective_status", side_effect=list(status_sequence))
     else:
-        status = patch(f"{_MODULE}.status_monitor.get_status", return_value=final_status)
+        status = patch(f"{_MODULE}.effective_status", return_value=final_status)
     get_wd = patch(
         f"{_MODULE}.terminal_service.get_working_directory",
         return_value=get_wd_return,
@@ -778,11 +779,12 @@ class TestIdleCompletionSignal:
         assert exc_info.value.kind == "error"
 
     def test_completion_poll_dispatches_get_status_via_to_thread(self):
-        """#558: status_monitor.get_status() can shell out to a real tmux capture-pane
-        subprocess (the stale-PROCESSING fallback); calling it inline in
+        """#558: the status read can shell out to a real tmux capture-pane
+        subprocess (the stale-PROCESSING fallback), and for a remote terminal it
+        consults the runtime registry; calling it inline in
         _wait_for_completion's poll loop would fork tmux ON the event loop every poll.
         Pin the asyncio.to_thread wrapping directly -- every other test here mocks
-        status_monitor.get_status itself, which cannot see HOW it was called, so a
+        the status read itself, which cannot see HOW it was called, so a
         regression back to a bare synchronous call would stay green."""
         create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
             final_status=TerminalStatus.COMPLETED,
@@ -797,18 +799,18 @@ class TestIdleCompletionSignal:
             status,
             patch(f"{_MODULE}.asyncio.to_thread", wraps=asyncio.to_thread) as mock_to_thread,
         ):
-            from cli_agent_orchestrator.services.agent_step import status_monitor
+            from cli_agent_orchestrator.services import agent_step
 
             asyncio.run(run_agent_step("kiro_cli", "dev", "x"))
 
-            # Captured while still inside the patch context -- status_monitor.get_status
+            # Captured while still inside the patch context -- effective_status
             # is the active mock here (patched by `status` above); comparing against it
             # after the patches unwind would compare against the restored, unpatched
-            # method instead.
+            # function instead.
             get_status_calls = [
-                c for c in mock_to_thread.call_args_list if c.args[0] == status_monitor.get_status
+                c for c in mock_to_thread.call_args_list if c.args[0] == agent_step.effective_status
             ]
-        assert get_status_calls, "status_monitor.get_status was never dispatched via to_thread"
+        assert get_status_calls, "the status read was never dispatched via to_thread"
         assert all(c.args[1] == "abc12345" for c in get_status_calls)
 
 
@@ -843,7 +845,7 @@ class TestPromptDeliveryVerification:
             get_output,
             exit_cli,
             wait,
-            patch(f"{_MODULE}.status_monitor.get_status", side_effect=get_status),
+            patch(f"{_MODULE}.effective_status", side_effect=get_status),
             patch(f"{_MODULE}._COMPLETION_POLL_INTERVAL", 0.01),
             patch(f"{_MODULE}._PROMPT_PICKUP_GRACE", 0.0),
             patch(
@@ -948,7 +950,7 @@ class TestPromptDeliveryVerification:
             get_output as m_out,
             exit_cli,
             wait,
-            patch(f"{_MODULE}.status_monitor.get_status", side_effect=_idle_forever),
+            patch(f"{_MODULE}.effective_status", side_effect=_idle_forever),
             patch(f"{_MODULE}._COMPLETION_POLL_INTERVAL", 0.01),
             patch(f"{_MODULE}._PROMPT_PICKUP_GRACE", 0.0),
             patch(
@@ -981,7 +983,7 @@ class TestInterruptibleCancel:
             ev = asyncio.Event()
             ev.set()
             with patch(
-                f"{_MODULE}.status_monitor.get_status",
+                f"{_MODULE}.effective_status",
                 return_value=TerminalStatus.PROCESSING,
             ):
                 await _wait_for_completion("term-hung", timeout=600, cancel_event=ev)
@@ -1007,7 +1009,7 @@ class TestInterruptibleCancel:
                 ev.set()
 
             with patch(
-                f"{_MODULE}.status_monitor.get_status",
+                f"{_MODULE}.effective_status",
                 return_value=TerminalStatus.PROCESSING,  # never settles
             ):
                 waiter = asyncio.ensure_future(
@@ -1136,3 +1138,112 @@ class TestOutputExtractionTeardown:
         m_out.assert_called_once_with("reuse99", OutputMode.LAST)
         m_delete.assert_not_called()
         m_exit.assert_not_called()
+
+
+class TestAHandoffFromARemoteCallerLandsInItsRuntime:
+    """#745: the step's terminal belongs where the CALLER runs.
+
+    ``assign`` reaches the runtime because it goes through
+    ``POST /sessions/{name}/terminals``, which is runtime-aware. ``run_agent_step``
+    called ``terminal_service.create_terminal`` directly, so a handoff issued by a
+    supervisor executing in a runtime tried to add a window to a session that only
+    exists in that pod — reproduced on EKS as
+    ``Failed to create terminal: Session 'cao-eks-assign-...' not found`` while the
+    three assigns in the same run succeeded.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_worker_is_launched_on_the_callers_runtime(self, monkeypatch):
+        import cli_agent_orchestrator.runtime_channel.api as rc_api
+        from cli_agent_orchestrator.services import agent_step as step_mod
+
+        registry = MagicMock()
+        registry.is_remote.return_value = True
+        registry.runtime_for_terminal.return_value = "cao-supervisor-0"
+        registry.placement.return_value = (True, "cao-supervisor-0")
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.runtime_channel.registry.runtime_registry", registry
+        )
+
+        captured = {}
+
+        async def fake_launch(runtime_id, body, owner_id):
+            captured["runtime_id"] = runtime_id
+            captured["body"] = body
+            return SimpleNamespace(id="wrk00001")
+
+        monkeypatch.setattr(rc_api, "launch_remote_terminal", fake_launch)
+
+        local = MagicMock()
+        monkeypatch.setattr(step_mod.terminal_service, "create_terminal", local)
+
+        assert step_mod._caller_runtime("sup12345") == "cao-supervisor-0"
+
+        # The local create path must not be taken for a remote caller.
+        local.assert_not_called()
+
+    def test_a_local_caller_still_creates_here(self, monkeypatch):
+        from cli_agent_orchestrator.services import agent_step as step_mod
+
+        registry = MagicMock()
+        registry.is_remote.return_value = False
+        registry.placement.return_value = (False, None)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.runtime_channel.registry.runtime_registry", registry
+        )
+        assert step_mod._caller_runtime("loc12345") is None
+        assert step_mod._caller_runtime(None) is None
+
+    def test_a_remote_caller_with_unreadable_placement_refuses(self, monkeypatch):
+        """Better to fail the step than to start the worker in the wrong container."""
+        from cli_agent_orchestrator.services import agent_step as step_mod
+
+        registry = MagicMock()
+        registry.is_remote.return_value = True  # fail-closed remote/unknown
+        registry.runtime_for_terminal.return_value = None  # placement unreadable
+        registry.placement.return_value = (True, None)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.runtime_channel.registry.runtime_registry", registry
+        )
+        with pytest.raises(RuntimeError, match="placement is currently unavailable"):
+            step_mod._caller_runtime("sup12345")
+
+
+class TestARemoteWorkerInheritsItsCallersOwner:
+    """A worker persisted with no owner is "unknown" to the revocation gate.
+
+    The remote handoff path passed owner_id=None, so the central row for a worker
+    created on a caller's behalf had no principal — and its later callback was
+    treated as unowned, letting work dispatched by a REVOKED caller deliver
+    instead of being held (Copilot review on #802).
+    """
+
+    def test_the_owner_comes_from_the_callers_own_row(self, monkeypatch):
+        from cli_agent_orchestrator.services import agent_step as step_mod
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+            lambda tid: {"id": tid, "owner": "auth0|supervisor-owner"},
+        )
+        assert step_mod.caller_owner_id("sup12345") == "auth0|supervisor-owner"
+
+    def test_an_unknown_owner_stays_unknown(self, monkeypatch):
+        """No row, or a row with no owner: unknown is not revoked, and inventing
+        an owner would be worse than the gap."""
+        from cli_agent_orchestrator.services import agent_step as step_mod
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+            lambda tid: None,
+        )
+        assert step_mod.caller_owner_id("sup12345") is None
+        assert step_mod.caller_owner_id(None) is None
+
+    def test_a_failed_lookup_does_not_break_the_step(self, monkeypatch):
+        from cli_agent_orchestrator.services import agent_step as step_mod
+
+        def boom(_tid):
+            raise RuntimeError("database unreachable")
+
+        monkeypatch.setattr("cli_agent_orchestrator.clients.database.get_terminal_metadata", boom)
+        assert step_mod.caller_owner_id("sup12345") is None

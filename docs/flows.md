@@ -95,6 +95,52 @@ else
 fi
 ```
 
+### Where the script runs
+
+By default the pre-script runs on the same host as the CAO server, with that
+process's environment, exactly as it always has.
+
+In a cluster deployment the server can be told to run it in an execution runtime
+instead (`CAO_SCRIPT_RUNTIME=<runtime id>`, see the EKS example), which keeps user
+code out of the container holding the database. The contract is unchanged — an
+executable file whose shebang picks its interpreter, printing
+`{"execute": …, "output": {…}}` — with one difference: the remote environment is
+constructed rather than inherited. A script there gets `PATH`, `HOME`,
+`CAO_API_BASE_URL` and `CAO_FLOW_NAME` and nothing else, so anything else your
+script reads from the environment must move into the script or be fetched over the
+API. The server still owns the schedule and the JSON verdict; a runtime that
+disappears mid-script fails the run rather than being read as "skip". A runtime
+that is named but not connected fails the run as well: once you have said where
+this code runs, "run it on the server after all" is not a fallback, it is the
+outcome the setting exists to prevent. Retry the run when the runtime is back.
+
+`script:` is resolved **on the client**, at `cao schedule add` time: a relative
+path resolves beside the flow file, an absolute one is taken as-is, and either
+way the file is read there. Registering against a shared server
+(`CAO_API_BASE_URL`) then uploads the pre-script's *contents*, not a path — the
+flow file never travels, so a path would be meaningless on the server, and an
+absolute server path is refused as an arbitrary-file execution vector. The
+server writes its own copy beside the flow and runs that (or, with
+`CAO_SCRIPT_RUNTIME` set, forwards the contents to the runtime, which never
+needs a copy either). A missing script is reported at `cao schedule add` time,
+while you are watching, rather than failing inside a scheduled run hours later.
+
+### Where the agent runs
+
+The session the flow launches is placed by its own variable,
+`CAO_FLOW_RUNTIME=<runtime id>`, and defaults to this host. Set it in a cluster
+deployment where the server container has no tmux of its own; it is separate from
+`CAO_SCRIPT_RUNTIME` so a quick health check and a long-lived agent can sit in
+different places.
+
+Two behaviours follow the placement. The previous run's session is recycled where
+it lives, so a busy agent in a runtime still blocks the next run and a teardown
+that does not confirm defers it rather than launching a second agent beside the
+first. And a named runtime that is not connected fails the run instead of falling
+back to this host — a silent fallback would start the agent in the container the
+variable exists to keep it out of. A flow that pins a non-default `engine` cannot
+be launched remotely yet and says so.
+
 ## Flow commands
 
 ```bash

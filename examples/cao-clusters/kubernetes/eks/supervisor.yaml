@@ -1,9 +1,21 @@
-# The one long-lived pod in the fleet. It holds the conversation a participant
-# drives, and every unit of delegated work becomes a Deployment that the broker
-# mints and destroys - so this is the only place CAO state persists.
+# The supervisor: an EXECUTION-ONLY pod that runs the participant's agent (#745).
 #
-# A StatefulSet rather than a Deployment for a stable name: `cao-supervisor` is
-# what the broker points CAO_MEMORY_API_URL at, and what workers call back to.
+# It used to be the whole system - its own cao-server, its own SQLite state, its
+# own inbound Service, and a fleet that pointed at it. It is now a `cao-bridge`
+# runtime: one outbound WebSocket to cao-server, no HTTP API, no inbound Service,
+# no persistent state. What is left in this pod is exactly what has to be here -
+# the tmux server, the provider CLI, and the agent's own working tree.
+#
+# Concretely, what moved out:
+#   * the API, scheduler and terminal registry  -> cao-server (server.yaml)
+#   * the SQLite state on an EBS PVC            -> cao-server's state PVC
+#   * the inbound Service on 9889               -> deleted; see the headless
+#                                                  governing Service below
+#   * taking worker leases from the broker      -> cao-server
+#
+# It still installs a provider and still warms Bedrock, because a remote launch
+# carries only the profile and provider NAMES down the channel: this pod resolves
+# them from its own store and spawns the CLI. The server needs neither.
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -13,6 +25,10 @@ metadata:
     app.kubernetes.io/name: cao-supervisor
     app.kubernetes.io/part-of: cao-elastic-fleet
 spec:
+  # Still a StatefulSet, but no longer for a stable ADDRESS - nothing dials this
+  # pod. It is for a stable RUNTIME ID: `cao-supervisor-0` is what the server
+  # registers, what a delegation targets, and what an attach relays to, so the
+  # identity has to survive a restart rather than being regenerated per pod.
   serviceName: cao-supervisor
   replicas: 1
   selector:
@@ -30,15 +46,23 @@ spec:
       # an auth one. The association is created in
       # iac/cfn-infrastructure.yaml.
       serviceAccountName: cao-supervisor
+      # Matches the 30s the broker gives a minted worker, and for the same
+      # reason: SIGTERM reaches tmux and a provider CLI, which take a moment to
+      # exit. Nothing here is waiting to be *saved* — this pod's state is an
+      # emptyDir and the terminal row lives on the server — so the grace is for
+      # a clean exit, not for durability. A live agent session does not survive
+      # this pod either way; see the README's restart limitations.
+      terminationGracePeriodSeconds: 30
       securityContext:
         fsGroup: 1000
         fsGroupChangePolicy: OnRootMismatch
       containers:
         - name: cao-node
           image: <server-image>:latest
-          ports:
-            - name: http
-              containerPort: 9889
+          # No `ports:` and no Service. Nothing reaches this pod inbound: the
+          # channel it holds to cao-server is outbound, and every command,
+          # keystroke and byte of output rides back up that one connection.
+          #
           # Provider credentials, for a provider that authenticates with a key
           # rather than with Pod Identity (kiro-cli). Created by
           # components/kiro/external-secret.yaml, which is not in the default
@@ -47,29 +71,49 @@ spec:
           # `optional: true` is what makes this free on the Bedrock path: that
           # Secret does not exist there, and a non-optional secretRef would hold
           # every pod in CreateContainerConfigError instead.
-          #
-          # envFrom rather than a named key, so a provider needing a different
-          # variable - or more than one - changes the secret's contents and
-          # nothing here. It is listed before `env:` to match precedence:
-          # explicit `env` entries below win over anything the secret carries.
           envFrom:
             - secretRef:
                 name: cao-provider-credentials
                 optional: true
           env:
-            - name: CAO_BIND_HOST
-              value: "0.0.0.0"
+            # ---- execution-only runtime (#745) ----
+            # entrypoint.sh branches on this AFTER seeding and profile install,
+            # then execs cao-bridge instead of cao-server.
+            - name: CAO_NODE_MODE
+              value: bridge
+            - name: CAO_BRIDGE_SERVER_URL
+              value: "ws://cao-server.cao-cluster.svc.cluster.local:9889/runtime/channel"
+            # The runtime id the server registers and a delegation targets.
+            # Taken from the pod name so it matches the StatefulSet ordinal
+            # rather than being a second name to keep in sync by hand.
+            - name: CAO_BRIDGE_RUNTIME_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # NOT optional, unlike on the old topology where the token only
+            # enabled an extra feature. Without it this pod cannot connect at
+            # all, and a pod that cannot connect can do nothing - so failing at
+            # CreateContainerConfigError is the honest outcome.
+            - name: CAO_RUNTIME_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: cao-runtime-token
+                  key: token
+            # Where the bridge writes its channel-established marker, read by
+            # the probes below. Spelled out rather than left to the default so
+            # the manifest and the probe cannot drift apart.
+            - name: CAO_BRIDGE_READY_FILE
+              value: /home/cao/.cao/state/bridge-connected
+            # The agent's MCP tools and orchestration helpers dial the CENTRAL
+            # server, never localhost - there is no server in this pod. These
+            # flow into the tmux session env (CAO_ prefix passthrough) and into
+            # the provider MCP configs the bridge writes.
+            - name: CAO_API_HOST
+              value: cao-server.cao-cluster.svc.cluster.local
             - name: CAO_API_PORT
               value: "9889"
-            - name: CAO_ALLOWED_HOSTS
-              value: "cao-supervisor,cao-supervisor.cao-cluster.svc.cluster.local,localhost"
-            - name: CAO_ADVERTISED_URL
-              value: "http://cao-supervisor.cao-cluster.svc.cluster.local:9889"
-            # Elastic workers receive this URL for callbacks instead of the
-            # full supervisor control API. The broker authenticates their
-            # per-worker release token and forwards only inbox/memory routes.
-            - name: CAO_ELASTIC_CALLBACK_URL
-              value: "http://cao-worker-broker.cao-cluster.svc.cluster.local:9890"
+            - name: CAO_MEMORY_API_URL
+              value: "http://cao-server.cao-cluster.svc.cluster.local:9889"
             - name: CAO_HOME_DIR
               value: /home/cao/.cao/state
             - name: CAO_PROJECT_ID
@@ -88,24 +132,23 @@ spec:
               value: "180"
             - name: CAO_MCP_REQUEST_TIMEOUT
               value: "240"
-            - name: CAO_ELASTIC_BROKER_URL
-              value: http://cao-worker-broker.cao-cluster.svc.cluster.local:9890
-            - name: CAO_ELASTIC_BROKER_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: cao-elastic-broker-token
-                  key: token
-            # How long assign_elastic polls a NEW worker's /health through its
-            # Service before giving up on it. The broker hands the lease back as
-            # soon as the Deployment and Service exist, so this is where its boot
-            # is waited out - on the address the task is about to be posted to,
-            # which is the only check that covers both "the pod came up" and "the
-            # Service in front of it routes". Generous on purpose: the failure it
-            # replaces was a 10s connect timeout destroying a worker that was three
-            # seconds from usable. Only assign_elastic reads it; a plain `assign`
-            # to a long-running node still fails fast.
-            - name: CAO_ELASTIC_WORKER_READY_WAIT
-              value: "120"
+            # No CAO_ELASTIC_* here any more. Taking a worker lease is a
+            # scheduling decision, and scheduling now happens on cao-server; a
+            # broker URL in this pod would be an execution node reaching for the
+            # one privileged API in the namespace.
+            #
+            # Which is exactly why this pod's agent uses the SHARED MCP endpoint
+            # rather than starting its own MCP server: the delegation tools need
+            # the broker credentials, and those live only in the server pod. With
+            # this set, the provider's declared `cao-mcp-server` is launched as
+            # `cao-mcp-stdio-bridge` instead (utils/mcp_resolution.py) and every
+            # tool call is forwarded, carrying this terminal's id as the caller.
+            # Unset it and the agent gets a local MCP server with no broker
+            # credentials, which is what "elastic workers are not configured"
+            # meant when this was first validated on EKS.
+            - name: CAO_MCP_HTTP_URL
+              value: "http://cao-server.cao-cluster.svc.cluster.local:9891/mcp"
+            #
             # SigV4 against Bedrock, credentials from Pod Identity. Note this is
             # NOT CLAUDE_CODE_USE_ANTHROPIC_AWS, which is a different product
             # and needs a workspace ID a vended account does not have.
@@ -131,37 +174,31 @@ spec:
               mountPath: /home/cao/.cao
             - name: workspace
               mountPath: /home/cao/workspace
-          # The entrypoint warms both pinned Bedrock models before starting the
-          # server, and each warm-up has a 180s timeout. A startup probe suppresses
-          # liveness/readiness until that bounded initialization finishes; without
-          # it the 20s liveness delay restarts a healthy first boot mid-warm-up.
+          # Readiness for a pod with no HTTP endpoint.
+          #
+          # The bridge writes this file after the hello exchange is accepted and
+          # removes it the moment the channel drops, so the file means "the
+          # server can reach an executor here" - which is the only useful sense
+          # of ready for this pod. An HTTP probe is not an option: there is no
+          # listener, and a TCP probe on 9889 would fail forever.
+          #
+          # There is deliberately NO liveness probe. The marker is absent while
+          # the bridge is backing off through a server restart, so a liveness
+          # probe on it would kill a healthy pod that is doing exactly the right
+          # thing and would take its tmux sessions with it. Liveness is already
+          # covered: cao-bridge is PID 1, so if it exits the container exits and
+          # the kubelet restarts it.
           startupProbe:
-            httpGet:
-              path: /health
-              port: 9889
-              httpHeaders:
-                - name: Host
-                  value: localhost
+            exec:
+              command: ["test", "-f", "/home/cao/.cao/state/bridge-connected"]
             periodSeconds: 10
-            failureThreshold: 40
+            # Profile install plus two Bedrock model warm-ups at 180s each, then
+            # the channel handshake. Long, bounded, and only paid at boot.
+            failureThreshold: 48
           readinessProbe:
-            httpGet:
-              path: /health
-              port: 9889
-              httpHeaders:
-                - name: Host
-                  value: localhost
-            initialDelaySeconds: 15
+            exec:
+              command: ["test", "-f", "/home/cao/.cao/state/bridge-connected"]
             periodSeconds: 10
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: 9889
-              httpHeaders:
-                - name: Host
-                  value: localhost
-            initialDelaySeconds: 20
-            periodSeconds: 15
           resources:
             requests:
               cpu: 250m
@@ -173,28 +210,30 @@ spec:
         - name: workspace
           persistentVolumeClaim:
             claimName: cao-elastic-workspace
-  # State is per pod and stays on EBS. It holds a SQLite DB, flock locks and
-  # FIFOs, all of which are unsafe over NFS - so it must not live on the shared
-  # EFS workspace even though only one supervisor writes it today.
-  volumeClaimTemplates:
-    - metadata:
-        name: state
-      spec:
-        accessModes: ["ReadWriteOnce"]
-        storageClassName: gp3
-        resources:
-          requests:
-            storage: 1Gi
+        # emptyDir, not a PVC - and that is the point of #745. The bridge keeps a
+        # local SQLite file as runtime-internal bookkeeping for the reused
+        # execution stack, but the authoritative terminal identity lives on
+        # cao-server. Nothing here needs to survive the pod, so replacing this
+        # pod costs a provider install and not a conversation.
+        - name: state
+          emptyDir: {}
 ---
+# A headless, PORTLESS governing Service. A StatefulSet requires `serviceName`,
+# and this satisfies it without publishing a way in: no ClusterIP, no ports, so
+# there is nothing here for a caller to dial even inside the namespace.
+#
+# The Service this replaces exposed 9889 and was how the broker, the panel and a
+# port-forward all reached the supervisor's API. That API is now cao-server's,
+# and it is reachable at exactly one address.
 apiVersion: v1
 kind: Service
 metadata:
   name: cao-supervisor
   namespace: cao-cluster
+  labels:
+    app.kubernetes.io/name: cao-supervisor
+    app.kubernetes.io/part-of: cao-elastic-fleet
 spec:
+  clusterIP: None
   selector:
     app.kubernetes.io/name: cao-supervisor
-  ports:
-    - name: http
-      port: 9889
-      targetPort: 9889

@@ -184,6 +184,32 @@ cao launch --agents analysis_supervisor --provider kimi_cli
 cao launch --agents analysis_supervisor --provider grok_cli
 ```
 
+### Running against a shared server (CAO 3.0)
+
+Nothing in this example changes when the supervisor executes in a remote runtime
+(a Kubernetes pod) instead of on your laptop:
+
+1. Install the three profiles where the agent runs — the runtime's own
+   `CAO_HOME_DIR/agent-store/` — **and** on the central server, which resolves a
+   delegation's provider from its own profile store.
+2. Launch the supervisor onto that runtime: `cao launch --runtime <id>`, or
+   `POST /runtimes/<id>/terminals` on the server.
+3. Send it the same task you would locally. Each `assign` and `handoff` reaches
+   the server as `POST /sessions/{session}/terminals`, and the server forwards it
+   to the runtime holding the **caller**, so the worker starts in that pod, in the
+   supervisor's tmux session.
+4. Read the results from the server as usual (`/terminals/{id}/output`,
+   `/terminals/{id}/inbox/messages`) — output is streamed up the runtime channel,
+   so nothing dials the pod that produced it.
+
+Step 3 is what keeps the callbacks working: `send_message` without a `receiver_id`
+routes to the recorded caller, and the caller is a sibling window in the same pod.
+
+`examples/cao-clusters/kubernetes/eks/README.md` has the copy-pasteable version of
+all four steps under **"Run the assign example on a runtime"**, including profile
+staging, the verification commands, and the transcript from a run on EKS with
+Claude Code on Bedrock.
+
 ## Usage
 
 In the supervisor terminal, try this example task:

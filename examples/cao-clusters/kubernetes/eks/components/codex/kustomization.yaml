@@ -1,0 +1,20 @@
+# Optional codex-on-Bedrock mode, using an image built with
+# `--build-arg INSTALL_CODEX=1`. deploy.sh adds this component to the rendered
+# root in `codex` mode.
+#
+# Unlike the kiro component this is NOT an API-key mode. codex reaches Bedrock
+# with SigV4 from the same Pod Identity association Claude Code uses, so there
+# is no secret to project and the Pod Identity egress rule must stay: a codex
+# pod that cannot reach 169.254.170.23 cannot get credentials at all. The two
+# providers differ in the API they call, not in how they authenticate.
+#
+# What this changes: the supervisor profile, the worker default, and the
+# Claude-specific environment. AWS_REGION is deliberately KEPT — the image
+# writes no `region` key into ~/.codex/config.toml so that one image works in
+# any region, which makes the pod's AWS_REGION the only thing telling codex's
+# SDK where to send the request.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+patches:
+  - path: supervisor-provider.yaml
+  - path: broker-provider.yaml

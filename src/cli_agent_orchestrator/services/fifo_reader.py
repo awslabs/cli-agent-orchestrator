@@ -143,10 +143,47 @@ class FifoManager:
         # the watchdog instead of re-probing (and logging a traceback) every tick
         # forever (harness-control#845).
         self._probe_failures: Dict[str, int] = {}
+        # Cumulative bytes published per terminal, i.e. the start offset of the
+        # NEXT output event. Assigned here, at the producer, because the bus is
+        # bounded and drops on full: a consumer that numbers chunks itself after
+        # the bus (the #745 bridge did) produces a contiguous sequence out of a
+        # stream with holes in it, and the loss becomes unreportable. See
+        # ``_publish_output``.
+        self._published_bytes: Dict[str, int] = {}
         self._watchdog_stop = threading.Event()
         self._watchdog_thread: Optional[threading.Thread] = None
 
         FIFO_DIR.mkdir(parents=True, exist_ok=True)
+
+    def _publish_output(self, terminal_id: str, text: str) -> None:
+        """Publish one output event carrying its own position in the stream.
+
+        ``offset`` is where this text starts in the terminal's byte stream,
+        counted in the UTF-8 encoding consumers see (the same string is what
+        every subscriber gets, so re-encoding it gives the same length the
+        remote replay buffer will append).
+
+        Consumers that only concatenate bytes — LogWriter, StatusMonitor, AG-UI
+        — ignore it. It exists for consumers that must know whether they missed
+        something: ``EventBus`` is bounded and drops on a full queue, so the
+        runtime bridge compares this offset against its replay buffer's
+        watermark and reports the difference as an explicit gap rather than
+        streaming a shortened transcript the server believes is complete
+        (review finding 3 on #802).
+        """
+        offset_bytes = len(text.encode("utf-8", errors="replace"))
+        # Assign the offset AND publish inside one critical section. Two threads
+        # feed this — the reader thread and the watchdog's rearm replay — so with
+        # the publish outside the lock they could take offsets 0 and N and then
+        # publish N first. The consumer reads a backwards offset as a producer
+        # that restarted its count, which is now a GENERATION RESTART on the
+        # bridge: it would splice a new stream onto the old one although nothing
+        # restarted (Copilot review on #802). ``bus.publish`` never blocks — the
+        # queue is bounded and drops when full — so the section stays short.
+        with self._lock:
+            offset = self._published_bytes.get(terminal_id, 0)
+            self._published_bytes[terminal_id] = offset + offset_bytes
+            bus.publish(f"terminal.{terminal_id}.output", {"data": text, "offset": offset})
 
     def create_reader(
         self,
@@ -220,6 +257,10 @@ class FifoManager:
             self._ever_delivered.pop(terminal_id, None)
             self._cold_start_attempts.pop(terminal_id, None)
             self._probe_failures.pop(terminal_id, None)
+            # The stream this counted is over. A late flush from the exiting
+            # reader thread restarts it at 0, which consumers treat as a stream
+            # restart rather than as missing bytes.
+            self._published_bytes.pop(terminal_id, None)
 
         # Deliberately NOT stopping the watchdog thread here even when this was
         # the last enrolled terminal: doing it under a "now idle" check raced
@@ -299,7 +340,6 @@ class FifoManager:
         the FIFO — the watchdog only cares whether the FIFO delivered data
         in a window, not whether/when that data was published.
         """
-        topic = f"terminal.{terminal_id}.output"
         read_fd = -1
         keepalive_fd = -1
         pending = bytearray()
@@ -363,7 +403,7 @@ class FifoManager:
                     or len(pending) >= _COALESCE_MAX_BYTES
                     or not readable
                 ):
-                    bus.publish(topic, {"data": pending.decode("utf-8", errors="replace")})
+                    self._publish_output(terminal_id, pending.decode("utf-8", errors="replace"))
                     pending.clear()
         except Exception as e:
             if not stop_flag.is_set():
@@ -373,7 +413,7 @@ class FifoManager:
             # terminal isn't lost — status/log consumers may need it.
             if pending:
                 try:
-                    bus.publish(topic, {"data": pending.decode("utf-8", errors="replace")})
+                    self._publish_output(terminal_id, pending.decode("utf-8", errors="replace"))
                 except Exception:
                     pass
             for fd in (read_fd, keepalive_fd):
@@ -746,7 +786,11 @@ class FifoManager:
             self._rearm_failures.pop(terminal_id, None)
             self._last_data_at[terminal_id] = time.monotonic()
 
-        bus.publish(f"terminal.{terminal_id}.output", {"data": replay})
+        # Goes through the same offset assignment as FIFO data: a re-armed pipe's
+        # replay is new bytes as far as every consumer is concerned, and a publish
+        # that skipped the counter would leave the producer's offsets and a remote
+        # replay buffer's watermark permanently disagreeing.
+        self._publish_output(terminal_id, replay)
 
 
 # Module-level singleton
