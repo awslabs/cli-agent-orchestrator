@@ -1932,6 +1932,8 @@ class TestClearedBufferEvidenceIsPinnedToItsTurn:
         assert sm.turn_state("t1") == (2, 0)
 
     def test_evidence_pinned_to_the_current_turn_closes_it(self):
+        """The bypass needs BOTH facts: ownership (the pin matches) and activity
+        evidence in the same buffer (round 5 split them into separate values)."""
         sm = StatusMonitor()
         provider = MagicMock()
         provider.supports_screen_detection = False
@@ -1939,8 +1941,25 @@ class TestClearedBufferEvidenceIsPinnedToItsTurn:
         with sm._lock:
             pinned = sm._pin_cleared_turn_locked("t1")
 
-        sm._apply_detection("t1", TerminalStatus.COMPLETED, cleared_buffer_turn=pinned)
+        sm._apply_detection(
+            "t1", TerminalStatus.COMPLETED, cleared_buffer_turn=pinned, activity_evidence=True
+        )
         assert sm.turn_state("t1") == (1, 1)
+
+    def test_ownership_alone_is_not_eligibility(self):
+        """A correctly-pinned observation with NO activity evidence keeps the
+        conservative gate — arrival time is not proof the turn rendered it."""
+        sm = StatusMonitor()
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        self._dispatch(sm, provider)
+        with sm._lock:
+            pinned = sm._pin_cleared_turn_locked("t1")
+
+        sm._apply_detection(
+            "t1", TerminalStatus.COMPLETED, cleared_buffer_turn=pinned, activity_evidence=False
+        )
+        assert sm.turn_state("t1") == (1, 0)
 
     def test_a_turn_dispatched_without_a_clear_gets_no_bypass(self):
         """Provider init keystrokes and send_special_key open turns without
@@ -2087,3 +2106,58 @@ class TestMismatchedEvidenceIsDiscardedEntirely:
 
         assert sm.turn_state("t1") == (2, 2)
         assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+
+
+class TestOwnershipSurvivesAMissingActivityMarker:
+    """Turn identity and bypass eligibility are separate facts (PR #812 review,
+    round 5).
+
+    _gate_cleared_pin answered "no activity marker" by returning None — erasing
+    the observation's IDENTITY, so the stale-observation discard had nothing to
+    check. Reviewer's reproduction at the real state_buffer_max=32768: turn 1 is
+    seen working, ordinary output evicts its working marker from the rolling
+    window, its completed reply lands; a paused get_status resumes after turn 2
+    has dispatched and shown busy output, and the stale COMPLETED — pin erased —
+    closes turn 2 as (2, 2). An observation must keep its turn identity even when
+    activity is absent, unsupported, or the probe fails; eligibility for the
+    seen-working bypass is a different question with a different answer.
+    """
+
+    def _two_turns_second_working(self):
+        sm = StatusMonitor()
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        # The marker was evicted from turn 1's window: no activity evidence.
+        provider.raw_buffer_shows_turn_activity.return_value = False
+        provider.get_status.return_value = TerminalStatus.COMPLETED
+        # Turn 1: dispatched, seen working, legitimately finished.
+        sm.notify_input_sent("t1")
+        sm.clear_rolling_buffer("t1", provider)
+        sm.notify_input_delivered("t1")
+        with sm._lock:
+            stale_pin = sm._pin_cleared_turn_locked("t1")
+        sm._apply_detection("t1", TerminalStatus.PROCESSING, settled=False)
+        sm._apply_detection("t1", TerminalStatus.COMPLETED, cleared_buffer_turn=stale_pin)
+        assert sm.turn_state("t1") == (1, 1)
+        # Turn 2: dispatched and observed working before the paused read resumes.
+        sm.notify_input_sent("t1")
+        sm.clear_rolling_buffer("t1", provider)
+        sm.notify_input_delivered("t1")
+        sm._apply_detection("t1", TerminalStatus.PROCESSING, settled=False)
+        assert sm.turn_state("t1") == (2, 1)
+        return sm, provider, stale_pin
+
+    def test_a_stale_markerless_observation_cannot_close_a_working_newer_turn(self):
+        sm, provider, stale_pin = self._two_turns_second_working()
+
+        # The paused reader resumes THROUGH the pipeline entry: turn 1's 32KB
+        # snapshot (marker evicted -> activity False) parses COMPLETED, pinned
+        # to turn 1.
+        with patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as pm:
+            pm.get_provider.return_value = provider
+            sm._schedule_raw_detection(
+                "t1", "turn 1's evicted-marker snapshot", provider, cleared_buffer_turn=stale_pin
+            )
+
+        assert sm.turn_state("t1") == (2, 1)
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING

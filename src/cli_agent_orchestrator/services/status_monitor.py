@@ -354,6 +354,7 @@ class StatusMonitor:
         settled: bool = True,
         observed: bool = True,
         cleared_buffer_turn: Optional[int] = None,
+        activity_evidence: bool = False,
     ) -> None:
         """Apply the sticky-latch rules to a freshly detected status and publish
         on change. Shared by the raw and pyte detection paths.
@@ -396,6 +397,7 @@ class StatusMonitor:
                 settled=settled,
                 observed=observed,
                 cleared_buffer_turn=cleared_buffer_turn,
+                activity_evidence=activity_evidence,
             )
         if changed:
             # Publish outside the lock — subscribers must never be able to
@@ -411,6 +413,7 @@ class StatusMonitor:
         settled: bool = True,
         observed: bool = True,
         cleared_buffer_turn: Optional[int] = None,
+        activity_evidence: bool = False,
     ) -> bool:
         """Sticky-latch core of _apply_detection. Caller MUST hold self._lock.
 
@@ -440,7 +443,11 @@ class StatusMonitor:
                 f"is on turn {self._turn.get(terminal_id, 0)}"
             )
             return False
-        from_cleared_buffer = cleared_buffer_turn is not None
+        # Eligibility for the seen-working bypass needs BOTH facts: the bytes
+        # belong to this turn (the pin matched above) AND they show the provider's
+        # working marker. Ownership alone is deliberately not enough — see
+        # _buffer_activity_evidence.
+        from_cleared_buffer = cleared_buffer_turn is not None and activity_evidence
 
         # Turn bookkeeping runs on the VERDICT, before any early return, because a
         # verdict that leaves the latched status alone is still evidence about the
@@ -580,7 +587,7 @@ class StatusMonitor:
         1. the agent was seen working since the dispatch (``_turn_started``), or
         2. the verdict was derived from the rolling buffer that send_input CLEARED
            at dispatch (``from_cleared_buffer``) AND that buffer shows the
-           provider's own working marker (see _gate_cleared_pin). This is what
+           provider's own working marker (see _buffer_activity_evidence). This is
            lets a fast reply that arrives as one coalesced working+answer chunk
            close its turn: such a reply never samples as busy, and requiring a
            separately observed busy status made it hang behind the gate with
@@ -833,32 +840,33 @@ class StatusMonitor:
         """
         return provider is not None and not getattr(provider, "supports_screen_detection", False)
 
-    def _gate_cleared_pin(
-        self, provider, buffer: str, cleared_turn: Optional[int]
-    ) -> Optional[int]:
-        """Keep the cleared-buffer pin only when the buffer itself shows a turn RAN.
+    def _buffer_activity_evidence(self, provider, buffer: str) -> bool:
+        """Whether this buffer shows the provider's own working marker.
 
-        Clearing establishes when bytes arrived, not which turn rendered them: a
-        TUI can re-emit its RETAINED previous answer into the fresh buffer, and
-        kiro's detector accepts that replay as COMPLETED — with an ungated pin the
-        new turn closed as finished before any work happened (PR #812 review,
-        round 2). What a bare replay cannot contain is the provider's own
-        working/thinking marker, and what a genuine coalesced fast reply always
-        carried in the measured cases is exactly that marker in the same chunk.
-        So the bypass demands ``raw_buffer_shows_turn_activity`` — a per-provider,
-        fail-closed predicate (grok: its live-progress markers; kiro: 'Kiro is
-        working'/'Thinking...'). Providers without the hook simply keep the
-        conservative seen-working gate, which is where they were before the
-        bypass existed.
+        Answers ONLY the bypass-eligibility question, never the ownership one —
+        the two were briefly conflated in one Optional[int], and answering "no
+        activity" by erasing the pin also erased the observation's turn identity,
+        so the stale-observation discard had nothing to check and an older
+        completion could close an already-working newer turn (PR #812 review,
+        round 5). Ownership (``cleared_buffer_turn``) always travels with the
+        observation, whatever this predicate says.
+
+        Why the bypass wants activity at all: clearing establishes when bytes
+        arrived, not which turn rendered them — a TUI can re-emit its RETAINED
+        previous answer into the fresh buffer, and kiro's detector accepts that
+        replay as COMPLETED (PR #812 review, round 2). Fail-closed on error and
+        for providers without the hook. NOTE (round 5): a marker occurring inside
+        old ANSWER TEXT still satisfies this predicate — word matching cannot
+        distinguish a live progress event from a quotation, so this check is due
+        to be replaced by response-identity tracking in the provider (design
+        under discussion on the PR); it is kept meanwhile because it narrows the
+        exposure without weakening ownership.
         """
-        if cleared_turn is None:
-            return None
         try:
-            if provider is not None and provider.raw_buffer_shows_turn_activity(buffer):
-                return cleared_turn
+            return provider is not None and provider.raw_buffer_shows_turn_activity(buffer)
         except Exception:
-            logger.exception("Error probing buffer activity; dropping the bypass")
-        return None
+            logger.exception("Error probing buffer activity; treating as no evidence")
+            return False
 
     def _pin_cleared_turn_locked(self, terminal_id: str) -> Optional[int]:
         """Pin the turn whose dispatch cleared the rolling buffer. Caller MUST
@@ -911,8 +919,7 @@ class StatusMonitor:
                 provider = None
         raw_calibrated = self._is_raw_calibrated(provider)
         cleared_turn = cleared_buffer_turn
-
-        cleared_turn = self._gate_cleared_pin(provider, buffer, cleared_turn)
+        activity = self._buffer_activity_evidence(provider, buffer)
 
         if loop is None:
             # No loop ever captured (unit tests / offline replay): detect
@@ -921,6 +928,7 @@ class StatusMonitor:
                 terminal_id,
                 self._detect_status(terminal_id, buffer),
                 cleared_buffer_turn=cleared_turn,
+                activity_evidence=activity,
             )
             return
 
@@ -964,6 +972,7 @@ class StatusMonitor:
                 detected,
                 settled=raw_calibrated,
                 cleared_buffer_turn=cleared_turn,
+                activity_evidence=activity,
             )
 
         self._arm_quiesce_timer(loop, terminal_id, self._on_raw_quiescent)
@@ -1080,11 +1089,13 @@ class StatusMonitor:
             quiesce_provider = provider_manager.get_provider(terminal_id)
         except Exception:
             quiesce_provider = None
-        cleared_turn = self._gate_cleared_pin(quiesce_provider, buffer, cleared_turn)
+        activity = self._buffer_activity_evidence(quiesce_provider, buffer)
 
         async def _detect_and_apply() -> None:
             detected = await asyncio.to_thread(self._detect_status, terminal_id, buffer)
-            self._apply_detection(terminal_id, detected, cleared_buffer_turn=cleared_turn)
+            self._apply_detection(
+                terminal_id, detected, cleared_buffer_turn=cleared_turn, activity_evidence=activity
+            )
 
         loop = self._loop or self._running_loop()
         if loop is None:
@@ -1092,6 +1103,7 @@ class StatusMonitor:
                 terminal_id,
                 self._detect_status(terminal_id, buffer),
                 cleared_buffer_turn=cleared_turn,
+                activity_evidence=activity,
             )
         else:
             self._spawn_tracked(loop, _detect_and_apply())
@@ -1397,8 +1409,9 @@ class StatusMonitor:
             if use_screen:
                 fresh = self._detect_screen(terminal_id, provider)
                 # A pyte screen read mid-burst is a half-drawn frame; a retained
-                # screen is never post-dispatch evidence.
-                settled, cleared_turn = (not bursting), None
+                # screen is never post-dispatch evidence, so it carries neither
+                # ownership nor eligibility.
+                settled, cleared_turn, activity = (not bursting), None, False
             else:
                 fresh = self._detect_status(terminal_id, buffer)
                 # A raw-calibrated detector is built for the live stream, so its
@@ -1408,7 +1421,7 @@ class StatusMonitor:
                 # (PR #812 review). Screen-calibrated providers read raw
                 # (CAO_PYTE_STATUS=false) keep the mid-stream restriction.
                 settled = True if raw_calibrated else (not bursting)
-                cleared_turn = self._gate_cleared_pin(provider, buffer, cleared_turn)
+                activity = self._buffer_activity_evidence(provider, buffer)
             logger.debug(
                 f"get_status [{terminal_id}]: cached=PROCESSING, "
                 f"fresh={fresh.value}, buffer_len={len(buffer)}, bursting={bursting}, "
@@ -1416,7 +1429,11 @@ class StatusMonitor:
             )
             if fresh != TerminalStatus.PROCESSING and fresh != TerminalStatus.UNKNOWN:
                 self._apply_detection(
-                    terminal_id, fresh, settled=settled, cleared_buffer_turn=cleared_turn
+                    terminal_id,
+                    fresh,
+                    settled=settled,
+                    cleared_buffer_turn=cleared_turn,
+                    activity_evidence=activity,
                 )
                 # Report what the latch ACCEPTED, not what this read proposed. A
                 # verdict refused as unsettled must not be handed to the caller
