@@ -2982,6 +2982,148 @@ class TestDeferredInitFailureNotification:
         mock_delete.assert_called_once_with("worker99", registry=None)
         mock_terminal_ended.assert_called_once_with("worker99")
 
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service._notify_caller_of_deferred_failure")
+    @patch("cli_agent_orchestrator.services.terminal_service._confirm_worker_started_or_resubmit")
+    @patch("cli_agent_orchestrator.services.terminal_service.send_input")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    async def test_deferred_kimi_provider_error_notifies_caller_and_tears_down(
+        self, mock_monitor, mock_meta, mock_send, mock_confirm, mock_notify
+    ):
+        """A post-dispatch provider ERROR is not a dropped paste.
+
+        Kimi's strict execution-evidence path may reach ERROR without ever
+        showing a processing spinner (for example an invalid model alias on the
+        first turn). The retry loop must stop, the assign caller must be told,
+        and a stock CAO assign caller must be notified before the ordinary
+        failed-worker teardown contract runs.
+        """
+
+        from cli_agent_orchestrator.services import terminal_service
+
+        provider_instance = AsyncMock()
+        provider_instance.initialize.return_value = True
+        provider_instance.shell_baseline = None
+        provider_instance.runtime_variant = None
+        provider_instance.requires_execution_evidence = True
+        mock_meta.return_value = {"caller_id": "super123"}
+        mock_confirm.return_value = True
+        mock_monitor.get_status.return_value = TerminalStatus.ERROR
+
+        before_tasks = set(terminal_service._deferred_init_tasks)
+        terminal_service._schedule_deferred_init(
+            provider_instance,
+            "worker99",
+            "do the task",
+            OrchestrationType.ASSIGN,
+            None,
+        )
+        (task,) = set(terminal_service._deferred_init_tasks) - before_tasks
+        await task
+
+        mock_send.assert_called_once()
+        mock_notify.assert_called_once()
+        assert mock_notify.call_args.args[3] is True
+        assert "entered ERROR" in mock_notify.call_args.args[1]
+        assert "torn down" in mock_notify.call_args.args[1]
+        assert "Inspect the worker terminal" not in mock_notify.call_args.args[1]
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service._notify_caller_of_deferred_failure")
+    @patch("cli_agent_orchestrator.services.terminal_service._confirm_worker_started_or_resubmit")
+    @patch("cli_agent_orchestrator.services.terminal_service.send_input")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    async def test_deferred_kimi_provider_error_without_caller_stays_inspectable(
+        self, mock_monitor, mock_meta, mock_send, mock_confirm, mock_notify, monkeypatch
+    ):
+        """Bridge/operator sessions have no CAO caller to receive a failure inbox.
+
+        Keep the ERROR terminal alive so their external observer sees the
+        provider failure instead of only a post-teardown 404. This exception is
+        disabled on elastic workers, where teardown is required to release the
+        lease.
+        """
+
+        from cli_agent_orchestrator.services import terminal_service
+
+        monkeypatch.delenv("CAO_ELASTIC_WORKER_ID", raising=False)
+        provider_instance = AsyncMock()
+        provider_instance.initialize.return_value = True
+        provider_instance.shell_baseline = None
+        provider_instance.runtime_variant = None
+        provider_instance.requires_execution_evidence = True
+        mock_meta.return_value = {"caller_id": None}
+        mock_confirm.return_value = True
+        mock_monitor.get_status.return_value = TerminalStatus.ERROR
+
+        before_tasks = set(terminal_service._deferred_init_tasks)
+        terminal_service._schedule_deferred_init(
+            provider_instance,
+            "worker99",
+            "do the task",
+            OrchestrationType.ASSIGN,
+            None,
+        )
+        (task,) = set(terminal_service._deferred_init_tasks) - before_tasks
+        await task
+
+        mock_send.assert_called_once()
+        mock_notify.assert_called_once()
+        assert mock_notify.call_args.args[3] is False
+        assert "Inspect the worker terminal" in mock_notify.call_args.args[1]
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service._notify_caller_of_deferred_failure")
+    @patch("cli_agent_orchestrator.services.terminal_service._confirm_worker_started_or_resubmit")
+    @patch("cli_agent_orchestrator.services.terminal_service.send_input")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_session_env")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    async def test_deferred_kimi_cross_node_error_preserves_remote_failure_contract(
+        self,
+        mock_monitor,
+        mock_meta,
+        mock_session_env,
+        mock_send,
+        mock_confirm,
+        mock_notify,
+        monkeypatch,
+    ):
+        """A remote target has no local caller row but does have callback ownership."""
+
+        from cli_agent_orchestrator.services import terminal_service
+
+        monkeypatch.delenv("CAO_ELASTIC_WORKER_ID", raising=False)
+        provider_instance = AsyncMock()
+        provider_instance.initialize.return_value = True
+        provider_instance.shell_baseline = None
+        provider_instance.runtime_variant = None
+        provider_instance.requires_execution_evidence = True
+        mock_meta.return_value = {"caller_id": None, "tmux_session": "cao-remote"}
+        mock_session_env.return_value = {
+            terminal_service.CALLBACK_URL_ENV: "http://supervisor:9889",
+            terminal_service.CALLBACK_TERMINAL_ID_ENV: "sup-remote",
+        }
+        mock_confirm.return_value = True
+        mock_monitor.get_status.return_value = TerminalStatus.ERROR
+
+        before_tasks = set(terminal_service._deferred_init_tasks)
+        terminal_service._schedule_deferred_init(
+            provider_instance,
+            "worker99",
+            "do the task",
+            OrchestrationType.ASSIGN,
+            None,
+        )
+        (task,) = set(terminal_service._deferred_init_tasks) - before_tasks
+        await task
+
+        mock_send.assert_called_once()
+        mock_notify.assert_called_once()
+        assert mock_notify.call_args.args[3] is True
+
 
 class TestDeferredInitWaitingUserAnswerSurvival:
     """PR #539 review (gutosantos82), BLOCKING test gap: "no test stubs

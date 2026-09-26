@@ -1773,7 +1773,16 @@ def _worker_is_started_direct(terminal_id: str, provider) -> bool:
             # must therefore run atomically with the StatusMonitor buffer epoch
             # reset performed by send_input; sampling with get_buffer() and
             # mutating later lets an old in-flight probe certify a newer turn.
-            return status_monitor.probe_execution_evidence(terminal_id, provider)
+            if status_monitor.probe_execution_evidence(terminal_id, provider):
+                return True
+            # Kimi deliberately refuses cached PROCESSING/COMPLETED as pickup
+            # evidence because those statuses can be retained from an older
+            # turn. ERROR is different: after this dispatch it is a terminal
+            # provider verdict, not evidence of successful work, and the only
+            # safe recovery is to stop re-delivery and let the caller observe
+            # the error. This also covers providers that adopt the same strict
+            # execution-evidence contract later.
+            return status_monitor.get_status(terminal_id) == TerminalStatus.ERROR
         output = get_backend().get_history(session_name, window_name, tail_lines=200)
         status = provider.get_status(output)
     except Exception:
@@ -2073,6 +2082,74 @@ def _schedule_deferred_init(
                     effective_orchestration_type,
                     provider=provider_instance,
                 )
+                # Strict execution-evidence providers (currently Kimi) do not
+                # accept cached PROCESSING/COMPLETED as pickup proof. Their
+                # direct probe does, however, stop redelivery on a provider
+                # ERROR that appears after dispatch: replaying the task cannot
+                # fix a rejected model/session and only repeats side effects.
+                # Surface that failure to stock-CAO callers instead of silently
+                # treating ERROR as a successful start, but keep the terminal
+                # alive so external observers (including Bridge) can inspect
+                # the actual provider error rather than racing a teardown/404.
+                if started and getattr(provider_instance, "requires_execution_evidence", False):
+                    current_status = await asyncio.to_thread(status_monitor.get_status, terminal_id)
+                    if current_status == TerminalStatus.ERROR:
+                        # Preserve the existing deferred-failure contract for a
+                        # real CAO supervisor (and for elastic worker pods,
+                        # whose lease must be released): notify and tear down.
+                        # Operator/Bridge-created sessions have no caller_id;
+                        # keep those ERROR terminals alive so an external
+                        # observer can read the provider failure instead of
+                        # racing a delete into a generic 404/orphaned result.
+                        session_name = metadata.get("tmux_session") if metadata else None
+                        has_cross_node_callback = False
+                        if session_name:
+                            try:
+                                session_env = get_session_env(session_name)
+                                has_cross_node_callback = bool(
+                                    session_env.get(CALLBACK_URL_ENV)
+                                    and session_env.get(CALLBACK_TERMINAL_ID_ENV)
+                                )
+                            except Exception:  # noqa: BLE001 — teardown policy stays conservative
+                                has_cross_node_callback = False
+                        delete_error_worker = (
+                            bool(caller_id)
+                            or has_cross_node_callback
+                            or bool(os.environ.get("CAO_ELASTIC_WORKER_ID"))
+                        )
+                        logger.error(
+                            "Deferred init for %s: provider entered ERROR after task "
+                            "delivery; notifying caller%s.",
+                            terminal_id,
+                            (
+                                " and tearing down worker"
+                                if delete_error_worker
+                                else " and leaving worker alive for inspection"
+                            ),
+                        )
+                        failure_message = (
+                            f"Worker {terminal_id} accepted the assigned task but the "
+                            "provider entered ERROR before producing a result. "
+                        )
+                        if delete_error_worker:
+                            failure_message += (
+                                "The failed worker terminal was torn down after this "
+                                "notification; correct the provider/model configuration "
+                                "and re-assign the task."
+                            )
+                        else:
+                            failure_message += (
+                                "Inspect the worker terminal, correct the provider/model "
+                                "configuration, then re-assign the task."
+                            )
+                        await asyncio.to_thread(
+                            _notify_caller_of_deferred_failure,
+                            terminal_id,
+                            failure_message,
+                            registry,
+                            delete_error_worker,
+                        )
+                        return
                 if not started:
                     logger.error(
                         "Deferred init for %s: worker never started after "

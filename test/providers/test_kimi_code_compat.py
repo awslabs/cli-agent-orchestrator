@@ -136,6 +136,24 @@ def _code_provider(terminal_id: str = "term-code", binary: str = "/usr/bin/kimi"
     return provider
 
 
+def _observe_turn_execution(provider: KimiCliProvider) -> None:
+    """Drive ``provider`` to "current turn has execution evidence".
+
+    Mirrors StatusMonitor's ``observe_execution_output`` at runtime: a turn is
+    only COMPLETED once live activity was seen, never from a response marker in
+    the frame at hand.
+    """
+
+    provider.mark_input_received()
+    provider.observe_execution_output(
+        "⠙ Thinking… 1s · 4 tokens\n",
+        provider._status_buffer_epoch,
+        truncated=False,
+    )
+    provider._last_dispatch_time = 0.0
+    assert provider._execution_observed is True
+
+
 # =============================================================================
 # A1.1 — dialect detection
 # =============================================================================
@@ -2080,6 +2098,273 @@ class TestKimiCodeStatusOnRealCaptures:
     def test_empty_output_is_unknown(self):
         provider = KimiCliProvider("t-empty", "s", "w")
         assert provider.get_status("") is TerminalStatus.UNKNOWN
+
+    def test_invalid_model_turn_is_error(self):
+        """Kimi Code validates a model alias only when the first turn starts.
+
+        The TUI remains fully rendered and returns to an empty composer after
+        the failure, so ready chrome must not hide the error line. This is the
+        live Kimi Code 2.1.1 shape that previously fell into deferred-submit
+        redelivery when pyte dropped the frame.
+        """
+
+        provider = KimiCliProvider("t-bad-model", "s", "w")
+        provider._dialect = KimiDialect.CODE
+        screen = [
+            '   Error: Failed to start a session: Model "bad-model" is',
+            " not configured in config.toml.",
+            "╭────────────────────────────────────────────╮",
+            "│ >                                          │",
+            "╰────────────────────────────────────────────╯",
+            "Never Ask  bad-model thinking  /tmp/project",
+            "context: 0%",
+        ]
+
+        assert provider.get_status_from_screen(screen) is TerminalStatus.ERROR
+
+    def test_answer_quoting_invalid_model_error_is_completed(self):
+        """Quoted startup-error prose belongs to the answer, not terminal state.
+
+        The quoted row is only prose once the current turn has execution
+        evidence; the provider must not re-derive that from the frame's bullet.
+        """
+
+        provider = KimiCliProvider("t-quoted-model-error", "s", "w")
+        provider._dialect = KimiDialect.CODE
+        _observe_turn_execution(provider)
+        screen = [
+            "● The command failed with this message:",
+            '   Error: Failed to start a session: Model "bad-model" is not configured.',
+            "╭────────────────────────────────────────────╮",
+            "│ >                                          │",
+            "╰────────────────────────────────────────────╯",
+            "Never Ask  cliproxy/deepseek-v4.1-flash thinking  /tmp/project",
+            "context: 1%",
+        ]
+
+        assert provider.get_status_from_screen(screen) is TerminalStatus.COMPLETED
+
+    def test_quoted_session_error_survives_answer_bullet_scrolling_out(self):
+        """#825 follow-up — execution evidence outlives the answer bullet.
+
+        The assistant may quote the indented session-start failure inside a real
+        answer. While the bullet is rendered the quoted row is just answer prose;
+        once the bullet scrolls out of the viewport only the quoted row is left.
+        The per-turn execution latch — never the frame at hand — keeps it
+        COMPLETED, and a NEW turn that produced no execution of its own surfaces
+        a real session-start failure as ERROR.
+        """
+
+        provider = KimiCliProvider("t-quoted-scrollout", "s", "w")
+        provider._dialect = KimiDialect.CODE
+        _observe_turn_execution(provider)
+
+        with_bullet = [
+            "● The command printed this and stopped:",
+            '   Error: Failed to start a session: Model "bad-model" is not configured.',
+            "╭────────────────────────────────────────────╮",
+            "│ >                                          │",
+            "╰────────────────────────────────────────────╯",
+            "Never Ask  cliproxy/deepseek-v4.1-flash thinking  /tmp/project",
+            "context: 1%",
+        ]
+        assert provider.get_status_from_screen(with_bullet) is TerminalStatus.COMPLETED
+
+        # SAME turn — the bullet has scrolled out; only the quoted row it
+        # introduced and the ready composer remain. The latch still holds.
+        quote_only = with_bullet[1:]
+        assert provider.get_status_from_screen(quote_only) is TerminalStatus.COMPLETED
+
+        # A NEW turn begins (dispatch resets execution evidence), so a real
+        # indented session-start failure with no activity of its own is ERROR.
+        provider.mark_input_received()
+        assert provider._execution_observed is False
+        real_failure = [
+            '   Error: Failed to start a session: Model "bad-model" is',
+            " not configured in config.toml.",
+            "╭────────────────────────────────────────────╮",
+            "│ >                                          │",
+            "╰────────────────────────────────────────────╯",
+            "Never Ask  bad-model thinking  /tmp/project",
+            "context: 0%",
+        ]
+        assert provider.get_status_from_screen(real_failure) is TerminalStatus.ERROR
+
+    def test_stale_previous_answer_repaint_after_new_dispatch_is_processing(self):
+        """Regression (#1): a post-dispatch redraw of turn N-1 cannot read ready.
+
+        The identical screen read COMPLETED for the settled turn; after a new
+        dispatch it must stay PROCESSING until the new turn has its own
+        execution evidence.
+        """
+        provider = KimiCliProvider("t-stale-repaint", "s", "w")
+        provider._dialect = KimiDialect.CODE
+        _observe_turn_execution(provider)
+        previous_answer = [
+            "● Previous answer text",
+            "╭────────────────────────────────────────────╮",
+            "│ >                                          │",
+            "╰────────────────────────────────────────────╯",
+            "Never Ask  cliproxy/deepseek-v4.1-flash thinking  /tmp/project",
+            "context: 1%",
+        ]
+        assert provider.get_status_from_screen(previous_answer) is TerminalStatus.COMPLETED
+
+        provider.mark_input_received()
+        assert (provider._execution_observed, provider._awaiting_turn) == (False, True)
+        assert provider.get_status_from_screen(previous_answer) is TerminalStatus.PROCESSING
+
+    def test_stale_previous_answer_does_not_hide_new_turn_model_error(self):
+        """A post-dispatch redraw of turn N-1 cannot own turn N's failure."""
+        provider = KimiCliProvider("t-stale-answer-new-error", "s", "w")
+        provider._dialect = KimiDialect.CODE
+        provider.mark_input_received()
+
+        stale_plus_failure = [
+            "● Previous answer text",
+            '   Error: Failed to start a session: Model "bad-model" is not configured.',
+            "╭────────────────────────────────────────────╮",
+            "│ >                                          │",
+            "╰────────────────────────────────────────────╯",
+            "Never Ask  bad-model thinking  /tmp/project",
+            "context: 0%",
+        ]
+        assert provider.get_status_from_screen(stale_plus_failure) is TerminalStatus.ERROR
+
+    def test_byte_identical_repeated_answers_complete(self):
+        """Regression (#2): identical consecutive answers both complete.
+
+        Execution evidence is per-turn state (reset then re-observed), not a
+        marker-identity baseline, so a byte-identical second answer is not
+        misread as a stale redraw.
+        """
+        provider = KimiCliProvider("t-byte-identical", "s", "w")
+        provider._dialect = KimiDialect.CODE
+        screen = [
+            "✨ repeat the same answer",
+            "● The answer is exactly 42.",
+            "╭────────────────────────────────────────────╮",
+            "│ >                                          │",
+            "╰────────────────────────────────────────────╯",
+            "Never Ask  cliproxy/deepseek-v4.1-flash thinking  /tmp/project",
+            "context: 1%",
+        ]
+        for _ in range(2):
+            _observe_turn_execution(provider)
+            assert provider.get_status_from_screen(screen) is TerminalStatus.COMPLETED
+
+    def test_ready_repaint_after_dispatch_before_spinner_is_processing(self):
+        """Regression (#6): the composer/status repaint precedes the spinner."""
+        provider = KimiCliProvider("t-ready-repaint", "s", "w")
+        provider._dialect = KimiDialect.CODE
+        _observe_turn_execution(provider)
+        ready = [
+            "✨ next task",
+            "● Previous answer text",
+            "╭────────────────────────────────────────────╮",
+            "│ >                                          │",
+            "╰────────────────────────────────────────────╯",
+            "Never Ask  cliproxy/deepseek-v4.1-flash thinking  /tmp/project",
+            "context: 1%",
+        ]
+        assert provider.get_status_from_screen(ready) is TerminalStatus.COMPLETED
+
+        provider.mark_input_received()
+        assert provider.get_status_from_screen(ready) is TerminalStatus.PROCESSING
+
+    def test_generic_fatal_error_after_execution_is_error(self):
+        """Regression (#5): a top-level failure is fatal even after execution."""
+        provider = KimiCliProvider("t-generic-fatal", "s", "w")
+        provider._dialect = KimiDialect.CODE
+        _observe_turn_execution(provider)
+        screen = [
+            "● The tool crashed.",
+            "Traceback (most recent call last):",
+            "  File 'x.py', line 1",
+            "╭────────────────────────────────────────────╮",
+            "│ >                                          │",
+            "╰────────────────────────────────────────────╯",
+            "Never Ask  cliproxy/deepseek-v4.1-flash thinking  /tmp/project",
+            "context: 1%",
+        ]
+        assert provider.get_status_from_screen(screen) is TerminalStatus.ERROR
+
+    def test_pre_eviction_observer_keeps_evicted_bullet_frame_completed(self):
+        """Regression (#3): observe execution before FIFO eviction removes the bullet."""
+        provider = KimiCliProvider("t-pre-eviction-owner", "s", "w")
+        provider._dialect = KimiDialect.CODE
+        provider.notify_status_buffer_reset(1)
+        provider.mark_input_received()
+        current_turn = (
+            "⠙ working…\n"
+            "● The command printed this and stopped:\n"
+            '   Error: Failed to start a session: Model "bad-model" is not configured.\n'
+        )
+
+        provider.observe_execution_output(current_turn, 1, truncated=True)
+
+        assert provider._execution_observed is True
+        quote_only = [
+            '   Error: Failed to start a session: Model "bad-model" is not configured.',
+            "╭────────────────────────────────────────────╮",
+            "│ >                                          │",
+            "╰────────────────────────────────────────────╯",
+            "Never Ask  cliproxy/deepseek-v4.1-flash thinking  /tmp/project",
+            "context: 1%",
+        ]
+        assert provider.get_status_from_screen(quote_only) is TerminalStatus.COMPLETED
+
+    def test_cleanup_and_new_turn_reset_execution_evidence(self, monkeypatch):
+        """Regression (#7): cleanup and a new turn clear current-turn evidence."""
+        provider = KimiCliProvider("t-cleanup-owner", "s", "w")
+        _observe_turn_execution(provider)
+        assert provider._execution_observed is True
+
+        provider.mark_input_received()
+        assert (provider._execution_observed, provider._awaiting_turn) == (False, True)
+
+        provider._execution_observed = True
+        provider._awaiting_turn = False
+        monkeypatch.setattr(provider, "_remove_managed_scratch", lambda: True)
+        monkeypatch.setattr(provider, "_remove_managed_runtime_home", lambda: True)
+        assert provider.cleanup() is True
+        assert (provider._execution_observed, provider._awaiting_turn) == (False, False)
+
+    def test_quoted_session_error_survives_scrolling_out_of_raw_buffer(self):
+        """The raw rolling-buffer path must agree with the rendered one (#825).
+
+        Same turn shape as the screen regression: the buffer keeps the quoted
+        row after the bullet is evicted. The per-turn execution latch — not the
+        frame at hand — decides whether the indented shape is fatal.
+        """
+
+        provider = KimiCliProvider("t-quoted-scrollout-raw", "s", "w")
+        provider._dialect = KimiDialect.CODE
+        _observe_turn_execution(provider)
+
+        with_bullet = (
+            "● The command printed this and stopped:\n"
+            '   Error: Failed to start a session: Model "bad-model" is not configured.\n'
+            "── input ─────────────────────────────────────────────\n"
+            "Never Ask  cliproxy/deepseek-v4.1-flash thinking  /tmp/project\n"
+            "context: 1%\n"
+        )
+        assert provider.get_status(with_bullet) is TerminalStatus.COMPLETED
+
+        # SAME turn — bullet evicted, quoted row + ready chrome only.
+        quote_only = with_bullet.split("\n", 1)[1]
+        assert provider.get_status(quote_only) is TerminalStatus.COMPLETED
+
+        # NEW turn — execution evidence cleared, real failure surfaces.
+        provider.mark_input_received()
+        provider._last_dispatch_time = 0.0
+        real_failure = (
+            '   Error: Failed to start a session: Model "bad-model" is not configured.\n'
+            "── input ─────────────────────────────────────────────\n"
+            "Never Ask  bad-model thinking  /tmp/project\n"
+            "context: 0%\n"
+        )
+        assert provider.get_status(real_failure) is TerminalStatus.ERROR
 
     def test_legacy_fixture_still_completes(self):
         """A2.1 — the legacy path must be untouched."""
