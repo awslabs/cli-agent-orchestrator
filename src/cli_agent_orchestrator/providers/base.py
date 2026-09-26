@@ -214,6 +214,19 @@ class BaseProvider(ABC):
     # never probed: the terminal keeps the status the edges give it.
     supports_midburst_processing_probe: bool = False
 
+    # Whether this provider's raw detector REJECTS replayed completions by
+    # response identity: it remembers the last completed response it reported,
+    # freezes that at dispatch (mark_input_received), and refuses to classify a
+    # byte-identical post-dispatch response as a NEW completion unless it saw
+    # the turn working (grok: buffer epochs; kiro: _response_identity). Only
+    # such a provider's settled post-clear COMPLETED may close a turn without a
+    # separately sampled busy status — for anyone else, a re-emitted old answer
+    # is indistinguishable from a new one (#735, PR #812 rounds 2-6; word-based
+    # activity matching was tried in between and is not sufficient: a completed
+    # answer can QUOTE the working words). Checked with `is True`, like
+    # assume_processing_on_dispatch, so mocks default closed.
+    owns_completion_identity: bool = False
+
     def probe_processing_from_screen(self, screen_lines: List[str]) -> bool:
         """Report whether this half-drawn frame shows the agent actively working.
 

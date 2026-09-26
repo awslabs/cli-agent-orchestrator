@@ -66,7 +66,9 @@ ok = terminal_service.send_input(
     sender_id="supervisor",
     orchestration_type=OrchestrationType.HANDOFF,
 )
-assert ok is True, "send_input returned False"
+# send_input returns the turn its dispatch opened (truthy; the monitor is
+# mocked here so only truthiness is meaningful).
+assert ok, "send_input reported failure"
 
 event = captured["event"]
 assert captured["event_type"] == "post_send_message"

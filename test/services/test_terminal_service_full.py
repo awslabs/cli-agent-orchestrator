@@ -1972,11 +1972,17 @@ class TestGetTerminal:
             "last_active": datetime.now(),
         }
         mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_status_monitor.turn_state.return_value = (3, 2)
 
         result = get_terminal("test1234")
 
         assert result["id"] == "test1234"
         assert result["status"] == TerminalStatus.IDLE.value
+        # #735: the turn counters ride along with status, so a caller can tell an
+        # IDLE that means "your turn finished" from one that means "the previous
+        # turn's prompt is still on screen".
+        assert result["turn"] == 3
+        assert result["turn_completed"] == 2
 
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_get_terminal_not_found(self, mock_get_metadata):
@@ -1999,6 +2005,7 @@ class TestGetTerminal:
             "last_active": datetime.now(),
         }
         mock_status_monitor.get_status.return_value = TerminalStatus.UNKNOWN
+        mock_status_monitor.turn_state.return_value = (0, 0)
 
         result = get_terminal("test1234")
 
@@ -2059,9 +2066,13 @@ class TestSendInput:
         mock_provider.paste_enter_count = 2
         mock_provider.paste_submit_delay = 0.3
 
+        mock_status_monitor.notify_input_sent.return_value = 7
+
         result = send_input("test1234", "test message")
 
-        assert result is True
+        # send_input returns the exact turn its dispatch opened (#812 review):
+        # the number notify_input_sent produced, not a re-derived one.
+        assert result == 7
         mock_tmux.send_keys.assert_called_once_with(
             "cao-session",
             "developer-abcd",
@@ -2220,9 +2231,11 @@ class TestSendInput:
         mock_provider.paste_enter_count = 1
         mock_provider.paste_submit_delay = 0.3
 
+        mock_status_monitor.notify_input_sent.return_value = 3
+
         result = send_input("test1234", "1")
 
-        assert result is True
+        assert result == 3
         mock_tmux.send_keys.assert_called_once_with(
             "cao-session",
             "developer-abcd",

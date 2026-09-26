@@ -240,15 +240,45 @@ def send(session_name, message, terminal_id, is_async, timeout):
     except requests.exceptions.RequestException as e:
         raise click.ClickException(f"Failed to connect to cao-server: {e}")
 
+    # The turn this message started. Waiting on it is what makes "done" mean
+    # "my message finished" rather than "the screen looks finished" (#735).
+    # Parsed OUTSIDE the request try-block: requests' JSONDecodeError subclasses
+    # RequestException (via InvalidJSONError) ahead of ValueError, so inside that
+    # block the RequestException clause caught it first (PR #812 review).
+    #
+    # A non-JSON 200 is NOT delivery: requests follows redirects, so a gateway
+    # can refuse the POST with a 303 to a sign-in page whose HTML 200 passes
+    # raise_for_status with zero messages accepted. Treating that as sent — or
+    # quietly falling back to the legacy wait — reports success for a message
+    # the server never saw (PR #812 review, round 3). Delivery is unconfirmed
+    # either way, so fail with a distinct error and no retry advice; a blind
+    # resend could paste a duplicate prompt into a working agent. The legacy
+    # wait remains only for a VALID JSON acknowledgement from an older server
+    # that simply does not name a turn.
+    try:
+        sent_turn = response.json().get("turn")
+    except ValueError:
+        raise click.ClickException(
+            f"cao-server returned a non-JSON acknowledgement for the send to "
+            f"terminal {target_id} (a proxy or sign-in page may have intercepted "
+            "the request). Delivery is UNCONFIRMED — inspect the terminal (`cao "
+            f"session status {session_name}`) before deciding whether to resend."
+        )
+
     if is_async:
         click.echo(f"Message sent to terminal {target_id}")
         return
 
-    time.sleep(3)
     effective_timeout = timeout if timeout is not None else _DEFAULT_SEND_TIMEOUT
     interrupted = False
     try:
-        poll_until_done(target_id, effective_timeout)
+        # No flat pre-sleep: it was only ever a guess at how long the previous
+        # turn's completion marker stays on screen, and the turn gate answers that
+        # exactly. Kept for servers that report no turn, where the guess is still
+        # the only thing standing between the poller and a stale marker.
+        if sent_turn is None:
+            time.sleep(3)
+        poll_until_done(target_id, effective_timeout, min_turn=sent_turn)
     except KeyboardInterrupt:
         interrupted = True
 

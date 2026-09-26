@@ -310,17 +310,46 @@ class TestSend:
         broker.send_input.assert_called_once_with("w1", "t1", "hostname?")
         assert "CPUs: 4." in result.output
 
-    def test_done_detection_reads_status_through_the_broker(self, runner, broker, poll):
+    def test_done_detection_reads_the_terminal_through_the_broker(self, runner, broker, poll):
         """Duplicating the local done-detection here would hang a kiro worker."""
         broker.sole_terminal.return_value = _terminal("t1")
         broker.terminal_output.return_value = ""
-        broker.terminal_status.return_value = "idle"
+        broker.terminal.return_value = _terminal("t1", status="idle", turn_completed=4)
 
         runner.invoke(worker, ["send", "w1", "hi"])
 
-        read_status = poll.call_args.kwargs["read_status"]
-        assert read_status("t1") == "idle"
-        broker.terminal_status.assert_called_with("w1", "t1")
+        read_terminal = poll.call_args.kwargs["read_terminal"]
+        assert read_terminal("t1")["status"] == "idle"
+        # The whole payload, not just `status`: `turn_completed` is what tells the
+        # waiter whether that status is about the message it just sent (#735).
+        assert read_terminal("t1")["turn_completed"] == 4
+        broker.terminal.assert_called_with("w1", "t1")
+
+    def test_the_turn_the_send_started_is_what_the_wait_is_gated_on(self, runner, broker, poll):
+        """#735: a worker's own cao-server names the turn, so `send` must pass it on.
+
+        Without this the wait falls back to reading the pane's current frame, where a
+        completion marker left by the PREVIOUS turn returns in a few seconds with the
+        previous answer -- the failure this whole path exists to avoid.
+        """
+        broker.sole_terminal.return_value = _terminal("t1")
+        broker.terminal_output.return_value = ""
+        broker.send_input.return_value = 7
+
+        runner.invoke(worker, ["send", "w1", "hi"])
+
+        assert poll.call_args.kwargs["min_turn"] == 7
+
+    def test_a_node_that_names_no_turn_still_waits_the_old_way(self, runner, broker, poll):
+        """A worker running an older cao-server reports no turn; it must not hang."""
+        broker.sole_terminal.return_value = _terminal("t1")
+        broker.terminal_output.return_value = ""
+        broker.send_input.return_value = None
+
+        result = runner.invoke(worker, ["send", "w1", "hi"])
+
+        assert result.exit_code == 0
+        assert poll.call_args.kwargs["min_turn"] is None
 
     def test_the_default_timeout_is_used_when_none_is_given(self, runner, broker, poll):
         broker.sole_terminal.return_value = _terminal("t1")

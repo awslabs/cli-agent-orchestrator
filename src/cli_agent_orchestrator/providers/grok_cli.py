@@ -674,6 +674,12 @@ class GrokCliProvider(BaseProvider):
         self._last_status_buffer = None
         self._last_status_buffer_stream_start = 0
 
+    # Replay rejection is owned here: the buffer-epoch machinery refuses to
+    # report a completion identical to the previous turn's without new activity
+    # (see the generation tests), so a post-clear COMPLETED from this detector
+    # is never a re-emitted old answer.
+    owns_completion_identity = True
+
     def get_status(self, output: Optional[str]) -> TerminalStatus:
         native = self._resolve_native_status(output)
         if native is not None:

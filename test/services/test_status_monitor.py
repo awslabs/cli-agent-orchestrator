@@ -14,6 +14,7 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.status_monitor import (
     STALE_PROCESSING_BUFFER_QUIET_S,
     STALE_PROCESSING_CONFIRM_TTL_S,
+    TURN_START_BACKSTOP_S,
     StatusMonitor,
 )
 
@@ -1408,4 +1409,760 @@ class TestMidBurstProcessingProbe:
             sm._midburst_probe_at.pop("t1", None)
         sm._bursting["t1"] = True
         sm._schedule_screen_detection("t1", provider)
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+
+
+class TestLiveTurnIsNotDemotedByAnUnsettledFrame:
+    """#735 / #407: a running turn must not be declared finished by a frame that
+    was still changing when it was read.
+
+    Measured on claude_code 2.1.282, one 28-second turn: the screen detector returned
+    PROCESSING thirty-one times and was overruled once, by the raw-buffer re-check
+    inside ``get_status()`` -- an Ink TUI redraws in place, so after escape-stripping
+    the live spinner arrives as fragments ('✢ g', ' Leavenin', '✳ 2') that no spinner
+    pattern matches, while the response marker from earlier in the turn matches
+    cleanly. That single COMPLETED latched, the revert arm was already spent, and all
+    thirty-one later PROCESSING verdicts were discarded. ``cao session send`` then
+    returned in 7.1s and printed the PREVIOUS turn's answer.
+
+    The latch already refused ready -> busy. These tests pin the other direction:
+    busy -> ready needs a settled frame.
+    """
+
+    def _monitor(self, latched=TerminalStatus.PROCESSING):
+        sm = StatusMonitor()
+        sm._last_status["t1"] = latched
+        sm._allow_processing_revert["t1"] = False  # arm spent by the real PROCESSING
+        return sm
+
+    def test_unsettled_ready_does_not_overwrite_processing(self):
+        sm = self._monitor()
+        sm._apply_detection("t1", TerminalStatus.COMPLETED, settled=False)
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+
+    def test_unsettled_idle_does_not_overwrite_processing(self):
+        """The same frame reads IDLE rather than COMPLETED when the TUI has cleared
+        the transcript and not yet redrawn it; both were observed live."""
+        sm = self._monitor()
+        sm._apply_detection("t1", TerminalStatus.IDLE, settled=False)
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+
+    def test_later_processing_is_still_honoured(self):
+        """The damage was never the one bad reading, it was everything after it.
+
+        A ready status is sticky and the arm is spent, so before this guard the
+        terminal read ready for the whole remaining turn.
+        """
+        sm = self._monitor()
+        sm._apply_detection("t1", TerminalStatus.COMPLETED, settled=False)
+        sm._apply_detection("t1", TerminalStatus.PROCESSING, settled=False)
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+
+    def test_a_settled_ready_still_ends_the_turn(self):
+        """Guards against over-tightening into a hang: the quiescence edge fires as
+        soon as output stops, which is exactly when a turn really ends."""
+        sm = self._monitor()
+        sm._apply_detection("t1", TerminalStatus.COMPLETED, settled=True)
+        assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+
+    def test_a_settled_frame_from_before_the_turn_started_cannot_end_it(self):
+        """The one settled frame that still lies: the one drawn between a dispatch and
+        the agent picking the prompt up.
+
+        claude_code waits 2s for its bracketed paste to settle before Enter, and the
+        stream is quiet for all of it, so the quiescence timer fires on a frame that is
+        entirely the PREVIOUS turn. Measured without this clause:
+        assume_processing_on_dispatch published PROCESSING, this frame reverted it ~0.5s
+        later, and since the assumption had already spent the revert arm the turn's
+        genuine PROCESSING was latch-blocked -- `completed` for a whole 25s turn.
+        """
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.COMPLETED
+        sm.notify_input_sent("t1", assume_processing=True)
+        sm.notify_input_delivered("t1")
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+
+        sm._apply_detection("t1", TerminalStatus.COMPLETED, settled=True)
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+
+        # And the turn's real activity is still honoured rather than latch-blocked.
+        sm._apply_detection("t1", TerminalStatus.PROCESSING, settled=False)
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        sm._apply_detection("t1", TerminalStatus.COMPLETED, settled=True)
+        assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+
+    def test_the_unstarted_window_expires_at_the_backstop_so_nothing_hangs(self):
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.COMPLETED
+        sm.notify_input_sent("t1", assume_processing=True)
+        with sm._lock:
+            sm._turn_delivered_at["t1"] = time.monotonic() - (TURN_START_BACKSTOP_S + 0.1)
+        sm._apply_detection("t1", TerminalStatus.COMPLETED, settled=True)
+        assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+
+    def test_error_is_never_held_back_by_the_turn_guards(self):
+        """ERROR says the provider process died, not that a turn finished.
+
+        It is a sticky-ready status like IDLE and COMPLETED, so a guard written against
+        that set would pin a dead terminal at PROCESSING until the backstop -- and a
+        caller waiting on it has to hear now, not in a minute.
+        """
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.COMPLETED
+        sm.notify_input_sent("t1", assume_processing=True)
+        sm.notify_input_delivered("t1")  # turn open, never seen working
+
+        sm._apply_detection("t1", TerminalStatus.ERROR, settled=False)
+
+        assert sm._last_status["t1"] == TerminalStatus.ERROR
+
+    def test_the_guard_does_not_touch_a_terminal_that_was_already_ready(self):
+        """IDLE -> COMPLETED on an unsettled frame is an upgrade, not a demotion."""
+        sm = self._monitor(latched=TerminalStatus.IDLE)
+        sm._apply_detection("t1", TerminalStatus.COMPLETED, settled=False)
+        assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_get_status_does_not_return_a_verdict_the_latch_refused(self, mock_get_backend):
+        """The read path must not put a rejected status back on the wire.
+
+        ``get_status`` applies what its re-check finds. If it returned that value
+        while the latch refused it, callers would keep seeing the stale ready status
+        and the guard above would be decorative.
+        """
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        sm = self._monitor()
+        sm._buffers["t1"] = "raw redraw soup"
+        sm._bursting["t1"] = True  # still streaming -> a screen read here is unsettled
+        # A SCREEN-calibrated provider: its mid-burst verdicts are the unsettled
+        # kind. (A raw-calibrated provider's verdicts are settled by design and
+        # exempt from this refusal — see the raw-calibrated tests in the grok
+        # suite.)
+        provider = MagicMock()
+        provider.supports_screen_detection = True
+        provider.get_status_from_screen.return_value = TerminalStatus.COMPLETED
+        sm._screens["t1"] = (MagicMock(display=["stale completed box"]), MagicMock())
+
+        with patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as mock_pm:
+            mock_pm.get_provider.return_value = provider
+            with patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", True):
+                assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_get_status_reroutes_the_recheck_to_the_registered_detector(self, mock_get_backend):
+        """A screen-detection provider must be re-checked against its SCREEN.
+
+        Running the raw-stream detector on one of these providers is not a near miss
+        but a systematic misread, and it is the single wrong verdict #735 traced.
+        _fresh_capture_pane_status already routes this way; the cheap re-check did not.
+        """
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        sm = self._monitor()
+        sm._buffers["t1"] = "raw redraw soup"
+        provider = MagicMock()
+        provider.supports_screen_detection = True
+        provider.get_status.side_effect = AssertionError(
+            "raw detector must not judge a screen-detection provider"
+        )
+        provider.get_status_from_screen.return_value = TerminalStatus.PROCESSING
+        sm._screens["t1"] = (MagicMock(display=["✢ Musing… (6s)"]), MagicMock())
+
+        with patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as mock_pm:
+            mock_pm.get_provider.return_value = provider
+            with patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", True):
+                assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        provider.get_status_from_screen.assert_called()
+
+
+class TestTurnCorrelation:
+    """#735: the turn number that makes "did MY send finish" answerable."""
+
+    def test_notify_input_sent_returns_an_increasing_turn(self):
+        sm = StatusMonitor()
+        assert sm.notify_input_sent("t1") == 1
+        assert sm.notify_input_sent("t1") == 2
+        assert sm.turn_state("t1") == (2, 0)
+
+    def test_a_terminal_never_sent_anything_reports_zeroes(self):
+        assert StatusMonitor().turn_state("t1") == (0, 0)
+
+    def test_a_stale_ready_frame_does_not_complete_the_new_turn(self):
+        """The whole point. The previous turn's COMPLETED box is still on screen
+        when the new turn is dispatched, and settles there before the agent draws
+        anything of its own."""
+        sm = StatusMonitor()
+        sm.notify_input_sent("t1")
+        sm.notify_input_delivered("t1")
+        sm._apply_detection("t1", TerminalStatus.COMPLETED, settled=True)
+        assert sm.turn_state("t1") == (1, 0)
+
+    def test_seen_working_then_a_settled_ready_completes_the_turn(self):
+        sm = StatusMonitor()
+        sm.notify_input_sent("t1")
+        sm.notify_input_delivered("t1")
+        sm._apply_detection("t1", TerminalStatus.PROCESSING, settled=False)
+        sm._apply_detection("t1", TerminalStatus.COMPLETED, settled=True)
+        assert sm.turn_state("t1") == (1, 1)
+
+    def test_a_repeated_ready_status_still_completes_the_turn(self):
+        """Two turns in a row can end on the same status, so the bookkeeping cannot
+        hang off a status CHANGE -- COMPLETED after COMPLETED changes nothing but is
+        still this turn finishing."""
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.COMPLETED
+        sm.notify_input_sent("t1")
+        sm.notify_input_delivered("t1")
+        sm._apply_detection("t1", TerminalStatus.PROCESSING, settled=False)
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._apply_detection("t1", TerminalStatus.COMPLETED, settled=True)
+        assert sm.turn_state("t1") == (1, 1)
+
+    def test_an_unsettled_ready_never_completes_the_turn(self):
+        sm = StatusMonitor()
+        sm.notify_input_sent("t1")
+        sm.notify_input_delivered("t1")
+        sm._apply_detection("t1", TerminalStatus.PROCESSING, settled=False)
+        sm._apply_detection("t1", TerminalStatus.COMPLETED, settled=False)
+        assert sm.turn_state("t1") == (1, 0)
+
+    def test_unknown_is_not_evidence_of_activity(self):
+        """UNKNOWN is a torn frame showing neither spinner nor prompt. Counting it
+        as "started" would let the next stale ready frame close the turn."""
+        sm = StatusMonitor()
+        sm.notify_input_sent("t1")
+        sm.notify_input_delivered("t1")
+        sm._apply_detection("t1", TerminalStatus.UNKNOWN, settled=True)
+        sm._apply_detection("t1", TerminalStatus.COMPLETED, settled=True)
+        assert sm.turn_state("t1") == (1, 0)
+
+    def test_a_turn_never_seen_working_closes_only_at_the_backstop(self):
+        """A liveness valve, not a correctness one. No real turn reaches it -- 28 of
+        28 measured turns were seen working within 2.5s -- so if it fires, something
+        is wrong with the terminal and reporting that beats burning the caller's
+        whole timeout."""
+        sm = StatusMonitor()
+        sm.notify_input_sent("t1")
+        sm.notify_input_delivered("t1")
+        with sm._lock:
+            sm._turn_delivered_at["t1"] = time.monotonic() - (TURN_START_BACKSTOP_S + 0.1)
+        sm._apply_detection("t1", TerminalStatus.COMPLETED, settled=True)
+        assert sm.turn_state("t1") == (1, 1)
+
+    def test_delivery_pushes_the_grace_back(self):
+        """notify_input_sent runs BEFORE send_keys, and a provider's paste submit
+        delay sits between them (2s for claude_code), so the arm-time stamp is
+        pessimistic on purpose. Delivery replaces it with the real one, which must
+        restart the grace rather than inherit the elapsed part of it.
+        """
+        sm = StatusMonitor()
+        sm.notify_input_sent("t1")
+        with sm._lock:  # pretend the arm happened a long time ago
+            sm._turn_delivered_at["t1"] = time.monotonic() - (TURN_START_BACKSTOP_S + 5)
+        sm.notify_input_delivered("t1")  # keystrokes land now
+        sm._apply_detection("t1", TerminalStatus.COMPLETED, settled=True)
+        assert sm.turn_state("t1") == (1, 0)
+
+    def test_a_turn_armed_but_never_delivered_can_still_close(self):
+        """Most notify_input_sent callers are provider init/launch keystrokes that
+        never reach notify_input_delivered. Leaving those turns permanently open
+        would make turn_completed trail turn forever, and every turn-aware waiter
+        would then wait for a turn that cannot finish.
+        """
+        sm = StatusMonitor()
+        sm.notify_input_sent("t1")
+        with sm._lock:
+            sm._turn_delivered_at["t1"] = time.monotonic() - (TURN_START_BACKSTOP_S + 0.1)
+        sm._apply_detection("t1", TerminalStatus.IDLE, settled=True)
+        assert sm.turn_state("t1") == (1, 1)
+
+    def test_a_new_turn_reopens_a_closed_one(self):
+        sm = StatusMonitor()
+        sm.notify_input_sent("t1")
+        sm.notify_input_delivered("t1")
+        sm._apply_detection("t1", TerminalStatus.PROCESSING, settled=False)
+        sm._apply_detection("t1", TerminalStatus.COMPLETED, settled=True)
+        assert sm.turn_state("t1") == (1, 1)
+
+        sm.notify_input_sent("t1")
+        sm.notify_input_delivered("t1")
+        assert sm.turn_state("t1") == (2, 1)
+        # The marker turn 1 left is still on screen and still settles there.
+        sm._apply_detection("t1", TerminalStatus.COMPLETED, settled=True)
+        assert sm.turn_state("t1") == (2, 1)
+
+    def test_assume_processing_on_dispatch_is_not_evidence_the_turn_started(self):
+        """It publishes PROCESSING for readers that cannot ask about turns. Letting
+        it mark the turn started would hand the next stale frame the corroboration
+        it needs to close the new turn -- reintroducing the defect through the fix
+        for it."""
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.COMPLETED
+        sm.notify_input_sent("t1", assume_processing=True)
+        sm.notify_input_delivered("t1")
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        sm._apply_detection("t1", TerminalStatus.COMPLETED, settled=True)
+        assert sm.turn_state("t1") == (1, 0)
+
+    def test_clear_terminal_forgets_the_turn_state(self):
+        sm = StatusMonitor()
+        sm.notify_input_sent("t1")
+        sm.clear_terminal("t1")
+        assert sm.turn_state("t1") == (0, 0)
+
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_an_event_inbox_backend_advances_the_turn_too(self, mock_get_backend, mock_pm):
+        """herdr never feeds _process_chunk, so without this the turn would never
+        close there and every turn-aware waiter would hang."""
+        mock_get_backend.return_value = _backend(event_inbox=True)
+        provider = MagicMock()
+        provider.get_status.return_value = TerminalStatus.COMPLETED
+        mock_pm.get_provider.return_value = provider
+
+        sm = StatusMonitor()
+        sm.notify_input_sent("t1")
+        sm.notify_input_delivered("t1")
+        sm._turn_started["t1"] = True
+        assert sm.get_status("t1") == TerminalStatus.COMPLETED
+        assert sm.turn_state("t1") == (1, 1)
+
+
+class TestRawPathDeferralForScreenProviders:
+    """`CAO_PYTE_STATUS=false` puts a screen-calibrated provider on a stream it cannot
+    read, so its end-of-turn verdict waits for output to actually stop (#735).
+
+    Measured over one 22s claude_code turn: 41 samples of the rolling buffer taken
+    while a spinner was on screen, and the raw detector answered `idle` twice and
+    `completed` twice. With pyte off one such reading 6.2s into a 28s turn ended the
+    turn, and `cao session send` printed a live spinner frame.
+    """
+
+    def _monitor(self, quiet_for):
+        sm = StatusMonitor()
+        sm._loop = MagicMock()
+        sm._buffer_changed_at["t1"] = time.monotonic() - quiet_for
+        sm._bursting["t1"] = True
+        armed = []
+        sm._arm_quiesce_timer = lambda loop, tid, cb, *a: armed.append(cb)
+        return sm, armed
+
+    def _provider(self, screen_capable):
+        provider = MagicMock()
+        provider.supports_screen_detection = screen_capable
+        return provider
+
+    @patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", False)
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_a_still_streaming_turn_defers_instead_of_deciding(self, mock_pm):
+        mock_pm.get_provider.return_value = self._provider(True)
+        sm, armed = self._monitor(quiet_for=0.3)
+        sm._detect_status = lambda tid, buf: pytest.fail("must not judge a live stream")
+
+        sm._on_raw_quiescent("t1")
+
+        assert armed == [sm._on_raw_quiescent]  # re-armed, nothing applied
+        assert sm._bursting["t1"] is True  # still considered mid-burst
+        assert "t1" not in sm._last_status
+
+    @patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", False)
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_once_output_stops_the_verdict_is_taken(self, mock_pm):
+        mock_pm.get_provider.return_value = self._provider(True)
+        sm, armed = self._monitor(quiet_for=STALE_PROCESSING_BUFFER_QUIET_S + 0.1)
+        sm._loop = None  # detect inline, as _on_raw_quiescent does off-loop
+        sm._detect_status = lambda tid, buf: TerminalStatus.COMPLETED
+
+        sm._on_raw_quiescent("t1")
+
+        assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", False)
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_a_raw_calibrated_provider_is_not_delayed(self, mock_pm):
+        """kiro_cli, cursor_cli, grok_cli: reading their stream is not a guess, so
+        they must keep the 200ms quiescence they are tuned against."""
+        mock_pm.get_provider.return_value = self._provider(False)
+        sm, armed = self._monitor(quiet_for=0.3)
+        sm._loop = None
+        sm._detect_status = lambda tid, buf: TerminalStatus.COMPLETED
+
+        sm._on_raw_quiescent("t1")
+
+        assert armed == []
+        assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", True)
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_the_gate_is_inert_when_the_screen_path_is_in_charge(self, mock_pm):
+        mock_pm.get_provider.return_value = self._provider(True)
+        sm, armed = self._monitor(quiet_for=0.3)
+        sm._loop = None
+        sm._detect_status = lambda tid, buf: TerminalStatus.COMPLETED
+
+        sm._on_raw_quiescent("t1")
+
+        assert armed == []
+        assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+
+
+class TestActivityIsNoticedWhileATurnIsUnseen:
+    """A dispatched turn nobody has seen working must still get its activity noticed.
+
+    assume_processing_on_dispatch latches PROCESSING from the paste alone, which took
+    the raw path's per-chunk detection out of play for the whole turn — and with the
+    quiescence deferral waiting for output to stop (which a live turn never does) that
+    left NO verdict at all. Measured: every send waited out the 60s backstop, 64s
+    against a 31s turn, correct but useless.
+    """
+
+    def _monitor(self):
+        sm = StatusMonitor()
+        sm._loop = MagicMock()
+        sm._arm_quiesce_timer = lambda *a, **k: None
+        sm._cancel_quiesce_handle = lambda *a, **k: None
+        sm._bursting["t1"] = True  # mid-turn, so the usual branches are all closed
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        return sm
+
+    def test_a_chunk_is_detected_while_the_turn_is_unseen(self):
+        sm = self._monitor()
+        sm.notify_input_sent("t1", assume_processing=True)
+        sm.notify_input_delivered("t1")
+        seen = []
+        sm._detect_status = lambda tid, buf: seen.append(buf) or TerminalStatus.PROCESSING
+
+        sm._schedule_raw_detection("t1", "a live spinner chunk")
+
+        assert seen == ["a live spinner chunk"]
+        assert sm._turn_started["t1"] is True
+
+    def test_once_the_turn_is_seen_working_the_debounce_returns(self):
+        """The extra detection is for the unseen window only — it must not re-introduce
+        per-chunk detection for the rest of a busy turn."""
+        sm = self._monitor()
+        sm.notify_input_sent("t1", assume_processing=True)
+        sm.notify_input_delivered("t1")
+        sm._turn_started["t1"] = True
+        seen = []
+        sm._detect_status = lambda tid, buf: seen.append(buf) or TerminalStatus.PROCESSING
+
+        sm._schedule_raw_detection("t1", "another chunk")
+
+        assert seen == []
+
+
+class TestCapturePaneReturnHonorsTheTurnGuard:
+    """A confirmed ready capture the latch REFUSED must not be handed to the caller.
+
+    PR #812 review (haofeif): the cheap-buffer branch of get_status() was fixed to
+    return what the latch accepted, but the capture-pane fallback still executed
+    ``return fresh_capture`` after ``_apply_detection_locked`` — so a dispatch with
+    assumed processing and no observed activity let the second eligible capture of
+    the RETAINED ready pane reach the API, `cao session send`'s pre-send check and
+    InboxService, while the latch itself stayed at PROCESSING and the turn at (1, 0).
+    Exactly the stale ready verdict the guard exists to refuse.
+    """
+
+    def _dispatched_quiet_monitor(self):
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.COMPLETED
+        sm.notify_input_sent("t1", assume_processing=True)
+        sm.notify_input_delivered("t1")
+        with sm._lock:
+            # The stale-PROCESSING quiet gate: buffer long quiet, so the capture
+            # fallback is eligible.
+            sm._buffer_changed_at["t1"] = time.monotonic() - (STALE_PROCESSING_BUFFER_QUIET_S + 1)
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        return sm
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_a_refused_capture_verdict_is_not_returned(self, mock_get_backend):
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        sm = self._dispatched_quiet_monitor()
+        # A two-read-confirmed capture of the retained pre-dispatch COMPLETED pane.
+        sm._fresh_capture_pane_status = lambda tid, gen: TerminalStatus.COMPLETED
+
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        assert sm.turn_state("t1") == (1, 0)
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_an_accepted_capture_verdict_still_returns_and_closes(self, mock_get_backend):
+        """Guard against over-tightening: once the turn was seen working, the
+        capture escape must keep doing its #558 job."""
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        sm = self._dispatched_quiet_monitor()
+        sm._apply_detection("t1", TerminalStatus.PROCESSING, settled=False)  # seen working
+        sm._fresh_capture_pane_status = lambda tid, gen: TerminalStatus.COMPLETED
+
+        assert sm.get_status("t1") == TerminalStatus.COMPLETED
+        assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+        assert sm.turn_state("t1") == (1, 1)
+
+
+class TestClearedBufferEvidenceIsPinnedToItsTurn:
+    """Cleared-buffer evidence closes only the turn whose dispatch cleared it.
+
+    The evidence-turn is pinned when a raw verdict's context is read and
+    revalidated under the lock that closes the turn: a new dispatch
+    (notify_input_sent plus clear_rolling_buffer, microseconds apart in
+    send_input) can slip between the two, and turn N's bytes must never close
+    turn N+1 — that would return before N+1's agent ever saw the prompt, the
+    #728 shape. Same pin-then-revalidate rule as the capture path's generation.
+    """
+
+    def _dispatch(self, sm, provider):
+        sm.notify_input_sent("t1")
+        sm.clear_rolling_buffer("t1", provider)
+        sm.notify_input_delivered("t1")
+
+    def test_evidence_from_a_previous_turn_cannot_close_the_next(self):
+        sm = StatusMonitor()
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        self._dispatch(sm, provider)  # turn 1
+        with sm._lock:
+            pinned = sm._pin_cleared_turn_locked("t1")
+        assert pinned == 1
+
+        self._dispatch(sm, provider)  # turn 2 slips in before the apply
+
+        sm._apply_detection("t1", TerminalStatus.COMPLETED, cleared_buffer_turn=pinned)
+        assert sm.turn_state("t1") == (2, 0)
+
+    def test_evidence_pinned_to_the_current_turn_closes_it(self):
+        """The bypass needs BOTH facts: ownership (the pin matches) and an
+        identity-guarded provider — one whose detector rejects replayed
+        completions itself, so this COMPLETED cannot be a re-emitted old answer
+        (round 6 replaced the forgeable word predicate with that capability)."""
+        sm = StatusMonitor()
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        self._dispatch(sm, provider)
+        with sm._lock:
+            pinned = sm._pin_cleared_turn_locked("t1")
+
+        sm._apply_detection(
+            "t1", TerminalStatus.COMPLETED, cleared_buffer_turn=pinned, identity_guarded=True
+        )
+        assert sm.turn_state("t1") == (1, 1)
+
+    def test_ownership_alone_is_not_eligibility(self):
+        """A correctly-pinned observation from a provider WITHOUT replay
+        rejection keeps the conservative gate — arrival time is not proof the
+        turn rendered it, and such a provider cannot tell a re-emitted old
+        answer from a new one."""
+        sm = StatusMonitor()
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        self._dispatch(sm, provider)
+        with sm._lock:
+            pinned = sm._pin_cleared_turn_locked("t1")
+
+        sm._apply_detection(
+            "t1", TerminalStatus.COMPLETED, cleared_buffer_turn=pinned, identity_guarded=False
+        )
+        assert sm.turn_state("t1") == (1, 0)
+
+    def test_a_turn_dispatched_without_a_clear_gets_no_bypass(self):
+        """Provider init keystrokes and send_special_key open turns without
+        clearing the buffer; their ready verdicts keep the conservative gate."""
+        sm = StatusMonitor()
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        sm.notify_input_sent("t1")  # no clear_rolling_buffer
+        with sm._lock:
+            pinned = sm._pin_cleared_turn_locked("t1")
+        assert pinned is None
+
+        sm._apply_detection("t1", TerminalStatus.COMPLETED, cleared_buffer_turn=pinned)
+        assert sm.turn_state("t1") == (1, 0)
+
+    def test_a_stale_pin_through_the_pipeline_cannot_close_the_new_turn(self):
+        """The pipeline passes the pin alongside the buffer it was snapshotted
+        with (_process_chunk pins inside the same lock that composes the buffer);
+        if a new dispatch lands before the verdict applies, revalidation refuses.
+        This drives _schedule_raw_detection with the stale pin exactly as
+        _process_chunk would have passed it (PR #812 self-review: the pin used to
+        be taken in a LATER lock acquisition, where it vouched for the new turn
+        with the old turn's bytes)."""
+        sm = StatusMonitor()
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        self._dispatch(sm, provider)  # turn 1; buffer snapshot + pin happen here
+        with sm._lock:
+            stale_pin = sm._pin_cleared_turn_locked("t1")
+        self._dispatch(sm, provider)  # turn 2 races in before the verdict applies
+
+        with patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as pm:
+            provider.get_status.return_value = TerminalStatus.COMPLETED
+            pm.get_provider.return_value = provider
+            sm._schedule_raw_detection(
+                "t1", "turn 1's completed bytes", provider, cleared_buffer_turn=stale_pin
+            )
+
+        assert sm.turn_state("t1") == (2, 0)
+
+
+class TestQuietTerminalCannotHoldATurnOpenForever:
+    """The poll itself closes an unseen turn once the backstop expires.
+
+    The backstop used to be evaluated only when a detection verdict arrived. A
+    screen-path terminal that goes quiet right after a dispatch produces none —
+    cached status is ready, so even the re-check doesn't run — and the turn stayed
+    open forever while the CLI waiter sat out its whole 300s timeout
+    (PR #812 review, finding 1's second half).
+    """
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_before_the_backstop_the_gate_holds(self, mock_get_backend):
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.COMPLETED  # previous turn's, retained
+        sm.notify_input_sent("t1")
+        sm.notify_input_delivered("t1")
+
+        assert sm.get_status("t1") == TerminalStatus.COMPLETED
+        assert sm.turn_state("t1") == (1, 0)  # still open: the reading is stale
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_after_the_backstop_the_poll_closes_the_turn(self, mock_get_backend):
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.COMPLETED
+        sm.notify_input_sent("t1")
+        sm.notify_input_delivered("t1")
+        with sm._lock:
+            sm._turn_delivered_at["t1"] = time.monotonic() - (TURN_START_BACKSTOP_S + 1)
+
+        assert sm.get_status("t1") == TerminalStatus.COMPLETED
+        assert sm.turn_state("t1") == (1, 1)
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_a_turn_seen_working_is_not_closed_from_a_stale_cache(self, mock_get_backend):
+        """Once started, completion must come from a real settled verdict — the
+        cached ready value predates the turn and is exactly what #735 returned."""
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.COMPLETED
+        sm.notify_input_sent("t1")
+        sm.notify_input_delivered("t1")
+        with sm._lock:
+            sm._turn_started["t1"] = True
+            sm._turn_delivered_at["t1"] = time.monotonic() - (TURN_START_BACKSTOP_S + 1)
+
+        assert sm.get_status("t1") == TerminalStatus.COMPLETED
+        assert sm.turn_state("t1") == (1, 0)
+
+
+class TestMismatchedEvidenceIsDiscardedEntirely:
+    """A raw observation whose pinned turn no longer matches is DISCARDED, not
+    demoted (PR #812 review, round 2's apply-time half).
+
+    Downgrading only the bypass flag protected an unstarted turn but not
+    ownership: once the newer turn had been seen working, the old turn's ready
+    verdict sailed through the seen-working branch and closed the newer turn with
+    the old reply — get_status paused between snapshot and apply, turn 1 finishes,
+    turn 2 dispatches and shows busy output, the resumed read reports
+    (turn, turn_completed) == (2, 2) while turn 2 is still working.
+    """
+
+    def _monitor_with_two_turns(self):
+        sm = StatusMonitor()
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        # Turn 1 dispatched, snapshot+pin taken, and legitimately finished.
+        sm.notify_input_sent("t1")
+        sm.clear_rolling_buffer("t1", provider)
+        sm.notify_input_delivered("t1")
+        with sm._lock:
+            stale_pin = sm._pin_cleared_turn_locked("t1")
+        sm._apply_detection("t1", TerminalStatus.PROCESSING, settled=False)
+        sm._apply_detection("t1", TerminalStatus.COMPLETED, cleared_buffer_turn=stale_pin)
+        assert sm.turn_state("t1") == (1, 1)
+        # Turn 2 dispatches and is observed working before the paused reader resumes.
+        sm.notify_input_sent("t1")
+        sm.clear_rolling_buffer("t1", provider)
+        sm.notify_input_delivered("t1")
+        sm._apply_detection("t1", TerminalStatus.PROCESSING, settled=False)
+        assert sm.turn_state("t1") == (2, 1)
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        return sm, stale_pin
+
+    def test_an_old_pinned_verdict_cannot_close_a_working_newer_turn(self):
+        sm, stale_pin = self._monitor_with_two_turns()
+
+        # The paused reader resumes and applies turn 1's COMPLETED observation.
+        sm._apply_detection("t1", TerminalStatus.COMPLETED, cleared_buffer_turn=stale_pin)
+
+        assert sm.turn_state("t1") == (2, 1)
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+
+    def test_a_current_pinned_verdict_still_closes_and_flips(self):
+        """Guard against over-tightening: the same observation pinned to the LIVE
+        turn keeps working."""
+        sm, _ = self._monitor_with_two_turns()
+        with sm._lock:
+            live_pin = sm._pin_cleared_turn_locked("t1")
+
+        sm._apply_detection("t1", TerminalStatus.COMPLETED, cleared_buffer_turn=live_pin)
+
+        assert sm.turn_state("t1") == (2, 2)
+        assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+
+
+class TestOwnershipSurvivesAMissingActivityMarker:
+    """Turn identity and bypass eligibility are separate facts (PR #812 review,
+    round 5).
+
+    _gate_cleared_pin answered "no activity marker" by returning None — erasing
+    the observation's IDENTITY, so the stale-observation discard had nothing to
+    check. Reviewer's reproduction at the real state_buffer_max=32768: turn 1 is
+    seen working, ordinary output evicts its working marker from the rolling
+    window, its completed reply lands; a paused get_status resumes after turn 2
+    has dispatched and shown busy output, and the stale COMPLETED — pin erased —
+    closes turn 2 as (2, 2). An observation must keep its turn identity even when
+    activity is absent, unsupported, or the probe fails; eligibility for the
+    seen-working bypass is a different question with a different answer.
+    """
+
+    def _two_turns_second_working(self):
+        sm = StatusMonitor()
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        # A MagicMock provider is not identity-guarded (`owns_completion_identity`
+        # is compared with `is True`), so nothing here is bypass-eligible — which
+        # is the point: ownership must protect the turn on its own.
+        provider.get_status.return_value = TerminalStatus.COMPLETED
+        # Turn 1: dispatched, seen working, legitimately finished.
+        sm.notify_input_sent("t1")
+        sm.clear_rolling_buffer("t1", provider)
+        sm.notify_input_delivered("t1")
+        with sm._lock:
+            stale_pin = sm._pin_cleared_turn_locked("t1")
+        sm._apply_detection("t1", TerminalStatus.PROCESSING, settled=False)
+        sm._apply_detection("t1", TerminalStatus.COMPLETED, cleared_buffer_turn=stale_pin)
+        assert sm.turn_state("t1") == (1, 1)
+        # Turn 2: dispatched and observed working before the paused read resumes.
+        sm.notify_input_sent("t1")
+        sm.clear_rolling_buffer("t1", provider)
+        sm.notify_input_delivered("t1")
+        sm._apply_detection("t1", TerminalStatus.PROCESSING, settled=False)
+        assert sm.turn_state("t1") == (2, 1)
+        return sm, provider, stale_pin
+
+    def test_a_stale_markerless_observation_cannot_close_a_working_newer_turn(self):
+        sm, provider, stale_pin = self._two_turns_second_working()
+
+        # The paused reader resumes THROUGH the pipeline entry: turn 1's 32KB
+        # snapshot (marker evicted -> activity False) parses COMPLETED, pinned
+        # to turn 1.
+        with patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as pm:
+            pm.get_provider.return_value = provider
+            sm._schedule_raw_detection(
+                "t1", "turn 1's evicted-marker snapshot", provider, cleared_buffer_turn=stale_pin
+            )
+
+        assert sm.turn_state("t1") == (2, 1)
         assert sm._last_status["t1"] == TerminalStatus.PROCESSING

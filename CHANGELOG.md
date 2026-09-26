@@ -42,6 +42,116 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`cao session send` could return the previous turn's answer, or a half-drawn
+  frame of the turn still running** (#735, the same symptom as #407 on a different
+  caller). Status describes the terminal's current frame, and for the first seconds
+  after a dispatch that frame is still the previous turn — its response, its
+  completion summary and the input box, which is exactly what a finished turn looks
+  like. Nothing correlated either the status read or `?mode=last` with the message
+  just posted; a flat `time.sleep(3)` was the only thing in between. Measured on
+  claude_code 2.1.282, three trials out of three: the send returned in ~7.1s and
+  printed either the previous turn's answer or a live spinner line, while the real
+  answer arrived ~29s in. Because the send returned early, a scripted loop then
+  pasted its next prompt into a working agent, which batches them — five sends
+  produced one answer and lost four tasks with no error reported.
+
+  Three things were wrong and all three are fixed:
+
+  - `POST /terminals/{id}/input` now returns the **`turn`** it started, and
+    `GET /terminals/{id}` reports **`turn`** and **`turn_completed`**.
+    `poll_until_done` takes `min_turn` and honours no "done" signal until the
+    server confirms that turn finished, so `cao session send`, `cao worker
+    send`/`attach` and `cao launch --initial-message` wait for the message they
+    sent rather than for the screen to look idle. The flat three-second sleep is
+    gone from all four (it remains only when talking to a server old enough not to
+    report a turn).
+  - `StatusMonitor.get_status()` re-checked a stuck-PROCESSING terminal with the
+    **raw-stream** detector even for providers registered with the pyte screen
+    detector. An Ink-style TUI redraws in place, so after escape-stripping the live
+    spinner arrives as fragments (`'✢ g'`, `' Leavenin'`, `'✳ 2'`) that no spinner
+    pattern matches, while the response marker from earlier in the turn matches
+    cleanly — a working agent parsed as COMPLETED. Over one 22-second turn, 41
+    samples of the rolling buffer taken while a spinner was on screen: `idle` twice,
+    `completed` twice. The re-check now routes to the detector the provider is
+    registered with, as `_fresh_capture_pane_status` already did.
+  - the sticky-status latch refused ready → busy but not busy → ready, so one such
+    reading overwrote a live PROCESSING and then stuck: in one traced 28-second turn
+    the screen detector returned PROCESSING thirty-one times and every one was
+    discarded. A ready reading from a RETAINED source (the pyte screen, a pane
+    capture) may now end a turn only from a frame that had stopped changing, and
+    only once the turn has been seen working — a retained frame right after a
+    dispatch still shows the previous turn, which is the defect itself.
+    `claude_code` also now sets `assume_processing_on_dispatch`, which no provider
+    had ever set, so readers that cannot ask about turns — InboxService,
+    `send_input`'s own busy check, the web UI — no longer see the old turn's ready
+    status as this one's.
+
+  The seen-working requirement deliberately does NOT apply to a settled ready
+  verdict from the raw rolling buffer when two facts hold together: `send_input`
+  cleared that buffer at dispatch (so everything the detector judged arrived
+  after the dispatch), AND the provider itself rejects replayed completions
+  (`owns_completion_identity` — declared by grok, whose buffer epochs already
+  did this, and now kiro; fail-closed for everyone else). Arrival time alone is
+  not enough — a TUI can re-emit its retained old answer into the fresh buffer.
+  A word-match for the provider's working markers was tried in between and is
+  not sufficient either: a completed answer can QUOTE the working words, and
+  content matching cannot tell a live progress event from a quotation. So kiro's
+  detector now owns the rejection by response identity, the way grok's does: it
+  remembers the last completed response it reported, freezes that at dispatch
+  (from its own cache — the rolling buffer is already cleared by then), and
+  reports a byte-identical post-dispatch completion as still-processing unless
+  it saw the turn working. Identity only ever vetoes replays; a different
+  response is never itself evidence of completion, truncated extractions make
+  no identity decision in either direction, and an identical fast answer whose
+  turn was never observed working conservatively stays open — resolving at the
+  waiter's timeout rather than with a possibly-wrong answer, the same trade
+  grok makes.
+  The evidence is pinned to its turn in the same critical section as the buffer
+  snapshot, and an observation whose pin no longer matches the live turn is
+  discarded outright — closing neither latch nor turn — so a read that straddles
+  a turn boundary can never finish the newer turn with the older turn's reply.
+  This is what lets a fast reply that arrives as one coalesced working+answer
+  chunk — which grok and kiro both parse as COMPLETED, and which therefore never
+  samples as busy — close its turn instead of hanging behind the gate. For the same reason a
+  raw-calibrated detector's verdicts count as settled without waiting for stream
+  silence: the live stream is the input it was built for, and a kiro-style TUI's
+  post-answer cursor refreshes can outrun the quiescence window forever, leaving
+  `get_status()`'s re-check as the only completion path. A quiet terminal cannot
+  hold a turn open forever either: the poll itself closes a never-seen-working
+  turn once the 60s backstop expires. And ERROR is exempt from all turn guards —
+  it reports a dead provider, not a finished turn.
+
+  With `CAO_PYTE_STATUS=false` a provider calibrated for the rendered screen is
+  forced onto a stream it cannot read, so its end-of-turn verdict now waits for
+  output to actually stop. That costs about three seconds per turn in that
+  non-default mode and was the only way to make it correct; three trials out of
+  three pass there now, against one out of two before. Providers calibrated for
+  the raw stream are unaffected.
+
+  The waiter itself: once the server confirms the sent turn finished, the wait
+  ends immediately — the current frame may already belong to a newer queued turn
+  (InboxService delivers the instant a turn closes), and requiring it to also
+  look done would block the waiter on other people's work. A server whose
+  reported `turn` is lower than the caller's `min_turn` has lost its in-memory
+  counters (restart); the waiter detects that and falls back to the frame
+  heuristic instead of burning its whole timeout. `POST /terminals/{id}/input`
+  reports the exact turn its own dispatch opened (`send_input` now returns it),
+  so a concurrent sender can never be handed the other sender's number. And a
+  non-JSON 200 on that POST — a gateway redirecting to a sign-in page, say — is
+  a distinct, non-success "delivery UNCONFIRMED" error in `cao session send`,
+  `cao launch --initial-message` and `cao worker send`: it neither proves
+  delivery nor disproves it, so reporting success (or quietly waiting) was
+  wrong, and the error deliberately avoids advising a retry that could paste a
+  duplicate prompt into a working agent. A valid JSON acknowledgement from an
+  older server that merely lacks the `turn` field keeps the legacy wait.
+
+  Known limits, deliberately unchanged here: the in-process step waiter
+  (`services/agent_step.py`) and the server-side `wait_until_status` still judge
+  frames, not turns — the same deferred follow-up — and on event-inbox (herdr)
+  backends a turn faster than the poll interval pays the 60s backstop, because a
+  native ready reading right after a dispatch is indistinguishable from the
+  pre-pickup idle state.
+
 - **a PTY WebSocket handshake with no peer address skipped the client-IP allowlist.**
   `/terminals/{id}/ws` checked `client_host not in WS_ALLOWED_CLIENTS` only when a
   peer address was present, so a `None` peer passed instead of failing closed. Not

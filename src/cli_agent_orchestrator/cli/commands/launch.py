@@ -348,11 +348,28 @@ def launch(
                 timeout=request_timeout,
             )
             response.raise_for_status()
-            time.sleep(3)
+            # Same acknowledgement rule as `cao session send` (PR #812 review):
+            # a non-JSON 200 does not confirm delivery — fail distinctly rather
+            # than proceeding to wait on a message the server may never have seen.
+            try:
+                sent_turn = response.json().get("turn")
+            except ValueError:
+                raise click.ClickException(
+                    "cao-server returned a non-JSON acknowledgement for the "
+                    "initial message (a proxy or sign-in page may have "
+                    "intercepted the request). Delivery is UNCONFIRMED — inspect "
+                    "the terminal (`cao session status "
+                    f"{terminal['session_name']}`) "
+                    "before deciding whether to resend."
+                )
             if is_async:
                 click.echo(f"Message sent to {terminal['name']}. Running in background.")
                 return
-            poll_until_done(terminal["id"], timeout=300)
+            # See `cao session send`: wait for the turn this input started, and keep
+            # the flat sleep only where the server cannot name one (#735).
+            if sent_turn is None:
+                time.sleep(3)
+            poll_until_done(terminal["id"], timeout=300, min_turn=sent_turn)
             request_timeout = get_server_settings()["mcp_request_timeout"]
             output_resp = requests.get(
                 f"{API_BASE_URL}/terminals/{terminal['id']}/output",

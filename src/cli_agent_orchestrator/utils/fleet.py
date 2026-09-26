@@ -172,8 +172,25 @@ class FleetClient:
         payload = self.node_get(worker_id, f"terminals/{terminal_id}/output", {"mode": "last"})
         return payload.get("output") if isinstance(payload, dict) else None
 
-    def send_input(self, worker_id: str, terminal_id: str, message: str) -> None:
-        self.node_post(worker_id, f"terminals/{terminal_id}/input", {"message": message})
+    def send_input(self, worker_id: str, terminal_id: str, message: str) -> Optional[int]:
+        """Deliver a message and return the turn it started, when the node names one.
+
+        None from a node too old to report a turn — a VALID JSON acknowledgement
+        without the field — which the waiter treats as "fall back to the frame
+        heuristic" (#735). A non-JSON body is a different animal entirely: the
+        broker's proxy chain answered, the node did not, and delivery is
+        unconfirmed — same acknowledgement rule as the local `cao session send`
+        (PR #812 review), so fail distinctly rather than waiting on a message the
+        worker may never have seen.
+        """
+        payload = self.node_post(worker_id, f"terminals/{terminal_id}/input", {"message": message})
+        if not isinstance(payload, dict):
+            raise click.ClickException(
+                f"worker {worker_id} returned a non-JSON acknowledgement for the "
+                "send; delivery is UNCONFIRMED — inspect the worker (`cao worker "
+                f"sessions {worker_id}`) before deciding whether to resend."
+            )
+        return payload.get("turn")
 
     def sole_terminal(self, worker_id: str) -> dict[str, Any]:
         """The worker's one terminal.
