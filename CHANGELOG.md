@@ -79,14 +79,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `send_input`'s own busy check, the web UI — no longer see the old turn's ready
     status as this one's.
 
-  The seen-working requirement deliberately does NOT apply to verdicts from the
-  raw rolling buffer, because `send_input` clears that buffer at dispatch:
-  everything a raw detector judges arrived after the dispatch, so its settled
-  ready verdict is current-turn evidence, pinned to the turn whose dispatch
-  cleared the buffer and revalidated under the latch's lock. This is what lets a
-  fast reply that arrives as one coalesced working+answer chunk — which grok and
-  kiro both parse as COMPLETED, and which therefore never samples as busy — close
-  its turn instead of hanging behind the gate. For the same reason a
+  The seen-working requirement deliberately does NOT apply to a settled ready
+  verdict from the raw rolling buffer when two facts hold together: `send_input`
+  cleared that buffer at dispatch (so everything the detector judged arrived
+  after the dispatch), AND the same buffer carries the provider's own working
+  marker (`raw_buffer_shows_turn_activity`, implemented for grok and kiro,
+  fail-closed for everyone else). Arrival time alone is not enough — a TUI can
+  re-emit its retained old answer into the fresh buffer, and kiro's detector
+  accepts that replay; the working marker is what a bare replay cannot contain.
+  The evidence is pinned to its turn in the same critical section as the buffer
+  snapshot, and an observation whose pin no longer matches the live turn is
+  discarded outright — closing neither latch nor turn — so a read that straddles
+  a turn boundary can never finish the newer turn with the older turn's reply.
+  This is what lets a fast reply that arrives as one coalesced working+answer
+  chunk — which grok and kiro both parse as COMPLETED, and which therefore never
+  samples as busy — close its turn instead of hanging behind the gate. For the same reason a
   raw-calibrated detector's verdicts count as settled without waiting for stream
   silence: the live stream is the input it was built for, and a kiro-style TUI's
   post-answer cursor refreshes can outrun the quiescence window forever, leaving
@@ -111,8 +118,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   heuristic instead of burning its whole timeout. `POST /terminals/{id}/input`
   reports the exact turn its own dispatch opened (`send_input` now returns it),
   so a concurrent sender can never be handed the other sender's number. And a
-  non-JSON 200 from a proxy on that POST falls back to the legacy wait instead
-  of mislabelling a delivered message as a connection failure.
+  non-JSON 200 on that POST — a gateway redirecting to a sign-in page, say — is
+  a distinct, non-success "delivery UNCONFIRMED" error in `cao session send`,
+  `cao launch --initial-message` and `cao worker send`: it neither proves
+  delivery nor disproves it, so reporting success (or quietly waiting) was
+  wrong, and the error deliberately avoids advising a retry that could paste a
+  duplicate prompt into a working agent. A valid JSON acknowledgement from an
+  older server that merely lacks the `turn` field keeps the legacy wait.
 
   Known limits, deliberately unchanged here: the in-process step waiter
   (`services/agent_step.py`) and the server-side `wait_until_status` still judge

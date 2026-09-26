@@ -674,6 +674,16 @@ class GrokCliProvider(BaseProvider):
         self._last_status_buffer = None
         self._last_status_buffer_stream_start = 0
 
+    def raw_buffer_shows_turn_activity(self, buffer: str) -> bool:
+        """Live-progress evidence for the StatusMonitor's cleared-buffer bypass.
+
+        PROCESSING_PATTERN is the same marker set get_status treats as a working
+        turn ('Waiting for response…', '[stop]', 'Esc:cancel', braille spinner) —
+        present in a genuine coalesced working+reply chunk, absent from a re-emitted
+        old answer (see test_buffer_clear_generation_rejects_stale_identical_...).
+        """
+        return bool(PROCESSING_PATTERN.search(buffer or ""))
+
     def get_status(self, output: Optional[str]) -> TerminalStatus:
         native = self._resolve_native_status(output)
         if native is not None:

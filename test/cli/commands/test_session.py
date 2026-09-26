@@ -622,14 +622,66 @@ class TestSendSync:
     @patch("cli_agent_orchestrator.cli.commands.session.time.sleep")
     @patch("cli_agent_orchestrator.cli.commands.session.requests.post")
     @patch("cli_agent_orchestrator.cli.commands.session.requests.get")
-    def test_a_delivered_message_with_a_non_json_body_is_not_a_connection_failure(
+    def test_a_non_json_acknowledgement_is_a_distinct_failure_not_success(
         self, mock_get, mock_post, mock_sleep, mock_poll, runner
     ):
-        """requests' JSONDecodeError subclasses RequestException AHEAD of ValueError,
-        so parsing inside the request try-block reported a DELIVERED message as
-        'Failed to connect' — inviting a retry that pastes a duplicate prompt into a
-        working agent (PR #812 review). A non-JSON 200 (proxy) must instead fall
-        back to the pre-turn behaviour: sleep, then the frame-heuristic poll."""
+        """An HTTP 200 with a non-JSON body does not prove delivery: requests
+        follows redirects, so a gateway can refuse the POST with a 303 to a
+        sign-in page whose HTML 200 passes raise_for_status with zero messages
+        accepted (PR #812 review, round 3). The send must fail with a distinct
+        delivery-unconfirmed error — not report success, not fall back to a wait
+        on a message the server may never have seen, and not advise a blind retry.
+        """
+        resolve_resp = MagicMock(status_code=200, json=lambda: [{"id": "abc12345"}])
+        status_resp = MagicMock(status_code=200)
+        status_resp.json.return_value = {"status": "idle"}
+        mock_get.side_effect = [resolve_resp, status_resp]
+        post_resp = MagicMock(status_code=200)
+        post_resp.json.side_effect = requests.exceptions.JSONDecodeError("x", "<html>", 0)
+        mock_post.return_value = post_resp
+
+        result = runner.invoke(session, ["send", "cao-test", "hello"])
+
+        assert result.exit_code != 0
+        assert "UNCONFIRMED" in result.output
+        assert "Failed to connect" not in result.output
+        assert "Message sent" not in result.output
+        mock_poll.assert_not_called()
+        mock_sleep.assert_not_called()
+
+    @patch("cli_agent_orchestrator.cli.commands.session.requests.post")
+    @patch("cli_agent_orchestrator.cli.commands.session.requests.get")
+    def test_async_send_also_refuses_an_unparseable_acknowledgement(
+        self, mock_get, mock_post, runner
+    ):
+        """--async returns before any wait, so it is the caller most likely to
+        trust the exit code alone; it must not print 'Message sent' for a POST a
+        sign-in page swallowed."""
+        resolve_resp = MagicMock(status_code=200, json=lambda: [{"id": "abc12345"}])
+        status_resp = MagicMock(status_code=200)
+        status_resp.json.return_value = {"status": "idle"}
+        mock_get.side_effect = [resolve_resp, status_resp]
+        post_resp = MagicMock(status_code=200)
+        post_resp.json.side_effect = requests.exceptions.JSONDecodeError("x", "<html>", 0)
+        mock_post.return_value = post_resp
+
+        result = runner.invoke(session, ["send", "cao-test", "hello", "--async"])
+
+        assert result.exit_code != 0
+        assert "Message sent" not in result.output
+        assert "UNCONFIRMED" in result.output
+
+    @patch("cli_agent_orchestrator.cli.commands.session.poll_until_done")
+    @patch("cli_agent_orchestrator.cli.commands.session.time.sleep")
+    @patch("cli_agent_orchestrator.cli.commands.session.requests.post")
+    @patch("cli_agent_orchestrator.cli.commands.session.requests.get")
+    def test_a_valid_json_ack_without_a_turn_keeps_the_legacy_wait(
+        self, mock_get, mock_post, mock_sleep, mock_poll, runner
+    ):
+        """An OLDER server acknowledges in valid JSON but names no turn: that is
+        confirmed delivery on a server that predates the field, and the legacy
+        sleep-plus-heuristic wait is the right behaviour — distinct from an
+        unparseable body, which confirms nothing."""
         resolve_resp = MagicMock(status_code=200, json=lambda: [{"id": "abc12345"}])
         status_resp = MagicMock(status_code=200)
         status_resp.json.return_value = {"status": "idle"}
@@ -637,12 +689,11 @@ class TestSendSync:
         output_resp.json.return_value = {"output": "the answer"}
         mock_get.side_effect = [resolve_resp, status_resp, output_resp]
         post_resp = MagicMock(status_code=200)
-        post_resp.json.side_effect = requests.exceptions.JSONDecodeError("x", "not json", 0)
+        post_resp.json.return_value = {"success": True}  # no "turn"
         mock_post.return_value = post_resp
 
         result = runner.invoke(session, ["send", "cao-test", "hello"])
 
         assert result.exit_code == 0
-        assert "Failed to connect" not in result.output
-        mock_sleep.assert_called_once_with(3)  # legacy fallback engaged
+        mock_sleep.assert_called_once_with(3)
         assert mock_poll.call_args.kwargs["min_turn"] is None

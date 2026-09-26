@@ -2031,3 +2031,59 @@ class TestQuietTerminalCannotHoldATurnOpenForever:
 
         assert sm.get_status("t1") == TerminalStatus.COMPLETED
         assert sm.turn_state("t1") == (1, 0)
+
+
+class TestMismatchedEvidenceIsDiscardedEntirely:
+    """A raw observation whose pinned turn no longer matches is DISCARDED, not
+    demoted (PR #812 review, round 2's apply-time half).
+
+    Downgrading only the bypass flag protected an unstarted turn but not
+    ownership: once the newer turn had been seen working, the old turn's ready
+    verdict sailed through the seen-working branch and closed the newer turn with
+    the old reply — get_status paused between snapshot and apply, turn 1 finishes,
+    turn 2 dispatches and shows busy output, the resumed read reports
+    (turn, turn_completed) == (2, 2) while turn 2 is still working.
+    """
+
+    def _monitor_with_two_turns(self):
+        sm = StatusMonitor()
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        # Turn 1 dispatched, snapshot+pin taken, and legitimately finished.
+        sm.notify_input_sent("t1")
+        sm.clear_rolling_buffer("t1", provider)
+        sm.notify_input_delivered("t1")
+        with sm._lock:
+            stale_pin = sm._pin_cleared_turn_locked("t1")
+        sm._apply_detection("t1", TerminalStatus.PROCESSING, settled=False)
+        sm._apply_detection("t1", TerminalStatus.COMPLETED, cleared_buffer_turn=stale_pin)
+        assert sm.turn_state("t1") == (1, 1)
+        # Turn 2 dispatches and is observed working before the paused reader resumes.
+        sm.notify_input_sent("t1")
+        sm.clear_rolling_buffer("t1", provider)
+        sm.notify_input_delivered("t1")
+        sm._apply_detection("t1", TerminalStatus.PROCESSING, settled=False)
+        assert sm.turn_state("t1") == (2, 1)
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        return sm, stale_pin
+
+    def test_an_old_pinned_verdict_cannot_close_a_working_newer_turn(self):
+        sm, stale_pin = self._monitor_with_two_turns()
+
+        # The paused reader resumes and applies turn 1's COMPLETED observation.
+        sm._apply_detection("t1", TerminalStatus.COMPLETED, cleared_buffer_turn=stale_pin)
+
+        assert sm.turn_state("t1") == (2, 1)
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+
+    def test_a_current_pinned_verdict_still_closes_and_flips(self):
+        """Guard against over-tightening: the same observation pinned to the LIVE
+        turn keeps working."""
+        sm, _ = self._monitor_with_two_turns()
+        with sm._lock:
+            live_pin = sm._pin_cleared_turn_locked("t1")
+
+        sm._apply_detection("t1", TerminalStatus.COMPLETED, cleared_buffer_turn=live_pin)
+
+        assert sm.turn_state("t1") == (2, 2)
+        assert sm._last_status["t1"] == TerminalStatus.COMPLETED

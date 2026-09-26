@@ -458,6 +458,20 @@ class KiroCliProvider(BaseProvider):
             timeout=remaining,
         )
 
+    def raw_buffer_shows_turn_activity(self, buffer: str) -> bool:
+        """Live-progress evidence for the StatusMonitor's cleared-buffer bypass.
+
+        TUI_PROCESSING_PATTERN is the same working evidence get_status honours
+        ('Kiro is working' / 'Thinking...'). A genuine coalesced fast reply
+        carries it in the same chunk as the answer; a re-emitted old reply after
+        clear_rolling_buffer does not — which is exactly the replay that closed a
+        new turn with the previous answer (PR #812 review, round 2).
+        """
+        # Strip ANSI first, exactly as get_status does before matching the same
+        # pattern — a live stream wraps these markers in colour codes.
+        clean = re.sub(ANSI_CODE_PATTERN, "", buffer or "")
+        return bool(re.search(TUI_PROCESSING_PATTERN, clean))
+
     def get_status(self, output: str) -> TerminalStatus:
         """Get Kiro CLI status by analyzing terminal output.
 
