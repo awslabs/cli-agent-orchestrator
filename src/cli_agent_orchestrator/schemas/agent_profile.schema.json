@@ -29,7 +29,7 @@
     },
     "role": {
       "type": "string",
-      "description": "Agent role. Built-in values: supervisor, developer, reviewer. Custom roles are also supported via settings.json."
+      "description": "Agent role. Built-in values: supervisor, developer, reviewer, workflow_scout. Custom roles are also supported via settings.json."
     },
     "provider": {
       "type": "string",

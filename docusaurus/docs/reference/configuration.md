@@ -90,7 +90,7 @@ Controls where CAO discovers agent profiles.
 | `dirs` | object | Provider-keyed paths to agent profile directories |
 | `extra_dirs` | array | Additional directories to scan for profiles |
 | `disabled_dirs` | array | Configured directories toggled off (profiles hidden without deletion) |
-| `roles` | object | Custom role-to-allowedTools mappings for names other than the built-in `supervisor`/`reviewer`/`developer`, which cannot be overridden |
+| `roles` | object | Custom role-to-allowedTools mappings for names other than the built-in `supervisor`/`reviewer`/`developer`/`workflow_scout`, which cannot be overridden |
 
 ### `skills`
 

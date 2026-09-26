@@ -45,6 +45,9 @@ role: supervisor
 | `supervisor` | `@cao-mcp-server`, `fs_read`, `fs_list` | Orchestrate workers + read files for context |
 | `developer` | `@builtin`, `fs_*`, `execute_bash`, `web_fetch`, `@cao-mcp-server` | Full access: read, write, execute, fetch, orchestrate |
 | `reviewer` | `@builtin`, `fs_read`, `fs_list`, `@cao-mcp-server` | Read-only: review code, no writes, execution, or network |
+| `workflow_scout` | `@builtin`, `fs_read`, `execute_bash`, `@cao-mcp-server` | Locate existing workflow specs (`cao workflow list` / `get`). Withholds `fs_write` and `web_fetch`; `execute_bash` is still a full shell |
+
+`workflow_scout` finds existing specs (`cao workflow list` / `cao workflow get`) so an authoring agent can extend them instead of duplicating them. The allowlist withholds the file-write category (`fs_write`) and the web-fetch category (`web_fetch`). It still grants `execute_bash`, which maps to a full shell (`Bash`, `shell`, or `run_shell_command`, depending on the provider). A permitted shell command can write files and reach the network. The profile prompt asks the scout to stay read-only; that is a convention, not a sandbox.
 
 #### Custom Roles
 
@@ -116,7 +119,7 @@ CAO translates these to each provider's native tool names automatically. You wri
 
 #### `discovery` is a separate opt-in, not part of `@cao-mcp-server`
 
-`discovery` gates `list_siblings`/`update_metadata` independently of `@cao-mcp-server`. A profile with `@cao-mcp-server` (handoff/assign/send_message) does **not** automatically get sibling discovery, and vice versa — none of the built-in roles (`supervisor`, `developer`, `reviewer`) include `discovery`; add it explicitly if a profile needs peer-to-peer discovery.
+`discovery` gates `list_siblings`/`update_metadata` independently of `@cao-mcp-server`. A profile with `@cao-mcp-server` (handoff/assign/send_message) does **not** automatically get sibling discovery, and vice versa — none of the built-in roles (`supervisor`, `developer`, `reviewer`, `workflow_scout`) include `discovery`; add it explicitly if a profile needs peer-to-peer discovery.
 
 This is deliberate (see the design discussion on [issue #432](https://github.com/awslabs/cli-agent-orchestrator/issues/432)): the supervisor/worker hierarchy `handoff`/`assign`/`send_message` are built around, and the flat peer layer `group`/`list_siblings`/`update_metadata` introduce, are two different communication topologies. A profile should be able to keep one without the other. See [Discovery Tool Coexistence](discovery-tool-coexistence.md) for the full rationale, the enforcement mechanism, and open follow-ups.
 
@@ -245,6 +248,8 @@ Priority (highest to lowest):
 ```
 
 Note: `--auto-approve` is **not** in this priority chain — it only controls whether the confirmation prompt is shown, not what restrictions are applied.
+
+An unrecognized `role` raises `ValueError` at install, launch, and delegation. It does not fall open to `["*"]`. Define the name under `agents.roles`, or omit `role` for developer defaults. An explicit `allowedTools` list is applied and does not raise.
 
 Note: MCP servers a profile declares in `mcpServers` are added to the resolved list automatically at levels 4 and 5 only. At levels 2 and 3 the list you write is the list you get, so a profile that declares a server and also sets `allowedTools` has to name `@<server>` for it to be granted. That is what lets a profile configure a server without granting it, and it keeps `--allowed-tools` and `allowedTools` resolving the same list to the same policy.
 
