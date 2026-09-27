@@ -378,6 +378,177 @@ class TestClaudeCodeProviderEffort:
         assert "export" not in baseline
 
 
+class TestClaudeCodeProviderClaudeCommand:
+    """Tests for the profile claudeCommand launcher override.
+
+    The field swaps ONLY the leading "claude" token of the launch command;
+    every flag CAO composes (permission mode, --model, MCP config, resume,
+    disallowedTools, the effort export) is unchanged. Absent (None) must
+    reproduce the pre-field command byte for byte. The path is validated
+    when the profile loads (absolute, no whitespace/shell metacharacters,
+    existing executable file) -- a bad value is a load error, never a
+    silent fallback to `claude`.
+    """
+
+    @staticmethod
+    def _make_launcher(tmp_path):
+        """Create a real executable launcher file and return its path."""
+        launcher = tmp_path / "fake-glm-launcher"
+        launcher.write_text("#!/bin/sh\nexec claude \"$@\"\n", encoding="utf-8")
+        launcher.chmod(0o755)
+        return str(launcher)
+
+    @staticmethod
+    def _build_with_profile(profile, **kwargs):
+        with patch(
+            "cli_agent_orchestrator.providers.claude_code.load_agent_profile"
+        ) as mock_load:
+            mock_load.return_value = profile
+            return ClaudeCodeProvider(
+                "test123", "test-session", "window-0", "test-agent", **kwargs
+            )._build_claude_command()
+
+    def test_absent_claude_command_leaves_command_unchanged(self, tmp_path):
+        """A profile without claudeCommand builds the exact pre-field command."""
+        baseline = ClaudeCodeProvider(
+            "test123", "test-session", "window-0", None
+        )._build_claude_command()
+
+        command = self._build_with_profile(
+            AgentProfile(name="test-agent", description="test", provider="claude_code")
+        )
+
+        assert command == baseline
+        assert command.split("; ")[-1].startswith("claude --dangerously-skip-permissions")
+
+    def test_claude_command_replaces_leading_token_in_permission_mode_branch(
+        self, tmp_path
+    ):
+        launcher = self._make_launcher(tmp_path)
+        command = self._build_with_profile(
+            AgentProfile(
+                name="test-agent",
+                description="test",
+                provider="claude_code",
+                permissionMode="plan",
+                claudeCommand=launcher,
+            )
+        )
+
+        args = shlex.split(command.split(";")[-1].strip())
+        assert args[0] == launcher
+        assert args[1:3] == ["--permission-mode", "plan"]
+
+    def test_claude_command_replaces_leading_token_in_yolo_branch(self, tmp_path):
+        """Non-root yolo keeps --dangerously-skip-permissions after the swap."""
+        launcher = self._make_launcher(tmp_path)
+        with patch("os.geteuid", return_value=1000):
+            command = self._build_with_profile(
+                AgentProfile(
+                    name="test-agent",
+                    description="test",
+                    provider="claude_code",
+                    claudeCommand=launcher,
+                ),
+                allowed_tools=["*"],
+            )
+
+        args = shlex.split(command.split(";")[-1].strip())
+        assert args[0] == launcher
+        assert "--dangerously-skip-permissions" in args
+
+    def test_claude_command_replaces_leading_token_in_root_branch(self, tmp_path):
+        """yolo+root omits --dangerously-skip-permissions but still swaps argv[0]."""
+        launcher = self._make_launcher(tmp_path)
+        with patch("os.geteuid", return_value=0):
+            command = self._build_with_profile(
+                AgentProfile(
+                    name="test-agent",
+                    description="test",
+                    provider="claude_code",
+                    claudeCommand=launcher,
+                ),
+                allowed_tools=["*"],
+            )
+
+        args = shlex.split(command.split(";")[-1].strip())
+        assert args[0] == launcher
+        assert args[1:] == []
+
+    def test_claude_command_keeps_model_flag(self, tmp_path):
+        launcher = self._make_launcher(tmp_path)
+        command = self._build_with_profile(
+            AgentProfile(
+                name="test-agent",
+                description="test",
+                provider="claude_code",
+                model="GLM-5.3-Flash",
+                claudeCommand=launcher,
+            )
+        )
+
+        args = shlex.split(command.split(";")[-1].strip())
+        assert args[0] == launcher
+        assert args[args.index("--model") + 1] == "GLM-5.3-Flash"
+
+    def test_claude_command_keeps_effort_export(self, tmp_path):
+        launcher = self._make_launcher(tmp_path)
+        command = self._build_with_profile(
+            AgentProfile(
+                name="test-agent",
+                description="test",
+                provider="claude_code",
+                claudeCommand=launcher,
+            ),
+            effort="high",
+        )
+
+        # The effort export sits between the sanitize block and the launch,
+        # unchanged, and the swapped launcher still travels through
+        # shlex.join as a single data token.
+        segments = command.split("; ")
+        assert segments[1] == "export CLAUDE_CODE_EFFORT_LEVEL=high"
+        args = shlex.split(segments[2])
+        assert args[0] == launcher
+        assert "--dangerously-skip-permissions" in args
+
+    def test_relative_claude_command_is_rejected(self):
+        with pytest.raises(ValueError, match="absolute"):
+            AgentProfile(
+                name="test-agent",
+                description="test",
+                provider="claude_code",
+                claudeCommand="bin/glmf",
+            )
+
+    def test_missing_claude_command_target_is_rejected(self):
+        with pytest.raises(ValueError, match="existing executable"):
+            AgentProfile(
+                name="test-agent",
+                description="test",
+                provider="claude_code",
+                claudeCommand="/nonexistent/glmf-launcher",
+            )
+
+    def test_claude_command_with_whitespace_is_rejected(self):
+        with pytest.raises(ValueError, match="metacharacters"):
+            AgentProfile(
+                name="test-agent",
+                description="test",
+                provider="claude_code",
+                claudeCommand="/tmp/my launcher/glmf",
+            )
+
+    def test_claude_command_with_shell_metacharacters_is_rejected(self):
+        with pytest.raises(ValueError, match="metacharacters"):
+            AgentProfile(
+                name="test-agent",
+                description="test",
+                provider="claude_code",
+                claudeCommand="/tmp/a;b/glmf",
+            )
+
+
 class TestClaudeCodeProviderStatusDetection:
     """Tests for ClaudeCodeProvider status detection."""
 

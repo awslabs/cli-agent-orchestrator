@@ -1,8 +1,10 @@
 """Agent profile models."""
 
+import os
+import re
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 
@@ -115,6 +117,44 @@ class AgentProfile(BaseModel):
     # or named profile files. Composes with codexProfile; because Codex applies
     # CLI overrides last, these win on key conflicts.
     codexConfig: Optional[Dict[str, Any]] = None
+
+    # Claude-only. Absolute path to a claude-compatible launcher (e.g. a
+    # wrapper script that pins a different model/backend). When set, it
+    # replaces ONLY the leading "claude" token of the launch command; every
+    # other flag CAO composes (permission mode, --model, --agent, MCP config,
+    # resume, disallowedTools, the effort export) is unchanged. Validated at
+    # profile load: must be absolute, contain no whitespace or shell
+    # metacharacters, and name an existing executable file -- otherwise
+    # loading fails loudly instead of silently falling back to `claude`. The
+    # character check mirrors shlex.quote's own safe set, so shlex.join
+    # emits the path as a single unquoted data token.
+    claudeCommand: Optional[str] = None
+
+    @field_validator("claudeCommand")
+    @classmethod
+    def _validate_claude_command(cls, value: Optional[str]) -> Optional[str]:
+        """Reject launcher paths that could not be used verbatim as argv[0]."""
+        if value is None:
+            return value
+        if not os.path.isabs(value):
+            raise ValueError(
+                f"claudeCommand must be an absolute path to a claude-compatible "
+                f"launcher, got '{value}'"
+            )
+        # Same safe-character set shlex.quote uses: anything outside it would
+        # get quoted (or worse, interpreted) when the command goes through
+        # shlex.join. Whitespace fails this check too.
+        unsafe = sorted(set(re.findall(r"[^\w@%+=:,./-]", value)))
+        if unsafe:
+            raise ValueError(
+                f"claudeCommand must not contain whitespace or shell "
+                f"metacharacters, got '{value}' (offending: {' '.join(unsafe)})"
+            )
+        if not (os.path.isfile(value) and os.access(value, os.X_OK)):
+            raise ValueError(
+                f"claudeCommand must name an existing executable file, got '{value}'"
+            )
+        return value
 
     # Hermes-only. Optionally names a Hermes profile wrapper command (for
     # example one created by `hermes profile alias <profile>`). When omitted,

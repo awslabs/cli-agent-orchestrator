@@ -113,6 +113,71 @@ class TestLoadAgentProfile:
         with pytest.raises(RuntimeError, match="Failed to load agent profile"):
             load_agent_profile("test-agent")
 
+    def test_load_agent_profile_claude_command_valid(self, tmp_path, monkeypatch):
+        """A profile with a valid claudeCommand loads and keeps the field."""
+        launcher = tmp_path / "fake-glm-launcher"
+        launcher.write_text("#!/bin/sh\nexec claude \"$@\"\n", encoding="utf-8")
+        launcher.chmod(0o755)
+        local_store = tmp_path / "agent-store"
+        local_store.mkdir()
+        (local_store / "test-agent.md").write_text(
+            "---\n"
+            "name: test-agent\n"
+            "description: Test agent\n"
+            f"claudeCommand: {launcher}\n"
+            "---\n"
+            "System prompt content"
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR", local_store
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_agent_dirs", lambda: {}
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", lambda: []
+        )
+
+        result = load_agent_profile("test-agent")
+
+        assert result.claudeCommand == str(launcher)
+
+    @pytest.mark.parametrize(
+        "claude_command",
+        [
+            "bin/glmf",  # relative
+            "/nonexistent/glmf-launcher",  # missing file
+            "/tmp/my launcher/glmf",  # whitespace
+            "/tmp/a;b/glmf",  # shell metacharacter
+        ],
+    )
+    def test_load_agent_profile_claude_command_invalid_is_a_clear_error(
+        self, tmp_path, monkeypatch, claude_command
+    ):
+        """An invalid claudeCommand fails the load loudly, never a silent fallback."""
+        local_store = tmp_path / "agent-store"
+        local_store.mkdir()
+        (local_store / "test-agent.md").write_text(
+            "---\n"
+            "name: test-agent\n"
+            "description: Test agent\n"
+            f"claudeCommand: {claude_command}\n"
+            "---\n"
+            "System prompt content"
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR", local_store
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_agent_dirs", lambda: {}
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", lambda: []
+        )
+
+        with pytest.raises(ValueError, match="claudeCommand"):
+            load_agent_profile("test-agent")
+
 
 class TestResolveProvider:
     """Tests for resolve_provider function."""

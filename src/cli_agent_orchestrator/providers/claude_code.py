@@ -373,6 +373,19 @@ class ClaudeCodeProvider(BaseProvider):
         else:
             command_parts = ["claude", "--dangerously-skip-permissions"]
 
+        # Optional claude-compatible launcher (e.g. a wrapper that pins another
+        # model/backend). It replaces ONLY the leading "claude" token above;
+        # every flag composed below -- permission mode, --model, --agent, MCP
+        # config, resume, disallowedTools, the effort export -- is unchanged.
+        # Validated at profile load (absolute, no whitespace/shell
+        # metacharacters, existing executable file), and shlex.join below keeps
+        # it a single data token. The isinstance guard mirrors claudeSessionId
+        # above so non-string placeholder attributes (mocked profiles) are
+        # ignored rather than stringified into the command.
+        claude_command = getattr(profile, "claudeCommand", None) if profile else None
+        if isinstance(claude_command, str) and claude_command:
+            command_parts[0] = claude_command
+
         # Resume a specific Claude Code conversation when the profile pins one.
         # This is intentionally profile-owned rather than inferred from CAO's
         # tmux/session name: a CAO runtime session and a Claude conversation are

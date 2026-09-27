@@ -102,6 +102,10 @@
     "codexConfig": {
       "type": "object"
     },
+    "claudeCommand": {
+      "type": "string",
+      "description": "Claude Code only. Absolute path to a claude-compatible launcher that replaces the leading 'claude' token of the launch command; every other flag is unchanged. Must be absolute, free of whitespace and shell metacharacters, and name an existing executable file."
+    },
     "hermesProfile": {
       "type": "string",
       "minLength": 1
