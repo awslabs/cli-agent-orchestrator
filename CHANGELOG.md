@@ -47,6 +47,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **a custom role in `settings.json` now outranks the built-in role of the same
+  name.** The resolver consulted the built-ins first, so when CAO shipped a
+  built-in `workflow_scout` an operator's saved `workflow_scout` policy was
+  silently replaced by the built-in's list: resolution and delegated child policy
+  gained `execute_bash` and lost the listing or web-fetch tools the saved policy
+  granted, while `settings.json` read back unchanged. Settings roles are now
+  consulted first for every name, so a saved `supervisor`, `developer` or
+  `reviewer` also takes effect where it was previously ignored. A settings role
+  that shadows a built-in is logged by name (never its contents). (#746)
 - **a PTY WebSocket handshake with no peer address skipped the client-IP allowlist.**
   `/terminals/{id}/ws` checked `client_host not in WS_ALLOWED_CLIENTS` only when a
   peer address was present, so a `None` peer passed instead of failing closed. Not
