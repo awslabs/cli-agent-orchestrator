@@ -33,9 +33,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reports `WAITING_USER_ANSWER` and a modal arriving below a stale composer no
   longer reads as ready; initialisation fails, instead of succeeding through
   the login menu's `WAITING_USER_ANSWER` path, when a trust or update dialog is
-  still on screen at the handler's cap or after the readiness wait; and a
+  still on screen at the handler's cap or after the readiness wait; a
   profile's own `provider_init_timeout` now governs every Codex initialisation
-  wait (#731)
+  wait; the resolver's mid-redraw ("transitional") reading is honoured only
+  until initialisation is over, so assistant prose quoting a startup phrase
+  mid-turn no longer flips a processing terminal to `WAITING_USER_ANSWER` on
+  the runtime status path; and the post-readiness check re-reads a mid-redraw
+  frame a few times instead of failing an otherwise-valid login start on a
+  single capture (#731)
 
 - **enabling `CAO_MEMORY_API_URL` rejected memory keys that work without it.**
   The `/internal/memory/store` and `/forget` routes validated the wire `key` as

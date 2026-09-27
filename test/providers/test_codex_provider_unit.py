@@ -17,6 +17,7 @@ from cli_agent_orchestrator.providers.codex import (
     APPROVAL_PROMPT_FOOTER,
     LOGIN_MENU_FOOTER,
     LOGIN_MENU_PATTERN,
+    POST_READINESS_TRANSITIONAL_REREADS,
     STARTUP_PROMPT_BOTTOM_LINES,
     TRUST_PROMPT_PATTERN,
     TRUST_PROMPT_PATTERN_V2,
@@ -110,10 +111,13 @@ def read_developer_instructions_file(command: str) -> str:
 
 class TestCodexProviderInitialization:
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
-    async def test_initialize_success(self, mock_tmux, mock_wait_shell, mock_wait_status):
+    async def test_initialize_success(
+        self, mock_tmux, mock_wait_shell, mock_wait_status, mock_sleep
+    ):
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
         # A settled frame (idle composer): the handler returns on its first poll.
@@ -148,10 +152,13 @@ class TestCodexProviderInitialization:
             await provider.initialize()
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
-    async def test_initialize_codex_timeout(self, mock_tmux, mock_wait_shell, mock_wait_status):
+    async def test_initialize_codex_timeout(
+        self, mock_tmux, mock_wait_shell, mock_wait_status, mock_sleep
+    ):
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = False
         mock_tmux.return_value.get_history.return_value = SETTLED
@@ -493,21 +500,26 @@ class TestCodexBuildCommand:
             provider._build_codex_command()
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
     async def test_initialize_with_agent_profile(
-        self, mock_tmux, mock_load_profile, mock_wait_shell, mock_wait_status, tmp_path
+        self, mock_tmux, mock_load_profile, mock_wait_shell, mock_wait_status, mock_sleep, tmp_path
     ):
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
-        mock_tmux.return_value.get_history.return_value = "OpenAI Codex (v0.98.0)"
+        # A settled frame: on the bare banner the handler polls to its cap --
+        # which, with a MagicMock profile, is float(MagicMock()) == 1.0, so the
+        # test was quietly timing-dependent as well as slow.
+        mock_tmux.return_value.get_history.return_value = SETTLED
         mock_profile = MagicMock()
         mock_profile.model = None
         mock_profile.system_prompt = "You are a supervisor."
         mock_profile.mcpServers = None
         mock_profile.codexProfile = None
+        mock_profile.provider_init_timeout = None
         mock_load_profile.return_value = mock_profile
 
         provider = CodexProvider("test1234", "test-session", "window-0", "code_supervisor")
@@ -2502,8 +2514,9 @@ class TestCodexProviderTrustPrompt:
         mock_backend.return_value.send_special_key.assert_not_called()
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
-    async def test_handle_trust_prompt_detected_and_accepted(self, mock_tmux):
+    async def test_handle_trust_prompt_detected_and_accepted(self, mock_tmux, mock_sleep):
         """Test that trust prompt is detected and auto-accepted."""
         mock_tmux.return_value.get_history.return_value = (
             "> You are running Codex in /Users/test/project\n"
@@ -2516,7 +2529,14 @@ class TestCodexProviderTrustPrompt:
         )
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        await provider._handle_trust_prompt(outer_timeout=2.0)
+        # The frame never settles, so the handler runs to its cap; the fake
+        # clock reaches it on the second poll instead of after 2 real seconds.
+        # deadline, last_prompt_time, poll1 now, trust reset, poll2 now (cap).
+        with patch(
+            "cli_agent_orchestrator.providers.codex.time",
+            fake_clock(0.0, 0.0, 0.0, 0.0, 100.0),
+        ):
+            await provider._handle_trust_prompt(outer_timeout=2.0)
 
         mock_tmux.return_value.send_special_key.assert_called_once_with(
             "test-session", "window-0", "Enter"
@@ -2932,11 +2952,12 @@ class TestCodexProviderTrustPrompt:
         assert status != TerminalStatus.WAITING_USER_ANSWER
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
     async def test_initialize_includes_waiting_user_answer_in_target_status(
-        self, mock_tmux, mock_wait_shell, mock_wait_status
+        self, mock_tmux, mock_wait_shell, mock_wait_status, mock_sleep
     ):
         """Regression test for the real, live-reproduced failure: an account with no
         credentials configured yet reaches a correctly-rendered, fully-alive login screen
@@ -3023,10 +3044,11 @@ class TestCodexProviderUpdateDialog:
         assert status == TerminalStatus.COMPLETED
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
-    async def test_handle_trust_prompt_dismisses_update_dialog(self, mock_tmux):
+    async def test_handle_trust_prompt_dismisses_update_dialog(self, mock_tmux, mock_sleep):
         """_handle_trust_prompt detects update dialog and selects '3'+Enter."""
-        mock_tmux.return_value.get_history.side_effect = [
+        mock_tmux.return_value.get_history.side_effect = frames(
             (
                 "✨ Update available! 0.142.5 -> 0.144.5\n"
                 "1. Update now (runs npm install -g @openai/codex)\n"
@@ -3035,7 +3057,7 @@ class TestCodexProviderUpdateDialog:
                 "Press enter to continue\n"
             ),
             "OpenAI Codex (v0.142.5)\n› ",
-        ]
+        )
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         await provider._handle_trust_prompt(outer_timeout=5.0)
@@ -3181,7 +3203,7 @@ class TestCodexProviderUpdateDialog:
         assert re.search(LOGIN_MENU_PATTERN, bottom) and re.search(LOGIN_MENU_FOOTER, bottom)
         assert re.search(TRUST_PROMPT_PATTERN, bottom)
 
-        mock_tmux.return_value.get_history.side_effect = self._frames(
+        mock_tmux.return_value.get_history.side_effect = frames(
             stacked_live, self.LOGIN_MENU_OUTPUT
         )
 
@@ -3230,7 +3252,7 @@ class TestCodexProviderUpdateDialog:
         assert re.search(TRUST_PROMPT_PATTERN, bottom), "v1 copy must be in the window"
         assert re.search(LOGIN_MENU_PATTERN, bottom) and re.search(LOGIN_MENU_FOOTER, bottom)
 
-        mock_tmux.return_value.get_history.side_effect = self._frames(trust_above)
+        mock_tmux.return_value.get_history.side_effect = frames(trust_above)
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         started = time.monotonic()
@@ -3249,8 +3271,11 @@ class TestCodexProviderUpdateDialog:
         mock_error.assert_not_called()
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
-    async def test_v1_twin_login_exit_waits_for_a_dismissed_v1_dialog_to_clear(self, mock_tmux):
+    async def test_v1_twin_login_exit_waits_for_a_dismissed_v1_dialog_to_clear(
+        self, mock_tmux, mock_sleep
+    ):
         """``has_dialog`` must count a live v1 dialog, not just the v2 variant.
 
         The v2 sibling of this test passes even with the v1 term removed from
@@ -3282,7 +3307,7 @@ class TestCodexProviderUpdateDialog:
         # this test would pin nothing — which is the gap it exists to close.
         assert not re.search(TRUST_PROMPT_PATTERN_V2, stacked_v1)
 
-        mock_tmux.return_value.get_history.side_effect = self._frames(
+        mock_tmux.return_value.get_history.side_effect = frames(
             stacked_v1, stacked_v1, self._SETTLED
         )
 
@@ -3296,8 +3321,9 @@ class TestCodexProviderUpdateDialog:
         )
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
-    async def test_stale_copy_above_and_live_dialog_below_dismisses(self, mock_tmux):
+    async def test_stale_copy_above_and_live_dialog_below_dismisses(self, mock_tmux, mock_sleep):
         """Both sides of the position test must take the LAST occurrence.
 
         Frame C: stale v1 copy above the menu AND a live v1 dialog below it. If the
@@ -3332,9 +3358,7 @@ class TestCodexProviderUpdateDialog:
         assert len(list(re.finditer(LOGIN_MENU_PATTERN, bottom))) == 2
         assert re.search(LOGIN_MENU_FOOTER, bottom)
 
-        mock_tmux.return_value.get_history.side_effect = self._frames(
-            frame_c, self.LOGIN_MENU_OUTPUT
-        )
+        mock_tmux.return_value.get_history.side_effect = frames(frame_c, self.LOGIN_MENU_OUTPUT)
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         await provider._handle_trust_prompt(idle_gap=20.0, outer_timeout=30.0)
@@ -3370,7 +3394,7 @@ class TestCodexProviderUpdateDialog:
         assert len(menus) == 2 and len(v1s) == 1
         assert menus[0].start() < v1s[-1].start() < menus[-1].start()
 
-        mock_tmux.return_value.get_history.side_effect = self._frames(frame)
+        mock_tmux.return_value.get_history.side_effect = frames(frame)
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         await provider._handle_trust_prompt(idle_gap=20.0, outer_timeout=30.0)
@@ -3390,27 +3414,6 @@ class TestCodexProviderUpdateDialog:
 
     _SETTLED = "OpenAI Codex (v0.149.0)\n› \n"
 
-    @staticmethod
-    def _frames(*sequence):
-        """A ``get_history`` side effect that yields ``sequence``, then repeats the last.
-
-        Never use a bare list here. A plain ``side_effect`` list raises
-        ``StopIteration`` once exhausted, and this handler reads through
-        ``asyncio.to_thread`` — which cannot deliver ``StopIteration`` out of its
-        future, so the test HANGS instead of failing. That turns "a guard
-        regressed" into "the suite stopped", which is how a regression gets
-        mistaken for infrastructure flake. Repeating the final frame means an
-        unexpected extra read looks like a pane that stopped changing: the handler
-        runs to its ``outer_timeout`` and the test fails on its own assertion,
-        with its own message, in bounded time.
-        """
-        frames = list(sequence)
-
-        def _next(*_args, **_kwargs):
-            return frames.pop(0) if len(frames) > 1 else frames[0]
-
-        return _next
-
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
     async def test_shared_footer_alone_does_not_suppress_trust_dismissal(self, mock_tmux):
@@ -3427,7 +3430,7 @@ class TestCodexProviderUpdateDialog:
             "\n"
             "  Press enter to continue\n"
         )
-        mock_tmux.return_value.get_history.side_effect = self._frames(frame, self._SETTLED)
+        mock_tmux.return_value.get_history.side_effect = frames(frame, self._SETTLED)
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         await provider._handle_trust_prompt(idle_gap=30.0, outer_timeout=30.0)
@@ -3435,8 +3438,11 @@ class TestCodexProviderUpdateDialog:
         mock_tmux.return_value.send_special_key.assert_any_call("test-session", "window-0", "Enter")
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
-    async def test_menu_text_without_the_footer_does_not_suppress_trust_dismissal(self, mock_tmux):
+    async def test_menu_text_without_the_footer_does_not_suppress_trust_dismissal(
+        self, mock_tmux, mock_sleep
+    ):
         """Kills a login block that counts without its footer.
 
         A menu line with no footer is not a live login menu — Codex's own
@@ -3464,7 +3470,7 @@ class TestCodexProviderUpdateDialog:
         assert re.search(LOGIN_MENU_PATTERN, _bottom) and not re.search(
             LOGIN_MENU_FOOTER, _bottom
         ), "fixture must carry the menu pattern WITHOUT the footer"
-        mock_tmux.return_value.get_history.side_effect = self._frames(
+        mock_tmux.return_value.get_history.side_effect = frames(
             mid_draw, trust_alone, self._SETTLED
         )
 
@@ -3478,8 +3484,11 @@ class TestCodexProviderUpdateDialog:
         assert mock_tmux.return_value.get_history.call_count >= 3
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
-    async def test_login_menu_only_in_scrollback_does_not_suppress_trust_dismissal(self, mock_tmux):
+    async def test_login_menu_only_in_scrollback_does_not_suppress_trust_dismissal(
+        self, mock_tmux, mock_sleep
+    ):
         """Kills a ``has_login`` matched against the whole capture.
 
         ``has_login`` must stay bottom-anchored. A login menu that has scrolled
@@ -3493,7 +3502,7 @@ class TestCodexProviderUpdateDialog:
             + "\n  Do you trust this workspace?\n"
             + "› 1. Yes, allow Codex to work in this folder without asking for approval\n"
         )
-        mock_tmux.return_value.get_history.side_effect = self._frames(frame, self._SETTLED)
+        mock_tmux.return_value.get_history.side_effect = frames(frame, self._SETTLED)
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         await provider._handle_trust_prompt(idle_gap=30.0, outer_timeout=30.0)
@@ -3501,8 +3510,11 @@ class TestCodexProviderUpdateDialog:
         mock_tmux.return_value.send_special_key.assert_any_call("test-session", "window-0", "Enter")
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
-    async def test_login_menu_does_not_short_circuit_a_stacked_trust_dialog(self, mock_tmux):
+    async def test_login_menu_does_not_short_circuit_a_stacked_trust_dialog(
+        self, mock_tmux, mock_sleep
+    ):
         """A trust dialog rendered over the login menu is still dismissed first.
 
         This is the hazard in returning early on a recognized-but-unanswerable
@@ -3555,9 +3567,7 @@ class TestCodexProviderUpdateDialog:
             LOGIN_MENU_FOOTER, _bottom
         ), "fixture no longer sets has_login; this test would pin nothing"
 
-        mock_tmux.return_value.get_history.side_effect = self._frames(
-            stacked, stacked, self._SETTLED
-        )
+        mock_tmux.return_value.get_history.side_effect = frames(stacked, stacked, self._SETTLED)
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         await provider._handle_trust_prompt(idle_gap=30.0, outer_timeout=30.0)
@@ -3610,8 +3620,9 @@ class TestCodexProviderUpdateDialog:
         mock_wait_status.assert_called_once()
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
-    async def test_handle_trust_then_late_update_dialog(self, mock_tmux):
+    async def test_handle_trust_then_late_update_dialog(self, mock_tmux, mock_sleep):
         """Multi-frame: trust dismissed → transitional banner (no dialog yet) → update dialog → dismissed."""
         # Frame 1: trust prompt visible
         frame_trust = (
@@ -3640,12 +3651,12 @@ class TestCodexProviderUpdateDialog:
         # Frame 4: update dismissed, idle prompt visible
         frame_idle = "OpenAI Codex (v0.142.5)\n› "
 
-        mock_tmux.return_value.get_history.side_effect = [
+        mock_tmux.return_value.get_history.side_effect = frames(
             frame_trust,
             frame_transitional,
             frame_update,
             frame_idle,
-        ]
+        )
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         await provider._handle_trust_prompt(outer_timeout=10.0)
@@ -4937,11 +4948,12 @@ class TestCodexProviderExitDetection:
         assert status == TerminalStatus.IDLE
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
     async def test_initialize_captures_shell_baseline(
-        self, mock_tmux, mock_wait_shell, mock_wait_status
+        self, mock_tmux, mock_wait_shell, mock_wait_status, mock_sleep
     ):
         """Initialize captures shell_baseline for exit detection."""
         mock_wait_shell.return_value = True
@@ -5070,13 +5082,20 @@ class TestCodexInitConfiguredTimeouts:
     """Codex init timeouts must come from settings, not hard-coded literals."""
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.services.settings_service.get_server_settings")
     @patch("cli_agent_orchestrator.providers.codex.get_server_settings")
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
     async def test_initialize_passes_provider_init_timeout_as_the_outer_cap(
-        self, mock_backend, mock_wait_shell, mock_wait_status, mock_settings, mock_base_settings
+        self,
+        mock_backend,
+        mock_wait_shell,
+        mock_wait_status,
+        mock_settings,
+        mock_base_settings,
+        mock_sleep,
     ):
         """The handler's hard cap is ``provider_init_timeout``, not the idle gap.
 
@@ -5107,13 +5126,20 @@ class TestCodexInitConfiguredTimeouts:
         mock_trust.assert_awaited_once_with(outer_timeout=60.0)
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.services.settings_service.get_server_settings")
     @patch("cli_agent_orchestrator.providers.codex.get_server_settings")
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
     async def test_init_timeout_error_reports_the_configured_bound(
-        self, mock_backend, mock_wait_shell, mock_wait_status, mock_settings, mock_base_settings
+        self,
+        mock_backend,
+        mock_wait_shell,
+        mock_wait_status,
+        mock_settings,
+        mock_base_settings,
+        mock_sleep,
     ):
         """The init-timeout message must name the timeout actually applied.
 
@@ -5352,6 +5378,7 @@ class TestCodexInitHonoursProfileTimeout:
     """Round-3 review of #731 (haofeif), P1: the per-profile override was ignored."""
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.services.settings_service.get_server_settings")
     @patch("cli_agent_orchestrator.providers.codex.get_server_settings")
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
@@ -5366,6 +5393,7 @@ class TestCodexInitHonoursProfileTimeout:
         mock_load_profile,
         mock_codex_settings,
         mock_base_settings,
+        mock_sleep,
     ):
         settings = {"provider_init_timeout": 60, "startup_prompt_handler_timeout": 45}
         mock_codex_settings.return_value = settings
@@ -5391,6 +5419,7 @@ class TestCodexInitHonoursProfileTimeout:
         assert mock_wait_status.await_args.kwargs["timeout"] == 180.0
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.services.settings_service.get_server_settings")
     @patch("cli_agent_orchestrator.providers.codex.get_server_settings")
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
@@ -5405,6 +5434,7 @@ class TestCodexInitHonoursProfileTimeout:
         mock_load_profile,
         mock_codex_settings,
         mock_base_settings,
+        mock_sleep,
     ):
         """Timeout resolution is best-effort; the real, error-raising load comes later."""
         settings = {"provider_init_timeout": 75, "startup_prompt_handler_timeout": 45}
@@ -5451,17 +5481,6 @@ class TestStartupHandlerHoldsATransitionalFrame:
     _UPDATE = _UPDATE_HEADER_ONLY + "2. Skip\n3. Skip until next version\nPress enter to continue\n"
     _SETTLED = "OpenAI Codex (v0.98.0)\n› "
 
-    @staticmethod
-    def _frames(*sequence):
-        """Yield ``sequence`` then repeat its last frame (a bare list would raise
-        StopIteration inside ``asyncio.to_thread`` and hang the test)."""
-        frames = list(sequence)
-
-        def _next(*_args, **_kwargs):
-            return frames.pop(0) if len(frames) > 1 else frames[0]
-
-        return _next
-
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
@@ -5475,9 +5494,7 @@ class TestStartupHandlerHoldsATransitionalFrame:
         """
         mid_redraw = self._TRUST_V2 + self._UPDATE_HEADER_ONLY
         finished = self._TRUST_V2 + self._UPDATE
-        mock_tmux.return_value.get_history.side_effect = self._frames(
-            mid_redraw, finished, self._SETTLED
-        )
+        mock_tmux.return_value.get_history.side_effect = frames(mid_redraw, finished, self._SETTLED)
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         await provider._handle_trust_prompt(idle_gap=30.0, outer_timeout=30.0)
@@ -5525,15 +5542,6 @@ class TestIdleGapIsJudgedOnAFreshFrame:
     )
     _SETTLED = "OpenAI Codex (v0.98.0)\n› "
 
-    @staticmethod
-    def _frames(*sequence):
-        frames = list(sequence)
-
-        def _next(*_args, **_kwargs):
-            return frames.pop(0) if len(frames) > 1 else frames[0]
-
-        return _next
-
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
@@ -5545,7 +5553,7 @@ class TestIdleGapIsJudgedOnAFreshFrame:
         Unfixed: the t=1 check saw 1.0 >= 1.0 and returned before reading, so the
         update dialog was never dismissed (no '3' was ever sent).
         """
-        mock_backend.return_value.get_history.side_effect = self._frames(
+        mock_backend.return_value.get_history.side_effect = frames(
             self._TRUST_V1, self._UPDATE, self._SETTLED
         )
 
@@ -5574,7 +5582,7 @@ class TestIdleGapIsJudgedOnAFreshFrame:
         the frame is read, the dialog on it holds the exit, and the handler
         returns on the next frame, which is quiet (3 polls).
         """
-        mock_backend.return_value.get_history.side_effect = self._frames(
+        mock_backend.return_value.get_history.side_effect = frames(
             self._TRUST_V1, self._TRUST_V1, self._SETTLED
         )
 
@@ -5780,11 +5788,12 @@ class TestOuterCapWithADialogUpFailsInitialization:
         mock_backend.return_value.send_special_key.assert_called_once()
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
     async def test_initialize_fails_instead_of_succeeding_on_the_stuck_dialog(
-        self, mock_tmux, mock_wait_shell, mock_wait_status
+        self, mock_tmux, mock_wait_shell, mock_wait_status, mock_sleep
     ):
         """Unfixed: ``initialize()`` returned True here (the dialog reads as
         WAITING_USER_ANSWER), and every assign/handoff was then refused."""
@@ -5799,11 +5808,12 @@ class TestOuterCapWithADialogUpFailsInitialization:
         mock_wait_status.assert_not_called()
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
     async def test_a_dialog_that_appears_after_the_handler_is_not_readiness(
-        self, mock_tmux, mock_wait_shell, mock_wait_status
+        self, mock_tmux, mock_wait_shell, mock_wait_status, mock_sleep
     ):
         """WAITING_USER_ANSWER satisfied the readiness wait, but the pane shows
         an update dialog, not the login menu."""
@@ -5824,11 +5834,12 @@ class TestOuterCapWithADialogUpFailsInitialization:
                 await provider.initialize()
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
     async def test_the_login_menu_is_still_a_successful_start(
-        self, mock_tmux, mock_wait_shell, mock_wait_status
+        self, mock_tmux, mock_wait_shell, mock_wait_status, mock_sleep
     ):
         login = (
             "  Sign in with ChatGPT to use Codex as part of your paid plan\n"
@@ -5844,3 +5855,118 @@ class TestOuterCapWithADialogUpFailsInitialization:
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         assert await provider.initialize() is True
+
+
+class TestTransitionalIsAStartupOnlyState:
+    """Round-7 review of #731 (gutosantos82, blocking; haofeif, P3).
+
+    ``transitional`` names a lone recognised startup header with no completing
+    footer/menu. During startup that is a modal mid-redraw and must hold every
+    exit -- but ``get_status`` runs for the whole session, and on an
+    initialized terminal the same shape is the model QUOTING a startup phrase
+    in its own reply. Mapping it to WAITING_USER_ANSWER flipped frames that
+    ``main`` classified PROCESSING, so a supervisor saw a generating worker as
+    blocked on input. The state is now honoured only until initialization is
+    over. ``initialize()``'s post-readiness check, which legitimately cares,
+    also stopped condemning it on a single read: a login menu caught between
+    redraw writes at that one instant now gets re-read instead of failing an
+    otherwise-valid start.
+    """
+
+    # The reviewer's reproduction shape: an active turn (user message, reply
+    # bullets, live progress spinner) whose prose quotes one startup phrase.
+    _QUOTED_HEADERS = [
+        "Do you trust the contents of this directory?",
+        "Sign in with ChatGPT to use Codex as part of your paid plan",
+        "✨ Update available! 0.142.5 -> 0.144.5",
+    ]
+
+    @staticmethod
+    def _mid_turn_frame(quoted: str) -> str:
+        return (
+            "› tell me what the codex first-run flow looks like\n"
+            "• The first-run flow can show a few dialogs. One asks:\n"
+            f"  {quoted}\n"
+            "  and there may be more before the composer appears.\n"
+            "• Working (3s • esc to interrupt)\n"
+        )
+
+    @pytest.mark.parametrize("quoted", _QUOTED_HEADERS)
+    def test_quoted_startup_phrase_mid_turn_is_processing_once_initialized(self, quoted):
+        frame = self._mid_turn_frame(quoted)
+        # The precondition the mapping decision rests on: the resolver DOES read
+        # this frame as transitional, so the outcome below is the gating.
+        assert _live_startup_block(frame) == "transitional"
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider._initialized = True
+        assert provider.get_status(frame) == TerminalStatus.PROCESSING
+
+    @pytest.mark.parametrize("quoted", _QUOTED_HEADERS)
+    def test_the_same_frame_is_still_waiting_during_startup(self, quoted):
+        """The conservative reading is kept where it is load-bearing:
+        ``initialize()``'s readiness wait may accept a mid-redraw frame as
+        WAITING, and its post-readiness re-reads then resolve it."""
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        assert provider.get_status(self._mid_turn_frame(quoted)) == (
+            TerminalStatus.WAITING_USER_ANSWER
+        )
+
+    _LOGIN_HEADER_ONLY = (
+        "  Sign in with ChatGPT to use Codex as part of your paid plan\n"
+        "> 1. Sign in with ChatGPT\n"
+    )
+    _LOGIN_COMPLETE = _LOGIN_HEADER_ONLY + (
+        "  2. Sign in with Device Code\n"
+        "  3. Provide your own API key\n"
+        "\n"
+        "  Press enter to continue\n"
+    )
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_post_readiness_rides_out_a_login_menu_mid_redraw(
+        self, mock_tmux, mock_wait_shell, mock_wait_status, mock_sleep
+    ):
+        """Header drawn, footer not yet, at the exact post-readiness instant.
+
+        On the previous head this one-shot read raised TimeoutError against a
+        start the handler's own loop would have ridden out.
+        """
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
+        mock_tmux.return_value.get_history.side_effect = frames(
+            self._LOGIN_HEADER_ONLY, self._LOGIN_COMPLETE
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        with patch.object(provider, "_handle_trust_prompt", new=AsyncMock(return_value="settled")):
+            assert await provider.initialize() is True
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_a_frame_that_never_resolves_still_fails_the_start(
+        self, mock_tmux, mock_wait_shell, mock_wait_status, mock_sleep
+    ):
+        """The ride-out is bounded: a header that never completes is a failed
+        start, exactly as before -- just judged on the last re-read, not the
+        first."""
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
+        mock_tmux.return_value.get_history.return_value = self._LOGIN_HEADER_ONLY
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        with patch.object(provider, "_handle_trust_prompt", new=AsyncMock(return_value="settled")):
+            with pytest.raises(TimeoutError, match="startup dialog on screen"):
+                await provider.initialize()
+
+        # One initial read plus every re-read: the bound is the constant, not luck.
+        assert (
+            mock_tmux.return_value.get_history.call_count == 1 + POST_READINESS_TRANSITIONAL_REREADS
+        )

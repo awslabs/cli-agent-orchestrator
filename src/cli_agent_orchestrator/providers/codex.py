@@ -145,8 +145,12 @@ LOGIN_MENU_FOOTER = TRUST_PROMPT_FOOTER
 # actually contains either way.
 UPDATE_DIALOG_PATTERN = r"Update available!\s+[\w.+-]+\s+->\s+[\w.+-]+"
 UPDATE_DIALOG_MENU_PATTERN = r"Skip until next version"
-UPDATE_DIALOG_FOOTER = TRUST_PROMPT_FOOTER
 STARTUP_PROMPT_BOTTOM_LINES = 15
+# How many times initialize()'s post-readiness check re-reads a frame that
+# resolves to "transitional" (a header mid-redraw) before failing the start.
+# 6 reads 0.5s apart give a redraw ~3s to complete -- generous for a TUI
+# write, and small next to provider_init_timeout.
+POST_READINESS_TRANSITIONAL_REREADS = 6
 STARTUP_ACTIVITY_PATTERN = r"^\s*•[^\S\n]+\S"
 # Codex's runtime approval prompt as actually rendered by codex-cli 0.147.0,
 # verified against a live tmux capture (test/providers/fixtures/
@@ -445,7 +449,7 @@ def _composer_position(bottom_region: str) -> Optional[int]:
     LAST such line is the composer; earlier ones are history.
     """
     lines = bottom_region.split("\n")
-    offsets: List[int] = []
+    offsets: list[int] = []
     position = 0
     for line in lines:
         offsets.append(position)
@@ -470,7 +474,11 @@ def _live_startup_block(bottom_region: str) -> Optional[str]:
     drawn below everything else complete, so the frame is mid-redraw and no key
     is safe) or ``None``. ``_handle_trust_prompt`` and ``get_status`` both take
     exactly one decision per frame from this, so a frame cannot be "ready" to
-    one and "waiting" to the other.
+    one and "waiting" to the other. ``"transitional"`` carries startup-only
+    weight: it is a hold for the handler and for ``initialize()``'s checks, but
+    ``get_status`` ignores it once initialization is over, because on a live
+    terminal a lone header is the model quoting a startup phrase, not a modal
+    (see the comment at ``get_status``'s startup check).
 
     THE COMPOSER IS A STATE, not a veto. Codex draws whatever is current LAST,
     and that holds for the composer as much as for a modal: an idle composer
@@ -1563,8 +1571,18 @@ class CodexProvider(BaseProvider):
 
         # WAITING_USER_ANSWER satisfied the wait; only the login menu is entitled
         # to. A trust/update dialog that appeared after the handler returned (or
-        # a modal mid-redraw) is a failed start, not a settled one.
+        # a modal mid-redraw) is a failed start, not a settled one. But a
+        # transitional frame is not condemned on one read: it may be the login
+        # menu (or the composer) caught between redraw writes at this exact
+        # instant, so it gets re-read -- the same hold the startup handler gives
+        # such frames -- and only a frame still unresolved after the re-reads
+        # fails the start (round-7 review of #731).
         startup_state = await self._current_startup_state()
+        for _ in range(POST_READINESS_TRANSITIONAL_REREADS):
+            if startup_state != "transitional":
+                break
+            await asyncio.sleep(0.5)
+            startup_state = await self._current_startup_state()
         if startup_state in ("trust", "update", "transitional"):
             raise TimeoutError(
                 f"Codex initialization ended with a startup dialog on screen ({startup_state}); "
@@ -1644,7 +1662,22 @@ class CodexProvider(BaseProvider):
         # #731). Bottom-anchored: a live dialog is in view by definition.
         bottom_region = "\n".join(clean_output.splitlines()[-STARTUP_PROMPT_BOTTOM_LINES:])
         startup_state = _live_startup_block(bottom_region)
-        if startup_state in ("trust", "update", "login", "transitional"):
+        if startup_state in ("trust", "update", "login"):
+            return TerminalStatus.WAITING_USER_ANSWER
+        # ``transitional`` is a STARTUP-ONLY answer. It names a lone recognised
+        # header with no completing footer/menu -- during startup that is a modal
+        # mid-redraw, but on an initialized terminal it is the model QUOTING a
+        # startup phrase mid-turn ("Do you trust the contents of this
+        # directory?", "Sign in with ChatGPT", "Update available! X -> Y" in
+        # assistant prose), and mapping it to WAITING here flipped PROCESSING
+        # frames to WAITING_USER_ANSWER on the always-on status path (round-7
+        # review of #731). The complete blocks above corroborate themselves with
+        # their footer/menu; a lone header corroborates nothing, so once
+        # initialization is over it falls through to the ordinary classification.
+        # Startup keeps the conservative reading: ``initialize()``'s readiness
+        # wait may accept the frame, and its post-readiness startup-state check
+        # re-reads until the frame resolves.
+        if startup_state == "transitional" and not self._initialized:
             return TerminalStatus.WAITING_USER_ANSWER
 
         if _has_approval_modal_in_bottom(clean_output):
