@@ -1239,11 +1239,31 @@ class TestARemoteWorkerInheritsItsCallersOwner:
         assert step_mod.caller_owner_id("sup12345") is None
         assert step_mod.caller_owner_id(None) is None
 
-    def test_a_failed_lookup_does_not_break_the_step(self, monkeypatch):
+    def test_a_failed_lookup_raises_rather_than_reporting_unowned(self, monkeypatch):
+        """Unreadable must not masquerade as confirmed-unowned.
+
+        This asserted ``is None`` — which read as "a lookup failure does not break
+        the step", but was the bug: ``None`` is indistinguishable from a caller with
+        no owner recorded, so the ownership check on the session route passed
+        silently and the worker was attributed to the REQUEST principal instead of
+        being refused. Both callers now turn the raise into a retryable 503
+        (Copilot review on #802).
+        """
         from cli_agent_orchestrator.services import agent_step as step_mod
 
         def boom(_tid):
             raise RuntimeError("database unreachable")
 
         monkeypatch.setattr("cli_agent_orchestrator.clients.database.get_terminal_metadata", boom)
+        with pytest.raises(step_mod.OwnerUnavailableError):
+            step_mod.caller_owner_id("sup12345")
+
+    def test_a_confirmed_unowned_caller_is_still_none(self, monkeypatch):
+        """The distinction must not collapse the other way either."""
+        from cli_agent_orchestrator.services import agent_step as step_mod
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+            lambda _tid: {"owner": None},
+        )
         assert step_mod.caller_owner_id("sup12345") is None

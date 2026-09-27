@@ -1046,7 +1046,15 @@ class CodexProvider(BaseProvider):
                         cfg = server_config.model_dump(exclude_none=True)
                     # Resolve the bundled cao-mcp-server console script to a
                     # PATH-independent invocation.
-                    cfg = resolve_mcp_server_config(cfg)
+                    # persisted=True even though this config is INLINE rather than file-backed.
+                    # omit_token, NOT persisted: `persisted` also switches command
+                    # resolution to a PATH lookup, and these providers must keep the
+                    # interpreter-sibling script they rebuild every launch. The flag here
+                    # is only about the TOKEN: this entry is serialized into
+                    # command-line arguments, so embedding the credential makes it readable by
+                    # any local process listing. The child inherits CAO_RUNTIME_TOKEN from this
+                    # process instead (Copilot review on #802).
+                    cfg = resolve_mcp_server_config(cfg, omit_token=True)
                     if "command" in cfg:
                         command_parts.extend(
                             ["-c", f"{prefix}.command={_toml_scalar(cfg['command'])}"]

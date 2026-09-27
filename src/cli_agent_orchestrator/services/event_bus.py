@@ -10,6 +10,7 @@ import logging
 import re
 import threading
 import time
+from collections import OrderedDict
 from typing import Dict, List, Optional, Tuple
 
 from cli_agent_orchestrator.services.settings_service import get_server_settings
@@ -50,10 +51,12 @@ class EventBus:
         self._drop_counts: Dict[str, int] = {}
         self._drop_last_logged: Dict[str, float] = {}
         # Loss ranges owed to specific subscriber queues that refused a payload.
-        # {id(queue): (queue, {"from_pos": int, "to_pos": int})} -- one widening
-        # range per queue, delivered on the next put that queue accepts, so the
-        # subscriber that actually lost bytes is the one told about it.
-        self._owed_loss: Dict[int, Tuple[asyncio.Queue, dict]] = {}
+        # {(id(queue), topic): (queue, {"from_pos", "to_pos", "generation"})} --
+        # one widening range per queue AND PER TOPIC. Keying on the queue alone
+        # misreported the loss under whichever terminal happened to flush it, since
+        # every real consumer subscribes once to terminal.*.output and routes by
+        # topic. Delivered on the next put that queue accepts for that topic.
+        self._owed_loss: "OrderedDict[Tuple[int, str], Tuple[asyncio.Queue, dict]]" = OrderedDict()
 
     def set_loop(self, loop: Optional[asyncio.AbstractEventLoop]) -> None:
         """Register the asyncio event loop (required for thread-safe publishing).
@@ -98,21 +101,10 @@ class EventBus:
     def unsubscribe(self, pattern: str, queue: asyncio.Queue) -> None:
         """Remove a queue from a subscription pattern."""
         with self._lock:
-            # Drop any loss marker owed to this queue. Two reasons, both real:
-            # the owed entry holds a reference to the queue, so leaving it behind
-            # pins a dead subscriber's queue forever; and the map is keyed by
-            # ``id(queue)``, which CPython reuses once an object is collected, so a
-            # stale entry could hand a future queue at the same address a gap it
-            # never suffered.
-            abandoned = [k for k in self._owed_loss if k[0] == id(queue)]
-            for k in abandoned:
-                _, rng = self._owed_loss.pop(k)
-                logger.warning(
-                    "subscriber for %s unsubscribed still owed a gap marker %s; "
-                    "that loss is now unreported",
-                    k[1],
-                    rng,
-                )
+            # Remove the subscription FIRST, then decide what is abandoned. Order
+            # matters: computing it beforehand always found the queue still
+            # subscribed to the very pattern being removed, so nothing was ever
+            # released.
             if "*" in pattern:
                 regex = pattern.replace(".", r"\.").replace("*", "[^.]+")
                 if regex in self._wildcard:
@@ -131,6 +123,49 @@ class EventBus:
                         pass
                     if not self._exact[pattern]:
                         del self._exact[pattern]
+
+            # Release loss markers this queue can no longer receive. Two reasons
+            # the entry must not simply be left behind: it holds a reference to the
+            # queue, pinning a dead subscriber's queue forever; and the map is keyed
+            # on ``id(queue)``, which CPython reuses once an object is collected, so
+            # a stale entry could hand a future queue at the same address a gap it
+            # never suffered.
+            #
+            # Scoped to what this queue can still receive: matching on the queue id
+            # alone discarded markers for topics it is STILL subscribed to under
+            # another pattern, and logged them as unreported.
+            still_subscribed = self._topics_for(queue)
+            abandoned = [
+                k for k in self._owed_loss if k[0] == id(queue) and k[1] not in still_subscribed
+            ]
+            for k in abandoned:
+                _, rng = self._owed_loss.pop(k)
+                logger.warning(
+                    "subscriber for %s unsubscribed still owed a gap marker %s; "
+                    "that loss is now unreported",
+                    k[1],
+                    rng,
+                )
+
+    def _topics_for(self, queue: "asyncio.Queue") -> set:
+        """Topics this queue can still receive, across every remaining pattern.
+
+        Used when unsubscribing one pattern: a marker owed for a topic the queue
+        still subscribes to elsewhere must be kept, not discarded as unreported.
+        Wildcards cannot be enumerated, so a queue on any wildcard pattern keeps
+        everything — the safe direction, since the cost is a retained marker rather
+        than a lost one.
+        """
+        topics: set = set()
+        for topic, queues in self._exact.items():
+            if queue in queues:
+                topics.add(topic)
+        for compiled, queues in self._wildcard.values():
+            if queue in queues:
+                for key in self._owed_loss:
+                    if key[0] == id(queue) and compiled.match(key[1]):
+                        topics.add(key[1])
+        return topics
 
     def _prune_drop_state(self, now: float) -> None:
         """Drop rate-limit entries for topics idle longer than the TTL.
@@ -277,6 +312,9 @@ class EventBus:
                 # server churning through terminals would otherwise accumulate one
                 # entry per terminal forever. Dropping the oldest is reported,
                 # because it means a loss nobody will now hear about.
+                # move_to_end on every touch makes this an LRU: widening a range
+                # in place does not reorder a dict, so plain insertion order evicted
+                # the busiest marker in favour of a stale single-shot one.
                 stale_key, (stale_q, stale_rng) = next(iter(self._owed_loss.items()))
                 self._owed_loss.pop(stale_key, None)
                 logger.warning(
@@ -288,6 +326,7 @@ class EventBus:
             self._owed_loss[key] = (q, dict(lost))
             return
         _, rng = owed
+        self._owed_loss.move_to_end(key)
         if rng.get("generation") != lost.get("generation"):
             self._owed_loss[key] = (q, dict(lost))
             return

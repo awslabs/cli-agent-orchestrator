@@ -210,9 +210,14 @@ async def _reconcile_orphaned_result(frame: CommandResultFrame, runtime_id: str)
         # result no operation asked for, which is the correct outcome for a forged
         # or foreign frame. Withholding the ack instead would only make a runtime
         # redeliver it forever.
-        logger.warning(
-            "discarding result for op %s from runtime %s: no dispatch on record "
-            "(forged frame, or a result for another server's database)",
+        # Only LAUNCH and RUN_SCRIPT are journalled, so a redelivered TEARDOWN or
+        # INPUT result legitimately has no entry. Calling that "forged" was a
+        # confident wrong diagnosis in the log for an ordinary event; the
+        # ack-and-drop behaviour was right either way.
+        logger.info(
+            "discarding result for op %s from runtime %s: no dispatch on record. "
+            "Expected for an unjournalled command (teardown, input); for a LAUNCH "
+            "or RUN_SCRIPT it means the frame is not ours",
             frame.op_id,
             runtime_id,
         )
@@ -238,9 +243,17 @@ async def _reconcile_orphaned_result(frame: CommandResultFrame, runtime_id: str)
     # gone or was never there.
     if frame.outcome != CommandOutcome.OK:
         if command_type == CommandType.LAUNCH.value and has_terminal:
-            return await _confirm_failed_launch_left_nothing(frame, info["id"], runtime_id)
-        # Any other failed operation created no terminal to orphan. Settle the
-        # journal so a restart does not report it as an outcome never seen.
+            return await _confirm_failed_launch_left_nothing(frame, info["id"], runtime_id, record)
+        # A failed RUN_SCRIPT orphans a RUN RECORD, not a terminal, and that is
+        # just as stuck: the runtime could not spawn the script, hit its wall-clock
+        # timeout, or was cancelled, and the durable run stays RUNNING forever
+        # because the driver that would have applied the outcome is gone. Handling
+        # only the OK case left exactly the bug _reconcile_orphaned_script_run
+        # exists to fix (own review of this PR).
+        if command_type == CommandType.RUN_SCRIPT.value:
+            _reconcile_orphaned_script_run(frame, record)
+        # Anything else failed without creating state to orphan. Settle so a restart
+        # does not report it as an outcome never seen.
         _settle_quietly(frame.op_id)
         return True
 
@@ -380,17 +393,41 @@ def _persist_reconciled_terminal(info: dict, runtime_id: str, record: dict, op_i
     return True
 
 
-async def _confirm_failed_launch_left_nothing(
-    frame: CommandResultFrame, terminal_id: str, runtime_id: str
-) -> bool:
-    """Tear down the pane a failed LAUNCH may have created, before acking it.
+#: Live failed-launch cleanup tasks, held so the event loop cannot collect one
+#: mid-flight. Discarded on completion by the done callback below.
+_failed_launch_cleanups: set = set()
 
-    The runtime is the only party that can say whether the id exists there, and
-    its TEARDOWN answer distinguishes the two cases: ``absent`` or ``deleted``
-    means nothing is running under that id and the result is safe to drop, while
-    anything else means a session may still be alive and the result must stay
-    retained for another attempt.
+
+async def _confirm_failed_launch_left_nothing(
+    frame: CommandResultFrame, terminal_id: str, runtime_id: str, record: dict
+) -> bool:
+    """Decide the ack for a failed LAUNCH, scheduling cleanup OFF the reader loop.
+
+    A LAUNCH that failed may still have created a pane, and only the runtime can
+    say. But the confirmation cannot be awaited here: this runs inside the channel's
+    single frame reader, and ``RuntimeConnection.resolve`` — the only thing that
+    completes a ``send_command`` future — is called from that same loop. Awaiting a
+    TEARDOWN result therefore waits for a frame that only the suspended reader can
+    deliver: the channel stalls for the full TEARDOWN_TIMEOUT, the wait times out,
+    the ack is withheld, and the next reconnect repeats it forever. The success
+    branch was unreachable by construction.
+
+    So the teardown runs as its own task and the ack is decided from the journal:
+
+    * ``state == "settled"`` means a previous attempt confirmed the id is gone, so
+      the result is safe to drop — this is what lets the retry converge, and it is
+      the one reader of the journal's ``state`` column.
+    * otherwise the cleanup is scheduled and the ack WITHHELD, so the runtime keeps
+      its retained copy and redelivers on the next reconnect, by which time the
+      task has normally settled the entry.
     """
+    if record.get("state") == "settled":
+        logger.info(
+            "failed LAUNCH %s was already cleaned up; acking the redelivered result",
+            frame.op_id,
+        )
+        return True
+
     conn = runtime_registry.get_runtime(runtime_id)
     if conn is None:
         logger.warning(
@@ -401,6 +438,35 @@ async def _confirm_failed_launch_left_nothing(
             runtime_id,
         )
         return False
+
+    # Strong reference held, per the project's BG-1 rule (see
+    # _schedule_background_drive in api/main.py): asyncio keeps only a WEAK
+    # reference to a task, so a bare create_task whose handle is discarded can be
+    # collected while suspended — and this task's entire job is to settle a journal
+    # row. Discarding it would also make it unawaitable and uncancellable at
+    # shutdown (own review of this PR).
+    task = asyncio.create_task(_cleanup_failed_launch(frame.op_id, terminal_id, runtime_id))
+    _failed_launch_cleanups.add(task)
+    task.add_done_callback(_failed_launch_cleanups.discard)
+    logger.warning(
+        "failed LAUNCH %s may have left terminal %s behind; cleanup scheduled and "
+        "the result left unacked until it is confirmed",
+        frame.op_id,
+        terminal_id,
+    )
+    return False
+
+
+async def _cleanup_failed_launch(op_id: str, terminal_id: str, runtime_id: str) -> None:
+    """Tear down the pane a failed LAUNCH may have left, then settle the journal.
+
+    Runs as its own task so the channel's frame reader stays free to deliver the
+    TEARDOWN result this awaits. Settling is what tells the next redelivery of the
+    same result that it is safe to ack.
+    """
+    conn = runtime_registry.get_runtime(runtime_id)
+    if conn is None:
+        return
     try:
         td = await conn.send_command(
             CommandType.TEARDOWN, {}, terminal_id=terminal_id, timeout=TEARDOWN_TIMEOUT
@@ -408,25 +474,23 @@ async def _confirm_failed_launch_left_nothing(
     except Exception:
         logger.exception(
             "could not confirm teardown of terminal %s after failed LAUNCH %s; "
-            "keeping the result retained",
+            "the result stays retained for another attempt",
             terminal_id,
-            frame.op_id,
+            op_id,
         )
-        return False
-    settled = td.outcome == CommandOutcome.OK and (
+        return
+    confirmed = td.outcome == CommandOutcome.OK and (
         td.payload.get("deleted") or td.payload.get("absent")
     )
-    if not settled:
+    if not confirmed:
         logger.error(
             "terminal %s may still be running after failed LAUNCH %s (teardown said "
-            "%s); NOT acking, so the result survives for another attempt",
+            "%s); not settling, so the result survives for another attempt",
             terminal_id,
-            frame.op_id,
+            op_id,
             td.payload,
         )
-        return False
-    # Nothing is running under that id. Drop any central row the failed launch
-    # left behind, then let the result go.
+        return
     try:
         if get_terminal_metadata(terminal_id) is not None:
             db_delete_terminal(terminal_id)
@@ -435,8 +499,7 @@ async def _confirm_failed_launch_left_nothing(
         logger.warning(
             "teardown of %s confirmed but central cleanup failed", terminal_id, exc_info=True
         )
-    _settle_quietly(frame.op_id)
-    return True
+    _settle_quietly(op_id)
 
 
 @router.websocket("/runtime/channel")

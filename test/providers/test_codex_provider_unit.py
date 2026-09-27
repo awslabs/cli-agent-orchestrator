@@ -262,7 +262,7 @@ class TestCodexBuildCommand:
         mock_profile.codexProfile = None
         mock_load_profile.return_value = mock_profile
         # Simulate the resolver returning a PATH-independent absolute path.
-        mock_resolve.side_effect = lambda cfg: {
+        mock_resolve.side_effect = lambda cfg, **_kw: {
             **cfg,
             "command": "/home/u/.local/bin/cao-mcp-server",
             "args": [],
@@ -290,7 +290,7 @@ class TestCodexBuildCommand:
         mock_profile.codexProfile = None
         mock_load_profile.return_value = mock_profile
         # Simulate a resolved path containing a backslash and a quote.
-        mock_resolve.side_effect = lambda cfg: {
+        mock_resolve.side_effect = lambda cfg, **_kw: {
             **cfg,
             "command": r'/tmp/we"ird\path/cao-mcp-server',
             "args": [],

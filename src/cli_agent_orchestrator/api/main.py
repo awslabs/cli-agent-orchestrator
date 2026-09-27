@@ -139,6 +139,7 @@ from cli_agent_orchestrator.services import (
     terminal_service,
 )
 from cli_agent_orchestrator.services.agent_step import (
+    OwnerUnavailableError,
     StepExecutionError,
     caller_owner_id,
     resolve_effective_working_directory,
@@ -3698,7 +3699,23 @@ async def create_terminal_in_session(
         # the same acknowledged posture as the inbox check; the broker gateway
         # overwrites the caller identity for worker callbacks, so the remaining
         # unbound case is a single-principal local install.
-        caller_owner = caller_owner_id(caller_id)
+        try:
+            # Off-thread: this is a sync DB read inside an async route, and the
+            # working-directory inheritance below needs the SAME row -- reading it
+            # twice was two queries for one answer.
+            caller_owner = await asyncio.to_thread(caller_owner_id, caller_id)
+        except OwnerUnavailableError as e:
+            # Unreadable is not unowned. Proceeding would skip the ownership check
+            # below and attribute the worker to the REQUEST principal, which is
+            # exactly the boundary that check exists to hold (Copilot review on
+            # #802). 503 so the caller retries rather than silently getting a
+            # worker owned by the wrong principal.
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    f"cannot read the owner recorded for caller '{caller_id}' " f"({e}); retry"
+                ),
+            )
         if is_auth_enabled() and caller_owner and caller_owner != principal.id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -4820,6 +4837,16 @@ async def run_step(
         _settle_step(None, str(e))
         await _record_job_state(job_id, "error", error_message=str(e))
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except OwnerUnavailableError as e:
+        # BEFORE the generic arm, which settles the step FAILED and answers 500. A
+        # transient owner-row read failure is retryable infrastructure, not a step
+        # outcome: previously it returned None and the step proceeded, so turning it
+        # into a permanent FAILED would be a net regression. The session route
+        # answers 503 for the identical condition (own review of this PR).
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"cannot read the owner recorded for the caller ({e}); retry",
+        )
     except Exception as e:
         _settle_step(None, str(e))
         await _record_job_state(job_id, "error", error_message=str(e))

@@ -1441,16 +1441,20 @@ class TestAReconciledTerminalKeepsItsEngine:
 
 
 class TestTheDispatchJournalDoesNotGrowForever:
-    """Settled entries are pruned; unsettled ones never are.
+    """Settled entries are pruned quickly; unsettled ones after a long window.
 
     Every dispatched operation writes a row, so without pruning the table grows for
     the life of the server's volume — observed on the cluster, where every entry
     still read `dispatched` after a successful run because only the orphan path
     settled them.
 
-    An UNSETTLED entry is never pruned by age, deliberately: one of those is an
-    operation whose outcome this server never saw, which is the thing the journal
-    exists to preserve.
+    An UNSETTLED entry is what the journal exists to preserve — an operation whose
+    outcome this server never saw — so it gets a far longer window than a settled
+    one. It is not kept forever: only the LAUNCH happy path settles, so every remote
+    RUN_SCRIPT and every failed launch leaves a permanent row, and a settled-only
+    prune could never reclaim the majority of the table. A runtime retains a result
+    only until its next reconnect, so a week-old dispatched row will never be
+    redelivered (own review of this PR).
     """
 
     @staticmethod
@@ -1483,8 +1487,8 @@ class TestTheDispatchJournalDoesNotGrowForever:
         assert db.prune_dispatch_journal() == 1
         assert db.get_dispatch_record("old-op") is None
 
-    def test_an_unsettled_entry_is_never_pruned(self, tmp_path, monkeypatch):
-        """The one row that must survive: an outcome nobody applied."""
+    def test_a_recent_unsettled_entry_survives_the_settled_window(self, tmp_path, monkeypatch):
+        """The row that must survive: an outcome nobody applied, still recoverable."""
         from datetime import datetime, timedelta
 
         db = self._db(tmp_path, monkeypatch)
@@ -1492,11 +1496,52 @@ class TestTheDispatchJournalDoesNotGrowForever:
 
         with db.SessionLocal() as s:
             row = s.query(db.DispatchJournalModel).filter_by(op_id="lost-op").first()
-            row.created_at = datetime.now() - timedelta(days=30)
+            # Well past the SETTLED window, nowhere near the dispatched one.
+            row.created_at = datetime.now() - timedelta(
+                seconds=db._DISPATCH_JOURNAL_SETTLED_TTL_SECS * 2
+            )
             s.commit()
 
         assert db.prune_dispatch_journal() == 0
         assert db.get_dispatch_record("lost-op")["state"] == "dispatched"
+
+    def test_even_an_ancient_unsettled_entry_survives(self, tmp_path, monkeypatch):
+        """Unsettled rows are NOT aged out, and the reason is specific.
+
+        An earlier revision of this prune aged them out after a week, on the claim
+        that "a runtime retains a result only until its next reconnect". The bridge
+        does the opposite: `_unacked` is instance state, re-sent after EVERY
+        reconnect, and dropped only on ack. So a week-old unacked result is still
+        redeliverable — and with its journal row gone the reconciler answers "no
+        dispatch on record" and ack-and-drops it, leaving a RUN_SCRIPT's run RUNNING
+        forever or a live pane untracked. That is the evidence this table exists to
+        keep (own review of this PR).
+        """
+        from datetime import datetime, timedelta
+
+        db = self._db(tmp_path, monkeypatch)
+        db.record_dispatch("ancient-op", "run_script", "worker-1", run_id="r1")
+
+        with db.SessionLocal() as s:
+            row = s.query(db.DispatchJournalModel).filter_by(op_id="ancient-op").first()
+            row.created_at = datetime.now() - timedelta(days=90)
+            s.commit()
+
+        assert db.prune_dispatch_journal() == 0
+        assert db.get_dispatch_record("ancient-op")["state"] == "dispatched"
+
+    def test_a_settled_row_with_no_timestamp_is_reclaimed(self, tmp_path, monkeypatch):
+        """Otherwise it is immortal: it matches neither prune branch."""
+        db = self._db(tmp_path, monkeypatch)
+        db.record_dispatch("odd-op", "launch", "worker-1")
+        with db.SessionLocal() as s:
+            row = s.query(db.DispatchJournalModel).filter_by(op_id="odd-op").first()
+            row.state = "settled"
+            row.settled_at = None
+            s.commit()
+
+        assert db.prune_dispatch_journal() == 1
+        assert db.get_dispatch_record("odd-op") is None
 
     def test_a_recently_settled_entry_is_kept_for_audit(self, tmp_path, monkeypatch):
         db = self._db(tmp_path, monkeypatch)

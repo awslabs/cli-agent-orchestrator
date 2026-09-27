@@ -34,7 +34,7 @@ import os
 import shutil
 import sys
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -234,7 +234,9 @@ def shared_endpoint_child_env_for(command: str, *, persisted: bool = False) -> d
     return shared_endpoint_child_env(persisted=persisted)
 
 
-def resolve_mcp_server_config(config: dict, *, persisted: bool = False) -> dict:
+def resolve_mcp_server_config(
+    config: dict, *, persisted: bool = False, omit_token: Optional[bool] = None
+) -> dict:
     """Return a copy of an MCP server config with its command resolved.
 
     ``persisted`` is forwarded to :func:`resolve_cao_mcp_command`; set it True
@@ -268,10 +270,34 @@ def resolve_mcp_server_config(config: dict, *, persisted: bool = False) -> dict:
     # Unrelated profile variables are still preserved: only the keys the
     # deployment actually defines are overridden, and an override is logged so a
     # profile that tries is visible rather than silently ignored.
+    # Two SEPARATE concerns that `persisted` used to conflate, with a real cost:
+    # it selects the command-resolution order (sibling script vs PATH lookup) AND
+    # whether the token is written. codex and Kimi need the token omitted from their
+    # inline argv but MUST keep the sibling-script resolution, because they rebuild
+    # the command every launch and a PATH lookup can resolve to a different or
+    # stale install. Passing persisted=True for the token silently changed which
+    # executable they launch (own review of this PR).
+    #
+    # `omit_token` defaults to `persisted` so every existing caller is unchanged.
+    omit = persisted if omit_token is None else omit_token
     if resolved.get("command") == CAO_MCP_SERVER_COMMAND:
-        extra = shared_endpoint_child_env(persisted=persisted)
+        extra = shared_endpoint_child_env(persisted=omit)
         if extra:
             profile_env = dict(resolved.get("env") or {})
+            # RESERVED keys are stripped whether or not the deployment supplies a
+            # value for them. With persisted=True `extra` deliberately omits the
+            # token, so a merge alone left an agent-supplied CAO_RUNTIME_TOKEN in
+            # place — in the one form that actually lands somewhere durable, a file
+            # or argv. That inverted the guard: it held for the live path and was
+            # absent exactly where a planted credential persists (own review).
+            for reserved in (SHARED_ENDPOINT_URL_ENV, RUNTIME_TOKEN_ENV):
+                if reserved in profile_env and reserved not in extra:
+                    logger.warning(
+                        "dropping profile-supplied %s: it is operator-controlled and "
+                        "is not persisted",
+                        reserved,
+                    )
+                    profile_env.pop(reserved, None)
             clobbered = sorted(
                 key
                 for key, value in extra.items()

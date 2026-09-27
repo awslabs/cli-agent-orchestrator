@@ -2261,20 +2261,28 @@ def get_working_directory(terminal_id: str) -> Optional[str]:
         if runtime_registry.is_remote(terminal_id):
             return metadata.get("working_directory")
 
+        # The live pane is the better answer when it is available (the agent may
+        # have cd'd), but a backend that cannot answer must not turn into "no
+        # directory" — fall back to what the row recorded.
+        #
+        # A FALSY return counts as "cannot answer", not just an exception:
+        # TmuxClient wraps its whole body and returns None on a missing session,
+        # window or pane rather than raising, so guarding the exception alone left
+        # this fallback unreachable for the default backend and the caller still got
+        # None — the outcome that made an assign forward no working directory at all
+        # (own review of this PR). Herdr's backend does raise, so both paths matter.
         try:
-            return get_backend().get_pane_working_directory(
+            live = get_backend().get_pane_working_directory(
                 metadata["tmux_session"], metadata["tmux_window"]
             )
         except Exception:
-            # The live pane is the better answer when it is available (the agent may
-            # have cd'd), but a backend that cannot answer must not turn into "no
-            # directory" — fall back to what the row recorded.
             logger.warning(
                 "could not read the live pane cwd for %s; using the recorded " "launch directory",
                 terminal_id,
                 exc_info=True,
             )
-            return metadata.get("working_directory")
+            live = None
+        return live or metadata.get("working_directory")
 
     except Exception as e:
         logger.error(f"Failed to get working directory for terminal {terminal_id}: {e}")

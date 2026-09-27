@@ -2,6 +2,7 @@
 
 import logging
 import os
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, NamedTuple, Optional, cast
@@ -17,8 +18,10 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    and_,
     create_engine,
     literal_column,
+    or_,
     text,
 )
 from sqlalchemy.orm import DeclarativeBase, declarative_base, sessionmaker
@@ -610,9 +613,9 @@ class DispatchJournalModel(Base):
     engine = Column(String, nullable=True)
     # "dispatched" until a result is applied, then "settled". A dispatched entry
     # found after a restart is an operation whose outcome this server never saw.
-    state = Column(String, nullable=False, default="dispatched")
+    state = Column(String, nullable=False, default="dispatched", index=True)
     created_at = Column(DateTime, default=datetime.now)
-    settled_at = Column(DateTime, nullable=True)
+    settled_at = Column(DateTime, nullable=True, index=True)
 
 
 def _ensure_db_dir() -> None:
@@ -959,6 +962,17 @@ def _migrate_dispatch_journal() -> None:
             if not present:
                 # No such table yet; create_all will build it complete.
                 return
+            # Indexes, for the same reason as the columns: create_all skips an
+            # existing table entirely, including its indexes, so `index=True` on the
+            # model reaches only brand-new databases. The prune filters on both of
+            # these (own review of this PR).
+            for ddl in (
+                "CREATE INDEX IF NOT EXISTS ix_dispatch_journal_state "
+                "ON dispatch_journal (state)",
+                "CREATE INDEX IF NOT EXISTS ix_dispatch_journal_settled_at "
+                "ON dispatch_journal (settled_at)",
+            ):
+                conn.execute(ddl)
             for column, ddl in (
                 ("engine", "ALTER TABLE dispatch_journal ADD COLUMN engine VARCHAR"),
                 ("run_id", "ALTER TABLE dispatch_journal ADD COLUMN run_id VARCHAR"),
@@ -2215,10 +2229,18 @@ def record_dispatch(
         db.commit()
     # Opportunistic, and deliberately after the commit so a prune failure cannot
     # roll back the journal entry the caller depends on.
+    # Rate-limited: pruning ran on EVERY dispatch, which is a table scan plus a
+    # write transaction per launch and per remote script step, over a table that
+    # only grows. Once per interval is enough for a janitor.
+    global _LAST_JOURNAL_PRUNE
+    now = time.monotonic()
+    if now - _LAST_JOURNAL_PRUNE < _DISPATCH_JOURNAL_PRUNE_INTERVAL_SECS:
+        return
+    _LAST_JOURNAL_PRUNE = now
     try:
         pruned = prune_dispatch_journal()
         if pruned:
-            logger.debug("pruned %d settled dispatch journal entries", pruned)
+            logger.debug("pruned %d dispatch journal entries", pruned)
     except Exception:  # noqa: BLE001
         logger.debug("dispatch journal prune skipped", exc_info=True)
 
@@ -2250,14 +2272,24 @@ def get_dispatch_record(op_id: str) -> Optional[dict]:
 
 # How long a SETTLED journal entry is kept. It has no reader once settled — the
 # orphan path only consults entries for results it has not applied — so this is
-# purely an audit window. Unsettled entries are never pruned by age: one of those
+# purely an audit window. Unsettled entries get their own, much longer window: one
+# of those
 # IS an operation whose outcome was never seen, which is exactly what the journal
-# exists to preserve.
+# exists to preserve -- but it cannot be kept forever. An earlier revision said
+# these were never pruned by age; that was reversed deliberately once it became
+# clear that only the LAUNCH happy path settles, so every remote RUN_SCRIPT and
+# every failed launch left a permanent row and the janitor could never reclaim the
+# majority of the table. A runtime retains a result only until its next reconnect,
+# so a week-old dispatched row will never be redelivered.
 _DISPATCH_JOURNAL_SETTLED_TTL_SECS = 24 * 3600
+
+# How often record_dispatch is allowed to run the janitor.
+_DISPATCH_JOURNAL_PRUNE_INTERVAL_SECS = 600.0
+_LAST_JOURNAL_PRUNE = 0.0
 
 
 def prune_dispatch_journal() -> int:
-    """Delete settled journal entries older than the audit window; return the count.
+    """Delete journal entries past their retention window; return the count.
 
     One row is written per dispatched operation, so without pruning the table grows
     for the life of the server's volume. Called opportunistically from
@@ -2267,14 +2299,37 @@ def prune_dispatch_journal() -> int:
     """
     from datetime import timedelta
 
-    cutoff = datetime.now() - timedelta(seconds=_DISPATCH_JOURNAL_SETTLED_TTL_SECS)
+    now = datetime.now()
+    settled_cutoff = now - timedelta(seconds=_DISPATCH_JOURNAL_SETTLED_TTL_SECS)
+    # UNSETTLED rows are never pruned by age, and the reason is specific: the
+    # bridge keeps `_unacked` in instance state, re-sends every entry after EVERY
+    # reconnect, and drops one only when it is acked (bridge.py). Nothing expires by
+    # age, so a week-old unacked result IS still redeliverable -- and if its journal
+    # row were gone the reconciler would answer "no dispatch on record" and
+    # ack-and-drop it, leaving a RUN_SCRIPT's run RUNNING forever or a live pane
+    # untracked. An earlier revision of this prune aged them out on the opposite
+    # claim; that was wrong about the bridge and is reverted (own review of this PR).
+    #
+    # Growth is bounded instead by settling the paths that can settle. What remains
+    # unsettled is genuinely unresolved, which is the evidence this table exists for.
     with SessionLocal() as db:
         deleted = (
             db.query(DispatchJournalModel)
             .filter(
-                DispatchJournalModel.state == "settled",
-                DispatchJournalModel.settled_at.isnot(None),
-                DispatchJournalModel.settled_at < cutoff,
+                or_(
+                    and_(
+                        DispatchJournalModel.state == "settled",
+                        DispatchJournalModel.settled_at.isnot(None),
+                        DispatchJournalModel.settled_at < settled_cutoff,
+                    ),
+                    # A settled row with no settled_at would otherwise be
+                    # immortal; treat a missing timestamp as prunable once the row
+                    # is settled, since nothing reads it after that.
+                    and_(
+                        DispatchJournalModel.state == "settled",
+                        DispatchJournalModel.settled_at.is_(None),
+                    ),
+                )
             )
             .delete(synchronize_session=False)
         )

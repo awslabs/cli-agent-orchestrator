@@ -79,3 +79,52 @@ class TestTheCwdLookupIsRemoteAware:
             patch.object(terminal_service, "get_backend", return_value=be),
         ):
             assert terminal_service.get_working_directory("abcd1234") == "/launch/dir"
+
+
+class TestAFalsyBackendAnswerFallsBackToo:
+    """TmuxClient RETURNS None on failure; it does not raise.
+
+    Guarding only the exception left the fallback unreachable for the default
+    backend, so the caller still got None — the outcome that made an assign forward
+    no working directory at all (own review of this PR).
+    """
+
+    def test_a_none_return_uses_the_recorded_directory(self):
+        from unittest.mock import MagicMock, patch
+
+        from cli_agent_orchestrator.services import terminal_service
+
+        row = {
+            "tmux_session": "cao-abcd1234",
+            "tmux_window": "w",
+            "working_directory": "/launch/dir",
+        }
+        be = MagicMock()
+        be.get_pane_working_directory.return_value = None  # tmux's real failure mode
+        with (
+            patch.object(terminal_service, "get_terminal_metadata", return_value=row),
+            patch(
+                "cli_agent_orchestrator.runtime_channel.registry.runtime_registry.is_remote",
+                return_value=False,
+            ),
+            patch.object(terminal_service, "get_backend", return_value=be),
+        ):
+            assert terminal_service.get_working_directory("abcd1234") == "/launch/dir"
+
+    def test_an_empty_string_return_also_falls_back(self):
+        from unittest.mock import MagicMock, patch
+
+        from cli_agent_orchestrator.services import terminal_service
+
+        row = {"tmux_session": "s", "tmux_window": "w", "working_directory": "/launch/dir"}
+        be = MagicMock()
+        be.get_pane_working_directory.return_value = ""
+        with (
+            patch.object(terminal_service, "get_terminal_metadata", return_value=row),
+            patch(
+                "cli_agent_orchestrator.runtime_channel.registry.runtime_registry.is_remote",
+                return_value=False,
+            ),
+            patch.object(terminal_service, "get_backend", return_value=be),
+        ):
+            assert terminal_service.get_working_directory("abcd1234") == "/launch/dir"

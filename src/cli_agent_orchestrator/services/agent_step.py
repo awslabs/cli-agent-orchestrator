@@ -471,13 +471,32 @@ async def resolve_effective_working_directory(
     return working_directory
 
 
+class OwnerUnavailableError(Exception):
+    """The owner column could not be READ, so ownership is unknown.
+
+    Distinct from a confirmed ``None`` (no row, or a row with no owner recorded),
+    and the distinction is load-bearing: the session route refuses a caller owned
+    by a different principal, and collapsing a read failure into ``None`` made that
+    check pass silently. With auth on, a remote caller's placement can come from
+    the in-memory registry without any row read succeeding, so the worker was
+    attributed to the REQUEST principal and the ownership boundary was skipped
+    rather than enforced (Copilot review on #802).
+
+    Mirrors ``PlacementUnavailableError``: unreadable is not an answer, and the
+    caller turns it into a retryable failure.
+    """
+
+
 def caller_owner_id(caller_id: Optional[str]) -> Optional[str]:
-    """The canonical owner id recorded for ``caller_id``, or ``None`` if unknown.
+    """The canonical owner id recorded for ``caller_id``, or ``None`` if unowned.
 
     Read from the server's own ``terminals.owner`` column — never from the
     agent-writable metadata bag, and never from anything the caller presented.
-    ``None`` (no row, no owner recorded, an unparseable value) stays None:
-    unknown is not revoked, and inventing an owner would be worse than the gap.
+
+    ``None`` means CONFIRMED unowned: no row, no owner recorded, or an unparseable
+    value. Unknown is not revoked, and inventing an owner would be worse than the
+    gap. A read that FAILS is not confirmed anything and raises
+    :class:`OwnerUnavailableError` instead.
     """
     if not caller_id:
         return None
@@ -485,9 +504,9 @@ def caller_owner_id(caller_id: Optional[str]) -> Optional[str]:
         from cli_agent_orchestrator.clients.database import get_terminal_metadata
 
         row = get_terminal_metadata(caller_id)
-    except Exception as exc:  # noqa: BLE001 — ownership inheritance is best-effort
+    except Exception as exc:  # noqa: BLE001 — surfaced as unknown, not as unowned
         logger.warning("could not read owner for caller %s: %s", caller_id, exc)
-        return None
+        raise OwnerUnavailableError(str(exc)) from exc
     owner = (row or {}).get("owner")
     return str(owner) if owner else None
 
@@ -780,6 +799,9 @@ async def run_agent_step(
                 # from anything the agent presented, and deliberately NOT included
                 # in the LAUNCH payload: an identity handed to an executor is an
                 # identity it could re-present.
+                # Raises OwnerUnavailableError when the row cannot be read, which
+                # propagates rather than silently launching an unowned worker: an
+                # unowned row passes the revocation gate.
                 owner_id=caller_owner_id(caller_id),
             )
         else:

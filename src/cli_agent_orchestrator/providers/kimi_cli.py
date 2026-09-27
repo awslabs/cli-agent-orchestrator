@@ -422,7 +422,17 @@ class KimiCliProvider(BaseProvider):
 
                         # Resolve the bundled cao-mcp-server console script to a
                         # PATH-independent invocation.
-                        mcp_config[server_name] = resolve_mcp_server_config(mcp_config[server_name])
+                        # persisted=True even though this config is INLINE rather than file-backed.
+                        # omit_token, NOT persisted: `persisted` also switches command
+                        # resolution to a PATH lookup, and these providers must keep the
+                        # interpreter-sibling script they rebuild every launch. The flag here
+                        # is only about the TOKEN: this entry is serialized into
+                        # command-line arguments, so embedding the credential makes it readable by
+                        # any local process listing. The child inherits CAO_RUNTIME_TOKEN from this
+                        # process instead (Copilot review on #802).
+                        mcp_config[server_name] = resolve_mcp_server_config(
+                            mcp_config[server_name], omit_token=True
+                        )
 
                         # Forward CAO_TERMINAL_ID so MCP servers (e.g. cao-mcp-server)
                         # can identify the current terminal for handoff/assign operations.
