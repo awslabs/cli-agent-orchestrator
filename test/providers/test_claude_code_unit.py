@@ -320,6 +320,64 @@ class TestClaudeCodeProviderInitialization:
         assert "claude --dangerously-skip-permissions" in call_args[0][2]
 
 
+class TestClaudeCodeProviderEffort:
+    """Tests for the per-launch effort override in _build_claude_command.
+
+    The value is exported as CLAUDE_CODE_EFFORT_LEVEL inside the pane's
+    compound command -- after the env-sanitizing unset block, so it survives
+    the sanitize -- and shlex-quoted so it travels as data, never syntax.
+    """
+
+    @staticmethod
+    def _build(effort=None):
+        return ClaudeCodeProvider(
+            "test123", "test-session", "window-0", None, effort=effort
+        )._build_claude_command()
+
+    def test_build_command_exports_effort_when_set(self):
+        command = self._build(effort="high")
+
+        # Export sits between the sanitize block and the claude invocation.
+        segments = command.split("; ")
+        assert segments[0].startswith("unset $(env | sed -n")
+        assert segments[1] == "export CLAUDE_CODE_EFFORT_LEVEL=high"
+        assert segments[2].startswith("claude ")
+
+        # Survives the sanitize: the unset's own grep -v exclusion for
+        # CLAUDE_CODE_EFFORT_LEVEL is intact, and the export comes after the
+        # unset anyway, so the value cannot be wiped before claude runs.
+        assert "CLAUDE_CODE_EFFORT_LEVEL" in segments[0]
+        assert command.index("export CLAUDE_CODE_EFFORT_LEVEL=high") > command.index("unset")
+
+        # The claude invocation itself is unchanged.
+        assert "claude --dangerously-skip-permissions" in segments[2]
+
+    def test_build_command_effort_is_shell_quoted_as_data(self):
+        """shlex round-trips the export: the whole assignment stays a single
+        token (the trailing ';' is just the statement separator posix word
+        splitting keeps attached), so even a hostile value could not split
+        the export or start a new command (the API boundary enum-validates
+        before we ever get here)."""
+        command = self._build(effort="high")
+
+        tokens = shlex.split(command)
+        idx = tokens.index("export")
+        assert tokens[idx + 1] == "CLAUDE_CODE_EFFORT_LEVEL=high;"
+        assert tokens[idx + 2] == "claude"
+
+    def test_build_command_absent_effort_leaves_command_unchanged(self):
+        """No effort kwarg, None, and empty string all byte-match the
+        pre-effort compound command."""
+        baseline = ClaudeCodeProvider(
+            "test123", "test-session", "window-0", None
+        )._build_claude_command()
+
+        assert self._build() == baseline
+        assert self._build(effort=None) == baseline
+        assert self._build(effort="") == baseline
+        assert "export" not in baseline
+
+
 class TestClaudeCodeProviderStatusDetection:
     """Tests for ClaudeCodeProvider status detection."""
 

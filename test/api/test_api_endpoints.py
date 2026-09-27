@@ -296,6 +296,7 @@ class TestCreateSession:
             initial_message=None,
             initial_message_orchestration_type=None,
             model=None,
+            effort=None,
             group=None,
             metadata=None,
         )
@@ -391,6 +392,88 @@ class TestCreateSession:
         assert response.status_code == 400
         assert "model" in response.json()["detail"]
         mock_svc.create_session.assert_not_called()
+
+    def test_create_session_passes_effort(self, client):
+        """The per-launch effort override reaches the session service."""
+        mock_terminal = Terminal(
+            id="abcd1234",
+            name="test-window",
+            session_name="test-session",
+            provider="codex",
+            agent_profile="developer",
+        )
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock(return_value=mock_terminal)
+
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "codex",
+                    "agent_profile": "developer",
+                    "effort": "xhigh",
+                },
+            )
+
+        assert response.status_code == 201
+        assert mock_svc.create_session.call_args.kwargs["effort"] == "xhigh"
+
+    def test_create_session_rejects_invalid_effort(self, client):
+        """An effort outside the provider's enum fails before any session
+        is created (400, the same boundary rule as a malformed model)."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "claude_code",
+                    "agent_profile": "developer",
+                    "effort": "xhigh",
+                },
+            )
+
+        assert response.status_code == 400
+        assert "effort" in response.json()["detail"]
+        mock_svc.create_session.assert_not_called()
+
+    def test_create_session_rejects_effort_for_unsupported_provider(self, client):
+        """A provider with no effort support rejects any non-empty effort
+        instead of silently ignoring it."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "effort": "high",
+                },
+            )
+
+        assert response.status_code == 400
+        assert "does not support" in response.json()["detail"]
+        mock_svc.create_session.assert_not_called()
+
+    def test_create_session_empty_effort_behaves_as_absent(self, client):
+        """An explicitly empty effort is treated exactly like an omitted one."""
+        mock_terminal = Terminal(
+            id="abcd1234",
+            name="test-window",
+            session_name="test-session",
+            provider="kiro_cli",
+            agent_profile="developer",
+        )
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock(return_value=mock_terminal)
+
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "effort": "",
+                },
+            )
+
+        assert response.status_code == 201
+        assert mock_svc.create_session.call_args.kwargs["effort"] is None
 
     def test_create_session_rejects_empty_initial_message(self, client):
         """An explicitly supplied but undeliverable empty task is not ignored."""

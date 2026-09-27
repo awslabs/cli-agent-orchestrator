@@ -38,6 +38,7 @@ class ProviderManager:
         allowed_tools: Optional[List[str]] = None,
         skill_prompt: Optional[str] = None,
         model: Optional[str] = None,
+        effort: Optional[str] = None,
         engine: Optional[KiroEngine] = None,
     ) -> BaseProvider:
         """Create and store provider instance."""
@@ -67,6 +68,7 @@ class ProviderManager:
                     allowed_tools,
                     skill_prompt=skill_prompt,
                     model=model,
+                    effort=effort,
                 )
             elif provider_type == ProviderType.CODEX.value:
                 provider = CodexProvider(
@@ -77,6 +79,7 @@ class ProviderManager:
                     allowed_tools,
                     skill_prompt=skill_prompt,
                     model=model,
+                    effort=effort,
                 )
             elif provider_type == ProviderType.COPILOT_CLI.value:
                 provider = CopilotCliProvider(

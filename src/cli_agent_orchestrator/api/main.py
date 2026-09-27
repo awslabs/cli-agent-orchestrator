@@ -84,6 +84,7 @@ from cli_agent_orchestrator.graph.sinks import get_sink
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
+from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.memory import (
     MemoryKey,
     MemoryScope,
@@ -344,6 +345,43 @@ def _validate_model_id(value: str) -> None:
         raise ValueError(f"model exceeds the {MODEL_ID_MAX_LEN}-char cap")
     if not re.fullmatch(MODEL_ID_RE, value):
         raise ValueError(f"model {value!r} is invalid (must match {MODEL_ID_RE!r})")
+
+
+# Per-provider effort levels for the ``effort`` override (the per-request
+# analogue of the ``model`` override). CAO owns the enum the same way it owns
+# model-id validation: the values are the ones each provider's launch surface
+# actually consumes (claude_code: ``CLAUDE_CODE_EFFORT_LEVEL``; codex:
+# ``-c model_reasoning_effort``). A provider missing from this map has no
+# effort support -- any non-empty effort is rejected there rather than being
+# silently ignored downstream.
+EFFORT_LEVELS_BY_PROVIDER: Dict[str, Tuple[str, ...]] = {
+    ProviderType.CLAUDE_CODE.value: ("low", "medium", "high"),
+    ProviderType.CODEX.value: ("low", "medium", "high", "xhigh"),
+}
+
+
+def _validate_effort(value: str, provider: Optional[str]) -> None:
+    """Validate an ``effort`` override at the request boundary.
+
+    Shared by the ``POST /sessions`` and
+    ``POST /sessions/{session_name}/terminals`` ``effort`` query params, so
+    both entry points into ``terminal_service.create_terminal`` apply the
+    same rule. Raises ``ValueError``; the endpoints translate that into an
+    explicit 400 -- not a 422 and (for the terminals endpoint) not the
+    not-found 404 its generic ValueError handler means.
+
+    Raises:
+        ValueError: ``provider`` has no effort support (any non-empty value
+            is rejected), or ``value`` is not one of the provider's levels.
+    """
+    levels = EFFORT_LEVELS_BY_PROVIDER.get(provider or "")
+    if levels is None:
+        raise ValueError(f"provider '{provider}' does not support an effort override")
+    if value not in levels:
+        raise ValueError(
+            f"effort {value!r} is invalid for provider '{provider}' "
+            f"(must be one of: {', '.join(levels)})"
+        )
 
 
 class UpdateGroupBody(BaseModel):
@@ -2392,6 +2430,7 @@ async def create_session(
     memory_manager: Optional[str] = None,
     engine: Optional[KiroEngine] = None,
     model: Optional[str] = None,
+    effort: Optional[str] = None,
     body: Optional[CreateSessionBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
@@ -2419,6 +2458,11 @@ async def create_session(
 
     ``model`` is an optional per-launch override. It uses the same validation
     and provider handoff as the existing terminal-creation endpoint.
+
+    ``effort`` is the per-launch reasoning-effort override, validated against
+    the provider's enum by ``_validate_effort`` exactly the way ``model`` is
+    validated by ``_validate_model_id``. Omitting it (or passing an empty
+    value) leaves provider behavior unchanged.
 
     ``body.group``/``body.metadata`` are the #432 discovery fields, set on
     the initial terminal at creation time (``group`` is also updatable later
@@ -2448,6 +2492,16 @@ async def create_session(
             validate_tmux_name(effective, "session_name")
         if model is not None:
             _validate_model_id(model)
+        # An explicitly empty effort is the same as not passing one; a
+        # non-empty one is validated against the *effective* provider (the
+        # request's, or the profile's when the request omits it) exactly the
+        # way session_service.create_session resolves it below.
+        effort = effort or None
+        if effort is not None:
+            _validate_effort(
+                effort,
+                provider or resolve_provider(agent_profile, fallback_provider=DEFAULT_PROVIDER),
+            )
         if initial_message == "":
             raise ValueError("initial_message must not be empty")
         if body and body.initial_message_orchestration_type:
@@ -2477,6 +2531,7 @@ async def create_session(
             initial_message=initial_message,
             initial_message_orchestration_type=initial_message_orchestration_type,
             model=model,
+            effort=effort,
             group=body.group if body else None,
             metadata=body.metadata if body else None,
         )
@@ -2589,6 +2644,7 @@ async def create_terminal_in_session(
     defer_init: bool = False,
     managed_callback: bool = False,
     model: Optional[str] = None,
+    effort: Optional[str] = None,
     use_worktree: bool = False,
     body: Optional[CreateTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
@@ -2615,6 +2671,11 @@ async def create_terminal_in_session(
     Lets a caller pin a specific model for one worker without needing a
     dedicated agent profile.
 
+    ``effort``: optional per-launch reasoning-effort override, validated
+    against the resolved provider's enum by ``_validate_effort`` the same
+    way ``model`` is validated by ``_validate_model_id``. Omitting it (or
+    passing an empty value) leaves provider behavior unchanged.
+
     ``use_worktree`` (issue #100 Phase 1): provision an isolated git worktree
     for this terminal instead of sharing ``working_directory`` as given. A
     plain boolean routing flag, so it stays a query param alongside
@@ -2626,6 +2687,15 @@ async def create_terminal_in_session(
         validate_tmux_name(session_name, "session_name")
         if model is not None:
             _validate_model_id(model)
+        # Same 400-before-any-resource rule as the model check: an invalid
+        # effort is a bad request, not this endpoint's 404-means-"not found".
+        # The provider is the effective one (the request's, or the profile's
+        # resolved below) so a profile-resolved provider is validated too.
+        effort = effort or None
+        if effort is not None:
+            _validate_effort(
+                effort, provider or resolve_provider(agent_profile, fallback_provider="kiro_cli")
+            )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     try:
@@ -2706,6 +2776,7 @@ async def create_terminal_in_session(
             initial_message_orchestration_type=orch_type,
             engine=engine,
             model=model,
+            effort=effort,
             use_worktree=use_worktree,
             metadata=metadata,
         )

@@ -502,6 +502,70 @@ class TestCodexProviderModelFlag:
         assert "--model fable-5" in command
 
 
+class TestCodexProviderEffort:
+    """Tests for the per-launch effort override in _build_codex_command.
+
+    The value rides ``-c model_reasoning_effort=<toml-scalar>``, emitted after
+    the profile's codexConfig block so an explicit request outranks a
+    profile-static effort on key conflict, and applies with or without a
+    profile at all.
+    """
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_build_command_emits_effort_override_when_set(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.codexProfile = None
+        mock_profile.codexConfig = None
+        mock_load.return_value = mock_profile
+
+        provider = CodexProvider("tid", "sess", "win", "agent", effort="high")
+        command = provider._build_codex_command()
+
+        assert 'model_reasoning_effort="high"' in command
+        # Still shlex-safe as a single -c token.
+        assert "-c" in shlex.split(command)
+        assert 'model_reasoning_effort="high"' in shlex.split(command)
+
+    def test_build_command_emits_effort_override_with_no_agent_profile(self):
+        provider = CodexProvider("tid", "sess", "win", None, effort="xhigh")
+        command = provider._build_codex_command()
+
+        assert 'model_reasoning_effort="xhigh"' in command
+
+    def test_explicit_effort_wins_over_profile_codex_config(self):
+        """Both the profile-static and the explicit override are emitted, the
+        explicit one LAST (codex applies later -c overrides on conflict)."""
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.codexProfile = None
+        mock_profile.codexConfig = {"model_reasoning_effort": "low"}
+        with patch("cli_agent_orchestrator.providers.codex.load_agent_profile") as mock_load:
+            mock_load.return_value = mock_profile
+            provider = CodexProvider("tid", "sess", "win", "agent", effort="high")
+            command = provider._build_codex_command()
+
+        assert 'model_reasoning_effort="low"' in command
+        assert 'model_reasoning_effort="high"' in command
+        assert command.index('model_reasoning_effort="high"') > command.index(
+            'model_reasoning_effort="low"'
+        )
+
+    def test_build_command_absent_effort_leaves_command_unchanged(self):
+        """No effort kwarg, None, and empty string all byte-match the
+        pre-effort launch command."""
+        baseline = CodexProvider("tid", "sess", "win", None)._build_codex_command()
+
+        for provider_kwargs in ({}, {"effort": None}, {"effort": ""}):
+            provider = CodexProvider("tid", "sess", "win", None, **provider_kwargs)
+            assert provider._build_codex_command() == baseline
+        assert "model_reasoning_effort" not in baseline
+
+
 class TestCodexBuildCommandExtra:
     """Coverage for branches inside ``_build_codex_command`` that the
     pre-existing fixtures didn't exercise."""

@@ -185,6 +185,7 @@ async def create_terminal(
     engine: Optional[KiroEngine | str] = None,
     kiro_capability_probe: Optional[Callable[[KiroEngine, set[str]], KiroCapabilities]] = None,
     model: Optional[str] = None,
+    effort: Optional[str] = None,
     use_worktree: bool = False,
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
@@ -225,6 +226,12 @@ async def create_terminal(
             (e.g. MCP handoff/assign's own `model` parameter) pin a specific
             model for one worker without needing a dedicated agent profile.
             None = behavior unchanged (profile.model, if any, still applies).
+        effort: Explicit per-call reasoning-effort override, forwarded to the
+            providers that support one (claude_code exports
+            CLAUDE_CODE_EFFORT_LEVEL in the pane launch command; codex emits
+            ``-c model_reasoning_effort``). The API boundary validates the
+            value against the provider's enum; unlike `model` there is no
+            profile-static fallback -- None = behavior unchanged.
         use_worktree: If True, provision an isolated ``git worktree`` (issue
             #100) for this terminal instead of using ``working_directory`` as
             given -- resolves the repo root from ``working_directory`` (or the
@@ -487,6 +494,7 @@ async def create_terminal(
             allowed_tools,
             skill_prompt=skill_prompt,
             model=model or (profile.model if profile else None),
+            effort=effort,
             engine=resolved_engine,
         )
 

@@ -407,6 +407,7 @@ class CodexProvider(BaseProvider):
         allowed_tools: Optional[list] = None,
         skill_prompt: Optional[str] = None,
         model: Optional[str] = None,
+        effort: Optional[str] = None,
     ):
         """Initialize provider state."""
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
@@ -414,6 +415,11 @@ class CodexProvider(BaseProvider):
         self._agent_profile = agent_profile
         # Explicit per-call override for profile.model, see _build_codex_command.
         self._model = model
+        # Explicit per-call reasoning-effort override (API-boundary validated;
+        # no profile-static counterpart -- a profile may pin one via
+        # codexConfig, which this explicit request outranks). Consumed by
+        # _build_codex_command.
+        self._effort = effort
 
     @property
     def blocks_orchestrated_input_while_waiting_user_answer(self) -> bool:
@@ -635,6 +641,17 @@ class CodexProvider(BaseProvider):
             if profile.codexConfig:
                 for key, value in profile.codexConfig.items():
                     command_parts.extend(["-c", _toml_override(key, value)])
+
+        # Explicit per-launch effort override -- the request-scoped analogue
+        # of the model override above, and applied even with no profile at
+        # all. Emitted after the profile's codexConfig block so an explicit
+        # request wins over a profile-static model_reasoning_effort on key
+        # conflict; _toml_scalar renders the TOML literal (quoted basic
+        # string) and the final shlex.join() quotes the whole -c token.
+        if self._effort:
+            command_parts.extend(
+                ["-c", f"model_reasoning_effort={_toml_scalar(self._effort)}"]
+            )
 
         # Suppress the startup update dialog at the source. Placed last so it
         # wins even if a profile sets check_for_update_on_startup=true.

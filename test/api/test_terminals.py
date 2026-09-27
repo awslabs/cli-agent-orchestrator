@@ -285,6 +285,112 @@ class TestTerminalCreationWithWorkingDirectory:
             assert response.status_code == 400
             mock_svc.create_terminal.assert_not_called()
 
+    def test_create_terminal_passes_effort(self, client):
+        """effort query param threads through to the service -- the per-launch
+        reasoning-effort override, validated against the provider's enum."""
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+        ):
+            mock_svc.create_terminal = AsyncMock(
+                return_value=Terminal(
+                    id="abcd5678",
+                    name="test-window",
+                    session_name="test-session",
+                    provider="codex",
+                    agent_profile="analyst",
+                )
+            )
+
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={
+                    "provider": "codex",
+                    "agent_profile": "analyst",
+                    "effort": "xhigh",
+                },
+            )
+
+            assert response.status_code == 201
+            call_kwargs = mock_svc.create_terminal.call_args.kwargs
+            assert call_kwargs.get("effort") == "xhigh"
+
+    def test_create_terminal_omitted_effort_forwards_none(self, client):
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+        ):
+            mock_svc.create_terminal = AsyncMock(
+                return_value=Terminal(
+                    id="abcd5678",
+                    name="test-window",
+                    session_name="test-session",
+                    provider="kiro_cli",
+                    agent_profile="analyst",
+                )
+            )
+
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={"provider": "kiro_cli", "agent_profile": "analyst"},
+            )
+
+            assert response.status_code == 201
+            call_kwargs = mock_svc.create_terminal.call_args.kwargs
+            assert call_kwargs.get("effort") is None
+
+    def test_create_terminal_rejects_invalid_effort(self, client):
+        """An effort outside the resolved provider's enum 400s at the
+        boundary -- a bad request, not the 404 this endpoint's generic
+        ValueError arm means -- before terminal_service is reached."""
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+        ):
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={
+                    "provider": "claude_code",
+                    "agent_profile": "analyst",
+                    "effort": "maximum",
+                },
+            )
+
+            assert response.status_code == 400
+            assert "effort" in response.json()["detail"]
+            mock_svc.create_terminal.assert_not_called()
+
+    def test_create_terminal_rejects_effort_for_unsupported_provider(self, client):
+        """A provider with no effort support rejects any non-empty effort."""
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+        ):
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "analyst",
+                    "effort": "high",
+                },
+            )
+
+            assert response.status_code == 400
+            assert "does not support" in response.json()["detail"]
+            mock_svc.create_terminal.assert_not_called()
+
     def test_create_terminal_kas_refusal_maps_to_400_not_404(self, client):
         """A KAS refusal is a bad request, not a missing resource.
 

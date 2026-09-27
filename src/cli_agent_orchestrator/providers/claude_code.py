@@ -253,6 +253,7 @@ class ClaudeCodeProvider(BaseProvider):
         allowed_tools: Optional[list] = None,
         skill_prompt: Optional[str] = None,
         model: Optional[str] = None,
+        effort: Optional[str] = None,
     ):
         """Initialize provider state."""
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
@@ -262,6 +263,10 @@ class ClaudeCodeProvider(BaseProvider):
         # --model resolution below) -- e.g. a handoff/assign caller pinning a
         # specific model for one worker without needing a dedicated profile.
         self._model = model
+        # Explicit per-call reasoning-effort override (API-boundary validated;
+        # no profile-static counterpart -- unlike model there is nothing to
+        # resolve against a profile). Consumed by _build_claude_command.
+        self._effort = effort
         # Native-status dispatch tracking (_task_dispatched + flush-wait timers)
         # lives on BaseProvider and is consumed by _resolve_native_status().
         self._input_generation: int = 0
@@ -502,6 +507,15 @@ class ClaudeCodeProvider(BaseProvider):
             "|CLAUDE_CODE_EFFORT_LEVEL'"
             ") 2>/dev/null"
         )
+        # Per-launch effort override: exported inside the pane compound
+        # command (pane-command-local, not the session env, so no blocklist
+        # change), after the unset above so the value cannot be wiped by it.
+        # shlex.quote keeps the value data, not shell syntax.
+        if self._effort:
+            return (
+                f"{unset_cmd}; "
+                f"export CLAUDE_CODE_EFFORT_LEVEL={shlex.quote(self._effort)}; {claude_cmd}"
+            )
         return f"{unset_cmd}; {claude_cmd}"
 
     @staticmethod
