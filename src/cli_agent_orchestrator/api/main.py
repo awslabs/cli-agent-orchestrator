@@ -3756,12 +3756,25 @@ async def create_terminal_in_session(
             try:
                 caller_row = await asyncio.to_thread(get_terminal_metadata, caller_id)
                 remote_working_directory = (caller_row or {}).get("working_directory")
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                # Retryable, NOT a silent fallback. Proceeding with None makes the
+                # bridge use its own process cwd, which can place the worker outside
+                # the caller's checkout and point `use_worktree` at the wrong
+                # repository -- the precise misrouting this recorded-cwd path exists
+                # to prevent. Degrading to the old behaviour here defeats the fix
+                # (Copilot review on #802).
                 logger.warning(
-                    "could not read the recorded working directory for caller %s; "
-                    "the runtime will choose its own",
+                    "could not read the recorded working directory for caller %s: %s",
                     caller_id,
-                    exc_info=True,
+                    exc,
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=(
+                        f"cannot read the working directory recorded for caller "
+                        f"'{caller_id}' ({exc}); retry rather than launching the "
+                        "worker in an unknown directory"
+                    ),
                 )
 
         if caller_runtime is not None:

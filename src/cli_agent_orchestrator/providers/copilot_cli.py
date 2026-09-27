@@ -236,7 +236,14 @@ class CopilotCliProvider(BaseProvider):
                 # Empty when no shared endpoint is configured.
                 "env": {
                     "CAO_TERMINAL_ID": self.terminal_id,
-                    **shared_endpoint_child_env(),
+                    # persisted=True to OMIT the token: this dict is serialized
+                    # into --additional-mcp-config on the command line, where any
+                    # local user or process monitor can read it. The child inherits
+                    # CAO_RUNTIME_TOKEN from this process instead. codex and Kimi
+                    # were fixed for the same reason; leaving this one on the
+                    # grounds that argv is "launch-time, not at rest" was the same
+                    # mistake twice (Copilot review on #802).
+                    **shared_endpoint_child_env(persisted=True),
                 },
             }
         }

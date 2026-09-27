@@ -219,17 +219,26 @@ async def test_an_explicit_cwd_is_not_overridden_by_the_callers(
 @patch("cli_agent_orchestrator.api.main.terminal_service")
 @patch("cli_agent_orchestrator.api.main.runtime_registry")
 @patch("cli_agent_orchestrator.api.main.get_terminal_metadata")
-async def test_an_unreadable_caller_row_does_not_block_the_launch(
+async def test_an_unreadable_caller_row_is_refused_not_launched_blind(
     mock_meta, mock_registry, mock_service, mock_launch
 ):
-    """Losing the inherited cwd is a worse default, not a reason to refuse work."""
+    """An unreadable row must not degrade to the bridge's own process cwd.
+
+    This asserted the launch proceeded with None, on the reasoning that losing the
+    inherited cwd is a worse default but not a reason to refuse work. That reasoning
+    defeats the fix: None makes the bridge use its own cwd, which can place the
+    worker outside the caller's checkout and point `use_worktree` at the wrong
+    repository — the exact misrouting the recorded-cwd path exists to prevent
+    (Copilot review on #802). 503 so the caller retries.
+    """
     mock_registry.is_remote.return_value = True
     mock_registry.runtime_for_terminal.return_value = RUNTIME
     mock_registry.placement.return_value = (True, RUNTIME)
     mock_launch.return_value = _remote_terminal()
     mock_meta.side_effect = RuntimeError("database unreachable")
 
-    await _call(working_directory=None)
-
-    body = mock_launch.call_args.args[1]
-    assert body.working_directory is None
+    with pytest.raises(HTTPException) as exc:
+        await _call(working_directory=None)
+    assert exc.value.status_code == 503
+    assert "working directory" in exc.value.detail
+    mock_launch.assert_not_awaited()

@@ -197,3 +197,19 @@ class TestAProfilePlantedTokenNeverPersists:
     def test_unrelated_profile_keys_survive_either_way(self):
         for persisted in (True, False):
             assert self._resolved(persisted)["env"]["unrelated"] == "kept"
+
+    def test_copilot_command_carries_no_token(self, monkeypatch):
+        """The third argv site. Fixing two and leaving this one was the same
+        mistake twice (Copilot review on #802)."""
+        from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.copilot_cli.load_agent_profile",
+            lambda *_a, **_k: self._profile_with_bundled_server(),
+        )
+        provider = object.__new__(CopilotCliProvider)
+        provider.terminal_id = "abcd1234"
+        provider._agent_profile = None
+        rendered = provider._build_runtime_mcp_config()
+        assert TOKEN not in rendered, "copilot put the runtime token in argv"
+        assert ENDPOINT in rendered, "copilot lost the endpoint too"
