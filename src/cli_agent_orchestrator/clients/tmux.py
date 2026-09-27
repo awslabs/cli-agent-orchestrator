@@ -403,6 +403,10 @@ class TmuxClient:
         # building its targets from its arguments, as it always did.
         self.pane_mode = pane_mode
 
+    # Pause before retrying a failed exit-empty set, long enough for a server
+    # that was killed a moment earlier to finish exiting and drop its socket.
+    _EXIT_EMPTY_RETRY_DELAY_S = 0.05
+
     def _set_server_exit_empty_off(self) -> None:
         """Keep the tmux server alive across a transient zero-session moment.
 
@@ -449,6 +453,15 @@ class TmuxClient:
         treats ``start-server`` there as a no-op and simply applies the
         ``set-option``.
 
+        A nonzero result is retried once after a short pause. ``tmux
+        kill-server`` returns before the old server process has exited, so a
+        create right after an external kill can connect to that dying server,
+        which drops the connection and exits: tmux prints ``server exited
+        unexpectedly``, the option lands nowhere, and the ``new_session`` that
+        follows starts a fresh server with the default ``exit-empty on``. By
+        the retry the old socket is gone, so ``start-server`` starts the new
+        server and sets the option in the same invocation.
+
         Best-effort: a failure here must never block a session launch. Because
         libtmux does not raise for this failure mode, the result's own
         ``returncode`` is checked explicitly rather than relying on a caught
@@ -456,6 +469,11 @@ class TmuxClient:
         """
         try:
             result = self.server.cmd("start-server", ";", "set-option", "-s", "exit-empty", "off")
+            if result.returncode != 0:
+                time.sleep(self._EXIT_EMPTY_RETRY_DELAY_S)
+                result = self.server.cmd(
+                    "start-server", ";", "set-option", "-s", "exit-empty", "off"
+                )
         except Exception:
             logger.warning("failed to set tmux server option 'exit-empty off'", exc_info=True)
             return
