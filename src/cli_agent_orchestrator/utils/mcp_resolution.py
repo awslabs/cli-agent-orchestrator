@@ -43,6 +43,10 @@ logger = logging.getLogger(__name__)
 # ``mcp_server.http_hosting`` to keep this leaf utility free of that dependency.
 SHARED_ENDPOINT_URL_ENV = "CAO_MCP_HTTP_URL"
 RUNTIME_TOKEN_ENV = "CAO_RUNTIME_TOKEN"
+# Points at an owner-only file holding the token, for a child whose env is
+# serialized somewhere readable (argv, or a config file it re-reads). A path is
+# safe to write there; the value is not.
+RUNTIME_TOKEN_FILE_ENV = "CAO_RUNTIME_TOKEN_FILE"
 
 # The bundled orchestration MCP server's console-script name.
 CAO_MCP_SERVER_COMMAND = "cao-mcp-server"
@@ -158,6 +162,55 @@ def shared_endpoint_url() -> str:
     return os.environ.get(SHARED_ENDPOINT_URL_ENV, "").strip()
 
 
+def _materialize_token_file() -> str:
+    """Write the channel token to an owner-only file and return its path.
+
+    Cached per process: the path is stable for the life of the server, so a
+    persisted provider config stays valid across relaunches of the provider, and
+    repeated resolution does not litter the tmp dir.
+
+    Returns "" when there is no token to write, which leaves the caller to emit no
+    file variable at all — the shim then reports the credential as absent, which is
+    the legible failure.
+    """
+    global _TOKEN_FILE_PATH
+    token = os.environ.get(RUNTIME_TOKEN_ENV, "").strip()
+    if not token:
+        return ""
+    if _TOKEN_FILE_PATH:
+        existing = Path(_TOKEN_FILE_PATH)
+        try:
+            # Reuse only if the CONTENT still matches. Caching on existence alone
+            # served a stale credential after an in-process token rotation, which
+            # the shim would then present and have rejected.
+            if existing.read_text(encoding="utf-8").strip() == token:
+                return _TOKEN_FILE_PATH
+        except OSError:
+            pass
+    try:
+        from cli_agent_orchestrator.constants import CAO_HOME_DIR
+        from cli_agent_orchestrator.utils.atomic_file import write_owner_only
+
+        tmp_dir = Path(CAO_HOME_DIR) / "tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        target = tmp_dir / "runtime-token"
+        write_owner_only(target, token)
+        _TOKEN_FILE_PATH = str(target)
+        return _TOKEN_FILE_PATH
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "could not materialize the runtime token file; the forwarded child will "
+            "have to inherit %s from the environment",
+            RUNTIME_TOKEN_ENV,
+            exc_info=True,
+        )
+        return ""
+
+
+#: Cached owner-only token file path, materialized on first use.
+_TOKEN_FILE_PATH = ""
+
+
 def shared_endpoint_child_env(*, persisted: bool = False) -> dict:
     """Env a forwarded MCP child needs, for callers that build env themselves.
 
@@ -206,6 +259,16 @@ def shared_endpoint_child_env(*, persisted: bool = False) -> dict:
         return {}
     env = {SHARED_ENDPOINT_URL_ENV: url}
     if persisted:
+        # Hand over a PATH, not the value. Omitting the credential entirely was
+        # wrong: the shim then relies on inheriting the parent environment, and
+        # that is not portable — Kimi does not pass its environment to MCP
+        # subprocesses, so the shim exited at startup and every forwarded tool call
+        # failed (Copilot review on #802). A 0600 file satisfies both constraints:
+        # nothing readable lands in argv or in a persisted config, and the child
+        # does not depend on inheritance.
+        token_file = _materialize_token_file()
+        if token_file:
+            env[RUNTIME_TOKEN_FILE_ENV] = token_file
         return env
     token = os.environ.get(RUNTIME_TOKEN_ENV, "").strip()
     if token:
@@ -290,7 +353,18 @@ def resolve_mcp_server_config(
             # place — in the one form that actually lands somewhere durable, a file
             # or argv. That inverted the guard: it held for the live path and was
             # absent exactly where a planted credential persists (own review).
-            for reserved in (SHARED_ENDPOINT_URL_ENV, RUNTIME_TOKEN_ENV):
+            # RUNTIME_TOKEN_FILE_ENV belongs here for exactly the same reason as
+            # the other two, and leaving it out reintroduced the hole one level
+            # down: `extra` normally clobbers it, but when _materialize_token_file
+            # returns "" (no token configured, or the write failed) there is no key
+            # to clobber with — so an agent-editable profile's own
+            # CAO_RUNTIME_TOKEN_FILE survived into the persisted config and the shim
+            # would read its credential from an attacker-chosen path.
+            for reserved in (
+                SHARED_ENDPOINT_URL_ENV,
+                RUNTIME_TOKEN_ENV,
+                RUNTIME_TOKEN_FILE_ENV,
+            ):
                 if reserved in profile_env and reserved not in extra:
                     logger.warning(
                         "dropping profile-supplied %s: it is operator-controlled and "

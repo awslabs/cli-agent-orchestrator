@@ -30,6 +30,7 @@ server would reintroduce exactly the per-agent control server this removes.
 
 import logging
 import os
+import pathlib
 import sys
 
 from cli_agent_orchestrator.mcp_server.caller_context import CALLER_TERMINAL_HEADER
@@ -38,6 +39,7 @@ from cli_agent_orchestrator.mcp_server.http_hosting import (
     RUNTIME_TOKEN_HEADER,
     shared_endpoint_url,
 )
+from cli_agent_orchestrator.utils.mcp_resolution import RUNTIME_TOKEN_FILE_ENV
 
 logger = logging.getLogger(__name__)
 
@@ -53,9 +55,29 @@ def build_forward_headers() -> dict:
     """
     token = os.environ.get(RUNTIME_TOKEN_ENV, "").strip()
     if not token:
+        # A FILE is the credential-safe delivery path for a provider whose MCP
+        # config is serialized into argv or into a config file it re-reads. The
+        # value would be world-readable there (argv is readable by every local
+        # process); a path is not, and the file itself is 0600.
+        #
+        # This exists because the two previous mechanisms each failed one way: the
+        # value in the config exposed it, and relying on the child inheriting the
+        # parent environment is not portable — Kimi does not pass its environment
+        # to MCP subprocesses, so omitting the value there made the shim exit at
+        # startup and every forwarded tool call fail (Copilot review on #802).
+        token_file = os.environ.get(RUNTIME_TOKEN_FILE_ENV, "").strip()
+        if token_file:
+            try:
+                token = pathlib.Path(token_file).read_text(encoding="utf-8").strip()
+            except OSError as exc:
+                raise SystemExit(
+                    f"{SHIM_NAME} could not read {RUNTIME_TOKEN_FILE_ENV}=" f"{token_file}: {exc}"
+                ) from exc
+    if not token:
         raise SystemExit(
-            f"{SHIM_NAME} requires {RUNTIME_TOKEN_ENV} to authenticate against the "
-            "shared MCP endpoint; refusing to start unauthenticated"
+            f"{SHIM_NAME} requires {RUNTIME_TOKEN_ENV} or {RUNTIME_TOKEN_FILE_ENV} to "
+            "authenticate against the shared MCP endpoint; refusing to start "
+            "unauthenticated"
         )
     headers = {RUNTIME_TOKEN_HEADER: token}
 
