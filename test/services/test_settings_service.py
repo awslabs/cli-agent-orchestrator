@@ -187,7 +187,8 @@ class TestSave:
         assert json.loads(settings_file.read_text()) == {"new": True}
         assert settings_file.stat().st_mode & 0o777 == 0o640
 
-    def test_concurrent_reader_never_observes_partial_json(self, settings_file, monkeypatch):
+    def test_concurrent_writes_and_reads_surface_writer_errors(self, settings_file, monkeypatch):
+        """Exercise concurrent access; replace and mode assertions pin atomicity."""
         monkeypatch.setattr(atomic_file, "LOCK_DIR", settings_file.parent / "locks")
         _save({"iteration": -1, "payload": "x" * 4096})
         finished = threading.Event()
