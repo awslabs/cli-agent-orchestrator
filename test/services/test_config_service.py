@@ -6,11 +6,13 @@ in the issue.
 """
 
 import json
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
 from cli_agent_orchestrator.services import config_service as cs
+from cli_agent_orchestrator.services import settings_service
 from cli_agent_orchestrator.services.config_service import ConfigService
 from cli_agent_orchestrator.utils import atomic_file
 
@@ -240,6 +242,65 @@ class TestSetAndPath:
         assert replacements[0][1] == settings_file
         assert json.loads(settings_file.read_text())["workflow"]["require_approval"] is False
         assert settings_file.stat().st_mode & 0o777 == 0o640
+
+    def test_config_and_settings_writers_share_lock_through_symlinked_home(
+        self, tmp_path, monkeypatch
+    ):
+        real_home = tmp_path / "real-home"
+        real_home.mkdir()
+        linked_home = tmp_path / "linked-home"
+        linked_home.symlink_to(real_home, target_is_directory=True)
+        settings_file = linked_home / "settings.json"
+        monkeypatch.setattr(settings_service, "CAO_HOME_DIR", linked_home)
+        monkeypatch.setattr(settings_service, "SETTINGS_FILE", settings_file)
+        monkeypatch.setattr(atomic_file, "LOCK_DIR", tmp_path / "locks")
+        lock_paths = []
+        real_file_lock = atomic_file._file_lock
+
+        @contextmanager
+        def _record_file_lock(lock_path, timeout):
+            lock_paths.append(lock_path)
+            with real_file_lock(lock_path, timeout):
+                yield
+
+        monkeypatch.setattr(atomic_file, "_file_lock", _record_file_lock)
+
+        cs._save_raw({"writer": "config"})
+        settings_service._save({"writer": "settings"})
+
+        assert lock_paths == [
+            atomic_file._lock_path_for(real_home / "settings.json"),
+            atomic_file._lock_path_for(real_home / "settings.json"),
+        ]
+
+    def test_delegation_and_migration_do_not_reenter_settings_lock(
+        self, _isolated_settings, monkeypatch
+    ):
+        monkeypatch.setattr(
+            atomic_file, "LOCK_DIR", _isolated_settings["settings"].parent / "locks"
+        )
+        real_file_lock = atomic_file._file_lock
+        lock_held = False
+
+        @contextmanager
+        def _reject_reentry(lock_path, timeout):
+            nonlocal lock_held
+            assert not lock_held, "settings lock was re-entered"
+            lock_held = True
+            try:
+                with real_file_lock(lock_path, timeout):
+                    yield
+            finally:
+                lock_held = False
+
+        monkeypatch.setattr(atomic_file, "_file_lock", _reject_reentry)
+
+        ConfigService.set("agents.dirs.kiro_cli", "/tmp/agents")
+        ConfigService.set("skills.extra_dirs", ["/tmp/skills"])
+        ConfigService.set("memory.enabled", False)
+        _isolated_settings["legacy"].write_text(json.dumps({"terminal_backend": "herdr"}))
+
+        assert ConfigService.get("terminal.backend") == "herdr"
 
     def test_set_agents_extra_dirs_routes_through_settings_service(self, _isolated_settings):
         ConfigService.set("agents.extra_dirs", ["/a", "/b"])
