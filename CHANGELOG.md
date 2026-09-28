@@ -106,8 +106,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wherever the data dir is unreadable. The import is now lazy.
 
 - **The local API bearer was sent to other nodes.** `handoff`/`assign` with a
-  `target_host`, `delete_terminal` with a `target_host`, and a remote worker's
-  `send_message` back to its supervisor's `CAO_CALLBACK_URL` all attached
+  `target_host`, `delete_terminal` with a `target_host`, `get_handoff_result`
+  with a `target_host`, and a remote worker's `send_message` back to its
+  supervisor's `CAO_CALLBACK_URL` all attached
   `CAO_AUTH_LOCAL_TOKEN` to requests aimed at another host. The token now goes
   only to this node's own `API_BASE_URL`; cross-node requests carry no
   `Authorization` header (the elastic worker gateway headers are unaffected).
@@ -115,12 +116,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   multi-node deployment that gave every node the same `CAO_AUTH_LOCAL_TOKEN`
   was authenticating these cross-node calls by accident, and they now fail
   with 401 on the remote node; the token is documented as this node's
-  loopback credential only.
+  loopback credential only (#822)
 
 - **Both MCP servers now pin `transport="stdio"`.** FastMCP otherwise honours
   `FASTMCP_TRANSPORT` from the environment, and an `http` value would have
   turned a stdio tool into a loopback listener with no MCP-level auth in front
-  of its API hop.
+  of its API hop (#822)
 
 ### Changed
 

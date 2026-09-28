@@ -637,3 +637,12 @@ class TestBearerStaysOnTheLocalNode:
         args, kwargs = mock_requests.delete.call_args
         assert args[0] == "http://cao-worker-0:9889/terminals/beef0003"
         assert kwargs["headers"] is None
+
+    @patch(f"{_SRV}.get_local_bearer", return_value="tok")
+    @patch(f"{_SRV}.requests")
+    def test_local_delete_still_carries_bearer(self, mock_requests, _bearer):
+        mock_requests.delete.return_value = _response(200)
+        delete_terminal("beef0004")
+        args, kwargs = mock_requests.delete.call_args
+        assert args[0] == f"{API_BASE_URL}/terminals/beef0004"
+        assert kwargs["headers"] == {"Authorization": "Bearer tok"}

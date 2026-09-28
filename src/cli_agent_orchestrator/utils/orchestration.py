@@ -63,7 +63,11 @@ def _mcp_timeout() -> float:
 def _auth_headers() -> Dict[str, str]:
     """Return the ``Authorization`` header for the internal client->API hop, if any.
 
-    Mirrors ``mcp_server.utils._auth_headers`` / ``mcp_server.app_tools._auth_headers``:
+    Same behaviour as ``mcp_server.utils._auth_headers`` / ``mcp_server.app_tools._auth_headers``;
+    the copies are per module, and what they share is the decision that matters,
+    ``_is_local_api`` (see ``_auth_headers_for``). ``test/test_bearer_scope_boundary.py``
+    holds every ``requests`` call in ``src/`` to the rule that an unscoped helper may
+    only be paired with a URL built on ``API_BASE_URL``. This helper
     attaches the operator-provisioned ``CAO_AUTH_LOCAL_TOKEN`` when the auth layer is
     enabled, and returns an empty mapping default-off so the no-auth posture stays
     byte-for-byte unchanged. Every ``requests`` call in this module passes
@@ -78,7 +82,15 @@ def _auth_headers() -> Dict[str, str]:
 
 
 def _is_local_api(base_url: str) -> bool:
-    """True when ``base_url`` is this node's own cao-server (``API_BASE_URL``)."""
+    """True when ``base_url`` is this node's own cao-server (``API_BASE_URL``).
+
+    An exact string compare after trailing-slash normalisation, deliberately: it
+    is not this module's job to decide that ``localhost`` or ``::1`` names the
+    same listener as ``CAO_API_HOST``. The normal local path passes the
+    ``API_BASE_URL`` constant itself, and a differently spelled self-reference
+    fails closed (no bearer, 401) rather than leaking the token on a guess.
+    ``mcp_server.utils._auth_headers_for`` shares this predicate.
+    """
     return base_url.rstrip("/") == API_BASE_URL.rstrip("/")
 
 
@@ -89,8 +101,9 @@ def _auth_headers_for(base_url: str) -> Dict[str, str]:
     Requests whose base URL came from a ``target_host`` argument or a
     ``CAO_CALLBACK_URL`` env var go to some other host, and sending the token
     there is a disclosure: whoever answers at that URL receives the operator's
-    bearer. Callers that may address another node use this instead of
-    ``_auth_headers()``. These hops carry no credential for a remote node's own
+    bearer. Every caller here that may address another node uses this instead
+    of ``_auth_headers()``; ``get_handoff_result`` in ``mcp_server.server`` uses
+    the ``mcp_server.utils`` twin. These hops carry no credential for a remote node's own
     auth layer; a deployment that provisioned the same token to every node was
     authenticating cross-node calls by accident, and those calls now arrive
     without a bearer.
