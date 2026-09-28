@@ -19,6 +19,8 @@ from typing import Optional
 import click
 import requests
 
+from cli_agent_orchestrator.security.bearer import authorization_header
+
 #: Optional bearer token for servers that enforce API scopes.
 API_TOKEN_ENV = "CAO_API_TOKEN"
 
@@ -63,10 +65,10 @@ def auth_headers() -> dict:
     Public because not every call can go through :func:`api_request`: commands
     that assemble their own request (``cao launch``) still need the credential,
     and a hand-rolled call that omits it fails only on a server with auth
-    enabled — the configuration least likely to be the one under test.
+    enabled — the configuration least likely to be the one under test. The
+    bearer token goes in the Authorization header via the shared builder.
     """
-    token = api_token()
-    return {"Authorization": f"Bearer {token}"} if token else {}
+    return authorization_header(api_token())
 
 
 def server_base_url() -> str:

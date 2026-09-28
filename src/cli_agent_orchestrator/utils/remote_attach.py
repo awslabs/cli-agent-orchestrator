@@ -21,6 +21,8 @@ from typing import Optional
 
 import click
 
+from cli_agent_orchestrator.security.bearer import authorization_header
+
 
 def _ws_url(base_url: str, terminal_id: str) -> str:
     scheme_swapped = base_url.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
@@ -42,10 +44,11 @@ def attach_remote_terminal(terminal_id: str, base_url: str, token: Optional[str]
     # a WebSocket handshake; this client can. A query parameter is logged by
     # uvicorn and by any proxy in between, and the access log's redaction filter
     # is keyed on the parameter names the browser paths use, so a native attach
-    # would have persisted a reusable bearer token in plaintext (Copilot review
-    # on #802). ``token`` is now redacted as well, for the browser path that has
-    # no alternative — but the native path should not need the redaction.
-    headers = {"Authorization": f"Bearer {token}"} if token else None
+    # would have persisted a reusable bearer token in plaintext (review on
+    # #802). ``token`` is now redacted as well, for the browser path that has
+    # no alternative — but the native path should not need the redaction. The
+    # bearer token is carried in the Authorization header via the shared builder.
+    headers = authorization_header(token) or None
 
     if not sys.stdin.isatty():
         raise click.ClickException("interactive attach requires a TTY (use --headless)")

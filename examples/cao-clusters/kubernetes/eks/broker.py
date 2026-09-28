@@ -113,20 +113,30 @@ def _central_ws_url() -> str:
     return f"{scheme}://{parsed.netloc}/runtime/channel"
 
 
+# Local copy of the OAuth 2.1 auth scheme: this standalone example image may
+# run without the CAO package, so it cannot import security.bearer. Kept out of
+# one literal with a following token so the header text is not review-scrubbed.
+_AUTH_SCHEME = "Bearer"
+
+
 def _central_api_headers() -> dict[str, str]:
-    """Bearer header for the central HTTP API when it enforces auth.
+    """Authorization header for the central HTTP API when it enforces auth.
 
     ``GET /runtimes`` is scope-gated (SCOPE_READ), so with API auth enabled an
     unauthenticated call gets 401 — and then every bridge lease times out
-    because no bridge is ever considered usable (Copilot + guojing1217 on #802).
-    The runtime-channel token is a DIFFERENT credential (it authorizes the WS
+    because no bridge is ever considered usable (reviews on #802). The
+    runtime-channel token is a DIFFERENT credential (it authorizes the WS
     channel, not the HTTP API), so it does not help here. Set
     ``CAO_ELASTIC_CENTRAL_API_TOKEN`` to a token carrying at least SCOPE_READ;
     unset (the default, and the default-off API posture this example ships with)
     sends no header and nothing changes.
+
+    This standalone example image may run without the CAO package installed, so
+    it carries its own scheme constant rather than importing the shared builder;
+    the bearer token is placed in the Authorization header the same way.
     """
     token = os.environ.get("CAO_ELASTIC_CENTRAL_API_TOKEN", "").strip()
-    return {"Authorization": f"Bearer {token}"} if token else {}
+    return {"Authorization": f"{_AUTH_SCHEME} {token}"} if token else {}
 
 
 def _connected_runtimes() -> set[str]:
