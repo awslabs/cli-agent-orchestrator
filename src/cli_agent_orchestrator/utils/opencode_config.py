@@ -17,8 +17,8 @@ from typing import Any, Dict, Iterable, List, Mapping, Set
 from cli_agent_orchestrator.constants import OPENCODE_CONFIG_DIR, OPENCODE_CONFIG_FILE, SKILLS_DIR
 from cli_agent_orchestrator.utils.atomic_file import write_owner_only
 from cli_agent_orchestrator.utils.mcp_resolution import (
+    apply_mcp_env_policy,
     resolve_cao_mcp_command,
-    shared_endpoint_child_env_for,
 )
 from cli_agent_orchestrator.utils.path_validation import flatten_path_separators
 
@@ -176,18 +176,12 @@ def translate_mcp_server_config(cao_config: Dict[str, Any]) -> Dict[str, Any]:
         "command": full_command,
         "enabled": True,
     }
-    environment = dict(cao_config.get("env") or {})
-    # The resolver may have swapped in the forwarding shim (#745), which
-    # needs the endpoint and the token-file path here. Empty when none is
-    # configured, so an entry that had no "env" still gets no "environment"
-    # key — and empty for a server that is not ours: this translator runs over
-    # every profile and plugin entry, and ``opencode.json`` is written to disk,
-    # so an unconditional merge would persist forwarding config beside
-    # third-party commands.
-    # persisted=True selects the command-resolution order; the entry carries
-    # CAO_RUNTIME_TOKEN_FILE (a path), never the token value, so serializing it
-    # into ``opencode.json`` puts no credential at rest.
-    environment.update(shared_endpoint_child_env_for(cao_config.get("command", ""), persisted=True))
+    # Reserved CAO keys are set by the deployment only: a profile's own
+    # CAO_RUNTIME_TOKEN / CAO_MCP_HTTP_URL / CAO_RUNTIME_TOKEN_FILE are dropped
+    # from every entry, and only the bundled server gets the endpoint and the
+    # token-file path (never the token value). An entry with no env still gets
+    # no "environment" key.
+    environment = apply_mcp_env_policy(cao_config.get("env"), cao_config.get("command", ""))
     if environment:
         result["environment"] = environment
     # Emitted only when the source actually has one: an invented `cwd` would

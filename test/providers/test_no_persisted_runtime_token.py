@@ -1,27 +1,11 @@
-"""No provider puts CAO_RUNTIME_TOKEN in a config file OR in argv (#802).
+"""No provider puts the runtime token's value in a config file or in argv.
 
-This class of bug was fixed three times before it stayed fixed, and each round
-found more call sites than the last: first the resolver's default, then two direct
-callers, then two INDIRECT ones behind ``resolve_mcp_server_config``, then three
-more file-backed writers (grok, minimax, omp). Reading the definition proves
-nothing, and neither does auditing the callers you happen to think of.
-
-So this is a behavioural sweep rather than a per-site assertion: for every
-provider that serializes an MCP config, build it with a shared endpoint
-configured and assert the token's VALUE does not appear in the bytes. A new
-provider that forgets ``persisted=True`` fails here without anyone remembering to
-add a case for it.
-
-The first version of this sweep covered only FILE-backed providers, and the review
-caught the gap: codex and Kimi serialize their MCP config into command-line
-arguments, where the credential is readable by any local process listing. argv is
-not better than a 0600 file — it is worse. Both are covered below.
-
-The token's VALUE is never written into these configs at all: CAO's own
-forwarded server receives ``CAO_RUNTIME_TOKEN_FILE`` (a path to an owner-only
-0600 file), and the shim reads the value from that file. A path is safe wherever
-the config lands — argv or a file — so the credential is never at rest and never
-in a process listing. See ``shared_endpoint_child_env``.
+A behavioural sweep: every provider that serializes an MCP config is built with a
+shared endpoint and a token configured, and the token's VALUE must not appear in the
+bytes it writes, whether a file (Kiro, Cursor, OpenCode, Grok, MiniMax, OMP) or
+argv (codex, Kimi, Copilot). CAO's own server entry receives
+``CAO_RUNTIME_TOKEN_FILE`` (a path to an owner-only file) and the shim reads the
+value from there; a path is safe wherever the config lands.
 """
 
 import json

@@ -22,6 +22,7 @@ from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.mcp_resolution import (
+    apply_mcp_env_policy,
     resolve_cao_mcp_command,
     shared_endpoint_child_env,
 )
@@ -232,17 +233,12 @@ class CopilotCliProvider(BaseProvider):
                 "args": mcp_args,
                 "disabled": False,
                 # The resolver may have swapped in the forwarding shim (#745);
-                # it then needs the endpoint and token in this child's env.
+                # it then needs the endpoint and the token-file path. This dict
+                # is serialized into --additional-mcp-config on the command line,
+                # so it carries CAO_RUNTIME_TOKEN_FILE (a path), never the token.
                 # Empty when no shared endpoint is configured.
                 "env": {
                     "CAO_TERMINAL_ID": self.terminal_id,
-                    # persisted=True to OMIT the token: this dict is serialized
-                    # into --additional-mcp-config on the command line, where any
-                    # local user or process monitor can read it. The child inherits
-                    # CAO_RUNTIME_TOKEN from this process instead. codex and Kimi
-                    # were fixed for the same reason; leaving this one on the
-                    # grounds that argv is "launch-time, not at rest" was the same
-                    # mistake twice (Copilot review on #802).
                     **shared_endpoint_child_env(persisted=True),
                 },
             }
@@ -273,7 +269,7 @@ class CopilotCliProvider(BaseProvider):
                 translated = COPILOT_TRANSPORTS.get(declared) if isinstance(declared, str) else None
                 if translated is not None:
                     entry["type"] = translated
-                env = dict(entry.get("env", {}))
+                env = apply_mcp_env_policy(entry.get("env"), entry.get("command", ""))
                 env.setdefault("CAO_TERMINAL_ID", self.terminal_id)
                 entry["env"] = env
                 entry.setdefault("disabled", False)

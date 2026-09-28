@@ -60,8 +60,8 @@ from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.atomic_file import write_owner_only
 from cli_agent_orchestrator.utils.mcp_resolution import (
+    apply_mcp_env_policy,
     resolve_cao_mcp_command,
-    shared_endpoint_child_env_for,
 )
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
@@ -430,18 +430,12 @@ class AntigravityCliProvider(BaseProvider):
                     "command": command,
                     "args": args,
                 }
-                env = dict(cfg.get("env", {}))
+                # Reserved CAO keys are set by the deployment only: a profile's
+                # own CAO_RUNTIME_TOKEN / CAO_MCP_HTTP_URL / CAO_RUNTIME_TOKEN_FILE
+                # are dropped from every entry, and only the bundled server gets
+                # the endpoint and the token-file path (never the token value).
+                env = apply_mcp_env_policy(cfg.get("env"), cfg.get("command", ""))
                 env["CAO_TERMINAL_ID"] = self.terminal_id
-                # The resolver may have swapped in the forwarding shim
-                # (#745), which needs the endpoint and the token-file path
-                # here. Empty when no shared endpoint is configured — and empty
-                # for a server that is not ours, which is launched as declared
-                # and must not be handed the channel credential (this loop
-                # covers every profile/plugin entry, not just the bundled one).
-                # persisted=True selects the command-resolution order; the
-                # entry carries CAO_RUNTIME_TOKEN_FILE (a path), never the token
-                # value, so writing this config to disk is safe.
-                env.update(shared_endpoint_child_env_for(cfg.get("command", ""), persisted=True))
                 entry["env"] = env
                 # Antigravity documents `cwd` ("Working directory for `stdio`
                 # servers."), so an agent plugin's directory is carried natively.

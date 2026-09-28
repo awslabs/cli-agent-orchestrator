@@ -1,28 +1,18 @@
-"""EVERY provider must keep CAO_RUNTIME_TOKEN out of its MCP config (#802).
+"""Every provider builds MCP env through CAO's shared policy, never with the token.
 
-This finding was filed five separate times, each naming a different site, because
-each round I fixed the site that was named instead of the property being violated.
-The sites, in the order they were reported: the resolver's own default; opencode and
-antigravity; cursor and claude_code (indirectly, through
-``resolve_mcp_server_config``'s default); grok, minimax and omp; then codex, kimi
-and copilot putting it in argv.
+The runtime-channel token's value is never written into an MCP config: the bundled
+server receives ``CAO_RUNTIME_TOKEN_FILE`` (a path) from the deployment, and a
+profile's own reserved keys are dropped (see ``apply_mcp_env_policy``). This
+module checks the two static properties that keep that true for every provider,
+including ones added later:
 
-So this test enumerates the property rather than the instances. It discovers every
-provider module that builds an MCP config and asserts each one asks for the token to
-be omitted — which means a provider added next month is covered without anyone
-remembering this file exists.
+* each module that builds MCP config calls one of the shared resolver/policy
+  functions (discovery also guards itself against silently finding nothing);
+* no provider module writes ``CAO_RUNTIME_TOKEN`` as a key of an env mapping.
 
-Two ways a provider may legitimately do it:
-
-* ``persisted=True`` — for a config written to a FILE the provider re-reads. This
-  also selects the stable PATH launcher for command resolution, which is what a
-  persisted path wants.
-* ``omit_token=True`` — for a config serialized into ARGV. Same token behaviour, but
-  it keeps the interpreter-sibling command resolution, which a config rebuilt on
-  every launch needs (a PATH lookup there can resolve to a different install).
-
-argv is not safer than a file: a 0600 file is readable by the owner, while argv is
-readable by every local process. Both must omit it.
+The behavioural side (the value never appears in files or argv, planted keys are
+stripped) is covered by ``test_no_persisted_runtime_token.py`` and
+``test_profile_cannot_plant_reserved_mcp_env.py``.
 """
 
 import ast
@@ -36,34 +26,41 @@ PROVIDERS_DIR = _REPO_ROOT / "src" / "cli_agent_orchestrator" / "providers"
 EXTRA_MODULES = [
     _REPO_ROOT / "src" / "cli_agent_orchestrator" / "utils" / "opencode_config.py",
 ]
-RESOLVERS = {
+POLICY_CALLS = {
     "resolve_mcp_server_config",
+    "apply_mcp_env_policy",
     "shared_endpoint_child_env",
-    "shared_endpoint_child_env_for",
 }
-# Names that mean "leave the token out".
-OMITTING_KWARGS = {"persisted", "omit_token"}
+TOKEN_NAMES = {"CAO_RUNTIME_TOKEN", "RUNTIME_TOKEN_ENV"}
 
 
-def _modules_building_mcp_config():
-    """Every module that calls a resolver, so a new provider is picked up for free."""
-    candidates = (
+def _candidates():
+    return (
         sorted(p for p in PROVIDERS_DIR.glob("*.py") if p.name not in {"__init__.py", "base.py"})
         + EXTRA_MODULES
     )
+
+
+def _modules_building_mcp_config():
     out = []
-    for path in candidates:
+    for path in _candidates():
         tree = ast.parse(path.read_text())
         calls = [
             node
             for node in ast.walk(tree)
             if isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
-            and node.func.id in RESOLVERS
+            and node.func.id in POLICY_CALLS
         ]
         if calls:
-            out.append((path, calls))
+            out.append((path, tree))
     return out
+
+
+def _names_the_token(node) -> bool:
+    if isinstance(node, ast.Constant) and node.value == "CAO_RUNTIME_TOKEN":
+        return True
+    return isinstance(node, ast.Name) and node.id in TOKEN_NAMES
 
 
 def test_at_least_the_known_providers_are_discovered():
@@ -85,18 +82,20 @@ def test_at_least_the_known_providers_are_discovered():
     assert not missing, f"discovery stopped finding known providers: {sorted(missing)}"
 
 
-@pytest.mark.parametrize(
-    "path,calls", _modules_building_mcp_config(), ids=lambda v: getattr(v, "stem", "")
-)
-def test_every_resolver_call_asks_for_the_token_to_be_omitted(path, calls):
+@pytest.mark.parametrize("path", _candidates(), ids=lambda p: p.stem)
+def test_no_provider_writes_the_token_into_an_env_mapping(path):
     offenders = []
-    for call in calls:
-        kwargs = {kw.arg for kw in call.keywords if kw.arg}
-        if not (kwargs & OMITTING_KWARGS):
-            offenders.append(f"{path}:{call.lineno} {call.func.id}() has no {OMITTING_KWARGS}")
-    assert not offenders, (
-        "a provider builds an MCP config without omitting the runtime token:\n  "
-        + "\n  ".join(offenders)
-        + "\n\nPass persisted=True for a file-backed config, or omit_token=True for an\n"
-        "inline/argv one (which keeps sibling command resolution)."
+    for node in ast.walk(ast.parse(path.read_text())):
+        # env["CAO_RUNTIME_TOKEN"] = ...
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Subscript) and _names_the_token(target.slice):
+                    offenders.append(f"{path.name}:{node.lineno} assigns the token key")
+        # {"CAO_RUNTIME_TOKEN": ...}
+        if isinstance(node, ast.Dict):
+            for key in node.keys:
+                if key is not None and _names_the_token(key):
+                    offenders.append(f"{path.name}:{node.lineno} dict literal with the token key")
+    assert not offenders, "a provider writes the runtime token into MCP env:\n  " + "\n  ".join(
+        offenders
     )

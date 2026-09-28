@@ -205,6 +205,36 @@ def shared_endpoint_child_env_for(command: str, *, persisted: bool = False) -> d
     return shared_endpoint_child_env(persisted=persisted)
 
 
+#: Env keys that belong to the deployment. A profile or plugin never sets them.
+RESERVED_ENV_KEYS = (SHARED_ENDPOINT_URL_ENV, RUNTIME_TOKEN_ENV, RUNTIME_TOKEN_FILE_ENV)
+
+
+def apply_mcp_env_policy(env: Optional[dict], command: str) -> dict:
+    """Return a copy of an MCP entry's ``env`` with CAO's reserved keys enforced.
+
+    Every entry loses the reserved keys a profile or plugin supplied, whether or
+    not a shared endpoint is configured. The bundled entry (``command`` as
+    declared names ``cao-mcp-server`` or the shim) then gets the deployment's
+    endpoint URL and token-file path when a shared endpoint exists. The token
+    value is never written into any entry.
+    """
+    source = dict(env or {})
+    deployment = shared_endpoint_child_env() if command in _BUNDLED_COMMANDS else {}
+    overridden = sorted(
+        key for key in RESERVED_ENV_KEYS if key in source and source[key] != deployment.get(key)
+    )
+    if overridden:
+        logger.warning(
+            "dropping profile-supplied %s from MCP server %r: these are set by the "
+            "deployment only",
+            ", ".join(overridden),
+            command,
+        )
+    cleaned = {key: value for key, value in source.items() if key not in RESERVED_ENV_KEYS}
+    cleaned.update(deployment)
+    return cleaned
+
+
 def resolve_mcp_server_config(
     config: dict, *, persisted: bool = False, omit_token: Optional[bool] = None
 ) -> dict:
@@ -212,9 +242,12 @@ def resolve_mcp_server_config(
 
     ``persisted`` is forwarded to :func:`resolve_cao_mcp_command`; set it True
     when the result is written to a config file the provider reads at a later
-    launch (e.g. Kiro/Q agent JSON). Convenience wrapper for the common
-    case of an entry shaped like ``{"command": ..., "args": [...], ...}``.
-    Leaves all other keys (``type``, ``env``, ...) untouched.
+    launch (e.g. Kiro/Q agent JSON). ``omit_token`` is accepted for existing
+    callers and has no effect: the token value is never written in any form.
+
+    The entry's ``env`` always goes through :func:`apply_mcp_env_policy`, so a
+    profile cannot plant the endpoint, the token or the token-file path in any
+    entry. Other keys (``type``, ...) are untouched.
 
     Entries without a ``command`` (e.g. url/transport servers shaped
     ``{"type": "http", "url": ...}``) pass through untouched — resolution only
@@ -222,76 +255,15 @@ def resolve_mcp_server_config(
     into a command-less entry would corrupt it for providers that emit every
     present key.
     """
+    del omit_token  # retained for callers; token handling no longer varies
     if "command" not in config:
         return dict(config)
     resolved = dict(config)
-    # A bundled entry being redirected to the shared endpoint also needs the
-    # endpoint and token in the child's env; the command swap itself happens in
-    # resolve_cao_mcp_command.
-    #
-    # These two keys are the DEPLOYMENT's, and they win over the profile. The
-    # merge used to run the other way, with a comment blessing it as "a value the
-    # profile set explicitly wins" — but the two values here are exactly the ones
-    # a profile must not choose. An agent-editable profile setting
-    # CAO_MCP_HTTP_URL redirected this shim to an arbitrary endpoint, and
-    # CAO_RUNTIME_TOKEN went with it, handing the channel credential to whatever
-    # was listening. That inverted the isolation the surrounding functions exist
-    # to enforce (Copilot review on #802).
-    #
-    # Unrelated profile variables are still preserved: only the keys the
-    # deployment actually defines are overridden, and an override is logged so a
-    # profile that tries is visible rather than silently ignored.
-    # Two SEPARATE concerns that `persisted` used to conflate, with a real cost:
-    # it selects the command-resolution order (sibling script vs PATH lookup) AND
-    # whether the token is written. codex and Kimi need the token omitted from their
-    # inline argv but MUST keep the sibling-script resolution, because they rebuild
-    # the command every launch and a PATH lookup can resolve to a different or
-    # stale install. Passing persisted=True for the token silently changed which
-    # executable they launch (own review of this PR).
-    #
-    # `omit_token` defaults to `persisted` so every existing caller is unchanged.
-    omit = persisted if omit_token is None else omit_token
-    if resolved.get("command") == CAO_MCP_SERVER_COMMAND:
-        extra = shared_endpoint_child_env(persisted=omit)
-        if extra:
-            profile_env = dict(resolved.get("env") or {})
-            # RESERVED keys are stripped whether or not the deployment supplies a
-            # value for them. With persisted=True `extra` deliberately omits the
-            # token, so a merge alone left an agent-supplied CAO_RUNTIME_TOKEN in
-            # place — in the one form that actually lands somewhere durable, a file
-            # or argv. That inverted the guard: it held for the live path and was
-            # absent exactly where a planted credential persists (own review).
-            # RUNTIME_TOKEN_FILE_ENV belongs here for exactly the same reason as
-            # the other two, and leaving it out reintroduced the hole one level
-            # down: `extra` normally clobbers it, but when no token is configured
-            # `runtime_token_file()` returns None and there is no key to clobber
-            # with — so an agent-editable profile's own CAO_RUNTIME_TOKEN_FILE
-            # survived into the persisted config and the shim would read its
-            # credential from an attacker-chosen path.
-            for reserved in (
-                SHARED_ENDPOINT_URL_ENV,
-                RUNTIME_TOKEN_ENV,
-                RUNTIME_TOKEN_FILE_ENV,
-            ):
-                if reserved in profile_env and reserved not in extra:
-                    logger.warning(
-                        "dropping profile-supplied %s: it is operator-controlled and "
-                        "is not persisted",
-                        reserved,
-                    )
-                    profile_env.pop(reserved, None)
-            clobbered = sorted(
-                key
-                for key, value in extra.items()
-                if key in profile_env and profile_env[key] != value
-            )
-            if clobbered:
-                logger.warning(
-                    "ignoring profile-supplied %s for the shared MCP endpoint: "
-                    "the endpoint and its token are operator-controlled",
-                    ", ".join(clobbered),
-                )
-            resolved["env"] = {**profile_env, **extra}
+    declared = resolved.get("command", "")
+    env = apply_mcp_env_policy(resolved.get("env"), declared)
+    if env or "env" in resolved:
+        # Do not add an empty env key to an entry that had none.
+        resolved["env"] = env
     command = resolved.get("command", "")
     args = resolved.get("args", []) or []
     new_command, new_args = resolve_cao_mcp_command(command, args, persisted=persisted)
