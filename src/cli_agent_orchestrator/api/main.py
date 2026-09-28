@@ -4856,6 +4856,14 @@ async def run_step(
         # outcome: previously it returned None and the step proceeded, so turning it
         # into a permanent FAILED would be a net regression. The session route
         # answers 503 for the identical condition (own review of this PR).
+        #
+        # The durable JOB, though, must be settled: run_step wrote state="running"
+        # and every other terminal exit records a terminal state, so skipping it
+        # left a handoff job stranded at "running" forever (haofeif #13 on #802).
+        # Settle the job to "error" while keeping the retryable 503. Do NOT call
+        # _settle_step — the workflow-step reservation stays retryable, unlike the
+        # job record which is the request's own durable outcome.
+        await _record_job_state(job_id, "error", error_message=f"owner unavailable: {e}")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=f"cannot read the owner recorded for the caller ({e}); retry",
