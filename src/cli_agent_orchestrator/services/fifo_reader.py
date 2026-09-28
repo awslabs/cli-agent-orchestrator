@@ -150,6 +150,12 @@ class FifoManager:
         # stream with holes in it, and the loss becomes unreportable. See
         # ``_publish_output``.
         self._published_bytes: Dict[str, int] = {}
+        # Per-terminal stream epoch, bumped whenever a reader is (re)created or
+        # stopped. Stamped on every output event so a consumer can fence a stream
+        # RESTART on the epoch rather than inferring it from a backward offset —
+        # which a dropped head defeats (Copilot review on #802). Monotonic and
+        # kept across create/stop so a reused terminal id never repeats an epoch.
+        self._epochs: Dict[str, int] = {}
         self._watchdog_stop = threading.Event()
         self._watchdog_thread: Optional[threading.Thread] = None
 
@@ -183,7 +189,10 @@ class FifoManager:
         with self._lock:
             offset = self._published_bytes.get(terminal_id, 0)
             self._published_bytes[terminal_id] = offset + offset_bytes
-            bus.publish(f"terminal.{terminal_id}.output", {"data": text, "offset": offset})
+            bus.publish(
+                f"terminal.{terminal_id}.output",
+                {"data": text, "offset": offset, "epoch": self._epochs.get(terminal_id, 0)},
+            )
 
     def create_reader(
         self,
@@ -208,6 +217,12 @@ class FifoManager:
 
             if not fifo_path.exists():
                 os.mkfifo(fifo_path)
+
+            # A new reader is a new stream: bump the epoch and restart the byte
+            # counter, so its first event both restarts at 0 and carries a higher
+            # epoch than the stream it replaced (Copilot review on #802).
+            self._epochs[terminal_id] = self._epochs.get(terminal_id, 0) + 1
+            self._published_bytes[terminal_id] = 0
 
             stop_flag = threading.Event()
             thread = threading.Thread(
@@ -261,6 +276,10 @@ class FifoManager:
             # reader thread restarts it at 0, which consumers treat as a stream
             # restart rather than as missing bytes.
             self._published_bytes.pop(terminal_id, None)
+            # Bump the epoch too: the stream has ended, so any late flush and any
+            # reader re-created under this id belong to a different stream and must
+            # carry a higher epoch than the one just stopped.
+            self._epochs[terminal_id] = self._epochs.get(terminal_id, 0) + 1
 
         # Deliberately NOT stopping the watchdog thread here even when this was
         # the last enrolled terminal: doing it under a "now idle" check raced

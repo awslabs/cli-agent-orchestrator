@@ -153,6 +153,10 @@ class Bridge:
         self._sent_capture: Dict[str, tuple] = {}
         self._sent_ops: set = set()
         self._sent_status: Dict[str, TerminalStatus] = {}
+        # Last producer epoch seen per terminal on the output stream. A change is
+        # a stream restart and begins a new buffer generation; the first epoch
+        # seen for a terminal is only recorded.
+        self._last_epoch: Dict[str, int] = {}
 
     # --- outbound plumbing ---
 
@@ -256,15 +260,30 @@ class Bridge:
                     gap, pos = None, buf.append(raw)
                 else:
                     start = int(offset)
-                    if start < buf.end_pos:
-                        # The producer's offset counter is monotonic per stream,
-                        # so a start BEHIND the watermark means it restarted: the
-                        # FIFO reader was re-armed, or the pane re-created, and
-                        # these bytes are a NEW stream reusing the terminal id.
-                        # Appending them contiguously would splice the two into a
-                        # transcript that never existed, so advance the generation
-                        # — the protocol's fence for precisely this — and number
-                        # the new stream from 0 (Copilot review on #802).
+                    epoch = event["data"].get("epoch")
+                    if epoch is not None:
+                        # The producer stamps a per-stream epoch, bumped whenever
+                        # its reader is re-armed. A change is a NEW stream reusing
+                        # the terminal id — the fence the offset heuristic below
+                        # could not see when the new stream's head was dropped, so
+                        # its first delivered offset landed at or past the old
+                        # watermark and the two spliced (Copilot review on #802).
+                        last = self._last_epoch.get(terminal_id)
+                        self._last_epoch[terminal_id] = epoch
+                        if last is not None and epoch != last:
+                            logger.warning(
+                                "terminal %s output stream re-armed (epoch %s -> %s); "
+                                "starting generation %s",
+                                terminal_id,
+                                last,
+                                epoch,
+                                buf.generation + 1,
+                            )
+                            buf.begin_generation()
+                    elif start < buf.end_pos:
+                        # No epoch (a non-FIFO producer): fall back to inferring a
+                        # restart from an offset behind the watermark. A monotonic
+                        # per-stream counter going backwards means it restarted.
                         logger.warning(
                             "terminal %s restarted its output stream at offset %s "
                             "(watermark was %s); starting generation %s",
