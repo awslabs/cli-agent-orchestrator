@@ -20,6 +20,7 @@ reaches its data over the REST surface only.
 """
 
 import json as _json
+import os
 import pathlib
 import re
 import sys
@@ -902,6 +903,12 @@ def _poll_to_terminal(run_id, as_json):
 @click.option("--input", "inputs", multiple=True, help="Run input as k=v (repeatable).")
 @click.option("--run-id", "run_id", default=None, help="Optional explicit run id.")
 @click.option(
+    "--working-directory",
+    type=click.Path(file_okay=False, path_type=str),
+    default=None,
+    help="Project root for script execution and approval fingerprinting.",
+)
+@click.option(
     "--detach",
     is_flag=True,
     default=False,
@@ -914,7 +921,7 @@ def _poll_to_terminal(run_id, as_json):
     help="Block on the server inline until the run finishes (the retained blocking path).",
 )
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit the result as JSON.")
-def run_cmd(name_or_path, inputs, run_id, detach, wait, as_json):
+def run_cmd(name_or_path, inputs, run_id, working_directory, detach, wait, as_json):
     """Run a workflow.
 
     By default (FR-4, issue #505) ``run`` SUBMITS the run asynchronously, prints
@@ -928,7 +935,11 @@ def run_cmd(name_or_path, inputs, run_id, detach, wait, as_json):
       1  run reached FAILED / CANCELLED, or the request errored
     """
     parsed = _parse_inputs(inputs)
-    payload = {"name_or_path": name_or_path, "inputs": parsed}
+    payload = {
+        "name_or_path": name_or_path,
+        "inputs": parsed,
+        "working_directory": os.path.abspath(working_directory or os.getcwd()),
+    }
     if run_id is not None:
         payload["run_id"] = run_id
     auth_headers = _auth_headers() or None

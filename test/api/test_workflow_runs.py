@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 from types import SimpleNamespace
 
@@ -218,11 +219,12 @@ def script_run_env(client, monkeypatch, tmp_path):
         lambda name_or_path, scan_dir=None: spec,
     )
 
-    spy = {"called": False, "inputs": None}
+    spy = {"called": False, "inputs": None, "working_directory": None}
 
-    async def _fake_run(spec_arg, inputs, run_id):
+    async def _fake_run(spec_arg, inputs, run_id, *, working_directory=None):
         spy["called"] = True
         spy["inputs"] = inputs
+        spy["working_directory"] = working_directory
         return _result(state=RunState.COMPLETED)
 
     monkeypatch.setattr(script_runner, "run_script_workflow", _fake_run)
@@ -275,17 +277,86 @@ def test_script_run_oversized_inputs_400_pre_journal(client, script_run_env):
     assert script_run_env["journal"].get_run("runD") is None
 
 
-def test_script_run_resolved_inputs_passed_to_runner(client, script_run_env):
+def test_script_run_resolved_inputs_passed_to_runner(client, script_run_env, tmp_path):
     # A valid run reaches the runner with the RESOLVED map (defaults filled),
     # not the raw request body.
     resp = client.post(
         "/workflows/runs",
-        json={"name_or_path": "scr", "inputs": {"topic": "birds"}, "run_id": "runE"},
+        json={
+            "name_or_path": "scr",
+            "inputs": {"topic": "birds"},
+            "run_id": "runE",
+            "working_directory": str(tmp_path),
+        },
     )
     assert resp.status_code == 200
     assert script_run_env["spy"]["called"] is True
     # ``note`` is optional with no default -> omitted; ``topic`` kept.
     assert script_run_env["spy"]["inputs"] == {"topic": "birds"}
+    assert script_run_env["spy"]["working_directory"] == str(tmp_path.resolve())
+
+
+@pytest.mark.parametrize("working_directory", ("", "\x00bad", "relative/path", "~/project"))
+def test_workflow_run_request_rejects_invalid_supplied_root(working_directory):
+    from pydantic import ValidationError
+
+    from cli_agent_orchestrator.api.main import WorkflowRunRequest
+
+    with pytest.raises(ValidationError):
+        WorkflowRunRequest(name_or_path="scr", working_directory=working_directory)
+
+
+@pytest.mark.parametrize("kind", ("file", "missing"))
+def test_script_request_rejects_non_directory_root(client, script_run_env, tmp_path, kind):
+    root = tmp_path / kind
+    if kind == "file":
+        root.write_text("not a directory")
+
+    response = client.post(
+        "/workflows/runs",
+        json={
+            "name_or_path": "scr",
+            "inputs": {"topic": "birds"},
+            "working_directory": str(root),
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "working_directory must name an existing directory"
+    assert str(root) not in response.text
+
+
+def test_script_request_canonicalizes_root_before_runner(client, script_run_env, tmp_path):
+    real_root = tmp_path / "real"
+    real_root.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(real_root, target_is_directory=True)
+
+    response = client.post(
+        "/workflows/runs",
+        json={
+            "name_or_path": "scr",
+            "inputs": {"topic": "birds"},
+            "working_directory": str(alias),
+        },
+    )
+
+    assert response.status_code == 200
+    assert script_run_env["spy"]["working_directory"] == os.path.realpath(alias)
+
+
+def test_omitted_script_root_uses_server_working_directory(
+    client, script_run_env, monkeypatch, tmp_path
+):
+    monkeypatch.chdir(tmp_path)
+
+    response = client.post(
+        "/workflows/runs",
+        json={"name_or_path": "scr", "inputs": {"topic": "birds"}},
+    )
+
+    assert response.status_code == 200
+    assert script_run_env["spy"]["working_directory"] == os.path.realpath(tmp_path)
 
 
 def test_blocking_script_start_returns_approval_refusal(client, monkeypatch):
@@ -304,7 +375,7 @@ def test_blocking_script_start_returns_approval_refusal(client, monkeypatch):
         lambda name_or_path, scan_dir=None: spec,
     )
 
-    async def _refuse(spec_arg, inputs, run_id):
+    async def _refuse(spec_arg, inputs, run_id, *, working_directory=None):
         raise approval_gate.PlanApprovalRequiredError(
             "Plan 'plan-v1:blocked' has not been approved.",
             plan_id="plan-v1:blocked",
@@ -358,7 +429,7 @@ def test_script_start_returns_503_when_the_plan_identity_is_unavailable(client, 
         lambda name_or_path, scan_dir=None: spec,
     )
 
-    async def _refuse(spec_arg, inputs, run_id):
+    async def _refuse(spec_arg, inputs, run_id, *, working_directory=None):
         raise approval_gate.PlanIdentityUnavailableError(
             "This script-tier run has no readable plan identifier in its frozen execution manifest."
         )
@@ -413,7 +484,7 @@ async def test_blocking_script_manifest_freeze_is_offloaded_from_event_loop(monk
     observed = {}
     event_loop_thread_id = threading.get_ident()
 
-    def blocking_manifest(*, source_hash, inputs):
+    def blocking_manifest(*, source_hash, inputs, cwd=None):
         observed["manifest_thread_id"] = threading.get_ident()
         probe_started.set()
         observed["sentinel_ran_while_blocked"] = same_loop_sentinel.wait(timeout=1)
@@ -425,7 +496,7 @@ async def test_blocking_script_manifest_freeze_is_offloaded_from_event_loop(monk
             await asyncio.sleep(0)
         same_loop_sentinel.set()
 
-    async def _drive(record, path, env):
+    async def _drive(record, path, env, *, working_directory=None):
         return _result()
 
     spec = ScriptSpec(
@@ -928,7 +999,7 @@ def async_script_env(client, monkeypatch, tmp_path):
 
     prepared = {"called": False}
 
-    async def _fake_prepared(record, spec_path, env):
+    async def _fake_prepared(record, spec_path, env, *, working_directory=None):
         prepared["called"] = True
         workflow_journal.update_run_state(
             record.run_id, RunState.COMPLETED.value, workflow_service._now()
@@ -936,9 +1007,64 @@ def async_script_env(client, monkeypatch, tmp_path):
         return _result(state=RunState.COMPLETED)
 
     monkeypatch.setattr(script_runner, "run_script_workflow_prepared", _fake_prepared)
-    yield {"prepared": prepared, "spec": spec, "script_runner": script_runner}
+    yield {
+        "prepared": prepared,
+        "spec": spec,
+        "script_runner": script_runner,
+        "root": str(tmp_path),
+    }
     workflow_service.run_registry.clear()
     workflow_service._active_drives.clear()
+
+
+def test_submit_manifest_freeze_failure_runs_when_approval_is_disabled(
+    client, async_script_env, monkeypatch
+):
+    """The explicit approval opt-out preserves manifest freeze's best-effort contract."""
+    from cli_agent_orchestrator.services import manifest_freeze
+
+    monkeypatch.setattr(manifest_freeze, "build_manifest_json", lambda **kwargs: None)
+
+    response = client.post(
+        "/workflows/runs:submit",
+        json={
+            "name_or_path": "scr",
+            "inputs": {},
+            "run_id": "async-without-manifest",
+            "working_directory": async_script_env["root"],
+        },
+    )
+
+    assert response.status_code == 202
+    row = workflow_journal.get_run("async-without-manifest")
+    assert row is not None
+    assert row.manifest_json is None
+
+
+def test_submit_manifest_freeze_failure_is_503_when_approval_is_required(
+    client, async_script_env, monkeypatch, tmp_path
+):
+    """A missing identity remains fail-closed under the default approval posture."""
+    from cli_agent_orchestrator.services import manifest_freeze, settings_service
+
+    gate_on = tmp_path / "gate-on.json"
+    gate_on.write_text(json.dumps({"workflow": {"require_approval": True}}))
+    monkeypatch.setattr(settings_service, "SETTINGS_FILE", gate_on)
+    monkeypatch.setattr(manifest_freeze, "build_manifest_json", lambda **kwargs: None)
+
+    response = client.post(
+        "/workflows/runs:submit",
+        json={
+            "name_or_path": "scr",
+            "inputs": {},
+            "run_id": "async-missing-identity",
+            "working_directory": async_script_env["root"],
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["kind"] == "plan_identity_unavailable"
+    assert workflow_journal.get_run("async-missing-identity") is None
 
 
 def test_submit_script_tier_202_and_drives(client, async_script_env):
@@ -977,11 +1103,11 @@ def test_submit_script_manifest_freezes_resolved_inputs(client, async_script_env
         workflow_spec_service, "get_workflow", lambda name_or_path, scan_dir=None: spec
     )
 
-    def _capture_manifest(*, source_hash, inputs):
+    def _capture_manifest(*, source_hash, inputs, cwd=None):
         captured["manifest_inputs"] = inputs
         return '{"plan_id":"plan-v1:resolved-inputs"}'
 
-    def _capture_schedule(record, spec_arg, run_id, tier, inputs):
+    def _capture_schedule(record, spec_arg, run_id, tier, inputs, **kwargs):
         captured["scheduled_inputs"] = inputs
 
     monkeypatch.setattr(manifest_freeze, "build_manifest_json", _capture_manifest)
@@ -1017,7 +1143,7 @@ async def test_submit_script_manifest_freeze_is_offloaded_from_event_loop(monkey
     observed = {}
     event_loop_thread_id = threading.get_ident()
 
-    def blocking_manifest(*, source_hash, inputs):
+    def blocking_manifest(*, source_hash, inputs, cwd=None):
         observed["manifest_thread_id"] = threading.get_ident()
         probe_started.set()
         observed["sentinel_ran_while_blocked"] = same_loop_sentinel.wait(timeout=1)
@@ -1044,7 +1170,7 @@ async def test_submit_script_manifest_freeze_is_offloaded_from_event_loop(monkey
     )
     monkeypatch.setattr(api_main.approval_gate, "ensure_plan_approved", lambda **kwargs: None)
     monkeypatch.setattr(workflow_journal, "insert_run", lambda *args: None)
-    monkeypatch.setattr(api_main, "_schedule_background_drive", lambda *args: None)
+    monkeypatch.setattr(api_main, "_schedule_background_drive", lambda *args, **kwargs: None)
 
     body = api_main.WorkflowRunRequest(name_or_path="scr", inputs={}, run_id="manifest-submit")
     submit_task = asyncio.create_task(api_main.submit_workflow_run_endpoint(body, []))

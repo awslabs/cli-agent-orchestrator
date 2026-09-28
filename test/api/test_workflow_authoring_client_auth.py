@@ -18,12 +18,18 @@ import pytest
 from click.testing import CliRunner
 from fastapi.testclient import TestClient
 
+from cli_agent_orchestrator.api import main as api_main
 from cli_agent_orchestrator.api.main import app
 from cli_agent_orchestrator.cli.commands import workflow as cli_workflow
 from cli_agent_orchestrator.mcp_server import server as mcp_server
 from cli_agent_orchestrator.models.workflow import ScriptSpec, ScriptValidationResult
 from cli_agent_orchestrator.security import auth as auth_module
-from cli_agent_orchestrator.services import approval_store, script_lint, workflow_spec_service
+from cli_agent_orchestrator.services import (
+    approval_store,
+    script_lint,
+    script_runner,
+    workflow_spec_service,
+)
 
 SOURCE = 'def main():\n    return {"ok": True}\n'
 PLAN_ID = "plan-v1:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -339,6 +345,42 @@ def test_local_token_crosses_cli_and_mcp_run_and_start_boundaries(monkeypatch):
     assert [headers for _, headers, _ in calls] == [{"Authorization": f"Bearer {token}"}] * 4
     assert calls[0][2] == cli_workflow.WORKFLOW_RUN_REQUEST_TIMEOUT
     assert calls[2][2] == cli_workflow.WORKFLOW_RUN_REQUEST_TIMEOUT
+
+
+def test_mcp_run_authenticates_terminal_root_lookup_and_first_post(
+    auth_enabled_env,
+    jwks_boundary,
+    rsa_keys,
+    client_boundary,
+    monkeypatch,
+    tmp_path,
+):
+    _split_client_from_authenticated_server(client_boundary, monkeypatch)
+    token = _set_token(monkeypatch, rsa_keys, "cao:write")
+    monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
+    monkeypatch.setattr(
+        api_main.terminal_service, "get_working_directory", lambda tid: str(tmp_path)
+    )
+
+    async def _run(spec, inputs, run_id, *, working_directory=None):
+        assert working_directory == str(tmp_path)
+        return SimpleNamespace(
+            model_dump=lambda: {
+                "run_id": run_id,
+                "state": "completed",
+                "steps": [],
+            }
+        )
+
+    monkeypatch.setattr(script_runner, "run_script_workflow", _run)
+
+    result = asyncio.run(_mcp_tool("workflow_run")(name_or_path="wf"))
+
+    assert result["ok"] is True
+    assert [headers["Authorization"] for headers in client_boundary.seen_headers] == [
+        f"Bearer {token}",
+        f"Bearer {token}",
+    ]
 
 
 def test_auth_off_sends_no_header_and_both_client_types_still_work(

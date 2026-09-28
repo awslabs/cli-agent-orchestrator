@@ -210,7 +210,7 @@ class TestRunTierDispatch:
         )
         monkeypatch.setattr(workflow_service, "_check_run_id_available", lambda rid: None)
 
-        async def _fake_run(spec_arg, inputs, run_id):
+        async def _fake_run(spec_arg, inputs, run_id, *, working_directory=None):
             from cli_agent_orchestrator.models.workflow_runtime import (
                 RunState,
                 WorkflowRunResult,
@@ -254,7 +254,7 @@ class TestRunTierDispatch:
 
         called = {"hit": False}
 
-        async def _should_not_run(spec_arg, inputs, run_id):
+        async def _should_not_run(spec_arg, inputs, run_id, *, working_directory=None):
             called["hit"] = True
             raise AssertionError("run_script_workflow must not be called after a 409 pre-check")
 
@@ -279,7 +279,7 @@ class TestRunTierDispatch:
 
         finding = LintFinding(rule_id="syntax", severity="error", line=1, message="bad")
 
-        async def _raise(spec_arg, inputs, run_id):
+        async def _raise(spec_arg, inputs, run_id, *, working_directory=None):
             raise script_runner.ScriptLintError([finding])
 
         monkeypatch.setattr(script_runner, "run_script_workflow", _raise)
@@ -301,7 +301,7 @@ class TestRunTierDispatch:
         )
         monkeypatch.setattr(workflow_service, "_check_run_id_available", lambda rid: None)
 
-        async def _raise(spec_arg, inputs, run_id):
+        async def _raise(spec_arg, inputs, run_id, *, working_directory=None):
             raise KeyError("run_id became unavailable")
 
         monkeypatch.setattr(script_runner, "run_script_workflow", _raise)
@@ -319,7 +319,7 @@ class TestRunTierDispatch:
         )
         monkeypatch.setattr(workflow_service, "_check_run_id_available", lambda rid: None)
 
-        async def _raise(spec_arg, inputs, run_id):
+        async def _raise(spec_arg, inputs, run_id, *, working_directory=None):
             raise ValueError("bad script run input")
 
         monkeypatch.setattr(script_runner, "run_script_workflow", _raise)
@@ -352,7 +352,7 @@ class TestSubmitTierDispatch:
 
         called = {"hit": False}
 
-        async def _prepared(record, spec_path, env):
+        async def _prepared(record, spec_path, env, *, working_directory=None):
             called["hit"] = True
             workflow_journal.update_run_state(record.run_id, RunState.COMPLETED.value, "t")
             from cli_agent_orchestrator.models.workflow_runtime import WorkflowRunResult

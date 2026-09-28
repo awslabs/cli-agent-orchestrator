@@ -2161,6 +2161,21 @@ async def workflow_return(
     ).model_dump()
 
 
+def _workflow_default_root(explicit: object) -> Optional[str]:
+    """Resolve an explicit or caller-terminal project root before the run POST."""
+    if isinstance(explicit, str):
+        return explicit
+    terminal_id = os.getenv("CAO_TERMINAL_ID")
+    if not terminal_id:
+        return None
+    try:
+        data = mcp_utils.get_json(f"/terminals/{quote(terminal_id, safe='')}/working-directory")
+        value = data.get("working_directory")
+        return value if isinstance(value, str) else None
+    except (requests.RequestException, ValueError, TypeError, AttributeError):
+        return None
+
+
 @mcp.tool()
 async def workflow_run(
     name_or_path: Annotated[
@@ -2177,6 +2192,16 @@ async def workflow_run(
                 "Optional explicit run id (matches WORKFLOW_NAME_RE); the server mints "
                 "one if omitted. Validation and the uniqueness/admission gate are "
                 "server-side — a collision surfaces as the ok=False error envelope."
+            )
+        ),
+    ] = None,
+    working_directory: Annotated[
+        Optional[str],
+        Field(
+            description=(
+                "Optional project root for a script run (its working directory, and the "
+                "directory fingerprinted for approval). Defaults to the calling terminal's "
+                "working directory, else cao-server's. Ignored for YAML workflows."
             )
         ),
     ] = None,
@@ -2212,6 +2237,9 @@ async def workflow_run(
     # sentinel, which is not a str) — FR-1.2.
     if isinstance(run_id, str):
         payload["run_id"] = run_id
+    root = _workflow_default_root(working_directory)
+    if root is not None:
+        payload["working_directory"] = root
     auth_headers = mcp_utils._auth_headers() or None
     try:
         # The server awaits the WHOLE run inline (Q1=A), so this blocks for the full
@@ -2383,6 +2411,16 @@ async def workflow_start(
             )
         ),
     ] = None,
+    working_directory: Annotated[
+        Optional[str],
+        Field(
+            description=(
+                "Optional project root for a script run (its working directory, and the "
+                "directory fingerprinted for approval). Defaults to the calling terminal's "
+                "working directory, else cao-server's. Ignored for YAML workflows."
+            )
+        ),
+    ] = None,
 ) -> Dict[str, Any]:
     """Submit a workflow run ASYNCHRONOUSLY and return its handle immediately (issue #505, U6).
 
@@ -2404,6 +2442,9 @@ async def workflow_start(
     # through FastMCP (Field default -> None) or called directly (FieldInfo sentinel).
     if isinstance(run_id, str):
         payload["run_id"] = run_id
+    root = _workflow_default_root(working_directory)
+    if root is not None:
+        payload["working_directory"] = root
     auth_headers = mcp_utils._auth_headers() or None
     try:
         # Async submit — the normal per-call timeout, NOT the long blocking one (TR-1).

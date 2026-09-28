@@ -722,6 +722,23 @@ class WorkflowRunRequest(BaseModel):
         default=None,
         description="Optional run id (matches WORKFLOW_NAME_RE); auto-generated if omitted",
     )
+    working_directory: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional project root for a script run: the script's working directory and "
+            "the directory whose repository state is fingerprinted for approval. Defaults "
+            "to cao-server's working directory. Ignored for YAML workflows."
+        ),
+    )
+
+    @field_validator("working_directory")
+    @classmethod
+    def validate_working_directory(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        if not value or "\x00" in value or value.startswith("~") or not os.path.isabs(value):
+            raise ValueError("working_directory must be a non-empty absolute path without NUL or ~")
+        return value
 
 
 class ResumeRunRequest(BaseModel):
@@ -4353,10 +4370,13 @@ async def run_step(
     # resolved value is what both the fingerprint and ``run_agent_step`` receive.
     # For every non-script-tier call this stays the posted value and
     # ``run_agent_step`` resolves exactly as it always did — no behaviour change.
-    effective_working_directory = body.working_directory
+    step_working_directory = body.working_directory
+    if step_working_directory is None and body.caller_id is None:
+        step_working_directory = script_runner.run_root_for(body.env_vars)
+    effective_working_directory = step_working_directory
     if replay_run_id and replay_step_id and on_step_terminal_ready is not None:
         effective_working_directory = await resolve_effective_working_directory(
-            body.working_directory, body.caller_id
+            step_working_directory, body.caller_id
         )
         # TD-2: the SAME ``compute`` over the SAME effective directory that
         # ``settlement-rewire`` hashed and ``begin_step`` stored. That is what makes
@@ -5136,7 +5156,13 @@ def _get_drive_semaphore() -> asyncio.Semaphore:
 
 
 def _schedule_background_drive(
-    record: Any, spec: Any, run_id: str, tier: str, inputs: Dict[str, Any]
+    record: Any,
+    spec: Any,
+    run_id: str,
+    tier: str,
+    inputs: Dict[str, Any],
+    *,
+    working_directory: Optional[str] = None,
 ) -> "asyncio.Task":
     """Schedule a background drive, holding a STRONG reference to its Task (BG-1).
 
@@ -5145,7 +5171,14 @@ def _schedule_background_drive(
     Task so a caller/test can await or cancel it.
     """
     task = asyncio.create_task(
-        _run_in_background(record, spec, run_id, tier, inputs),
+        _run_in_background(
+            record,
+            spec,
+            run_id,
+            tier,
+            inputs,
+            working_directory=working_directory,
+        ),
         name=f"workflow-drive-{run_id}",
     )
     _background_drives.add(task)
@@ -5154,7 +5187,13 @@ def _schedule_background_drive(
 
 
 async def _run_in_background(
-    record: Any, spec: Any, run_id: str, tier: str, inputs: Dict[str, Any]
+    record: Any,
+    spec: Any,
+    run_id: str,
+    tier: str,
+    inputs: Dict[str, Any],
+    *,
+    working_directory: Optional[str] = None,
 ) -> None:
     """The fire-and-forget background drive for an async-submitted run (U2, C2).
 
@@ -5227,7 +5266,12 @@ async def _run_in_background(
                 await workflow_service.start_run_prepared(record)
             else:
                 env = script_runner.build_env(run_id, "1", inputs)
-                await script_runner.run_script_workflow_prepared(record, spec.path, env)
+                await script_runner.run_script_workflow_prepared(
+                    record,
+                    spec.path,
+                    env,
+                    working_directory=working_directory,
+                )
     except asyncio.CancelledError:
         # BR-2a: cancellation is NOT an Exception subclass — settle the durable row
         # before letting the cancellation continue to propagate.
@@ -5456,6 +5500,17 @@ def _approval_refusal_detail(error: approval_gate.PlanApprovalRequiredError) -> 
     return {"kind": kind, "plan_id": error.plan_id, "message": str(error)}
 
 
+def _script_root(value: Optional[str]) -> str:
+    """Resolve one canonical script-run root without disclosing refused paths."""
+    root = os.path.realpath(value if value is not None else os.getcwd())
+    if not os.path.isdir(root):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="working_directory must name an existing directory",
+        )
+    return root
+
+
 @app.post("/workflows/runs")
 async def start_workflow_run_endpoint(
     body: WorkflowRunRequest,
@@ -5501,6 +5556,7 @@ async def start_workflow_run_endpoint(
     run_id = body.run_id or f"run-{uuid.uuid4().hex[:16]}"
 
     if isinstance(spec, ScriptSpec):
+        root = _script_root(body.working_directory)
         # Unit A (ADR-6 / blocker #2): validate + cap the inputs BEFORE any
         # journal row or registry entry is created — no orphan RUNNING row can
         # result from bad/oversized input (BR-A3). The RESOLVED map (defaults
@@ -5520,7 +5576,12 @@ async def start_workflow_run_endpoint(
         except KeyError as e:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
         try:
-            result = await script_runner.run_script_workflow(spec, resolved, run_id)
+            result = await script_runner.run_script_workflow(
+                spec,
+                resolved,
+                run_id,
+                working_directory=root,
+            )
         except script_runner.ScriptLintError as e:
             raise HTTPException(
                 status_code=422,
@@ -5681,6 +5742,7 @@ async def submit_workflow_run_endpoint(
     # any insert so a rejected run leaves NO durable row and NO 202; (5) the awaited
     # HARD durable insert; (6) the in-process record C2 will drive.
     if isinstance(spec, ScriptSpec):
+        root = _script_root(body.working_directory)
         # Step 4 — script lint gate (OR-2): a lint fail -> 422 with a findings body,
         # in the handler's validation phase (never deferred into the background
         # task, where a 202 + RUNNING row would already exist).
@@ -5691,7 +5753,12 @@ async def submit_workflow_run_endpoint(
                 detail={"findings": workflow_spec_service.render_findings(lint_result.findings)},
             )
         spec_snapshot = json.dumps(
-            {"source": spec.source, "path": spec.path, "content_hash": spec.content_hash}
+            {
+                "source": spec.source,
+                "path": spec.path,
+                "content_hash": spec.content_hash,
+                "working_directory": root,
+            }
         )
         # Step 4b — approval gate (issue #583 Bolt 2, ``approval-gate``). Built ONCE here and handed
         # to the INSERT below unchanged, so the manifest that is CHECKED is byte-identical to the one
@@ -5704,6 +5771,7 @@ async def submit_workflow_run_endpoint(
             manifest_freeze.build_manifest_json,
             source_hash=spec.content_hash,
             inputs=resolved,
+            cwd=root,
         )
         try:
             approval_gate.ensure_plan_approved(tier="script", manifest_json=manifest_json)
@@ -5777,6 +5845,7 @@ async def submit_workflow_run_endpoint(
             started_at=started_at,
             finished_at=None,
             tier="script",
+            working_directory=root,
         )
         tier = "script"
     else:
@@ -5839,7 +5908,14 @@ async def submit_workflow_run_endpoint(
     # Via the registry helper, NOT a bare create_task: the Task must be strongly
     # referenced or it can be collected mid-drive (BG-1), and the drive itself is
     # admission-bounded (AB-1) inside the task.
-    _schedule_background_drive(record, spec, run_id, tier, resolved)
+    _schedule_background_drive(
+        record,
+        spec,
+        run_id,
+        tier,
+        resolved,
+        working_directory=root if tier == "script" else None,
+    )
 
     # --- Step 8: ack 202. The insert (step 5) is awaited and durable before this,
     # so the instant this returns, get_run(run_id) finds the row (INV-1). ---

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 from typing import List, Optional
 
@@ -182,6 +183,7 @@ def _install_fake_spawn(monkeypatch: pytest.MonkeyPatch, process: _FakeProcess) 
     async def _fake_exec(*args, **kwargs):
         captured["args"] = args
         captured["env"] = kwargs.get("env")
+        captured["cwd"] = kwargs.get("cwd")
         return process
 
     monkeypatch.setattr(
@@ -292,11 +294,18 @@ async def test_lint_fail_raises_before_any_spawn(monkeypatch: pytest.MonkeyPatch
 
 
 @pytest.mark.asyncio
-async def test_happy_completed_result_shape_and_sentinel(monkeypatch: pytest.MonkeyPatch):
+async def test_happy_completed_result_shape_and_sentinel(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
     """M1 + A6: exit 0 -> COMPLETED, tier-neutral shape, sentinel output parsed."""
     proc = _FakeProcess(exit_rc=0, stdout=b'log line\nCAO_WORKFLOW_OUTPUT:{"answer": 42}\n')
     captured = _install_fake_spawn(monkeypatch, proc)
-    result = await run_script_workflow(_FakeScriptSpec(), {}, "run-ok")
+    result = await run_script_workflow(
+        _FakeScriptSpec(),
+        {},
+        "run-ok",
+        working_directory=str(tmp_path),
+    )
 
     assert isinstance(result, WorkflowRunResult)
     assert result.state == RunState.COMPLETED
@@ -312,6 +321,8 @@ async def test_happy_completed_result_shape_and_sentinel(monkeypatch: pytest.Mon
     # F3: the journaled started_at is the SAME timestamp as the record's, not a
     # second independent _now() call.
     assert row.started_at == result.started_at
+    assert captured["cwd"] == os.path.realpath(tmp_path)
+    assert json.loads(row.spec_snapshot)["working_directory"] == os.path.realpath(tmp_path)
     # Constructed env is the exact 6-key allowlist (INV-2 + BR-A5), no resume flag.
     env = captured["env"]
     assert set(env) == {
