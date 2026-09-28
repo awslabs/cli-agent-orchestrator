@@ -83,7 +83,9 @@ class CallerIdentityMiddleware(Middleware):
     def _require_token(self) -> None:
         headers = get_http_headers()
         presented = headers.get(RUNTIME_TOKEN_HEADER, "")
-        if not hmac.compare_digest(presented, self._expected_token):
+        # Encode both operands: hmac.compare_digest raises TypeError on a
+        # non-ASCII str, which would crash the request instead of refusing it.
+        if not hmac.compare_digest(presented.encode("utf-8"), self._expected_token.encode("utf-8")):
             # Never fall through to an anonymous/global identity — refuse.
             raise ValueError("unauthorized: missing or invalid runtime token")
 
@@ -114,7 +116,9 @@ def build_http_app(mcp):
     Fails closed: raises if ``CAO_RUNTIME_TOKEN`` is unset, so a shared HTTP
     endpoint cannot be started without authentication.
     """
-    expected = os.environ.get(RUNTIME_TOKEN_ENV, "").strip()
+    from cli_agent_orchestrator.utils.runtime_token import runtime_token
+
+    expected = runtime_token()
     if not expected:
         raise SharedTokenError(
             f"shared HTTP MCP hosting requires {RUNTIME_TOKEN_ENV} to be set; refusing to "

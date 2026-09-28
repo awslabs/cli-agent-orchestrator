@@ -332,7 +332,13 @@ class TestStdioForwardingShim:
         as the child's exit status and stderr, in the provider's own log.
         """
         command, args = resolve_cao_mcp_command(CAO_MCP_STDIO_BRIDGE_COMMAND, [])
-        env = {k: v for k, v in os.environ.items() if k != "CAO_RUNTIME_TOKEN"}
+        # The token now travels only as a file path; strip both the value and
+        # the path so the child truly starts with no credential.
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k not in ("CAO_RUNTIME_TOKEN", "CAO_RUNTIME_TOKEN_FILE")
+        }
         env["CAO_MCP_HTTP_URL"] = shared_endpoint
         proc = subprocess.run(
             [command, *args], env=env, capture_output=True, text=True, timeout=120

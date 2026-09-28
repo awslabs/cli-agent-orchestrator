@@ -72,6 +72,7 @@ from cli_agent_orchestrator.security.auth import (
 )
 from cli_agent_orchestrator.security.principal import Principal
 from cli_agent_orchestrator.services.event_bus import bus
+from cli_agent_orchestrator.utils.runtime_token import runtime_token
 
 logger = logging.getLogger(__name__)
 
@@ -97,8 +98,9 @@ __all__ = [
 
 
 def _expected_token() -> Optional[str]:
-    token = os.environ.get(RUNTIME_TOKEN_ENV, "").strip()
-    return token or None
+    # The token is normalized to an owner-only file at startup; read the value
+    # from there rather than from the environment.
+    return runtime_token()
 
 
 def _note_heartbeat_watermark(behind: dict, stream_pos: StreamPosition, runtime_id: str) -> None:
@@ -506,7 +508,9 @@ async def _cleanup_failed_launch(op_id: str, terminal_id: str, runtime_id: str) 
 async def runtime_channel(ws: WebSocket) -> None:
     expected = _expected_token()
     presented = ws.headers.get(RUNTIME_TOKEN_HEADER, "")
-    if expected is None or not hmac.compare_digest(presented, expected):
+    if expected is None or not hmac.compare_digest(
+        presented.encode("utf-8"), expected.encode("utf-8")
+    ):
         # Rejecting before accept() fails the WebSocket handshake with 403,
         # which the bridge treats as a fatal auth error, not a retry case.
         await ws.close(code=status.WS_1008_POLICY_VIOLATION)

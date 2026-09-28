@@ -145,6 +145,25 @@ def _reset_backend_registry():
 
 
 @pytest.fixture(autouse=True)
+def _reset_runtime_token_cache():
+    """Clear the process-lifetime runtime-token cache between tests (#802).
+
+    ``load_runtime_token`` caches the token for the life of the process and moves
+    an env-supplied value into an owner-only file, rewriting ``os.environ`` in
+    place. Both the cache and the leaked ``CAO_RUNTIME_TOKEN_FILE`` would
+    otherwise cross test boundaries and make token-presence assertions depend on
+    order. Mirrors ``_reset_backend_registry`` above.
+    """
+    from cli_agent_orchestrator.utils import runtime_token as _rt
+
+    _rt._reset_cache_for_tests()
+    os.environ.pop("CAO_RUNTIME_TOKEN_FILE", None)
+    yield
+    _rt._reset_cache_for_tests()
+    os.environ.pop("CAO_RUNTIME_TOKEN_FILE", None)
+
+
+@pytest.fixture(autouse=True)
 def _hermetic_cao_env(monkeypatch, tmp_path):
     """Keep tests independent of CAO runtime identity and persisted settings.
 
