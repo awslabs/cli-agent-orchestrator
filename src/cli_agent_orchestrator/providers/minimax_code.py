@@ -363,6 +363,14 @@ class MiniMaxCodeProvider(BaseProvider):
         for server in servers.values():
             if server["type"] == "stdio":
                 server["env"]["CAO_TERMINAL_ID"] = self.terminal_id
+                # In an execution-only runtime (#745) the CAO API is not on
+                # localhost: forward the pod's explicit server address so a
+                # direct cao-mcp-server child dials the right host instead of
+                # 127.0.0.1:9889 (the same trio claude_code/codex forward).
+                # Unset locally -> nothing injected and behavior is unchanged.
+                for var in ("CAO_API_HOST", "CAO_API_PORT", "CAO_MEMORY_API_URL"):
+                    if var not in server["env"] and os.environ.get(var):
+                        server["env"][var] = os.environ[var]
 
         manifest = {
             "schemaVersion": 1,

@@ -421,27 +421,36 @@ class KimiCliProvider(BaseProvider):
                             mcp_config[server_name] = server_config.model_dump(exclude_none=True)
 
                         # Resolve the bundled cao-mcp-server console script to a
-                        # PATH-independent invocation.
-                        # persisted=True even though this config is INLINE rather than file-backed.
-                        # omit_token, NOT persisted: `persisted` also switches command
-                        # resolution to a PATH lookup, and these providers must keep the
-                        # interpreter-sibling script they rebuild every launch. The flag here
-                        # is only about the TOKEN: this entry is serialized into
-                        # command-line arguments, so embedding the credential makes it readable by
-                        # any local process listing. The child inherits CAO_RUNTIME_TOKEN from this
-                        # process instead (Copilot review on #802).
+                        # PATH-independent invocation. omit_token=True keeps that
+                        # interpreter-sibling resolution (the command is rebuilt
+                        # every launch, so a PATH lookup could hit a different
+                        # install) while writing CAO_RUNTIME_TOKEN_FILE -- the path
+                        # of an owner-only 0600 file -- into this entry's env
+                        # instead of the token value, so the secret never appears
+                        # in the argv this config is serialized into. The shim
+                        # reads the token from that file.
                         mcp_config[server_name] = resolve_mcp_server_config(
                             mcp_config[server_name], omit_token=True
                         )
 
                         # Forward CAO_TERMINAL_ID so MCP servers (e.g. cao-mcp-server)
                         # can identify the current terminal for handoff/assign operations.
-                        # Kimi CLI does not automatically forward parent shell env vars
-                        # to MCP subprocesses, so we inject it explicitly via the env field.
+                        # Kimi CLI does not forward parent shell env vars to MCP
+                        # subprocesses, so everything the child needs (this id, the
+                        # endpoint, and the token-file path above) is injected
+                        # explicitly via the entry's env field.
                         env = mcp_config[server_name].get("env", {})
                         if "CAO_TERMINAL_ID" not in env:
                             env["CAO_TERMINAL_ID"] = self.terminal_id
-                            mcp_config[server_name]["env"] = env
+                        # In an execution-only runtime (#745) the CAO API is not on
+                        # localhost: forward the pod's explicit server address so a
+                        # direct cao-mcp-server child dials the right host instead of
+                        # 127.0.0.1:9889 (the same trio claude_code/codex forward).
+                        # Unset locally -> nothing injected and behavior is unchanged.
+                        for var in ("CAO_API_HOST", "CAO_API_PORT", "CAO_MEMORY_API_URL"):
+                            if var not in env and os.environ.get(var):
+                                env[var] = os.environ[var]
+                        mcp_config[server_name]["env"] = env
 
                         # Select the declared protocol explicitly rather than
                         # letting FastMCP infer it from the URL path. `cwd` is
