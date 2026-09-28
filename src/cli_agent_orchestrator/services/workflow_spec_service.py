@@ -219,7 +219,12 @@ def _workflow_lock_identity(canonical_target: str) -> str:
     every filesystem access. ASCII basename folding intentionally over-serializes
     case-distinct workflow names on case-sensitive filesystems.
     """
-    parent = os.path.dirname(canonical_target)
+    parent = os.path.realpath(os.path.dirname(canonical_target))
+    real_target = os.path.realpath(canonical_target)
+    if real_target != parent and not real_target.startswith(parent + os.sep):
+        raise LockUnavailableError(
+            "workflow lock target escapes its canonical parent; refusing unlocked access"
+        )
     try:
         parent_stat = os.stat(parent)
     except OSError as exc:
@@ -452,7 +457,6 @@ def _write_contained_spec_bytes(
         prefix=f".{os.path.basename(real_path)}.", suffix=".tmp", dir=safe_base
     )
     raw_fd_owned = True
-    published = False
     try:
         with os.fdopen(fd, "wb") as handle:
             raw_fd_owned = False
@@ -481,11 +485,9 @@ def _write_contained_spec_bytes(
                         "filesystem does not support atomic no-replace workflow publication"
                     ) from exc
                 raise
-            published = True
             os.unlink(tmp_name)
         else:
             os.replace(tmp_name, real_path)
-            published = True
 
         # Persist the directory entry. If this fails after publication, report
         # the error honestly but never unlink the committed final as "rollback".
