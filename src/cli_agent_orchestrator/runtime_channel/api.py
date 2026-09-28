@@ -22,7 +22,7 @@ import logging
 import os
 import time
 import uuid
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, cast
 
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, status
 from pydantic import BaseModel, ConfigDict
@@ -274,8 +274,9 @@ async def _reconcile_orphaned_result(frame: CommandResultFrame, runtime_id: str)
         if not has_terminal:
             await asyncio.to_thread(_settle_quietly, frame.op_id)
             return True
+        # has_terminal already established that `info` is a terminal dict.
         return await asyncio.to_thread(
-            _persist_reconciled_terminal, info, runtime_id, record, frame.op_id
+            _persist_reconciled_terminal, cast(dict, info), runtime_id, record, frame.op_id
         )
 
     # A successful non-LAUNCH result with no in-memory waiter: the caller that
@@ -1135,7 +1136,7 @@ async def launch_remote_terminal(
                 # send_command does NOT raise on a runtime-side teardown FAILURE —
                 # it returns a non-OK result frame. Treating that as success would
                 # report the leak as cleaned up when the agent is still running.
-                cleaned = td.outcome == CommandOutcome.OK and (
+                cleaned = td.outcome == CommandOutcome.OK and bool(
                     td.payload.get("deleted") or td.payload.get("absent")
                 )
                 if not cleaned:

@@ -727,8 +727,8 @@ class RuntimeChannelRegistry:
         # from memory: still UNKNOWN unless a hello has meanwhile bound it here to
         # a connected runtime.
         with self._lock:
-            runtime_id = self._terminal_runtime.get(terminal_id)
-            if runtime_id is None or runtime_id not in self._runtimes:
+            bound = self._terminal_runtime.get(terminal_id)
+            if bound is None or bound not in self._runtimes:
                 return True, TerminalStatus.UNKNOWN
             return True, self._status.get(terminal_id, TerminalStatus.UNKNOWN)
 

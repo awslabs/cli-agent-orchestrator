@@ -193,7 +193,8 @@ def effective_status(terminal_id: str) -> "TerminalStatus":
 
     is_remote, status = runtime_registry.observe(terminal_id)
     if is_remote:
-        return status
+        # observe() always pairs a remote placement with a status.
+        return status if status is not None else TerminalStatus.UNKNOWN
     return status_monitor.get_status(terminal_id)
 
 

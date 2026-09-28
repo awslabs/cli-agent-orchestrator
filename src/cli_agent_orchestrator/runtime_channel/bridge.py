@@ -21,6 +21,7 @@ the central server's row remains the authoritative terminal identity.
 
 import asyncio
 import base64
+import functools
 import logging
 import os
 import re
@@ -1225,7 +1226,7 @@ class Bridge:
         self._terminal_chains[tid] = task
         # Drop the chain entry once it finishes, but only if it is still the tail
         # — a newer command for the same terminal may have replaced it.
-        task.add_done_callback(lambda t, tid=tid: self._forget_chain(tid, t))
+        task.add_done_callback(functools.partial(self._forget_chain_callback, tid))
 
     async def _handle_command_after(
         self, prev: Optional[asyncio.Task], frame: CommandFrame
@@ -1239,6 +1240,9 @@ class Bridge:
                 # _handle_command; it must not block the next command in the chain.
                 pass
         await self._handle_command(frame)
+
+    def _forget_chain_callback(self, terminal_id: str, task: "asyncio.Task[None]") -> None:
+        self._forget_chain(terminal_id, task)
 
     def _forget_chain(self, terminal_id: str, task: asyncio.Task) -> None:
         if self._terminal_chains.get(terminal_id) is task:

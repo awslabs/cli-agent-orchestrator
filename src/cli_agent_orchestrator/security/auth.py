@@ -342,9 +342,14 @@ def _verify_token(token: str) -> dict:
         # genuinely unknown key still raises and maps to 401, and is negative-cached
         # so the next request in the window does not refetch.
         kid = _unverified_kid(token)
-        client = _jwks_cache.client_for_unknown_kid(uri, kid)
+        retry_client = _jwks_cache.client_for_unknown_kid(uri, kid)
+        if retry_client is None:
+            # No keys in hand at all (the cache was cleared concurrently): the key
+            # is unknown, so keep the original failure.
+            _jwks_cache.remember_unknown_kid(uri, kid)
+            raise
         try:
-            signing_key = client.get_signing_key_from_jwt(token)
+            signing_key = retry_client.get_signing_key_from_jwt(token)
         except PyJWKClientError:
             _jwks_cache.remember_unknown_kid(uri, kid)
             raise

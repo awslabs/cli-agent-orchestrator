@@ -46,8 +46,9 @@ def _service_principal_id() -> Optional[str]:
     if not token:
         return None
     with _lock:
-        if token in _verified_ids:
-            return _verified_ids[token]
+        cached = _verified_ids.get(token)
+        if cached is not None:
+            return str(cached)
     try:
         principal = auth.extract_principal_from_token(token)
     except Exception:
