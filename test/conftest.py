@@ -17,7 +17,6 @@ import os
 import pathlib
 import time
 from typing import Any, Dict
-from unittest.mock import patch
 
 import pytest
 
@@ -119,37 +118,6 @@ def mint_test_token(
     }
     token = jwt.encode(header, claims, private_pem)
     return token.decode("utf-8") if isinstance(token, bytes) else token
-
-
-@pytest.fixture
-def auth_enabled_env(monkeypatch):
-    """Switch on Auth0 enforcement (AUTH0_DOMAIN + AUTH0_AUDIENCE)."""
-    from cli_agent_orchestrator.security import auth as _auth_mod
-
-    monkeypatch.setenv("AUTH0_DOMAIN", _AUTH_TEST_DOMAIN)
-    monkeypatch.setenv("AUTH0_AUDIENCE", _AUTH_TEST_AUDIENCE)
-    _auth_mod.reset_jwks_cache()
-    yield
-    _auth_mod.reset_jwks_cache()
-
-
-@pytest.fixture
-def mock_jwks(rsa_keys):
-    """Stub the JWKS HTTP fetch with the in-process public key."""
-    _, public_jwk = rsa_keys
-    jwks = {"keys": [public_jwk.as_dict()]}
-
-    class _Resp:
-        status_code = 200
-
-        def raise_for_status(self):
-            pass
-
-        def json(self):
-            return jwks
-
-    with patch("cli_agent_orchestrator.security.auth.requests.get", return_value=_Resp()):
-        yield
 
 
 @pytest.fixture(autouse=True)
