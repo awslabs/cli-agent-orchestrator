@@ -173,7 +173,6 @@ Attempt the run. If it is refused, the response tells you which of two things ha
 | --- | --- | --- |
 | `approval_required` | this plan has no approval yet | present the `plan_id` to the user and **stop** |
 | `plan_identity_unavailable` | **CAO** could not complete its own freeze | retry; there is nothing to approve |
-| `plan_inputs_changed` | while approval enforcement is on, the run's recorded profile or memory setting changed, its launch state is unreadable, or approval settings could not be read | start a new run for changed inputs or unreadable launch state; if settings could not be read, repair `settings.json`, then resume |
 
 On `approval_required`, show the user the identifier and the one command that grants it:
 
@@ -276,6 +275,13 @@ class from the message, the state, or the status:
 | `transient` | a persisted timeout; the artifact may still be usable | **Retry — transient failure**: resume the same run |
 | `artifact_defect` | the persisted generic `error` currently maps here conservatively; no finer production provider-error taxonomy exists, so a provider error is not automatically transient | **Fix the spec — artifact defect**: inspect and repair the script before authoring a new run |
 | `cancelled` | the run was deliberately cancelled | **Cancelled by a human**: inspect the intent before taking another action; no automatic retry is promised |
+
+`plan_inputs_changed` surfaces later, from an agent step's `POST /terminals/run-step`, rather than
+from the initial run attempt. The failed step or run error carries that `kind`. While approval
+enforcement is on, it means the recorded profile or memory setting changed, the launch state is
+unreadable, approval enforcement was turned on after this run started, or approval settings could
+not be read. Start a new run for changed inputs, unreadable launch state, or newly enabled
+enforcement. If approval settings could not be read, repair `settings.json`, then resume.
 
 This is the second half of what the sequence promises: branch on the emitted field, then resume only a
 known transient timeout. For a generic persisted error, inspect and repair before retrying by authoring

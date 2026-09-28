@@ -136,15 +136,21 @@ def test_the_approve_step_names_the_command_and_says_no_tool_can_do_it(skill):
 
 
 def test_the_refusal_is_branched_on_a_field_not_a_message(skill):
+    run_refusal = skill.split("### d. PRESENT THE PLAN", 1)[1].split("### e. RUN", 1)[0]
+    observe = skill.split("### g. OBSERVE", 1)[1].split("\n## ", 1)[0]
     assert "approval_required" in skill
     assert "plan_identity_unavailable" in skill, (
         "both kinds, because retrying a 403 is a bypass and presenting an approval after a 503 sends "
         "someone hunting for a plan that was never readable"
     )
-    assert "plan_inputs_changed" in skill, (
-        "a 409 means the approved run's launch inputs no longer match; the agent must distinguish "
-        "starting a new run from repairing settings.json and resuming"
+    assert "plan_inputs_changed" not in run_refusal, (
+        "plan drift surfaces from a script agent step, not the initial run attempt"
     )
+    assert "plan_inputs_changed" in observe, (
+        "the failed step or run must tell the agent whether to start a new run or repair "
+        "settings.json and resume"
+    )
+    assert "approval enforcement was turned on after this run started" in observe
 
 
 def test_the_first_run_being_refused_is_stated_as_by_design(skill):
