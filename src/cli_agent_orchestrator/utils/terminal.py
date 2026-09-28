@@ -180,25 +180,19 @@ async def wait_for_shell(
 def effective_status(terminal_id: str) -> "TerminalStatus":
     """The status of any terminal, wherever its pane actually lives (#745).
 
-    ``StatusMonitor`` is a LOCAL detector: it reads a rolling buffer fed by this
-    process's FIFO reader and, on its fallbacks, shells out to this host's tmux.
-    For a terminal in an execution runtime none of that describes the right
-    machine — the buffer is empty and the answer is a permanent ``UNKNOWN``. The
-    runtime derives status beside its own pane and pushes it over the channel, so
-    for a remote terminal the registry's last reported status IS the status; the
-    review finding this closes is a step that timed out while its worker had
-    reported COMPLETED minutes earlier (finding 4 on #802).
-
-    The same routing decision the service seams already make one by one
-    (``terminal_service.get_terminal``, ``InboxService.deliver_pending``), in the
-    one form the polling waits can share. Blocking (both arms may do I/O) —
-    callers on the event loop hand it to ``asyncio.to_thread``.
+    A remote terminal's status is what its runtime last reported over the
+    channel; a local one's is the local ``StatusMonitor`` verdict. Placement and
+    the remote status are read in ONE registry observation (``observe``) so a
+    disconnect cannot land between a separate placement check and status read and
+    return a stale value. Blocking (either arm may do I/O) — callers on the event
+    loop hand it to ``asyncio.to_thread``.
     """
     from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
     from cli_agent_orchestrator.services.status_monitor import status_monitor
 
-    if runtime_registry.is_remote(terminal_id):
-        return runtime_registry.get_status(terminal_id)
+    is_remote, status = runtime_registry.observe(terminal_id)
+    if is_remote:
+        return status
     return status_monitor.get_status(terminal_id)
 
 

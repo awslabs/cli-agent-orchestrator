@@ -611,6 +611,73 @@ class RuntimeChannelRegistry:
             return True, None
         return placed is not None, placed
 
+    def observe(self, terminal_id: str) -> Tuple[bool, Optional[TerminalStatus]]:
+        """``(is_remote, status)`` for a terminal from ONE observation of state.
+
+        ``(True, status)`` for a remote terminal, ``(False, None)`` for a local
+        one. ``effective_status`` used to ask ``is_remote`` then ``get_status`` —
+        two lock acquisitions from a worker thread while the channel loop mutates
+        the registry, so a disconnect landing between them could return a stale
+        ``COMPLETED`` (Copilot review on #802). This decides placement and reads
+        status together so the pair is internally consistent.
+
+        ``status`` follows ``get_status``' rule: UNKNOWN unless the terminal is
+        bound in memory to a CONNECTED runtime.
+        """
+        with self._lock:
+            if terminal_id in self._terminal_runtime:
+                runtime_id = self._terminal_runtime[terminal_id]
+                if runtime_id not in self._runtimes:
+                    return True, TerminalStatus.UNKNOWN
+                return True, self._status.get(terminal_id, TerminalStatus.UNKNOWN)
+        # Not bound in memory: read the durable placement OUTSIDE the lock, so a
+        # worker thread's DB read never blocks the channel loop.
+        try:
+            placed = self._placement_from_the_central_row(terminal_id)
+        except PlacementUnavailableError:
+            # Unknown placement fails closed to remote/UNKNOWN, never to the local
+            # status monitor for a terminal that may live in a runtime.
+            return True, TerminalStatus.UNKNOWN
+        if placed is None:
+            return False, None
+        # The row names a runtime. Re-take the lock once and compute the status
+        # from memory: still UNKNOWN unless a hello has meanwhile bound it here to
+        # a connected runtime.
+        with self._lock:
+            runtime_id = self._terminal_runtime.get(terminal_id)
+            if runtime_id is None or runtime_id not in self._runtimes:
+                return True, TerminalStatus.UNKNOWN
+            return True, self._status.get(terminal_id, TerminalStatus.UNKNOWN)
+
+    def live_remote_bindings(self) -> List[Tuple[str, str]]:
+        """Every ``(terminal_id, runtime_id)`` whose runtime is CONNECTED.
+
+        The enumeration companion to ``remote_terminal_ids``: it returns the
+        runtime with each terminal under ONE lock acquisition, so a caller
+        building a session listing does not follow the snapshot with a
+        per-terminal ``runtime_for_terminal`` that could observe a different
+        world (Copilot review on #802). Disconnected bindings are excluded for
+        the same reason ``remote_terminal_ids`` excludes them: a binding outlives
+        its channel for routing, but a dead runtime's sessions must not enumerate.
+        """
+        with self._lock:
+            return [
+                (tid, rid) for tid, rid in self._terminal_runtime.items() if rid in self._runtimes
+            ]
+
+    def is_bound(self, terminal_id: str) -> bool:
+        """Whether this terminal is bound to a runtime IN MEMORY, lock only.
+
+        A pure in-memory fast check with no DB fallback: the status monitor's
+        event loop uses it to skip a known-remote terminal without ever reaching
+        the synchronous placement read that ``is_remote`` can trigger on a cold
+        cache (Copilot overview / haofeif #11 on #802). A ``False`` here is not
+        "local" — it only means "not bound in this process's memory"; the caller
+        confirms placement off the loop.
+        """
+        with self._lock:
+            return terminal_id in self._terminal_runtime
+
     def remote_terminal_ids(self) -> List[str]:
         """Every terminal bound to a runtime that is currently CONNECTED.
 

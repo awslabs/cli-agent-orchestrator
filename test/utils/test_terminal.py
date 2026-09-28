@@ -264,9 +264,11 @@ class TestWaitUntilStatus:
     """Tests for wait_until_status function."""
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.runtime_channel.registry.runtime_registry")
     @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
-    async def test_wait_until_status_success(self, mock_monitor):
+    async def test_wait_until_status_success(self, mock_monitor, mock_registry):
         """Test successful status wait."""
+        mock_registry.observe.return_value = (False, None)
         mock_monitor.get_status.return_value = TerminalStatus.IDLE
 
         result = await wait_until_status(
@@ -276,9 +278,11 @@ class TestWaitUntilStatus:
         assert result is True
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.runtime_channel.registry.runtime_registry")
     @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
-    async def test_wait_until_status_timeout(self, mock_monitor):
+    async def test_wait_until_status_timeout(self, mock_monitor, mock_registry):
         """Test status wait timeout."""
+        mock_registry.observe.return_value = (False, None)
         mock_monitor.get_status.return_value = TerminalStatus.PROCESSING
 
         result = await wait_until_status(
@@ -288,9 +292,11 @@ class TestWaitUntilStatus:
         assert result is False
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.runtime_channel.registry.runtime_registry")
     @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
-    async def test_wait_until_status_with_set(self, mock_monitor):
+    async def test_wait_until_status_with_set(self, mock_monitor, mock_registry):
         """Test status wait accepts a set of target statuses."""
+        mock_registry.observe.return_value = (False, None)
         mock_monitor.get_status.return_value = TerminalStatus.COMPLETED
 
         result = await wait_until_status(
@@ -303,9 +309,11 @@ class TestWaitUntilStatus:
         assert result is True
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.runtime_channel.registry.runtime_registry")
     @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
-    async def test_wait_until_status_eventually_succeeds(self, mock_monitor):
+    async def test_wait_until_status_eventually_succeeds(self, mock_monitor, mock_registry):
         """Test status wait that eventually succeeds."""
+        mock_registry.observe.return_value = (False, None)
         mock_monitor.get_status.side_effect = [
             TerminalStatus.PROCESSING,
             TerminalStatus.PROCESSING,
