@@ -293,19 +293,25 @@ class TestReconnectRecovery:
         assert ("beef0001", 0) in {(s.terminal_id, s.end_pos) for s in hello.streams}
 
     @pytest.mark.asyncio
-    async def test_a_resume_position_past_this_runtimes_buffer_is_clamped(self, caplog):
+    async def test_a_resume_position_past_this_runtimes_buffer_is_reported_as_a_bounded_gap(
+        self, caplog
+    ):
         """The server asks to resume from further on than this runtime ever got.
 
-        `replay_from` raises for a position past its end, which would abort the
-        handshake in a loop. Clamping to the watermark keeps the channel coming
-        up, but it means the server's bookkeeping and this runtime's disagree —
-        a stream restarted under a reused terminal id — so it is logged rather
-        than silently corrected (Copilot review on #802, finding 12).
+        `replay_from` raises for a position past its end, so the channel cannot
+        just replay it. Rather than silently accept the impossible position, the
+        bridge reports the missing range as a bounded GapFrame in the OLD
+        generation and then starts a NEW generation — a stream restarted under a
+        reused terminal id — so the server's bookkeeping and this runtime's can
+        never be spliced into one transcript (Copilot review on #802).
         """
         import logging
 
         bridge = _bridge()
-        bridge._buffer_for(TID).append(b"12345")
+        buf = bridge._buffer_for(TID)
+        buf.append(b"12345")
+        stale_end = buf.end_pos
+        old_generation = buf.generation
         ws = _FakeWS(
             HelloFrame(
                 protocol_version=PROTOCOL_VERSION,
@@ -314,7 +320,7 @@ class TestReconnectRecovery:
                     StreamPosition(
                         terminal_id=TID,
                         stream=StreamName.CAPTURE,
-                        generation=0,
+                        generation=old_generation,
                         end_pos=9999,
                     )
                 ],
@@ -325,7 +331,16 @@ class TestReconnectRecovery:
             await asyncio.wait_for(bridge._serve(ws), timeout=5)
 
         assert "past this runtime's watermark" in caplog.text
-        # Clamped, so the handshake completed and nothing was re-sent as new.
+        # Reported as an explicit bounded gap in the old generation, not accepted
+        # silently: from_pos is the old watermark, to_pos the impossible position.
+        gaps = ws.frames_of(GapFrame)
+        assert len(gaps) == 1, f"expected exactly one gap, got {gaps}"
+        assert gaps[0].from_pos == stale_end
+        assert gaps[0].to_pos == 9999
+        assert gaps[0].generation == old_generation
+        # The buffer then restarts, so no later live frame reads as a rewind.
+        assert buf.generation == old_generation + 1
+        # Nothing was re-sent as new output.
         assert ws.frames_of(StreamFrame) == []
 
 
@@ -373,7 +388,7 @@ class TestReconnectBackoff:
                 bridge._stop.set()
             return _Conn()
 
-        monkeypatch.setattr(bridge_mod.websockets, "connect", fake_connect)
+        monkeypatch.setattr(bridge_mod, "connect", fake_connect)
         real_wait_for = asyncio.wait_for
 
         async def recording_wait_for(awaitable, timeout=None):
