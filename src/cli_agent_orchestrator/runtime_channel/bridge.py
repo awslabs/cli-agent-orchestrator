@@ -452,6 +452,9 @@ class Bridge:
                 payload["message"],
                 sender_id=payload.get("sender_id"),
                 orchestration_type=payload.get("orchestration_type"),
+                # Forwarded UNCHANGED: None, "" and a real block are distinct
+                # instructions to inject_memory_context (haofeif #8).
+                frozen_memory=payload.get("frozen_memory"),
             )
             return CommandOutcome.OK, {"success": success}, terminal_id
         if frame.type == CommandType.SPECIAL_KEY:

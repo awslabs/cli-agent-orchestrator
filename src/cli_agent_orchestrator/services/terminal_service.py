@@ -2294,6 +2294,7 @@ def _send_input_remote(
     message: str,
     sender_id: str | None,
     orchestration_type: OrchestrationType | None,
+    frozen_memory: str | None = None,
 ) -> bool:
     """Hand one send to the runtime that owns the terminal (#745).
 
@@ -2301,6 +2302,12 @@ def _send_input_remote(
     The runtime performs the real send_input beside its own tmux — including
     memory injection, the provider's paste rules and the status gates — so this
     side deliberately does none of that.
+
+    ``frozen_memory`` rides along verbatim. None, "" and a real block are three
+    distinct instructions to the runtime's ``inject_memory_context`` ("" means
+    an intentionally empty frozen context, not "look one up"), so the field is
+    carried on the wire rather than dropped, which had collapsed all three to a
+    live lookup on the runtime (haofeif #8).
     """
     from cli_agent_orchestrator.runtime_channel.protocol import CommandOutcome, CommandType
     from cli_agent_orchestrator.runtime_channel.registry import INPUT_TIMEOUT, runtime_registry
@@ -2316,6 +2323,7 @@ def _send_input_remote(
                 if isinstance(orchestration_type, OrchestrationType)
                 else orchestration_type
             ),
+            "frozen_memory": frozen_memory,
         },
         timeout=INPUT_TIMEOUT,
     )
@@ -2366,7 +2374,9 @@ def send_input(
         from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
 
         if runtime_registry.is_remote(terminal_id):
-            return _send_input_remote(terminal_id, message, sender_id, orchestration_type)
+            return _send_input_remote(
+                terminal_id, message, sender_id, orchestration_type, frozen_memory
+            )
 
         if (
             metadata.get("provider") == ProviderType.KIRO_CLI.value
