@@ -190,9 +190,7 @@ def test_observe_names_the_classification_field(skill):
     observe = skill.split("### g. OBSERVE", 1)[1].split("\n## ", 1)[0]
     documented = set(re.findall(r"(?m)^\| `([^`]+)` \|", observe)) - {"classification"}
     emitted = {
-        value
-        for name, value in vars(api_main).items()
-        if name.startswith("CLASSIFICATION_")
+        value for name, value in vars(api_main).items() if name.startswith("CLASSIFICATION_")
     }
     assert documented == emitted
 

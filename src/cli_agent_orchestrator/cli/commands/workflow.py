@@ -520,7 +520,7 @@ def list_cmd(scan_dir, as_json):
 @click.argument("name")
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit the spec as JSON.")
 def get_cmd(name, as_json):
-    """Show the parsed/validated spec for a workflow name or file path."""
+    """Show the parsed and validated spec for an indexed workflow name."""
     quoted_name = _quoted_workflow_name(name, as_json)
     auth_headers = _auth_headers() or None
     try:
