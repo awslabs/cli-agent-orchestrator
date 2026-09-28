@@ -1,12 +1,20 @@
 """Tests for cleanup service."""
 
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
+from cli_agent_orchestrator.clients.database import (
+    Base,
+    HandoffResultModel,
+    get_handoff_result,
+    upsert_handoff_result,
+)
 from cli_agent_orchestrator.services.cleanup_service import cleanup_old_data
 
 
@@ -261,3 +269,86 @@ class TestCleanupOldData:
 
         # Verify filter was called (terminals: .all() + .delete(), inbox: .delete())
         assert len(filter_calls) >= 2
+
+
+class TestHandoffResultRetention:
+    """The handoff_results sweep (issue #447), PR #453 review findings 1 and 7.
+
+    Two distinct gaps, two tests. Finding 1 is the CLOCK: every other swept table
+    defaults its timestamp to naive-local ``datetime.now``, so ``cutoff_date``
+    matches them, but ``HandoffResultModel.created_at`` defaults to ``_utcnow()``
+    and SQLite keeps only the UTC wall-clock -- a local cutoff therefore deletes
+    rows UTC-offset hours early or late. Finding 7 is the WIRING: every other
+    cleanup test here patches ``cleanup_service.SessionLocal``, which does NOT
+    intercept the ``database.SessionLocal`` that ``delete_old_handoff_results``
+    opens internally, so no existing test touches the handoff table at all.
+    """
+
+    @patch("cli_agent_orchestrator.services.cleanup_service.delete_old_handoff_results")
+    @patch("cli_agent_orchestrator.services.cleanup_service.SessionLocal")
+    @patch("cli_agent_orchestrator.services.cleanup_service.TERMINAL_LOG_DIR")
+    @patch("cli_agent_orchestrator.services.cleanup_service.LOG_DIR")
+    @patch("cli_agent_orchestrator.services.cleanup_service.RETENTION_DAYS", 30)
+    def test_handoff_sweep_uses_a_tz_aware_utc_cutoff(
+        self, mock_log_dir, mock_terminal_log_dir, mock_session_local, mock_delete
+    ):
+        """The cutoff handed to the handoff sweep must be tz-aware UTC, not the
+        naive-local ``cutoff_date`` the sibling tables use.
+
+        The ``tzinfo is not None`` assertion is what makes this non-vacuous and
+        TZ-independent: the pre-fix code passed ``cutoff_date``, which is naive in
+        EVERY timezone including UTC, so this fails on the old code without needing
+        the suite to run east of Greenwich.
+        """
+        mock_db = MagicMock()
+        mock_session_local.return_value.__enter__.return_value = mock_db
+        mock_db.query.return_value.filter.return_value.delete.return_value = 0
+        mock_db.query.return_value.filter.return_value.all.return_value = []
+        mock_log_dir.exists.return_value = False
+        mock_terminal_log_dir.exists.return_value = False
+        mock_delete.return_value = 0
+
+        cleanup_old_data()
+
+        mock_delete.assert_called_once()
+        cutoff = mock_delete.call_args[0][0]
+        assert cutoff.tzinfo is not None, "handoff cutoff must be tz-aware, not naive local"
+        assert cutoff.utcoffset() == timedelta(0), "handoff cutoff must be UTC"
+        expected = datetime.now(timezone.utc) - timedelta(days=30)
+        assert abs((cutoff - expected).total_seconds()) < 60
+
+    @patch("cli_agent_orchestrator.services.cleanup_service.TERMINAL_LOG_DIR")
+    @patch("cli_agent_orchestrator.services.cleanup_service.LOG_DIR")
+    @patch("cli_agent_orchestrator.services.cleanup_service.RETENTION_DAYS", 30)
+    def test_handoff_sweep_reaches_the_real_table(
+        self, mock_log_dir, mock_terminal_log_dir, monkeypatch
+    ):
+        """End-to-end through the REAL ``delete_old_handoff_results``: an aged row is
+        swept and a fresh one survives.
+
+        ``database.SessionLocal`` is patched in ADDITION to
+        ``cleanup_service.SessionLocal`` -- patching only the latter (what every
+        other test in this file does) leaves the handoff sweep talking to the
+        operator's real DB, which is why this path shipped unverified.
+        """
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(bind=engine)
+        TestSession = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+        monkeypatch.setattr("cli_agent_orchestrator.clients.database.SessionLocal", TestSession)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.cleanup_service.SessionLocal", TestSession
+        )
+        mock_log_dir.exists.return_value = False
+        mock_terminal_log_dir.exists.return_value = False
+
+        upsert_handoff_result("aged", "completed", last_message="old output")
+        upsert_handoff_result("fresh", "completed", last_message="new output")
+        with TestSession() as db:
+            row = db.query(HandoffResultModel).filter(HandoffResultModel.job_id == "aged").first()
+            row.created_at = datetime.now(timezone.utc) - timedelta(days=31)
+            db.commit()
+
+        cleanup_old_data()
+
+        assert get_handoff_result("aged") is None
+        assert get_handoff_result("fresh") is not None

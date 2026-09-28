@@ -11,8 +11,9 @@ from typing import Any, Dict, Optional
 
 import requests
 
-from cli_agent_orchestrator.constants import API_BASE_URL, MCP_REQUEST_TIMEOUT
+from cli_agent_orchestrator.constants import API_BASE_URL
 from cli_agent_orchestrator.security.auth import get_local_bearer
+from cli_agent_orchestrator.utils.orchestration import _mcp_timeout
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +39,7 @@ def get_json(path: str, *, timeout: Optional[float] = None, **params: Any) -> An
         f"{API_BASE_URL}{path}",
         params={k: v for k, v in params.items() if v is not None} or None,
         headers=_auth_headers() or None,
-        timeout=MCP_REQUEST_TIMEOUT if timeout is None else timeout,
+        timeout=_mcp_timeout() if timeout is None else timeout,
     )
     response.raise_for_status()
     return response.json()
@@ -55,7 +56,7 @@ def post_body_json(path: str, body: Dict[str, Any], *, timeout: Optional[float] 
         f"{API_BASE_URL}{path}",
         json=body,
         headers=_auth_headers() or None,
-        timeout=MCP_REQUEST_TIMEOUT if timeout is None else timeout,
+        timeout=_mcp_timeout() if timeout is None else timeout,
     )
     response.raise_for_status()
     try:
@@ -83,7 +84,7 @@ def get_terminal_record(terminal_id: str) -> Optional[Dict[str, Any]]:
         response = requests.get(
             f"{API_BASE_URL}/terminals/{terminal_id}",
             headers=_auth_headers() or None,
-            timeout=MCP_REQUEST_TIMEOUT,
+            timeout=_mcp_timeout(),
         )
     except requests.RequestException as exc:
         logger.warning("Failed to fetch terminal record for %s: %s", terminal_id, exc)

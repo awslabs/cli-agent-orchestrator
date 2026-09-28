@@ -1,4 +1,36 @@
-const BASE = ''  // Vite proxy handles routing to backend
+/**
+ * Path prefix this bundle is served under, with no trailing slash.
+ *
+ * Vite fills `import.meta.env.BASE_URL` from the `base` config (or `--base` on
+ * the CLI) and always terminates it with a slash. A default build therefore
+ * gives `/`, so BASE is `''` and every URL built below is byte-identical to the
+ * root-absolute paths it replaced. Only a build that opts in with
+ * `--base=/some/prefix/` sees a different value.
+ *
+ * `--base` on its own is not enough to serve the app under a prefix: Vite
+ * rewrites the asset references baked into index.html and the bundle, but it
+ * cannot touch a URL the app assembles at runtime, because those are ordinary
+ * strings it never sees as URLs. The three helpers here are those runtime URLs
+ * — REST, the terminal WebSocket, the workflow event stream — and they are the
+ * whole set (`DashboardHome`'s `fetch` is a local that shadows the global and
+ * calls `api.getTerminalStatus`).
+ *
+ * A relative `--base` such as `./` cannot work for runtime calls and is not
+ * supported; use an absolute prefix.
+ */
+const BASE = import.meta.env.BASE_URL.replace(/\/$/, '')
+
+/** URL for the terminal's xterm WebSocket, honouring BASE. */
+export function terminalSocketUrl(terminalId: string): string {
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
+  return `${protocol}//${location.host}${BASE}/terminals/${terminalId}/ws`
+}
+
+/** URL for a workflow run's SSE event stream, honouring BASE. */
+export function eventStreamUrl(runId: string, afterSeq?: number): string {
+  const q = afterSeq != null ? `?after_seq=${afterSeq}` : ''
+  return `${BASE}/workflows/runs/${encodeURIComponent(runId)}/events${q}`
+}
 
 /**
  * Error thrown by fetchJSON on a non-OK response. Carries the HTTP status and
@@ -462,6 +494,86 @@ export interface RunSummaryRow {
   current_step_id: string | null
 }
 
+// ── Agent Plugins (Agent Plugins 1.0.0) ──────────────────────────────────────
+// Distinct from CAO's event-plugin system, which has no web surface.
+
+export interface PluginFinding {
+  severity: 'fatal' | 'skipped' | 'warning' | 'info'
+  code: string
+  /** The specification clause this finding enforces, e.g. "§5.2". */
+  spec_ref: string
+  message: string
+  path: string | null
+}
+
+export interface PluginDiscoveredSkill {
+  name: string
+  directory: string
+  description: string
+}
+
+/** A live session whose profile references a skill a removal would withdraw. */
+export interface PluginAffectedSession {
+  terminal_id: string
+  session_name: string
+  profile_name: string
+  skill_names: string[]
+}
+
+export interface InstalledPlugin {
+  name: string
+  version: string | null
+  source: { kind: string; location: string; ref: string | null; subdir: string | null }
+  resolved_ref: string | null
+  installed_at: string
+  schema_id: string
+  skill_names: string[]
+  projected_skill_names: string[]
+  findings: PluginFinding[]
+  affected_sessions: PluginAffectedSession[]
+}
+
+export interface PluginListResponse {
+  plugins: InstalledPlugin[]
+  untrusted_content_warning: string
+}
+
+export interface PluginValidationReport {
+  root: string
+  loadable: boolean
+  name: string | null
+  version: string | null
+  description: string | null
+  schema_id: string | null
+  skills: PluginDiscoveredSkill[]
+  mcp_present: boolean
+  findings: PluginFinding[]
+}
+
+export interface PluginInstallOutcome {
+  installed: boolean
+  dry_run: boolean
+  report: PluginValidationReport
+  record: InstalledPlugin | null
+  projection_findings: PluginFinding[]
+}
+
+export interface PluginUninstallOutcome {
+  name: string
+  removed: boolean
+  purged_data: boolean
+  affected_sessions: PluginAffectedSession[]
+  projection_findings: PluginFinding[]
+}
+
+export interface PluginInstallBody {
+  source: string
+  kind?: 'path' | 'git'
+  ref?: string
+  subdir?: string
+  force?: boolean
+}
+
 export const api = {
   // Agent Profiles & Providers
   listProfiles: () => fetchJSON<AgentProfileInfo[]>('/agents/profiles'),
@@ -687,5 +799,39 @@ export const api = {
   getTerminalOutputRange: (terminalId: string, offset: number, length: number) =>
     fetchJSON<TerminalOutputRange>(
       `/terminals/${encodeURIComponent(terminalId)}/output/range?offset=${offset}&length=${length}`,
+    ),
+  // Agent Plugins. Install clones or copies a whole package tree and rebuilds
+  // the skill projection, so it gets a wider timeout than the 10s default —
+  // a git source has a network fetch in the middle of it.
+  //
+  // 330_000 is derived, not chosen: the server's clone budget is
+  // `GIT_TIMEOUT_S = 300` in `agent_plugins/resolver.py`, plus 30s of margin for
+  // validation and the projection rebuild that follow the clone. The client MUST
+  // outlast the server, because the route awaits `asyncio.to_thread(...)`, which
+  // cannot be cancelled and sees no client disconnect: aborting first showed the
+  // operator a failure for an install the backend went on to commit. `validatePlugin`
+  // carries the same budget because validation resolves — and therefore clones — the
+  // source first. If `GIT_TIMEOUT_S` moves, these move with it;
+  // `test/agent_plugins/test_web_timeout_drift.py` fails if they ever cross.
+  listPlugins: () => fetchJSON<PluginListResponse>('/plugins'),
+  installPlugin: (body: PluginInstallBody) =>
+    fetchJSON<PluginInstallOutcome>('/plugins', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      timeoutMs: 330000,
+    }),
+  validatePlugin: (body: PluginInstallBody) =>
+    fetchJSON<PluginValidationReport>('/plugins/validate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      timeoutMs: 330000,
+    }),
+  // No git involved in a removal, so it keeps the narrower budget.
+  uninstallPlugin: (name: string, purgeData = false) =>
+    fetchJSON<PluginUninstallOutcome>(
+      `/plugins/${encodeURIComponent(name)}${purgeData ? '?purge_data=true' : ''}`,
+      { method: 'DELETE', timeoutMs: 60000 },
     ),
 }

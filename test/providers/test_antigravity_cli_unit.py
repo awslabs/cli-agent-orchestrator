@@ -974,3 +974,41 @@ def test_cleanup_logs_unregister_exception(caplog):
     assert "disk full" in caplog.text
     assert "_unregister_mcp_servers" in caplog.text
     loop.close()
+
+
+def test_cwd_reaches_the_shared_mcp_config(tmp_path):
+    """Reported by review 5222539218 on #584 (item 4).
+
+    Antigravity documents ``cwd`` ("Working directory for `stdio` servers."), so an
+    agent plugin's declared directory is carried natively into mcp_config.json
+    rather than through the ``/bin/sh`` wrapper the formats without such a field
+    need.
+    """
+    import json
+
+    from cli_agent_orchestrator.models.agent_profile import AgentProfile
+
+    cfg = tmp_path / "mcp_config.json"
+    profile = AgentProfile(
+        name="worker",
+        description="Worker",
+        system_prompt="Work.",
+        mcpServers={"demo-tools": {"command": "demo-server", "args": [], "cwd": "/plugins/demo"}},
+    )
+    p = make_provider(agent_profile="worker")
+    with (
+        patch(
+            "cli_agent_orchestrator.providers.antigravity_cli.shutil.which",
+            return_value="/usr/local/bin/agy",
+        ),
+        patch(
+            "cli_agent_orchestrator.providers.antigravity_cli.load_agent_profile",
+            return_value=profile,
+        ),
+        patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=cfg),
+    ):
+        p._build_agy_command()
+
+    entry = json.loads(cfg.read_text())["mcpServers"]["demo-tools-test-tid"]
+    assert entry["cwd"] == "/plugins/demo"
+    assert entry["command"] == "demo-server", "must NOT be shimmed: the format has a cwd field"

@@ -162,6 +162,7 @@ def launch(
         forwarded_env = _parse_env_pairs(env_pairs) if env_pairs else {}
 
         # Resolve allowedTools: --yolo > --allowed-tools CLI > profile/role defaults
+        from cli_agent_orchestrator.agent_plugins.mcp_delivery import grantable_server_names
         from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
         from cli_agent_orchestrator.utils.tool_mapping import (
             format_tool_summary,
@@ -179,7 +180,7 @@ def launch(
             # Load profile to get role-based defaults
             try:
                 profile = load_agent_profile(agents)
-                mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
+                mcp_server_names = grantable_server_names(profile)
                 no_role_set = not profile.role and not profile.allowedTools
                 resolved_allowed_tools = resolve_allowed_tools(
                     profile.allowedTools, profile.role, mcp_server_names

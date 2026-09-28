@@ -842,6 +842,126 @@ def test_restricted_command_allows_only_valid_configured_mcp_servers(tmp_path):
     provider.cleanup()
 
 
+# ---------------------------------------------------------------------------
+# Documented ``@glob`` grants (docs/agent-plugins.md:207, example at :225).
+#
+# ``_permitted_mcp_server_refs`` converted each ``@...`` entry to one exact
+# server name and required that literal to be configured, so the ``@plugin-*``
+# the documentation tells an operator to write resolved to nothing and the
+# launch command carried no ``MCPTool(...)`` rule at all. Asserted on the
+# command string rather than the resolver's return value, because the command
+# is the artifact that decides what Grok actually permits.
+# ---------------------------------------------------------------------------
+
+
+def _grok_mcp_rules(provider, profile, tmp_path) -> set[str]:
+    """Return the ``MCPTool(...)`` rules in the launch command Grok is given."""
+
+    with (
+        patch("cli_agent_orchestrator.providers.grok_cli.CAO_HOME_DIR", tmp_path),
+        patch("cli_agent_orchestrator.providers.grok_cli.shutil.which", return_value="/bin/grok"),
+        patch(
+            "cli_agent_orchestrator.providers.grok_cli.load_agent_profile",
+            return_value=profile,
+        ),
+    ):
+        parts = shlex.split(provider._build_grok_command())
+    try:
+        return {
+            parts[index + 1]
+            for index, part in enumerate(parts)
+            if part == "--allow" and parts[index + 1].startswith("MCPTool(")
+        }
+    finally:
+        provider.cleanup()
+
+
+def _plugin_profile(**extra) -> AgentProfile:
+    """A profile whose configured servers include a plugin-delivered one."""
+
+    servers = {
+        "plugin-tools": {"command": "plugin-tools-mcp"},
+        "other-tools": {"command": "other-tools-mcp"},
+    }
+    servers.update(extra.pop("mcpServers", {}))
+    return _profile(mcpServers=servers, **extra)
+
+
+def test_grok_honors_a_documented_glob_mcp_grant(tmp_path):
+    """``@plugin-*`` must reach the launch command as the concrete server's rule."""
+
+    provider = make_provider(agent_profile="grok-worker", allowed_tools=["fs_read", "@plugin-*"])
+
+    rules = _grok_mcp_rules(provider, _plugin_profile(), tmp_path)
+
+    assert "MCPTool(plugin-tools__*)" in rules, (
+        f"the documented @plugin-* grant authorized nothing; Grok was launched with "
+        f"{sorted(rules)} (docs/agent-plugins.md:207)"
+    )
+
+
+def test_grok_glob_grant_does_not_reach_a_non_matching_server(tmp_path):
+    """The glob is a filter, not a switch: a sibling server stays denied."""
+
+    provider = make_provider(agent_profile="grok-worker", allowed_tools=["fs_read", "@plugin-*"])
+
+    rules = _grok_mcp_rules(provider, _plugin_profile(), tmp_path)
+
+    assert "MCPTool(other-tools__*)" not in rules
+
+
+def test_grok_glob_grant_is_case_sensitive(tmp_path):
+    """``@PLUGIN-*`` must not match ``plugin-tools`` on any platform.
+
+    ``fnmatch.fnmatch`` case-folds wherever ``os.path.normcase`` does, which
+    would silently widen the grant on a case-insensitive host. The rule uses
+    ``fnmatchcase``.
+    """
+
+    provider = make_provider(agent_profile="grok-worker", allowed_tools=["fs_read", "@PLUGIN-*"])
+
+    rules = _grok_mcp_rules(provider, _plugin_profile(), tmp_path)
+
+    assert "MCPTool(plugin-tools__*)" not in rules
+    assert not any(rule.startswith("MCPTool(plugin") for rule in rules), sorted(rules)
+
+
+def test_grok_glob_grant_never_invents_an_unconfigured_server(tmp_path):
+    """A pattern matching nothing configured must not be interpolated raw.
+
+    The pattern is expanded against the concrete configured names only. A rule
+    built from the pattern itself would hand Grok ``MCPTool(ghost-*__*)`` and
+    authorize whatever later answered to it.
+    """
+
+    provider = make_provider(
+        agent_profile="grok-worker",
+        allowed_tools=["fs_read", "@cao-mcp-server", "@ghost-*"],
+    )
+
+    rules = _grok_mcp_rules(provider, _plugin_profile(), tmp_path)
+
+    assert rules == {"MCPTool(cao-mcp-server__*)"}, sorted(rules)
+
+
+def test_grok_exact_and_star_grants_are_unchanged(tmp_path):
+    """The controls: exact membership still works and ``"*"`` is untouched."""
+
+    exact = make_provider(agent_profile="grok-worker", allowed_tools=["fs_read", "@plugin-tools"])
+    assert "MCPTool(plugin-tools__*)" in _grok_mcp_rules(exact, _plugin_profile(), tmp_path)
+
+    unrestricted = make_provider(allowed_tools=["*"])
+    with (
+        patch("cli_agent_orchestrator.providers.grok_cli.CAO_HOME_DIR", tmp_path),
+        patch("cli_agent_orchestrator.providers.grok_cli.shutil.which", return_value="/bin/grok"),
+    ):
+        parts = shlex.split(unrestricted._build_grok_command())
+    # "*" takes the unrestricted branch, which emits no permission rules at all.
+    assert "--always-approve" in parts
+    assert not any(part.startswith("MCPTool(") for part in parts)
+    unrestricted.cleanup()
+
+
 def test_web_capability_omits_disable_flag(tmp_path):
     provider = make_provider(allowed_tools=["web_fetch"])
     with (
@@ -1416,3 +1536,59 @@ def test_atomic_write_repairs_existing_permissive_mode(tmp_path):
     make_provider()._atomic_write_private(target, "new\n")
     assert target.read_text(encoding="utf-8") == "new\n"
     assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
+def test_streamable_http_is_written_as_grok_http():
+    """Reproduced by review 3 on #584: CAO and Grok name the same transport differently.
+
+    The Agent Plugins ``mcp.json`` schema and CAO's mapper use the MCP spec's
+    ``streamable-http``; Grok's TOML calls it ``http``. Before the alias, wiring
+    Grok into plugin delivery meant a schema-valid plugin server raised
+    ``ProviderError`` out of ``_render_mcp_config`` — during terminal creation,
+    so the whole agent failed to launch rather than losing one tool.
+    """
+    rendered = make_provider()._render_mcp_config(
+        {"remote": {"url": "https://mcp.example.invalid", "type": "streamable-http"}}
+    )
+    assert 'type = "http"' in rendered
+    assert "streamable-http" not in rendered
+
+
+def test_sse_is_still_written_as_sse():
+    """SSE requires an explicit type in Grok, so it must not collapse to http."""
+    rendered = make_provider()._render_mcp_config(
+        {"remote": {"url": "https://mcp.example.invalid", "type": "sse"}}
+    )
+    assert 'type = "sse"' in rendered
+
+
+def test_the_profile_load_is_wrapped_in_plugin_delivery(tmp_path, monkeypatch):
+    """The launch-time seam: Grok must see installed plugins' MCP servers.
+
+    Asserted on the provider key as well as the call, because the key selects the
+    transport row — passing the module name instead of the ``ProviderType`` value
+    would silently fall through to the stdio-only default.
+    """
+    from cli_agent_orchestrator.models.provider import ProviderType
+
+    calls = []
+
+    def spy(profile, provider=None):
+        calls.append((profile, provider))
+        return profile
+
+    monkeypatch.setattr("cli_agent_orchestrator.providers.grok_cli.CAO_HOME_DIR", tmp_path)
+    monkeypatch.setattr("cli_agent_orchestrator.providers.grok_cli._with_plugin_mcp", spy)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.grok_cli.load_agent_profile",
+        lambda _name: _profile(),
+    )
+
+    provider = make_provider(agent_profile="analyst")
+    with patch(
+        "cli_agent_orchestrator.providers.grok_cli.shutil.which", return_value="/usr/bin/grok"
+    ):
+        provider._build_grok_command()
+
+    assert calls, "grok built its command without passing the profile through plugin delivery"
+    assert all(provider_key == ProviderType.GROK_CLI.value for _, provider_key in calls), calls

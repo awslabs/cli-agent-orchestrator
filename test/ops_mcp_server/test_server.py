@@ -14,7 +14,10 @@ from cli_agent_orchestrator.ops_mcp_server.models import (
     SessionListResult,
 )
 from cli_agent_orchestrator.ops_mcp_server.server import (
+    _HTTP_TIMEOUT,
     _launch_session_impl,
+    _lookup_session,
+    _request_json,
     get_profile_details,
     get_session_info,
     get_terminal_output,
@@ -73,6 +76,8 @@ class TestProfileTools:
             "http://127.0.0.1:9889/agents/profiles",
             params=None,
             json=None,
+            timeout=_HTTP_TIMEOUT,
+            headers=None,
         )
 
     async def test_list_profiles_returns_empty_list(self) -> None:
@@ -158,6 +163,8 @@ class TestProfileTools:
             "http://127.0.0.1:9889/agents/profiles/install",
             params=None,
             json={"source": "developer", "provider": "kiro_cli"},
+            timeout=_HTTP_TIMEOUT,
+            headers=None,
         )
 
     async def test_install_profile_returns_result_for_url_source(self) -> None:
@@ -182,6 +189,8 @@ class TestProfileTools:
             "http://127.0.0.1:9889/agents/profiles/install",
             params=None,
             json={"source": "https://example.com/remote.md", "provider": "kiro_cli"},
+            timeout=_HTTP_TIMEOUT,
+            headers=None,
         )
 
     async def test_install_profile_omits_provider_when_not_explicit(self) -> None:
@@ -207,6 +216,8 @@ class TestProfileTools:
             "http://127.0.0.1:9889/agents/profiles/install",
             params=None,
             json={"source": "developer"},
+            timeout=_HTTP_TIMEOUT,
+            headers=None,
         )
 
     async def test_install_profile_forwards_env_vars(self) -> None:
@@ -238,6 +249,8 @@ class TestProfileTools:
                 "provider": "kiro_cli",
                 "env_vars": {"API_TOKEN": "secret", "BASE_URL": "http://localhost:27124"},
             },
+            timeout=_HTTP_TIMEOUT,
+            headers=None,
         )
 
     async def test_install_profile_returns_failure_for_invalid_provider(self) -> None:
@@ -311,6 +324,8 @@ class TestSessionLifecycleTools:
                 "allowed_tools": "fs_read,execute_bash",
             },
             json=None,
+            timeout=_HTTP_TIMEOUT,
+            headers=None,
         )
 
     async def test_launch_session_passes_custom_params(self) -> None:
@@ -344,6 +359,8 @@ class TestSessionLifecycleTools:
                 "working_directory": "/workspace/project",
             },
             json=None,
+            timeout=_HTTP_TIMEOUT,
+            headers=None,
         )
 
     async def test_launch_session_result_includes_provider_from_api_response(self) -> None:
@@ -399,6 +416,8 @@ class TestSessionLifecycleTools:
                 "model": "gpt-5.1-codex",
             },
             json={"initial_message": initial_message},
+            timeout=_HTTP_TIMEOUT,
+            headers=None,
         )
         request_url = mock_request.call_args.args[1]
         request_params = mock_request.call_args.kwargs["params"]
@@ -433,6 +452,8 @@ class TestSessionLifecycleTools:
                 "session_name": "env-session",
             },
             json={"env_vars": env_vars},
+            timeout=_HTTP_TIMEOUT,
+            headers=None,
         )
         # A forwarded value must not leak into the URL or query params.
         request_url = mock_request.call_args.args[1]
@@ -587,6 +608,8 @@ class TestSessionLifecycleTools:
             "http://127.0.0.1:9889/terminals/term-123/inbox/messages",
             params={"sender_id": "cao-ops-mcp", "message": "Build feature X"},
             json=None,
+            timeout=_HTTP_TIMEOUT,
+            headers=None,
         )
 
     async def test_send_session_message_returns_failure_for_not_found(self) -> None:
@@ -722,7 +745,12 @@ class TestSessionLifecycleTools:
 
         assert result == payload
         mock_request.assert_called_once_with(
-            "get", "http://127.0.0.1:9889/sessions/cao-acc-agy", params=None, json=None
+            "get",
+            "http://127.0.0.1:9889/sessions/cao-acc-agy",
+            params=None,
+            json=None,
+            timeout=_HTTP_TIMEOUT,
+            headers=None,
         )
 
     async def test_get_session_info_does_not_retry_when_already_prefixed(self) -> None:
@@ -738,7 +766,12 @@ class TestSessionLifecycleTools:
             "message": "Get session info for 'cao-missing' failed: Session not found",
         }
         mock_request.assert_called_once_with(
-            "get", "http://127.0.0.1:9889/sessions/cao-missing", params=None, json=None
+            "get",
+            "http://127.0.0.1:9889/sessions/cao-missing",
+            params=None,
+            json=None,
+            timeout=_HTTP_TIMEOUT,
+            headers=None,
         )
 
     async def test_get_session_info_surfaces_a_non_404_error_without_a_second_read(
@@ -756,7 +789,12 @@ class TestSessionLifecycleTools:
             "message": "Get session info for 'acc-agy' failed: Internal error",
         }
         mock_request.assert_called_once_with(
-            "get", "http://127.0.0.1:9889/sessions/cao-acc-agy", params=None, json=None
+            "get",
+            "http://127.0.0.1:9889/sessions/cao-acc-agy",
+            params=None,
+            json=None,
+            timeout=_HTTP_TIMEOUT,
+            headers=None,
         )
 
     async def test_shutdown_session_canonicalizes_a_bare_name_before_deleting(
@@ -946,6 +984,8 @@ class TestTerminalMonitoringTools:
             "http://127.0.0.1:9889/terminals/term-123",
             params=None,
             json=None,
+            timeout=_HTTP_TIMEOUT,
+            headers=None,
         )
 
     async def test_get_terminal_status_returns_failure_for_not_found(self) -> None:
@@ -975,6 +1015,8 @@ class TestTerminalMonitoringTools:
             "http://127.0.0.1:9889/terminals/term-123/output",
             params={"mode": "last"},
             json=None,
+            timeout=_HTTP_TIMEOUT,
+            headers=None,
         )
 
     async def test_get_terminal_output_passes_full_mode(self) -> None:
@@ -1034,3 +1076,78 @@ def test_plugin_mcp_surfaces_are_registered_on_ops_server() -> None:
         reloaded = importlib.reload(ops_server)
         mock_register.assert_called_once_with(reloaded.mcp)
     importlib.reload(ops_server)
+
+
+class TestLocalBearer:
+    """Reported by review 5222539218 on #584 (item 7).
+
+    The packaged ``cao-ops`` server reached the CAO API with no ``Authorization``
+    header even when the documented local bearer was configured, so against an
+    auth-enabled API every scope-gated operation returned 401. Both call sites are
+    covered: ``_request_json`` and ``_lookup_session`` (the latter arrived in the
+    rebase with neither a bearer nor a bound).
+    """
+
+    def test_no_authorization_header_when_auth_is_disabled(self, monkeypatch):
+        """Default-off posture is byte-for-byte unchanged apart from headers=None."""
+        monkeypatch.delenv("AUTH0_DOMAIN", raising=False)
+        monkeypatch.delenv("CAO_AUTH_JWKS_URI", raising=False)
+        monkeypatch.delenv("CAO_AUTH_LOCAL_TOKEN", raising=False)
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data={"ok": True}),
+        ) as mock_request:
+            _request_json("get", "/health", operation="Probe")
+        assert mock_request.call_args.kwargs["headers"] is None
+
+    def test_bearer_is_attached_when_auth_is_enabled_and_a_local_token_is_set(self, monkeypatch):
+        monkeypatch.setenv("AUTH0_DOMAIN", "example.auth0.com")
+        monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", "tok")
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data={"ok": True}),
+        ) as mock_request:
+            _request_json("get", "/health", operation="Probe")
+        assert mock_request.call_args.kwargs["headers"] == {"Authorization": "Bearer tok"}
+
+    def test_auth_enabled_without_a_token_returns_the_actionable_error_and_sends_nothing(
+        self, monkeypatch
+    ):
+        """A bare 401 is replaced by a message naming the variable to set."""
+        monkeypatch.setenv("AUTH0_DOMAIN", "example.auth0.com")
+        monkeypatch.delenv("CAO_AUTH_LOCAL_TOKEN", raising=False)
+        with patch("cli_agent_orchestrator.ops_mcp_server.server.requests.request") as mock_request:
+            data, error = _request_json("get", "/health", operation="Probe")
+        assert data is None
+        assert "CAO_AUTH_LOCAL_TOKEN" in error
+        mock_request.assert_not_called()
+
+    def test_the_session_lookup_also_carries_the_bearer(self, monkeypatch):
+        monkeypatch.setenv("AUTH0_DOMAIN", "example.auth0.com")
+        monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", "tok")
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data={"name": "cao-x"}),
+        ) as mock_request:
+            found, error = _lookup_session("cao-x")
+        assert (found, error) == (True, None)
+        assert mock_request.call_args.kwargs["headers"] == {"Authorization": "Bearer tok"}
+
+    def test_the_session_lookup_is_bounded_by_the_same_timeout(self):
+        """An unbounded probe here would hang ``shutdown_session`` indefinitely."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data={"name": "cao-x"}),
+        ) as mock_request:
+            _lookup_session("cao-x")
+        assert mock_request.call_args.kwargs["timeout"] == _HTTP_TIMEOUT
+
+    def test_the_session_lookup_reports_the_misconfiguration_as_unresolved(self, monkeypatch):
+        """Not absence: a misconfigured hop must not read as 'no such session'."""
+        monkeypatch.setenv("AUTH0_DOMAIN", "example.auth0.com")
+        monkeypatch.delenv("CAO_AUTH_LOCAL_TOKEN", raising=False)
+        with patch("cli_agent_orchestrator.ops_mcp_server.server.requests.request") as mock_request:
+            found, error = _lookup_session("cao-x")
+        assert found is False
+        assert error is not None and "CAO_AUTH_LOCAL_TOKEN" in error
+        mock_request.assert_not_called()

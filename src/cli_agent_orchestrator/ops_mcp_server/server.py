@@ -14,6 +14,10 @@ from cli_agent_orchestrator.ops_mcp_server.models import (
     SendMessageResult,
     SessionListResult,
 )
+from cli_agent_orchestrator.security.auth import (
+    get_local_bearer,
+    local_auth_misconfig_error,
+)
 from cli_agent_orchestrator.utils.forwarded_env import (
     ForwardedEnvError,
     validate_forwarded_env,
@@ -21,6 +25,11 @@ from cli_agent_orchestrator.utils.forwarded_env import (
 from cli_agent_orchestrator.utils.terminal import generate_session_name
 
 JsonDict = Dict[str, Any]
+
+# (connect, read) seconds for every call to the CAO API server. The server is
+# localhost-only, so a slow connect means something is wrong rather than far
+# away; the read budget is generous because launching a session is not instant.
+_HTTP_TIMEOUT = (5, 300)
 
 mcp = FastMCP(
     "cao-ops-mcp",
@@ -62,6 +71,25 @@ def _response_detail(response: requests.Response) -> str:
     return text or f"HTTP {response.status_code}"
 
 
+def _auth_headers() -> Optional[Dict[str, str]]:
+    """Return the ``Authorization`` header for the ops -> API hop, or ``None``.
+
+    Mirrors ``mcp_server/utils.py::_auth_headers``, but returns ``None`` rather
+    than ``{}`` when there is no token: every call site here passes the result
+    straight to ``requests``, and ``headers=None`` is exactly "send no header",
+    which keeps the default-off wire bytes unchanged.
+
+    Reported by review 5222539218 on #584 (item 7): the packaged ``cao-ops``
+    server sent no credential even when the operator had provisioned
+    ``CAO_AUTH_LOCAL_TOKEN``, so against an auth-enabled API every scope-gated
+    operation came back 401. No credential is ever stored in the package -- the
+    token is read from the environment of whatever client launched the server.
+    """
+
+    token = get_local_bearer()
+    return {"Authorization": f"Bearer {token}"} if token else None
+
+
 def _request_json(
     method: str,
     path: str,
@@ -70,13 +98,33 @@ def _request_json(
     json: Optional[Any] = None,
     operation: str,
 ) -> tuple[Optional[Any], Optional[str]]:
-    """Execute an API request and return either JSON data or an error message."""
+    """Execute an API request and return either JSON data or an error message.
+
+    Errors are **returned, not raised**, so every tool surfaces a structured,
+    operation-named string to the calling agent rather than a traceback, a hang,
+    or a silently empty result. That contract is what the packaged ``cao-ops``
+    Agent Plugin depends on when the operator's ``cao-server`` is not running.
+    """
+    # Surface an actionable misconfiguration instead of letting a bare 401 leak
+    # out of the API boundary (see security/auth.local_auth_misconfig_error).
+    misconfig = local_auth_misconfig_error()
+    if misconfig:
+        return None, f"{operation} failed: {misconfig}"
+
     try:
         response = requests.request(
             method,
             f"{API_BASE_URL}{path}",
             params=params,
             json=json,
+            headers=_auth_headers(),
+            # Bounded so "the server never answers" cannot become an
+            # indefinite hang. Connection-refused — the common case when
+            # cao-server simply is not running — already returns immediately;
+            # this covers the rest (a dropped packet, a wedged listener). A
+            # timeout is a `requests.RequestException`, so it flows through the
+            # same handler below and produces the identical structured error.
+            timeout=_HTTP_TIMEOUT,
         )
     except requests.RequestException as exc:
         return None, f"{operation} failed: {exc}"
@@ -157,9 +205,24 @@ def _lookup_session(candidate: str) -> tuple[bool, Optional[str]]:
       (``api/main.py``'s handler maps any non-ValueError to 500), and a 403
       simply means this token lacks read scope while still holding admin.
     """
+    # A misconfigured hop is UNRESOLVED, never absence -- the same three-outcome
+    # discipline this function's docstring describes. Reporting it as absence
+    # would let `shutdown_session` act on the wrong target.
+    misconfig = local_auth_misconfig_error()
+    if misconfig:
+        return False, f"lookup of session '{candidate}' failed: {misconfig}"
+
     try:
         response = requests.request(
-            "get", f"{API_BASE_URL}/sessions/{candidate}", params=None, json=None
+            "get",
+            f"{API_BASE_URL}/sessions/{candidate}",
+            params=None,
+            json=None,
+            headers=_auth_headers(),
+            # Bounded for the same reason `_request_json` is: this probe gates
+            # every `shutdown_session`, so an unbounded read here hangs the tool
+            # exactly the way an unbounded request does anywhere else.
+            timeout=_HTTP_TIMEOUT,
         )
     except requests.RequestException as exc:
         return False, f"lookup of session '{candidate}' failed: {exc}"

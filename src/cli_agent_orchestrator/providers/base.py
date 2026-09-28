@@ -44,6 +44,30 @@ class OutputExtractionError(ValueError):
     Subclasses ``ValueError`` so existing ``except ValueError`` callers keep
     working; the API boundary catches this narrower type first so an extraction
     failure is not reported as 404 Not Found (issue #570).
+
+    This is the *retryable* half of the extraction contract: the response marker
+    was not found, so a wider capture may still succeed. A refusal to publish
+    content that was actually found is :class:`OutputExtractionRejected`.
+    """
+
+
+class OutputExtractionRejected(OutputExtractionError):
+    """A deliberate refusal to publish extracted content.
+
+    Raised when the extractor *found* the response region and refused to publish
+    what was in it — the turn produced only private reasoning, or every candidate
+    row was chrome, a user echo, or reasoning.
+
+    The distinction is a security boundary, not a taxonomy nicety. A missing
+    marker is worth retrying with a wider capture and may legitimately degrade to
+    a labelled raw-transcript fallback. A deliberate rejection must do neither:
+    the raw pane contains the very content that was refused, so substituting it
+    silently republishes private reasoning as the agent's answer. Callers that
+    escalate or fall back on :class:`OutputExtractionError` must re-raise this
+    subtype unchanged.
+
+    Subclasses :class:`OutputExtractionError` so existing callers that handle the
+    broader type keep working and the API boundary still maps it away from 404.
     """
 
 
@@ -311,6 +335,19 @@ class BaseProvider(ABC):
         with re-capture between attempts.  Default is 0 (no retries).
         """
         return 0
+
+    @property
+    def allow_raw_transcript_fallback(self) -> bool:
+        """Whether LAST output may degrade to the provider raw terminal pane.
+
+        The historical service behavior is permissive because several providers
+        have no private sub-channels in their rendered transcript. Providers
+        whose pane can contain non-publishable channels must override this to
+        False. Extraction retries still widen normally; only the raw-pane
+        substitution after exhaustion is disabled.
+        """
+
+        return True
 
     @abstractmethod
     def extract_last_message_from_script(self, script_output: str) -> str:

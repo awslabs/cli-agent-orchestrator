@@ -8,6 +8,7 @@ from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
 from cli_agent_orchestrator.providers.hermes import HermesProvider
+from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider, KimiDialect
 from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
 from cli_agent_orchestrator.providers.manager import ProviderManager
 from cli_agent_orchestrator.providers.omp import OmpProvider
@@ -150,6 +151,61 @@ def test_get_provider_creates_copilot_on_demand_from_metadata():
 
     assert isinstance(provider, CopilotCliProvider)
     assert manager.get_provider("t1") is provider
+
+
+def test_get_provider_restores_kimi_runtime_variant_after_restart():
+    """A reconstructed Kimi Code terminal must keep CODE spinner semantics."""
+
+    manager = ProviderManager()
+    with patch(
+        "cli_agent_orchestrator.providers.manager.get_terminal_metadata",
+        return_value={
+            "provider": ProviderType.KIMI_CLI.value,
+            "tmux_session": "s1",
+            "tmux_window": "w1",
+            "agent_profile": None,
+            "provider_variant": "code",
+            "engine": None,
+            "shell_command": None,
+        },
+    ):
+        provider = manager.get_provider("t-kimi")
+
+    assert isinstance(provider, KimiCliProvider)
+    assert provider._dialect is KimiDialect.CODE
+    assert provider.runtime_variant == "code"
+
+
+def test_get_provider_fails_closed_for_pre_variant_kimi_row():
+    """Upgrade-era Kimi rows must never be reconstructed by guessing legacy."""
+
+    manager = ProviderManager()
+    with patch(
+        "cli_agent_orchestrator.providers.manager.get_terminal_metadata",
+        return_value={
+            "provider": ProviderType.KIMI_CLI.value,
+            "tmux_session": "s1",
+            "tmux_window": "w1",
+            "agent_profile": None,
+            "provider_variant": None,
+            "engine": None,
+            "shell_command": None,
+        },
+    ):
+        with pytest.raises(Exception, match="launch dialect was not persisted"):
+            manager.get_provider("t-old-kimi")
+
+
+def test_create_provider_rejects_unknown_persisted_kimi_variant():
+    manager = ProviderManager()
+    with pytest.raises(Exception, match="persisted Kimi dialect|UNKNOWN Kimi dialect"):
+        manager.create_provider(
+            ProviderType.KIMI_CLI.value,
+            terminal_id="t-kimi",
+            tmux_session="s1",
+            tmux_window="w1",
+            provider_variant="unknown",
+        )
 
 
 def test_cleanup_provider_calls_cleanup_and_removes():

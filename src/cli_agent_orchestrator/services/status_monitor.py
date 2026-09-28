@@ -8,7 +8,7 @@ import asyncio
 import logging
 import threading
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from cli_agent_orchestrator.constants import (
     CAO_PYTE_STATUS,
@@ -22,6 +22,11 @@ from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.event import terminal_id_from_topic
+
+if TYPE_CHECKING:
+    import pyte
+
+    from cli_agent_orchestrator.providers.base import BaseProvider
 
 logger = logging.getLogger(__name__)
 
@@ -149,7 +154,7 @@ class StatusMonitor:
         # on two edges only — rising (output resumed) and quiescence (output
         # stopped for PYTE_QUIESCENCE_DELAY_S) — never mid-burst, which is what
         # keeps status flap-free.
-        self._screens: Dict[str, Tuple[object, object]] = {}
+        self._screens: Dict[str, Tuple["pyte.Screen", "pyte.Stream"]] = {}
         self._bursting: Dict[str, bool] = {}
         # Pending quiescence-detect timer handle per terminal (loop.call_later).
         self._quiesce_handle: Dict[str, asyncio.TimerHandle] = {}
@@ -219,6 +224,16 @@ class StatusMonitor:
 
         with self._lock:
             buffer = self._buffers.get(terminal_id, "") + chunk
+            # Acceptance evidence is separate from generic/debounced status.
+            # Observe the complete current-generation prefix before eviction,
+            # atomically with clear_rolling_buffer's epoch notification.
+            observer = getattr(provider, "observe_execution_output", None)
+            if callable(observer):
+                observer(
+                    buffer,
+                    self._buffer_epochs.get(terminal_id, 0),
+                    truncated=len(buffer) > state_buffer_max,
+                )
             if len(buffer) > state_buffer_max:
                 buffer = buffer[-state_buffer_max:]
             self._buffers[terminal_id] = buffer
@@ -362,7 +377,9 @@ class StatusMonitor:
                 )
                 return None, buffer
 
-    def _detect_screen(self, terminal_id: str, provider) -> TerminalStatus:
+    def _detect_screen(
+        self, terminal_id: str, provider: Optional["BaseProvider"]
+    ) -> TerminalStatus:
         """Detect status from the terminal's composited pyte screen."""
         rendered, buffer = self._screen_lines(terminal_id)
         fallback_buffer: Optional[str] = None if rendered is not None else buffer
@@ -1027,6 +1044,28 @@ class StatusMonitor:
         """Get accumulated output buffer for a terminal."""
         with self._lock:
             return self._buffers.get(terminal_id, "")
+
+    def probe_execution_evidence(self, terminal_id: str, provider) -> bool:
+        """Atomically inspect current-generation execution evidence.
+
+        Kimi's execution-evidence parser is stateful: recognizing a live
+        processing row latches acceptance on the provider.  Sampling the
+        rolling buffer with :meth:`get_buffer` and invoking that parser after
+        releasing this lock leaves a generation race: a new ``send_input`` can
+        clear the buffer/reset the provider epoch between the two operations,
+        after which the stale probe can certify old bytes as activity for the
+        new turn.
+
+        Keep the buffer snapshot and the provider latch mutation under the same
+        lock used by :meth:`clear_rolling_buffer` and :meth:`_process_chunk`.
+        An old probe may finish before a reset, or a reset may win first, but
+        they cannot straddle the generation boundary.
+        """
+        checker = getattr(provider, "has_execution_evidence", None)
+        if not callable(checker):
+            return False
+        with self._lock:
+            return checker(self._buffers.get(terminal_id, "")) is True
 
 
 # Module-level singleton

@@ -233,3 +233,8 @@ If the supervisor completes the analysis work itself, the per-directory lock or 
 - [Cursor CLI Overview](https://cursor.com/docs/cli/overview)
 - [Cursor CLI Parameters](https://cursor.com/docs/cli/reference/parameters)
 - [Issue #264: Add support for Cursor CLI as a provider](https://github.com/awslabs/cli-agent-orchestrator/issues/264)
+
+### Agent-plugin MCP working directory
+
+Its MCP config format has no working-directory key (checked against the vendor's own MCP documentation, 2026-09-16), so CAO carries an agent plugin's declared `cwd` by launching the server through `/bin/sh -c 'cd -- "$1" && shift && exec "$@"'`. `exec` replaces the shell, the environment passes through, and argument boundaries survive because each argument stays a separate argv element. On a host with no `/bin/sh` such a server is skipped with `mcp.cwd_unsupported` rather than started in the wrong directory.
+See [Agent Plugins](agent-plugins.md) for the full per-provider table.
