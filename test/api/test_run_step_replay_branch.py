@@ -74,7 +74,13 @@ from cli_agent_orchestrator.constants import TERMINALS_RUN_STEP_ROUTE
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
 from cli_agent_orchestrator.models.workflow import RecoveryPolicy, StepResultEnvelope
 from cli_agent_orchestrator.models.workflow_runtime import RunState
-from cli_agent_orchestrator.services import step_replay, workflow_journal, workflow_service
+from cli_agent_orchestrator.services import (
+    launch_guard,
+    settings_service,
+    step_replay,
+    workflow_journal,
+    workflow_service,
+)
 from cli_agent_orchestrator.services.script_runner import ScriptRunRecord
 from cli_agent_orchestrator.services.step_fingerprint import StepCallFields, compute
 from cli_agent_orchestrator.services.step_replay import ReplayDecision, ReplayVerdict
@@ -173,6 +179,18 @@ def _register_run(
     )
     workflow_service.run_registry[run_id] = record
     return record
+
+
+def _guarded_snapshot(agent: str = "developer") -> str:
+    return json.dumps(
+        {
+            "source": "",
+            "launch_guard": {
+                "profiles": {agent: launch_guard._profile_digest(agent)},
+                "memory_enabled": settings_service.is_memory_enabled(),
+            },
+        }
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -763,7 +781,10 @@ class TestTheHoist:
         not fire — no flag, no second lookup."""
         run_id = "run-hoist-b"
         body = _body(env_vars=_env(run_id), caller_id="sup-one")
-        _register_run(run_id)  # no step row -> EXECUTE, so the whole path runs
+        _register_run(
+            run_id,
+            spec_snapshot=_guarded_snapshot(),
+        )  # no step row -> EXECUTE, so the whole path runs
 
         create, send, delete, out, exit_cli, wait, status_p, _unused = _patch_terminal_layer()
         with (
@@ -788,7 +809,10 @@ class TestTheHoist:
         permanent false DIVERGED."""
         run_id = "run-hoist-c"
         body = _body(env_vars=_env(run_id), caller_id="sup-one", model="fable-5")
-        _register_run(run_id)
+        _register_run(
+            run_id,
+            spec_snapshot=_guarded_snapshot(),
+        )
 
         gate_fingerprints: list = []
         stored_fingerprints: list = []
