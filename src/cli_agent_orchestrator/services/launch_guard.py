@@ -47,8 +47,8 @@ def capture() -> Dict[str, Any]:
 def check(run_id: Optional[str], agent: str) -> None:
     posture = settings_service.resolve_workflow_approval_posture()
     if posture.source == settings_service.GATE_SOURCE_READ_FAILURE:
-        # Atomic writes make torn reads impossible for this codebase, but retry
-        # once for an external writer or a transient filesystem read failure.
+        # CAO's own settings writers publish atomically; retry once for an
+        # external writer or a transient filesystem read failure.
         posture = settings_service.resolve_workflow_approval_posture()
     if not posture.required:
         return

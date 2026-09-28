@@ -6,11 +6,13 @@ in the issue.
 """
 
 import json
+from pathlib import Path
 
 import pytest
 
 from cli_agent_orchestrator.services import config_service as cs
 from cli_agent_orchestrator.services.config_service import ConfigService
+from cli_agent_orchestrator.utils import atomic_file
 
 
 @pytest.fixture(autouse=True)
@@ -215,6 +217,29 @@ class TestSetAndPath:
         assert ConfigService.get("terminal.backend") == "herdr"
         on_disk = json.loads(_isolated_settings["settings"].read_text())
         assert on_disk["terminal"]["backend"] == "herdr"
+
+    def test_set_atomically_replaces_settings_and_preserves_mode(
+        self, _isolated_settings, monkeypatch
+    ):
+        settings_file = _isolated_settings["settings"]
+        settings_file.write_text('{"workflow": {"require_approval": true}}')
+        settings_file.chmod(0o640)
+        monkeypatch.setattr(atomic_file, "LOCK_DIR", settings_file.parent / "locks")
+        real_replace = atomic_file.os.replace
+        replacements = []
+
+        def _record_replace(source, target):
+            replacements.append((Path(source), Path(target)))
+            real_replace(source, target)
+
+        monkeypatch.setattr(atomic_file.os, "replace", _record_replace)
+
+        ConfigService.set("workflow.require_approval", False)
+
+        assert len(replacements) == 1
+        assert replacements[0][1] == settings_file
+        assert json.loads(settings_file.read_text())["workflow"]["require_approval"] is False
+        assert settings_file.stat().st_mode & 0o777 == 0o640
 
     def test_set_agents_extra_dirs_routes_through_settings_service(self, _isolated_settings):
         ConfigService.set("agents.extra_dirs", ["/a", "/b"])
