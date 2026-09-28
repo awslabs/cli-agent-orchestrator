@@ -17,6 +17,7 @@ import json
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Protocol, Tuple
 
+from cli_agent_orchestrator.security.bearer import authorization_header
 from cli_agent_orchestrator.services.agui_stream import (
     _MAX_GENERATIVE_PROPS_BYTES,
     GENERATIVE_UI_COMPONENTS,
@@ -100,7 +101,7 @@ class HttpUiEmitter:
 
         headers: Dict[str, str] = {"Content-Type": "application/json"}
         if self._token:
-            headers["Authorization"] = f"Bearer {self._token}"
+            headers.update(authorization_header(self._token))
 
         payload: Dict[str, Any] = {"component": component, "props": props}
         if terminal_id is not None:

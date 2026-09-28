@@ -18,6 +18,7 @@ from cli_agent_orchestrator.security.auth import (
     get_local_bearer,
     local_auth_misconfig_error,
 )
+from cli_agent_orchestrator.security.bearer import authorization_header
 from cli_agent_orchestrator.utils.forwarded_env import (
     ForwardedEnvError,
     validate_forwarded_env,
@@ -87,7 +88,7 @@ def _auth_headers() -> Optional[Dict[str, str]]:
     """
 
     token = get_local_bearer()
-    return {"Authorization": f"Bearer {token}"} if token else None
+    return authorization_header(token) or None
 
 
 def _request_json(

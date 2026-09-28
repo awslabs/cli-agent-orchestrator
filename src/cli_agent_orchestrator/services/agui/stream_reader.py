@@ -20,6 +20,8 @@ from typing import Any, Dict, Generator, Optional, Tuple, Union
 
 import requests
 
+from cli_agent_orchestrator.security.bearer import authorization_header
+
 logger = logging.getLogger(__name__)
 
 # Default connect/read timeouts (seconds). Read must exceed the server's 15s
@@ -96,7 +98,7 @@ class AguiStreamReader:
     def _build_headers(self) -> Dict[str, str]:
         headers: Dict[str, str] = {"Accept": "text/event-stream"}
         if self._access_token:
-            headers["Authorization"] = f"Bearer {self._access_token}"
+            headers.update(authorization_header(self._access_token))
         if self._last_event_id:
             headers["Last-Event-ID"] = self._last_event_id
         return headers

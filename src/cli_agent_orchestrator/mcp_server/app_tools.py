@@ -52,6 +52,7 @@ from cli_agent_orchestrator.security.auth import (
     get_scopes_for_local_token,
     local_auth_misconfig_error,
 )
+from cli_agent_orchestrator.security.bearer import authorization_header
 from cli_agent_orchestrator.services.config_service import ConfigService
 from cli_agent_orchestrator.services.event_log_service import get_event_log
 from cli_agent_orchestrator.services.event_primitives import normalize_kind
@@ -114,7 +115,7 @@ def _auth_headers() -> Dict[str, str]:
     """
 
     token = get_local_bearer()
-    return {"Authorization": f"Bearer {token}"} if token else {}
+    return authorization_header(token)
 
 
 def _get_json(path: str, **params: Any) -> Any:

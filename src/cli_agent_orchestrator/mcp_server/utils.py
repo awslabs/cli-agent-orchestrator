@@ -13,6 +13,7 @@ import requests
 
 from cli_agent_orchestrator.constants import API_BASE_URL
 from cli_agent_orchestrator.security.auth import get_local_bearer
+from cli_agent_orchestrator.security.bearer import authorization_header
 from cli_agent_orchestrator.utils.orchestration import _mcp_timeout
 
 logger = logging.getLogger(__name__)
@@ -29,7 +30,7 @@ def _auth_headers() -> Dict[str, str]:
     """
 
     token = get_local_bearer()
-    return {"Authorization": f"Bearer {token}"} if token else {}
+    return authorization_header(token)
 
 
 def get_json(path: str, *, timeout: Optional[float] = None, **params: Any) -> Any:

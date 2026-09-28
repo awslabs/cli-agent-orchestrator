@@ -10,6 +10,7 @@ import requests
 
 from cli_agent_orchestrator.constants import MCP_REQUEST_TIMEOUT
 from cli_agent_orchestrator.security.auth import get_local_bearer
+from cli_agent_orchestrator.security.bearer import authorization_header
 from cli_agent_orchestrator.services.elastic_worker_gateway import (
     elastic_worker_gateway_headers,
 )
@@ -28,8 +29,7 @@ def remote_memory_url() -> Optional[str]:
 def _headers() -> dict[str, str]:
     headers = elastic_worker_gateway_headers()
     token = get_local_bearer()
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+    headers.update(authorization_header(token))
     return headers
 
 
