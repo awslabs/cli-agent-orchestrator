@@ -251,6 +251,11 @@ def launch(
     try:
         display_dir = working_directory or os.path.realpath(os.getcwd())
         explicit_provider = provider is not None  # True only when --provider was passed
+        # True only when the user actually chose a tool policy (--allowed-tools
+        # or --yolo). Tracked like explicit_provider so the /sessions branch can
+        # tell a real override apart from a policy resolved off the CLIENT's
+        # profile store, which is the wrong store for a shared/remote server.
+        explicit_allowed_tools = bool(yolo) or bool(allowed_tools)
         forwarded_env = _parse_env_pairs(env_pairs) if env_pairs else {}
 
         # Resolve allowedTools: --yolo > --allowed-tools CLI > profile/role defaults
@@ -428,8 +433,12 @@ def launch(
             params["engine"] = engine
         if session_name:
             params["session_name"] = session_name
-        if resolved_allowed_tools:
-            # Pass as comma-separated string for query param
+        if resolved_allowed_tools and explicit_allowed_tools:
+            # Only a user-supplied policy (--allowed-tools/--yolo) travels. Without
+            # an explicit flag the tools were resolved against the CLIENT's profile
+            # store, which on a shared server is the wrong one (and a missing client
+            # profile resolves to broad developer defaults); omit it and let the
+            # server resolve against its own installed profile (haofeif #9 on #802).
             params["allowed_tools"] = ",".join(resolved_allowed_tools)
         if memory:
             params["memory_manager"] = "true"
