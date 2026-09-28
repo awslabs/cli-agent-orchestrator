@@ -30,7 +30,7 @@ import logging
 import os
 import threading
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, List, Optional, cast
+from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 
 import jwt
 from fastapi import Depends, Header, HTTPException, status
@@ -66,6 +66,13 @@ _JWKS_TTL = timedelta(hours=1)
 # would otherwise let revoked keys validate indefinitely), so validation fails
 # closed instead.
 _JWKS_MAX_STALENESS = timedelta(hours=24)
+
+# An unknown ``kid`` comes from an UNVERIFIED token header, so an
+# unauthenticated caller can present a fresh bogus ``kid`` on every request. A
+# refetch is attempted at most once per JWKS URI per this window, and each
+# unknown ``kid`` is negative-cached for it, so a flood of bogus kids cannot
+# force a JWKS fetch per request.
+_JWKS_REFETCH_COOLDOWN = timedelta(seconds=60)
 
 
 # --- configuration (default-off) -----------------------------------------
@@ -164,6 +171,13 @@ class _JWKSCache:
         self._uri: Optional[str] = None
         self._fetched_at: Optional[datetime] = None
         self._lock = threading.Lock()
+        # Rate-limit state for unknown-kid refetches (never touched on the happy
+        # path). ``_last_refetch`` bounds refetches to one per cooldown window;
+        # ``_negative_kids`` maps ``(uri, kid)`` to the time its negative entry
+        # expires so a repeat of a known-bad kid does not even try to refetch.
+        self._last_refetch: Optional[datetime] = None
+        self._negative_kids: Dict[Tuple[str, str], datetime] = {}
+        self._cooldown = _JWKS_REFETCH_COOLDOWN
 
     def get_client(self, uri: str) -> PyJWKClient:
         with self._lock:
@@ -202,6 +216,44 @@ class _JWKSCache:
                         uri,
                     )
                 raise
+
+    def client_for_unknown_kid(self, uri: str, kid: Optional[str]) -> Optional[PyJWKClient]:
+        """Return a client to retry an unknown ``kid`` against, refetching sparingly.
+
+        The ``kid`` comes from an unverified header, so this path must not let an
+        unauthenticated caller drive a JWKS fetch per request. A fresh fetch is
+        attempted only once per URI per :data:`_JWKS_REFETCH_COOLDOWN`; within
+        that window — or for a ``kid`` already known-bad in it — the current
+        cached client is returned unchanged so the retry re-checks only keys
+        already in hand. The cache is never cleared for an unverified ``kid``.
+        """
+        with self._lock:
+            now = datetime.now(timezone.utc)
+            self._negative_kids = {k: exp for k, exp in self._negative_kids.items() if exp > now}
+            if kid is not None and (uri, kid) in self._negative_kids:
+                return self._client
+            if self._last_refetch is not None and (now - self._last_refetch) < self._cooldown:
+                return self._client
+            self._last_refetch = now
+            try:
+                client = PyJWKClient(uri)
+                client.get_jwk_set()
+                self._client = client
+                self._uri = uri
+                self._fetched_at = now
+                return client
+            except Exception:  # refetch failed: reuse cached keys, never clear
+                logger.warning(
+                    "JWKS refetch for an unknown kid failed; reusing cached keys for %s", uri
+                )
+                return self._client
+
+    def remember_unknown_kid(self, uri: str, kid: Optional[str]) -> None:
+        """Negative-cache a ``kid`` that is still unknown after a refetch."""
+        if kid is None:
+            return
+        with self._lock:
+            self._negative_kids[(uri, kid)] = datetime.now(timezone.utc) + self._cooldown
 
     def clear(self) -> None:
         with self._lock:
@@ -250,6 +302,18 @@ def _scopes_from_claims(claims: dict) -> List[str]:
     return deduped
 
 
+def _unverified_kid(token: str) -> Optional[str]:
+    """Return the ``kid`` from the token's UNVERIFIED header, or ``None``.
+
+    Only used to key the unknown-kid rate limiter; the value is never trusted
+    for anything security-bearing.
+    """
+    try:
+        return jwt.get_unverified_header(token).get("kid")
+    except Exception:  # noqa: BLE001 - a malformed header simply has no usable kid
+        return None
+
+
 def _verify_token(token: str) -> dict:
     """Validate ``token`` (RS256 + issuer + audience + expiry via JWKS) and
     return its claims.
@@ -271,13 +335,19 @@ def _verify_token(token: str) -> dict:
     try:
         signing_key = client.get_signing_key_from_jwt(token)
     except PyJWKClientError:
-        # Unknown ``kid`` — almost always an IdP key rotation the 1 h TTL has not
-        # picked up yet. Force a single refresh and retry rather than rejecting
-        # valid tokens (and re-issued keys) for up to an hour. A genuinely
-        # unknown key still raises on the retry and maps to 401.
-        _jwks_cache.clear()
-        client = _jwks_cache.get_client(uri)
-        signing_key = client.get_signing_key_from_jwt(token)
+        # Unknown ``kid`` — usually an IdP key rotation the TTL has not picked up
+        # yet. Retry against a rate-limited refetch rather than clearing the whole
+        # cache: the kid is attacker-controllable, so an unconditional clear+fetch
+        # here let an unauthenticated caller force a JWKS fetch per request. A
+        # genuinely unknown key still raises and maps to 401, and is negative-cached
+        # so the next request in the window does not refetch.
+        kid = _unverified_kid(token)
+        client = _jwks_cache.client_for_unknown_kid(uri, kid)
+        try:
+            signing_key = client.get_signing_key_from_jwt(token)
+        except PyJWKClientError:
+            _jwks_cache.remember_unknown_kid(uri, kid)
+            raise
 
     audience = get_expected_audience()
     # Pin to the first advertised authorization server (the PRM endpoint

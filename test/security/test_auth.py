@@ -446,6 +446,10 @@ def test_extract_scopes_refreshes_on_unknown_kid(monkeypatch, rsa_key):
 
     fake = _RotatingClient()
     monkeypatch.setattr(auth.get_jwks_cache(), "get_client", lambda uri: fake)
+    # The unknown-kid retry now goes through client_for_unknown_kid (a
+    # rate-limited refetch) rather than clear()+get_client; point it at the same
+    # rotating client so the second lookup succeeds.
+    monkeypatch.setattr(auth.get_jwks_cache(), "client_for_unknown_kid", lambda uri, kid: fake)
 
     token = _make_token(rsa_key, _base_claims({"scope": "cao:read"}))
     assert auth.extract_scopes_from_token(token) == ["cao:read"]
@@ -462,7 +466,9 @@ def test_extract_scopes_unknown_kid_still_raises_after_refresh(monkeypatch, rsa_
         def get_signing_key_from_jwt(self, token):  # noqa: ANN001
             raise jwt.PyJWKClientError("no matching key for kid")
 
-    monkeypatch.setattr(auth.get_jwks_cache(), "get_client", lambda uri: _AlwaysMissing())
+    missing = _AlwaysMissing()
+    monkeypatch.setattr(auth.get_jwks_cache(), "get_client", lambda uri: missing)
+    monkeypatch.setattr(auth.get_jwks_cache(), "client_for_unknown_kid", lambda uri, kid: missing)
     token = _make_token(rsa_key, _base_claims({"scope": "cao:read"}))
     with pytest.raises(jwt.PyJWKClientError):
         auth.extract_scopes_from_token(token)
