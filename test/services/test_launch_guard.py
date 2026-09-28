@@ -173,10 +173,11 @@ def test_check_retries_read_failure_then_reports_settings_repair(monkeypatch):
         "resolve_workflow_approval_posture",
         lambda: resolutions.pop(0),
     )
+    reads = []
     monkeypatch.setattr(
         launch_guard.workflow_journal,
         "get_run",
-        lambda run_id: pytest.fail("settings failure must stop before journal reads"),
+        lambda run_id: reads.append(run_id) or _script_row("{}"),
     )
 
     with pytest.raises(launch_guard.PlanInputsChangedError) as exc:
@@ -186,6 +187,7 @@ def test_check_retries_read_failure_then_reports_settings_repair(monkeypatch):
     assert "repair settings.json and then resume" in str(exc.value)
     assert "changed" not in str(exc.value)
     assert resolutions == []
+    assert reads == ["run-1"]
 
 
 def test_check_read_failure_retry_can_observe_approval_off(monkeypatch):
@@ -216,10 +218,11 @@ def test_check_invalid_settings_reports_settings_repair_without_retry(monkeypatc
         "resolve_workflow_approval_posture",
         lambda: resolutions.pop(0),
     )
+    reads = []
     monkeypatch.setattr(
         launch_guard.workflow_journal,
         "get_run",
-        lambda run_id: pytest.fail("invalid settings must stop before journal reads"),
+        lambda run_id: reads.append(run_id) or _script_row("{}"),
     )
 
     with pytest.raises(launch_guard.PlanInputsChangedError) as exc:
@@ -229,6 +232,54 @@ def test_check_invalid_settings_reports_settings_repair_without_retry(monkeypatc
     assert "repair settings.json and then resume" in str(exc.value)
     assert "changed" not in str(exc.value)
     assert resolutions == []
+    assert reads == ["run-1"]
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        '{"workflow":{"require_approval":"false"}}',
+        '{"workflow":"off"}',
+        "{not-json",
+    ],
+    ids=["invalid-value", "invalid-section", "undecodable"],
+)
+def test_malformed_settings_only_block_script_run_steps(monkeypatch, tmp_path, contents):
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(contents)
+    monkeypatch.setattr(launch_guard.settings_service, "SETTINGS_FILE", settings_path)
+    monkeypatch.delenv("CAO_WORKFLOW_REQUIRE_APPROVAL", raising=False)
+    rows = {
+        "yaml-run": SimpleNamespace(tier="yaml", spec_snapshot="{}"),
+        "script-run": _script_row(
+            json.dumps(
+                {
+                    "launch_guard": {
+                        "profiles": {"worker": "sha256:frozen"},
+                        "memory_enabled": False,
+                    }
+                }
+            )
+        ),
+    }
+    reads = []
+    monkeypatch.setattr(
+        launch_guard.workflow_journal,
+        "get_run",
+        lambda run_id: reads.append(run_id) or rows.get(run_id),
+    )
+
+    launch_guard.check(None, "worker")
+    assert reads == []
+    launch_guard.check("no-such-run", "worker")
+    launch_guard.check("yaml-run", "worker")
+    with pytest.raises(launch_guard.PlanInputsChangedError) as exc:
+        launch_guard.check("script-run", "worker")
+
+    assert reads == ["no-such-run", "yaml-run", "script-run"]
+    assert "approval setting could not be read" in str(exc.value)
+    assert "repair settings.json and then resume" in str(exc.value)
+    assert "changed" not in str(exc.value)
 
 
 @pytest.mark.parametrize(

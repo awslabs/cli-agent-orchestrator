@@ -50,11 +50,6 @@ def check(run_id: Optional[str], agent: str) -> None:
         # Atomic writes make torn reads impossible for this codebase, but retry
         # once for an external writer or a transient filesystem read failure.
         posture = settings_service.resolve_workflow_approval_posture()
-    if posture.source in (
-        settings_service.GATE_SOURCE_READ_FAILURE,
-        settings_service.GATE_SOURCE_INVALID_SETTINGS,
-    ):
-        raise PlanInputsChangedError(_SETTINGS_FAILURE_MESSAGE)
     if not posture.required:
         return
     if not run_id:
@@ -62,6 +57,11 @@ def check(run_id: Optional[str], agent: str) -> None:
     row = workflow_journal.get_run(run_id)
     if row is None or row.tier != "script":
         return
+    if posture.source in (
+        settings_service.GATE_SOURCE_READ_FAILURE,
+        settings_service.GATE_SOURCE_INVALID_SETTINGS,
+    ):
+        raise PlanInputsChangedError(_SETTINGS_FAILURE_MESSAGE)
     try:
         snapshot = json.loads(row.spec_snapshot)
     except (TypeError, json.JSONDecodeError):
