@@ -36,11 +36,17 @@ See `docs/issues/745-remote-execution-boundary/design.md` for the full contract.
 
 **Configuration (bridge worker):** `CAO_NODE_MODE=bridge`,
 `CAO_BRIDGE_SERVER_URL=ws://cao-server:9889/runtime/channel`,
-`CAO_BRIDGE_RUNTIME_ID=<unique>`, `CAO_RUNTIME_TOKEN=<shared secret>`. The
-central server needs the same `CAO_RUNTIME_TOKEN` (fail-closed: unset → the
-channel refuses all connections) and durable state on a `ReadWriteOnce` PVC
-with `CAO_HOME_DIR` pointed at the mount and an `fsGroup` matching the `cao`
-uid (1000), so terminal rows survive a restart.
+`CAO_BRIDGE_RUNTIME_ID=<unique>`, and the runtime token. The token is delivered
+as a **file**, not an environment value: the `cao-runtime-token` Secret is
+mounted read-only (`defaultMode: 0440`, group-readable via `fsGroup: 1000`) and
+`CAO_RUNTIME_TOKEN_FILE` points at `<mount>/token`. Its value never enters the
+pod environment, so it cannot leak through `ps`, `/proc/<pid>/environ`, or the
+tmux pane env forwarded to the agent. `entrypoint.sh` and `cao-bridge` accept
+either `CAO_RUNTIME_TOKEN_FILE` or the legacy `CAO_RUNTIME_TOKEN`. The central
+server mounts the same Secret the same way (fail-closed: no token → the channel
+refuses all connections) and keeps durable state on a `ReadWriteOnce` PVC with
+`CAO_HOME_DIR` pointed at the mount and an `fsGroup` matching the `cao` uid
+(1000), so terminal rows survive a restart.
 
 **Supported scope of the bridge slice:** launch, input, key, output extraction,
 worker-derived status, teardown, and multi-worker routing for the existing
@@ -274,8 +280,9 @@ The fix is to move the tool, not the credential. One variable does it:
 With that set, `utils/mcp_resolution.py` launches the provider's declared
 `cao-mcp-server` as `cao-mcp-stdio-bridge` instead — a stdio shim that registers
 no tools and holds no state, forwarding every call to the shared endpoint with
-this terminal's id as the caller identity and `CAO_RUNTIME_TOKEN` as the
-credential. No provider code knows the endpoint exists; the substitution happens
+this terminal's id as the caller identity and the runtime token — read from the
+owner-only file named by `CAO_RUNTIME_TOKEN_FILE` — as the credential. No
+provider code knows the endpoint exists; the substitution happens
 at the one resolver every provider already funnels through, so it applies to
 Claude Code, Copilot, OpenCode, Kiro and Antigravity alike.
 

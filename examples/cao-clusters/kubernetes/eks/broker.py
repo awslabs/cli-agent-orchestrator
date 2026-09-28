@@ -410,13 +410,13 @@ def _worker_deployment(
             client.V1EnvVar(name="CAO_NODE_MODE", value="bridge"),
             client.V1EnvVar(name="CAO_BRIDGE_SERVER_URL", value=_central_ws_url()),
             client.V1EnvVar(name="CAO_BRIDGE_RUNTIME_ID", value=name),
+            # Mounted as a file (#802): the token's value never enters the
+            # worker's env, so it cannot leak through `ps`, /proc/<pid>/environ,
+            # or tmux forwarding into the agent's pane. The path names the
+            # Secret's `token` key under the read-only mount added below.
             client.V1EnvVar(
-                name="CAO_RUNTIME_TOKEN",
-                value_from=client.V1EnvVarSource(
-                    secret_key_ref=client.V1SecretKeySelector(
-                        name=RUNTIME_TOKEN_SECRET, key="token"
-                    )
-                ),
+                name="CAO_RUNTIME_TOKEN_FILE",
+                value="/var/run/cao/runtime-token/token",
             ),
             # The agent's MCP tools and orchestration helpers dial the CENTRAL
             # API, never localhost — these flow into the tmux session env (the
@@ -589,6 +589,17 @@ def _build_worker_deployment(
                 read_only=True,
             )
         )
+    # Bridge workers receive the runtime token as a mounted file (#802); the
+    # value never enters the worker env. Keyed off the env the caller built.
+    _needs_runtime_token = any(getattr(e, "name", None) == "CAO_RUNTIME_TOKEN_FILE" for e in env)
+    if _needs_runtime_token:
+        mounts.append(
+            client.V1VolumeMount(
+                name="runtime-token",
+                mount_path="/var/run/cao/runtime-token",
+                read_only=True,
+            )
+        )
     init = client.V1Container(
         name="prepare-workspace",
         image="public.ecr.aws/docker/library/busybox:1.36",
@@ -704,6 +715,21 @@ def _build_worker_deployment(
                     )
                 ]
                 if WORKER_IRSA_ROLE_ARN
+                else []
+            ),
+            *(
+                [
+                    client.V1Volume(
+                        name="runtime-token",
+                        secret=client.V1SecretVolumeSource(
+                            secret_name=RUNTIME_TOKEN_SECRET,
+                            # 0440 with fsGroup 1000: owner+group readable, never
+                            # world; the value stays out of the env entirely.
+                            default_mode=0o440,
+                        ),
+                    )
+                ]
+                if _needs_runtime_token
                 else []
             ),
         ],

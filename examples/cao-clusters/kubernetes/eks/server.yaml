@@ -75,11 +75,13 @@ spec:
             # the server refuses `cao-bridge` connections on WS /runtime/channel
             # (fail-closed), and with no runtime connected there is nowhere for
             # any agent to run. deploy.sh mints this secret.
-            - name: CAO_RUNTIME_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: cao-runtime-token
-                  key: token
+            #
+            # Delivered as a mounted file, not an env value (#802): the token's
+            # value never enters the pod environment, so `ps`, /proc/<pid>/environ
+            # and tmux pane forwarding cannot leak it. The path names the Secret's
+            # `token` key under the read-only mount below.
+            - name: CAO_RUNTIME_TOKEN_FILE
+              value: /var/run/cao/runtime-token/token
             - name: CAO_HOME_DIR
               value: /home/cao/.cao/state
             - name: CAO_PROJECT_ID
@@ -140,6 +142,11 @@ spec:
             # resolve to the same tree the executors see.
             - name: workspace
               mountPath: /home/cao/workspace
+              readOnly: true
+            # The runtime token as a file (#802). Read-only; group-readable via
+            # fsGroup 1000 (defaultMode 0440 on the volume below).
+            - name: runtime-token
+              mountPath: /var/run/cao/runtime-token
               readOnly: true
           # No provider warm-up on this pod, so startup is schema migrations and
           # a uvicorn bind — seconds, not minutes. The startup probe is kept
@@ -217,11 +224,9 @@ spec:
               value: "9891"
             # Fail-closed: build_http_app refuses to start an unauthenticated
             # shared endpoint, so this secret is what makes the endpoint exist.
-            - name: CAO_RUNTIME_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: cao-runtime-token
-                  key: token
+            # Mounted as a file (#802): the value stays out of the pod env.
+            - name: CAO_RUNTIME_TOKEN_FILE
+              value: /var/run/cao/runtime-token/token
             - name: CAO_HOME_DIR
               value: /home/cao/.cao/state
             - name: CAO_PROJECT_ID
@@ -271,6 +276,9 @@ spec:
             - name: workspace
               mountPath: /home/cao/workspace
               readOnly: true
+            - name: runtime-token
+              mountPath: /var/run/cao/runtime-token
+              readOnly: true
           # A TCP check only. There is no unauthenticated HTTP route to probe:
           # every MCP call must carry the runtime token, so an HTTP probe would
           # either need the secret or be answered 401 and restart the pod
@@ -294,6 +302,13 @@ spec:
         - name: workspace
           persistentVolumeClaim:
             claimName: cao-elastic-workspace
+        # The runtime token, mounted read-only as a file (#802). defaultMode
+        # 0440 with the pod's fsGroup 1000 makes it owner+group readable and
+        # never world-readable; the value never lands in an env var.
+        - name: runtime-token
+          secret:
+            secretName: cao-runtime-token
+            defaultMode: 0440
   # SQLite, flock locks and FIFOs — none of which are safe over NFS, so this
   # stays on EBS and must not be moved to the shared EFS workspace. It is also
   # the directory the owner lock guards: one volume, one writer.

@@ -136,7 +136,12 @@ fi
 if [ "${CAO_NODE_MODE:-server}" = "bridge" ]; then
   : "${CAO_BRIDGE_SERVER_URL:?CAO_NODE_MODE=bridge requires CAO_BRIDGE_SERVER_URL}"
   : "${CAO_BRIDGE_RUNTIME_ID:?CAO_NODE_MODE=bridge requires CAO_BRIDGE_RUNTIME_ID}"
-  : "${CAO_RUNTIME_TOKEN:?CAO_NODE_MODE=bridge requires CAO_RUNTIME_TOKEN}"
+  # The token may arrive as a value (CAO_RUNTIME_TOKEN) or, preferred, as a path
+  # to an owner-only file (CAO_RUNTIME_TOKEN_FILE, #802). Require at least one.
+  if [ -z "${CAO_RUNTIME_TOKEN:-}" ] && [ -z "${CAO_RUNTIME_TOKEN_FILE:-}" ]; then
+    echo "[cao-entrypoint] CAO_NODE_MODE=bridge requires CAO_RUNTIME_TOKEN or CAO_RUNTIME_TOKEN_FILE" >&2
+    exit 1
+  fi
   echo "[cao-entrypoint] starting cao-bridge (execution-only runtime ${CAO_BRIDGE_RUNTIME_ID})"
   exec cao-bridge
 fi

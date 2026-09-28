@@ -94,11 +94,12 @@ spec:
             # enabled an extra feature. Without it this pod cannot connect at
             # all, and a pod that cannot connect can do nothing - so failing at
             # CreateContainerConfigError is the honest outcome.
-            - name: CAO_RUNTIME_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: cao-runtime-token
-                  key: token
+            #
+            # Mounted as a file (#802): the value never enters the pod env, so it
+            # cannot leak through `ps`, /proc/<pid>/environ, or tmux forwarding
+            # into the agent's pane. entrypoint.sh and cao-bridge read the path.
+            - name: CAO_RUNTIME_TOKEN_FILE
+              value: /var/run/cao/runtime-token/token
             # Where the bridge writes its channel-established marker, read by
             # the probes below. Spelled out rather than left to the default so
             # the manifest and the probe cannot drift apart.
@@ -174,6 +175,9 @@ spec:
               mountPath: /home/cao/.cao
             - name: workspace
               mountPath: /home/cao/workspace
+            - name: runtime-token
+              mountPath: /var/run/cao/runtime-token
+              readOnly: true
           # Readiness for a pod with no HTTP endpoint.
           #
           # The bridge writes this file after the hello exchange is accepted and
@@ -217,6 +221,13 @@ spec:
         # pod costs a provider install and not a conversation.
         - name: state
           emptyDir: {}
+        # The runtime token, mounted read-only as a file (#802). defaultMode
+        # 0440 with fsGroup 1000 keeps it owner+group readable, never world; the
+        # value never enters the pod env or the agent's tmux pane.
+        - name: runtime-token
+          secret:
+            secretName: cao-runtime-token
+            defaultMode: 0440
 ---
 # A headless, PORTLESS governing Service. A StatefulSet requires `serviceName`,
 # and this satisfies it without publishing a way in: no ClusterIP, no ports, so

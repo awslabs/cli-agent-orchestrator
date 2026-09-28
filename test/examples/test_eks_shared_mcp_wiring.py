@@ -49,6 +49,22 @@ def _value(container, name):
     return _env(container)[name].get("value")
 
 
+def _assert_runtime_token_file_mount(sts, container):
+    """The token Secret is mounted read-only at 0440, not injected as an env value."""
+    mount = next((m for m in container["volumeMounts"] if m["name"] == "runtime-token"), None)
+    assert mount is not None, "container does not mount the runtime-token secret"
+    assert mount["mountPath"] == "/var/run/cao/runtime-token"
+    assert mount.get("readOnly") is True
+    volume = next(
+        (v for v in sts["spec"]["template"]["spec"]["volumes"] if v["name"] == "runtime-token"),
+        None,
+    )
+    assert volume is not None, "pod spec has no runtime-token volume"
+    assert volume["secret"]["secretName"] == "cao-runtime-token"
+    # 0440 in YAML octal is 288 decimal; group-readable via fsGroup, never world.
+    assert volume["secret"]["defaultMode"] in (0o440, 288)
+
+
 @pytest.fixture(scope="module")
 def server():
     return _one("server.yaml", "StatefulSet")
@@ -148,15 +164,23 @@ class TestTheCredentialBoundaryHolds:
 
     def test_the_endpoint_is_authenticated(self, server):
         """build_http_app refuses to start without it, so an endpoint that exists
-        is an endpoint that demands the token."""
-        env = _env(_containers(server)["cao-mcp"])
-        assert env["CAO_RUNTIME_TOKEN"]["valueFrom"]["secretKeyRef"]["name"] == "cao-runtime-token"
+        is an endpoint that demands the token. Delivered as a mounted file (#802),
+        so the value never enters the pod env."""
+        sidecar = _containers(server)["cao-mcp"]
+        env = _env(sidecar)
+        assert "CAO_RUNTIME_TOKEN" not in env
+        assert env["CAO_RUNTIME_TOKEN_FILE"]["value"] == "/var/run/cao/runtime-token/token"
+        _assert_runtime_token_file_mount(server, sidecar)
 
     def test_the_supervisor_can_present_that_token(self, supervisor):
-        """The shim forwards it from the pod env; the pod already has it for its
-        own runtime channel, so this is not a new secret in the agent's reach."""
-        env = _env(_containers(supervisor)["cao-node"])
-        assert env["CAO_RUNTIME_TOKEN"]["valueFrom"]["secretKeyRef"]["name"] == "cao-runtime-token"
+        """The shim reads it from the owner-only file the pod mounts; the pod
+        already mounts it for its own runtime channel, so this is not a new
+        secret in the agent's reach — and the value never lands in the env."""
+        node = _containers(supervisor)["cao-node"]
+        env = _env(node)
+        assert "CAO_RUNTIME_TOKEN" not in env
+        assert env["CAO_RUNTIME_TOKEN_FILE"]["value"] == "/var/run/cao/runtime-token/token"
+        _assert_runtime_token_file_mount(supervisor, node)
 
 
 class TestTheSidecarStartsSafely:

@@ -1523,6 +1523,7 @@ with TestClient(broker.app) as c:
     # `connection.sock` is None on a streaming urllib3 2.x response, and a
     # fake that fabricated it hid a bug that failed every real follow.
     import http.server as _hs
+
     import urllib3 as _u3
 
     class _OneLineHandler(_hs.BaseHTTPRequestHandler):
@@ -1719,9 +1720,24 @@ check(
     bridge_env.get("CAO_BRIDGE_RUNTIME_ID", {}).get("value") == "cao-worker-beadfeed",
 )
 check(
-    "bridge runtime token comes from the shared secret",
-    bridge_env.get("CAO_RUNTIME_TOKEN", {}).get("valueFrom", {}).get("secretKeyRef", {}).get("name")
-    == "cao-runtime-token",
+    "bridge runtime token is delivered as a mounted file path, not a value",
+    bridge_env.get("CAO_RUNTIME_TOKEN_FILE", {}).get("value") == "/var/run/cao/runtime-token/token"
+    and "CAO_RUNTIME_TOKEN" not in bridge_env,
+)
+check(
+    "bridge worker mounts the runtime-token secret read-only at 0440",
+    any(
+        m["name"] == "runtime-token"
+        and m["mountPath"] == "/var/run/cao/runtime-token"
+        and m.get("readOnly") is True
+        for m in bridge_container.get("volumeMounts", [])
+    )
+    and any(
+        v["name"] == "runtime-token"
+        and v.get("secret", {}).get("secretName") == "cao-runtime-token"
+        and v.get("secret", {}).get("defaultMode") == 0o440
+        for v in bridge_spec.get("volumes", [])
+    ),
 )
 check(
     "agent-side API points at the central server",
