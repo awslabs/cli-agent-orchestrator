@@ -19,6 +19,7 @@ Terminal Workflow:
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import re
@@ -26,27 +27,34 @@ import threading
 import time
 from datetime import datetime
 from enum import Enum
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
 from pydantic import ValidationError
 
 from cli_agent_orchestrator.backends.registry import get_backend
-from cli_agent_orchestrator.clients.database import (
+from cli_agent_orchestrator.clients.database import (  # Compatibility/test seam: creation no longer bulk-deletes with this helper,; but older integrations/tests patch the imported symbol while exercising; create_terminal. Keep the name exported from this module until that seam; can be retired separately.
+    count_runtime_allocated_terminals,
     create_inbox_message,
 )
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
-from cli_agent_orchestrator.clients.database import (
+from cli_agent_orchestrator.clients.database import (  # Compatibility/test seam: creation no longer bulk-deletes with this helper,; but older integrations/tests patch the imported symbol while exercising; create_terminal. Keep the name exported from this module until that seam; can be retired separately.
     delete_idempotency_key,
 )
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
-from cli_agent_orchestrator.clients.database import (
+from cli_agent_orchestrator.clients.database import (  # Compatibility/test seam: creation no longer bulk-deletes with this helper,; but older integrations/tests patch the imported symbol while exercising; create_terminal. Keep the name exported from this module until that seam; can be retired separately.
     delete_terminals_by_session,
     get_idempotency_record,
     get_terminal_metadata,
     list_all_terminals,
+    list_pending_deferred_init_external_owner_terminal_ids,
     list_siblings_by_group_prefix,
+    list_terminals_by_session,
     update_last_active,
+    update_terminal_deferred_init_external_owner,
+    update_terminal_deferred_init_failure,
+    update_terminal_deferred_init_runtime_reclaimed,
     update_terminal_group,
     update_terminal_metadata,
     update_terminal_provider_variant,
@@ -125,6 +133,13 @@ from cli_agent_orchestrator.utils.terminal import (
 )
 
 logger = logging.getLogger(__name__)
+
+_DEFERRED_INIT_FAILURE_MESSAGE_MAX = 4096
+_DEFERRED_INIT_FAILURE_SCAN_MAX = 16384
+_DEFERRED_INIT_FAILURE_PERSIST_ATTEMPTS = 3
+_DEFERRED_INIT_FAILURE_FALLBACK_SUFFIX = ".deferred-init-failure.json"
+_DEFERRED_INIT_COMPLETE_FALLBACK_SUFFIX = ".deferred-init-complete"
+_DEFERRED_INIT_SIDECAR_LOCK = threading.RLock()
 
 
 class IdempotencyKeyConflict(Exception):
@@ -1019,7 +1034,7 @@ async def create_terminal(
     # which is acceptable for the cap's placement-guard purpose.
     max_terminals = get_max_terminals()
     if max_terminals is not None:
-        tracked_count = len(list_all_terminals())
+        tracked_count = count_runtime_allocated_terminals()
         if tracked_count >= max_terminals:
             raise TerminalLimitError(
                 f"Terminal limit reached: this node already has {tracked_count} tracked "
@@ -1203,6 +1218,8 @@ async def create_terminal(
         # Why the section ends here: provider.initialize() below can take tens
         # of seconds, and a teardown of this name must never queue behind an
         # agent launch. Everything inside is short, synchronous state mutation.
+        deferred_delete_on_failure: bool | None = None
+
         def _create_session_or_window_locked() -> Tuple[str, bool, bool]:
             """Runs under the lifecycle lock on a worker thread.
 
@@ -1245,6 +1262,7 @@ async def create_terminal(
             not own, leaving ITS row pointing at nothing. Under the lock the
             name goes free -> free with no observable intermediate state.
             """
+            nonlocal deferred_delete_on_failure
             assert session_name is not None  # narrowed by the caller
             with session_lifecycle_lock(session_name):
                 if new_session:
@@ -1258,12 +1276,13 @@ async def create_terminal(
                     clear_session_env(session_name)
 
                     # Create new tmux session with initial window
+                    effective_env = dict(env_vars or {})
                     get_backend().create_session(
                         session_name,
                         window_name,
                         terminal_id,
                         resolved_working_directory,
-                        extra_env=env_vars,
+                        extra_env=effective_env or None,
                     )
                     created_window_name = window_name
                     created_session, created_window = True, False
@@ -1278,14 +1297,20 @@ async def create_terminal(
                     # env (per-step wins on conflict): workflow routing ids like
                     # CAO_WORKFLOW_RUN_ID must reach the window even when it
                     # joins an existing session (issue #408).
+                    effective_env = {**get_session_env(session_name), **(env_vars or {})}
                     created_window_name = get_backend().create_window(
                         session_name,
                         window_name,
                         terminal_id,
                         resolved_working_directory,
-                        extra_env={**get_session_env(session_name), **(env_vars or {})},
+                        extra_env=effective_env,
                     )
                     created_session, created_window = False, True
+
+                if defer_init:
+                    deferred_delete_on_failure = _deferred_failure_delete_from_creation(
+                        caller_id, effective_env
+                    )
 
                 # From here the backend resource EXISTS, so every remaining step
                 # is guarded: on failure the resource is rolled back under this
@@ -1297,7 +1322,7 @@ async def create_terminal(
                         # Drop rows a previous incarnation of this session name
                         # left behind. Inside the lock, so it can never race the
                         # row write of a concurrent create for the same name.
-                        delete_terminals_by_session(session_name)
+                        _purge_stale_session_rows_for_recreate(session_name)
 
                         if env_vars:
                             # Persist forwarded env only after the tmux session
@@ -1325,6 +1350,9 @@ async def create_terminal(
                         group=group,
                         metadata=metadata,
                         working_directory=resolved_working_directory,
+                        deferred_init_external_owner=bool(
+                            defer_init and deferred_delete_on_failure is False
+                        ),
                         idempotency_key=idempotency_key,
                         request_fingerprint=request_fingerprint,
                     )
@@ -1429,12 +1457,20 @@ async def create_terminal(
         # keeps the tool call under 2s.
         if defer_init:
             shell_command = None  # unknown until initialize() runs
+            # Freeze lifecycle ownership while creation inputs are still in
+            # hand. A deferred failure may coincide with a database outage, so
+            # deciding who owns teardown by re-reading the terminal row later
+            # is not reliable enough. Cross-node callback ownership is likewise
+            # explicit in the launch env at this point.
+            assert deferred_delete_on_failure is not None
             _schedule_deferred_init(
                 provider_instance,
                 terminal_id,
                 initial_message,
                 initial_message_orchestration_type,
                 registry,
+                initial_caller_id=caller_id,
+                delete_on_failure=deferred_delete_on_failure,
             )
         else:
             await provider_instance.initialize()
@@ -1468,6 +1504,7 @@ async def create_terminal(
             shell_command=shell_command,
             group=group,
             metadata=metadata,
+            deferred_init_failure=None,
             status=initial_status,
             last_active=datetime.now(),
         )
@@ -1718,6 +1755,447 @@ def _notify_caller_of_deferred_failure(
         # terminal does not change the pod phase. Tell the broker explicitly or
         # the failed lease remains Ready until its completion timeout.
         _notify_elastic_terminal_ended(terminal_id)
+
+
+def _sanitize_deferred_failure_message(message: str) -> str:
+    """Bound/control-clean an error string before persisting it in terminal metadata."""
+
+    message = str(message)[:_DEFERRED_INIT_FAILURE_SCAN_MAX]
+    cleaned = "".join(
+        ch
+        for ch in message
+        if (ch in {"\n", "\t"} or ord(ch) >= 32) and not 0xD800 <= ord(ch) <= 0xDFFF
+    ).strip()
+    return cleaned[:_DEFERRED_INIT_FAILURE_MESSAGE_MAX]
+
+
+def _deferred_failure_fallback_path(terminal_id: str) -> Path:
+    return TERMINAL_LOG_DIR / f"{terminal_id}{_DEFERRED_INIT_FAILURE_FALLBACK_SUFFIX}"
+
+
+def _deferred_init_complete_fallback_path(terminal_id: str) -> Path:
+    return TERMINAL_LOG_DIR / f"{terminal_id}{_DEFERRED_INIT_COMPLETE_FALLBACK_SUFFIX}"
+
+
+def _fsync_parent_directory(path: Path) -> None:
+    """Make an atomic rename durable across host crashes, not only process crashes."""
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    fd = os.open(str(path.parent), flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _write_deferred_failure_fallback(terminal_id: str, failure: dict[str, Any]) -> bool:
+    """Atomically persist deferred failure outside SQLite as a last-resort tombstone."""
+
+    try:
+        TERMINAL_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        target = _deferred_failure_fallback_path(terminal_id)
+        tmp = target.with_name(target.name + ".tmp")
+        payload = json.dumps(failure, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, payload)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, target)
+        os.chmod(target, 0o600)
+        _fsync_parent_directory(target)
+        return True
+    except Exception as exc:  # noqa: BLE001 — fallback is best-effort but explicit
+        logger.error("Could not persist deferred-init fallback for %s: %s", terminal_id, exc)
+        return False
+
+
+def _publish_deferred_failure_fallback(terminal_id: str, failure: dict[str, Any]) -> bool:
+    """Publish a failure sidecar only while its terminal row is not proven gone.
+
+    The existence check and atomic sidecar rename share the same lock as
+    ``delete_terminal_row``. A concurrent DELETE therefore orders either before
+    this function (row missing => no new sidecar) or after it (DELETE removes
+    the just-published sidecar). A transient DB read failure is not proof that
+    the row disappeared, so fail toward publishing the external-owner evidence.
+    """
+
+    with _DEFERRED_INIT_SIDECAR_LOCK:
+        try:
+            if get_terminal_metadata(terminal_id) is None:
+                return False
+        except Exception:  # noqa: BLE001 — DB outage is why this fallback exists
+            pass
+        return _write_deferred_failure_fallback(terminal_id, failure)
+
+
+def _read_deferred_failure_fallback(terminal_id: str) -> dict[str, Any] | None:
+    try:
+        path = _deferred_failure_fallback_path(terminal_id)
+        raw = path.read_bytes()
+        # Refuse an unexpectedly large/corrupt fallback before JSON allocation.
+        if len(raw) > 65536:
+            return None
+        value = json.loads(raw.decode("utf-8"))
+        return value if isinstance(value, dict) else None
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+
+
+def get_deferred_init_failure(terminal_id: str, candidate: Any = None) -> dict[str, Any] | None:
+    """Return authoritative deferred-init failure from DB value or fallback sidecar."""
+
+    if isinstance(candidate, dict):
+        return candidate
+    return _read_deferred_failure_fallback(terminal_id)
+
+
+def _delete_deferred_failure_fallback(terminal_id: str) -> None:
+    try:
+        _deferred_failure_fallback_path(terminal_id).unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("Could not remove deferred-init fallback for %s: %s", terminal_id, exc)
+
+
+def _write_deferred_init_complete_fallback(terminal_id: str) -> bool:
+    """Durably record successful deferred init when the DB ownership clear is unavailable."""
+
+    try:
+        TERMINAL_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        target = _deferred_init_complete_fallback_path(terminal_id)
+        tmp = target.with_name(target.name + ".tmp")
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, b"complete\n")
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, target)
+        os.chmod(target, 0o600)
+        _fsync_parent_directory(target)
+        return True
+    except Exception as exc:  # noqa: BLE001 — fail-closed retention is safer than deletion
+        logger.error(
+            "Could not persist deferred-init success fallback for %s: %s", terminal_id, exc
+        )
+        return False
+
+
+def _publish_deferred_init_complete_fallback(terminal_id: str) -> bool:
+    """Publish successful-init fallback without racing terminal deletion."""
+
+    with _DEFERRED_INIT_SIDECAR_LOCK:
+        try:
+            if get_terminal_metadata(terminal_id) is None:
+                return False
+        except Exception:  # noqa: BLE001 — preserve success truth through DB outage
+            pass
+        return _write_deferred_init_complete_fallback(terminal_id)
+
+
+def _has_deferred_init_complete_fallback(terminal_id: str) -> bool:
+    try:
+        return _deferred_init_complete_fallback_path(terminal_id).is_file()
+    except OSError:
+        return False
+
+
+def _delete_deferred_init_complete_fallback(terminal_id: str) -> None:
+    try:
+        _deferred_init_complete_fallback_path(terminal_id).unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning(
+            "Could not remove deferred-init success fallback for %s: %s", terminal_id, exc
+        )
+
+
+def should_retain_deferred_failure_tombstone(
+    terminal_id: str, metadata: dict[str, Any] | None = None
+) -> bool:
+    """Return whether lifecycle cleanup must retain this terminal's registry row.
+
+    A durable failure (DB or sidecar) is always retained. Creation-time external
+    ownership is retained only while deferred init is still pending. If clearing
+    that DB bit failed after a successful init, the completion sidecar is the
+    durable success override and we opportunistically repair the stale bit.
+    """
+
+    if metadata is None:
+        metadata = get_terminal_metadata(terminal_id)
+    metadata = metadata or {}
+    if get_deferred_init_failure(terminal_id, metadata.get("deferred_init_failure")) is not None:
+        return True
+    if not metadata.get("deferred_init_external_owner"):
+        return False
+    if not _has_deferred_init_complete_fallback(terminal_id):
+        return True
+    try:
+        if update_terminal_deferred_init_external_owner(terminal_id, False):
+            _delete_deferred_init_complete_fallback(terminal_id)
+    except Exception as exc:  # noqa: BLE001 — the sidecar remains authoritative
+        logger.debug("Deferred-init success ownership repair for %s deferred: %s", terminal_id, exc)
+    return False
+
+
+def _purge_stale_session_rows_for_recreate(session_name: str) -> None:
+    """Remove stale rows for a reused session name without erasing tombstones.
+
+    ``new_session=True`` historically bulk-deleted every DB row sharing the
+    session label.  External-observer deferred failures deliberately outlive the
+    provider session, so a later replacement session may legitimately reuse the
+    same label while those rows still carry unacknowledged failure truth.  Keep
+    such rows and remove only ordinary stale records; row deletion goes through
+    ``delete_terminal_row`` so any lifecycle sidecars are reclaimed too.
+    """
+
+    for terminal in list_terminals_by_session(session_name):
+        terminal_id = str(terminal["id"])
+        metadata = get_terminal_metadata(terminal_id)
+        if should_retain_deferred_failure_tombstone(terminal_id, metadata):
+            logger.info(
+                "Preserving deferred-init tombstone %s while recreating session %s",
+                terminal_id,
+                session_name,
+            )
+            continue
+        delete_terminal_row(terminal_id, metadata, registry=None)
+
+
+def _deferred_failure_delete_worker(terminal_id: str) -> bool:
+    """Whether CAO, rather than an external lifecycle owner, must tear down.
+
+    Local callers, cross-node callbacks and elastic workers all have an explicit
+    CAO-owned failure-delivery/release contract. A terminal with none of those
+    is operator/external-observer owned (Bridge is the primary example): delete
+    would erase the only durable failure surface and turn a known init failure
+    into a generic 404/orphaned observation.
+    """
+
+    try:
+        metadata = get_terminal_metadata(terminal_id) or {}
+    except Exception:  # noqa: BLE001 — unknown ownership must retain evidence
+        return bool(os.environ.get("CAO_ELASTIC_WORKER_ID"))
+    if metadata.get("caller_id"):
+        return True
+    session_name = metadata.get("tmux_session")
+    if session_name:
+        try:
+            session_env = get_session_env(str(session_name))
+            if session_env.get(CALLBACK_URL_ENV) and session_env.get(CALLBACK_TERMINAL_ID_ENV):
+                return True
+        except Exception:  # noqa: BLE001 — fail closed toward retaining evidence
+            pass
+    return bool(os.environ.get("CAO_ELASTIC_WORKER_ID"))
+
+
+def _deferred_failure_delete_from_creation(
+    caller_id: str | None, env_vars: Optional[dict[str, str]]
+) -> bool:
+    """Freeze deferred-failure ownership from terminal-creation inputs."""
+
+    return (
+        bool(caller_id)
+        or bool(
+            env_vars and env_vars.get(CALLBACK_URL_ENV) and env_vars.get(CALLBACK_TERMINAL_ID_ENV)
+        )
+        or bool(os.environ.get("CAO_ELASTIC_WORKER_ID"))
+    )
+
+
+async def _clear_deferred_init_external_owner(terminal_id: str) -> None:
+    """Clear creation-time retention once deferred init becomes a normal live terminal."""
+
+    for attempt in range(1, _DEFERRED_INIT_FAILURE_PERSIST_ATTEMPTS + 1):
+        try:
+            updated = await asyncio.to_thread(
+                update_terminal_deferred_init_external_owner, terminal_id, False
+            )
+            if updated:
+                await asyncio.to_thread(_delete_deferred_init_complete_fallback, terminal_id)
+                return
+            # The update helper returns False only after a successful DB query
+            # proves the terminal row no longer exists. Do not turn an explicit
+            # concurrent DELETE into a new orphan completion sidecar.
+            await asyncio.to_thread(_delete_deferred_init_complete_fallback, terminal_id)
+            return
+        except Exception as exc:  # noqa: BLE001 — retry a transient DB failure
+            logger.warning(
+                "Deferred-init ownership clear attempt %d/%d for %s failed: %s",
+                attempt,
+                _DEFERRED_INIT_FAILURE_PERSIST_ATTEMPTS,
+                terminal_id,
+                exc,
+            )
+        if attempt < _DEFERRED_INIT_FAILURE_PERSIST_ATTEMPTS:
+            await asyncio.sleep(0.05 * attempt)
+    logger.error(
+        "Could not clear deferred-init external ownership for successful terminal %s; "
+        "persisting successful-init sidecar fallback",
+        terminal_id,
+    )
+    await asyncio.to_thread(_publish_deferred_init_complete_fallback, terminal_id)
+
+
+async def recover_interrupted_deferred_init_external_owners() -> None:
+    """Turn restart-stranded external deferred inits into durable failures.
+
+    Deferred-init tasks live only in the cao-server process.  After a restart,
+    any row that still carries the creation-time external-owner bit can no
+    longer make progress by itself.  Preserve an already-persisted failure (or
+    sidecar), repair a successful-init completion sidecar, and otherwise publish
+    an explicit ``interrupted_init`` failure so external observers see ERROR
+    instead of a permanently pending tombstone/404 ambiguity.
+    """
+
+    try:
+        terminal_ids = await asyncio.to_thread(
+            list_pending_deferred_init_external_owner_terminal_ids
+        )
+    except Exception as exc:  # noqa: BLE001 — startup remains resilient
+        logger.warning("Could not list interrupted deferred-init terminals: %s", exc)
+        return
+
+    for terminal_id in terminal_ids:
+        try:
+            metadata = await asyncio.to_thread(get_terminal_metadata, terminal_id)
+        except Exception as exc:  # noqa: BLE001 — retry on next restart/cleanup pass
+            logger.warning(
+                "Could not inspect deferred-init terminal %s during restart recovery: %s",
+                terminal_id,
+                exc,
+            )
+            continue
+        if not metadata:
+            continue
+        if (
+            get_deferred_init_failure(terminal_id, metadata.get("deferred_init_failure"))
+            is not None
+        ):
+            continue
+        if _has_deferred_init_complete_fallback(terminal_id):
+            await _clear_deferred_init_external_owner(terminal_id)
+            continue
+        await _surface_deferred_init_failure(
+            terminal_id,
+            kind="interrupted_init",
+            message=(
+                f"Worker {terminal_id} deferred initialization was interrupted by "
+                "cao-server restart before completion. Re-assign the task."
+            ),
+            exception_type="ServerRestart",
+            registry=None,
+            delete_on_failure=False,
+        )
+
+
+def _persist_deferred_init_failure(
+    terminal_id: str,
+    *,
+    kind: str,
+    message: str,
+    exception_type: str | None = None,
+) -> dict[str, Any] | None:
+    """Persist one server-owned deferred-init failure outside consumer metadata."""
+
+    failure = {
+        "phase": "deferred_init",
+        "kind": str(kind),
+        "message": _sanitize_deferred_failure_message(message),
+    }
+    if exception_type:
+        failure["exception_type"] = str(exception_type)
+    if not update_terminal_deferred_init_failure(terminal_id, failure):
+        return None
+    _delete_deferred_failure_fallback(terminal_id)
+    return failure
+
+
+async def _surface_deferred_init_failure(
+    terminal_id: str,
+    *,
+    kind: str,
+    message: str,
+    registry: PluginRegistry | None,
+    exception_type: str | None = None,
+    delete_on_failure: bool | None = None,
+) -> bool:
+    """Persist/notify one init failure and apply lifecycle ownership.
+
+    Returns True when CAO owns teardown, False when an external observer owns
+    the retained terminal. Failure metadata is written before either branch so
+    GET /terminals can remain an authoritative error surface across restarts.
+    """
+
+    delete_worker = (
+        bool(delete_on_failure)
+        if delete_on_failure is not None
+        else await asyncio.to_thread(_deferred_failure_delete_worker, terminal_id)
+    )
+    persisted = False
+    terminal_missing = False
+    failure_payload = {
+        "phase": "deferred_init",
+        "kind": str(kind),
+        "message": _sanitize_deferred_failure_message(message),
+    }
+    if exception_type:
+        failure_payload["exception_type"] = str(exception_type)
+    for attempt in range(1, _DEFERRED_INIT_FAILURE_PERSIST_ATTEMPTS + 1):
+        try:
+            failure = await asyncio.to_thread(
+                _persist_deferred_init_failure,
+                terminal_id,
+                kind=kind,
+                message=message,
+                exception_type=exception_type,
+            )
+            persisted = failure is not None
+            if persisted:
+                break
+            # None means the DB query succeeded but the row is gone. A
+            # concurrent explicit DELETE owns the terminal now; publishing a
+            # failure sidecar afterwards would create an unreferenced tombstone.
+            terminal_missing = True
+            break
+        except Exception as exc:  # noqa: BLE001 — lifecycle action must still run
+            logger.warning(
+                "Deferred-init failure persistence attempt %d/%d for %s failed: %s",
+                attempt,
+                _DEFERRED_INIT_FAILURE_PERSIST_ATTEMPTS,
+                terminal_id,
+                exc,
+            )
+        if attempt < _DEFERRED_INIT_FAILURE_PERSIST_ATTEMPTS:
+            await asyncio.sleep(0.05 * attempt)
+    if not persisted:
+        logger.error(
+            "Deferred-init failure for %s could not be persisted in SQLite",
+            terminal_id,
+        )
+        # CAO-owned failures are immediately notified/teardown and do not need a
+        # long-lived tombstone. External owners do: if SQLite is temporarily
+        # unavailable, persist a small sidecar so GET /terminals remains able to
+        # surface ERROR after the DB recovers or the server restarts.
+        if not delete_worker and not terminal_missing:
+            await asyncio.to_thread(
+                _publish_deferred_failure_fallback, terminal_id, failure_payload
+            )
+    notification = _sanitize_deferred_failure_message(message)
+    if delete_worker:
+        notification += " The failed worker terminal will be torn down."
+    else:
+        notification += " The failed worker terminal is retained for its external lifecycle owner."
+    await asyncio.to_thread(
+        _notify_caller_of_deferred_failure,
+        terminal_id,
+        notification,
+        registry,
+        delete_worker,
+    )
+    return delete_worker
 
 
 # --- deferred-init submit verification ----------------------------------------
@@ -2007,6 +2485,9 @@ def _schedule_deferred_init(
     initial_message: Optional[str],
     orchestration_type: Optional[OrchestrationType],
     registry: PluginRegistry | None,
+    *,
+    initial_caller_id: Optional[str] = None,
+    delete_on_failure: bool | None = None,
 ) -> None:
     """Kick off provider.initialize() in the background and, on success,
     deliver the initial message via send_input.
@@ -2024,7 +2505,7 @@ def _schedule_deferred_init(
     """
 
     async def _run() -> None:
-        caller_id: Optional[str] = None
+        caller_id: Optional[str] = initial_caller_id
         try:
             await provider_instance.initialize()
             shell_command = provider_instance.shell_baseline
@@ -2094,81 +2575,42 @@ def _schedule_deferred_init(
                 if started and getattr(provider_instance, "requires_execution_evidence", False):
                     current_status = await asyncio.to_thread(status_monitor.get_status, terminal_id)
                     if current_status == TerminalStatus.ERROR:
-                        # Preserve the existing deferred-failure contract for a
-                        # real CAO supervisor (and for elastic worker pods,
-                        # whose lease must be released): notify and tear down.
-                        # Operator/Bridge-created sessions have no caller_id;
-                        # keep those ERROR terminals alive so an external
-                        # observer can read the provider failure instead of
-                        # racing a delete into a generic 404/orphaned result.
-                        session_name = metadata.get("tmux_session") if metadata else None
-                        has_cross_node_callback = False
-                        if session_name:
-                            try:
-                                session_env = get_session_env(session_name)
-                                has_cross_node_callback = bool(
-                                    session_env.get(CALLBACK_URL_ENV)
-                                    and session_env.get(CALLBACK_TERMINAL_ID_ENV)
-                                )
-                            except Exception:  # noqa: BLE001 — teardown policy stays conservative
-                                has_cross_node_callback = False
-                        delete_error_worker = (
-                            bool(caller_id)
-                            or has_cross_node_callback
-                            or bool(os.environ.get("CAO_ELASTIC_WORKER_ID"))
-                        )
                         logger.error(
-                            "Deferred init for %s: provider entered ERROR after task "
-                            "delivery; notifying caller%s.",
+                            "Deferred init for %s: provider entered ERROR after task delivery.",
                             terminal_id,
-                            (
-                                " and tearing down worker"
-                                if delete_error_worker
-                                else " and leaving worker alive for inspection"
+                        )
+                        await _surface_deferred_init_failure(
+                            terminal_id,
+                            kind="provider_error_after_delivery",
+                            message=(
+                                f"Worker {terminal_id} accepted the assigned task but the "
+                                "provider entered ERROR before producing a result. Correct "
+                                "the provider/model configuration and re-assign the task."
                             ),
-                        )
-                        failure_message = (
-                            f"Worker {terminal_id} accepted the assigned task but the "
-                            "provider entered ERROR before producing a result. "
-                        )
-                        if delete_error_worker:
-                            failure_message += (
-                                "The failed worker terminal was torn down after this "
-                                "notification; correct the provider/model configuration "
-                                "and re-assign the task."
-                            )
-                        else:
-                            failure_message += (
-                                "Inspect the worker terminal, correct the provider/model "
-                                "configuration, then re-assign the task."
-                            )
-                        await asyncio.to_thread(
-                            _notify_caller_of_deferred_failure,
-                            terminal_id,
-                            failure_message,
-                            registry,
-                            delete_error_worker,
+                            registry=registry,
+                            delete_on_failure=delete_on_failure,
                         )
                         return
                 if not started:
                     logger.error(
                         "Deferred init for %s: worker never started after "
-                        "resubmits; task not delivered — notifying caller and "
-                        "tearing down.",
+                        "resubmits; task not delivered.",
                         terminal_id,
                     )
-                    await asyncio.to_thread(
-                        _notify_caller_of_deferred_failure,
+                    await _surface_deferred_init_failure(
                         terminal_id,
-                        (
+                        kind="task_not_started",
+                        message=(
                             f"Worker {terminal_id} received the assigned task but "
                             f"never started processing (input not accepted after "
-                            f"retries). It has been deleted — re-assign the task."
+                            f"retries). Re-assign the task after correcting the provider "
+                            "or delivery state."
                         ),
-                        registry,
-                        True,  # delete_worker
+                        registry=registry,
+                        delete_on_failure=delete_on_failure,
                     )
                     return
+            await _clear_deferred_init_external_owner(terminal_id)
         except TerminalInputBlockedError as e:
             # The worker initialized but is parked on an interactive prompt
             # (WAITING_USER_ANSWER). It is alive and can be driven via
@@ -2181,6 +2623,7 @@ def _schedule_deferred_init(
                 terminal_id,
                 e,
             )
+            await _clear_deferred_init_external_owner(terminal_id)
             await asyncio.to_thread(
                 _notify_caller_of_deferred_failure,
                 terminal_id,
@@ -2197,19 +2640,18 @@ def _schedule_deferred_init(
             # newline/control-character injection into logs and the inbox message
             # (the exception text can contain provider-supplied content).
             logger.error(
-                "Deferred init for terminal %s failed: %r. "
-                "Notifying caller and tearing down worker.",
+                "Deferred init for terminal %s failed: %r.",
                 terminal_id,
                 e,
                 exc_info=True,
             )
-            await asyncio.to_thread(
-                _notify_caller_of_deferred_failure,
+            await _surface_deferred_init_failure(
                 terminal_id,
-                f"Worker {terminal_id} failed to initialize: {e!r}. It has been "
-                f"deleted — re-assign the task or report the failure.",
-                registry,
-                delete_worker=True,
+                kind="provider_init_error",
+                message=f"Worker {terminal_id} failed to initialize: {e}",
+                exception_type=type(e).__name__,
+                registry=registry,
+                delete_on_failure=delete_on_failure,
             )
 
     try:
@@ -2229,7 +2671,19 @@ def get_terminal(terminal_id: str) -> Dict:
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
-        status = status_monitor.get_status(terminal_id).value
+        public_metadata = metadata.get("metadata")
+        deferred_failure = get_deferred_init_failure(
+            terminal_id, metadata.get("deferred_init_failure")
+        )
+
+        # Deferred init can fail before provider status becomes meaningful. The
+        # DB-backed failure marker is authoritative and survives server restart,
+        # unlike StatusMonitor's in-memory latch.
+        status = (
+            TerminalStatus.ERROR.value
+            if deferred_failure is not None
+            else status_monitor.get_status(terminal_id).value
+        )
 
         return {
             "id": metadata["id"],
@@ -2241,7 +2695,8 @@ def get_terminal(terminal_id: str) -> Dict:
             "allowed_tools": metadata.get("allowed_tools"),
             "engine": metadata.get("engine"),
             "group": metadata.get("group"),
-            "metadata": metadata.get("metadata"),
+            "metadata": public_metadata,
+            "deferred_init_failure": deferred_failure,
             "status": status,
             "last_active": metadata["last_active"],
         }
@@ -2882,11 +3337,17 @@ def capture_terminal_snapshot(terminal_id: str) -> Optional[Dict]:
     # of which terminals are worktree-backed). Best-effort: a read failure
     # means the snapshot's working_directory field is None and no worktree
     # cleanup runs later.
-    live_working_directory = None
+    # Launch-time cwd is durable and is the best fallback once a pane has
+    # already disappeared (Herdr pane/workspace close). Prefer a live read when
+    # available, but never lose the worktree-cleanup identity solely because
+    # the runtime ended before lifecycle reconciliation reached this row.
+    live_working_directory = metadata.get("working_directory")
     try:
-        live_working_directory = get_backend().get_pane_working_directory(
+        observed_cwd = get_backend().get_pane_working_directory(
             metadata["tmux_session"], metadata["tmux_window"]
         )
+        if observed_cwd:
+            live_working_directory = observed_cwd
     except Exception as e:
         logger.warning(f"Failed to read working directory for {terminal_id}: {e}")
     metadata["live_working_directory"] = live_working_directory
@@ -3055,7 +3516,16 @@ def delete_terminal_row(
     single-terminal ``delete_terminal`` path holds no such lock and passes its
     registry straight through.
     """
-    deleted = db_delete_terminal(terminal_id)
+    # Serialize row deletion with fallback publication. Otherwise a deferred
+    # init task can exhaust DB retries, a concurrent DELETE can remove the row
+    # and existing sidecars, and then the background task can publish a new
+    # orphan sidecar after DELETE has already returned.
+    with _DEFERRED_INIT_SIDECAR_LOCK:
+        deleted = db_delete_terminal(terminal_id)
+        # Sidecars are keyed by terminal id and are safe to remove even when the
+        # DB row was already deleted by another lifecycle owner.
+        _delete_deferred_failure_fallback(terminal_id)
+        _delete_deferred_init_complete_fallback(terminal_id)
     logger.info(f"Deleted terminal: {terminal_id}")
     if deleted and metadata:
         dispatch_plugin_event(

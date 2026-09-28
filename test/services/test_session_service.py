@@ -906,6 +906,116 @@ class TestGetSession:
         assert result["terminals"][0]["status"] == "processing"
         assert result["terminals"][1]["status"] == "completed"
 
+    @patch("cli_agent_orchestrator.services.session_service.get_deferred_init_failure")
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor.get_status")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_get_session_prefers_durable_deferred_failure_over_live_status(
+        self, mock_get_backend, mock_list_terminals, mock_get_status, mock_failure
+    ):
+        mock_get_backend.return_value.session_exists.return_value = True
+        mock_get_backend.return_value.list_sessions.return_value = [{"id": "cao-test"}]
+        mock_list_terminals.return_value = [
+            {
+                "id": "term-a",
+                "tmux_session": "cao-test",
+                "deferred_init_failure": {
+                    "phase": "deferred_init",
+                    "kind": "provider_init_error",
+                    "message": "workspace trust required",
+                },
+            }
+        ]
+        mock_failure.return_value = mock_list_terminals.return_value[0]["deferred_init_failure"]
+
+        result = get_session("cao-test")
+
+        assert result["terminals"][0]["status"] == "error"
+        assert result["terminals"][0]["deferred_init_failure"]["message"] == (
+            "workspace trust required"
+        )
+        mock_get_status.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.session_service.get_deferred_init_failure")
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor.get_status")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_get_session_filters_old_failure_tombstone_when_replacement_is_live(
+        self, mock_get_backend, mock_list_terminals, mock_get_status, mock_failure
+    ):
+        mock_get_backend.return_value.session_exists.return_value = True
+        mock_get_backend.return_value.list_sessions.return_value = [{"id": "cao-reused"}]
+        mock_list_terminals.return_value = [
+            {
+                "id": "old-failed",
+                "tmux_session": "cao-reused",
+                "deferred_init_failure": {"message": "trust required"},
+                "deferred_init_runtime_reclaimed": True,
+            },
+            {
+                "id": "new-live",
+                "tmux_session": "cao-reused",
+                "deferred_init_failure": None,
+                "deferred_init_runtime_reclaimed": False,
+            },
+        ]
+        mock_failure.side_effect = lambda terminal_id, candidate=None: (
+            {"message": "trust required"} if terminal_id == "old-failed" else None
+        )
+        mock_get_status.return_value.value = "idle"
+
+        result = get_session("cao-reused")
+
+        assert [terminal["id"] for terminal in result["terminals"]] == ["new-live"]
+        assert result["terminals"][0]["status"] == "idle"
+
+    @patch("cli_agent_orchestrator.services.session_service.get_deferred_init_failure")
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor.get_status")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_get_session_returns_terminated_tombstone_after_backend_session_is_gone(
+        self, mock_get_backend, mock_list_terminals, mock_get_status, mock_failure
+    ):
+        mock_get_backend.return_value.session_exists.return_value = False
+        failure = {
+            "phase": "deferred_init",
+            "kind": "provider_init_error",
+            "message": "workspace trust required",
+        }
+        mock_list_terminals.return_value = [
+            {
+                "id": "term-a",
+                "tmux_session": "cao-gone",
+                "deferred_init_failure": failure,
+            }
+        ]
+        mock_failure.return_value = failure
+
+        result = get_session("cao-gone")
+
+        assert result["session"] == {
+            "id": "cao-gone",
+            "name": "cao-gone",
+            "status": "terminated",
+        }
+        assert result["terminals"][0]["status"] == "error"
+        assert result["terminals"][0]["deferred_init_failure"] == failure
+        mock_get_backend.return_value.list_sessions.assert_not_called()
+        mock_get_status.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.session_service.get_deferred_init_failure")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_get_session_missing_backend_without_tombstone_stays_not_found(
+        self, mock_get_backend, mock_list_terminals, mock_failure
+    ):
+        mock_get_backend.return_value.session_exists.return_value = False
+        mock_list_terminals.return_value = [{"id": "term-a", "tmux_session": "cao-gone"}]
+        mock_failure.return_value = None
+
+        with pytest.raises(ValueError, match="Session 'cao-gone' not found"):
+            get_session("cao-gone")
+
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_get_session_not_found(self, mock_get_backend):
         """Test getting non-existent session."""

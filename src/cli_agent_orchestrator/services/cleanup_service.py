@@ -34,36 +34,58 @@ def cleanup_old_data():
             f"Starting cleanup of data older than {RETENTION_DAYS} days (before {cutoff_date})"
         )
 
-        # Clean up old terminals (stop FIFO readers and clear state first)
+        # Clean up old terminals. Deferred-init external-owner/failure rows are
+        # lifecycle tombstones: age alone must never erase failure truth before
+        # the external owner acknowledges it. Ordinary stale rows keep the
+        # historical FIFO/status/Grok cleanup posture, but row deletion now
+        # flows through terminal_service.delete_terminal_row so lifecycle
+        # sidecars are removed atomically with the registry record instead of
+        # being orphaned by a bulk SQL DELETE.
         with SessionLocal() as db:
-            old_terminals = (
+            old_terminals = list(
                 db.query(TerminalModel).filter(TerminalModel.last_active < cutoff_date).all()
             )
-            retained_terminal_ids: set[str] = set()
-            for terminal in old_terminals:
-                fifo_manager.stop_reader(terminal.id)
-                status_monitor.clear_terminal(terminal.id)
-                # A stale Grok terminal can still own a private GROK_HOME. An
-                # explicit deferred cleanup is its retry handle, so retention
-                # housekeeping must not bulk-delete that row underneath it.
-                if (
-                    terminal.provider == ProviderType.GROK_CLI.value
-                    and provider_manager.cleanup_provider(terminal.id) is False
-                ):
-                    retained_terminal_ids.add(terminal.id)
-                    logger.warning(
-                        "Retaining stale Grok terminal %s while cleanup is deferred",
-                        terminal.id,
+
+        from cli_agent_orchestrator.services import terminal_service
+
+        deleted_terminals = 0
+        for terminal in old_terminals:
+            terminal_id = str(terminal.id)
+            try:
+                if terminal_service.should_retain_deferred_failure_tombstone(terminal_id):
+                    logger.info(
+                        "Retaining old deferred-init terminal %s until external-owner cleanup",
+                        terminal_id,
                     )
-            terminal_query = db.query(TerminalModel).filter(TerminalModel.last_active < cutoff_date)
-            if retained_terminal_ids:
-                deleted_terminals = terminal_query.filter(
-                    ~TerminalModel.id.in_(retained_terminal_ids)
-                ).delete()
-            else:
-                deleted_terminals = terminal_query.delete()
-            db.commit()
-            logger.info(f"Deleted {deleted_terminals} old terminals from database")
+                    continue
+            except Exception as exc:  # noqa: BLE001 — uncertain ownership fails closed
+                logger.warning(
+                    "Could not establish deferred-init ownership for stale terminal %s; "
+                    "retaining it: %s",
+                    terminal_id,
+                    exc,
+                )
+                continue
+
+            fifo_manager.stop_reader(terminal_id)
+            status_monitor.clear_terminal(terminal_id)
+            if (
+                terminal.provider == ProviderType.GROK_CLI.value
+                and provider_manager.cleanup_provider(terminal_id) is False
+            ):
+                logger.warning(
+                    "Retaining stale Grok terminal %s while cleanup is deferred", terminal_id
+                )
+                continue
+
+            try:
+                metadata = terminal_service.get_terminal_metadata(terminal_id)
+                if terminal_service.delete_terminal_row(terminal_id, metadata, registry=None):
+                    deleted_terminals += 1
+            except Exception as exc:  # noqa: BLE001 — retention sweep is best-effort
+                logger.warning("Failed to delete stale terminal %s: %s", terminal_id, exc)
+
+        logger.info(f"Deleted {deleted_terminals} old terminals from database")
 
         # Clean up old inbox messages
         with SessionLocal() as db:

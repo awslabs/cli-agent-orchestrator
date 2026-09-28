@@ -1280,6 +1280,10 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.warning("OTel telemetry init failed; continuing", exc_info=True)
     init_db()
+    # Deferred-init tasks are process-local.  Recover any external-owner rows
+    # left pending by a prior cao-server crash/restart into durable ERROR before
+    # background cleanup can mistake them for ordinary ghosts.
+    await terminal_service.recover_interrupted_deferred_init_external_owners()
     _seed_default_skills_at_startup()
     _reconcile_memory_at_startup()
     registry = PluginRegistry()

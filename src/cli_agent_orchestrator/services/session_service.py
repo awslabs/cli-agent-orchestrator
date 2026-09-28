@@ -45,7 +45,10 @@ from cli_agent_orchestrator.plugins import (
 from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_event
 from cli_agent_orchestrator.services.session_env import clear_session_env
 from cli_agent_orchestrator.services.session_lock import session_lifecycle_lock
-from cli_agent_orchestrator.services.terminal_service import create_terminal
+from cli_agent_orchestrator.services.terminal_service import (
+    create_terminal,
+    get_deferred_init_failure,
+)
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 
 logger = logging.getLogger(__name__)
@@ -173,6 +176,23 @@ def _terminals_grouped_by_session(session_names: List[str]) -> Dict[str, List[Di
     # populated by construction — no falsy-key guard needed here.
     for terminal in terminals:
         grouped.setdefault(terminal["tmux_session"], []).append(terminal)
+
+    # A retained deferred-init tombstone deliberately keeps its historical
+    # tmux_session label after the provider runtime is gone. If a replacement
+    # live session later reuses that label, the old failure row must not become
+    # the replacement's conductor/ownership source. Keep tombstones visible only
+    # when they are the session's sole durable record; otherwise prefer normal
+    # live/pending rows for session ownership enrichment.
+    for session_name, rows in list(grouped.items()):
+        active_rows: List[Dict[str, Any]] = []
+        for terminal in rows:
+            failure = get_deferred_init_failure(
+                str(terminal["id"]), terminal.get("deferred_init_failure")
+            )
+            if failure is None and not terminal.get("deferred_init_runtime_reclaimed"):
+                active_rows.append(terminal)
+        if active_rows:
+            grouped[session_name] = active_rows
     return grouped
 
 
@@ -277,16 +297,46 @@ def get_session(session_name: str) -> Dict:
     supervisor that will read the first entry as the conductor.
     """
     try:
-        if not get_backend().session_exists(session_name):
-            raise ValueError(f"Session '{session_name}' not found")
-
-        tmux_sessions = get_backend().list_sessions()
-        session_data = next((s for s in tmux_sessions if s["id"] == session_name), None)
-
-        if not session_data:
-            raise ValueError(f"Session '{session_name}' not found")
-
         terminals = list_terminals_by_session(session_name)
+        backend_exists = get_backend().session_exists(session_name)
+        session_data = None
+        if backend_exists:
+            tmux_sessions = get_backend().list_sessions()
+            session_data = next((s for s in tmux_sessions if s["id"] == session_name), None)
+
+        # A deferred-init failure tombstone deliberately outlives its provider
+        # session so an external lifecycle owner can observe the real failure
+        # before reclaiming it. Preserve the old not-found contract for ordinary
+        # missing sessions, but synthesize a terminated session shell when the DB
+        # still carries authoritative failure truth (including sidecar fallback).
+        failures: dict[str, dict[str, Any]] = {}
+        for terminal in terminals:
+            failure = get_deferred_init_failure(
+                terminal["id"], terminal.get("deferred_init_failure")
+            )
+            if failure is not None:
+                failures[str(terminal["id"])] = failure
+
+        if backend_exists:
+            live_rows = [
+                terminal
+                for terminal in terminals
+                if str(terminal["id"]) not in failures
+                and not terminal.get("deferred_init_runtime_reclaimed")
+            ]
+            if live_rows:
+                terminals = live_rows
+                failures = {}
+
+        if session_data is None:
+            if not failures:
+                raise ValueError(f"Session '{session_name}' not found")
+            session_data = {
+                "id": session_name,
+                "name": session_name,
+                "status": "terminated",
+            }
+
         # Enrich each terminal with its live status. list_terminals_by_session
         # reads only the DB row (no status column), but callers monitoring an
         # orchestration — the web UI, and the cao-ops-mcp get_session_info tool
@@ -297,7 +347,14 @@ def get_session(session_name: str) -> Dict:
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
         for terminal in terminals:
-            terminal["status"] = status_monitor.get_status(terminal["id"]).value
+            failure = failures.get(str(terminal["id"]))
+            if failure is not None:
+                terminal["deferred_init_failure"] = failure
+                terminal["status"] = "error"
+            elif not backend_exists:
+                terminal["status"] = "unknown"
+            else:
+                terminal["status"] = status_monitor.get_status(terminal["id"]).value
         return {"session": session_data, "terminals": terminals}
 
     except Exception as e:

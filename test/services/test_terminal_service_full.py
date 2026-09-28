@@ -2,7 +2,7 @@
 
 import os
 from datetime import datetime
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
@@ -143,7 +143,68 @@ class TestCreateTerminal:
             "Review the current change",
             OrchestrationType.SEND_MESSAGE,
             None,
+            initial_caller_id=None,
+            delete_on_failure=False,
         )
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service._schedule_deferred_init")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_session_env")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    async def test_deferred_existing_session_inherits_callback_ownership(
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_window,
+        mock_get_session_env,
+        mock_backend,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+        mock_schedule,
+    ):
+        """Inherited callback env makes deferred failure CAO-owned even without explicit env_vars."""
+
+        from cli_agent_orchestrator.services import terminal_service
+
+        mock_gen_id.return_value = "test1234"
+        mock_gen_window.return_value = "developer-abcd"
+        mock_backend.session_exists.return_value = True
+        mock_backend.create_window.return_value = "developer-abcd"
+        mock_get_session_env.return_value = {
+            terminal_service.CALLBACK_URL_ENV: "http://remote:9889",
+            terminal_service.CALLBACK_TERMINAL_ID_ENV: "sup-remote",
+        }
+        mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
+        mock_provider = AsyncMock()
+        mock_provider_manager.create_provider.return_value = mock_provider
+        mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+
+        result = await create_terminal(
+            "codex",
+            "developer",
+            session_name="cao-existing",
+            new_session=False,
+            defer_init=True,
+            initial_message="Review the current change",
+            initial_message_orchestration_type=OrchestrationType.ASSIGN,
+        )
+
+        assert result.status == TerminalStatus.UNKNOWN
+        assert mock_db_create.call_args.kwargs["deferred_init_external_owner"] is False
+        mock_schedule.assert_called_once()
+        assert mock_schedule.call_args.kwargs["delete_on_failure"] is True
+        mock_backend.create_window.assert_called_once()
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
@@ -204,6 +265,7 @@ class TestCreateTerminal:
             group=None,
             metadata=None,
             working_directory=os.path.realpath(os.getcwd()),
+            deferred_init_external_owner=False,
             idempotency_key=None,
             # No key supplied, so no fingerprint is computed (review on PR #634).
             request_fingerprint=None,
@@ -2820,6 +2882,45 @@ class TestDeleteTerminalWorktree:
 
 
 class TestDeferredInitFailureNotification:
+    def test_recreate_purge_preserves_deferred_tombstone_and_deletes_only_stale_rows(
+        self, monkeypatch
+    ):
+        from cli_agent_orchestrator.services import terminal_service
+
+        monkeypatch.setattr(
+            terminal_service,
+            "list_terminals_by_session",
+            MagicMock(
+                return_value=[
+                    {"id": "failed001"},
+                    {"id": "stale001"},
+                ]
+            ),
+        )
+        metadata = {
+            "failed001": {
+                "id": "failed001",
+                "deferred_init_external_owner": True,
+                "deferred_init_failure": {"message": "trust required"},
+            },
+            "stale001": {"id": "stale001"},
+        }
+        monkeypatch.setattr(
+            terminal_service,
+            "get_terminal_metadata",
+            MagicMock(side_effect=lambda terminal_id: metadata[terminal_id]),
+        )
+        retain = MagicMock(
+            side_effect=lambda terminal_id, _metadata=None: terminal_id == "failed001"
+        )
+        delete_row = MagicMock(return_value=True)
+        monkeypatch.setattr(terminal_service, "should_retain_deferred_failure_tombstone", retain)
+        monkeypatch.setattr(terminal_service, "delete_terminal_row", delete_row)
+
+        terminal_service._purge_stale_session_rows_for_recreate("cao-reused")
+
+        assert delete_row.call_args_list == [call("stale001", metadata["stale001"], registry=None)]
+
     """PR #390 must-fixes #1/#3: a deferred-init failure must be OBSERVABLE to
     the supervisor (assign already returned success=True), teardown must pass
     the registry (post_kill_terminal parity), and TerminalInputBlockedError
@@ -2974,6 +3075,8 @@ class TestDeferredInitFailureNotification:
             "do the task",
             OrchestrationType.ASSIGN,
             None,
+            initial_caller_id="super123",
+            delete_on_failure=True,
         )
         (task,) = set(terminal_service._deferred_init_tasks) - before_tasks
         await task
@@ -2983,7 +3086,7 @@ class TestDeferredInitFailureNotification:
         mock_terminal_ended.assert_called_once_with("worker99")
 
     @pytest.mark.asyncio
-    @patch("cli_agent_orchestrator.services.terminal_service._notify_caller_of_deferred_failure")
+    @patch("cli_agent_orchestrator.services.terminal_service._surface_deferred_init_failure")
     @patch("cli_agent_orchestrator.services.terminal_service._confirm_worker_started_or_resubmit")
     @patch("cli_agent_orchestrator.services.terminal_service.send_input")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
@@ -3018,25 +3121,26 @@ class TestDeferredInitFailureNotification:
             "do the task",
             OrchestrationType.ASSIGN,
             None,
+            initial_caller_id="super123",
+            delete_on_failure=True,
         )
         (task,) = set(terminal_service._deferred_init_tasks) - before_tasks
         await task
 
         mock_send.assert_called_once()
-        mock_notify.assert_called_once()
-        assert mock_notify.call_args.args[3] is True
-        assert "entered ERROR" in mock_notify.call_args.args[1]
-        assert "torn down" in mock_notify.call_args.args[1]
-        assert "Inspect the worker terminal" not in mock_notify.call_args.args[1]
+        mock_notify.assert_awaited_once()
+        assert mock_notify.call_args.kwargs["kind"] == "provider_error_after_delivery"
+        assert mock_notify.call_args.kwargs["delete_on_failure"] is True
+        assert "entered ERROR" in mock_notify.call_args.kwargs["message"]
 
     @pytest.mark.asyncio
-    @patch("cli_agent_orchestrator.services.terminal_service._notify_caller_of_deferred_failure")
+    @patch("cli_agent_orchestrator.services.terminal_service._surface_deferred_init_failure")
     @patch("cli_agent_orchestrator.services.terminal_service._confirm_worker_started_or_resubmit")
     @patch("cli_agent_orchestrator.services.terminal_service.send_input")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     async def test_deferred_kimi_provider_error_without_caller_stays_inspectable(
-        self, mock_monitor, mock_meta, mock_send, mock_confirm, mock_notify, monkeypatch
+        self, mock_monitor, mock_meta, mock_send, mock_confirm, mock_surface, monkeypatch
     ):
         """Bridge/operator sessions have no CAO caller to receive a failure inbox.
 
@@ -3065,14 +3169,425 @@ class TestDeferredInitFailureNotification:
             "do the task",
             OrchestrationType.ASSIGN,
             None,
+            initial_caller_id=None,
+            delete_on_failure=False,
         )
         (task,) = set(terminal_service._deferred_init_tasks) - before_tasks
         await task
 
         mock_send.assert_called_once()
-        mock_notify.assert_called_once()
-        assert mock_notify.call_args.args[3] is False
-        assert "Inspect the worker terminal" in mock_notify.call_args.args[1]
+        mock_surface.assert_awaited_once()
+        assert mock_surface.call_args.kwargs["kind"] == "provider_error_after_delivery"
+        assert mock_surface.call_args.kwargs["delete_on_failure"] is False
+
+    @pytest.mark.asyncio
+    async def test_deferred_failure_surface_retains_external_observer_terminal(self, monkeypatch):
+        from cli_agent_orchestrator.services import terminal_service
+
+        persist = MagicMock(return_value={"message": "workspace trust required"})
+        notify = MagicMock()
+        monkeypatch.setattr(terminal_service, "_persist_deferred_init_failure", persist)
+        monkeypatch.setattr(
+            terminal_service, "_deferred_failure_delete_worker", MagicMock(return_value=False)
+        )
+        monkeypatch.setattr(terminal_service, "_notify_caller_of_deferred_failure", notify)
+
+        deleted = await terminal_service._surface_deferred_init_failure(
+            "worker99",
+            kind="provider_init_error",
+            message="workspace trust required",
+            exception_type="ProviderError",
+            registry=None,
+        )
+
+        assert deleted is False
+        persist.assert_called_once()
+        assert notify.call_args.args[3] is False
+        assert "retained for its external lifecycle owner" in notify.call_args.args[1]
+
+    def test_deferred_failure_delete_policy_local_cross_node_elastic_vs_external(self, monkeypatch):
+        from cli_agent_orchestrator.services import terminal_service
+
+        monkeypatch.delenv("CAO_ELASTIC_WORKER_ID", raising=False)
+        monkeypatch.setattr(
+            terminal_service,
+            "get_terminal_metadata",
+            MagicMock(return_value={"caller_id": None, "tmux_session": "session"}),
+        )
+        monkeypatch.setattr(terminal_service, "get_session_env", MagicMock(return_value={}))
+        assert terminal_service._deferred_failure_delete_worker("worker99") is False
+
+        terminal_service.get_terminal_metadata.return_value = {
+            "caller_id": "super123",
+            "tmux_session": "session",
+        }
+        assert terminal_service._deferred_failure_delete_worker("worker99") is True
+
+        terminal_service.get_terminal_metadata.return_value = {
+            "caller_id": None,
+            "tmux_session": "session",
+        }
+        terminal_service.get_session_env.return_value = {
+            terminal_service.CALLBACK_URL_ENV: "http://remote",
+            terminal_service.CALLBACK_TERMINAL_ID_ENV: "super456",
+        }
+        assert terminal_service._deferred_failure_delete_worker("worker99") is True
+
+        terminal_service.get_session_env.return_value = {}
+        monkeypatch.setenv("CAO_ELASTIC_WORKER_ID", "elastic1")
+        assert terminal_service._deferred_failure_delete_worker("worker99") is True
+
+    def test_creation_time_deferred_failure_ownership_is_db_independent(self, monkeypatch):
+        from cli_agent_orchestrator.services import terminal_service
+
+        monkeypatch.delenv("CAO_ELASTIC_WORKER_ID", raising=False)
+        assert terminal_service._deferred_failure_delete_from_creation(None, None) is False
+        assert terminal_service._deferred_failure_delete_from_creation("super123", None) is True
+        assert (
+            terminal_service._deferred_failure_delete_from_creation(
+                None,
+                {
+                    terminal_service.CALLBACK_URL_ENV: "http://remote",
+                    terminal_service.CALLBACK_TERMINAL_ID_ENV: "super456",
+                },
+            )
+            is True
+        )
+        monkeypatch.setenv("CAO_ELASTIC_WORKER_ID", "elastic1")
+        assert terminal_service._deferred_failure_delete_from_creation(None, None) is True
+
+    @pytest.mark.asyncio
+    async def test_frozen_ownership_survives_database_read_failure(self, monkeypatch):
+        from cli_agent_orchestrator.services import terminal_service
+
+        persist = MagicMock(side_effect=RuntimeError("database is locked"))
+        notify = MagicMock()
+        # If the fallback resolver were consulted this test would fail. The
+        # creation-time ownership bit must be sufficient by itself.
+        resolver = MagicMock(side_effect=RuntimeError("metadata read also failed"))
+        monkeypatch.setattr(terminal_service, "_persist_deferred_init_failure", persist)
+        monkeypatch.setattr(terminal_service, "_deferred_failure_delete_worker", resolver)
+        monkeypatch.setattr(terminal_service, "_notify_caller_of_deferred_failure", notify)
+
+        deleted = await terminal_service._surface_deferred_init_failure(
+            "worker99",
+            kind="provider_init_error",
+            message="init failed",
+            exception_type="ProviderError",
+            registry=None,
+            delete_on_failure=True,
+        )
+
+        assert deleted is True
+        assert persist.call_count == terminal_service._DEFERRED_INIT_FAILURE_PERSIST_ATTEMPTS
+        resolver.assert_not_called()
+        assert notify.call_args.args[3] is True
+
+    def test_persist_deferred_failure_uses_server_owned_state(self, monkeypatch):
+        from cli_agent_orchestrator.services import terminal_service
+
+        update = MagicMock(return_value=True)
+        monkeypatch.setattr(terminal_service, "update_terminal_deferred_init_failure", update)
+
+        failure = terminal_service._persist_deferred_init_failure(
+            "worker99",
+            kind="provider_init_error",
+            message="workspace trust required\x00",
+            exception_type="ProviderError",
+        )
+
+        assert failure == {
+            "phase": "deferred_init",
+            "kind": "provider_init_error",
+            "message": "workspace trust required",
+            "exception_type": "ProviderError",
+        }
+        assert update.call_args.args == ("worker99", failure)
+
+    @pytest.mark.asyncio
+    async def test_persistence_error_does_not_block_notification_or_teardown(self, monkeypatch):
+        from cli_agent_orchestrator.services import terminal_service
+
+        persist = MagicMock(side_effect=RuntimeError("database is locked"))
+        notify = MagicMock()
+        monkeypatch.setattr(terminal_service, "_persist_deferred_init_failure", persist)
+        monkeypatch.setattr(
+            terminal_service, "_deferred_failure_delete_worker", MagicMock(return_value=True)
+        )
+        monkeypatch.setattr(terminal_service, "_notify_caller_of_deferred_failure", notify)
+
+        deleted = await terminal_service._surface_deferred_init_failure(
+            "worker99",
+            kind="provider_init_error",
+            message="init failed",
+            exception_type="ProviderError",
+            registry=None,
+        )
+
+        assert deleted is True
+        assert persist.call_count == terminal_service._DEFERRED_INIT_FAILURE_PERSIST_ATTEMPTS
+        assert notify.call_args.args[3] is True
+        assert "will be torn down" in notify.call_args.args[1]
+
+    @pytest.mark.asyncio
+    async def test_external_failure_persistence_outage_uses_sidecar_and_get_recovers_error(
+        self, monkeypatch, tmp_path
+    ):
+        from cli_agent_orchestrator.services import terminal_service
+
+        failure_message = "Kimi Code workspace trust is required for /tmp/untrusted"
+        persist = MagicMock(side_effect=RuntimeError("database is locked"))
+        notify = MagicMock()
+        monitor = MagicMock()
+        monkeypatch.setattr(terminal_service, "TERMINAL_LOG_DIR", tmp_path)
+        monkeypatch.setattr(terminal_service, "_persist_deferred_init_failure", persist)
+        monkeypatch.setattr(terminal_service, "_notify_caller_of_deferred_failure", notify)
+        monkeypatch.setattr(terminal_service, "status_monitor", monitor)
+        metadata_read = MagicMock(side_effect=RuntimeError("database is locked"))
+        monkeypatch.setattr(terminal_service, "get_terminal_metadata", metadata_read)
+
+        deleted = await terminal_service._surface_deferred_init_failure(
+            "worker99",
+            kind="provider_init_error",
+            message=failure_message,
+            exception_type="ProviderError",
+            registry=None,
+            delete_on_failure=False,
+        )
+
+        assert deleted is False
+        assert persist.call_count == terminal_service._DEFERRED_INIT_FAILURE_PERSIST_ATTEMPTS
+        fallback = terminal_service._deferred_failure_fallback_path("worker99")
+        assert fallback.is_file()
+
+        metadata_read.side_effect = None
+        metadata_read.return_value = {
+            "id": "worker99",
+            "tmux_window": "w",
+            "provider": "kimi_cli",
+            "tmux_session": "s",
+            "agent_profile": "developer",
+            "caller_id": None,
+            "allowed_tools": None,
+            "engine": None,
+            "group": None,
+            "metadata": {"origin": "cao-devspace-bridge"},
+            "deferred_init_failure": None,
+            "last_active": None,
+        }
+
+        terminal = terminal_service.get_terminal("worker99")
+        assert terminal["status"] == "error"
+        assert terminal["deferred_init_failure"]["message"] == failure_message
+        monitor.get_status.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_successful_deferred_init_clears_external_owner(self, monkeypatch):
+        from cli_agent_orchestrator.services import terminal_service
+
+        update = MagicMock(return_value=True)
+        monkeypatch.setattr(
+            terminal_service, "update_terminal_deferred_init_external_owner", update
+        )
+
+        await terminal_service._clear_deferred_init_external_owner("worker99")
+
+        update.assert_called_once_with("worker99", False)
+
+    @pytest.mark.asyncio
+    async def test_restart_pending_external_owner_becomes_interrupted_init_failure(
+        self, monkeypatch
+    ):
+        from cli_agent_orchestrator.services import terminal_service
+
+        monkeypatch.setattr(
+            terminal_service,
+            "list_pending_deferred_init_external_owner_terminal_ids",
+            MagicMock(return_value=["worker99"]),
+        )
+        monkeypatch.setattr(
+            terminal_service,
+            "get_terminal_metadata",
+            MagicMock(
+                return_value={
+                    "id": "worker99",
+                    "deferred_init_external_owner": True,
+                    "deferred_init_failure": None,
+                }
+            ),
+        )
+        monkeypatch.setattr(
+            terminal_service, "_has_deferred_init_complete_fallback", MagicMock(return_value=False)
+        )
+        surface = AsyncMock(return_value=False)
+        monkeypatch.setattr(terminal_service, "_surface_deferred_init_failure", surface)
+
+        await terminal_service.recover_interrupted_deferred_init_external_owners()
+
+        surface.assert_awaited_once()
+        assert surface.call_args.kwargs["kind"] == "interrupted_init"
+        assert surface.call_args.kwargs["exception_type"] == "ServerRestart"
+        assert surface.call_args.kwargs["delete_on_failure"] is False
+
+    @pytest.mark.asyncio
+    async def test_successful_init_missing_row_does_not_create_completion_sidecar(
+        self, monkeypatch
+    ):
+        from cli_agent_orchestrator.services import terminal_service
+
+        update = MagicMock(return_value=False)
+        write = MagicMock(return_value=True)
+        monkeypatch.setattr(
+            terminal_service, "update_terminal_deferred_init_external_owner", update
+        )
+        monkeypatch.setattr(terminal_service, "_write_deferred_init_complete_fallback", write)
+
+        await terminal_service._clear_deferred_init_external_owner("already-deleted")
+
+        update.assert_called_once_with("already-deleted", False)
+        write.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_missing_row_failure_does_not_publish_orphan_sidecar(self, monkeypatch):
+        from cli_agent_orchestrator.services import terminal_service
+
+        persist = MagicMock(return_value=None)
+        fallback = MagicMock(return_value=True)
+        notify = MagicMock()
+        monkeypatch.setattr(terminal_service, "_persist_deferred_init_failure", persist)
+        monkeypatch.setattr(terminal_service, "_write_deferred_failure_fallback", fallback)
+        monkeypatch.setattr(terminal_service, "_notify_caller_of_deferred_failure", notify)
+
+        await terminal_service._surface_deferred_init_failure(
+            "already-deleted",
+            kind="provider_init_error",
+            message="gone",
+            registry=None,
+            delete_on_failure=False,
+        )
+
+        persist.assert_called_once()
+        fallback.assert_not_called()
+
+    def test_sidecar_writers_fsync_parent_directory(self, monkeypatch, tmp_path):
+        from cli_agent_orchestrator.services import terminal_service
+
+        fsync_parent = MagicMock()
+        monkeypatch.setattr(terminal_service, "TERMINAL_LOG_DIR", tmp_path)
+        monkeypatch.setattr(terminal_service, "_fsync_parent_directory", fsync_parent)
+
+        assert terminal_service._write_deferred_failure_fallback(
+            "worker99", {"message": "trust required"}
+        )
+        assert terminal_service._write_deferred_init_complete_fallback("worker99")
+
+        assert fsync_parent.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_successful_init_clear_outage_uses_complete_sidecar_and_repairs_owner(
+        self, monkeypatch, tmp_path
+    ):
+        from cli_agent_orchestrator.services import terminal_service
+
+        failing_update = MagicMock(side_effect=RuntimeError("database is locked"))
+        monkeypatch.setattr(terminal_service, "TERMINAL_LOG_DIR", tmp_path)
+        monkeypatch.setattr(
+            terminal_service, "update_terminal_deferred_init_external_owner", failing_update
+        )
+        monkeypatch.setattr(
+            terminal_service,
+            "get_terminal_metadata",
+            MagicMock(side_effect=RuntimeError("database is locked")),
+        )
+
+        await terminal_service._clear_deferred_init_external_owner("worker99")
+
+        complete = terminal_service._deferred_init_complete_fallback_path("worker99")
+        assert complete.is_file()
+
+        repair = MagicMock(return_value=True)
+        monkeypatch.setattr(
+            terminal_service, "update_terminal_deferred_init_external_owner", repair
+        )
+        retained = terminal_service.should_retain_deferred_failure_tombstone(
+            "worker99",
+            {
+                "deferred_init_external_owner": True,
+                "deferred_init_failure": None,
+            },
+        )
+
+        assert retained is False
+        repair.assert_called_once_with("worker99", False)
+        assert not complete.exists()
+
+    def test_complete_sidecar_never_masks_real_deferred_failure(self, monkeypatch, tmp_path):
+        from cli_agent_orchestrator.services import terminal_service
+
+        monkeypatch.setattr(terminal_service, "TERMINAL_LOG_DIR", tmp_path)
+        terminal_service._write_deferred_init_complete_fallback("worker99")
+        monkeypatch.setattr(
+            terminal_service,
+            "_read_deferred_failure_fallback",
+            MagicMock(return_value={"message": "workspace trust required"}),
+        )
+        repair = MagicMock(return_value=True)
+        monkeypatch.setattr(
+            terminal_service, "update_terminal_deferred_init_external_owner", repair
+        )
+
+        assert (
+            terminal_service.should_retain_deferred_failure_tombstone(
+                "worker99",
+                {
+                    "deferred_init_external_owner": True,
+                    "deferred_init_failure": None,
+                },
+            )
+            is True
+        )
+        repair.assert_not_called()
+
+    def test_get_terminal_deferred_failure_is_durable_error_without_status_monitor(
+        self, monkeypatch
+    ):
+        from cli_agent_orchestrator.services import terminal_service
+
+        failure = {
+            "phase": "deferred_init",
+            "kind": "provider_init_error",
+            "message": "workspace trust required",
+            "exception_type": "ProviderError",
+        }
+        monitor = MagicMock()
+        monkeypatch.setattr(terminal_service, "status_monitor", monitor)
+        monkeypatch.setattr(
+            terminal_service,
+            "get_terminal_metadata",
+            MagicMock(
+                return_value={
+                    "id": "worker99",
+                    "tmux_window": "w",
+                    "provider": "kimi_cli",
+                    "tmux_session": "s",
+                    "agent_profile": "developer",
+                    "caller_id": None,
+                    "allowed_tools": None,
+                    "engine": None,
+                    "group": None,
+                    "metadata": {"origin": "cao-devspace-bridge"},
+                    "deferred_init_failure": failure,
+                    "last_active": None,
+                }
+            ),
+        )
+
+        terminal = terminal_service.get_terminal("worker99")
+
+        assert terminal["status"] == "error"
+        assert terminal["deferred_init_failure"] == failure
+        assert terminal["metadata"]["origin"] == "cao-devspace-bridge"
+        monitor.get_status.assert_not_called()
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service._notify_caller_of_deferred_failure")

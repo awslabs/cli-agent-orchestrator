@@ -19,6 +19,7 @@ from cli_agent_orchestrator.clients.database import (
     InboxModel,
     MemoryMetadataModel,
     TerminalModel,
+    count_runtime_allocated_terminals,
     create_flow,
     create_inbox_message,
     create_terminal,
@@ -43,6 +44,8 @@ from cli_agent_orchestrator.clients.database import (
     update_flow_run_times,
     update_last_active,
     update_message_status,
+    update_terminal_deferred_init_failure,
+    update_terminal_deferred_init_runtime_reclaimed,
     update_terminal_group,
     update_terminal_metadata,
     update_terminal_shell_command,
@@ -75,6 +78,16 @@ class TestTerminalOperations:
         assert result["id"] == "test123"
         mock_session.add.assert_called_once()
         mock_session.commit.assert_called_once()
+
+    def test_runtime_capacity_excludes_reclaimed_deferred_tombstone(self, test_db):
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            create_terminal("live0001", "cao-live", "w-live", "kimi_cli")
+            create_terminal("dead0001", "cao-dead", "w-dead", "kimi_cli")
+            assert count_runtime_allocated_terminals() == 2
+
+            assert update_terminal_deferred_init_runtime_reclaimed("dead0001", True)
+
+            assert count_runtime_allocated_terminals() == 1
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_get_terminal_metadata_found(self, mock_session_class):
@@ -223,6 +236,7 @@ class TestTerminalOperations:
         mock_terminal.provider = "kiro_cli"
         mock_terminal.agent_profile = "developer"
         mock_terminal.working_directory = "/workspace/project"
+        mock_terminal.deferred_init_failure_json = None
         mock_terminal.last_active = datetime.now()
 
         mock_query = MagicMock()
@@ -647,6 +661,9 @@ class TestGroupAndMetadata:
         mock_terminal.allowed_tools = None
         mock_terminal.group = '["tenant_1", "project_5"]'
         mock_terminal.metadata_json = '{"task": "reviewing PR"}'
+        mock_terminal.deferred_init_failure_json = (
+            '{"phase": "deferred_init", "kind": "provider_init_error", "message": "failed"}'
+        )
         mock_terminal.last_active = datetime.now()
 
         mock_query = MagicMock()
@@ -658,6 +675,11 @@ class TestGroupAndMetadata:
 
         assert result["group"] == ["tenant_1", "project_5"]
         assert result["metadata"] == {"task": "reviewing PR"}
+        assert result["deferred_init_failure"] == {
+            "phase": "deferred_init",
+            "kind": "provider_init_error",
+            "message": "failed",
+        }
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_update_terminal_group(self, mock_session_class):
@@ -743,6 +765,36 @@ class TestGroupAndMetadata:
         result = update_terminal_metadata("nonexistent", {"task": "x"})
 
         assert result is False
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_update_terminal_deferred_init_failure_is_separate_from_metadata(
+        self, mock_session_class
+    ):
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+
+        mock_terminal = MagicMock()
+        mock_terminal.metadata_json = '{"origin":"bridge"}'
+        mock_query = MagicMock()
+        mock_query.filter.return_value.first.return_value = mock_terminal
+        mock_session.query.return_value = mock_query
+        mock_session_class.return_value = mock_session
+
+        failure = {
+            "phase": "deferred_init",
+            "kind": "provider_init_error",
+            "message": "workspace trust required",
+        }
+        result = update_terminal_deferred_init_failure("test123", failure)
+
+        assert result is True
+        assert mock_terminal.deferred_init_failure_json == (
+            '{"phase": "deferred_init", "kind": "provider_init_error", '
+            '"message": "workspace trust required"}'
+        )
+        assert mock_terminal.metadata_json == '{"origin":"bridge"}'
+        mock_session.commit.assert_called_once()
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_get_terminal_group_returns_decoded_list(self, mock_session_class):
@@ -1694,6 +1746,9 @@ class TestTerminalsSchemaMigration:
         assert "caller_id" in columns
         assert "working_directory" in columns
         assert "provider_variant" in columns
+        assert "deferred_init_failure" in columns
+        assert "deferred_init_external_owner" in columns
+        assert "deferred_init_runtime_reclaimed" in columns
         assert rows == [("abc12345", None, None)], "existing rows must get NULL metadata values"
 
     def test_migration_is_idempotent(self, tmp_path, monkeypatch):
@@ -1725,6 +1780,9 @@ class TestTerminalsSchemaMigration:
         assert columns.count("working_directory") == 1
         assert columns.count("allowed_tools") == 1
         assert columns.count("provider_variant") == 1
+        assert columns.count("deferred_init_failure") == 1
+        assert columns.count("deferred_init_external_owner") == 1
+        assert columns.count("deferred_init_runtime_reclaimed") == 1
 
     def test_group_and_metadata_columns_added_to_legacy_table(self, tmp_path, monkeypatch):
         """#432: a pre-existing terminals table (predating group/metadata) gains both
@@ -2346,6 +2404,9 @@ class TestListTerminalsInSessions:
             "agent_profile",
             "working_directory",
             "engine",
+            "deferred_init_failure",
+            "deferred_init_external_owner",
+            "deferred_init_runtime_reclaimed",
             "last_active",
         }
 

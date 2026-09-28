@@ -4,9 +4,12 @@ import asyncio
 import inspect
 import json
 import time
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
-from cli_agent_orchestrator.services.herdr_inbox_service import HerdrInboxService
+from cli_agent_orchestrator.services.herdr_inbox_service import (
+    HerdrInboxService,
+    _retain_deferred_failure_tombstone,
+)
 
 
 def _run_async(coro):
@@ -664,10 +667,13 @@ class TestHerdrInboxSnapshot:
 class TestHerdrInboxServiceStartupDbCleanup:
     """Test _startup_db_cleanup removes ghost terminals on server start."""
 
+    @patch("cli_agent_orchestrator.clients.database.list_all_terminals", return_value=[])
     @patch("cli_agent_orchestrator.clients.database.delete_terminal")
     @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
     @patch.object(HerdrInboxService, "_fetch_snapshot")
-    def test_startup_cleanup_deletes_ghost_from_snapshot(self, mock_snap, mock_list, mock_delete):
+    def test_startup_cleanup_deletes_ghost_from_snapshot(
+        self, mock_snap, mock_list, mock_delete, _mock_all
+    ):
         """Ghost terminals (window not in live herdr tabs) are deleted at startup."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
 
@@ -687,10 +693,13 @@ class TestHerdrInboxServiceStartupDbCleanup:
 
         mock_delete.assert_called_once_with("tid-ghost")
 
+    @patch("cli_agent_orchestrator.clients.database.list_all_terminals", return_value=[])
     @patch("cli_agent_orchestrator.clients.database.delete_terminal")
     @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
     @patch.object(HerdrInboxService, "_fetch_snapshot")
-    def test_startup_cleanup_skips_on_snapshot_none(self, mock_snap, mock_list, mock_delete):
+    def test_startup_cleanup_skips_on_snapshot_none(
+        self, mock_snap, mock_list, mock_delete, _mock_all
+    ):
         """When the snapshot is unavailable (None), no DB queries or deletes run."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
 
@@ -699,10 +708,13 @@ class TestHerdrInboxServiceStartupDbCleanup:
         mock_list.assert_not_called()
         mock_delete.assert_not_called()
 
+    @patch("cli_agent_orchestrator.clients.database.list_all_terminals", return_value=[])
     @patch("cli_agent_orchestrator.clients.database.delete_terminal")
     @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
     @patch.object(HerdrInboxService, "_fetch_snapshot")
-    def test_startup_cleanup_no_deletes_when_all_live(self, mock_snap, mock_list, mock_delete):
+    def test_startup_cleanup_no_deletes_when_all_live(
+        self, mock_snap, mock_list, mock_delete, _mock_all
+    ):
         """No deletions when all DB terminals have matching live tabs."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
 
@@ -718,6 +730,45 @@ class TestHerdrInboxServiceStartupDbCleanup:
         _run_async(service._startup_db_cleanup())
 
         mock_delete.assert_not_called()
+
+    @patch("cli_agent_orchestrator.clients.database.list_all_terminals", return_value=[])
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service._retain_deferred_failure_tombstone")
+    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_startup_cleanup_retains_deferred_failure_tombstone(
+        self, mock_snap, mock_list, mock_delete, mock_retain, _mock_all
+    ):
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        mock_snap.return_value = {
+            "panes": [],
+            "workspaces": [{"workspace_id": "ws-abc", "label": "my-session"}],
+            "tabs": [],
+        }
+        mock_list.return_value = [{"id": "tid-failed", "tmux_window": "dead-window"}]
+        mock_retain.return_value = True
+
+        _run_async(service._startup_db_cleanup())
+
+        mock_retain.assert_called_once_with("tid-failed", on_cleanup_deferred=ANY)
+        mock_delete.assert_not_called()
+
+    @patch("cli_agent_orchestrator.clients.database.list_all_terminals")
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service._retain_deferred_failure_tombstone")
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_startup_cleanup_discovers_tombstone_when_workspace_fully_absent(
+        self, mock_snap, mock_retain, mock_all
+    ):
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        mock_snap.return_value = {"panes": [], "workspaces": [], "tabs": []}
+        mock_all.return_value = [
+            {"id": "tid-absent", "tmux_session": "cao-gone", "tmux_window": "gone-window"}
+        ]
+        mock_retain.return_value = True
+
+        _run_async(service._startup_db_cleanup())
+
+        mock_retain.assert_called_once_with("tid-absent", on_cleanup_deferred=ANY)
 
 
 class TestHerdrInboxServiceSingleSubscribePerConnection:
@@ -752,6 +803,216 @@ class TestHerdrInboxServiceSingleSubscribePerConnection:
 
 
 class TestHerdrInboxServiceLifecycleEvents:
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service._retain_deferred_failure_tombstone")
+    def test_tombstone_runtime_cleanup_retries_until_complete(self, mock_retain):
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service._pending_tombstone_runtime_cleanup.add("tid-retry")
+        attempts = 0
+
+        def retain(_terminal_id, *, on_cleanup_deferred=None):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                assert on_cleanup_deferred is not None
+                on_cleanup_deferred("tid-retry")
+            return True
+
+        mock_retain.side_effect = retain
+
+        service._retry_pending_tombstone_runtime_cleanup()
+        assert service._pending_tombstone_runtime_cleanup == {"tid-retry"}
+
+        service._retry_pending_tombstone_runtime_cleanup()
+        assert service._pending_tombstone_runtime_cleanup == set()
+
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service._retain_deferred_failure_tombstone")
+    def test_closed_workspace_retry_never_deletes_replacement_live_label(
+        self, mock_retain, mock_list, mock_delete
+    ):
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service._live_tab_labels = MagicMock(return_value={"developer-new1234"})
+        mock_list.return_value = [
+            {"id": "old00001", "tmux_window": "developer-old1234"},
+            {"id": "new00001", "tmux_window": "developer-new1234"},
+        ]
+        mock_retain.return_value = False
+
+        assert service._cleanup_closed_session("cao-reused") is True
+
+        mock_delete.assert_called_once_with("old00001")
+        assert call("new00001") not in mock_delete.call_args_list
+
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_lock.session_lifecycle_lock")
+    def test_closed_workspace_cleanup_freezes_rows_then_reads_liveness_under_session_lock(
+        self, mock_lock, mock_list, mock_delete
+    ):
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        state = {"locked": False}
+        order = []
+
+        cm = MagicMock()
+        cm.__enter__.side_effect = lambda: state.__setitem__("locked", True)
+        cm.__exit__.side_effect = lambda *_args: state.__setitem__("locked", False)
+        mock_lock.return_value = cm
+
+        def list_rows(_session_name):
+            assert state["locked"] is True
+            order.append("rows")
+            return []
+
+        def live_labels():
+            assert state["locked"] is True
+            order.append("liveness")
+            return set()
+
+        mock_list.side_effect = list_rows
+        service._live_tab_labels = MagicMock(side_effect=live_labels)
+
+        assert service._cleanup_closed_session("cao-reused") is True
+
+        assert order == ["rows", "liveness"]
+        mock_lock.assert_called_once_with("cao-reused")
+        mock_delete.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service._retain_deferred_failure_tombstone")
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
+    def test_pane_closed_db_outage_ignores_replayed_live_pane(
+        self, mock_meta, mock_snapshot, mock_retain
+    ):
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service.register_terminal("tid-live", "pane-a")
+        mock_meta.side_effect = RuntimeError("database is locked")
+        mock_snapshot.return_value = {
+            "panes": [{"pane_id": "pane-a", "terminal_id": "tid-live"}],
+            "workspaces": [],
+            "tabs": [],
+        }
+
+        service._handle_lifecycle_event("pane.closed", {"pane_id": "pane-a"})
+
+        assert service._terminal_to_pane["tid-live"] == "pane-a"
+        mock_retain.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service._retain_deferred_failure_tombstone")
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
+    def test_pane_closed_db_outage_cleans_confirmed_dead_pane(
+        self, mock_meta, mock_snapshot, mock_retain
+    ):
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service.register_terminal("tid-dead", "pane-a")
+        mock_meta.side_effect = RuntimeError("database is locked")
+        mock_snapshot.return_value = {"panes": [], "workspaces": [], "tabs": []}
+        mock_retain.return_value = True
+
+        service._handle_lifecycle_event("pane.closed", {"pane_id": "pane-a"})
+
+        assert "tid-dead" not in service._terminal_to_pane
+        mock_retain.assert_called_once_with("tid-dead", on_cleanup_deferred=ANY)
+
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service._retain_deferred_failure_tombstone")
+    @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_reconcile_db_outage_uses_live_terminal_id_to_remap(
+        self, mock_snapshot, mock_meta, mock_retain
+    ):
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service.register_terminal("tid-live", "pane-old")
+        mock_snapshot.return_value = {
+            "panes": [{"pane_id": "pane-new", "terminal_id": "tid-live"}],
+            "workspaces": [],
+            "tabs": [],
+        }
+        mock_meta.side_effect = RuntimeError("database is locked")
+
+        _run_async(service._reconcile())
+
+        assert service._terminal_to_pane["tid-live"] == "pane-new"
+        assert service._pane_to_terminal["pane-new"] == "tid-live"
+        assert "pane-old" not in service._pane_to_terminal
+        mock_retain.assert_not_called()
+
+    def test_pending_closed_session_retries_until_cleanup_succeeds(self):
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service._pending_closed_sessions["ws-closed"] = "cao-closed"
+        service._cleanup_closed_session = MagicMock(side_effect=[False, True])
+
+        service._retry_pending_closed_sessions()
+        assert service._pending_closed_sessions == {"ws-closed": "cao-closed"}
+
+        service._retry_pending_closed_sessions()
+        assert service._pending_closed_sessions == {}
+
+    @patch("cli_agent_orchestrator.services.terminal_service.dismantle_terminal_runtime")
+    @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
+    def test_retention_db_outage_still_dismantles_runtime(self, mock_meta, mock_dismantle):
+        """Unknown DB ownership retains evidence but must not leak provider/FIFO runtime."""
+
+        mock_meta.side_effect = RuntimeError("database is locked")
+        mock_dismantle.return_value = True
+
+        assert _retain_deferred_failure_tombstone("tid-db-outage") is True
+
+        mock_dismantle.assert_called_once_with("tid-db-outage", None, kill_window=False)
+
+    @patch("cli_agent_orchestrator.services.terminal_service.dismantle_terminal_runtime")
+    @patch("cli_agent_orchestrator.services.terminal_service.capture_terminal_snapshot")
+    @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service.should_retain_deferred_failure_tombstone"
+    )
+    def test_pending_external_owner_dismantles_runtime_but_retains_row(
+        self, mock_retain, mock_meta, mock_capture, mock_dismantle
+    ):
+        """Creation-time ownership closes pane.closed-before-failure persistence race."""
+
+        mock_retain.return_value = True
+        metadata = {
+            "id": "tid-pending",
+            "tmux_session": "cao-pending",
+            "tmux_window": "pending-window",
+            "deferred_init_external_owner": True,
+            "deferred_init_failure": None,
+        }
+        mock_capture.return_value = metadata
+        mock_meta.return_value = metadata
+        mock_dismantle.return_value = True
+
+        assert _retain_deferred_failure_tombstone("tid-pending") is True
+
+        mock_retain.assert_called_once_with("tid-pending", metadata)
+        mock_dismantle.assert_called_once_with("tid-pending", metadata, kill_window=False)
+
+    @patch.object(HerdrInboxService, "_label_still_live", return_value=False)
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service._retain_deferred_failure_tombstone")
+    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_reconcile_stale_pane_retains_external_tombstone(
+        self, mock_snapshot, mock_meta, mock_delete, mock_retain, mock_live
+    ):
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service.register_terminal("tid-failed", "pane-old")
+        mock_snapshot.return_value = {"panes": [], "workspaces": [], "tabs": []}
+        mock_meta.return_value = {
+            "id": "tid-failed",
+            "tmux_session": "cao-failed",
+            "tmux_window": "failed-window",
+        }
+        mock_retain.return_value = True
+
+        _run_async(service._reconcile())
+
+        mock_retain.assert_called_once_with("tid-failed", on_cleanup_deferred=ANY)
+        mock_live.assert_called_once_with("failed-window")
+        mock_delete.assert_not_called()
+        assert "tid-failed" not in service._terminal_to_pane
+
     """Test _handle_lifecycle_event for pane.closed and workspace.closed."""
 
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
@@ -864,12 +1125,8 @@ class TestHerdrInboxServiceLifecycleEvents:
     @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
     @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
-    def test_pane_closed_deletes_when_herdr_query_fails(self, mock_meta, mock_delete, mock_run):
-        """If herdr cannot be queried, fall back to deleting (fail toward cleanup).
-
-        We must never leave a terminal we believe is open when it may be closed,
-        so an unreachable herdr makes the liveness check fail toward delete.
-        """
+    def test_pane_closed_defers_when_herdr_query_fails(self, mock_meta, mock_delete, mock_run):
+        """Unknown liveness is not evidence of death for a replayable pane id."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         service.register_terminal("9d00610c", "pane-3", is_kiro=False)
         mock_meta.return_value = {
@@ -888,8 +1145,9 @@ class TestHerdrInboxServiceLifecycleEvents:
 
         service._handle_lifecycle_event("pane.closed", {"pane_id": "pane-3"})
 
-        mock_delete.assert_called_once_with("9d00610c")
-        assert "pane-3" not in service._pane_to_terminal
+        mock_delete.assert_not_called()
+        assert service._terminal_to_pane["9d00610c"] == "pane-3"
+        assert service._pane_to_terminal["pane-3"] == "9d00610c"
 
     @patch("cli_agent_orchestrator.clients.database.delete_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal", return_value=False)
@@ -907,6 +1165,32 @@ class TestHerdrInboxServiceLifecycleEvents:
         mock_teardown.assert_called_once_with("retained-grok")
         mock_database_delete.assert_not_called()
 
+    @patch.object(HerdrInboxService, "_label_still_live", return_value=False)
+    @patch(
+        "cli_agent_orchestrator.services.herdr_inbox_service._retain_deferred_failure_tombstone",
+        return_value=True,
+    )
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
+    def test_pane_closed_retains_deferred_failure_tombstone(
+        self, mock_meta, mock_delete, mock_retain, mock_live
+    ):
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service.register_terminal("tid-failed", "pane-failed")
+        mock_meta.return_value = {
+            "tmux_session": "cao-failed",
+            "tmux_window": "failed-window",
+            "deferred_init_failure": {"message": "workspace trust required"},
+        }
+
+        service._handle_lifecycle_event("pane.closed", {"pane_id": "pane-failed"})
+
+        assert "pane-failed" not in service._pane_to_terminal
+        assert "tid-failed" not in service._terminal_to_pane
+        mock_live.assert_called_once_with("failed-window")
+        mock_retain.assert_called_once_with("tid-failed", on_cleanup_deferred=ANY)
+        mock_delete.assert_not_called()
+
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
     @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
     @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
@@ -921,6 +1205,7 @@ class TestHerdrInboxServiceLifecycleEvents:
         off DB session ownership rather than the pane_id string.
         """
         service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service._live_tab_labels = MagicMock(return_value=set())
         service.register_terminal("tid1", "p-7")
         service.register_terminal("tid2", "p-8")
         service.register_terminal("tid3", "p-9")  # Different session
