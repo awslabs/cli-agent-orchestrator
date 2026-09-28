@@ -130,7 +130,9 @@ class TestReaderThreadLifecycle:
         are all published; writer disconnects must not kill the reader."""
         received = []
         monkeypatch.setattr(
-            fr.bus, "publish", lambda topic, data: received.append((topic, data["data"]))
+            fr.bus,
+            "publish_with_loss_markers",
+            lambda topic, data, **_: received.append((topic, data["data"])),
         )
         manager = self._manager(tmp_path, monkeypatch)
         manager.create_reader("term-data")
@@ -196,7 +198,7 @@ class TestReaderLoopCoalescing:
 
         published: list[dict] = []
 
-        def fake_publish(topic, payload):
+        def fake_publish(topic, payload, **_):
             published.append({"topic": topic, "data": payload["data"]})
 
         # _reader_loop is an instance method (it records per-terminal liveness
@@ -205,7 +207,7 @@ class TestReaderLoopCoalescing:
         manager = FifoManager()
         stop_flag = threading.Event()
         with patch(
-            "cli_agent_orchestrator.services.fifo_reader.bus.publish",
+            "cli_agent_orchestrator.services.fifo_reader.bus.publish_with_loss_markers",
             side_effect=fake_publish,
         ):
             reader = threading.Thread(
@@ -257,7 +259,7 @@ class TestReaderLoopCoalescing:
 
         published: list[dict] = []
 
-        def fake_publish(topic, payload):
+        def fake_publish(topic, payload, **_):
             published.append({"topic": topic, "data": payload["data"]})
 
         # _reader_loop is an instance method (it records per-terminal liveness
@@ -266,7 +268,7 @@ class TestReaderLoopCoalescing:
         manager = FifoManager()
         stop_flag = threading.Event()
         with patch(
-            "cli_agent_orchestrator.services.fifo_reader.bus.publish",
+            "cli_agent_orchestrator.services.fifo_reader.bus.publish_with_loss_markers",
             side_effect=fake_publish,
         ):
             reader = threading.Thread(
@@ -411,7 +413,11 @@ class TestPipeLivenessWatchdog:
         instead of waiting for the agent to emit something new."""
         monkeypatch.setattr(fr, "PIPE_LIVENESS_STALL_CHECKS", 1)
         published: list = []
-        monkeypatch.setattr(fr.bus, "publish", lambda topic, data: published.append((topic, data)))
+        monkeypatch.setattr(
+            fr.bus,
+            "publish_with_loss_markers",
+            lambda topic, data, **_: published.append((topic, data)),
+        )
 
         manager = self._manager(tmp_path, monkeypatch)
         pane = {"content": "before"}
@@ -442,7 +448,11 @@ class TestPipeLivenessWatchdog:
         convert each bare "\\n" to "\\r\\n" so pyte renders it as a real newline."""
         monkeypatch.setattr(fr, "PIPE_LIVENESS_STALL_CHECKS", 1)
         published: list = []
-        monkeypatch.setattr(fr.bus, "publish", lambda topic, data: published.append((topic, data)))
+        monkeypatch.setattr(
+            fr.bus,
+            "publish_with_loss_markers",
+            lambda topic, data, **_: published.append((topic, data)),
+        )
 
         manager = self._manager(tmp_path, monkeypatch)
         multiline = "line0\nline1\nline2 (rendered but never piped)"
@@ -860,7 +870,11 @@ class TestColdStartStallDetection:
         wait_for_shell() even though the FIFO itself never delivered a byte."""
         monkeypatch.setattr(fr, "PIPE_LIVENESS_COLD_START_GRACE_S", 0.0)
         published: list = []
-        monkeypatch.setattr(fr.bus, "publish", lambda topic, data: published.append((topic, data)))
+        monkeypatch.setattr(
+            fr.bus,
+            "publish_with_loss_markers",
+            lambda topic, data, **_: published.append((topic, data)),
+        )
 
         manager = self._manager(tmp_path, monkeypatch)
         pane = {"content": "user@host:~$ "}
@@ -1028,7 +1042,7 @@ class TestConcurrencyRaces:
         stop_flag = threading.Event()
 
         with (
-            patch("cli_agent_orchestrator.services.fifo_reader.bus.publish"),
+            patch("cli_agent_orchestrator.services.fifo_reader.bus.publish_with_loss_markers"),
             patch(
                 "cli_agent_orchestrator.services.fifo_reader.time.monotonic",
                 side_effect=blocking_monotonic,

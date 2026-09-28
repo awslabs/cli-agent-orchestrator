@@ -243,84 +243,126 @@ class Bridge:
         try:
             while True:
                 event = await queue.get()
-                match = _OUTPUT_TOPIC.match(event["topic"])
-                if not match:
-                    continue
-                terminal_id = match.group(1)
-                data = event["data"].get("data", "")
-                if not data:
-                    continue
-                raw = data.encode("utf-8", errors="replace")
-                buf = self._buffer_for(terminal_id)
-                offset = event["data"].get("offset")
-                if offset is None:
-                    # A publisher that carries no offset (a non-FIFO producer)
-                    # keeps the old arrival-order numbering; nothing claims its
-                    # stream is gap-checked.
-                    gap, pos = None, buf.append(raw)
-                else:
-                    start = int(offset)
-                    epoch = event["data"].get("epoch")
-                    if epoch is not None:
-                        # The producer stamps a per-stream epoch, bumped whenever
-                        # its reader is re-armed. A change is a NEW stream reusing
-                        # the terminal id — the fence the offset heuristic below
-                        # could not see when the new stream's head was dropped, so
-                        # its first delivered offset landed at or past the old
-                        # watermark and the two spliced (Copilot review on #802).
-                        last = self._last_epoch.get(terminal_id)
-                        self._last_epoch[terminal_id] = epoch
-                        if last is not None and epoch != last:
-                            logger.warning(
-                                "terminal %s output stream re-armed (epoch %s -> %s); "
-                                "starting generation %s",
-                                terminal_id,
-                                last,
-                                epoch,
-                                buf.generation + 1,
-                            )
-                            buf.begin_generation()
-                    elif start < buf.end_pos:
-                        # No epoch (a non-FIFO producer): fall back to inferring a
-                        # restart from an offset behind the watermark. A monotonic
-                        # per-stream counter going backwards means it restarted.
-                        logger.warning(
-                            "terminal %s restarted its output stream at offset %s "
-                            "(watermark was %s); starting generation %s",
-                            terminal_id,
-                            start,
-                            buf.end_pos,
-                            buf.generation + 1,
-                        )
-                        buf.begin_generation()
-                    gap, pos = buf.append_at(start, raw)
-                if gap is not None:
-                    logger.warning(
-                        "dropped output for terminal %s: [%s, %s) never reached the channel",
-                        terminal_id,
-                        gap.from_pos,
-                        gap.to_pos,
-                    )
-                    await self._send(
-                        GapFrame(
-                            terminal_id=terminal_id,
-                            stream=StreamName.CAPTURE,
-                            generation=buf.generation,
-                            from_pos=gap.from_pos,
-                            to_pos=gap.to_pos,
-                        )
-                    )
+                await self._process_output_event(event)
+                # A chunk the bounded bus refused is owed to this queue as a loss
+                # marker; collect it whenever the queue drains so a dropped FINAL
+                # chunk becomes a reported gap rather than an invisible short
+                # watermark (review finding 5 on #802).
+                if queue.empty():
+                    bus.flush_owed_to(queue)
+        finally:
+            bus.unsubscribe("terminal.*.output", queue)
+
+    async def _process_output_event(self, event: dict) -> None:
+        """Forward one output event: bytes as a StreamFrame, a loss marker as a
+        GapFrame. A marker (``data == ""`` with a ``gap`` dict) is a range the
+        bus dropped, so it records the hole and advances the buffer watermark."""
+        match = _OUTPUT_TOPIC.match(event["topic"])
+        if not match:
+            return
+        terminal_id = match.group(1)
+        gap_marker = event["data"].get("gap")
+        if gap_marker is not None:
+            # The bytes never reached this queue, so there is nothing to append,
+            # only a hole to report. Ignore a marker stamped with a different
+            # producer epoch than the one currently seen — the generation
+            # transition already represents that discontinuity.
+            marker_gen = gap_marker.get("generation")
+            last = self._last_epoch.get(terminal_id)
+            if marker_gen is not None and last is not None and marker_gen != last:
+                return
+            buf = self._buffer_for(terminal_id)
+            from_pos = gap_marker.get("from_pos")
+            to_pos = gap_marker.get("to_pos")
+            if buf.note_gap(from_pos, to_pos):
+                logger.warning(
+                    "dropped output for terminal %s: [%s, %s) never reached the channel",
+                    terminal_id,
+                    from_pos,
+                    to_pos,
+                )
                 await self._send(
-                    StreamFrame(
+                    GapFrame(
                         terminal_id=terminal_id,
                         stream=StreamName.CAPTURE,
                         generation=buf.generation,
-                        pos=pos,
-                        data=base64.b64encode(raw).decode(),
+                        from_pos=from_pos,
+                        to_pos=to_pos,
                     )
                 )
-        finally:
-            bus.unsubscribe("terminal.*.output", queue)
+            return
+        data = event["data"].get("data", "")
+        if not data:
+            return
+        raw = data.encode("utf-8", errors="replace")
+        buf = self._buffer_for(terminal_id)
+        offset = event["data"].get("offset")
+        if offset is None:
+            # A publisher that carries no offset (a non-FIFO producer)
+            # keeps the old arrival-order numbering; nothing claims its
+            # stream is gap-checked.
+            gap, pos = None, buf.append(raw)
+        else:
+            start = int(offset)
+            epoch = event["data"].get("epoch")
+            if epoch is not None:
+                # The producer stamps a per-stream epoch, bumped whenever
+                # its reader is re-armed. A change is a NEW stream reusing
+                # the terminal id — the fence the offset heuristic below
+                # could not see when the new stream's head was dropped, so
+                # its first delivered offset landed at or past the old
+                # watermark and the two spliced (Copilot review on #802).
+                last = self._last_epoch.get(terminal_id)
+                self._last_epoch[terminal_id] = epoch
+                if last is not None and epoch != last:
+                    logger.warning(
+                        "terminal %s output stream re-armed (epoch %s -> %s); "
+                        "starting generation %s",
+                        terminal_id,
+                        last,
+                        epoch,
+                        buf.generation + 1,
+                    )
+                    buf.begin_generation()
+            elif start < buf.end_pos:
+                # No epoch (a non-FIFO producer): fall back to inferring a
+                # restart from an offset behind the watermark. A monotonic
+                # per-stream counter going backwards means it restarted.
+                logger.warning(
+                    "terminal %s restarted its output stream at offset %s "
+                    "(watermark was %s); starting generation %s",
+                    terminal_id,
+                    start,
+                    buf.end_pos,
+                    buf.generation + 1,
+                )
+                buf.begin_generation()
+            gap, pos = buf.append_at(start, raw)
+        if gap is not None:
+            logger.warning(
+                "dropped output for terminal %s: [%s, %s) never reached the channel",
+                terminal_id,
+                gap.from_pos,
+                gap.to_pos,
+            )
+            await self._send(
+                GapFrame(
+                    terminal_id=terminal_id,
+                    stream=StreamName.CAPTURE,
+                    generation=buf.generation,
+                    from_pos=gap.from_pos,
+                    to_pos=gap.to_pos,
+                )
+            )
+        await self._send(
+            StreamFrame(
+                terminal_id=terminal_id,
+                stream=StreamName.CAPTURE,
+                generation=buf.generation,
+                pos=pos,
+                data=base64.b64encode(raw).decode(),
+            )
+        )
 
     async def _forward_status(self) -> None:
         queue = bus.subscribe("terminal.*.status")

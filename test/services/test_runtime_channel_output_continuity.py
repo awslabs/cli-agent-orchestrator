@@ -133,8 +133,8 @@ class TestTheProducerStampsTheOffset:
         manager = FifoManager()
         published = []
         with patch(
-            "cli_agent_orchestrator.services.fifo_reader.bus.publish",
-            side_effect=lambda topic, payload: published.append(payload),
+            "cli_agent_orchestrator.services.fifo_reader.bus.publish_with_loss_markers",
+            side_effect=lambda topic, payload, **_: published.append(payload),
         ):
             manager._publish_output(TID, "abc")
             manager._publish_output(TID, "dé")  # two chars, three UTF-8 bytes
@@ -148,8 +148,8 @@ class TestTheProducerStampsTheOffset:
         manager = FifoManager()
         published = []
         with patch(
-            "cli_agent_orchestrator.services.fifo_reader.bus.publish",
-            side_effect=lambda topic, payload: published.append((topic, payload["offset"])),
+            "cli_agent_orchestrator.services.fifo_reader.bus.publish_with_loss_markers",
+            side_effect=lambda topic, payload, **_: published.append((topic, payload["offset"])),
         ):
             manager._publish_output(TID, "abcd")
             manager._publish_output("bbbb2222", "x")
@@ -174,8 +174,8 @@ class TestTheProducerStampsTheOffset:
         manager._rearm[TID] = lambda: None
         published = []
         with patch(
-            "cli_agent_orchestrator.services.fifo_reader.bus.publish",
-            side_effect=lambda topic, payload: published.append(payload),
+            "cli_agent_orchestrator.services.fifo_reader.bus.publish_with_loss_markers",
+            side_effect=lambda topic, payload, **_: published.append(payload),
         ):
             manager._publish_output(TID, "abcd")
             manager._rearm_stalled_pipe(TID, "pane\nlines", lambda: None, cold_start=False)
@@ -191,8 +191,8 @@ class TestTheProducerStampsTheOffset:
         stop_flag = threading.Event()
         published = []
         with patch(
-            "cli_agent_orchestrator.services.fifo_reader.bus.publish",
-            side_effect=lambda topic, payload: published.append(payload),
+            "cli_agent_orchestrator.services.fifo_reader.bus.publish_with_loss_markers",
+            side_effect=lambda topic, payload, **_: published.append(payload),
         ):
             reader = threading.Thread(
                 target=manager._reader_loop,
@@ -221,7 +221,7 @@ class TestTheProducerStampsTheOffset:
     def test_teardown_forgets_the_counter(self, tmp_path, monkeypatch):
         monkeypatch.setattr("cli_agent_orchestrator.services.fifo_reader.FIFO_DIR", tmp_path)
         manager = FifoManager()
-        with patch("cli_agent_orchestrator.services.fifo_reader.bus.publish"):
+        with patch("cli_agent_orchestrator.services.fifo_reader.bus.publish_with_loss_markers"):
             manager._publish_output(TID, "abcd")
         manager.stop_reader(TID)
         assert TID not in manager._published_bytes
@@ -422,12 +422,15 @@ class TestOffsetOrderMatchesPublishOrder:
         seen: list = []
         seen_lock = threading.Lock()
 
-        def record(topic, payload):
+        def record(topic, payload, **_):
             # Capture publish ORDER, which is what the consumer sees.
             with seen_lock:
                 seen.append(payload["offset"])
 
-        with patch("cli_agent_orchestrator.services.fifo_reader.bus.publish", side_effect=record):
+        with patch(
+            "cli_agent_orchestrator.services.fifo_reader.bus.publish_with_loss_markers",
+            side_effect=record,
+        ):
 
             def hammer():
                 for _ in range(150):

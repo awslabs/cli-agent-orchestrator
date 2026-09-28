@@ -156,6 +156,22 @@ class ReplayBuffer:
         self._end_pos = start
         return gap, self.append(chunk)
 
+    def note_gap(self, from_pos: int, to_pos: Optional[int]) -> bool:
+        """Record that ``[from_pos, to_pos)`` was lost, advancing the watermark.
+
+        Used when the bus itself dropped an output event: the bytes never
+        reached this buffer, so there is nothing to retain, only a hole to
+        acknowledge. Advancing ``end_pos`` past the lost range is what makes the
+        watermark the hello/heartbeat advertises match the producer's true end,
+        so a dropped FINAL chunk is not invisible (review finding 5 on #802). A
+        range already behind the watermark is ignored, so a re-delivered marker
+        is idempotent; returns whether the watermark moved.
+        """
+        if to_pos is None or to_pos <= self._end_pos:
+            return False
+        self._end_pos = to_pos
+        return True
+
     def replay_from(self, pos: int) -> List[ReplayItem]:
         """Return everything needed to bring a consumer at ``pos`` current.
 

@@ -28,8 +28,8 @@ class TestTheProducerStampsAnEpoch:
         manager = FifoManager()
         published = []
         with patch(
-            "cli_agent_orchestrator.services.fifo_reader.bus.publish",
-            side_effect=lambda topic, payload: published.append(payload),
+            "cli_agent_orchestrator.services.fifo_reader.bus.publish_with_loss_markers",
+            side_effect=lambda topic, payload, **_: published.append(payload),
         ):
             manager._publish_output(TID, "abc")
         assert "epoch" in published[0]
@@ -37,7 +37,7 @@ class TestTheProducerStampsAnEpoch:
     def test_creating_a_reader_bumps_the_epoch_and_resets_the_counter(self, tmp_path, monkeypatch):
         monkeypatch.setattr("cli_agent_orchestrator.services.fifo_reader.FIFO_DIR", tmp_path)
         manager = FifoManager()
-        with patch("cli_agent_orchestrator.services.fifo_reader.bus.publish"):
+        with patch("cli_agent_orchestrator.services.fifo_reader.bus.publish_with_loss_markers"):
             manager._publish_output(TID, "abcd")  # advances the byte counter
         before = manager._epochs.get(TID, 0)
         manager.create_reader(TID)
@@ -60,8 +60,8 @@ class TestTheProducerStampsAnEpoch:
         manager = FifoManager()
         published = []
         with patch(
-            "cli_agent_orchestrator.services.fifo_reader.bus.publish",
-            side_effect=lambda topic, payload: published.append(payload["epoch"]),
+            "cli_agent_orchestrator.services.fifo_reader.bus.publish_with_loss_markers",
+            side_effect=lambda topic, payload, **_: published.append(payload["epoch"]),
         ):
             manager.create_reader(TID)
             manager._publish_output(TID, "old")

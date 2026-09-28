@@ -189,9 +189,16 @@ class FifoManager:
         with self._lock:
             offset = self._published_bytes.get(terminal_id, 0)
             self._published_bytes[terminal_id] = offset + offset_bytes
-            bus.publish(
+            epoch = self._epochs.get(terminal_id, 0)
+            # Through publish_with_loss_markers, not publish: the bus is bounded
+            # and drops on a full queue, so a subscriber that refuses this event
+            # is owed a marker for exactly these bytes. A dropped FINAL chunk then
+            # becomes a reported gap instead of an invisible short watermark
+            # (review finding 5 on #802).
+            bus.publish_with_loss_markers(
                 f"terminal.{terminal_id}.output",
-                {"data": text, "offset": offset, "epoch": self._epochs.get(terminal_id, 0)},
+                {"data": text, "offset": offset, "epoch": epoch},
+                lost={"from_pos": offset, "to_pos": offset + offset_bytes, "generation": epoch},
             )
 
     def create_reader(

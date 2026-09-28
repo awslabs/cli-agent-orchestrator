@@ -272,6 +272,41 @@ class EventBus:
         """
         return self._dispatch(topic, data, lost=lost)
 
+    def publish_with_loss_markers(self, topic: str, data: dict, *, lost: dict) -> None:
+        """Publish like :meth:`publish`, owing a marker to any queue that refuses it.
+
+        Thread-safe: it hops to the loop with ``call_soon_threadsafe`` exactly as
+        ``publish`` does, so the FIFO reader thread can report the loss of the
+        bytes it just published. A queue that drops the event is owed a marker
+        for ``lost``'s range and receives it on the next put it accepts, or when
+        a consumer calls :meth:`flush_owed_to` (Copilot review on #802).
+        """
+        loop = self._loop
+        if loop is None:
+            return
+        try:
+            loop.call_soon_threadsafe(self._dispatch, topic, data, lost)
+        except RuntimeError:
+            logger.debug("Event bus loop closed; dropping event: %s", topic)
+
+    def flush_owed_to(self, queue: "asyncio.Queue") -> int:
+        """Hand ``queue`` every loss marker it is owed, across all topics.
+
+        Loop-thread only. "Delivered on the next put that queue accepts" strands
+        a marker when the dropped chunk was a stream's LAST output: no further
+        event for that topic ever arrives. A consumer that has drained its queue
+        calls this to collect what it is owed while it can still act on it — the
+        runtime bridge does so whenever its queue empties, so a dropped tail
+        becomes a GapFrame instead of an invisible short watermark. Returns how
+        many markers remain owed to this queue afterwards (a queue that filled up
+        again keeps them).
+        """
+        with self._lock:
+            topics = [k[1] for k in self._owed_loss if k[0] == id(queue)]
+            for topic in topics:
+                self._flush_owed_loss(queue, topic)
+            return sum(1 for k in self._owed_loss if k[0] == id(queue))
+
     def deliver_now(self, topic: str, data: dict) -> int:
         """Dispatch on the CALLING thread and report how many subscribers dropped it.
 
