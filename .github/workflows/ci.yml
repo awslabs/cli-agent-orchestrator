@@ -10,6 +10,18 @@ permissions:
   contents: read
   security-events: write
 
+env:
+  # Every uv command in this workflow (including the ones the Makefile runs)
+  # must execute against the committed uv.lock and fail if pyproject.toml has
+  # drifted from it. The per-command --locked flags below say the same thing
+  # where a reader looks; this catches the `uv run` / `uv export` sites that
+  # have no flag. Measured on uv 0.12: the env var alone rejects a stale lock
+  # for sync, run and export; UV_FROZEN would install the OLD lock silently;
+  # and a flag beats the variable in either direction (uv prints "Ignoring
+  # UV_LOCKED because --frozen was provided" and proceeds), so the flags
+  # below are --locked, not --frozen, and must stay that way.
+  UV_LOCKED: "1"
+
 jobs:
   test:
     name: Unit Tests
@@ -32,7 +44,7 @@ jobs:
         run: uv python install ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: uv sync --frozen --all-extras --dev
+        run: uv sync --locked --all-extras --dev
 
       - name: Run unit tests with coverage
         run: |
@@ -151,7 +163,7 @@ jobs:
         run: uv python install 3.12
 
       - name: Install Python deps (for the HTTP-only guard + coverage ratchet)
-        run: uv sync --frozen --all-extras --dev
+        run: uv sync --locked --all-extras --dev
 
       - name: Install MCP-apps deps
         run: npm ci
@@ -251,7 +263,7 @@ jobs:
         run: uv python install 3.12
 
       - name: Install dependencies
-        run: uv sync --frozen --all-extras --dev
+        run: uv sync --locked --all-extras --dev
 
       - name: Check code formatting with black
         run: uv run black --check src/ test/
@@ -284,7 +296,7 @@ jobs:
         run: uv python install 3.12
 
       - name: Install dependencies (cao-server for the live AG-UI surface)
-        run: uv sync --frozen --all-extras --dev
+        run: uv sync --locked --all-extras --dev
 
       - name: Set up Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -336,7 +348,7 @@ jobs:
         run: uv python install 3.12
 
       - name: Install dependencies (constructs + examples run under uv)
-        run: uv sync --frozen --all-extras --dev
+        run: uv sync --locked --all-extras --dev
 
       - name: Set up Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -387,7 +399,7 @@ jobs:
         run: uv python install 3.12
 
       - name: Install dependencies (cao runs the dog-food pipeline under uv)
-        run: uv sync --all-extras --dev --frozen
+        run: uv sync --locked --all-extras --dev
 
       - name: Set up Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -441,7 +453,7 @@ jobs:
         run: uv python install 3.12
 
       - name: Install dependencies (cao-server + agui run plane)
-        run: uv sync --frozen --all-extras --dev
+        run: uv sync --locked --all-extras --dev
 
       - name: Set up Node.js (for the @ag-ui/client stock SDK)
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -592,10 +604,6 @@ jobs:
       # This job runs `uv` but had NO `setup-uv` — it was the only uv-using job in the workflow
       # without it, so `uv sync` would fail with `uv: command not found`. Caught by comparing every
       # job's setup-uv presence against its uv usage rather than assuming the toolchain was there.
-      # NOTE: `@v4` is a MUTABLE tag, matching the three pre-existing setup-uv call sites in this
-      # file. The affirmed SHA-pinning rule covers actions THIS INTENT adds; pinning here while the
-      # other three stay on @v4 would be inconsistent without pinning all four. Flagged in
-      # ci-config.md as a follow-up rather than half-applied. (#321)
       - name: Install uv
         uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4
         with:
@@ -603,7 +611,7 @@ jobs:
           cache-dependency-glob: "uv.lock"
 
       - name: Install the Python project (provides cao-server for the live contract test)
-        run: uv sync --frozen --all-extras --dev
+        run: uv sync --locked --all-extras --dev
 
       - name: Start cao-server and wait for readiness
         # Poll /health rather than `sleep N`: a fixed sleep is either flaky or slow, and /health is
@@ -711,7 +719,7 @@ jobs:
 
       - name: Generate requirements.txt for scanning
         run: |
-          uv export --format requirements-txt > requirements.txt
+          uv export --locked --format requirements-txt > requirements.txt
 
       # SR-4 (interview Q1): `exit-code: 1` makes this job FAIL on a CRITICAL/HIGH finding.
       # Before this, the step had no exit-code, so it uploaded SARIF and continued — meaning
