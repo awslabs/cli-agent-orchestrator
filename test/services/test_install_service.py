@@ -59,7 +59,7 @@ def install_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, 
         path.mkdir(parents=True, exist_ok=True)
 
     monkeypatch.setattr(
-        "cli_agent_orchestrator.services.install_service.LOCAL_AGENT_STORE_DIR",
+        "cli_agent_orchestrator.services.profile_store.LOCAL_AGENT_STORE_DIR",
         local_store_dir,
     )
     monkeypatch.setattr(
@@ -266,6 +266,27 @@ class TestInstallAgent:
         entry = kiro_config["mcpServers"]["cao-mcp-server"]
         # persisted=True prefers the stable PATH launcher.
         assert entry["command"] == "/home/u/.local/bin/cao-mcp-server"
+
+    def test_install_rejects_kas_profile_before_writing_kiro_config(
+        self, install_paths: dict[str, Path]
+    ) -> None:
+        profile_path = install_paths["local_store_dir"] / "kas-agent.md"
+        profile_path.write_text(
+            "---\n"
+            "name: kas-agent\n"
+            "description: KAS agent\n"
+            "engine: kas\n"
+            "allowedTools: [fs_read]\n"
+            "---\n"
+            "KAS profile.\n",
+            encoding="utf-8",
+        )
+
+        result = install_agent("kas-agent", "kiro_cli")
+
+        assert result.success is False
+        assert "Cedar" in result.message
+        assert not (install_paths["kiro_dir"] / "kas-agent.json").exists()
 
     def test_install_sets_env_vars_before_profile_loading(
         self, install_paths: dict[str, Path]
@@ -616,7 +637,7 @@ class TestInstallSkillCatalogBaking:
             d.mkdir()
 
         monkeypatch.setattr(
-            "cli_agent_orchestrator.services.install_service.LOCAL_AGENT_STORE_DIR",
+            "cli_agent_orchestrator.services.profile_store.LOCAL_AGENT_STORE_DIR",
             local_store_dir,
         )
         monkeypatch.setattr(
@@ -677,8 +698,14 @@ class TestInstallSkillCatalogBaking:
         assert agent_json["prompt"] == "Build things"
         assert "Available Skills" not in agent_json["prompt"]
         skill_resources = [r for r in agent_json["resources"] if r.startswith("skill://")]
-        assert len(skill_resources) == 1
-        assert skill_resources[0].endswith("/**/SKILL.md")
+        # Two globs. `*/SKILL.md` is what guarantees a projected agent-plugin
+        # skill (a symlink into the plugin store) is found whatever `**` means to
+        # Kiro's glob; `**/SKILL.md` keeps Kiro's native nested-directory support.
+        assert len(skill_resources) == 2
+        assert [r.rsplit("/skills", 1)[-1] for r in skill_resources] == [
+            "/**/SKILL.md",
+            "/*/SKILL.md",
+        ]
 
     def test_install_kiro_keeps_prompt_clean_with_skill_resources(
         self, install_workspace: dict
@@ -702,7 +729,7 @@ class TestInstallSkillCatalogBaking:
         assert agent_json["prompt"] == "Build things"
         assert "Available Skills" not in agent_json["prompt"]
         skill_resources = [r for r in agent_json["resources"] if r.startswith("skill://")]
-        assert len(skill_resources) == 1
+        assert len(skill_resources) == 2
 
     def test_install_kiro_omits_prompt_field_when_profile_prompt_is_empty(
         self, install_workspace: dict
@@ -721,7 +748,7 @@ class TestInstallSkillCatalogBaking:
         agent_json = json.loads(agent_path.read_text())
         assert "prompt" not in agent_json
         skill_resources = [r for r in agent_json["resources"] if r.startswith("skill://")]
-        assert len(skill_resources) == 1
+        assert len(skill_resources) == 2
 
     def test_install_non_ascii_prompt_round_trips_through_refresh_without_byte_drift(
         self, install_workspace: dict
@@ -1013,3 +1040,15 @@ class TestInjectKiroMcpTimeout:
 
         assert _inject_kiro_mcp_timeout(None) is None
         assert _inject_kiro_mcp_timeout({}) == {}
+
+
+def test_install_omp_writes_context_only(install_paths: dict[str, Path]) -> None:
+    profile = install_paths["local_store_dir"] / "omp-agent.md"
+    profile.write_text(_profile_text(name="omp-agent"), encoding="utf-8")
+
+    result = install_agent("omp-agent", "omp")
+
+    assert result.success is True
+    assert result.provider == "omp"
+    assert result.agent_file is None
+    assert (install_paths["context_dir"] / "omp-agent.md").exists()

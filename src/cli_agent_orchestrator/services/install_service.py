@@ -1,29 +1,43 @@
 """Service helpers for installing agent profiles."""
 
+import errno
 import logging
 import os
 import re
 from pathlib import Path
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 from urllib.parse import urlparse
 
 import frontmatter
 import requests  # type: ignore[import-untyped]
 from pydantic import BaseModel
 
+from cli_agent_orchestrator.agent_plugins.mcp_delivery import (
+    McpDeliveryResult,
+    apply_plugin_mcp_servers,
+    grantable_server_names,
+    log_delivery_findings,
+    merge_plugin_mcp_servers,
+    opencode_config_collision_finding,
+)
+from cli_agent_orchestrator.agent_plugins.mcp_mapping import is_pre_expanded as is_plugin_mcp_entry
+from cli_agent_orchestrator.agent_plugins.mcp_mapping import strip_marker as strip_plugin_mcp_marker
+from cli_agent_orchestrator.agent_plugins.models import Finding
+from cli_agent_orchestrator.agent_plugins.store import InstalledPluginStore
 from cli_agent_orchestrator.constants import (
     AGENT_CONTEXT_DIR,
     COPILOT_AGENTS_DIR,
     DEFAULT_PROVIDER,
     KIRO_AGENTS_DIR,
-    LOCAL_AGENT_STORE_DIR,
     OPENCODE_AGENTS_DIR,
     SKILLS_DIR,
 )
 from cli_agent_orchestrator.models.copilot_agent import CopilotAgentConfig
 from cli_agent_orchestrator.models.kiro_agent import KiroAgentConfig
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.opencode_agent import OpenCodeAgentConfig
 from cli_agent_orchestrator.models.provider import ProviderType
+from cli_agent_orchestrator.services.profile_store import write_profile
 from cli_agent_orchestrator.utils.agent_profiles import (
     _read_agent_profile_source,
     parse_agent_profile_text,
@@ -31,7 +45,11 @@ from cli_agent_orchestrator.utils.agent_profiles import (
 from cli_agent_orchestrator.utils.env import resolve_env_vars, set_env_var
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 from cli_agent_orchestrator.utils.opencode_config import (
+    disable_mcp_server,
     ensure_skills_symlink,
+    entry_within_roots,
+    is_cao_owned_mcp_entry,
+    read_config,
     remove_agent_tools,
     to_opencode_agent_id,
     translate_mcp_server_config,
@@ -39,8 +57,12 @@ from cli_agent_orchestrator.utils.opencode_config import (
     upsert_mcp_server,
 )
 from cli_agent_orchestrator.utils.opencode_permissions import cao_tools_to_opencode_permission
+from cli_agent_orchestrator.utils.path_validation import (
+    flatten_path_separators,
+    validate_path_component,
+)
 from cli_agent_orchestrator.utils.skill_injection import compose_agent_prompt
-from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
+from cli_agent_orchestrator.utils.tool_mapping import granted_mcp_servers, resolve_allowed_tools
 
 logger = logging.getLogger(__name__)
 
@@ -152,11 +174,11 @@ def _download_agent(source: str) -> str:
     has legitimate filesystem trust, and keeping Path(user_input) out of the
     HTTP-reachable layer closes an entire class of py/path-injection alerts
     (CodeQL #49/#61 kept reopening while this lived here). The CLI entry point
-    copies local files into LOCAL_AGENT_STORE_DIR itself and then calls
+    resolves the local file itself and stores it via profile_store, then calls
     install_agent() with the bare stem, which flows through the "name" branch.
+    This function only ever hands profile_store a stem it has already validated,
+    never a caller-supplied path.
     """
-    LOCAL_AGENT_STORE_DIR.mkdir(parents=True, exist_ok=True)
-
     # SSRF hardening: narrow what a caller-provided URL can reach before any
     # network I/O happens. https-only rules out http://169.254.169.254/...;
     # the host allowlist rules out arbitrary internal services; the path
@@ -197,9 +219,12 @@ def _download_agent(source: str) -> str:
         raise ValueError("Redirects are not allowed for profile downloads.")
     response.raise_for_status()
 
-    dest_file = LOCAL_AGENT_STORE_DIR / filename
-    dest_file.write_text(response.text, encoding="utf-8")
-    return dest_file.stem
+    # The stem was validated against _PROFILE_NAME_RE above; profile_store owns
+    # the store join and the atomic write. overwrite=True preserves the
+    # pre-existing re-download behaviour of replacing the stored copy.
+    stem = filename[: -len(".md")]
+    write_profile(stem, response.text, overwrite=True)
+    return stem
 
 
 def parse_env_assignment(env_assignment: str) -> Tuple[str, str]:
@@ -215,10 +240,81 @@ def parse_env_assignment(env_assignment: str) -> Tuple[str, str]:
 
 
 def _write_context_file(agent_name: str, raw_content: str) -> Path:
-    """Write the unresolved profile source to the shared context directory."""
+    """Write the unresolved profile source to the shared context directory.
+
+    The context copy's filename derives from the profile's RESOLVED frontmatter
+    ``name:``. That value is NOT covered by ``_PROFILE_NAME_RE`` -- that regex
+    validates the install *source handle* (the URL stem / bare-name argument),
+    not the resolved name -- and a profile can be installed straight from a URL,
+    so the field is attacker-controlled. Without a guard, a name like
+    ``../../foo`` or an absolute path steers this write outside
+    ``AGENT_CONTEXT_DIR`` and can overwrite a trusted ``.md`` instruction file.
+
+    Three layers, all in this function (see the barrier note below):
+
+    1. ``validate_path_component`` -- the shared segment validator, which rejects
+       empty, ``.``/``..``, NUL, every path separator, and anything outside
+       ``[A-Za-z0-9._-]``. The allowlist also makes Unicode normalization a
+       non-issue: a fullwidth solidus (U+FF0F) is rejected outright rather than
+       having to be caught before it folds to ``/`` under NFKC.
+    2. Lexical containment under the realpath of the base directory.
+    3. ``O_NOFOLLOW`` at the open, so the kernel refuses to write *through* a
+       symlink at the final component.
+    """
     AGENT_CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
-    context_file = AGENT_CONTEXT_DIR / f"{agent_name}.md"
-    context_file.write_text(raw_content, encoding="utf-8")
+    # BARRIER PLACEMENT: the validation and the containment check are inlined
+    # here, in the same function as the os.open() sink, rather than factored into
+    # a helper. This mirrors the deliberate repetition in
+    # ``services/profile_store`` -- CodeQL's py/path-injection dataflow only
+    # recognises a barrier that guards, in the same function as the sink, the
+    # very variable that reaches it. A helper that returns a validated path is
+    # more readable but invisible to the analysis, and this repo has a history of
+    # that alert reopening (see profile_store._PROFILE_NAME_RE). Load-bearing,
+    # not an oversight.
+    safe_name = validate_path_component(agent_name, description="profile name")
+    # Resolve only the BASE (so a symlinked context root is handled) and keep the
+    # final component UNRESOLVED. Resolving the whole candidate -- as
+    # ``safe_join_under_base`` does -- would follow a symlink planted at the
+    # target and silently write to wherever it resolves; leaving the final
+    # component lexical means such a symlink is refused by O_NOFOLLOW below.
+    # That is why this does not simply call ``safe_join_under_base``.
+    base = os.path.realpath(AGENT_CONTEXT_DIR)
+    candidate = os.path.join(base, f"{safe_name}.md")
+    if candidate != base and not candidate.startswith(base + os.sep):
+        raise ValueError(
+            f"Refusing to write context copy: profile name {agent_name!r} resolves "
+            f"to a path outside the agent context directory ({candidate!r})."
+        )
+    context_file = Path(candidate)
+    # O_NOFOLLOW so the kernel itself refuses to write THROUGH a symlink at the
+    # final component: a plain ``write_text``/``open`` follows a symlink, so even
+    # after the containment check above, a symlink planted at the target
+    # (pre-existing, or swapped in via a check-then-write race) would let the
+    # write land outside the directory. O_TRUNC (not O_EXCL) so a normal
+    # reinstall still overwrites the profile's own regular-file copy. ELOOP on a
+    # symlink target becomes a clear refusal rather than an opaque OS error.
+    #
+    # Mode 0o600: this lives under ~/.aws/cli-agent-orchestrator/ and holds agent
+    # instruction content, so it does not need to be group/world readable.
+    #
+    # PLATFORM NOTE: os.O_NOFOLLOW does not exist on Windows, so getattr(...) is 0
+    # there and the kernel-level symlink refusal degrades to a no-op. The name
+    # validation and containment check above still hold on Windows; only the
+    # write-time symlink/race guard is POSIX-only. Acceptable because the primary
+    # deployment target is POSIX and the validation already blocks the traversal
+    # vectors; flagged so it is a conscious limitation, not a silent gap.
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(context_file, flags, 0o600)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.EISDIR, errno.ENXIO):
+            raise ValueError(
+                f"Refusing to write context copy: {context_file} exists and is not a "
+                "regular file (symlink, directory, or device). Remove it and reinstall."
+            ) from exc
+        raise
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(raw_content)
     return context_file
 
 
@@ -235,10 +331,126 @@ def _build_provider_config(
     )
 
 
+def _materialize_opencode_mcp(
+    agent_id: str,
+    merged_servers: Optional[Dict[str, Any]],
+    plugin_delivery: McpDeliveryResult,
+    *,
+    agent_name: str,
+    allowed_tools: List[str],
+) -> None:
+    """Write this agent's MCP servers into the shared ``opencode.json`` safely.
+
+    OpenCode keeps every provider's MCP declarations in one shared file that CAO
+    edits in place, which creates two obligations Kiro's/Copilot's wholesale
+    rewrites do not have (design.md §10a):
+
+    * **Never clobber a user's entry (Finding 2).** A plugin-derived server whose
+      name already exists under an entry CAO cannot prove it owns is dropped with
+      a report, not overwritten — and the agent is not granted a tool alias for a
+      server CAO did not write.
+    * **Disable, don't orphan, a withdrawn server (Finding 1).** Removal deletes a
+      plugin's ``PLUGIN_ROOT`` but there is no ``opencode.json`` delete, so a
+      server no longer in the desired set is set ``enabled: false`` — only when it
+      is provably CAO's (its command resolves inside the plugin store), so a
+      user's own server and CAO's ``cao-mcp-server`` are never touched.
+
+    The same "only touch what CAO can prove it owns" rule governs the per-agent
+    grant: ``upsert_agent_tools``/``remove_agent_tools`` merge into
+    ``agent.<id>.tools`` and withdraw only the keys recorded in the
+    ``cao-grants.json`` sidecar or provably naming a plugin-store server, so a
+    user's ``model``, ``prompt`` or ``"bash": false`` on a CAO-installed agent
+    survives every install and uninstall (review 3 on #584).
+
+    ``allowed_tools`` is what keeps the no-auto-grant rule (issue #573 AC7)
+    provider-independent. ``agent.<id>.tools`` **is** OpenCode's ``@<server>``
+    grant, so writing ``{"<plugin-server>*": True}`` for a profile that never
+    named it would reinstate on OpenCode exactly the widening the resolved
+    allowlist withholds on every other provider. Delivery is unaffected: the
+    server is still written into the shared ``mcp`` section, it is simply not
+    switched on for an agent that was not granted it. Membership follows
+    ``tool_mapping.granted_mcp_servers`` — ``"*"``, an explicit ``@<name>``, or a
+    matching glob, which is what ``docs/agent-plugins.md`` documents — and it is
+    the ONE rule Grok's launch path uses too, rather than a second matcher free
+    to drift from it. The expansion is over the names actually written here, so a
+    pattern can only ever select from what was delivered, and a human still had
+    to write that pattern into the profile.
+
+    Ownership is a heuristic without persisted provenance; see
+    ``opencode_config.is_cao_owned_mcp_entry`` and design.md §10a options 1/2 for
+    the exact-cleanup follow-up. Keeping the top-level ``tools`` default-deny
+    matches the prior in-place behaviour.
+    """
+    store = InstalledPluginStore()
+    plugin_store_roots = (store.plugins_dir, store.data_dir)
+    plugin_derived = set(plugin_delivery.servers)
+
+    # Snapshot the pre-write state so a server written earlier in this same pass
+    # is never mistaken for a pre-existing user entry on a later iteration.
+    existing_before = read_config().get("mcp", {})
+    if not isinstance(existing_before, dict):
+        existing_before = {}
+
+    collisions: List[Finding] = []
+
+    if merged_servers:
+        granted: List[str] = []
+        # Expanded once, against the concrete names about to be written: a
+        # ``@plugin-*`` in the profile selects from THESE and can never name a
+        # server that was not delivered.
+        grantable = set(granted_mcp_servers(allowed_tools, merged_servers))
+        for mcp_name, mcp_cfg in merged_servers.items():
+            opencode_mcp_cfg = translate_mcp_server_config(dict(mcp_cfg))
+            existing = existing_before.get(mcp_name)
+            if (
+                mcp_name in plugin_derived
+                and isinstance(existing, dict)
+                and not is_cao_owned_mcp_entry(
+                    existing, opencode_mcp_cfg, plugin_store_roots=plugin_store_roots
+                )
+            ):
+                collisions.append(
+                    opencode_config_collision_finding(
+                        server_name=mcp_name,
+                        plugin=plugin_delivery.owners.get(mcp_name, "unknown"),
+                    )
+                )
+                continue
+            upsert_mcp_server(mcp_name, opencode_mcp_cfg)
+            if mcp_name in grantable:
+                granted.append(mcp_name)
+        # Grant only the servers actually written for this agent AND present in
+        # its resolved allowlist (a dropped collision is excluded, and so is a
+        # plugin server the profile never named); a reinstall without MCP takes
+        # the else and withdraws only the grant keys CAO recorded or can prove,
+        # leaving any tool policy the user wrote for this agent intact.
+        upsert_agent_tools(agent_id, granted, plugin_store_roots=plugin_store_roots)
+    else:
+        remove_agent_tools(agent_id, plugin_store_roots=plugin_store_roots)
+
+    # Finding 1 reconcile: disable any CAO-plugin server no longer desired.
+    # Plugin servers are delivered to every agent uniformly, so a server absent
+    # from this agent's merged set means its plugin was uninstalled. The
+    # plugin-store containment check is what keeps this from touching a user's
+    # own server or CAO's ``cao-mcp-server`` (neither resolves inside the store).
+    desired = set(merged_servers or {})
+    current = read_config().get("mcp", {})
+    if isinstance(current, dict):
+        for name, cfg in current.items():
+            if name in desired or not isinstance(cfg, dict) or cfg.get("enabled") is False:
+                continue
+            if entry_within_roots(cfg, plugin_store_roots):
+                disable_mcp_server(name)
+
+    if collisions:
+        log_delivery_findings(McpDeliveryResult(findings=tuple(collisions)), agent_name=agent_name)
+
+
 def install_agent(
     source: str,
     provider: Optional[str] = None,
     env_vars: Optional[Dict[str, str]] = None,
+    preserve_recorded_provider: bool = False,
 ) -> InstallResult:
     """Install an agent profile for the requested provider.
 
@@ -246,6 +458,19 @@ def install_agent(
     (see ``resolve_provider``): an explicit argument wins, then the profile's
     frontmatter ``provider:`` key, then ``DEFAULT_PROVIDER``. Pass ``None``
     to defer to the profile.
+
+    ``preserve_recorded_provider`` materialises the provider's config WITHOUT
+    re-recording the store copy's ``provider:`` key. It exists for exactly one
+    caller — ``refresh_installed_agents_for_plugin_mcp``, which replays this
+    function once per already-installed artifact — and defaults to False so
+    every deliberate call keeps today's behaviour. The distinction is
+    provenance versus configuration: recording a provider answers "which
+    provider did the operator install this agent for", and only an operator's
+    own ``cao install <agent> --provider X`` may answer it. A plugin add or
+    remove re-materialises config for whatever is already installed and has no
+    standing to change that answer; without this flag an agent installed for
+    two providers ends up recorded as whichever leg the refresh loop visited
+    last (spec ``pr584-review-fable`` R9, design §3.1).
 
     ``source`` must be either an https:// URL on the allowlist or a bare
     profile name matching ``_PROFILE_NAME_RE``. Local ``.md`` file paths
@@ -323,28 +548,124 @@ def install_agent(
         # prefers the stable PATH launcher (e.g. ~/.local/bin/cao-mcp-server)
         # over the versioned venv-internal path, so a later `uv tool upgrade`
         # does not leave the written config pointing at a relocated binary.
-        if profile.mcpServers:
-            profile.mcpServers = {
-                name: resolve_mcp_server_config(dict(cfg), persisted=True)
-                for name, cfg in profile.mcpServers.items()
-            }
+        # Agent Plugins: merge installed plugins' mcp.json servers into this
+        # profile's mcpServers. Placed HERE, between provider resolution and
+        # CAO's own ${VAR} resolution below, and both halves of that placement
+        # are load-bearing. After provider resolution, because the transport
+        # matrix is provider-dependent (OpenCode carries stdio only, so a
+        # url-based plugin server must be skipped for that provider alone).
+        # Before the resolution pass, because the pre-expanded marker exists
+        # precisely to be seen by that pass and skipped — merging afterwards
+        # would leave the marker unread and leak it into provider config files.
+        #
+        # `profile.mcpServers` is the one shape from which install_service and
+        # utils/opencode_config.translate_mcp_server_config already derive every
+        # provider's native MCP form, so this single merge reaches all of them
+        # with no per-provider code.
+        #
+        # Shared with the launch path (`mcp_delivery.with_plugin_mcp`) rather than
+        # duplicated: review on #584 found the two had silently disagreed, because
+        # this merge existed only here while five providers re-read the profile
+        # from disk at launch.
+        plugin_mcp = apply_plugin_mcp_servers(
+            profile, provider=provider, persisted=True, normalize_existing=True
+        )
+        log_delivery_findings(plugin_mcp, agent_name=profile.name)
+
+        # Record the provider we actually installed for into the LOCAL store
+        # copy, so later provider resolution on this node is deterministic.
+        #
+        # Without this, `cao install <p> --provider <x>` materialised the
+        # provider-specific config (below) but left no trace of <x> anywhere
+        # readable: resolve_provider() re-reads the profile, finds no
+        # frontmatter `provider:` key, and silently falls back to the caller's
+        # provider or DEFAULT_PROVIDER. Locally that is usually masked because
+        # the fallback is inherited from the calling terminal, but on the
+        # cross-node assign/handoff path `_assign_remote` deliberately omits
+        # the provider and lets the TARGET node resolve it — so the target
+        # would resolve DEFAULT_PROVIDER regardless of what was installed
+        # there, and remote placement fails on any node whose installed
+        # provider is not the default.
+        #
+        # Only the resolved `provider:` key is added; the body and every other
+        # frontmatter key are preserved verbatim, and raw (unresolved) content
+        # is stored so ${VARS} keep their placeholder form like the context
+        # file. Note this materialises a local-store copy of a built-in
+        # profile, which then shadows the packaged one on this node — that is
+        # intended (the install is a per-node fact), but it does mean later CAO
+        # upgrades will not change this profile's body on this node.
+        # ``preserve_recorded_provider`` suppresses only this record, never the
+        # provider-specific materialisation below. The refresh loop's whole job is
+        # to re-materialise configs, so it must still run every provider branch;
+        # what it must not do is claim the operator chose the provider it is
+        # currently replaying. See the keyword's note in this function's docstring
+        # and design §3.1 for why the guard is here at the caller's request rather
+        # than a change to the rewrite itself: the rewrite is correct whenever an
+        # operator asked for it.
+        if profile.provider != provider and not preserve_recorded_provider:
+            stored = frontmatter.loads(raw_content)
+            stored["provider"] = provider
+            write_profile(agent_name, frontmatter.dumps(stored), overwrite=True)
 
         unresolved_vars = sorted(set(re.findall(r"\$\{(\w+)\}", resolved_content)))
         context_file = _write_context_file(profile.name, raw_content)
 
-        mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
+        # ``delivered=`` is not optional in spirit: ``apply_plugin_mcp_servers``
+        # above stripped the pre-expanded marker from every entry it merged, so
+        # the helper's entry-level check cannot see a plugin server on this path.
+        # The delivery result was computed before that strip and is the only
+        # durable answer. Dropping this argument silently reinstates the
+        # auto-grant (G0) -- test_no_auto_grant.py's install-path cases fail if
+        # it goes missing.
+        mcp_server_names = grantable_server_names(profile, delivered=plugin_mcp)
         allowed_tools = resolve_allowed_tools(profile.allowedTools, profile.role, mcp_server_names)
 
         agent_file: Optional[Path] = None
-        safe_filename = profile.name.replace("/", "__")
+        # Defence in depth. The resolved profile name is attacker-controlled, but
+        # _write_context_file above has already REJECTED any name carrying a path
+        # separator, so nothing separator-bearing reaches these provider sinks in
+        # the normal flow. The flatten stays so each sink is independently safe if
+        # the order ever changes or a new caller appears.
+        safe_filename = flatten_path_separators(profile.name)
 
         if provider == ProviderType.KIRO_CLI.value:
+            if profile.engine == KiroEngine.KAS:
+                raise ValueError(
+                    "Kiro KAS profiles cannot be installed in Phase 0: CAO cannot "
+                    "render KAS profiles or translate allowedTools/toolsSettings to Cedar. "
+                    "Set engine: v2 or wait for a later migration phase."
+                )
             KIRO_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
             # Kiro natively supports skill:// resources with progressive loading
             # (metadata at startup, full content on demand).
+            #
+            # TWO globs, not one, and the second is not redundant. Kiro expands
+            # these itself, so which files it finds depends on ITS glob
+            # implementation, and `**` does not have one agreed meaning for
+            # directory symlinks: Python's own stdlib `glob.glob(recursive=True)`
+            # descends into them while `pathlib.Path.glob` does not. Agent-plugin
+            # skills are projected into SKILLS_DIR as symlinks to the plugin
+            # store, so under the stricter reading every plugin skill would be
+            # invisible to Kiro alone while reaching all six other providers.
+            #
+            # `*/SKILL.md` is immune to that ambiguity: a single-level match names
+            # the symlink as a directory entry and resolves through it, with no
+            # recursive descent to opt out of. It covers exactly the layout CAO
+            # guarantees — skills are immediate children of the store (see
+            # docs/skills.md "No nested skill directories") — so it alone is
+            # sufficient for CAO-managed skills. `**/SKILL.md` is kept because
+            # Kiro supports nested skill directories natively even though CAO's
+            # own catalog does not, and dropping it would silently narrow a
+            # capability operators may already rely on.
+            #
+            # Duplicate matches are not a concern: both patterns resolve to the
+            # same absolute paths, and Kiro deduplicates the skills it loads by
+            # path. Verified by TestKiroFilesystemGlob in
+            # test/agent_plugins/test_delivery_providers.py.
             kiro_resources = [
                 f"file://{context_file.absolute()}",
                 f"skill://{SKILLS_DIR}/**/SKILL.md",
+                f"skill://{SKILLS_DIR}/*/SKILL.md",
             ]
             raw_prompt = (
                 profile.prompt.strip() if profile.prompt and profile.prompt.strip() else None
@@ -422,18 +743,18 @@ def install_agent(
                 encoding="utf-8",
             )
 
-            # OpenCode uses a shared opencode.json for MCP declarations. Keep
-            # top-level MCP entries default-denied, then re-enable them only
-            # for the installed agent. A reinstall without MCP removes stale
-            # per-agent grants.
-            if profile.mcpServers:
-                mcp_names = list(profile.mcpServers.keys())
-                for mcp_name, mcp_cfg in profile.mcpServers.items():
-                    opencode_mcp_cfg = translate_mcp_server_config(dict(mcp_cfg))
-                    upsert_mcp_server(mcp_name, opencode_mcp_cfg)
-                upsert_agent_tools(agent_id, mcp_names)
-            else:
-                remove_agent_tools(agent_id)
+            # OpenCode uses a shared opencode.json for MCP declarations. Unlike
+            # Kiro/Copilot, whose per-agent files are rewritten wholesale, this
+            # file is edited in place — so delivery must also guard a user's own
+            # entries and actively disable a plugin server that removal withdrew
+            # (there is no delete). See _materialize_opencode_mcp / design.md §10a.
+            _materialize_opencode_mcp(
+                agent_id,
+                profile.mcpServers,
+                plugin_mcp,
+                agent_name=profile.name,
+                allowed_tools=allowed_tools,
+            )
 
         return InstallResult(
             success=True,
@@ -452,3 +773,99 @@ def install_agent(
         return InstallResult(success=False, message=str(exc))
     except Exception as exc:
         return InstallResult(success=False, message=f"Failed to install agent: {exc}")
+
+
+def refresh_installed_agents_for_plugin_mcp() -> List[str]:
+    """Re-materialize provider configs so plugin MCP servers appear and disappear.
+
+    Skill delivery needs no equivalent: skills are *projected* into ``SKILLS_DIR``
+    and every provider reads that store (or a catalog rebuilt from it) at launch,
+    so installing a plugin makes its skills reachable without rewriting a single
+    provider file. MCP is the opposite — ``mcpServers`` is **baked into each
+    provider's config at install time**: Kiro's agent JSON carries it inline, and
+    OpenCode's shared ``opencode.json`` carries it plus a per-agent tool grant.
+    Nothing re-reads a plugin's ``mcp.json`` later. So without this, a plugin's
+    servers would only reach agents installed *after* the plugin, and uninstalling
+    a plugin would leave its servers configured in every provider file that
+    already had them — pointing at a ``PLUGIN_ROOT`` that no longer exists.
+
+    The mechanism is deliberately "re-run the real thing" rather than a targeted
+    patch of each provider file. Editing configs in place would mean a second
+    implementation of every provider's MCP shape, which would drift from
+    ``install_agent`` and is exactly the per-provider duplication the mapping
+    design exists to avoid. ``install_agent`` is idempotent for a bare profile
+    name — it reads the profile from the local store, downloads nothing, and
+    mutates no environment when no ``env_vars`` are passed — so replaying it
+    reproduces the current profile plus the current plugin set.
+
+    Best effort by contract: this is called from the plugin install and uninstall
+    paths, and a profile that has since been deleted, or a provider config that
+    cannot be written, must not fail the plugin operation. Failures are logged and
+    skipped.
+
+    Returns:
+        The names of the agents whose provider config was re-materialized, in the
+        order attempted. Useful to tests and to callers that want to report how
+        far the refresh reached; never raises.
+    """
+    refreshed: List[str] = []
+
+    if not AGENT_CONTEXT_DIR.is_dir():
+        return refreshed
+
+    # ``AGENT_CONTEXT_DIR/<name>.md`` is CAO's existing marker for "this agent is
+    # CAO-managed" — ``skill_injection._is_cao_managed_copilot_agent`` already
+    # uses exactly this test, so reusing it keeps one definition of managed.
+    for context_file in sorted(AGENT_CONTEXT_DIR.glob("*.md")):
+        agent_name = context_file.stem
+        safe_filename = agent_name.replace("/", "__")
+
+        for provider, artifact in (
+            (ProviderType.KIRO_CLI.value, KIRO_AGENTS_DIR / f"{safe_filename}.json"),
+            (ProviderType.COPILOT_CLI.value, COPILOT_AGENTS_DIR / f"{safe_filename}.agent.md"),
+            (
+                ProviderType.OPENCODE_CLI.value,
+                OPENCODE_AGENTS_DIR / f"{to_opencode_agent_id(agent_name)}.md",
+            ),
+        ):
+            # Only re-materialize what is actually installed. Installing an agent
+            # for a provider the operator never chose would be a side effect, not
+            # a refresh.
+            try:
+                if not artifact.is_file():
+                    continue
+            except OSError:  # pragma: no cover - unreadable provider dir
+                continue
+
+            try:
+                # ``preserve_recorded_provider=True`` is what makes this loop a
+                # refresh rather than a re-install. Each leg materialises the
+                # config for a provider whose artifact ALREADY exists, so the
+                # provider argument here is a description of what is installed,
+                # not a choice; recording it would let the last leg visited
+                # overwrite the operator's own ``--provider`` decision on every
+                # unrelated plugin add and remove (R9). This is the only call site
+                # that passes the keyword.
+                result = install_agent(agent_name, provider, preserve_recorded_provider=True)
+            except Exception as exc:  # pragma: no cover - install_agent is total
+                logger.warning(
+                    "Could not refresh agent '%s' for provider '%s' after an agent-plugin "
+                    "change: %s",
+                    agent_name,
+                    provider,
+                    exc,
+                )
+                continue
+
+            if result.success:
+                refreshed.append(agent_name)
+            else:
+                logger.warning(
+                    "Could not refresh agent '%s' for provider '%s' after an agent-plugin "
+                    "change: %s",
+                    agent_name,
+                    provider,
+                    result.message,
+                )
+
+    return refreshed

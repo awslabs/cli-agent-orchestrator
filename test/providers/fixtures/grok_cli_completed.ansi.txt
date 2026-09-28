@@ -1,0 +1,10 @@
+[1G     [1m❯[0m Return a concise answer.
+
+     ◆ [1;2mThought[0;2m for 0.1s[0m
+
+[2A[1G[2K     [32mANSI-safe response.[0m
+
+     [2mWorked for 1.2s[0m
+
+  │ ❯ │
+  Shift+Tab:mode  │  Ctrl+x:shortcuts

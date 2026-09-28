@@ -19,6 +19,9 @@ CAO's memory system gives agents persistent, cross-session storage. Agents store
   by default, `--apply` to mutate, with a full audit trail.
 - **Tiered retention / cleanup**, a daily audit log, and a memory Web UI.
 
+Vault-backed memory behavior, configuration, indexing, and retention limits are
+documented in [Obsidian Vault Knowledge Source](obsidian-vault.md).
+
 ## How It Works
 
 1. **Agent stores a memory** via `memory_store` MCP tool during a session
@@ -231,6 +234,11 @@ given, results follow scope precedence: `session` > `project` > `global`.
 
 Remove a memory by key.
 
+The result's `action` is authoritative. The legacy `deleted` boolean means CAO
+completed the forget operation, not necessarily that a vault file was removed.
+For a vault-backed memory, CAO de-indexes the note and retains its file; inspect
+the returned `path` for the retained vault location.
+
 ```
 memory_forget(
   key="testing-framework",
@@ -281,7 +289,38 @@ cao memory export --scope global -o ./bundle --include-history --redact --prune
 cao memory import ./memory-bundle --scope global
 cao memory import ./memory-bundle --scope project --conflict merge
 cao memory import ./memory-bundle --scope global --dry-run   # full pipeline, no writes
+
+# Inspect and curate typed relationships between memories
+cao memory relationships list
+cao memory relationships list --scope project --source-key testing-framework
+cao memory relationships list --status proposal        # the review queue
+cao memory relationships list --stale                 # edges older than their source
+cao memory relationships list --format json
+cao memory relationships inspect <relationship-id>
+cao memory relationships promote <relationship-id>    # proposal -> active
+cao memory relationships reject <relationship-id>     # -> rejected (survives recompute)
 ```
+
+### Typed relationships
+
+Memories are linked by typed, provenance-tagged edges (`relates_to`,
+`contradiction`, `supersedes`) held in a durable store rather than inferred at
+read time. Each edge records its `origin` — `compiler`, `wiki_lint`, `human`,
+`legacy_related_keys`, `external_import`, or `vault` — and a `status`.
+
+Writes are **producer-scoped**: when the compiler or linter recomputes its edges
+for a source memory, it replaces only rows carrying its own origin and type, so a
+human-authored edge on the same memory is never touched.
+
+`reject` is durable curation. A rejected edge is **not** resurrected by a later
+producer recompute, and is not deleted if the producer stops reporting it — the
+operator's verdict outranks the producer, and each refusal is reported back to
+the producer. `promote` refuses to act on a rejected or deleted edge; re-create
+it instead.
+
+`--stale` surfaces edges computed before their source memory was last edited
+(the edge stores the source's `updated_at` at write time), which is the signal
+that a recompute is due.
 
 `cao memory heal` consumes the findings from `cao memory lint` and applies one fix per
 issue type: it deletes orphan pages, resolves contradictions (keeping the newer article),
@@ -316,7 +355,7 @@ CAO injects relevant memories into a new session two ways:
 
 1. **First-message block** — when an agent receives its first message in a session,
    CAO prepends a `<cao-memory>` block containing relevant memories.
-2. **Provider config file** — built-in plugins for Claude Code, Codex, and Kiro CLI
+2. **Provider config file** — built-in event plugins for Claude Code, Codex, and Kiro CLI
    write the same block into each provider's per-project config file (e.g.
    `.claude/CLAUDE.md`) on terminal creation, delimited by `cao-memory` markers so
    repeated runs overwrite the same section.
@@ -342,7 +381,7 @@ the injection budget.
 ## Saving Memories
 
 Agents call `memory_store` explicitly via MCP when they want to persist a fact; agent
-profiles include guidance on when to store (see below). Hook- and plugin-driven injection
+profiles include guidance on when to store (see below). Hook- and event-plugin-driven injection
 surfaces stored memories back into later sessions automatically.
 
 ## Storage Layout

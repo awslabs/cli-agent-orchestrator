@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "child-result.schema.json",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "project",
+    "intent",
+    "changedComponents",
+    "changedCapabilities",
+    "contracts",
+    "dependencyAssumptions",
+    "verification",
+    "submittedAt"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "project": { "$ref": "#/$defs/id" },
+    "intent": { "$ref": "#/$defs/id" },
+    "changedComponents": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/id" },
+      "uniqueItems": true
+    },
+    "changedCapabilities": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/id" },
+      "uniqueItems": true
+    },
+    "contracts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["dependency", "change", "evidence"],
+        "additionalProperties": false,
+        "properties": {
+          "dependency": { "$ref": "#/$defs/id" },
+          "change": { "enum": ["compatible", "breaking", "unknown"] },
+          "evidence": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    },
+    "dependencyAssumptions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["dependency", "disposition", "note"],
+        "additionalProperties": false,
+        "properties": {
+          "dependency": { "$ref": "#/$defs/id" },
+          "disposition": {
+            "enum": ["satisfied", "blocked", "deferred", "unknown"]
+          },
+          "note": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "verification": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "submittedAt": { "type": "string", "minLength": 1 }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]*$"
+    }
+  }
+}

@@ -16,6 +16,10 @@ from cli_agent_orchestrator.constants import (
 )
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.settings_service import get_server_settings
+from cli_agent_orchestrator.utils.forwarded_env import (
+    ForwardedEnvError,
+    validate_forwarded_env,
+)
 from cli_agent_orchestrator.utils.terminal import (
     poll_until_done,
     sync_backend_from_server,
@@ -29,65 +33,42 @@ PROVIDERS_REQUIRING_WORKSPACE_ACCESS = {
     "codex",
     "copilot_cli",
     "cursor_cli",
+    "grok_cli",
     "hermes",
     "kimi_cli",
     "kiro_cli",
+    "mcode",
     "opencode_cli",
+    "omp",
 }
 
-# Validation constraints for ``--env`` forwarded vars (mirrored server-side
-# in ``TmuxClient._merge_extra_env``). See issue #248.
-_FORWARDED_ENV_BLOCKED_PREFIXES = ("CLAUDE", "CODEX_", "__MISE_")
-_FORWARDED_ENV_PREFIX_ALLOWLIST = frozenset(
-    {
-        "CLAUDE_CODE_USE_BEDROCK",
-        "CLAUDE_CODE_USE_VERTEX",
-        "CLAUDE_CODE_USE_FOUNDRY",
-        "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
-        "CLAUDE_CODE_SKIP_VERTEX_AUTH",
-        "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
-    }
-)
-_FORWARDED_ENV_MAX_VALUE_BYTES = 2048
+# Validation constraints for ``--env`` forwarded vars live in
+# ``utils.forwarded_env`` (shared with the ops-MCP ``launch_session`` tool so
+# the two client paths cannot drift) and are mirrored server-side in
+# ``TmuxClient._merge_extra_env``. See issue #248.
 
 
 def _parse_env_pairs(pairs):
-    """Parse repeated ``KEY=VALUE`` entries into a dict, validating each.
+    """Parse repeated ``KEY=VALUE`` entries into a validated dict.
 
-    Mirrors the constraints applied to inherited env in TmuxClient so a
-    forwarded var that would be silently dropped server-side is rejected at
-    the CLI boundary with a clear error message instead.
+    Splitting each ``KEY=VALUE`` string (and the last-wins duplicate handling)
+    is CLI-specific, but every validation rule is delegated to the shared
+    ``validate_forwarded_env`` so ``--env`` and the ops-MCP ``launch_session``
+    tool can never drift. Each shared message begins with ``env ``; prefixing
+    with ``--`` reproduces the historical ``--env ...`` CLI messages exactly.
     """
-    result: dict[str, str] = {}
+    parsed: dict[str, str] = {}
     for raw in pairs:
         if "=" not in raw:
             raise click.ClickException(
                 f"--env expects KEY=VALUE (got {raw!r}); did you forget the '='?"
             )
         key, value = raw.split("=", 1)
-        # POSIX env names: leading letter/underscore, then alnum/underscore.
-        # Stricter than ``str.isidentifier`` only in that it forbids non-ASCII.
-        if (
-            not key
-            or not (key[0].isalpha() or key[0] == "_")
-            or not all(c.isalnum() or c == "_" for c in key)
-            or not key.isascii()
-        ):
-            raise click.ClickException(f"--env key must match [A-Za-z_][A-Za-z0-9_]* (got {key!r})")
-        if key not in _FORWARDED_ENV_PREFIX_ALLOWLIST and any(
-            key.startswith(p) for p in _FORWARDED_ENV_BLOCKED_PREFIXES
-        ):
-            raise click.ClickException(
-                f"--env key {key!r} uses a blocked prefix "
-                f"({', '.join(_FORWARDED_ENV_BLOCKED_PREFIXES)}) reserved for provider env"
-            )
-        if len(value.encode("utf-8")) >= _FORWARDED_ENV_MAX_VALUE_BYTES:
-            raise click.ClickException(
-                f"--env value for {key!r} exceeds {_FORWARDED_ENV_MAX_VALUE_BYTES} bytes "
-                "(tmux argv limit, PR #246)"
-            )
-        result[key] = value
-    return result
+        parsed[key] = value  # last-wins on a duplicate key
+    try:
+        return validate_forwarded_env(parsed)
+    except ForwardedEnvError as exc:
+        raise click.ClickException(f"--{exc}") from exc
 
 
 @click.command()
@@ -99,6 +80,13 @@ def _parse_env_pairs(pairs):
     "--provider",
     default=None,
     help=f"Provider to use (default: profile provider or {DEFAULT_PROVIDER})",
+)
+@click.option(
+    "--engine",
+    "engine",
+    type=click.Choice(["v2", "kas"], case_sensitive=True),
+    default=None,
+    help="Explicit Kiro engine (default: profile engine or v2).",
 )
 @click.option(
     "--allowed-tools",
@@ -143,6 +131,14 @@ def _parse_env_pairs(pairs):
     "the URL. Blocked prefixes (CLAUDE/CODEX_/__MISE_) and >=2048-byte values "
     "are rejected. See issue #248.",
 )
+@click.option(
+    "--resume-session-id",
+    "resume_session_id",
+    default=None,
+    metavar="SESSION_ID",
+    help="Resume a prior Claude Code conversation in the launched supervisor "
+    "(claude --resume <id>). claude_code provider only.",
+)
 def launch(
     message,
     agents,
@@ -150,12 +146,14 @@ def launch(
     headless,
     is_async,
     provider,
+    engine,
     allowed_tools,
     auto_approve,
     yolo,
     working_directory,
     memory,
     env_pairs,
+    resume_session_id,
 ):
     """Launch cao session with specified agent profile."""
     try:
@@ -164,6 +162,7 @@ def launch(
         forwarded_env = _parse_env_pairs(env_pairs) if env_pairs else {}
 
         # Resolve allowedTools: --yolo > --allowed-tools CLI > profile/role defaults
+        from cli_agent_orchestrator.agent_plugins.mcp_delivery import grantable_server_names
         from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
         from cli_agent_orchestrator.utils.tool_mapping import (
             format_tool_summary,
@@ -181,7 +180,7 @@ def launch(
             # Load profile to get role-based defaults
             try:
                 profile = load_agent_profile(agents)
-                mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
+                mcp_server_names = grantable_server_names(profile)
                 no_role_set = not profile.role and not profile.allowedTools
                 resolved_allowed_tools = resolve_allowed_tools(
                     profile.allowedTools, profile.role, mcp_server_names
@@ -222,12 +221,15 @@ def launch(
                     f"  Directory: {display_dir}\n"
                 )
                 if provider == "kiro_cli":
-                    # kiro-cli 2.0.1 TUI blocks on an interactive "Yes, I accept"
-                    # consent dialog when --trust-all-tools is set. CAO cannot
-                    # answer it headlessly, so yolo launches use --legacy-ui.
+                    # The kiro-cli TUI blocks on an interactive "Yes, I accept"
+                    # consent dialog when --trust-all-tools is set. CAO answers
+                    # it automatically after launch (the provider verifies the
+                    # dialog first), so no --legacy-ui suppression is needed —
+                    # and --legacy-ui must not be used, because it selects the
+                    # v1 engine, which serves the agent no MCP tools.
                     click.echo(
-                        "  Note: kiro_cli will launch in --legacy-ui mode so "
-                        "--trust-all-tools can be applied non-interactively.\n"
+                        "  Note: kiro_cli's --trust-all-tools consent dialog will be "
+                        "auto-answered at startup.\n"
                     )
                 elif provider == "opencode_cli":
                     # opencode's TUI has no runtime skip-permissions flag
@@ -276,6 +278,8 @@ def launch(
         }
         if explicit_provider:
             params["provider"] = provider
+        if engine is not None:
+            params["engine"] = engine
         if session_name:
             params["session_name"] = session_name
         if resolved_allowed_tools:
@@ -283,6 +287,8 @@ def launch(
             params["allowed_tools"] = ",".join(resolved_allowed_tools)
         if memory:
             params["memory_manager"] = "true"
+        if resume_session_id:
+            params["resume_session_id"] = resume_session_id
 
         # Forwarded env vars travel in the JSON body so values (which may
         # contain secrets) don't end up in cao-server's HTTP access log.

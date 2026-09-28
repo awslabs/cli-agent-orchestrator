@@ -35,13 +35,58 @@ Author scripts import from the `cao_workflow` package. This package runs **only 
 subprocess** and imports nothing from `cli_agent_orchestrator.*` — it talks to CAO over HTTP.
 Its public surface:
 
+- `step(provider, agent, prompt, *, recovery, step_id=None, timeout=None, **opts) -> StepHandle` —
+  run one agent step and **declare** what re-running it would mean. `recovery` is keyword-only
+  with no default, so omitting it is a `TypeError` at the call. See "Declaring a recovery
+  policy" below before you pick a value.
 - `run_step(provider, agent, prompt, *, step_id=None, timeout=None, **opts) -> StepHandle` —
-  run one agent step. `StepHandle` has `.step_id`, `.terminal_id`, `.output`, `.status`.
+  the same call, **declaring no policy**. That is the only difference between the two. A
+  `recovery=` passed to `run_step` lands in `**opts`; the server validates it, the shim does
+  not — see below.
+- `StepHandle` has **five** fields: `.step_id`, `.terminal_id`, `.output`, `.status`, and
+  `.replayed`. **`.replayed` qualifies `.terminal_id`.** When it is `True` the server returned
+  a stored result and ran nothing, and `.terminal_id` is the ORIGINAL id — it names a terminal
+  that **no longer exists**. That flag is the only thing standing between you and reading,
+  writing to, or waiting on a dead id, so check it before you touch `.terminal_id`.
 - `get_inputs() -> dict` — the run's resolved inputs (see Parameterized workflows). Returns
   `{}` when nothing was declared; never raises on absence.
 - `emit_output(value)` — print the run-level `CAO_WORKFLOW_OUTPUT:` sentinel (the run's return).
 - `ShimError` (and `ShimIdentityError`, `ShimTransportError`, `ShimHTTPError`) — the failure
-  hierarchy `run_step` raises. Failures surface **unchanged** — the shim never retries.
+  hierarchy `step` and `run_step` raise. Failures surface **unchanged** — the shim never
+  retries.
+
+## Declaring a recovery policy
+
+`recovery=` is **the author's claim about the step, and nothing more.** CAO has no mechanism to
+prove what a step does to the outside world, so it cannot and does not verify the claim. A
+recovery policy **DECLARES what re-running this step would mean; it never grants permission.**
+
+The three values, all of which are statements you are making, not protections you are getting:
+
+| Value | What you are asserting |
+| --- | --- |
+| `"idempotent"` | re-running this step has the same effect as running it once |
+| `"reconcile"` | re-running it needs a reconciliation step first (**deferred** — today CAO treats it exactly like `idempotent`) |
+| `"manual"` | do not decide this one without me — halt and ask |
+
+**`"idempotent"` grants nothing and protects nothing.** It does not make a step safe to re-run;
+it tells the resume gate that *you* believe it already is — and wherever the gate would otherwise
+stop and ask a human, it re-executes the step on your word instead. Declare it on a step that
+charges a card, sends mail, or files a ticket and CAO will charge the card again, exactly as
+instructed. If you cannot show the step is safe to repeat, `"manual"` is the honest declaration.
+
+Omitting a policy is a **fourth, distinct state** — it is never silently read as `"manual"`. Use
+`run_step` for it deliberately: an undeclared step still replays (replay executes nothing), but
+where the alternative is re-execution it halts for a human.
+
+**`recovery=` on `run_step` is checked late, not never.** `run_step` has no `recovery`
+parameter, so the value rides `**opts` to the server, which stores it, lets the resume gate
+honour it, and **rejects an unknown value with a `422`** — the route types that field as the
+closed policy enum. What `run_step` lacks is `step()`'s client-side check, which refuses a bad
+value *before any HTTP attempt*; on `run_step` a typo instead fails that step mid-run. Neither
+surface has its value checked by `validate` (the linter sees the keyword, not its contents),
+which is why `validate` reports the `run_step` form as `unenforced-recovery-policy`. Use
+`step()` to declare, and `run_step` only to declare nothing.
 
 ## Lifecycle
 
@@ -73,6 +118,13 @@ nits:
   top-to-bottom** and replays journaled step results. Any nondeterministic value computed at
   the top level will differ on replay and raise `ReplayDivergenceError`. Keep the script
   deterministic: derive IDs from inputs, not from the clock or an RNG.
+- **`missing-recovery-policy` is a blocking ERROR.** A `step()` call with no `recovery=`
+  keyword fails validation — the signature requires one and so does the linter. Two related
+  warnings fire without blocking: `unverifiable-recovery-policy` (a `step()` call passing
+  `**kwargs`, so the linter cannot see whether a policy is in there) and
+  `unenforced-recovery-policy` (a `recovery=` on `run_step`, which is honoured at resume and
+  validated by the server with a `422`, but is not checked client-side before it is sent). See
+  "Declaring a recovery policy" above.
 
 ### c. ASK the user — NEVER auto-run
 
@@ -109,8 +161,43 @@ So:
 cao workflow resume <run-id>
 ```
 
-Resume replays completed steps from the journal and continues from the first incomplete one.
-Deterministic scripts (see step b) resume clean; nondeterministic ones diverge.
+Resume **re-executes the script top-to-bottom** — that is what step b's determinism warning is
+about — and the server decides each step call as it arrives. Never assume your top-level code
+does not re-run. Each step lands on one of three outcomes:
+
+- **replayed** — the stored result is returned and **nothing runs**. `StepHandle.replayed` is
+  `True`, and its `.terminal_id` names a terminal that no longer exists.
+- **executed** — the step runs again for real.
+- **halted** — CAO will not decide this one alone, so the run stops there and waits for a human.
+
+A fourth outcome ends the whole run rather than one step: if the script changed at a step's key,
+that step **diverges** and the run fails with `ReplayDivergenceError`. Deterministic scripts (see
+step b) resume clean; nondeterministic ones diverge.
+
+#### Resolving a halt
+
+A halt reaches your script as a `ShimHTTPError` whose `.status` is `409` and whose `.body` names
+`kind: "decision_required"`, the `step_id`, and which condition halted it. A step halts when its
+outcome is genuinely unknown or unverifiable: it was dispatched and never settled and no declared
+policy permits re-execution; its stored result is unreadable; its recorded provenance cannot be
+verified under the current scheme; or its author declared `recovery="manual"` and asked to see it.
+
+Resolve it by naming a decision per halted step and resuming again:
+
+```
+cao workflow resume <run-id> --decide <step_id>=rerun   # re-execute that step
+cao workflow resume <run-id> --decide <step_id>=skip    # accept its stored result
+```
+
+`--decide` is repeatable, one per halted step.
+
+**A decision authorises exactly ONE attempt.** If that attempt crashes before it settles, the
+next resume asks again rather than re-executing on the old consent. Consent does not carry
+forward — never present one `rerun` to a user as standing authorisation for later resumes.
+
+**Do not let a blanket `except ShimError` swallow a halt** (see R4): `ShimHTTPError` is a
+`ShimError`, so a catch-all around a step absorbs the 409 and the run finishes with a sentinel
+where a human decision was required. Re-raise when `.status == 409`.
 
 ## Parameterized workflows
 
@@ -167,6 +254,11 @@ permission it can't get. Read-only steps must READ their inputs and **RETURN fin
 **Catch `ShimError` inside each fan-out unit** so one step's timeout degrades to a survivor set
 rather than failing the whole run with a 504. Return a sentinel/`None` for the failed unit and
 let the aggregate proceed.
+
+**But do not swallow a halt or a divergence.** `ShimHTTPError` is a `ShimError`, so the same
+catch also absorbs the `409` a resume raises when a step halts or diverges — and the run then
+completes with a sentinel in place of a result a human was supposed to decide on. Re-raise when
+`.status == 409` (see Resolving a halt).
 
 ### Big-outputs discipline
 

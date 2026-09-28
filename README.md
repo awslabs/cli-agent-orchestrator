@@ -1,3 +1,23 @@
+<!-- An absolute raw URL, not a repo-relative path: this file is also the PyPI
+     long description (see `readme` in pyproject.toml) and PyPI cannot resolve
+     relative paths.
+
+     The banner is used rather than the bare mark because it supplies its own
+     background, so the mark's navy never has to survive a backdrop it cannot
+     see. The bare mark would need a <picture>/prefers-color-scheme swap, since
+     that navy contrasts at only 1.77:1 on GitHub's dark theme, and PyPI allows
+     <img> but not <picture>, so that markup would either be dropped or escaped
+     into visible tag soup depending on how it sanitizes.
+
+     The same constraint means the banner cannot be swapped per theme either.
+     It is light, matching PyPI and GitHub's light theme, and it shows as a
+     bright panel on GitHub's dark theme. That is a deliberate trade, not an
+     oversight. Keep in sync with README.zh-CN.md. -->
+<p align="center">
+  <img src="https://raw.githubusercontent.com/awslabs/cli-agent-orchestrator/main/docusaurus/static/img/cao-social-card.png"
+       alt="" width="640">
+</p>
+
 # CLI Agent Orchestrator (CAO)
 
 [English](README.md) | [简体中文](README.zh-CN.md)
@@ -8,6 +28,9 @@
 
 **CLI Agent Orchestrator (CAO)** coordinates multiple AI coding CLIs so a
 supervisor can delegate work to specialist agents in parallel or sequence.
+
+📚 **[Documentation](https://awslabs.github.io/cli-agent-orchestrator/)** —
+guides, reference, and two interactive courses.
 
 ## What CAO does
 
@@ -27,9 +50,11 @@ Install:
   [Kiro CLI](docs/kiro-cli.md), [Claude Code](docs/claude-code.md),
   [Codex CLI](docs/codex-cli.md), [Antigravity CLI](docs/antigravity-cli.md),
   [Hermes](docs/hermes.md), [Kimi CLI](docs/kimi-cli.md),
+  [MiniMax Code](docs/minimax-code.md),
   [GitHub Copilot CLI](docs/copilot-cli.md),
-  [OpenCode CLI](docs/opencode-cli.md), or
-  [Cursor CLI](docs/cursor-cli.md)
+  [OpenCode CLI](docs/opencode-cli.md), [Oh My Pi(OMP) CLI](docs/omp-cli.md),
+  [Cursor CLI](docs/cursor-cli.md), or
+  [Grok Build CLI](docs/grok-cli.md)
 
 The focused provider guides contain installation, authentication, and
 provider-specific behavior.
@@ -109,8 +134,12 @@ provider override while keeping the same sequence.
 - [Memory](docs/memory.md) and [self-learning](docs/self-learning.md):
   persistent cross-session memory, and the opt-in loop that turns workflow
   outcomes into lessons and promoted instructions.
+- [AI-DLC portfolio example](examples/aidlc-portfolio/README.md): coordinate
+  parallel AI-DLC intents across repositories and isolated worktrees.
 - [Tool restrictions](docs/tool-restrictions.md): roles, allowlists, and
   provider enforcement.
+- [Kubernetes deployment](examples/cao-clusters/kubernetes/eks/README.md): run a supervisor and worker fleet on
+  Amazon EKS, with shared workspace, per-pod state, and credential delivery.
 - [Updating CAO](docs/updating.md): update an installed uv tool.
 
 ### Configure and integrate
@@ -119,14 +148,22 @@ provider override while keeping the same sequence.
   selection, and overrides.
 - [HTTP API and PTY WebSocket](docs/api.md): route-family overview and terminal
   streaming contract.
-- [Plugins](docs/plugins.md): outbound events, installation, and authoring.
+- [Agent plugins](docs/agent-plugins.md): installing portable Agent Plugins
+  1.0.0 packages, and CAO's own operator and contributor packages. Every
+  surface — the CLI, TUI, web panel, and the `/plugins*` HTTP routes — is built
+  but **gated off by default** pending a naming decision. Set
+  `CAO_AGENT_PLUGINS_ENABLED` to open it; until then the routes answer `404`,
+  exactly as an unregistered path would.
+- [Event plugins](docs/plugins.md): outbound events, installation, and authoring.
 - Provider behavior:
   [Kiro CLI](docs/kiro-cli.md), [Claude Code](docs/claude-code.md),
   [Codex CLI](docs/codex-cli.md), [Antigravity CLI](docs/antigravity-cli.md),
   [Hermes](docs/hermes.md), [Kimi CLI](docs/kimi-cli.md),
+  [MiniMax Code](docs/minimax-code.md),
   [GitHub Copilot CLI](docs/copilot-cli.md),
-  [OpenCode CLI](docs/opencode-cli.md), and
-  [Cursor CLI](docs/cursor-cli.md).
+  [OpenCode CLI](docs/opencode-cli.md), [Oh My Pi(OMP) CLI](docs/omp-cli.md),
+  [Cursor CLI](docs/cursor-cli.md), and
+  [Grok Build CLI](docs/grok-cli.md).
 - [Security policy](SECURITY.md): vulnerability reporting and deployment
   guidance.
 

@@ -1,0 +1,9 @@
+  Approve in your browser to finish signing in.
+
+  XXXX-XXXX
+
+  Make sure your browser shows this code.
+
+  Waiting for approval...
+
+  ctrl+q  quit

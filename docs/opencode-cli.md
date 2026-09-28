@@ -82,6 +82,7 @@ Storage layout:
 ```
 ~/.aws/opencode/
 ├── opencode.json          # MCP servers + per-agent tool gating (written by cao install)
+├── cao-grants.json        # CAO's record of which tool grants it wrote (see below)
 ├── package.json           # written by opencode on first launch
 ├── node_modules/          # ~57 MB, written by opencode on first launch
 └── agents/
@@ -157,10 +158,39 @@ The provider detects terminal state from the tmux capture buffer (ANSI-stripped)
 - Each `mcpServers` entry from the agent profile is added under the top-level `mcp` key
 - The server's tools are default-denied globally (`"<servername>*": false` under `tools`)
 - Re-enabled per-agent under `agent.<agent_id>.tools`
+- An entry carries `cwd` when its source declares one. Agent-plugin servers always
+  do — their working directory defaults to that agent plugin's `PLUGIN_ROOT` — so an agent plugin
+  whose command or arguments are relative to its own directory starts in the right
+  place rather than in OpenCode's workspace directory
 
 The agent ID is the slash-sanitized form of the profile name (`/` → `__`) — the same identifier used for the installed `.md` filename and the runtime `opencode --agent <id>` argument. This keeps the filename, the `--agent` arg, and the `opencode.json` key aligned for any profile name.
 
-Reinstalling an agent whose profile no longer declares `mcpServers` explicitly removes its `agent.<agent_id>` entry from `opencode.json`, so previously-granted MCP tools do not survive as stale grants.
+### Your `agent.<id>` entry is yours to edit
+
+`opencode.json` is a shared file that you are expected to hand-edit, so CAO **merges
+into** `agent.<agent_id>` rather than rewriting it. A `model`, `prompt`,
+`temperature` or tool policy you set on a CAO-installed agent — including a
+`"bash": false` or a grant for a server of your own — survives every `cao install`,
+every agent-plugin refresh, and the uninstall.
+
+Withdrawing a grant is therefore restricted to keys CAO can *prove* are its own:
+
+- keys recorded in `cao-grants.json`, a sidecar CAO writes next to `opencode.json`
+  listing the `<servername>*` keys it granted per agent, and
+- `<servername>*` for any `mcp` entry whose paths resolve inside CAO's agent-plugin store,
+  which keeps grants from installs predating the sidecar cleanable
+
+A `<servername>*` key CAO has no record of and cannot place in the agent-plugin store is
+left alone rather than deleted on a guess. Deleting `cao-grants.json` is safe; it
+only costs CAO the first of the two proofs.
+
+One exception to "your tool policy survives", and it predates this behaviour: a
+grant is *re-applied* on every refresh, so setting `"<servername>*": false` by hand
+on a server CAO grants this agent is overwritten back to `true` the next time the
+agent is installed or a plugin changes. To keep such a server switched off, remove
+it from the agent's profile rather than denying it here. Reinstalling an agent whose profile no
+longer declares `mcpServers` withdraws CAO's grants for it, and drops the
+`agent.<agent_id>` entry entirely only when nothing but those grants was in it.
 
 `CAO_TERMINAL_ID` is **not** written to `opencode.json`. OpenCode spawns MCP subprocesses that inherit the tmux window's environment, so the terminal ID propagates naturally — the same mechanism Kiro uses.
 
@@ -230,6 +260,10 @@ Press `q` or `Escape` to exit copy mode. If you need to read earlier conversatio
 ### `opencode.json` concurrent writes
 
 Parallel `cao install --provider opencode_cli` invocations (e.g., from a batch script) can race on the shared `~/.aws/opencode/opencode.json` file. The second writer may clobber the first's agent entry. **Sequential installs are safe.** File locking is deferred to a future release.
+
+`cao-grants.json` is written atomically (temp file + rename), so it is never observed
+half-written — but it is a whole-file write like `opencode.json`, so it races the same
+way under parallel installs.
 
 ## Troubleshooting
 

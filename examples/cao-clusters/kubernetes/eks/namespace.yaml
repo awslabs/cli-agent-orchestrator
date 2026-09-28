@@ -1,0 +1,7 @@
+# Dedicated namespace for the elastic CAO topology.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cao-cluster
+  labels:
+    app.kubernetes.io/part-of: cao-elastic-fleet

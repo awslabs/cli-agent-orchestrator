@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "dependency.schema.json",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "id",
+    "source",
+    "target",
+    "type",
+    "blockingAt",
+    "status",
+    "confidence",
+    "evidence",
+    "lastVerified"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+    "source": { "$ref": "#/$defs/endpoint" },
+    "target": { "$ref": "#/$defs/endpoint" },
+    "type": {
+      "enum": [
+        "runtime",
+        "contract",
+        "data",
+        "build",
+        "deployment",
+        "operational",
+        "business",
+        "release"
+      ]
+    },
+    "blockingAt": {
+      "type": "array",
+      "items": {
+        "enum": ["dispatch", "design", "build", "integration", "release"]
+      },
+      "uniqueItems": true
+    },
+    "contract": {
+      "type": "object",
+      "required": ["kind", "location", "compatibility"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "type": "string", "minLength": 1 },
+        "location": { "type": "string", "minLength": 1 },
+        "compatibility": {
+          "enum": ["backward-compatible", "breaking", "unknown"]
+        }
+      }
+    },
+    "status": { "enum": ["discovered", "proposed", "verified", "retired"] },
+    "confidence": { "enum": ["low", "medium", "high"] },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["source"],
+        "additionalProperties": false,
+        "properties": {
+          "source": { "type": "string", "minLength": 1 },
+          "revision": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "lastVerified": { "type": "string", "minLength": 1 }
+  },
+  "$defs": {
+    "endpoint": {
+      "type": "object",
+      "required": ["project"],
+      "additionalProperties": false,
+      "properties": {
+        "project": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+        "component": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" }
+      }
+    }
+  }
+}
+

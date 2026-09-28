@@ -1,0 +1,169 @@
+<section class="module" id="module-4">
+  <div class="module-content">
+
+    <div class="module-header animate-in">
+      <span class="module-number">04</span>
+      <h1 class="module-title">Automation & Ops</h1>
+      <p class="module-subtitle">Run agents on a schedule, orchestrate them from the outside, and build zero-human-in-the-loop pipelines.</p>
+    </div>
+
+  <!-- Screen 1: Scheduled Flows -->
+  <div class="screen" id="screen-4-1">
+    <h2>Scheduled Flows</h2>
+    <p>
+      Scheduled Flows let you run agent tasks on a cron-like schedule without any human trigger.
+      Define a flow as a Markdown file with YAML frontmatter, register it with the CLI, and CAO's
+      background daemon handles the rest.
+    </p>
+
+    <div class="translation-block animate-in">
+      <div class="translation-code">
+        <span class="translation-label">Flow File (nightly-review.md)</span>
+<pre><code><span class="code-comment">---</span>
+<span class="code-keyword">name</span>: nightly-review
+<span class="code-keyword">schedule</span>: <span class="code-string">"0 2 * * *"</span>
+<span class="code-keyword">agent_profile</span>: code_supervisor
+<span class="code-keyword">provider</span>: claude_code
+<span class="code-comment">---</span>
+
+Review all PRs opened today and
+summarize findings.</code></pre>
+      </div>
+      <div class="translation-english">
+        <span class="translation-label">Plain English</span>
+        <div class="translation-lines">
+          <div class="tl">&nbsp;</div>
+          <div class="tl">Name this flow "nightly-review".</div>
+          <div class="tl">Run every day at 2:00 AM.</div>
+          <div class="tl">Use the code_supervisor profile.</div>
+          <div class="tl">Run inside Claude Code.</div>
+          <div class="tl">&nbsp;</div>
+          <div class="tl">The body becomes the agent's task prompt.</div>
+          <div class="tl">&nbsp;</div>
+        </div>
+      </div>
+    </div>
+
+    <p>
+      The server's background daemon checks every <strong>60 seconds</strong> for flows whose
+      cron expression matches. Sessions are auto-named <code>cao-flow-{name}</code>.
+    </p>
+    <p>
+      CLI commands: <code>cao schedule add FILE</code>, <code>cao schedule list</code>,
+      <code>cao schedule run NAME</code>, <code>cao schedule enable/disable NAME</code>,
+      <code>cao schedule remove NAME</code>.
+    </p>
+    <p>
+      Flows can include a <code>script</code> step that runs first and outputs JSON. If it
+      returns <code>{"execute": false}</code>, the flow is skipped for that cycle — useful for
+      conditional execution based on external state.
+    </p>
+  </div>
+
+  <!-- Screen 2: The Ops MCP Server -->
+  <div class="screen" id="screen-4-2">
+    <h2>The Ops MCP Server</h2>
+    <p>
+      CAO ships two MCP servers with very different purposes. Understanding which is which
+      is essential for building integrations.
+    </p>
+
+    <div class="pattern-cards">
+      <div class="pattern-card" style="border-top: 3px solid var(--color-actor-2);">
+        <h3><code>cao-mcp-server</code></h3>
+        <p><strong>Runs INSIDE agent sessions.</strong></p>
+        <p>Provides tools like <code>handoff</code>, <code>assign</code>, and <code>send_message</code> so agents can orchestrate each other during a workflow.</p>
+        <p class="pattern-metaphor">The internal intercom system between coworkers.</p>
+      </div>
+      <div class="pattern-card" style="border-top: 3px solid var(--color-actor-5);">
+        <h3><code>cao-ops-mcp-server</code></h3>
+        <p><strong>Runs OUTSIDE — for external control.</strong></p>
+        <p>Lets CI/CD pipelines, meta-agents, or scripts manage CAO itself: launch sessions, send messages, read output, shut things down.</p>
+        <p class="pattern-metaphor">The building's reception desk — controls who enters and exits.</p>
+      </div>
+    </div>
+
+    <p><strong>Ops server tools:</strong></p>
+    <ul>
+      <li><code>list_profiles</code> — discover available agent profiles</li>
+      <li><code>install_profile</code> — install a profile by name or URL</li>
+      <li><code>launch_session</code> — start a new CAO session</li>
+      <li><code>send_session_message</code> — deliver a message to a running session</li>
+      <li><code>get_terminal_status</code> — check if a terminal is idle, processing, etc.</li>
+      <li><code>get_terminal_output</code> — read recent terminal output</li>
+      <li><code>read_session_output</code> — read a terminal's captured output by session name</li>
+      <li><code>get_profile_details</code> — get detailed information about a specific profile</li>
+      <li><code>list_sessions</code> — list all active CAO sessions</li>
+      <li><code>get_session_info</code> — get detailed info about a specific session</li>
+      <li><code>shutdown_session</code> — gracefully stop a session</li>
+    </ul>
+  </div>
+
+  <!-- Screen 3: Fully Autonomous Operation -->
+  <div class="screen" id="screen-4-3">
+    <h2>Fully Autonomous Operation</h2>
+    <p>
+      When an agent hits a permission prompt or asks for clarification, it enters
+      <strong>WAITING_USER_ANSWER</strong> status. Normally a human would respond. But the
+      <code>answer_user_prompt</code> tool lets another agent respond programmatically.
+    </p>
+    <p>
+      A supervisor (or another internal agent via the <code>cao-mcp-server</code>) calls
+      <code>answer_user_prompt(terminal_id, answer)</code> to unblock the waiting worker — no
+      human needed. Note: <code>answer_user_prompt</code> is available only through the internal
+      <code>cao-mcp-server</code>, not the ops server. External scripts can send input to a waiting terminal via <code>POST /terminals/{id}/input</code> — the same generic endpoint used for all terminal input.
+    </p>
+
+    <div class="callout callout-accent">
+      <div class="callout-icon">&#9889;</div>
+      <div class="callout-content">
+        <span class="callout-title">Zero-Human-in-the-Loop</span>
+        <p>
+          Combine all three pieces for fully autonomous pipelines:
+          <strong>Scheduled Flows</strong> trigger work on a cron,
+          the <strong>Ops MCP Server</strong> lets external systems monitor and control sessions,
+          and <strong>answer_user_prompt</strong> resolves any agent-to-human blocks automatically.
+          The result: agents that run 24/7 without anyone watching.
+        </p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Screen 4: Quiz -->
+  <div class="screen" id="screen-4-4">
+    <h2>Check Your Understanding</h2>
+
+    <div class="quiz-container" id="quiz-automation-ops">
+
+      <div class="quiz-question-block" data-correct="cao-ops-mcp-server" data-explanation-right="Correct! The ops server is designed for external orchestration — CI/CD pipelines, scripts, and meta-agents that manage CAO from the outside." data-explanation-wrong="The cao-ops-mcp-server is the one designed for external systems. The cao-mcp-server runs inside agent sessions for inter-agent communication.">
+        <p class="quiz-question"><strong>Which MCP server would a CI/CD pipeline use to launch a CAO session?</strong></p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-value="cao-mcp-server" onclick="selectOption(this)">
+            <span class="quiz-option-radio"></span>
+            <span>cao-mcp-server — it handles agent orchestration</span>
+          </button>
+          <button class="quiz-option" data-value="cao-ops-mcp-server" onclick="selectOption(this)">
+            <span class="quiz-option-radio"></span>
+            <span>cao-ops-mcp-server — it is designed for external orchestration</span>
+          </button>
+          <button class="quiz-option" data-value="either" onclick="selectOption(this)">
+            <span class="quiz-option-radio"></span>
+            <span>Either one — they both expose launch_session</span>
+          </button>
+        </div>
+        <div class="quiz-feedback"></div>
+      </div>
+
+      <div style="margin-top: var(--space-6);">
+        <button class="btn btn-primary quiz-check-btn" onclick="checkQuiz('quiz-automation-ops')">Check Answer</button>
+        <button class="btn quiz-reset-btn" onclick="resetQuiz('quiz-automation-ops')">Try Again</button>
+      </div>
+    </div>
+
+    <p style="margin-top: var(--space-8);">
+      <a href="../course/index.html">&larr; Back to the fundamentals course</a>
+    </p>
+  </div>
+
+  </div>
+</section>

@@ -1,0 +1,6 @@
+Approval needed
+Run this command?
+$ pnpm test
+1 Allow for this conversation
+2 Always allow this action
+3 Deny

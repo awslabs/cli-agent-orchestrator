@@ -109,6 +109,14 @@ class TestValidateFrontmatter:
         }
         assert _validate_frontmatter(meta) == []
 
+    @pytest.mark.parametrize("engine", ["v2", "kas"])
+    def test_valid_kiro_engine(self, engine):
+        assert _validate_frontmatter({"name": "x", "engine": engine}) == []
+
+    def test_invalid_kiro_engine(self):
+        msgs = _validate_frontmatter({"name": "x", "engine": "v3"})
+        assert any("[error]" in msg and "engine" in msg for msg in msgs)
+
     def test_missing_name(self):
         meta = {"description": "no name"}
         msgs = _validate_frontmatter(meta)
@@ -135,6 +143,10 @@ class TestValidateFrontmatter:
 
     def test_valid_tools(self):
         meta = {"name": "x", "allowedTools": ["execute_bash", "@cao-mcp-server"]}
+        assert _validate_frontmatter(meta) == []
+
+    def test_claude_config_accepted(self):
+        meta = {"name": "x", "claudeConfig": {"effort": "high"}}
         assert _validate_frontmatter(meta) == []
 
 
@@ -340,7 +352,10 @@ class TestProfileRemoveVerb:
         profile_file = store / "test-agent.md"
         profile_file.write_text("---\nname: test-agent\n---\ntest")
 
-        with patch("cli_agent_orchestrator.cli.commands.profile.LOCAL_AGENT_STORE_DIR", store):
+        with (
+            patch("cli_agent_orchestrator.cli.commands.profile.LOCAL_AGENT_STORE_DIR", store),
+            patch("cli_agent_orchestrator.services.profile_store.LOCAL_AGENT_STORE_DIR", store),
+        ):
             result = runner.invoke(profile, ["remove", "test-agent", "-y"])
         assert result.exit_code == 0
         assert "Removed" in result.output
@@ -353,7 +368,10 @@ class TestProfileRemoveVerb:
         store = tmp_path / "store"
         store.mkdir()
 
-        with patch("cli_agent_orchestrator.cli.commands.profile.LOCAL_AGENT_STORE_DIR", store):
+        with (
+            patch("cli_agent_orchestrator.cli.commands.profile.LOCAL_AGENT_STORE_DIR", store),
+            patch("cli_agent_orchestrator.services.profile_store.LOCAL_AGENT_STORE_DIR", store),
+        ):
             result = runner.invoke(profile, ["remove", "../../etc/passwd", "-y"])
         assert result.exit_code != 0
         assert "Invalid" in result.output or "not found" in result.output.lower()
@@ -367,7 +385,10 @@ class TestProfileRemoveVerb:
         profile_file = store / "keep-me.md"
         profile_file.write_text("---\nname: keep-me\n---\ntest")
 
-        with patch("cli_agent_orchestrator.cli.commands.profile.LOCAL_AGENT_STORE_DIR", store):
+        with (
+            patch("cli_agent_orchestrator.cli.commands.profile.LOCAL_AGENT_STORE_DIR", store),
+            patch("cli_agent_orchestrator.services.profile_store.LOCAL_AGENT_STORE_DIR", store),
+        ):
             result = runner.invoke(profile, ["remove", "keep-me"], input="n\n")
         assert profile_file.exists()  # File should still be there
 

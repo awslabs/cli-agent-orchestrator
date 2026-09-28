@@ -11,8 +11,9 @@ from typing import Any, Dict, Optional
 
 import requests
 
-from cli_agent_orchestrator.constants import API_BASE_URL, MCP_REQUEST_TIMEOUT
+from cli_agent_orchestrator.constants import API_BASE_URL
 from cli_agent_orchestrator.security.auth import get_local_bearer
+from cli_agent_orchestrator.utils.orchestration import _mcp_timeout
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,39 @@ def _auth_headers() -> Dict[str, str]:
 
     token = get_local_bearer()
     return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+def get_json(path: str, *, timeout: Optional[float] = None, **params: Any) -> Any:
+    """GET ``path`` and return parsed JSON. ``None`` params are dropped."""
+
+    response = requests.get(
+        f"{API_BASE_URL}{path}",
+        params={k: v for k, v in params.items() if v is not None} or None,
+        headers=_auth_headers() or None,
+        timeout=_mcp_timeout() if timeout is None else timeout,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def post_body_json(path: str, body: Dict[str, Any], *, timeout: Optional[float] = None) -> Any:
+    """POST ``path`` with a JSON BODY.
+
+    A body rather than query parameters because the payloads these carry include
+    free text (``friction_notes``) that would be mangled in a URL.
+    """
+
+    response = requests.post(
+        f"{API_BASE_URL}{path}",
+        json=body,
+        headers=_auth_headers() or None,
+        timeout=_mcp_timeout() if timeout is None else timeout,
+    )
+    response.raise_for_status()
+    try:
+        return response.json()
+    except ValueError:  # pragma: no cover - some mutations return empty bodies
+        return {}
 
 
 def get_terminal_record(terminal_id: str) -> Optional[Dict[str, Any]]:
@@ -50,7 +84,7 @@ def get_terminal_record(terminal_id: str) -> Optional[Dict[str, Any]]:
         response = requests.get(
             f"{API_BASE_URL}/terminals/{terminal_id}",
             headers=_auth_headers() or None,
-            timeout=MCP_REQUEST_TIMEOUT,
+            timeout=_mcp_timeout(),
         )
     except requests.RequestException as exc:
         logger.warning("Failed to fetch terminal record for %s: %s", terminal_id, exc)

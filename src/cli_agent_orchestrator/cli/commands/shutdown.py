@@ -21,7 +21,21 @@ def _delete_session(name):
         if response.status_code == 404:
             click.echo(f"Session '{name}' already removed", err=True)
             return False
+        if response.status_code == 409:
+            raise click.ClickException(
+                f"Session '{name}' cleanup is pending; retry shutdown after residual "
+                "Grok processes exit"
+            )
         response.raise_for_status()
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = {}
+        if isinstance(payload, dict) and (payload.get("success") is False or payload.get("errors")):
+            raise click.ClickException(
+                f"Session '{name}' cleanup is pending; retry shutdown after residual "
+                "Grok processes exit"
+            )
         return True
     except requests.exceptions.RequestException as e:
         raise click.ClickException(f"Failed to connect to cao-server: {e}")

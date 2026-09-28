@@ -1,0 +1,11 @@
+Warning: Model "definitely-not-a-model" not found
+
+Reply with exactly ERROR_FIXTURE.
+
+Error: No model selected.
+
+Use /login, set an API key environment variable, or create <OMP_AGENT_DIR>/agent.db
+Then use /model to select a model.
+
+╭── OMP session ─────────────────────────────────────────────────────────────╮
+╰─                                                                            ─╯

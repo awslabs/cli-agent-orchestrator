@@ -52,24 +52,28 @@ class TestBuildCommandMcpServerModelDump:
 class TestHandleStartupPromptsBranches:
     """Test _handle_startup_prompts branches."""
 
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.claude_code.asyncio.sleep")
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_bypass_permissions_prompt(self, mock_backend, provider):
+    async def test_bypass_permissions_prompt(self, mock_backend, mock_sleep, provider):
         """Detects bypass permissions prompt and sends Down arrow + Enter via backend."""
         mock_backend.get_history.return_value = (
             "⚠ Bypass Permissions mode\n" "1. No, exit\n" "2. Yes, I accept\n"
         )
 
-        provider._handle_startup_prompts(idle_gap=1.0)
+        await provider._handle_startup_prompts(idle_gap=1.0)
 
-        # Down arrow sent via send_keys, Enter via send_special_key
-        mock_backend.send_keys.assert_called_once()
-        mock_backend.send_special_key.assert_called_once_with(
-            provider.session_name, provider.window_name, "Enter"
-        )
+        assert [call.args[2] for call in mock_backend.send_special_key.call_args_list] == [
+            "Down",
+            "Enter",
+        ]
 
-    @patch("cli_agent_orchestrator.providers.claude_code.time.sleep", lambda *a, **k: None)
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.claude_code.asyncio.sleep")
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_echoed_prompt_does_not_short_circuit_trust(self, mock_backend, provider):
+    async def test_echoed_prompt_does_not_short_circuit_trust(
+        self, mock_backend, mock_sleep, provider
+    ):
         """Regression: the injected --append-system-prompt contains a line that
         starts with "> `memory_store`". The shell echoes the launch command into
         the capture buffer ~300ms before the workspace-trust dialog renders, so
@@ -91,9 +95,17 @@ class TestHandleStartupPromptsBranches:
             "❯ 1. Yes, I trust this folder\n"
             "  2. No, exit\n"
         )
-        mock_backend.get_history.side_effect = [echoed_launch_cmd, trust_frame]
+        # A third frame is required because accepting trust no longer ends the
+        # handler: the model-upgrade nudge can render after it, so the loop keeps
+        # polling until the banner (or the idle gap). Without the banner frame
+        # here the mock's side_effect list runs dry mid-loop.
+        mock_backend.get_history.side_effect = [
+            echoed_launch_cmd,
+            trust_frame,
+            "Welcome to Claude Code v2.1.235",
+        ]
 
-        provider._handle_startup_prompts(idle_gap=5.0)
+        await provider._handle_startup_prompts(idle_gap=5.0)
 
         # Trust dialog accepted via Enter — proves we did not early-return on the
         # echoed "> memory_store" marker.
@@ -101,21 +113,25 @@ class TestHandleStartupPromptsBranches:
             provider.session_name, provider.window_name, "Enter"
         )
 
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.claude_code.asyncio.sleep")
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_welcome_banner_detected_early_return(self, mock_backend, provider):
+    async def test_welcome_banner_detected_early_return(self, mock_backend, mock_sleep, provider):
         """When welcome banner is visible, returns immediately."""
         mock_backend.get_history.return_value = "Welcome to Claude Code v2.5.0"
 
-        provider._handle_startup_prompts(idle_gap=1.0)
+        await provider._handle_startup_prompts(idle_gap=1.0)
 
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.claude_code.asyncio.sleep")
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_trust_prompt_detected(self, mock_backend, provider):
+    async def test_trust_prompt_detected(self, mock_backend, mock_sleep, provider):
         """Trust prompt sends Enter to accept via backend send_special_key."""
         mock_backend.get_history.return_value = (
             "Do you trust the files in this folder?\n" "❯ Yes, I trust this folder"
         )
 
-        provider._handle_startup_prompts(idle_gap=1.0)
+        await provider._handle_startup_prompts(idle_gap=1.0)
 
         mock_backend.send_special_key.assert_called_once_with(
             provider.session_name, provider.window_name, "Enter"

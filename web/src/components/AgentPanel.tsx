@@ -10,7 +10,7 @@ import { TerminalMeta } from '../api'
 import { StatusBadge } from './StatusBadge'
 import { OutputViewer } from './OutputViewer'
 
-export const FALLBACK_PROVIDERS = ['kiro_cli', 'claude_code', 'q_cli', 'codex', 'gemini_cli', 'hermes', 'kimi_cli', 'copilot_cli', 'opencode_cli', 'cursor_cli']
+export const FALLBACK_PROVIDERS = ['kiro_cli', 'claude_code', 'q_cli', 'codex', 'gemini_cli', 'hermes', 'kimi_cli', 'copilot_cli', 'opencode_cli', 'cursor_cli', 'grok_cli']
 
 const SOURCE_LABELS: Record<string, string> = {
   'built-in': 'Built-in',
@@ -74,8 +74,11 @@ export function AgentPanel() {
       if (liveTerminal?.id === id) setLiveTerminal(null)
       if (activeSession) await selectSession(activeSession)
       showSnackbar({ type: 'success', message: `Terminal ${id} closed — tmux window killed` })
-    } catch {
-      showSnackbar({ type: 'error', message: `Failed to close terminal ${id}` })
+    } catch (e: any) {
+      showSnackbar({
+        type: 'error',
+        message: e.detail || e.message || `Failed to close terminal ${id}`,
+      })
     }
     setClosingTerminal(null)
     setPendingClose(null)

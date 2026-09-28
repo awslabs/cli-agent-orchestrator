@@ -1,0 +1,2 @@
+]0;Reply with exactly RAW_FIXTURE.[?25l[?2026h[?7l[1A[48;2;5;5;5m Reply with exactly RAW_FIXTURE. [49m[0m
+⠋ Working… ⟨esc⟩⠙ Working… ⟨esc⟩⠹ Working… ⟨esc⟩RAW_FIXTURE

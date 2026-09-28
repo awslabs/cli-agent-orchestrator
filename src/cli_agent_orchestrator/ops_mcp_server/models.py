@@ -2,7 +2,7 @@
 
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from cli_agent_orchestrator.services.install_service import InstallResult
 
@@ -19,6 +19,10 @@ class LaunchResult(BaseModel):
     terminal_id: Optional[str] = Field(
         default=None,
         description="The created terminal ID",
+    )
+    provider: Optional[str] = Field(
+        default=None,
+        description="The CLI provider the session was launched with",
     )
 
 
@@ -44,9 +48,25 @@ class SessionListResult(BaseModel):
         default=None,
         description="Error message when success is False",
     )
-    sessions: List[Dict[str, Any]] = Field(
+    sessions: List["SessionListEntry"] = Field(
         default_factory=list,
-        description="Active CAO sessions with terminal counts and statuses",
+        description="Active CAO sessions with ownership metadata and statuses",
+    )
+
+
+class SessionListEntry(BaseModel):
+    """A single active CAO session returned by list_sessions."""
+
+    model_config = ConfigDict(extra="allow")
+
+    id: Optional[str] = Field(default=None, description="Session identifier")
+    name: Optional[str] = Field(default=None, description="Session display name")
+    status: Optional[str] = Field(default=None, description="Backend session status")
+    working_directory: Optional[str] = Field(
+        default=None, description="Best-effort launch or pane working directory"
+    )
+    agent_profile: Optional[str] = Field(
+        default=None, description="Agent profile for the session's first known terminal"
     )
 
 
@@ -62,6 +82,7 @@ __all__ = [
     "InstallResult",
     "LaunchResult",
     "ProfileListResult",
+    "SessionListEntry",
     "SendMessageResult",
     "SessionListResult",
 ]

@@ -52,6 +52,29 @@ Rejected at the CLI boundary:
 
 Forwarded vars are held in process memory on cao-server and dropped when the session is deleted; restarting cao-server wipes them.
 
+### From the ops-MCP `launch_session` tool
+
+An external agent driving CAO through the `cao-ops` MCP server forwards the same
+vars via an `env_vars` mapping on `launch_session` — the identical mechanism,
+validation, and request-body delivery as `cao launch --env`:
+
+```python
+launch_session(
+    agent_profile="code_supervisor",
+    env_vars={
+        "MNEMOSYNE_DIR": "/root/mnemosyne",
+        "ISAAC_CHANNEL": "room:engineering",
+    },
+)
+```
+
+The same three rules are enforced at the tool boundary — blocked
+`CLAUDE` / `CODEX_` / `__MISE_` prefixes (with the 6 `CLAUDE_CODE_USE_*` /
+`CLAUDE_CODE_SKIP_*` flags allowlisted), non-POSIX keys, and values ≥ 2048 bytes
+— so an entry the server would silently drop fails the tool call loudly instead
+of vanishing. The CLI and the ops-MCP tool share one validator
+(`utils/forwarded_env.py`) so the two paths cannot drift.
+
 ## Notes
 
 - CAO session names are automatically prefixed with `cao-`. Use the prefixed name (e.g. `cao-my-task`) when referencing a session in `tmux attach`, `cao session send`, or `cao shutdown`.

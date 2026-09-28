@@ -119,6 +119,11 @@ polling for `completed` status.
 > `cao session send` waits for completion and returns output inline by default. With `--async`, it sends and returns immediately without waiting. With `--timeout N`, it waits up to N seconds — if the timeout expires, the agent is still running; check status later.
 > Session names in commands use the `cao-` prefixed form (e.g. `--session-name mywork` → use `cao-mywork`).
 
+A reported status is inferred from the rendered terminal screen, not from a
+structured protocol, so it can disagree with reality. Before reporting readiness,
+progress, or completion to a user, corroborate the status with an output read —
+see [cao-session-liveness](../cao-session-liveness/SKILL.md).
+
 ## Worker Communication
 
 Inside a session, the conductor talks to workers via two MCP tools:

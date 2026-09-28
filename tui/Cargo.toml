@@ -1,0 +1,188 @@
+# cao-tui — the Rust TUI front door for CAO. See issue #321.
+#
+# Single crate at the root sibling `tui/`, deliberately NOT a Cargo workspace:
+# `web/` and `cao_mcp_apps/` are already root-level siblings carrying their own
+# manifests, and a workspace buys nothing until a second crate exists. (#321)
+[package]
+name = "cao-tui"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Terminal UI front door for CLI Agent Orchestrator"
+# Never goes to crates.io — it ships inside the cli-agent-orchestrator wheel. (#321)
+publish = false
+
+[[bin]]
+name = "cao-tui"
+path = "src/main.rs"
+
+# Dependency-free apart from `thiserror`, which the affirmed crate-root error type
+# requires from commit one. The catalog, wire-type, pty, and HTTP units each add
+# what they actually use; a speculative dependency list here would be
+# supply-chain surface this unit never exercises. (#321)
+[dependencies]
+thiserror = "2"
+# `shared-types` adds only the derive machinery. (#321)
+serde = { version = "1", features = ["derive"] }
+# PROMOTED from [dev-dependencies] by `server-client` (Bolt 3), exactly as the note it
+# replaced anticipated: "`server-client` owns that choice and promotes whichever JSON crate
+# it needs." Both crates were already in the tree as dev-dependencies, so this adds ZERO new
+# supply-chain surface — `Cargo.lock` gains no package, and cargo-deny's licences check
+# already covered them via `include-dev = true`. (#321)
+#
+# `serde_json` is the wire codec. It is not optional for this unit: the six methods
+# deserialise the server's projections, and `create_session` builds its query string FROM
+# `serde_json`'s rendering of `SessionParams` so the `agent_profile` wire key comes from the
+# same `#[serde(rename)]` the body uses. A hand-rolled key list would be a second place for
+# that name to live and drift — a runtime 422, never a compile error. (#321)
+serde_json = "1"
+# `minreq` is the HTTP client. Kept as the choice `skeleton-endpoint-verify` made for its
+# live-server contract test, now promoted for production, because the reasoning that
+# selected it is the production reasoning too:
+#
+# - **0 transitive crates** with default features (measured against `ureq` 3.3
+#   `default-features = false`, which adds 8). Less `cargo-deny` advisory surface, and it
+#   keeps the release binary under NFR-2's 10 MB ceiling.
+# - **No TLS feature.** `https` is off (not a default), so no `rustls`/`openssl` enters the
+#   tree. SR-5 states the loopback assumption plainly rather than claiming transport
+#   security this unit does not provide; enabling TLS would add a large supply-chain surface
+#   for a scheme the server does not serve.
+# - **`send_lazy` gives incremental reads**, which is what BR-17 needs: `run()` writes each
+#   chunk to the pane as it arrives instead of buffering to completion, so a slow command is
+#   not indistinguishable from a hang.
+# - **`with_timeout` is the per-request bound** (TS-3), deliberately a different number from
+#   the 30-second readiness cap in `handoff.rs`: one bounds a single call, the other bounds a
+#   loop of up to 30.
+#
+# `urlencoding` is deliberately NOT enabled: `src/server.rs` percent-encodes every
+# operator-supplied value itself. One fixed rule, no extra crate, and the encoding is
+# testable in isolation — which matters because it is a correctness control, not cosmetics
+# (an unencoded `&` in a session name would split into a second query parameter). (#321)
+minreq = "3"
+
+# ---------------------------------------------------------------------------------------
+# THE TUI RENDERING STACK, added by `results-pane` (Bolt 4) — the crate's first UI
+# dependencies, and by far its largest single jump in supply-chain surface.
+#
+# MEASURED, not estimated: 39 resolved crates before, 95 after
+# (`cargo tree --target all -e normal,build,dev`, deduplicated by name+version). The three
+# manifest lines below account for 56 new crates. cargo-deny runs with `include-dev = true`,
+# so every one of them is in the licences and advisories denominator.
+#
+# `default-features = false` on ratatui is a deliberate narrowing, and it was measured rather
+# than assumed. ratatui's defaults are
+# `all-widgets, crossterm, layout-cache, macros, underline-color`; dropping `all-widgets` and
+# `macros` removes 8 crates — `ratatui-macros`, plus the whole `time` subtree
+# (`time`, `time-core`, `deranged`, `num-conv`, `num_threads`, `powerfmt`) that arrives ONLY
+# via `widget-calendar`. This pane renders a Paragraph in a Block and needs neither a
+# calendar widget nor the `line!`/`text!` macros, so 104 crates became 96 for no loss of
+# capability. `layout-cache` and `underline-color` are also dropped: the first is a
+# performance cache this pane does not need (it computes one vertical split per render), the
+# second an optional style capability nothing here sets.
+#
+# `crossterm` is declared DIRECTLY as well as arriving under `ratatui/crossterm`, and that is
+# not duplication: `Cargo.lock` gains no package (ratatui-crossterm 0.1.2 depends on
+# `crossterm 0.29` under the alias `crossterm_0_29`, and cargo unifies the two into one node —
+# verified with `cargo tree -i crossterm`, which shows the single 0.29.0 node reached from
+# both). Declaring it directly is what lets the key map name `KeyCode` without going through
+# `ratatui::crossterm`, and the two paths are the SAME type — verified by assigning across
+# them, which compiles.
+#
+# NOTE the shipped-binary cost, since NFR-2 sets a 10 MB ceiling: unlike `portable-pty`,
+# these are `[dependencies]`, not `[dev-dependencies]`, because the pane is production code.
+# That is unavoidable for a TUI and is the reason the feature set is narrowed rather than
+# taken as it comes. (#321)
+#
+# `unstable-rendered-line-info` is added for `Paragraph::line_count`, which the left column's
+# viewport needs to know how tall its content is ONCE WRAPPED. It adds **zero crates**
+# (`Cargo.lock` is byte-identical with and without it — verified) and compiles on stable rustc:
+# ratatui gates the API behind an attribute, not behind a nightly feature.
+#
+# The alternative was to compute wrapped height here, and that is the worse risk: it would be a
+# second implementation of word wrapping that agrees with the one actually rendering only until a
+# line holds a long word or a wide grapheme. Measured at the 80x24 floor, 32 lines occupy 44 rows,
+# so the naive `Vec::len()` count understates height by a third and an overflow guard built on it
+# passes while content runs off screen.
+#
+# The exposure is that the API is unstable upstream (ratatui#293) and could change or vanish in a
+# minor release. `the_wrap_measurement_agrees_with_what_is_actually_drawn` (in `src/renderer.rs`)
+# pins the behaviour against a real rendered buffer rather than against the API's own claim, so an
+# upstream change surfaces as a red test rather than as a silently mis-sized viewport. The test name
+# is cited here on purpose — a reviewer is being asked to accept an unstable upstream dependency on
+# the strength of that guard, so the citation has to resolve; the name it carried before named no
+# test at all. (PR #564 review)
+ratatui = { version = "0.30.2", default-features = false, features = [
+    "std",
+    "crossterm",
+    "unstable-rendered-line-info",
+] }
+crossterm = "0.29.0"
+
+# ---------------------------------------------------------------------------------------
+# THE ANSI STRIPPER (SR-1) — `vte` directly, NOT `strip-ansi-escapes`, and the reason is a
+# measured behavioural defect in the latter rather than a size preference.
+#
+# `security-requirements.md` SR-1 names "`strip-ansi-escapes` or equivalent". That crate was
+# evaluated first, and its own `Writer` is built on a `std::io::LineWriter`. Measured with a
+# spy sink that reports what the inner writer has received at each step:
+#
+#     write_all(b"Loading")  -> inner sink has ""      <-- WITHHELD
+#     write_all(b" 50%")     -> inner sink has ""      <-- STILL WITHHELD
+#     write_all(b"\n")       -> inner sink has "Loading 50%\n"
+#
+# A newline-less chunk is buffered until a newline arrives. That is exactly the shape of a
+# progress line, and PR-1 makes incrementality a REQUIREMENT — a pane that withholds
+# `Loading 50%` until the command finishes its line is the "slow command indistinguishable
+# from a hang" failure PR-1 exists to prevent. The alternative, its free `strip()` function,
+# is worse for a different reason: it creates a fresh parser per call, so an escape split
+# across two chunks is not recognised. Measured — `strip(b"before\x1b")` then
+# `strip(b"[2Jafter")` yields `"before"` + `"[2Jafter"`, leaking the payload as visible text,
+# where one persistent parser yields `"beforeafter"`.
+#
+# `vte` is `strip-ansi-escapes`' own dependency, so this is not a different supply chain: it
+# is the same parser without the `LineWriter`. It costs ONE crate fewer (95 vs 96 — dropping
+# `strip-ansi-escapes` itself; `memchr` stays, already present via `serde_json`), and
+# `default-features = false` drops its `no_std`/`arrayvec` path since this crate has `std`.
+#
+# Hand-rolling was rejected: a naive `\x1b[` scanner misses OSC (`\x1b]…\x07`), DCS
+# (`\x1bP…\x1b\\`), single-character escapes (`\x1bc`), and the C1 control bytes — all four
+# verified stripped by `vte` and all four plausible in real command output. (#321)
+vte = { version = "0.14", default-features = false }
+
+[dev-dependencies]
+
+# The pty harness (walking-skeleton item 2) and NOTHING else. All three are
+# `[dev-dependencies]` on purpose: this is test infrastructure whose types never appear in
+# the shipped binary's runtime paths, and `[dependencies]` would grow the release binary
+# against NFR-2's 10 MB ceiling for no runtime benefit. That choice is what puts the harness
+# in `tests/` — a dev-dependency is only linkable from test targets, so a harness under
+# `src/` could not compile against it. (#321)
+#
+# `portable-pty` in particular is what lets `#![forbid(unsafe_code)]` stand: pty allocation,
+# TIOCSWINSZ, and the setsid/TIOCSCTTY dance all live behind its safe API, so this crate
+# needs no `unsafe` for real-terminal tests. (#321)
+portable-pty = "0.9"
+# Already in the tree as portable-pty's own dependency, so neither adds supply-chain surface.
+# `filedescriptor::poll` is the per-read BOUND that keeps the drain loop self-terminating
+# (T-7, BR-1, BR-5) — the safe alternative to a hand-rolled `libc::poll`. `nix` provides the
+# SIGTERM/SIGKILL escalation (BR-7) and the `kill(pid, 0)` -> ESRCH absence probe that proves
+# a kill actually worked rather than merely returning Ok (VR-4). (#321)
+filedescriptor = "0.8.3"
+nix = { version = "0.28", features = ["signal"] }
+# The drain thread's bounded reads surface pty-allocation failures as `anyhow::Error` from
+# `portable-pty`; `HarnessError` wraps them as `#[source]`. Affirmed practice: `anyhow` at
+# integration boundaries, `thiserror` for the crate-internal type. (#321)
+anyhow = "1"
+
+# `serde_json` and `minreq` WERE declared here, by `shared-types` and
+# `skeleton-endpoint-verify` respectively. **Both moved up to `[dependencies]` when
+# `server-client` landed** — see the notes there for why each is needed in production and why
+# the move costs nothing. A dependency is visible to test targets too, so
+# `tests/endpoint_contract.rs` still links `minreq` unchanged and the walking skeleton's item 4
+# is unaffected.
+#
+# Retaining them here as well would be a duplicate-key error in this manifest, so the choice
+# is forced rather than stylistic. The one real consequence is worth naming: `minreq` now ships
+# inside the release binary, which is what NFR-2's 10 MB ceiling is measured against. That was
+# always going to happen the moment the TUI made a production HTTP call — the crate adds zero
+# transitive dependencies, which is why it was the choice to promote. (#321)

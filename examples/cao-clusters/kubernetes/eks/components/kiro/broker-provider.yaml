@@ -1,0 +1,27 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cao-worker-broker
+  namespace: cao-cluster
+spec:
+  template:
+    spec:
+      containers:
+        - name: broker
+          env:
+            - name: CAO_ELASTIC_WORKER_PROVIDER
+              value: "kiro_cli"
+            - name: CAO_ELASTIC_WORKER_ENV_PASSTHROUGH
+              value: "CAO_PROVIDER_INIT_TIMEOUT,CAO_MCP_REQUEST_TIMEOUT"
+            - name: CLAUDE_CODE_USE_BEDROCK
+              $patch: delete
+            - name: AWS_REGION
+              $patch: delete
+            - name: ANTHROPIC_MODEL
+              $patch: delete
+            - name: ANTHROPIC_DEFAULT_OPUS_MODEL
+              $patch: delete
+            - name: ANTHROPIC_DEFAULT_SONNET_MODEL
+              $patch: delete
+            - name: ANTHROPIC_DEFAULT_HAIKU_MODEL
+              $patch: delete

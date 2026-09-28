@@ -18,6 +18,7 @@ describe('API wrapper', () => {
       status,
       statusText: status === 200 ? 'OK' : 'Error',
       json: () => Promise.resolve(data),
+      text: () => Promise.resolve(JSON.stringify(data)),
     })
   }
 
@@ -104,9 +105,17 @@ describe('API wrapper', () => {
   })
 
   it('deleteSession sends DELETE', async () => {
-    mockResponse({ success: true, deleted: [], errors: [] })
+    mockResponse({ success: true, deleted: ['s1'], errors: [] })
     await api.deleteSession('s1')
     expect(mockFetch).toHaveBeenCalledWith('/sessions/s1', expect.objectContaining({ method: 'DELETE' }))
+  })
+
+  it('deleteSession rejects deferred cleanup payloads', async () => {
+    mockResponse({ success: false, deleted: [], errors: [{ error: 'cleanup deferred; retry delete_session' }] })
+    await expect(api.deleteSession('s1')).rejects.toMatchObject({
+      status: 409,
+      message: 'cleanup deferred; retry delete_session',
+    })
   })
 
   it('sendInput sends POST with message', async () => {
@@ -240,6 +249,14 @@ describe('API wrapper', () => {
     expect(mockFetch).toHaveBeenCalledWith('/terminals/t1', expect.objectContaining({ method: 'DELETE' }))
   })
 
+  it('deleteTerminal rejects deferred cleanup payloads', async () => {
+    mockResponse({ success: false })
+    await expect(api.deleteTerminal('t1')).rejects.toMatchObject({
+      status: 409,
+      message: 'Terminal cleanup is pending; retry delete',
+    })
+  })
+
   it('getMemoryStatus fetches /settings/memory', async () => {
     mockResponse({ enabled: true })
     const result = await api.getMemoryStatus()
@@ -370,5 +387,66 @@ describe('API wrapper', () => {
     await expect(
       api.exportGraph('memory', { sink: 'obsidian', dest: 'x' }, 'global')
     ).rejects.toMatchObject({ status: 422, detail: "export rejected: secret pattern 'aws-key' detected" })
+  })
+
+  // ── Agent Plugins ─────────────────────────────────────────────────────────
+
+  it('listPlugins fetches /plugins', async () => {
+    mockResponse({ plugins: [], untrusted_content_warning: 'w' })
+    const result = await api.listPlugins()
+    expect(result.plugins).toEqual([])
+    expect(mockFetch).toHaveBeenCalledWith('/plugins', expect.objectContaining({ signal: expect.any(AbortSignal) }))
+  })
+
+  it('installPlugin POSTs the source body to /plugins', async () => {
+    mockResponse({ installed: true })
+    await api.installPlugin({ source: 'https://github.com/o/r', ref: 'main' })
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/plugins',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ source: 'https://github.com/o/r', ref: 'main' }),
+      }),
+    )
+  })
+
+  it('validatePlugin POSTs to /plugins/validate', async () => {
+    mockResponse({ loadable: true })
+    await api.validatePlugin({ source: '/local/plugin' })
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/plugins/validate',
+      expect.objectContaining({ method: 'POST' }),
+    )
+  })
+
+  it('uninstallPlugin DELETEs the encoded name', async () => {
+    mockResponse({ removed: true })
+    await api.uninstallPlugin('my plugin')
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/plugins/my%20plugin',
+      expect.objectContaining({ method: 'DELETE' }),
+    )
+  })
+
+  it('uninstallPlugin forwards purge_data only when asked', async () => {
+    mockResponse({ removed: true })
+    await api.uninstallPlugin('demo', true)
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/plugins/demo?purge_data=true',
+      expect.objectContaining({ method: 'DELETE' }),
+    )
+  })
+
+  it('installPlugin surfaces the 422 validation detail', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 422,
+      statusText: 'Unprocessable Entity',
+      json: () => Promise.resolve({ detail: 'plugin is not loadable' }),
+    })
+    await expect(api.installPlugin({ source: '/bad' })).rejects.toMatchObject({
+      status: 422,
+      detail: 'plugin is not loadable',
+    })
   })
 })

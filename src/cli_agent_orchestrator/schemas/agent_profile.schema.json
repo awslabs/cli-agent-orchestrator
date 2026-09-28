@@ -35,6 +35,11 @@
       "type": "string",
       "description": "Provider override (e.g. claude_code, kiro_cli, codex)."
     },
+    "engine": {
+      "type": "string",
+      "enum": ["v2", "kas"],
+      "description": "Kiro engine selection."
+    },
     "allowedTools": {
       "type": "array",
       "items": {"type": "string"},
@@ -45,14 +50,19 @@
       "description": "MCP server configurations for additional tools.",
       "additionalProperties": {
         "type": "object",
+        "description": "One MCP server. A command-launched server sets 'command'; a remote server sets 'url', with 'type' naming its transport (for example 'http' or 'sse'). At least one of the two is required.",
         "properties": {
           "type": {"type": "string"},
           "command": {"type": "string"},
           "args": {"type": "array", "items": {"type": "string"}},
           "env": {"type": "object", "additionalProperties": {"type": "string"}},
-          "timeout": {"type": "integer"}
+          "timeout": {"type": "integer"},
+          "url": {"type": "string"}
         },
-        "required": ["command"]
+        "anyOf": [
+          {"required": ["command"]},
+          {"required": ["url"]}
+        ]
       }
     },
     "tools": {
@@ -83,13 +93,44 @@
     "codexConfig": {
       "type": "object"
     },
+    "claudeConfig": {
+      "type": "object"
+    },
     "hermesProfile": {
       "type": "string",
       "minLength": 1
     },
+    "grokNativeWorkflows": {
+      "type": "boolean",
+      "default": false,
+      "description": "Grok Build only. Explicitly permits Grok-native subagents, workflows, and /goal in this CAO terminal."
+    },
     "skills": {
       "type": "array",
       "items": {"type": "string"}
+    },
+    "container": {
+      "type": "object",
+      "description": "CAO-native container settings. Consumed by the provider layer, not passed through to provider JSON.",
+      "properties": {
+        "path_maps": {
+          "type": "array",
+          "description": "Host-to-guest path translations for provider files used inside a container. CAO rewrites matching prefixes using the longest match; it does not create the container or its bind mounts.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "host": {"type": "string", "minLength": 1},
+              "guest": {"type": "string", "minLength": 1}
+            },
+            "required": ["host", "guest"]
+          }
+        }
+      }
+    },
+    "provider_init_timeout": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Per-profile override, in seconds, for provider initialization. Replaces the server-wide provider_init_timeout as the hard outer cap for this profile."
     },
     "prompt": {
       "type": "string"

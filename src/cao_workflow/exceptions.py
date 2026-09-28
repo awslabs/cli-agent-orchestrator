@@ -1,8 +1,15 @@
-"""Shim exception hierarchy (E3, BR-1/BR-4/BR-6/BR-17).
+"""Shim exception hierarchy (E3, and the original WorkflowShim design's
+BR-1/BR-4/BR-6/BR-17 — NOT issue #583's ``shim-step-surface`` rules of the same
+numbers, whose BR-8 is the recovery key rather than anything here).
 
 Never caught by the shim itself — every failure raises to the author's own
 ``except`` block or crashes the script (no retry, no recovery, no silent
 fallback).
+
+Note for authors: ``ShimHTTPError`` carries a resume HALT and a resume
+DIVERGENCE as well as ordinary failures — both arrive as ``.status == 409``
+(issue #583). Because it subclasses ``ShimError``, a blanket
+``except ShimError`` absorbs them; see the authoring guide.
 """
 
 from __future__ import annotations

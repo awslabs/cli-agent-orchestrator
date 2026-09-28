@@ -15,14 +15,47 @@ from typing import Optional
 
 from libtmux.exc import LibTmuxException
 
+from cli_agent_orchestrator.agent_plugins.mcp_delivery import with_plugin_mcp as _with_plugin_mcp
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
+from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_cao_mcp_command
 from cli_agent_orchestrator.utils.terminal import wait_for_shell
 
 logger = logging.getLogger(__name__)
+
+#: CAO transport name -> the ``type`` value Copilot CLI's MCP config expects.
+#:
+#: Copilot's documented vocabulary is ``local``/``stdio`` for a command-based
+#: server, ``http`` for Streamable HTTP, and ``sse`` for the legacy transport
+#: (https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-mcp-servers).
+#: CAO and the Agent Plugins ``mcp.json`` schema use the MCP specification's
+#: ``streamable-http``, which Copilot has no case for, so the value has to be
+#: translated rather than passed through — the same defect class as
+#: ``GROK_URL_TRANSPORTS`` (review 3) and ``KIMI_TRANSPORTS`` (review 5222539218
+#: item 5), both on #584. Found by self-audit; Copilot was the site both of those
+#: rounds missed.
+#:
+#: ``stdio`` maps to itself deliberately. The vendor documents ``Local`` and
+#: ``STDIO`` as working the same way and recommends ``stdio`` for configurations
+#: shared with VS Code, the cloud agent, and other MCP clients, so rewriting it to
+#: ``local`` would trade a portable spelling for a Copilot-only one and fix
+#: nothing. Only ``streamable-http`` actually changes here.
+#:
+#: Only these spellings translate. An absent or unrecognised ``type`` is left
+#: alone: ``_map_entry`` always emits ``type`` for a plugin server, so a type-less
+#: entry came from a hand-written profile — or is CAO's own in-session server,
+#: which carries no ``type`` and works because Copilot infers a command-based
+#: server from ``command``. Inventing one would be a behaviour change beyond this
+#: finding, which is the same boundary ``KIMI_TRANSPORTS`` draws.
+COPILOT_TRANSPORTS: dict[str, str] = {
+    "stdio": "stdio",
+    "streamable-http": "http",
+    "http": "http",
+    "sse": "sse",
+}
 
 ANSI_CODE_PATTERN = r"\x1b\[[0-?]*[ -/]*[@-~]"
 OSC_PATTERN = r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"
@@ -113,14 +146,22 @@ class CopilotCliProvider(BaseProvider):
                 self._copilot_help_text_cache = ""
         return flag in self._copilot_help_text_cache
 
-    def _wait_for_shell_ready(self, timeout: float = 30.0, polling_interval: float = 0.5) -> bool:
-        """Wait for a stable non-empty shell screen using provider-safe history reads."""
+    async def _wait_for_shell_ready(
+        self, timeout: float = 30.0, polling_interval: float = 0.5
+    ) -> bool:
+        """Wait for a stable non-empty shell screen using provider-safe history reads.
+
+        issue #494: real coroutine, not sync code called from an async
+        caller (initialize()) -- the blocking history read is offloaded via
+        asyncio.to_thread and the poll delay is asyncio.sleep, so this no
+        longer blocks the shared event loop while waiting.
+        """
         start_time = time.time()
         previous_output: Optional[str] = None
         stable_reads = 0
 
         while time.time() - start_time < timeout:
-            output = self._history(tail_lines=120)
+            output = await asyncio.to_thread(self._history, tail_lines=120)
             if output and output.strip():
                 if previous_output is not None and output == previous_output:
                     stable_reads += 1
@@ -130,7 +171,7 @@ class CopilotCliProvider(BaseProvider):
                     stable_reads = 0
 
             previous_output = output
-            time.sleep(polling_interval)
+            await asyncio.sleep(polling_interval)
 
         return False
 
@@ -165,7 +206,9 @@ class CopilotCliProvider(BaseProvider):
 
         # Apply tool restrictions via --deny-tool flags.
         # --deny-tool takes precedence over --allow-all.
-        if self._allowed_tools and "*" not in self._allowed_tools:
+        # A present-but-empty list is deny-all (same as Grok). A falsy check
+        # used to skip --deny-tool entirely for allowed_tools=[].
+        if self._allowed_tools is not None and "*" not in self._allowed_tools:
             from cli_agent_orchestrator.utils.tool_mapping import get_disallowed_tools
 
             disallowed = get_disallowed_tools("copilot_cli", self._allowed_tools)
@@ -188,6 +231,38 @@ class CopilotCliProvider(BaseProvider):
                 "env": {"CAO_TERMINAL_ID": self.terminal_id},
             }
         }
+
+        # Agent Plugins: this runtime config is the only MCP configuration Copilot
+        # reads, so a plugin server absent here is a plugin server Copilot never
+        # sees. Review on #584 found it hardcoded to cao-mcp-server alone, which
+        # meant plugin MCP delivery silently did not reach this provider at all.
+        if self._agent_profile is not None:
+            try:
+                profile = _with_plugin_mcp(load_agent_profile(self._agent_profile), "copilot_cli")
+            except Exception as exc:
+                # Never block a launch on plugin delivery.
+                logger.warning(
+                    "Could not load profile '%s' for Copilot MCP config: %s",
+                    self._agent_profile,
+                    exc,
+                )
+                profile = None
+
+            for name, cfg in ((profile.mcpServers if profile else None) or {}).items():
+                if name in merged_servers:
+                    # CAO's own in-session server is not replaceable by a plugin.
+                    continue
+                entry = dict(cfg) if isinstance(cfg, dict) else cfg.model_dump(exclude_none=True)
+                declared = entry.get("type")
+                translated = COPILOT_TRANSPORTS.get(declared) if isinstance(declared, str) else None
+                if translated is not None:
+                    entry["type"] = translated
+                env = dict(entry.get("env", {}))
+                env.setdefault("CAO_TERMINAL_ID", self.terminal_id)
+                entry["env"] = env
+                entry.setdefault("disabled", False)
+                merged_servers[name] = entry
+
         return json.dumps({"mcpServers": merged_servers}, ensure_ascii=False)
 
     def _send_enter(self) -> None:
@@ -196,10 +271,23 @@ class CopilotCliProvider(BaseProvider):
     def _send_key(self, key: str) -> None:
         get_backend().send_special_key(self.session_name, self.window_name, key)
 
-    def _accept_trust_prompts(self, timeout: float = 30.0) -> None:
+    async def _accept_trust_prompts(self, timeout: float = 30.0) -> None:
+        """Poll the pane and auto-accept Copilot's folder-trust dialogs.
+
+        issue #494: real coroutine, not sync code called from an async
+        caller. Re-entered from initialize()'s polling loop (see its
+        WAITING_USER_ANSWER branch) -- that re-entrant contract is unchanged,
+        only the blocking mechanics are: ``_history`` and the ``_send_enter``/
+        ``_send_key`` backend calls are offloaded via ``asyncio.to_thread``
+        (the two helpers themselves stay sync -- they are also called
+        directly from tests and other contexts, so wrapping happens at each
+        call site here rather than making them coroutines) and every poll
+        delay is ``asyncio.sleep``, so this no longer blocks the shared event
+        loop while polling.
+        """
         start = time.time()
         while time.time() - start < timeout:
-            raw_content = self._history(tail_lines=120)
+            raw_content = await asyncio.to_thread(self._history, tail_lines=120)
             content = raw_content.lower()
 
             if (
@@ -209,8 +297,8 @@ class CopilotCliProvider(BaseProvider):
             ):
                 # The first option is pre-selected; Enter is the most reliable
                 # accept action across Copilot builds.
-                self._send_enter()
-                time.sleep(1)
+                await asyncio.to_thread(self._send_enter)
+                await asyncio.sleep(1)
                 continue
 
             if (
@@ -219,36 +307,36 @@ class CopilotCliProvider(BaseProvider):
             ) and re.search(r"\b1\.\s*yes\b", content):
                 # Option 1 is selected by default in the trust dialog; Enter is
                 # the most reliable way to accept across Copilot builds.
-                self._send_enter()
-                time.sleep(1)
+                await asyncio.to_thread(self._send_enter)
+                await asyncio.sleep(1)
                 continue
 
             if "do you trust all the actions in this folder" in content:
-                self._send_key("y")
-                self._send_enter()
-                time.sleep(1)
+                await asyncio.to_thread(self._send_key, "y")
+                await asyncio.to_thread(self._send_enter)
+                await asyncio.sleep(1)
                 continue
 
             if re.search(r"\[\s*y\s*/\s*n\s*]", content):
-                self._send_key("y")
-                self._send_enter()
-                time.sleep(1)
+                await asyncio.to_thread(self._send_key, "y")
+                await asyncio.to_thread(self._send_enter)
+                await asyncio.sleep(1)
                 continue
 
             if "confirm folder trust" in content or "press enter to continue" in content:
-                self._send_enter()
-                time.sleep(1)
+                await asyncio.to_thread(self._send_enter)
+                await asyncio.sleep(1)
                 continue
 
             if re.search(WAITING_PROMPT_PATTERN, content, re.IGNORECASE):
                 # Generic waiting prompt fallback: confirm with Enter.
-                self._send_enter()
-                time.sleep(1)
+                await asyncio.to_thread(self._send_enter)
+                await asyncio.sleep(1)
                 continue
 
             if self._has_idle_prompt_near_end(raw_content.splitlines()):
                 return
-            time.sleep(1)
+            await asyncio.sleep(1)
 
         logger.warning(
             "Trust prompt handler timed out for %s:%s",
@@ -257,6 +345,25 @@ class CopilotCliProvider(BaseProvider):
         )
 
     async def initialize(self) -> bool:
+        """Initialize the Copilot CLI provider by starting ``copilot``.
+
+        issue #494: ``self._command()`` does two blocking things --
+        ``_supports_flag`` runs a cached blocking ``subprocess.run(["copilot",
+        "--help"])`` and ``get_backend().get_pane_working_directory`` is a
+        blocking subprocess call -- and ``get_backend().send_keys`` is
+        likewise blocking. All three are offloaded via ``asyncio.to_thread``
+        so building and sending the launch command can't block the shared
+        event loop under concurrent session creation. ``status_monitor.
+        get_status`` is offloaded too: it is NOT in-memory only -- for a
+        terminal stuck in PROCESSING it can fork a real tmux capture-pane
+        subprocess (status_monitor.py's stale-PROCESSING fallback), and this
+        provider's own get_status falls back to ``self._history()`` (another
+        capture-pane) when the buffer has no visible text. Copilot init is
+        exactly the regime that trips the fallback -- cached status PROCESSING
+        while the CLI boots, pane quiet during auth/MCP startup -- and this
+        loop polls every second for up to 60s, multiplied by concurrent
+        session creations.
+        """
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
         try:
@@ -270,19 +377,22 @@ class CopilotCliProvider(BaseProvider):
                 exc,
             )
             init_timeout = get_server_settings()["provider_init_timeout"]
-            shell_ready = self._wait_for_shell_ready(timeout=init_timeout)
+            shell_ready = await self._wait_for_shell_ready(timeout=init_timeout)
 
         if not shell_ready:
             raise TimeoutError(f"Shell initialization timed out after {init_timeout}s")
 
-        get_backend().send_keys(self.session_name, self.window_name, self._command())
+        command = await asyncio.to_thread(self._command)
+        await asyncio.to_thread(
+            get_backend().send_keys, self.session_name, self.window_name, command
+        )
 
         deadline = time.time() + 60.0
-        self._accept_trust_prompts(timeout=10.0)
+        await self._accept_trust_prompts(timeout=10.0)
         while time.time() < deadline:
-            status = status_monitor.get_status(self.terminal_id)
+            status = await asyncio.to_thread(status_monitor.get_status, self.terminal_id)
             if status == TerminalStatus.WAITING_USER_ANSWER:
-                self._accept_trust_prompts(timeout=5.0)
+                await self._accept_trust_prompts(timeout=5.0)
                 await asyncio.sleep(1.0)
                 continue
             if status in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):

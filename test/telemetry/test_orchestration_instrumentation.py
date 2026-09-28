@@ -53,7 +53,7 @@ provider_stub.paste_submit_delay = 0.3
 
 terminal_service.get_terminal_metadata = lambda tid: {"tmux_session": "cao-s", "tmux_window": "w"}
 terminal_service.provider_manager.get_provider = lambda tid: provider_stub
-terminal_service.inject_memory_context = lambda msg, tid: msg
+terminal_service.inject_memory_context = lambda msg, tid, frozen=None: msg
 terminal_service.update_last_active = lambda tid: None
 terminal_service.status_monitor = MagicMock()
 terminal_service.get_backend = lambda: MagicMock()

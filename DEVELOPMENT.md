@@ -86,10 +86,10 @@ Unit tests are fast and use mocked dependencies:
 
 ```bash
 # Run all unit tests (excludes E2E and integration tests)
-uv run pytest test/ --ignore=test/e2e -m "not integration" -v
+uv run pytest -v
 
 # Run with coverage report
-uv run pytest test/ --ignore=test/e2e -m "not integration" --cov=src --cov-report=term-missing -v
+uv run pytest --cov=src --cov-report=term-missing -v
 
 # Run specific test file
 uv run pytest test/providers/test_claude_code_unit.py -v
@@ -104,11 +104,18 @@ Integration tests require the provider CLI to be installed and authenticated:
 
 ```bash
 # Run integration tests for a specific provider (example: Kiro CLI)
-uv run pytest test/providers/test_kiro_cli_integration.py -v
+uv run pytest test/providers/test_kiro_cli_integration.py -m integration -v
 
 # Skip integration tests
-uv run pytest test/providers/ -m "not integration" -v
+uv run pytest test/providers/ -v
 ```
+
+The default pytest configuration is the contributor unit-suite entry point and owns
+the marker selection. A regression test keeps integration tests and the 15 e2e-marked
+tests outside `test/e2e/` out of that suite. A command-line `-m` replaces the configured
+marker rather than composing with it, so use plain `uv run pytest` for this suite.
+For the same reason, running an integration suite requires opting back into its
+excluded marker explicitly with `-m integration`.
 
 ### E2E Tests
 
@@ -125,14 +132,29 @@ uv run pytest -m e2e test/e2e/ -v -k codex
 ### Run All Tests
 
 ```bash
-# Run all tests
+# Run everything except E2E (the `addopts` in pyproject.toml deselects e2e by default)
 uv run pytest -v
 
-# Run tests with coverage for all modules
+# Same, with coverage for all modules
 uv run pytest --cov=src --cov-report=term-missing -v
 
 # Run tests in parallel (faster)
 uv run pytest -n auto
+```
+
+### What CI runs on your pull request
+
+Run this before opening a PR — it is the exact command in `.github/workflows/ci.yml`,
+and it is a strictly larger set than the unit-test command above:
+
+```bash
+uv run pytest test/ \
+  --ignore=test/providers/test_kiro_cli_integration.py \
+  --ignore=test/e2e \
+  -m "not e2e" \
+  --cov=src/cli_agent_orchestrator --cov-report=term-missing -v
+
+uv run python scripts/validate_markdown_links.py
 ```
 
 ### Test Markers
@@ -223,10 +245,12 @@ Add or update tests in `test/`
 
 ```bash
 # Run unit tests (fast, excludes E2E and integration)
-uv run pytest test/ --ignore=test/e2e -m "not integration" -v
+uv run pytest -v
 
-# Run all tests with coverage
-uv run pytest test/ --ignore=test/e2e --cov=src --cov-report=term-missing -v
+# Run the larger CI suite with coverage (see the exact command above)
+uv run pytest test/ --ignore=test/providers/test_kiro_cli_integration.py \
+  --ignore=test/e2e -m "not e2e" --cov=src/cli_agent_orchestrator \
+  --cov-report=term-missing -v
 ```
 
 ### 5. Check Code Quality
@@ -256,7 +280,7 @@ Create a pull request on GitHub. CI will automatically run tests and code qualit
 Runs on all pushes to `main` and all PRs targeting `main`:
 - **Unit tests**: Python 3.10, 3.11, 3.12 matrix with coverage
 - **Code quality**: black, isort, mypy
-- **Security scan**: Trivy vulnerability scanner (CRITICAL/HIGH)
+- **Security scan**: Trivy filesystem scan — fails on a finding of **any** severity (see [SECURITY.md](SECURITY.md#running-security-scans-locally) for why the workflow's `CRITICAL,HIGH` input is ignored)
 - **Dependency review**: License and vulnerability checks on PRs
 
 ### Provider-Specific Workflows (path-triggered)
@@ -270,6 +294,16 @@ Each provider has a dedicated workflow that runs only when its files change:
 | `test-kiro-cli-provider.yml` | `test_kiro_cli_unit.py` | `providers/kiro_cli.py`, `test/providers/**` |
 
 Each includes unit tests (Python 3.10/3.11/3.12) and code quality checks (black, isort, mypy).
+
+### Docs Site Workflow (`gh-pages.yml`)
+
+Builds the Docusaurus site (`docusaurus/`) on every PR and push to `main` for a
+build signal, but only **deploys** to GitHub Pages on the upstream repo
+(`awslabs/cli-agent-orchestrator`) by default — forks don't have Pages enabled,
+so `actions/deploy-pages` would otherwise fail with a 404. Fork maintainers can
+opt in by enabling GitHub Pages in their fork and setting the `DEPLOY_DOCS_PAGES`
+repository variable to `true`; see [docusaurus/README.md](docusaurus/README.md#deploying-on-a-fork)
+for the full steps.
 
 ## Working with Providers
 
@@ -285,7 +319,7 @@ which kiro
 kiro --help
 
 # Run that provider's integration tests
-uv run pytest test/providers/test_kiro_cli_integration.py -v
+uv run pytest test/providers/test_kiro_cli_integration.py -m integration -v
 ```
 
 The same pattern applies to every provider that ships an `<provider>_integration.py` file — substitute the binary and the test filename.

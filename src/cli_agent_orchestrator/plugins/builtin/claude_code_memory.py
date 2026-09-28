@@ -14,13 +14,15 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from cli_agent_orchestrator.clients.database import get_terminal_metadata
-from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.plugins import PostCreateTerminalEvent, hook
 from cli_agent_orchestrator.plugins.base import CaoPlugin
-from cli_agent_orchestrator.services.memory_service import MemoryService
 from cli_agent_orchestrator.utils.atomic_file import locked_atomic_rewrite
+
+if TYPE_CHECKING:
+    from cli_agent_orchestrator.backends.base import TerminalBackend
+    from cli_agent_orchestrator.services.memory_service import MemoryService as _MemoryService
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +33,57 @@ BEGIN_MARKER = "<!-- cao-memory:begin -->"
 END_MARKER = "<!-- cao-memory:end -->"
 CLAUDE_FILENAME = "CLAUDE.md"
 CLAUDE_DIR = ".claude"
+
+
+def get_backend() -> "TerminalBackend":
+    """Resolve the backend only on the server-side handler path."""
+    from cli_agent_orchestrator.backends.registry import get_backend as _get_backend
+
+    return _get_backend()
+
+
+def remote_memory_url() -> str | None:
+    """Resolve the memory gateway only on the server-side handler path."""
+    from cli_agent_orchestrator.services.memory_gateway import (
+        remote_memory_url as _remote_memory_url,
+    )
+
+    return _remote_memory_url()
+
+
+def memory_context_for_terminal(terminal_id: str, task_description: str = "") -> str:
+    """Delegate to the memory gateway without importing it during discovery."""
+    from cli_agent_orchestrator.services.memory_gateway import (
+        memory_context_for_terminal as _memory_context_for_terminal,
+    )
+
+    return _memory_context_for_terminal(terminal_id, task_description)
+
+
+def MemoryService() -> "_MemoryService":
+    """Construct the local service without importing it during discovery."""
+    from cli_agent_orchestrator.services.memory_service import MemoryService as _MemoryService
+
+    return _MemoryService()
+
+
+def get_terminal_metadata(terminal_id: str):
+    """Lazy indirection onto ``clients.database.get_terminal_metadata``.
+
+    Deliberately a wrapper rather than a module-level import. These plugins are
+    discovered through the ``cao.plugins`` entry points, and that discovery also
+    runs in the AGENT's MCP process (``register_mcp_server_surfaces`` is called at
+    MCP server import). A module-level import therefore ran ``clients.database``'s
+    import-time ``_ensure_db_dir()`` -> ``DB_DIR.mkdir()`` inside every agent
+    process: a filesystem side effect on agent startup that also fails outright
+    wherever the data dir is unreadable. This handler only ever fires
+    server-side, so resolving the symbol on call costs nothing.
+    """
+    from cli_agent_orchestrator.clients.database import (
+        get_terminal_metadata as _get_terminal_metadata,
+    )
+
+    return _get_terminal_metadata(terminal_id)
 
 
 class ClaudeCodeMemoryPlugin(CaoPlugin):
@@ -67,7 +120,13 @@ class ClaudeCodeMemoryPlugin(CaoPlugin):
             return
 
         try:
-            context_block = MemoryService().get_memory_context_for_terminal(event.terminal_id)
+            if remote_memory_url():
+                context_block = await asyncio.to_thread(
+                    memory_context_for_terminal,
+                    event.terminal_id,
+                )
+            else:
+                context_block = MemoryService().get_memory_context_for_terminal(event.terminal_id)
         except Exception as exc:
             logger.warning(
                 "claude_code_memory: memory fetch failed for %s: %s",
@@ -109,7 +168,7 @@ class ClaudeCodeMemoryPlugin(CaoPlugin):
     # helpers
 
     def _resolve_working_directory(self, event: PostCreateTerminalEvent) -> str | None:
-        """Look up the tmux pane's working directory for the terminal."""
+        """Look up the pane's working directory for the terminal via backend."""
 
         metadata = get_terminal_metadata(event.terminal_id)
         if metadata is None:
@@ -120,7 +179,7 @@ class ClaudeCodeMemoryPlugin(CaoPlugin):
         if not session_name or not window_name:
             return None
 
-        return tmux_client.get_pane_working_directory(session_name, window_name)
+        return get_backend().get_pane_working_directory(session_name, window_name)
 
     def _validated_target_path(self, working_directory: str) -> Path:
         """Return <cwd>/.claude/CLAUDE.md, rejecting paths that escape the cwd.

@@ -37,10 +37,24 @@ def full_env(monkeypatch):
 
 
 def _success_response(terminal_id="term-1", last_message="hi", status="COMPLETED"):
+    """A 200 body shaped like ``RunStepResponse``.
+
+    ``replayed`` is present because the server ALWAYS serialises it — the field
+    is non-optional with a ``False`` default — and the shim reads it by direct
+    indexing rather than a defaulting ``.get`` (issue #583, BR-3): a defaulting
+    read would silently re-manufacture the false ``replayed=False`` that flag
+    exists to eliminate. A fixture omitting it would model a wire contract that
+    does not exist. Replay-specific assertions live in ``test_step_surface.py``.
+    """
     return _Response(
         status=200,
         body=json.dumps(
-            {"terminal_id": terminal_id, "last_message": last_message, "status": status}
+            {
+                "terminal_id": terminal_id,
+                "last_message": last_message,
+                "status": status,
+                "replayed": False,
+            }
         ),
     )
 

@@ -1,0 +1,13 @@
+schemaVersion: 1
+id: example-learning
+project: example-project
+intent: example-intent
+space: default
+destination: project
+heading: Corrections
+rule: Replace with one durable, testable practice.
+evidence:
+  - Describe the observed behavior and why this rule should persist.
+source:
+  stage: build-and-test
+baseRevision: "0000000000000000000000000000000000000000000000000000000000000000"

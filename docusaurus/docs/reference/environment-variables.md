@@ -1,0 +1,106 @@
+---
+sidebar_position: 3
+---
+
+# Environment Variables
+
+CAO uses `CAO_*` environment variables as one tier in the configuration precedence chain: CLI flag > env var > settings.json > default.
+
+## Wired Through ConfigService
+
+These variables map 1:1 to a `settings.json` key. Setting either the env var or the file key has the same runtime effect.
+
+| Env Var | Config Path | Type | Default |
+|---------|-------------|------|---------|
+| `CAO_TERMINAL_BACKEND` | `terminal.backend` | str | `"tmux"` |
+| `CAO_HERDR_SESSION` | `terminal.herdr_session` | str | `"cao"` |
+| `CAO_MCP_APPS_ENABLED` | `apps.enabled` | bool | `false` |
+| `CAO_MCP_APPS_STATIC_DIR` | `apps.static_dir` | str | `null` |
+| `CAO_LOG_LEVEL` | `logging.level` | str | `"INFO"` |
+| `CAO_MEMORY_ENABLED` | `memory.enabled` | bool | `true` |
+| `CAO_MEMORY_COMPILE_MODE` | `memory.compile_mode` | str | `"llm"` |
+| `CAO_MEMORY_FLUSH_THRESHOLD` | `memory.flush_threshold` | float | `0.85` |
+| `CAO_MEMORY_LINT_ENABLED` | `memory.lint_enabled` | bool | `true` |
+| `CAO_MCP_REQUEST_TIMEOUT` | `server.mcp_request_timeout` | int | `30` |
+| `CAO_EVENT_BUS_MAX_QUEUE_SIZE` | `server.event_bus_max_queue_size` | int | `1024` |
+| `CAO_PROVIDER_INIT_TIMEOUT` | `server.provider_init_timeout` | int | `60` |
+| `CAO_STARTUP_PROMPT_HANDLER_TIMEOUT` | `server.startup_prompt_handler_timeout` | int | `20` |
+
+## Network and Auth (Env-Var Only)
+
+These have schema entries but only the env var is actually honored at runtime.
+
+| Env Var | Purpose | Notes |
+|---------|---------|-------|
+| `CAO_ALLOWED_HOSTS` | Extend Host header allowlist for TrustedHostMiddleware | Comma-separated; extends (not replaces) loopback defaults |
+| `CAO_CORS_ORIGINS` | Extend browser origins permitted by CORS | Comma-separated |
+| `CAO_WS_ALLOWED_CLIENTS` | Extend client IPs permitted to attach to PTY WebSocket | Comma-separated; security-sensitive |
+| `CAO_FORWARDED_ALLOW_IPS` | Trusted proxy IPs for X-Forwarded-For parsing | Comma-separated |
+| `CAO_AUTH_JWKS_URI` | IdP JWKS endpoint (activates auth when set) | Bearer tokens are then RS256 JWTs verified against this JWKS |
+| `CAO_AUTH_AUDIENCE` | Expected token audience | IdP mode only |
+| `CAO_AUTH_ISSUER` | Issuer for RFC 9728 PRM endpoint | IdP mode only |
+| `CAO_AUTH_LOCAL_TOKEN` | Shared-secret bearer token. Set **alone** (no IdP) it activates auth: every scope-gated route, the PTY WebSocket handshake and the AG-UI stream must present this value as a bearer (compared after trimming surrounding whitespace; a blank value leaves auth off), and anything else is refused: HTTP 401, or close code 4401 on the WebSocket. Routes that stay open in every mode are listed under "Default posture" in the configuration guide. Set **together with** an IdP it is instead the machine JWT CAO's own clients forward on their internal calls. | Security-sensitive. Generate with `openssl rand -hex 32`. With none of the three auth variables set, the API trusts every caller that can reach its port (loopback by default, so every process and user on the host). |
+
+## Remote Fleets (Env-Var Only)
+
+These two are read directly by `utils/fleet.py` and have no schema entry, no
+`settings.json` key, and no default. They are the entire configuration of
+[`cao fleet` and `cao worker`](cli-commands.md#cao-fleet): without both, every
+subcommand exits with `No fleet configured.` rather than falling back to the
+`cao-server` on this machine.
+
+| Env Var | Purpose | Notes |
+|---------|---------|-------|
+| `CAO_ELASTIC_BROKER_URL` | Base URL of the fleet's worker broker | e.g. `http://127.0.0.1:9890` after a port-forward |
+| `CAO_ELASTIC_BROKER_TOKEN` | Shared secret sent as `X-CAO-Broker-Token` | Security-sensitive: it authorizes releasing workers and sending input to their agents, so treat it as a write credential |
+
+A supervisor pod in a CAO cluster already has both set, which is why
+`cao fleet status` needs no setup when run inside one.
+
+## Server and Runtime
+
+| Env Var | Purpose | Default |
+|---------|---------|---------|
+| `CAO_API_HOST` | Bind address for cao-server | `127.0.0.1` |
+| `CAO_API_PORT` | Port for cao-server | `9889` |
+| `CAO_PYTE_STATUS` | Enable pyte-rendered status detection | `true` |
+| `CAO_EAGER_INBOX_DELIVERY` | Deliver inbox messages during PROCESSING for capable providers | `false` |
+| `CAO_ENABLE_WORKING_DIRECTORY` | Enable `working_directory` parameter on orchestration tools | `false` |
+| `CAO_ENABLE_SENDER_ID_INJECTION` | Auto-append supervisor terminal ID to assign messages | `true` |
+
+## Per-Terminal (Set Automatically)
+
+These are set by CAO on each terminal's environment and used for routing/identification. Do not set them manually.
+
+| Env Var | Purpose |
+|---------|---------|
+| `CAO_TERMINAL_ID` | Unique 8-char hex ID for this terminal (set by tmux session env) |
+| `CAO_SESSION_NAME` | Name of the parent CAO session (herdr backend only; the default tmux backend sets just `CAO_TERMINAL_ID`) |
+| `CAO_WORKFLOW_RUN_ID` | Workflow run identifier (when executing a workflow) |
+| `CAO_WORKFLOW_STEP_ID` | Current workflow step identifier |
+| `CAO_WORKFLOW_GENERATION` | Run generation, incremented on resume |
+
+## Provider-Specific
+
+| Env Var | Purpose |
+|---------|---------|
+| `CAO_AGENTS_DIR` | Override Kiro CLI agent directory (default: `~/.kiro/agents`) |
+| `CAO_GRAPH_EXPORT_ROOT` | Override graph export confinement root |
+| `CAO_PROFILE_ALLOWED_HOSTS` | Allowlist for profile install from URLs (comma-separated) |
+
+## Managed Environment File
+
+CAO also supports a managed `.env` file at `~/.aws/cli-agent-orchestrator/.env`. Values here are substituted into agent profiles when they are loaded or installed &mdash; they are **not** injected into the agent's terminal environment. To pass real environment variables to a session, use `cao launch --env KEY=VALUE`. Manage the file with:
+
+```bash
+# Set a variable
+cao env set MY_API_KEY sk-abc123
+
+# List variables
+cao env list
+
+# Remove a variable
+cao env unset MY_API_KEY
+```
+
+Variables in the `.env` file can be referenced in agent profiles using `${VAR}` syntax. Flow prompts use a separate mechanism: `[[key]]` placeholders filled from the flow script's JSON `output` object.

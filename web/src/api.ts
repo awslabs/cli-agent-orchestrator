@@ -1,4 +1,36 @@
-const BASE = ''  // Vite proxy handles routing to backend
+/**
+ * Path prefix this bundle is served under, with no trailing slash.
+ *
+ * Vite fills `import.meta.env.BASE_URL` from the `base` config (or `--base` on
+ * the CLI) and always terminates it with a slash. A default build therefore
+ * gives `/`, so BASE is `''` and every URL built below is byte-identical to the
+ * root-absolute paths it replaced. Only a build that opts in with
+ * `--base=/some/prefix/` sees a different value.
+ *
+ * `--base` on its own is not enough to serve the app under a prefix: Vite
+ * rewrites the asset references baked into index.html and the bundle, but it
+ * cannot touch a URL the app assembles at runtime, because those are ordinary
+ * strings it never sees as URLs. The three helpers here are those runtime URLs
+ * — REST, the terminal WebSocket, the workflow event stream — and they are the
+ * whole set (`DashboardHome`'s `fetch` is a local that shadows the global and
+ * calls `api.getTerminalStatus`).
+ *
+ * A relative `--base` such as `./` cannot work for runtime calls and is not
+ * supported; use an absolute prefix.
+ */
+const BASE = import.meta.env.BASE_URL.replace(/\/$/, '')
+
+/** URL for the terminal's xterm WebSocket, honouring BASE. */
+export function terminalSocketUrl(terminalId: string): string {
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
+  return `${protocol}//${location.host}${BASE}/terminals/${terminalId}/ws`
+}
+
+/** URL for a workflow run's SSE event stream, honouring BASE. */
+export function eventStreamUrl(runId: string, afterSeq?: number): string {
+  const q = afterSeq != null ? `?after_seq=${afterSeq}` : ''
+  return `${BASE}/workflows/runs/${encodeURIComponent(runId)}/events${q}`
+}
 
 /**
  * Error thrown by fetchJSON on a non-OK response. Carries the HTTP status and
@@ -42,7 +74,17 @@ async function fetchJSON<T>(url: string, opts?: RequestInit & { timeoutMs?: numb
       err.detailMeta = detailMeta
       throw err
     }
-    return res.json()
+    // A 204 No Content — e.g. the workflow-run DELETE (U7/#504) — has no JSON
+    // to parse. Neither does ANY successful response whose body is empty or
+    // whitespace-only, which is a real deployment condition on this
+    // SSE-adjacent surface: an intermediary proxy can strip a body. Read the
+    // body as text once and parse it ourselves so both cases return undefined
+    // instead of letting res.json() throw. Additive: every pre-existing
+    // endpoint returns a non-empty JSON body, so existing callers are
+    // unaffected.
+    const text = await res.text()
+    if (text.trim() === '') return undefined as T
+    return JSON.parse(text) as T
   } finally {
     clearTimeout(timeout)
   }
@@ -93,6 +135,77 @@ export interface AgentProfileInfo {
   // Other enabled directories that also define this profile name (the winner
   // above is what loads). Empty/absent when the name is unique. (GH #280)
   duplicated_in?: string[]
+}
+
+/**
+ * One row from `GET /agents/profiles/search`. The backend contract
+ * (services/profile_search.py RESULT_FIELDS) is metadata-only: the profile
+ * prompt body is never returned. `score` = `coverage` + a BM25 tie-break
+ * fraction below 1, so descending score always agrees with the server's
+ * result order — the client must preserve that order, never re-sort.
+ */
+export interface ProfileSearchResult {
+  name: string
+  description: string
+  capabilities: string[]
+  tags: string[]
+  role: string
+  source: AgentProfileSource
+  coverage: number
+  score: number
+}
+
+/**
+ * Parsed profile from `GET /agents/profiles/{name}`. This response is
+ * *resolved* (env-var placeholders substituted) — fine for display, but an
+ * editor must load `GET /agents/profiles/{name}/source` instead so a save
+ * never persists resolved secrets. Only the fields the detail pane renders
+ * are declared; the endpoint returns the full model with nulls excluded.
+ */
+export interface AgentProfileDetail {
+  name: string
+  description: string
+  provider?: string
+  model?: string
+  role?: string
+  tags?: string[]
+  capabilities?: string[]
+}
+
+/** One scaffold template from `GET /agents/profiles/templates`. `name` is `category/name`. */
+export interface TemplateSummary {
+  name: string
+  description: string
+}
+
+/**
+ * One finding from the profile validator, shared by
+ * `POST /agents/profiles/validate` and the write routes' `warnings`.
+ */
+export interface ProfileValidationMessage {
+  severity: 'error' | 'warning'
+  message: string
+  path?: string | null
+}
+
+export interface ProfileValidationResponse {
+  valid: boolean
+  messages: ProfileValidationMessage[]
+}
+
+/**
+ * Outcome of a profile create or replace. `warnings` carries advisory
+ * findings that did not block the write; error findings reject with 400
+ * (detail shape `{message, errors}`) and never reach here.
+ */
+export interface ProfileWriteResponse {
+  name: string
+  warnings: ProfileValidationMessage[]
+}
+
+export interface TemplatePreview {
+  template: string
+  content: string
 }
 
 export interface AgentDirsSettings {
@@ -189,9 +302,337 @@ export interface GraphExportResult {
   dest: string
 }
 
+// ── Workflow run journal (Issue #504 / U8) ──────────────────────────────
+// Wire shapes for the durable workflow-run read APIs consumed by the
+// Workflows web surface. Each interface mirrors a server Pydantic model in
+// src/cli_agent_orchestrator/api/main.py (RunInspection, StepInspection,
+// EventTimelinePage, RunComparison, DiagnosticBundle) or a sibling-intent
+// (#505) shape (RunSummaryRow). All read-only over already-built endpoints;
+// U8 adds NO server code.
+
+/**
+ * One durable event row (server EventRow, workflow_journal.py — all 21 columns).
+ * `seq` is the SOLE ordering authority (never order by `ts`). The two
+ * `terminal_offset_*` fields are the null-offset seam: currently ALWAYS null until
+ * offset-capture emission is wired — SyncedTerminalPane degrades gracefully
+ * on null and lights up unchanged the moment they populate.
+ */
+export interface WorkflowEvent {
+  run_id: string
+  seq: number
+  event_type: string
+  event_schema_version: number
+  ts: string
+  step_id?: string | null
+  attempt?: number | null
+  state?: string | null
+  elapsed_ms?: number | null
+  provider?: string | null
+  agent_profile?: string | null
+  engine?: string | null
+  terminal_id?: string | null
+  terminal_offset_start?: number | null
+  terminal_offset_len?: number | null
+  error_kind?: string | null
+  reason?: string | null
+  validation_result?: string | null
+  output_ref?: string | null
+  iteration?: number | null
+  which_guard_fired?: string | null
+}
+
+/**
+ * A DECLARED hole in a run's event sequence (server GapMarker). The API
+ * declares gaps as data — the client renders exactly what it is told and
+ * NEVER infers a gap from event numbering (BR-4).
+ */
+export interface GapMarker {
+  after_seq: number
+  before_seq: number
+  missing_count: number
+  reason: string
+}
+
+/** One step's durable projection inside a RunInspection (server StepInspection). */
+export interface StepInspection {
+  id: string
+  state: string
+  attempts: number
+  output_json?: string | null
+  error?: string | null
+  error_kind?: string | null
+  terminal_id?: string | null
+  reprompted?: number | null
+  call_fingerprint?: string | null
+}
+
+/** Enriched single-run inspection (server RunInspection, FR-5.1). */
+export interface RunInspection {
+  run_id: string
+  workflow_name: string
+  state: string
+  current_step_id?: string | null
+  started_at: string
+  finished_at?: string | null
+  tier: string
+  steps: StepInspection[]
+}
+
+/** A batch page of a run's ordered event timeline (server EventTimelinePage). */
+export interface EventTimelinePage {
+  events: WorkflowEvent[]
+  gaps: GapMarker[]
+  next_after_seq: number | null
+}
+
+/** An offset-ranged terminal-log read (server TerminalOutputRange, U5/FR-4.3). */
+export interface TerminalOutputRange {
+  terminal_id: string
+  offset: number
+  length: number
+  data: string
+}
+
+/** One run's side of an aligned comparison step (server StepComparisonSide). */
+export interface StepComparisonSide {
+  attempts: number
+  duration_ms?: number | null
+  provider?: string | null
+  agent_profile?: string | null
+  validation?: string | null
+  state: string
+  error_kind?: string | null
+  reprompted?: number | null
+}
+
+/**
+ * One aligned step across two runs (server StepComparison). `status` is
+ * `aligned` | `added` (only in compare) | `removed` (only in baseline) — a
+ * step present in one run and absent in the other is ALWAYS surfaced (BR-1).
+ */
+export interface StepComparison {
+  step_id: string
+  status: 'aligned' | 'added' | 'removed' | string
+  a?: StepComparisonSide | null
+  b?: StepComparisonSide | null
+}
+
+/** A reference-level output/artifact difference for an aligned step (server OutputDiff). */
+export interface OutputDiff {
+  step_id: string
+  a_refs: string[]
+  b_refs: string[]
+}
+
+/** Compare two runs by aligned step (server RunComparison, FR-8). */
+export interface RunComparison {
+  baseline_run_id: string
+  compare_run_id: string
+  steps: StepComparison[]
+  output_diffs: OutputDiff[]
+}
+
+/** A step's terminal outcome inside a DiagnosticBundle (server StepOutcome). */
+export interface StepOutcome {
+  step_id: string
+  state: string
+  error_kind?: string | null
+}
+
+/** Provider/agent/engine metadata for a bundle (server BundleEnvironment). */
+export interface BundleEnvironment {
+  providers: string[]
+  agent_profiles: string[]
+  engines: string[]
+}
+
+/** A terminal-log offset-range reference in a bundle (server TerminalReference). */
+export interface TerminalReference {
+  terminal_id: string
+  offset_start?: number | null
+  offset_len?: number | null
+}
+
+/** Terminal + artifact references for a bundle (server BundleReferences). */
+export interface BundleReferences {
+  terminals: TerminalReference[]
+  artifacts: string[]
+}
+
+/** A retention-safe, size-limited output excerpt (server BundleExcerpt). */
+export interface BundleExcerpt {
+  step_id: string
+  excerpt: string
+}
+
+/** A run's troubleshooting export bundle (server DiagnosticBundle, FR-9). */
+export interface DiagnosticBundle {
+  spec_id: string
+  spec_content_hash: string
+  inputs: string
+  events: WorkflowEvent[]
+  gaps: GapMarker[]
+  step_outcomes: StepOutcome[]
+  environment: BundleEnvironment
+  references: BundleReferences
+  excerpts: BundleExcerpt[]
+  capture_enabled: boolean
+}
+
+/**
+ * The run-list row owned by sibling intent #505 (FINAL, stable shape — #505 is
+ * done). CONSUMED here, not built. `GET /workflows/runs` returns an array of
+ * these; U8 never reimplements the list endpoint.
+ */
+export interface RunSummaryRow {
+  run_id: string
+  workflow_name: string
+  state: string
+  tier: string
+  started_at: string
+  finished_at: string | null
+  current_step_id: string | null
+}
+
+// ── Agent Plugins (Agent Plugins 1.0.0) ──────────────────────────────────────
+// Distinct from CAO's event-plugin system, which has no web surface.
+
+export interface PluginFinding {
+  severity: 'fatal' | 'skipped' | 'warning' | 'info'
+  code: string
+  /** The specification clause this finding enforces, e.g. "§5.2". */
+  spec_ref: string
+  message: string
+  path: string | null
+}
+
+export interface PluginDiscoveredSkill {
+  name: string
+  directory: string
+  description: string
+}
+
+/** A live session whose profile references a skill a removal would withdraw. */
+export interface PluginAffectedSession {
+  terminal_id: string
+  session_name: string
+  profile_name: string
+  skill_names: string[]
+}
+
+export interface InstalledPlugin {
+  name: string
+  version: string | null
+  source: { kind: string; location: string; ref: string | null; subdir: string | null }
+  resolved_ref: string | null
+  installed_at: string
+  schema_id: string
+  skill_names: string[]
+  projected_skill_names: string[]
+  findings: PluginFinding[]
+  affected_sessions: PluginAffectedSession[]
+}
+
+export interface PluginListResponse {
+  plugins: InstalledPlugin[]
+  untrusted_content_warning: string
+}
+
+export interface PluginValidationReport {
+  root: string
+  loadable: boolean
+  name: string | null
+  version: string | null
+  description: string | null
+  schema_id: string | null
+  skills: PluginDiscoveredSkill[]
+  mcp_present: boolean
+  findings: PluginFinding[]
+}
+
+export interface PluginInstallOutcome {
+  installed: boolean
+  dry_run: boolean
+  report: PluginValidationReport
+  record: InstalledPlugin | null
+  projection_findings: PluginFinding[]
+}
+
+export interface PluginUninstallOutcome {
+  name: string
+  removed: boolean
+  purged_data: boolean
+  affected_sessions: PluginAffectedSession[]
+  projection_findings: PluginFinding[]
+}
+
+export interface PluginInstallBody {
+  source: string
+  kind?: 'path' | 'git'
+  ref?: string
+  subdir?: string
+  force?: boolean
+}
+
 export const api = {
   // Agent Profiles & Providers
   listProfiles: () => fetchJSON<AgentProfileInfo[]>('/agents/profiles'),
+  // Server-ranked search. Result order is the relevance ranking — render as-is.
+  searchProfiles: (q: string, limit?: number) =>
+    fetchJSON<ProfileSearchResult[]>(`/agents/profiles/search?q=${encodeURIComponent(q)}${limit ? `&limit=${limit}` : ''}`),
+  getProfile: (name: string) => fetchJSON<AgentProfileDetail>(`/agents/profiles/${encodeURIComponent(name)}`),
+  // Profile authoring (issue #510).
+  getProfileSchema: () => fetchJSON<Record<string, any>>('/agents/profiles/schema'),
+  listProfileTemplates: () => fetchJSON<TemplateSummary[]>('/agents/profiles/templates'),
+  // The template identifier is `category/name` and travels as two path
+  // segments — the backend route is declared as
+  // `/templates/{category}/{name}/schema` — so the slash must NOT be encoded.
+  getTemplateSchema: (template: string) =>
+    fetchJSON<Record<string, any>>(`/agents/profiles/templates/${template.split('/').map(encodeURIComponent).join('/')}/schema`),
+  previewTemplate: (template: string, config: Record<string, unknown>) =>
+    fetchJSON<TemplatePreview>('/agents/profiles/templates/preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ template, config }),
+      // Authoring calls run the full validator server-side; the 10s
+      // default turns a slow round-trip into a phantom 'Validation failed'.
+      timeoutMs: 30000
+    }),
+  validateProfile: (content: string) =>
+    fetchJSON<ProfileValidationResponse>('/agents/profiles/validate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content }),
+      // Authoring calls run the full validator server-side; the 10s
+      // default turns a slow round-trip into a phantom 'Validation failed'.
+      timeoutMs: 30000
+    }),
+  createProfile: (name: string, content: string) =>
+    fetchJSON<ProfileWriteResponse>('/agents/profiles', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, content }),
+      // Authoring calls run the full validator server-side; the 10s
+      // default turns a slow round-trip into a phantom 'Validation failed'.
+      timeoutMs: 30000
+    }),
+  // The authoring read: returns the document exactly as stored, with env-var
+  // placeholders intact. An editor MUST read from here — the parsed
+  // GET /agents/profiles/{name} is resolved, and round-tripping it through a
+  // write would persist resolved secrets into a plaintext profile.
+  getProfileSource: (name: string) =>
+    fetchJSON<{ name: string; content: string }>(`/agents/profiles/${encodeURIComponent(name)}/source`),
+  replaceProfile: (name: string, content: string) =>
+    fetchJSON<ProfileWriteResponse>(`/agents/profiles/${encodeURIComponent(name)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content }),
+      // Authoring calls run the full validator server-side; the 10s
+      // default turns a slow round-trip into a phantom 'Validation failed'.
+      timeoutMs: 30000
+    }),
+  deleteProfile: (name: string) =>
+    fetchJSON<void>(`/agents/profiles/${encodeURIComponent(name)}`, { method: 'DELETE' }),
   listProviders: () => fetchJSON<ProviderInfo[]>('/agents/providers'),
 
   // Settings
@@ -208,7 +649,16 @@ export const api = {
   getSession: (name: string) => fetchJSON<SessionDetail>(`/sessions/${name}`),
   createSession: (provider: string, agentProfile: string, sessionName?: string, workingDirectory?: string) =>
     fetchJSON<Terminal>(`/sessions?provider=${encodeURIComponent(provider)}&agent_profile=${encodeURIComponent(agentProfile)}${sessionName ? `&session_name=${encodeURIComponent(sessionName)}` : ''}${workingDirectory ? `&working_directory=${encodeURIComponent(workingDirectory)}` : ''}`, { method: 'POST', timeoutMs: 90000 }),
-  deleteSession: (name: string) => fetchJSON<{ success: boolean; deleted: string[]; errors: any[] }>(`/sessions/${name}`, { method: 'DELETE' }),
+  deleteSession: async (name: string) => {
+    const result = await fetchJSON<{ success: boolean; deleted: string[]; errors: any[] }>(`/sessions/${name}`, { method: 'DELETE' })
+    if (!result?.success || (result.errors && result.errors.length > 0)) {
+      const err: ApiError = new Error(result?.errors?.[0]?.error || 'Session cleanup is pending; retry delete')
+      err.status = 409
+      err.detail = err.message
+      throw err
+    }
+    return result
+  },
 
   // Terminals
   getTerminalStatus: (id: string) =>
@@ -219,7 +669,16 @@ export const api = {
     fetchJSON<{ success: boolean }>(`/terminals/${id}/input?message=${encodeURIComponent(message)}`, { method: 'POST' }),
   exitTerminal: (id: string) =>
     fetchJSON<{ success: boolean }>(`/terminals/${id}/exit`, { method: 'POST' }),
-  deleteTerminal: (id: string) => fetchJSON<{ success: boolean }>(`/terminals/${id}`, { method: 'DELETE' }),
+  deleteTerminal: async (id: string) => {
+    const result = await fetchJSON<{ success: boolean }>(`/terminals/${id}`, { method: 'DELETE' })
+    if (!result?.success) {
+      const err: ApiError = new Error('Terminal cleanup is pending; retry delete')
+      err.status = 409
+      err.detail = err.message
+      throw err
+    }
+    return result
+  },
   getWorkingDirectory: (id: string) =>
     fetchJSON<{ working_directory: string | null }>(`/terminals/${id}/working-directory`),
   addTerminalToSession: (sessionName: string, provider: string, agentProfile: string, workingDirectory?: string) =>
@@ -297,4 +756,82 @@ export const api = {
       },
     )
   },
+
+  // ── Workflow run journal (Issue #504 / U8) — read + delete over the
+  // already-built durable-journal APIs. All additive; no server code here.
+
+  // #505's run list (FINAL RunSummaryRow shape). Consumed, not built.
+  listWorkflowRuns: () => fetchJSON<RunSummaryRow[]>('/workflows/runs'),
+
+  // U3 inspect — enriched single-run projection (journal-authoritative).
+  inspectWorkflowRun: (runId: string) =>
+    fetchJSON<RunInspection>(`/workflows/runs/${encodeURIComponent(runId)}`),
+
+  // U3/U4 batch event page. `afterSeq` is the replay/next-page cursor (events
+  // with seq strictly greater); omit to read from the start of the timeline.
+  getWorkflowRunEvents: (runId: string, afterSeq?: number) => {
+    const q = afterSeq != null ? `?after_seq=${afterSeq}` : ''
+    return fetchJSON<EventTimelinePage>(`/workflows/runs/${encodeURIComponent(runId)}/events${q}`)
+  },
+
+  // U6 compare — aligned-step diff of the path run against `against` (BR-1:
+  // added/removed steps always surfaced; a missing side is a 404).
+  compareWorkflowRuns: (runId: string, against: string) =>
+    fetchJSON<RunComparison>(
+      `/workflows/runs/${encodeURIComponent(runId)}/compare?against=${encodeURIComponent(against)}`,
+    ),
+
+  // U6 diagnostics — the run's troubleshooting bundle (redaction + size limits
+  // are enforced server-side; this is a plain read).
+  getWorkflowRunDiagnostics: (runId: string) =>
+    fetchJSON<DiagnosticBundle>(`/workflows/runs/${encodeURIComponent(runId)}/diagnostics`, {
+      timeoutMs: 30000,
+    }),
+
+  // U7 delete — cascade-delete a run's durable data. 204 No Content on success
+  // (fetchJSON returns undefined). Idempotent server-side (unknown id -> 204).
+  deleteWorkflowRun: (runId: string) =>
+    fetchJSON<void>(`/workflows/runs/${encodeURIComponent(runId)}`, { method: 'DELETE' }),
+
+  // U5 terminal offset-range read — the bytes produced around a selected event
+  // (FR-7.3). Called by SyncedTerminalPane only when an event carries non-null
+  // terminal_offset_start/len (the null-offset seam). `length` is capped server-side.
+  getTerminalOutputRange: (terminalId: string, offset: number, length: number) =>
+    fetchJSON<TerminalOutputRange>(
+      `/terminals/${encodeURIComponent(terminalId)}/output/range?offset=${offset}&length=${length}`,
+    ),
+  // Agent Plugins. Install clones or copies a whole package tree and rebuilds
+  // the skill projection, so it gets a wider timeout than the 10s default —
+  // a git source has a network fetch in the middle of it.
+  //
+  // 330_000 is derived, not chosen: the server's clone budget is
+  // `GIT_TIMEOUT_S = 300` in `agent_plugins/resolver.py`, plus 30s of margin for
+  // validation and the projection rebuild that follow the clone. The client MUST
+  // outlast the server, because the route awaits `asyncio.to_thread(...)`, which
+  // cannot be cancelled and sees no client disconnect: aborting first showed the
+  // operator a failure for an install the backend went on to commit. `validatePlugin`
+  // carries the same budget because validation resolves — and therefore clones — the
+  // source first. If `GIT_TIMEOUT_S` moves, these move with it;
+  // `test/agent_plugins/test_web_timeout_drift.py` fails if they ever cross.
+  listPlugins: () => fetchJSON<PluginListResponse>('/plugins'),
+  installPlugin: (body: PluginInstallBody) =>
+    fetchJSON<PluginInstallOutcome>('/plugins', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      timeoutMs: 330000,
+    }),
+  validatePlugin: (body: PluginInstallBody) =>
+    fetchJSON<PluginValidationReport>('/plugins/validate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      timeoutMs: 330000,
+    }),
+  // No git involved in a removal, so it keeps the narrower budget.
+  uninstallPlugin: (name: string, purgeData = false) =>
+    fetchJSON<PluginUninstallOutcome>(
+      `/plugins/${encodeURIComponent(name)}${purgeData ? '?purge_data=true' : ''}`,
+      { method: 'DELETE', timeoutMs: 60000 },
+    ),
 }

@@ -10,6 +10,16 @@ const DEFAULTS = {
   cao_installed: '/home/u/.aws/cli-agent-orchestrator/agent-context',
 }
 
+// fetchJSON reads the body via res.text() and parses it itself (so an
+// empty/proxy-stripped body yields undefined), so a mock must supply text().
+const okJson = (data: unknown) => ({
+  ok: true,
+  status: 200,
+  statusText: 'OK',
+  json: () => Promise.resolve(data),
+  text: () => Promise.resolve(JSON.stringify(data)),
+})
+
 describe('SettingsPanel — directory enable/disable (GH #280/#281)', () => {
   let state: any
   let posts: any[]
@@ -21,23 +31,18 @@ describe('SettingsPanel — directory enable/disable (GH #280/#281)', () => {
       posts.push(body)
       if (body.extra_dirs !== undefined) state.extra_dirs = body.extra_dirs
       if (body.disabled_dirs !== undefined) state.disabled_dirs = body.disabled_dirs
-      return { ok: true, status: 200, json: () => Promise.resolve(state) }
+      return okJson(state)
     }
     if (url.includes('/settings/agent-dirs')) {
-      return { ok: true, status: 200, json: () => Promise.resolve(state) }
+      return okJson(state)
     }
     if (url.includes('/agents/profiles')) {
-      return {
-        ok: true,
-        status: 200,
-        json: () =>
-          Promise.resolve([
-            { name: 'dev', description: '', source: 'custom', duplicated_in: ['built-in'] },
-            { name: 'analyst', description: '', source: 'built-in', duplicated_in: [] },
-          ]),
-      }
+      return okJson([
+        { name: 'dev', description: '', source: 'custom', duplicated_in: ['built-in'] },
+        { name: 'analyst', description: '', source: 'built-in', duplicated_in: [] },
+      ])
     }
-    return { ok: true, status: 200, json: () => Promise.resolve({}) }
+    return okJson({})
   })
 
   beforeEach(() => {

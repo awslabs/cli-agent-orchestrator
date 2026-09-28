@@ -46,6 +46,42 @@ class TestGetAgentProfileEndpoint:
         assert response.status_code == 404
         assert response.json()["detail"] == "Agent profile not found: missing"
 
+    def test_serializes_explicit_grok_native_workflows_setting(self, client) -> None:
+        """The opt-in remains visible, while omitted profiles stay unchanged."""
+        profile = AgentProfile(
+            name="grok-native",
+            description="Grok agent with native workflows",
+            provider="grok_cli",
+            grokNativeWorkflows=True,
+        )
+
+        with patch(
+            "cli_agent_orchestrator.api.main.load_agent_profile",
+            return_value=profile,
+        ):
+            response = client.get("/agents/profiles/grok-native")
+
+        assert response.status_code == 200
+        assert response.json()["grokNativeWorkflows"] is True
+
+    def test_serializes_explicitly_disabled_grok_native_workflows(self, client) -> None:
+        """An explicit false is distinct from an omitted backward-compatible field."""
+        profile = AgentProfile(
+            name="grok-controlled",
+            description="Grok agent managed by CAO",
+            provider="grok_cli",
+            grokNativeWorkflows=False,
+        )
+
+        with patch(
+            "cli_agent_orchestrator.api.main.load_agent_profile",
+            return_value=profile,
+        ):
+            response = client.get("/agents/profiles/grok-controlled")
+
+        assert response.status_code == 200
+        assert response.json()["grokNativeWorkflows"] is False
+
     def test_returns_500_for_parse_failure(self, client) -> None:
         """Malformed profiles should return 500."""
         with patch(

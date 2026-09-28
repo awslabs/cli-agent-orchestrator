@@ -1,0 +1,9 @@
+  Help improve Grok                                               [Opt out] [Opt in]
+  Off by default. Opt-in to allow the provider to retain coding data for training and debugging purposes. Change anytime via settings.
+  Read Terms and Privacy Policy.
+
+  ╭────────────────╮
+  │ ❯              │
+  ╰── Grok 4.5 (high) · always-approve ─╯
+
+  Shift+Tab:mode  │  Ctrl+x:shortcuts

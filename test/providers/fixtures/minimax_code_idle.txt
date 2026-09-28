@@ -1,0 +1,6 @@
+╭─ v0.1.2 ───────────────────────────── ● Ready ─╮
+│                                                │
+│ ›                                              │
+╰────────────────────────────────────────────────╯
+Message · Enter send · Shift+Enter newline
+/workspace │ Full access │ ✦ MiniMax-M3 · Thinking On

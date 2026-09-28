@@ -1,0 +1,241 @@
+<section class="module" id="module-1">
+  <div class="module-content">
+
+    <!-- Module Header -->
+    <div class="module-header animate-in">
+      <span class="module-number">01</span>
+      <h1 class="module-title">What CAO Does</h1>
+      <p class="module-subtitle">From one agent doing everything serially to a team of agents working in parallel — orchestrated by infrastructure, not magic.</p>
+    </div>
+
+    <!-- ═══════════════════════════════════════════════════════════
+         SCREEN 1 — The Problem
+         ═══════════════════════════════════════════════════════════ -->
+    <div class="screen" id="screen-1-1">
+      <h2 class="screen-heading animate-in">The Problem</h2>
+
+      <p class="animate-in">
+        You have <strong>3 features</strong> to build, <strong>one AI agent</strong>, and a deadline breathing down your neck.
+        The agent works on Feature A... finishes... moves to Feature B... finishes... then Feature C.
+        Each feature takes 10 minutes. That is <strong>30 minutes of serial execution</strong>.
+      </p>
+
+      <p class="animate-in">
+        Now imagine: what if you could spin up <strong>3 agents simultaneously</strong>, each working on a different feature
+        in its own isolated terminal?
+        All three finish in 10 minutes. Same work, one-third the wall-clock time.
+      </p>
+
+      <p class="animate-in">
+        That is exactly what CAO does.
+      </p>
+
+      <div class="callout callout-accent animate-in">
+        <div class="callout-icon">&#9889;</div>
+        <div class="callout-content">
+          <span class="callout-title">Key Insight</span>
+          <p>CAO is not another AI model — it is <strong>infrastructure</strong> that lets any CLI-based AI agent work as part of a team. It handles process management, message routing, and lifecycle — so the agents can focus on code.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════════════════════════════════════════════════════════
+         SCREEN 2 — The Supervisor-Worker Pattern
+         ═══════════════════════════════════════════════════════════ -->
+    <div class="screen" id="screen-1-2">
+      <h2 class="screen-heading animate-in">The Supervisor-Worker Pattern</h2>
+
+      <p class="animate-in">
+        Think of an air traffic control tower. The controller does not fly the planes — it assigns runways,
+        sequences takeoffs, and resolves conflicts. The pilots (agents) do the actual flying. CAO's
+        supervisor
+        works the same way: it reads your task, breaks it into sub-tasks, and delegates each one to a
+        worker agent.
+      </p>
+
+      <p class="animate-in">
+        The supervisor never writes code directly. It thinks in terms of delegation — "worker-1 handles the API route,
+        worker-2 writes the tests, worker-3 updates the docs" — then monitors their progress through an
+        MCP-based
+        message system. When all workers report done, the supervisor synthesizes results and reports back to you.
+      </p>
+
+      <!-- Flow Animation -->
+      <div class="flow-animation animate-in" data-steps='[
+        {"label":"You run: cao launch --agents code_supervisor","highlight":"flow-you"},
+        {"label":"cao-server creates a tmux session and launches the supervisor terminal","highlight":"flow-server"},
+        {"label":"Supervisor reads the task and decides to split it into sub-tasks","highlight":"flow-supervisor"},
+        {"label":"Supervisor calls assign() — spawns worker-1 and worker-2 in new tmux windows","highlight":"flow-supervisor"},
+        {"label":"Workers execute tasks in parallel, each in its own isolated tmux window","highlight":"flow-workers"},
+        {"label":"Workers call send_message() to report results back to the supervisor","highlight":"flow-workers"}
+      ]'>
+        <div class="flow-actors">
+          <div class="flow-actor" id="flow-you">
+            <div class="flow-actor-icon" style="background: var(--color-accent-light); border-color: #3b82f6;">Y</div>
+            <span>You</span>
+          </div>
+          <div class="flow-actor" id="flow-server">
+            <div class="flow-actor-icon" style="background: var(--color-accent-light); border-color: var(--color-actor-2);">S</div>
+            <span>cao-server</span>
+          </div>
+          <div class="flow-actor" id="flow-supervisor">
+            <div class="flow-actor-icon" style="background: var(--color-accent-light); border-color: var(--color-actor-3);">V</div>
+            <span>Supervisor</span>
+          </div>
+          <div class="flow-actor" id="flow-workers">
+            <div class="flow-actor-icon" style="background: var(--color-accent-light); border-color: var(--color-actor-5);">W</div>
+            <span>Workers</span>
+          </div>
+        </div>
+        <div class="flow-step-label">Click "Next Step" to begin</div>
+        <div class="flow-packet"></div>
+        <div class="flow-controls">
+          <button class="btn btn-primary flow-next-btn">Next Step &rarr;</button>
+          <button class="btn flow-reset-btn">Reset</button>
+          <span class="flow-progress">Step 0 / 6</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════════════════════════════════════════════════════════
+         SCREEN 3 — What Happens When You Type `cao launch`
+         ═══════════════════════════════════════════════════════════ -->
+    <div class="screen" id="screen-1-3">
+      <h2 class="screen-heading animate-in">What Happens When You Type <code>cao launch</code></h2>
+
+      <p class="animate-in">
+        Five concrete steps, from your terminal to a running agent:
+      </p>
+
+      <div class="stagger-children">
+        <div class="icon-row animate-in">
+          <div class="icon-circle" style="background: var(--color-accent-light); color: var(--color-accent);">1</div>
+          <div>
+            <strong>CLI sends HTTP POST to cao-server on port 9889</strong>
+            <p>The <code>cao</code> CLI is a thin client. It sends your launch request to the locally running cao-server.</p>
+          </div>
+        </div>
+
+        <div class="icon-row animate-in">
+          <div class="icon-circle" style="background: var(--color-accent-light); color: var(--color-accent);">2</div>
+          <div>
+            <strong>Server creates a tmux session prefixed <code>cao-</code></strong>
+            <p>Each orchestration run gets its own isolated session (e.g., <code>cao-a1b2c3d4</code>) so multiple runs never collide.</p>
+          </div>
+        </div>
+
+        <div class="icon-row animate-in">
+          <div class="icon-circle" style="background: var(--color-accent-light); color: var(--color-accent);">3</div>
+          <div>
+            <strong>Server launches your AI provider in a tmux window</strong>
+            <p>The provider (e.g., Claude Code, Kiro CLI, Codex) starts in its own window — just like you would run it manually, but automated.</p>
+          </div>
+        </div>
+
+        <div class="icon-row animate-in">
+          <div class="icon-circle" style="background: var(--color-accent-light); color: var(--color-accent);">4</div>
+          <div>
+            <strong>The agent's system prompt is injected from the profile</strong>
+            <p>Profiles define the agent's role ("you are a code reviewer"), available tools, and constraints. This is how the supervisor knows it should delegate, not code.</p>
+          </div>
+        </div>
+
+        <div class="icon-row animate-in">
+          <div class="icon-circle" style="background: var(--color-accent-light); color: var(--color-accent);">5</div>
+          <div>
+            <strong>You are attached to the tmux session — you see the agent working</strong>
+            <p>You can watch the supervisor think, see workers appear in new windows, and even interact with any agent mid-task via <code>tmux</code>.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════════════════════════════════════════════════════════
+         SCREEN 4 — Quick Start
+         ═══════════════════════════════════════════════════════════ -->
+    <div class="screen" id="screen-1-4">
+      <h2 class="screen-heading animate-in">Quick Start</h2>
+
+      <p class="animate-in">Install CAO and launch your first orchestrated agent in under a minute:</p>
+
+      <div class="translation-block animate-in">
+        <div class="translation-code">
+          <span class="translation-label">terminal</span>
+<pre><span class="code-comment"># Install CAO</span>
+<span class="code-function">uv tool install</span> cli-agent-orchestrator
+
+<span class="code-comment"># Start the server (leave running)</span>
+<span class="code-function">cao-server</span>
+
+<span class="code-comment"># Launch a supervisor agent</span>
+<span class="code-function">cao launch</span> <span class="code-string">--agents code_supervisor</span> \
+  <span class="code-string">--provider claude_code</span></pre>
+        </div>
+        <div class="translation-english">
+          <span class="translation-label">What each line does</span>
+          <div class="translation-lines">
+            <div class="tl">Install the CLI tool via uv (or pip install cli-agent-orchestrator)</div>
+            <div class="tl">Start the background HTTP server on port 9889</div>
+            <div class="tl">Launch a supervisor that will orchestrate workers using Claude Code as the provider</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="callout callout-info animate-in">
+        <div class="callout-icon">&#128268;</div>
+        <div class="callout-content">
+          <span class="callout-title">Provider Agnostic</span>
+          <p>Multiple providers supported — swap <code>--provider claude_code</code> for <code>kiro_cli</code>, <code>codex</code>, <code>copilot_cli</code>, <code>cursor_cli</code>, and more.
+          The orchestration layer does not care which AI model runs inside the terminal. If it has a CLI, CAO can manage it.</p>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- ═══════════════════════════════════════════════════════════
+         GLOSSARY TERM CARDS
+         ═══════════════════════════════════════════════════════════ -->
+    <div class="screen" id="screen-1-glossary">
+      <h2 class="screen-heading animate-in">Key Terms</h2>
+
+      <div class="pattern-cards stagger-children">
+        <div class="pattern-card animate-in">
+          <div class="pattern-icon" style="background: var(--color-info-light); color: var(--color-info);">&#9642;</div>
+          <h3 class="pattern-title">tmux</h3>
+          <p class="pattern-desc">A terminal multiplexer that lets multiple terminal sessions run independently inside a single window. CAO uses it to isolate each agent.</p>
+        </div>
+
+        <div class="pattern-card animate-in">
+          <div class="pattern-icon" style="background: var(--color-success-light); color: var(--color-success);">&#9654;</div>
+          <h3 class="pattern-title">Session</h3>
+          <p class="pattern-desc">A named tmux session (prefixed <code>cao-</code>) that groups all agent windows for a single orchestration run.</p>
+        </div>
+
+        <div class="pattern-card animate-in">
+          <div class="pattern-icon" style="background: var(--color-error-light); color: var(--color-error);">&#9632;</div>
+          <h3 class="pattern-title">Terminal</h3>
+          <p class="pattern-desc">A tmux window within a session where a single agent process runs. Each agent gets its own terminal.</p>
+        </div>
+
+        <div class="pattern-card animate-in">
+          <div class="pattern-icon" style="background: #FDF3E4; color: var(--color-actor-4);">&#9830;</div>
+          <h3 class="pattern-title">Provider</h3>
+          <p class="pattern-desc">A supported AI CLI tool (Claude Code, Kiro CLI, Codex, Copilot CLI, Cursor CLI, etc.) that CAO can launch and manage as an agent process.</p>
+        </div>
+
+        <div class="pattern-card animate-in">
+          <div class="pattern-icon" style="background: var(--color-accent-light); color: var(--color-accent);">&#9998;</div>
+          <h3 class="pattern-title">Profile</h3>
+          <p class="pattern-desc">A configuration file that defines an agent's role, system prompt, available MCP tools, and behavioral constraints.</p>
+        </div>
+
+        <div class="pattern-card animate-in">
+          <div class="pattern-icon" style="background: var(--color-info-light); color: var(--color-info);">&#9672;</div>
+          <h3 class="pattern-title">MCP</h3>
+          <p class="pattern-desc">Model Context Protocol — the standard interface agents use to call tools (like <code>assign()</code> and <code>send_message()</code>) exposed by the CAO server.</p>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</section>

@@ -287,12 +287,32 @@ class TestPipeLivenessWatchdog:
         monkeypatch.setattr("cli_agent_orchestrator.services.fifo_reader.FIFO_DIR", tmp_path)
         return FifoManager()
 
-    def _enroll(self, manager, terminal_id, pane_holder, rearm_calls, last_data_at):
+    def _enroll(
+        self,
+        manager,
+        terminal_id,
+        pane_holder,
+        rearm_calls,
+        last_data_at,
+        fifo_buffer=None,
+    ):
         """Register a terminal with fake probe/rearm WITHOUT starting the reader
-        thread or the real watchdog — we call _check_pipe_liveness by hand."""
+        thread or the real watchdog — we call _check_pipe_liveness by hand.
+
+        The FIFO buffer defaults to the raw-stream shape tmux pipe-pane really
+        delivers: CRLF line ends, SGR runs and partial-redraw control
+        sequences, not the pane's rendered text.
+        """
+        if fifo_buffer is None:
+            fifo_buffer = {
+                "content": "\x1b[32m" + pane_holder["content"].replace("\n", "\r\n") + "\x1b[0m"
+            }
         manager._pane_probe[terminal_id] = lambda: pane_holder["content"]
         manager._rearm[terminal_id] = lambda: rearm_calls.append(True)
         manager._last_data_at[terminal_id] = last_data_at
+        if not hasattr(manager, "_fifo_buffer_probe"):
+            manager._fifo_buffer_probe = {}
+        manager._fifo_buffer_probe[terminal_id] = lambda: fifo_buffer["content"]
 
     def test_stall_is_detected_and_pipe_rearmed(self, tmp_path, monkeypatch):
         """Pane advanced but the FIFO delivered nothing since the last check ->
@@ -329,20 +349,36 @@ class TestPipeLivenessWatchdog:
         assert rearm_calls == [], "an idle terminal must never be re-armed"
 
     def test_healthy_pipe_is_not_rearmed(self, tmp_path, monkeypatch):
-        """Pane advancing AND the FIFO delivering bytes = a healthy pipe; no
-        re-arm even though the screen keeps changing."""
+        """Raw FIFO delivery must not cause strikes against capture-pane rows,
+        either during sustained redraws or after the terminal settles."""
+        monkeypatch.setattr(fr, "PIPE_LIVENESS_STALL_CHECKS", 2)
         manager = self._manager(tmp_path, monkeypatch)
-        pane = {"content": "line0"}
+        pane = {"content": "prompt\nline0"}
+        fifo_buffer = {"content": "prompt\r\n\x1b[32mline0\x1b[0m"}
         rearm_calls: list = []
-        self._enroll(manager, "term", pane, rearm_calls, last_data_at=time.monotonic())
+        self._enroll(
+            manager,
+            "term",
+            pane,
+            rearm_calls,
+            last_data_at=time.monotonic(),
+            fifo_buffer=fifo_buffer,
+        )
 
-        manager._check_pipe_liveness("term")  # baseline
-        for i in range(1, 4):
-            pane["content"] = f"line{i}"
-            # Simulate the reader delivering a byte right before this check.
+        manager._check_pipe_liveness("term")
+        strikes = []
+        for i in range(1, 9):
+            pane["content"] = f"prompt\nline{i}"
+            fifo_buffer["content"] += f"\r\x1b[2K\x1b[32mline{i}\x1b[0m"
             manager._last_data_at["term"] = time.monotonic()
             manager._check_pipe_liveness("term")
-        assert rearm_calls == [], "a healthy, delivering pipe must never be re-armed"
+            strikes.append(manager._liveness["term"][2])
+        for _ in range(4):
+            manager._check_pipe_liveness("term")
+            strikes.append(manager._liveness["term"][2])
+
+        assert (strikes, rearm_calls) == ([0] * 12, [])
+        assert manager._liveness["term"][0] == "prompt\nline8"
 
     def test_rearm_replays_live_pane_into_pipeline(self, tmp_path, monkeypatch):
         """After re-arm the lost bytes are gone, but the pane's CURRENT content
@@ -556,6 +592,80 @@ class TestPipeLivenessWatchdog:
         assert "term" not in manager._pane_probe, "terminal must be dropped after repeated failures"
         assert "term" not in manager._rearm
         assert "term" not in manager._rearm_failures
+
+    def test_probe_failure_is_bounded_and_terminal_dropped(self, tmp_path, monkeypatch):
+        """harness-control#845: when probe() itself raises (session/window/whole
+        tmux server gone, e.g. libtmux ObjectDoesNotExist) the exception must NOT
+        propagate to _watchdog_loop (which would log a full traceback per terminal
+        per tick forever — the storm). Instead it is caught and bounded: after
+        PIPE_LIVENESS_MAX_PROBE_FAILURES consecutive failures the terminal is
+        dropped from the watchdog, once, with a single summary log."""
+        monkeypatch.setattr(fr, "PIPE_LIVENESS_MAX_PROBE_FAILURES", 3)
+
+        manager = self._manager(tmp_path, monkeypatch)
+        probe_calls: list = []
+
+        def gone_probe():
+            probe_calls.append(True)
+            raise RuntimeError(
+                "No objects found: session gone"
+            )  # mimics libtmux ObjectDoesNotExist
+
+        manager._pane_probe["term"] = gone_probe
+        manager._rearm["term"] = lambda: None
+        manager._last_data_at["term"] = time.monotonic()
+
+        # Each call must return normally (NOT raise) — this is the storm fix: the
+        # exception is swallowed here so _watchdog_loop never logs a per-tick traceback.
+        for _ in range(3):
+            manager._check_pipe_liveness("term")  # must not raise
+
+        assert len(probe_calls) == 3
+        assert (
+            "term" not in manager._pane_probe
+        ), "gone terminal must be dropped after the probe-failure cap"
+        assert "term" not in manager._rearm
+        assert "term" not in manager._probe_failures
+
+        # A further watchdog pass no longer probes it at all (storm over): the
+        # terminal is unenrolled, so _watchdog_loop wouldn't even iterate it.
+        manager._check_pipe_liveness("term")
+        assert len(probe_calls) == 3, "a dropped terminal must never be probed again"
+
+    def test_probe_failure_counter_resets_on_success(self, tmp_path, monkeypatch):
+        """A brief transient probe failure (session momentarily unavailable but not
+        gone) must not accumulate toward the cap across recoveries: a successful
+        probe resets the counter, so the terminal is never falsely dropped."""
+        monkeypatch.setattr(fr, "PIPE_LIVENESS_MAX_PROBE_FAILURES", 3)
+        monkeypatch.setattr(fr, "PIPE_LIVENESS_STALL_CHECKS", 1)
+
+        manager = self._manager(tmp_path, monkeypatch)
+        state = {"fail": True, "content": "l0"}
+
+        def flaky_probe():
+            if state["fail"]:
+                raise RuntimeError("transient: No objects found")
+            return state["content"]
+
+        manager._pane_probe["term"] = flaky_probe
+        manager._rearm["term"] = lambda: None
+        manager._last_data_at["term"] = time.monotonic()
+
+        # Two failures (below the cap of 3), then a success.
+        manager._check_pipe_liveness("term")
+        manager._check_pipe_liveness("term")
+        assert manager._probe_failures.get("term") == 2
+        state["fail"] = False
+        manager._check_pipe_liveness("term")  # success -> resets the counter
+        assert "term" in manager._pane_probe, "must not be dropped after recovering"
+        assert "term" not in manager._probe_failures, "counter must reset on a successful probe"
+
+        # Two more failures must again NOT drop it (proves it didn't secretly carry 2+2).
+        state["fail"] = True
+        manager._check_pipe_liveness("term")
+        manager._check_pipe_liveness("term")
+        assert "term" in manager._pane_probe
+        assert manager._probe_failures.get("term") == 2
 
     def test_create_reader_enrolls_and_starts_watchdog(self, tmp_path, monkeypatch):
         """A tmux caller passing probe+rearm enrolls the terminal and starts the

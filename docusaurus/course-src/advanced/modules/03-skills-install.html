@@ -1,0 +1,163 @@
+<section class="module" id="module-3">
+  <div class="module-content">
+
+    <!-- Module Header -->
+    <div class="module-header animate-in">
+      <span class="module-number">03</span>
+      <h1 class="module-title">Skills &amp; Install</h1>
+      <p class="module-subtitle">Reusable behavior modules that agents load on demand, and the install system that wires everything together.</p>
+    </div>
+
+    <!-- ═══════════════════════════════════════════════════════════
+         SCREEN 1 — Skills
+         ═══════════════════════════════════════════════════════════ -->
+    <div class="screen" id="screen-3-1">
+      <h2 class="screen-heading animate-in">Skills</h2>
+
+      <p class="animate-in">
+        A <strong>skill</strong> is a folder containing a <code>SKILL.md</code> file with structured instructions
+        that an agent can load at runtime. Skills live in <code>~/.aws/cli-agent-orchestrator/skills/</code>
+        and are managed via the CLI: <code>cao skills add</code>, <code>cao skills remove</code>, <code>cao skills list</code>.
+      </p>
+
+      <p class="animate-in">
+        When an agent needs a skill, it calls the <code>load_skill(name)</code> MCP tool.
+        For Kiro CLI, skills are delivered natively via <code>skill://</code> resources in the agent JSON.
+        Kiro CLI and OpenCode CLI discover skills natively; other providers load them on demand through the MCP server.
+      </p>
+
+      <div class="pattern-cards stagger-children">
+        <div class="pattern-card animate-in">
+          <div class="pattern-icon" style="background: var(--color-accent-light); color: var(--color-accent);">&#9998;</div>
+          <h3 class="pattern-title">What's in a Skill</h3>
+          <p class="pattern-desc">A folder with a <code>SKILL.md</code> file containing step-by-step instructions, constraints, and examples. The agent receives this content verbatim when it loads the skill.</p>
+        </div>
+
+        <div class="pattern-card animate-in">
+          <div class="pattern-icon" style="background: var(--color-info-light); color: var(--color-info);">&#9672;</div>
+          <h3 class="pattern-title">How Agents Discover Them</h3>
+          <p class="pattern-desc">Agents call <code>load_skill(name)</code> at runtime. The MCP server resolves the name to the skill folder, reads <code>SKILL.md</code>, and returns its content directly into the agent's context.</p>
+        </div>
+
+        <div class="pattern-card animate-in">
+          <div class="pattern-icon" style="background: var(--color-success-light); color: var(--color-success);">&#9654;</div>
+          <h3 class="pattern-title">Built-in Skills</h3>
+          <p class="pattern-desc">CAO ships 11 built-in skills, including supervisor and worker protocols, memory usage, workflow authoring, session management, and agent routing. These cover the most common multi-agent patterns out of the box.</p>
+        </div>
+      </div>
+
+      <div class="icon-row animate-in">
+        <div class="icon-circle" style="background: var(--color-accent-light); color: var(--color-accent);">+</div>
+        <div>
+          <strong><code>cao skills add ./my-custom-skill</code></strong>
+          <p>Copies the skill folder into the skills directory, making it available to all agents immediately.</p>
+        </div>
+      </div>
+
+      <div class="icon-row animate-in">
+        <div class="icon-circle" style="background: var(--color-error-light); color: var(--color-error);">&minus;</div>
+        <div>
+          <strong><code>cao skills remove my-custom-skill</code></strong>
+          <p>Removes the skill from the skills directory. Running agents that already loaded it are unaffected.</p>
+        </div>
+      </div>
+
+      <div class="icon-row animate-in">
+        <div class="icon-circle" style="background: var(--color-info-light); color: var(--color-info);">&#8801;</div>
+        <div>
+          <strong><code>cao skills list</code></strong>
+          <p>Shows all installed skills with their names and descriptions.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════════════════════════════════════════════════════════
+         SCREEN 2 — Installing Agents
+         ═══════════════════════════════════════════════════════════ -->
+    <div class="screen" id="screen-3-2">
+      <h2 class="screen-heading animate-in">Installing Agents</h2>
+
+      <p class="animate-in">
+        The <code>cao install</code> command takes a profile name, local path, or URL and sets it up
+        for your provider automatically. No manual JSON editing or config wrangling required.
+      </p>
+
+      <div class="step-cards stagger-children">
+        <div class="step-card animate-in">
+          <div class="step-num">1</div>
+          <div class="step-body">
+            <strong>Install the profile</strong>
+            <p><code>cao install code_supervisor</code> &mdash; Resolves a built-in profile and writes a context file to <code>agent-context/</code>. Also accepts local paths (<code>./my-agent.md</code>) or URLs from an allowlisted host such as <code>raw.githubusercontent.com</code>.</p>
+          </div>
+        </div>
+
+        <div class="step-card animate-in">
+          <div class="step-num">2</div>
+          <div class="step-body">
+            <strong>Provider-specific setup happens automatically</strong>
+            <p>For Kiro CLI, CAO writes the agent JSON with <code>skill://</code> resources. For Claude Code and Codex, it writes a context file (no provider-specific config needed). You never touch provider configs directly.</p>
+          </div>
+        </div>
+
+        <div class="step-card animate-in">
+          <div class="step-num">3</div>
+          <div class="step-body">
+            <strong>Set secrets with <code>cao env</code></strong>
+            <p><code>cao env set ANTHROPIC_API_KEY sk-...</code> &mdash; Stores the variable in <code>~/.aws/cli-agent-orchestrator/.env</code>. Profiles reference them with <code>${VAR}</code> syntax.</p>
+          </div>
+        </div>
+
+        <div class="step-card animate-in">
+          <div class="step-num">4</div>
+          <div class="step-body">
+            <strong>Verify the installation</strong>
+            <p><code>cao profile list</code> &mdash; Confirms the profile is registered and lists the name, source, and description. Use <code>cao profile show &lt;name&gt;</code> for the provider, role, and tool access.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="translation-block animate-in">
+        <div class="translation-code">
+          <span class="translation-label">terminal</span>
+<pre><span class="code-comment"># Install from built-in registry</span>
+<span class="code-function">cao install</span> code_supervisor
+
+<span class="code-comment"># Install from a local file</span>
+<span class="code-function">cao install</span> <span class="code-string">./my-agent.md</span>
+
+<span class="code-comment"># Install from URL with env var</span>
+<span class="code-function">cao install</span> <span class="code-string">https://raw.githubusercontent.com/org/repo/main/agent.md</span> \
+  <span class="code-string">--env TEAM=platform</span>
+
+<span class="code-comment"># Manage environment variables</span>
+<span class="code-function">cao env set</span> ANTHROPIC_API_KEY sk-...
+<span class="code-function">cao env list</span>
+<span class="code-function">cao env unset</span> ANTHROPIC_API_KEY</pre>
+        </div>
+        <div class="translation-english">
+          <span class="translation-label">What each command does</span>
+          <div class="translation-lines">
+            <div class="tl">Downloads and registers the built-in code_supervisor profile</div>
+            <div class="tl">Installs a custom profile from a local markdown file</div>
+            <div class="tl">Fetches a remote profile and embeds the TEAM env var into it</div>
+            <div class="tl">Stores, lists, and removes environment variables used by profiles</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════════════════════════════════════════════════════════
+         CALLOUT
+         ═══════════════════════════════════════════════════════════ -->
+    <div class="screen" id="screen-3-3">
+      <div class="callout callout-accent animate-in">
+        <div class="callout-icon">&#9889;</div>
+        <div class="callout-content">
+          <span class="callout-title">Skills Compose with Profiles</span>
+          <p>A profile says <strong>WHAT</strong> the agent is &mdash; its role, provider, and system prompt. Skills say <strong>HOW</strong> it should behave in specific situations. A single profile can reference multiple skills, and the same skill can be shared across many profiles. This separation keeps agent definitions clean and behavior reusable.</p>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</section>

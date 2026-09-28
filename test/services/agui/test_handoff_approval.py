@@ -143,6 +143,23 @@ class TestResume:
         assert ("send_special_key", "t-1", "Escape") in delivery.calls
 
     @pytest.mark.asyncio
+    async def test_approve_omp_sends_enter(self, construct, delivery):
+        interrupt = construct.on_provider_waiting("t-omp", "omp", "Allow tool: shell")
+        result = await construct.resume(interrupt.id, ApprovalDecision.APPROVE)
+        assert result.outcome == "approve"
+        assert delivery.calls == [("send_special_key", "t-omp", "Enter")]
+
+    @pytest.mark.asyncio
+    async def test_deny_omp_sends_down_then_enter(self, construct, delivery):
+        interrupt = construct.on_provider_waiting("t-omp", "omp", "Allow tool: shell")
+        result = await construct.resume(interrupt.id, ApprovalDecision.DENY)
+        assert result.outcome == "deny"
+        assert delivery.calls == [
+            ("send_special_key", "t-omp", "Down"),
+            ("send_special_key", "t-omp", "Enter"),
+        ]
+
+    @pytest.mark.asyncio
     async def test_approve_kiro_cli(self, construct, delivery):
         interrupt = construct.on_provider_waiting("t-1", "kiro_cli", "Allow this action? [y/n/t]:")
         result = await construct.resume(interrupt.id, ApprovalDecision.APPROVE)
@@ -563,6 +580,51 @@ class TestDeliveryFailureRetryable:
         assert result.resolved
         assert result.outcome == "approve"
         assert len(working.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_partial_omp_deny_retry_does_not_approve(self):
+        from cli_agent_orchestrator.services.agui.handoff_approval import DeliveryError
+
+        class _PartialOmpDelivery:
+            def __init__(self) -> None:
+                self.calls: List[str] = []
+                self.outcomes: List[str] = []
+                self.selected = "approve"
+                self.fail_enter = True
+
+            def send_input(self, terminal_id: str, text: str, **kwargs: Any) -> None:
+                raise AssertionError("OMP approval must use selector keys")
+
+            def send_special_key(self, terminal_id: str, key: str) -> bool:
+                self.calls.append(key)
+                if key == "Down":
+                    self.selected = "deny"
+                elif key == "Enter":
+                    if self.fail_enter:
+                        self.fail_enter = False
+                        raise RuntimeError("backend down")
+                    self.outcomes.append(self.selected)
+                return True
+
+        delivery = _PartialOmpDelivery()
+        construct = AgentHandoffWithApproval(emitter=RecordingUiEmitter(), answer_delivery=delivery)
+        interrupt = construct.on_provider_waiting("t-omp", "omp", "Allow tool: shell")
+
+        with pytest.raises(DeliveryError):
+            await construct.resume(interrupt.id, ApprovalDecision.DENY)
+
+        assert not interrupt.resolved
+        assert delivery.calls == ["Down", "Enter"]
+
+        # Contrary retry asks for approve, but the physically started deny
+        # selection remains pinned and only its unsent Enter is delivered.
+        result = await construct.resume(interrupt.id, ApprovalDecision.APPROVE)
+
+        assert result.resolved
+        assert result.outcome == "deny"
+        # Down was already delivered; retrying only Enter cannot select Approve.
+        assert delivery.calls == ["Down", "Enter", "Enter"]
+        assert delivery.outcomes == ["deny"]
 
     @pytest.mark.asyncio
     async def test_delivery_runs_off_loop_via_to_thread(self, monkeypatch):

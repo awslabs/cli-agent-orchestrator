@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CAO Advanced Features — Interactive Course</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,700;12..96,800&family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400;1,9..40,500&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+  <link rel="stylesheet" href="../course-assets/styles.css">
+
+  <style>
+    :root {
+      --color-accent:       #7B6DAA;
+      --color-accent-hover: #6358A0;
+      --color-accent-light: #F3EAFF;
+      --color-accent-muted: #9B8DC0;
+    }
+
+    /* Screen headings */
+    .screen h2 {
+      color: var(--color-accent);
+      margin-bottom: var(--space-4);
+      padding-bottom: var(--space-2);
+      border-bottom: 2px solid var(--color-accent-light);
+    }
+
+    /* Pattern card title spacing */
+    .pattern-card h3 {
+      margin-bottom: var(--space-3);
+      padding-bottom: var(--space-2);
+      border-bottom: 1px solid var(--color-border);
+    }
+
+    /* Word wrap for callouts */
+    .callout, .callout p, .pattern-card, .pattern-card p {
+      word-break: break-word;
+      overflow-wrap: break-word;
+    }
+
+    /* Unified button style */
+    /* Tint the flow step label to match whichever actor is active. */
+    .flow-animation:has(#flow-pipe.active) .flow-step-label { color: #3b82f6; }
+    .flow-animation:has(#flow-fifo.active) .flow-step-label { color: var(--color-actor-2); }
+    .flow-animation:has(#flow-bus.active) .flow-step-label { color: var(--color-actor-3); }
+    .flow-animation:has(#flow-status.active) .flow-step-label { color: var(--color-actor-4); }
+    .flow-animation:has(#flow-inbox.active) .flow-step-label { color: var(--color-actor-5); }
+    .flow-animation:has(#flow-log.active) .flow-step-label { color: #3b82f6; }
+
+    .flow-step-label { font-weight: 600; transition: color 0.3s ease; }
+  </style>
+
+  <script src="../course-assets/main.js" defer></script>
+</head>
+<body>
+
+  <nav class="nav" id="nav">
+    <div class="progress-bar" id="progress-bar" role="progressbar" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100"></div>
+    <div class="nav-inner">
+      <span class="nav-title">CAO Advanced</span>
+      <div class="nav-dots" id="nav-dots" role="tablist">
+        <button class="nav-dot" data-target="module-1" data-tooltip="The Event Pipeline" role="tab" aria-label="Module 1: The Event Pipeline"></button>
+        <button class="nav-dot" data-target="module-2" data-tooltip="Workflows" role="tab" aria-label="Module 2: Workflows"></button>
+        <button class="nav-dot" data-target="module-3" data-tooltip="Skills & Install" role="tab" aria-label="Module 3: Skills & Install"></button>
+        <button class="nav-dot" data-target="module-4" data-tooltip="Automation & Ops" role="tab" aria-label="Module 4: Automation & Ops"></button>
+      </div>
+    </div>
+  </nav>
+
+  <main id="main">

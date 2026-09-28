@@ -40,6 +40,7 @@ describe('MemoryPanel', () => {
       status: 200,
       statusText: 'OK',
       json: () => Promise.resolve(data),
+      text: () => Promise.resolve(JSON.stringify(data)),
     })
   }
 

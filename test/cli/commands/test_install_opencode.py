@@ -36,7 +36,7 @@ def install_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Dict[s
     # opencode_agents intentionally NOT pre-created — install must mkdir it.
 
     monkeypatch.setattr(
-        "cli_agent_orchestrator.services.install_service.LOCAL_AGENT_STORE_DIR", local_store
+        "cli_agent_orchestrator.services.profile_store.LOCAL_AGENT_STORE_DIR", local_store
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR", local_store
@@ -428,14 +428,46 @@ class TestPreserveExistingConfig:
 
 
 # ---------------------------------------------------------------------------
-# Scenario: slash-safe agent ID parity (filename === opencode.json key)
+# Scenario: agent ID parity (filename === opencode.json key), and the refusal of
+# a namespaced frontmatter name
 # ---------------------------------------------------------------------------
 
 
-class TestSlashSafeAgentId:
-    """The sanitized agent ID must be used for both the .md filename and the
+class TestAgentIdParity:
+    """One sanitized agent ID must be used for both the .md filename and the
     ``agent.<id>.tools`` key in opencode.json, so the value passed to
     ``opencode --agent <id>`` at runtime lines up with its MCP grants."""
+
+    def test_filename_and_config_key_agree(
+        self, runner: CliRunner, install_workspace: Dict[str, Any]
+    ):
+        _write_profile(
+            install_workspace["local_store"] / "test-agent.md",
+            name="test-agent",
+            mcp_servers="  cao-mcp-server:\n    command: cao-mcp-server\n",
+        )
+
+        runner.invoke(install, ["test-agent", "--provider", "opencode_cli"])
+
+        assert (install_workspace["agents_dir"] / "test-agent.md").exists()
+        data = json.loads(install_workspace["config_file"].read_text())
+        assert "test-agent" in data["agent"], "agent ID must be the opencode.json key"
+        assert data["agent"]["test-agent"]["tools"]["cao-mcp-server*"] is True
+
+
+class TestNamespacedNameIsRefused:
+    """A frontmatter ``name:`` containing a path separator is no longer installable.
+
+    Security fix for GHSA-6m35-gcf5-xm75: the resolved ``name:`` is
+    attacker-controlled for URL installs and feeds the context-copy filename, so
+    it is now validated as a single path segment. Namespaced names like
+    ``my/agent`` are rejected as a consequence — they only ever worked when the
+    intermediate context directory happened to already exist, and permitting them
+    is exactly what let a hostile ``../..`` name escape.
+
+    Replaces the former ``TestSlashSafeAgentId``, which asserted the now-removed
+    behavior that such a profile installs successfully.
+    """
 
     def _write_slash_profile(self, install_workspace: Dict[str, Any]) -> None:
         _write_profile(
@@ -443,36 +475,37 @@ class TestSlashSafeAgentId:
             name="my/agent",
             mcp_servers="  cao-mcp-server:\n    command: cao-mcp-server\n",
         )
-        # profile.name "my/agent" → context path would be context_dir/my/agent.md;
-        # pre-create the intermediate dir so the context write doesn't fail before
-        # reaching the agent-file step that we want to assert on.
+        # The pre-fix code needed context_dir/my/ to exist for the write to land.
+        # Create it deliberately, so the refusal below is provably the name
+        # validation and not an incidental missing-parent-directory failure.
         (install_workspace["context_dir"] / "my").mkdir(parents=True, exist_ok=True)
 
-    def test_slash_replaced_in_agent_filename(
+    def test_install_reports_the_refusal(
+        self, runner: CliRunner, install_workspace: Dict[str, Any]
+    ):
+        self._write_slash_profile(install_workspace)
+
+        result = runner.invoke(install, ["my__agent", "--provider", "opencode_cli"])
+
+        # NOTE: asserted on the message, not the exit code. `cao install` echoes
+        # "Error: ..." and returns, so a failed install still exits 0 — a
+        # pre-existing CLI bug (see cli/commands/install.py, `if not
+        # result.success: ... return`) that is out of scope for this fix.
+        assert "Error" in result.output
+        assert "profile name" in result.output
+        assert "my/agent" in result.output
+
+    def test_no_agent_file_or_context_copy_is_written(
         self, runner: CliRunner, install_workspace: Dict[str, Any]
     ):
         self._write_slash_profile(install_workspace)
 
         runner.invoke(install, ["my__agent", "--provider", "opencode_cli"])
 
-        agent_file = install_workspace["agents_dir"] / "my__agent.md"
-        assert agent_file.exists()
-
-    def test_opencode_json_uses_sanitized_agent_id(
-        self, runner: CliRunner, install_workspace: Dict[str, Any]
-    ):
-        """The agent.<id>.tools key must use the sanitized filename, not the
-        frontmatter ``name`` with ``/`` in it."""
-        self._write_slash_profile(install_workspace)
-
-        runner.invoke(install, ["my__agent", "--provider", "opencode_cli"])
-
-        data = json.loads(install_workspace["config_file"].read_text())
-        assert "my__agent" in data["agent"], "sanitized agent ID must be the key"
-        assert data["agent"]["my__agent"]["tools"]["cao-mcp-server*"] is True
-        assert (
-            "my/agent" not in data["agent"]
-        ), "unsanitized profile.name must not be written as an agent key"
+        assert not (install_workspace["agents_dir"] / "my__agent.md").exists()
+        # nothing landed in the pre-created subdirectory either
+        assert list((install_workspace["context_dir"] / "my").iterdir()) == []
+        assert not install_workspace["config_file"].exists()
 
 
 # ---------------------------------------------------------------------------
@@ -531,7 +564,7 @@ class TestOpencodeAgentListIntegration:
         context_dir.mkdir(parents=True)
 
         monkeypatch.setattr(
-            "cli_agent_orchestrator.services.install_service.LOCAL_AGENT_STORE_DIR", local_store
+            "cli_agent_orchestrator.services.profile_store.LOCAL_AGENT_STORE_DIR", local_store
         )
         monkeypatch.setattr(
             "cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR", local_store

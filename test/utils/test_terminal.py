@@ -318,6 +318,25 @@ class TestWaitUntilStatus:
 
         assert result is True
 
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.utils.terminal.asyncio.to_thread")
+    async def test_wait_until_status_dispatches_get_status_via_to_thread(self, mock_to_thread):
+        """#558: status_monitor.get_status() can shell out to a real tmux capture-pane
+        subprocess (the stale-PROCESSING fallback); calling it inline here would fork
+        tmux ON the event loop every poll. Pin the asyncio.to_thread wrapping directly --
+        the other tests in this class mock status_monitor itself and cannot see HOW it
+        was called, so a regression back to a bare synchronous call would stay green."""
+        mock_to_thread.return_value = TerminalStatus.IDLE
+
+        result = await wait_until_status(
+            "test-terminal", TerminalStatus.IDLE, timeout=1.0, polling_interval=0.1
+        )
+
+        assert result is True
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        mock_to_thread.assert_called_once_with(status_monitor.get_status, "test-terminal")
+
 
 class TestWaitUntilTerminalStatus:
     """Tests for wait_until_terminal_status function."""

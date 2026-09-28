@@ -13,7 +13,7 @@ credential shapes.
 """
 
 import re
-from typing import List, Optional, Pattern, Tuple
+from typing import Any, List, Optional, Pattern, Tuple
 
 # Ordered (name, compiled_regex) pairs. First match wins, so ordering is
 # stable and reproducible across calls. No entropy scoring.
@@ -79,3 +79,40 @@ def redact_secrets(content: str) -> Tuple[str, List[str]]:
         if count:
             fired.append(name)
     return content, fired
+
+
+def redact_json_leaves(node: Any) -> Any:
+    """Recursively :func:`redact_secrets` every string inside a parsed JSON document.
+
+    Dict KEYS are redacted alongside values. A credential is as capable of landing in
+    a key as in a value, and no unredacted credential may be persisted; the accepted
+    cost is that two keys differing only inside a redacted span collapse into one,
+    which loses a member but cannot produce an invalid document. Non-string scalars
+    pass through untouched — there is nothing in an ``int`` for a pattern to match.
+
+    PROMOTED HERE from ``script_runner._redact_json_leaves`` by issue #583 Bolt 2, unit
+    ``manifest-envelope``, so that BOTH the step-output path and the execution-manifest
+    envelope share ONE definition. Two copies of this function would drift, and the
+    drift would be silent and security-relevant in the worst direction: one path would
+    keep persisting a credential class the other had already learned to catch.
+
+    THIS MODULE IS THE RIGHT HOME because it is a LEAF — it imports only ``re`` and
+    ``typing``. ``services/execution_manifest.py`` can therefore depend on it and remain
+    a leaf itself, which importing from ``script_runner`` (a heavyweight module) would
+    have prevented by inverting the layering that ``step_result.py`` and
+    ``step_fingerprint.py`` established.
+
+    OPERATE ON THE PARSED TREE, NEVER ON THE SERIALISED STRING. Redacting a JSON string
+    would replace text inside string literals and could span a quote or an escape
+    sequence, producing an unparseable document — written successfully and failing on
+    every read. Walking parsed values and re-serialising afterwards makes output
+    validity hold by construction.
+    """
+    if isinstance(node, str):
+        redacted, _fired = redact_secrets(node)
+        return redacted
+    if isinstance(node, dict):
+        return {redact_json_leaves(k): redact_json_leaves(v) for k, v in node.items()}
+    if isinstance(node, list):
+        return [redact_json_leaves(v) for v in node]
+    return node

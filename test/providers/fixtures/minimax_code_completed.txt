@@ -1,0 +1,12 @@
+› Explain the result.
+└ • Thought for 5.9s
+Called cao_mcp_server_h3d59107c31cf98997240.send_message
+├ Tool returned successfully
+● The integration is complete.
+  All focused checks pass.
+└ Completed in 4s · ⚡ 12.1 tok/s
+╭────────────────────────────────────────────────╮
+│ ›                                              │
+╰────────────────────────────────────────────────╯
+Message · Enter send · Shift+Enter newline
+/workspace │ Full access │ ✦ MiniMax-M3 · Thinking On

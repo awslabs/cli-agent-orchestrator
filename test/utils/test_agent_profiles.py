@@ -677,3 +677,27 @@ class TestCodexConfigParsing:
         profile = parse_agent_profile_text(text, "codex-agent")
 
         assert profile.codexConfig is None
+
+
+class TestGrokNativeWorkflowsParsing:
+    """Grok's native-workflow opt-in is a typed profile setting."""
+
+    def test_grok_native_workflows_is_opt_in(self):
+        text = (
+            "---\n"
+            "name: grok-native\n"
+            "description: Grok agent with native workers\n"
+            "provider: grok_cli\n"
+            "grokNativeWorkflows: true\n"
+            "---\n"
+            "System prompt content"
+        )
+
+        profile = parse_agent_profile_text(text, "grok-native")
+
+        assert profile.grokNativeWorkflows is True
+
+    def test_omitted_grok_native_workflows_preserves_profile_api_compatibility(self):
+        profile = AgentProfile(name="grok-default", description="Grok agent")
+
+        assert profile.grokNativeWorkflows is None

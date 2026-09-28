@@ -300,3 +300,31 @@ class TestAntigravityCliSendMessage:
     def test_send_message_to_inbox(self, require_antigravity):
         """Send a message to another Antigravity CLI terminal's inbox and verify delivery."""
         _run_send_message_test(provider="antigravity_cli", agent_profile="developer")
+
+
+@pytest.mark.e2e
+class TestOmpSendMessage:
+    def test_send_message_to_inbox(self, require_omp):
+        _run_send_message_test(provider="omp", agent_profile="developer")
+
+
+# ---------------------------------------------------------------------------
+# Grok Build CLI provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestGrokCliSendMessage:
+    """E2E inbox delivery test for the official xAI Grok Build CLI."""
+
+    def test_send_message_to_inbox(self, require_grok):
+        """Deliver an inbox message to an idle Grok terminal and process it."""
+        _run_send_message_test(provider="grok_cli", agent_profile="developer")
+
+
+@pytest.mark.e2e
+class TestMiniMaxCodeSendMessage:
+    """E2E inbox delivery test for MiniMax Code."""
+
+    def test_send_message_to_inbox(self, require_minimax_code):
+        _run_send_message_test(provider="mcode", agent_profile="developer")

@@ -1,0 +1,17 @@
+     ❯ Return a concise answer.
+
+     ◆ Thought for 2.6s
+
+     Here is the answer with **Markdown**.
+
+     ```python
+     print(42)
+     ```
+
+     Worked for 4.9s
+
+  ╭────────────────╮
+  │ ❯              │
+  ╰── Grok 4.5 (high) · always-approve ─╯
+
+  Shift+Tab:mode  │  Ctrl+x:shortcuts

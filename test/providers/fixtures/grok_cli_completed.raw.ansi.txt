@@ -1,0 +1,1 @@
+[45;3H❯ Run a harmless task.[48;3H⠹Waiting for response… 0.0s[48;180H[stop][49;3HShift+Tab:mode │ Esc:cancel[44;3H◆ Thought for 0.0s[45;3HRAW_COMPLETION_OK[46;3HWorked for 2.0s[49;160HCtrl+x:shortcuts[47;3H╰────────────────╯[48;5H❯

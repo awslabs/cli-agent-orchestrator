@@ -166,9 +166,44 @@ class TestTmuxDelegationRegression:
 
 
 from cli_agent_orchestrator.utils.path_validation import (  # noqa: E402
+    flatten_path_separators,
     safe_join_under_base,
     validate_path_component,
 )
+
+
+class TestFlattenPathSeparators:
+    """The lossy sibling of ``validate_path_component``, used by the provider
+    agent-file sinks where a separator is folded rather than rejected.
+
+    Security regression for GHSA-6m35-gcf5-xm75: only ``/`` was folded, so a
+    resolved profile ``name:`` of ``..\\..\\evil`` kept its backslashes and
+    traversed out of the provider agent directory on Windows.
+    """
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "..\\..\\evil",
+            "a\\b",
+            "..\\../mixed",
+            "C:\\Windows\\evil",
+            "../../evil",
+            "sub/dir",
+        ],
+    )
+    def test_no_separator_survives(self, value):
+        produced = flatten_path_separators(value)
+        assert "/" not in produced
+        assert "\\" not in produced
+
+    @pytest.mark.parametrize("value", ["developer", "my__agent", "a.b-c_d", ""])
+    def test_separator_free_input_is_unchanged(self, value):
+        assert flatten_path_separators(value) == value
+
+    def test_idempotent(self):
+        once = flatten_path_separators("a/b\\c")
+        assert flatten_path_separators(once) == once
 
 
 class TestValidatePathComponent:

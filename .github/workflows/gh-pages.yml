@@ -1,0 +1,87 @@
+name: Docs site
+
+# Builds the Docusaurus site on every pull request so reviewers get a build
+# signal, and additionally deploys to GitHub Pages when the change lands on
+# main. The deploy job is gated on the event type so pull requests never
+# publish.
+#
+# The deploy job is ALSO gated so it never runs on a fork by default: forks
+# don't have GitHub Pages enabled (and publish to the fork owner's own Pages
+# site, not upstream's), so `actions/deploy-pages` 404s there
+# (see run 31220638813 / job 93004402444 on a fork of this repo). Deploys run
+# when either:
+#   - this is the upstream repo (`awslabs/cli-agent-orchestrator`), or
+#   - the repository variable `DEPLOY_DOCS_PAGES` is set to `true` — an
+#     explicit opt-in for a fork maintainer who has enabled GitHub Pages in
+#     their own fork's Settings > Pages. See docusaurus/README.md for the
+#     opt-in steps.
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'docusaurus/**'
+      - '.github/workflows/gh-pages.yml'
+  pull_request:
+    paths:
+      - 'docusaurus/**'
+      - '.github/workflows/gh-pages.yml'
+  workflow_dispatch:
+
+permissions: {}
+
+# Never cancel an in-flight production deployment; queue behind it instead.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: docusaurus/package-lock.json
+
+      - name: Install dependencies
+        run: cd docusaurus && npm ci
+
+      - name: Typecheck
+        run: cd docusaurus && npm run typecheck
+
+      - name: Build website
+        run: cd docusaurus && npm run build
+
+      # Only needed by the deploy job, which does not run on pull requests or
+      # (by default) on forks. Keep this condition in sync with the `deploy`
+      # job's `if:` below.
+      - name: Upload artifact
+        if: |
+          github.event_name == 'push' &&
+          (github.repository == 'awslabs/cli-agent-orchestrator' || vars.DEPLOY_DOCS_PAGES == 'true')
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: docusaurus/build
+
+  deploy:
+    needs: build
+    if: |
+      github.event_name == 'push' &&
+      (github.repository == 'awslabs/cli-agent-orchestrator' || vars.DEPLOY_DOCS_PAGES == 'true')
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

@@ -138,6 +138,25 @@ def resolve_and_validate_path(
 _SAFE_PATH_COMPONENT_RE = re.compile(r"\A[A-Za-z0-9._-]+\Z")
 
 
+def flatten_path_separators(value: str) -> str:
+    """Flatten every path separator in ``value`` to ``__``.
+
+    Used where a user- or profile-derived string becomes a single filename
+    component and the separators should be folded rather than rejected (the
+    provider agent-file sinks, which historically accepted namespaced names).
+    Both ``/`` and ``\\`` are flattened: backslash is a path separator on
+    Windows, so leaving it intact would let a name like ``..\\..\\x`` traverse
+    out of the provider directory there.
+
+    Prefer :func:`validate_path_component` when the value should be *rejected*
+    rather than rewritten. This is the weaker, lossy primitive; it guarantees
+    the result contains no separator, not that the result is a sensible name.
+
+    Idempotent: a value with no separator is returned unchanged.
+    """
+    return value.replace("/", "__").replace("\\", "__")
+
+
 def validate_path_component(component: str, description: str = "path component") -> str:
     """Validate that ``component`` is a single, safe path segment.
 

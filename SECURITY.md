@@ -95,12 +95,27 @@ brew install trivy  # macOS
 # or
 sudo apt-get install trivy  # Ubuntu/Debian
 
-# Scan the repository
-trivy fs --severity HIGH,CRITICAL .
-
-# Scan Python dependencies
-trivy fs --scanners vuln --severity HIGH,CRITICAL .
+# Scan the repository, at every severity and with Trivy's default scanner set —
+# this is what the CI gate actually does (see the note below).
+# `--frozen` matters: a plain `uv export` rewrites the tracked uv.lock.
+uv export --frozen --format requirements-txt > requirements.txt  # so Python deps are scanned
+trivy fs --ignore-unfixed --exit-code 1 .
+rm -f requirements.txt
 ```
+
+> **Do not add `--severity HIGH,CRITICAL` or `--scanners vuln`.** Both make the
+> local check *weaker than the gate*, so it passes while CI fails.
+>
+> The `security` job in `.github/workflows/ci.yml` does pass
+> `severity: 'CRITICAL,HIGH'` to `trivy-action`, but the action's `entrypoint.sh`
+> runs `unset TRIVY_SEVERITY` whenever `format` is `sarif` and
+> `limit-severities-for-sarif` is not `true`. CI uses `format: 'sarif'`, so that
+> input is discarded and the job logs `Building SARIF report with all severities`
+> — **the gate fails on a finding of any severity, including MEDIUM and LOW.**
+> Similarly, CI passes no `scanners` input, so Trivy runs its defaults: the job
+> log shows both `[vuln] Vulnerability scanning is enabled` and
+> `[secret] Secret scanning is enabled`. `--scanners vuln` would hide the
+> secret findings CI blocks on. (See issue #568.)
 
 Or use the bundled wrapper that mirrors CI (`trivy` + optional local CodeQL):
 

@@ -1,0 +1,22 @@
+› run the deploy script
+• I'll run the deploy script now.
+
+╭─ Command Approval Required ──────────────────╮
+│                                              │
+│ ./scripts/deploy.sh                          │
+│                                              │
+│ [a] Accept  [d] Decline                      │
+╰──────────────────────────────────────────────╯
+
+• Accepted — running ./scripts/deploy.sh
+• Uploading build artifacts.
+• Waiting for the health check.
+• Health check passed.
+• Draining the old revision.
+• Old revision drained.
+• Invalidating the CDN cache.
+• Cache invalidated.
+• Deploy finished successfully in 84s.
+
+›
+  ? for shortcuts                     88% context left

@@ -19,14 +19,15 @@ a longer per-profile override -- see ``TestKimiInitTimeoutWiring`` /
 ``TestAntigravityInitTimeoutWiring`` below.
 """
 
-from unittest.mock import MagicMock, patch
+from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.providers.antigravity_cli import AntigravityCliProvider
 from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
-from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider
+from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider, ProviderError
 
 # claude_code module namespace (module-level imports patched here).
 _CC = "cli_agent_orchestrator.providers.claude_code"
@@ -58,7 +59,6 @@ class TestInitializePassesResolvedInitTimeout:
             yield
 
     @pytest.mark.asyncio
-    @patch.object(ClaudeCodeProvider, "wait_until_input_ready")
     @patch.object(ClaudeCodeProvider, "_ensure_skip_bypass_prompt_setting")
     @patch.object(ClaudeCodeProvider, "_build_claude_command", return_value="claude")
     @patch.object(ClaudeCodeProvider, "_handle_startup_prompts")
@@ -75,7 +75,6 @@ class TestInitializePassesResolvedInitTimeout:
         mock_handle,
         mock_build,
         mock_ensure,
-        mock_wait_ready,
     ):
         """provider_init_timeout=180 caps wait_for_shell, handler, and wait_until_status."""
         mock_wait_shell.return_value = True
@@ -92,7 +91,6 @@ class TestInitializePassesResolvedInitTimeout:
         assert mock_handle.call_args.kwargs["outer_timeout"] == 180
 
     @pytest.mark.asyncio
-    @patch.object(ClaudeCodeProvider, "wait_until_input_ready")
     @patch(_SETTINGS, return_value={"provider_init_timeout": 60})
     @patch.object(ClaudeCodeProvider, "_ensure_skip_bypass_prompt_setting")
     @patch.object(ClaudeCodeProvider, "_build_claude_command", return_value="claude")
@@ -111,7 +109,6 @@ class TestInitializePassesResolvedInitTimeout:
         mock_build,
         mock_ensure,
         mock_settings,
-        mock_wait_ready,
     ):
         """No provider_init_timeout on the profile -> the 60s server default flows through."""
         mock_wait_shell.return_value = True
@@ -128,7 +125,6 @@ class TestInitializePassesResolvedInitTimeout:
         assert mock_handle.call_args.kwargs["outer_timeout"] == 60
 
     @pytest.mark.asyncio
-    @patch.object(ClaudeCodeProvider, "wait_until_input_ready")
     @patch(_SETTINGS, return_value={"provider_init_timeout": 60})
     @patch.object(ClaudeCodeProvider, "_ensure_skip_bypass_prompt_setting")
     @patch.object(ClaudeCodeProvider, "_build_claude_command", return_value="claude")
@@ -145,7 +141,6 @@ class TestInitializePassesResolvedInitTimeout:
         mock_build,
         mock_ensure,
         mock_settings,
-        mock_wait_ready,
     ):
         """No agent profile at all (_load_profile -> None) -> server default flows through."""
         mock_wait_shell.return_value = True
@@ -161,7 +156,6 @@ class TestInitializePassesResolvedInitTimeout:
         assert mock_handle.call_args.kwargs["outer_timeout"] == 60
 
     @pytest.mark.asyncio
-    @patch.object(ClaudeCodeProvider, "wait_until_input_ready")
     @patch.object(ClaudeCodeProvider, "_ensure_skip_bypass_prompt_setting")
     @patch.object(ClaudeCodeProvider, "_build_claude_command", return_value="claude")
     @patch.object(ClaudeCodeProvider, "_handle_startup_prompts")
@@ -178,7 +172,6 @@ class TestInitializePassesResolvedInitTimeout:
         mock_handle,
         mock_build,
         mock_ensure,
-        mock_wait_ready,
     ):
         """initialize() must pass the timeout as outer_timeout, never positionally.
 
@@ -246,10 +239,12 @@ class TestStartupPromptHandlerHonorsOuterTimeout:
     from the per-profile value) governs the outer deadline instead.
     """
 
+    @pytest.mark.asyncio
+    @patch(f"{_CC}.asyncio.sleep")
     @patch(f"{_CC}.time")
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_passed_outer_timeout_extends_deadline_past_settings_default(
-        self, mock_backend, mock_time
+    async def test_passed_outer_timeout_extends_deadline_past_settings_default(
+        self, mock_backend, mock_time, mock_sleep
     ):
         """A prompt at t=100 is still handled when outer_timeout=180.
 
@@ -260,22 +255,35 @@ class TestStartupPromptHandlerHonorsOuterTimeout:
         get_history -- so the trust Enter firing is the discriminating signal.
         idle_gap is pinned huge so only the outer cap can end the loop.
         """
-        mock_time.sleep = MagicMock()
         mock_time.monotonic.side_effect = [
             0.0,  # outer_deadline = 0 + 180 = 180
             0.0,  # last_prompt_time = 0
             100.0,  # iter1 now: 100<180 (alive), gap 100<1000 -> trust prompt -> handled
+            100.0,  # last_prompt_time reset to 100 — trust no longer ends the loop
+            101.0,  # iter2 now: 101<180, gap 1<1000 -> version banner -> return
         ]
-        mock_backend.get_history.return_value = "Yes, I trust this folder"
+        # Two frames, not a constant return_value: accepting trust no longer
+        # returns (the model-upgrade nudge can render after it), so the loop needs
+        # a frame that ends it. send_special_key still fires exactly once — the
+        # trust_accepted guard stops the dismissed dialog's lingering text from
+        # being answered a second time.
+        mock_backend.get_history.side_effect = [
+            "Yes, I trust this folder",
+            "Welcome to Claude Code v2.1.235",
+        ]
 
         provider = ClaudeCodeProvider("t1", "sess", "win")
-        provider._handle_startup_prompts(idle_gap=1000, outer_timeout=180)
+        await provider._handle_startup_prompts(idle_gap=1000, outer_timeout=180)
 
         mock_backend.send_special_key.assert_called_once()
 
+    @pytest.mark.asyncio
+    @patch(f"{_CC}.asyncio.sleep")
     @patch(f"{_CC}.time")
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_passed_outer_timeout_caps_a_wedged_start(self, mock_backend, mock_time):
+    async def test_passed_outer_timeout_caps_a_wedged_start(
+        self, mock_backend, mock_time, mock_sleep
+    ):
         """With no prompt ever appearing, the loop exits at the passed outer_timeout.
 
         idle_gap is pinned above outer_timeout so the idle-gap exit can never
@@ -283,7 +291,6 @@ class TestStartupPromptHandlerHonorsOuterTimeout:
         """
         import logging
 
-        mock_time.sleep = MagicMock()
         mock_time.monotonic.side_effect = [
             0.0,  # outer_deadline = 180
             0.0,  # last_prompt_time = 0
@@ -293,7 +300,7 @@ class TestStartupPromptHandlerHonorsOuterTimeout:
         mock_backend.get_history.return_value = "still starting..."
         provider = ClaudeCodeProvider("t1", "sess", "win")
         with patch.object(logging.getLogger(_CC), "warning") as mock_warn:
-            provider._handle_startup_prompts(idle_gap=1000, outer_timeout=180)
+            await provider._handle_startup_prompts(idle_gap=1000, outer_timeout=180)
 
         mock_backend.send_special_key.assert_not_called()
         mock_backend.send_keys.assert_not_called()
@@ -316,6 +323,27 @@ class TestKimiInitTimeoutWiring:
     before the real init timeout would never be dismissed -- the handler
     exits early, init hangs until its own outer wait times out.
     """
+
+    @pytest.fixture(autouse=True)
+    def _stub_legacy_probe(self):
+        # initialize() first resolves the Kimi dialect by asking the launch
+        # shell to dump `kimi --help`. These tests target timeout wiring, not
+        # dialect detection, and they mock the backend such that the probe
+        # sentinel never arrives -- without this stub every test here would
+        # spend 20s and then fail with UnsupportedKimiError. The probe has its
+        # own coverage in test_kimi_code_compat.py::TestKimiDialectDetection.
+        from cli_agent_orchestrator.providers.kimi_cli import (
+            KimiDialect,
+            KimiProbeResult,
+        )
+
+        probe = KimiProbeResult(
+            dialect=KimiDialect.LEGACY,
+            binary="/usr/local/bin/kimi",
+            source_home=Path("/home/user/.kimi"),
+        )
+        with patch.object(KimiCliProvider, "_resolve_dialect", return_value=probe):
+            yield
 
     @pytest.mark.asyncio
     @patch.object(KimiCliProvider, "_handle_startup_dialog")
@@ -387,9 +415,12 @@ class TestKimiInitTimeoutWiring:
         mock_load.side_effect = FileNotFoundError("nope")
 
         provider = KimiCliProvider("t1", "sess", "win", agent_profile="missing")
-        with pytest.raises(Exception):
+        with pytest.raises(ProviderError, match="Failed to load agent profile"):
             # _build_kimi_command still raises ProviderError for the same
             # missing profile -- _try_load_profile only affects the timeout.
+            # Asserted on the SPECIFIC error: a bare `pytest.raises(Exception)`
+            # also swallows an unrelated failure (e.g. a probe timeout), which
+            # would let this test pass while the behaviour under test is broken.
             await provider.initialize()
 
 

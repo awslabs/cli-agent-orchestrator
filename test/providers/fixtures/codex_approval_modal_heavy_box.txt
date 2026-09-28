@@ -1,0 +1,9 @@
+› run the deploy script
+• I'll run the deploy script now.
+
+┏━ Command Approval Required ━━━━━━━━━━━━━━━━━━┓
+┃                                              ┃
+┃ ./scripts/deploy.sh                          ┃
+┃                                              ┃
+┃ [a] Accept   [d] Decline                     ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛

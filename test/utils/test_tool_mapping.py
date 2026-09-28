@@ -4,8 +4,11 @@ import pytest
 
 from cli_agent_orchestrator.utils.tool_mapping import (
     format_tool_summary,
+    get_allowed_tools,
     get_disallowed_tools,
+    granted_mcp_servers,
     resolve_allowed_tools,
+    tool_constraint_instruction,
 )
 
 
@@ -58,6 +61,79 @@ class TestResolveAllowedTools:
         """Wildcard '*' in profile tools is preserved."""
         result = resolve_allowed_tools(["*"], "supervisor")
         assert result == ["*"]
+
+
+class TestExplicitAllowedToolsIsTheWholeList:
+    """Regression for #772: an explicit allowedTools does not get MCP refs appended.
+
+    The append exists so that declaring a server in ``mcpServers`` is enough to use
+    it. Applied to an explicit ``allowedTools`` it also meant the operator could not
+    withhold one, and ``--allowed-tools`` never got the append, so the two spellings
+    ``docs/tool-restrictions.md`` calls priority 2 and 3 resolved to different
+    policies from the same list.
+    """
+
+    def test_a_declared_server_is_not_added_to_an_explicit_list(self):
+        result = resolve_allowed_tools(["fs_read"], None, ["cao-mcp-server"])
+        assert result == ["fs_read"]
+
+    def test_the_same_holds_when_a_role_is_also_set(self):
+        """``allowedTools`` outranks ``role``, so the role must not reintroduce it."""
+        result = resolve_allowed_tools(["fs_read"], "developer", ["cao-mcp-server"])
+        assert result == ["fs_read"]
+
+    def test_naming_the_server_still_grants_it(self):
+        """The supported way to keep the grant is to write it in the list."""
+        result = resolve_allowed_tools(["fs_read", "@cao-mcp-server"], None, ["cao-mcp-server"])
+        assert result == ["fs_read", "@cao-mcp-server"]
+
+    def test_an_empty_list_denies_everything(self):
+        """``allowedTools: []`` is a deny-all and used to resolve to one grant."""
+        assert resolve_allowed_tools([], None, ["cao-mcp-server"]) == []
+
+    def test_the_cli_and_the_profile_agree_on_the_same_list(self):
+        """The disagreement in #772.
+
+        ``cli/commands/launch.py`` assigns ``list(allowed_tools)`` for
+        ``--allowed-tools`` and never calls this function, so the CLI spelling was
+        already unappended. Matching it here is what makes the two priorities
+        express one policy.
+        """
+        written_by_the_operator = ["fs_read", "execute_bash"]
+        via_cli = list(written_by_the_operator)
+        via_profile = resolve_allowed_tools(written_by_the_operator, None, ["cao-mcp-server"])
+        assert via_profile == via_cli
+
+    def test_the_role_branch_still_appends(self):
+        """Unchanged: a role default is CAO's list, not the operator's."""
+        result = resolve_allowed_tools(None, "supervisor", ["my-server"])
+        assert "@my-server" in result
+
+    def test_the_no_role_fallback_still_appends(self):
+        result = resolve_allowed_tools(None, None, ["my-server"])
+        assert "@my-server" in result
+
+    def test_an_explicit_wildcard_is_still_untouched(self):
+        assert resolve_allowed_tools(["*"], None, ["cao-mcp-server"]) == ["*"]
+
+
+class TestToolConstraintInstruction:
+    """Regression for the #803 review: the sentence has to hold for an empty list.
+
+    Five soft-enforcement providers built this by joining the allowlist, so a
+    deny-all produced a sentence that named no tools and read as an authoring
+    slip rather than as a restriction.
+    """
+
+    def test_a_deny_all_says_so_in_words(self):
+        assert tool_constraint_instruction([]) == (
+            "You may not use any tools. Do not attempt to call one."
+        )
+
+    def test_a_restricted_policy_keeps_the_existing_wording(self):
+        assert tool_constraint_instruction(["fs_read", "fs_list"]) == (
+            "You only have access to these tools: fs_read, fs_list"
+        )
 
 
 class TestGetDisallowedTools:
@@ -176,6 +252,72 @@ class TestClaudeCodeWebFetch:
         )
 
 
+class TestGrokCliToolMapping:
+    """Grok restrictions use native deny rules, not prompt enforcement."""
+
+    def test_supervisor_blocks_execution_write_and_network(self):
+        disallowed = get_disallowed_tools("grok_cli", ["@cao-mcp-server", "fs_read", "fs_list"])
+
+        assert "Bash" in disallowed
+        assert "Edit" in disallowed
+        assert "Write" in disallowed
+        assert "NotebookEdit" in disallowed
+        assert "WebFetch" in disallowed
+        assert "WebSearch" in disallowed
+        assert "Read" not in disallowed
+        assert "Grep" not in disallowed
+        assert "Glob" not in disallowed
+
+    def test_reviewer_keeps_read_and_search_only(self):
+        disallowed = get_disallowed_tools(
+            "grok_cli", ["@builtin", "fs_read", "fs_list", "@cao-mcp-server"]
+        )
+
+        assert "Read" not in disallowed
+        assert "NotebookRead" not in disallowed
+        assert "Grep" not in disallowed
+        assert "Glob" not in disallowed
+        assert {"Bash", "Edit", "Write", "NotebookEdit"}.issubset(disallowed)
+
+    def test_developer_mapping_allows_every_category(self):
+        assert (
+            get_disallowed_tools(
+                "grok_cli",
+                ["@builtin", "fs_*", "execute_bash", "web_fetch", "@cao-mcp-server"],
+            )
+            == []
+        )
+
+    def test_unrestricted_star_emits_no_deny_rules(self):
+        assert get_disallowed_tools("grok_cli", ["*"]) == []
+
+    def test_restricted_allowlist_returns_only_explicit_native_capabilities(self):
+        assert get_allowed_tools("grok_cli", ["@cao-mcp-server", "fs_read", "fs_list"]) == [
+            "Glob",
+            "Grep",
+            "NotebookRead",
+            "Read",
+        ]
+        assert "Bash" not in get_allowed_tools(
+            "grok_cli", ["@cao-mcp-server", "fs_read", "fs_list"]
+        )
+
+    def test_wildcard_allowlist_returns_all_native_capabilities(self):
+        assert set(get_allowed_tools("grok_cli", ["*"])) == set(
+            get_allowed_tools("grok_cli", ["fs_*", "execute_bash", "web_fetch"])
+        )
+
+    def test_each_category_remains_independently_governed(self):
+        bash_only = get_disallowed_tools("grok_cli", ["execute_bash"])
+        assert "Bash" not in bash_only
+        assert {"Read", "Edit", "Grep", "WebFetch", "WebSearch"}.issubset(bash_only)
+
+        web_only = get_disallowed_tools("grok_cli", ["web_fetch"])
+        assert "WebFetch" not in web_only
+        assert "WebSearch" not in web_only
+        assert {"Bash", "Read", "Edit", "Grep"}.issubset(web_only)
+
+
 class TestFormatToolSummary:
     """Tests for format_tool_summary."""
 
@@ -228,3 +370,64 @@ class TestClaudeCodeSubagentEscape:
 
     def test_unrestricted_star_keeps_everything(self):
         assert get_disallowed_tools("claude_code", ["*"]) == []
+
+
+class TestGrantedMcpServers:
+    """The one matching rule both grant sites share.
+
+    These pin the rule's vocabulary. They are NOT what proves the defect fixed:
+    the rule was always easy to write correctly, and the gap was that neither
+    call site applied one. That is asserted on the emitted artifacts in
+    ``test/agent_plugins/test_no_auto_grant.py`` (OpenCode's ``opencode.json``)
+    and ``test/providers/test_grok_cli_unit.py`` (Grok's launch command).
+    """
+
+    SERVERS = ["plugin-tools", "other-tools", "cao-mcp-server"]
+
+    def test_a_glob_selects_the_matching_servers(self):
+        assert granted_mcp_servers(["fs_read", "@plugin-*"], self.SERVERS) == ["plugin-tools"]
+
+    def test_an_exact_reference_still_works(self):
+        assert granted_mcp_servers(["@cao-mcp-server"], self.SERVERS) == ["cao-mcp-server"]
+
+    def test_star_grants_every_delivered_server(self):
+        assert granted_mcp_servers(["*"], self.SERVERS) == sorted(self.SERVERS)
+
+    def test_an_empty_allowlist_grants_nothing(self):
+        assert granted_mcp_servers([], self.SERVERS) == []
+
+    def test_a_non_matching_glob_grants_nothing(self):
+        assert granted_mcp_servers(["@ghost-*"], self.SERVERS) == []
+
+    def test_matching_is_case_sensitive(self):
+        """``fnmatchcase``, not ``fnmatch``: the latter case-folds on some hosts."""
+        assert granted_mcp_servers(["@PLUGIN-*"], self.SERVERS) == []
+        assert granted_mcp_servers(["@Plugin-Tools"], self.SERVERS) == []
+
+    def test_expansion_is_over_the_given_names_only(self):
+        """A pattern is never returned as though it were a server name."""
+        assert granted_mcp_servers(["@plugin-*"], []) == []
+        assert granted_mcp_servers(["@*"], None) == []
+
+    def test_builtin_is_cao_vocabulary_not_a_server_reference(self):
+        """``@builtin`` names a provider's own tool set, so it matches nothing."""
+        assert granted_mcp_servers(["@builtin"], ["builtin", "plugin-tools"]) == []
+
+    def test_a_bare_at_sign_matches_nothing(self):
+        assert granted_mcp_servers(["@"], self.SERVERS) == []
+
+    def test_an_exact_name_containing_glob_syntax_still_matches(self):
+        """Exact membership is checked independently, so nothing the old rule
+        granted is lost — even for a name ``fnmatch`` would read as syntax.
+
+        Such a reference now ALSO matches what it denotes as a pattern
+        (``@srv[1]`` is a one-character class), which is inherent to the
+        documented glob semantics. Conventional MCP names contain no ``fnmatch``
+        metacharacter, so the two readings coincide in practice, and Grok's
+        ``_MCP_SERVER_REF`` refuses such a name outright.
+        """
+        assert granted_mcp_servers(["@srv[1]"], ["srv[1]", "srv1"]) == ["srv1", "srv[1]"]
+        assert granted_mcp_servers(["@srv[1]"], ["srv[1]"]) == ["srv[1]"]
+
+    def test_non_string_entries_are_ignored(self):
+        assert granted_mcp_servers(["@plugin-*", None, 7], self.SERVERS) == ["plugin-tools"]

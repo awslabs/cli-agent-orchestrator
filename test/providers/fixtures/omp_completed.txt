@@ -1,0 +1,12 @@
+[48;2;5;5;5m
+ Reply with exactly ACK and do not use any tools.
+
+[49m ACK
+
+[48;2;5;5;5m
+ Reply with exactly RAW_FIXTURE.
+
+[49m RAW_FIXTURE
+
+╭── OMP session ─────────────────────────────────────────────────────────────╮
+╰─                                                                            ─╯

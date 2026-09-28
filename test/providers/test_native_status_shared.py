@@ -1,4 +1,4 @@
-"""Shared native-status (herdr backend) tests across all herdr-capable providers.
+"""Shared native-status (herdr backend) tests across all registered providers.
 
 Every provider's ``get_status()`` must consult the backend's native agent state
 before parsing its output buffer, because on the herdr backend ``pipe_pane`` is a
@@ -14,8 +14,9 @@ the None fall-through to buffer parsing on the tmux backend.
 
 ``claude_code`` keeps its own detailed suite (``TestClaudeCodeProviderNativeStatus``
 in test_claude_code_unit.py); it is included here for breadth alongside the
-providers that previously had no native-status coverage. ``q_cli`` and
-``gemini_cli`` are out of scope for the herdr backend and excluded.
+providers that previously had no native-status coverage. The credential-free
+``mock_cli`` provider is included too because it is a registered provider used
+by orchestration tests and must obey the same backend contract.
 """
 
 import time
@@ -29,14 +30,20 @@ from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
 from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
 from cli_agent_orchestrator.providers.cursor_cli import CursorCliProvider
+from cli_agent_orchestrator.providers.grok_cli import GrokCliProvider
 from cli_agent_orchestrator.providers.hermes import HermesProvider
 from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider
 from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
+from cli_agent_orchestrator.providers.minimax_code import MiniMaxCodeProvider
+from cli_agent_orchestrator.providers.mock_cli import MockCliProvider
+from cli_agent_orchestrator.providers.omp import OmpProvider
 from cli_agent_orchestrator.providers.opencode_cli import OpenCodeCliProvider
 
 
 def _make(provider_cls):
     """Construct a provider with the minimal args each constructor requires."""
+    if provider_cls is MockCliProvider:
+        return provider_cls("test1234", "test-session", "window-0")
     return provider_cls("test1234", "test-session", "window-0", "developer")
 
 
@@ -48,10 +55,14 @@ PROVIDERS = [
     pytest.param(CopilotCliProvider, None, id="copilot_cli"),
     pytest.param(KimiCliProvider, "_has_received_input", id="kimi_cli"),
     pytest.param(OpenCodeCliProvider, None, id="opencode_cli"),
+    pytest.param(OmpProvider, "_turns", id="omp"),
     pytest.param(CursorCliProvider, "_turns", id="cursor_cli"),
     pytest.param(AntigravityCliProvider, "_turns", id="antigravity_cli"),
     pytest.param(HermesProvider, None, id="hermes"),
     pytest.param(ClaudeCodeProvider, None, id="claude_code"),
+    pytest.param(GrokCliProvider, "_turns", id="grok_cli"),
+    pytest.param(MiniMaxCodeProvider, "_has_received_input", id="mcode"),
+    pytest.param(MockCliProvider, None, id="mock_cli"),
 ]
 
 

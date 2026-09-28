@@ -15,6 +15,7 @@ from cli_agent_orchestrator.constants import (
     PIPE_LIVENESS_CHECK_INTERVAL_S,
     PIPE_LIVENESS_COLD_START_GRACE_S,
     PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS,
+    PIPE_LIVENESS_MAX_PROBE_FAILURES,
     PIPE_LIVENESS_MAX_REARM_FAILURES,
     PIPE_LIVENESS_STALL_CHECKS,
 )
@@ -136,6 +137,12 @@ class FifoManager:
         # any successful re-arm; once it hits PIPE_LIVENESS_MAX_REARM_FAILURES
         # the terminal is dropped from the watchdog instead of retrying forever.
         self._rearm_failures: Dict[str, int] = {}
+        # Consecutive liveness-*probe* failures per terminal (probe() raised — the
+        # session/window/whole tmux server is gone). Reset on any successful probe;
+        # once it hits PIPE_LIVENESS_MAX_PROBE_FAILURES the terminal is dropped from
+        # the watchdog instead of re-probing (and logging a traceback) every tick
+        # forever (harness-control#845).
+        self._probe_failures: Dict[str, int] = {}
         self._watchdog_stop = threading.Event()
         self._watchdog_thread: Optional[threading.Thread] = None
 
@@ -212,6 +219,7 @@ class FifoManager:
             self._registered_at.pop(terminal_id, None)
             self._ever_delivered.pop(terminal_id, None)
             self._cold_start_attempts.pop(terminal_id, None)
+            self._probe_failures.pop(terminal_id, None)
 
         # Deliberately NOT stopping the watchdog thread here even when this was
         # the last enrolled terminal: doing it under a "now idle" check raced
@@ -463,7 +471,52 @@ class FifoManager:
         # probe() is a slow tmux `capture-pane` call — deliberately made
         # without holding self._lock so it never blocks stop_reader() (or
         # other terminals' housekeeping) for its duration.
-        content = probe()
+        try:
+            content = probe()
+        except Exception:
+            # The session/window/whole tmux server is gone, so probe() raises
+            # (e.g. libtmux ObjectDoesNotExist) and will keep raising every tick.
+            # Nothing downstream (the re-arm / cold-start counters) is ever reached
+            # on this path, so without a dedicated bound a dead terminal produces an
+            # unbounded per-tick traceback storm across every ghost terminal
+            # (harness-control#845). Bound it exactly like the re-arm and cold-start
+            # give-up paths: count consecutive probe failures and, after
+            # PIPE_LIVENESS_MAX_PROBE_FAILURES, drop the terminal from the watchdog,
+            # emitting ONE summary WARNING instead of a traceback per tick.
+            with self._lock:
+                # stop_reader() may have unenrolled this terminal while probe()
+                # was in flight; don't resurrect state for a terminal that's gone.
+                if terminal_id not in self._pane_probe:
+                    return
+                failures = self._probe_failures.get(terminal_id, 0) + 1
+                if failures >= PIPE_LIVENESS_MAX_PROBE_FAILURES:
+                    self._pane_probe.pop(terminal_id, None)
+                    self._rearm.pop(terminal_id, None)
+                    self._liveness.pop(terminal_id, None)
+                    self._rearm_failures.pop(terminal_id, None)
+                    self._registered_at.pop(terminal_id, None)
+                    self._ever_delivered.pop(terminal_id, None)
+                    self._cold_start_attempts.pop(terminal_id, None)
+                    self._probe_failures.pop(terminal_id, None)
+                    give_up = True
+                else:
+                    self._probe_failures[terminal_id] = failures
+                    give_up = False
+            if give_up:
+                logger.warning(
+                    "pipe-pane liveness probe for terminal %s failed %d consecutive "
+                    "times (session/window/server gone); dropping it from the watchdog",
+                    terminal_id,
+                    PIPE_LIVENESS_MAX_PROBE_FAILURES,
+                )
+            else:
+                logger.debug(
+                    "pipe-pane liveness probe for terminal %s failed (%d/%d); will retry",
+                    terminal_id,
+                    failures,
+                    PIPE_LIVENESS_MAX_PROBE_FAILURES,
+                )
+            return
         now = time.monotonic()
 
         do_rearm = False
@@ -479,6 +532,10 @@ class FifoManager:
             # and never cleaned up, leaking slowly across create/stop churn.
             if terminal_id not in self._pane_probe:
                 return
+            # probe() succeeded — the session is reachable again, so clear any
+            # accumulated probe-failure strikes (harness-control#845): a brief
+            # transient must never accumulate across recoveries into a false drop.
+            self._probe_failures.pop(terminal_id, None)
             last_data_at = self._last_data_at.get(terminal_id, 0.0)
 
             # ---- cold-start check (harness-control#93) ----
@@ -521,6 +578,7 @@ class FifoManager:
                     self._registered_at.pop(terminal_id, None)
                     self._ever_delivered.pop(terminal_id, None)
                     self._cold_start_attempts.pop(terminal_id, None)
+                    self._probe_failures.pop(terminal_id, None)
                 else:
                     self._cold_start_attempts[terminal_id] = attempts
                     # Reset the grace-period clock so the NEXT evaluation is
@@ -664,6 +722,7 @@ class FifoManager:
                     self._registered_at.pop(terminal_id, None)
                     self._ever_delivered.pop(terminal_id, None)
                     self._cold_start_attempts.pop(terminal_id, None)
+                    self._probe_failures.pop(terminal_id, None)
             if give_up:
                 # Not a silent retry-forever: a re-arm that keeps failing
                 # (e.g. the tmux pane is gone) previously re-struck and

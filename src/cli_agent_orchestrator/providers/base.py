@@ -33,6 +33,44 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class OutputExtractionError(ValueError):
+    """A provider ran but no usable message could be extracted from its output.
+
+    Distinct from the ``ValueError``s that name a bad terminal or provider
+    reference, which are genuine lookup failures. This one means the terminal
+    exists and the step ran; only the response marker was missing from the
+    scrollback.
+
+    Subclasses ``ValueError`` so existing ``except ValueError`` callers keep
+    working; the API boundary catches this narrower type first so an extraction
+    failure is not reported as 404 Not Found (issue #570).
+
+    This is the *retryable* half of the extraction contract: the response marker
+    was not found, so a wider capture may still succeed. A refusal to publish
+    content that was actually found is :class:`OutputExtractionRejected`.
+    """
+
+
+class OutputExtractionRejected(OutputExtractionError):
+    """A deliberate refusal to publish extracted content.
+
+    Raised when the extractor *found* the response region and refused to publish
+    what was in it — the turn produced only private reasoning, or every candidate
+    row was chrome, a user echo, or reasoning.
+
+    The distinction is a security boundary, not a taxonomy nicety. A missing
+    marker is worth retrying with a wider capture and may legitimately degrade to
+    a labelled raw-transcript fallback. A deliberate rejection must do neither:
+    the raw pane contains the very content that was refused, so substituting it
+    silently republishes private reasoning as the agent's answer. Callers that
+    escalate or fall back on :class:`OutputExtractionError` must re-raise this
+    subtype unchanged.
+
+    Subclasses :class:`OutputExtractionError` so existing callers that handle the
+    broader type keep working and the API boundary still maps it away from 404.
+    """
+
+
 class BaseProvider(ABC):
     """Abstract base class for CLI tool providers.
 
@@ -165,6 +203,37 @@ class BaseProvider(ABC):
     # this False — their COMPLETED/IDLE split is not screen-detectable.
     supports_direct_status_probe: bool = False
 
+    # Opt-in for the mid-burst PROCESSING probe (StatusMonitor._midburst_processing_probe).
+    # Set True ONLY alongside a probe_processing_from_screen() override that is
+    # side-effect free. The probe runs on a HALF-DRAWN frame, off the two edges
+    # the screen path is otherwise restricted to, and its verdict is discarded
+    # unless it says PROCESSING — so a detector that commits turn bookkeeping
+    # while deciding (minimax_code's completion identity/epoch and _awaiting_turn,
+    # grok_cli's _turn_activity_seen) would have that bookkeeping applied from a
+    # frame the monitor then throws away. Providers that leave this False are
+    # never probed: the terminal keeps the status the edges give it.
+    supports_midburst_processing_probe: bool = False
+
+    def probe_processing_from_screen(self, screen_lines: List[str]) -> bool:
+        """Report whether this half-drawn frame shows the agent actively working.
+
+        A pure observation, called only when ``supports_midburst_processing_probe``
+        is True: it MUST NOT mutate provider state, because the monitor ignores
+        everything it says except True, and the frame it sees is mid-redraw
+        rather than settled.
+
+        Answer True only on POSITIVE evidence of work — a drawn spinner or
+        progress row — never on the absence of a ready prompt. A partial redraw
+        routinely erases the composer while the previous response is still on
+        screen, and a settled detector reasonably calls that PROCESSING; here it
+        is not, and a True there spends the monitor's dispatch arm on a frame
+        that shows no new turn (see CodexProvider). Leave every other verdict to
+        the rising edge and quiescence, which see whole frames.
+
+        Default: False — no provider is probed unless it opts in.
+        """
+        return False
+
     def get_status_from_screen(self, screen_lines: List[str]) -> TerminalStatus:
         """Detect status from a pyte-rendered screen (composited viewport).
 
@@ -184,6 +253,15 @@ class BaseProvider(ABC):
         (see ClaudeCodeProvider) and set ``supports_screen_detection = True``.
         """
         return self.get_status("\n".join(screen_lines))
+
+    def extract_current_composer(self, rendered_pane: str) -> Optional[str]:
+        """Return this provider's current editable composer, when it is known.
+
+        A rendered pane also contains transcript history, so callers must not
+        infer an input boundary from its cursor position alone. Providers opt
+        in only when they can identify their own live composer structure.
+        """
+        return None
 
     @property
     def paste_submit_delay(self) -> float:
@@ -237,6 +315,17 @@ class BaseProvider(ABC):
         return False
 
     @property
+    def assume_processing_on_dispatch(self) -> bool:
+        """Publish PROCESSING immediately when a task is dispatched.
+
+        Most CLIs repaint quickly enough for their first activity frame to
+        drive the transition. Full-screen TUIs that can remain visually
+        unchanged just after submission opt in so callers cannot observe the
+        previous turn's cached COMPLETED state as the new turn's result.
+        """
+        return False
+
+    @property
     def extraction_retries(self) -> int:
         """Number of extraction retries for transient TUI rendering issues.
 
@@ -246,6 +335,19 @@ class BaseProvider(ABC):
         with re-capture between attempts.  Default is 0 (no retries).
         """
         return 0
+
+    @property
+    def allow_raw_transcript_fallback(self) -> bool:
+        """Whether LAST output may degrade to the provider raw terminal pane.
+
+        The historical service behavior is permissive because several providers
+        have no private sub-channels in their rendered transcript. Providers
+        whose pane can contain non-publishable channels must override this to
+        False. Extraction retries still widen normally; only the raw-pane
+        substitution after exhaustion is disabled.
+        """
+
+        return True
 
     @abstractmethod
     def extract_last_message_from_script(self, script_output: str) -> str:
@@ -269,8 +371,13 @@ class BaseProvider(ABC):
         pass
 
     @abstractmethod
-    def cleanup(self) -> None:
-        """Clean up provider resources."""
+    def cleanup(self) -> bool | None:
+        """Clean up provider resources.
+
+        Providers may return ``False`` when cleanup is intentionally deferred
+        and lifecycle metadata must be retained for a retry. Existing providers
+        that return ``None`` are treated as successfully cleaned up.
+        """
         pass
 
     def mark_input_received(self) -> None:
@@ -290,6 +397,26 @@ class BaseProvider(ABC):
         self._last_dispatch_time = time.time()
         self._done_first_detected = 0.0
         self._idle_first_detected = 0.0
+
+    def notify_status_buffer_reset(self, epoch: int) -> None:
+        """Notify the provider that StatusMonitor started a fresh byte buffer.
+
+        ``StatusMonitor.clear_rolling_buffer()`` is used immediately before a
+        new prompt is pasted.  Providers that carry state across observations
+        (for example a completion fingerprint plus a monotonic stream offset)
+        must not infer continuity through that explicit boundary.  The monitor
+        supplies a monotonically increasing per-terminal ``epoch`` so a
+        provider can retain stale-screen protections while recognising output
+        from the newly-dispatched turn.
+
+        Implementations must be synchronous, cheap, and must not call back
+        into ``StatusMonitor``: the notification is delivered while its lock is
+        held to make the clear and reset atomic relative to output processing.
+        """
+
+        # Most providers only inspect their current rolling buffer and have no
+        # cross-observation state, so the default is intentionally a no-op.
+        del epoch
 
     def _resolve_native_status(self, buffer: Optional[str] = None) -> Optional[TerminalStatus]:
         """Resolve status from the backend's native agent state, if available.

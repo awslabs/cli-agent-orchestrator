@@ -13,14 +13,20 @@ exhaust system resources. CAO provides automatic and manual cleanup paths.
 | Handoff completes successfully (auto-delete) | Yes |
 | `delete_terminal` MCP tool | Yes |
 | `DELETE /terminals/{id}` API | Yes |
-| `cao shutdown --session <name>` | No |
-| `cao shutdown --all` | No |
+| `cao shutdown --session <name>` | Yes |
+| `cao shutdown --all` | Yes |
 | Process crash | No |
 
-Snapshots are only saved when a terminal is deleted individually via
-`terminal_service.delete_terminal`. Session-level shutdown (`delete_session`)
-kills windows directly and does not snapshot. If you want scrollback preserved,
-delete terminals individually before shutting down the session.
+Individual deletion snapshots via `terminal_service.delete_terminal`.
+Session-level shutdown (`delete_session`, which both `cao shutdown` modes reach
+over `DELETE /sessions/{name}`) snapshots too: capturing each terminal's
+scrollback is an explicit step of the teardown, and it deliberately runs
+*before* the session kill, since scrollback only exists while the pane does. A
+crash bypasses both paths, so nothing is captured.
+
+Capture is best-effort everywhere, not just at session level: a snapshot whose
+write fails is logged and teardown continues regardless of which path took it.
+So "Yes" above means the path attempts a snapshot, not that one is guaranteed.
 
 ## Snapshot files
 

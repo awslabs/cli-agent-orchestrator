@@ -18,6 +18,12 @@ returns `disabled: true`, skip it silently and continue your task** — learning
 is off for this run (often deliberately, e.g. a control run) and that is
 expected, not an error.
 
+**A bare `error` with no `disabled` key is different: say so, don't skip it.**
+That shape means the tool could not reach a verdict — cao-server is unreachable,
+or its `settings.json` could not be read — so learning may well be ON while
+nothing is being recorded. Mention it in your response and carry on with the
+task.
+
 ## If you are a SUPERVISOR
 
 ### Report an outcome after each meaningful unit of work

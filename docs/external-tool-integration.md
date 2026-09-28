@@ -6,7 +6,7 @@ Any tool that loads SKILL.md files can consume these skills. [OpenClaw](https://
 
 ## What This Enables
 
-By adding the `cao-session-management` skill to an external tool, the agent in that tool can orchestrate CAO sessions via shell commands — launching supervisor agents, sending tasks, and collecting results without leaving its own chat loop.
+By adding the `cao-session-management` skill to an external tool, the agent in that tool can orchestrate CAO sessions via shell commands — launching supervisor agents, sending tasks, and collecting results without leaving its own chat loop. The companion `cao-session-liveness` skill teaches the same agent how to confirm a session is genuinely alive before it reports progress.
 
 The agent can:
 
@@ -14,6 +14,7 @@ The agent can:
 - **Send work synchronously** — block until the CAO agent completes and return results inline
 - **Send work asynchronously** — fire a task and continue, check back later for status
 - **Monitor sessions** — list active sessions, check worker status, retrieve output
+- **Verify liveness** — corroborate a reported status against terminal output, and recognize a session whose provider has already exited
 - **Shut down sessions** — clean up when done
 
 This turns any SKILL.md-compatible tool into an orchestration client for CAO's multi-agent system.
@@ -35,10 +36,15 @@ TARGET_SKILLS=~/.openclaw/workspace/skills          # OpenClaw example
 # TARGET_SKILLS=~/.hermes/skills/cli-agent-orchestrator   # Hermes Agent example
 mkdir -p "$TARGET_SKILLS"
 
-# Symlink the session management skill
-ln -sf ~/.aws/cli-agent-orchestrator/skills/cao-session-management \
-       "$TARGET_SKILLS/cao-session-management"
+# Symlink the session management skill and its liveness companion
+for skill in cao-session-management cao-session-liveness; do
+  ln -sf ~/.aws/cli-agent-orchestrator/skills/"$skill" "$TARGET_SKILLS/$skill"
+done
 ```
+
+Each skill is a self-contained `<skill-name>/SKILL.md` folder, which is the layout
+both hosts expect: OpenClaw loads them flat under its skill directory, and Hermes
+Agent nests the same folders under a category directory.
 
 Symlinks stay in sync with CAO upgrades automatically.
 
@@ -66,7 +72,23 @@ If the external tool's agent has filesystem access, tell it to install the skill
 
 The agent will read the SKILL.md, copy the folder into its own workspace, and make it available for future sessions.
 
-For Hermes Agent specifically, the agent can run `from pathlib import Path; skill_manage(action='create', name='cao-session-management', category='cli-agent-orchestrator', content=Path('~/.aws/cli-agent-orchestrator/skills/cao-session-management/SKILL.md').expanduser().read_text())` to register the skill into `~/.hermes/skills/cli-agent-orchestrator/cao-session-management/`. Note that Option C creates a copy that will go stale on CAO upgrades — prefer Option A (symlink) when a shared filesystem is available.
+For Hermes Agent specifically, the agent can register each skill under a category
+directory, which produces `~/.hermes/skills/cli-agent-orchestrator/<skill-name>/`:
+
+```python
+from pathlib import Path
+
+for skill in ("cao-session-management", "cao-session-liveness"):
+    source = Path(f"~/.aws/cli-agent-orchestrator/skills/{skill}/SKILL.md").expanduser()
+    skill_manage(
+        action="create",
+        name=skill,
+        category="cli-agent-orchestrator",
+        content=source.read_text(),
+    )
+```
+
+Note that Option C creates a copy that will go stale on CAO upgrades — prefer Option A (symlink) when a shared filesystem is available.
 
 ## Scope
 

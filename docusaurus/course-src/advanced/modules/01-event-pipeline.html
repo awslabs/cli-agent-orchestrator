@@ -1,0 +1,180 @@
+<section class="module" id="module-1">
+  <div class="module-content">
+
+    <div class="module-header animate-in">
+      <span class="module-number">01</span>
+      <h1 class="module-title">The Event Pipeline</h1>
+      <p class="module-subtitle">How CAO detects agent state and delivers messages at the right time — without polling.</p>
+    </div>
+
+  <!-- Screen 1: The Newsroom Metaphor -->
+  <div class="screen" id="screen-1-1">
+    <h2>The Event Pipeline</h2>
+    <p>
+      The fundamentals course introduced the Event Bus as the glue between CAO's components. Now let's look at what
+      actually flows through it — and the five specialized services that make message delivery feel instant.
+    </p>
+    <p>
+      Think of it as a newsroom. Reporters (FIFOs) feed raw stories into a
+      wire service (EventBus), editors (StatusMonitor) decide what is breaking news, and the
+      dispatch desk (InboxService) routes the right story to the right person at the right time.
+    </p>
+
+    <div class="icon-rows">
+      <div class="icon-row">
+        <div class="icon-circle" style="background: var(--color-actor-1); color: white;">F</div>
+        <div>
+          <strong>FifoManager (Reporters)</strong>
+          <p>Reads raw bytes from named FIFOs at <code>~/.aws/cli-agent-orchestrator/fifos/{id}.fifo</code>. Coalesces rapid-fire chunks within a 50ms window before publishing.</p>
+        </div>
+      </div>
+      <div class="icon-row">
+        <div class="icon-circle" style="background: var(--color-actor-2); color: white;">B</div>
+        <div>
+          <strong>EventBus (Wire Service)</strong>
+          <p>Async pub/sub backbone. Wildcard topic matching (<code>terminal.*.output</code>), bounded queues (1024 default), drop-and-log on overflow.</p>
+        </div>
+      </div>
+      <div class="icon-row">
+        <div class="icon-circle" style="background: var(--color-actor-3); color: white;">S</div>
+        <div>
+          <strong>StatusMonitor (Editors)</strong>
+          <p>Maintains an 8KB rolling buffer per terminal. Runs provider-specific pattern matching to detect IDLE, PROCESSING, COMPLETED, WAITING_USER_ANSWER, or ERROR. Uses debounced edge detection with a sticky latch.</p>
+        </div>
+      </div>
+      <div class="icon-row">
+        <div class="icon-circle" style="background: var(--color-actor-5); color: white;">I</div>
+        <div>
+          <strong>InboxService (Dispatch Desk)</strong>
+          <p>Routes the right message at the right time. When a terminal reaches IDLE or COMPLETED, delivers one pending message from its inbox.</p>
+        </div>
+      </div>
+      <div class="icon-row">
+        <div class="icon-circle" style="background: var(--color-actor-4); color: white;">L</div>
+        <div>
+          <strong>LogWriter (Archivist)</strong>
+          <p>Subscribes to <code>terminal.*.output</code> alongside everyone else. Batches writes to per-terminal log files so you always have a full record.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Screen 2: Watch a Chunk Travel -->
+  <div class="screen" id="screen-1-2">
+    <h2>Watch a Chunk Travel</h2>
+    <p>
+      Follow a single piece of terminal output as it flows through every stage of the pipeline.
+      Notice how the EventBus appears twice -- once routing raw output, once routing the
+      derived status change. This two-phase publish is the key to decoupling detection from delivery.
+    </p>
+
+    <div class="flow-animation animate-in" data-steps='[
+      {"label":"tmux pipe-pane: Agent prints idle prompt text","highlight":"flow-pipe"},
+      {"label":"FifoManager: Reads from FIFO, coalesces 50ms, publishes terminal.a1b2c3d4.output","highlight":"flow-fifo"},
+      {"label":"EventBus: Routes to all subscribers of terminal.*.output","highlight":"flow-bus"},
+      {"label":"StatusMonitor: Buffer updated → pattern match → status = IDLE","highlight":"flow-status"},
+      {"label":"EventBus: Publishes terminal.a1b2c3d4.status = IDLE","highlight":"flow-bus"},
+      {"label":"InboxService: IDLE detected! Delivering 1 pending message...","highlight":"flow-inbox"},
+      {"label":"LogWriter: Appends chunk to logs/terminal/a1b2c3d4.log","highlight":"flow-log"}
+    ]'>
+      <div class="flow-actors">
+        <div class="flow-actor" id="flow-pipe">
+          <div class="flow-actor-icon" style="background: var(--color-accent-light); border-color: #3b82f6;">P</div>
+          <span>pipe-pane</span>
+        </div>
+        <div class="flow-actor" id="flow-fifo">
+          <div class="flow-actor-icon" style="background: var(--color-accent-light); border-color: var(--color-actor-2);">F</div>
+          <span>FifoManager</span>
+        </div>
+        <div class="flow-actor" id="flow-bus">
+          <div class="flow-actor-icon" style="background: var(--color-accent-light); border-color: var(--color-actor-3);">B</div>
+          <span>EventBus</span>
+        </div>
+        <div class="flow-actor" id="flow-status">
+          <div class="flow-actor-icon" style="background: var(--color-accent-light); border-color: var(--color-actor-4);">S</div>
+          <span>StatusMonitor</span>
+        </div>
+        <div class="flow-actor" id="flow-inbox">
+          <div class="flow-actor-icon" style="background: var(--color-accent-light); border-color: var(--color-actor-5);">I</div>
+          <span>InboxService</span>
+        </div>
+        <div class="flow-actor" id="flow-log">
+          <div class="flow-actor-icon" style="background: var(--color-accent-light); border-color: #3b82f6;">L</div>
+          <span>LogWriter</span>
+        </div>
+      </div>
+      <div class="flow-step-label">Click "Next Step" to begin</div>
+      <div class="flow-packet"></div>
+      <div class="flow-controls">
+        <button class="btn btn-primary flow-next-btn">Next Step &rarr;</button>
+        <button class="btn flow-reset-btn">Reset</button>
+        <span class="flow-progress">Step 0 / 7</span>
+      </div>
+    </div>
+
+    <div class="callout callout-info">
+      <div class="callout-icon">&#128161;</div>
+      <div class="callout-content">
+        <span class="callout-title">Key Insight: Two-Phase Publish</span>
+        <p>The EventBus carries two kinds of topics: <code>terminal.{id}.output</code> for raw data, and <code>terminal.{id}.status</code> for derived state changes. StatusMonitor subscribes to the first and publishes the second. InboxService only subscribes to the second -- it never sees raw output.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Screen 3: The Sticky Latch -->
+  <div class="screen" id="screen-1-3">
+    <h2>The Sticky Latch</h2>
+    <p>
+      StatusMonitor uses <strong>debounced edge detection</strong> -- it does not re-evaluate
+      status on every single chunk. Instead it waits for output to settle, then checks. And
+      once it determines a terminal is IDLE, it applies a "sticky latch":
+    </p>
+
+    <div class="callout callout-info">
+      <div class="callout-icon">&#128274;</div>
+      <div class="callout-content">
+        <span class="callout-title">Why a Latch?</span>
+        <p>Once an agent reaches IDLE, the StatusMonitor latches that status. It will not drop to PROCESSING just because the TUI redraws a progress bar or refreshes the screen. Any new input sent to the terminal unlocks the latch and allows a transition back to PROCESSING &mdash; that includes <code>handoff</code>, <code>assign</code>, inbox delivery, and <code>cao session send</code>.</p>
+      </div>
+    </div>
+
+    <div class="callout callout-accent">
+      <div class="callout-icon">&#9888;&#65039;</div>
+      <div class="callout-content">
+        <span class="callout-title">Without the Latch</span>
+        <p>A TUI redraw would momentarily look like new output, causing StatusMonitor to flip the terminal to PROCESSING. InboxService would then hold messages hostage until the next IDLE detection until the next genuine idle detection.</p>
+      </div>
+    </div>
+
+    <p>
+      Here is the core loop, simplified. The real code adds debouncing, buffer rotation, and
+      the latch logic, but the publish/subscribe pattern remains the same:
+    </p>
+
+    <div class="translation-block">
+      <div class="translation-code">
+        <span class="translation-label">Python</span>
+<pre><code><span class="code-comment"># services/status_monitor.py (simplified)</span>
+<span class="code-keyword">queue</span> = bus.subscribe(<span class="code-string">"terminal.*.output"</span>)  <span class="code-comment"># wildcard!</span>
+<span class="code-keyword">async for</span> topic, data <span class="code-keyword">in</span> queue:
+    terminal_id = topic.split(<span class="code-string">"."</span>)[<span class="code-number">1</span>]
+    buffer[terminal_id] += data
+    status = provider.get_status(buffer[terminal_id])
+    <span class="code-keyword">if</span> status != last_status[terminal_id]:
+        bus.publish(<span class="code-function">f</span><span class="code-string">"terminal.{terminal_id}.status"</span>, {<span class="code-string">"status"</span>: status})</code></pre>
+      </div>
+      <div class="translation-english">
+        <span class="translation-label">Plain English</span>
+        <div class="translation-lines">
+          <div class="tl">Subscribe to ALL terminal output using a wildcard pattern.</div>
+          <div class="tl">When new data arrives, extract the terminal ID from the topic.</div>
+          <div class="tl">Append the data to that terminal's rolling buffer.</div>
+          <div class="tl">Ask the provider-specific detector what state the terminal is in.</div>
+          <div class="tl">If the state changed from last time, announce the new status on the bus.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  </div>
+</section>

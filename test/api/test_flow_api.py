@@ -3,7 +3,9 @@
 from datetime import datetime
 from unittest.mock import AsyncMock, patch
 
+import frontmatter
 import pytest
+import yaml
 
 from cli_agent_orchestrator.api.main import app
 from cli_agent_orchestrator.models.flow import Flow
@@ -244,6 +246,96 @@ class TestCreateFlow:
 
             assert response.status_code == 404
             assert "Invalid flow file" in response.json()["detail"]
+
+    def test_create_flow_rejects_schedule_with_newline(self, client, tmp_path, monkeypatch):
+        """A schedule embedding a newline and script key is rejected with 422 and
+        writes nothing, so no script key can be persisted."""
+        monkeypatch.setattr("cli_agent_orchestrator.api.main.CAO_HOME_DIR", tmp_path)
+        with patch("cli_agent_orchestrator.api.main.flow_service") as mock_svc:
+            response = client.post(
+                "/flows",
+                json={
+                    "name": "evil-flow",
+                    "schedule": '0 0 * * *"\nscript: /tmp/evil\n"',
+                    "agent_profile": "developer",
+                    "provider": "kiro_cli",
+                    "prompt_template": "Do work.",
+                },
+            )
+
+            assert response.status_code == 422
+            mock_svc.add_flow.assert_not_called()
+            flows_dir = tmp_path / "flows"
+            assert not flows_dir.exists() or not list(flows_dir.iterdir())
+
+    def test_create_flow_written_file_has_no_script_key(
+        self, client, sample_flow, tmp_path, monkeypatch
+    ):
+        """A valid POST writes a flow file whose frontmatter round-trips through
+        frontmatter.load with a single-line schedule and no script key."""
+        monkeypatch.setattr("cli_agent_orchestrator.api.main.CAO_HOME_DIR", tmp_path)
+        with patch("cli_agent_orchestrator.api.main.flow_service") as mock_svc:
+            mock_svc.add_flow.return_value = sample_flow
+
+            response = client.post(
+                "/flows",
+                json={
+                    "name": "test-flow",
+                    "schedule": "0 * * * *",
+                    "agent_profile": "developer",
+                    "provider": "kiro_cli",
+                    "prompt_template": "Do some work.",
+                },
+            )
+
+            assert response.status_code == 201
+            flow_file = tmp_path / "flows" / "test-flow.flow.md"
+            assert flow_file.exists()
+            post = frontmatter.loads(flow_file.read_text())
+            assert "script" not in post.metadata
+            assert post.metadata["schedule"] == "0 * * * *"
+            assert post.metadata["agent_profile"] == "developer"
+            assert post.metadata["provider"] == "kiro_cli"
+            assert "Do some work." in post.content
+
+    def test_create_flow_serialization_neutralizes_embedded_newline(self, tmp_path):
+        """Defense-in-depth: yaml.safe_dump renders a raw newline as a quoted
+        scalar, so a script key cannot be smuggled into the frontmatter even if
+        a hostile value reached the serializer."""
+        file_path = tmp_path / "evil.flow.md"
+        file_path.write_text(
+            "---\n"
+            + yaml.safe_dump(
+                {
+                    "name": "evil-flow",
+                    "schedule": '0 0 * * *"\nscript: /tmp/evil\n"',
+                    "agent_profile": "developer",
+                    "provider": "kiro_cli",
+                },
+                sort_keys=False,
+            )
+            + "---\n"
+            + "Do work."
+        )
+
+        post = frontmatter.loads(file_path.read_text())
+        assert "script" not in post.metadata
+        assert post.metadata["schedule"] == '0 0 * * *"\nscript: /tmp/evil\n"'
+        assert post.content.strip() == "Do work."
+
+    def test_create_flow_rejects_empty_agent_profile(self, client):
+        """POST /flows rejects an empty agent_profile with 422."""
+        response = client.post(
+            "/flows",
+            json={
+                "name": "empty-profile-flow",
+                "schedule": "0 * * * *",
+                "agent_profile": "",
+                "provider": "kiro_cli",
+                "prompt_template": "Do work.",
+            },
+        )
+        assert response.status_code == 422
 
 
 class TestDeleteFlow:

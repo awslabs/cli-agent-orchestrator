@@ -418,6 +418,15 @@ class TestT9SyncVsNowait:
                 "find_related_completed",
                 # Self-learning instruction promotion (CLI/apply path).
                 "instruction_promotion",
+                # Typed memory relationship store (issue #511) — content-free
+                # mutation audit, emitted by the synchronous relationship service
+                # via write_audit_nowait (same path as the memory_* events).
+                "relationship_mutation",
+                # U5-B reconciliation outcomes. Registration precedes their
+                # emit sites because unlisted events are silently dropped.
+                "vault_reconcile_completed",
+                "vault_note_quarantined",
+                "vault_secret_quarantined",
             }
         )
 
