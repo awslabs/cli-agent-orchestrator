@@ -197,6 +197,8 @@ class TestSave:
             try:
                 for iteration in range(150):
                     _save({"iteration": iteration, "payload": str(iteration) * 4096})
+            except Exception as exc:  # noqa: BLE001 - captured for the test thread
+                failures.append(exc)
             finally:
                 finished.set()
 
