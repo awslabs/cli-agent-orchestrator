@@ -307,7 +307,7 @@ def _load_raw() -> Dict[str, Any]:
 
 
 def _save_raw(data: Dict[str, Any]) -> None:
-    settings_file = _settings_file()
+    settings_file = _settings_file().resolve()
     atomic_file.locked_atomic_write(settings_file, json.dumps(data, indent=2))
 
 

@@ -187,6 +187,33 @@ class TestSave:
         assert json.loads(settings_file.read_text()) == {"new": True}
         assert settings_file.stat().st_mode & 0o777 == 0o640
 
+    def test_save_preserves_settings_symlink_and_target_mode(
+        self, settings_file, monkeypatch
+    ):
+        target = settings_file.with_name("dotfiles-settings.json")
+        target.write_text('{"old": true}')
+        target.chmod(0o640)
+        settings_file.symlink_to(target)
+        monkeypatch.setattr(atomic_file, "LOCK_DIR", settings_file.parent / "locks")
+        lock_path_before = atomic_file._lock_path_for(settings_file)
+
+        _save({"new": True})
+
+        assert settings_file.is_symlink()
+        assert json.loads(target.read_text()) == {"new": True}
+        assert target.stat().st_mode & 0o777 == 0o640
+        assert atomic_file._lock_path_for(settings_file) == lock_path_before
+
+    def test_save_through_dangling_settings_symlink(self, settings_file, monkeypatch):
+        target = settings_file.with_name("dotfiles-settings.json")
+        settings_file.symlink_to(target)
+        monkeypatch.setattr(atomic_file, "LOCK_DIR", settings_file.parent / "locks")
+
+        _save({"new": True})
+
+        assert settings_file.is_symlink()
+        assert json.loads(target.read_text()) == {"new": True}
+
     def test_concurrent_writes_and_reads_surface_writer_errors(self, settings_file, monkeypatch):
         """Exercise concurrent access; replace and mode assertions pin atomicity."""
         monkeypatch.setattr(atomic_file, "LOCK_DIR", settings_file.parent / "locks")

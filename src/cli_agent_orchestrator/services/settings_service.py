@@ -130,7 +130,7 @@ def settings_readable() -> bool:
 def _save(data: Dict[str, Any]) -> None:
     """Save settings to disk."""
     CAO_HOME_DIR.mkdir(parents=True, exist_ok=True)
-    atomic_file.locked_atomic_write(SETTINGS_FILE, json.dumps(data, indent=2))
+    atomic_file.locked_atomic_write(SETTINGS_FILE.resolve(), json.dumps(data, indent=2))
 
 
 def get_agent_dirs() -> Dict[str, str]:
