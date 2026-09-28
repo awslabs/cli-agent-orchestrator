@@ -868,15 +868,20 @@ async def runtime_channel(ws: WebSocket) -> None:
                 if not runtime_registry.claim_terminal(frame.terminal_id, runtime_id):
                     continue
                 if frame.type == EventType.STATUS and frame.status is not None:
-                    runtime_registry.set_status(
+                    # Publish only the status the registry ACCEPTED: a stale
+                    # generation is fenced in set_status, and publishing it anyway
+                    # let a rejected report reach the bus consumers while the cache
+                    # kept the live one (review finding 6 on #802).
+                    if runtime_registry.set_status(
                         frame.terminal_id,
                         frame.status,
                         conn=conn,
                         generation=frame.generation,
-                    )
-                    bus.publish(
-                        f"terminal.{frame.terminal_id}.status", {"status": frame.status.value}
-                    )
+                    ):
+                        bus.publish(
+                            f"terminal.{frame.terminal_id}.status",
+                            {"status": frame.status.value},
+                        )
                     # A status change is the one reliable signal that a stream may
                     # have stopped producing. Hand over any loss marker still owed
                     # for this terminal's output now, while a consumer is still

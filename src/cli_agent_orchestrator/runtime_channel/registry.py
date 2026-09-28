@@ -828,8 +828,14 @@ class RuntimeChannelRegistry:
         conn: Optional[RuntimeConnection] = None,
         generation: Optional[int] = None,
         stream: str = StreamName.CAPTURE.value,
-    ) -> None:
+    ) -> bool:
         """Record what a runtime says this terminal is doing.
+
+        Returns whether the report was APPLIED. A caller that also publishes the
+        status onto the bus must gate that on the return value: the fence lives
+        here, and publishing a report this method dropped let a rejected
+        stale-generation status reach the event consumers while the polling cache
+        kept the live one (review finding 6 on #802).
 
         ``conn`` is the channel the report arrived on. A report from a connection
         that is no longer the registered one for its runtime id is DROPPED: it
@@ -875,7 +881,7 @@ class RuntimeChannelRegistry:
                     terminal_id,
                     generation,
                 )
-                return
+                return False
             if conn is not None:
                 current = self._runtimes.get(conn.runtime_id)
                 if current is not conn or conn.incarnation != self._incarnations.get(
@@ -890,7 +896,7 @@ class RuntimeChannelRegistry:
                         conn.runtime_id,
                         self._incarnations.get(conn.runtime_id, 0),
                     )
-                    return
+                    return False
             # Record the generation this status was accepted at, so the next
             # report from an older one is refused. Only advances: a status may
             # arrive before any position for its generation, and that is exactly
@@ -900,6 +906,7 @@ class RuntimeChannelRegistry:
                     generation, self._status_generations.get(key, generation)
                 )
             self._status[terminal_id] = status
+            return True
 
     def reconcile_hello(self, runtime_id: str, advertised: Iterable[str]) -> List[str]:
         """Forget state for terminals the runtime's new hello does not claim.
