@@ -1260,8 +1260,14 @@ async def _handoff_impl(
             # and tool inheritance. Byte-for-byte the original single-seam
             # behavior (BR-8) -- this is what the MCP tool always takes.
             shaped_message = _shape_handoff_message(provider, message)
-            # Minted before the POST so a transport timeout still leaves the
-            # client with the server-side result lookup key (issue #447).
+            # Minted HERE, before the POST, so the key exists on the client even
+            # if the response never arrives (issue #447). The server records the
+            # result under it; client-side generation is what makes it available
+            # to the Timeout branch in ``_run_step_and_build_result``. This does
+            # NOT deduplicate execution -- a retry with the same job_id would
+            # still run a second step. Only the default single-call path needs
+            # it: the early-terminal-id path already hands back a real
+            # terminal_id, which is its own discovery handle.
             job_id = uuid.uuid4().hex
             payload: Dict[str, Any] = {
                 "provider": provider,

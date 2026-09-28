@@ -749,9 +749,13 @@ fn route(id: CommandId) -> Option<Route> {
         // path to a human authorisation act that nothing in the interface has reviewed.
         // (#583 Bolt 2, approval-operation)
         CommandId::WorkflowApprove => None,
-        // Workflow authoring is hidden until its security-sensitive interaction is deliberately
-        // designed for the TUI. Update also needs a pre-existing expected hash; fetching it at
-        // submission time would defeat the stale-update precondition.
+        // `cao workflow create` and `cao workflow update` are classified HIDE for the same reason
+        // `approve` is, so these arms are `None` on the same principle: routing a command the TUI does
+        // not offer would build a reachable path to a spec WRITE that nothing in the interface has
+        // reviewed. `update` additionally requires an `--expected-hash` the caller must already hold,
+        // and a route that fetched it would defeat the stale-update check outright — a hash read from
+        // the file about to be overwritten always matches.
+        // (#583 Bolt 3, authoring-cli-verbs)
         CommandId::WorkflowCreate => None,
         CommandId::WorkflowUpdate => None,
         // HIDE (issue #640), so it is unreachable through `commands()` and needs no route — the
