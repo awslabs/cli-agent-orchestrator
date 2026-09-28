@@ -21,9 +21,11 @@ reaches its data over the REST surface only.
 
 import json as _json
 import pathlib
+import re
 import sys
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 import click
 import requests
@@ -34,6 +36,7 @@ from cli_agent_orchestrator.constants import (
     WORKFLOW_EVENTS_CONNECT_TIMEOUT,
     WORKFLOW_EVENTS_MAX_RECONNECTS,
     WORKFLOW_EVENTS_READ_TIMEOUT,
+    WORKFLOW_NAME_RE,
     WORKFLOW_POLL_INTERVAL_SECONDS,
     WORKFLOW_RUN_REQUEST_TIMEOUT,
     WORKFLOW_STEP_REQUEST_TIMEOUT,
@@ -81,11 +84,11 @@ def _render_lint_findings(findings: object) -> str:
     that to leak." A finding names a line so the AUTHOR can look -- the finding locates, the author
     reads.
 
-    DUPLICATED, deliberately, with ``mcp_server/server.py::_render_lint_findings``. ``render_findings``
-    returns ``List[dict]`` rather than strings and there is no shared renderer to reuse, so unifying
-    would mean the MCP server importing from the CLI package or a new module, for two call sites. The
-    trigger for consolidating is a THIRD caller, not a second -- the same call Bolt 2 made for its
-    never-raises git wrapper.
+    DUPLICATED, deliberately, with ``utils/orchestration.py::_render_lint_findings``.
+    ``render_findings`` returns ``List[dict]`` rather than strings and there is no shared renderer to
+    reuse, so unifying would mean the CLI importing orchestration internals or a new module, for two
+    call sites. The trigger for consolidating is a THIRD caller, not a second -- the same call Bolt 2
+    made for its never-raises git wrapper.
     """
     if not isinstance(findings, list):
         return ""
@@ -221,6 +224,23 @@ def _emit_json_failure(envelope: dict) -> None:
     raise click.exceptions.Exit(1)
 
 
+def _quoted_workflow_name(name: str, as_json: bool) -> str:
+    """Validate a bare workflow name and return its URL-safe path segment."""
+    if re.fullmatch(WORKFLOW_NAME_RE, name):
+        return quote(name, safe="")
+
+    message = f"invalid workflow name '{name}': must match [A-Za-z0-9_-]{{1,64}}"
+    if as_json:
+        _emit_json_failure(
+            {
+                "ok": False,
+                "class": "invalid_request",
+                "message": message,
+            }
+        )
+    raise click.ClickException(message)
+
+
 def _authoring_failure(
     response: requests.Response,
     as_json: bool,
@@ -281,6 +301,9 @@ def _echo_spec_result(record: dict, as_json: bool, verb: str) -> None:
     click.echo(f"{verb} {record['name']}")
     click.echo(f"  path: {record.get('path')}")
     click.echo(f"  hash: {record.get('content_hash')}")
+    rendered_findings = _render_lint_findings(record.get("findings"))
+    if rendered_findings:
+        click.echo(f"  {rendered_findings}")
 
 
 @click.group()
@@ -375,6 +398,7 @@ def update_cmd(name, from_file, expected_hash, as_json):
       0  updated
       1  refused, or the request errored (``--json`` carries a machine-readable class)
     """
+    quoted_name = _quoted_workflow_name(name, as_json)
     try:
         source = pathlib.Path(from_file).read_text()
     except (OSError, ValueError) as e:
@@ -383,7 +407,7 @@ def update_cmd(name, from_file, expected_hash, as_json):
     auth_headers = _auth_headers() or None
     try:
         response = requests.put(
-            f"{API_BASE_URL}/workflows/{name}",
+            f"{API_BASE_URL}/workflows/{quoted_name}",
             json={"source": source, "expected_hash": expected_hash},
             headers=auth_headers,
             timeout=MCP_REQUEST_TIMEOUT,
@@ -420,16 +444,16 @@ def validate_cmd(file, as_json):
             timeout=MCP_REQUEST_TIMEOUT,
         )
     except requests.exceptions.RequestException as e:
-        raise click.ClickException(f"could not reach cao-server: {e}")
+        raise _unreachable(e, as_json)
 
-    authentication_detail = _authentication_failure_detail(response, auth_headers)
-    if authentication_detail:
-        raise click.ClickException(authentication_detail)
-    if response.status_code == 400:
-        # Out-of-policy path / unreadable source — surfaced as a hard error.
-        raise click.ClickException(_extract_detail(response, "invalid request"))
     if response.status_code != 200:
-        raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
+        raise _authoring_failure(
+            response,
+            as_json,
+            f"status {response.status_code}",
+            "validate",
+            auth_headers,
+        )
 
     result = response.json()
     if as_json:
@@ -496,10 +520,11 @@ def list_cmd(scan_dir, as_json):
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit the spec as JSON.")
 def get_cmd(name, as_json):
     """Show the parsed/validated spec for a workflow name or file path."""
+    quoted_name = _quoted_workflow_name(name, as_json)
     auth_headers = _auth_headers() or None
     try:
         response = requests.get(
-            f"{API_BASE_URL}/workflows/{name}",
+            f"{API_BASE_URL}/workflows/{quoted_name}",
             headers=auth_headers,
             timeout=MCP_REQUEST_TIMEOUT,
         )
@@ -607,14 +632,16 @@ def approve_cmd(plan_id, as_json):
 @workflow.command(name="delete")
 @click.argument("name")
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt.")
-def delete_cmd(name, yes):
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit the result as JSON.")
+def delete_cmd(name, yes, as_json):
     """Delete a workflow's spec file and its index row."""
+    quoted_name = _quoted_workflow_name(name, as_json)
     if not yes:
         click.confirm(f"Delete workflow '{name}'?", abort=True)
     auth_headers = _auth_headers() or None
     try:
         response = requests.delete(
-            f"{API_BASE_URL}/workflows/{name}",
+            f"{API_BASE_URL}/workflows/{quoted_name}",
             headers=auth_headers,
             timeout=MCP_REQUEST_TIMEOUT,
         )
@@ -630,6 +657,9 @@ def delete_cmd(name, yes):
         raise click.ClickException(_extract_detail(response, "invalid request"))
     if response.status_code not in (200, 204):
         raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
+    if as_json:
+        click.echo(_json.dumps({"ok": True, "name": name}, indent=2))
+        return
     click.echo(f"deleted '{name}'")
 
 

@@ -21,6 +21,7 @@ from types import SimpleNamespace
 import pytest
 from click.testing import CliRunner
 
+from cli_agent_orchestrator.cli.commands import workflow as workflow_module
 from cli_agent_orchestrator.cli.commands.workflow import workflow
 from cli_agent_orchestrator.mcp_server import server as mcp_server
 from cli_agent_orchestrator.models.workflow import ScriptSpec
@@ -53,7 +54,7 @@ def source_file(tmp_path):
 def test_create_posts_the_source_text_and_reports_the_hash(monkeypatch, source_file):
     captured = {}
 
-    def fake_post(url, json=None, timeout=None):
+    def fake_post(url, json=None, headers=None, timeout=None):
         captured["url"] = url
         captured["json"] = json
         return _resp(
@@ -132,7 +133,7 @@ def test_update_requires_expected_hash(monkeypatch, source_file):
 def test_update_passes_the_hash_through_verbatim(monkeypatch, source_file):
     captured = {}
 
-    def fake_put(url, json=None, timeout=None):
+    def fake_put(url, json=None, headers=None, timeout=None):
         captured["json"] = json
         return _resp(200, {"name": "wf", "path": "/x/wf.py", "content_hash": "sha256:new"})
 
@@ -146,6 +147,108 @@ def test_update_passes_the_hash_through_verbatim(monkeypatch, source_file):
     assert result.exit_code == 0, result.output
     assert captured["json"]["expected_hash"] == "sha256:old", "never recomputed, never normalised"
     assert "sha256:new" in result.output, "the NEW hash comes back, closing the loop"
+
+
+@pytest.mark.parametrize("name", ("../workflows", "foo/../../workflows"))
+@pytest.mark.parametrize("as_json", (False, True), ids=("plain", "json"))
+@pytest.mark.parametrize("verb", ("get", "update", "delete"))
+def test_path_like_names_are_rejected_before_any_request(
+    monkeypatch, source_file, verb, as_json, name
+):
+    def request_must_not_happen(*args, **kwargs):  # pragma: no cover - boundary assertion
+        raise AssertionError("invalid workflow names must not reach requests")
+
+    monkeypatch.setattr(
+        workflow_module.requests, verb if verb != "update" else "put", request_must_not_happen
+    )
+    arguments = [verb, name]
+    if verb == "update":
+        arguments.extend(["--from-file", str(source_file), "--expected-hash", "sha256:old"])
+    elif verb == "delete":
+        arguments.append("--yes")
+    if as_json:
+        arguments.append("--json")
+
+    result = CliRunner().invoke(workflow, arguments)
+
+    assert result.exit_code == 1
+    if as_json:
+        assert _json.loads(result.output) == {
+            "ok": False,
+            "class": "invalid_request",
+            "message": (f"invalid workflow name '{name}': " "must match [A-Za-z0-9_-]{1,64}"),
+        }
+    else:
+        assert "invalid workflow name" in result.output
+
+
+@pytest.mark.parametrize("verb", ("create", "update"))
+def test_write_verbs_forward_the_local_bearer(monkeypatch, source_file, verb):
+    """Removing ``headers=`` from either write client must fail this test."""
+    captured = {}
+
+    def capture(*args, **kwargs):
+        captured["headers"] = kwargs.get("headers")
+        return _resp(
+            201 if verb == "create" else 200,
+            {"name": "wf", "path": "/x/wf.py", "content_hash": "sha256:new"},
+        )
+
+    monkeypatch.setenv("AUTH0_DOMAIN", "auth.test")
+    monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", "test-token")
+    monkeypatch.setattr(workflow_module.requests, "post" if verb == "create" else "put", capture)
+    arguments = (
+        [verb, "wf", "--from-file", str(source_file)]
+        if verb == "create"
+        else [
+            verb,
+            "wf",
+            "--from-file",
+            str(source_file),
+            "--expected-hash",
+            "sha256:old",
+        ]
+    )
+
+    result = CliRunner().invoke(workflow, arguments)
+
+    assert result.exit_code == 0, result.output
+    assert captured["headers"] == {"Authorization": "Bearer test-token"}
+
+
+@pytest.mark.parametrize("verb", ("create", "update"))
+def test_write_verbs_omit_authorization_without_a_local_bearer(monkeypatch, source_file, verb):
+    """Auth-off/public servers receive no synthetic Authorization header."""
+    captured = {}
+
+    def capture(*args, **kwargs):
+        captured["headers"] = kwargs.get("headers")
+        return _resp(
+            201 if verb == "create" else 200,
+            {"name": "wf", "path": "/x/wf.py", "content_hash": "sha256:new"},
+        )
+
+    monkeypatch.delenv("AUTH0_DOMAIN", raising=False)
+    monkeypatch.delenv("CAO_AUTH_JWKS_URI", raising=False)
+    monkeypatch.delenv("CAO_AUTH_LOCAL_TOKEN", raising=False)
+    monkeypatch.setattr(workflow_module.requests, "post" if verb == "create" else "put", capture)
+    arguments = (
+        [verb, "wf", "--from-file", str(source_file)]
+        if verb == "create"
+        else [
+            verb,
+            "wf",
+            "--from-file",
+            str(source_file),
+            "--expected-hash",
+            "sha256:old",
+        ]
+    )
+
+    result = CliRunner().invoke(workflow, arguments)
+
+    assert result.exit_code == 0, result.output
+    assert captured["headers"] is None
 
 
 @pytest.mark.parametrize(
@@ -164,7 +267,9 @@ def test_each_refusal_carries_its_class_in_json_mode(
     monkeypatch.setattr(
         "cli_agent_orchestrator.cli.commands.workflow.requests."
         + ("post" if verb == "create" else "put"),
-        lambda url, json=None, timeout=None: _resp(status, {"detail": "the server's own words"}),
+        lambda url, json=None, headers=None, timeout=None: _resp(
+            status, {"detail": "the server's own words"}
+        ),
     )
 
     arguments = (
@@ -216,7 +321,7 @@ def test_the_source_is_never_echoed(monkeypatch, tmp_path):
     src.write_text(SECRET_ISH)
     monkeypatch.setattr(
         "cli_agent_orchestrator.cli.commands.workflow.requests.post",
-        lambda url, json=None, timeout=None: _resp(
+        lambda url, json=None, headers=None, timeout=None: _resp(
             201, {"name": "s", "path": "/x/s.py", "content_hash": "sha256:bb"}
         ),
     )
@@ -225,6 +330,73 @@ def test_the_source_is_never_echoed(monkeypatch, tmp_path):
 
     assert result.exit_code == 0
     assert "hunter2-do-not-echo" not in result.output
+
+
+@pytest.mark.parametrize("verb", ("create", "update"))
+def test_plain_authoring_success_renders_warning_findings(monkeypatch, source_file, verb):
+    response = _resp(
+        201 if verb == "create" else 200,
+        {
+            "name": "warned",
+            "path": "/x/warned.py",
+            "content_hash": "sha256:new",
+            "findings": [
+                {
+                    "rule_id": "dynamic-import",
+                    "severity": "warning",
+                    "line": 7,
+                    "message": "import may vary",
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        workflow_module.requests, "post" if verb == "create" else "put", lambda *a, **k: response
+    )
+    arguments = [verb, "warned", "--from-file", str(source_file)]
+    if verb == "update":
+        arguments.extend(["--expected-hash", "sha256:old"])
+
+    result = CliRunner().invoke(workflow, arguments)
+
+    assert result.exit_code == 0, result.output
+    assert "warning dynamic-import at line 7: import may vary" in result.output
+
+
+def test_validate_json_http_failure_uses_the_authoring_envelope(monkeypatch):
+    monkeypatch.setattr(
+        workflow_module.requests,
+        "post",
+        lambda *a, **k: _resp(400, {"detail": "path is outside the workflow directory"}),
+    )
+
+    result = CliRunner().invoke(workflow, ["validate", "draft.py", "--json"])
+
+    assert result.exit_code == 1
+    assert _json.loads(result.output) == {
+        "ok": False,
+        "class": "invalid_request",
+        "status": 400,
+        "message": "path is outside the workflow directory",
+    }
+
+
+def test_validate_json_transport_failure_uses_the_authoring_envelope(monkeypatch):
+    import requests as _requests
+
+    def unreachable(*args, **kwargs):
+        raise _requests.exceptions.ConnectionError("connection refused")
+
+    monkeypatch.setattr(workflow_module.requests, "post", unreachable)
+
+    result = CliRunner().invoke(workflow, ["validate", "draft.py", "--json"])
+
+    assert result.exit_code == 1
+    assert _json.loads(result.output) == {
+        "ok": False,
+        "class": "unreachable",
+        "message": "could not reach cao-server: connection refused",
+    }
 
 
 def test_get_shows_the_hash_for_a_script_spec(monkeypatch):
@@ -236,7 +408,7 @@ def test_get_shows_the_hash_for_a_script_spec(monkeypatch):
     ).model_dump()
     monkeypatch.setattr(
         "cli_agent_orchestrator.cli.commands.workflow.requests.get",
-        lambda url, timeout=None: _resp(200, script),
+        lambda url, headers=None, timeout=None: _resp(200, script),
     )
 
     result = CliRunner().invoke(workflow, ["get", "s"])
@@ -252,7 +424,9 @@ def test_get_omits_the_hash_for_yaml(monkeypatch):
     """The other half of the pair: a YAML spec carries no hash, so the line must be absent."""
     monkeypatch.setattr(
         "cli_agent_orchestrator.cli.commands.workflow.requests.get",
-        lambda url, timeout=None: _resp(200, {"name": "y", "mode": "sequential", "steps": []}),
+        lambda url, headers=None, timeout=None: _resp(
+            200, {"name": "y", "mode": "sequential", "steps": []}
+        ),
     )
 
     result = CliRunner().invoke(workflow, ["get", "y"])
