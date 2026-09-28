@@ -492,9 +492,8 @@ def test_no_follow_batch_read(runner):
     assert result.exit_code == 0
     assert "seq 1" in result.output and "seq 2" in result.output
     # Batch read does NOT request the SSE variant.
-    assert "headers" not in get.call_args.kwargs or "Accept" not in get.call_args.kwargs.get(
-        "headers", {}
-    )
+    headers = get.call_args.kwargs.get("headers") or {}
+    assert "Accept" not in headers
 
 
 def test_cli_module_is_thin_http_client_no_engine_import():
