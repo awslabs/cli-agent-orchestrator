@@ -24,6 +24,7 @@ from typing import Awaitable, Callable, Dict, Iterable, List, Optional, Tuple
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.runtime_channel.protocol import (
+    AckFrame,
     CommandFrame,
     CommandResultFrame,
     CommandType,
@@ -103,6 +104,10 @@ class RuntimeConnection:
         self.runtime_id = runtime_id
         self._send_text = send_text
         self._pending: Dict[str, asyncio.Future] = {}
+        # The command type of each in-flight op, so the frame reader can tell
+        # whether a matched result's ack must be deferred (LAUNCH / RUN_SCRIPT
+        # create durable state the waiting coroutine applies before acking).
+        self._op_types: Dict[str, CommandType] = {}
         self.connected_at = time.time()
         self.last_seen = time.time()
         # Set by the registry at register(); 0 means "never registered", which is
@@ -143,6 +148,7 @@ class RuntimeConnection:
         )
         future: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending[op_id] = future
+        self._op_types[op_id] = command_type
         try:
             if self.closed:
                 # Provably nothing on the wire: the registry had already declared
@@ -170,6 +176,7 @@ class RuntimeConnection:
             return await asyncio.wait_for(future, timeout=timeout)
         finally:
             self._pending.pop(op_id, None)
+            self._op_types.pop(op_id, None)
 
     def resolve(self, result: CommandResultFrame) -> bool:
         """Complete the waiting future for ``result.op_id``.
@@ -193,6 +200,38 @@ class RuntimeConnection:
             result.op_id,
         )
         return False
+
+    def ack_is_deferred(self, op_id: str) -> bool:
+        """Whether the frame reader must leave this op's ack to its waiter.
+
+        LAUNCH and RUN_SCRIPT results create durable state — a central terminal
+        row, a workflow run's terminal state — that the waiting coroutine applies
+        after the result arrives. Their ack is what lets the runtime drop its only
+        retained copy, so it must not be sent until that state is on disk; the
+        coroutine sends it via ``ack``. Every other op has no such state and is
+        acked on resolve as before. Answered from ``_op_types``, which is still
+        populated when the reader asks (it is cleared only in ``send_command``'s
+        finally, after the waiter resumes).
+        """
+        return self._op_types.get(op_id) in (CommandType.LAUNCH, CommandType.RUN_SCRIPT)
+
+    async def ack(self, op_id: str) -> None:
+        """Send the deferred AckFrame for a result whose outcome is now durable.
+
+        A failed send is logged, not raised: a lost ack only makes the runtime
+        redeliver after its next reconnect, which the orphan path handles
+        idempotently, so it must not undo the caller's already-applied outcome.
+        """
+        try:
+            await self._send_text(encode_frame(AckFrame(op_id=op_id)))
+        except Exception:  # noqa: BLE001 — a lost ack is recovered by redelivery
+            logger.warning(
+                "could not ack op %s on runtime %s; the runtime will redeliver "
+                "the result on its next reconnect",
+                op_id,
+                self.runtime_id,
+                exc_info=True,
+            )
 
     def fail_all_pending(self, reason: str) -> None:
         for future in self._pending.values():
