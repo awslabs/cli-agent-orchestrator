@@ -937,16 +937,9 @@ class TestTheScriptTierGuard:
             lambda: False,
         )
         observed = {}
-        create_terminal = AsyncMock()
+        create, send, delete, out, exit_cli, wait, status_p, get_wd = _patch_terminal_layer()
 
         async def _drive_resumed_step(record, script_path, env):
-            # The profile changes after resume admission but before the resumed
-            # script asks for its next agent terminal.
-            monkeypatch.setattr(
-                launch_guard,
-                "_profile_digest",
-                lambda agent: "sha256:changed",
-            )
             observed["response"] = client.post(
                 TERMINALS_RUN_STEP_ROUTE,
                 json=_body(env_vars=_env(run_id, "s1", record.generation)),
@@ -959,12 +952,30 @@ class TestTheScriptTierGuard:
             )
 
         monkeypatch.setattr(script_runner, "_drive_process", _drive_resumed_step)
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.services.agent_step.terminal_service.create_terminal",
-            create_terminal,
-        )
 
-        asyncio.run(script_runner.resume_script_run(run_id))
+        # The profile changes before resume admission. Resume must keep the
+        # frozen guard rather than recapturing the changed launch inputs.
+        monkeypatch.setattr(
+            launch_guard.agent_profiles,
+            "list_agent_profiles",
+            lambda: [{"name": "developer"}],
+        )
+        monkeypatch.setattr(
+            launch_guard,
+            "_profile_digest",
+            lambda agent: "sha256:changed",
+        )
+        with (
+            create as create_terminal,
+            send,
+            delete,
+            out,
+            exit_cli,
+            wait,
+            status_p,
+            get_wd,
+        ):
+            asyncio.run(script_runner.resume_script_run(run_id))
 
         response = observed["response"]
         assert response.status_code == 409, response.text
