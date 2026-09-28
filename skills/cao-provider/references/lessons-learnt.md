@@ -115,8 +115,8 @@ unset_cmd = (
 
 **Resolution chain:**
 1. Explicit `allowedTools` in profile or `--allowed-tools` CLI flag (highest priority). An explicit list is honored even when `role` names nothing.
-2. Role-based defaults from `constants.py` (`supervisor` → `["@cao-mcp-server", "fs_read", "fs_list"]`, `developer` → `["@builtin", "fs_*", "execute_bash", "web_fetch", "@cao-mcp-server"]`, `reviewer` → `["@builtin", "fs_read", "fs_list", "@cao-mcp-server"]`, `workflow_scout` → `["@builtin", "fs_read", "execute_bash", "@cao-mcp-server"]`)
-3. Custom roles from `settings.json` (user-defined bundles)
+2. Custom roles from `settings.json` (user-defined bundles). A settings role with the same name as a built-in replaces it, and CAO logs a warning naming the role.
+3. Role-based defaults from `constants.py` (`supervisor` → `["@cao-mcp-server", "fs_read", "fs_list"]`, `developer` → `["@builtin", "fs_*", "execute_bash", "web_fetch", "@cao-mcp-server"]`, `reviewer` → `["@builtin", "fs_read", "fs_list", "@cao-mcp-server"]`, `workflow_scout` → `["@builtin", "fs_read", "execute_bash", "@cao-mcp-server"]`)
 4. Developer defaults when `role` and `allowedTools` are both omitted. An unrecognized `role` raises `ValueError` instead of falling open to unrestricted `["*"]`.
 5. MCP server names appended as `@server_name` when CAO chose the list. An explicit `allowedTools` list is left as written.
 

@@ -71,7 +71,7 @@ role: data_analyst
 ---
 ```
 
-Custom roles follow the same rules as built-in roles — they're just a named `allowedTools` list. A custom role with the same name as a built-in role replaces it: the `settings.json` list is used and CAO logs a warning naming the role, so a policy you saved before a built-in of that name shipped keeps resolving as saved.
+Custom roles follow the same rules as built-in roles — they're just a named `allowedTools` list. A custom role with the same name as a built-in role replaces it: the `settings.json` list is used and CAO logs a warning naming the role, so a policy you saved before a built-in of that name shipped keeps resolving as saved. The replacement is complete, in both directions: a settings entry can narrow a built-in or widen it, up to `["*"]` (unrestricted, which also switches off native tool denial). The `roles` key is written only by `cao config set` and by hand (no REST or MCP route touches `agents.roles`), so treat it as operator-trusted configuration.
 
 ### 2. `allowedTools` — The Precise Way
 
