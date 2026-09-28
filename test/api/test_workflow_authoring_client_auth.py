@@ -335,15 +335,26 @@ def test_local_token_crosses_cli_and_mcp_run_and_start_boundaries(monkeypatch):
 
     def _get(url: str, **kwargs: Any):
         calls.append((url, kwargs.get("headers"), kwargs["timeout"]))
+        if url.endswith("/plan"):
+            return SimpleNamespace(
+                status_code=200,
+                json=lambda: {
+                    "run_id": "run-1",
+                    "plan_id": PLAN_ID,
+                    "approved": True,
+                },
+            )
         return SimpleNamespace(
             status_code=200,
             json=lambda: {"run_id": "run-1", "state": "completed", "steps": []},
         )
 
     monkeypatch.setattr(cli_workflow.requests, "get", _get)
+    monkeypatch.setattr(mcp_server.requests, "get", _get)
 
     mcp_run = asyncio.run(_mcp_tool("workflow_run")(name_or_path="wf"))
     mcp_start = asyncio.run(_mcp_tool("workflow_start")(name_or_path="wf"))
+    mcp_plan = asyncio.run(_mcp_tool("workflow_plan_approval")(run_id="run-1"))
     runner = CliRunner()
     cli_run = runner.invoke(cli_workflow.workflow, ["run", "wf", "--wait"])
     cli_start = runner.invoke(cli_workflow.workflow, ["run", "wf", "--detach"])
@@ -352,13 +363,14 @@ def test_local_token_crosses_cli_and_mcp_run_and_start_boundaries(monkeypatch):
 
     assert mcp_run["ok"] is True
     assert mcp_start["ok"] is True
+    assert mcp_plan["ok"] is True
     assert cli_run.exit_code == 0, cli_run.output
     assert cli_start.exit_code == 0, cli_start.output
     assert cli_follow.exit_code == 0, cli_follow.output
     assert cli_follow_json.exit_code == 0, cli_follow_json.output
-    assert [headers for _, headers, _ in calls] == [{"Authorization": f"Bearer {token}"}] * 8
+    assert [headers for _, headers, _ in calls] == [{"Authorization": f"Bearer {token}"}] * 9
     assert calls[0][2] == cli_workflow.WORKFLOW_RUN_REQUEST_TIMEOUT
-    assert calls[2][2] == cli_workflow.WORKFLOW_RUN_REQUEST_TIMEOUT
+    assert calls[3][2] == cli_workflow.WORKFLOW_RUN_REQUEST_TIMEOUT
 
 
 def test_every_registered_workflow_mcp_http_tool_forwards_auth():
@@ -386,7 +398,7 @@ def test_every_registered_workflow_mcp_http_tool_forwards_auth():
     assert {
         name
         for name, source in direct_http_tools.items()
-        if "headers=" not in source
+        if "mcp_utils._auth_headers()" not in source
     } == set()
 
 
