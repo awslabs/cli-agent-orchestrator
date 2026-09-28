@@ -157,6 +157,12 @@ class Bridge:
         # a stream restart and begins a new buffer generation; the first epoch
         # seen for a terminal is only recorded.
         self._last_epoch: Dict[str, int] = {}
+        # Terminals this runtime owns, added on a successful LAUNCH and removed on
+        # TEARDOWN. The hello/heartbeat snapshot is built from this set (unioned
+        # with any buffered ids) rather than from _buffers alone, so a live
+        # terminal that has no in-memory buffer is still advertised and a
+        # restarted server can rebind it (Copilot review on #802).
+        self._live_terminals: set = set()
 
     # --- outbound plumbing ---
 
@@ -402,11 +408,22 @@ class Bridge:
             StreamPosition(
                 terminal_id=tid,
                 stream=StreamName.CAPTURE,
-                generation=buf.generation,
-                end_pos=buf.end_pos,
+                generation=self._buffer_for(tid).generation,
+                end_pos=self._buffer_for(tid).end_pos,
             )
-            for tid, buf in self._buffers.items()
+            for tid in self._advertised_terminals()
         ]
+
+    def _advertised_terminals(self) -> list:
+        """Terminals to advertise in the hello/heartbeat snapshot.
+
+        The live set unioned with any terminal that already has a buffer:
+        liveness is what this runtime owns (LAUNCH/TEARDOWN), not merely what has
+        emitted bytes, so a live-but-unbuffered pane is included; a buffered id
+        not (yet) in the live set — output seen before the LAUNCH was tracked, a
+        resumed stream — is not dropped either. Sorted for a deterministic order.
+        """
+        return sorted(self._live_terminals | set(self._buffers))
 
     def _terminal_statuses(self) -> dict:
         """Current status per live terminal, for the hello snapshot.
@@ -416,7 +433,7 @@ class Bridge:
         own UNKNOWN default already covers that.
         """
         statuses = {}
-        for tid in self._buffers:
+        for tid in self._advertised_terminals():
             try:
                 status = status_monitor.get_status(tid)
             except Exception as e:  # a status read must never fail the hello
@@ -522,6 +539,9 @@ class Bridge:
             # learned its status (Copilot review on #802, finding 11). An empty
             # buffer reports end_pos 0, which is exactly true.
             self._buffer_for(terminal.id)
+            # This runtime now owns the pane: advertise it in the hello/heartbeat
+            # snapshot even before it emits a byte or if its buffer is later reset.
+            self._live_terminals.add(terminal.id)
             if payload.get("initial_message") and not defer_init:
                 await asyncio.to_thread(
                     terminal_service.send_input, terminal.id, payload["initial_message"]
@@ -588,7 +608,12 @@ class Bridge:
                     await asyncio.to_thread(terminal_service.get_terminal_metadata, terminal_id)
                 ) is None
                 if absent:
+                    # Gone from this runtime: drop it from the advertised set.
+                    self._live_terminals.discard(terminal_id)
                     return CommandOutcome.OK, {"deleted": False, "absent": True}, terminal_id
+            else:
+                # Torn down here: stop advertising it.
+                self._live_terminals.discard(terminal_id)
             return (
                 CommandOutcome.OK if deleted else CommandOutcome.FAILED,
                 {"deleted": deleted},
@@ -989,7 +1014,7 @@ class Bridge:
         """
         while True:
             sent_something = False
-            for terminal_id in list(self._buffers):
+            for terminal_id in self._advertised_terminals():
                 buf = self._buffer_for(terminal_id)
                 sent = self._sent_capture.get(terminal_id)
                 if sent is None:
