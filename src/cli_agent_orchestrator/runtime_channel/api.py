@@ -1036,6 +1036,7 @@ async def launch_remote_terminal(
             body.model_dump(exclude_none=True),
             timeout=LAUNCH_TIMEOUT,
             op_id=op_id,
+            defer_ack=True,
         )
     except RuntimeNotDispatchedError as e:
         # PROVABLY nothing on the wire, so a retry cannot duplicate the launch:

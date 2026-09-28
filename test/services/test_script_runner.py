@@ -1290,7 +1290,7 @@ async def test_remote_script_run_executes_in_runtime_and_completes(
             return None
 
         async def send_command(
-            self, command_type, payload, terminal_id=None, timeout=None, op_id=None
+            self, command_type, payload, terminal_id=None, timeout=None, op_id=None, **_kw
         ):
             assert command_type == CommandType.RUN_SCRIPT
             # The driver mints the op_id and the bridge indexes the subprocess
@@ -1353,7 +1353,7 @@ async def test_remote_script_run_nonzero_exit_is_failed(
             return None
 
         async def send_command(
-            self, command_type, payload, terminal_id=None, timeout=None, op_id=None
+            self, command_type, payload, terminal_id=None, timeout=None, op_id=None, **_kw
         ):
             assert op_id, "the caller must name the operation it will later cancel"
             result = await bridge._run_script(

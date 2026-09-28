@@ -1033,25 +1033,15 @@ async def _finalize(
 # Shared drive: spawn -> concurrent drain -> reap -> exit interp -> finalize
 # ---------------------------------------------------------------------------
 def _remote_script_runtime() -> Optional[str]:
-    """The runtime id scripts should execute on, or None for local execution.
+    """The runtime id scripts must execute on, or None for local execution.
 
-    Set ``CAO_SCRIPT_RUNTIME`` on the central server to relocate workflow /
-    flow-pre-script execution into that runtime (#745) instead of spawning
-    subprocesses in the server container. Unset (the default) → local execution,
-    unchanged: that is every single-host install.
+    ``CAO_SCRIPT_RUNTIME`` on the central server relocates workflow and flow
+    pre-script execution into that runtime (#745). Unset (the default) means local
+    execution, unchanged for single-host installs.
 
-    A configured runtime is returned **whether or not its channel is currently
-    up**. This used to fall back to local execution when the runtime was
-    disconnected, on the reasoning that a brief outage should not fail a
-    scheduled flow. But the env var is an operator's placement decision, and the
-    fallback answered a disconnect by doing the one thing the setting exists to
-    prevent: running author-supplied code in the server container, beside the
-    central database and every credential the server holds. Both the design and
-    the EKS runbook state the opposite ("disconnect → explicit failure", "never
-    a false success"), and the sibling agent-session path (``CAO_FLOW_RUNTIME``)
-    already fails loudly. The remote path turns a missing runtime into a failed
-    run with the reason attached, so the caller sees a run it can retry instead
-    of a success that ran in the wrong place (Copilot review on #802, finding 7).
+    A configured runtime is returned whether or not its channel is up. A
+    disconnected runtime makes the run FAIL with the reason; the script never
+    falls back to a local subprocess beside the server's database.
     """
     return os.environ.get("CAO_SCRIPT_RUNTIME", "").strip() or None
 
@@ -1200,6 +1190,7 @@ async def _drive_process_remote(
             },
             timeout=wait_timeout,
             op_id=op_id,
+            defer_ack=True,
         )
     except RuntimeNotDispatchedError:
         # Nothing was put on the wire (RuntimeNotDispatchedError is the provable

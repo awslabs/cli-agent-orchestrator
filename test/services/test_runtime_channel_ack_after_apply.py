@@ -53,7 +53,13 @@ def temp_db(monkeypatch):
 # RuntimeConnection: the deferral flag and the ack sender
 # --------------------------------------------------------------------------- #
 @pytest.mark.asyncio
-async def test_launch_and_run_script_defer_their_ack_but_input_does_not():
+async def test_only_senders_that_opt_in_defer_their_ack():
+    """Deferral is explicit: a sender that applies durable state asks for it.
+
+    A RUN_SCRIPT sent without ``defer_ack`` (a flow pre-script, which applies
+    nothing durable) is acked by the reader; otherwise its retained result would
+    sit unacked in the runtime until the next reconnect.
+    """
     sent = []
 
     async def send_text(text):
@@ -61,22 +67,32 @@ async def test_launch_and_run_script_defer_their_ack_but_input_does_not():
 
     conn = RuntimeConnection("worker-1", send_text)
 
-    async def _pending(command_type, op_id):
-        task = asyncio.ensure_future(conn.send_command(command_type, {}, op_id=op_id, timeout=5))
+    async def _pending(command_type, op_id, defer_ack):
+        task = asyncio.ensure_future(
+            conn.send_command(command_type, {}, op_id=op_id, timeout=5, defer_ack=defer_ack)
+        )
         await asyncio.sleep(0)  # let send_command register the op
         return task
 
-    launch_task = await _pending(CommandType.LAUNCH, "op-L")
-    input_task = await _pending(CommandType.INPUT, "op-I")
-    script_task = await _pending(CommandType.RUN_SCRIPT, "op-S")
+    launch_task = await _pending(CommandType.LAUNCH, "op-L", True)
+    input_task = await _pending(CommandType.INPUT, "op-I", False)
+    script_task = await _pending(CommandType.RUN_SCRIPT, "op-S", True)
+    prescript_task = await _pending(CommandType.RUN_SCRIPT, "op-P", False)
 
     assert conn.ack_is_deferred("op-L") is True
     assert conn.ack_is_deferred("op-S") is True
     assert conn.ack_is_deferred("op-I") is False
+    assert conn.ack_is_deferred("op-P") is False
 
-    for op_id, task in (("op-L", launch_task), ("op-I", input_task), ("op-S", script_task)):
+    for op_id, task in (
+        ("op-L", launch_task),
+        ("op-I", input_task),
+        ("op-S", script_task),
+        ("op-P", prescript_task),
+    ):
         conn.resolve(CommandResultFrame(op_id=op_id, outcome=CommandOutcome.OK, payload={}))
         await task
+    assert not conn.ack_is_deferred("op-L"), "the opt-in is cleared when the op completes"
 
 
 @pytest.mark.asyncio
