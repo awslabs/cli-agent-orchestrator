@@ -2142,6 +2142,7 @@ async def workflow_return(
         response = requests.post(
             f"{API_BASE_URL}/workflows/runs/{run_id}/steps/{step_id}/output",
             json=payload,
+            headers=mcp_utils._auth_headers() or None,
             timeout=_mcp_timeout(),
         )
     except requests.RequestException as e:
@@ -2338,6 +2339,7 @@ async def workflow_resume(
         response = requests.post(
             f"{API_BASE_URL}/workflows/runs/{run_id}/resume",
             json={"decisions": dict(supplied)} if supplied else None,
+            headers=mcp_utils._auth_headers() or None,
             timeout=WORKFLOW_RUN_REQUEST_TIMEOUT,
         )
     except requests.RequestException as e:
@@ -2372,6 +2374,7 @@ async def workflow_cancel(
     try:
         response = requests.post(
             f"{API_BASE_URL}/workflows/runs/{run_id}/cancel",
+            headers=mcp_utils._auth_headers() or None,
             timeout=_mcp_timeout(),
         )
     except requests.RequestException as e:
@@ -2515,6 +2518,7 @@ async def workflow_plan_approval(
     try:
         response = requests.get(
             f"{API_BASE_URL}/workflows/runs/{run_id}/plan",
+            headers=mcp_utils._auth_headers() or None,
             timeout=_mcp_timeout(),
         )
     except requests.RequestException as e:
@@ -2551,6 +2555,7 @@ async def workflow_status(
     try:
         response = requests.get(
             f"{API_BASE_URL}/workflows/runs/{run_id}",
+            headers=mcp_utils._auth_headers() or None,
             timeout=_mcp_timeout(),
         )
     except requests.RequestException as e:
@@ -2602,6 +2607,7 @@ async def workflow_result(
     try:
         response = requests.get(
             f"{API_BASE_URL}/workflows/runs/{run_id}/result",
+            headers=mcp_utils._auth_headers() or None,
             timeout=_mcp_timeout(),
         )
     except requests.RequestException as e:
@@ -2635,6 +2641,7 @@ async def workflow_list(
         response = requests.get(
             f"{API_BASE_URL}/workflows/runs",
             params=params,
+            headers=mcp_utils._auth_headers() or None,
             timeout=_mcp_timeout(),
         )
     except requests.RequestException as e:
@@ -2672,6 +2679,7 @@ async def workflow_wait(
         try:
             response = requests.get(
                 f"{API_BASE_URL}/workflows/runs/{run_id}",
+                headers=mcp_utils._auth_headers() or None,
                 timeout=_mcp_timeout(),
             )
         except requests.RequestException as e:
@@ -2698,6 +2706,7 @@ async def workflow_wait(
     try:
         result_response = requests.get(
             f"{API_BASE_URL}/workflows/runs/{run_id}/result",
+            headers=mcp_utils._auth_headers() or None,
             timeout=_mcp_timeout(),
         )
     except requests.RequestException as e:
@@ -2737,7 +2746,11 @@ def _classify_events_404(run_id: str, detail: str) -> tuple:
     than asserting a server capability it could not verify.
     """
     try:
-        probe = requests.get(f"{API_BASE_URL}/workflows/runs/{run_id}", timeout=_mcp_timeout())
+        probe = requests.get(
+            f"{API_BASE_URL}/workflows/runs/{run_id}",
+            headers=mcp_utils._auth_headers() or None,
+            timeout=_mcp_timeout(),
+        )
     except requests.RequestException:
         return detail, False
     if probe.status_code == 200:
@@ -2814,7 +2827,7 @@ async def workflow_events(
     params: Dict[str, Any] = {}
     if isinstance(after_seq, int):
         params["after_seq"] = after_seq
-    headers = {"Accept": "text/event-stream"}
+    headers = {**mcp_utils._auth_headers(), "Accept": "text/event-stream"}
 
     events: List[Dict[str, Any]] = []
     gaps: List[Dict[str, Any]] = []

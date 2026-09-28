@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 from contextlib import contextmanager
@@ -332,19 +333,104 @@ def test_local_token_crosses_cli_and_mcp_run_and_start_boundaries(monkeypatch):
 
     monkeypatch.setattr(mcp_server.requests, "post", _post)
 
+    def _get(url: str, **kwargs: Any):
+        calls.append((url, kwargs.get("headers"), kwargs["timeout"]))
+        return SimpleNamespace(
+            status_code=200,
+            json=lambda: {"run_id": "run-1", "state": "completed", "steps": []},
+        )
+
+    monkeypatch.setattr(cli_workflow.requests, "get", _get)
+
     mcp_run = asyncio.run(_mcp_tool("workflow_run")(name_or_path="wf"))
     mcp_start = asyncio.run(_mcp_tool("workflow_start")(name_or_path="wf"))
     runner = CliRunner()
     cli_run = runner.invoke(cli_workflow.workflow, ["run", "wf", "--wait"])
     cli_start = runner.invoke(cli_workflow.workflow, ["run", "wf", "--detach"])
+    cli_follow = runner.invoke(cli_workflow.workflow, ["run", "wf"])
+    cli_follow_json = runner.invoke(cli_workflow.workflow, ["run", "wf", "--json"])
 
     assert mcp_run["ok"] is True
     assert mcp_start["ok"] is True
     assert cli_run.exit_code == 0, cli_run.output
     assert cli_start.exit_code == 0, cli_start.output
-    assert [headers for _, headers, _ in calls] == [{"Authorization": f"Bearer {token}"}] * 4
+    assert cli_follow.exit_code == 0, cli_follow.output
+    assert cli_follow_json.exit_code == 0, cli_follow_json.output
+    assert [headers for _, headers, _ in calls] == [{"Authorization": f"Bearer {token}"}] * 8
     assert calls[0][2] == cli_workflow.WORKFLOW_RUN_REQUEST_TIMEOUT
     assert calls[2][2] == cli_workflow.WORKFLOW_RUN_REQUEST_TIMEOUT
+
+
+def test_every_registered_workflow_mcp_http_tool_forwards_auth():
+    """New workflow tools cannot silently add an unauthenticated HTTP hop."""
+    if hasattr(mcp_server.mcp, "get_tools"):
+        tools = asyncio.run(mcp_server.mcp.get_tools())
+        registered = {
+            name: getattr(tool, "fn", tool)
+            for name, tool in tools.items()
+            if name.startswith("workflow_")
+        }
+    else:
+        registered = {
+            name: _mcp_tool(name)
+            for name in dir(mcp_server)
+            if name.startswith("workflow_")
+        }
+
+    direct_http_tools = {
+        name: inspect.getsource(tool)
+        for name, tool in registered.items()
+        if "requests." in inspect.getsource(tool)
+    }
+    assert direct_http_tools
+    assert {
+        name
+        for name, source in direct_http_tools.items()
+        if "headers=" not in source
+    } == set()
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["status", "run-1"],
+        ["status"],
+        ["runs"],
+        ["wait", "run-1"],
+        ["result", "run-1"],
+        ["resume", "run-1"],
+        ["step", "run-1", "step-1"],
+        ["cancel", "run-1"],
+        ["events", "run-1", "--no-follow"],
+    ],
+)
+def test_remaining_workflow_cli_verbs_forward_auth(monkeypatch, args):
+    token = "remaining-cli-token"
+    monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", token)
+    seen: list[dict[str, str] | None] = []
+
+    def _response(url: str, **kwargs: Any):
+        seen.append(kwargs.get("headers"))
+        if url.endswith("/workflows/runs"):
+            body = [{"run_id": "run-1", "state": "completed"}]
+        elif url.endswith("/result") or url.endswith("/resume"):
+            body = {"run_id": "run-1", "state": "completed", "steps": []}
+        elif "/steps/" in url:
+            body = {"run_id": "run-1", "step_id": "step-1", "error": None}
+        elif url.endswith("/events"):
+            body = []
+        else:
+            body = {"run_id": "run-1", "state": "completed"}
+        return SimpleNamespace(status_code=200, json=lambda: body)
+
+    monkeypatch.setattr(cli_workflow.requests, "get", _response)
+    monkeypatch.setattr(cli_workflow.requests, "post", _response)
+
+    result = CliRunner().invoke(cli_workflow.workflow, args)
+
+    assert result.exit_code == 0, result.output
+    assert seen
+    assert seen == [{"Authorization": f"Bearer {token}"}] * len(seen)
 
 
 def test_mcp_run_authenticates_terminal_root_lookup_and_first_post(
