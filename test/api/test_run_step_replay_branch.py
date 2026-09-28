@@ -57,6 +57,7 @@ from one run would change the verdict of the next.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import sqlite3
@@ -73,9 +74,10 @@ from cli_agent_orchestrator.clients.database import (
 from cli_agent_orchestrator.constants import TERMINALS_RUN_STEP_ROUTE
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
 from cli_agent_orchestrator.models.workflow import RecoveryPolicy, StepResultEnvelope
-from cli_agent_orchestrator.models.workflow_runtime import RunState
+from cli_agent_orchestrator.models.workflow_runtime import RunState, WorkflowRunResult
 from cli_agent_orchestrator.services import (
     launch_guard,
+    script_runner,
     settings_service,
     step_replay,
     workflow_journal,
@@ -896,6 +898,81 @@ class TestReplayedTerminalId:
 # BR-2/SR-5 — the branch engages for script-tier calls ONLY.
 # ---------------------------------------------------------------------------
 class TestTheScriptTierGuard:
+    def test_resumed_run_keeps_launch_guard_for_its_next_agent_step(self, client, monkeypatch):
+        run_id = "run-resume-guard-drift"
+        frozen_guard = {
+            "profiles": {"developer": "sha256:frozen"},
+            "memory_enabled": False,
+        }
+        workflow_journal.insert_run(
+            run_id=run_id,
+            workflow_name="wf",
+            spec_snapshot=json.dumps(
+                {
+                    "source": "print('resume')\n",
+                    "launch_guard": frozen_guard,
+                }
+            ),
+            inputs_json="{}",
+            state="failed",
+            started_at=TS,
+            tier="script",
+            generation="1",
+        )
+        monkeypatch.setattr(
+            script_runner.approval_gate,
+            "ensure_plan_approved",
+            lambda **kwargs: None,
+        )
+        monkeypatch.setattr(
+            launch_guard.settings_service,
+            "resolve_workflow_approval_posture",
+            lambda: settings_service.WorkflowApprovalPosture(
+                True, settings_service.GATE_SOURCE_FILE
+            ),
+        )
+        monkeypatch.setattr(
+            launch_guard.settings_service,
+            "is_memory_enabled",
+            lambda: False,
+        )
+        observed = {}
+        create_terminal = AsyncMock()
+
+        async def _drive_resumed_step(record, script_path, env):
+            # The profile changes after resume admission but before the resumed
+            # script asks for its next agent terminal.
+            monkeypatch.setattr(
+                launch_guard,
+                "_profile_digest",
+                lambda agent: "sha256:changed",
+            )
+            observed["response"] = client.post(
+                TERMINALS_RUN_STEP_ROUTE,
+                json=_body(env_vars=_env(run_id, "s1", record.generation)),
+            )
+            return WorkflowRunResult(
+                run_id=run_id,
+                workflow_name="wf",
+                state=RunState.FAILED,
+                started_at=record.started_at,
+            )
+
+        monkeypatch.setattr(script_runner, "_drive_process", _drive_resumed_step)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.agent_step.terminal_service.create_terminal",
+            create_terminal,
+        )
+
+        asyncio.run(script_runner.resume_script_run(run_id))
+
+        response = observed["response"]
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"]["kind"] == "plan_inputs_changed"
+        assert "profile 'developer' changed" in response.json()["detail"]["message"].lower()
+        assert _raw_row(run_id, "s1") is None
+        create_terminal.assert_not_awaited()
+
     def test_approval_off_allows_two_agent_steps_and_creates_both_terminals(self, client):
         run_id = "run-guard-disabled-two-steps"
         _register_run(run_id)  # launch_guard=null: shape journaled before this fix
