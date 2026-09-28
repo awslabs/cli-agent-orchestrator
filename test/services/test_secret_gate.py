@@ -198,9 +198,34 @@ class TestZeroWidthEvasion:
         ]
         assert missing == []
 
-    @pytest.mark.parametrize("zw", ["\U000110bd", "\U00013430", "\U0001343f"])
-    def test_astral_format_controls_are_stripped_too(self, zw):
+    @pytest.mark.parametrize(
+        "zw",
+        [
+            "\u0890",  # Arabic pound mark above, Unicode 14.0
+            "\U000110bd",  # Kaithi number sign
+            "\U00013430",  # Egyptian hieroglyph vertical joiner
+            "\U0001343f",  # Egyptian hieroglyph end walled enclosure, Unicode 15.0
+        ],
+        ids=lambda c: f"U+{ord(c):04X}",
+    )
+    def test_format_controls_newer_than_the_interpreter_are_stripped_too(self, zw):
+        """Python 3.10 ships Unicode 13 and 3.11 ships 14, where two of these are
+        unassigned; the frozen table must catch them on every supported Python."""
         assert scan_for_secrets(f"AK{zw}IAIOSFODNN7EXAMPLE") == "aws_access_key"
+
+    def test_frozen_table_is_the_format_category_where_the_interpreter_knows_it(self):
+        """Guards the table against typos: on an interpreter whose tables are at
+        least Unicode 15.0, every frozen code point must really be Cf, and the
+        frozen table must be the whole category (no Cf outside it)."""
+        import unicodedata
+
+        from cli_agent_orchestrator.services.secret_gate import _FORMAT_CONTROL_RANGES
+
+        if tuple(int(x) for x in unicodedata.unidata_version.split(".")) < (15, 0, 0):
+            pytest.skip(f"unicodedata is Unicode {unicodedata.unidata_version}")
+        frozen = {cp for lo, hi in _FORMAT_CONTROL_RANGES for cp in range(lo, hi + 1)}
+        live = {cp for cp in range(0x110000) if unicodedata.category(chr(cp)) == "Cf"}
+        assert frozen == live
 
     def test_visible_combining_marks_are_not_stripped(self):
         # An acute accent (Mn) is visible and belongs to its base letter; a key

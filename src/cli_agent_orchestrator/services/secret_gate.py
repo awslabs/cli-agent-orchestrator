@@ -105,16 +105,52 @@ _SECRET_PATTERNS: List[Tuple[str, Pattern[str]]] = [
 # ``scan_for_secrets`` judges the content with these removed. ``redact_secrets``
 # removes them only from inside spans that match once they are gone, so a
 # U+200D joining an emoji sequence elsewhere in the same string survives.
+# The Cf category as of Unicode 16.0.0, frozen. ``unicodedata`` reports the
+# category of the interpreter's own tables, and those lag: Python 3.10 ships
+# Unicode 13 and 3.11 ships 14, so on them U+0890/U+0891 (Arabic pound and
+# piastre marks, 14.0) and U+13439-U+1343F (Egyptian hieroglyph format controls,
+# 15.0) are "unassigned" and would pass through, while any newer interpreter and
+# every terminal already treats them as format characters. Which code point an
+# attacker can hide behind must not depend on which Python the server runs, so
+# this table is the floor and the live category is unioned on top of it.
+_FORMAT_CONTROL_RANGES: Tuple[Tuple[int, int], ...] = (
+    (0x00AD, 0x00AD),
+    (0x0600, 0x0605),
+    (0x061C, 0x061C),
+    (0x06DD, 0x06DD),
+    (0x070F, 0x070F),
+    (0x0890, 0x0891),
+    (0x08E2, 0x08E2),
+    (0x180E, 0x180E),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x2064),
+    (0x2066, 0x206F),
+    (0xFEFF, 0xFEFF),
+    (0xFFF9, 0xFFFB),
+    (0x110BD, 0x110BD),
+    (0x110CD, 0x110CD),
+    (0x13430, 0x1343F),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0001, 0xE0001),
+    (0xE0020, 0xE007F),
+)
+
+
 def _invisible_character_class() -> str:
-    # Every Cf code point lives in planes 0 and 1 (BMP and SMP: bidi and
-    # zero-width controls, Kaithi and Egyptian hieroglyph format controls,
-    # musical and shorthand format controls) or in the plane-14 tag block.
-    # Planes 0-1 are enumerated from unicodedata at import (~13 ms); plane 14 is
-    # listed, since iterating the whole code space costs ~120 ms. A test compares
-    # this class against the live category over the full range so a Unicode
-    # update that adds a format character elsewhere fails loudly.
-    code_points = [cp for cp in range(0x20000) if unicodedata.category(chr(cp)) == "Cf"]
-    code_points += [0xE0001] + list(range(0xE0020, 0xE0080))
+    # Start from the frozen table above, then add whatever the running
+    # interpreter's tables call Cf, so a newer Unicode release is picked up
+    # on a newer Python without waiting for this table to be updated. Every Cf
+    # code point lives in planes 0 and 1 (BMP and SMP: bidi and zero-width
+    # controls, Kaithi and Egyptian hieroglyph format controls, musical and
+    # shorthand format controls) or in the plane-14 tag block, so planes 0-1 are
+    # enumerated at import (~13 ms) and plane 14 is covered by the table, since
+    # iterating the whole code space costs ~120 ms. A test compares the class
+    # against the live category over the full range so a Unicode update that
+    # adds a format character elsewhere fails loudly.
+    code_points = [cp for lo, hi in _FORMAT_CONTROL_RANGES for cp in range(lo, hi + 1)]
+    code_points += [cp for cp in range(0x20000) if unicodedata.category(chr(cp)) == "Cf"]
     # Invisible by rendering rather than by category: the combining grapheme
     # joiner and the variation selectors (Mn).
     code_points += [0x034F]

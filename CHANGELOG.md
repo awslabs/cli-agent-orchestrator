@@ -112,8 +112,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keys (next to an `aws ... secret`/`access` context word or a
   `SecretAccessKey` key), and it no longer lets an invisible character inside
   a prefix hide a credential: the whole Unicode format category (zero-width
-  characters, bidi marks, soft hyphen, invisible operators) plus the
-  variation selectors, not a short list. Parsed documents keep their key
+  characters, bidi marks, soft hyphen, invisible operators; frozen at Unicode
+  16.0 so Python 3.10 and 3.11, whose own tables are older, catch the same
+  code points) plus the variation selectors, not a short list. Parsed
+  documents keep their key
   context: the execution manifest and step output redact a 40-character value
   under a `SecretAccessKey`-style key, a value whose key makes the pair read
   as a credential assignment (`{"password": …}`, `{"api_key": …}`), and the
