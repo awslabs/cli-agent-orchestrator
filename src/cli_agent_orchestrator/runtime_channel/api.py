@@ -70,7 +70,11 @@ from cli_agent_orchestrator.security.auth import (
     get_current_principal,
     require_any_scope,
 )
-from cli_agent_orchestrator.security.principal import Principal
+from cli_agent_orchestrator.security.principal import (
+    Principal,
+    PrincipalError,
+    may_start_work,
+)
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.utils.runtime_token import runtime_token
 
@@ -194,7 +198,9 @@ async def _reconcile_orphaned_result(frame: CommandResultFrame, runtime_id: str)
 
     record = None
     try:
-        record = get_dispatch_record(frame.op_id)
+        # SQLite is synchronous; keep it off the frame-reader event loop so a slow
+        # read cannot stall every other terminal's frames (Augusto on #802).
+        record = await asyncio.to_thread(get_dispatch_record, frame.op_id)
     except Exception:
         # Provenance is MANDATORY only when applying this result would create or
         # destroy state; otherwise the journal is an optimisation and an unreadable
@@ -253,17 +259,24 @@ async def _reconcile_orphaned_result(frame: CommandResultFrame, runtime_id: str)
         # only the OK case left exactly the bug _reconcile_orphaned_script_run
         # exists to fix (own review of this PR).
         if command_type == CommandType.RUN_SCRIPT.value:
-            _reconcile_orphaned_script_run(frame, record)
+            applied = await asyncio.to_thread(_reconcile_orphaned_script_run, frame, record)
+            if not applied:
+                # The workflow-journal write raised. Do NOT settle and do NOT ack,
+                # so the runtime redelivers on its next reconnect and the write can
+                # be retried — acking now would strand the run RUNNING (haefeif #3).
+                return False
         # Anything else failed without creating state to orphan. Settle so a restart
         # does not report it as an outcome never seen.
-        _settle_quietly(frame.op_id)
+        await asyncio.to_thread(_settle_quietly, frame.op_id)
         return True
 
     if command_type == CommandType.LAUNCH.value:
         if not has_terminal:
-            _settle_quietly(frame.op_id)
+            await asyncio.to_thread(_settle_quietly, frame.op_id)
             return True
-        return _persist_reconciled_terminal(info, runtime_id, record, frame.op_id)
+        return await asyncio.to_thread(
+            _persist_reconciled_terminal, info, runtime_id, record, frame.op_id
+        )
 
     # A successful non-LAUNCH result with no in-memory waiter: the caller that
     # would have applied it is gone. RUN_SCRIPT is the one that matters — its
@@ -273,12 +286,16 @@ async def _reconcile_orphaned_result(frame: CommandResultFrame, runtime_id: str)
     # record it as an outcome that arrived without an owner and settle it, rather
     # than acking into silence.
     if command_type == CommandType.RUN_SCRIPT.value:
-        _reconcile_orphaned_script_run(frame, record)
-    _settle_quietly(frame.op_id)
+        applied = await asyncio.to_thread(_reconcile_orphaned_script_run, frame, record)
+        if not applied:
+            # The durable run write failed; keep the result unacked and the journal
+            # unsettled so redelivery can retry it (haefeif #3 on #802).
+            return False
+    await asyncio.to_thread(_settle_quietly, frame.op_id)
     return True
 
 
-def _reconcile_orphaned_script_run(frame: CommandResultFrame, record: dict) -> None:
+def _reconcile_orphaned_script_run(frame: CommandResultFrame, record: dict) -> bool:
     """Settle the durable run a redelivered RUN_SCRIPT result belongs to.
 
     The in-memory driver that owned this run died with the previous server
@@ -296,6 +313,12 @@ def _reconcile_orphaned_script_run(frame: CommandResultFrame, record: dict) -> N
 
     ``settle_run_state_if_running`` is conditional, so a run the engine already
     settled by some other path is left exactly as it is.
+
+    Returns whether the durable write is done with. ``False`` means the
+    workflow-journal write RAISED: the caller must then neither settle the
+    dispatch journal nor ack, so the runtime redelivers on its next reconnect and
+    the write can be retried (haefeif #3 on #802). ``True`` covers the writes that
+    landed and the runs that had nothing to settle.
     """
     run_id = record.get("run_id")
     if not run_id:
@@ -303,7 +326,7 @@ def _reconcile_orphaned_script_run(frame: CommandResultFrame, record: dict) -> N
             "orphaned RUN_SCRIPT result for op %s has no run in the journal; " "nothing to settle",
             frame.op_id,
         )
-        return
+        return True
     try:
         from datetime import datetime, timezone
 
@@ -331,10 +354,12 @@ def _reconcile_orphaned_script_run(frame: CommandResultFrame, record: dict) -> N
                 run_id,
                 frame.op_id,
             )
+        return True
     except Exception:  # noqa: BLE001
         logger.warning(
             "could not settle run %s from redelivered RUN_SCRIPT result", run_id, exc_info=True
         )
+        return False
 
 
 def _settle_quietly(op_id: str) -> None:
@@ -372,6 +397,11 @@ def _persist_reconciled_terminal(info: dict, runtime_id: str, record: dict, op_i
                 # and never told the runtime. Previously this wrote no owner at
                 # all, and an unowned row passes the revocation gate.
                 owner=record.get("owner"),
+                # Restored from the journal too: the runtime's result payload
+                # carries neither, so without this a reconciled terminal lost its
+                # callback parent and recorded workspace (haefeif #7 on #802).
+                caller_id=record.get("caller_id"),
+                working_directory=record.get("working_directory"),
                 # server_metadata, not metadata: placement is server-owned and
                 # caller-supplied copies of these keys are stripped at creation.
                 server_metadata={"runtime_id": runtime_id},
@@ -623,6 +653,14 @@ async def runtime_channel(ws: WebSocket) -> None:
             conn.last_seen = time.time()
             if isinstance(frame, CommandResultFrame):
                 matched = conn.resolve(frame)
+                # A matched LAUNCH or RUN_SCRIPT result is NOT acked here: its
+                # outcome creates durable state (a terminal row, a workflow run)
+                # that the waiting coroutine applies, and the ack — which lets the
+                # runtime drop its only retained copy — must wait until that state
+                # is on disk. The coroutine sends it via ``conn.ack`` after the
+                # apply. Read the deferral before yielding, so it is answered while
+                # the op is still in flight (haefeif #3 on #802).
+                deferred = matched and conn.ack_is_deferred(frame.op_id)
                 safe_to_ack = True
                 if not matched:
                     # A result the runtime retained for an op sent before this
@@ -632,11 +670,12 @@ async def runtime_channel(ws: WebSocket) -> None:
                     # would orphan a running agent nothing can route to or tear
                     # down (guojing1217 on #802). Reconcile it before acking.
                     safe_to_ack = await _reconcile_orphaned_result(frame, runtime_id)
-                # Ack only once any reconciliation SUCCEEDED: the ack is what lets
-                # the runtime drop its retained copy, and dropping it after a
-                # failed reconcile would orphan a live agent for good. Worker
-                # cleanup must not outrun result delivery either way.
-                if safe_to_ack:
+                # Ack only once any reconciliation SUCCEEDED, and never for a
+                # deferred op: the ack is what lets the runtime drop its retained
+                # copy, and dropping it after a failed reconcile — or before the
+                # coroutine has durably applied a matched result — would orphan a
+                # live agent for good.
+                if safe_to_ack and not deferred:
                     await ws.send_text(encode_frame(AckFrame(op_id=frame.op_id)))
             elif isinstance(frame, StreamFrame):
                 raw = base64.b64decode(frame.data)
@@ -887,6 +926,19 @@ async def launch_remote_terminal(
     happens here, in one place, because a second launch path that forgot one of
     them would leave a terminal nobody can route to.
     """
+    # Revocation gate (#745 criterion 14): a removed principal may not start new
+    # work. Checked before journaling or dispatching — nothing reaches the wire
+    # for a revoked owner — on the same may_start_work seam inbox delivery uses.
+    # An unreadable owner id is unknown, not revoked (principal.py), so allowed.
+    try:
+        owner_principal = Principal.parse(owner_id)
+    except PrincipalError:
+        owner_principal = None
+    if not may_start_work(owner_principal):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"principal {owner_id} is revoked and may not start new work",
+        )
     conn = runtime_registry.get_runtime(runtime_id)
     if conn is None:
         # 503, not 404: a disconnected runtime is a retryable availability
@@ -914,6 +966,10 @@ async def launch_remote_terminal(
             # The runtime's result payload does not echo `engine`, so the journal
             # is the only place a reconcile after a restart can read it from.
             engine=body.engine,
+            # Recorded so a launch reconciled after a restart restores the caller
+            # its callbacks route to and the workspace it ran in (haefeif #7).
+            caller_id=body.caller_id,
+            working_directory=body.working_directory,
         )
     except Exception:
         # A launch that cannot be journalled must not happen: its result would be
@@ -933,7 +989,9 @@ async def launch_remote_terminal(
         )
     except RuntimeNotDispatchedError as e:
         # PROVABLY nothing on the wire, so a retry cannot duplicate the launch:
-        # 503, the retryable signal.
+        # 503, the retryable signal. The outcome is known (nothing ran), so settle
+        # the journal — an unsettled row here would be a permanent leak (#15).
+        _settle_quietly(op_id)
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
     except RuntimeUnavailableError as e:
         # The base class means the frame's fate is UNKNOWN — the channel can close
@@ -953,6 +1011,11 @@ async def launch_remote_terminal(
             detail=f"launch on runtime '{runtime_id}' timed out; outcome unknown",
         )
     if result.outcome != CommandOutcome.OK:
+        # Matched and (deferred) acked: the runtime executed and reported a
+        # definitive failure that cannot be reconciled later. Settle the journal
+        # and ack so the runtime drops its retained copy (#15).
+        _settle_quietly(op_id)
+        await conn.ack(op_id)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"launch failed on runtime '{runtime_id}': "
@@ -967,107 +1030,131 @@ async def launch_remote_terminal(
     # (guojing1217 on #802). Prefer the runtime's echo, fall back to the
     # request.
     engine = info.get("engine") or body.engine
-    # Persist the authoritative registry row centrally. runtime_id is recorded
-    # in metadata so the association is inspectable and survives restarts
-    # alongside the hello-snapshot rebinding.
-    #
-    # ``owner`` records who this remote terminal's work is for (#745). It is
-    # written here, on the server, and deliberately NOT sent to the runtime in
-    # the LAUNCH payload: the executor pod is the least trusted party in this
-    # topology, and an identity handed to it is an identity it could re-present.
-    # Every later question about this terminal ("may this still start work?",
-    # "whose callback is this?") is answered by reading this row, which is the
-    # concrete form of #745's rule that agent-supplied IDs alone are not
-    # authorization.
-    try:
-        db_create_terminal(
-            info["id"],
-            info["session_name"],
-            info["name"],
-            info["provider"],
-            agent_profile=info.get("agent_profile"),
-            allowed_tools=info.get("allowed_tools"),
-            shell_command=info.get("shell_command"),
-            caller_id=body.caller_id,
-            engine=engine,
-            working_directory=body.working_directory,
-            # server_metadata, not metadata: placement is server-owned and
-            # caller-supplied copies of these keys are stripped at creation.
-            server_metadata={"runtime_id": runtime_id},
-            owner=owner_id,
-        )
-    except Exception:
-        # The provider is already running in the runtime, but there is no row and
-        # no binding — nothing can route to it or tear it down, so it is a leaked
-        # pod holding a live model session (guojing1217 on #802). Compensate with
-        # a best-effort TEARDOWN on the same connection; both ids are in hand.
-        # The launch failure is what the caller must see, so re-raise after.
-        logger.exception(
-            "persisting terminal %s failed after launch on %s; tearing it back down",
-            info.get("id"),
-            runtime_id,
-        )
+    terminal_id = info["id"]
+
+    async def _persist_bind_settle_ack() -> Terminal:
+        """Apply the launch outcome durably, then ack.
+
+        Run under ``asyncio.shield`` so a cancelled request cannot stop it after
+        the provider is already running: the ack that lets the runtime drop its
+        retained copy is sent only once the central row is written, routing is
+        bound, and the journal is settled — never on ``conn.resolve`` from the
+        frame reader (haefeif #3 on #802).
+        """
+        # Persist the authoritative registry row centrally. runtime_id is recorded
+        # in metadata so the association is inspectable and survives restarts
+        # alongside the hello-snapshot rebinding.
+        #
+        # ``owner`` records who this remote terminal's work is for (#745), written
+        # here on the server and deliberately NOT sent to the runtime: the executor
+        # pod is the least trusted party, and an identity handed to it is one it
+        # could re-present.
         try:
-            td = await conn.send_command(
-                CommandType.TEARDOWN, {}, timeout=TEARDOWN_TIMEOUT, terminal_id=info["id"]
+            db_create_terminal(
+                terminal_id,
+                info["session_name"],
+                info["name"],
+                info["provider"],
+                agent_profile=info.get("agent_profile"),
+                allowed_tools=info.get("allowed_tools"),
+                shell_command=info.get("shell_command"),
+                caller_id=body.caller_id,
+                engine=engine,
+                working_directory=body.working_directory,
+                # server_metadata, not metadata: placement is server-owned and
+                # caller-supplied copies of these keys are stripped at creation.
+                server_metadata={"runtime_id": runtime_id},
+                owner=owner_id,
             )
-            # send_command does NOT raise on a runtime-side teardown FAILURE — it
-            # returns a result frame with a non-OK outcome. Treating that as
-            # success would report the leak as cleaned up when the agent is still
-            # running (Copilot follow-up on #802), so check the outcome and the
-            # deleted/absent confirmation the teardown path uses.
-            cleaned = td.outcome == CommandOutcome.OK and (
-                td.payload.get("deleted") or td.payload.get("absent")
-            )
-            if not cleaned:
-                logger.error(
-                    "compensating teardown of leaked terminal %s did not confirm cleanup: "
-                    "outcome=%s payload=%s — the agent may still be running on %s",
-                    info.get("id"),
-                    td.outcome,
-                    td.payload,
-                    runtime_id,
-                )
         except Exception:
-            logger.exception("compensating teardown of leaked terminal %s failed", info.get("id"))
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"launched terminal on '{runtime_id}' but failed to persist it; tore it down",
+            # The provider is already running in the runtime, but there is no row
+            # and no binding — nothing can route to it or tear it down, so it is a
+            # leaked pod holding a live model session (guojing1217 on #802).
+            # Compensate with a best-effort TEARDOWN on the same connection.
+            logger.exception(
+                "persisting terminal %s failed after launch on %s; tearing it back down",
+                terminal_id,
+                runtime_id,
+            )
+            cleaned = False
+            try:
+                td = await conn.send_command(
+                    CommandType.TEARDOWN, {}, timeout=TEARDOWN_TIMEOUT, terminal_id=terminal_id
+                )
+                # send_command does NOT raise on a runtime-side teardown FAILURE —
+                # it returns a non-OK result frame. Treating that as success would
+                # report the leak as cleaned up when the agent is still running
+                # (Copilot follow-up on #802).
+                cleaned = td.outcome == CommandOutcome.OK and (
+                    td.payload.get("deleted") or td.payload.get("absent")
+                )
+                if not cleaned:
+                    logger.error(
+                        "compensating teardown of leaked terminal %s did not confirm "
+                        "cleanup: outcome=%s payload=%s — the agent may still be "
+                        "running on %s",
+                        terminal_id,
+                        td.outcome,
+                        td.payload,
+                        runtime_id,
+                    )
+            except Exception:
+                logger.exception("compensating teardown of leaked terminal %s failed", terminal_id)
+            if cleaned:
+                # Confirmed clean: the failure is definitive with nothing left
+                # running, so settle the journal (#15) and tell the truth (#12).
+                _settle_quietly(op_id)
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=(
+                        f"launched terminal {terminal_id} on '{runtime_id}' but failed "
+                        f"to persist it; tore it down"
+                    ),
+                )
+            # NOT confirmed: the agent may still be running, so the outcome is
+            # unknown — leave the journal unsettled (the reconnect orphan path will
+            # persist the row and make a live agent tracked) and name the id so
+            # recovery tooling can find it (#12/#15).
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=(
+                    f"launched terminal {terminal_id} on '{runtime_id}' but failed to "
+                    f"persist it; compensating teardown was NOT confirmed — terminal "
+                    f"{terminal_id} on {runtime_id} may still be running"
+                ),
+            )
+        runtime_registry.bind_terminal(terminal_id, runtime_id)
+        # The outcome has been applied: row written, routing bound. Settle the
+        # journal so it is no longer an operation whose result this server never
+        # saw, then ack — only now is it safe for the runtime to drop its copy.
+        _settle_quietly(op_id)
+        await conn.ack(op_id)
+        try:
+            reported = TerminalStatus(info.get("status", "unknown"))
+        except ValueError:
+            reported = TerminalStatus.UNKNOWN
+        runtime_registry.set_status(terminal_id, reported)
+
+        from datetime import datetime
+
+        return Terminal(
+            id=terminal_id,
+            name=info["name"],
+            provider=info["provider"],
+            session_name=info["session_name"],
+            agent_profile=info.get("agent_profile"),
+            caller_id=body.caller_id,
+            allowed_tools=info.get("allowed_tools"),
+            engine=engine,
+            shell_command=info.get("shell_command"),
+            group=None,
+            metadata={"runtime_id": runtime_id},
+            owner=owner_id,
+            status=reported,
+            last_active=datetime.now(),
         )
-    runtime_registry.bind_terminal(info["id"], runtime_id)
-    # The outcome has been applied: row written, routing bound. Settle the journal
-    # entry so it is no longer an operation whose result this server never saw.
-    #
-    # Without this the happy path never settles, which is not just untidy
-    # bookkeeping: one row accumulates per launch, forever, on the server's volume,
-    # and a restart auditing the journal cannot tell a genuinely unresolved
-    # operation from thousands of completed ones. Observed on the cluster, where
-    # every entry read `dispatched` after a successful run.
-    _settle_quietly(op_id)
-    try:
-        reported = TerminalStatus(info.get("status", "unknown"))
-    except ValueError:
-        reported = TerminalStatus.UNKNOWN
-    runtime_registry.set_status(info["id"], reported)
 
-    from datetime import datetime
-
-    return Terminal(
-        id=info["id"],
-        name=info["name"],
-        provider=info["provider"],
-        session_name=info["session_name"],
-        agent_profile=info.get("agent_profile"),
-        caller_id=body.caller_id,
-        allowed_tools=info.get("allowed_tools"),
-        engine=engine,
-        shell_command=info.get("shell_command"),
-        group=None,
-        metadata={"runtime_id": runtime_id},
-        owner=owner_id,
-        status=reported,
-        last_active=datetime.now(),
-    )
+    return await asyncio.shield(_persist_bind_settle_ack())
 
 
 async def remote_terminal_command(
