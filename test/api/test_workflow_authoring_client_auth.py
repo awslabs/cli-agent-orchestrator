@@ -375,10 +375,8 @@ def test_local_token_crosses_cli_and_mcp_run_and_start_boundaries(monkeypatch):
 
 
 def _registered_workflow_mcp_names() -> set[str]:
-    if hasattr(mcp_server.mcp, "get_tools"):
-        tools = asyncio.run(mcp_server.mcp.get_tools())
-        return {name for name in tools if name.startswith("workflow_")}
-    return {name for name in dir(mcp_server) if name.startswith("workflow_")}
+    tools = asyncio.run(mcp_server.mcp.list_tools())
+    return {tool.name for tool in tools if tool.name.startswith("workflow_")}
 
 
 def _contains_auth_derivation(node: ast.AST, derived_names: set[str]) -> bool:
@@ -395,31 +393,57 @@ def _contains_auth_derivation(node: ast.AST, derived_names: set[str]) -> bool:
     return False
 
 
-def _request_auth_failures(module: object, roots: set[str] | None = None) -> list[str]:
-    """Return every reachable requests call whose headers are not auth-derived."""
+def _request_auth_failures(
+    module: object, roots: set[str] | None = None
+) -> tuple[list[str], list[str]]:
+    """Audit direct requests hops in reachable functions.
+
+    This fails closed for direct ``requests`` calls in the scanned module,
+    including imported aliases and module-level helpers passed by name. HTTP
+    helpers from other modules (for example ``mcp_utils.get_json``) remain
+    outside this AST scan and are pinned by the executed client tests instead.
+    """
     tree = ast.parse(inspect.getsource(module))
     functions = {
         node.name: node
         for node in tree.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
+    request_modules = {
+        alias.asname or alias.name
+        for node in tree.body
+        if isinstance(node, ast.Import)
+        for alias in node.names
+        if alias.name == "requests"
+    }
+    request_functions = {
+        alias.asname or alias.name
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom) and node.module == "requests"
+        for alias in node.names
+    }
     reachable = set(functions) if roots is None else set(roots)
+    missing_roots = reachable - functions.keys()
+    assert not missing_roots, (
+        "registered workflow tools have no matching top-level definition: "
+        f"{sorted(missing_roots)}"
+    )
     pending = list(reachable)
     while pending:
-        node = functions.get(pending.pop())
-        if node is None:
-            continue
-        for call in (child for child in ast.walk(node) if isinstance(child, ast.Call)):
-            if isinstance(call.func, ast.Name) and call.func.id in functions:
-                if call.func.id not in reachable:
-                    reachable.add(call.func.id)
-                    pending.append(call.func.id)
+        node = functions[pending.pop()]
+        referenced_functions = {
+            child.id
+            for child in ast.walk(node)
+            if isinstance(child, ast.Name) and child.id in functions
+        }
+        for function_name in referenced_functions - reachable:
+            reachable.add(function_name)
+            pending.append(function_name)
 
     failures: list[str] = []
+    inspected_calls: list[str] = []
     for name in sorted(reachable):
-        node = functions.get(name)
-        if node is None:
-            continue
+        node = functions[name]
         derived_names = {
             arg.arg for arg in (*node.args.args, *node.args.kwonlyargs) if arg.arg == "auth_headers"
         }
@@ -433,26 +457,35 @@ def _request_auth_failures(module: object, roots: set[str] | None = None) -> lis
                     )
         for call in (child for child in ast.walk(node) if isinstance(child, ast.Call)):
             func = call.func
-            if not (
+            is_module_call = (
                 isinstance(func, ast.Attribute)
                 and isinstance(func.value, ast.Name)
-                and func.value.id == "requests"
-            ):
+                and func.value.id in request_modules
+            )
+            is_imported_call = isinstance(func, ast.Name) and func.id in request_functions
+            if not (is_module_call or is_imported_call):
                 continue
+            inspected_calls.append(f"{name}:{call.lineno}")
             headers = next((kw.value for kw in call.keywords if kw.arg == "headers"), None)
             if headers is None or not _contains_auth_derivation(headers, derived_names):
                 failures.append(f"{name}:{call.lineno}")
-    return failures
+    return failures, inspected_calls
 
 
 def test_every_registered_workflow_mcp_http_hop_forwards_auth():
-    """Registered tools and transitively called helpers authenticate every request."""
-    assert _request_auth_failures(mcp_server, _registered_workflow_mcp_names()) == []
+    """Registered tools authenticate every direct requests hop in this module."""
+    failures, inspected = _request_auth_failures(mcp_server, _registered_workflow_mcp_names())
+    assert inspected
+    assert len(inspected) >= 17
+    assert failures == []
 
 
 def test_every_workflow_cli_http_hop_forwards_auth():
-    """No CLI workflow request can bypass the shared bearer derivation."""
-    assert _request_auth_failures(cli_workflow) == []
+    """CLI workflow functions authenticate every direct requests hop in this module."""
+    failures, inspected = _request_auth_failures(cli_workflow)
+    assert inspected
+    assert len(inspected) >= 21
+    assert failures == []
 
 
 @pytest.mark.parametrize(
