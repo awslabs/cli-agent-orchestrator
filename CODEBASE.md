@@ -129,11 +129,12 @@ config files runs in the runtime; the server relays interactive traffic,
 keeps routing and state, and republishes runtime events onto the existing bus
 for consumers that only depend on the bus topic contract.
 
-`runtime_channel/registry.py` maps each terminal to its live channel and
-persists the association so routing survives a server restart — rebuilt from
-each runtime's reconnect (`hello`) snapshot. A request for one terminal can
-never be served by another runtime: inbound channel frames go through an
-ownership-checked claim rather than an unconditional bind.
+`runtime_channel/registry.py` maps each terminal to its live channel. The
+placement is also recorded on the terminal's central row, so routing survives a
+server restart and is rebuilt from each runtime's reconnect (`hello`) snapshot.
+A request for one terminal can never be served by another runtime: inbound
+channel frames go through an ownership-checked claim rather than an
+unconditional bind.
 
 `clients/database.py` gains a **dispatch journal** (`dispatch_journal` table)
 that records each remote command with the owner it was made for, so a `LAUNCH`
