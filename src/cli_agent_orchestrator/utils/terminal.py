@@ -184,8 +184,9 @@ def effective_status(terminal_id: str) -> "TerminalStatus":
     channel; a local one's is the local ``StatusMonitor`` verdict. Placement and
     the remote status are read in ONE registry observation (``observe``) so a
     disconnect cannot land between a separate placement check and status read and
-    return a stale value. Blocking (either arm may do I/O) — callers on the event
-    loop hand it to ``asyncio.to_thread``.
+    return a stale value. An unreadable placement row fails closed: the answer is
+    UNKNOWN and the local monitor is not consulted. Blocking (either arm may do
+    I/O) — callers on the event loop hand it to ``asyncio.to_thread``.
     """
     from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
     from cli_agent_orchestrator.services.status_monitor import status_monitor

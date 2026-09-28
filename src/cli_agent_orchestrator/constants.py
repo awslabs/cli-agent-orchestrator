@@ -391,7 +391,9 @@ SERVER_VERSION = "0.1.0"
 
 
 # CAO_API_BASE_URL selects a remote shared server explicitly (#745); when it
-# is unset the CLI targets the local host/port exactly as before.
+# is unset the CLI targets the local host/port exactly as before. Every CLI
+# request to it carries CAO_API_TOKEN via ``utils.remote_server.auth_headers``
+# (or ``api_request``); test_api_calls_carry_credentials.py enforces that.
 API_BASE_URL = os.environ.get("CAO_API_BASE_URL", "").strip().rstrip("/") or (
     f"http://{SERVER_HOST}:{SERVER_PORT}"
 )

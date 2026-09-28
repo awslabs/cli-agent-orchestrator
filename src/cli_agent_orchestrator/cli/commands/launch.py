@@ -96,11 +96,10 @@ def _attach_via_relay(terminal):
                 fg="yellow",
             )
         )
-    # The relay socket is an authenticated endpoint like every other: a server
-    # with AUTH0_* set closes the handshake without a bearer token, which would
-    # leave the terminal created and the attach refused. ``attach_remote_terminal``
-    # puts it in the query string (a browser cannot set a WS header either, so
-    # that is the form the endpoint accepts). None when unset — unchanged locally.
+    # The relay socket is authenticated like every other endpoint: a server with
+    # auth enabled refuses a handshake without a bearer token. The CLI token
+    # (CAO_API_TOKEN) is passed here and ``attach_remote_terminal`` sends it in the
+    # handshake's Authorization header, never in the URL. None when unset.
     attach_remote_terminal(terminal["id"], server_base_url(), token=api_token())
 
 

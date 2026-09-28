@@ -31,7 +31,17 @@ from pathlib import Path
 from typing import Dict, Optional
 
 import websockets
-from websockets.asyncio.client import ClientConnection, connect
+
+try:
+    # The asyncio client, and its additional_headers keyword, exist from
+    # websockets 14; pyproject requires >=14.0. An older install fails here with
+    # a clear message instead of a TypeError at connect time.
+    from websockets.asyncio.client import ClientConnection, connect
+except ImportError as exc:  # pragma: no cover - only on an unsupported install
+    raise ImportError(
+        "cao-bridge requires websockets>=14.0 (found "
+        f"{getattr(websockets, '__version__', 'unknown')})"
+    ) from exc
 
 from cli_agent_orchestrator.clients.database import init_runtime_db
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
