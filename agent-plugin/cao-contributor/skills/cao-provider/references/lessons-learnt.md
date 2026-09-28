@@ -138,10 +138,12 @@ When writing handoff/assign logic, never flatten `["*"]` to `None` before passin
 
 **Problem:** Implementing tool restrictions the wrong way for your provider type. A provider that accepts CAO vocabulary in agent JSON doesn't need TOOL_MAPPING, and a provider with no native restriction mechanism can only use soft enforcement (system prompt).
 
-**The three approaches:**
-- **Hard via CLI flags** (Claude Code `--disallowedTools`, Copilot CLI `--deny-tool`): Add provider to `TOOL_MAPPING` in `tool_mapping.py` to translate CAO vocabulary → native tool names. `get_disallowed_tools()` computes which native tools to block.
-- **Hard via agent JSON** (Kiro CLI): The CLI reads `allowedTools` from the agent profile at install time. No `TOOL_MAPPING` entry needed — pass CAO vocabulary directly.
-- **Soft via system prompt** (Kimi CLI, Codex): No native restriction mechanism. CAO prepends `SECURITY_PROMPT` from `constants.py` to the system prompt. This is advisory only — the CLI can still use any tool.
+**Delivery (three mechanisms) and enforcement (three levels) are separate questions:**
+- **CLI flags** (Claude Code `--disallowedTools`, Copilot CLI `--deny-tool`, Grok `--allow`/`--deny`): Add provider to `TOOL_MAPPING` in `tool_mapping.py` to translate CAO vocabulary → native tool names. `get_disallowed_tools()` computes which native tools to block. Enforcement: `native`.
+- **Agent file** (Kiro CLI, OpenCode CLI): CAO writes the policy into the agent file at install time; no `TOOL_MAPPING` entry is needed. Enforcement depends on the CLI: OpenCode applies its permission block (`native`, install time); Kiro is launched `--trust-all-tools` with `tools: ["*"]` and its `allowedTools` only suppresses approval prompts (`none`).
+- **System prompt** (Kimi CLI, Codex): No native restriction mechanism. CAO prepends `SECURITY_PROMPT` from `constants.py` to the system prompt. Enforcement: `prompt` (advisory only — the CLI can still use any tool).
+
+Record the level in `PROVIDER_ENFORCEMENT` (`utils/enforcement.py`) when adding a provider; the launch gate, the server warning and the docs tables all read it.
 
 **Limitation:** Soft enforcement is not a security boundary. If a provider doesn't support native tool blocking, document this in the provider's docs under "Known Limitations".
 

@@ -32,7 +32,12 @@ PROVIDER_ENFORCEMENT: Dict[str, str] = {
     # resolved CAO policy is not applied at all on the default path.
     "kiro_cli": NONE,
     "copilot_cli": NATIVE,  # --deny-tool
-    "opencode_cli": NATIVE,  # permission: block written at install time
+    # The permission block is written at `cao install` time from the profile's
+    # allowedTools and enforced by opencode itself. The runtime policy CAO
+    # resolves at launch is NOT applied: --allowed-tools and a role override
+    # select the installed agent and change nothing in it (see
+    # INSTALL_TIME_PROVIDERS and describe_enforcement).
+    "opencode_cli": NATIVE,
     "grok_cli": NATIVE,  # --permission-mode dontAsk with --allow/--deny
     "kimi_cli": PROMPT,
     "codex": PROMPT,
@@ -43,6 +48,13 @@ PROVIDER_ENFORCEMENT: Dict[str, str] = {
     "cursor_cli": NONE,  # launches --force; allowedTools is not applied
     "mock_cli": NONE,
 }
+
+# NATIVE providers whose enforcement comes from the INSTALLED agent, not from
+# the policy resolved at launch. A launch-time override (--allowed-tools, a
+# role change) does not reach the provider; what runs is what `cao install`
+# wrote. The launch gate must say so instead of attaching the native promise
+# to the requested list.
+INSTALL_TIME_PROVIDERS = frozenset({"opencode_cli"})
 
 
 def enforcement_for(provider: str) -> str:
@@ -59,9 +71,19 @@ def is_restricted(allowed_tools: Optional[Sequence[str]]) -> bool:
     return allowed_tools is not None and "*" not in allowed_tools
 
 
+def is_install_time(provider: str) -> bool:
+    """True when the native policy is the installed agent's, not the launch request's."""
+    return provider in INSTALL_TIME_PROVIDERS
+
+
 def describe_enforcement(provider: str, allowed_tools: Optional[Sequence[str]]) -> str:
     """One line for the launch gate saying what the Blocked list is worth here."""
     level = enforcement_for(provider)
+    if level == NATIVE and is_install_time(provider):
+        return (
+            "native at install time (the installed agent's permission block applies; "
+            "launch overrides do not change it)"
+        )
     if level == NATIVE:
         return "native (the provider refuses blocked tools)"
     if not is_restricted(allowed_tools):

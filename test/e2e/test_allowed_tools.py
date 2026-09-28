@@ -13,8 +13,11 @@ Test strategy:
 6. Verify the agent CAN execute bash — output should contain the command result
 
 Provider coverage:
-- Kiro CLI: Hard enforcement via agent JSON allowedTools (set at install time).
-  Tests use the built-in code_supervisor profile (role=supervisor, no execute_bash).
+- Kiro CLI: NO enforcement. CAO launches kiro-cli --trust-all-tools and writes
+  tools: ["*"], so the allowedTools in the agent JSON only suppresses approval
+  prompts (utils/enforcement.py classifies kiro_cli as ``none``). The restricted
+  case below therefore asserts that bash RUNS; if Kiro ever blocks it, that
+  test fails and the classification must be revisited.
 - Claude Code: Hard enforcement via --disallowedTools flags.
   Tests pass allowed_tools=@cao-mcp-server to trigger Bash blocking.
 - Codex: Soft enforcement via security system prompt.
@@ -299,11 +302,19 @@ def _grok_restricted_diagnostics(
         return f"<failed to collect Grok diagnostics: {type(exc).__name__}: {exc}>"
 
 
-def _run_restricted_tool_test(provider: str, agent_profile: str, allowed_tools: str):
-    """Test that a terminal with restricted allowedTools cannot execute bash.
+def _run_restricted_tool_test(
+    provider: str, agent_profile: str, allowed_tools: str, *, expect_blocked: bool = True
+):
+    """Test what a terminal with restricted allowedTools does with a bash task.
 
     Creates a terminal with the given allowed_tools restriction, sends a task
-    that requires bash, and verifies the agent refuses or is blocked.
+    that requires bash, and checks the marker file on disk. With
+    ``expect_blocked`` (the default) the agent must have refused or been
+    blocked. With ``expect_blocked=False`` the assertion is inverted: the
+    provider is classified ``none`` in ``utils/enforcement.py`` and the test
+    pins that the restriction is NOT applied, so bash must have run. Either
+    way an environmental failure (session create, readiness) fails the test
+    loudly instead of passing as the expected outcome.
     """
     session_suffix = uuid.uuid4().hex[:6]
     session_name = f"e2e-tools-r-{provider[:5]}-{session_suffix}"
@@ -351,16 +362,27 @@ def _run_restricted_tool_test(provider: str, agent_profile: str, allowed_tools: 
         # Ground truth: check whether the file was actually created on disk.
         # This cannot be faked by the agent's text output.
         time.sleep(2)
-        assert not marker_file.exists(), (
-            f"Agent executed bash despite restricted allowedTools! "
-            f"Provider={provider}, allowed_tools={allowed_tools}. "
-            f"Marker file {marker_file} was created on disk.\n"
-            + (
-                _grok_restricted_diagnostics(terminal_id, actual_session, terminals_before)
-                if provider == "grok_cli"
-                else ""
+        if expect_blocked:
+            assert not marker_file.exists(), (
+                f"Agent executed bash despite restricted allowedTools! "
+                f"Provider={provider}, allowed_tools={allowed_tools}. "
+                f"Marker file {marker_file} was created on disk.\n"
+                + (
+                    _grok_restricted_diagnostics(terminal_id, actual_session, terminals_before)
+                    if provider == "grok_cli"
+                    else ""
+                )
             )
-        )
+        else:
+            assert completed, (
+                f"Restricted {provider} agent did not complete the bash task within "
+                f"{COMPLETION_TIMEOUT}s; no evidence either way about enforcement."
+            )
+            assert marker_file.exists(), (
+                f"{provider} BLOCKED bash for a restricted profile, but utils/enforcement.py "
+                f"classifies it as 'none' (policy not applied). Revisit the classification: "
+                f"allowed_tools={allowed_tools}, marker {marker_file} was not created."
+            )
         marker_file.unlink(missing_ok=True)
 
     finally:
@@ -543,7 +565,7 @@ def _run_reviewer_write_test(provider: str):
 
 
 # ---------------------------------------------------------------------------
-# Kiro CLI provider — hard enforcement via agent JSON allowedTools
+# Kiro CLI provider — no enforcement (allowedTools only suppresses prompts)
 # ---------------------------------------------------------------------------
 
 
@@ -551,10 +573,13 @@ def _run_reviewer_write_test(provider: str):
 class TestKiroCliAllowedTools:
     """E2E allowedTools tests for the Kiro CLI provider.
 
-    Kiro CLI enforces tool restrictions at INSTALL time via the agent JSON's
-    allowedTools field. Runtime allowed_tools API params are stored in the DB
-    for auditing/inheritance but don't directly affect Kiro's behavior —
-    enforcement happens when ``cao install`` writes the agent JSON.
+    ``cao install`` writes the profile's allowedTools into the agent JSON, but
+    Kiro's ``allowedTools`` names the tools that run WITHOUT an approval prompt,
+    not the tools that exist; availability is ``tools``, which CAO writes as
+    ``["*"]``, and CAO launches ``--trust-all-tools`` on every profile. So the
+    CAO policy is not applied at runtime and ``utils/enforcement.py`` classifies
+    kiro_cli as ``none`` (#824). Runtime allowed_tools API params are stored in
+    the DB for auditing/inheritance and do not affect Kiro's behavior either.
 
     To test Kiro's actual tool blocking, first run:
         cao install src/cli_agent_orchestrator/agent_store/code_supervisor.md --provider kiro_cli
@@ -576,20 +601,32 @@ class TestKiroCliAllowedTools:
             allowed_tools="@builtin,fs_read,@cao-mcp-server",
         )
 
-    def test_restricted_supervisor_cannot_bash(self, require_kiro):
-        """Supervisor with install-time restrictions should not execute bash.
+    def test_restricted_supervisor_can_still_bash(self, require_kiro):
+        """A restricted Kiro supervisor CAN run bash: the CAO policy is not applied.
 
-        NOTE: This test only passes if code_supervisor was installed with:
+        kiro_cli is launched --trust-all-tools with tools: ["*"], and the
+        allowedTools written to the agent JSON only suppresses approval
+        prompts, so utils/enforcement.py classifies it ``none``. This test is
+        the executable statement of that claim (#824): it asserts the marker
+        file IS created. If Kiro starts enforcing, this fails with a message
+        saying the classification must be revisited. It is a direct assertion
+        rather than an xfail so that an environmental failure (session create,
+        readiness, completion timeout) fails visibly instead of being counted
+        as the expected outcome.
+
+        NOTE: the installed profile matters for what this case means. The
+        shipped code_supervisor installs allowedTools
+        ["@cao-mcp-server", "fs_read", "fs_list"] (no execute_bash) via
             cao install code_supervisor --provider kiro_cli
-        which writes allowedTools: ["@cao-mcp-server"] to the agent JSON.
-        If the profile was installed before the allowedTools feature, the
-        agent JSON won't have restrictions and this test will fail.
-        Reinstall the profile to fix.
+        A profile installed before the allowedTools feature carries no
+        restriction at all, so bash runs for a different reason and this test
+        says nothing about Kiro's enforcement; reinstall the profile first.
         """
         _run_restricted_tool_test(
             provider="kiro_cli",
             agent_profile="code_supervisor",
             allowed_tools="@cao-mcp-server",
+            expect_blocked=False,
         )
 
 

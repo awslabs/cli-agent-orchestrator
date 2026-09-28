@@ -20,6 +20,7 @@ from cli_agent_orchestrator.utils.enforcement import (
     NATIVE,
     describe_enforcement,
     enforcement_for,
+    is_install_time,
     is_restricted,
     native_providers,
 )
@@ -260,7 +261,17 @@ def launch(
                 blocked = get_disallowed_tools(provider, resolved_allowed_tools)
                 blocked_summary = ", ".join(blocked) if blocked else "(none)"
                 level = enforcement_for(provider)
-                if level != NATIVE and is_restricted(resolved_allowed_tools) and not blocked:
+                if is_install_time(provider):
+                    # opencode enforces the permission block `cao install` wrote
+                    # from the profile, and ignores the list resolved here. There
+                    # is no TOOL_MAPPING for it either, so the deny list is empty
+                    # whatever the installed agent denies. Say where the policy
+                    # lives rather than printing "(none)" next to a native promise.
+                    blocked_summary = (
+                        "(set at install time from the installed agent's permissions; "
+                        "not shown here, and --allowed-tools does not change it)"
+                    )
+                elif level != NATIVE and is_restricted(resolved_allowed_tools) and not blocked:
                     # Providers with no TOOL_MAPPING entry return an empty
                     # deny list; "(none)" would read as "nothing is blocked
                     # because nothing needs to be", which is the opposite of

@@ -162,14 +162,14 @@ CAO translates `allowedTools` into each provider's native restriction mechanism:
 |----------|------------|-----------|
 | Claude Code | Hard | `--disallowedTools` flags block specific tools |
 | Copilot CLI | Hard | `--deny-tool` flags override `--allow-all` |
-| OpenCode CLI | Hard | `permission:` block written at install time |
+| OpenCode CLI | Hard | `permission:` block written at install time from the profile; launch-time `--allowed-tools` and role overrides do not change it |
 | Grok Build CLI | Hard | `--permission-mode dontAsk` with `--allow`/`--deny` |
 | Kimi CLI | Soft | Security system prompt (no native mechanism) |
 | Codex | Soft | Security system prompt (no native mechanism) |
 | Antigravity CLI | Soft | Security system prompt (no native mechanism) |
 | OMP | Soft | Security system prompt (no native mechanism) |
 | MiniMax Code | Soft | Security bootstrap prompt (no native mechanism) |
-| Kiro CLI | None | Launched `--trust-all-tools` on every profile; the `allowedTools` written to the agent JSON only suppresses approval prompts, and `tools` is `["*"]` unless the profile sets its own `tools` list |
+| Kiro CLI | None | Launched `--trust-all-tools` on every profile on the default (v2) engine; the `--v3` engine gets no such flag but the same `tools: ["*"]`; the `allowedTools` written to the agent JSON only suppresses approval prompts, and `tools` is `["*"]` unless the profile sets its own `tools` list |
 | Hermes | None | Launched `--yolo --accept-hooks`; restrict tools inside the Hermes profile |
 | Cursor CLI | None | Launched `--force`; `allowedTools` is not applied |
 

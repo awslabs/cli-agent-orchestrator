@@ -82,7 +82,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   install time. A profile whose `allowedTools` listed **only** `@builtin`
   previously got `read`/`grep`/`glob` (and the write and bash tools) on
   OpenCode and now gets none of them: add `fs_read`, `fs_list` and the rest
-  explicitly, as the shipped roles already do.
+  explicitly, as the shipped roles already do (#824)
 
 - **enabling `CAO_MEMORY_API_URL` rejected memory keys that work without it.**
   The `/internal/memory/store` and `/forget` routes validated the wire `key` as
@@ -126,7 +126,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in a 0600 `rules.md` inside the terminal's private `GROK_HOME`, referenced
   from the line with `"$(cat …)"` (as the Codex provider already does for its
   instructions), the line no longer grows with the profile, and the permission
-  flags precede it.
+  flags precede it (#824)
 
 - **The launch confirmation showed a Blocked list on providers that cannot
   enforce one.** `cao launch` printed `Allowed:`/`Blocked:` for every provider
@@ -145,7 +145,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the agent JSON only suppresses approval prompts in Kiro; `tools` decides
   availability and is `["*"]` unless the profile sets it. Applying the CAO
   policy to Kiro at launch, and refusing restricted roles on providers that
-  cannot enforce them, are separate decisions.
+  cannot enforce them, are separate decisions. OpenCode is the one native provider whose policy is the INSTALLED agent's: the gate now says `native at install time` and that launch overrides do not change it, instead of `Blocked: (none)` beside a native promise; the third copy of the "providers with native tool denial" list (docs/cursor-cli.md) and the prompt-only provider prose in docs/tool-restrictions.md now agree with the table, and the Kiro e2e case that asserted blocking now asserts the opposite directly (a restricted Kiro supervisor can run bash), so an environmental failure cannot pass as the expected result; on the author's machine the case has not yet produced a result (kiro-cli 2.24.1 timed out waiting for its agent prompt), so the classification rests on the launch flags and Kiro's documentation, not on an observed run (#824)
 
 ### Changed
 
