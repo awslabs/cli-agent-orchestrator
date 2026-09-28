@@ -703,9 +703,7 @@ class TestTheHoist:
 
         assert response.status_code == 200, response.text
         assert m_run.await_args.kwargs["working_directory"] == root
-        assert fingerprints == [
-            _route_fingerprint(body, effective_working_directory=root)
-        ]
+        assert fingerprints == [_route_fingerprint(body, effective_working_directory=root)]
 
     def test_explicit_step_root_overrides_run_root_without_conflict(self, client):
         run_id = "run-root-explicit"
@@ -890,9 +888,7 @@ class TestReplayedTerminalId:
 # ---------------------------------------------------------------------------
 class TestTheScriptTierGuard:
     @pytest.mark.parametrize("drift", ["profile", "memory"])
-    def test_approved_launch_input_drift_fails_closed_before_step_settlement(
-        self, client, drift
-    ):
+    def test_approved_launch_input_drift_fails_closed_before_step_settlement(self, client, drift):
         run_id = f"run-guard-{drift}"
         guard = {
             "profiles": {"developer": "sha256:frozen"},

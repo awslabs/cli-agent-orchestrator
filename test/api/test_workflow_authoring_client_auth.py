@@ -384,9 +384,7 @@ def test_every_registered_workflow_mcp_http_tool_forwards_auth():
         }
     else:
         registered = {
-            name: _mcp_tool(name)
-            for name in dir(mcp_server)
-            if name.startswith("workflow_")
+            name: _mcp_tool(name) for name in dir(mcp_server) if name.startswith("workflow_")
         }
 
     direct_http_tools = {
