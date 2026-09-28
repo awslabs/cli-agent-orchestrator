@@ -187,9 +187,7 @@ class TestSave:
         assert json.loads(settings_file.read_text()) == {"new": True}
         assert settings_file.stat().st_mode & 0o777 == 0o640
 
-    def test_save_preserves_settings_symlink_and_target_mode(
-        self, settings_file, monkeypatch
-    ):
+    def test_save_preserves_settings_symlink_and_target_mode(self, settings_file, monkeypatch):
         target = settings_file.with_name("dotfiles-settings.json")
         target.write_text('{"old": true}')
         target.chmod(0o640)

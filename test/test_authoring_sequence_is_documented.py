@@ -143,9 +143,9 @@ def test_the_refusal_is_branched_on_a_field_not_a_message(skill):
         "both kinds, because retrying a 403 is a bypass and presenting an approval after a 503 sends "
         "someone hunting for a plan that was never readable"
     )
-    assert "plan_inputs_changed" not in run_refusal, (
-        "plan drift surfaces from a script agent step, not the initial run attempt"
-    )
+    assert (
+        "plan_inputs_changed" not in run_refusal
+    ), "plan drift surfaces from a script agent step, not the initial run attempt"
     assert "plan_inputs_changed" in observe, (
         "the failed step or run must tell the agent whether to start a new run or repair "
         "settings.json and resume"

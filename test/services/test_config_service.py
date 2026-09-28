@@ -243,9 +243,7 @@ class TestSetAndPath:
         assert json.loads(settings_file.read_text())["workflow"]["require_approval"] is False
         assert settings_file.stat().st_mode & 0o777 == 0o640
 
-    def test_set_preserves_settings_symlink_and_target_mode(
-        self, _isolated_settings, monkeypatch
-    ):
+    def test_set_preserves_settings_symlink_and_target_mode(self, _isolated_settings, monkeypatch):
         settings_file = _isolated_settings["settings"]
         target = settings_file.with_name("dotfiles-settings.json")
         target.write_text('{"workflow": {"require_approval": true}}')
@@ -261,9 +259,7 @@ class TestSetAndPath:
         assert target.stat().st_mode & 0o777 == 0o640
         assert atomic_file._lock_path_for(settings_file) == lock_path_before
 
-    def test_set_through_dangling_settings_symlink(
-        self, _isolated_settings, monkeypatch
-    ):
+    def test_set_through_dangling_settings_symlink(self, _isolated_settings, monkeypatch):
         settings_file = _isolated_settings["settings"]
         target = settings_file.with_name("dotfiles-settings.json")
         settings_file.symlink_to(target)
