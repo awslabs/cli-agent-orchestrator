@@ -776,13 +776,15 @@ class TestTheHoist:
 
     def test_the_resolution_runs_once(self, client):
         """The route resolved, so ``run_agent_step``'s own inheritance guard must
-        not fire — no flag, no second lookup."""
+        not fire — no flag, no second lookup.
+
+        This deliberately keeps the pre-guard approval-off snapshot shape. It
+        caught the regression where a null guard was rejected before the current
+        approval posture was consulted.
+        """
         run_id = "run-hoist-b"
         body = _body(env_vars=_env(run_id), caller_id="sup-one")
-        _register_run(
-            run_id,
-            spec_snapshot=_guarded_snapshot(),
-        )  # no step row -> EXECUTE, so the whole path runs
+        _register_run(run_id)  # launch_guard=null is a pre-upgrade approval-off run
 
         create, send, delete, out, exit_cli, wait, status_p, _unused = _patch_terminal_layer()
         with (
@@ -794,6 +796,13 @@ class TestTheHoist:
             wait,
             status_p,
             patch(_GET_WD, return_value="/cwd/one") as m_get_wd,
+            patch(
+                "cli_agent_orchestrator.services.launch_guard.settings_service."
+                "resolve_workflow_approval_posture",
+                return_value=settings_service.WorkflowApprovalPosture(
+                    False, settings_service.GATE_SOURCE_FILE
+                ),
+            ),
         ):
             resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=body)
 
@@ -887,6 +896,87 @@ class TestReplayedTerminalId:
 # BR-2/SR-5 — the branch engages for script-tier calls ONLY.
 # ---------------------------------------------------------------------------
 class TestTheScriptTierGuard:
+    def test_approval_off_allows_two_agent_steps_and_creates_both_terminals(self, client):
+        run_id = "run-guard-disabled-two-steps"
+        _register_run(run_id)  # launch_guard=null: shape journaled before this fix
+        first = _body(env_vars=_env(run_id, "s1"), prompt="first")
+        second = _body(env_vars=_env(run_id, "s2"), prompt="second")
+        create, send, delete, out, exit_cli, wait, status_p, get_wd = _patch_terminal_layer()
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.launch_guard.settings_service."
+                "resolve_workflow_approval_posture",
+                return_value=settings_service.WorkflowApprovalPosture(
+                    False, settings_service.GATE_SOURCE_FILE
+                ),
+            ),
+            create as m_create,
+            send,
+            delete,
+            out,
+            exit_cli,
+            wait,
+            status_p,
+            get_wd,
+        ):
+            first_response = client.post(TERMINALS_RUN_STEP_ROUTE, json=first)
+            second_response = client.post(TERMINALS_RUN_STEP_ROUTE, json=second)
+
+        assert first_response.status_code == 200, first_response.text
+        assert second_response.status_code == 200, second_response.text
+        assert m_create.await_count == 2
+        assert _raw_row(run_id, "s1") is not None
+        assert _raw_row(run_id, "s2") is not None
+
+    @pytest.mark.parametrize(
+        ("suffix", "snapshot", "message"),
+        [
+            (
+                "disabled-marker",
+                json.dumps({"source": "", "launch_guard": {"approval_required": False}}),
+                "approval enforcement was turned on after this run started",
+            ),
+            (
+                "legacy-missing",
+                json.dumps({"source": ""}),
+                "recorded launch state is unreadable",
+            ),
+        ],
+    )
+    def test_approval_on_rejects_unbound_run_before_step_settlement(
+        self, client, suffix, snapshot, message
+    ):
+        run_id = f"run-guard-{suffix}"
+        _register_run(run_id, spec_snapshot=snapshot)
+        body = _body(env_vars=_env(run_id))
+        create, send, delete, out, exit_cli, wait, status_p, get_wd = _patch_terminal_layer()
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.launch_guard.settings_service."
+                "resolve_workflow_approval_posture",
+                return_value=settings_service.WorkflowApprovalPosture(
+                    True, settings_service.GATE_SOURCE_FILE
+                ),
+            ),
+            create as m_create,
+            send,
+            delete,
+            out,
+            exit_cli,
+            wait,
+            status_p,
+            get_wd,
+        ):
+            response = client.post(TERMINALS_RUN_STEP_ROUTE, json=body)
+
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"]["kind"] == "plan_inputs_changed"
+        assert message in response.json()["detail"]["message"]
+        assert _raw_row(run_id) is None
+        m_create.assert_not_awaited()
+
     @pytest.mark.parametrize("drift", ["profile", "memory"])
     def test_approved_launch_input_drift_fails_closed_before_step_settlement(self, client, drift):
         run_id = f"run-guard-{drift}"
