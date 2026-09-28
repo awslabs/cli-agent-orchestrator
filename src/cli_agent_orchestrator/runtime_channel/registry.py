@@ -107,7 +107,8 @@ class RuntimeConnection:
         # The command type of each in-flight op, so the frame reader can tell
         # whether a matched result's ack must be deferred (LAUNCH / RUN_SCRIPT
         # create durable state the waiting coroutine applies before acking).
-        self._op_types: Dict[str, CommandType] = {}
+        # Ops whose sender acks after applying the result (see send_command).
+        self._deferred_acks: set = set()
         self.connected_at = time.time()
         self.last_seen = time.time()
         # Set by the registry at register(); 0 means "never registered", which is
@@ -125,8 +126,14 @@ class RuntimeConnection:
         terminal_id: Optional[str] = None,
         timeout: float = DEFAULT_COMMAND_TIMEOUT,
         op_id: Optional[str] = None,
+        defer_ack: bool = False,
     ) -> CommandResultFrame:
         """Send one correlated command and wait for its retained result.
+
+        ``defer_ack`` is for a caller that applies durable state from the result
+        (a central terminal row, a workflow run's outcome): the frame reader then
+        leaves the ack to that caller, which sends it with :meth:`ack` once the
+        state is on disk. Without it the reader acks as soon as the result arrives.
 
         A timeout here means the RESPONSE is missing, not that the work did
         not happen — callers must treat it as unknown, never resubmit the same
@@ -148,7 +155,8 @@ class RuntimeConnection:
         )
         future: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending[op_id] = future
-        self._op_types[op_id] = command_type
+        if defer_ack:
+            self._deferred_acks.add(op_id)
         try:
             if self.closed:
                 # Provably nothing on the wire: the registry had already declared
@@ -176,7 +184,7 @@ class RuntimeConnection:
             return await asyncio.wait_for(future, timeout=timeout)
         finally:
             self._pending.pop(op_id, None)
-            self._op_types.pop(op_id, None)
+            self._deferred_acks.discard(op_id)
 
     def resolve(self, result: CommandResultFrame) -> bool:
         """Complete the waiting future for ``result.op_id``.
@@ -202,18 +210,12 @@ class RuntimeConnection:
         return False
 
     def ack_is_deferred(self, op_id: str) -> bool:
-        """Whether the frame reader must leave this op's ack to its waiter.
+        """Whether this op's sender asked to send the ack itself (``defer_ack``).
 
-        LAUNCH and RUN_SCRIPT results create durable state — a central terminal
-        row, a workflow run's terminal state — that the waiting coroutine applies
-        after the result arrives. Their ack is what lets the runtime drop its only
-        retained copy, so it must not be sent until that state is on disk; the
-        coroutine sends it via ``ack``. Every other op has no such state and is
-        acked on resolve as before. Answered from ``_op_types``, which is still
-        populated when the reader asks (it is cleared only in ``send_command``'s
-        finally, after the waiter resumes).
+        Asked by the frame reader right after ``resolve``, before the waiter can
+        resume and clear the op.
         """
-        return self._op_types.get(op_id) in (CommandType.LAUNCH, CommandType.RUN_SCRIPT)
+        return op_id in self._deferred_acks
 
     async def ack(self, op_id: str) -> None:
         """Send the deferred AckFrame for a result whose outcome is now durable.
@@ -306,20 +308,21 @@ class RuntimeChannelRegistry:
     def register(
         self, runtime_id: str, send_text: Callable[[str], Awaitable[None]]
     ) -> RuntimeConnection:
-        existing = self._runtimes.get(runtime_id)
+        conn = RuntimeConnection(runtime_id, send_text)
+        # Swap the connection in under one lock hold, so no reader sees the old
+        # and new channel for the same runtime id at once. The incarnation counts
+        # executor processes (or channels) claiming this identity; reported state
+        # is accepted only from the current one -- see ``set_status``.
+        with self._lock:
+            existing = self._runtimes.get(runtime_id)
+            self._incarnations[runtime_id] = self._incarnations.get(runtime_id, 0) + 1
+            conn.incarnation = self._incarnations[runtime_id]
+            self._runtimes[runtime_id] = conn
         if existing is not None:
             # A reconnect superseding a half-open connection: fail the old
             # channel's waiters rather than leaving them to time out.
             existing.closed = True
             existing.fail_all_pending(f"runtime {runtime_id} reconnected on a new channel")
-        conn = RuntimeConnection(runtime_id, send_text)
-        # The incarnation of a runtime id: one more executor process (or one more
-        # channel from the same one) claiming this identity. Reported state is
-        # accepted only from the current incarnation -- see ``set_status``.
-        with self._lock:
-            self._incarnations[runtime_id] = self._incarnations.get(runtime_id, 0) + 1
-            conn.incarnation = self._incarnations[runtime_id]
-            self._runtimes[runtime_id] = conn
         # Capture the loop the channels live on. Command futures are created on
         # it (see RuntimeConnection.send_command), so a caller on a worker thread
         # has no way to dispatch without it — see send_terminal_command_blocking.
@@ -375,7 +378,8 @@ class RuntimeChannelRegistry:
         conn.fail_all_pending(f"runtime {runtime_id} channel closed")
 
     def get_runtime(self, runtime_id: str) -> Optional[RuntimeConnection]:
-        return self._runtimes.get(runtime_id)
+        with self._lock:
+            return self._runtimes.get(runtime_id)
 
     def list_runtimes(self) -> Dict[str, dict]:
         with self._lock:
@@ -402,90 +406,58 @@ class RuntimeChannelRegistry:
     def claim_terminal(self, terminal_id: str, runtime_id: str) -> bool:
         """A runtime asserts, over the channel, that it owns ``terminal_id``.
 
-        ``CAO_RUNTIME_TOKEN`` is one secret shared by the whole fleet, so a
-        connected runtime is only ever proven to be *some* authorized executor —
-        never proven to be the one that launched this terminal. Binding on that
-        assertion alone let any runtime claim any terminal id: routing, replay
-        position and the next input then followed the claimant, and on the next
-        real owner's heartbeat the binding flapped back, so an operator saw
-        routing change by itself (guojing1217 + Copilot reviews on #802,
-        reproduced on EKS). ``generation`` was meant to fence a takeover but is
-        never advanced, so it cannot tell a takeover from a continuation.
+        ``CAO_RUNTIME_TOKEN`` is shared by the whole fleet, so a connected runtime
+        is only proven to be *some* authorized executor, not the one that launched
+        this terminal. The bind is allowed only when the claim agrees with an
+        authority the runtime cannot forge:
 
-        The bind is therefore allowed only when the claim is consistent with an
-        authority this runtime cannot forge:
+        * already bound here to this same runtime (a continuation);
+        * the durable central row names this runtime (recovery after a server
+          restart, via the launching runtime's own hello);
+        * no central row at all and the id was not deleted here (the window a
+          tracked launch or reconcile binds through before its row commits).
 
-        * the terminal is already bound here to this same runtime — a
-          continuation, the common case for every frame after the first;
-        * the durable central row names this runtime — the restarted-server
-          recovery path, where the launching runtime's own hello re-establishes
-          the binding;
-        * no central row exists at all AND the id was not deleted by this
-          process — a phantom with no pane and no output to hijack, plus the
-          window a tracked launch/reconcile binds through before its row is
-          committed. A DELETED id is tombstoned and refused, so a frame queued
-          before TEARDOWN cannot resurrect routing for it.
+        Refused: a tombstoned (deleted) id, an id bound to another runtime, a row
+        naming another runtime, a row naming no runtime (a local terminal), and an
+        unreadable row. Returns True when bound to ``runtime_id`` on return.
 
-        A row that exists but names NO runtime is a confirmed-LOCAL terminal, and
-        a runtime claiming it would redirect a real local pane's routing/status;
-        that is refused, distinct from the no-row case (Copilot follow-up on
-        #802). So is a row naming a different runtime, and an unreadable row. A
-        refused claim leaves the existing binding untouched and is logged.
-        Returns ``True`` when bound to ``runtime_id`` on return, else ``False``.
+        The decision is made under the lock, the placement row is read outside it,
+        and the decision is re-checked and the bind made under the lock in one
+        hold, so a TEARDOWN or unbind that lands during the read cannot be undone.
         """
-        if terminal_id in self._tombstones:
-            # Deleted here. A straggler frame must not resurrect it through the
-            # no-row branch below.
-            logger.warning(
-                "runtime %s tried to claim terminal %s after it was deleted; refusing",
-                runtime_id,
-                terminal_id,
-            )
-            return False
-        current = self._terminal_runtime.get(terminal_id)
-        if current == runtime_id:
-            return True
-        if current is not None:
-            logger.warning(
-                "runtime %s tried to claim terminal %s already bound to %s; refusing",
-                runtime_id,
-                terminal_id,
-                current,
-            )
-            return False
+        with self._lock:
+            decided = self._claim_decision_locked(terminal_id, runtime_id)
+        if decided is not None:
+            return decided
         try:
             state, placement = self._placement_state(terminal_id)
         except PlacementUnavailableError:
-            # Cannot confirm ownership: refuse rather than bind on a claim the
-            # durable row would have adjudicated. The runtime retries its hello.
-            logger.warning(
-                "runtime %s claim of terminal %s refused: placement unreadable",
-                runtime_id,
-                terminal_id,
-            )
-            return False
-        if state == "named" and placement != runtime_id:
-            logger.warning(
-                "runtime %s tried to claim terminal %s placed on %s; refusing",
-                runtime_id,
-                terminal_id,
-                placement,
-            )
-            return False
-        if state == "local":
-            logger.warning(
-                "runtime %s tried to claim terminal %s, which is a local terminal; refusing",
-                runtime_id,
-                terminal_id,
-            )
-            return False
-        self.bind_terminal(terminal_id, runtime_id)
-        return True
+            return self._refuse_unreadable_claim(terminal_id, runtime_id)
+        with self._lock:
+            return self._claim_finish_locked(terminal_id, runtime_id, state, placement)
 
-    def _claim_lock_only(self, terminal_id: str, runtime_id: str) -> Optional[bool]:
-        """The part of a claim decision that needs no durable row; call under the
-        lock. Returns True/False when decided, or None when the placement row
-        must be read to decide."""
+    async def claim_terminal_async(self, terminal_id: str, runtime_id: str) -> bool:
+        """:meth:`claim_terminal` for callers on the channel loop.
+
+        Same decision; the cold-path placement read runs in ``asyncio.to_thread``
+        so it never blocks the frame reader.
+        """
+        with self._lock:
+            decided = self._claim_decision_locked(terminal_id, runtime_id)
+        if decided is not None:
+            return decided
+        try:
+            state, placement = await asyncio.to_thread(self._placement_state, terminal_id)
+        except PlacementUnavailableError:
+            return self._refuse_unreadable_claim(terminal_id, runtime_id)
+        with self._lock:
+            return self._claim_finish_locked(terminal_id, runtime_id, state, placement)
+
+    def _claim_decision_locked(self, terminal_id: str, runtime_id: str) -> Optional[bool]:
+        """The part of a claim that needs no durable row. Call with the lock held.
+
+        True/False when decided; None when the placement row must be read.
+        """
         if terminal_id in self._tombstones:
             logger.warning(
                 "runtime %s tried to claim terminal %s after it was deleted; refusing",
@@ -506,51 +478,42 @@ class RuntimeChannelRegistry:
             return False
         return None
 
-    async def claim_terminal_async(self, terminal_id: str, runtime_id: str) -> bool:
-        """:meth:`claim_terminal` for callers on the channel loop.
-
-        Same decision, but the cold-path placement DB read runs in
-        ``asyncio.to_thread`` so it never blocks the single frame reader, and the
-        binding is re-checked under the lock after it returns — a hello or another
-        frame could have bound or torn the terminal down while the read was in
-        flight. The lock-only cases (continuation,
-        tombstone, already bound elsewhere) never touch the DB.
-        """
-        with self._lock:
-            decided = self._claim_lock_only(terminal_id, runtime_id)
+    def _claim_finish_locked(
+        self, terminal_id: str, runtime_id: str, state: str, placement: Optional[str]
+    ) -> bool:
+        """Re-check and bind after the placement read. Call with the lock held."""
+        decided = self._claim_decision_locked(terminal_id, runtime_id)
         if decided is not None:
             return decided
-        try:
-            state, placement = await asyncio.to_thread(self._placement_state, terminal_id)
-        except PlacementUnavailableError:
+        if state == "named" and placement != runtime_id:
             logger.warning(
-                "runtime %s claim of terminal %s refused: placement unreadable",
+                "runtime %s tried to claim terminal %s placed on %s; refusing",
+                runtime_id,
+                terminal_id,
+                placement,
+            )
+            return False
+        if state == "local":
+            logger.warning(
+                "runtime %s tried to claim terminal %s, which is a local terminal; refusing",
                 runtime_id,
                 terminal_id,
             )
             return False
-        with self._lock:
-            decided = self._claim_lock_only(terminal_id, runtime_id)
-            if decided is not None:
-                return decided
-            if state == "named" and placement != runtime_id:
-                logger.warning(
-                    "runtime %s tried to claim terminal %s placed on %s; refusing",
-                    runtime_id,
-                    terminal_id,
-                    placement,
-                )
-                return False
-            if state == "local":
-                logger.warning(
-                    "runtime %s tried to claim terminal %s, which is a local terminal; refusing",
-                    runtime_id,
-                    terminal_id,
-                )
-                return False
-            self._terminal_runtime[terminal_id] = runtime_id
-            self._recovered_placement.pop(terminal_id, None)
-            return True
+        self._terminal_runtime[terminal_id] = runtime_id
+        self._recovered_placement.pop(terminal_id, None)
+        return True
+
+    @staticmethod
+    def _refuse_unreadable_claim(terminal_id: str, runtime_id: str) -> bool:
+        # Cannot confirm ownership: refuse rather than bind on a claim the durable
+        # row would have adjudicated. The runtime retries on its next hello.
+        logger.warning(
+            "runtime %s claim of terminal %s refused: placement unreadable",
+            runtime_id,
+            terminal_id,
+        )
+        return False
 
     def unbind_terminal(self, terminal_id: str, deleted: bool = False) -> None:
         """Drop routing state for a terminal.
@@ -838,7 +801,7 @@ class RuntimeChannelRegistry:
         runtime_id = self.runtime_for_terminal(terminal_id)
         if runtime_id is None:
             raise RuntimeNotDispatchedError(f"terminal {terminal_id} is not bound to a runtime")
-        conn = self._runtimes.get(runtime_id)
+        conn = self.get_runtime(runtime_id)
         if conn is None:
             raise RuntimeNotDispatchedError(
                 f"runtime {runtime_id} for terminal {terminal_id} is not connected"
@@ -1010,9 +973,9 @@ class RuntimeChannelRegistry:
                 # binding is deliberately kept (so commands fail explicitly rather
                 # than looking unknown), which means no disconnect sweep will reach
                 # it either (Copilot review on #802).
-                abandoned_sink = self._attach_sinks.pop(tid, None)
-                if abandoned_sink is not None:
-                    self._eof_sink(abandoned_sink)
+                abandoned = self._attach_sinks.pop(tid, None)
+                if abandoned is not None:
+                    self._eof_sink(abandoned[0])
                 self._status.pop(tid, None)
                 for stream in StreamName:
                     self._positions.pop((tid, stream.value), None)
@@ -1095,7 +1058,8 @@ class RuntimeChannelRegistry:
                 self._positions[key] = end_pos
 
     def resume_position(self, terminal_id: str, stream: str) -> int:
-        return self._positions.get((terminal_id, stream), 0)
+        with self._lock:
+            return self._positions.get((terminal_id, stream), 0)
 
     def stream_forward_jump(
         self, terminal_id: str, stream: str, generation: int, pos: int
