@@ -127,7 +127,12 @@ from cli_agent_orchestrator.security.auth import (
     is_auth_enabled,
     require_any_scope,
 )
-from cli_agent_orchestrator.security.principal import Principal
+from cli_agent_orchestrator.security.principal import (
+    Principal,
+    PrincipalError,
+    may_start_work,
+    revocation,
+)
 from cli_agent_orchestrator.security.service_principal import is_service_principal
 from cli_agent_orchestrator.services import (
     approval_gate,
@@ -3317,6 +3322,16 @@ async def create_session(
     terminal has since been torn down is stale, not conflicting, and simply
     creates fresh.
     """
+    # Revocation gate (#745; Augusto on #802): a revoked principal may not START
+    # new work. Checked here, before anything is created or journaled, so a
+    # removed member cannot open a fresh session with an unexpired token. Placed
+    # before the try below because that block maps every exception to 500 and
+    # would mask this 403.
+    if not may_start_work(principal):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"principal {principal.id} is revoked and may not start new work",
+        )
     initial_message = body.initial_message if body else None
     initial_message_orchestration_type = None
     # Structural caps on group/metadata (call-me-ram, PR #433 review) are
@@ -3735,6 +3750,25 @@ async def create_terminal_in_session(
         # residual — anyone holding the service token can name any terminal — is
         # the shared-credential limit tracked by #774.
         worker_owner = caller_owner or principal.id
+
+        # Revocation gate (#745; Augusto on #802): a revoked principal may not
+        # START new work. The worker is owned by ``worker_owner`` (the caller's
+        # owner when there is one, else the request principal), so that is the
+        # principal to check. Gated on ``any_revoked`` so the parse/lookup only
+        # runs when a revocation is configured; this ``try`` re-raises HTTPException
+        # so the 403 is not masked. Nothing is created or journaled before here.
+        if revocation.any_revoked():
+            try:
+                worker_owner_principal = Principal.parse(worker_owner)
+            except PrincipalError:
+                # An unparseable owner is unknown, and unknown is not revoked
+                # (same rule inbox delivery applies).
+                worker_owner_principal = None
+            if not may_start_work(worker_owner_principal):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"principal {worker_owner} is revoked and may not start new work",
+                )
 
         caller_runtime = None
         if caller_id:
@@ -4538,6 +4572,30 @@ async def run_step(
             )
         except KeyError as e:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+
+    # Revocation gate (#745; Augusto on #802): a revoked principal may not START
+    # new work. The step is owned by the caller's recorded owner, so resolve and
+    # check it BEFORE the "running" write below, so a refused step creates and
+    # journals nothing. Gated on ``any_revoked`` so the owner read only happens
+    # when a revocation is configured; an unreadable owner is a retryable 503, the
+    # same posture the OwnerUnavailableError arm uses.
+    if revocation.any_revoked():
+        try:
+            step_owner_id = caller_owner_id(body.caller_id)
+        except OwnerUnavailableError as e:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"cannot read the owner recorded for the caller ({e}); retry",
+            )
+        try:
+            step_owner = Principal.parse(step_owner_id)
+        except PrincipalError:
+            step_owner = None
+        if not may_start_work(step_owner):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"principal {step_owner_id} is revoked and may not start new work",
+            )
 
     # Mark the job as in-progress before the long-running substrate starts.
     # This is best-effort; a failure here must not block execution. Placed
