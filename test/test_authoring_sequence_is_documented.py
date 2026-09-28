@@ -141,6 +141,10 @@ def test_the_refusal_is_branched_on_a_field_not_a_message(skill):
         "both kinds, because retrying a 403 is a bypass and presenting an approval after a 503 sends "
         "someone hunting for a plan that was never readable"
     )
+    assert "plan_inputs_changed" in skill, (
+        "a 409 means the approved run's launch inputs no longer match; the agent must distinguish "
+        "starting a new run from repairing settings.json and resuming"
+    )
 
 
 def test_the_first_run_being_refused_is_stated_as_by_design(skill):

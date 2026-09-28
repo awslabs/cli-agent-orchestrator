@@ -497,6 +497,7 @@ The refusal causes are deliberately distinct, because the operator's next action
 | Status | Meaning | What to do |
 |---|---|---|
 | `403` | The plan's `plan_id` has no approval. | `cao workflow approve <plan_id>`, then run again. |
+| `409` | `plan_inputs_changed`: while approval enforcement is on, the run's recorded agent profile or memory setting changed, its launch state is unreadable, or approval settings could not be read. | Start a new run for changed inputs or unreadable launch state. If approval settings could not be read, repair `settings.json`, then resume. |
 | `503` | No plan identifier could be read from the run's frozen manifest — CAO's own freeze failed. Nothing about your request was wrong. | Retry. No approval will help. |
 | `503` | The approval store could not be read, so CAO cannot determine whether the plan is approved. | Restore database access, then retry. The run remains refused. |
 
@@ -572,7 +573,8 @@ hash of the **full** resolved content into the same manifest. Every later termin
 however long afterwards — is given that recorded copy. **Editing CAO memory after a failure therefore does not
 change what a resumed run sees.**
 Memory content is not part of plan identity; the memory-enabled setting is recorded at the
-approval check and changing it stops further agent launches for that run.
+approval check while approval enforcement is on, and changing it stops further agent launches for
+that run while enforcement remains on.
 
 One consequence is worth stating plainly, because it differs from a non-workflow terminal:
 
@@ -592,8 +594,9 @@ Stated here because its absence is easy to assume away:
    limits and retry policy. Script-tier steps are discovered by executing the Python, so those values
    have no run-level existence at freeze time; they are covered transitively by the source hash,
    because changing any of them means editing the script.
-   The profile set and the memory-enabled setting are recorded at the approval check; a run
-   refuses to launch further agent steps if either changes.
+   While approval enforcement is on, the profile set and the memory-enabled setting are recorded at
+   the approval check; the run refuses to launch further agent steps if either changes while
+   enforcement remains on.
 
 > **Stale source-hash rejection now runs** (issue #583 Bolt 3). This section previously listed it as a
 > second gap. `cao workflow update` and the `workflow_update` tool both require the `content_hash` you

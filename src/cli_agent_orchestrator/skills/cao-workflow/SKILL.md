@@ -173,6 +173,7 @@ Attempt the run. If it is refused, the response tells you which of two things ha
 | --- | --- | --- |
 | `approval_required` | this plan has no approval yet | present the `plan_id` to the user and **stop** |
 | `plan_identity_unavailable` | **CAO** could not complete its own freeze | retry; there is nothing to approve |
+| `plan_inputs_changed` | while approval enforcement is on, the run's recorded profile or memory setting changed, its launch state is unreadable, or approval settings could not be read | start a new run for changed inputs or unreadable launch state; if settings could not be read, repair `settings.json`, then resume |
 
 On `approval_required`, show the user the identifier and the one command that grants it:
 
