@@ -192,17 +192,40 @@ class StatusMonitor:
             try:
                 event = await queue.get()
                 terminal_id = terminal_id_from_topic(event["topic"])
-                if self._belongs_to_a_runtime(terminal_id):
-                    # A remote terminal's status is its runtime's own verdict,
-                    # pushed over the channel and held in the registry (#745).
-                    # The server republishes the bytes for history and browsers;
-                    # scanning them here to reach a second opinion would burn the
-                    # server on every executor's pane and could disagree with the
-                    # only process that can actually see the pane.
+                from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
+
+                # Fast path, lock only: a terminal already bound to a runtime in
+                # memory is remote, so skip it here without touching the DB. This
+                # keeps the common remote case off the synchronous placement read
+                # entirely.
+                if runtime_registry.is_bound(terminal_id):
                     continue
-                await asyncio.to_thread(self._process_chunk, terminal_id, event["data"]["data"])
+                # Not bound in memory. The remaining placement decision can reach a
+                # synchronous SQLite read on a cold cache, so it runs OFF the loop
+                # together with chunk processing — never inline here, where it would
+                # block the loop that services every terminal's output (haofeif #11 /
+                # Copilot status_monitor.py:203 on #802).
+                await asyncio.to_thread(
+                    self._process_chunk_if_local, terminal_id, event["data"]["data"]
+                )
             except Exception as e:
                 logger.exception(f"Error in StatusMonitor: {e}")
+
+    def _process_chunk_if_local(self, terminal_id: str, chunk: str) -> None:
+        """Confirm placement, then process the chunk — both on a worker thread.
+
+        ``run`` has already skipped terminals bound to a runtime in memory; this
+        covers the cold-cache case where placement is only known from the durable
+        central row, whose read ``_belongs_to_a_runtime`` performs synchronously.
+        A remote terminal's status is its runtime's own verdict, pushed over the
+        channel and held in the registry (#745); the server republishes the bytes
+        for history and browsers, but scanning them here to reach a second opinion
+        would burn the server on every executor's pane and could disagree with the
+        only process that can actually see the pane.
+        """
+        if self._belongs_to_a_runtime(terminal_id):
+            return
+        self._process_chunk(terminal_id, chunk)
 
     @staticmethod
     def _belongs_to_a_runtime(terminal_id: str) -> bool:
