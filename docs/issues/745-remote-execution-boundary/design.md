@@ -162,8 +162,9 @@ Every frame is one JSON object:
 
 - Runtime dials out with backoff; heartbeats both ways; half-open detection by heartbeat
   timeout.
-- **Authentication from the first slice**: the runtime presents its worker-specific
-  credential (today's `X-CAO-Release-Token` binding, extended per #774/#779 later). Auth
+- **Authentication from the first slice**: the runtime presents the shared
+  `CAO_RUNTIME_TOKEN`, sent in the `x-cao-runtime-token` header and fleet-shared
+  until per-runtime delegated credentials replace it in #774/#779. Auth
   failure is surfaced as an error, never retried as an anonymous connection. Revocation
   closes the channel; a previously accepted handshake is not continuing authorization.
 - One active cao-server owner (single replica, non-overlapping rollout per #745). On
@@ -201,7 +202,10 @@ Every frame is one JSON object:
 
 - **`cao-bridge`** entrypoint: FifoManager + StatusMonitor + TerminalBackend + provider
   bootstrap + the channel client. Explicitly not a renamed cao-server: no HTTP API, no
-  DB, no scheduler, no bus consumers.
+  scheduler, no bus consumers, and no control-plane database — it keeps only a
+  pane-local SQLite file (the `terminals`, `inbox` and `idempotency_keys` tables)
+  as scratch for the reused service layer, while the central server's row stays
+  the authoritative terminal identity.
 - Launch path: `run_agent_step` / `terminal_service.create_terminal` gain a routing seam —
   local backend vs. channel commands — selected per terminal, not process-globally.
 - Script execution: `script_runner` dispatches the prepared script + inputs to a runtime
@@ -353,7 +357,7 @@ not one written for the test: `cao-server` as a StatefulSet with
 | **Status survives a server restart**: `HelloFrame.statuses` carries the runtime's verdict per live terminal and the server seeds its cache from the snapshot it already uses to rebuild routing — status is pushed on change, so an idle terminal would otherwise read UNKNOWN indefinitely. A runtime omits what it cannot read rather than claiming UNKNOWN; a hello cannot set status for another runtime's terminal; a disconnected runtime still reports UNKNOWN | `runtime_channel/{protocol,bridge,api}.py` | 8 tests, all three non-behaviours mutation-checked; **found in live EKS validation, not by a test** |
 | CLI→HTTP flow registration preserves `engine` + conditional pre-script (was silently dropped → unconditional launch); rejects arbitrary server paths | `api/main.py` `CreateFlowRequest` | 2 tests |
 | **Python workflow scripts execute in the runtime** (`CAO_SCRIPT_RUNTIME`), not the server host: `RUN_SCRIPT`/`CANCEL_SCRIPT` commands; server keeps record/journal/generation/cancel; outcome flows through the shared `_finalize`; `CAO_API_BASE_URL` rewritten to the advertised URL for callbacks; disconnect → explicit failure | `runtime_channel/{protocol,bridge}.py`, `services/script_runner.py` | 13 tests + **EKS-validated** |
-| **Flow pre-scripts too** — the other user-code path the issue names by file and line. `RUN_SCRIPT` gained `mode: executable` (the file's shebang picks its interpreter; `docs/flows.md`'s example is bash) and `PROTOCOL_VERSION` went to `2` so a v1 bridge is refused at hello rather than running a bash script through `sys.executable`. The remote env is constructed, not the server's own; timeout, non-zero exit, unparseable JSON and a disconnect all raise instead of reading as "skip" | `services/flow_service.py`, `runtime_channel/{protocol,bridge}.py` | 17 tests (11 new + 6 bridge-mode); the mode field and the env construction each fail a test if reverted |
+| **Flow pre-scripts too** — the other user-code path the issue names by file and line. `RUN_SCRIPT` gained `mode: executable` (the file's shebang picks its interpreter; `docs/flows.md`'s example is bash) and the channel `PROTOCOL_VERSION` was bumped so an older bridge is refused at hello rather than running a bash script through `sys.executable`. The remote env is constructed, not the server's own; timeout, non-zero exit, unparseable JSON and a disconnect all raise instead of reading as "skip" | `services/flow_service.py`, `runtime_channel/{protocol,bridge}.py` | 17 tests (11 new + 6 bridge-mode); the mode field and the env construction each fail a test if reverted |
 | **A scheduled flow's agent is placed too** — the second half of the same criterion. `CAO_FLOW_RUNTIME` launches the flow's session in a runtime through the one shared launch path the HTTP route uses (extracted, not copied, so the registry row, the runtime binding and the reported status cannot drift between the two callers), and recycling follows it: the previous session is torn down over the channel, a busy remote conductor still blocks, an unconfirmed teardown defers the run, and local leftovers from a placement change are still cleaned. A disconnected runtime fails the run rather than falling back into the server container; a non-default `engine`, which `LAUNCH` cannot carry, is refused rather than silently downgraded | `services/flow_service.py`, `runtime_channel/api.py` | 9 tests |
 | **Owner carried through queues, schedules and cross-pod callbacks** (criterion 14, in part): `flows.owner` + `terminals.owner` written server-side at registration/launch; dispatch gated at `execute_flow` (above the pre-script, schedule still advances) and at inbox delivery (sender's owner; held messages stay `PENDING`); revocation withdraws *start* authority only | `security/principal.py`, `security/auth.py`, `services/{flow,inbox,session,terminal}_service.py`, `runtime_channel/api.py`, `clients/database.py` | 68 tests (58 in five new files, 10 appended to `test/security/test_auth.py`); the two trust decisions (owner absent from the `LAUNCH` payload; owner not in agent-writable `metadata`) are pinned by tests that fail if either is undone |
 
@@ -651,3 +655,7 @@ probe appeared in exactly one pod's pane. Note that `ps | grep cao-server` is
 **Compatibility gate**: the runtime channel rejects a `PROTOCOL_VERSION`
 mismatch at hello, before any command is accepted — the "unsupported
 combinations must fail before accepting new work" requirement for the channel.
+The current version is `3`; because it is checked for equality on both sides,
+the central server and every executor (the supervisor and broker-minted workers
+included) must be upgraded together — a bridge on an older version is refused at
+hello and stays unready rather than running with a misread frame.
