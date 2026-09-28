@@ -136,6 +136,7 @@ def _register_run(
     generation: str = "1",
     script_tier: bool = True,
     spec_snapshot: str = '{"source":"","launch_guard":null}',
+    working_directory: Optional[str] = None,
 ) -> Optional[ScriptRunRecord]:
     """Journal a ``workflow_run`` row and (optionally) register a live script record.
 
@@ -168,6 +169,7 @@ def _register_run(
         started_at=TS,
         finished_at=None,
         tier="script",
+        working_directory=working_directory,
     )
     workflow_service.run_registry[run_id] = record
     return record
@@ -654,6 +656,49 @@ class TestTheHoist:
     """VARYING THE POSTED DIRECTORY WOULD PROVE NOTHING. These vary only the
     EFFECTIVE one: the posted value is ``None`` in every call and the difference
     is the caller terminal's CWD."""
+
+    def test_script_step_defaults_to_run_root_for_execution_and_fingerprint(self, client):
+        run_id = "run-root-default"
+        root = "/run/root"
+        body = _body(env_vars=_env(run_id))
+        _register_run(run_id, working_directory=root)
+        fingerprints = []
+
+        def _decide(r_id, s_id, fingerprint, policy):
+            fingerprints.append(fingerprint)
+            return ReplayDecision(
+                verdict=ReplayVerdict.EXECUTE,
+                envelope=None,
+                reason=None,
+                rule=None,
+            )
+
+        async def _run(*args, **kwargs):
+            kwargs["on_step_terminal_ready"]("fresh-terminal", fingerprints[-1])
+            return _ok_result()
+
+        with (
+            patch(_DECIDE, side_effect=_decide),
+            patch(_RUN_STEP, new=AsyncMock(side_effect=_run)) as m_run,
+        ):
+            response = client.post(TERMINALS_RUN_STEP_ROUTE, json=body)
+
+        assert response.status_code == 200, response.text
+        assert m_run.await_args.kwargs["working_directory"] == root
+        assert fingerprints == [
+            _route_fingerprint(body, effective_working_directory=root)
+        ]
+
+    def test_explicit_step_root_overrides_run_root_without_conflict(self, client):
+        run_id = "run-root-explicit"
+        body = _body(env_vars=_env(run_id), working_directory="/step/root")
+        _register_run(run_id, working_directory="/run/root")
+
+        with patch(_RUN_STEP, new=AsyncMock(return_value=_ok_result())) as m_run:
+            response = client.post(TERMINALS_RUN_STEP_ROUTE, json=body)
+
+        assert response.status_code == 200
+        assert m_run.await_args.kwargs["working_directory"] == "/step/root"
 
     def test_two_effective_directories_do_not_replay_each_other(self, client):
         run_id = "run-hoist-a"

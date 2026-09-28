@@ -300,6 +300,12 @@ async def test_happy_completed_result_shape_and_sentinel(
     """M1 + A6: exit 0 -> COMPLETED, tier-neutral shape, sentinel output parsed."""
     proc = _FakeProcess(exit_rc=0, stdout=b'log line\nCAO_WORKFLOW_OUTPUT:{"answer": 42}\n')
     captured = _install_fake_spawn(monkeypatch, proc)
+    manifest_cwds = []
+    monkeypatch.setattr(
+        script_runner.manifest_freeze,
+        "build_manifest_json",
+        lambda **kwargs: manifest_cwds.append(kwargs["cwd"]) or None,
+    )
     result = await run_script_workflow(
         _FakeScriptSpec(),
         {},
@@ -321,7 +327,9 @@ async def test_happy_completed_result_shape_and_sentinel(
     # F3: the journaled started_at is the SAME timestamp as the record's, not a
     # second independent _now() call.
     assert row.started_at == result.started_at
+    assert script_runner.run_registry["run-ok"].working_directory == os.path.realpath(tmp_path)
     assert captured["cwd"] == os.path.realpath(tmp_path)
+    assert manifest_cwds == [os.path.realpath(tmp_path)]
     assert json.loads(row.spec_snapshot)["working_directory"] == os.path.realpath(tmp_path)
     # Constructed env is the exact 6-key allowlist (INV-2 + BR-A5), no resume flag.
     env = captured["env"]
@@ -783,7 +791,9 @@ async def test_resume_happy_materializes_and_deletes_temp(monkeypatch: pytest.Mo
     workflow_journal.insert_run(
         run_id="run-resume",
         workflow_name="wf",
-        spec_snapshot=json.dumps({"source": source, "path": "/tmp/wf.py"}),
+        spec_snapshot=json.dumps(
+            {"source": source, "path": "/tmp/wf.py", "working_directory": "/recorded/root"}
+        ),
         inputs_json="{}",
         state="failed",
         started_at="2026-07-08T00:00:00Z",
@@ -802,6 +812,8 @@ async def test_resume_happy_materializes_and_deletes_temp(monkeypatch: pytest.Mo
     env = captured["env"]
     assert env["CAO_WORKFLOW_RESUME"] == "1"
     assert env["CAO_WORKFLOW_GENERATION"] == "4"
+    assert captured["cwd"] == "/recorded/root"
+    assert script_runner.run_registry["run-resume"].working_directory == "/recorded/root"
     # The exec'd path is the engine-owned materialized temp file, NOT the on-disk
     # author file — and it is deleted in the finally after reap (BR-30).
     exec_path = captured["args"][1]

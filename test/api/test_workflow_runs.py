@@ -1001,6 +1001,7 @@ def async_script_env(client, monkeypatch, tmp_path):
 
     async def _fake_prepared(record, spec_path, env, *, working_directory=None):
         prepared["called"] = True
+        prepared["working_directory"] = working_directory
         workflow_journal.update_run_state(
             record.run_id, RunState.COMPLETED.value, workflow_service._now()
         )
@@ -1076,6 +1077,11 @@ def test_submit_script_tier_202_and_drives(client, async_script_env):
     assert resp.status_code == 202
     row = workflow_journal.get_run("async-scr")
     assert row is not None and row.tier == "script"
+    snapshot = json.loads(row.spec_snapshot)
+    expected_root = os.path.realpath(os.getcwd())
+    assert snapshot["working_directory"] == expected_root
+    assert workflow_service.run_registry["async-scr"].working_directory == expected_root
+    assert async_script_env["prepared"]["working_directory"] == expected_root
     final = None
     for _ in range(100):
         client.get("/workflows/runs/async-scr")
