@@ -150,6 +150,7 @@ def test_the_refusal_is_branched_on_a_field_not_a_message(skill):
         "the failed step or run must tell the agent whether to start a new run or repair "
         "settings.json and resume"
     )
+    assert "ShimHTTPError" in observe
     assert "approval enforcement was turned on after this run started" in observe
 
 

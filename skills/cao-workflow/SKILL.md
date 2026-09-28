@@ -277,11 +277,15 @@ class from the message, the state, or the status:
 | `cancelled` | the run was deliberately cancelled | **Cancelled by a human**: inspect the intent before taking another action; no automatic retry is promised |
 
 `plan_inputs_changed` surfaces later, from an agent step's `POST /terminals/run-step`, rather than
-from the initial run attempt. The failed step or run error carries that `kind`. While approval
-enforcement is on, it means the recorded profile or memory setting changed, the launch state is
-unreadable, approval enforcement was turned on after this run started, or approval settings could
-not be read. Start a new run for changed inputs, unreadable launch state, or newly enabled
-enforcement. If approval settings could not be read, repair `settings.json`, then resume.
+from the initial run attempt. It reaches your script as a `ShimHTTPError` whose `.status` is `409`
+and whose `.body` names `kind: "plan_inputs_changed"` and the reason; no step is recorded. The run
+record does not carry that `kind`: if the script lets the error escape, the run ends `FAILED` with
+kind `error` (classified `artifact_defect` above) and its stderr tail shows only
+`run-step returned HTTP 409`. While approval enforcement is on, it means the recorded profile or
+memory setting changed, the launch state is unreadable, or approval settings could not be read. It
+also means approval enforcement was turned on after this run started. Start a new run for changed
+inputs, unreadable launch state, or newly enabled enforcement. If approval settings could not be
+read, repair `settings.json`, then resume.
 
 This is the second half of what the sequence promises: branch on the emitted field, then resume only a
 known transient timeout. For a generic persisted error, inspect and repair before retrying by authoring
