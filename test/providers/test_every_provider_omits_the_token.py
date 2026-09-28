@@ -30,10 +30,11 @@ import pathlib
 
 import pytest
 
-PROVIDERS_DIR = pathlib.Path("src/cli_agent_orchestrator/providers")
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+PROVIDERS_DIR = _REPO_ROOT / "src" / "cli_agent_orchestrator" / "providers"
 # Shared helpers that serialize an MCP config on a provider's behalf.
 EXTRA_MODULES = [
-    pathlib.Path("src/cli_agent_orchestrator/utils/opencode_config.py"),
+    _REPO_ROOT / "src" / "cli_agent_orchestrator" / "utils" / "opencode_config.py",
 ]
 RESOLVERS = {
     "resolve_mcp_server_config",
