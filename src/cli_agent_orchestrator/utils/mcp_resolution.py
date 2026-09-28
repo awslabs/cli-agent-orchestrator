@@ -23,9 +23,10 @@ server, or an explicit absolute path) passes through unchanged.
 
 This is also where a bundled entry is redirected to the shared HTTP endpoint
 (#745). When ``CAO_MCP_HTTP_URL`` is set, ``cao-mcp-server`` is replaced by
-``cao-mcp-stdio-bridge`` with the endpoint and token injected into the child
-env. Doing it here rather than in each provider is what lets the shim's promise
-hold literally — no provider code knows the endpoint exists — and it is why an
+``cao-mcp-stdio-bridge`` with the endpoint and the token-file path injected into
+the child env (the value never travels — only ``CAO_RUNTIME_TOKEN_FILE``). Doing
+it here rather than in each provider is what lets the shim's promise hold
+literally — no provider code knows the endpoint exists — and it is why an
 agent pod needs no MCP server, and therefore no broker credentials, of its own.
 """
 
@@ -35,6 +36,8 @@ import shutil
 import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
+
+from cli_agent_orchestrator.utils.runtime_token import runtime_token_file
 
 logger = logging.getLogger(__name__)
 
@@ -162,135 +165,40 @@ def shared_endpoint_url() -> str:
     return os.environ.get(SHARED_ENDPOINT_URL_ENV, "").strip()
 
 
-def _materialize_token_file() -> str:
-    """Write the channel token to an owner-only file and return its path.
-
-    Cached per process: the path is stable for the life of the server, so a
-    persisted provider config stays valid across relaunches of the provider, and
-    repeated resolution does not litter the tmp dir.
-
-    Returns "" when there is no token to write, which leaves the caller to emit no
-    file variable at all — the shim then reports the credential as absent, which is
-    the legible failure.
-    """
-    global _TOKEN_FILE_PATH
-    token = os.environ.get(RUNTIME_TOKEN_ENV, "").strip()
-    if not token:
-        return ""
-    if _TOKEN_FILE_PATH:
-        existing = Path(_TOKEN_FILE_PATH)
-        try:
-            # Reuse only if the CONTENT still matches. Caching on existence alone
-            # served a stale credential after an in-process token rotation, which
-            # the shim would then present and have rejected.
-            if existing.read_text(encoding="utf-8").strip() == token:
-                return _TOKEN_FILE_PATH
-        except OSError:
-            pass
-    try:
-        from cli_agent_orchestrator.constants import CAO_HOME_DIR
-        from cli_agent_orchestrator.utils.atomic_file import write_owner_only
-
-        tmp_dir = Path(CAO_HOME_DIR) / "tmp"
-        tmp_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        target = tmp_dir / "runtime-token"
-        write_owner_only(target, token)
-        _TOKEN_FILE_PATH = str(target)
-        return _TOKEN_FILE_PATH
-    except Exception:  # noqa: BLE001
-        logger.warning(
-            "could not materialize the runtime token file; the forwarded child will "
-            "have to inherit %s from the environment",
-            RUNTIME_TOKEN_ENV,
-            exc_info=True,
-        )
-        return ""
-
-
-#: Cached owner-only token file path, materialized on first use.
-_TOKEN_FILE_PATH = ""
-
-
 def shared_endpoint_child_env(*, persisted: bool = False) -> dict:
     """Env a forwarded MCP child needs, for callers that build env themselves.
 
-    Exactly two things the profile cannot know: which endpoint to dial and the
-    token to present. Empty dict when no endpoint is configured, so a caller can
-    merge it unconditionally.
+    The child receives the endpoint URL and ``CAO_RUNTIME_TOKEN_FILE`` — the path
+    of an owner-only file — and never the token value, in either form. Empty dict
+    when no endpoint is configured, so a caller can merge it unconditionally.
 
-    The token is omitted when unset rather than sent empty — the shim's own
-    check then reports it as absent, which is the legible failure. It is not a
-    new secret in the agent's reach either way: the pod that runs the agent
-    already carries ``CAO_RUNTIME_TOKEN`` in its environment, because that is
-    what its runtime channel authenticates with.
+    ``persisted`` is retained for the command-resolution order in
+    :func:`resolve_cao_mcp_command`; it no longer changes token handling, because
+    a path is safe to write wherever the config lands.
 
-    ``persisted`` omits the TOKEN, and only the token. Set it when the result is
-    written to a config file the provider reads at a later launch. The endpoint
-    URL still goes in — it is deployment configuration, not a credential, and the
-    shim cannot find the server without it.
-
-    The token is left out because it does not need to be there: the shim inherits
-    it from the process environment of the pod that launches it, which carries
-    ``CAO_RUNTIME_TOKEN`` for its own runtime channel. Writing it into the file
-    as well added nothing and put the channel credential on disk in provider
-    config — in Kiro's agent JSON and Cursor's plugin.json at the default umask,
-    so mode 0644 (Copilot review on #802). A secret that is redundant at rest
-    should not be at rest.
-
-    WHAT THIS IS NOT. It is not an isolation boundary, and the per-command gate in
-    :func:`shared_endpoint_child_env_for` is not either. Both only decide what is
-    WRITTEN. ``TmuxClient.create_session`` forwards every non-blocked ``CAO_*``
-    variable from the server's environment into the provider's pane
-    (``clients/tmux.py``), so the provider process — and therefore any MCP child
-    it spawns, third-party ones included — inherits ``CAO_RUNTIME_TOKEN`` anyway.
-
-    So the honest claim is narrow: these two rules reduce the credential's
-    exposure AT REST and keep it out of files a third-party server's author never
-    expected to hold a secret. They do not stop a third-party MCP server from
-    reading the token out of its own environment. Real isolation needs the token
-    withheld from the pane and delivered to the shim alone — which the MCP
-    config's per-entry ``env`` is the only existing channel for, and that puts it
-    back on disk. Closing that properly means the shim fetching its own
-    credential rather than being handed one; until then this is a reduction, not
-    a boundary (Copilot review on #802).
+    This is not an isolation boundary. A process running as the same OS user can
+    read the file, and provider panes never carry the value at all now (the tmux
+    forwarder blocks ``CAO_RUNTIME_TOKEN``); per-process isolation needs
+    per-runtime credentials (#774).
     """
     url = shared_endpoint_url()
     if not url:
         return {}
     env = {SHARED_ENDPOINT_URL_ENV: url}
-    if persisted:
-        # Hand over a PATH, not the value. Omitting the credential entirely was
-        # wrong: the shim then relies on inheriting the parent environment, and
-        # that is not portable — Kimi does not pass its environment to MCP
-        # subprocesses, so the shim exited at startup and every forwarded tool call
-        # failed (Copilot review on #802). A 0600 file satisfies both constraints:
-        # nothing readable lands in argv or in a persisted config, and the child
-        # does not depend on inheritance.
-        token_file = _materialize_token_file()
-        if token_file:
-            env[RUNTIME_TOKEN_FILE_ENV] = token_file
-        return env
-    token = os.environ.get(RUNTIME_TOKEN_ENV, "").strip()
-    if token:
-        env[RUNTIME_TOKEN_ENV] = token
+    token_file = runtime_token_file()
+    if token_file:
+        env[RUNTIME_TOKEN_FILE_ENV] = token_file
     return env
 
 
 def shared_endpoint_child_env_for(command: str, *, persisted: bool = False) -> dict:
     """:func:`shared_endpoint_child_env`, but only for the entry it belongs to.
 
-    *command* is the entry's command **as declared**, before resolution. The
-    forwarding env is CAO's own: only the bundled server (or an entry already
-    naming the shim) is redirected, so only that child needs the endpoint — and
-    only that child should be handed ``CAO_RUNTIME_TOKEN``. A third-party MCP
-    server declared by an agent profile or plugin is launched unchanged; giving
-    it the channel credential would widen the token's reach to code CAO does not
-    ship, for no purpose, and — where the provider persists its config — write it
-    into a file that server's author never expected to hold a secret.
-
-    Reported by Copilot review on #802 (findings 2 and 9): providers that build
-    a child env by hand merged this unconditionally, while
-    :func:`resolve_mcp_server_config` had always gated it.
+    *command* is the entry's command **as declared**, before resolution. Only the
+    bundled server (or an entry already naming the shim) is redirected, so only
+    that child needs the endpoint and the token-file path. A third-party MCP
+    server declared by a profile or plugin is launched unchanged and gets neither
+    key — CAO does not hand its channel credential to code it does not ship.
     """
     if command not in _BUNDLED_COMMANDS:
         return {}
@@ -355,11 +263,11 @@ def resolve_mcp_server_config(
             # absent exactly where a planted credential persists (own review).
             # RUNTIME_TOKEN_FILE_ENV belongs here for exactly the same reason as
             # the other two, and leaving it out reintroduced the hole one level
-            # down: `extra` normally clobbers it, but when _materialize_token_file
-            # returns "" (no token configured, or the write failed) there is no key
-            # to clobber with — so an agent-editable profile's own
-            # CAO_RUNTIME_TOKEN_FILE survived into the persisted config and the shim
-            # would read its credential from an attacker-chosen path.
+            # down: `extra` normally clobbers it, but when no token is configured
+            # `runtime_token_file()` returns None and there is no key to clobber
+            # with — so an agent-editable profile's own CAO_RUNTIME_TOKEN_FILE
+            # survived into the persisted config and the shim would read its
+            # credential from an attacker-chosen path.
             for reserved in (
                 SHARED_ENDPOINT_URL_ENV,
                 RUNTIME_TOKEN_ENV,

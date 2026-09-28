@@ -17,9 +17,11 @@ caught the gap: codex and Kimi serialize their MCP config into command-line
 arguments, where the credential is readable by any local process listing. argv is
 not better than a 0600 file — it is worse. Both are covered below.
 
-The token is redundant in those files: the shim inherits it from the process that
-launches it. That inheritance is also why this is a reduction of exposure at rest
-and not an isolation boundary — see ``shared_endpoint_child_env``.
+The token's VALUE is never written into these configs at all: CAO's own
+forwarded server receives ``CAO_RUNTIME_TOKEN_FILE`` (a path to an owner-only
+0600 file), and the shim reads the value from that file. A path is safe wherever
+the config lands — argv or a file — so the credential is never at rest and never
+in a process listing. See ``shared_endpoint_child_env``.
 """
 
 import json
@@ -30,6 +32,7 @@ import pytest
 from cli_agent_orchestrator.utils.mcp_resolution import (
     CAO_MCP_SERVER_COMMAND,
     RUNTIME_TOKEN_ENV,
+    RUNTIME_TOKEN_FILE_ENV,
     SHARED_ENDPOINT_URL_ENV,
 )
 
@@ -153,12 +156,12 @@ class TestInlineProviderConfigsCarryNoTokenInArgv:
 
 
 class TestAProfilePlantedTokenNeverPersists:
-    """The reserved-key guard has to hold on the PERSISTED path especially.
+    """The reserved-key guard holds on every form, persisted or live.
 
-    `shared_endpoint_child_env(persisted=True)` omits the token, so `extra` has no
-    CAO_RUNTIME_TOKEN key — and a merge alone therefore left an agent-supplied one
-    in place. The guard held for the live path and was missing in the one form that
-    actually lands somewhere durable: a file, or argv (own review of this PR).
+    Neither form carries the token VALUE now: both deliver
+    ``CAO_RUNTIME_TOKEN_FILE`` (a path) and both strip an agent-supplied
+    ``CAO_RUNTIME_TOKEN``/endpoint. `extra` never contains the value, so the
+    guard must drop a planted one rather than relying on a clobber.
     """
 
     HOSTILE = "PLANTED-BY-PROFILE"
@@ -190,9 +193,13 @@ class TestAProfilePlantedTokenNeverPersists:
         resolved = self._resolved(True)
         assert resolved["env"][SHARED_ENDPOINT_URL_ENV] == ENDPOINT
 
-    def test_the_live_form_still_overrides_with_the_real_token(self):
+    def test_the_live_form_strips_the_planted_token_and_delivers_a_path(self):
+        import json
+
         resolved = self._resolved(False)
-        assert resolved["env"][RUNTIME_TOKEN_ENV] == TOKEN
+        assert RUNTIME_TOKEN_ENV not in resolved["env"]
+        assert self.HOSTILE not in json.dumps(resolved)
+        assert resolved["env"][RUNTIME_TOKEN_FILE_ENV]
 
     def test_unrelated_profile_keys_survive_either_way(self):
         for persisted in (True, False):

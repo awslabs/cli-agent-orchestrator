@@ -433,15 +433,14 @@ class AntigravityCliProvider(BaseProvider):
                 env = dict(cfg.get("env", {}))
                 env["CAO_TERMINAL_ID"] = self.terminal_id
                 # The resolver may have swapped in the forwarding shim
-                # (#745), which needs the endpoint and token here. Empty
-                # when no shared endpoint is configured — and empty for a
-                # server that is not ours, which is launched as declared and
-                # must not be handed the channel token (this loop covers every
-                # profile/plugin entry, not just the bundled one).
-                # persisted=True for the same reason as OpenCode: this entry is
-                # written to a config file Antigravity re-reads at every launch,
-                # so the endpoint is persisted and the token is inherited from
-                # the launching process instead of stored (Copilot on #802).
+                # (#745), which needs the endpoint and the token-file path
+                # here. Empty when no shared endpoint is configured — and empty
+                # for a server that is not ours, which is launched as declared
+                # and must not be handed the channel credential (this loop
+                # covers every profile/plugin entry, not just the bundled one).
+                # persisted=True selects the command-resolution order; the
+                # entry carries CAO_RUNTIME_TOKEN_FILE (a path), never the token
+                # value, so writing this config to disk is safe.
                 env.update(shared_endpoint_child_env_for(cfg.get("command", ""), persisted=True))
                 entry["env"] = env
                 # Antigravity documents `cwd` ("Working directory for `stdio`
@@ -457,14 +456,15 @@ class AntigravityCliProvider(BaseProvider):
                 self._mcp_server_names.append(unique_key)
 
             # Owner-only unconditionally, including over a file that already
-            # exists at 0644. The bundled entry's env holds CAO_RUNTIME_TOKEN
-            # when a shared endpoint is configured (#745) and agy re-reads this
-            # path at every later launch, so the token persists here: 0600 is a
-            # property of what the file CONTAINS, not a preference the operator
-            # may have overridden. Preserving the previous mode — as this did —
-            # left a config that predated the rule, or that another tool created
-            # world-readable, handing the control-plane token to every local
-            # account (both Copilot reviews on #802, finding 8).
+            # exists at 0644. The bundled entry's env holds
+            # CAO_RUNTIME_TOKEN_FILE — a path to the owner-only token file —
+            # when a shared endpoint is configured (#745), and agy re-reads this
+            # path at every later launch. 0600 is still a property of what the
+            # file CONTAINS (a caller could also plant a value here), not a
+            # preference the operator may have overridden. Preserving the
+            # previous mode — as this did — left a config that predated the
+            # rule, or that another tool created world-readable, readable by
+            # every local account (both Copilot reviews on #802, finding 8).
             write_owner_only(path, json.dumps(config, indent=2))
 
     def _unregister_mcp_servers(self) -> None:
@@ -507,8 +507,8 @@ class AntigravityCliProvider(BaseProvider):
                         servers.pop(name, None)
                     # Same rule as registration: this rewrite removes only THIS
                     # terminal's entries, so a concurrent terminal's entry — and
-                    # its CAO_RUNTIME_TOKEN — is still in the bytes being
-                    # published. Republishing at the old mode would undo
+                    # its CAO_RUNTIME_TOKEN_FILE path — is still in the bytes
+                    # being published. Republishing at the old mode would undo
                     # registration's 0600 on the way out.
                     write_owner_only(path, json.dumps(config, indent=2))
             except (json.JSONDecodeError, OSError) as exc:

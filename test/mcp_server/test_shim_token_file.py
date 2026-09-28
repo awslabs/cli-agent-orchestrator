@@ -43,10 +43,10 @@ def _endpoint(monkeypatch, tmp_path):
     )
     monkeypatch.setenv(SHARED_ENDPOINT_URL_ENV, ENDPOINT)
     monkeypatch.setenv(RUNTIME_TOKEN_ENV, TOKEN)
-    # The path is cached per process; clear it so each test materializes its own.
-    import cli_agent_orchestrator.utils.mcp_resolution as mr
+    # The token is cached per process; clear it so each test resolves its own.
+    import cli_agent_orchestrator.utils.runtime_token as rt
 
-    monkeypatch.setattr(mr, "_TOKEN_FILE_PATH", "")
+    rt._reset_cache_for_tests()
 
 
 def _omitting_config():
@@ -125,19 +125,19 @@ class TestAProfileCannotChooseTheTokenFile:
     """The path is operator state, so a profile must not be able to name it.
 
     `extra` normally clobbers the key, but when no token is configured
-    `_materialize_token_file` returns "" and there is nothing to clobber with — so a
-    profile-planted `CAO_RUNTIME_TOKEN_FILE` survived into the persisted config and
-    the shim would read its credential from an attacker-chosen path. Found by review
-    of the token-file change itself.
+    `runtime_token_file()` returns None and there is nothing to clobber with — so a
+    profile-planted `CAO_RUNTIME_TOKEN_FILE` would survive into the persisted config
+    and the shim would read its credential from an attacker-chosen path. Found by
+    review of the token-file change itself.
     """
 
     HOSTILE = "/tmp/attacker-supplied-token"
 
     def test_a_planted_path_is_stripped_when_no_token_is_configured(self, monkeypatch):
         monkeypatch.delenv(RUNTIME_TOKEN_ENV, raising=False)
-        import cli_agent_orchestrator.utils.mcp_resolution as mr
+        import cli_agent_orchestrator.utils.runtime_token as rt
 
-        monkeypatch.setattr(mr, "_TOKEN_FILE_PATH", "")
+        rt._reset_cache_for_tests()
 
         resolved = resolve_mcp_server_config(
             {
@@ -162,15 +162,28 @@ class TestAProfileCannotChooseTheTokenFile:
         assert resolved["env"][RUNTIME_TOKEN_FILE_ENV] != self.HOSTILE
         assert pathlib.Path(resolved["env"][RUNTIME_TOKEN_FILE_ENV]).read_text() == TOKEN
 
-    def test_a_rotated_token_refreshes_the_file(self, monkeypatch):
-        """Caching on existence alone served a stale credential after rotation."""
+    def test_rotation_requires_a_process_restart(self, monkeypatch):
+        """The token is read once and cached; rotation means restarting the process."""
+        import cli_agent_orchestrator.utils.runtime_token as rt
+
         first = resolve_mcp_server_config(
             {"command": CAO_MCP_SERVER_COMMAND, "args": []}, omit_token=True
         )["env"][RUNTIME_TOKEN_FILE_ENV]
         assert pathlib.Path(first).read_text() == TOKEN
 
+        # A new env value is ignored within the same process (value is cached).
         monkeypatch.setenv(RUNTIME_TOKEN_ENV, "rotated-token")
-        second = resolve_mcp_server_config(
+        monkeypatch.delenv(RUNTIME_TOKEN_FILE_ENV, raising=False)
+        unchanged = resolve_mcp_server_config(
             {"command": CAO_MCP_SERVER_COMMAND, "args": []}, omit_token=True
         )["env"][RUNTIME_TOKEN_FILE_ENV]
-        assert pathlib.Path(second).read_text() == "rotated-token"
+        assert pathlib.Path(unchanged).read_text() == TOKEN
+
+        # Only a restart (cache clear) picks up the rotated value.
+        rt._reset_cache_for_tests()
+        monkeypatch.setenv(RUNTIME_TOKEN_ENV, "rotated-token")
+        monkeypatch.delenv(RUNTIME_TOKEN_FILE_ENV, raising=False)
+        after = resolve_mcp_server_config(
+            {"command": CAO_MCP_SERVER_COMMAND, "args": []}, omit_token=True
+        )["env"][RUNTIME_TOKEN_FILE_ENV]
+        assert pathlib.Path(after).read_text() == "rotated-token"

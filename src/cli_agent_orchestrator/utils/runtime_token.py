@@ -30,6 +30,7 @@ RUNTIME_TOKEN_FILE_ENV = "CAO_RUNTIME_TOKEN_FILE"
 _LOCK = threading.Lock()
 _LOADED = False
 _TOKEN: Optional[str] = None
+_TOKEN_FILE: Optional[str] = None
 
 
 def load_runtime_token() -> Optional[str]:
@@ -48,11 +49,12 @@ def load_runtime_token() -> Optional[str]:
 
 
 def _resolve() -> Optional[str]:
+    global _TOKEN_FILE
     file_path = os.environ.get(RUNTIME_TOKEN_FILE_ENV, "").strip()
     if file_path:
         # Already a path: read it and leave the file where it is.
         try:
-            return Path(file_path).read_text(encoding="utf-8").strip() or None
+            value = Path(file_path).read_text(encoding="utf-8").strip() or None
         except OSError:
             logger.warning(
                 "could not read %s=%s; the runtime token is unavailable",
@@ -61,6 +63,9 @@ def _resolve() -> Optional[str]:
                 exc_info=True,
             )
             return None
+        if value:
+            _TOKEN_FILE = file_path
+        return value
 
     value = os.environ.get(RUNTIME_TOKEN_ENV, "").strip()
     if not value:
@@ -70,6 +75,7 @@ def _resolve() -> Optional[str]:
     # environment, so it survives startup only as a path.
     path = _write_token_file(value)
     if path:
+        _TOKEN_FILE = path
         os.environ[RUNTIME_TOKEN_FILE_ENV] = path
         os.environ.pop(RUNTIME_TOKEN_ENV, None)
     return value
@@ -99,13 +105,13 @@ def runtime_token() -> Optional[str]:
 def runtime_token_file() -> Optional[str]:
     """Path to the owner-only token file, loading on first use, or ``None``."""
     load_runtime_token()
-    path = os.environ.get(RUNTIME_TOKEN_FILE_ENV, "").strip()
-    return path or None
+    return _TOKEN_FILE
 
 
 def _reset_cache_for_tests() -> None:
     """Clear the process cache so a test can re-resolve under a fresh environment."""
-    global _LOADED, _TOKEN
+    global _LOADED, _TOKEN, _TOKEN_FILE
     with _LOCK:
         _LOADED = False
         _TOKEN = None
+        _TOKEN_FILE = None

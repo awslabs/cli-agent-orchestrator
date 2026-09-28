@@ -33,6 +33,7 @@ from cli_agent_orchestrator.utils.mcp_resolution import (
     CAO_MCP_SERVER_COMMAND,
     CAO_MCP_STDIO_BRIDGE_COMMAND,
     RUNTIME_TOKEN_ENV,
+    RUNTIME_TOKEN_FILE_ENV,
     SHARED_ENDPOINT_URL_ENV,
     resolve_cao_mcp_command,
     resolve_mcp_server_config,
@@ -78,7 +79,10 @@ class TestRedirectWhenConfigured:
     def test_the_child_env_carries_endpoint_and_token(self, shared_endpoint):
         resolved = resolve_mcp_server_config({"command": CAO_MCP_SERVER_COMMAND, "args": []})
         assert resolved["env"][SHARED_ENDPOINT_URL_ENV] == ENDPOINT
-        assert resolved["env"][RUNTIME_TOKEN_ENV] == "runtime-token-value"
+        # The value never lands in a child env; only the owner-only file path does.
+        assert RUNTIME_TOKEN_ENV not in resolved["env"]
+        assert resolved["env"][RUNTIME_TOKEN_FILE_ENV]
+        assert "runtime-token-value" not in json.dumps(resolved)
 
     def test_a_profiles_own_env_survives_the_redirect(self, shared_endpoint):
         """The profile keeps its own variables — just not the two reserved ones.
@@ -161,18 +165,15 @@ class TestTheTokenIsWrittenOnlyForCaosOwnChild:
 
     `resolve_mcp_server_config` has always gated the forwarding env on the command,
     but a provider that merges `shared_endpoint_child_env()` into every entry it
-    writes hands `CAO_RUNTIME_TOKEN` — the channel credential for the whole
-    runtime — to third-party MCP servers CAO does not ship, for no purpose. Where
-    the provider persists its config, it also writes that secret into a file whose
-    author never expected to hold one (Copilot review on #802, findings 2 and 9).
+    writes would hand the endpoint and token-file path to third-party MCP servers
+    CAO does not ship, for no purpose (Copilot review on #802, findings 2 and 9).
 
-    Scope, because the original name of this class ("ReachesOnlyCaosOwnChild")
-    claimed more than any assertion here shows: every test below is about what is
-    WRITTEN into a config entry. A third-party MCP child still INHERITS the token
-    from the provider's pane environment, which `TmuxClient.create_session`
-    populates from every non-blocked `CAO_*` variable. That is a real gap and it is
-    documented in `shared_endpoint_child_env`; do not read these tests as proof of
-    runtime isolation (Copilot review on #802).
+    Every test below is about what is WRITTEN into a config entry. The token's
+    value is no longer in any child env: the entry carries only
+    `CAO_RUNTIME_TOKEN_FILE`, and `TmuxClient.create_session` blocks
+    `CAO_RUNTIME_TOKEN` from the pane, so a third-party child cannot inherit the
+    value either. A process running as the same OS user can still read the file;
+    per-process isolation needs per-runtime credentials (#774).
     """
 
     def test_the_helper_is_silent_for_a_third_party_command(self, shared_endpoint):
@@ -182,7 +183,8 @@ class TestTheTokenIsWrittenOnlyForCaosOwnChild:
     def test_the_helper_still_answers_for_the_bundled_command(self, shared_endpoint):
         env = shared_endpoint_child_env_for(CAO_MCP_SERVER_COMMAND)
         assert env[SHARED_ENDPOINT_URL_ENV] == ENDPOINT
-        assert env[RUNTIME_TOKEN_ENV] == "runtime-token-value"
+        assert RUNTIME_TOKEN_ENV not in env
+        assert env[RUNTIME_TOKEN_FILE_ENV]
 
     def test_an_entry_already_naming_the_shim_still_gets_it(self, shared_endpoint):
         assert (
@@ -200,11 +202,11 @@ class TestTheTokenIsWrittenOnlyForCaosOwnChild:
     def test_opencode_gives_caos_own_server_the_endpoint_but_not_the_token(self, shared_endpoint):
         """``opencode.json`` is read at a later launch, so it is a persisted form.
 
-        This asserted the token WAS written here, which is what the persisted
-        contract forbids: the shim inherits CAO_RUNTIME_TOKEN from the process
-        that launches it, so a copy in the file is a credential at rest for no
-        gain (Copilot follow-up on #802). The endpoint still belongs there —
-        without it the shim has nowhere to dial.
+        This asserted the token VALUE was written here, which the persisted
+        contract forbids. The entry carries ``CAO_RUNTIME_TOKEN_FILE`` (a path)
+        instead, and the shim reads the value from that owner-only file (Copilot
+        follow-up on #802). The endpoint still belongs there — without it the shim
+        has nowhere to dial.
         """
         from cli_agent_orchestrator.utils.opencode_config import translate_mcp_server_config
 
@@ -301,7 +303,10 @@ class TestAProfileCannotRedirectTheShimOrItsToken:
                 "env": {RUNTIME_TOKEN_ENV: "attacker-supplied"},
             }
         )
-        assert resolved["env"][RUNTIME_TOKEN_ENV] == "runtime-token-value"
+        # A planted value is stripped, not honoured; the child gets the file path.
+        assert RUNTIME_TOKEN_ENV not in resolved["env"]
+        assert "attacker-supplied" not in json.dumps(resolved)
+        assert resolved["env"][RUNTIME_TOKEN_FILE_ENV]
 
     def test_the_token_does_not_follow_a_redirected_endpoint(self, shared_endpoint):
         """The two together are the actual exfiltration: destination plus credential."""
@@ -316,7 +321,8 @@ class TestAProfileCannotRedirectTheShimOrItsToken:
             }
         )
         assert resolved["env"][SHARED_ENDPOINT_URL_ENV] == ENDPOINT
-        assert resolved["env"][RUNTIME_TOKEN_ENV] == "runtime-token-value"
+        assert RUNTIME_TOKEN_ENV not in resolved["env"]
+        assert "attacker-supplied" not in json.dumps(resolved)
         assert self.HOSTILE not in resolved["env"].values()
 
     def test_unrelated_profile_variables_are_preserved(self, shared_endpoint):
@@ -350,12 +356,12 @@ class TestAProfileCannotRedirectTheShimOrItsToken:
 class TestThePersistedFormCarriesNoToken:
     """A config file read at a later launch must not hold the channel token.
 
-    The shim inherits CAO_RUNTIME_TOKEN from the process that launches it — the
-    agent's own pod carries it for its runtime channel — so a copy in the
-    provider's config file added nothing and put the credential on disk. It
-    reached Kiro's agent JSON and Cursor's plugin.json at the umask default, mode
-    0644 (Copilot review on #802). The endpoint URL stays: it is deployment
-    configuration, not a secret, and the shim cannot find the server without it.
+    The token's value never travels: CAO's own server entry receives
+    ``CAO_RUNTIME_TOKEN_FILE`` (a path to a 0600 file) and the shim reads the
+    value from there. An earlier version copied the value into the config, which
+    reached Kiro's agent JSON and Cursor's plugin.json at mode 0644 (Copilot
+    review on #802). The endpoint URL stays: it is deployment configuration, not
+    a secret, and the shim cannot find the server without it.
     """
 
     def test_persisted_keeps_the_endpoint_and_drops_the_token(self, shared_endpoint):
@@ -365,10 +371,11 @@ class TestThePersistedFormCarriesNoToken:
         assert resolved["env"][SHARED_ENDPOINT_URL_ENV] == ENDPOINT
         assert RUNTIME_TOKEN_ENV not in resolved["env"]
 
-    def test_the_live_form_still_carries_the_token(self, shared_endpoint):
-        """Not persisted means launched right now, which is the case that needs it."""
+    def test_the_live_form_carries_the_token_path_not_the_value(self, shared_endpoint):
+        """Live launch gets the path too — the value never lands in any env."""
         resolved = resolve_mcp_server_config({"command": CAO_MCP_SERVER_COMMAND, "args": []})
-        assert resolved["env"][RUNTIME_TOKEN_ENV] == "runtime-token-value"
+        assert RUNTIME_TOKEN_ENV not in resolved["env"]
+        assert resolved["env"][RUNTIME_TOKEN_FILE_ENV]
 
     def test_no_token_anywhere_in_the_persisted_entry(self, shared_endpoint):
         """Not just the env key — the value must not appear in the serialized form."""
@@ -385,6 +392,8 @@ class TestThePersistedFormCarriesNoToken:
         env = shared_endpoint_child_env_for(CAO_MCP_SERVER_COMMAND, persisted=True)
         assert env[SHARED_ENDPOINT_URL_ENV] == ENDPOINT
         assert RUNTIME_TOKEN_ENV not in env
+        assert env[RUNTIME_TOKEN_FILE_ENV]
 
         live = shared_endpoint_child_env_for(CAO_MCP_SERVER_COMMAND)
-        assert live[RUNTIME_TOKEN_ENV] == "runtime-token-value"
+        assert RUNTIME_TOKEN_ENV not in live
+        assert live[RUNTIME_TOKEN_FILE_ENV]

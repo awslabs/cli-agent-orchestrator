@@ -60,6 +60,7 @@ from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.log_writer import log_writer
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.utils.logging import setup_logging
+from cli_agent_orchestrator.utils.runtime_token import load_runtime_token, runtime_token
 
 logger = logging.getLogger(__name__)
 
@@ -1011,13 +1012,16 @@ class Bridge:
 
 
 async def _amain() -> None:
+    # Normalize the token to an owner-only file before anything else, so its
+    # value survives startup only as a path.
+    load_runtime_token()
     server_url = os.environ.get("CAO_BRIDGE_SERVER_URL")
     runtime_id = os.environ.get("CAO_BRIDGE_RUNTIME_ID")
-    token = os.environ.get("CAO_RUNTIME_TOKEN")
+    token = runtime_token()
     if not server_url or not runtime_id or not token:
         raise SystemExit(
             "cao-bridge requires CAO_BRIDGE_SERVER_URL, CAO_BRIDGE_RUNTIME_ID "
-            "and CAO_RUNTIME_TOKEN"
+            "and CAO_RUNTIME_TOKEN or CAO_RUNTIME_TOKEN_FILE"
         )
 
     setup_logging()

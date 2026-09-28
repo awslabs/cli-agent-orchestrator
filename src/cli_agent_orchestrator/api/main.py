@@ -1344,6 +1344,12 @@ async def lifespan(app: FastAPI):
     # only in ``main()`` — so the imported-app deployment path
     # (``uvicorn cli_agent_orchestrator.api.main:app``) is covered too. Idempotent.
     install_access_log_redaction()
+    # Normalize the runtime-channel token to an owner-only file at startup, so
+    # its value never survives in the environment (no-op when neither
+    # CAO_RUNTIME_TOKEN nor CAO_RUNTIME_TOKEN_FILE is set). (#802)
+    from cli_agent_orchestrator.utils.runtime_token import load_runtime_token
+
+    load_runtime_token()
     # OpenTelemetry (ported): opt-in — no-op unless OTEL_SDK_DISABLED=false.
     # Safe to call unconditionally; failure-isolated so it never blocks boot.
     try:

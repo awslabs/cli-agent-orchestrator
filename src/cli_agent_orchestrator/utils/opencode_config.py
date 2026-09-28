@@ -117,11 +117,12 @@ def write_config(data: Dict[str, Any]) -> None:
     """Persist *data* to ``opencode.json``, creating parent directories as needed.
 
     Owner-only (0600): an ``mcp`` entry's ``environment`` carries credentials —
-    for CAO's own forwarded server that is ``CAO_RUNTIME_TOKEN`` (#745), and a
-    profile may put an API key in any entry. Default umask leaves this
-    world-readable, which on a shared host hands the token to every local
-    account (Copilot review on #802, finding 8). Applied on the existing file
-    too, so an install predating this does not stay open.
+    for CAO's own forwarded server that is ``CAO_RUNTIME_TOKEN_FILE`` (a path to
+    the owner-only token file, #745), and a profile may put an API key in any
+    entry. Default umask leaves this world-readable, which on a shared host
+    exposes those to every local account (Copilot review on #802, finding 8).
+    Applied on the existing file too, so an install predating this does not stay
+    open.
 
     Owner-only from the FIRST byte rather than chmodded after the fact: writing
     the body and then narrowing the mode leaves a window in which another local
@@ -177,17 +178,16 @@ def translate_mcp_server_config(cao_config: Dict[str, Any]) -> Dict[str, Any]:
     }
     environment = dict(cao_config.get("env") or {})
     # The resolver may have swapped in the forwarding shim (#745), which
-    # needs the endpoint and token here. Empty when none is configured, so
-    # an entry that had no "env" still gets no "environment" key — and empty
-    # for a server that is not ours: this translator runs over every profile
-    # and plugin entry, and ``opencode.json`` is written to disk, so an
-    # unconditional merge would persist the channel token beside third-party
-    # commands (Copilot review on #802, finding 9).
-    # persisted=True: this dict is serialized into ``opencode.json``, which
-    # OpenCode reads at every later launch. The endpoint belongs there; the
-    # channel token does not, because the shim inherits it from the process that
-    # launches it and a second copy on disk is a credential at rest for no gain
-    # (Copilot follow-up on #802).
+    # needs the endpoint and the token-file path here. Empty when none is
+    # configured, so an entry that had no "env" still gets no "environment"
+    # key — and empty for a server that is not ours: this translator runs over
+    # every profile and plugin entry, and ``opencode.json`` is written to disk,
+    # so an unconditional merge would persist forwarding config beside
+    # third-party commands (Copilot review on #802, finding 9).
+    # persisted=True selects the command-resolution order; the entry carries
+    # CAO_RUNTIME_TOKEN_FILE (a path), never the token value, so serializing it
+    # into ``opencode.json`` puts no credential at rest (Copilot follow-up on
+    # #802).
     environment.update(shared_endpoint_child_env_for(cao_config.get("command", ""), persisted=True))
     if environment:
         result["environment"] = environment
