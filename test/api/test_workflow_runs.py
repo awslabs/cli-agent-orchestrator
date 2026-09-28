@@ -1068,9 +1068,17 @@ def test_submit_manifest_freeze_failure_is_503_when_approval_is_required(
     assert workflow_journal.get_run("async-missing-identity") is None
 
 
-def test_submit_script_tier_202_and_drives(client, async_script_env):
+def test_submit_script_tier_202_and_drives(client, async_script_env, monkeypatch):
     """CR-2: a script spec is submittable async, journals tier=script, and reaches
     its prepared entry."""
+    from cli_agent_orchestrator.services import manifest_freeze
+
+    manifest_cwds = []
+    monkeypatch.setattr(
+        manifest_freeze,
+        "build_manifest_json",
+        lambda **kwargs: manifest_cwds.append(kwargs["cwd"]) or None,
+    )
     resp = client.post(
         "/workflows/runs:submit", json={"name_or_path": "scr", "inputs": {}, "run_id": "async-scr"}
     )
@@ -1079,6 +1087,7 @@ def test_submit_script_tier_202_and_drives(client, async_script_env):
     assert row is not None and row.tier == "script"
     snapshot = json.loads(row.spec_snapshot)
     expected_root = os.path.realpath(os.getcwd())
+    assert manifest_cwds == [expected_root]
     assert snapshot["working_directory"] == expected_root
     assert workflow_service.run_registry["async-scr"].working_directory == expected_root
     assert async_script_env["prepared"]["working_directory"] == expected_root

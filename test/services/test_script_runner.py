@@ -393,7 +393,7 @@ async def test_crash_nonzero_exit_failed_kind_error(monkeypatch: pytest.MonkeyPa
 
     monkeypatch.setattr(script_runner, "_reconcile_orphans", _fake_sweep)
     proc = _FakeProcess(exit_rc=1, stderr=f"Traceback: boom with {aws_key}\n".encode())
-    _install_fake_spawn(monkeypatch, proc)
+    captured = _install_fake_spawn(monkeypatch, proc)
 
     result = await run_script_workflow(_FakeScriptSpec(), {}, "run-crash")
     assert result.state == RunState.FAILED
@@ -1292,16 +1292,19 @@ async def test_run_script_workflow_prepared_drives_without_reinsert(
     monkeypatch.setattr(workflow_journal, "insert_run", _fail_insert)
 
     proc = _FakeProcess(exit_rc=0, stdout=b'CAO_WORKFLOW_OUTPUT:{"ok": true}\n')
-    _install_fake_spawn(monkeypatch, proc)
+    captured = _install_fake_spawn(monkeypatch, proc)
 
     record = _make_record("run-prep-script", process=None, generation="1")
     workflow_service.run_registry["run-prep-script"] = record
 
     env = build_env("run-prep-script", "1", {})
-    result = await run_script_workflow_prepared(record, "/tmp/wf.py", env)
+    result = await run_script_workflow_prepared(
+        record, "/tmp/wf.py", env, working_directory="/prepared/root"
+    )
 
     assert result.state == RunState.COMPLETED
     assert result.output == {"ok": True}
+    assert captured["cwd"] == "/prepared/root"
     # DR-2: liveness mark cleared on exit.
     assert "run-prep-script" not in workflow_service._active_drives
 
