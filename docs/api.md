@@ -198,6 +198,56 @@ security boundary on top of them.
 Terminal identifiers used in these routes are eight-character hexadecimal
 strings. See [Control Planes](control-planes.md) for operator-facing choices.
 
+### Remote runtimes
+
+These routes exist only in the remote execution topology, where one central
+`cao-server` coordinates execution runtimes running `cao-bridge` (#745/#776, see
+[CODEBASE.md](../CODEBASE.md#remote-execution-boundary)).
+
+- `GET /runtimes` lists the execution runtimes currently connected to this
+  server. Read-scoped when authentication is enabled.
+- `POST /runtimes/{runtime_id}/terminals` launches one terminal on a connected
+  runtime and records the authoritative registry row centrally; the runtime runs
+  the full launch sequence beside its own tmux. Write- or admin-scoped. A
+  disconnected runtime is `503` (retryable), a runtime whose launch outcome is
+  unknown is `504`, and a runtime that reports a launch failure is `502`.
+  `cao launch --runtime <id>` drives this route to place a terminal on a named
+  runtime when the central server hosts no tmux of its own (`--engine` and
+  `--resume-session-id` are not supported with `--runtime`).
+- `WS /runtime/channel` is the persistent **outbound** WebSocket each
+  `cao-bridge` runtime dials — not a client-facing route. It is authenticated
+  with a shared runtime token presented in the `x-cao-runtime-token` header and
+  **fails closed**: when `CAO_RUNTIME_TOKEN` is not configured on the server,
+  every runtime connection is refused, so a purely local install exposes no
+  anonymous execution channel. The channel carries an explicit protocol version
+  checked for equality at `hello`; a runtime on a different version is refused
+  before any work is accepted. (#774 replaces the shared token with per-runtime
+  credentials.)
+
+Once a terminal is bound to a runtime, its existing `/terminals/{terminal_id}*`
+operations (input, key, output, delete) are transparently routed over that
+runtime's channel. Those operations gain three remote-only status codes so a
+caller can tell a retryable condition from an unknown outcome:
+
+- `503`: the runtime is not connected, or the command was provably not
+  dispatched — nothing was sent, so it is safe to retry.
+- `504`: the outcome is unknown — the frame may have been delivered before the
+  channel closed, or the operation timed out. **Do not blindly retry**, since a
+  retry can duplicate a side effect that already happened.
+- `502`: the runtime reported an explicit failure.
+
+### Shared MCP endpoint
+
+When `CAO_MCP_TRANSPORT=http` (default `stdio`), the in-session orchestration MCP
+tools are served over HTTP at the `/mcp` path on a separate listener (default
+port 9890), instead of one stdio process per agent. Every request must carry the
+shared runtime token in the `x-cao-runtime-token` header — including
+`initialize` and `tools/list` — and the endpoint resolves the caller's terminal
+identity per authenticated request rather than from a process-global
+`CAO_TERMINAL_ID`. It fails closed when `CAO_RUNTIME_TOKEN` is unset. A
+stdio-only provider reaches this endpoint through the `cao-mcp-stdio-bridge`
+forwarding shim.
+
 ### Durable handoff results
 
 - `POST /terminals/run-step` runs one agent step and accepts an optional
@@ -347,6 +397,14 @@ parameter for clients that cannot set that header. An extracted header token
 takes precedence over the query parameter. Passing the Origin check does not
 supply a bearer token; the client must provide it. Keep token-bearing URLs out
 of logs and use TLS for remote connections.
+
+This `?token=` parameter and the AG-UI SSE stream's `?access_token=`
+(`/agui/v1/stream`) exist only because a browser cannot set an `Authorization`
+header on a WebSocket handshake or an `EventSource` request; native clients send
+the header instead. The server redacts **both** parameter names from its
+`uvicorn.access` log, so a JWT does not persist in an access-log line — but the
+token still travels in the URL, so this is not a substitute for TLS and for
+keeping such URLs out of other logs.
 
 With neither authentication-enabling variable set, no token is required.
 The client-IP and Origin restrictions still apply in both modes. See the
