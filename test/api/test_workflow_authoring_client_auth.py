@@ -402,6 +402,9 @@ def _request_auth_failures(
     including imported aliases and module-level helpers passed by name. HTTP
     helpers from other modules (for example ``mcp_utils.get_json``) remain
     outside this AST scan and are pinned by the executed client tests instead.
+    Parameters named ``auth_headers`` are trusted without inspecting their call
+    sites, and module-level ``requests.Session`` instances and their method calls
+    are not scanned.
     """
     tree = ast.parse(inspect.getsource(module))
     functions = {
