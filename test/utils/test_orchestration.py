@@ -23,21 +23,35 @@ from cli_agent_orchestrator.utils.orchestration import (
 
 
 class TestAuthHeaders:
-    """Tests for the local-auth bearer helper (review on PR #634).
+    """Tests for the local-auth bearer helper (review on PR #634, scoped on #802).
 
-    ``_auth_headers()`` is what every ``requests`` call in this module passes as
-    ``headers=_auth_headers() or None`` -- without it, an auth-enabled cao-server
-    rejects every orchestration call with a 401.
+    ``_auth_headers(dest)`` is what every ``requests`` call in this module passes
+    as ``headers=_auth_headers(<base url>) or None`` -- without it, an
+    auth-enabled cao-server rejects every orchestration call with a 401. The
+    credential is attached only when ``dest`` is this process's own server.
     """
 
+    @patch(
+        "cli_agent_orchestrator.utils.orchestration._own_server_base_url",
+        return_value="http://own.example:9889",
+    )
     @patch("cli_agent_orchestrator.utils.orchestration.get_local_bearer", return_value="tok")
-    def test_returns_bearer_header_when_token_configured(self, _bearer):
-        assert _auth_headers() == {"Authorization": "Bearer tok"}
+    def test_returns_bearer_header_for_own_server(self, _bearer, _own):
+        assert _auth_headers("http://own.example:9889") == {"Authorization": "Bearer tok"}
+
+    @patch(
+        "cli_agent_orchestrator.utils.orchestration._own_server_base_url",
+        return_value="http://own.example:9889",
+    )
+    @patch("cli_agent_orchestrator.utils.orchestration.get_local_bearer", return_value="tok")
+    def test_returns_empty_dict_for_foreign_host(self, _bearer, _own):
+        """A caller-supplied target that is not this server gets no credential."""
+        assert _auth_headers("http://foreign.example:9889") == {}
 
     @patch("cli_agent_orchestrator.utils.orchestration.get_local_bearer", return_value=None)
     def test_returns_empty_dict_when_no_token(self, _bearer):
         """Default-off: no Authorization header -- byte-for-byte unchanged."""
-        assert _auth_headers() == {}
+        assert _auth_headers(API_BASE_URL) == {}
 
 
 class TestStatusImpl:

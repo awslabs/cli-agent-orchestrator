@@ -42,6 +42,7 @@ from cli_agent_orchestrator.mcp_server.models import HandoffResult
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.security.auth import get_local_bearer
+from cli_agent_orchestrator.security.bearer import authorization_header
 from cli_agent_orchestrator.services.elastic_worker_gateway import (
     elastic_worker_gateway_headers,
 )
@@ -60,20 +61,59 @@ def _mcp_timeout() -> float:
     return float(get_server_settings()["mcp_request_timeout"])
 
 
-def _auth_headers() -> Dict[str, str]:
-    """Return the ``Authorization`` header for the internal client->API hop, if any.
+def _own_server_base_url() -> str:
+    """This process's own cao-server base URL, resolved at call time.
 
-    Mirrors ``mcp_server.utils._auth_headers`` / ``mcp_server.app_tools._auth_headers``:
-    attaches the operator-provisioned ``CAO_AUTH_LOCAL_TOKEN`` when the auth layer is
-    enabled, and returns an empty mapping default-off so the no-auth posture stays
+    ``CAO_API_BASE_URL`` when set (an explicitly selected shared server), else
+    ``constants.API_BASE_URL``. Read live so a value exported after import still
+    wins and so tests can point it at a stub.
+    """
+    from cli_agent_orchestrator import constants
+
+    override = os.environ.get("CAO_API_BASE_URL", "").strip().rstrip("/")
+    return override or constants.API_BASE_URL
+
+
+def _origin(url: str) -> Tuple[str, str, int]:
+    """``(scheme, host, port)`` for *url*, with default ports normalized.
+
+    A bare ``host``/``host:port`` (no scheme) is treated as ``http://`` — the
+    same assumption ``_resolve_target_base_url`` makes — so the comparison in
+    :func:`_auth_headers` lines up with the URL actually requested.
+    """
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(url if "://" in url else f"http://{url}")
+    scheme = (parts.scheme or "http").lower()
+    host = (parts.hostname or "").lower()
+    port = parts.port
+    if port is None:
+        port = 443 if scheme == "https" else 80
+    return (scheme, host, port)
+
+
+def _auth_headers(destination_base_url: str) -> Dict[str, str]:
+    """``Authorization`` header for a call to *destination_base_url*, if any.
+
+    The controller's ``CAO_AUTH_LOCAL_TOKEN`` authenticates it to its OWN
+    cao-server only. It is attached only when *destination_base_url* has the
+    same origin (scheme, host, port) as this process's server; a caller-supplied
+    ``target_host`` pointing anywhere else — including the ``/health`` probe that
+    happens before the endpoint is even known to be a cao-server — gets no
+    credential, so the local token is never disclosed to an arbitrary host
+    (haofeif P1 on #802). The bearer token, when attached, is carried in the
+    Authorization header via the shared builder.
+
+    Returns an empty mapping default-off (no token) so the no-auth posture is
     byte-for-byte unchanged. Every ``requests`` call in this module passes
-    ``headers=_auth_headers() or None`` -- without this, an auth-enabled deployment's
-    cao-server rejects every one of these calls with a 401 and the CLI/MCP orchestration
-    surface (assign, handoff, send_message, status, result, cancel, delete_terminal)
-    cannot be used at all.
+    ``headers=_auth_headers(<its base url>) or None``.
     """
     token = get_local_bearer()
-    return {"Authorization": f"Bearer {token}"} if token else {}
+    if not token:
+        return {}
+    if _origin(destination_base_url) != _origin(_own_server_base_url()):
+        return {}
+    return authorization_header(token)
 
 
 # Environment variable to enable/disable automatic sender terminal ID injection.
@@ -127,7 +167,7 @@ def _get_cleanup_nudge() -> str:
             return ""
         resp = requests.get(
             f"{API_BASE_URL}/terminals/{current_terminal_id}",
-            headers=_auth_headers() or None,
+            headers=_auth_headers(API_BASE_URL) or None,
             timeout=_mcp_timeout(),
         )
         if resp.status_code != 200:
@@ -137,7 +177,7 @@ def _get_cleanup_nudge() -> str:
             return ""
         resp = requests.get(
             f"{API_BASE_URL}/sessions/{session_name}/terminals",
-            headers=_auth_headers() or None,
+            headers=_auth_headers(API_BASE_URL) or None,
             timeout=_mcp_timeout(),
         )
         if resp.status_code != 200:
@@ -257,7 +297,7 @@ def _wait_remote_ready(base_url: str, timeout: float) -> None:
         attempt += 1
         try:
             response = requests.get(
-                f"{base_url}/health", timeout=(2.0, 5.0), headers=_auth_headers() or None
+                f"{base_url}/health", timeout=(2.0, 5.0), headers=_auth_headers(base_url) or None
             )
             if response.status_code < 400:
                 if attempt > 1:
@@ -304,7 +344,7 @@ def _resolve_remote_provider(base_url: str, agent_profile: str) -> str:
         response = requests.get(
             f"{base_url}/agents/profiles/{agent_profile}",
             timeout=(REMOTE_CONNECT_TIMEOUT, _mcp_timeout()),
-            headers=_auth_headers() or None,
+            headers=_auth_headers(base_url) or None,
         )
     except requests.RequestException as exc:
         raise ValueError(
@@ -339,7 +379,7 @@ def _cleanup_remote_terminal(base_url: str, terminal_id: str) -> bool:
         response = requests.delete(
             f"{base_url}/terminals/{terminal_id}",
             timeout=(REMOTE_CONNECT_TIMEOUT, _mcp_timeout()),
-            headers=_auth_headers() or None,
+            headers=_auth_headers(base_url) or None,
         )
         if response.status_code == 404:
             return True
@@ -470,7 +510,7 @@ def _create_terminal(
         # Get terminal metadata via API
         response = requests.get(
             f"{API_BASE_URL}/terminals/{current_terminal_id}",
-            headers=_auth_headers() or None,
+            headers=_auth_headers(API_BASE_URL) or None,
             timeout=_mcp_timeout(),
         )
         response.raise_for_status()
@@ -486,7 +526,7 @@ def _create_terminal(
             try:
                 response = requests.get(
                     f"{API_BASE_URL}/terminals/{current_terminal_id}/working-directory",
-                    headers=_auth_headers() or None,
+                    headers=_auth_headers(API_BASE_URL) or None,
                     timeout=_mcp_timeout(),
                 )
                 if response.status_code == 200:
@@ -542,7 +582,7 @@ def _create_terminal(
             f"{API_BASE_URL}/sessions/{session_name}/terminals",
             params=params,
             json=json_body,
-            headers=_auth_headers() or None,
+            headers=_auth_headers(API_BASE_URL) or None,
             timeout=create_timeout if create_timeout is not None else _mcp_timeout(),
         )
         response.raise_for_status()
@@ -610,7 +650,7 @@ def _create_terminal(
             f"{API_BASE_URL}/sessions",
             params=params,
             json=json_body,
-            headers=_auth_headers() or None,
+            headers=_auth_headers(API_BASE_URL) or None,
             timeout=create_timeout if create_timeout is not None else _mcp_timeout(),
         )
         response.raise_for_status()
@@ -643,7 +683,7 @@ def _send_direct_input(
             "sender_id": _current_terminal_id() or "supervisor",
             "orchestration_type": orchestration_type,
         },
-        headers=_auth_headers() or None,
+        headers=_auth_headers(API_BASE_URL) or None,
         timeout=_mcp_timeout(),
     )
     response.raise_for_status()
@@ -732,7 +772,7 @@ def _resolve_handoff_provider(agent_profile: str) -> HandoffContext:
 
     response = requests.get(
         f"{API_BASE_URL}/terminals/{current_terminal_id}",
-        headers=_auth_headers() or None,
+        headers=_auth_headers(API_BASE_URL) or None,
         timeout=_mcp_timeout(),
     )
     response.raise_for_status()
@@ -828,15 +868,19 @@ def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
     params = {"sender_id": sender_id, "message": message}
     # BOTH header sets, and the union is not a compromise between two merge
     # sides -- they are disjoint and independently load-bearing.
-    # `_auth_headers()` carries the local `Authorization: Bearer` an
-    # auth-enabled cao-server rejects every call without (haofeif's P2 on PR
-    # #634); `elastic_worker_gateway_headers()` carries the broker's
+    # `_auth_headers(dest)` carries the local bearer token in the Authorization
+    # header an auth-enabled cao-server rejects every call without (haofeif's P2
+    # on PR #634), but only when `dest` is this process's own server;
+    # `elastic_worker_gateway_headers()` carries the broker's
     # worker-id/release-token pair an elastic worker's callback hop needs. They
     # share no key, so neither can shadow the other, and an auth-enabled
     # elastic deployment genuinely needs both on the same request. Each is
     # empty when its own feature is off, so the default-off posture is still
-    # byte-for-byte `None`.
-    request_headers = {**_auth_headers(), **elastic_worker_gateway_headers()} or None
+    # byte-for-byte `None`. The header set is rebuilt per destination so the
+    # local bearer is scoped to the URL actually posted to, not carried across
+    # to a foreign callback node.
+    gateway_headers = elastic_worker_gateway_headers()
+    request_headers = {**_auth_headers(base_url), **gateway_headers} or None
     response = requests.post(
         f"{base_url}/terminals/{receiver_id}/inbox/messages",
         params=params,
@@ -847,10 +891,11 @@ def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
         # Receiver unknown on this node but a cross-node supervisor is
         # recorded — the caller likely quoted a terminal ID that lives on the
         # supervisor's node. One retry against that node before failing.
+        retry_headers = {**_auth_headers(callback_url), **gateway_headers} or None
         response = requests.post(
             f"{callback_url}/terminals/{receiver_id}/inbox/messages",
             params=params,
-            headers=request_headers,
+            headers=retry_headers,
             timeout=_mcp_timeout(),
         )
     response.raise_for_status()
@@ -945,7 +990,7 @@ async def _run_step_and_build_result(
         response = requests.post(
             f"{base_url}/terminals/run-step",
             json=payload,
-            headers=_auth_headers() or None,
+            headers=_auth_headers(base_url) or None,
             timeout=request_timeout,
         )
     except requests.Timeout:
@@ -1480,7 +1525,7 @@ def _assign_remote(
             },
         },
         timeout=(REMOTE_CONNECT_TIMEOUT, _mcp_timeout()),
-        headers=_auth_headers() or None,
+        headers=_auth_headers(base_url) or None,
     )
     if response.status_code >= 400:
         # Surface the remote node's JSON detail (e.g. a 429 "Terminal limit
@@ -1553,7 +1598,9 @@ def _wait_runtime_connected(runtime_id: str, wait_seconds: float) -> None:
     while time.monotonic() < deadline:
         try:
             response = requests.get(
-                f"{API_BASE_URL}/runtimes", timeout=(5, 10), headers=_auth_headers() or None
+                f"{API_BASE_URL}/runtimes",
+                timeout=(5, 10),
+                headers=_auth_headers(API_BASE_URL) or None,
             )
             response.raise_for_status()
             if runtime_id in response.json().get("runtimes", {}):
@@ -1646,7 +1693,7 @@ def _assign_bridge(
         f"{API_BASE_URL}/runtimes/{runtime_id}/terminals",
         json=body,
         timeout=(REMOTE_CONNECT_TIMEOUT, 300),
-        headers=_auth_headers() or None,
+        headers=_auth_headers(API_BASE_URL) or None,
     )
     if response.status_code >= 400:
         detail = _extract_error_detail(response, f"status {response.status_code}")
@@ -1845,7 +1892,7 @@ def _send_message_impl(receiver_id: Optional[str], message: str) -> Dict[str, An
                 }
             response = requests.get(
                 f"{API_BASE_URL}/terminals/{own_terminal_id}",
-                headers=_auth_headers() or None,
+                headers=_auth_headers(API_BASE_URL) or None,
                 timeout=_mcp_timeout(),
             )
             try:
@@ -1933,7 +1980,7 @@ def _delete_terminal_impl(terminal_id: str, target_host: Optional[str] = None) -
         base_url = _resolve_target_base_url(target_host) if target_host else API_BASE_URL
         response = requests.delete(
             f"{base_url}/terminals/{terminal_id}",
-            headers=_auth_headers() or None,
+            headers=_auth_headers(base_url) or None,
             # A remote node that is unreachable must fail on CONNECT rather than
             # hang for the full read timeout; a local delete keeps its single
             # scalar timeout so default-path behavior is unchanged.
@@ -1989,7 +2036,7 @@ def _status_impl(terminal_id: str) -> Dict[str, Any]:
     try:
         response = requests.get(
             f"{API_BASE_URL}/terminals/{terminal_id}",
-            headers=_auth_headers() or None,
+            headers=_auth_headers(API_BASE_URL) or None,
             timeout=_mcp_timeout(),
         )
         if response.status_code == 404:
@@ -2036,7 +2083,7 @@ def _result_impl(terminal_id: str) -> Dict[str, Any]:
         response = requests.get(
             f"{API_BASE_URL}/terminals/{terminal_id}/output",
             params={"mode": "last"},
-            headers=_auth_headers() or None,
+            headers=_auth_headers(API_BASE_URL) or None,
             timeout=_mcp_timeout(),
         )
         if response.status_code == 404:
@@ -2084,7 +2131,7 @@ def _cancel_impl(terminal_id: str, delete: bool = False) -> Dict[str, Any]:
         response = requests.post(
             f"{API_BASE_URL}/terminals/{terminal_id}/key",
             params={"key": "C-c"},
-            headers=_auth_headers() or None,
+            headers=_auth_headers(API_BASE_URL) or None,
             timeout=_mcp_timeout(),
         )
         if response.status_code == 404:
