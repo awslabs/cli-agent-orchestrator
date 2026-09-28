@@ -482,6 +482,76 @@ class RuntimeChannelRegistry:
         self.bind_terminal(terminal_id, runtime_id)
         return True
 
+    def _claim_lock_only(self, terminal_id: str, runtime_id: str) -> Optional[bool]:
+        """The part of a claim decision that needs no durable row; call under the
+        lock. Returns True/False when decided, or None when the placement row
+        must be read to decide."""
+        if terminal_id in self._tombstones:
+            logger.warning(
+                "runtime %s tried to claim terminal %s after it was deleted; refusing",
+                runtime_id,
+                terminal_id,
+            )
+            return False
+        current = self._terminal_runtime.get(terminal_id)
+        if current == runtime_id:
+            return True
+        if current is not None:
+            logger.warning(
+                "runtime %s tried to claim terminal %s already bound to %s; refusing",
+                runtime_id,
+                terminal_id,
+                current,
+            )
+            return False
+        return None
+
+    async def claim_terminal_async(self, terminal_id: str, runtime_id: str) -> bool:
+        """:meth:`claim_terminal` for callers on the channel loop.
+
+        Same decision, but the cold-path placement DB read runs in
+        ``asyncio.to_thread`` so it never blocks the single frame reader, and the
+        binding is re-checked under the lock after it returns — a hello or another
+        frame could have bound or torn the terminal down while the read was in
+        flight (Augusto nit on #802). The lock-only cases (continuation,
+        tombstone, already bound elsewhere) never touch the DB.
+        """
+        with self._lock:
+            decided = self._claim_lock_only(terminal_id, runtime_id)
+        if decided is not None:
+            return decided
+        try:
+            state, placement = await asyncio.to_thread(self._placement_state, terminal_id)
+        except PlacementUnavailableError:
+            logger.warning(
+                "runtime %s claim of terminal %s refused: placement unreadable",
+                runtime_id,
+                terminal_id,
+            )
+            return False
+        with self._lock:
+            decided = self._claim_lock_only(terminal_id, runtime_id)
+            if decided is not None:
+                return decided
+            if state == "named" and placement != runtime_id:
+                logger.warning(
+                    "runtime %s tried to claim terminal %s placed on %s; refusing",
+                    runtime_id,
+                    terminal_id,
+                    placement,
+                )
+                return False
+            if state == "local":
+                logger.warning(
+                    "runtime %s tried to claim terminal %s, which is a local terminal; refusing",
+                    runtime_id,
+                    terminal_id,
+                )
+                return False
+            self._terminal_runtime[terminal_id] = runtime_id
+            self._recovered_placement.pop(terminal_id, None)
+            return True
+
     def unbind_terminal(self, terminal_id: str, deleted: bool = False) -> None:
         """Drop routing state for a terminal.
 

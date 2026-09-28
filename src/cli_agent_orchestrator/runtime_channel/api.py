@@ -576,7 +576,7 @@ async def runtime_channel(ws: WebSocket) -> None:
         # token makes that a claim, not a proof: refuse any it does not own and
         # drop the entry from resume, so the server never hands a claiming
         # runtime the stream position of a terminal it never launched.
-        if not runtime_registry.claim_terminal(stream_pos.terminal_id, runtime_id):
+        if not await runtime_registry.claim_terminal_async(stream_pos.terminal_id, runtime_id):
             continue
         bound_this_hello.add(stream_pos.terminal_id)
         # ESTABLISH the advertised generation, rather than only echoing it back.
@@ -685,7 +685,7 @@ async def runtime_channel(ws: WebSocket) -> None:
                 # can just as easily emit a StreamFrame for a terminal it does
                 # not own to republish its output and advance its position; a
                 # refused claim drops the frame rather than rebinding.
-                if not runtime_registry.claim_terminal(frame.terminal_id, runtime_id):
+                if not await runtime_registry.claim_terminal_async(frame.terminal_id, runtime_id):
                     continue
                 if frame.stream == StreamName.ATTACH:
                     # Interactive bytes go to the live attach client, never
@@ -803,7 +803,7 @@ async def runtime_channel(ws: WebSocket) -> None:
                 # terminal frames — otherwise a shared-token runtime could forge a
                 # gap for a terminal it does not own and make the server discard or
                 # report output that was never its (Copilot follow-up on #802).
-                if not runtime_registry.claim_terminal(frame.terminal_id, runtime_id):
+                if not await runtime_registry.claim_terminal_async(frame.terminal_id, runtime_id):
                     continue
                 # Same generation fence as StreamFrame: a gap declared by a
                 # superseded stream says nothing about the live one.
@@ -865,7 +865,7 @@ async def runtime_channel(ws: WebSocket) -> None:
                     },
                 )
             elif isinstance(frame, EventFrame):
-                if not runtime_registry.claim_terminal(frame.terminal_id, runtime_id):
+                if not await runtime_registry.claim_terminal_async(frame.terminal_id, runtime_id):
                     continue
                 if frame.type == EventType.STATUS and frame.status is not None:
                     # Publish only the status the registry ACCEPTED: a stale
@@ -897,7 +897,9 @@ async def runtime_channel(ws: WebSocket) -> None:
                         )
             elif isinstance(frame, HeartbeatFrame):
                 for stream_pos in frame.streams:
-                    if not runtime_registry.claim_terminal(stream_pos.terminal_id, runtime_id):
+                    if not await runtime_registry.claim_terminal_async(
+                        stream_pos.terminal_id, runtime_id
+                    ):
                         continue
                     _note_heartbeat_watermark(behind, stream_pos, runtime_id)
             else:
