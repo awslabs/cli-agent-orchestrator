@@ -154,10 +154,11 @@ class TestAsPipePaneRunsIt:
         read_fd = _reader(fifo)
         try:
             proc = self._spawn(fifo)
-            proc.stdin.write(b"hello from the pane\n")
-            proc.stdin.close()
+            # communicate() writes stdin and closes it itself; closing it by
+            # hand first makes communicate() raise on Python 3.10-3.12
+            # ("flush of closed file"), which only 3.13+ tolerates.
+            _, err = proc.communicate(b"hello from the pane\n", timeout=10)
             out = _drain(read_fd, len(b"hello from the pane\n"))
-            _, err = proc.communicate(timeout=10)
         finally:
             os.close(read_fd)
         assert proc.returncode == 0, err
@@ -169,9 +170,7 @@ class TestAsPipePaneRunsIt:
         link = tmp_path / "t.fifo"
         link.symlink_to(victim)
         proc = self._spawn(link)
-        proc.stdin.write(b"stolen output\n")
-        proc.stdin.close()
-        _, err = proc.communicate(timeout=10)
+        _, err = proc.communicate(b"stolen output\n", timeout=10)
         assert proc.returncode == 1
         assert b"fifo_writer" in err
         assert victim.read_bytes() == b""
