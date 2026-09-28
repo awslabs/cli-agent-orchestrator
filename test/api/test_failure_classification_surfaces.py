@@ -141,7 +141,7 @@ def test_the_cli_and_the_mcp_tool_agree(client, monkeypatch):
     monkeypatch.setattr(
         cli_workflow.requests,
         "get",
-        lambda url, timeout=None: client.get("/workflows/runs/run-agree/result"),
+        lambda url, timeout=None, headers=None: client.get("/workflows/runs/run-agree/result"),
     )
     result = CliRunner().invoke(cli_workflow.workflow, ["result", "run-agree"])
 
