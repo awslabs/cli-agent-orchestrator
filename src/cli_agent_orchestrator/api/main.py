@@ -4728,7 +4728,14 @@ async def validate_workflow_endpoint(
     # when ``path`` became optional at the model level; fixed here because ``mypy`` runs
     # ``continue-on-error`` in CI and would never have failed a PR over it.
     spec_path = body.path
-    assert spec_path is not None  # guaranteed by the exactly-one check above
+    if spec_path is None:
+        # Keep this invariant explicit under ``python -O``. The normal request path is
+        # rejected by the exactly-one check above; this defensive arm uses the same
+        # path-free client-error convention if the request model is ever mutated.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="supply exactly one of 'path' or 'source'",
+        )
 
     ext = _os.path.splitext(spec_path)[1].lower()
     if ext in (".yaml", ".yml"):
