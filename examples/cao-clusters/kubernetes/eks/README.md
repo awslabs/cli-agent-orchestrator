@@ -217,6 +217,35 @@ returned. The broker reaps it and records why; see [Reading the lease
 ledger](#reading-the-lease-ledger). Custom profiles should say "do all tool calls
 first, speak once at the end".
 
+## What moved, and what it costs
+
+Centralizing the server is not a free win. Ten agents cost one server rather
+than eleven, tmux never runs on the server, and a single owner lock (not merely
+`replicas: 1`) makes overlapping writers impossible — but one property genuinely
+regressed, and one limitation remains open.
+
+**The boundary is a single trust domain until #774.** The runtime channel and
+the shared MCP endpoint both authenticate with one fleet-shared
+`CAO_RUNTIME_TOKEN`, so a connected runtime is only ever proven to be *some*
+authorized executor — never proven to be the specific one that launched a given
+terminal. Possession of that token is possession of the control API. Per-runtime
+delegated credentials (#774) replace it with a verified per-caller subject; until
+they land, treat every executor in the fleet as equally trusted.
+
+**Known limitation — shared-token terminal binding.** Terminal ids are
+runtime-minted UUIDs, and the ownership check that guards inbound channel frames
+allows a bind when no central row exists yet (the launch/reconcile window) and
+the id was not deleted here. A row that names a different runtime, a
+confirmed-local row, and a tombstoned id are all refused, so the cross-runtime
+hijack the reviewers reproduced is closed. What stays open is narrower: with a
+shared token, a runtime can still bind a terminal id that has **no central row
+yet**. The ids are unguessable UUIDs and such a phantom has no pane or output to
+hijack, but the bind is not *proven* to belong to the claiming runtime. #774's
+per-runtime credentials close this residual.
+
+The full rationale is in
+`docs/issues/745-remote-execution-boundary/design.md`.
+
 <a id="the-shared-mcp-endpoint"></a>
 ## The shared MCP endpoint
 
@@ -924,9 +953,12 @@ this pod does not run: it answered `[]` with four live agents in executor pods.
 
 Every component in this namespace runs the **same image**, and that is the
 supported configuration. The runtime channel carries an explicit
-`PROTOCOL_VERSION` (`runtime_channel/protocol.py`, currently `2`), checked for
+`PROTOCOL_VERSION` (`runtime_channel/protocol.py`, currently `3`), checked for
 **equality** on both sides of the `hello` exchange — there is no negotiation and no
-compatibility window.
+compatibility window. Because the check is equality, `cao-server` and every
+executor — the supervisor and every broker-minted worker included — move
+together across a version bump: a bridge on the previous version (`2`) is
+refused at `hello` and stays unready until it is replaced with the new image.
 
 | Pairing | Result |
 |---|---|
@@ -945,7 +977,7 @@ mismatch on every attempt, and keeps whatever tmux sessions it already had.
 Nothing half-works.
 
 Observed in this namespace during #745's validation, when two executors were
-left on an older image while the server moved to `PROTOCOL_VERSION` 2: both sat
+left on an older image while the server moved to a newer `PROTOCOL_VERSION`: both sat
 at `0/1` for hours, neither appeared in `GET /runtimes`, and no work reached
 them — the gate behaving exactly as described. It also exposed a retry bug now
 fixed: the backoff was reset as soon as the socket opened, and a mismatch is
@@ -1440,11 +1472,14 @@ cancel the deletion only if you need to read an etcd backup from that cluster.
 
 ## Testing the broker
 
-`broker.py` is not part of the CAO package and needs `fastapi` plus the
-Kubernetes client, so its test runs in a throwaway environment. It stubs the API
+`examples/cao-clusters/kubernetes/eks/test_broker.py` is a **manual** suite:
+CI does not run it. The pipeline's `pytest` covers only `test/` and
+`examples/workflow/tests/` (`.github/workflows/ci.yml`), and `broker.py` is not
+part of the CAO package and needs `fastapi` plus the Kubernetes client, so its
+test runs in a throwaway environment. It stubs the API
 server and pushes every `V1*` object through the client's real serializer, which
 is what actually rejects a bad field name — so a mistake fails on a laptop rather
-than at the first lease on a live cluster.
+than at the first lease on a live cluster. Run it yourself with:
 
 ```bash
 uv venv /tmp/brokertest --python 3.12
