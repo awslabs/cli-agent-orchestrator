@@ -29,11 +29,13 @@ import pytest
 from cli_agent_orchestrator.constants import LOCK_DIR
 from cli_agent_orchestrator.utils.atomic_file import (
     LockTimeoutError,
+    LockUnavailableError,
     _file_lock,
     _lock_path_for,
     locked_atomic_delete,
     locked_atomic_rewrite,
     locked_atomic_write,
+    strict_target_lock,
 )
 
 
@@ -107,6 +109,56 @@ def test_lock_path_stable_and_distinct(tmp_path: Path) -> None:
     # A different target must not collide.
     other = tmp_path / "sub" / "CLAUDE.md"
     assert _lock_path_for(other) != first
+
+
+def test_strict_lock_refuses_to_run_without_fcntl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import cli_agent_orchestrator.utils.atomic_file as atomic_file_module
+
+    target = tmp_path / "workflow.py"
+    monkeypatch.setattr(atomic_file_module, "_FCNTL_AVAILABLE", False)
+
+    with pytest.raises(LockUnavailableError, match="unavailable"):
+        with strict_target_lock(target):
+            pytest.fail("strict lock must never yield without process locking")
+
+    assert not target.exists()
+
+
+def test_strict_lock_keeps_one_permanent_lock_inode(tmp_path: Path) -> None:
+    target = tmp_path / "workflow.py"
+    lock_path = _lock_path_for(target)
+
+    with strict_target_lock(target):
+        first_inode = lock_path.stat().st_ino
+    with strict_target_lock(target):
+        second_inode = lock_path.stat().st_ino
+
+    assert first_inode == second_inode
+    assert lock_path.exists()
+
+
+def test_strict_lock_open_failure_never_yields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import cli_agent_orchestrator.utils.atomic_file as atomic_file_module
+
+    target = tmp_path / "workflow.py"
+    real_open = atomic_file_module.os.open
+    lock_path = _lock_path_for(target)
+
+    def _failing_open(path: str, *args: object, **kwargs: object) -> int:
+        if path == str(lock_path):
+            raise OSError("lock storage unavailable")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(atomic_file_module.os, "open", _failing_open)
+    with pytest.raises(LockUnavailableError, match="cannot open workflow lock"):
+        with strict_target_lock(target):
+            pytest.fail("strict lock must not yield after lockfile open failure")
+
+    assert not target.exists()
 
 
 def test_creates_parent_directory(tmp_path: Path) -> None:

@@ -65,6 +65,7 @@ so this is a pragmatic fallback, not the primary supported path.
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import logging
 import os
@@ -106,11 +107,26 @@ def _lock_path_for(target: Path) -> Path:
     stable regardless of whether the target exists at lock time.
     """
     resolved = str(target.resolve(strict=False))
-    digest = hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:16]
+    return _lock_path_for_identity(resolved)
+
+
+def _lock_path_for_identity(identity: str) -> Path:
+    """Return the permanent common lock path for an exact caller identity.
+
+    Callers with filesystem-specific aliasing rules may supply an identity
+    normalized for their storage contract. This helper deliberately performs
+    no path resolution or case normalization itself; the existing target-based
+    lock behavior remains unchanged.
+    """
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
     return LOCK_DIR / f"{digest}.lock"
 
 
-class LockTimeoutError(TimeoutError):
+class LockUnavailableError(OSError):
+    """Raised when a required inter-process lock cannot be provided."""
+
+
+class LockTimeoutError(LockUnavailableError, TimeoutError):
     """Raised when the inter-process lock cannot be acquired in time."""
 
     def __init__(self, lock_path: Path, timeout: float) -> None:
@@ -120,6 +136,65 @@ class LockTimeoutError(TimeoutError):
             f"timed out after {timeout}s waiting for lock {lock_path} "
             "(another process is holding it)"
         )
+
+
+@contextlib.contextmanager
+def strict_target_lock(
+    target: Path,
+    *,
+    lock_timeout: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
+    lock_identity: str | None = None,
+) -> Iterator[None]:
+    """Hold the permanent common lock for ``target`` or refuse explicitly.
+
+    Unlike the older general-purpose helpers' best-effort fallback, this
+    context never yields unless ``fcntl.flock`` is available and acquired.
+    Workflow create/update use this strict boundary because proceeding unlocked
+    would make their existence/hash checks racy again.
+    """
+    lock_path = (
+        _lock_path_for(target) if lock_identity is None else _lock_path_for_identity(lock_identity)
+    )
+    if not _FCNTL_AVAILABLE or fcntl is None:
+        raise LockUnavailableError(
+            f"inter-process locking is unavailable for workflow target {target}"
+        )
+
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        lock_fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT, 0o600)
+    except OSError as exc:
+        raise LockUnavailableError(f"cannot open workflow lock {lock_path}") from exc
+
+    acquired = False
+    deadline = time.monotonic() + lock_timeout
+    try:
+        while True:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise LockTimeoutError(lock_path, lock_timeout)
+                time.sleep(_LOCK_POLL_INTERVAL_SECONDS)
+            except OSError as exc:
+                if exc.errno in (errno.EACCES, errno.EAGAIN):
+                    if time.monotonic() >= deadline:
+                        raise LockTimeoutError(lock_path, lock_timeout) from exc
+                    time.sleep(_LOCK_POLL_INTERVAL_SECONDS)
+                    continue
+                raise LockUnavailableError(
+                    f"inter-process locking is unsupported for {lock_path}"
+                ) from exc
+        yield
+    finally:
+        if acquired:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        os.close(lock_fd)
 
 
 @contextlib.contextmanager
