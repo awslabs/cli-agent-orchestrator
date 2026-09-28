@@ -19,11 +19,11 @@ own memory as the whole truth.
 import pytest
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.runtime_channel.protocol import CommandType
 from cli_agent_orchestrator.runtime_channel.registry import (
     RuntimeChannelRegistry,
     RuntimeUnavailableError,
 )
-from cli_agent_orchestrator.runtime_channel.protocol import CommandType
 
 TID = "aaaa1111"
 

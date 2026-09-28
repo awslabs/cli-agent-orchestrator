@@ -18,11 +18,10 @@ Two invariants live here rather than in the transport:
   cannot settle the current assignment.
 """
 
+import base64
 import json
 from enum import Enum
 from typing import Annotated, Any, Dict, List, Literal, Optional, Union
-
-import base64
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator
 

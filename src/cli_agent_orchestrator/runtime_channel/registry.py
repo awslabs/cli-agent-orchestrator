@@ -15,11 +15,11 @@ terminal.
 """
 
 import asyncio
-from collections import OrderedDict
 import logging
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from typing import Awaitable, Callable, Dict, Iterable, List, Optional, Tuple
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
