@@ -1285,6 +1285,10 @@ async def test_remote_script_run_executes_in_runtime_and_completes(
     class _RoutingConn:
         runtime_id = "worker-live"
 
+        async def ack(self, op_id):
+            # The remote script driver now acks after finalize (haefeif #3).
+            return None
+
         async def send_command(
             self, command_type, payload, terminal_id=None, timeout=None, op_id=None
         ):
@@ -1344,6 +1348,9 @@ async def test_remote_script_run_nonzero_exit_is_failed(
 
     class _RoutingConn:
         runtime_id = "worker-live"
+
+        async def ack(self, op_id):
+            return None
 
         async def send_command(
             self, command_type, payload, terminal_id=None, timeout=None, op_id=None

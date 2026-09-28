@@ -311,6 +311,9 @@ class TestCancellationNamesTheRunningOperation:
         seen = {}
 
         class _Conn:
+            async def ack(self, op_id):
+                return None
+
             async def send_command(self, command_type, payload, **kwargs):
                 # Captured here rather than after the call: the driver clears
                 # record.remote_script in its own `finally`.

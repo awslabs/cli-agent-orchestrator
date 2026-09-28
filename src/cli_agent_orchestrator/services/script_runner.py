@@ -1136,6 +1136,7 @@ async def _drive_process_remote(
     """
     from cli_agent_orchestrator.runtime_channel.protocol import CommandType
     from cli_agent_orchestrator.runtime_channel.registry import (
+        RuntimeNotDispatchedError,
         RuntimeUnavailableError,
         runtime_registry,
     )
@@ -1200,6 +1201,24 @@ async def _drive_process_remote(
             timeout=wait_timeout,
             op_id=op_id,
         )
+    except RuntimeNotDispatchedError:
+        # Nothing was put on the wire (RuntimeNotDispatchedError is the provable
+        # non-dispatch case), so the outcome is KNOWN: the run failed to dispatch.
+        # Settle the journal — no redelivery is possible — and fail with a definite
+        # reason, not "outcome unknown". Caught before RuntimeUnavailableError,
+        # which it subclasses (haefeif #3 on #802).
+        try:
+            from cli_agent_orchestrator.clients.database import settle_dispatch
+
+            settle_dispatch(op_id)
+        except Exception:  # noqa: BLE001
+            logger.warning("could not settle RUN_SCRIPT dispatch for op %s", op_id, exc_info=True)
+        return await _finalize(
+            record,
+            state=RunState.FAILED,
+            kind="error",
+            error=f"script runtime '{runtime_id}' is not connected",
+        )
     except RuntimeUnavailableError:
         await _reconcile_orphans(record.run_id)
         return await _finalize(
@@ -1220,13 +1239,28 @@ async def _drive_process_remote(
         record.remote_script = None
 
     payload = result.payload
-    return await _interpret_and_finalize(
+    outcome = await _interpret_and_finalize(
         record,
         returncode=payload.get("returncode"),
         stdout=payload.get("stdout", ""),
         stderr=payload.get("stderr", ""),
         timed_out=bool(payload.get("timed_out", False)),
     )
+    # The RUN_SCRIPT result's ack is deferred to here: the frame reader does not
+    # ack a matched RUN_SCRIPT, so the runtime keeps its retained copy until the
+    # outcome is durably applied. finalize has now written the run's terminal
+    # state, so settle the dispatch journal — this path never settled before, so
+    # every successful remote script left a permanent `dispatched` row — and ack.
+    # If finalize had raised, neither would run and the runtime would redeliver
+    # (haefeif #3 on #802).
+    try:
+        from cli_agent_orchestrator.clients.database import settle_dispatch
+
+        settle_dispatch(op_id)
+    except Exception:  # noqa: BLE001
+        logger.warning("could not settle RUN_SCRIPT dispatch for op %s", op_id, exc_info=True)
+    await conn.ack(op_id)
+    return outcome
 
 
 async def _drive_process(
@@ -1238,9 +1272,12 @@ async def _drive_process(
     only difference is the env (``CAO_WORKFLOW_RESUME``) and the script path
     (author file vs materialized snapshot). Never ``shell=True`` (C-2).
 
-    #745: when ``CAO_SCRIPT_RUNTIME`` names a connected runtime, execution is
-    relocated there (``_drive_process_remote``) instead of spawning locally;
-    the server keeps the record/journal/generation/cancel ownership either way.
+    #745: when ``CAO_SCRIPT_RUNTIME`` is set, the script ALWAYS runs in that
+    runtime (``_drive_process_remote``) — a disconnected runtime fails the run,
+    it never falls back to a local subprocess, because the setting exists to keep
+    author-supplied code out of the server container. Unset (the default, every
+    single-host install) is the local subprocess path below. The server keeps the
+    record/journal/generation/cancel ownership either way.
     """
     remote_runtime = _remote_script_runtime()
     if remote_runtime is not None:
