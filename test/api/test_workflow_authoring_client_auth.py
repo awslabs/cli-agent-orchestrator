@@ -404,7 +404,9 @@ def _request_auth_failures(
     outside this AST scan and are pinned by the executed client tests instead.
     Parameters named ``auth_headers`` are trusted without inspecting their call
     sites, and module-level ``requests.Session`` instances and their method calls
-    are not scanned.
+    are not scanned. The taint analysis is flow-insensitive, so reassigned or
+    conditional header values are not distinguished, and function-local
+    ``import requests as X`` aliases are not resolved.
     """
     tree = ast.parse(inspect.getsource(module))
     functions = {
