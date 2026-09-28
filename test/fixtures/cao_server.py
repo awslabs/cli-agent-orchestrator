@@ -649,30 +649,46 @@ def cao_server_with_auth(
         jwks.stop()
 
 
+# Phrases that mean a provider CLI could not start for an ENVIRONMENTAL reason
+# (not installed, unauthenticated, slow to init) — a property of the host, not a
+# broken contract. Deliberately does NOT include the provider name: a 5xx whose
+# body merely mentions the provider (e.g. "sqlite error while creating
+# claude_code terminal") is a real defect and must not be skipped.
+_PROVIDER_PREREQUISITE_PHRASES = (
+    "initialization timed out",
+    "not installed",
+    "not found",
+    "command not found",
+    "unusable help output",
+)
+
+
+def is_provider_prerequisite_failure(status_code: int, body: str) -> bool:
+    """True when a session-create 5xx is an environmental prerequisite miss.
+
+    Pure so it can be unit-tested without standing a server up. Matches only the
+    explicit environmental phrases above, never the provider name.
+    """
+    return status_code >= 500 and any(
+        phrase in body.lower() for phrase in _PROVIDER_PREREQUISITE_PHRASES
+    )
+
+
 def skip_if_provider_unusable(status_code: int, body: str, provider: str) -> None:
     """Skip when a session creation failed because the provider cannot boot here.
 
     Provider boot is fragile — the CLI may be installed but unauthenticated,
     rate-limited, or slow to TUI-init, and several wrappers read their login
     state from ``$HOME``, which this fixture deliberately redirects. A 5xx that
-    names the provider is a property of the machine, not a broken contract.
+    names one of the environmental phrases is a property of the machine, not a
+    broken contract.
 
     Shared so a test that drives a provider through a *subprocess* (``cao
     launch`` in an example runner) classifies the same failure the same way the
     ``cao_terminal`` fixture does, instead of reporting a red test for a CLI that
     was never going to start.
     """
-    if status_code >= 500 and any(
-        marker in body.lower()
-        for marker in (
-            "initialization timed out",
-            "not installed",
-            "not found",
-            "command not found",
-            "unusable help output",
-            provider.lower(),
-        )
-    ):
+    if is_provider_prerequisite_failure(status_code, body):
         pytest.skip(
             f"provider {provider!r} not usable on this host " f"(HTTP {status_code}): {body[:200]}"
         )
