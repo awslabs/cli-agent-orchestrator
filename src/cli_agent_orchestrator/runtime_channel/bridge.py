@@ -492,7 +492,10 @@ class Bridge:
             )
         if frame.type == CommandType.ATTACH_OPEN:
             opened = await self._attach_open(
-                terminal_id, int(payload.get("rows", 24)), int(payload.get("cols", 80))
+                terminal_id,
+                int(payload.get("rows", 24)),
+                int(payload.get("cols", 80)),
+                int(payload.get("epoch", 0)),
             )
             return (
                 CommandOutcome.OK if opened else CommandOutcome.FAILED,
@@ -500,25 +503,31 @@ class Bridge:
                 terminal_id,
             )
         if frame.type == CommandType.ATTACH_DATA:
-            written = self._attach_write(terminal_id, base64.b64decode(payload["data"]))
+            written = self._attach_write(
+                terminal_id, base64.b64decode(payload["data"]), payload.get("epoch")
+            )
             return CommandOutcome.OK, {"written": written}, terminal_id
         if frame.type == CommandType.RESIZE:
             resized = self._attach_resize(
-                terminal_id, int(payload.get("rows", 24)), int(payload.get("cols", 80))
+                terminal_id,
+                int(payload.get("rows", 24)),
+                int(payload.get("cols", 80)),
+                payload.get("epoch"),
             )
             return CommandOutcome.OK, {"resized": resized}, terminal_id
         if frame.type == CommandType.ATTACH_CLOSE:
-            await self._attach_close(terminal_id)
-            return CommandOutcome.OK, {"closed": True}, terminal_id
+            closed = await self._attach_close(terminal_id, epoch=payload.get("epoch"))
+            return CommandOutcome.OK, {"closed": closed}, terminal_id
         raise ValueError(f"unsupported command type: {frame.type.value}")
 
     # --- interactive attach (#776): PTY lives beside the tmux socket ---
 
-    async def _attach_open(self, terminal_id: str, rows: int, cols: int) -> bool:
+    async def _attach_open(self, terminal_id: str, rows: int, cols: int, epoch: int = 0) -> bool:
         """Spawn the backend's interactive attach client in a local PTY and
         pump its output up the channel as the ``attach`` stream. One attach
         per terminal; a second open replaces the first (last caller wins,
-        mirroring tmux's own attach semantics)."""
+        mirroring tmux's own attach semantics). The *epoch* stamps this attach's
+        frames so the server can tell them from a displaced attach's."""
         import fcntl
         import pty
         import struct
@@ -528,7 +537,11 @@ class Bridge:
         from cli_agent_orchestrator.backends.registry import get_backend
         from cli_agent_orchestrator.clients.database import get_terminal_metadata
 
-        await self._attach_close(terminal_id)
+        # A reopen REPLACES the PTY, it does not end the stream: the server
+        # already EOF'd the displaced client's sink when it bound the new one,
+        # so an EOF here would be routed to the NEW client and close it. Close
+        # the old PTY silently (Copilot review on #802).
+        await self._attach_close(terminal_id, notify_server=False)
 
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
@@ -543,47 +556,48 @@ class Bridge:
             logger.warning("attach open failed for %s: %s", terminal_id, exc)
             return False
 
-        master_fd, slave_fd = pty.openpty()
-        fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+        parent_fd, child_fd = pty.openpty()
+        fcntl.ioctl(child_fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
         env = dict(os.environ)
         if env.get("TERM", "dumb") == "dumb":
             env["TERM"] = "xterm-256color"
         proc = subprocess.Popen(
             attach_command,
-            stdin=slave_fd,
-            stdout=slave_fd,
-            stderr=slave_fd,
+            stdin=child_fd,
+            stdout=child_fd,
+            stderr=child_fd,
             close_fds=True,
             preexec_fn=os.setsid,
             env=env,
         )
-        os.close(slave_fd)
-        flag = fcntl.fcntl(master_fd, fcntl.F_GETFL)
-        fcntl.fcntl(master_fd, fcntl.F_SETFL, flag | os.O_NONBLOCK)
+        os.close(child_fd)
+        flag = fcntl.fcntl(parent_fd, fcntl.F_GETFL)
+        fcntl.fcntl(parent_fd, fcntl.F_SETFL, flag | os.O_NONBLOCK)
 
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue = asyncio.Queue()
 
         def _on_pty_data():
             try:
-                data = os.read(master_fd, 65536)
+                data = os.read(parent_fd, 65536)
                 queue.put_nowait(data if data else None)
             except BlockingIOError:
                 pass
             except OSError:
                 queue.put_nowait(None)
 
-        loop.add_reader(master_fd, _on_pty_data)
+        loop.add_reader(parent_fd, _on_pty_data)
         # Positions restart per attach: the attach stream is live-interaction
         # bytes, not replayable history — a reconnect renders a fresh screen
         # (tmux redraws), so no replay buffer is kept (#776 allows an explicit
-        # fresh generation here).
+        # fresh generation here). The epoch rides the frames' generation field.
         state = {
             "proc": proc,
-            "master_fd": master_fd,
+            "parent_fd": parent_fd,
             "queue": queue,
             "pos": 0,
             "task": None,
+            "epoch": epoch,
         }
         state["task"] = asyncio.create_task(self._attach_pump(terminal_id, state))
         self._attach[terminal_id] = state
@@ -600,7 +614,7 @@ class Bridge:
                 StreamFrame(
                     terminal_id=terminal_id,
                     stream=StreamName.ATTACH,
-                    generation=0,
+                    generation=state["epoch"],
                     pos=pos,
                     data=base64.b64encode(data).decode(),
                 )
@@ -610,29 +624,36 @@ class Bridge:
         # while this state is still the terminal's live attach — a second
         # ATTACH_OPEN replaces the PTY, and the outgoing pump's EOF would
         # otherwise reach the server after the new client bound its sink and
-        # close a session that had just opened.
+        # close a session that had just opened. The epoch (generation) lets the
+        # server drop it even if it does slip through.
         if self._attach.get(terminal_id) is state:
             await self._send(
                 StreamFrame(
                     terminal_id=terminal_id,
                     stream=StreamName.ATTACH,
-                    generation=0,
+                    generation=state["epoch"],
                     pos=state["pos"],
                     data="",
                 )
             )
 
-    def _attach_write(self, terminal_id: str, data: bytes) -> bool:
+    def _attach_write(self, terminal_id: str, data: bytes, epoch: Optional[int] = None) -> bool:
         state = self._attach.get(terminal_id)
         if state is None:
             return False
+        # A write from a displaced attach (its epoch is not the current PTY's)
+        # must not reach the replacement's PTY.
+        if epoch is not None and state.get("epoch") != epoch:
+            return False
         try:
-            os.write(state["master_fd"], data)
+            os.write(state["parent_fd"], data)
             return True
         except OSError:
             return False
 
-    def _attach_resize(self, terminal_id: str, rows: int, cols: int) -> bool:
+    def _attach_resize(
+        self, terminal_id: str, rows: int, cols: int, epoch: Optional[int] = None
+    ) -> bool:
         import fcntl
         import struct
         import termios
@@ -640,21 +661,36 @@ class Bridge:
         state = self._attach.get(terminal_id)
         if state is None:
             return False
+        if epoch is not None and state.get("epoch") != epoch:
+            return False
         try:
             fcntl.ioctl(
-                state["master_fd"], termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0)
+                state["parent_fd"], termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0)
             )
             return True
         except OSError:
             return False
 
-    async def _attach_close(self, terminal_id: str) -> None:
-        state = self._attach.pop(terminal_id, None)
+    async def _attach_close(
+        self, terminal_id: str, epoch: Optional[int] = None, notify_server: bool = True
+    ) -> bool:
+        """End the terminal's attach PTY. Returns whether a PTY was closed.
+
+        ``epoch`` scopes an ``ATTACH_CLOSE``: a close naming an epoch other than
+        the current PTY's is stale (a newer attach has replaced it) and is
+        ignored, so it cannot tear down the replacement. TEARDOWN passes no
+        epoch and closes whatever PTY is current. ``notify_server`` is False for
+        the internal reopen close, where an EOF would reach the new client.
+        """
+        state = self._attach.get(terminal_id)
         if state is None:
-            return
+            return False
+        if epoch is not None and state.get("epoch") != epoch:
+            return False
+        self._attach.pop(terminal_id, None)
         loop = asyncio.get_running_loop()
         try:
-            loop.remove_reader(state["master_fd"])
+            loop.remove_reader(state["parent_fd"])
         except (ValueError, OSError):
             pass
         # Send the EOF frame BEFORE cancelling the pump that would have sent it.
@@ -664,16 +700,18 @@ class Bridge:
         # the relay parked on `sink.get()` forever — and `unbind_terminal(...,
         # deleted=True)` then removed the binding, so no later disconnect sweep
         # could find the sink either. Only a client keystroke ended it, by raising
-        # out of the upstream half (Copilot review on #802).
-        await self._send(
-            StreamFrame(
-                terminal_id=terminal_id,
-                stream=StreamName.ATTACH,
-                generation=0,
-                pos=0,
-                data="",
+        # out of the upstream half (Copilot review on #802). The EOF carries this
+        # PTY's epoch so the server routes it to the matching client only.
+        if notify_server:
+            await self._send(
+                StreamFrame(
+                    terminal_id=terminal_id,
+                    stream=StreamName.ATTACH,
+                    generation=state["epoch"],
+                    pos=0,
+                    data="",
+                )
             )
-        )
         task = state.get("task")
         if task is not None:
             task.cancel()
@@ -682,9 +720,10 @@ class Bridge:
         except OSError:
             pass
         try:
-            os.close(state["master_fd"])
+            os.close(state["parent_fd"])
         except OSError:
             pass
+        return True
 
     # --- script execution (#745) ---
 

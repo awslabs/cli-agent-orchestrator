@@ -267,8 +267,12 @@ class RuntimeChannelRegistry:
         # (Copilot review on #802). Bounded: ids are only useful until the
         # in-flight frames for them drain.
         self._tombstones: "OrderedDict[str, float]" = OrderedDict()
-        # Live interactive-attach clients by terminal (#776).
-        self._attach_sinks: Dict[str, "asyncio.Queue"] = {}
+        # Live interactive-attach clients by terminal (#776). Each entry is the
+        # (sink, epoch) pair: the epoch fences a displaced client's stale
+        # frames so a late EOF for an old PTY cannot close a newer attach.
+        self._attach_sinks: Dict[str, Tuple["asyncio.Queue", int]] = {}
+        # Monotonic per-terminal attach epoch, handed out at bind time.
+        self._attach_epochs: Dict[str, int] = {}
         # The loop the channel connections belong to, captured at register().
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         # How many times each runtime id has been claimed by a channel in this
@@ -351,9 +355,9 @@ class RuntimeChannelRegistry:
                 or self._recovered_placement.get(tid) == runtime_id
             ]
             for tid in orphaned:
-                sink = self._attach_sinks.pop(tid, None)
-                if sink is not None:
-                    self._eof_sink(sink)
+                bound = self._attach_sinks.pop(tid, None)
+                if bound is not None:
+                    self._eof_sink(bound[0])
         if orphaned:
             logger.info(
                 "closed %d interactive attach(es) for disconnected runtime %s: %s",
@@ -492,7 +496,7 @@ class RuntimeChannelRegistry:
             # attached terminal hung exactly this way (Copilot review on #802).
             sink = self._attach_sinks.pop(terminal_id, None)
             if sink is not None:
-                self._eof_sink(sink)
+                self._eof_sink(sink[0])
             self._terminal_runtime.pop(terminal_id, None)
             self._recovered_placement.pop(terminal_id, None)
             self._status.pop(terminal_id, None)
@@ -1011,8 +1015,19 @@ class RuntimeChannelRegistry:
     # channel are handed to that client's queue instead of the bus. `None`
     # on the queue means the runtime-side PTY ended (EOF/detach).
 
-    def bind_attach(self, terminal_id: str, sink: "asyncio.Queue") -> bool:
-        """Make *sink* the live attach client, ending any client it displaces.
+    def next_attach_epoch(self, terminal_id: str) -> int:
+        """Hand out the next attach epoch for *terminal_id* (starts at 1).
+
+        Strictly increasing per terminal, so each attach carries an identity a
+        stale frame from an earlier attach can be told apart from.
+        """
+        with self._lock:
+            epoch = self._attach_epochs.get(terminal_id, 0) + 1
+            self._attach_epochs[terminal_id] = epoch
+            return epoch
+
+    def bind_attach(self, terminal_id: str, sink: "asyncio.Queue", epoch: int = 0) -> bool:
+        """Make *sink* the live attach client at *epoch*, ending any it displaces.
 
         Returns True when this call displaced an earlier client. That client is
         sent ``None`` — the same EOF the runtime PTY's own end produces — so its
@@ -1020,13 +1035,15 @@ class RuntimeChannelRegistry:
         will ever feed again (Copilot review on #802, finding 6). Ownership is
         what the ``None`` conveys, not a PTY that ended: the PTY is still alive
         and now belongs to *sink*, which is why the displaced relay must not go
-        on to close it (see :meth:`unbind_attach`).
+        on to close it (see :meth:`unbind_attach`). The stored epoch is what
+        :meth:`deliver_attach` matches against so a late frame from the
+        displaced attach is dropped rather than routed to the new client.
         """
         with self._lock:
             previous = self._attach_sinks.get(terminal_id)
-            self._attach_sinks[terminal_id] = sink
-        if previous is not None and previous is not sink:
-            self._eof_sink(previous)
+            self._attach_sinks[terminal_id] = (sink, epoch)
+        if previous is not None and previous[0] is not sink:
+            self._eof_sink(previous[0])
             return True
         return False
 
@@ -1039,15 +1056,35 @@ class RuntimeChannelRegistry:
         in the old relay's ``finally`` killed a live attach (finding 4).
         """
         with self._lock:
-            if self._attach_sinks.get(terminal_id) is sink:
+            bound = self._attach_sinks.get(terminal_id)
+            if bound is not None and bound[0] is sink:
                 del self._attach_sinks[terminal_id]
                 return True
             return False
 
-    def deliver_attach(self, terminal_id: str, data: Optional[bytes]) -> bool:
+    def deliver_attach(
+        self, terminal_id: str, data: Optional[bytes], epoch: Optional[int] = None
+    ) -> bool:
+        """Route an attach frame to the live client, unless its epoch is stale.
+
+        ``epoch`` is the frame's stamp (its ``generation``). A frame whose epoch
+        is not the bound sink's belongs to an attach that has since been
+        displaced — most importantly the old PTY's EOF, which would otherwise
+        close the replacement client — so it is dropped. ``None`` skips the
+        check for callers that do not carry an epoch.
+        """
         with self._lock:
-            sink = self._attach_sinks.get(terminal_id)
-        if sink is None:
+            bound = self._attach_sinks.get(terminal_id)
+        if bound is None:
+            return False
+        sink, bound_epoch = bound
+        if epoch is not None and epoch != bound_epoch:
+            logger.debug(
+                "dropping attach frame for %s: epoch %s is not the bound epoch %s",
+                terminal_id,
+                epoch,
+                bound_epoch,
+            )
             return False
         sink.put_nowait(data)
         return True

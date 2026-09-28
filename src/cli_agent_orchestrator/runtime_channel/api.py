@@ -689,8 +689,13 @@ async def runtime_channel(ws: WebSocket) -> None:
                     continue
                 if frame.stream == StreamName.ATTACH:
                     # Interactive bytes go to the live attach client, never
-                    # the bus; an empty frame is the runtime PTY's EOF.
-                    runtime_registry.deliver_attach(frame.terminal_id, raw if raw else None)
+                    # the bus; an empty frame is the runtime PTY's EOF. The
+                    # frame's generation is the attach epoch: a frame from a
+                    # displaced attach is dropped rather than routed to the
+                    # client that replaced it.
+                    runtime_registry.deliver_attach(
+                        frame.terminal_id, raw or None, frame.generation
+                    )
                     continue
                 # A frame from a SUPERSEDED generation belongs to a stream this
                 # server has already moved past: drop it rather than splice its
@@ -1209,11 +1214,19 @@ async def relay_remote_attach(websocket, terminal_id: str) -> None:
     from starlette.websockets import WebSocketDisconnect as _WSDisconnect
 
     sink: asyncio.Queue = asyncio.Queue()
-    runtime_registry.bind_attach(terminal_id, sink)
+    # A per-terminal epoch fences this attach against a displaced one: the
+    # sink is bound with it, every command carries it, and the runtime stamps
+    # it on the attach-stream frames so a late EOF for a prior PTY is dropped
+    # instead of closing this client (Copilot review on #802).
+    epoch = runtime_registry.next_attach_epoch(terminal_id)
+    runtime_registry.bind_attach(terminal_id, sink, epoch)
     try:
         try:
             result = await runtime_registry.send_terminal_command(
-                terminal_id, CommandType.ATTACH_OPEN, {"rows": 24, "cols": 80}, timeout=30.0
+                terminal_id,
+                CommandType.ATTACH_OPEN,
+                {"rows": 24, "cols": 80, "epoch": epoch},
+                timeout=30.0,
             )
         except (RuntimeUnavailableError, TimeoutError) as exc:
             await websocket.close(code=4010, reason=f"remote attach failed: {exc}")
@@ -1237,14 +1250,21 @@ async def relay_remote_attach(websocket, terminal_id: str) -> None:
                     await runtime_registry.send_terminal_command(
                         terminal_id,
                         CommandType.ATTACH_DATA,
-                        {"data": _b64.b64encode(payload["data"].encode()).decode()},
+                        {
+                            "data": _b64.b64encode(payload["data"].encode()).decode(),
+                            "epoch": epoch,
+                        },
                         timeout=INPUT_TIMEOUT,
                     )
                 elif payload.get("type") == "resize":
                     await runtime_registry.send_terminal_command(
                         terminal_id,
                         CommandType.RESIZE,
-                        {"rows": payload.get("rows", 24), "cols": payload.get("cols", 80)},
+                        {
+                            "rows": payload.get("rows", 24),
+                            "cols": payload.get("cols", 80),
+                            "epoch": epoch,
+                        },
                         timeout=INPUT_TIMEOUT,
                     )
 
@@ -1254,13 +1274,25 @@ async def relay_remote_attach(websocket, terminal_id: str) -> None:
             done, pending = await asyncio.wait({down, up}, return_when=asyncio.FIRST_COMPLETED)
             for task in pending:
                 task.cancel()
+            # A mid-session upstream failure (the runtime went away or a
+            # keystroke timed out) closes with an error code so the client can
+            # tell it apart from a normal PTY EOF, which _downstream ends with a
+            # clean close (Augusto nit on #802).
+            error_close = None
             for task in done:
                 exc = task.exception()
-                if exc is not None and not isinstance(exc, (_WSDisconnect, RuntimeError)):
+                if exc is None:
+                    continue
+                if isinstance(exc, (RuntimeUnavailableError, TimeoutError)):
+                    error_close = (4011, f"remote attach lost: {exc}")
+                elif not isinstance(exc, (_WSDisconnect, RuntimeError)):
                     logger.warning("remote attach relay error for %s: %s", terminal_id, exc)
         finally:
             try:
-                await websocket.close()
+                if error_close is not None:
+                    await websocket.close(code=error_close[0], reason=error_close[1])
+                else:
+                    await websocket.close()
             except Exception:  # noqa: BLE001 — already closed is fine
                 pass
     finally:
@@ -1271,7 +1303,7 @@ async def relay_remote_attach(websocket, terminal_id: str) -> None:
         if runtime_registry.unbind_attach(terminal_id, sink):
             try:
                 await runtime_registry.send_terminal_command(
-                    terminal_id, CommandType.ATTACH_CLOSE, {}, timeout=10.0
+                    terminal_id, CommandType.ATTACH_CLOSE, {"epoch": epoch}, timeout=10.0
                 )
             except Exception:  # noqa: BLE001 — best-effort close on a dead runtime
                 pass
