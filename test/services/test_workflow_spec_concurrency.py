@@ -322,6 +322,30 @@ def test_workflow_lock_identity_rechecks_target_containment_before_stat(
         svc._workflow_lock_identity(target)
 
 
+def test_workflow_lock_identity_rejects_sibling_prefix_after_realpath(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = "/validated/workflows/example.py"
+    parent = "/validated/workflows"
+    real_realpath = os.path.realpath
+
+    def _redirect_target_to_sibling_prefix(path: os.PathLike[str] | str) -> str:
+        value = os.fspath(path)
+        if value == parent:
+            return parent
+        if value == target:
+            return "/validated/workflows-evil/example.py"
+        return real_realpath(path)
+
+    monkeypatch.setattr(svc.os.path, "realpath", _redirect_target_to_sibling_prefix)
+
+    with pytest.raises(
+        atomic_file.LockUnavailableError,
+        match="escapes its canonical parent",
+    ):
+        svc._workflow_lock_identity(target)
+
+
 def test_concurrent_reader_observes_only_complete_old_or_new_bytes(tmp_path: Path) -> None:
     created = svc.create_workflow("contended", BASE, scan_dir=str(tmp_path))
     new_source = _large_source("reader-safe")
