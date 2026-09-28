@@ -42,7 +42,7 @@ def test_check_rejects_profile_and_memory_drift(monkeypatch):
         launch_guard.check("run-1", "worker")
 
 
-def test_check_ignores_yaml_and_legacy_script_rows(monkeypatch):
+def test_check_ignores_yaml_but_rejects_unreadable_script_rows(monkeypatch):
     rows = {
         "yaml": SimpleNamespace(tier="yaml", spec_snapshot="{}"),
         "legacy": SimpleNamespace(tier="script", spec_snapshot="steps: []"),
@@ -50,4 +50,24 @@ def test_check_ignores_yaml_and_legacy_script_rows(monkeypatch):
     monkeypatch.setattr(launch_guard.workflow_journal, "get_run", rows.get)
 
     launch_guard.check("yaml", "worker")
-    launch_guard.check("legacy", "worker")
+    with pytest.raises(launch_guard.PlanInputsChangedError, match="unreadable"):
+        launch_guard.check("legacy", "worker")
+
+
+@pytest.mark.parametrize(
+    "guard",
+    [
+        None,
+        {"profiles": [], "memory_enabled": False},
+        {"profiles": {"worker": "sha256:frozen"}},
+    ],
+)
+def test_check_rejects_corrupt_launch_guards(monkeypatch, guard):
+    row = SimpleNamespace(
+        tier="script",
+        spec_snapshot=json.dumps({"launch_guard": guard}),
+    )
+    monkeypatch.setattr(launch_guard.workflow_journal, "get_run", lambda run_id: row)
+
+    with pytest.raises(launch_guard.PlanInputsChangedError, match="unreadable"):
+        launch_guard.check("run-1", "worker")

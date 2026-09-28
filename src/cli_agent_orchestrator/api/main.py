@@ -4655,6 +4655,7 @@ async def run_step(
         await _record_job_state(job_id, "error", error_message=str(e))
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
     except PlanInputsChangedError as e:
+        await _record_job_state(job_id, "error", error_message=str(e))
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={"message": str(e), "kind": "plan_inputs_changed"},

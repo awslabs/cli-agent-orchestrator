@@ -58,6 +58,7 @@ from one run would change the verdict of the next.
 from __future__ import annotations
 
 import inspect
+import json
 import sqlite3
 from pathlib import Path
 from typing import Optional
@@ -134,6 +135,7 @@ def _register_run(
     *,
     generation: str = "1",
     script_tier: bool = True,
+    spec_snapshot: str = '{"source":"","launch_guard":null}',
 ) -> Optional[ScriptRunRecord]:
     """Journal a ``workflow_run`` row and (optionally) register a live script record.
 
@@ -145,7 +147,7 @@ def _register_run(
     workflow_journal.insert_run(
         run_id=run_id,
         workflow_name="wf",
-        spec_snapshot='{"source":"","launch_guard":null}',
+        spec_snapshot=spec_snapshot,
         inputs_json="{}",
         state="running",
         started_at=TS,
@@ -818,6 +820,55 @@ class TestReplayedTerminalId:
 # BR-2/SR-5 — the branch engages for script-tier calls ONLY.
 # ---------------------------------------------------------------------------
 class TestTheScriptTierGuard:
+    @pytest.mark.parametrize("drift", ["profile", "memory"])
+    def test_approved_launch_input_drift_fails_closed_before_step_settlement(
+        self, client, drift
+    ):
+        run_id = f"run-guard-{drift}"
+        guard = {
+            "profiles": {"developer": "sha256:frozen"},
+            "memory_enabled": False,
+        }
+        _register_run(
+            run_id,
+            spec_snapshot=json.dumps({"source": "", "launch_guard": guard}),
+        )
+        job_id = "a" * 32 if drift == "profile" else "b" * 32
+        body = _body(env_vars=_env(run_id), job_id=job_id)
+        create, send, delete, out, exit_cli, wait, status_p, get_wd = _patch_terminal_layer()
+        current_digest = "sha256:changed" if drift == "profile" else "sha256:frozen"
+        current_memory = drift == "memory"
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.launch_guard._profile_digest",
+                return_value=current_digest,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.launch_guard.settings_service.is_memory_enabled",
+                return_value=current_memory,
+            ),
+            patch(
+                "cli_agent_orchestrator.api.main._record_job_state",
+                new=AsyncMock(),
+            ) as record_job,
+            create as m_create,
+            send,
+            delete,
+            out,
+            exit_cli,
+            wait,
+            status_p,
+            get_wd,
+        ):
+            response = client.post(TERMINALS_RUN_STEP_ROUTE, json=body)
+
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"]["kind"] == "plan_inputs_changed"
+        assert _raw_row(run_id) is None
+        m_create.assert_not_awaited()
+        assert record_job.await_args_list[-1].args[:2] == (job_id, "error")
+
     def test_yaml_tier_call_reaches_run_agent_step_with_no_gate_call(self, client):
         """Both env vars present, but no live ``ScriptRunRecord`` — which is what a
         YAML-tier run looks like to this guard."""

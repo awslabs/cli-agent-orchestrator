@@ -1087,6 +1087,38 @@ def test_submit_script_tier_202_and_drives(client, async_script_env):
     assert async_script_env["prepared"]["called"] is True
 
 
+def test_submit_persists_launch_guard(client, async_script_env, monkeypatch):
+    from cli_agent_orchestrator.services import approval_gate, launch_guard
+
+    monkeypatch.setattr(approval_gate, "ensure_plan_approved", lambda **kwargs: None)
+    monkeypatch.setattr(
+        launch_guard.settings_service,
+        "is_workflow_approval_required",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        launch_guard.agent_profiles,
+        "list_agent_profiles",
+        lambda: [{"name": "developer"}],
+    )
+    monkeypatch.setattr(
+        launch_guard.agent_profiles,
+        "_read_agent_profile_source",
+        lambda name: "profile source",
+    )
+    monkeypatch.setattr(launch_guard.settings_service, "is_memory_enabled", lambda: False)
+
+    response = client.post(
+        "/workflows/runs:submit",
+        json={"name_or_path": "scr", "inputs": {}, "run_id": "async-guard"},
+    )
+
+    assert response.status_code == 202
+    snapshot = json.loads(workflow_journal.get_run("async-guard").spec_snapshot)
+    assert snapshot["launch_guard"]["memory_enabled"] is False
+    assert set(snapshot["launch_guard"]["profiles"]) == {"developer"}
+
+
 def test_submit_script_manifest_freezes_resolved_inputs(client, async_script_env, monkeypatch):
     """The async script manifest, journal, and drive share resolved inputs."""
     from cli_agent_orchestrator.api import main as api_main

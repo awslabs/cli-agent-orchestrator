@@ -47,15 +47,19 @@ def check(run_id: Optional[str], agent: str) -> None:
     try:
         snapshot = json.loads(row.spec_snapshot)
     except (TypeError, json.JSONDecodeError):
-        # Snapshots written before this guard existed were YAML-shaped. They
-        # remain resumable and have no approved launch state to compare.
-        return
+        # Both script admission paths persist JSON snapshots. A non-JSON script
+        # row cannot prove the approved launch state and must fail closed.
+        raise PlanInputsChangedError(
+            "This run's recorded launch state is unreadable; start a new run."
+        ) from None
     try:
         guard = snapshot.get("launch_guard")
         if guard is None:
-            return
+            raise TypeError("missing launch guard")
         profiles = guard["profiles"]
         memory_enabled = guard["memory_enabled"]
+        if not isinstance(profiles, dict):
+            raise TypeError("invalid profile guard")
     except (TypeError, KeyError, AttributeError):
         raise PlanInputsChangedError(
             "This run's recorded launch state is unreadable; start a new run."

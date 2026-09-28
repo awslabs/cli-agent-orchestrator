@@ -338,6 +338,43 @@ async def test_happy_completed_result_shape_and_sentinel(
 
 
 @pytest.mark.asyncio
+async def test_blocking_run_persists_launch_guard(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        script_runner.launch_guard.settings_service,
+        "is_workflow_approval_required",
+        lambda: True,
+    )
+    monkeypatch.setattr(script_runner.approval_gate, "ensure_plan_approved", lambda **kwargs: None)
+    monkeypatch.setattr(
+        script_runner.launch_guard.agent_profiles,
+        "list_agent_profiles",
+        lambda: [{"name": "developer"}],
+    )
+    monkeypatch.setattr(
+        script_runner.launch_guard.agent_profiles,
+        "_read_agent_profile_source",
+        lambda name: "profile source",
+    )
+    monkeypatch.setattr(
+        script_runner.launch_guard.settings_service,
+        "is_memory_enabled",
+        lambda: True,
+    )
+    _install_fake_spawn(monkeypatch, _FakeProcess(exit_rc=0))
+
+    await run_script_workflow(
+        _FakeScriptSpec(),
+        {},
+        "run-guard-persisted",
+        working_directory=str(tmp_path),
+    )
+
+    snapshot = json.loads(workflow_journal.get_run("run-guard-persisted").spec_snapshot)
+    assert snapshot["launch_guard"]["memory_enabled"] is True
+    assert set(snapshot["launch_guard"]["profiles"]) == {"developer"}
+
+
+@pytest.mark.asyncio
 async def test_crash_nonzero_exit_failed_kind_error(monkeypatch: pytest.MonkeyPatch):
     """Nonzero exit -> FAILED with a redacted durable diagnostic and a swept worker."""
     swept = {"run": None}
