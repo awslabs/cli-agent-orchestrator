@@ -126,7 +126,7 @@ class TestTheMarkerFollowsTheChannel:
             raise_on_iter=ConnectionClosedError(None, None),
             stop_after=bridge,
         )
-        monkeypatch.setattr(bridge_mod.websockets, "connect", lambda *a, **k: ws)
+        monkeypatch.setattr(bridge_mod, "connect", lambda *a, **k: ws)
         await asyncio.wait_for(bridge.run(), timeout=10)
 
         # The channel is gone, so the pod must read unready even though the
@@ -159,7 +159,7 @@ class TestTheMarkerFollowsTheChannel:
                 )
             raise InvalidStatus(_Response())
 
-        monkeypatch.setattr(bridge_mod.websockets, "connect", _connect)
+        monkeypatch.setattr(bridge_mod, "connect", _connect)
         monkeypatch.setattr(bridge_mod, "RECONNECT_BACKOFF_INITIAL", 0.01)
         with pytest.raises(InvalidStatus):
             await asyncio.wait_for(bridge.run(), timeout=10)
@@ -187,7 +187,7 @@ class TestTheMarkerFollowsTheChannel:
             bridge.stop()
             raise OSError("no route to host")
 
-        monkeypatch.setattr(bridge_mod.websockets, "connect", _refuse)
+        monkeypatch.setattr(bridge_mod, "connect", _refuse)
         await asyncio.wait_for(bridge.run(), timeout=10)
         assert observed == [False]
 
@@ -231,7 +231,7 @@ class TestAnOrderlyStop:
         """
         bridge = _bridge()
         ws = _ParkedWS(_good_hello())
-        monkeypatch.setattr(bridge_mod.websockets, "connect", lambda *a, **k: ws)
+        monkeypatch.setattr(bridge_mod, "connect", lambda *a, **k: ws)
 
         run = asyncio.create_task(bridge.run())
         for _ in range(200):
