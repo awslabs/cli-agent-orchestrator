@@ -611,6 +611,13 @@ class DispatchJournalModel(Base):
     # persisted with engine=None even though it was launched engine-pinned -- and
     # reuse validation and the input gate both read that column.
     engine = Column(String, nullable=True)
+    # For LAUNCH: the caller terminal a callback routes to (``caller_id``) and the
+    # workspace the agent runs in (``working_directory``). The runtime's result
+    # payload does not echo either, so a launch reconciled after a restart could
+    # only restore what the journal held -- and without these it lost its callback
+    # parent and its recorded directory.
+    caller_id = Column(String, nullable=True)
+    working_directory = Column(String, nullable=True)
     # "dispatched" until a result is applied, then "settled". A dispatched entry
     # found after a restart is an operation whose outcome this server never saw.
     state = Column(String, nullable=False, default="dispatched", index=True)
@@ -977,6 +984,11 @@ def _migrate_dispatch_journal() -> None:
                 ("engine", "ALTER TABLE dispatch_journal ADD COLUMN engine VARCHAR"),
                 ("run_id", "ALTER TABLE dispatch_journal ADD COLUMN run_id VARCHAR"),
                 ("step_id", "ALTER TABLE dispatch_journal ADD COLUMN step_id VARCHAR"),
+                ("caller_id", "ALTER TABLE dispatch_journal ADD COLUMN caller_id VARCHAR"),
+                (
+                    "working_directory",
+                    "ALTER TABLE dispatch_journal ADD COLUMN working_directory VARCHAR",
+                ),
             ):
                 if column not in present:
                     conn.execute(ddl)
@@ -2191,6 +2203,8 @@ def record_dispatch(
     run_id: Optional[str] = None,
     step_id: Optional[str] = None,
     engine: Optional[str] = None,
+    caller_id: Optional[str] = None,
+    working_directory: Optional[str] = None,
 ) -> None:
     """Journal an operation BEFORE its frame is sent to a runtime.
 
@@ -2213,6 +2227,8 @@ def record_dispatch(
                     run_id=run_id,
                     step_id=step_id,
                     engine=engine,
+                    caller_id=caller_id,
+                    working_directory=working_directory,
                     state="dispatched",
                 )
             )
@@ -2224,6 +2240,8 @@ def record_dispatch(
             row.run_id = run_id
             row.step_id = step_id
             row.engine = engine
+            row.caller_id = caller_id
+            row.working_directory = working_directory
             row.state = "dispatched"
             row.settled_at = None
         db.commit()
@@ -2266,21 +2284,24 @@ def get_dispatch_record(op_id: str) -> Optional[dict]:
             "run_id": row.run_id,
             "step_id": row.step_id,
             "engine": row.engine,
+            "caller_id": row.caller_id,
+            "working_directory": row.working_directory,
             "state": cast(str, row.state),
         }
 
 
 # How long a SETTLED journal entry is kept. It has no reader once settled — the
 # orphan path only consults entries for results it has not applied — so this is
-# purely an audit window. Unsettled entries get their own, much longer window: one
-# of those
-# IS an operation whose outcome was never seen, which is exactly what the journal
-# exists to preserve -- but it cannot be kept forever. An earlier revision said
-# these were never pruned by age; that was reversed deliberately once it became
-# clear that only the LAUNCH happy path settles, so every remote RUN_SCRIPT and
-# every failed launch left a permanent row and the janitor could never reclaim the
-# majority of the table. A runtime retains a result only until its next reconnect,
-# so a week-old dispatched row will never be redelivered.
+# purely an audit window, after which prune_dispatch_journal deletes it.
+#
+# Unsettled rows are never pruned by age. One of those IS an operation whose
+# outcome this server never saw, which is exactly what the journal exists to
+# preserve, and the bridge re-sends an unacked result after every reconnect, so
+# even an old one is still redeliverable. Growth is instead bounded by settling
+# every path whose outcome is known — the launch happy path, the definitively
+# failed launch arms (503 not-dispatched, 502 non-OK, 500 after a confirmed
+# teardown), and each finished remote RUN_SCRIPT — so what remains unsettled is
+# genuinely unresolved.
 _DISPATCH_JOURNAL_SETTLED_TTL_SECS = 24 * 3600
 
 # How often record_dispatch is allowed to run the janitor.
