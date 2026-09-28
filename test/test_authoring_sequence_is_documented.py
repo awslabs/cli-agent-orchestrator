@@ -28,6 +28,8 @@ from pathlib import Path
 
 import pytest
 
+from cli_agent_orchestrator.api import main as api_main
+
 REPO = Path(__file__).resolve().parents[1]
 SKILL_COPIES = (
     REPO / "skills" / "cao-workflow" / "SKILL.md",
@@ -184,9 +186,15 @@ def test_the_agent_is_told_python_is_the_format_and_never_to_ask(skill):
 
 
 def test_observe_names_the_classification_field(skill):
-    assert "failure_envelope.classification" in skill or "classification" in skill
-    lowered = skill.lower()
-    assert "transient" in lowered and "durable" in lowered
+    assert "failure_envelope.classification" in skill
+    observe = skill.split("### g. OBSERVE", 1)[1].split("\n## ", 1)[0]
+    documented = set(re.findall(r"(?m)^\| `([^`]+)` \|", observe)) - {"classification"}
+    emitted = {
+        value
+        for name, value in vars(api_main).items()
+        if name.startswith("CLASSIFICATION_")
+    }
+    assert documented == emitted
 
 
 # ---------------------------------------------------------------------------

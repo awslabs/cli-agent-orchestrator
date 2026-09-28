@@ -272,11 +272,13 @@ class from the message, the state, or the status:
 
 | `classification` | What it means | What to do |
 | --- | --- | --- |
-| `transient` | the failure was environmental — a timeout, a provider error | **resume** the same run |
-| `durable` | the artifact itself is wrong and a resume will fail the same way | **repair** the script, then author a new run |
+| `transient` | a persisted timeout; the artifact may still be usable | **Retry — transient failure**: resume the same run |
+| `artifact_defect` | the persisted generic `error` currently maps here conservatively; no finer production provider-error taxonomy exists, so a provider error is not automatically transient | **Fix the spec — artifact defect**: inspect and repair the script before authoring a new run |
+| `cancelled` | the run was deliberately cancelled | **Cancelled by a human**: inspect the intent before taking another action; no automatic retry is promised |
 
-This is the second half of what the sequence promises: a transient failure and a defect that needs a
-new run are told apart by a field, so you never advise a user to retry something that cannot succeed.
+This is the second half of what the sequence promises: branch on the emitted field, then resume only a
+known transient timeout. For a generic persisted error, inspect and repair before retrying by authoring
+a new run; do not infer a provider-specific cause that the persisted record does not contain.
 
 ## Parameterized workflows
 
