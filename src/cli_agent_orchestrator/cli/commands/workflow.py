@@ -484,7 +484,10 @@ def list_cmd(scan_dir, as_json):
         params["dir"] = scan_dir
     try:
         response = requests.get(
-            f"{API_BASE_URL}/workflows", params=params, timeout=MCP_REQUEST_TIMEOUT
+            f"{API_BASE_URL}/workflows",
+            params=params,
+            headers=_auth_headers() or None,
+            timeout=MCP_REQUEST_TIMEOUT,
         )
     except requests.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")

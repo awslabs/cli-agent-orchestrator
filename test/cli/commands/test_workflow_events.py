@@ -102,7 +102,7 @@ def _snap_resp(state, status_code=200):
 # ---------------------------------------------------------------------------
 # OR-1: renders normal frames in seq order and OR-2: closes on terminal.
 # ---------------------------------------------------------------------------
-def test_renders_normal_frames_in_seq_order(runner):
+def test_renders_normal_frames_in_seq_order(runner, monkeypatch):
     """OR-1/OR-2: normal frames render in ascending seq; a terminal run.* frame
     ends the follow and yields exit 0 for a completed run."""
     stream = _stream_resp(
@@ -110,6 +110,7 @@ def test_renders_normal_frames_in_seq_order(runner):
         _event_frame(2, "step.completed", "s2", "completed"),
         _event_frame(3, "run.completed", None, "completed"),
     )
+    monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", "events-follow-token")
     with (
         patch(
             "cli_agent_orchestrator.cli.commands.workflow.requests.get", return_value=stream
@@ -126,6 +127,7 @@ def test_renders_normal_frames_in_seq_order(runner):
     args, kwargs = get.call_args
     assert args[0].endswith("/workflows/runs/run1/events")
     assert kwargs["headers"]["Accept"] == "text/event-stream"
+    assert kwargs["headers"]["Authorization"] == "Bearer events-follow-token"
     assert kwargs["stream"] is True
 
 
@@ -266,11 +268,12 @@ def test_after_seq_flag_sets_initial_cursor(runner):
 # ---------------------------------------------------------------------------
 # F-1 terminal guard: a stream that ends WITHOUT a terminal event must not hang.
 # ---------------------------------------------------------------------------
-def test_stream_ends_without_terminal_does_final_status_check(runner):
+def test_stream_ends_without_terminal_does_final_status_check(runner, monkeypatch):
     """F-1: the stream ends with NO terminal frame (a swallowed terminal event). The
     follower must NOT hang — it does a final GET status and closes on the terminal
     state read there (here: completed -> exit 0)."""
     stream = _stream_resp(_event_frame(1, "step.completed", "s1", "completed"))
+    monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", "events-final-token")
     with patch(
         "cli_agent_orchestrator.cli.commands.workflow.requests.get",
         side_effect=[stream, _snap_resp("completed")],
@@ -279,6 +282,7 @@ def test_stream_ends_without_terminal_does_final_status_check(runner):
     assert result.exit_code == 0
     # The 2nd GET is the snapshot route (the terminal guard).
     assert get.call_args_list[1].args[0].endswith("/workflows/runs/run1")
+    assert get.call_args_list[1].kwargs["headers"] == {"Authorization": "Bearer events-final-token"}
     assert "completed" in result.output
 
 
@@ -395,7 +399,7 @@ def test_unknown_run_404(runner):
     assert "unknown run" in result.output
 
 
-def test_absent_events_route_reported_as_capability_not_unknown_run(runner):
+def test_absent_events_route_reported_as_capability_not_unknown_run(runner, monkeypatch):
     """CD-1: a 404 from the events route on a run that IS readable means the ROUTE is
     missing (it ships with issue #504), not the run.
 
@@ -412,17 +416,22 @@ def test_absent_events_route_reported_as_capability_not_unknown_run(runner):
     snapshot_200 = MagicMock()
     snapshot_200.status_code = 200
     snapshot_200.json.return_value = {"run_id": "live-1", "state": "running", "steps": []}
+    monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", "events-probe-token")
 
     with patch(
         "cli_agent_orchestrator.cli.commands.workflow.requests.get",
         side_effect=[events_404, snapshot_200],
-    ):
+    ) as get:
         result = runner.invoke(workflow, ["events", "live-1"])
     assert result.exit_code != 0
     # Names the CAPABILITY, not the run, and points at something that works.
     assert "no live event stream" in result.output
     assert "unknown run" not in result.output
     assert "cao workflow wait live-1" in result.output
+    assert all(
+        call.kwargs["headers"]["Authorization"] == "Bearer events-probe-token"
+        for call in get.call_args_list
+    )
 
 
 def test_absent_events_route_on_batch_read_also_degrades(runner):

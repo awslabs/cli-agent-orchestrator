@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import inspect
 import logging
@@ -373,36 +374,91 @@ def test_local_token_crosses_cli_and_mcp_run_and_start_boundaries(monkeypatch):
     assert calls[3][2] == cli_workflow.WORKFLOW_RUN_REQUEST_TIMEOUT
 
 
-def test_every_registered_workflow_mcp_http_tool_forwards_auth():
-    """New workflow tools cannot silently add an unauthenticated HTTP hop."""
+def _registered_workflow_mcp_names() -> set[str]:
     if hasattr(mcp_server.mcp, "get_tools"):
         tools = asyncio.run(mcp_server.mcp.get_tools())
-        registered = {
-            name: getattr(tool, "fn", tool)
-            for name, tool in tools.items()
-            if name.startswith("workflow_")
-        }
-    else:
-        registered = {
-            name: _mcp_tool(name) for name in dir(mcp_server) if name.startswith("workflow_")
-        }
+        return {name for name in tools if name.startswith("workflow_")}
+    return {name for name in dir(mcp_server) if name.startswith("workflow_")}
 
-    direct_http_tools = {
-        name: inspect.getsource(tool)
-        for name, tool in registered.items()
-        if "requests." in inspect.getsource(tool)
+
+def _contains_auth_derivation(node: ast.AST, derived_names: set[str]) -> bool:
+    for child in ast.walk(node):
+        if isinstance(child, ast.Name) and child.id in derived_names:
+            return True
+        if not isinstance(child, ast.Call):
+            continue
+        func = child.func
+        if isinstance(func, ast.Name) and func.id == "_auth_headers":
+            return True
+        if isinstance(func, ast.Attribute) and func.attr == "_auth_headers":
+            return True
+    return False
+
+
+def _request_auth_failures(module: object, roots: set[str] | None = None) -> list[str]:
+    """Return every reachable requests call whose headers are not auth-derived."""
+    tree = ast.parse(inspect.getsource(module))
+    functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
-    assert direct_http_tools
-    assert {
-        name
-        for name, source in direct_http_tools.items()
-        if "mcp_utils._auth_headers()" not in source
-    } == set()
+    reachable = set(functions) if roots is None else set(roots)
+    pending = list(reachable)
+    while pending:
+        node = functions.get(pending.pop())
+        if node is None:
+            continue
+        for call in (child for child in ast.walk(node) if isinstance(child, ast.Call)):
+            if isinstance(call.func, ast.Name) and call.func.id in functions:
+                if call.func.id not in reachable:
+                    reachable.add(call.func.id)
+                    pending.append(call.func.id)
+
+    failures: list[str] = []
+    for name in sorted(reachable):
+        node = functions.get(name)
+        if node is None:
+            continue
+        derived_names = {
+            arg.arg for arg in (*node.args.args, *node.args.kwonlyargs) if arg.arg == "auth_headers"
+        }
+        for child in ast.walk(node):
+            if isinstance(child, (ast.Assign, ast.AnnAssign)):
+                value = child.value
+                targets = child.targets if isinstance(child, ast.Assign) else [child.target]
+                if value is not None and _contains_auth_derivation(value, derived_names):
+                    derived_names.update(
+                        target.id for target in targets if isinstance(target, ast.Name)
+                    )
+        for call in (child for child in ast.walk(node) if isinstance(child, ast.Call)):
+            func = call.func
+            if not (
+                isinstance(func, ast.Attribute)
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "requests"
+            ):
+                continue
+            headers = next((kw.value for kw in call.keywords if kw.arg == "headers"), None)
+            if headers is None or not _contains_auth_derivation(headers, derived_names):
+                failures.append(f"{name}:{call.lineno}")
+    return failures
+
+
+def test_every_registered_workflow_mcp_http_hop_forwards_auth():
+    """Registered tools and transitively called helpers authenticate every request."""
+    assert _request_auth_failures(mcp_server, _registered_workflow_mcp_names()) == []
+
+
+def test_every_workflow_cli_http_hop_forwards_auth():
+    """No CLI workflow request can bypass the shared bearer derivation."""
+    assert _request_auth_failures(cli_workflow) == []
 
 
 @pytest.mark.parametrize(
     "args",
     [
+        ["list"],
         ["status", "run-1"],
         ["status"],
         ["runs"],
@@ -421,7 +477,9 @@ def test_remaining_workflow_cli_verbs_forward_auth(monkeypatch, args):
 
     def _response(url: str, **kwargs: Any):
         seen.append(kwargs.get("headers"))
-        if url.endswith("/workflows/runs"):
+        if url.endswith("/workflows"):
+            body = []
+        elif url.endswith("/workflows/runs"):
             body = [{"run_id": "run-1", "state": "completed"}]
         elif url.endswith("/result") or url.endswith("/resume"):
             body = {"run_id": "run-1", "state": "completed", "steps": []}
