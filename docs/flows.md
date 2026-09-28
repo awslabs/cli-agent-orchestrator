@@ -120,3 +120,13 @@ cao schedule remove daily-standup
 parameterized Python workflow with a scheduled flow. Its weekly cron entry uses
 a deterministic guard to produce an exact 14-day cadence across month
 boundaries. Scheduled runs default to non-mutating dry-run mode.
+Its separately registered apply template authorizes comments only; the workflow
+cannot change labels, PR state, reviews, statuses, or checks.
+
+Registering that apply template is not the authorization boundary — the flow
+prompt says so explicitly. Because a run's `inputs` are part of the plan
+identifier, `mode=apply` is a different plan than `mode=dry_run`, so it needs its
+own `cao workflow approve <plan_id>` once `workflow.require_approval` is enabled.
+The example also bounds its own noise: notifications are grouped into epochs with
+a 90-day re-entry cooldown and lifetime caps, so a permanently stale PR receives a
+small constant number of comments rather than one per run forever.

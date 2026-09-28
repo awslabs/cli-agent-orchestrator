@@ -1,19 +1,51 @@
-"""Deterministic health analysis and guarded enforcement for open GitHub PRs.
+"""Deterministic health analysis and comment-only notifications for open GitHub PRs.
 
 Dry-run mode snapshots GitHub data, calculates scores with fixed rules, persists
 the two-observation warning state, and asks a reviewer for an advisory importance
-synthesis. Apply mode revalidates every candidate against live data before making
-an idempotent comment or state change. Closure also requires an explicit allowlist.
+synthesis. Apply mode revalidates every candidate against live data before posting
+an idempotent comment. It cannot change labels, PR state, reviews, statuses, checks,
+or any other PR status.
 
-Two invariants keep enforcement from spamming or stalling, and both are covered
-by ``test/examples/test_pr_health_workflow_example.py``:
+Notifications are organized into NOTIFICATION EPOCHS, and the whole point of the
+model is that a PR's lifetime noise is a small constant rather than a function of
+how long it stays open. One epoch is at most three comments and always begins
+with a warning: warning, then either an escalation (a protected P0/P1 or already
+approved PR, which ends the epoch there) or a draft recommendation, and then a
+closure recommendation. An escalation and a closure recommendation are both
+terminal and both close the epoch. A closed epoch can reopen only after
+``EPOCH_REENTRY_COOLDOWN_DAYS`` measured from whichever came last, the terminal
+advisory or the owner's answer, and it always restarts at a warning. Four epochs
+and three escalations are the lifetime caps; past either, the decision is
+``report_only`` and nothing is posted.
 
-- Each lifecycle stage notifies the owner at most once. Idempotency keys on a
-  marker's *stage*, never on its full text, because the marker also embeds the
-  emitting run's score and ``as_of``.
-- Lifecycle progression is independent of the run cadence. The
-  furthest-advanced marker owns the PR's grace period, so a later earlier-stage
-  comment cannot restart the clock or shadow the closure branch.
+Three invariants keep enforcement from spamming or stalling, and all three are
+covered by ``test/examples/test_pr_health_workflow_example.py`` over simulated
+multi-year runs at the real fortnightly cadence:
+
+- Stage dedup is EXACT on ``(epoch, stage)``. Not on marker text, which embeds
+  the emitting run's own score and date and so never matches; and not on a date
+  window, which expires and thereby lets a spent stage be posted twice inside a
+  single epoch.
+- The ladder never runs backwards. Every branch that observes a marker returns a
+  decision; none falls through to the fresh ladder, which is how a warned PR used
+  to be re-warned and how a PR scoring 51-59 used to stall one rung short forever.
+- Lifecycle progression is independent of the run cadence. Grace periods are
+  measured in elapsed days against marker dates, so a weekly, fortnightly, or
+  ad-hoc run reaches the same stage after the same elapsed time.
+
+Marker versioning: this example emits ``cao-pr-health:v2`` markers carrying an
+explicit ``epoch`` and ``stage``. The earlier ``v1`` markers — both the
+``stage=`` and the ``action=escalation`` forms — are read as epoch 0, so a PR
+that was mid-ladder when this example changed keeps its place rather than
+restarting a ladder it has already climbed.
+
+Authorization: dry-run mode is automatic and non-mutating. Apply mode is NOT
+gated by anything in this file's prose — prose is not an authorization boundary.
+It is gated by CAO's plan-approval gate, because the run's ``inputs`` are part of
+the plan identifier, so an ``apply`` run is a DIFFERENT plan than a ``dry_run``
+run and needs its own ``cao workflow approve <plan_id>``. See this example's
+README for the version requirement and for the capability gaps this file does not
+paper over.
 
 Example (authoring does not authorize this run):
     cao workflow run pr_health --run-id pr-health-2026-07-31 \
@@ -72,26 +104,77 @@ INPUTS = {
         "required": False,
         "default": "dry_run",
     },
-    "close_allowlist": {
-        "type": "string",
-        "required": False,
-        "default": "",
-    },
 }
 
-SCHEMA_VERSION = 1
-MARKER_RE = re.compile(
-    r"<!--\s*cao-pr-health:v1\s+"
-    r"stage=(warning|draft|closed)\s+score=(\d{1,3})\s+"
+SCHEMA_VERSION = 2
+SUPPORTED_STATE_SCHEMA_VERSIONS = frozenset({1, 2})
+MARKER_SCHEMA_VERSION = 2
+
+STAGE_NAMES = "warning|draft_recommendation|closure_recommendation|escalation"
+MARKER_V2_RE = re.compile(
+    r"<!--\s*cao-pr-health:v2\s+"
+    r"epoch=(\d{1,3})\s+"
+    rf"stage=({STAGE_NAMES})\s+"
+    r"score=(\d{1,3})\s+"
     r"as_of=(\d{4}-\d{2}-\d{2})\s*-->"
 )
-ESCALATION_MARKER_RE = re.compile(
+# v1 had no epoch. Every v1 marker reads as notification epoch 0 so a PR that
+# was mid-ladder when this example shipped keeps its place instead of restarting.
+MARKER_V1_RE = re.compile(
+    r"<!--\s*cao-pr-health:v1\s+"
+    r"stage=(warning|draft_recommendation|closure_recommendation|draft|closed)\s+"
+    r"score=(\d{1,3})\s+"
+    r"as_of=(\d{4}-\d{2}-\d{2})\s*-->"
+)
+ESCALATION_MARKER_V1_RE = re.compile(
     r"<!--\s*cao-pr-health:v1\s+action=escalation\s+score=(\d{1,3})\s+"
     r"as_of=(\d{4}-\d{2}-\d{2})\s*-->"
 )
-# Lifecycle stages never regress: the furthest-advanced stage owns the PR's
-# grace period, so a later-posted earlier-stage marker cannot shadow it.
-STAGE_RANK = {"warning": 0, "draft": 1, "closed": 2}
+# ``draft`` and ``closed`` were emitted by the pre-comment-only example. Read
+# them conservatively, but never emit wording that implies a status effect.
+STAGE_ALIASES = {
+    "warning": "warning",
+    "draft": "draft_recommendation",
+    "draft_recommendation": "draft_recommendation",
+    "closed": "closure_recommendation",
+    "closure_recommendation": "closure_recommendation",
+    "escalation": "escalation",
+}
+# ``escalation`` and ``closure_recommendation`` share rank 2: both are the last
+# advisory an epoch can carry, and which one a PR gets depends only on whether
+# it is protected. Equal rank is what lets the monotonicity invariant hold
+# across a protected/unprotected transition.
+STAGE_RANK = {
+    "warning": 0,
+    "draft_recommendation": 1,
+    "closure_recommendation": 2,
+    "escalation": 2,
+}
+TERMINAL_STAGES = frozenset({"closure_recommendation", "escalation"})
+
+# ---------------------------------------------------------------------------
+# Fixed notification policy. These six values are the whole noise budget: a PR
+# can receive at most MAX_NOTIFICATION_EPOCHS ladders in its lifetime, each of
+# at most three comments, separated by EPOCH_REENTRY_COOLDOWN_DAYS. The grace
+# periods are chosen against the scheduled flows' fortnightly cadence so the
+# ladder always advances on a run boundary rather than between two runs.
+# ---------------------------------------------------------------------------
+HEALTHY_SCORE = 60
+WARNING_GRACE_DAYS = 7
+DRAFT_GRACE_DAYS = 14
+OWNER_RESPONSE_GRACE_DAYS = 30
+EPOCH_REENTRY_COOLDOWN_DAYS = 90
+MAX_NOTIFICATION_EPOCHS = 4
+MAX_ESCALATION_NOTIFICATIONS = 3
+STALE_DRAFT_PENALTY = 25
+# Inline decisions keep the journal record readable without unbounding it; the
+# full list is always written to ``decisions.json`` regardless.
+MAX_INLINE_DECISIONS = 200
+
+COMMENT_HEADER = "## Automated PR-health notification"
+COMMENT_ONLY_DISCLAIMER = (
+    "> This automated workflow only posts comments; it does not change PR status."
+)
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 RESERVED_IDS = {".", ".."}
 ISSUE_REF_RE = re.compile(r"(?i)(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)?\s*#\d+")
@@ -145,22 +228,27 @@ PR_FIELDS = (
     "changedFiles,files,labels,comments,commits,reviewDecision,mergeable,"
     "mergeStateStatus,statusCheckRollup,closingIssuesReferences"
 )
-ACTIONABLE_RECOMMENDATIONS = {
-    "escalate_protected_pr",
-    "propose_close",
-    "propose_draft",
-    "second_owner_notification",
-    "warn_owner",
-}
-# Marker stage each enforcement action writes. Idempotency is keyed on the
-# stage alone: the marker text also carries the run's score and as_of, so an
-# exact-string comparison would never match a prior run's marker and the same
-# notification would be posted again on every run.
+ACTIONABLE_RECOMMENDATIONS = frozenset(
+    {
+        "escalate_protected_pr",
+        "propose_close",
+        "propose_draft",
+        "second_owner_notification",
+        "warn_owner",
+    }
+)
+# Reported in the run output and the report, never commented: the PR has hit a
+# lifetime cap, so the only remaining action is a human's.
+REPORT_ONLY_RECOMMENDATION = "report_only"
+# Advisory marker stage each notification writes. Idempotency is keyed on the
+# (epoch, stage) pair: exact-string comparison would never match a prior run
+# because the marker also carries that run's score and date, and date-window
+# comparison would let a spent stage come back inside its own epoch.
 ACTION_STAGES = {
     "warn_owner": "warning",
-    "propose_draft": "draft",
-    "second_owner_notification": "draft",
-    "propose_close": "closed",
+    "propose_draft": "draft_recommendation",
+    "second_owner_notification": "draft_recommendation",
+    "propose_close": "closure_recommendation",
     "escalate_protected_pr": "escalation",
 }
 
@@ -209,7 +297,42 @@ def _repo_storage_key(repo: str) -> str:
     return quote(repo, safe="")
 
 
+def _is_scoped_repo(value: str) -> bool:
+    return value.count("/") == 1 and all(value.split("/"))
+
+
+def _is_positive_ascii_integer(value: str) -> bool:
+    return re.fullmatch(r"[1-9][0-9]*", value) is not None
+
+
+def _validate_gh_read_args(args: list[str]) -> None:
+    list_shape = (
+        len(args) == 10
+        and args[:2] == ["pr", "list"]
+        and args[2] == "--repo"
+        and _is_scoped_repo(args[3])
+        and args[4:6] == ["--state", "open"]
+        and args[6] == "--limit"
+        and _is_positive_ascii_integer(args[7])
+        and int(args[7]) <= 2001
+        and args[8:] == ["--json", "number"]
+    )
+    view_shape = (
+        len(args) == 7
+        and args[:2] == ["pr", "view"]
+        and _is_positive_ascii_integer(args[2])
+        and args[3] == "--repo"
+        and _is_scoped_repo(args[4])
+        and args[5:] == ["--json", PR_FIELDS]
+    )
+    if not (list_shape or view_shape):
+        raise ValueError(
+            "the PR-health GitHub read boundary only permits scoped pr list/view"
+        )
+
+
 def _run_gh(args: list[str]) -> Any:
+    _validate_gh_read_args(args)
     completed = subprocess.run(
         ["gh", *args],
         check=False,
@@ -217,7 +340,9 @@ def _run_gh(args: list[str]) -> Any:
         text=True,
     )
     if completed.returncode != 0:
-        detail = completed.stderr.strip() or completed.stdout.strip() or "unknown gh error"
+        detail = (
+            completed.stderr.strip() or completed.stdout.strip() or "unknown gh error"
+        )
         raise RuntimeError(f"gh command failed ({completed.returncode}): {detail}")
     try:
         return json.loads(completed.stdout)
@@ -226,6 +351,19 @@ def _run_gh(args: list[str]) -> Any:
 
 
 def _run_gh_command(args: list[str]) -> str:
+    if len(args) < 2 or args[:2] != ["pr", "comment"]:
+        raise ValueError("the PR-health GitHub write boundary is comment-only")
+    if (
+        len(args) != 7
+        or not _is_positive_ascii_integer(args[2])
+        or args[3] != "--repo"
+        or not _is_scoped_repo(args[4])
+        or args[5] != "--body"
+        or not args[6]
+    ):
+        raise ValueError(
+            "PR-health comments require an explicit repository and PR number"
+        )
     completed = subprocess.run(
         ["gh", *args],
         check=False,
@@ -233,7 +371,9 @@ def _run_gh_command(args: list[str]) -> str:
         text=True,
     )
     if completed.returncode != 0:
-        detail = completed.stderr.strip() or completed.stdout.strip() or "unknown gh error"
+        detail = (
+            completed.stderr.strip() or completed.stdout.strip() or "unknown gh error"
+        )
         raise RuntimeError(f"gh command failed ({completed.returncode}): {detail}")
     return completed.stdout.strip()
 
@@ -276,8 +416,8 @@ def _latest_commit_at(pr: dict[str, Any]) -> str:
 
     ``gh pr view --json commits`` may return a truncated page on PRs with very
     long histories. A missed newer commit only makes the PR look more idle than
-    it is, which lowers its score; the live re-score before any mutation reads
-    the same field, so enforcement never acts on a stale page alone.
+    it is, which lowers its score; the live re-score before any comment reads
+    the same field, so notification never acts on a stale page alone.
     """
     dates = []
     for commit in pr.get("commits") or []:
@@ -308,7 +448,11 @@ def _ci_component(pr: dict[str, Any]) -> tuple[int, str]:
         state = str(check.get("state") or check.get("status") or "").upper()
         if conclusion in FAILURE_CONCLUSIONS or state in FAILURE_CONCLUSIONS:
             has_failure = True
-        elif state in PENDING_STATES or not conclusion and state not in SUCCESS_CONCLUSIONS:
+        elif (
+            state in PENDING_STATES
+            or not conclusion
+            and state not in SUCCESS_CONCLUSIONS
+        ):
             has_pending = True
         elif conclusion and conclusion not in SUCCESS_CONCLUSIONS:
             has_failure = True
@@ -362,7 +506,9 @@ def _completeness_component(pr: dict[str, Any]) -> tuple[int, dict[str, int]]:
     files = pr.get("files") or []
     paths = [str(item.get("path") or "") for item in files if isinstance(item, dict)]
     description = 3 if len(body) >= 200 else 0
-    linked_issue = bool(pr.get("closingIssuesReferences")) or bool(ISSUE_REF_RE.search(body))
+    linked_issue = bool(pr.get("closingIssuesReferences")) or bool(
+        ISSUE_REF_RE.search(body)
+    )
     rationale = 2 if linked_issue or RATIONALE_RE.search(body) else 0
     has_test_file = any(
         path.startswith(("test/", "tests/", "web/src/test/"))
@@ -439,21 +585,15 @@ def _category(score: int) -> str:
     return "abandoned"
 
 
-def _lifecycle_marker(pr: dict[str, Any]) -> dict[str, Any] | None:
-    """Return the marker that owns the PR's current grace period.
-
-    The furthest-advanced stage wins, and within that stage the earliest
-    marker wins. Selecting by recency instead would let a later warning-stage
-    comment shadow an existing draft marker, so the draft grace period would
-    restart on every run and the closure branch would never be re-evaluated.
-    Lifecycle progression therefore does not depend on the run cadence.
+def _parse_markers(pr: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every workflow-authored lifecycle marker on the PR, v1 and v2 alike.
 
     Only comments authored by the authenticated identity count, and ``gh pr
     view`` may return a truncated comment page on very busy PRs; a marker that
     falls outside that page reads as absent, which is the conservative
-    direction (the ladder restarts rather than escalating).
+    direction (the ladder restarts at a warning rather than escalating).
     """
-    markers = []
+    markers: list[dict[str, Any]] = []
     for comment in pr.get("comments") or []:
         if not isinstance(comment, dict):
             continue
@@ -463,27 +603,89 @@ def _lifecycle_marker(pr: dict[str, Any]) -> dict[str, Any] | None:
         created_at = comment.get("createdAt")
         if not isinstance(created_at, str):
             continue
-        for match in MARKER_RE.finditer(body):
+        for match in MARKER_V2_RE.finditer(body):
             markers.append(
                 {
-                    "stage": match.group(1),
+                    "version": 2,
+                    "epoch": int(match.group(1)),
+                    "stage": STAGE_ALIASES[match.group(2)],
+                    "score": int(match.group(3)),
+                    "as_of": match.group(4),
+                    "created_at": created_at,
+                }
+            )
+        for match in MARKER_V1_RE.finditer(body):
+            markers.append(
+                {
+                    "version": 1,
+                    "epoch": 0,
+                    "stage": STAGE_ALIASES[match.group(1)],
                     "score": int(match.group(2)),
                     "as_of": match.group(3),
                     "created_at": created_at,
                 }
             )
+        for match in ESCALATION_MARKER_V1_RE.finditer(body):
+            markers.append(
+                {
+                    "version": 1,
+                    "epoch": 0,
+                    "stage": "escalation",
+                    "score": int(match.group(1)),
+                    "as_of": match.group(2),
+                    "created_at": created_at,
+                }
+            )
+    return markers
+
+
+def _lifecycle(pr: dict[str, Any]) -> dict[str, Any]:
+    """Summarize the PR's notification history as epochs and a current stage.
+
+    The current epoch is the highest epoch number present; within it the
+    furthest-advanced stage owns the grace period, and the newest marker of
+    that stage anchors it. Exact ``(epoch, stage)`` dedup means at most one
+    marker per pair in normal operation, so "newest" only matters when a
+    duplicate exists — and then the newest is the least-noise choice, because
+    it lengthens the wait rather than shortening it.
+    """
+    markers = _parse_markers(pr)
     if not markers:
-        return None
-    return min(
-        markers,
-        key=lambda item: (-STAGE_RANK[item["stage"]], item["created_at"]),
+        return {
+            "current": None,
+            "current_epoch": 0,
+            "epoch_count": 0,
+            "escalation_count": 0,
+            "epochs": [],
+        }
+    epochs = sorted({int(marker["epoch"]) for marker in markers})
+    current_epoch = epochs[-1]
+    in_epoch = [marker for marker in markers if int(marker["epoch"]) == current_epoch]
+    current = max(
+        in_epoch, key=lambda item: (STAGE_RANK[item["stage"]], item["created_at"])
     )
+    return {
+        "current": current,
+        "current_epoch": current_epoch,
+        "epoch_count": len(epochs),
+        "escalation_count": sum(
+            1 for marker in markers if marker["stage"] == "escalation"
+        ),
+        "epochs": epochs,
+    }
 
 
-def _owner_responded_after(pr: dict[str, Any], marker_at: str) -> bool:
+def _lifecycle_marker(pr: dict[str, Any]) -> dict[str, Any] | None:
+    """The single marker that owns the PR's current grace period, or ``None``."""
+    return _lifecycle(pr)["current"]
+
+
+def _latest_owner_activity_after(pr: dict[str, Any], marker_at: str) -> str | None:
+    activity_dates = []
     owner = _login(pr.get("author"))
-    if _latest_commit_at(pr) > marker_at:
-        return True
+    latest_commit_at = _latest_commit_at(pr)
+    if latest_commit_at > marker_at:
+        activity_dates.append(latest_commit_at)
     for comment in pr.get("comments") or []:
         if not isinstance(comment, dict):
             continue
@@ -491,8 +693,17 @@ def _owner_responded_after(pr: dict[str, Any], marker_at: str) -> bool:
             continue
         created_at = comment.get("createdAt")
         if isinstance(created_at, str) and created_at > marker_at:
-            return True
-    return False
+            activity_dates.append(created_at)
+    return max(activity_dates) if activity_dates else None
+
+
+def _owner_responded_after(pr: dict[str, Any], marker_at: str, as_of: str) -> bool:
+    """Did the owner answer ``marker_at`` recently enough to hold the epoch open?"""
+    activity_at = _latest_owner_activity_after(pr, marker_at)
+    return (
+        activity_at is not None
+        and _days_between(activity_at, as_of) < OWNER_RESPONSE_GRACE_DAYS
+    )
 
 
 def _observation_streak(
@@ -501,7 +712,7 @@ def _observation_streak(
     score: int,
     next_actor: str,
 ) -> int:
-    qualifies = score < 60 and next_actor == "OWNER"
+    qualifies = score < HEALTHY_SCORE and next_actor == "OWNER"
     if not qualifies:
         return 0
     if not previous:
@@ -523,10 +734,77 @@ def _observation_streak(
         return 1
     if as_of == previous_as_of:
         return int(previous.get("below60_owner_streak") or 1)
+    previous_score = previous.get("last_score")
     prior_qualified = (
-        int(previous.get("last_score") or 100) < 60 and previous.get("last_next_actor") == "OWNER"
+        int(100 if previous_score is None else previous_score) < HEALTHY_SCORE
+        and previous.get("last_next_actor") == "OWNER"
     )
     return int(previous.get("below60_owner_streak") or 0) + 1 if prior_qualified else 1
+
+
+def _fresh_ladder(
+    score: int,
+    next_actor: str,
+    streak: int,
+    reasons: list[str],
+    epoch: int,
+) -> tuple[int, str, list[str], int]:
+    """The start of a notification epoch. Every epoch begins at ``warn_owner``.
+
+    Re-entry deliberately restarts here rather than resuming mid-ladder: a PR
+    that has been silent for a full cooldown gets the same first notice a
+    never-notified PR would, and no epoch can open on an escalation or a
+    closure recommendation.
+    """
+    if next_actor == "CI":
+        return score, "await_ci", reasons, epoch
+    if next_actor != "OWNER":
+        return score, "alert_maintainers", reasons, epoch
+    if streak >= 2:
+        return score, "warn_owner", reasons, epoch
+    return score, "observe_again", reasons, epoch
+
+
+def _reenter_or_hold(
+    lifecycle: dict[str, Any],
+    anchor_at: str,
+    as_of: str,
+    score: int,
+    next_actor: str,
+    streak: int,
+    reasons: list[str],
+) -> tuple[int, str, list[str], int]:
+    """Decide whether a settled epoch may reopen as the next one.
+
+    ``anchor_at`` is whichever came last: the terminal advisory that closed the
+    epoch, or the owner activity that answered it. Anchoring on the response is
+    what stops a PR the owner engaged with from being re-warned on the terminal
+    marker's older clock.
+    """
+    cooldown_age = _days_between(anchor_at, as_of)
+    current_epoch = int(lifecycle["current_epoch"])
+    reasons.append(f"epoch_settled_age={cooldown_age}")
+    if cooldown_age < EPOCH_REENTRY_COOLDOWN_DAYS:
+        reasons.append("awaiting_epoch_reentry_cooldown")
+        return score, "await_owner_deadline", reasons, current_epoch
+    if int(lifecycle["epoch_count"]) >= MAX_NOTIFICATION_EPOCHS:
+        reasons.append("notification_epoch_cap_reached")
+        return score, REPORT_ONLY_RECOMMENDATION, reasons, current_epoch
+    next_epoch = current_epoch + 1
+    reasons.append(f"epoch_reentry={next_epoch}")
+    return _fresh_ladder(score, next_actor, streak, reasons, next_epoch)
+
+
+def _escalate_or_report_only(
+    lifecycle: dict[str, Any],
+    score: int,
+    reasons: list[str],
+    epoch: int,
+) -> tuple[int, str, list[str], int]:
+    if int(lifecycle["escalation_count"]) >= MAX_ESCALATION_NOTIFICATIONS:
+        reasons.append("escalation_cap_reached")
+        return score, REPORT_ONLY_RECOMMENDATION, reasons, epoch
+    return score, "escalate_protected_pr", reasons, epoch
 
 
 def _recommend_action(
@@ -534,57 +812,84 @@ def _recommend_action(
     raw_score: int,
     priority: str,
     next_actor: str,
-    marker: dict[str, Any] | None,
+    lifecycle: dict[str, Any],
     streak: int,
     as_of: str,
-) -> tuple[int, str, list[str]]:
+) -> tuple[int, str, list[str], int]:
+    """Return ``(score, action, reasons, notification_epoch)``.
+
+    Every branch that observes a marker RETURNS. There is deliberately no fall
+    through into the fresh ladder: that fall-through was how a warned PR came
+    back around to ``warn_owner``, and how a PR scoring 51-59 matched no
+    advancement branch at all and stalled forever one stage short of the ladder
+    it had already entered.
+    """
     score = raw_score
-    reasons = []
+    reasons: list[str] = []
+    healthy = raw_score >= HEALTHY_SCORE
     protected = (
-        priority in {"P0", "P1"} or str(pr.get("reviewDecision") or "").upper() == "APPROVED"
+        priority in {"P0", "P1"}
+        or str(pr.get("reviewDecision") or "").upper() == "APPROVED"
     )
+    current = lifecycle["current"]
+    epoch = int(lifecycle["current_epoch"])
 
-    if marker:
-        marker_age = _days_between(marker["created_at"], as_of)
-        responded = _owner_responded_after(pr, marker["created_at"])
-        reasons.append(f"{marker['stage']}_marker_age={marker_age}")
-        if responded:
-            reasons.append("owner_responded")
-            return score, "monitor_response", reasons
-        if marker["stage"] == "draft" and marker_age >= 14:
-            score = max(0, score - 25)
-            reasons.append("ignored_intervention=-25")
-            if score < 30:
-                if protected:
-                    return score, "escalate_protected_pr", reasons
-                return score, "propose_close", reasons
-        if marker["stage"] == "warning" and marker_age >= 7 and score <= 50:
-            if bool(pr.get("isDraft")):
-                return score, "second_owner_notification", reasons
-            if protected:
-                return score, "escalate_protected_pr", reasons
-            return score, "propose_draft", reasons
-        if marker["stage"] in {"warning", "draft"} and score < 60:
-            # The stage's notification is already on the PR and its grace period
-            # has not expired. Falling through to the score<60 ladder would
-            # re-recommend warn_owner — a stage this PR has already passed — so
-            # hold here instead of walking the lifecycle backwards.
-            reasons.append(f"awaiting_{marker['stage']}_grace_period")
-            return score, "await_owner_deadline", reasons
-        # stage=closed means a previous close was reverted (PR reopened); the
-        # ladder restarts from observation below.
+    if current is None:
+        if healthy:
+            return score, "none", reasons, epoch
+        return _fresh_ladder(score, next_actor, streak, reasons, epoch)
 
-    if score < 60:
-        if next_actor == "CI":
-            return score, "await_ci", reasons
-        if next_actor != "OWNER":
-            return score, "alert_maintainers", reasons
+    marker_age = _days_between(current["created_at"], as_of)
+    stage = str(current["stage"])
+    reasons.append(f"epoch={epoch}")
+    reasons.append(f"{stage}_marker_age={marker_age}")
+    owner_activity_at = _latest_owner_activity_after(pr, current["created_at"])
+
+    if _owner_responded_after(pr, current["created_at"], as_of):
+        reasons.append("owner_responded")
+        return score, "monitor_response", reasons, epoch
+    if healthy:
+        reasons.append("recovered_above_notification_threshold")
+        return score, "none", reasons, epoch
+    if owner_activity_at is not None:
+        # The owner did engage, so this epoch is settled on their answer rather
+        # than on the advisory. It expires into a cooldown, NOT into the next
+        # rung: escalating a PR whose owner replied — merely late — is the
+        # single loudest thing this workflow could do.
+        reasons.append("owner_response_epoch_expired")
+        return _reenter_or_hold(
+            lifecycle, owner_activity_at, as_of, score, next_actor, streak, reasons
+        )
+    if stage in TERMINAL_STAGES:
+        reasons.append("epoch_closed_by_terminal_stage")
+        return _reenter_or_hold(
+            lifecycle, current["created_at"], as_of, score, next_actor, streak, reasons
+        )
+
+    if stage == "warning":
+        if marker_age < WARNING_GRACE_DAYS:
+            reasons.append("awaiting_warning_grace_period")
+            return score, "await_owner_deadline", reasons, epoch
         if protected:
-            return score, "escalate_protected_pr", reasons
-        if streak >= 2:
-            return score, "warn_owner", reasons
-        return score, "observe_again", reasons
-    return score, "none", reasons
+            return _escalate_or_report_only(lifecycle, score, reasons, epoch)
+        if bool(pr.get("isDraft")):
+            return score, "second_owner_notification", reasons, epoch
+        return score, "propose_draft", reasons, epoch
+
+    # ``stage`` can only be ``draft_recommendation`` here: STAGE_ALIASES maps
+    # every readable marker onto warning / draft_recommendation / a terminal
+    # stage, and the two others returned above.
+    if marker_age < DRAFT_GRACE_DAYS:
+        reasons.append("awaiting_draft_recommendation_grace_period")
+        return score, "await_owner_deadline", reasons, epoch
+    # The penalty is a statement about an unanswered advisory, so it only
+    # applies while the PR is still insufficiently healthy — a recovered PR
+    # returned "none" above and never reaches it.
+    score = max(0, raw_score - STALE_DRAFT_PENALTY)
+    reasons.append(f"unanswered_draft_recommendation=-{STALE_DRAFT_PENALTY}")
+    if protected:
+        return _escalate_or_report_only(lifecycle, score, reasons, epoch)
+    return score, "propose_close", reasons, epoch
 
 
 def _score_pr(
@@ -602,20 +907,27 @@ def _score_pr(
     review_points, review_status = _review_component(pr)
     engagement_points = _engagement_component(idle_days)
     completeness_points, completeness_details = _completeness_component(pr)
-    raw_score = ci_points + merge_points + review_points + engagement_points + completeness_points
+    raw_score = (
+        ci_points
+        + merge_points
+        + review_points
+        + engagement_points
+        + completeness_points
+    )
     priority, priority_evidence = _priority(pr)
     next_actor = _next_actor(pr, ci_status, merge_status, review_status)
-    marker = _lifecycle_marker(pr)
+    lifecycle = _lifecycle(pr)
     streak = _observation_streak(previous, as_of, raw_score, next_actor)
-    score, action, action_reasons = _recommend_action(
+    score, action, action_reasons, notification_epoch = _recommend_action(
         pr,
         raw_score,
         priority,
         next_actor,
-        marker,
+        lifecycle,
         streak,
         as_of,
     )
+    marker = lifecycle["current"]
     result = {
         "number": number,
         "title": str(pr.get("title") or ""),
@@ -633,7 +945,10 @@ def _score_pr(
         "recommended_action": action,
         "action_reasons": action_reasons,
         "below60_owner_streak": streak,
+        "notification_epoch": notification_epoch,
         "lifecycle_marker": marker,
+        "notification_epochs_used": lifecycle["epoch_count"],
+        "escalations_used": lifecycle["escalation_count"],
         "components": {
             "ci": {"points": ci_points, "status": ci_status},
             "mergeability": {"points": merge_points, "status": merge_status},
@@ -643,19 +958,24 @@ def _score_pr(
                 "points": completeness_points,
                 **completeness_details,
             },
-            "ignored_intervention": score - raw_score,
+            "unanswered_draft_recommendation": score - raw_score,
         },
     }
     next_state = {
         "last_as_of": as_of,
-        "last_score": score,
+        # The RAW score, never the penalized one: persisting the penalty would
+        # re-apply it on the next run, compounding a one-time -25 into a drift
+        # that eventually reads as "abandoned" on its own.
+        "last_score": raw_score,
         "last_next_actor": next_actor,
         "below60_owner_streak": streak,
     }
     return result, next_state
 
 
-def _fetch_snapshot(repo: str, as_of: str, snapshot_id: str, max_prs: int) -> dict[str, Any]:
+def _fetch_snapshot(
+    repo: str, as_of: str, snapshot_id: str, max_prs: int
+) -> dict[str, Any]:
     rows = _run_gh(
         [
             "pr",
@@ -701,24 +1021,28 @@ def _fetch_snapshot(repo: str, as_of: str, snapshot_id: str, max_prs: int) -> di
     }
 
 
-def _render_report(repo: str, as_of: str, scores: list[dict[str, Any]], mode: str) -> str:
+def _render_report(
+    repo: str, as_of: str, scores: list[dict[str, Any]], mode: str
+) -> str:
     lines = [
         "# PR Health Report",
         "",
         f"- Repository: `{repo}`",
         f"- As of: `{as_of}`",
         f"- Open PRs: {len(scores)}",
-        "- Scoring: deterministic schema v1",
+        f"- Scoring: deterministic schema v{SCHEMA_VERSION}",
+        f"- Markers: `cao-pr-health:v{MARKER_SCHEMA_VERSION}` (v1 markers read as epoch 0)",
         "",
-        "| PR | Score | Health | Priority | Idle | Next actor | Recommendation |",
-        "|---:|---:|---|---|---:|---|---|",
+        "| PR | Score | Health | Priority | Idle | Next actor | Epoch | Recommendation |",
+        "|---:|---:|---|---|---:|---|---:|---|",
     ]
     for item in sorted(scores, key=lambda value: (value["score"], value["number"])):
         lines.append(
             "| "
             f"[#{item['number']}]({item['url']}) | {item['score']} | "
             f"{item['category']} | {item['priority']} | {item['idle_days']}d | "
-            f"{item['next_actor']} | {item['recommended_action']} |"
+            f"{item['next_actor']} | {item['notification_epoch']} | "
+            f"{item['recommended_action']} |"
         )
     lines.extend(
         [
@@ -730,12 +1054,41 @@ def _render_report(repo: str, as_of: str, scores: list[dict[str, Any]], mode: st
             "- Review: 15 approved, 10 review required, 5 draft, 0 changes requested.",
             "- Engagement: 40/32/24/16/8/0 across <=3/7/14/21/30/>30 idle days.",
             "- Completeness: 3 description, 2 rationale, 3 tests, 2 focused scope.",
-            "- Ignoring a draft-stage notification for 14 days applies -25.",
+            (
+                "- Leaving a draft recommendation unanswered for "
+                f"{DRAFT_GRACE_DAYS} days applies -{STALE_DRAFT_PENALTY}, "
+                f"and only while the score is under {HEALTHY_SCORE}."
+            ),
+            "",
+            "## Notification Policy",
+            "",
+            (
+                f"- Ladder: warning -> draft recommendation -> terminal advisory, with "
+                f"{WARNING_GRACE_DAYS} and {DRAFT_GRACE_DAYS} day grace periods."
+            ),
+            (
+                "- A terminal advisory (closure recommendation or escalation) closes the "
+                "notification epoch."
+            ),
+            (
+                f"- Owner activity answers the epoch for {OWNER_RESPONSE_GRACE_DAYS} days; "
+                "an expired response never escalates, it settles the epoch."
+            ),
+            (
+                f"- A closed epoch may reopen only {EPOCH_REENTRY_COOLDOWN_DAYS} days after "
+                "its terminal advisory or the owner's last answer, whichever is later, "
+                "and always restarts at a warning."
+            ),
+            (
+                f"- Lifetime caps: {MAX_NOTIFICATION_EPOCHS} notification epochs and "
+                f"{MAX_ESCALATION_NOTIFICATIONS} escalations per PR. At either cap the "
+                "decision becomes `report_only` and no comment is posted."
+            ),
             "",
             (
                 "Dry-run mode: this report does not mutate GitHub."
                 if mode == "dry_run"
-                else "Apply mode: eligible recommendations are live-revalidated before enforcement."
+                else "Apply mode: eligible comments are live-revalidated before posting."
             ),
             "",
         ]
@@ -743,7 +1096,9 @@ def _render_report(repo: str, as_of: str, scores: list[dict[str, Any]], mode: st
     return "\n".join(lines)
 
 
-def _importance_prompt(report_path: Path, scores_path: Path, repo: str, as_of: str) -> str:
+def _importance_prompt(
+    report_path: Path, scores_path: Path, repo: str, as_of: str
+) -> str:
     return f"""Review the deterministic PR health artifacts for {repo} as of {as_of}.
 
 Read:
@@ -762,16 +1117,16 @@ Call out uncertain importance classifications as advisory. Return Markdown only.
 Do not modify files or GitHub."""
 
 
-def _action_marker(action: str, score: int, as_of: str) -> str:
-    if action == "warn_owner":
-        return f"<!-- cao-pr-health:v1 stage=warning score={score} as_of={as_of} -->"
-    if action in {"propose_draft", "second_owner_notification"}:
-        return f"<!-- cao-pr-health:v1 stage=draft score={score} as_of={as_of} -->"
-    if action == "propose_close":
-        return f"<!-- cao-pr-health:v1 stage=closed score={score} as_of={as_of} -->"
-    if action == "escalate_protected_pr":
-        return f"<!-- cao-pr-health:v1 action=escalation score={score} " f"as_of={as_of} -->"
-    raise ValueError(f"unsupported enforcement action: {action}")
+def _action_marker(action: str, epoch: int, score: int, as_of: str) -> str:
+    stage = ACTION_STAGES.get(action)
+    if stage is None:
+        raise ValueError(f"unsupported notification action: {action}")
+    if not isinstance(epoch, int) or isinstance(epoch, bool) or not 0 <= epoch <= 999:
+        raise ValueError("notification epoch must be an integer from 0 through 999")
+    return (
+        f"<!-- cao-pr-health:v{MARKER_SCHEMA_VERSION} epoch={epoch} "
+        f"stage={stage} score={score} as_of={as_of} -->"
+    )
 
 
 def _blocker_lines(item: dict[str, Any]) -> list[str]:
@@ -789,7 +1144,9 @@ def _comment_body(item: dict[str, Any], as_of: str) -> str:
     owner = item["owner"]
     score = item["score"]
     blockers = "\n".join(_blocker_lines(item))
-    marker = _action_marker(action, score, as_of)
+    marker = _action_marker(
+        action, int(item.get("notification_epoch") or 0), score, as_of
+    )
 
     if action == "warn_owner":
         message = f"""@{owner} This PR's automated health score is **{score}/100** and needs attention.
@@ -797,28 +1154,28 @@ def _comment_body(item: dict[str, Any], as_of: str) -> str:
 Current signals:
 {blockers}
 
-No state change is being made now. Please push an update or reply with your plan within 7 days. The score will be recalculated before any further action."""
+Please push an update or reply with your plan within 7 days. The score will be recalculated before any further notification."""
     elif action == "propose_draft":
         message = f"""@{owner} This PR's automated health score is now **{score}/100**. The previous notification has been open for at least 7 days without new activity.
 
 Current signals:
 {blockers}
 
-The PR is being moved to draft while the outstanding issues are addressed. Please push an update or reply with a concrete plan within 14 days. No closure will occur without another evaluation."""
+Maintainers may consider moving this PR to draft while the outstanding issues are addressed. Please push an update or reply with a concrete plan within 14 days."""
     elif action == "second_owner_notification":
         message = f"""@{owner} This draft PR's automated health score is **{score}/100**. The previous notification has been open for at least 7 days without new activity.
 
 Current signals:
 {blockers}
 
-Please push an update or reply with a concrete plan within 14 days. No closure will occur without another evaluation."""
+Please push an update or reply with a concrete plan within 14 days."""
     elif action == "propose_close":
         message = f"""@{owner} This PR's automated health score is **{score}/100** after the warning and draft grace periods.
 
 Current signals:
 {blockers}
 
-The PR remains blocked and no owner activity was detected, so it is being closed to keep the active backlog current. This is not a rejection of the proposal. It can be reopened or resubmitted when the work is ready to continue."""
+The PR remains blocked and no owner activity was detected. Maintainers may consider closing it to keep the active backlog current."""
     elif action == "escalate_protected_pr":
         protections = []
         if item["priority"] in {"P0", "P1"}:
@@ -831,43 +1188,34 @@ The PR remains blocked and no owner activity was detected, so it is being closed
 Current signals:
 {blockers}
 
-This PR is protected from automated draft or closure because of its {protection_text}. Maintainer escalation is requested. Please push an update or reply with the intended next step."""
+This PR has {protection_text}, so maintainer escalation is requested. Please push an update or reply with the intended next step."""
     else:
-        raise ValueError(f"unsupported enforcement action: {action}")
+        raise ValueError(f"unsupported notification action: {action}")
 
-    return f"{message}\n\n{marker}"
-
-
-def _authored_bodies(pr: dict[str, Any]) -> list[str]:
-    return [
-        str(comment.get("body") or "")
-        for comment in pr.get("comments") or []
-        if isinstance(comment, dict) and comment.get("viewerDidAuthor") is True
-    ]
+    return f"{COMMENT_HEADER}\n\n{COMMENT_ONLY_DISCLAIMER}\n\n{message}\n\n{marker}"
 
 
-def _has_marker_for_stage(pr: dict[str, Any], stage: str) -> bool:
-    """Has this workflow identity already posted a marker for ``stage``?
+def _has_marker_for_stage(pr: dict[str, Any], stage: str, epoch: int) -> bool:
+    """Has this workflow identity already posted ``stage`` in ``epoch``?
 
-    Dedupe is by stage presence, never by exact marker text: markers embed the
-    run's ``score`` and ``as_of``, so exact matching would re-post the same
-    notification every run.
+    Dedupe is EXACT on the ``(epoch, stage)`` pair, never on marker text and
+    never on a date window. Text comparison always missed, because the marker
+    embeds the emitting run's own score and date. A date window was worse: it
+    expired, so a spent stage became postable again inside its own epoch, which
+    is precisely the repeat notification the epoch model exists to prevent.
+    Re-notifying requires a NEW epoch, and opening one requires the cooldown.
     """
-    for body in _authored_bodies(pr):
-        if stage == "escalation":
-            if ESCALATION_MARKER_RE.search(body):
-                return True
-            continue
-        if any(match.group(1) == stage for match in MARKER_RE.finditer(body)):
+    for marker in _parse_markers(pr):
+        if marker["stage"] == stage and int(marker["epoch"]) == int(epoch):
             return True
     return False
 
 
-def _has_marker_for_action(pr: dict[str, Any], action: str) -> bool:
+def _has_marker_for_action(pr: dict[str, Any], action: str, epoch: int) -> bool:
     stage = ACTION_STAGES.get(action)
     if stage is None:
-        raise ValueError(f"unsupported enforcement action: {action}")
-    return _has_marker_for_stage(pr, stage)
+        raise ValueError(f"unsupported notification action: {action}")
+    return _has_marker_for_stage(pr, stage, epoch)
 
 
 def _fetch_pr(repo: str, number: int) -> dict[str, Any]:
@@ -887,24 +1235,11 @@ def _fetch_pr(repo: str, number: int) -> dict[str, Any]:
     return value
 
 
-def _parse_close_allowlist(value: str) -> set[int]:
-    if not value.strip():
-        return set()
-    result = set()
-    for token in value.split(","):
-        token = token.strip()
-        if not token.isdigit() or int(token) < 1:
-            raise ValueError("close_allowlist must be a comma-separated list of PR numbers")
-        result.add(int(token))
-    return result
-
-
 def _apply_recommendations(
     repo: str,
     as_of: str,
     scores: list[dict[str, Any]],
     persisted_state: dict[str, Any],
-    close_allowlist: set[int],
     journal_path: Path,
 ) -> list[dict[str, Any]]:
     results = []
@@ -915,9 +1250,11 @@ def _apply_recommendations(
         if action not in ACTIONABLE_RECOMMENDATIONS:
             continue
         number = int(planned["number"])
+        epoch = int(planned.get("notification_epoch") or 0)
         result: dict[str, Any] = {
             "number": number,
             "planned_action": action,
+            "notification_epoch": epoch,
             "status": "pending",
         }
         try:
@@ -935,7 +1272,10 @@ def _apply_recommendations(
                     },
                 )
                 continue
-            if _has_marker_for_action(live_pr, action):
+            if _has_marker_for_action(live_pr, action, epoch):
+                # The replay/resume guard. Resume re-executes this script
+                # top-to-bottom, so the marker already on the PR — not any
+                # in-process bookkeeping — is what makes a second pass silent.
                 result["status"] = "already_applied"
                 results.append(result)
                 _write_json(
@@ -956,41 +1296,22 @@ def _apply_recommendations(
             if (
                 live_score["score"] != planned["score"]
                 or live_score["recommended_action"] != action
+                or int(live_score["notification_epoch"]) != epoch
             ):
                 result.update(
                     {
                         "status": "skipped_live_drift",
                         "live_score": live_score["score"],
                         "live_recommendation": live_score["recommended_action"],
+                        "live_notification_epoch": live_score["notification_epoch"],
                     }
                 )
-            elif action == "propose_close" and number not in close_allowlist:
-                result["status"] = "skipped_closure_not_allowlisted"
             else:
                 body = _comment_body(planned, as_of)
-                if action == "propose_draft":
-                    # propose_draft is only recommended for a non-draft PR, and
-                    # the live re-score above rejects any drift, so the PR is
-                    # known not to be a draft here.
-                    _run_gh_command(["pr", "ready", str(number), "--repo", repo, "--undo"])
-                    _run_gh_command(["pr", "comment", str(number), "--repo", repo, "--body", body])
-                    result["status"] = "drafted_and_commented"
-                elif action == "propose_close":
-                    _run_gh_command(
-                        [
-                            "pr",
-                            "close",
-                            str(number),
-                            "--repo",
-                            repo,
-                            "--comment",
-                            body,
-                        ]
-                    )
-                    result["status"] = "closed_and_commented"
-                else:
-                    _run_gh_command(["pr", "comment", str(number), "--repo", repo, "--body", body])
-                    result["status"] = "commented"
+                _run_gh_command(
+                    ["pr", "comment", str(number), "--repo", repo, "--body", body]
+                )
+                result["status"] = "commented"
         except Exception as exc:
             result.update({"status": "error", "error": str(exc)})
         results.append(result)
@@ -1006,6 +1327,60 @@ def _apply_recommendations(
     return results
 
 
+def _migrate_state(state: dict[str, Any], repo: str) -> dict[str, Any]:
+    """Accept any supported persisted-state schema and return it at the current one.
+
+    Rejecting an older schema would abort every run for the whole repository
+    until an operator deleted the file by hand — a much worse failure than
+    carrying forward four scalar fields whose meaning did not change. The v1
+    ``last_score`` was the penalized score rather than the raw one; carrying it
+    forward can only shorten a streak by one observation, which is the quiet
+    direction.
+    """
+    version = state.get("schema_version")
+    if version not in SUPPORTED_STATE_SCHEMA_VERSIONS:
+        raise ValueError("persisted PR health state has an unsupported schema")
+    if state.get("repo") != repo or not isinstance(state.get("prs"), dict):
+        raise ValueError("persisted PR health state has an unsupported schema")
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "repo": repo,
+        "prs": dict(state["prs"]),
+    }
+
+
+def _decision_record(item: dict[str, Any], notified: bool) -> dict[str, Any]:
+    """One PR's structured decision, small enough to live in the run output."""
+    marker = item.get("lifecycle_marker")
+    return {
+        "number": item["number"],
+        "url": item["url"],
+        "score": item["score"],
+        "raw_score": item["raw_score"],
+        "category": item["category"],
+        "priority": item["priority"],
+        "next_actor": item["next_actor"],
+        "recommended_action": item["recommended_action"],
+        "notification_epoch": item["notification_epoch"],
+        "marker_stage": marker["stage"] if marker else None,
+        "marker_epoch": marker["epoch"] if marker else None,
+        "notification_epochs_used": item["notification_epochs_used"],
+        "escalations_used": item["escalations_used"],
+        "action_reasons": list(item["action_reasons"]),
+        "notified": notified,
+    }
+
+
+POLICY = {
+    "warning_grace_days": WARNING_GRACE_DAYS,
+    "draft_grace_days": DRAFT_GRACE_DAYS,
+    "owner_response_grace_days": OWNER_RESPONSE_GRACE_DAYS,
+    "epoch_reentry_cooldown_days": EPOCH_REENTRY_COOLDOWN_DAYS,
+    "max_notification_epochs": MAX_NOTIFICATION_EPOCHS,
+    "max_escalation_notifications": MAX_ESCALATION_NOTIFICATIONS,
+}
+
+
 def _run_locked(inputs: dict[str, Any]) -> None:
     repo = str(inputs.get("repo") or "").strip()
     as_of = str(inputs.get("as_of") or "").strip()
@@ -1015,7 +1390,6 @@ def _run_locked(inputs: dict[str, Any]) -> None:
     importance_provider = str(inputs.get("importance_provider") or "").strip()
     importance_agent = str(inputs.get("importance_agent") or "").strip()
     mode = str(inputs.get("mode") or "").strip()
-    close_allowlist_text = str(inputs.get("close_allowlist") or "").strip()
 
     if repo.count("/") != 1 or any(not part for part in repo.split("/")):
         raise ValueError("repo must be in owner/name form")
@@ -1025,7 +1399,11 @@ def _run_locked(inputs: dict[str, Any]) -> None:
             "snapshot_id may contain only letters, numbers, dot, underscore, and dash, "
             "and may not be '.' or '..'"
         )
-    if isinstance(max_prs, bool) or not isinstance(max_prs, int) or not 1 <= max_prs <= 2000:
+    if (
+        isinstance(max_prs, bool)
+        or not isinstance(max_prs, int)
+        or not 1 <= max_prs <= 2000
+    ):
         raise ValueError("max_prs must be an integer from 1 through 2000")
     if not isinstance(importance_analysis, bool):
         raise ValueError("importance_analysis must be boolean")
@@ -1035,9 +1413,6 @@ def _run_locked(inputs: dict[str, Any]) -> None:
         raise ValueError("importance_agent must be a nonempty safe identifier")
     if mode not in {"dry_run", "apply"}:
         raise ValueError("mode must be dry_run or apply")
-    close_allowlist = _parse_close_allowlist(close_allowlist_text)
-    if mode == "dry_run" and close_allowlist:
-        raise ValueError("close_allowlist is only valid in apply mode")
 
     repo_key = _repo_storage_key(repo)
     root = Path.home() / ".local" / "state" / "cao" / "pr-health" / repo_key
@@ -1046,6 +1421,7 @@ def _run_locked(inputs: dict[str, Any]) -> None:
     scores_path = artifact_dir / "scores.json"
     report_path = artifact_dir / "report.md"
     analysis_path = artifact_dir / "importance-analysis.md"
+    decisions_path = artifact_dir / "decisions.json"
     enforcement_path = artifact_dir / "enforcement.json"
     manifest_path = artifact_dir / "manifest.json"
     state_path = root / "state.json"
@@ -1075,17 +1451,12 @@ def _run_locked(inputs: dict[str, Any]) -> None:
         snapshot = _fetch_snapshot(repo, as_of, snapshot_id, max_prs)
         _write_json(snapshot_path, snapshot)
 
-    state = (
+    state = _migrate_state(
         _read_object(state_path)
         if state_path.is_file()
-        else {"schema_version": SCHEMA_VERSION, "repo": repo, "prs": {}}
+        else {"schema_version": SCHEMA_VERSION, "repo": repo, "prs": {}},
+        repo,
     )
-    if (
-        state.get("schema_version") != SCHEMA_VERSION
-        or state.get("repo") != repo
-        or not isinstance(state.get("prs"), dict)
-    ):
-        raise ValueError("persisted PR health state has an unsupported schema")
 
     scores = []
     next_pr_state = dict(state["prs"])
@@ -1100,7 +1471,9 @@ def _run_locked(inputs: dict[str, Any]) -> None:
 
     open_numbers = {str(item["number"]) for item in scores}
     next_pr_state = {
-        number: value for number, value in next_pr_state.items() if number in open_numbers
+        number: value
+        for number, value in next_pr_state.items()
+        if number in open_numbers
     }
     updated_state = {
         "schema_version": SCHEMA_VERSION,
@@ -1133,7 +1506,9 @@ def _run_locked(inputs: dict[str, Any]) -> None:
                 step_id=f"importance-{snapshot_id}",
                 timeout=1800.0,
             )
-            analysis_path.write_text(f"{(handle.output or '').strip()}\n", encoding="utf-8")
+            analysis_path.write_text(
+                f"{(handle.output or '').strip()}\n", encoding="utf-8"
+            )
         except ShimError as exc:
             analysis_error = str(exc)
 
@@ -1144,36 +1519,64 @@ def _run_locked(inputs: dict[str, Any]) -> None:
             as_of,
             scores,
             updated_state,
-            close_allowlist,
             enforcement_path,
         )
 
     actions: dict[str, int] = {}
     for item in scores:
-        actions[item["recommended_action"]] = actions.get(item["recommended_action"], 0) + 1
+        actions[item["recommended_action"]] = (
+            actions.get(item["recommended_action"], 0) + 1
+        )
+    notified_numbers = {
+        int(result["number"])
+        for result in enforcement_results
+        if result.get("status") == "commented"
+    }
+    decisions = [
+        _decision_record(item, int(item["number"]) in notified_numbers)
+        for item in sorted(scores, key=lambda value: int(value["number"]))
+    ]
+    _write_json(
+        decisions_path,
+        {
+            "schema_version": SCHEMA_VERSION,
+            "repo": repo,
+            "as_of": as_of,
+            "snapshot_id": snapshot_id,
+            "mode": mode,
+            "policy": dict(POLICY),
+            "decisions": decisions,
+        },
+    )
     manifest = {
         "schema_version": SCHEMA_VERSION,
+        "marker_schema_version": MARKER_SCHEMA_VERSION,
         "repo": repo,
         "as_of": as_of,
         "snapshot_id": snapshot_id,
         "mode": mode,
         "open_prs": len(scores),
         "actions": dict(sorted(actions.items())),
+        "policy": dict(POLICY),
+        "artifact_dir": str(artifact_dir),
         "snapshot_file": str(snapshot_path),
         "scores_file": str(scores_path),
         "report_file": str(report_path),
-        "importance_analysis_file": (str(analysis_path) if analysis_path.is_file() else None),
+        "decisions_file": str(decisions_path),
+        # The journal stores the run output verbatim, so the inline copy is
+        # bounded; ``decisions_file`` always holds the complete list.
+        "decisions": decisions[:MAX_INLINE_DECISIONS],
+        "decisions_truncated": len(decisions) > MAX_INLINE_DECISIONS,
+        "importance_analysis_file": (
+            str(analysis_path) if analysis_path.is_file() else None
+        ),
         "importance_analysis_error": analysis_error,
-        "enforcement_file": (str(enforcement_path) if enforcement_path.is_file() else None),
+        "enforcement_file": (
+            str(enforcement_path) if enforcement_path.is_file() else None
+        ),
         "enforcement_results": enforcement_results,
-        "mutated_github": any(
-            result.get("status")
-            in {
-                "closed_and_commented",
-                "commented",
-                "drafted_and_commented",
-            }
-            for result in enforcement_results
+        "posted_github_comments": any(
+            result.get("status") == "commented" for result in enforcement_results
         ),
     }
     _write_json(manifest_path, manifest)
@@ -1181,7 +1584,9 @@ def _run_locked(inputs: dict[str, Any]) -> None:
 
 
 def _acquire_repo_lock(repo: str) -> tuple[TextIO, Path]:
-    root = Path.home() / ".local" / "state" / "cao" / "pr-health" / _repo_storage_key(repo)
+    root = (
+        Path.home() / ".local" / "state" / "cao" / "pr-health" / _repo_storage_key(repo)
+    )
     root.mkdir(parents=True, exist_ok=True)
     lock_path = root / ".workflow.lock"
     lock_handle = lock_path.open("a+", encoding="utf-8")

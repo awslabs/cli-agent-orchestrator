@@ -245,6 +245,9 @@ All eight verbs live under `cao workflow`.
   - [`fanout_example.py`](examples/fanout_example.py) — concurrent fan-out via `ThreadPoolExecutor`.
   - [`loop_raw_http_example.py`](examples/loop_raw_http_example.py) — the same loop with no shim, raw `urllib` against the identity env vars.
 - [`examples/workflows/pr-health/`](../examples/workflows/pr-health/) — a
-  deterministic open-PR health scorer with guarded enforcement and a biweekly
-  scheduled-flow example.
+  deterministic open-PR health scorer with comment-only notifications, an
+  epoch-bounded notification lifecycle (fixed grace periods, a 90-day re-entry
+  cooldown, and lifetime caps past which decisions are report-only), a
+  journal-visible per-PR decision record, and a biweekly scheduled-flow example.
+  Its apply mode is gated by plan approval rather than by prompt prose.
 - [`skills/cao-workflow/SKILL.md`](../skills/cao-workflow/SKILL.md) — the agent-facing skill that teaches this lifecycle.
