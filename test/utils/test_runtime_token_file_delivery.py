@@ -82,3 +82,38 @@ def test_load_is_idempotent_and_cached(monkeypatch):
     # A later env change is ignored until the process restarts (cache clear).
     monkeypatch.setenv("CAO_RUNTIME_TOKEN", "changed")
     assert rt.load_runtime_token() == first == "once"
+
+
+def test_the_raw_value_leaves_the_env_when_a_file_is_also_configured(monkeypatch, tmp_path):
+    """Both variables set: the file wins and the raw value is still removed."""
+    import cli_agent_orchestrator.utils.runtime_token as rt
+
+    token_file = tmp_path / "mounted-token"
+    token_file.write_text("from-file\n")
+    monkeypatch.setenv("CAO_RUNTIME_TOKEN_FILE", str(token_file))
+    monkeypatch.setenv("CAO_RUNTIME_TOKEN", "raw-value")
+
+    assert rt.load_runtime_token() == "from-file"
+    assert "CAO_RUNTIME_TOKEN" not in os.environ
+    assert os.environ["CAO_RUNTIME_TOKEN_FILE"] == str(token_file)
+
+
+def test_an_unreadable_file_does_not_fall_back_to_the_raw_value(monkeypatch):
+    import cli_agent_orchestrator.utils.runtime_token as rt
+
+    monkeypatch.setenv("CAO_RUNTIME_TOKEN_FILE", "/nonexistent/dir/runtime-token")
+    monkeypatch.setenv("CAO_RUNTIME_TOKEN", "raw-value")
+
+    assert rt.load_runtime_token() is None
+    assert "CAO_RUNTIME_TOKEN" not in os.environ
+
+
+def test_the_raw_value_leaves_the_env_even_when_the_file_cannot_be_written(monkeypatch):
+    import cli_agent_orchestrator.utils.runtime_token as rt
+
+    monkeypatch.setattr(rt, "_write_token_file", lambda token: None)
+    monkeypatch.setenv("CAO_RUNTIME_TOKEN", "raw-value")
+
+    assert rt.load_runtime_token() == "raw-value"
+    assert "CAO_RUNTIME_TOKEN" not in os.environ
+    assert "CAO_RUNTIME_TOKEN_FILE" not in os.environ

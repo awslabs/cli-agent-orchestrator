@@ -50,13 +50,17 @@ def load_runtime_token() -> Optional[str]:
 
 def _resolve() -> Optional[str]:
     global _TOKEN_FILE
+    # The raw value leaves the environment whichever source wins, before anything
+    # else runs: a child started after this point must never inherit it.
+    raw = os.environ.pop(RUNTIME_TOKEN_ENV, "").strip()
     file_path = os.environ.get(RUNTIME_TOKEN_FILE_ENV, "").strip()
     if file_path:
-        # Already a path: read it and leave the file where it is.
+        # A configured file is authoritative. If it cannot be read the token is
+        # unavailable (callers fail closed); the raw value is not a fallback.
         try:
             value = Path(file_path).read_text(encoding="utf-8").strip() or None
         except OSError:
-            logger.warning(
+            logger.error(
                 "could not read %s=%s; the runtime token is unavailable",
                 RUNTIME_TOKEN_FILE_ENV,
                 file_path,
@@ -67,18 +71,22 @@ def _resolve() -> Optional[str]:
             _TOKEN_FILE = file_path
         return value
 
-    value = os.environ.get(RUNTIME_TOKEN_ENV, "").strip()
-    if not value:
+    if not raw:
         return None
 
-    # A raw value from the env: move it into an owner-only file and out of the
-    # environment, so it survives startup only as a path.
-    path = _write_token_file(value)
+    # A raw value: move it into an owner-only file so it survives startup only as
+    # a path. If the file cannot be written, the value stays in this process's
+    # memory and no child can receive it.
+    path = _write_token_file(raw)
     if path:
         _TOKEN_FILE = path
         os.environ[RUNTIME_TOKEN_FILE_ENV] = path
-        os.environ.pop(RUNTIME_TOKEN_ENV, None)
-    return value
+    else:
+        logger.error(
+            "could not write the runtime token file; MCP shims launched by this "
+            "process will have no runtime token"
+        )
+    return raw
 
 
 def _write_token_file(token: str) -> Optional[str]:
