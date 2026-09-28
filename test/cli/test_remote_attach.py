@@ -62,19 +62,19 @@ class TestDetach:
         session — the CLI must return on its own. It reads stdin with a poll
         precisely so it is not parked in a blocking read that only the next
         keypress could release."""
-        master, slave = pty.openpty()
+        parent, child = pty.openpty()
         ws = _FakeWS([b"screen bytes"])
         try:
             with (
-                patch.object(remote_attach.sys, "stdin", _Stdin(slave)),
+                patch.object(remote_attach.sys, "stdin", _Stdin(child)),
                 patch("websockets.sync.client.connect", return_value=ws),
             ):
                 started = time.monotonic()
                 remote_attach.attach_remote_terminal("abcd1234", "http://server:9889")
                 elapsed = time.monotonic() - started
         finally:
-            os.close(master)
-            os.close(slave)
+            os.close(parent)
+            os.close(child)
 
         # Nothing was ever written to the pty: the exit came from the relay.
         assert elapsed < 10
@@ -82,10 +82,10 @@ class TestDetach:
         assert "[detached]" in capfd.readouterr().out
 
     def test_handshake_failure_is_a_click_error_not_a_raw_traceback(self):
-        master, slave = pty.openpty()
+        parent, child = pty.openpty()
         try:
             with (
-                patch.object(remote_attach.sys, "stdin", _Stdin(slave)),
+                patch.object(remote_attach.sys, "stdin", _Stdin(child)),
                 patch(
                     "websockets.sync.client.connect",
                     side_effect=OSError("connection refused"),
@@ -94,8 +94,8 @@ class TestDetach:
                 with pytest.raises(click.ClickException, match="could not reach"):
                     remote_attach.attach_remote_terminal("abcd1234", "http://server:9889")
         finally:
-            os.close(master)
-            os.close(slave)
+            os.close(parent)
+            os.close(child)
 
 
 class TestTheCredentialIsNotInTheUrl:
@@ -109,19 +109,19 @@ class TestTheCredentialIsNotInTheUrl:
     """
 
     def test_the_token_travels_as_an_authorization_header(self):
-        master, slave = pty.openpty()
+        parent, child = pty.openpty()
         ws = _FakeWS([b"bytes"])
         try:
             with (
-                patch.object(remote_attach.sys, "stdin", _Stdin(slave)),
+                patch.object(remote_attach.sys, "stdin", _Stdin(child)),
                 patch("websockets.sync.client.connect", return_value=ws) as connect,
             ):
                 remote_attach.attach_remote_terminal(
                     "abcd1234", "http://server:9889", token="SECRET.J.WT"
                 )
         finally:
-            os.close(master)
-            os.close(slave)
+            os.close(parent)
+            os.close(child)
 
         url = connect.call_args.args[0]
         assert "SECRET.J.WT" not in url
@@ -131,17 +131,17 @@ class TestTheCredentialIsNotInTheUrl:
         }
 
     def test_no_token_sends_no_header(self):
-        master, slave = pty.openpty()
+        parent, child = pty.openpty()
         ws = _FakeWS([b"bytes"])
         try:
             with (
-                patch.object(remote_attach.sys, "stdin", _Stdin(slave)),
+                patch.object(remote_attach.sys, "stdin", _Stdin(child)),
                 patch("websockets.sync.client.connect", return_value=ws) as connect,
             ):
                 remote_attach.attach_remote_terminal("abcd1234", "http://server:9889")
         finally:
-            os.close(master)
-            os.close(slave)
+            os.close(parent)
+            os.close(child)
 
         assert connect.call_args.kwargs["additional_headers"] is None
 

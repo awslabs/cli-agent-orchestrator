@@ -38,7 +38,14 @@ from cli_agent_orchestrator.models.terminal import TerminalId, TerminalStatus
 # script. That is a dropped field reinterpreted as a different command, which
 # this channel is required to refuse at connect rather than discover at call
 # time; hence a bump and not a silent addition.
-PROTOCOL_VERSION = 2
+#
+# 3: INPUT gained ``frozen_memory`` and the ATTACH stream gained a per-terminal
+# epoch (carried as the frame ``generation``). A v2 bridge drops ``frozen_memory``
+# — turning a frozen empty context into a live memory lookup — and ignores the
+# epoch, so a displaced attach's EOF could still close the replacement client.
+# Both are dropped-field-becomes-different-behavior, the same class the v2 bump
+# named, so the mismatch is refused at hello rather than mis-served.
+PROTOCOL_VERSION = 3
 
 
 class FrameKind(str, Enum):

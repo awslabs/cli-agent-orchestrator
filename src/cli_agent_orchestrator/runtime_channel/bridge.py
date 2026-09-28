@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 import websockets
+from websockets.asyncio.client import ClientConnection, connect
 
 from cli_agent_orchestrator.clients.database import init_runtime_db
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
@@ -120,7 +121,7 @@ class Bridge:
         # Results not yet acked by the server, re-sent after every reconnect.
         # Bounded by the number of in-flight ops, which the server bounds.
         self._unacked: Dict[str, CommandResultFrame] = {}
-        self._ws: Optional[websockets.ClientConnection] = None
+        self._ws: Optional[ClientConnection] = None
         self._send_lock = asyncio.Lock()
         self._stop = asyncio.Event()
         # In-flight script subprocesses by op_id, so CANCEL_SCRIPT can terminate
@@ -990,7 +991,7 @@ class Bridge:
             # the delay actually waited — it is decided below, not here.
             reason = None
             try:
-                async with websockets.connect(
+                async with connect(
                     self._server_url,
                     additional_headers={RUNTIME_TOKEN_HEADER: self._token},
                     max_size=16 * 1024 * 1024,
