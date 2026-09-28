@@ -128,6 +128,7 @@ from cli_agent_orchestrator.security.auth import (
     require_any_scope,
 )
 from cli_agent_orchestrator.security.principal import Principal
+from cli_agent_orchestrator.security.service_principal import is_service_principal
 from cli_agent_orchestrator.services import (
     approval_gate,
     approval_provenance,
@@ -3716,7 +3717,12 @@ async def create_terminal_in_session(
                     f"cannot read the owner recorded for caller '{caller_id}' " f"({e}); retry"
                 ),
             )
-        if is_auth_enabled() and caller_owner and caller_owner != principal.id:
+        if (
+            is_auth_enabled()
+            and caller_owner
+            and caller_owner != principal.id
+            and not is_service_principal(principal)
+        ):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=(
@@ -3724,6 +3730,10 @@ async def create_terminal_in_session(
                     "may only be created on behalf of a terminal you own"
                 ),
             )
+        # The MCP->API hop authenticates as the shared service principal, not the
+        # human caller, so it is allowed to name a caller it did not own. The
+        # residual — anyone holding the service token can name any terminal — is
+        # the shared-credential limit tracked by #774.
         worker_owner = caller_owner or principal.id
 
         caller_runtime = None
@@ -7492,7 +7502,11 @@ async def create_inbox_message_endpoint(
     if is_auth_enabled() and sender_id not in _OPERATOR_SENDER_LABELS:
         sender_row = await asyncio.to_thread(get_terminal_metadata, sender_id)
         sender_owner = (sender_row or {}).get("owner")
-        if sender_owner and sender_owner != principal.id:
+        if sender_owner and sender_owner != principal.id and not is_service_principal(principal):
+            # The MCP->API hop authenticates as the shared service principal, not
+            # the human sender, so it is allowed to name a sender it did not own.
+            # The residual — anyone holding the service token can name any terminal
+            # — is the shared-credential limit tracked by #774.
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=(
