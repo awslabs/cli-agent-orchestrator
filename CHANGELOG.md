@@ -14,6 +14,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   agent profiles over the profile management APIs, with validate-before-save
   surfacing bounded findings and the truncation-marker contract (#510)
 
+- Remote execution boundary: one central `cao-server` (API, scheduler, SQLite
+  state) coordinates N execution runtimes running the new `cao-bridge` console
+  script, each holding one persistent outbound WebSocket to `WS
+  /runtime/channel`. The server exposes `POST /runtimes/{id}/terminals` to
+  launch a terminal on a connected runtime and `GET /runtimes` for operator
+  visibility, and routes input/key/output/status/delete for a remote terminal
+  over its bound channel — in remote mode the server never touches tmux
+  (#745, #776)
+
+- `cao launch --runtime <id>` places the launched terminal on a named execution
+  runtime when the central server hosts no tmux of its own (#745)
+
+- Shared MCP hosting over HTTP (`CAO_MCP_TRANSPORT=http`, default `stdio`
+  unchanged): the endpoint resolves the caller's terminal identity per
+  authenticated request instead of a process-global `CAO_TERMINAL_ID`, and the
+  new `cao-mcp-stdio-bridge` console script lets a stdio-only provider reach the
+  shared endpoint with no provider changes (#745)
+
+- Script and flow relocation: `CAO_SCRIPT_RUNTIME` runs Python workflow scripts
+  and flow pre-scripts in an execution runtime, and `CAO_FLOW_RUNTIME` places a
+  scheduled flow's agent session there; the server keeps journal, schedule, and
+  cancellation ownership (#745)
+
+- Broker bridge mode (`CAO_ELASTIC_WORKER_MODE=bridge`): the worker broker mints
+  execution-only `cao-bridge` workers with no per-worker Service or HTTP API,
+  and `assign_elastic` routes their leases through the central `POST
+  /runtimes/{id}/terminals` (#745)
+
+- Single active server owner: `cao-server` takes an exclusive `flock` on its
+  state directory at startup and refuses to serve while another process holds
+  it, naming the holder. `CAO_SERVER_OWNER_LOCK=0` opts out for a single local
+  state directory (#745)
+
+- Owner carried through deferred work: new `flows.owner` and `terminals.owner`
+  columns (idempotent PRAGMA-gated migrations) record the principal a schedule,
+  queued message, or cross-pod callback is for, and a dispatch journal
+  correlates each remote command with its owner so a launch redelivered after a
+  reconnect is reconciled rather than orphaned (#745)
+
+- Principal revocation via `CAO_REVOKED_PRINCIPALS` withdraws the authority to
+  *start* work (never to stop it): gated at flow dispatch and inbox delivery,
+  and on the synchronous create-terminal routes, so a revoked principal cannot
+  launch fresh work. The list is operator-supplied until the identity source in
+  #774/#779 lands (#745)
+
 ### Fixed
 
 - **enabling `CAO_MEMORY_API_URL` rejected memory keys that work without it.**
