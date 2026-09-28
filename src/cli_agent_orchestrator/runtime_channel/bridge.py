@@ -13,9 +13,10 @@ in-process bus) and forwards what used to be co-located hops over the channel:
   (generation, position) sequencing from a bounded replay buffer, so a server
   that reconnects resumes or sees an explicit gap.
 
-The bridge keeps its own local SQLite registry (throwaway pod storage) as
-runtime-internal bookkeeping for the reused service layer; the central
-server's row remains the authoritative terminal identity.
+The bridge keeps a pane-local SQLite file (the ``terminals``, ``inbox`` and
+``idempotency_keys`` tables only) as scratch for the reused service layer. It
+holds no control-plane state — no scheduler, workflow, or memory schemas — and
+the central server's row remains the authoritative terminal identity.
 """
 
 import asyncio
