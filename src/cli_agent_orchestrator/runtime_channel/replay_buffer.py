@@ -144,13 +144,19 @@ class ReplayBuffer:
         window keeps a hole rather than filler -- nothing may invent bytes the
         terminal did not emit.
 
-        A ``start`` BEHIND the watermark is a producer that restarted its count
-        (a torn-down terminal's last flush, a re-created reader). Those bytes are
-        real and new to this stream, so they are appended contiguously and the
-        stale offset is ignored; the caller can compare the returned position
-        with ``start`` to notice.
+        A ``start`` BEHIND the watermark overlaps bytes this stream already
+        recorded, so only the part past the watermark is appended (a chunk that
+        lies entirely behind it adds nothing). This never treats a restarted
+        producer as a continuation: a restart is a new stream, and the caller
+        starts a new generation (``begin_generation``) when the producer's epoch
+        changes, before any of the new stream's bytes arrive here.
         """
-        if start <= self._end_pos:
+        if start < self._end_pos:
+            overlap = self._end_pos - start
+            if overlap >= len(chunk):
+                return None, self._end_pos
+            return None, self.append(chunk[overlap:])
+        if start == self._end_pos:
             return None, self.append(chunk)
         gap = GapInfo(from_pos=self._end_pos, to_pos=start)
         self._end_pos = start

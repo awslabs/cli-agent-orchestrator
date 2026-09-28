@@ -278,13 +278,11 @@ class FifoManager:
             self._ever_delivered.pop(terminal_id, None)
             self._cold_start_attempts.pop(terminal_id, None)
             self._probe_failures.pop(terminal_id, None)
-            # The stream this counted is over. A late flush from the exiting
-            # reader thread restarts it at 0, which consumers treat as a stream
-            # restart rather than as missing bytes.
+            # The stream this counted is over: reset the byte counter and advance
+            # the epoch. Consumers start a new generation when the epoch changes,
+            # so a late flush from the exiting thread, or a reader re-created under
+            # this id, is never appended to the stream that just ended.
             self._published_bytes.pop(terminal_id, None)
-            # Bump the epoch too: the stream has ended, so any late flush and any
-            # reader re-created under this id belong to a different stream and must
-            # carry a higher epoch than the one just stopped.
             self._epochs[terminal_id] = self._epochs.get(terminal_id, 0) + 1
 
         # Deliberately NOT stopping the watchdog thread here even when this was

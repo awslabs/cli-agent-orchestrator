@@ -110,14 +110,17 @@ class TestProducerAssignedPositions:
                 consumer.append_at(offset, chunk)
         assert consumer.end_pos == producer.end_pos
 
-    def test_an_offset_behind_the_watermark_appends_contiguously(self):
-        """A producer that restarted its count must not rewrite the stream."""
+    def test_an_offset_behind_the_watermark_is_an_overlap_not_new_bytes(self):
+        """Bytes already recorded are not appended again at the old end."""
         buf = ReplayBuffer(max_bytes=1024)
         buf.append_at(0, b"abcdef")
-        gap, pos = buf.append_at(0, b"ghi")
+        gap, pos = buf.append_at(0, b"abc")
         assert gap is None
-        assert pos == 6, "the stale offset is ignored, and the caller can see that"
-        assert buf.end_pos == 9
+        assert (pos, buf.end_pos) == (6, 6), "a chunk entirely behind the watermark adds nothing"
+        gap, pos = buf.append_at(4, b"efgh")
+        assert gap is None
+        assert (pos, buf.end_pos) == (6, 8), "only the part past the watermark is appended"
+        assert buf.replay_from(0) == [(0, b"abcdef"), (6, b"gh")]
 
     def test_an_empty_chunk_after_a_gap_still_advances_the_watermark(self):
         buf = ReplayBuffer(max_bytes=1024)
