@@ -1,6 +1,7 @@
 """Tests for settings_service module."""
 
 import json
+import threading
 from pathlib import Path
 from unittest.mock import patch
 
@@ -18,6 +19,7 @@ from cli_agent_orchestrator.services.settings_service import (
     set_extra_agent_dirs,
     set_extra_skill_dirs,
 )
+from cli_agent_orchestrator.utils import atomic_file
 
 
 @pytest.fixture
@@ -164,6 +166,60 @@ class TestSave:
         _save({"old": True})
         _save({"new": True})
         assert json.loads(settings_file.read_text()) == {"new": True}
+
+    def test_save_atomically_replaces_and_preserves_mode(self, settings_file, monkeypatch):
+        settings_file.write_text('{"old": true}')
+        settings_file.chmod(0o640)
+        monkeypatch.setattr(atomic_file, "LOCK_DIR", settings_file.parent / "locks")
+        real_replace = atomic_file.os.replace
+        replacements = []
+
+        def _record_replace(source, target):
+            replacements.append((Path(source), Path(target)))
+            real_replace(source, target)
+
+        monkeypatch.setattr(atomic_file.os, "replace", _record_replace)
+
+        _save({"new": True})
+
+        assert len(replacements) == 1
+        assert replacements[0][1] == settings_file
+        assert json.loads(settings_file.read_text()) == {"new": True}
+        assert settings_file.stat().st_mode & 0o777 == 0o640
+
+    def test_concurrent_reader_never_observes_partial_json(self, settings_file, monkeypatch):
+        monkeypatch.setattr(atomic_file, "LOCK_DIR", settings_file.parent / "locks")
+        _save({"iteration": -1, "payload": "x" * 4096})
+        finished = threading.Event()
+        failures = []
+
+        def _writer():
+            try:
+                for iteration in range(150):
+                    _save({"iteration": iteration, "payload": str(iteration) * 4096})
+            finally:
+                finished.set()
+
+        def _reader():
+            while not finished.is_set():
+                try:
+                    value = json.loads(settings_file.read_text())
+                    assert isinstance(value["iteration"], int)
+                    assert isinstance(value["payload"], str)
+                except Exception as exc:  # noqa: BLE001 - captured for the test thread
+                    failures.append(exc)
+                    return
+
+        writer = threading.Thread(target=_writer)
+        reader = threading.Thread(target=_reader)
+        reader.start()
+        writer.start()
+        writer.join(timeout=10)
+        reader.join(timeout=10)
+
+        assert not writer.is_alive()
+        assert not reader.is_alive()
+        assert failures == []
 
 
 class TestGetAgentDirs:

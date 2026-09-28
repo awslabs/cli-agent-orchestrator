@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, NamedTuple, Optional, Set, Tuple
 
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
+from cli_agent_orchestrator.utils import atomic_file
 from cli_agent_orchestrator.utils.paths import normalized_path
 
 logger = logging.getLogger(__name__)
@@ -129,7 +130,7 @@ def settings_readable() -> bool:
 def _save(data: Dict[str, Any]) -> None:
     """Save settings to disk."""
     CAO_HOME_DIR.mkdir(parents=True, exist_ok=True)
-    SETTINGS_FILE.write_text(json.dumps(data, indent=2))
+    atomic_file.locked_atomic_write(SETTINGS_FILE, json.dumps(data, indent=2))
 
 
 def get_agent_dirs() -> Dict[str, str]:
