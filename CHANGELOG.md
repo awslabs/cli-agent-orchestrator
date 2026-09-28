@@ -119,7 +119,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking / migration:** workflow approval enforcement now defaults ON for script-tier runs
   (#583 Bolt 3) (#699). The first run of each script plan is refused until
   `cao workflow approve <plan_id>`; to keep the previous behaviour set
-  `workflow.require_approval: false` in `settings.json`. Plan identifiers keep the `plan-v1:` scheme.
+  `workflow.require_approval: false` in `settings.json`. Script runs journaled before this upgrade
+  cannot launch further agent steps while approval enforcement is on; start a new run. With
+  approval enforcement off, those runs continue. Plan identifiers keep the `plan-v1:` scheme.
 
 - Script runs execute in, and fingerprint, one project root (#699): the run request's optional
   `working_directory`, defaulting to cao-server's working directory. The CLI sends its current
