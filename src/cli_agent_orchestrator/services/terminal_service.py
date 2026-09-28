@@ -374,6 +374,30 @@ def _roll_back_backend_create_locked(
             logger.exception(f"Rollback: failed to kill window {session_name}:{window_name}")
 
 
+def _still_owns_incarnation(session_name: str, terminal_id: Optional[str]) -> bool:
+    """Under the lifecycle lock: does this create's registry row still name the session?
+
+    The row was committed under the lock in the create transaction, and every
+    path that replaces the incarnation (``delete_session``'s scoped row sweep,
+    the ``delete_terminals_by_session`` a rebuilding create runs) removes it
+    under the same lock. A surviving row is therefore proof that the backend
+    session or window under ``session_name`` is still the one this call built;
+    a missing row means another lifecycle operation owns the name now and the
+    backend state must be left alone. ``tmux_session`` is written once and
+    never updated, so the equality check is a guard against that ever changing,
+    not a branch that can fire today. Callers must hold the lock.
+    """
+    row = get_terminal_metadata(terminal_id) if terminal_id else None
+    if row is None or row.get("tmux_session") != session_name:
+        logger.warning(
+            f"Rollback: terminal {terminal_id} is no longer registered under "
+            f"{session_name}; another lifecycle operation owns that name now, so "
+            f"the backend session is left alone"
+        )
+        return False
+    return True
+
+
 def _roll_back_cancelled_create(
     session_name: str,
     terminal_id: str,
@@ -387,15 +411,22 @@ def _roll_back_cancelled_create(
     REACQUIRE the lifecycle lock: the worker released it when it returned, and
     an unlocked late kill could destroy a NEW incarnation of the name that
     another caller legitimately built in between — the same
-    never-observable-half-built argument the closure's docstring makes. Under
-    the lock, kill the session/window THIS call created, then drop the
-    committed row, so the cancelled create leaves both stores exactly as it
-    found them.
+    never-observable-half-built argument the closure's docstring makes. The
+    lock serializes lifecycle operations; it does not say whose incarnation is
+    under the name once acquired, so the row is checked as well: a
+    ``delete_session`` plus a fresh create of the same name can both complete
+    between the worker's commit and this compensation, and killing by name
+    then would destroy the replacement and clear its forwarded env. Under the
+    lock, if the row this call committed is still there, kill the
+    session/window THIS call created and drop the row; if it is gone, the name
+    is someone else's and there is nothing of ours left to remove.
 
     Best-effort like its sibling: the cancellation is already propagating and
     is what the caller must see.
     """
     with session_lifecycle_lock(session_name):
+        if not _still_owns_incarnation(session_name, terminal_id):
+            return
         _roll_back_backend_create_locked(session_name, window_name, created_session=created_session)
         try:
             db_delete_terminal(terminal_id)
@@ -423,24 +454,17 @@ def _roll_back_backend_create_if_still_ours(
     nothing.
 
     Reacquire the lock, then use this call's own registry row as the ownership
-    witness: the row was committed under the lock in the create transaction,
-    and every path that replaces the incarnation (``delete_session``'s scoped
-    row sweep, the ``delete_terminals_by_session`` a rebuilding create runs)
-    removes it under the same lock. If the row is gone, the name is no longer
-    ours and the backend session is left alone; the caller still drops the row,
-    which is idempotent. If the row is present the existing locked rollback runs
-    exactly as before. (``tmux_session`` is written once and never updated, so
-    a surviving row always names this session; the equality check is a guard
-    against that ever changing, not a branch that can fire today.)
+    witness (``_still_owns_incarnation``). If the row is gone, the name is no
+    longer ours and the backend session is left alone; the caller still drops
+    the row, which is idempotent. If the row is present the existing locked
+    rollback runs exactly as before.
+
+    Synchronous, and it blocks on a ``threading.Lock``: the async caller runs it
+    through ``asyncio.to_thread`` so a same-name teardown holding the lock
+    parks this thread, not the API event loop.
     """
     with session_lifecycle_lock(session_name):
-        row = get_terminal_metadata(terminal_id) if terminal_id else None
-        if row is None or row.get("tmux_session") != session_name:
-            logger.warning(
-                f"Rollback: terminal {terminal_id} is no longer registered under "
-                f"{session_name}; another lifecycle operation owns that name now, so "
-                f"the backend session is left alone"
-            )
+        if not _still_owns_incarnation(session_name, terminal_id):
             return
         _roll_back_backend_create_locked(
             session_name, window_name or "", created_session=created_session
@@ -1556,9 +1580,16 @@ async def create_terminal(
         if session_created and session_name:
             # Locked and ownership-checked: see _roll_back_backend_create_if_still_ours.
             # The helper also drops the forwarded env for a session it kills.
+            # Off-loop: the lock is a threading.Lock, and a same-name teardown
+            # holding it would otherwise stall every request on the event loop
+            # for as long as that teardown runs.
             try:
-                _roll_back_backend_create_if_still_ours(
-                    session_name, window_name, terminal_id, created_session=True
+                await asyncio.to_thread(
+                    _roll_back_backend_create_if_still_ours,
+                    session_name,
+                    window_name,
+                    terminal_id,
+                    created_session=True,
                 )
             except Exception:
                 logger.exception(f"Rollback: locked session rollback failed for {session_name}")
@@ -1577,8 +1608,12 @@ async def create_terminal(
             # invisible to this terminal's own list/tree (the DB row is gone),
             # never cleaned up, sitting there indefinitely.
             try:
-                _roll_back_backend_create_if_still_ours(
-                    session_name, window_name, terminal_id, created_session=False
+                await asyncio.to_thread(
+                    _roll_back_backend_create_if_still_ours,
+                    session_name,
+                    window_name,
+                    terminal_id,
+                    created_session=False,
                 )
             except Exception:
                 logger.exception(

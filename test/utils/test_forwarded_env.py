@@ -197,6 +197,13 @@ def test_aggregate_argv_budget_just_under_allowed():
         "RUBYOPT",
         "RUBYLIB",
         "GCONV_PATH",
+        "PYTHONUSERBASE",
+        "PERLLIB",
+        "NODE_PATH",
+        # the AWS SDK reads these when the provider authenticates at startup;
+        # a profile's credential_process runs the command the file names
+        "AWS_CONFIG_FILE",
+        "AWS_SHARED_CREDENTIALS_FILE",
     ],
 )
 def test_loader_shell_interpreter_startup_keys_rejected(hijack_key):
@@ -206,7 +213,19 @@ def test_loader_shell_interpreter_startup_keys_rejected(hijack_key):
 
 
 @pytest.mark.parametrize(
-    "key", ["ld_preload", "MY_LD_PRELOAD", "NODE_OPTIONS_BACKUP", "ENVIRONMENT"]
+    "key",
+    [
+        "ld_preload",
+        "MY_LD_PRELOAD",
+        "NODE_OPTIONS_BACKUP",
+        "ENVIRONMENT",
+        # the rest of AWS_* stays forwardable: region, profile NAME and static
+        # credentials do not name a file whose contents run a command
+        "AWS_REGION",
+        "AWS_PROFILE",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_CONFIG_FILE_BACKUP",
+    ],
 )
 def test_lookalike_keys_are_not_rejected(key):
     """Only the exact names and the LD_/DYLD_ families are refused; env is case-sensitive."""

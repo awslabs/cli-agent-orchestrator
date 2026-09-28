@@ -111,7 +111,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SHELL`, `BASH_ENV`, `ENV`, `ZDOTDIR`, `PROMPT_COMMAND`, `PS0`, `PS1`, `PS2`,
   `PS4`, `PYTHONSTARTUP`, `PYTHONPATH`, `PYTHONHOME`, `PERL5OPT`, `PERL5LIB`,
   `NODE_OPTIONS`, `RUBYOPT` and `RUBYLIB`, whose value decides what runs as the
-  operator the moment the pane starts. `POST /sessions` also applies the existing forwarded-env rules at
+  operator the moment the pane starts, plus their siblings `PYTHONUSERBASE`,
+  `PERLLIB` and `NODE_PATH`, and `AWS_CONFIG_FILE` / `AWS_SHARED_CREDENTIALS_FILE`,
+  which the AWS SDK reads when the provider CLI authenticates at startup and
+  whose `credential_process` runs the command the file names. `POST /sessions` also applies the existing forwarded-env rules at
   the HTTP boundary (422 naming the key) instead of dropping violating keys
   server-side with only a log warning.
 
@@ -121,7 +124,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the predictable `<CAO_HOME_DIR>/fifos/<terminal>.fifo` (by default under
   `~/.aws/cli-agent-orchestrator`) could redirect the output stream. The FIFO is now created exclusively with mode 0600, an existing
   non-FIFO at the path fails terminal creation instead of being used, and both
-  opens use `O_NOFOLLOW` and verify the descriptor is a FIFO.
+  opens use `O_NOFOLLOW` and verify the descriptor is a FIFO. The write end
+  had the same gap from the other side: `pipe-pane -o "cat >> <path>"` follows
+  a symlink and appends to a regular file, so a swapped path received the
+  pane's output while the hardened reader stayed on the old pipe. tmux now
+  runs `utils/fifo_writer.py` (standard library only, started by file path with `-I -S`)
+  instead of `cat`, which opens with `O_NOFOLLOW`, checks the descriptor is a
+  FIFO, and only then copies the pane's output into it.
 
 - **Session teardown could reach tmux sessions CAO did not create.** CAO
   shares the operator's default tmux server and names every session it creates
@@ -146,7 +155,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lifecycle lock, so a teardown and recreate of that name landing in between
   lost the new session. The rollback now reacquires the lock and proceeds only
   if this create's own registry row still names the session; otherwise the
-  name belongs to someone else and the backend session is left alone.
+  name belongs to someone else and the backend session is left alone. The
+  same check now guards the compensator for a create whose caller was
+  cancelled after the row committed, which killed by name too. Both rollbacks
+  run off the event loop: they block on the lifecycle lock, and a same-name
+  teardown holding it would otherwise have stalled every API request until it
+  finished.
 
 ### Changed
 

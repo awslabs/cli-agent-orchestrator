@@ -1839,3 +1839,190 @@ def test_post_commit_failure_rollback_leaves_a_newer_incarnation_alone(
     assert backend.session_exists(name) is True
     assert backend.windows(name) == {"w-new"}
     assert {r["id"] for r in database.list_terminals_by_session(name)} == {"t-new"}
+
+
+def test_post_commit_window_rollback_leaves_a_window_it_no_longer_owns_alone(
+    real_db, runtime, monkeypatch
+):
+    """new_session=False mirror of the ownership witness: if this create's row is
+    gone by the time the rollback runs, the window under that name is somebody
+    else's and must not be killed. The pre-existing session and its peer are
+    untouched throughout."""
+    backend = FakeTmuxBackend()
+    set_backend(backend)
+    _seed(backend, "cao-existing", [("t-peer", "w-peer")], runtime)
+    _fail_in_provider_init(monkeypatch)
+
+    def _someone_else_took_over_the_window(tid):
+        # Runs inside the outer failure handler, BEFORE the backend rollback:
+        # another lifecycle operation removed this terminal's row (a
+        # delete_terminal by id), so the name is no longer ours to clean up.
+        runtime.fifo_readers.discard(tid)
+        database.delete_terminal(tid)
+
+    monkeypatch.setattr(
+        terminal_service.fifo_manager, "stop_reader", _someone_else_took_over_the_window
+    )
+
+    with pytest.raises(RuntimeError, match="provider init boom"):
+        _create_in_thread_kw(session_name="cao-existing", new_session=False)
+
+    # Row gone -> the rollback did not kill anything, window or session.
+    assert backend.kill_window_calls == 0
+    assert backend.kill_session_calls == 0
+    assert backend.session_exists("cao-existing") is True
+    assert "w-peer" in backend.windows("cao-existing")
+    assert {r["id"] for r in database.list_terminals_by_session("cao-existing")} == {"t-peer"}
+    assert runtime.is_fully_live("t-peer")
+
+
+def test_post_commit_failure_rollback_waits_for_the_lock_off_the_event_loop(
+    real_db, runtime, monkeypatch
+):
+    """A same-name teardown holding the lifecycle lock must park the rollback's
+    THREAD, not the API event loop.
+
+    The lock is a ``threading.Lock``. Acquired synchronously inside the async
+    ``create_terminal`` failure handler it stalled every coroutine on the loop
+    (requests for unrelated sessions included) until the teardown finished.
+    Construction, not clock: the holder takes the lock after the create
+    transaction committed and before provider init fails; the rollback is
+    provably contending (``_wait_until_lock_contended``); and a coroutine on the
+    SAME loop must still get to run while it waits. On the old code that
+    coroutine never resumes, because the loop thread is inside ``lock.acquire``.
+    """
+    import asyncio
+
+    backend = FakeTmuxBackend()
+    set_backend(backend)
+    name = "cao-loop-free"
+
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+
+    def _hold_lock():
+        with session_lock.session_lifecycle_lock(name):
+            lock_held.set()
+            release_lock.wait(DEADLOCK_TIMEOUT)
+
+    holder = threading.Thread(target=_hold_lock, daemon=True)
+
+    def _boom_with_the_lock_taken(provider, terminal_id, *args, **kwargs):
+        # The create transaction has committed and released the lock by now
+        # (provider init runs outside it), so the holder acquires promptly.
+        holder.start()
+        assert lock_held.wait(DEADLOCK_TIMEOUT), "holder never took the lock"
+        raise RuntimeError("provider init boom")
+
+    monkeypatch.setattr(
+        terminal_service.provider_manager, "create_provider", _boom_with_the_lock_taken
+    )
+
+    loop_still_turning = threading.Event()
+    outcome: Dict[str, BaseException] = {}
+
+    def _run_loop():
+        async def scenario():
+            task = asyncio.create_task(
+                terminal_service.create_terminal(
+                    provider="claude_code",
+                    agent_profile="developer",
+                    session_name=name,
+                    new_session=True,
+                )
+            )
+            # holder (1) + the rollback (2): the rollback is committed to
+            # lock.acquire(). If that acquire ran on the loop thread, this
+            # to_thread result could never be delivered and we would hang here.
+            await asyncio.to_thread(_wait_until_lock_contended, name, 2)
+            loop_still_turning.set()
+            release_lock.set()
+            try:
+                await task
+            except RuntimeError as exc:
+                outcome["create"] = exc
+
+        asyncio.run(scenario())
+
+    loop_thread = threading.Thread(target=_run_loop, daemon=True)
+    loop_thread.start()
+    try:
+        assert loop_still_turning.wait(
+            DEADLOCK_TIMEOUT
+        ), "the event loop was blocked while the rollback waited for the lifecycle lock"
+    finally:
+        release_lock.set()
+        loop_thread.join(timeout=DEADLOCK_TIMEOUT)
+        holder.join(timeout=DEADLOCK_TIMEOUT)
+
+    assert not loop_thread.is_alive(), "scenario did not finish"
+    assert "provider init boom" in str(outcome.get("create"))
+    # Once the holder let go, the rollback ran and cleaned up its own session.
+    assert backend.kill_session_calls == 1
+    assert backend.session_exists(name) is False
+    assert database.list_terminals_by_session(name) == []
+    assert session_lock._session_locks == {}
+
+
+def test_cancelled_create_compensation_leaves_a_replacement_alone(real_db, runtime, monkeypatch):
+    """The lock serializes; it does not establish ownership of a LATER incarnation.
+
+    Cancel while the worker is inside the row write, let it commit, and park
+    the compensation before it takes the lock. In that window a real teardown
+    and a fresh create of the same name both complete. The compensator must
+    then find its own row gone and leave the replacement's session, window,
+    row and forwarded env untouched, instead of killing by name.
+    """
+    import asyncio
+
+    backend = FakeTmuxBackend()
+    set_backend(backend)
+    name = "cao-cancel-replaced"
+
+    worker_blocked = threading.Event()
+    release_worker = threading.Event()
+    compensated = threading.Event()
+
+    real_create = terminal_service.db_create_terminal
+
+    def gated_create(*args, **kwargs):
+        worker_blocked.set()
+        assert release_worker.wait(DEADLOCK_TIMEOUT), "scenario never released the row write"
+        return real_create(*args, **kwargs)
+
+    monkeypatch.setattr(terminal_service, "db_create_terminal", gated_create)
+
+    real_compensate = terminal_service._roll_back_cancelled_create
+
+    def replaced_then_compensate(session_name, terminal_id, window_name, *, created_session):
+        # On the compensator's worker thread, BEFORE it acquires the lock:
+        # models a delete_session plus a successful new create reusing the name.
+        database.delete_terminals_by_session(session_name)
+        backend.kill_session(session_name)
+        backend.add_session(session_name, {"w-new"})
+        database.create_terminal(
+            terminal_id="t-new",
+            tmux_session=session_name,
+            tmux_window="w-new",
+            provider="claude_code",
+            agent_profile="developer",
+        )
+        session_env.set_session_env(session_name, {"KEEP": "me"})
+        try:
+            real_compensate(session_name, terminal_id, window_name, created_session=created_session)
+        finally:
+            compensated.set()
+
+    monkeypatch.setattr(terminal_service, "_roll_back_cancelled_create", replaced_then_compensate)
+
+    raised = _cancel_create_scenario(name, worker_blocked, release_worker, compensated)
+
+    assert isinstance(raised, asyncio.CancelledError), f"expected CancelledError, got {raised!r}"
+    # Exactly one kill: the simulated teardown's own. The compensator saw its
+    # row was gone and left the replacement alone, env included.
+    assert backend.kill_session_calls == 1
+    assert backend.session_exists(name) is True
+    assert backend.windows(name) == {"w-new"}
+    assert {r["id"] for r in database.list_terminals_by_session(name)} == {"t-new"}
+    assert session_env.get_session_env(name) == {"KEEP": "me"}
+    assert session_lock._session_locks == {}

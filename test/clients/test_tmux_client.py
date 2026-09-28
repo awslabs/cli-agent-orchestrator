@@ -912,7 +912,26 @@ class TestPipePane:
 
         tmux.pipe_pane("ses", "win", "/tmp/log.txt")
 
-        mock_pane.cmd.assert_called_once_with("pipe-pane", "-o", "cat >> /tmp/log.txt")
+        # Our FIFO writer, not `cat >> path`: cat follows a symlink and appends
+        # to a regular file swapped in at the FIFO path; the writer refuses both.
+        import shlex
+        import sys
+
+        from cli_agent_orchestrator.utils import fifo_writer
+
+        mock_pane.cmd.assert_called_once_with(
+            "pipe-pane",
+            "-o",
+            f"{shlex.quote(sys.executable)} -I -S {shlex.quote(fifo_writer.__file__)} /tmp/log.txt",
+        )
+
+    def test_pipe_pane_command_quotes_the_fifo_path(self, tmux):
+        """The path rides through `sh -c`; a space or quote in it must not split the command."""
+        import shlex
+
+        command = tmux._pipe_pane_command("/tmp/odd dir/it's.fifo")
+        assert command.endswith(" " + shlex.quote("/tmp/odd dir/it's.fifo"))
+        assert shlex.split(command)[-1] == "/tmp/odd dir/it's.fifo"
 
     def test_pipe_pane_session_not_found(self, tmux):
         tmux.server.sessions.get.return_value = None

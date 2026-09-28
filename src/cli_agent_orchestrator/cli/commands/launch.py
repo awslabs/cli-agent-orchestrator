@@ -128,8 +128,9 @@ def _parse_env_pairs(pairs):
     metavar="KEY=VALUE",
     help="Forward an env var to the supervisor AND every worker spawned later "
     "in the same session. Repeatable. Values travel in the request body, not "
-    "the URL. Blocked prefixes (CLAUDE/CODEX_/__MISE_) and >=2048-byte values "
-    "are rejected. See issue #248.",
+    "the URL. Rejected: provider prefixes (CLAUDE/CODEX_/__MISE_), the loader, "
+    "shell, interpreter and AWS-config startup keys listed in docs/tmux.md, and "
+    ">=2048-byte values. See issue #248.",
 )
 @click.option(
     "--resume-session-id",

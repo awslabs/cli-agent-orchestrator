@@ -42,15 +42,18 @@ FORWARDED_ENV_PREFIX_ALLOWLIST = frozenset(
 
 # Variables that decide what the spawned pane runs BEFORE the provider CLI's
 # first tool call: the dynamic loader's hooks, which program and rc file the
-# shell starts with, the shell's own prompt hooks, and the interpreters'
-# startup imports. A forwarded value here executes attacker code as the
-# operator the moment the pane starts, regardless of provider or role, so they
-# are refused outright. Exact names for the shell/interpreter hooks; prefixes
-# for the loaders, whose whole ``LD_*`` / ``DYLD_*`` families are control
-# knobs. Variables that only act when the agent itself runs a program
+# shell starts with, the shell's own prompt hooks, the interpreters' startup
+# imports, and the files the AWS SDK reads to authenticate the provider itself.
+# A forwarded value here executes attacker code as the operator before the
+# agent has done anything, regardless of provider or role, so they are refused
+# outright. Exact names for the shell/interpreter hooks; prefixes for the
+# loaders, whose whole ``LD_*`` / ``DYLD_*`` families are control knobs.
+# Variables that only act when the agent itself runs a program
 # (``GIT_SSH_COMMAND``, ``EDITOR``, ``PAGER``, ...) are not listed: whether
 # the agent may run programs at all is the tool policy's decision, and a value
-# in those cannot run before it. Mirrored server-side in
+# in those cannot run before it. This is a denylist and will trail new
+# providers and new startup hooks; an allowlist of known-safe forwarded names
+# is the shape that would not. Mirrored server-side in
 # ``TmuxClient._is_blocked_env_key``.
 FORWARDED_ENV_HIJACK_KEYS = frozenset(
     {
@@ -74,13 +77,26 @@ FORWARDED_ENV_HIJACK_KEYS = frozenset(
         "PYTHONSTARTUP",
         "PYTHONPATH",
         "PYTHONHOME",
+        # relocates the user site-packages, whose usercustomize.py is imported
+        # automatically at interpreter start -- same effect as PYTHONPATH
+        "PYTHONUSERBASE",
         "PERL5OPT",
         "PERL5LIB",
+        # PERLLIB is PERL5LIB's older alias; NODE_PATH is the fallback module
+        # search path for a program's own require() calls
+        "PERLLIB",
+        "NODE_PATH",
         "NODE_OPTIONS",
         "RUBYOPT",
         "RUBYLIB",
         # glibc loads charset-conversion modules (shared objects) from here
         "GCONV_PATH",
+        # the AWS SDK reads these files when the provider CLI authenticates at
+        # startup (CAO first-classes Bedrock auth, and AWS_* is otherwise
+        # forwarded); a profile's credential_process runs whatever command the
+        # file names, before the provider's first tool call
+        "AWS_CONFIG_FILE",
+        "AWS_SHARED_CREDENTIALS_FILE",
     }
 )
 FORWARDED_ENV_HIJACK_PREFIXES = ("LD_", "DYLD_")

@@ -22,6 +22,7 @@ from cli_agent_orchestrator.constants import (
     SESSION_PREFIX,
     TMUX_HISTORY_LINES,
 )
+from cli_agent_orchestrator.utils import fifo_writer
 from cli_agent_orchestrator.utils.forwarded_env import is_hijack_env_key
 from cli_agent_orchestrator.utils.path_validation import (
     BLOCKED_SYSTEM_DIRECTORIES,
@@ -2048,13 +2049,36 @@ class TmuxClient:
             logger.error(f"Failed to get pane command for {session_name}:{window_name}: {e}")
             return None
 
+    @staticmethod
+    def _pipe_pane_command(file_path: str) -> str:
+        """The ``pipe-pane -o`` command: our FIFO writer, not ``cat >> path``.
+
+        ``cat >>`` opens the path with ``O_CREAT | O_APPEND`` and follows
+        symlinks, so a symlink or regular file swapped in at the FIFO path
+        received the pane's output. ``utils/fifo_writer.py`` opens with
+        ``O_NOFOLLOW``, confirms the descriptor is a FIFO, and only then copies
+        stdin into it. It is standard-library only, run by file path, and
+        started with ``-I -S`` (isolated mode, no ``site``): nothing from the
+        environment or a user site-packages is imported. tmux runs the command
+        through ``sh -c`` on the same host as the server; measured that way the
+        writer starts in ~37 ms against ~19 ms for ``cat``, about 15-20 ms more
+        per pipe-pane attach or liveness re-arm. The interpreter running
+        cao-server is the one to name, by absolute path; PATH does not matter.
+        """
+        interpreter = sys.executable or "python3"
+        return " ".join(
+            shlex.quote(part)
+            for part in (interpreter, "-I", "-S", fifo_writer.__file__, str(file_path))
+        )
+
     def pipe_pane(self, session_name: str, window_name: str, file_path: str) -> None:
-        """Start piping pane output to file.
+        """Start piping pane output to the FIFO at ``file_path``.
 
         Args:
             session_name: Tmux session name
             window_name: Tmux window name
-            file_path: Absolute path to log file
+            file_path: Absolute path to the FIFO (must already exist as a FIFO;
+                the writer refuses anything else at that path)
 
         Raises:
             ValueError: The session or window is genuinely gone.
@@ -2069,7 +2093,7 @@ class TmuxClient:
 
             pane = self._resolve_pane(session, session_name, window_name, required=True)
             if pane:
-                pane.cmd("pipe-pane", "-o", f"cat >> {shlex.quote(str(file_path))}")
+                pane.cmd("pipe-pane", "-o", self._pipe_pane_command(file_path))
                 logger.info(f"Started pipe-pane for {session_name}:{window_name} to {file_path}")
         except Exception as e:
             logger.error(f"Failed to start pipe-pane for {session_name}:{window_name}: {e}")
