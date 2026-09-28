@@ -163,7 +163,7 @@ class ReplayBuffer:
         reached this buffer, so there is nothing to retain, only a hole to
         acknowledge. Advancing ``end_pos`` past the lost range is what makes the
         watermark the hello/heartbeat advertises match the producer's true end,
-        so a dropped FINAL chunk is not invisible (review finding 5 on #802). A
+        so a dropped FINAL chunk is not invisible. A
         range already behind the watermark is ignored, so a re-delivered marker
         is idempotent; returns whether the watermark moved.
         """

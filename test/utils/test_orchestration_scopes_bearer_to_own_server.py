@@ -1,4 +1,4 @@
-"""The controller's local bearer only travels to its OWN server (haofeif P1 #802).
+"""The controller's local bearer only travels to its OWN server.
 
 ``orchestration._auth_headers`` used to attach ``CAO_AUTH_LOCAL_TOKEN`` to every
 ``requests`` call, including ones whose base URL is a caller-supplied

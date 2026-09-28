@@ -100,9 +100,9 @@ def _auth_headers(destination_base_url: str) -> Dict[str, str]:
     same origin (scheme, host, port) as this process's server; a caller-supplied
     ``target_host`` pointing anywhere else — including the ``/health`` probe that
     happens before the endpoint is even known to be a cao-server — gets no
-    credential, so the local token is never disclosed to an arbitrary host
-    (haofeif P1 on #802). The bearer token, when attached, is carried in the
-    Authorization header via the shared builder.
+    credential, so the local token is never disclosed to an arbitrary host.
+    The bearer token, when attached, is carried in the Authorization header via
+    the shared builder.
 
     Returns an empty mapping default-off (no token) so the no-auth posture is
     byte-for-byte unchanged. Every ``requests`` call in this module passes
@@ -869,8 +869,8 @@ def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
     # BOTH header sets, and the union is not a compromise between two merge
     # sides -- they are disjoint and independently load-bearing.
     # `_auth_headers(dest)` carries the local bearer token in the Authorization
-    # header an auth-enabled cao-server rejects every call without (haofeif's P2
-    # on PR #634), but only when `dest` is this process's own server;
+    # header an auth-enabled cao-server rejects every call without, but only
+    # when `dest` is this process's own server;
     # `elastic_worker_gateway_headers()` carries the broker's
     # worker-id/release-token pair an elastic worker's callback hop needs. They
     # share no key, so neither can shadow the other, and an auth-enabled

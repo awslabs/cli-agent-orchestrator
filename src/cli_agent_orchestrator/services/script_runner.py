@@ -1206,7 +1206,7 @@ async def _drive_process_remote(
         # non-dispatch case), so the outcome is KNOWN: the run failed to dispatch.
         # Settle the journal — no redelivery is possible — and fail with a definite
         # reason, not "outcome unknown". Caught before RuntimeUnavailableError,
-        # which it subclasses (haefeif #3 on #802).
+        # which it subclasses.
         try:
             from cli_agent_orchestrator.clients.database import settle_dispatch
 
@@ -1249,10 +1249,8 @@ async def _drive_process_remote(
     # The RUN_SCRIPT result's ack is deferred to here: the frame reader does not
     # ack a matched RUN_SCRIPT, so the runtime keeps its retained copy until the
     # outcome is durably applied. finalize has now written the run's terminal
-    # state, so settle the dispatch journal — this path never settled before, so
-    # every successful remote script left a permanent `dispatched` row — and ack.
-    # If finalize had raised, neither would run and the runtime would redeliver
-    # (haefeif #3 on #802).
+    # state, so settle the dispatch journal and ack. If finalize had raised,
+    # neither would run and the runtime would redeliver the result.
     try:
         from cli_agent_orchestrator.clients.database import settle_dispatch
 

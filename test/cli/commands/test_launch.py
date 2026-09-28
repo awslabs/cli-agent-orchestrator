@@ -513,7 +513,7 @@ def test_launch_builtin_profile_omits_implicit_allowed_tools():
 
     The client no longer pushes its own resolved role defaults: without an
     explicit flag the server resolves allowedTools against its OWN installed
-    profile, so ``allowed_tools`` is absent from the request (haofeif #9, #802).
+    profile, so ``allowed_tools`` is absent from the request.
     """
     runner = CliRunner()
 

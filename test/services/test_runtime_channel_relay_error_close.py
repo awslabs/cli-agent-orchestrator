@@ -1,4 +1,4 @@
-"""A mid-session relay failure closes the client with an error code (Augusto).
+"""A mid-session relay failure closes the client with an error code.
 
 The OPEN failure already closed with 4010, but once the relay was running a
 runtime that went away or a keystroke that timed out fell into the generic

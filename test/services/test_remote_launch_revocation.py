@@ -1,5 +1,4 @@
-"""A revoked owner may not start work on the remote launch route (Augusto on
-PR #802; #745 criterion 14).
+"""A revoked owner may not start work on the remote launch route (#745).
 
 ``POST /runtimes/{id}/terminals`` (via ``launch_remote_terminal``) must return
 403 BEFORE it journals or dispatches anything when the owner principal is

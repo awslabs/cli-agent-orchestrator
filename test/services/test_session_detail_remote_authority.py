@@ -1,11 +1,9 @@
 """Session enumeration and detail read from the same placement authority (#745).
 
-Stream Q, #802:
-
-- Q2: ``_remote_sessions`` builds the remote listing from ONE registry snapshot
+- ``_remote_sessions`` builds the remote listing from ONE registry snapshot
   (``live_remote_bindings``) rather than ``remote_terminal_ids`` followed by a
   per-row ``runtime_for_terminal``.
-- Q3 (haofeif #10): ``get_session`` treats a session present only in remote
+- ``get_session`` treats a session present only in remote
   bindings as existing, and reads every terminal's status through
   ``effective_status`` — the same authority ``list_sessions`` uses — so a
   remote-only session's detail no longer 404s and a hybrid same-name session

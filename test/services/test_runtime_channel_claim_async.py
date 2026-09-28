@@ -4,7 +4,7 @@
 the channel's single frame reader that runs on the event loop, that SQLite read
 blocks the loop. The async variant makes the same decision but runs the cold
 read in ``asyncio.to_thread`` and re-checks the binding under the lock after
-(Augusto nit on #802).
+the read returns.
 """
 
 import threading

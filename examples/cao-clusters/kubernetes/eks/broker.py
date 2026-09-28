@@ -124,7 +124,7 @@ def _central_api_headers() -> dict[str, str]:
 
     ``GET /runtimes`` is scope-gated (SCOPE_READ), so with API auth enabled an
     unauthenticated call gets 401 — and then every bridge lease times out
-    because no bridge is ever considered usable (reviews on #802). The
+    because no bridge is ever considered usable. The
     runtime-channel token is a DIFFERENT credential (it authorizes the WS
     channel, not the HTTP API), so it does not help here. Set
     ``CAO_ELASTIC_CENTRAL_API_TOKEN`` to a token carrying at least SCOPE_READ;
@@ -410,7 +410,7 @@ def _worker_deployment(
             client.V1EnvVar(name="CAO_NODE_MODE", value="bridge"),
             client.V1EnvVar(name="CAO_BRIDGE_SERVER_URL", value=_central_ws_url()),
             client.V1EnvVar(name="CAO_BRIDGE_RUNTIME_ID", value=name),
-            # Mounted as a file (#802): the token's value never enters the
+            # Mounted as a file: the token's value never enters the
             # worker's env, so it cannot leak through `ps`, /proc/<pid>/environ,
             # or tmux forwarding into the agent's pane. The path names the
             # Secret's `token` key under the read-only mount added below.
@@ -589,7 +589,7 @@ def _build_worker_deployment(
                 read_only=True,
             )
         )
-    # Bridge workers receive the runtime token as a mounted file (#802); the
+    # Bridge workers receive the runtime token as a mounted file; the
     # value never enters the worker env. Keyed off the env the caller built.
     _needs_runtime_token = any(getattr(e, "name", None) == "CAO_RUNTIME_TOKEN_FILE" for e in env)
     if _needs_runtime_token:

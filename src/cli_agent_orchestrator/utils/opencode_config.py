@@ -120,7 +120,7 @@ def write_config(data: Dict[str, Any]) -> None:
     for CAO's own forwarded server that is ``CAO_RUNTIME_TOKEN_FILE`` (a path to
     the owner-only token file, #745), and a profile may put an API key in any
     entry. Default umask leaves this world-readable, which on a shared host
-    exposes those to every local account (Copilot review on #802, finding 8).
+    exposes those to every local account.
     Applied on the existing file too, so an install predating this does not stay
     open.
 
@@ -183,11 +183,10 @@ def translate_mcp_server_config(cao_config: Dict[str, Any]) -> Dict[str, Any]:
     # key — and empty for a server that is not ours: this translator runs over
     # every profile and plugin entry, and ``opencode.json`` is written to disk,
     # so an unconditional merge would persist forwarding config beside
-    # third-party commands (Copilot review on #802, finding 9).
+    # third-party commands.
     # persisted=True selects the command-resolution order; the entry carries
     # CAO_RUNTIME_TOKEN_FILE (a path), never the token value, so serializing it
-    # into ``opencode.json`` puts no credential at rest (Copilot follow-up on
-    # #802).
+    # into ``opencode.json`` puts no credential at rest.
     environment.update(shared_endpoint_child_env_for(cao_config.get("command", ""), persisted=True))
     if environment:
         result["environment"] = environment

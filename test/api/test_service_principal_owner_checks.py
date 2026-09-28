@@ -4,7 +4,7 @@ The MCP->API hop authenticates with the server's own service token, whose
 principal is not the human owner of the terminal a callback is about. The owner
 checks on ``create_inbox_message_endpoint`` (sender owner) and
 ``create_terminal_in_session`` (caller owner) used to compare owner to the
-request principal and 403 every such legitimate callback (haofeif #2 on #802).
+request principal and 403 every such legitimate callback.
 They now allow the verified service principal to name an existing terminal, while
 still rejecting any other principal that names a terminal owned by someone else.
 

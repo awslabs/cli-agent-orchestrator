@@ -153,7 +153,7 @@ class FifoManager:
         # Per-terminal stream epoch, bumped whenever a reader is (re)created or
         # stopped. Stamped on every output event so a consumer can fence a stream
         # RESTART on the epoch rather than inferring it from a backward offset —
-        # which a dropped head defeats (Copilot review on #802). Monotonic and
+        # which a dropped head defeats. Monotonic and
         # kept across create/stop so a reused terminal id never repeats an epoch.
         self._epochs: Dict[str, int] = {}
         self._watchdog_stop = threading.Event()
@@ -193,8 +193,7 @@ class FifoManager:
             # Through publish_with_loss_markers, not publish: the bus is bounded
             # and drops on a full queue, so a subscriber that refuses this event
             # is owed a marker for exactly these bytes. A dropped FINAL chunk then
-            # becomes a reported gap instead of an invisible short watermark
-            # (review finding 5 on #802).
+            # becomes a reported gap instead of an invisible short watermark.
             bus.publish_with_loss_markers(
                 f"terminal.{terminal_id}.output",
                 {"data": text, "offset": offset, "epoch": epoch},
@@ -227,7 +226,7 @@ class FifoManager:
 
             # A new reader is a new stream: bump the epoch and restart the byte
             # counter, so its first event both restarts at 0 and carries a higher
-            # epoch than the stream it replaced (Copilot review on #802).
+            # epoch than the stream it replaced.
             self._epochs[terminal_id] = self._epochs.get(terminal_id, 0) + 1
             self._published_bytes[terminal_id] = 0
 

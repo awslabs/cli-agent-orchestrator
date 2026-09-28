@@ -1,4 +1,4 @@
-"""The runtime token is normalized to an owner-only file at load (#802).
+"""The runtime token is normalized to an owner-only file at load.
 
 After ``load_runtime_token`` the value is never in ``CAO_RUNTIME_TOKEN`` again:
 either it came from a file (left in place) or it was moved out of the env into a

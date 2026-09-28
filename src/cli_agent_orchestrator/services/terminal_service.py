@@ -2307,7 +2307,7 @@ def _send_input_remote(
     distinct instructions to the runtime's ``inject_memory_context`` ("" means
     an intentionally empty frozen context, not "look one up"), so the field is
     carried on the wire rather than dropped, which had collapsed all three to a
-    live lookup on the runtime (haofeif #8).
+    live lookup on the runtime.
     """
     from cli_agent_orchestrator.runtime_channel.protocol import CommandOutcome, CommandType
     from cli_agent_orchestrator.runtime_channel.registry import INPUT_TIMEOUT, runtime_registry

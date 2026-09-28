@@ -1,4 +1,4 @@
-"""Commands for one terminal run in arrival order (#745, Augusto nit).
+"""Commands for one terminal run in arrival order (#745).
 
 ``_serve`` dispatched every CommandFrame with a fresh ``create_task``, so two
 INPUTs for the same terminal raced on the thread pool and could reach the pane
@@ -44,7 +44,7 @@ async def test_two_inputs_to_one_terminal_reach_send_input_in_order():
     bridge = _bridge()
     order = []
 
-    def fake_send_input(terminal_id, message, sender_id=None, orchestration_type=None):
+    def fake_send_input(terminal_id, message, **_kwargs):
         if message == "a":
             time.sleep(0.2)  # the first call is slow; b must still wait for it
         order.append(message)
@@ -65,7 +65,7 @@ async def test_a_slow_command_on_one_terminal_does_not_delay_another():
     bridge = _bridge()
     order = []
 
-    def fake_send_input(terminal_id, message, sender_id=None, orchestration_type=None):
+    def fake_send_input(terminal_id, message, **_kwargs):
         if terminal_id == TID:
             time.sleep(0.3)  # the slow terminal
         order.append(terminal_id)

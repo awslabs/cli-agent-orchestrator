@@ -23,7 +23,7 @@ from cli_agent_orchestrator.utils.orchestration import (
 
 
 class TestAuthHeaders:
-    """Tests for the local-auth bearer helper (review on PR #634, scoped on #802).
+    """Tests for the local-auth bearer helper and its destination scoping.
 
     ``_auth_headers(dest)`` is what every ``requests`` call in this module passes
     as ``headers=_auth_headers(<base url>) or None`` -- without it, an

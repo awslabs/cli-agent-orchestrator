@@ -1,5 +1,5 @@
 """The dispatch journal carries caller_id and working_directory, so a launch
-reconciled after a restart is restored with both (haefeif re#7 on PR #802).
+reconciled after a restart is restored with both.
 
 The redelivered-LAUNCH reconcile writer can only restore what the journal held,
 and the journal held neither field: a recovered terminal lost its callback

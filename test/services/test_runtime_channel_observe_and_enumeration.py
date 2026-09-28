@@ -1,4 +1,4 @@
-"""Single-observation reads on the runtime registry (#745, #802 stream Q).
+"""Single-observation reads on the runtime registry (#745).
 
 Three new registry methods route status/placement/enumeration through one lock
 acquisition (or, for ``is_bound``, a lock-only in-memory check) so callers on
@@ -6,8 +6,7 @@ worker threads stop splitting a decision across reads the channel loop mutates
 between:
 
 - ``observe`` — ``(is_remote, status)`` from one observation, replacing
-  ``effective_status``' ``is_remote`` + ``get_status`` pair (Copilot 4104866574,
-  4070130514);
+  ``effective_status``' ``is_remote`` + ``get_status`` pair;
 - ``live_remote_bindings`` — ``(terminal_id, runtime_id)`` for connected runtimes
   under one lock, replacing ``remote_terminal_ids`` + per-row
   ``runtime_for_terminal`` in session enumeration;

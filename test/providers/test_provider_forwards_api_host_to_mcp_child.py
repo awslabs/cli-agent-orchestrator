@@ -1,4 +1,4 @@
-"""Kimi and MiniMax forward CAO_API_HOST/PORT/MEMORY into the MCP child env (#802).
+"""Kimi and MiniMax forward CAO_API_HOST/PORT/MEMORY into the MCP child env.
 
 Only claude_code and codex used to forward the trio a direct (non-shim)
 cao-mcp-server child needs to find the CAO API off localhost. On an

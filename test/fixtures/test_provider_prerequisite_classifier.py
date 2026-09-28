@@ -1,4 +1,4 @@
-"""The E2E prerequisite classifier skips only environmental failures (#802 #14).
+"""The E2E prerequisite classifier skips only environmental failures.
 
 ``skip_if_provider_unusable`` used to skip any 5xx whose body contained the
 provider name, so a genuine defect like "sqlite error while creating

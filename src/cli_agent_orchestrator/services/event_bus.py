@@ -279,7 +279,7 @@ class EventBus:
         ``publish`` does, so the FIFO reader thread can report the loss of the
         bytes it just published. A queue that drops the event is owed a marker
         for ``lost``'s range and receives it on the next put it accepts, or when
-        a consumer calls :meth:`flush_owed_to` (Copilot review on #802).
+        a consumer calls :meth:`flush_owed_to`.
         """
         loop = self._loop
         if loop is None:

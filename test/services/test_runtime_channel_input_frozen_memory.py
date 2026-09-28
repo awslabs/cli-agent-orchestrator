@@ -1,4 +1,4 @@
-"""frozen_memory survives the remote INPUT hop unchanged (haofeif #8).
+"""frozen_memory survives the remote INPUT hop unchanged.
 
 ``send_input(..., frozen_memory=...)`` freezes a workflow's memory context so
 the terminal is fed exactly that block — including the empty string, which

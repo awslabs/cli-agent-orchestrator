@@ -47,7 +47,7 @@ def wired(monkeypatch):
     conn = MagicMock()
     conn.send_command = AsyncMock(return_value=_launch_result())
     # The OK launch path now defers the ack to launch_remote_terminal, which awaits
-    # conn.ack after the row is persisted (haefeif #3 on #802), so it must be async.
+    # conn.ack after the row is persisted, so it must be async.
     conn.ack = AsyncMock()
 
     registry = MagicMock()

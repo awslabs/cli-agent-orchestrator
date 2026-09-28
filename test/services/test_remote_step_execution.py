@@ -43,16 +43,21 @@ LOCAL = "abc12345"
 
 @pytest.fixture
 def placement():
-    """Route ``REMOTE`` to a runtime and leave ``LOCAL`` on this host."""
+    """Route ``REMOTE`` to a runtime and leave ``LOCAL`` on this host.
+
+    Routing callers ask ``is_remote``; ``effective_status`` asks ``observe`` once.
+    ``remote_status`` is what the runtime reported for ``REMOTE``.
+    """
+    remote_status = MagicMock(return_value=TerminalStatus.COMPLETED)
     with (
         patch(
             "cli_agent_orchestrator.runtime_channel.registry.runtime_registry.is_remote",
             side_effect=lambda tid: tid == REMOTE,
         ) as is_remote,
         patch(
-            "cli_agent_orchestrator.runtime_channel.registry.runtime_registry.get_status",
-            return_value=TerminalStatus.COMPLETED,
-        ) as remote_status,
+            "cli_agent_orchestrator.runtime_channel.registry.runtime_registry.observe",
+            side_effect=lambda tid: (True, remote_status(tid)) if tid == REMOTE else (False, None),
+        ),
         patch(
             "cli_agent_orchestrator.services.status_monitor.status_monitor.get_status",
             return_value=TerminalStatus.IDLE,

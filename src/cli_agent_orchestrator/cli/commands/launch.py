@@ -438,7 +438,7 @@ def launch(
             # an explicit flag the tools were resolved against the CLIENT's profile
             # store, which on a shared server is the wrong one (and a missing client
             # profile resolves to broad developer defaults); omit it and let the
-            # server resolve against its own installed profile (haofeif #9 on #802).
+            # server resolve against its own installed profile.
             params["allowed_tools"] = ",".join(resolved_allowed_tools)
         if memory:
             params["memory_manager"] = "true"

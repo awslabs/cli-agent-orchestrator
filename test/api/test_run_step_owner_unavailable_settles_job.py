@@ -2,8 +2,8 @@
 
 ``run_step`` writes job state "running" before execution and every failure arm
 settles it. The ``OwnerUnavailableError`` arm raised 503 without recording a
-terminal job state, so a handoff job stayed "running" forever (haofeif #13 on
-#802). The 503 (retryable) is kept; the job state is now settled to "error".
+terminal job state, so a handoff job stayed "running" forever. The 503
+(retryable) is kept; the job state is now settled to "error".
 ``_settle_step`` is deliberately NOT called — the workflow step stays retryable.
 """
 

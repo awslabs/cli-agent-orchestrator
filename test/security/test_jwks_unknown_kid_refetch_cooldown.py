@@ -1,4 +1,4 @@
-"""Unknown kids do not amplify JWKS refetches (Augusto auth-dos, #802).
+"""Unknown kids do not amplify JWKS refetches.
 
 ``_verify_token`` used to ``clear()`` the whole JWKS cache and refetch on any
 ``PyJWKClientError``. The ``kid`` comes from the unverified header, so an

@@ -1,4 +1,4 @@
-"""Protocol v3 and the small bridge hygiene items on #802.
+"""Protocol v3 and small bridge hygiene items.
 
 - v3: INPUT now carries ``frozen_memory`` and the attach stream carries an
   epoch; a v2 bridge would drop the field and ignore the epoch, so the version

@@ -3,7 +3,7 @@
 Before this fix ``effective_status`` called ``runtime_registry.is_remote`` and
 then ``runtime_registry.get_status`` — two lock acquisitions from a worker
 thread while the channel loop mutated the registry, so a disconnect between them
-could hand a waiter a stale COMPLETED (Copilot 4104866574 / 4070130514 on #802).
+could hand a waiter a stale COMPLETED.
 It now takes ``runtime_registry.observe`` once and only consults the local status
 monitor for a confirmed-local terminal.
 """

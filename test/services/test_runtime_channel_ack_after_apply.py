@@ -1,6 +1,6 @@
 """Ack LAUNCH / RUN_SCRIPT results only after their outcome is durably applied.
 
-haefeif re#3 on PR #802: the frame reader acked a matched result the instant
+The frame reader acked a matched result the instant
 ``conn.resolve`` woke the waiter — before ``launch_remote_terminal`` wrote the
 central row and bound routing, and before ``_drive_process_remote`` settled the
 workflow run. The ack is what lets the runtime drop its only retained copy of

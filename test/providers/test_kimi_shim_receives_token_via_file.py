@@ -1,10 +1,10 @@
-"""Kimi delivers the runtime token to the shim via a file, never in argv (#802).
+"""Kimi delivers the runtime token to the shim via a file, never in argv.
 
-Copilot (4116854565, 4113446177) reads Kimi's config as removing
-CAO_RUNTIME_TOKEN without giving the shim any way to obtain it. In fact
-``resolve_mcp_server_config(omit_token=True)`` writes CAO_RUNTIME_TOKEN_FILE
-(an owner-only file) into the entry's env, and the shim reads the token from
-that file. This drives the real command in shared-endpoint mode and asserts
+Kimi does not pass its own environment to MCP children, so the token must reach
+the shim through the entry itself. ``resolve_mcp_server_config(omit_token=True)``
+writes CAO_RUNTIME_TOKEN_FILE (an owner-only file) into the entry's env, and the
+shim reads the token from that file. This drives the real command in
+shared-endpoint mode and asserts
 the observable delivery: the entry names a readable file, the token value is
 absent from argv, and the shim's header builder produces the runtime-token
 header equal to the token when run under only that entry env.

@@ -303,7 +303,7 @@ class TestReconnectRecovery:
         bridge reports the missing range as a bounded GapFrame in the OLD
         generation and then starts a NEW generation — a stream restarted under a
         reused terminal id — so the server's bookkeeping and this runtime's can
-        never be spliced into one transcript (Copilot review on #802).
+        never be spliced into one transcript.
         """
         import logging
 

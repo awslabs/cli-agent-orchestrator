@@ -498,16 +498,12 @@ class ClaudeCodeProvider(BaseProvider):
                 tmp_dir = CAO_HOME_DIR / "tmp"
                 tmp_dir.mkdir(parents=True, exist_ok=True)
                 mcp_file = tmp_dir / f"{self.terminal_id}.mcp.json"
-                # Owner-only from the first byte. The channel token is no longer
-                # written here — the resolver above is called with persisted=True
-                # and the shim inherits CAO_RUNTIME_TOKEN from this process — but
-                # the file still carries the endpoint and the whole tool surface,
-                # and the mode matters for its own sake: `write_text` then `chmod`
-                # publishes the whole body at the umask default first, so another
-                # local account can open it inside that window and keep reading
-                # through the descriptor after the narrowing. The name is
-                # deterministic per terminal, so an inode left 0644 by an older
-                # build is not hypothetical either (Copilot review on #802).
+                # Owner-only from the first byte. The file holds the endpoint,
+                # CAO_RUNTIME_TOKEN_FILE (a path, never the token) and the tool
+                # surface. write_owner_only creates it at 0600 rather than chmod-ing
+                # afterwards, so the body is never readable at the umask default, and
+                # it replaces a 0644 inode an older build may have left at this
+                # deterministic path.
                 write_owner_only(mcp_file, json.dumps({"mcpServers": mcp_config}))
                 command_parts.extend(
                     [

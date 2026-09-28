@@ -2,8 +2,8 @@
 
 ``StatusMonitor.run`` used to call ``_belongs_to_a_runtime`` inline on the loop,
 which reaches a synchronous SQLite ``get_terminal_metadata`` read on a cold
-placement cache — blocking the loop that services every terminal's output
-(haofeif #11 / Copilot status_monitor.py:203 on #802). The in-memory fast check
+placement cache — blocking the loop that services every terminal's output.
+The in-memory fast check
 stays on the loop; the DB-backed placement check moves into the worker thread
 alongside chunk processing.
 """

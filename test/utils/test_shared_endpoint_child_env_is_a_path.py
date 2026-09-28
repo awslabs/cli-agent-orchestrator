@@ -1,4 +1,4 @@
-"""The forwarded MCP child env carries a token PATH, never the value (#802).
+"""The forwarded MCP child env carries a token PATH, never the value.
 
 After the structural fix, ``shared_endpoint_child_env`` returns only the
 endpoint URL and ``CAO_RUNTIME_TOKEN_FILE`` — in both the persisted and the

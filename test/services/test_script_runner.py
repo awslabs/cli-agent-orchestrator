@@ -1286,7 +1286,7 @@ async def test_remote_script_run_executes_in_runtime_and_completes(
         runtime_id = "worker-live"
 
         async def ack(self, op_id):
-            # The remote script driver now acks after finalize (haefeif #3).
+            # The remote script driver now acks after finalize.
             return None
 
         async def send_command(

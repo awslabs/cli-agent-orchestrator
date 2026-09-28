@@ -1,6 +1,6 @@
 """Settle definitively failed remote launches; keep unknown outcomes unsettled.
 
-haefeif re#15 + Augusto on PR #802: the dispatch journal only settled on the
+The dispatch journal only settled on the
 launch happy path, so every definitively failed launch left a permanent
 ``dispatched`` row that the janitor (which prunes only settled rows) could never
 reclaim. The arms whose outcome is KNOWN must settle:
@@ -14,7 +14,7 @@ The arms whose outcome is UNKNOWN must NOT settle (the runtime may redeliver):
   * 504 base ``RuntimeUnavailableError`` and 504 ``TimeoutError``;
   * 500 persist failure with an UNCONFIRMED teardown (the agent may be live).
 
-haefeif re#12: the 500 detail must state whether the compensating teardown was
+The 500 detail must state whether the compensating teardown was
 confirmed, and when it was not, name the terminal id / runtime and say the agent
 may still be running — not the unconditional "tore it down".
 """

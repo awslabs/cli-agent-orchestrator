@@ -1,9 +1,9 @@
-"""The runtime-channel handshake rejects a non-ASCII token cleanly (#802).
+"""The runtime-channel handshake rejects a non-ASCII token cleanly.
 
 ``hmac.compare_digest`` on ``str`` raises ``TypeError`` for a non-ASCII operand,
 so a hostile header would crash the handshake instead of closing 1008. The
 endpoint is driven directly with a stub WebSocket: before the fix the coroutine
-raises TypeError; after it, it closes with the policy-violation code (Augusto).
+raises TypeError; after it, it closes with the policy-violation code.
 """
 
 import asyncio

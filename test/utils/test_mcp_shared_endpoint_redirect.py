@@ -166,7 +166,7 @@ class TestTheTokenIsWrittenOnlyForCaosOwnChild:
     `resolve_mcp_server_config` has always gated the forwarding env on the command,
     but a provider that merges `shared_endpoint_child_env()` into every entry it
     writes would hand the endpoint and token-file path to third-party MCP servers
-    CAO does not ship, for no purpose (Copilot review on #802, findings 2 and 9).
+    CAO does not ship, for no purpose.
 
     Every test below is about what is WRITTEN into a config entry. The token's
     value is no longer in any child env: the entry carries only
@@ -204,8 +204,8 @@ class TestTheTokenIsWrittenOnlyForCaosOwnChild:
 
         This asserted the token VALUE was written here, which the persisted
         contract forbids. The entry carries ``CAO_RUNTIME_TOKEN_FILE`` (a path)
-        instead, and the shim reads the value from that owner-only file (Copilot
-        follow-up on #802). The endpoint still belongs there — without it the shim
+        instead, and the shim reads the value from that owner-only file. The
+        endpoint still belongs there — without it the shim
         has nowhere to dial.
         """
         from cli_agent_orchestrator.utils.opencode_config import translate_mcp_server_config
@@ -359,8 +359,8 @@ class TestThePersistedFormCarriesNoToken:
     The token's value never travels: CAO's own server entry receives
     ``CAO_RUNTIME_TOKEN_FILE`` (a path to a 0600 file) and the shim reads the
     value from there. An earlier version copied the value into the config, which
-    reached Kiro's agent JSON and Cursor's plugin.json at mode 0644 (Copilot
-    review on #802). The endpoint URL stays: it is deployment configuration, not
+    reached Kiro's agent JSON and Cursor's plugin.json at mode 0644. The
+    endpoint URL stays: it is deployment configuration, not
     a secret, and the shim cannot find the server without it.
     """
 

@@ -1,4 +1,4 @@
-"""A dropped FINAL output event becomes a reported gap (#745, review finding 5).
+"""A dropped FINAL output event becomes a reported gap (#745).
 
 ``_stream_positions`` advertised only ``buf.end_pos`` — bytes the bridge
 dequeued. When the bounded bus drops the LAST event, the producer's tail never

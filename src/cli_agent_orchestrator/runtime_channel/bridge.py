@@ -161,7 +161,7 @@ class Bridge:
         # TEARDOWN. The hello/heartbeat snapshot is built from this set (unioned
         # with any buffered ids) rather than from _buffers alone, so a live
         # terminal that has no in-memory buffer is still advertised and a
-        # restarted server can rebind it (Copilot review on #802).
+        # restarted server can rebind it.
         self._live_terminals: set = set()
         # Per-terminal command chains: the in-flight task for a terminal-scoped
         # command, so the next one for the same terminal awaits it and they reach
@@ -258,7 +258,7 @@ class Bridge:
                 # A chunk the bounded bus refused is owed to this queue as a loss
                 # marker; collect it whenever the queue drains so a dropped FINAL
                 # chunk becomes a reported gap rather than an invisible short
-                # watermark (review finding 5 on #802).
+                # watermark.
                 if queue.empty():
                     bus.flush_owed_to(queue)
         finally:
@@ -322,7 +322,7 @@ class Bridge:
                 # the terminal id — the fence the offset heuristic below
                 # could not see when the new stream's head was dropped, so
                 # its first delivered offset landed at or past the old
-                # watermark and the two spliced (Copilot review on #802).
+                # watermark and the two spliced.
                 last = self._last_epoch.get(terminal_id)
                 self._last_epoch[terminal_id] = epoch
                 if last is not None and epoch != last:
@@ -582,7 +582,7 @@ class Bridge:
                 sender_id=payload.get("sender_id"),
                 orchestration_type=payload.get("orchestration_type"),
                 # Forwarded UNCHANGED: None, "" and a real block are distinct
-                # instructions to inject_memory_context (haofeif #8).
+                # instructions to inject_memory_context.
                 frozen_memory=payload.get("frozen_memory"),
             )
             return CommandOutcome.OK, {"success": success}, terminal_id
@@ -674,7 +674,7 @@ class Bridge:
         # A reopen REPLACES the PTY, it does not end the stream: the server
         # already EOF'd the displaced client's sink when it bound the new one,
         # so an EOF here would be routed to the NEW client and close it. Close
-        # the old PTY silently (Copilot review on #802).
+        # the old PTY silently.
         await self._attach_close(terminal_id, notify_server=False)
 
         metadata = get_terminal_metadata(terminal_id)
@@ -834,7 +834,7 @@ class Bridge:
         # the relay parked on `sink.get()` forever — and `unbind_terminal(...,
         # deleted=True)` then removed the binding, so no later disconnect sweep
         # could find the sink either. Only a client keystroke ended it, by raising
-        # out of the upstream half (Copilot review on #802). The EOF carries this
+        # out of the upstream half. The EOF carries this
         # PTY's epoch so the server routes it to the matching client only.
         if notify_server:
             await self._send(
@@ -1123,22 +1123,11 @@ class Bridge:
                 continue
             start = resume.end_pos
             if start > buf.end_pos:
-                # The server claims bytes past this buffer's watermark. It can
-                # happen legitimately — a pane recovered under an id whose
-                # earlier stream this server had consumed, so its position
-                # belongs to a buffer that no longer exists — but it is never
-                # ordinary, and `replay_from` would raise on it.
-                #
-                # Logging and clamping was not enough. `replay_from(end_pos)`
-                # returns nothing, so no bytes and no gap were sent, the
-                # generation never moved, and the server kept its impossible
-                # watermark: the next live frame then arrived BELOW that
-                # watermark in the same generation, indistinguishable from a
-                # rewind (Copilot review on #802). What actually happened is
-                # that this is a different stream wearing the same id, so say
-                # exactly that — a new generation makes the server's old
-                # position inapplicable by construction rather than by
-                # arithmetic, and the gap names the range nobody can supply.
+                # The server claims bytes past this buffer's watermark: a different
+                # stream now wears this terminal id. Report the unreachable range as
+                # a gap in the OLD generation (read the old watermark before
+                # begin_generation() zeroes it), then start a new generation so the
+                # server's old position no longer applies.
                 logger.warning(
                     "server resume position %s for terminal %s is past this "
                     "runtime's watermark %s; starting a new generation "
@@ -1147,18 +1136,6 @@ class Bridge:
                     resume.terminal_id,
                     buf.end_pos,
                 )
-                # Read the OLD watermark and report the gap in the OLD generation,
-                # BEFORE the new one starts. Order is the whole correctness of this
-                # block: `begin_generation()` zeroes `end_pos`, so building the gap
-                # after it produced `from_pos=0` stamped with the NEW generation —
-                # and the server's higher-generation branch in `record_position`
-                # SETS the watermark from a gap's `to_pos`, so the fresh generation
-                # inherited exactly the impossible position this code exists to
-                # escape. Live frames at 0..N then never advanced it and every
-                # later reconnect re-entered here, calling `begin_generation()`
-                # again and discarding the retained window each time — a one-off
-                # mismatch turned into recurring real output loss. Found by review
-                # of the first version of this fix.
                 stale_end = buf.end_pos
                 await self._send(
                     GapFrame(

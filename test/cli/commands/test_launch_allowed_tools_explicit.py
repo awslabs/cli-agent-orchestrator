@@ -1,4 +1,4 @@
-"""``cao launch`` sends allowed_tools only when the user set it (haofeif #9, #802).
+"""``cao launch`` sends allowed_tools only when the user set it.
 
 The shared-server ``/sessions`` branch used to serialize the client-resolved
 tool policy unconditionally, overriding the server installation's own profile

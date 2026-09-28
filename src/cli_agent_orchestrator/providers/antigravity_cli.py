@@ -464,7 +464,7 @@ class AntigravityCliProvider(BaseProvider):
             # preference the operator may have overridden. Preserving the
             # previous mode — as this did — left a config that predated the
             # rule, or that another tool created world-readable, readable by
-            # every local account (both Copilot reviews on #802, finding 8).
+            # every local account.
             write_owner_only(path, json.dumps(config, indent=2))
 
     def _unregister_mcp_servers(self) -> None:

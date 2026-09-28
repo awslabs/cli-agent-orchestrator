@@ -1,4 +1,4 @@
-"""``skip_if_provider_unusable`` must not skip genuine internal errors (#802 #14).
+"""``skip_if_provider_unusable`` must not skip genuine internal errors.
 
 Behavioral counterpart to ``test_provider_prerequisite_classifier``: it drives
 the public skip helper (which existed before the fix) and asserts a 5xx that

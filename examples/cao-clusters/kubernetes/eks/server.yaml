@@ -76,7 +76,7 @@ spec:
             # (fail-closed), and with no runtime connected there is nowhere for
             # any agent to run. deploy.sh mints this secret.
             #
-            # Delivered as a mounted file, not an env value (#802): the token's
+            # Delivered as a mounted file, not an env value: the token's
             # value never enters the pod environment, so `ps`, /proc/<pid>/environ
             # and tmux pane forwarding cannot leak it. The path names the Secret's
             # `token` key under the read-only mount below.
@@ -143,7 +143,7 @@ spec:
             - name: workspace
               mountPath: /home/cao/workspace
               readOnly: true
-            # The runtime token as a file (#802). Read-only; group-readable via
+            # The runtime token as a file. Read-only; group-readable via
             # fsGroup 1000 (defaultMode 0440 on the volume below).
             - name: runtime-token
               mountPath: /var/run/cao/runtime-token
@@ -224,7 +224,7 @@ spec:
               value: "9891"
             # Fail-closed: build_http_app refuses to start an unauthenticated
             # shared endpoint, so this secret is what makes the endpoint exist.
-            # Mounted as a file (#802): the value stays out of the pod env.
+            # Mounted as a file: the value stays out of the pod env.
             - name: CAO_RUNTIME_TOKEN_FILE
               value: /var/run/cao/runtime-token/token
             - name: CAO_HOME_DIR
@@ -302,7 +302,7 @@ spec:
         - name: workspace
           persistentVolumeClaim:
             claimName: cao-elastic-workspace
-        # The runtime token, mounted read-only as a file (#802). defaultMode
+        # The runtime token, mounted read-only as a file. defaultMode
         # 0440 with the pod's fsGroup 1000 makes it owner+group readable and
         # never world-readable; the value never lands in an env var.
         - name: runtime-token

@@ -1,4 +1,4 @@
-"""TmuxClient never forwards the runtime token value into a pane (#802).
+"""TmuxClient never forwards the runtime token value into a pane.
 
 ``create_session`` forwards non-blocked ``CAO_*`` variables from the server's
 environment into the provider's pane. ``CAO_RUNTIME_TOKEN`` (and the local auth

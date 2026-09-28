@@ -48,7 +48,7 @@ def _connected_runtime():
         )
     )
     # The OK launch path defers its ack to launch_remote_terminal, which awaits
-    # conn.ack after persisting the row (haefeif #3 on #802).
+    # conn.ack after persisting the row.
     conn.ack = AsyncMock()
     return conn
 

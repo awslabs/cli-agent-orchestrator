@@ -1,8 +1,8 @@
 """Revoked principals cannot start new work on the create/run routes (#745).
 
 ``may_start_work`` was consulted only by inbox delivery and flow dispatch. A
-revoked principal could still start work through the synchronous create routes
-(Augusto on #802; decision: enforce). ``create_session``,
+revoked principal could still start work through the synchronous create routes.
+``create_session``,
 ``create_terminal_in_session`` and ``run_step`` now refuse a revoked owner with
 403 and create/journal nothing. An unrevoked principal is unaffected.
 """

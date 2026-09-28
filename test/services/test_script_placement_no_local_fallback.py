@@ -1,9 +1,8 @@
-"""A configured script runtime never falls back to a local subprocess
-(Copilot 4061732145 on PR #802).
+"""A configured script runtime never falls back to a local subprocess.
 
 When ``CAO_SCRIPT_RUNTIME`` is set the script ALWAYS runs in that runtime; a
 disconnected runtime fails the run rather than silently spawning author code
-beside the central server. This pins the exact Copilot scenario — runtime
+beside the central server. This pins the scenario — runtime
 configured, disconnected -> FAILED, and no local subprocess is spawned — so the
 misleading "when it names a connected runtime" wording cannot regress into an
 actual local fallback.

@@ -199,7 +199,7 @@ async def _reconcile_orphaned_result(frame: CommandResultFrame, runtime_id: str)
     record = None
     try:
         # SQLite is synchronous; keep it off the frame-reader event loop so a slow
-        # read cannot stall every other terminal's frames (Augusto on #802).
+        # read cannot stall every other terminal's frames.
         record = await asyncio.to_thread(get_dispatch_record, frame.op_id)
     except Exception:
         # Provenance is MANDATORY only when applying this result would create or
@@ -263,7 +263,7 @@ async def _reconcile_orphaned_result(frame: CommandResultFrame, runtime_id: str)
             if not applied:
                 # The workflow-journal write raised. Do NOT settle and do NOT ack,
                 # so the runtime redelivers on its next reconnect and the write can
-                # be retried — acking now would strand the run RUNNING (haefeif #3).
+                # be retried — acking now would strand the run RUNNING.
                 return False
         # Anything else failed without creating state to orphan. Settle so a restart
         # does not report it as an outcome never seen.
@@ -289,7 +289,7 @@ async def _reconcile_orphaned_result(frame: CommandResultFrame, runtime_id: str)
         applied = await asyncio.to_thread(_reconcile_orphaned_script_run, frame, record)
         if not applied:
             # The durable run write failed; keep the result unacked and the journal
-            # unsettled so redelivery can retry it (haefeif #3 on #802).
+            # unsettled so redelivery can retry it.
             return False
     await asyncio.to_thread(_settle_quietly, frame.op_id)
     return True
@@ -317,7 +317,7 @@ def _reconcile_orphaned_script_run(frame: CommandResultFrame, record: dict) -> b
     Returns whether the durable write is done with. ``False`` means the
     workflow-journal write RAISED: the caller must then neither settle the
     dispatch journal nor ack, so the runtime redelivers on its next reconnect and
-    the write can be retried (haefeif #3 on #802). ``True`` covers the writes that
+    the write can be retried. ``True`` covers the writes that
     landed and the runs that had nothing to settle.
     """
     run_id = record.get("run_id")
@@ -399,7 +399,7 @@ def _persist_reconciled_terminal(info: dict, runtime_id: str, record: dict, op_i
                 owner=record.get("owner"),
                 # Restored from the journal too: the runtime's result payload
                 # carries neither, so without this a reconciled terminal lost its
-                # callback parent and recorded workspace (haefeif #7 on #802).
+                # callback parent and recorded workspace.
                 caller_id=record.get("caller_id"),
                 working_directory=record.get("working_directory"),
                 # server_metadata, not metadata: placement is server-owned and
@@ -659,7 +659,7 @@ async def runtime_channel(ws: WebSocket) -> None:
                 # runtime drop its only retained copy — must wait until that state
                 # is on disk. The coroutine sends it via ``conn.ack`` after the
                 # apply. Read the deferral before yielding, so it is answered while
-                # the op is still in flight (haefeif #3 on #802).
+                # the op is still in flight.
                 deferred = matched and conn.ack_is_deferred(frame.op_id)
                 safe_to_ack = True
                 if not matched:
@@ -718,8 +718,7 @@ async def runtime_channel(ws: WebSocket) -> None:
                 # the watermark alone would step over silently. Report the range as
                 # a loss to output consumers, with the marker shape the GapFrame
                 # branch uses, then process the frame normally. Exclusions (first
-                # frame, higher generation, post-unbounded-gap) live in the detector
-                # (Copilot review on #802).
+                # frame, higher generation, post-unbounded-gap) live in the detector.
                 jump = runtime_registry.stream_forward_jump(
                     frame.terminal_id, frame.stream.value, frame.generation, frame.pos
                 )
@@ -871,7 +870,7 @@ async def runtime_channel(ws: WebSocket) -> None:
                     # Publish only the status the registry ACCEPTED: a stale
                     # generation is fenced in set_status, and publishing it anyway
                     # let a rejected report reach the bus consumers while the cache
-                    # kept the live one (review finding 6 on #802).
+                    # kept the live one.
                     if runtime_registry.set_status(
                         frame.terminal_id,
                         frame.status,
@@ -1018,7 +1017,7 @@ async def launch_remote_terminal(
             # is the only place a reconcile after a restart can read it from.
             engine=body.engine,
             # Recorded so a launch reconciled after a restart restores the caller
-            # its callbacks route to and the workspace it ran in (haefeif #7).
+            # its callbacks route to and the workspace it ran in.
             caller_id=body.caller_id,
             working_directory=body.working_directory,
         )
@@ -1090,7 +1089,7 @@ async def launch_remote_terminal(
         the provider is already running: the ack that lets the runtime drop its
         retained copy is sent only once the central row is written, routing is
         bound, and the journal is settled — never on ``conn.resolve`` from the
-        frame reader (haefeif #3 on #802).
+        frame reader.
         """
         # Persist the authoritative registry row centrally. runtime_id is recorded
         # in metadata so the association is inspectable and survives restarts
@@ -1120,7 +1119,7 @@ async def launch_remote_terminal(
         except Exception:
             # The provider is already running in the runtime, but there is no row
             # and no binding — nothing can route to it or tear it down, so it is a
-            # leaked pod holding a live model session (guojing1217 on #802).
+            # leaked pod holding a live model session.
             # Compensate with a best-effort TEARDOWN on the same connection.
             logger.exception(
                 "persisting terminal %s failed after launch on %s; tearing it back down",
@@ -1134,8 +1133,7 @@ async def launch_remote_terminal(
                 )
                 # send_command does NOT raise on a runtime-side teardown FAILURE —
                 # it returns a non-OK result frame. Treating that as success would
-                # report the leak as cleaned up when the agent is still running
-                # (Copilot follow-up on #802).
+                # report the leak as cleaned up when the agent is still running.
                 cleaned = td.outcome == CommandOutcome.OK and (
                     td.payload.get("deleted") or td.payload.get("absent")
                 )
@@ -1263,7 +1261,7 @@ async def relay_remote_attach(websocket, terminal_id: str) -> None:
     # A per-terminal epoch fences this attach against a displaced one: the
     # sink is bound with it, every command carries it, and the runtime stamps
     # it on the attach-stream frames so a late EOF for a prior PTY is dropped
-    # instead of closing this client (Copilot review on #802).
+    # instead of closing this client.
     epoch = runtime_registry.next_attach_epoch(terminal_id)
     runtime_registry.bind_attach(terminal_id, sink, epoch)
     try:
@@ -1323,7 +1321,7 @@ async def relay_remote_attach(websocket, terminal_id: str) -> None:
             # A mid-session upstream failure (the runtime went away or a
             # keystroke timed out) closes with an error code so the client can
             # tell it apart from a normal PTY EOF, which _downstream ends with a
-            # clean close (Augusto nit on #802).
+            # clean close.
             error_close = None
             for task in done:
                 exc = task.exception()

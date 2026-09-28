@@ -95,7 +95,7 @@ spec:
             # all, and a pod that cannot connect can do nothing - so failing at
             # CreateContainerConfigError is the honest outcome.
             #
-            # Mounted as a file (#802): the value never enters the pod env, so it
+            # Mounted as a file: the value never enters the pod env, so it
             # cannot leak through `ps`, /proc/<pid>/environ, or tmux forwarding
             # into the agent's pane. entrypoint.sh and cao-bridge read the path.
             - name: CAO_RUNTIME_TOKEN_FILE
@@ -221,7 +221,7 @@ spec:
         # pod costs a provider install and not a conversation.
         - name: state
           emptyDir: {}
-        # The runtime token, mounted read-only as a file (#802). defaultMode
+        # The runtime token, mounted read-only as a file. defaultMode
         # 0440 with fsGroup 1000 keeps it owner+group readable, never world; the
         # value never enters the pod env or the agent's tmux pane.
         - name: runtime-token

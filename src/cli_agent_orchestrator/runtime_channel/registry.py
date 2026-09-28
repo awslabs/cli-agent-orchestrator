@@ -513,7 +513,7 @@ class RuntimeChannelRegistry:
         ``asyncio.to_thread`` so it never blocks the single frame reader, and the
         binding is re-checked under the lock after it returns — a hello or another
         frame could have bound or torn the terminal down while the read was in
-        flight (Augusto nit on #802). The lock-only cases (continuation,
+        flight. The lock-only cases (continuation,
         tombstone, already bound elsewhere) never touch the DB.
         """
         with self._lock:
@@ -738,7 +738,7 @@ class RuntimeChannelRegistry:
         one. ``effective_status`` used to ask ``is_remote`` then ``get_status`` —
         two lock acquisitions from a worker thread while the channel loop mutates
         the registry, so a disconnect landing between them could return a stale
-        ``COMPLETED`` (Copilot review on #802). This decides placement and reads
+        ``COMPLETED``. This decides placement and reads
         status together so the pair is internally consistent.
 
         ``status`` follows ``get_status``' rule: UNKNOWN unless the terminal is
@@ -776,7 +776,7 @@ class RuntimeChannelRegistry:
         runtime with each terminal under ONE lock acquisition, so a caller
         building a session listing does not follow the snapshot with a
         per-terminal ``runtime_for_terminal`` that could observe a different
-        world (Copilot review on #802). Disconnected bindings are excluded for
+        world. Disconnected bindings are excluded for
         the same reason ``remote_terminal_ids`` excludes them: a binding outlives
         its channel for routing, but a dead runtime's sessions must not enumerate.
         """
@@ -791,7 +791,7 @@ class RuntimeChannelRegistry:
         A pure in-memory fast check with no DB fallback: the status monitor's
         event loop uses it to skip a known-remote terminal without ever reaching
         the synchronous placement read that ``is_remote`` can trigger on a cold
-        cache (Copilot overview / haofeif #11 on #802). A ``False`` here is not
+        cache. A ``False`` here is not
         "local" — it only means "not bound in this process's memory"; the caller
         confirms placement off the loop.
         """
@@ -905,7 +905,7 @@ class RuntimeChannelRegistry:
         status onto the bus must gate that on the return value: the fence lives
         here, and publishing a report this method dropped let a rejected
         stale-generation status reach the event consumers while the polling cache
-        kept the live one (review finding 6 on #802).
+        kept the live one.
 
         ``conn`` is the channel the report arrived on. A report from a connection
         that is no longer the registered one for its runtime id is DROPPED: it

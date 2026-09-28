@@ -203,8 +203,7 @@ class StatusMonitor:
                 # Not bound in memory. The remaining placement decision can reach a
                 # synchronous SQLite read on a cold cache, so it runs OFF the loop
                 # together with chunk processing — never inline here, where it would
-                # block the loop that services every terminal's output (haofeif #11 /
-                # Copilot status_monitor.py:203 on #802).
+                # block the loop that services every terminal's output.
                 await asyncio.to_thread(
                     self._process_chunk_if_local, terminal_id, event["data"]["data"]
                 )

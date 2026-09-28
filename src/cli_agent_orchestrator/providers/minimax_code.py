@@ -304,9 +304,9 @@ class MiniMaxCodeProvider(BaseProvider):
             if isinstance(raw_config, dict)
             else raw_config.model_dump(exclude_none=True)
         )
-        # persisted=True: `_serialize_server`'s result is written to
-        # `servers.mcp.json`, which MiniMax reads at launch, so the endpoint is
-        # persisted and the token is inherited (Copilot review on #802).
+        # persisted=True: the result is written to `servers.mcp.json`, which MiniMax
+        # reads at launch. It holds the endpoint and CAO_RUNTIME_TOKEN_FILE (a path),
+        # never the token itself.
         config = resolve_mcp_server_config(config, persisted=True)
         command = config.get("command")
         url = config.get("url")

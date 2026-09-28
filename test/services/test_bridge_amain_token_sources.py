@@ -1,4 +1,4 @@
-"""cao-bridge names both token sources when neither is configured (#802).
+"""cao-bridge names both token sources when neither is configured.
 
 ``_amain`` now accepts the token via ``CAO_RUNTIME_TOKEN`` or the owner-only
 ``CAO_RUNTIME_TOKEN_FILE``. When neither is set the startup error must name both

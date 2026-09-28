@@ -509,8 +509,8 @@ class CursorCliProvider(BaseProvider):
                 servers[server_name] = server_config.model_dump(exclude_none=True)
             # Resolve the bundled cao-mcp-server console script to a
             # PATH-independent invocation. persisted=True: the result is written
-            # to plugin.json below, so the endpoint is persisted and the channel
-            # token is inherited from the launching process rather than stored.
+            # to plugin.json below, so it holds the endpoint and
+            # CAO_RUNTIME_TOKEN_FILE (a path), never the token itself.
             servers[server_name] = resolve_mcp_server_config(servers[server_name], persisted=True)
             env = servers[server_name].get("env", {})
             if "CAO_TERMINAL_ID" not in env:

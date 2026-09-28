@@ -1346,7 +1346,7 @@ async def lifespan(app: FastAPI):
     install_access_log_redaction()
     # Normalize the runtime-channel token to an owner-only file at startup, so
     # its value never survives in the environment (no-op when neither
-    # CAO_RUNTIME_TOKEN nor CAO_RUNTIME_TOKEN_FILE is set). (#802)
+    # CAO_RUNTIME_TOKEN nor CAO_RUNTIME_TOKEN_FILE is set).
     from cli_agent_orchestrator.utils.runtime_token import load_runtime_token
 
     load_runtime_token()
@@ -3328,7 +3328,7 @@ async def create_session(
     terminal has since been torn down is stale, not conflicting, and simply
     creates fresh.
     """
-    # Revocation gate (#745; Augusto on #802): a revoked principal may not START
+    # Revocation gate (#745): a revoked principal may not START
     # new work. Checked here, before anything is created or journaled, so a
     # removed member cannot open a fresh session with an unexpired token. Placed
     # before the try below because that block maps every exception to 500 and
@@ -3757,7 +3757,7 @@ async def create_terminal_in_session(
         # the shared-credential limit tracked by #774.
         worker_owner = caller_owner or principal.id
 
-        # Revocation gate (#745; Augusto on #802): a revoked principal may not
+        # Revocation gate (#745): a revoked principal may not
         # START new work. The worker is owned by ``worker_owner`` (the caller's
         # owner when there is one, else the request principal), so that is the
         # principal to check. Gated on ``any_revoked`` so the parse/lookup only
@@ -4579,7 +4579,7 @@ async def run_step(
         except KeyError as e:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
-    # Revocation gate (#745; Augusto on #802): a revoked principal may not START
+    # Revocation gate (#745): a revoked principal may not START
     # new work. The step is owned by the caller's recorded owner, so resolve and
     # check it BEFORE the "running" write below, so a refused step creates and
     # journals nothing. Gated on ``any_revoked`` so the owner read only happens
@@ -4933,7 +4933,7 @@ async def run_step(
         #
         # The durable JOB, though, must be settled: run_step wrote state="running"
         # and every other terminal exit records a terminal state, so skipping it
-        # left a handoff job stranded at "running" forever (haofeif #13 on #802).
+        # left a handoff job stranded at "running" forever.
         # Settle the job to "error" while keeping the retryable 503. Do NOT call
         # _settle_step — the workflow-step reservation stays retryable, unlike the
         # job record which is the request's own durable outcome.

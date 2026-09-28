@@ -146,7 +146,7 @@ def _reset_backend_registry():
 
 @pytest.fixture(autouse=True)
 def _reset_runtime_token_cache():
-    """Clear the process-lifetime runtime-token cache between tests (#802).
+    """Clear the process-lifetime runtime-token cache between tests.
 
     ``load_runtime_token`` caches the token for the life of the process and moves
     an env-supplied value into an owner-only file, rewriting ``os.environ`` in

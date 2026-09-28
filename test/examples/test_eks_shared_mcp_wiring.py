@@ -164,7 +164,7 @@ class TestTheCredentialBoundaryHolds:
 
     def test_the_endpoint_is_authenticated(self, server):
         """build_http_app refuses to start without it, so an endpoint that exists
-        is an endpoint that demands the token. Delivered as a mounted file (#802),
+        is an endpoint that demands the token. Delivered as a mounted file,
         so the value never enters the pod env."""
         sidecar = _containers(server)["cao-mcp"]
         env = _env(sidecar)

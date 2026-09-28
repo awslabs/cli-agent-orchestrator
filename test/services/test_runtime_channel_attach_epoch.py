@@ -1,5 +1,4 @@
-"""Attach displacement is fenced by a per-terminal epoch (Copilot 4061732117 /
-4061732047).
+"""Attach displacement is fenced by a per-terminal epoch.
 
 These wire the REAL ``Bridge`` to the REAL ``registry.deliver_attach`` — the
 existing attach tests patch ``send_terminal_command``, so they never exercised

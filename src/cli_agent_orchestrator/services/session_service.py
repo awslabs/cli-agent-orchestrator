@@ -281,7 +281,7 @@ def _remote_sessions(local_session_names: Set[str]) -> List[Dict[str, Any]]:
         # One snapshot decides both which terminals are remote AND which runtime
         # each is on, so the enumeration never follows a per-row
         # ``runtime_for_terminal`` that could observe a different world than the
-        # membership list it is annotating (Copilot review on #802).
+        # membership list it is annotating.
         runtime_by_terminal: Dict[str, str] = dict(bindings)
         runtimes_by_session: Dict[str, Set[str]] = {}
         for terminal in list_terminals_by_ids(list(runtime_by_terminal)):
@@ -372,7 +372,7 @@ def get_session(session_name: str) -> Dict:
             # host may not host this one) -- but it may still exist as a remote
             # session, exactly as ``list_sessions`` advertises it via
             # ``_remote_sessions``. Detail must use the same authority as the list,
-            # or a session that lists raises "not found" when opened (haofeif #10).
+            # or a session that lists raises "not found" when opened.
             session_data = next(
                 (s for s in _remote_sessions(set()) if s["id"] == session_name), None
             )
@@ -386,7 +386,7 @@ def get_session(session_name: str) -> Dict:
         # terminal's status from the runtime that owns its pane and a local one's
         # from the local monitor. Reading the local monitor unconditionally (as
         # before) reported a remote terminal's status as UNKNOWN even while its
-        # runtime had it COMPLETED (haofeif #10).
+        # runtime had it COMPLETED.
         from cli_agent_orchestrator.utils.terminal import effective_status
 
         for terminal in terminals:

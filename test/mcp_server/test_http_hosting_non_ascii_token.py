@@ -1,8 +1,8 @@
-"""A non-ASCII runtime token is rejected cleanly, not with a TypeError (#802).
+"""A non-ASCII runtime token is rejected cleanly, not with a TypeError.
 
 ``hmac.compare_digest`` on ``str`` raises ``TypeError`` for a non-ASCII operand.
 The shared-HTTP token gate must encode both operands so a hostile or malformed
-header is refused as unauthorized rather than crashing the request (Augusto).
+header is refused as unauthorized rather than crashing the request.
 """
 
 from unittest.mock import patch

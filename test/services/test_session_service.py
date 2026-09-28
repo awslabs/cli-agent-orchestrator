@@ -890,7 +890,7 @@ class TestGetSession:
         and the cao-ops-mcp get_session_info tool an external supervisor polls).
 
         Status comes from ``effective_status`` (the placement-aware authority the
-        session list also uses), not the local monitor directly (haofeif #10)."""
+        session list also uses), not the local monitor directly."""
         from cli_agent_orchestrator.models.terminal import TerminalStatus
 
         mock_get_backend.return_value.session_exists.return_value = True
