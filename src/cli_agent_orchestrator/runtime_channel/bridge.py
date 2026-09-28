@@ -163,6 +163,11 @@ class Bridge:
         # terminal that has no in-memory buffer is still advertised and a
         # restarted server can rebind it (Copilot review on #802).
         self._live_terminals: set = set()
+        # Per-terminal command chains: the in-flight task for a terminal-scoped
+        # command, so the next one for the same terminal awaits it and they reach
+        # the pane in arrival order. Different terminals and runtime-scoped
+        # commands are not chained and stay concurrent.
+        self._terminal_chains: Dict[str, asyncio.Task] = {}
 
     # --- outbound plumbing ---
 
@@ -1207,15 +1212,50 @@ class Bridge:
         async for raw in ws:
             frame: Frame = decode_frame(raw)
             if isinstance(frame, CommandFrame):
-                # Concurrent dispatch: a slow LAUNCH must not block an input
-                # or teardown for another terminal.
-                asyncio.create_task(self._handle_command(frame))
+                self._dispatch_command(frame)
             elif isinstance(frame, AckFrame):
                 self._unacked.pop(frame.op_id, None)
             elif isinstance(frame, HeartbeatFrame):
                 pass
             else:
                 logger.warning("unexpected frame kind from server: %s", frame.kind)
+
+    def _dispatch_command(self, frame: CommandFrame) -> None:
+        """Dispatch a command, serializing per terminal but not across terminals.
+
+        A runtime-scoped command (no terminal_id: LAUNCH, RUN_SCRIPT,
+        CANCEL_SCRIPT) runs concurrently, so a slow launch never blocks another
+        terminal. A terminal-scoped command chains after the previous one for the
+        SAME terminal, so two INPUTs (or a TEARDOWN racing an INPUT) reach the
+        pane in arrival order.
+        """
+        if frame.terminal_id is None:
+            asyncio.create_task(self._handle_command(frame))
+            return
+        tid = frame.terminal_id
+        prev = self._terminal_chains.get(tid)
+        task = asyncio.create_task(self._handle_command_after(prev, frame))
+        self._terminal_chains[tid] = task
+        # Drop the chain entry once it finishes, but only if it is still the tail
+        # — a newer command for the same terminal may have replaced it.
+        task.add_done_callback(lambda t, tid=tid: self._forget_chain(tid, t))
+
+    async def _handle_command_after(
+        self, prev: Optional[asyncio.Task], frame: CommandFrame
+    ) -> None:
+        """Run one terminal-scoped command after the previous one for its terminal."""
+        if prev is not None:
+            try:
+                await prev
+            except Exception:
+                # A prior command's failure is already reported by its own
+                # _handle_command; it must not block the next command in the chain.
+                pass
+        await self._handle_command(frame)
+
+    def _forget_chain(self, terminal_id: str, task: asyncio.Task) -> None:
+        if self._terminal_chains.get(terminal_id) is task:
+            del self._terminal_chains[terminal_id]
 
     async def run(self) -> None:
         backoff = RECONNECT_BACKOFF_INITIAL
