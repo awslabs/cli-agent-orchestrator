@@ -326,9 +326,7 @@ def _validate_gh_read_args(args: list[str]) -> None:
         and args[5:] == ["--json", PR_FIELDS]
     )
     if not (list_shape or view_shape):
-        raise ValueError(
-            "the PR-health GitHub read boundary only permits scoped pr list/view"
-        )
+        raise ValueError("the PR-health GitHub read boundary only permits scoped pr list/view")
 
 
 def _run_gh(args: list[str]) -> Any:
@@ -340,9 +338,7 @@ def _run_gh(args: list[str]) -> Any:
         text=True,
     )
     if completed.returncode != 0:
-        detail = (
-            completed.stderr.strip() or completed.stdout.strip() or "unknown gh error"
-        )
+        detail = completed.stderr.strip() or completed.stdout.strip() or "unknown gh error"
         raise RuntimeError(f"gh command failed ({completed.returncode}): {detail}")
     try:
         return json.loads(completed.stdout)
@@ -361,9 +357,7 @@ def _run_gh_command(args: list[str]) -> str:
         or args[5] != "--body"
         or not args[6]
     ):
-        raise ValueError(
-            "PR-health comments require an explicit repository and PR number"
-        )
+        raise ValueError("PR-health comments require an explicit repository and PR number")
     completed = subprocess.run(
         ["gh", *args],
         check=False,
@@ -371,9 +365,7 @@ def _run_gh_command(args: list[str]) -> str:
         text=True,
     )
     if completed.returncode != 0:
-        detail = (
-            completed.stderr.strip() or completed.stdout.strip() or "unknown gh error"
-        )
+        detail = completed.stderr.strip() or completed.stdout.strip() or "unknown gh error"
         raise RuntimeError(f"gh command failed ({completed.returncode}): {detail}")
     return completed.stdout.strip()
 
@@ -448,11 +440,7 @@ def _ci_component(pr: dict[str, Any]) -> tuple[int, str]:
         state = str(check.get("state") or check.get("status") or "").upper()
         if conclusion in FAILURE_CONCLUSIONS or state in FAILURE_CONCLUSIONS:
             has_failure = True
-        elif (
-            state in PENDING_STATES
-            or not conclusion
-            and state not in SUCCESS_CONCLUSIONS
-        ):
+        elif state in PENDING_STATES or not conclusion and state not in SUCCESS_CONCLUSIONS:
             has_pending = True
         elif conclusion and conclusion not in SUCCESS_CONCLUSIONS:
             has_failure = True
@@ -506,9 +494,7 @@ def _completeness_component(pr: dict[str, Any]) -> tuple[int, dict[str, int]]:
     files = pr.get("files") or []
     paths = [str(item.get("path") or "") for item in files if isinstance(item, dict)]
     description = 3 if len(body) >= 200 else 0
-    linked_issue = bool(pr.get("closingIssuesReferences")) or bool(
-        ISSUE_REF_RE.search(body)
-    )
+    linked_issue = bool(pr.get("closingIssuesReferences")) or bool(ISSUE_REF_RE.search(body))
     rationale = 2 if linked_issue or RATIONALE_RE.search(body) else 0
     has_test_file = any(
         path.startswith(("test/", "tests/", "web/src/test/"))
@@ -661,16 +647,12 @@ def _lifecycle(pr: dict[str, Any]) -> dict[str, Any]:
     epochs = sorted({int(marker["epoch"]) for marker in markers})
     current_epoch = epochs[-1]
     in_epoch = [marker for marker in markers if int(marker["epoch"]) == current_epoch]
-    current = max(
-        in_epoch, key=lambda item: (STAGE_RANK[item["stage"]], item["created_at"])
-    )
+    current = max(in_epoch, key=lambda item: (STAGE_RANK[item["stage"]], item["created_at"]))
     return {
         "current": current,
         "current_epoch": current_epoch,
         "epoch_count": len(epochs),
-        "escalation_count": sum(
-            1 for marker in markers if marker["stage"] == "escalation"
-        ),
+        "escalation_count": sum(1 for marker in markers if marker["stage"] == "escalation"),
         "epochs": epochs,
     }
 
@@ -700,10 +682,7 @@ def _latest_owner_activity_after(pr: dict[str, Any], marker_at: str) -> str | No
 def _owner_responded_after(pr: dict[str, Any], marker_at: str, as_of: str) -> bool:
     """Did the owner answer ``marker_at`` recently enough to hold the epoch open?"""
     activity_at = _latest_owner_activity_after(pr, marker_at)
-    return (
-        activity_at is not None
-        and _days_between(activity_at, as_of) < OWNER_RESPONSE_GRACE_DAYS
-    )
+    return activity_at is not None and _days_between(activity_at, as_of) < OWNER_RESPONSE_GRACE_DAYS
 
 
 def _observation_streak(
@@ -828,8 +807,7 @@ def _recommend_action(
     reasons: list[str] = []
     healthy = raw_score >= HEALTHY_SCORE
     protected = (
-        priority in {"P0", "P1"}
-        or str(pr.get("reviewDecision") or "").upper() == "APPROVED"
+        priority in {"P0", "P1"} or str(pr.get("reviewDecision") or "").upper() == "APPROVED"
     )
     current = lifecycle["current"]
     epoch = int(lifecycle["current_epoch"])
@@ -907,13 +885,7 @@ def _score_pr(
     review_points, review_status = _review_component(pr)
     engagement_points = _engagement_component(idle_days)
     completeness_points, completeness_details = _completeness_component(pr)
-    raw_score = (
-        ci_points
-        + merge_points
-        + review_points
-        + engagement_points
-        + completeness_points
-    )
+    raw_score = ci_points + merge_points + review_points + engagement_points + completeness_points
     priority, priority_evidence = _priority(pr)
     next_actor = _next_actor(pr, ci_status, merge_status, review_status)
     lifecycle = _lifecycle(pr)
@@ -973,9 +945,7 @@ def _score_pr(
     return result, next_state
 
 
-def _fetch_snapshot(
-    repo: str, as_of: str, snapshot_id: str, max_prs: int
-) -> dict[str, Any]:
+def _fetch_snapshot(repo: str, as_of: str, snapshot_id: str, max_prs: int) -> dict[str, Any]:
     rows = _run_gh(
         [
             "pr",
@@ -1021,9 +991,7 @@ def _fetch_snapshot(
     }
 
 
-def _render_report(
-    repo: str, as_of: str, scores: list[dict[str, Any]], mode: str
-) -> str:
+def _render_report(repo: str, as_of: str, scores: list[dict[str, Any]], mode: str) -> str:
     lines = [
         "# PR Health Report",
         "",
@@ -1096,9 +1064,7 @@ def _render_report(
     return "\n".join(lines)
 
 
-def _importance_prompt(
-    report_path: Path, scores_path: Path, repo: str, as_of: str
-) -> str:
+def _importance_prompt(report_path: Path, scores_path: Path, repo: str, as_of: str) -> str:
     return f"""Review the deterministic PR health artifacts for {repo} as of {as_of}.
 
 Read:
@@ -1144,9 +1110,7 @@ def _comment_body(item: dict[str, Any], as_of: str) -> str:
     owner = item["owner"]
     score = item["score"]
     blockers = "\n".join(_blocker_lines(item))
-    marker = _action_marker(
-        action, int(item.get("notification_epoch") or 0), score, as_of
-    )
+    marker = _action_marker(action, int(item.get("notification_epoch") or 0), score, as_of)
 
     if action == "warn_owner":
         message = f"""@{owner} This PR's automated health score is **{score}/100** and needs attention.
@@ -1308,9 +1272,7 @@ def _apply_recommendations(
                 )
             else:
                 body = _comment_body(planned, as_of)
-                _run_gh_command(
-                    ["pr", "comment", str(number), "--repo", repo, "--body", body]
-                )
+                _run_gh_command(["pr", "comment", str(number), "--repo", repo, "--body", body])
                 result["status"] = "commented"
         except Exception as exc:
             result.update({"status": "error", "error": str(exc)})
@@ -1399,11 +1361,7 @@ def _run_locked(inputs: dict[str, Any]) -> None:
             "snapshot_id may contain only letters, numbers, dot, underscore, and dash, "
             "and may not be '.' or '..'"
         )
-    if (
-        isinstance(max_prs, bool)
-        or not isinstance(max_prs, int)
-        or not 1 <= max_prs <= 2000
-    ):
+    if isinstance(max_prs, bool) or not isinstance(max_prs, int) or not 1 <= max_prs <= 2000:
         raise ValueError("max_prs must be an integer from 1 through 2000")
     if not isinstance(importance_analysis, bool):
         raise ValueError("importance_analysis must be boolean")
@@ -1452,9 +1410,11 @@ def _run_locked(inputs: dict[str, Any]) -> None:
         _write_json(snapshot_path, snapshot)
 
     state = _migrate_state(
-        _read_object(state_path)
-        if state_path.is_file()
-        else {"schema_version": SCHEMA_VERSION, "repo": repo, "prs": {}},
+        (
+            _read_object(state_path)
+            if state_path.is_file()
+            else {"schema_version": SCHEMA_VERSION, "repo": repo, "prs": {}}
+        ),
         repo,
     )
 
@@ -1471,9 +1431,7 @@ def _run_locked(inputs: dict[str, Any]) -> None:
 
     open_numbers = {str(item["number"]) for item in scores}
     next_pr_state = {
-        number: value
-        for number, value in next_pr_state.items()
-        if number in open_numbers
+        number: value for number, value in next_pr_state.items() if number in open_numbers
     }
     updated_state = {
         "schema_version": SCHEMA_VERSION,
@@ -1506,9 +1464,7 @@ def _run_locked(inputs: dict[str, Any]) -> None:
                 step_id=f"importance-{snapshot_id}",
                 timeout=1800.0,
             )
-            analysis_path.write_text(
-                f"{(handle.output or '').strip()}\n", encoding="utf-8"
-            )
+            analysis_path.write_text(f"{(handle.output or '').strip()}\n", encoding="utf-8")
         except ShimError as exc:
             analysis_error = str(exc)
 
@@ -1524,9 +1480,7 @@ def _run_locked(inputs: dict[str, Any]) -> None:
 
     actions: dict[str, int] = {}
     for item in scores:
-        actions[item["recommended_action"]] = (
-            actions.get(item["recommended_action"], 0) + 1
-        )
+        actions[item["recommended_action"]] = actions.get(item["recommended_action"], 0) + 1
     notified_numbers = {
         int(result["number"])
         for result in enforcement_results
@@ -1567,13 +1521,9 @@ def _run_locked(inputs: dict[str, Any]) -> None:
         # bounded; ``decisions_file`` always holds the complete list.
         "decisions": decisions[:MAX_INLINE_DECISIONS],
         "decisions_truncated": len(decisions) > MAX_INLINE_DECISIONS,
-        "importance_analysis_file": (
-            str(analysis_path) if analysis_path.is_file() else None
-        ),
+        "importance_analysis_file": (str(analysis_path) if analysis_path.is_file() else None),
         "importance_analysis_error": analysis_error,
-        "enforcement_file": (
-            str(enforcement_path) if enforcement_path.is_file() else None
-        ),
+        "enforcement_file": (str(enforcement_path) if enforcement_path.is_file() else None),
         "enforcement_results": enforcement_results,
         "posted_github_comments": any(
             result.get("status") == "commented" for result in enforcement_results
@@ -1584,9 +1534,7 @@ def _run_locked(inputs: dict[str, Any]) -> None:
 
 
 def _acquire_repo_lock(repo: str) -> tuple[TextIO, Path]:
-    root = (
-        Path.home() / ".local" / "state" / "cao" / "pr-health" / _repo_storage_key(repo)
-    )
+    root = Path.home() / ".local" / "state" / "cao" / "pr-health" / _repo_storage_key(repo)
     root.mkdir(parents=True, exist_ok=True)
     lock_path = root / ".workflow.lock"
     lock_handle = lock_path.open("a+", encoding="utf-8")

@@ -79,10 +79,7 @@ def _marker(stage: str, score: int, as_of: str) -> str:
 
 
 def _marker_v2(epoch: int, stage: str, score: int, as_of: str) -> str:
-    return (
-        f"<!-- cao-pr-health:v2 epoch={epoch} stage={stage} "
-        f"score={score} as_of={as_of} -->"
-    )
+    return f"<!-- cao-pr-health:v2 epoch={epoch} stage={stage} " f"score={score} as_of={as_of} -->"
 
 
 def _authored_comment(body: str, created_at: str) -> dict[str, Any]:
@@ -132,9 +129,7 @@ def warned_pr(at_risk_pr: dict[str, Any]) -> dict[str, Any]:
         "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "FAILURE"}],
         "commits": [{"committedDate": "2026-07-23T00:00:00Z"}],
         "comments": [
-            _authored_comment(
-                _marker("warning", 44, "2026-07-24"), "2026-07-24T00:00:00Z"
-            )
+            _authored_comment(_marker("warning", 44, "2026-07-24"), "2026-07-24T00:00:00Z")
         ],
     }
 
@@ -267,9 +262,7 @@ def test_date_ordinal_agrees_with_stdlib_across_a_dense_range(
     ]
     for value in samples:
         delta = workflow._date_ordinal(value.isoformat()) - value.toordinal()
-        assert (
-            delta == workflow._date_ordinal("2026-01-01") - date(2026, 1, 1).toordinal()
-        )
+        assert delta == workflow._date_ordinal("2026-01-01") - date(2026, 1, 1).toordinal()
 
 
 @pytest.mark.parametrize(
@@ -389,11 +382,7 @@ def test_ignored_draft_after_fourteen_days_proposes_close(
         "isDraft": True,
         "reviewDecision": "REVIEW_REQUIRED",
         "commits": [{"committedDate": "2026-06-01T00:00:00Z"}],
-        "comments": [
-            _authored_comment(
-                _marker("draft", 50, "2026-07-17"), "2026-07-17T00:00:00Z"
-            )
-        ],
+        "comments": [_authored_comment(_marker("draft", 50, "2026-07-17"), "2026-07-17T00:00:00Z")],
     }
 
     abandoned, _ = workflow._score_pr(abandoned_pr, "2026-07-31", None)
@@ -413,11 +402,7 @@ def test_protected_pr_escalates_instead_of_closing(
         "isDraft": True,
         "reviewDecision": "REVIEW_REQUIRED",
         "commits": [{"committedDate": "2026-06-01T00:00:00Z"}],
-        "comments": [
-            _authored_comment(
-                _marker("draft", 50, "2026-07-17"), "2026-07-17T00:00:00Z"
-            )
-        ],
+        "comments": [_authored_comment(_marker("draft", 50, "2026-07-17"), "2026-07-17T00:00:00Z")],
         "title": "fix(security): prevent command injection",
         "labels": [{"name": "security"}],
     }
@@ -548,9 +533,7 @@ def test_draft_marker_wins_over_a_later_warning_marker(
                 _marker("draft_recommendation", 50, "2026-07-01"),
                 "2026-07-01T00:00:00Z",
             ),
-            _authored_comment(
-                _marker("warning", 45, "2026-07-20"), "2026-07-20T00:00:00Z"
-            ),
+            _authored_comment(_marker("warning", 45, "2026-07-20"), "2026-07-20T00:00:00Z"),
         ],
     }
 
@@ -574,12 +557,8 @@ def test_latest_marker_of_the_winning_stage_owns_the_grace_period(
     pr = {
         **base_pr,
         "comments": [
-            _authored_comment(
-                _marker("warning", 50, "2026-07-01"), "2026-07-01T00:00:00Z"
-            ),
-            _authored_comment(
-                _marker("warning", 45, "2026-07-20"), "2026-07-20T00:00:00Z"
-            ),
+            _authored_comment(_marker("warning", 50, "2026-07-01"), "2026-07-01T00:00:00Z"),
+            _authored_comment(_marker("warning", 45, "2026-07-20"), "2026-07-20T00:00:00Z"),
         ],
     }
 
@@ -598,9 +577,7 @@ def test_policy_constants_match_the_approved_values(workflow: ModuleType) -> Non
     assert workflow.EPOCH_REENTRY_COOLDOWN_DAYS == 90
     assert workflow.MAX_NOTIFICATION_EPOCHS == 4
     assert workflow.MAX_ESCALATION_NOTIFICATIONS == 3
-    assert workflow.TERMINAL_STAGES == frozenset(
-        {"closure_recommendation", "escalation"}
-    )
+    assert workflow.TERMINAL_STAGES == frozenset({"closure_recommendation", "escalation"})
 
 
 def test_v2_marker_carries_epoch_and_stage(workflow: ModuleType) -> None:
@@ -769,9 +746,7 @@ def test_expired_owner_response_does_not_escalate_immediately(
     }
 
     expired, _ = workflow._score_pr(pr, "2026-08-15", _streak_state("2026-08-01"))
-    after_cooldown, _ = workflow._score_pr(
-        pr, "2026-09-30", _streak_state("2026-09-16")
-    )
+    after_cooldown, _ = workflow._score_pr(pr, "2026-09-30", _streak_state("2026-09-16"))
 
     assert expired["recommended_action"] == "await_owner_deadline"
     assert "awaiting_epoch_reentry_cooldown" in expired["action_reasons"]
@@ -800,9 +775,7 @@ def test_mid_score_pr_advances_past_warning_without_a_dead_zone(
         ],
     }
 
-    result, _ = workflow._score_pr(
-        pr, "2026-07-31", _streak_state("2026-07-17", score=56)
-    )
+    result, _ = workflow._score_pr(pr, "2026-07-31", _streak_state("2026-07-17", score=56))
 
     assert result["raw_score"] == 56
     assert result["recommended_action"] == "propose_draft"
@@ -830,9 +803,7 @@ def test_no_action_after_a_marker_ever_walks_the_ladder_backwards(
                     )
                 ],
             }
-            result, _ = workflow._score_pr(
-                pr, "2026-07-31", _streak_state("2026-07-17", score=56)
-            )
+            result, _ = workflow._score_pr(pr, "2026-07-31", _streak_state("2026-07-17", score=56))
             action = result["recommended_action"]
             if stage == "warning":
                 assert action != "warn_owner", (stage, marker_as_of, action)
@@ -878,11 +849,7 @@ def test_persisted_score_is_the_raw_score_not_the_penalized_score(
         "isDraft": True,
         "reviewDecision": "REVIEW_REQUIRED",
         "commits": [{"committedDate": "2026-06-01T00:00:00Z"}],
-        "comments": [
-            _authored_comment(
-                _marker("draft", 50, "2026-07-17"), "2026-07-17T00:00:00Z"
-            )
-        ],
+        "comments": [_authored_comment(_marker("draft", 50, "2026-07-17"), "2026-07-17T00:00:00Z")],
     }
 
     result, state = workflow._score_pr(pr, "2026-07-31", None)
@@ -924,15 +891,9 @@ def test_escalation_notifications_are_capped_over_three_years(
     protected_stale_pr: dict[str, Any],
 ) -> None:
     """A protected PR escalates instead of closing, at most three times ever."""
-    actions, results, posted = _simulate_cadence(
-        workflow, protected_stale_pr, "2026-01-05", 78
-    )
+    actions, results, posted = _simulate_cadence(workflow, protected_stale_pr, "2026-01-05", 78)
 
-    assert (
-        actions.count("escalate_protected_pr")
-        == workflow.MAX_ESCALATION_NOTIFICATIONS
-        == 3
-    )
+    assert actions.count("escalate_protected_pr") == workflow.MAX_ESCALATION_NOTIFICATIONS == 3
     assert actions.count("propose_close") == 0
     assert actions.count("warn_owner") == 4
     assert len(posted) == 7
@@ -949,11 +910,13 @@ def test_the_ladder_never_regresses_across_a_year_of_runs(
 
     progress = [
         (
-            result["lifecycle_marker"]["epoch"],
-            workflow.STAGE_RANK[result["lifecycle_marker"]["stage"]],
+            (
+                result["lifecycle_marker"]["epoch"],
+                workflow.STAGE_RANK[result["lifecycle_marker"]["stage"]],
+            )
+            if result["lifecycle_marker"]
+            else (0, -1)
         )
-        if result["lifecycle_marker"]
-        else (0, -1)
         for result in results
     ]
     assert progress == sorted(progress)
@@ -993,9 +956,7 @@ def test_warned_pr_holds_instead_of_re_warning_before_the_deadline(
     pr = {
         **warned_pr,
         "comments": [
-            _authored_comment(
-                _marker("warning", 44, "2026-07-28"), "2026-07-28T00:00:00Z"
-            )
+            _authored_comment(_marker("warning", 44, "2026-07-28"), "2026-07-28T00:00:00Z")
         ],
     }
     state = {
@@ -1130,11 +1091,7 @@ def test_escalation_comment_names_the_protection_and_is_parseable(
         "isDraft": True,
         "reviewDecision": "REVIEW_REQUIRED",
         "commits": [{"committedDate": "2026-06-01T00:00:00Z"}],
-        "comments": [
-            _authored_comment(
-                _marker("draft", 50, "2026-07-17"), "2026-07-17T00:00:00Z"
-            )
-        ],
+        "comments": [_authored_comment(_marker("draft", 50, "2026-07-17"), "2026-07-17T00:00:00Z")],
         "title": "fix(security): prevent command injection",
         "labels": [{"name": "security"}],
     }
@@ -1182,9 +1139,7 @@ def test_marker_from_a_prior_run_is_recognized_despite_different_score_and_date(
     """
     pr = {
         "comments": [
-            _authored_comment(
-                _marker_v2(1, stage, 33, "2026-01-01"), "2026-01-01T00:00:00Z"
-            )
+            _authored_comment(_marker_v2(1, stage, 33, "2026-01-01"), "2026-01-01T00:00:00Z")
         ]
     }
 
@@ -1228,9 +1183,7 @@ def test_legacy_escalation_marker_dedupes_epoch_zero(workflow: ModuleType) -> No
 def test_legacy_v1_stage_marker_dedupes_epoch_zero(workflow: ModuleType) -> None:
     pr = {
         "comments": [
-            _authored_comment(
-                _marker("warning", 44, "2026-07-24"), "2026-07-24T00:00:00Z"
-            )
+            _authored_comment(_marker("warning", 44, "2026-07-24"), "2026-07-24T00:00:00Z")
         ]
     }
 
@@ -1241,9 +1194,7 @@ def test_legacy_v1_stage_marker_dedupes_epoch_zero(workflow: ModuleType) -> None
 def test_marker_for_a_different_stage_does_not_dedupe(workflow: ModuleType) -> None:
     pr = {
         "comments": [
-            _authored_comment(
-                _marker_v2(0, "warning", 44, "2026-07-24"), "2026-07-24T00:00:00Z"
-            )
+            _authored_comment(_marker_v2(0, "warning", 44, "2026-07-24"), "2026-07-24T00:00:00Z")
         ]
     }
 
@@ -1253,11 +1204,7 @@ def test_marker_for_a_different_stage_does_not_dedupe(workflow: ModuleType) -> N
 
 
 def test_marker_authored_by_someone_else_does_not_dedupe(workflow: ModuleType) -> None:
-    pr = {
-        "comments": [
-            _owner_comment("2026-07-24T00:00:00Z", _marker_v2(0, "warning", 44, "x"))
-        ]
-    }
+    pr = {"comments": [_owner_comment("2026-07-24T00:00:00Z", _marker_v2(0, "warning", 44, "x"))]}
 
     assert workflow._has_marker_for_action(pr, "warn_owner", 0) is False
 
@@ -1296,9 +1243,7 @@ def enforcement(workflow: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path:
             "_fetch_pr",
             lambda _repo, _number: dict(live_pr or {"state": "OPEN", "comments": []}),
         )
-        monkeypatch.setattr(
-            workflow, "_run_gh_command", lambda args: commands.append(args)
-        )
+        monkeypatch.setattr(workflow, "_run_gh_command", lambda args: commands.append(args))
         return workflow._apply_recommendations(
             "owner/repo",
             "2026-07-31",
@@ -1332,9 +1277,7 @@ def test_enforcement_is_idempotent_across_runs(enforcement) -> None:
     live = {
         "state": "OPEN",
         "comments": [
-            _authored_comment(
-                _marker_v2(0, "warning", 12, "2026-07-25"), "2026-07-25T00:00:00Z"
-            )
+            _authored_comment(_marker_v2(0, "warning", 12, "2026-07-25"), "2026-07-25T00:00:00Z")
         ],
     }
 
@@ -1372,11 +1315,7 @@ def test_enforcement_close_recommendation_only_comments(
         "isDraft": True,
         "reviewDecision": "REVIEW_REQUIRED",
         "commits": [{"committedDate": "2026-06-01T00:00:00Z"}],
-        "comments": [
-            _authored_comment(
-                _marker("draft", 50, "2026-07-17"), "2026-07-17T00:00:00Z"
-            )
-        ],
+        "comments": [_authored_comment(_marker("draft", 50, "2026-07-17"), "2026-07-17T00:00:00Z")],
     }
     planned, _ = workflow._score_pr(abandoned_pr, "2026-07-31", None)
 
@@ -1425,10 +1364,7 @@ def test_already_draft_pr_gets_a_second_notification_not_a_draft_call(
 
     assert results[0]["status"] == "commented"
     assert [command[:2] for command in commands] == [["pr", "comment"]]
-    assert (
-        _marker_v2(0, "draft_recommendation", planned["score"], "2026-07-31")
-        in commands[0][-1]
-    )
+    assert _marker_v2(0, "draft_recommendation", planned["score"], "2026-07-31") in commands[0][-1]
 
 
 def test_enforcement_comments_for_a_warning(
@@ -1587,9 +1523,7 @@ def test_github_write_boundary_runs_one_explicitly_scoped_comment(
 
     def _completed(args: list[str], **_kwargs: Any) -> Any:
         calls.append(args)
-        return workflow.subprocess.CompletedProcess(
-            args, 0, stdout="commented\n", stderr=""
-        )
+        return workflow.subprocess.CompletedProcess(args, 0, stdout="commented\n", stderr="")
 
     monkeypatch.setattr(workflow.subprocess, "run", _completed)
 
@@ -1598,9 +1532,7 @@ def test_github_write_boundary_runs_one_explicitly_scoped_comment(
     )
 
     assert output == "commented"
-    assert calls == [
-        ["gh", "pr", "comment", "17", "--repo", "owner/repo", "--body", "message"]
-    ]
+    assert calls == [["gh", "pr", "comment", "17", "--repo", "owner/repo", "--body", "message"]]
 
 
 @pytest.mark.parametrize(
@@ -1696,9 +1628,7 @@ def test_github_read_boundary_runs_only_expected_list_and_view_shapes(
             "number",
         ]
     )
-    workflow._run_gh(
-        ["pr", "view", "17", "--repo", "owner/repo", "--json", workflow.PR_FIELDS]
-    )
+    workflow._run_gh(["pr", "view", "17", "--repo", "owner/repo", "--json", workflow.PR_FIELDS])
 
     assert calls == [
         [
@@ -1742,9 +1672,7 @@ def test_enforcement_records_gh_failures_without_aborting_the_run(
     }
     planned, _ = workflow._score_pr(live, "2026-07-31", previous)
 
-    monkeypatch.setattr(
-        workflow, "_fetch_pr", lambda _repo, number: {**live, "number": number}
-    )
+    monkeypatch.setattr(workflow, "_fetch_pr", lambda _repo, number: {**live, "number": number})
 
     def _boom(_args: list[str]) -> str:
         raise RuntimeError("gh command failed (1): rate limited")
