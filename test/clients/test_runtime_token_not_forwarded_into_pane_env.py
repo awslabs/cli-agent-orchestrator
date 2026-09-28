@@ -1,10 +1,11 @@
 """TmuxClient never forwards the runtime token value into a pane.
 
 ``create_session`` forwards non-blocked ``CAO_*`` variables from the server's
-environment into the provider's pane. ``CAO_RUNTIME_TOKEN`` (and the local auth
-token) must be excluded by an exact-name blocklist, so a third-party MCP child
-the provider spawns cannot inherit the value for free. ``CAO_RUNTIME_TOKEN_FILE``
-is a path, not the value, and is still forwarded.
+environment into the provider's pane. ``CAO_RUNTIME_TOKEN`` is excluded by an
+exact-name blocklist, so a third-party MCP child the provider spawns cannot
+inherit the value. ``CAO_RUNTIME_TOKEN_FILE`` is a path, not the value, and is
+still forwarded. ``CAO_AUTH_LOCAL_TOKEN`` is still forwarded because the in-pane
+``cao-mcp-server`` authenticates its API calls with it.
 """
 
 from unittest.mock import MagicMock, patch
@@ -40,10 +41,8 @@ def _captured_pane_env(tmux, tmp_path):
 
 def test_runtime_token_value_is_not_forwarded_into_the_pane(tmux, tmp_path, monkeypatch):
     monkeypatch.setenv("CAO_RUNTIME_TOKEN", "s3cret-value")
-    monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", "local-secret")
     env = _captured_pane_env(tmux, tmp_path)
     assert "CAO_RUNTIME_TOKEN" not in env
-    assert "CAO_AUTH_LOCAL_TOKEN" not in env
     assert "s3cret-value" not in env.values()
 
 
@@ -53,11 +52,17 @@ def test_the_token_file_path_is_still_forwarded(tmux, tmp_path, monkeypatch):
     assert env["CAO_RUNTIME_TOKEN_FILE"] == "/run/tok/runtime-token"
 
 
-def test_is_blocked_env_key_covers_the_exact_token_names():
+def test_the_mcp_servers_api_credential_is_still_forwarded(tmux, tmp_path, monkeypatch):
+    monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", "local-api-token")
+    env = _captured_pane_env(tmux, tmp_path)
+    assert env["CAO_AUTH_LOCAL_TOKEN"] == "local-api-token"
+
+
+def test_is_blocked_env_key_covers_the_runtime_token_only():
     from cli_agent_orchestrator.clients.tmux import TmuxClient
 
     assert TmuxClient._is_blocked_env_key("CAO_RUNTIME_TOKEN") is True
-    assert TmuxClient._is_blocked_env_key("CAO_AUTH_LOCAL_TOKEN") is True
-    # The path variable and unrelated CAO_* vars stay forwardable.
+    # The path variable and other CAO_* vars stay forwardable.
     assert TmuxClient._is_blocked_env_key("CAO_RUNTIME_TOKEN_FILE") is False
+    assert TmuxClient._is_blocked_env_key("CAO_AUTH_LOCAL_TOKEN") is False
     assert TmuxClient._is_blocked_env_key("CAO_TERMINAL_ID") is False

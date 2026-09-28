@@ -661,12 +661,13 @@ class TmuxClient:
     # Applied to BOTH inherited env and operator-supplied --env vars so a
     # forwarded ``CLAUDE_CODE_*`` cannot reintroduce nesting.
     _BLOCKED_ENV_PREFIXES = ("CLAUDE", "CODEX_", "__MISE_")
-    # Exact-name blocklist for credential VALUES that must never reach a pane,
-    # even though they share the forwarded ``CAO_`` prefix. A third-party MCP
-    # server the provider spawns would otherwise inherit them from the pane env.
-    # The token's PATH form (``CAO_RUNTIME_TOKEN_FILE``) is safe and still
-    # forwarded; CAO's own shim reads the value from that owner-only file.
-    _BLOCKED_ENV_NAMES = frozenset({"CAO_RUNTIME_TOKEN", "CAO_AUTH_LOCAL_TOKEN"})
+    # Exact-name blocklist: the runtime-channel token VALUE never reaches a pane,
+    # even though it shares the forwarded ``CAO_`` prefix, so a third-party MCP
+    # server the provider spawns cannot inherit it. The PATH form
+    # (``CAO_RUNTIME_TOKEN_FILE``) is still forwarded; CAO's shim reads the value
+    # from that owner-only file. ``CAO_AUTH_LOCAL_TOKEN`` stays forwarded: the
+    # in-pane ``cao-mcp-server`` authenticates its API calls with it.
+    _BLOCKED_ENV_NAMES = frozenset({"CAO_RUNTIME_TOKEN"})
     _BLOCKED_PREFIX_ALLOWLIST = frozenset(
         {
             "CLAUDE_CODE_USE_BEDROCK",
