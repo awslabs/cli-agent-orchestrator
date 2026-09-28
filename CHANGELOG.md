@@ -13,8 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `workflow_update`, `workflow_get` and `workflow_validate` MCP tools (#583 Bolt 3) (#699). Spec writes
   are atomic and serialized per workflow, so two concurrent creates cannot both succeed and an update
   with a stale `--expected-hash` is rejected at commit time. Lint warnings are shown on the default CLI
-  output. The CLI and MCP authoring, approval and run clients forward `CAO_AUTH_LOCAL_TOKEN` when API
-  authentication is enabled.
+  output. Every `cao workflow` HTTP verb and every workflow MCP tool forward
+  `CAO_AUTH_LOCAL_TOKEN` when API authentication is enabled. The Python workflow SDK's
+  run-step transport does not yet receive that credential; subprocess credential delivery
+  remains a separate security-boundary decision.
 
 - `terminal.pane_layout` chooses how a pane-mode window is arranged after each
   spawn: `tiled` (default, unchanged behaviour), `even-vertical`,
@@ -1100,4 +1102,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bump to v0.51.0, update method name (#31)
 
 - accept optional U+03BB (λ) after % in kiro and q CLIs (#44)
-

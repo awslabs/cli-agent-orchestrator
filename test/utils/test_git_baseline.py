@@ -300,7 +300,7 @@ def test_broken_git_marker_is_not_treated_as_plain_directory(monkeypatch, tmp_pa
     assert git_baseline.derive_baseline(str(tmp_path)) == {"available": False}
 
 
-def test_inherited_git_dir_cannot_redirect_the_declared_root(monkeypatch, tmp_path):
+def test_inherited_git_dir_cannot_redirect_the_selected_root(monkeypatch, tmp_path):
     declared = tmp_path / "declared"
     redirected = tmp_path / "redirected"
     declared.mkdir()

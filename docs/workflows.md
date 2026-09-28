@@ -366,8 +366,8 @@ All sixteen verbs live under `cao workflow`.
 | `update <name>` | `--from-file <path>` (required), `--expected-hash <hash>` (required), `--json` | Replace an **existing** spec's source, refusing a stale update. Refuses to create — use `create`. `--expected-hash` is required and is never computed for you: it is your assertion about what you believe you are replacing, and a hash derived from the file about to be overwritten would always match. There is no `--force`. Get the current hash from `get <name>` (the `Hash:` line). |
 | `list` | `--dir <path>`, `--json` | List indexed workflows (rebuilt from spec files on disk). Script-tier rows show `-` for step count. |
 | `get <name>` | `--json` | Show the parsed/validated spec for a name or file path. |
-| `delete <name>` | `--yes` / `-y` | Delete a workflow's spec file and index row (prompts unless `--yes`). |
-| `run <name_or_path>` | `--input k=v` (repeatable), `--run-id <id>`, `--detach`, `--wait`, `--json` | Submit a run and follow it to a terminal state. `--detach` submits and exits; `--wait` blocks inline. Exit 0 completed, 1 failed/cancelled. `--json` emits `{run_id, state}` — see the breaking-change note above. |
+| `delete <name>` | `--yes` / `-y`, `--json` | Delete a workflow's spec file and index row (prompts unless `--yes`). |
+| `run <name_or_path>` | `--input k=v` (repeatable), `--run-id <id>`, `--working-directory <path>`, `--detach`, `--wait`, `--json` | Submit a run and follow it to a terminal state. `--detach` submits and exits; `--wait` blocks inline. Exit 0 completed, 1 failed/cancelled. `--json` emits `{run_id, state}` — see the breaking-change note above. |
 | `status <run_id>` | `--json` | Point-in-time status snapshot for a run (full detail, including steps). |
 | `runs` | `--state <state>`, `--limit <n>`, `--json` | List recorded runs from the durable journal, newest first. |
 | `wait <run_id>` | `--json` | Follow an already-submitted run by polling until terminal. Same exit codes as `run`. |
@@ -569,6 +569,8 @@ A script-tier run resolves CAO memory **once**, at its first terminal, and recor
 hash of the **full** resolved content into the same manifest. Every later terminal of that run — and every resume,
 however long afterwards — is given that recorded copy. **Editing CAO memory after a failure therefore does not
 change what a resumed run sees.**
+Memory content is not part of plan identity; the memory-enabled setting is recorded at the
+approval check and changing it stops further agent launches for that run.
 
 One consequence is worth stating plainly, because it differs from a non-workflow terminal:
 
@@ -588,6 +590,8 @@ Stated here because its absence is easy to assume away:
    limits and retry policy. Script-tier steps are discovered by executing the Python, so those values
    have no run-level existence at freeze time; they are covered transitively by the source hash,
    because changing any of them means editing the script.
+   The profile set and the memory-enabled setting are recorded at the approval check; a run
+   refuses to launch further agent steps if either changes.
 
 > **Stale source-hash rejection now runs** (issue #583 Bolt 3). This section previously listed it as a
 > second gap. `cao workflow update` and the `workflow_update` tool both require the `content_hash` you

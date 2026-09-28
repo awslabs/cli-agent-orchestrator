@@ -7,6 +7,11 @@ live in `~/.aws/cli-agent-orchestrator/workflows/` and are run **by their
 stem**: `<name>.py` there runs as `cao workflow run <name>`. There is no
 `--script` flag, and a path outside that directory is rejected.
 
+Script runs execute in one project root: the run request's `working_directory`, defaulting
+to the calling terminal's directory (MCP), the current directory (CLI), or cao-server's
+directory (direct REST). The same directory is fingerprinted for approval and used for agent
+steps that name no directory. Resume reuses the recorded root.
+
 It covers the `cao_workflow` shim's contract, when to reach for a script
 instead of YAML, the determinism obligation resume relies on, how to declare
 a recovery policy, and the resume boundary itself.
