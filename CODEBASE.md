@@ -13,6 +13,15 @@ CAO is a local client-server application with several entry points:
   `src/cli_agent_orchestrator/api/main.py`.
 - `cao-mcp-server` exposes in-session supervisor/worker tools from
   `src/cli_agent_orchestrator/mcp_server/`.
+- `cao-bridge` is the execution-only runtime entrypoint in
+  `src/cli_agent_orchestrator/runtime_channel/bridge.py`, launched with
+  `CAO_NODE_MODE=bridge`. It has no HTTP API, scheduler, or MCP host of its own;
+  it dials one persistent outbound WebSocket to the central server's
+  `WS /runtime/channel` and runs providers beside its own tmux.
+- `cao-mcp-stdio-bridge` in
+  `src/cli_agent_orchestrator/mcp_server/stdio_bridge.py` forwards a stdio-only
+  provider's MCP calls to the shared HTTP MCP endpoint, carrying the caller
+  identity in a header without letting the agent choose it.
 - `cao-ops-mcp-server` exposes external fleet-management tools from
   `src/cli_agent_orchestrator/ops_mcp_server/`.
 - The bundled browser client is built from `web/`; MCP App views are built
@@ -27,6 +36,7 @@ to use.
 | Path | Ownership |
 |---|---|
 | `src/cli_agent_orchestrator/api/` | FastAPI HTTP, SSE, AG-UI, and PTY WebSocket endpoints |
+| `src/cli_agent_orchestrator/runtime_channel/` | Remote execution boundary (#745/#776): the `WS /runtime/channel` endpoint and `/runtimes*` routes (`api.py`), the `cao-bridge` execution-runtime entrypoint (`bridge.py`), the terminal→runtime routing registry (`registry.py`), the frame protocol and codec (`protocol.py`), and the bounded per-stream output replay buffer (`replay_buffer.py`) |
 | `src/cli_agent_orchestrator/cli/` | `cao` commands and command-line validation |
 | `src/cli_agent_orchestrator/mcp_server/` | In-session orchestration MCP tools |
 | `src/cli_agent_orchestrator/ops_mcp_server/` | External operations MCP tools |
@@ -106,6 +116,44 @@ Workflow specifications and runs are handled by the workflow services and the
 separate `src/cao_workflow/` package. Scheduled flows are handled by
 `services/flow_service.py`. Memory, archive, wiki, and graph modules own their
 respective persistence and projection behavior.
+
+## Remote execution boundary
+
+CAO runs in two topologies from the same image. In the default local topology
+every operation is co-located: the API, scheduler, state, and tmux all live in
+one `cao-server`. In the remote topology one central `cao-server` (API,
+scheduler, SQLite state) coordinates N execution runtimes running `cao-bridge`,
+each holding one persistent **outbound** WebSocket to `WS /runtime/channel`.
+Anything that touches the tmux socket, the provider process, its PTY, or its
+config files runs in the runtime; the server relays interactive traffic,
+keeps routing and state, and republishes runtime events onto the existing bus
+for consumers that only depend on the bus topic contract.
+
+`runtime_channel/registry.py` maps each terminal to its live channel and
+persists the association so routing survives a server restart — rebuilt from
+each runtime's reconnect (`hello`) snapshot. A request for one terminal can
+never be served by another runtime: inbound channel frames go through an
+ownership-checked claim rather than an unconditional bind.
+
+`clients/database.py` gains a **dispatch journal** (`dispatch_journal` table)
+that records each remote command with the owner it was made for, so a `LAUNCH`
+or `RUN_SCRIPT` result redelivered after a reconnect is reconciled with its
+original owner instead of orphaned. It settles operations whose outcome is
+known and leaves unknown-outcome operations unsettled for redelivery. The
+`flows.owner` and `terminals.owner` columns record the principal that deferred
+work belongs to (see [design.md](docs/issues/745-remote-execution-boundary/design.md)).
+
+Shared MCP hosting (`mcp_server/http_hosting.py`, selected by
+`CAO_MCP_TRANSPORT=http`) serves the in-session tools over HTTP and resolves the
+caller's terminal identity per authenticated request, replacing the
+process-global `CAO_TERMINAL_ID`. A stdio-only provider reaches the same
+endpoint through the `cao-mcp-stdio-bridge` forwarding shim
+(`mcp_server/stdio_bridge.py`), which registers no tools and holds no state.
+
+The full contract lives in
+[design.md](docs/issues/745-remote-execution-boundary/design.md); the route
+families are in [docs/api.md](docs/api.md); the deployed topology is the
+[EKS example](examples/cao-clusters/kubernetes/eks/README.md).
 
 ## Plugins, security, and telemetry
 
