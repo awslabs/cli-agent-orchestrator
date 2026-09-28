@@ -260,6 +260,12 @@ class RuntimeChannelRegistry:
         # generation, so it cannot be fenced by a position that does not exist
         # yet; see set_status.
         self._status_generations: Dict[Tuple[str, str], int] = {}
+        # (terminal, stream) keys where the last frame was an UNBOUNDED gap, with
+        # the generation it happened in. A same-generation forward jump right
+        # after one is the expected discontinuity (the runtime could not bound the
+        # loss), so the forward-jump detector is suppressed for that key until the
+        # generation advances.
+        self._unbounded_gap: Dict[Tuple[str, str], int] = {}
         # Terminal ids whose rows this process deleted. A FIFO/status event queued
         # before TEARDOWN can arrive after the row is gone, and the no-row branch
         # of claim_terminal would treat that id as a harmless phantom and REBIND
@@ -504,6 +510,7 @@ class RuntimeChannelRegistry:
                 self._positions.pop((terminal_id, stream.value), None)
                 self._generations.pop((terminal_id, stream.value), None)
                 self._status_generations.pop((terminal_id, stream.value), None)
+                self._unbounded_gap.pop((terminal_id, stream.value), None)
 
     def _placement_from_the_central_row(self, terminal_id: str) -> Optional[str]:
         """The runtime this terminal was launched on, per the persisted row.
@@ -934,6 +941,7 @@ class RuntimeChannelRegistry:
                     self._positions.pop((tid, stream.value), None)
                     self._generations.pop((tid, stream.value), None)
                     self._status_generations.pop((tid, stream.value), None)
+                    self._unbounded_gap.pop((tid, stream.value), None)
         if stale:
             logger.warning(
                 "runtime %s reconnected without terminals %s; their cached state is discarded",
@@ -994,6 +1002,9 @@ class RuntimeChannelRegistry:
                     self._generations[key] = generation
                 elif generation > known:
                     self._generations[key] = generation
+                    # A new generation ends any unbounded-gap suppression from the
+                    # old one.
+                    self._unbounded_gap.pop(key, None)
                     logger.info(
                         "terminal %s %s advanced to generation %s; watermark reset to %s",
                         terminal_id,
@@ -1008,6 +1019,47 @@ class RuntimeChannelRegistry:
 
     def resume_position(self, terminal_id: str, stream: str) -> int:
         return self._positions.get((terminal_id, stream), 0)
+
+    def stream_forward_jump(
+        self, terminal_id: str, stream: str, generation: int, pos: int
+    ) -> Optional[Tuple[int, int]]:
+        """Detect a SAME-generation forward jump past the recorded watermark.
+
+        Returns ``(recorded, pos)`` when ``pos`` is beyond the position already
+        recorded for this (terminal, stream) IN this generation, meaning
+        ``[recorded, pos)`` never arrived; otherwise ``None``. The caller reports
+        that range as a loss before processing the frame.
+
+        Deliberately silent for the legitimate discontinuities: the first frame
+        of a (terminal, stream) with no recorded byte position (a generation is
+        seeded at hello, but no position yet), a higher generation (a new stream
+        numbered from 0, which ``record_position`` resets to), and the frame
+        right after an UNBOUNDED gap in the same generation (the runtime said it
+        cannot bound the loss, so a higher position is expected). The attach
+        stream is excluded by the caller, which only asks for CAPTURE.
+        """
+        with self._lock:
+            key = (terminal_id, stream)
+            if key not in self._positions:
+                return None
+            known = self._generations.get(key)
+            if known is None or generation != known:
+                return None
+            if self._unbounded_gap.get(key) == generation:
+                return None
+            recorded = self._positions[key]
+            if pos > recorded:
+                return (recorded, pos)
+            return None
+
+    def note_unbounded_gap(self, terminal_id: str, stream: str, generation: int) -> None:
+        """Record that an unbounded gap ended this (terminal, stream, generation).
+
+        Suppresses the forward-jump detector for the key until the generation
+        advances (see :meth:`stream_forward_jump`).
+        """
+        with self._lock:
+            self._unbounded_gap[(terminal_id, stream)] = generation
 
     # --- interactive attach relay (#776) ---
     #

@@ -712,6 +712,37 @@ async def runtime_channel(ws: WebSocket) -> None:
                         frame.generation,
                     )
                     continue
+                # A same-generation forward jump means bytes between the last
+                # recorded position and this frame's never arrived — the shape the
+                # reconnect gate loss and a mid-stream drop leave on the wire, which
+                # the watermark alone would step over silently. Report the range as
+                # a loss to output consumers, with the marker shape the GapFrame
+                # branch uses, then process the frame normally. Exclusions (first
+                # frame, higher generation, post-unbounded-gap) live in the detector
+                # (Copilot review on #802).
+                jump = runtime_registry.stream_forward_jump(
+                    frame.terminal_id, frame.stream.value, frame.generation, frame.pos
+                )
+                if jump is not None:
+                    lost_from, lost_to = jump
+                    logger.warning(
+                        "output gap for remote terminal %s [%s, %s): a stream frame "
+                        "at %s jumped past the recorded position %s",
+                        frame.terminal_id,
+                        lost_from,
+                        lost_to,
+                        frame.pos,
+                        lost_from,
+                    )
+                    bus.deliver_with_loss_markers(
+                        f"terminal.{frame.terminal_id}.output",
+                        {"data": "", "gap": {"from_pos": lost_from, "to_pos": lost_to}},
+                        lost={
+                            "from_pos": lost_from,
+                            "to_pos": lost_to,
+                            "generation": frame.generation,
+                        },
+                    )
                 # Republish onto the existing in-process bus with the exact
                 # payload shape the local FIFO reader uses, so bus-contract
                 # consumers (LogWriter, AG-UI, inbox) work unchanged.
@@ -810,6 +841,14 @@ async def runtime_channel(ws: WebSocket) -> None:
                         frame.stream.value,
                         frame.to_pos,
                         generation=frame.generation,
+                    )
+                else:
+                    # Unbounded: the runtime cannot bound the loss, so the next
+                    # same-generation frame's higher position is the expected
+                    # discontinuity. Suppress the forward-jump detector for this
+                    # stream until the generation advances.
+                    runtime_registry.note_unbounded_gap(
+                        frame.terminal_id, frame.stream.value, frame.generation
                     )
                 # Drop-aware, like the StreamFrame arm: the watermark has already
                 # advanced over this range, so a marker lost to a full queue is a
