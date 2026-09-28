@@ -508,8 +508,13 @@ def test_launch_allowed_tools_override():
         assert params["allowed_tools"] == "@cao-mcp-server,fs_read"
 
 
-def test_launch_builtin_profile_resolves_role_defaults():
-    """Test that launching a built-in profile resolves role-based allowedTools."""
+def test_launch_builtin_profile_omits_implicit_allowed_tools():
+    """A built-in profile launch without --allowed-tools/--yolo sends no policy.
+
+    The client no longer pushes its own resolved role defaults: without an
+    explicit flag the server resolves allowedTools against its OWN installed
+    profile, so ``allowed_tools`` is absent from the request (haofeif #9, #802).
+    """
     runner = CliRunner()
 
     with (
@@ -532,8 +537,7 @@ def test_launch_builtin_profile_resolves_role_defaults():
         assert result.exit_code == 0
         call_args = mock_post.call_args
         params = call_args.kwargs["params"]
-        # Supervisor should only have MCP server tools
-        assert "@cao-mcp-server" in params["allowed_tools"]
+        assert "allowed_tools" not in params
 
 
 def test_launch_headless_message_conductor_not_ready():
