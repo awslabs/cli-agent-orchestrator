@@ -145,7 +145,7 @@ def _register_run(
     workflow_journal.insert_run(
         run_id=run_id,
         workflow_name="wf",
-        spec_snapshot="steps: []",
+        spec_snapshot='{"source":"","launch_guard":null}',
         inputs_json="{}",
         state="running",
         started_at=TS,

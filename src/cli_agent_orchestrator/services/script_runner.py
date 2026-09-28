@@ -53,6 +53,7 @@ from cli_agent_orchestrator.models.workflow_runtime import (
 )
 from cli_agent_orchestrator.services import (
     approval_gate,
+    launch_guard,
     manifest_freeze,
     terminal_service,
     workflow_journal,
@@ -137,6 +138,24 @@ def run_root_for(env: Optional[Dict[str, str]]) -> Optional[str]:
     run_id = (env or {}).get("CAO_WORKFLOW_RUN_ID")
     record = run_registry.get(run_id) if isinstance(run_id, str) else None
     return record.working_directory if isinstance(record, ScriptRunRecord) else None
+
+
+def build_script_snapshot(
+    spec: Any,
+    *,
+    working_directory: str,
+    launch_guard: Optional[Dict[str, Any]],
+) -> str:
+    """Serialize the durable source snapshot and its launch-time drift guard."""
+    return json.dumps(
+        {
+            "source": spec.source,
+            "path": spec.path,
+            "content_hash": getattr(spec, "content_hash", None),
+            "working_directory": working_directory,
+            "launch_guard": launch_guard,
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1207,6 +1226,7 @@ async def run_script_workflow(
     #     nothing.
     # No-ops entirely when enforcement is disabled, which is the default.
     approval_gate.ensure_plan_approved(tier="script", manifest_json=manifest_json)
+    guard = await asyncio.to_thread(launch_guard.capture)
 
     # --- Step 1: register the live record + journal the durable run row ---
     record = ScriptRunRecord(
@@ -1230,13 +1250,10 @@ async def run_script_workflow(
     run_registry[run_id] = record
 
     # The durable spec_snapshot carries the frozen source (resume reads it back).
-    spec_snapshot = json.dumps(
-        {
-            "source": spec.source,
-            "path": spec.path,
-            "content_hash": getattr(spec, "content_hash", None),
-            "working_directory": root,
-        }
+    spec_snapshot = build_script_snapshot(
+        spec,
+        working_directory=root,
+        launch_guard=guard,
     )
     try:
         await asyncio.to_thread(

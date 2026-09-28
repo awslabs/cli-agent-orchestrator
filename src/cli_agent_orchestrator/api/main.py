@@ -4253,7 +4253,8 @@ async def run_step(
     # shared ScriptRunRecord's step_states as soon as it exists, so U4's orphan sweep
     # can tear it down if the subprocess dies mid-call. No-op for YAML/handoff
     # callers (no run/step env or no script record in the registry).
-    from cli_agent_orchestrator.services import step_replay, workflow_service
+    from cli_agent_orchestrator.services import script_runner, step_replay, workflow_service
+    from cli_agent_orchestrator.services.launch_guard import PlanInputsChangedError
     from cli_agent_orchestrator.services.script_runner import (
         make_step_terminal_recorder,
         record_step_completion,
@@ -4653,6 +4654,11 @@ async def run_step(
         _settle_step(None, str(e))
         await _record_job_state(job_id, "error", error_message=str(e))
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
+    except PlanInputsChangedError as e:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"message": str(e), "kind": "plan_inputs_changed"},
+        )
     except ValueError as e:
         # Unknown terminal / bad input surfaced by the terminal layer.
         await _record_job_state(job_id, "error", error_message=str(e))
@@ -5673,6 +5679,7 @@ async def submit_workflow_run_endpoint(
     )
     from cli_agent_orchestrator.models.workflow_runtime import RunState, StepState
     from cli_agent_orchestrator.services import (
+        launch_guard,
         script_runner,
         workflow_journal,
         workflow_service,
@@ -5752,14 +5759,6 @@ async def submit_workflow_run_endpoint(
                 status_code=422,
                 detail={"findings": workflow_spec_service.render_findings(lint_result.findings)},
             )
-        spec_snapshot = json.dumps(
-            {
-                "source": spec.source,
-                "path": spec.path,
-                "content_hash": spec.content_hash,
-                "working_directory": root,
-            }
-        )
         # Step 4b — approval gate (issue #583 Bolt 2, ``approval-gate``). Built ONCE here and handed
         # to the INSERT below unchanged, so the manifest that is CHECKED is byte-identical to the one
         # STORED. Gating BEFORE the INSERT means a refused start leaves no ``workflow_run`` row: every
@@ -5775,6 +5774,7 @@ async def submit_workflow_run_endpoint(
         )
         try:
             approval_gate.ensure_plan_approved(tier="script", manifest_json=manifest_json)
+            guard = await asyncio.to_thread(launch_guard.capture)
         except approval_gate.PlanIdentityUnavailableError as e:
             # 503, not 403: the freeze above returned None, so CAO could not complete its own work and
             # nothing about the caller was wrong. MUST precede the arm below, which is its base class
@@ -5791,6 +5791,11 @@ async def submit_workflow_run_endpoint(
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN, detail=_approval_refusal_detail(e)
             )
+        spec_snapshot = script_runner.build_script_snapshot(
+            spec,
+            working_directory=root,
+            launch_guard=guard,
+        )
         # Step 5 — the script row is a single INSERT (no seed steps), already
         # atomic on its own connection. This is the one deliberate deviation from
         # the engines' best-effort write: awaited, and its failure aborts with 500.
