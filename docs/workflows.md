@@ -545,8 +545,10 @@ cao workflow approve plan-v1:<digest>
 cao workflow run my-script          # starts
 ```
 
-This friction is temporary rather than intrinsic — the authoring sequence that presents a plan and
-takes approval *before* running is a later piece of work.
+Bolt 3 ships the conversational authoring sequence around this loop: create or update the script,
+validate it, present it for review, make the plan-discovery run above, and surface the refused run's
+`plan_id` for a human to approve before retrying. The discovery run remains necessary because the
+`plan_id` does not exist before run admission computes it.
 
 ### What approval is, and is not
 
