@@ -42,10 +42,18 @@ BLOCKED_SYSTEM_DIRECTORIES = frozenset(
 
 # Directories under which NOTHING is an acceptable working directory or
 # archive target, at any depth: system configuration, kernel and device
-# pseudo-filesystems, boot files and the system binaries. Distinct from the
-# exact-match set above because projects legitimately live beneath /tmp,
-# /var/folders, /home or /Users, so those stay exact-only. Includes the macOS
-# /private/etc realpath.
+# pseudo-filesystems, boot files, the system binaries and libraries, and the
+# per-user crontab spool. Distinct from the exact-match set above because
+# projects legitimately live beneath /tmp, /var/folders, /home or /Users, so
+# those stay exact-only. The paths are compared AFTER ``os.path.realpath``, so
+# every canonical spelling a root can resolve to must be listed: the macOS
+# ``/etc`` -> ``/private/etc``, and on usr-merged Linux ``/lib`` ->
+# ``/usr/lib`` and ``/lib64`` -> ``/usr/lib64``, where the ``/lib`` entries on
+# their own never fire. ``/root`` is a subtree too: ``/root/.ssh/authorized_keys``
+# and ``/root/.bashrc`` are persistence for whoever can reach the API of a
+# cao-server that runs as root, and nothing in the repository's container or
+# cluster manifests runs it as root with projects under ``/root``. A deployment
+# that does must keep its projects elsewhere (``/workspace``, ``/srv``).
 BLOCKED_SYSTEM_SUBTREES = frozenset(
     {
         "/bin",
@@ -57,8 +65,12 @@ BLOCKED_SYSTEM_SUBTREES = frozenset(
         "/proc",
         "/sys",
         "/boot",
+        "/root",
         "/lib",
         "/lib64",
+        "/usr/lib",
+        "/usr/lib64",
+        "/var/spool/cron",
         "/private/etc",
     }
 )

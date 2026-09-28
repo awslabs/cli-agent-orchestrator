@@ -108,28 +108,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The credential gate on federated memory writes and `--redact` exports
   missed common key formats.** It now recognises Anthropic and OpenAI API
   keys, GitHub fine-grained and OAuth/app tokens, Slack tokens, JSON Web
-  Tokens and AWS secret access keys (next to an `aws ... secret`/`access`
-  context word or a `SecretAccessKey` key), and it no longer lets a zero-width
-  character inside a prefix hide a credential.
+  Tokens, Slack bot/user/app-level (`xapp-`) tokens and AWS secret access
+  keys (next to an `aws ... secret`/`access` context word or a
+  `SecretAccessKey` key), and it no longer lets an invisible character inside
+  a prefix hide a credential: the whole Unicode format category (zero-width
+  characters, bidi marks, soft hyphen, invisible operators) plus the
+  variation selectors, not a short list. Parsed documents keep their key
+  context: the execution manifest and step output redact a 40-character value
+  under a `SecretAccessKey`-style key, a value whose key makes the pair read
+  as a credential assignment (`{"password": …}`, `{"api_key": …}`), and the
+  `value` of a `{name: AWS_SECRET_ACCESS_KEY, value: …}` entry, none of which
+  the text pattern can see once key and value are scanned apart. The graph export gate
+  scans the parsed view (`scan_json_for_secrets`) rather than its
+  `json.dumps` form, whose default `ensure_ascii` had turned a hidden
+  character into a `\u` escape before the gate could strip it.
   Vendor patterns are matched before the generic `bearer`/`secret` ones, so
-  the reported pattern name is the specific one.
+  the reported pattern name is the specific one (#821)
 
 - **Atomic file writes read the process umask by setting it to 0.** The
-  writer behind profile, memory and archive updates derived a new file's mode
-  with `os.umask(0)` followed by a restore. The umask is process-wide and
-  cao-server is threaded, so a file created with the default mode by any other
-  thread inside that window could be born world-writable. A new file's temp is now created with
-  `O_EXCL` and mode 0666 so the kernel applies the umask itself; an existing
-  file's mode is preserved as before, and the umask is never touched.
+  writer behind profile and archive updates (`utils/atomic_file`) and the
+  vault writer behind federated memory notes (`services/vault/writer`) both
+  derived a new file's mode with `os.umask(0)` followed by a restore. The
+  umask is process-wide and cao-server is threaded, so a file created with
+  the default mode by any other thread inside that window could be born
+  world-writable. A new file's temp is now created with `O_EXCL` and mode
+  0666 so the kernel applies the umask itself; an existing file's mode is
+  preserved as before, and the umask is never touched (#821)
 
 - **The blocked-path list for working directories and archive targets was
   exact-match only.** `/etc/passwd` passed with `allow_file`, and an existing
   directory such as `/etc/ssl` was a valid working directory. System
-  configuration, kernel and device pseudo-filesystems, boot files and the
-  system binary directories (`/etc`, `/proc`, `/sys`, `/dev`, `/boot`, `/bin`,
-  `/sbin`, `/usr/bin`, `/usr/sbin`, `/lib`, `/lib64`) are now refused at any
+  configuration, kernel and device pseudo-filesystems, boot files, the
+  system binary and library directories and the crontab spool (`/etc`,
+  `/proc`, `/sys`, `/dev`, `/boot`, `/bin`, `/sbin`, `/usr/bin`, `/usr/sbin`,
+  `/lib`, `/lib64`, `/usr/lib`, `/usr/lib64`, `/root`, `/var/spool/cron`, and
+  `/private/etc` on macOS; the `/usr/lib*` entries are what makes the `/lib`
+  rule hold on usr-merged Linux, where `/lib` resolves to `/usr/lib`) are now refused at any
   depth, with `/dev/shm` carved out. `/tmp`, `/var`, `/home`-style roots stay
-  exact-only because projects legitimately live beneath them.
+  exact-only because projects legitimately live beneath them; a cao-server
+  that runs as root must keep its projects outside `/root` (#821)
 
 ### Changed
 

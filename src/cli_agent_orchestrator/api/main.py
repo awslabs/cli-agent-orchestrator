@@ -6985,11 +6985,14 @@ async def export_graph_endpoint(
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
-    # Credential gate (ADR-5): scan the serialized view; on a hit, reject
-    # before the sink writes anything. secret_gate returns the pattern NAME,
-    # never the matched bytes, so the detail is safe to surface.
-    serialized = json.dumps(view.to_dict())
-    hit = secret_gate.scan_for_secrets(serialized)
+    # Credential gate (ADR-5): scan the PARSED view; on a hit, reject before
+    # the sink writes anything. secret_gate returns the pattern NAME, never
+    # the matched bytes, so the detail is safe to surface. Not json.dumps then
+    # scan: the default ensure_ascii=True turns an invisible character hiding
+    # inside a credential prefix into a literal \u escape the gate cannot
+    # strip, and the structured scan also keeps the key context a
+    # SecretAccessKey value needs.
+    hit = secret_gate.scan_json_for_secrets(view.to_dict())
     if hit is not None:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,

@@ -60,6 +60,85 @@ class TestRedactSecretsEdgeCases:
         assert scan_for_secrets("clean") is None
 
 
+# Assembled from short pieces so no quoted run reads as a credential to a scanner.
+_AWS_40_CHAR_SAMPLE = "wJalrXUtn" + "FEMI/K7MD" + "ENG/bPxRf" + "iCYEXAMPL" + "EKEY"
+_LONG_VALUE = "hunter2long" + "enough12345"
+
+
+class TestRedactJsonLeavesKeepsKeyContext:
+    """``redact_json_leaves`` scans keys and values apart; the key IS the context."""
+
+    def test_secret_access_key_value_is_redacted_whole(self):
+        from cli_agent_orchestrator.services.secret_gate import redact_json_leaves
+
+        out = redact_json_leaves(
+            {"Credentials": {"SecretAccessKey": _AWS_40_CHAR_SAMPLE, "Expiration": "t"}}
+        )
+        assert out == {
+            "Credentials": {
+                "SecretAccessKey": "[REDACTED:aws_secret_access_key]",
+                "Expiration": "t",
+            }
+        }
+
+    def test_snake_case_key_counts_too(self):
+        from cli_agent_orchestrator.services.secret_gate import redact_json_leaves
+
+        out = redact_json_leaves({"aws_secret_access_key": _AWS_40_CHAR_SAMPLE})
+        assert out == {"aws_secret_access_key": "[REDACTED:aws_secret_access_key]"}
+
+    def test_environment_entry_value_is_redacted_and_name_kept(self):
+        from cli_agent_orchestrator.services.secret_gate import redact_json_leaves
+
+        entries = [
+            {"name": "AWS_REGION", "value": "us-east-1"},
+            {"name": "AWS_SECRET_ACCESS_KEY", "value": _AWS_40_CHAR_SAMPLE},
+        ]
+        assert redact_json_leaves(entries) == [
+            {"name": "AWS_REGION", "value": "us-east-1"},
+            {"name": "AWS_SECRET_ACCESS_KEY", "value": "[REDACTED:aws_secret_access_key]"},
+        ]
+
+    def test_generic_credential_keys_redact_their_values(self):
+        from cli_agent_orchestrator.services.secret_gate import redact_json_leaves
+
+        out = redact_json_leaves(
+            {
+                "password": "correct horse battery staple",
+                "api_key": _LONG_VALUE,
+                "user": "ted",
+            }
+        )
+        assert out == {
+            "password": "[REDACTED:secret_assignment]",
+            "api_key": "[REDACTED:bearer_token]",
+            "user": "ted",
+        }
+
+    def test_forty_character_run_under_another_key_is_left_alone(self):
+        from cli_agent_orchestrator.services.secret_gate import redact_json_leaves
+
+        doc = {
+            "commit": "a" * 40,
+            "build_id": _AWS_40_CHAR_SAMPLE,
+            "entries": [{"name": "BUILD", "value": _AWS_40_CHAR_SAMPLE}],
+        }
+        assert redact_json_leaves(doc) == doc
+
+    def test_step_output_sanitiser_uses_the_key_context(self):
+        import json
+
+        from cli_agent_orchestrator.services.script_runner import _sanitise_output_json
+
+        raw = json.dumps({"sts": {"SecretAccessKey": _AWS_40_CHAR_SAMPLE}}, separators=(",", ":"))
+        cleaned = _sanitise_output_json(raw)
+        assert cleaned is not None
+        assert _AWS_40_CHAR_SAMPLE not in cleaned
+        assert json.loads(cleaned) == {
+            "sts": {"SecretAccessKey": "[REDACTED:aws_secret_access_key]"}
+        }
+
+
 class TestRedactZeroWidth:
     def test_hidden_credential_is_redacted_whole(self):
         redacted, fired = redact_secrets("k=AK\u200bIAIOSFODNN7EXAMPLE")
@@ -107,8 +186,6 @@ class TestRedactVendorFamilies:
         assert fired == list(secrets)  # _SECRET_PATTERNS order
 
     def test_aws_secret_key_context_form(self):
-        redacted, fired = redact_secrets(
-            "export AWS_SECRET_ACCESS_KEY=" + "wJalrXUtnFEMI/K7MDENG/" + "bPxRfiCYEXAMPLEKEY"
-        )
+        redacted, fired = redact_secrets("export AWS_SECRET_ACCESS_KEY=" + _AWS_40_CHAR_SAMPLE)
         assert "wJalrXUtnFEMI" not in redacted
         assert fired == ["aws_secret_access_key"]

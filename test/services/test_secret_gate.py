@@ -71,7 +71,7 @@ def test_bearer_space_form_is_caught():
 # Fixtures are assembled at runtime so no credential-shaped literal sits in the
 # source: the repo's gitleaks gate and GitHub push protection scan test files
 # too, and these are the documented AWS example key and the jwt.io sample.
-_AWS_DOC_SAMPLE = "wJalrXUtnFEMI/K7MDENG/" + "bPxRfiCYEXAMPLEKEY"
+_AWS_DOC_SAMPLE = "wJalrXUtn" + "FEMI/K7MD" + "ENG/bPxRf" + "iCYEXAMPL" + "EKEY"
 _JWT_SAMPLE = ".".join(
     [
         "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
@@ -98,6 +98,8 @@ _VENDOR_POSITIVE = [
     ("slack_token", "xox" + "b-1234567890-1234567890-AbCdEfGhIjKlMnOp"),
     ("slack_token", "xox" + "p-1234567890-1234567890-1234567890-abcdef0123456789"),
     ("slack_token", "xox" + "e-1-AbCdEfGhIjKlMnOpQrStUv"),
+    # app-level token: the documented xapp- shape, which no xox? form covers
+    ("slack_token", "xa" + "pp-1-A0ABCDEFG-1234567890123-abcdef0123456789abcdef"),
     (
         "jwt",
         _JWT_SAMPLE,
@@ -139,6 +141,7 @@ _VENDOR_NEGATIVE = [
         "aws access review, see commit " + "a1b2c3d4e5f6a7b8c9d0" + "e1f2a3b4c5d6e7f8a9b0",
     ),
     ("slack_docs_path", "https://api.slack.com/xoxb-example-token"),
+    ("slack_app_docs", "an app-level token starts with the letters x, a, p, p and a dash"),
 ]
 
 
@@ -148,13 +151,142 @@ def test_vendor_lookalikes_stay_clean(label, content):
 
 
 class TestZeroWidthEvasion:
-    """A zero-width code point inside a prefix must not hide a credential."""
+    """An invisible code point inside a prefix must not hide a credential.
+
+    Not only the five zero-width characters: any Unicode format character
+    (bidi marks, soft hyphen, invisible operators, tags) and the variation
+    selectors split a prefix the same way, and an attacker picks the next one.
+    """
 
     @pytest.mark.parametrize(
-        "zw", ["\u200b", "\u200c", "\u200d", "\u2060", "\ufeff"], ids=lambda c: f"U+{ord(c):04X}"
+        "zw",
+        [
+            "\u200b",  # zero width space
+            "\u200c",  # zero width non-joiner
+            "\u200d",  # zero width joiner
+            "\u2060",  # word joiner
+            "\ufeff",  # BOM
+            "\u200e",  # left-to-right mark
+            "\u200f",  # right-to-left mark
+            "\u202e",  # right-to-left override
+            "\u2066",  # left-to-right isolate
+            "\u00ad",  # soft hyphen
+            "\u2061",  # function application
+            "\u2064",  # invisible plus
+            "\u034f",  # combining grapheme joiner
+            "\ufe0f",  # variation selector 16
+            "\U000e0100",  # variation selector 17
+            "\U000e0020",  # tag space
+        ],
+        ids=lambda c: f"U+{ord(c):04X}",
     )
     def test_split_aws_prefix_is_still_caught(self, zw):
         assert scan_for_secrets(f"AK{zw}IAIOSFODNN7EXAMPLE") == "aws_access_key"
 
+    def test_class_matches_the_live_format_category_everywhere(self):
+        """The class is built from planes 0-1 plus a listed plane-14 block; a
+        Unicode update that puts a format character anywhere else must fail here,
+        not silently pass a hidden credential."""
+        import unicodedata
+
+        from cli_agent_orchestrator.services.secret_gate import _INVISIBLE
+
+        missing = [
+            hex(cp)
+            for cp in range(0x110000)
+            if unicodedata.category(chr(cp)) == "Cf" and not _INVISIBLE.match(chr(cp))
+        ]
+        assert missing == []
+
+    @pytest.mark.parametrize("zw", ["\U000110bd", "\U00013430", "\U0001343f"])
+    def test_astral_format_controls_are_stripped_too(self, zw):
+        assert scan_for_secrets(f"AK{zw}IAIOSFODNN7EXAMPLE") == "aws_access_key"
+
+    def test_visible_combining_marks_are_not_stripped(self):
+        # An acute accent (Mn) is visible and belongs to its base letter; a key
+        # "split" by one is not hidden, it is a different string, and stripping
+        # it would corrupt legitimate text on the redact side.
+        from cli_agent_orchestrator.services.secret_gate import _INVISIBLE, redact_secrets
+
+        assert _INVISIBLE.match("\u0301") is None
+        text = "cafe\u0301 and AK\u200bIAIOSFODNN7EXAMPLE"
+        redacted, _ = redact_secrets(text)
+        assert redacted == "cafe\u0301 and [REDACTED:aws_access_key]"
+
     def test_split_vendor_prefix_is_still_caught(self):
         assert scan_for_secrets("sk-\u200bant-" + "x" * 30) == "anthropic_api_key"
+
+
+# A 40-character mixed-case run of the AWS secret alphabet, assembled at runtime
+# so no credential-shaped literal sits in the file.
+_AWS_40_CHAR_SAMPLE = "wJalrXUtn" + "FEMI/K7MD" + "ENG/bPxRf" + "iCYEXAMPL" + "EKEY"
+_LONG_VALUE = "hunter2long" + "enough12345"
+_HEX_VALUE = "abcdef01234" + "56789ABCDEF"
+
+
+class TestScanJsonForSecrets:
+    """The parsed-tree scan keeps the key context a serialised scan loses."""
+
+    def test_secret_access_key_under_its_own_key(self):
+        from cli_agent_orchestrator.services.secret_gate import scan_json_for_secrets
+
+        doc = {
+            "Credentials": {
+                "AccessKeyId": "ASIA" + "X" * 16,
+                "SecretAccessKey": _AWS_40_CHAR_SAMPLE,
+            }
+        }
+        assert scan_json_for_secrets({"c": {"SecretAccessKey": _AWS_40_CHAR_SAMPLE}}) == (
+            "aws_secret_access_key"
+        )
+        assert scan_json_for_secrets(doc) in {"aws_access_key", "aws_secret_access_key"}
+
+    @pytest.mark.parametrize(
+        "key", ["aws_secret_access_key", "AWS_SECRET_ACCESS_KEY", "secretAccessKey"]
+    )
+    def test_every_spelling_of_the_key_counts(self, key):
+        from cli_agent_orchestrator.services.secret_gate import scan_json_for_secrets
+
+        assert scan_json_for_secrets({key: _AWS_40_CHAR_SAMPLE}) == "aws_secret_access_key"
+
+    def test_environment_entry_name_value_pair(self):
+        from cli_agent_orchestrator.services.secret_gate import scan_json_for_secrets
+
+        env = [
+            {"name": "AWS_REGION", "value": "us-east-1"},
+            {"name": "AWS_SECRET_ACCESS_KEY", "value": _AWS_40_CHAR_SAMPLE},
+        ]
+        assert scan_json_for_secrets({"environment": env}) == "aws_secret_access_key"
+
+    @pytest.mark.parametrize(
+        "key, value, name",
+        [
+            ("password", "correct horse battery staple", "secret_assignment"),
+            ("api_key", _LONG_VALUE, "bearer_token"),
+            ("TOKEN", _HEX_VALUE, "bearer_token"),
+        ],
+    )
+    def test_generic_credential_keys_give_their_value_context(self, key, value, name):
+        from cli_agent_orchestrator.services.secret_gate import scan_json_for_secrets
+
+        assert scan_json_for_secrets({key: value}) == name
+        assert scan_json_for_secrets([{"name": key, "value": value}]) == name
+
+    def test_context_free_forty_character_runs_stay_clean(self):
+        from cli_agent_orchestrator.services.secret_gate import scan_json_for_secrets
+
+        # A git SHA and a mixed-case run under an unrelated key: the text
+        # pattern's refusal to match without context is preserved.
+        assert scan_json_for_secrets({"commit": "a" * 40, "build_id": _AWS_40_CHAR_SAMPLE}) is None
+        assert scan_json_for_secrets([{"name": "BUILD_ID", "value": _AWS_40_CHAR_SAMPLE}]) is None
+
+    def test_invisible_characters_inside_values_are_seen_unescaped(self):
+        from cli_agent_orchestrator.services.secret_gate import scan_json_for_secrets
+
+        # Through json.dumps (ensure_ascii) the U+200B would be six ASCII bytes.
+        assert scan_json_for_secrets({"k": "AK\u200bIAIOSFODNN7EXAMPLE"}) == "aws_access_key"
+
+    def test_non_string_scalars_and_empty_containers(self):
+        from cli_agent_orchestrator.services.secret_gate import scan_json_for_secrets
+
+        assert scan_json_for_secrets({"n": 1, "b": True, "x": None, "l": [], "d": {}}) is None
