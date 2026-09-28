@@ -273,24 +273,26 @@ def _remote_sessions(local_session_names: Set[str]) -> List[Dict[str, Any]]:
     creation order, so repeated calls agree.
     """
     try:
-        terminal_ids = runtime_registry.remote_terminal_ids()
+        bindings = runtime_registry.live_remote_bindings()
         # Zero queries when nothing is remote, which is every purely local
         # install -- the cost of this path is paid only by deployments using it.
-        if not terminal_ids:
+        if not bindings:
             return []
+        # One snapshot decides both which terminals are remote AND which runtime
+        # each is on, so the enumeration never follows a per-row
+        # ``runtime_for_terminal`` that could observe a different world than the
+        # membership list it is annotating (Copilot review on #802).
+        runtime_by_terminal: Dict[str, str] = dict(bindings)
         runtimes_by_session: Dict[str, Set[str]] = {}
-        for terminal in list_terminals_by_ids(terminal_ids):
+        for terminal in list_terminals_by_ids(list(runtime_by_terminal)):
             session_name = terminal.get("tmux_session") or ""
             if not session_name.startswith(SESSION_PREFIX):
                 continue
             if session_name in local_session_names:
                 continue
-            runtime_id = runtime_registry.runtime_for_terminal(terminal["id"])
+            runtime_id = runtime_by_terminal.get(terminal["id"])
             entry = runtimes_by_session.setdefault(session_name, set())
             if runtime_id:
-                # Absent only if the channel dropped between the snapshot above
-                # and here. The session still lists -- one of its terminals was
-                # bound a moment ago -- just without that runtime's id.
                 entry.add(runtime_id)
         return [
             {
@@ -359,27 +361,36 @@ def get_session(session_name: str) -> Dict:
     supervisor that will read the first entry as the conductor.
     """
     try:
-        if not get_backend().session_exists(session_name):
-            raise ValueError(f"Session '{session_name}' not found")
+        backend = get_backend()
+        session_data = None
+        if backend.session_exists(session_name):
+            tmux_sessions = backend.list_sessions()
+            session_data = next((s for s in tmux_sessions if s["id"] == session_name), None)
 
-        tmux_sessions = get_backend().list_sessions()
-        session_data = next((s for s in tmux_sessions if s["id"] == session_name), None)
+        if session_data is None:
+            # Not a local tmux session (a pure controller runs none, and a hybrid
+            # host may not host this one) -- but it may still exist as a remote
+            # session, exactly as ``list_sessions`` advertises it via
+            # ``_remote_sessions``. Detail must use the same authority as the list,
+            # or a session that lists raises "not found" when opened (haofeif #10).
+            session_data = next(
+                (s for s in _remote_sessions(set()) if s["id"] == session_name), None
+            )
 
-        if not session_data:
+        if session_data is None:
             raise ValueError(f"Session '{session_name}' not found")
 
         terminals = list_terminals_by_session(session_name)
-        # Enrich each terminal with its live status. list_terminals_by_session
-        # reads only the DB row (no status column), but callers monitoring an
-        # orchestration — the web UI, and the cao-ops-mcp get_session_info tool
-        # an external supervisor polls — need to distinguish
-        # IDLE/PROCESSING/COMPLETED/ERROR per terminal. status_monitor is the
-        # single source of truth and is backend-aware (tmux push vs herdr
-        # native), so derive it here rather than persisting a stale column.
-        from cli_agent_orchestrator.services.status_monitor import status_monitor
+        # Enrich each terminal with its live status through the SAME placement
+        # authority the session list uses: ``effective_status`` reads a remote
+        # terminal's status from the runtime that owns its pane and a local one's
+        # from the local monitor. Reading the local monitor unconditionally (as
+        # before) reported a remote terminal's status as UNKNOWN even while its
+        # runtime had it COMPLETED (haofeif #10).
+        from cli_agent_orchestrator.utils.terminal import effective_status
 
         for terminal in terminals:
-            terminal["status"] = status_monitor.get_status(terminal["id"]).value
+            terminal["status"] = effective_status(terminal["id"]).value
         return {"session": session_data, "terminals": terminals}
 
     except Exception as e:
