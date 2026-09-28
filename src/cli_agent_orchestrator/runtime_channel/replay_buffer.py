@@ -47,10 +47,26 @@ class ReplayBuffer:
         self._chunks: Deque[Tuple[int, bytes]] = deque()
         self._retained = 0
         self._end_pos = 0
+        # The generation just superseded by begin_generation() and the position
+        # it ended at. A reconnect catch-up that had sent bytes in the old
+        # generation reports its lost tail as a bounded gap in that generation
+        # before switching to the new one.
+        self._prev_generation: Optional[int] = None
+        self._prev_end_pos = 0
 
     @property
     def generation(self) -> int:
         return self._generation
+
+    @property
+    def previous_generation(self) -> Optional[int]:
+        """The generation begin_generation() last superseded, or None."""
+        return self._prev_generation
+
+    @property
+    def previous_end_pos(self) -> int:
+        """Watermark the previous generation ended at (0 if there was none)."""
+        return self._prev_end_pos
 
     def begin_generation(self) -> int:
         """Declare the previous byte stream over and start numbering from 0.
@@ -73,6 +89,9 @@ class ReplayBuffer:
         stream it described -- replaying those bytes under the new generation
         would attribute one stream's output to another.
         """
+        # Remember the stream just ended so a catch-up can name its lost tail.
+        self._prev_generation = self._generation
+        self._prev_end_pos = self._end_pos
         self._generation += 1
         self._chunks.clear()
         self._retained = 0

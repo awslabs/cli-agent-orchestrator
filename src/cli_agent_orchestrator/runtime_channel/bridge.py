@@ -137,31 +137,51 @@ class Bridge:
         # the replay have finished, so the long-lived forwarding tasks cannot
         # write into a connection that is still negotiating or still catching up.
         self._ready = asyncio.Event()
+        # Latest worker-reported status per terminal, written by _forward_status
+        # even while the gate is shut, so a status change produced during the
+        # catch-up is not lost with the dropped send.
+        self._pending_status: Dict[str, TerminalStatus] = {}
+        # Per-CONNECTION record of what has actually reached the wire, reset at
+        # the start of every _serve. The catch-up compares the buffer, _unacked
+        # and _pending_status against these to send only what this connection
+        # has not yet seen, then opens the gate on exactly the position it left
+        # off at.
+        #   _sent_capture: terminal_id -> (generation, end position) of CAPTURE
+        #                  bytes/gaps sent;
+        #   _sent_ops:     op_ids of results sent;
+        #   _sent_status:  last status sent per terminal (hello statuses count).
+        self._sent_capture: Dict[str, tuple] = {}
+        self._sent_ops: set = set()
+        self._sent_status: Dict[str, TerminalStatus] = {}
 
     # --- outbound plumbing ---
 
     async def _send(self, frame, *, handshake: bool = False) -> None:
         """Send if connected AND past the handshake; silently skip otherwise.
 
-        Skipping is safe, and is the point: the replay buffer and the
-        unacked-result map are what survive a disconnection, not the send.
+        Skipping is safe because a gated frame is RECOVERABLE from durable
+        state, not because it is unimportant: capture keeps buffering into the
+        replay buffer, ``_forward_status`` retains the latest status in
+        ``_pending_status``, and results stay in ``_unacked``. The reconnect
+        catch-up in ``_serve`` re-reads all three and re-sends whatever this
+        connection has not yet carried, so the gate belongs on the send and not
+        on the forwarding tasks.
 
-        ``handshake`` is for the frames that ARE the hello exchange and its
-        replay — they must go out while the gate is still shut. Everything else
-        waits, because the forwarding tasks are started once and live across
-        reconnects (``run`` never cancels them), so without this gate they keep
-        writing into a socket that has not negotiated yet. Three things went
-        wrong, in increasing order of severity: a live chunk at the resume offset
-        was sent and then replayed again, duplicating output and advancing the
-        server's watermark out of order; the watermark could move before the
-        replay that was supposed to fill it; and since the hello itself used a
-        bare ``ws.send`` that took no lock, a StreamFrame could be the FIRST
-        frame on the connection, which is a protocol violation rather than a
-        duplicate (Copilot review on #802).
+        ``handshake`` is for the frames that ARE the hello exchange, its replay
+        and the catch-up — they must go out while the gate is still shut.
+        Everything else waits, because the forwarding tasks are started once and
+        live across reconnects (``run`` never cancels them), so without this gate
+        they keep writing into a socket that has not negotiated yet. Three things
+        went wrong before it existed, in increasing severity: a live chunk at the
+        resume offset was sent and then replayed again, duplicating output; the
+        watermark could move before the replay meant to fill it; and the bare
+        ``ws.send`` hello took no lock, so a StreamFrame could be the FIRST frame
+        on the connection, a protocol violation rather than a duplicate.
 
-        Capture keeps buffering while the gate is shut — it is the buffer that
-        makes a gated frame recoverable, so the gate belongs on the send and not
-        on ``_forward_output``.
+        On a successful send this records what reached the wire (CAPTURE stream
+        position, result op_ids, status per terminal) so the catch-up knows where
+        to resume and the first live frame after the gate opens continues exactly
+        where it left off.
         """
         ws = self._ws
         if ws is None:
@@ -172,7 +192,25 @@ class Bridge:
             try:
                 await ws.send(encode_frame(frame))
             except websockets.exceptions.ConnectionClosed:
-                pass
+                return
+        self._record_sent(frame)
+
+    def _record_sent(self, frame) -> None:
+        """Note what a successful send put on the wire, for the catch-up."""
+        if isinstance(frame, StreamFrame) and frame.stream == StreamName.CAPTURE:
+            end = frame.pos + len(base64.b64decode(frame.data))
+            self._sent_capture[frame.terminal_id] = (frame.generation, end)
+        elif isinstance(frame, GapFrame) and frame.stream == StreamName.CAPTURE:
+            end = frame.to_pos if frame.to_pos is not None else frame.from_pos
+            self._sent_capture[frame.terminal_id] = (frame.generation, end)
+        elif isinstance(frame, CommandResultFrame):
+            self._sent_ops.add(frame.op_id)
+        elif (
+            isinstance(frame, EventFrame)
+            and frame.type == EventType.STATUS
+            and frame.status is not None
+        ):
+            self._sent_status[frame.terminal_id] = frame.status
 
     def _buffer_for(self, terminal_id: str) -> ReplayBuffer:
         buf = self._buffers.get(terminal_id)
@@ -278,6 +316,10 @@ class Bridge:
                     status = TerminalStatus(event["data"]["status"])
                 except (KeyError, ValueError):
                     continue
+                # Retain it even while the gate is shut: a status change produced
+                # during the catch-up would otherwise vanish with the dropped
+                # send, and the catch-up re-sends it from here.
+                self._pending_status[terminal_id] = status
                 await self._send(
                     EventFrame(
                         terminal_id=terminal_id,
@@ -837,24 +879,140 @@ class Bridge:
 
     # --- connection lifecycle ---
 
+    async def _replay_items(self, terminal_id: str, generation: int, items) -> None:
+        """Send a ``ReplayBuffer.replay_from`` result as CAPTURE frames in order.
+
+        Gaps and bytes are emitted exactly as they come back, so a consumer
+        never advances past a hole it has not been told about.
+        """
+        for item in items:
+            if isinstance(item, GapInfo):
+                await self._send(
+                    GapFrame(
+                        terminal_id=terminal_id,
+                        stream=StreamName.CAPTURE,
+                        generation=generation,
+                        from_pos=item.from_pos,
+                        to_pos=item.to_pos,
+                    ),
+                    handshake=True,
+                )
+                continue
+            pos, chunk = item
+            await self._send(
+                StreamFrame(
+                    terminal_id=terminal_id,
+                    stream=StreamName.CAPTURE,
+                    generation=generation,
+                    pos=pos,
+                    data=base64.b64encode(chunk).decode(),
+                ),
+                handshake=True,
+            )
+
+    async def _catch_up(self) -> None:
+        """Send what was produced while the gate was shut, then let it open.
+
+        The redelivery and replay in ``_serve`` are a one-shot snapshot; output
+        appended, a status change, or a result added to ``_unacked`` after it —
+        all dropped by ``_send`` while ``_ready`` was clear — would otherwise
+        never reach this connection. Re-read the durable state (the replay
+        buffers, ``_pending_status`` and ``_unacked``) and send only the delta
+        each has over what ``_sent_capture`` / ``_sent_status`` / ``_sent_ops``
+        record as already on the wire.
+
+        A send's ``await`` lets the forwarding tasks append more, so this loops
+        until one full pass sends nothing; ``_serve`` then sets ``_ready`` with
+        no ``await`` in between, so no forwarded frame can slip past the final
+        check.
+        """
+        while True:
+            sent_something = False
+            for terminal_id in list(self._buffers):
+                buf = self._buffer_for(terminal_id)
+                sent = self._sent_capture.get(terminal_id)
+                if sent is None:
+                    # The hello/resume never covered it (launched during the
+                    # disconnect, say): stream it from the start.
+                    items = buf.replay_from(0)
+                    if items:
+                        sent_something = True
+                        await self._replay_items(terminal_id, buf.generation, items)
+                    self._sent_capture[terminal_id] = (buf.generation, buf.end_pos)
+                    continue
+                sent_gen, sent_pos = sent
+                if buf.generation == sent_gen:
+                    if buf.end_pos > sent_pos:
+                        sent_something = True
+                        await self._replay_items(
+                            terminal_id, buf.generation, buf.replay_from(sent_pos)
+                        )
+                        self._sent_capture[terminal_id] = (buf.generation, buf.end_pos)
+                elif buf.generation > sent_gen:
+                    # Re-armed while gated: name the old generation's lost tail
+                    # as a bounded gap (unbounded if it advanced more than once
+                    # and the end is no longer known), then the new stream from 0.
+                    sent_something = True
+                    old_end = buf.previous_end_pos if buf.previous_generation == sent_gen else None
+                    await self._send(
+                        GapFrame(
+                            terminal_id=terminal_id,
+                            stream=StreamName.CAPTURE,
+                            generation=sent_gen,
+                            from_pos=sent_pos,
+                            to_pos=old_end,
+                        ),
+                        handshake=True,
+                    )
+                    await self._replay_items(terminal_id, buf.generation, buf.replay_from(0))
+                    self._sent_capture[terminal_id] = (buf.generation, buf.end_pos)
+            for op_id, result in list(self._unacked.items()):
+                if op_id not in self._sent_ops:
+                    sent_something = True
+                    await self._send(result, handshake=True)
+            for terminal_id, status in list(self._pending_status.items()):
+                if self._sent_status.get(terminal_id) != status:
+                    sent_something = True
+                    await self._send(
+                        EventFrame(
+                            terminal_id=terminal_id,
+                            generation=self._buffer_for(terminal_id).generation,
+                            type=EventType.STATUS,
+                            status=status,
+                        ),
+                        handshake=True,
+                    )
+            if not sent_something:
+                return
+
     async def _serve(self, ws) -> None:
         self._ws = ws
         # Shut for this attempt before the socket is visible to _send. Cleared
         # here rather than only in `run`'s finally so a reconnect cannot inherit
         # the previous attempt's open gate.
         self._ready.clear()
+        # Reset the per-connection catch-up bookkeeping: nothing has reached this
+        # new socket yet, so the redelivery, replay and catch-up below start from
+        # a clean slate.
+        self._sent_capture = {}
+        self._sent_ops = set()
+        self._sent_status = {}
         # Through _send, not a bare ws.send: the bare form took no lock, so a
         # concurrent forwarded frame could interleave with — or precede — the
         # hello on the same connection.
+        hello_statuses = self._terminal_statuses()
         await self._send(
             HelloFrame(
                 protocol_version=PROTOCOL_VERSION,
                 runtime_id=self._runtime_id,
                 streams=self._stream_positions(),
-                statuses=self._terminal_statuses(),
+                statuses=hello_statuses,
             ),
             handshake=True,
         )
+        # The hello already advertised these, so the catch-up must not re-emit
+        # them as EventFrames; only a status that has since diverged is sent.
+        self._sent_status.update(hello_statuses)
         server_hello = decode_frame(await ws.recv())
         if not isinstance(server_hello, HelloFrame):
             raise ValueError("server did not answer hello with hello")
@@ -928,30 +1086,23 @@ class Bridge:
             # already down when the bus dropped the chunk) is re-reported here,
             # ahead of the bytes that follow it, so the server never advances
             # past a range it has not received.
-            for item in buf.replay_from(start):
-                if isinstance(item, GapInfo):
-                    await self._send(
-                        GapFrame(
-                            terminal_id=resume.terminal_id,
-                            stream=StreamName.CAPTURE,
-                            generation=buf.generation,
-                            from_pos=item.from_pos,
-                            to_pos=item.to_pos,
-                        ),
-                        handshake=True,
-                    )
-                    continue
-                pos, chunk = item
-                await self._send(
-                    StreamFrame(
-                        terminal_id=resume.terminal_id,
-                        stream=StreamName.CAPTURE,
-                        generation=buf.generation,
-                        pos=pos,
-                        data=base64.b64encode(chunk).decode(),
-                    ),
-                    handshake=True,
-                )
+            #
+            # Snapshot the (generation, watermark) BEFORE replaying: bytes can
+            # arrive during a send's await, and recording where the replay was
+            # asked to reach — not where the buffer has since grown to — is what
+            # lets the catch-up below send the delta rather than skip it.
+            target = (buf.generation, buf.end_pos)
+            await self._replay_items(resume.terminal_id, buf.generation, buf.replay_from(start))
+            self._sent_capture[resume.terminal_id] = target
+
+        # Finish the catch-up before opening the gate: bytes appended to a
+        # buffer, a status change, or a result added to _unacked WHILE the gate
+        # was shut were all dropped by _send, and the one-shot replay above ran
+        # before they existed. Re-read that durable state and send whatever this
+        # connection has not yet carried, looping until a full pass sends
+        # nothing (a send's await lets the forwarding tasks append more), so the
+        # gate opens on exactly the position the wire left off at.
+        await self._catch_up()
 
         logger.info("runtime channel established to %s", self._server_url)
         # After the hello exchange and the replay, not at connect: a socket that
