@@ -16,6 +16,18 @@ on:
 permissions:
   contents: read
 
+env:
+  # Every uv command in this workflow (including the ones the Makefile runs)
+  # must execute against the committed uv.lock and fail if pyproject.toml has
+  # drifted from it. The per-command --locked flags below say the same thing
+  # where a reader looks; this catches the `uv run` / `uv export` sites that
+  # have no flag. Measured on uv 0.12: the env var alone rejects a stale lock
+  # for sync, run and export; UV_FROZEN would install the OLD lock silently;
+  # and a flag beats the variable in either direction (uv prints "Ignoring
+  # UV_LOCKED because --frozen was provided" and proceeds), so the flags
+  # below are --locked, not --frozen, and must stay that way.
+  UV_LOCKED: "1"
+
 jobs:
   # ---------------------------------------------------------------------------------------
   # Per-platform wheels (issue #321, unit `wheel-matrix`). THIS JOB ADDS THIS REPO'S FIRST
@@ -448,7 +460,7 @@ jobs:
       - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v4.2.0
 
       - name: Install the project
-        run: uv sync --all-extras --dev
+        run: uv sync --locked --all-extras --dev
 
       # PyPI's index is eventually consistent: `publish-pypi` succeeding does not mean
       # `/pypi/<dist>/<version>/json` answers yet, and `verify_published` would fail on a

@@ -450,25 +450,36 @@ def _check_indexable(rendered: str, vault: VaultSpec) -> None:
         raise
 
 
-def _umask_default_mode() -> int:
-    current = os.umask(0)
-    os.umask(current)
-    return 0o666 & ~current
+def _target_mode(managed_fd: int, target_name: str) -> Optional[int]:
+    """The mode to publish under: an existing note's own mode, or ``None`` for a new note.
 
-
-def _target_mode(managed_fd: int, target_name: str) -> int:
+    ``None`` means "let the kernel apply the umask": the temp file is then
+    created with mode 0666 and never ``fchmod``ed, which is what any ordinary
+    ``open(..., "w")`` gets. Reading the umask with ``os.umask(0)`` and a
+    restore, as this did before, is process-wide, and cao-server is threaded, so
+    a file another thread created inside that window was born world-writable.
+    Same fix as ``utils.atomic_file``; the vault is the federated memory store,
+    so this writer is the "memory" half of that change.
+    """
     target_name = validate_path_component(target_name, "vault note filename")
     try:
         metadata = os.stat(target_name, dir_fd=managed_fd, follow_symlinks=False)
     except FileNotFoundError:
-        return _umask_default_mode()
+        return None
     if not stat.S_ISREG(metadata.st_mode):
         raise VaultWriteBoundaryError("vault write target is not a regular file")
     return stat.S_IMODE(metadata.st_mode)
 
 
-def _publish_managed_note(managed_fd: int, target_name: str, content: str, mode: int) -> None:
-    """Atomically replace one entry relative to a held managed-directory descriptor."""
+def _publish_managed_note(
+    managed_fd: int, target_name: str, content: str, mode: Optional[int]
+) -> None:
+    """Atomically replace one entry relative to a held managed-directory descriptor.
+
+    ``mode`` is the existing note's mode to preserve, or ``None`` for a new
+    note, whose temp is created 0666 so the kernel applies the umask (see
+    ``_target_mode``); the umask itself is never read or set here.
+    """
     target_name = validate_path_component(target_name, "vault note filename")
     temp_name = ""
     fd = -1
@@ -478,7 +489,7 @@ def _publish_managed_note(managed_fd: int, target_name: str, content: str, mode:
             fd = os.open(
                 temp_name,
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                mode,
+                0o666 if mode is None else mode,
                 dir_fd=managed_fd,
             )
             break
@@ -491,7 +502,8 @@ def _publish_managed_note(managed_fd: int, target_name: str, content: str, mode:
             fd = -1
             handle.write(content)
             handle.flush()
-            os.fchmod(handle.fileno(), mode)
+            if mode is not None:
+                os.fchmod(handle.fileno(), mode)
             os.fsync(handle.fileno())
         os.replace(
             temp_name,

@@ -45,7 +45,10 @@ USER_MESSAGE_PATTERN = r"^┃\s{2}"
 # Two middle-dot separators and a trailing duration are required.
 # OpenCode formats duration as "Ns" for short runs and "Nm Ns" once the turn
 # exceeds 60 seconds (e.g. "1m 8s").  Both forms must be matched.
-COMPLETION_MARKER_PATTERN = r"▣\s+\S+\s+·\s+.+?\s+·\s+(?:\d+m\s+)?\d+(?:\.\d+)?s"
+# The agent is shown by its display name, which may contain spaces
+# ("Sisyphus - Ultraworker"), so it runs up to the first separator.  It must not
+# cross a newline, or a stray "▣" earlier in the response would start the match.
+COMPLETION_MARKER_PATTERN = r"▣\s+[^·\n]+·\s+.+?\s+·\s+(?:\d+m\s+)?\d+(?:\.\d+)?s"
 
 # Processing footer — keybind hint present while the agent is generating.
 PROCESSING_FOOTER_PATTERN = r"\besc interrupt\b"
