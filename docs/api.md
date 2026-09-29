@@ -198,6 +198,22 @@ security boundary on top of them.
 Terminal identifiers used in these routes are eight-character hexadecimal
 strings. See [Control Planes](control-planes.md) for operator-facing choices.
 
+### Execution runtimes
+
+- `WS /runtime/channel` is the channel an execution runtime (`cao-bridge`)
+  dials, authenticated by the shared runtime token in the
+  `x-cao-runtime-token` header. It is refused when the server has no token.
+- `POST /runtimes/{runtime_id}/terminals` launches a terminal in a connected
+  runtime (`agent_profile`, optional `provider` and `working_directory`) and
+  returns `201` with the terminal.
+- `GET /runtimes` lists the connected runtimes and the terminals placed on
+  them.
+- The `/terminals/{terminal_id}*` operations above, and `DELETE
+  /sessions/{session_name}`, route a remote terminal to its runtime. They
+  return `503` when the runtime is not connected, `504` when the outcome is
+  unknown, and `502` when the runtime reports a failure. See
+  [Execution runtimes](execution-runtimes.md).
+
 ### Durable handoff results
 
 - `POST /terminals/run-step` runs one agent step and accepts an optional
