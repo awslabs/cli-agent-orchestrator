@@ -143,7 +143,6 @@ def strict_target_lock(
     target: Path,
     *,
     lock_timeout: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
-    lock_identity: str | None = None,
 ) -> Iterator[None]:
     """Hold the permanent common lock for ``target`` or refuse explicitly.
 
@@ -152,9 +151,33 @@ def strict_target_lock(
     Workflow create/update use this strict boundary because proceeding unlocked
     would make their existence/hash checks racy again.
     """
-    lock_path = (
-        _lock_path_for(target) if lock_identity is None else _lock_path_for_identity(lock_identity)
-    )
+    lock_path = _lock_path_for(target)
+    with _strict_lock_path(lock_path, target, lock_timeout):
+        yield
+
+
+@contextlib.contextmanager
+def strict_identity_lock(
+    lock_identity: str,
+    target: Path,
+    *,
+    lock_timeout: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
+) -> Iterator[None]:
+    """Hold a strict lock selected solely by a caller-provided identity.
+
+    Workflow authoring has already resolved and contained its target before it
+    constructs a filesystem-aware identity. Keeping that contained path out of
+    :func:`_lock_path_for` prevents a second, unguarded path resolution while
+    retaining the target in storage error messages.
+    """
+    lock_path = _lock_path_for_identity(lock_identity)
+    with _strict_lock_path(lock_path, target, lock_timeout):
+        yield
+
+
+@contextlib.contextmanager
+def _strict_lock_path(lock_path: Path, target: Path, lock_timeout: float) -> Iterator[None]:
+    """Acquire one already-selected strict lock path."""
     if not _FCNTL_AVAILABLE or fcntl is None:
         raise LockUnavailableError(
             f"inter-process locking is unavailable for workflow target {target}"

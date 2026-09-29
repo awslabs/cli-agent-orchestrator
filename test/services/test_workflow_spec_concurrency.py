@@ -395,7 +395,7 @@ def test_service_lock_timeout_preserves_target_and_releases_cleanly(
     lock_identity = svc._workflow_lock_identity(svc._safe_spec_path(target, str(tmp_path)))
 
     def _hold() -> None:
-        with atomic_file.strict_target_lock(target, lock_identity=lock_identity):
+        with atomic_file.strict_identity_lock(lock_identity, target):
             holder_ready.set()
             release_holder.wait(timeout=5)
 
@@ -403,14 +403,14 @@ def test_service_lock_timeout_preserves_target_and_releases_cleanly(
     holder.start()
     assert holder_ready.wait(timeout=5)
 
-    real_strict_lock = atomic_file.strict_target_lock
+    real_strict_lock = atomic_file.strict_identity_lock
 
     @contextmanager
-    def _short_lock(path: Path, *, lock_identity: str | None = None):
-        with real_strict_lock(path, lock_timeout=0.1, lock_identity=lock_identity):
+    def _short_lock(identity: str, path: Path):
+        with real_strict_lock(identity, path, lock_timeout=0.1):
             yield
 
-    monkeypatch.setattr(svc, "strict_target_lock", _short_lock)
+    monkeypatch.setattr(svc, "strict_identity_lock", _short_lock)
     try:
         with pytest.raises(atomic_file.LockTimeoutError):
             svc.update_workflow(
@@ -425,7 +425,7 @@ def test_service_lock_timeout_preserves_target_and_releases_cleanly(
         holder.join(timeout=5)
 
     assert not holder.is_alive()
-    with real_strict_lock(target, lock_timeout=0.5, lock_identity=lock_identity):
+    with real_strict_lock(lock_identity, target, lock_timeout=0.5):
         pass
 
 

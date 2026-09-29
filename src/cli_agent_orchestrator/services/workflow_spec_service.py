@@ -61,7 +61,7 @@ from cli_agent_orchestrator.models.workflow import validate_only as _model_valid
 from cli_agent_orchestrator.services.script_lint import lint_script
 from cli_agent_orchestrator.utils.atomic_file import (
     LockUnavailableError,
-    strict_target_lock,
+    strict_identity_lock,
 )
 
 logger = logging.getLogger(__name__)
@@ -1159,7 +1159,7 @@ def create_workflow(name: str, source: str, scan_dir: Optional[str] = None) -> S
     # path from creating even a lock sidecar outside the validated workflow
     # target identity.
     lock_target = _safe_spec_path(target_path, safe_base)
-    with strict_target_lock(Path(lock_target), lock_identity=_workflow_lock_identity(lock_target)):
+    with strict_identity_lock(_workflow_lock_identity(lock_target), Path(lock_target)):
         if os.path.exists(target_path):
             raise FileExistsError(f"workflow '{name}' already exists; use update to change it")
         _check_tier_collision(name, safe_base)  # -> TierCollisionError (409)
@@ -1226,7 +1226,7 @@ def update_workflow(
     """
     safe_base, target_path = _validate_write_target(name, scan_dir)
     lock_target = _safe_spec_path(target_path, safe_base)
-    with strict_target_lock(Path(lock_target), lock_identity=_workflow_lock_identity(lock_target)):
+    with strict_identity_lock(_workflow_lock_identity(lock_target), Path(lock_target)):
         if not os.path.exists(target_path):
             raise WorkflowNotFoundError(f"workflow '{name}' does not exist; use create to add it")
         _check_tier_collision(name, safe_base)
