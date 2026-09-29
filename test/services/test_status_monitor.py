@@ -2014,6 +2014,17 @@ class TestClearedBufferEvidenceIsPinnedToItsTurn:
         sm._apply_detection("t1", TerminalStatus.COMPLETED, work_evidence=True)
         assert sm.turn_state("t1") == (1, 1)
 
+    def test_work_evidence_is_ignored_for_a_turn_opened_without_a_clear(self):
+        """A special-key or init turn keeps the previous turn's bytes in the rolling
+        buffer, so a work sign there is old: it must not start the new turn."""
+        sm = StatusMonitor()
+        sm.notify_input_sent("t1")  # special key / init: no clear_rolling_buffer
+        sm._apply_detection("t1", TerminalStatus.COMPLETED, work_evidence=True)
+        assert sm.turn_state("t1") == (1, 0)
+        sm._apply_detection("t1", TerminalStatus.PROCESSING, work_evidence=False)
+        sm._apply_detection("t1", TerminalStatus.COMPLETED, work_evidence=False)
+        assert sm.turn_state("t1") == (1, 1)  # the legacy rule still closes it
+
     def test_a_turn_dispatched_without_a_clear_gets_no_bypass(self):
         """Provider init keystrokes and send_special_key open turns without
         clearing the buffer; their ready verdicts keep the conservative gate."""

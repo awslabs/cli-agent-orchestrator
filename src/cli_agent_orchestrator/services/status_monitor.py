@@ -612,7 +612,10 @@ class StatusMonitor:
         provider_decides = work_evidence is not None and self._turn_buffer_cleared.get(
             terminal_id, False
         )
-        if work_evidence is True:
+        # Evidence counts only from a buffer cleared for THIS turn. A turn opened
+        # without a clear (init, special keys) still holds the previous turn's
+        # bytes, work sign included, so there the legacy rule applies unchanged.
+        if provider_decides and work_evidence is True:
             self._turn_started[terminal_id] = True
         if detected in _ACTIVE_STATUSES:
             if not provider_decides:
