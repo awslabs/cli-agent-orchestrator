@@ -60,6 +60,7 @@ from cli_agent_orchestrator.clients.database import (
     get_inbox_messages,
     get_terminal_metadata,
     init_db,
+    list_all_terminals,
     upsert_handoff_result,
 )
 from cli_agent_orchestrator.constants import (
@@ -1263,6 +1264,43 @@ def _sweep_workflow_runs_at_startup() -> None:
         logger.warning("workflow retention sweep failed at startup: %s", e)
 
 
+def _persisted_terminals_at_startup() -> List[Dict[str, Any]]:
+    """Snapshot the terminal registry for startup re-adoption.
+
+    Taken synchronously in the lifespan, BEFORE the server serves a request or
+    any background task runs: re-adoption itself runs in a worker thread, and a
+    terminal that THIS server creates meanwhile must never be mistaken for one a
+    previous server left behind (re-arming it would race ``create_terminal``'s
+    own ``pipe_pane``, whose toggle would then switch the fresh pipe off).
+    """
+    try:
+        return list_all_terminals()
+    except Exception as e:  # noqa: BLE001 — never block startup on re-adoption
+        logger.warning("terminal re-adoption skipped: could not read the registry: %s", e)
+        return []
+
+
+def _readopt_terminals_at_startup(rows: List[Dict[str, Any]]) -> None:
+    """Re-adopt (or finalize) the terminals a previous server left behind.
+
+    Blocking tmux and SQLite work, one row at a time, so the lifespan runs it via
+    ``asyncio.to_thread`` like the other startup sweeps above. Best-effort: a
+    failure is logged and never prevents the server from starting.
+    """
+    try:
+        counts = terminal_service.readopt_terminals_at_startup(rows)
+    except Exception as e:  # noqa: BLE001 — never block startup on re-adoption
+        logger.warning("terminal re-adoption failed at startup: %s", e)
+        return
+    if any(counts.values()):
+        logger.info(
+            "Terminal re-adoption: %d re-adopted, %d finalized, %d left untouched",
+            counts["readopted"],
+            counts["finalized"],
+            counts["skipped"],
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
@@ -1308,6 +1346,15 @@ async def lifespan(app: FastAPI):
     log_writer_task = asyncio.create_task(log_writer.run())
     inbox_service_task = asyncio.create_task(inbox_service.run(registry))
     logger.info("Event bus consumers started (StatusMonitor, LogWriter, InboxService)")
+
+    # Re-adopt persisted terminals whose tmux windows survived a server restart
+    # (and finalize the ones whose session is confirmed gone). Scheduled AFTER
+    # the event bus consumers above: the re-armed FIFO readers publish into that
+    # pipeline. The rows are snapshotted here, before anything else runs; the
+    # blocking pass itself goes to a worker thread so the loop stays free.
+    readopt_task = asyncio.create_task(
+        asyncio.to_thread(_readopt_terminals_at_startup, _persisted_terminals_at_startup())
+    )
 
     # Start ApprovalBridge when AG-UI surface is enabled
     approval_bridge_task: Optional[asyncio.Task] = None
@@ -1409,6 +1456,15 @@ async def lifespan(app: FastAPI):
     inbox_reconcile_task.cancel()
     try:
         await inbox_reconcile_task
+    except asyncio.CancelledError:
+        pass
+
+    # Cancel startup re-adoption on shutdown, like the tasks above. This releases
+    # the lifespan from awaiting it; it cannot interrupt the worker thread, so a
+    # row already in progress still completes.
+    readopt_task.cancel()
+    try:
+        await readopt_task
     except asyncio.CancelledError:
         pass
 

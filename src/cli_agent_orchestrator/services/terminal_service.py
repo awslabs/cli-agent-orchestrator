@@ -31,6 +31,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import requests
 from pydantic import ValidationError
 
+from cli_agent_orchestrator.backends.base import TerminalBackend
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
@@ -306,6 +307,54 @@ def _resolve_working_directory(working_directory: Optional[str]) -> str:
         allow_file=False,
         description="Working directory",
     )
+
+
+def _write_terminal_snapshot(
+    terminal_id: str,
+    *,
+    session_name: str,
+    window_name: str,
+    agent_profile: Optional[str],
+    provider: str,
+    working_directory: Optional[str],
+    allowed_tools: Optional[list[str]],
+    caller_id: Optional[str],
+) -> None:
+    """Write (or refresh) TERMINAL_LOG_DIR/<tid>.snapshot.json.
+
+    The single writer of the snapshot format. ``create_terminal`` calls it at
+    creation (Step 3d: an early snapshot, so a crash still leaves restore
+    metadata behind) and ``capture_terminal_snapshot`` calls it again at
+    deletion, refreshing ``working_directory`` with the pane's live value.
+
+    The file is created owner-only (0600) from its first byte, and an existing
+    file is tightened too; ``constants.py`` creates the log directory 0700, so
+    this is defense in depth. Best-effort: snapshot failures never break the
+    caller.
+    """
+    try:
+        import json as _json
+
+        snapshot = {
+            "terminal_id": terminal_id,
+            "session_name": session_name,
+            "window_name": window_name,
+            "agent_profile": agent_profile,
+            "provider": provider,
+            "working_directory": working_directory,
+            "allowed_tools": allowed_tools,
+            "caller_id": caller_id,
+        }
+        snapshot_path = TERMINAL_LOG_DIR / f"{terminal_id}.snapshot.json"
+        # The mode in os.open only applies when O_CREAT creates the file, so an
+        # existing one (an older release's, or the creation-time snapshot being
+        # refreshed) is tightened with fchmod before anything is written.
+        fd = os.open(snapshot_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            os.fchmod(f.fileno(), 0o600)
+            f.write(_json.dumps(snapshot, indent=2))
+    except Exception as e:
+        logger.warning(f"Failed to write snapshot for {terminal_id}: {e}")
 
 
 def _roll_back_backend_create_locked(
@@ -1364,6 +1413,22 @@ async def create_terminal(
                     # ORIGINAL cancellation is re-raised below either way.
                     pass
             raise
+
+        # Step 3d: Early snapshot. Delete-time snapshotting only covers CLEAN
+        # deletions; a crash / tmux kill / reboot used to leave nothing behind.
+        # The snapshot's fields are static launch metadata, so write it now;
+        # capture_terminal_snapshot refreshes it through the same writer at
+        # deletion, with the pane's live working directory.
+        _write_terminal_snapshot(
+            terminal_id,
+            session_name=session_name,
+            window_name=window_name,
+            agent_profile=agent_profile,
+            provider=provider,
+            working_directory=resolved_working_directory,
+            allowed_tools=allowed_tools,
+            caller_id=caller_id,
+        )
 
         # Step 4/5: Set up the FIFO event-driven output pipeline for pipe-pane
         # backends (tmux). Event-inbox backends (herdr) deliver via their own
@@ -2826,20 +2891,17 @@ def capture_terminal_snapshot(terminal_id: str) -> Optional[Dict]:
         scrollback_path = TERMINAL_LOG_DIR / f"{terminal_id}.scrollback"
         scrollback_path.write_text(scrollback, encoding="utf-8")
 
-        import json as _json
-
-        snapshot = {
-            "terminal_id": terminal_id,
-            "session_name": metadata["tmux_session"],
-            "window_name": metadata["tmux_window"],
-            "agent_profile": metadata.get("agent_profile"),
-            "provider": metadata["provider"],
-            "working_directory": live_working_directory,
-            "allowed_tools": metadata.get("allowed_tools"),
-            "caller_id": metadata.get("caller_id"),
-        }
-        snapshot_path = TERMINAL_LOG_DIR / f"{terminal_id}.snapshot.json"
-        snapshot_path.write_text(_json.dumps(snapshot, indent=2), encoding="utf-8")
+        # Refresh the creation-time snapshot with the live working directory.
+        _write_terminal_snapshot(
+            terminal_id,
+            session_name=metadata["tmux_session"],
+            window_name=metadata["tmux_window"],
+            agent_profile=metadata.get("agent_profile"),
+            provider=metadata["provider"],
+            working_directory=live_working_directory,
+            allowed_tools=metadata.get("allowed_tools"),
+            caller_id=metadata.get("caller_id"),
+        )
     except Exception as e:
         logger.warning(f"Failed to snapshot terminal {terminal_id}: {e}")
 
@@ -3015,3 +3077,181 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
     except Exception as e:
         logger.error(f"Failed to delete terminal {terminal_id}: {e}")
         raise
+
+
+def readopt_terminals_at_startup(rows: List[Dict[str, Any]]) -> Dict[str, int]:
+    """Re-adopt persisted terminals after a cao-server restart.
+
+    ``create_terminal`` is the only place the FIFO -> EventBus logging
+    pipeline is armed, so restarting cao-server used to leave live tmux
+    agents half-adopted: the pane keeps running, but its ``<tid>.log`` stops
+    growing and status detection observes nothing.
+
+    Synchronous and blocking (tmux subprocesses and SQLite for every row): the
+    lifespan runs it in a worker thread. ``rows`` is the registry snapshot the
+    lifespan takes before the server starts serving, so terminals this server
+    creates meanwhile are never touched. Each row is decided under its session's
+    lifecycle lock, so it cannot interleave with a session teardown (#498):
+
+    - session confirmed alive and the window readable: re-arm the pipeline —
+      recreate the FIFO reader (same probe/re-arm closures ``create_terminal``
+      uses) and stop+start pipe-pane so the pane streams into the fresh FIFO
+      (a bare pipe_pane() would toggle a still-registered pipe OFF). Nothing
+      is typed into the pane: a quiet agent's status is seeded by the
+      pipe-liveness watchdog replaying the pane's current content once the
+      fresh FIFO has stayed silent for its cold-start grace period.
+    - session confirmed ABSENT (``session_exists_strict`` returned False):
+      finalize — recover a ``.scrollback`` from the ANSI-stripped ``<tid>.log``
+      if none exists (crashes never ran the delete-path capture), then tear the
+      terminal down the way session teardown does once its session is confirmed
+      gone: runtime dismantle (stale FIFO, provider cleanup; a deferred cleanup
+      keeps the row for a retry), then the DB row, so it does not linger as an
+      orphan until retention cleanup. The recovered scrollback is only what
+      the old server logged: ``<tid>.log`` stopped growing when that server
+      died, so whatever the agent printed after that is missing. It is not a
+      full transcript.
+    - could not tell — the strict session check raised, or the session is alive
+      but the window could not be read: leave the row untouched. Deleting a row
+      is teardown confirmation, which must never act on a lookup error (#498).
+      Leaving it costs nothing: the next restart re-evaluates it, and retention
+      cleanup still collects it if it really is dead. A window missing from a
+      live session lands here too: there is no strict window-level check, and
+      a window lookup rides on tmux listings, so "not found" is not proof (the
+      window may simply have been renamed).
+
+    Providers need no re-registration: ``provider_manager.get_provider``
+    rebuilds instances on demand from the DB row. Event-inbox backends
+    (herdr) deliver output via their own socket events, so there is nothing
+    to re-arm there.
+
+    Returns:
+        Counts: ``{"readopted": N, "finalized": M, "skipped": K}``, where
+        ``skipped`` rows were left exactly as they were.
+    """
+    counts = {"readopted": 0, "finalized": 0, "skipped": 0}
+    if not rows:
+        return counts
+    backend = get_backend()
+    if backend.supports_event_inbox():
+        return counts
+
+    for row in rows:
+        terminal_id = row["id"]
+        try:
+            with session_lifecycle_lock(row["tmux_session"]):
+                outcome = _readopt_terminal(backend, row)
+        except Exception as e:
+            logger.warning(f"Failed to re-adopt terminal {terminal_id}, leaving it untouched: {e}")
+            outcome = "skipped"
+        counts[outcome] += 1
+
+    return counts
+
+
+def _readopt_terminal(backend: TerminalBackend, row: Dict[str, Any]) -> str:
+    """Decide one persisted row and act on it; return its ``counts`` key.
+
+    The caller holds the row's session lifecycle lock.
+    """
+    terminal_id = row["id"]
+    session_name = row["tmux_session"]
+    window_name = row["tmux_window"]
+
+    try:
+        session_alive = backend.session_exists_strict(session_name)
+    except Exception as e:
+        logger.warning(
+            f"Could not tell whether session {session_name} of terminal {terminal_id} "
+            f"is alive; leaving it untouched: {e}"
+        )
+        return "skipped"
+
+    if not session_alive:
+        if not _finalize_dead_terminal(terminal_id, row):
+            return "skipped"
+        logger.info(f"Finalized dead terminal {terminal_id} ({session_name}:{window_name})")
+        return "finalized"
+
+    try:
+        # A 1-line history read is cheap for a live window and raises for one
+        # it cannot read.
+        backend.get_history(session_name, window_name, tail_lines=1)
+    except Exception as e:
+        logger.warning(
+            f"Session {session_name} is alive but window {window_name} of terminal "
+            f"{terminal_id} could not be read; leaving it untouched: {e}"
+        )
+        return "skipped"
+
+    _rearm_terminal_pipeline(backend, terminal_id, session_name, window_name)
+    logger.info(f"Re-adopted terminal {terminal_id} ({session_name}:{window_name})")
+    return "readopted"
+
+
+def _rearm_terminal_pipeline(
+    backend: TerminalBackend, terminal_id: str, session_name: str, window_name: str
+) -> None:
+    """Re-arm the FIFO -> EventBus pipeline of a terminal whose pane survived."""
+    fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
+
+    def _probe_pane(s=session_name, w=window_name) -> str:
+        return get_backend().get_history(s, w, tail_lines=PIPE_LIVENESS_TAIL_LINES)
+
+    def _rearm_pipe(s=session_name, w=window_name, p=str(fifo_path)) -> None:
+        get_backend().stop_pipe_pane(s, w)
+        get_backend().pipe_pane(s, w, p)
+
+    # Reader first, so it catches the pane from the pipe's first byte.
+    fifo_manager.create_reader(terminal_id, pane_probe=_probe_pane, rearm=_rearm_pipe)
+    try:
+        # stop-then-start, NOT a bare pipe_pane(): after the old server died
+        # the pane may still report pane_pipe=1, and tmux's ``pipe-pane -o``
+        # toggle would switch it OFF.
+        backend.stop_pipe_pane(session_name, window_name)
+        backend.pipe_pane(session_name, window_name, str(fifo_path))
+    except Exception:
+        # Nothing will ever write to this FIFO: unregister the reader (and its
+        # watchdog enrollment) rather than leave an orphan behind.
+        fifo_manager.stop_reader(terminal_id)
+        raise
+    # Deliberately NO keystroke. create_terminal's post-pipe Enter lands on a
+    # bare shell; here the pane holds a live agent in an arbitrary state, where
+    # Enter is a submit -- on a permission prompt it answers the highlighted
+    # option. The status buffer is seeded from the pane's own content instead:
+    # an agent that is working streams output through the fresh pipe, and one
+    # that is quiet (idle, or parked on a prompt) never delivers a byte, which
+    # is the watchdog's cold-start case -- it re-arms the pipe and replays the
+    # pane's current content into the pipeline (FifoManager._rearm_stalled_pipe).
+
+
+def _finalize_dead_terminal(terminal_id: str, row: Dict[str, Any]) -> bool:
+    """Finalize a terminal whose tmux session is confirmed gone.
+
+    Returns False when provider cleanup was deferred and the row was kept for a
+    retry (see ``dismantle_terminal_runtime``).
+    """
+    from cli_agent_orchestrator.utils.text import strip_terminal_escapes
+
+    # Best-effort: <tid>.log stays on disk either way, so a failed recovery
+    # loses nothing and must not keep a dead row alive.
+    try:
+        scrollback_path = TERMINAL_LOG_DIR / f"{terminal_id}.scrollback"
+        if not scrollback_path.exists():
+            log_path = TERMINAL_LOG_DIR / f"{terminal_id}.log"
+            if log_path.exists():
+                raw = log_path.read_text(encoding="utf-8", errors="replace")
+                scrollback_path.write_text(strip_terminal_escapes(raw), encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"Failed to recover scrollback for {terminal_id}: {e}")
+
+    # The same two halves session teardown runs once it has confirmed the
+    # session gone (#498), with kill_window=False for the same reason: there is
+    # no pane left to stop piping or to kill. Provider cleanup is the part that
+    # matters here -- it rebuilds Grok / MiniMax / Kimi Code private homes from
+    # the row, so the row must still exist when it runs. No live pane means no
+    # live working directory, so no worktree is removed.
+    if not dismantle_terminal_runtime(terminal_id, row, kill_window=False):
+        logger.warning("Terminal %s cleanup deferred; retaining its row for a retry", terminal_id)
+        return False
+    delete_terminal_row(terminal_id, row)
+    return True

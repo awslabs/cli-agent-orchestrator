@@ -16,6 +16,19 @@ def isolated_startup_skill_store(tmp_path, monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def no_startup_terminal_readoption(monkeypatch):
+    """Keep server startup from re-adopting terminals it finds in the registry.
+
+    Re-adoption stops and restarts ``pipe-pane`` on every live tmux window a
+    registry row points at. Tests that drive the real lifespan run against
+    whatever registry and tmux server the machine has, so without this they
+    could re-pipe a developer's own running agents. Tests of the re-adoption
+    wiring patch ``list_all_terminals`` themselves, which takes precedence.
+    """
+    monkeypatch.setattr("cli_agent_orchestrator.api.main.list_all_terminals", lambda: [])
+
+
 class TestClientWithHost(TestClient):
     """TestClient that always sends correct Host header for TrustedHostMiddleware."""
 

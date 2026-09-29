@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `cao-server` re-adopts the terminals a previous server left behind. Agents
+  run in tmux and outlive the server, but their output pipeline did not: after
+  a restart, `<id>.log` stopped growing and status stayed `unknown`. On startup,
+  each terminal whose tmux session is confirmed alive gets its pipeline
+  re-armed, without any key being sent to its pane; one whose session is
+  confirmed gone is finalized, with a `.scrollback` recovered from its log and
+  the same teardown as any other terminal, provider cleanup included; one whose
+  state cannot be established is left untouched. Every terminal now also gets
+  its `<id>.snapshot.json` (owner-only) when it is created, so a crash still
+  leaves restore metadata behind. See
+  [Terminal Lifecycle](docs/terminal-lifecycle.md#server-restart) (#667)
 - built-in `workflow_scout` role (`@builtin`, `fs_read`, `execute_bash`,
   `@cao-mcp-server`). The shipped scout profile previously resolved through
   the unknown-role fallback to unrestricted `["*"]`. It now resolves to this
