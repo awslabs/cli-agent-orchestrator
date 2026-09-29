@@ -9,6 +9,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from cli_agent_orchestrator.api.main import app
+from cli_agent_orchestrator.security import auth
 from cli_agent_orchestrator.services.session_env import (
     clear_session_env,
     get_session_env,
@@ -261,3 +263,49 @@ class TestSetSessionEnvLookupFailure:
         assert "could not determine whether session" in detail
         assert "retry" in detail
         assert get_session_env(SESSION) == {"KEEP": "old"}
+
+
+class TestSetSessionEnvScopeGate:
+    """``require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)`` on this secrets-writing route.
+
+    Every other test here runs with auth off, where the dependency admits everything, and
+    ``test_scope_coverage.py``'s enforcement tests exercise other routes — so without these
+    the route's scope contract is asserted by nothing. Auth is switched on the same way as
+    there: an IdP JWKS URI in the environment, and ``get_current_scopes`` overridden to
+    stand in for a validated token carrying the given scopes."""
+
+    @pytest.fixture(autouse=True)
+    def _auth_on(self, monkeypatch):
+        monkeypatch.setenv("CAO_AUTH_JWKS_URI", "https://idp.example/jwks")
+        yield
+        app.dependency_overrides.pop(auth.get_current_scopes, None)
+        clear_session_env(SESSION)
+
+    @staticmethod
+    def _token_with(scopes):
+        async def _dep():
+            return list(scopes)
+
+        app.dependency_overrides[auth.get_current_scopes] = _dep
+
+    @pytest.mark.parametrize(
+        "scopes", [[auth.SCOPE_READ], []], ids=["read-only-token", "token-without-scopes"]
+    )
+    def test_token_without_write_or_admin_is_403_and_stores_nothing(self, client, scopes):
+        self._token_with(scopes)
+
+        resp = _post_env(client, {"TOKEN": "s3cret"})
+
+        assert resp.status_code == 403
+        assert get_session_env(SESSION) == {}
+
+    @pytest.mark.parametrize(
+        "scope", [auth.SCOPE_WRITE, auth.SCOPE_ADMIN], ids=["write-token", "admin-token"]
+    )
+    def test_write_or_admin_token_is_admitted(self, client, scope):
+        self._token_with([scope])
+
+        resp = _post_env(client, {"TOKEN": "s3cret"})
+
+        assert resp.status_code == 200, resp.text
+        assert get_session_env(SESSION) == {"TOKEN": "s3cret"}
