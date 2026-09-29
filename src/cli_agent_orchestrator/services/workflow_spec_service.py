@@ -220,6 +220,8 @@ def _workflow_lock_identity(canonical_target: str, canonical_parent: str) -> str
     influencing the filesystem lookup. The original target path remains
     unchanged for every filesystem access. ASCII basename folding intentionally
     over-serializes case-distinct workflow names on case-sensitive filesystems.
+    Identity is ``(stat(safe_base), unresolved-name basename)``, not the resolved target's
+    parent; the writer's ``islink`` check refuses the only case where that distinction matters.
     """
     parent = os.path.realpath(canonical_parent)
     real_target = os.path.realpath(canonical_target)
@@ -334,6 +336,7 @@ def _contained_spec_exists(path: Union[str, Path], safe_base: str) -> bool:
     CodeQL's path-injection barrier does not survive a checked path being
     returned from another function. Keep the single positive containment
     check and ``exists`` sink together, matching the guarded read/write helpers.
+    A path resolving to ``safe_base`` itself is refused, including a symlinked name.
     """
     real_path = _resolve_contained_spec_path(path, safe_base)
     if not real_path.startswith(safe_base + os.sep):
@@ -412,7 +415,7 @@ def _write_contained_spec_bytes(
     manifest, not to user source.
 
     This helper owns atomic publication, not the admission lock. Workflow
-    create/update hold :func:`strict_target_lock` from their existence/hash
+    create/update hold :func:`strict_identity_lock` from their existence/hash
     checks through this call. Other direct callers must provide equivalent
     serialization when their result depends on prior target state.
 
