@@ -7,7 +7,7 @@ These tests pin the resolution, so a message meant for one agent cannot be
 delivered to whichever pane happens to be focused.
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 from libtmux.constants import PaneDirection
@@ -341,3 +341,150 @@ class TestAttachCommand:
             "-t",
             "ses:win",
         ]
+
+
+# ── captions ─────────────────────────────────────────────────────────
+
+
+def host_window(own_border=None):
+    """A pane window, and the border setting it carries itself.
+
+    Models ``show-options -w``: without ``-A`` tmux lists only what this window
+    sets, so a double that answers for the inherited default cannot see an
+    implementation that asks the window what it set. ``show_option`` is not
+    modelled, because the implementation must not use it.
+    """
+    window = MagicMock()
+    lines = [] if own_border is None else [f"pane-border-status {own_border}"]
+    window.cmd.return_value.stdout = lines
+    return window
+
+
+class TestPaneCaptions:
+    """A shared window is only readable if a person can tell the panes apart.
+
+    The caption reads the mark, not ``pane_title``: measured on tmux 3.6a, a
+    program in the pane sets its own title with OSC 2, so the title becomes
+    whatever the agent's TUI wants while the mark survives.
+    """
+
+    def test_the_caption_format_is_the_one_verified_against_tmux(self):
+        """Pinned to the exact string rendered on tmux 3.6a, not to its shape.
+
+        A malformed conditional still contains the mark, so a substring check
+        passes on a format tmux would refuse. Renaming the mark fails this on
+        purpose: the renamed format has not been put in front of tmux.
+        """
+        from cli_agent_orchestrator.clients.tmux import BORDER_CAPTION_FORMAT
+
+        assert BORDER_CAPTION_FORMAT == " #{?@cao_terminal,#{@cao_terminal},#{pane_index}} "
+
+    def test_the_caption_never_reads_the_pane_title(self):
+        from cli_agent_orchestrator.clients.tmux import BORDER_CAPTION_FORMAT
+
+        assert "pane_title" not in BORDER_CAPTION_FORMAT
+
+    def test_a_created_host_window_is_captioned(self, tmux, tmp_path):
+        from cli_agent_orchestrator.clients.tmux import (
+            BORDER_CAPTION_FORMAT,
+            BORDER_FORMAT_OPTION,
+            BORDER_STATUS_OPTION,
+            BORDER_STATUS_TOP,
+        )
+
+        session = session_with()
+        window = host_window()
+        session.new_window.return_value = window
+        tmux.server.sessions.get.return_value = session
+
+        tmux.create_pane("ses", "cao-agents", "coder-3", "tid", str(tmp_path))
+
+        assert window.set_option.call_args_list == [
+            call(BORDER_STATUS_OPTION, BORDER_STATUS_TOP),
+            call(BORDER_FORMAT_OPTION, BORDER_CAPTION_FORMAT),
+        ]
+
+    def test_a_window_opened_before_captions_existed_gets_them(self, tmux, tmp_path):
+        """The window outlives cao-server, so creation time is not the only chance."""
+        from cli_agent_orchestrator.clients.tmux import BORDER_STATUS_OPTION
+
+        window = host_window()
+        session = session_with(window=window)
+        tmux.server.sessions.get.return_value = session
+
+        tmux.create_pane("ses", "cao-agents", "coder-3", "tid", str(tmp_path))
+
+        assert BORDER_STATUS_OPTION in str(window.set_option.call_args_list)
+
+    @pytest.mark.parametrize("own_border", ["off", "top", "bottom"])
+    def test_a_window_with_its_own_border_setting_is_left_alone(self, tmux, tmp_path, own_border):
+        """Somebody who set this deliberately keeps it — including ``off``."""
+        window = host_window(own_border=own_border)
+        session = session_with(window=window)
+        tmux.server.sessions.get.return_value = session
+
+        tmux.create_pane("ses", "cao-agents", "coder-3", "tid", str(tmp_path))
+
+        window.set_option.assert_not_called()
+
+    def test_the_setting_never_leaves_that_window(self, tmux, tmp_path):
+        """Window scope only, so the user's own windows keep their borders."""
+        session = session_with()
+        session.new_window.return_value = host_window()
+        tmux.server.sessions.get.return_value = session
+
+        tmux.create_pane("ses", "cao-agents", "coder-3", "tid", str(tmp_path))
+
+        for mock in (session.set_option, tmux.server.set_option):
+            assert not [c for c in mock.call_args_list if "pane-border" in str(c)]
+
+    def test_a_tmux_that_refuses_the_options_still_gives_the_terminal(self, tmux, tmp_path):
+        """The captions are cosmetic; losing them must not lose the spawn."""
+        session = session_with()
+        window = host_window()
+        window.set_option.side_effect = LibTmuxException("unknown option: pane-border-status")
+        session.new_window.return_value = window
+        tmux.server.sessions.get.return_value = session
+
+        assert tmux.create_pane("ses", "cao-agents", "coder-3", "tid", str(tmp_path)) == "coder-3"
+
+    def test_a_tmux_that_refuses_the_read_still_gives_the_terminal(self, tmux, tmp_path):
+        """Asking the window what it set is the first thing that can fail."""
+        window = host_window()
+        window.cmd.side_effect = LibTmuxException("no server running")
+        session = session_with(window=window)
+        tmux.server.sessions.get.return_value = session
+
+        assert tmux.create_pane("ses", "cao-agents", "coder-3", "tid", str(tmp_path)) == "coder-3"
+
+    def test_the_caption_comes_after_the_split(self, tmux, tmp_path):
+        """A caption costs a row per pane, so it must not decide whether this fits."""
+        window = host_window()
+        session = session_with(window=window)
+        tmux.server.sessions.get.return_value = session
+
+        tmux.create_pane("ses", "cao-agents", "coder-3", "tid", str(tmp_path))
+
+        names = [c[0] for c in window.mock_calls]
+        assert names.index("split") < names.index("set_option")
+
+    def test_a_full_window_is_still_captioned(self, tmux, tmp_path):
+        """The placement is settled once the split has been tried, so caption anyway.
+
+        Otherwise a window already at capacity when it was opened by an earlier
+        version would never be captioned: every spawn into it raises first.
+        """
+        from cli_agent_orchestrator.clients.tmux import (
+            BORDER_STATUS_OPTION,
+            PaneSpawnUnavailable,
+        )
+
+        window = host_window()
+        window.split.side_effect = LibTmuxException("no space for new pane")
+        session = session_with(window=window)
+        tmux.server.sessions.get.return_value = session
+
+        with pytest.raises(PaneSpawnUnavailable):
+            tmux.create_pane("ses", "cao-agents", "coder-3", "tid", str(tmp_path))
+
+        assert BORDER_STATUS_OPTION in str(window.set_option.call_args_list)

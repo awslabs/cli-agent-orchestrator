@@ -58,6 +58,19 @@ NO_RELAYOUT = "none"
 # Holds the most panes of the four, which is what a fleet needs.
 DEFAULT_PANE_LAYOUT = "tiled"
 
+# What a person reads off the window. tmux expands a user option inside a
+# format, so the border can show the mark itself -- the one label an agent
+# cannot overwrite, unlike pane_title, which a TUI rewrites on startup. Built
+# from TERMINAL_MARK_OPTION so renaming the mark cannot leave the border
+# silently reading an option nothing sets. A pane somebody split by hand has no
+# mark, and falls back to its index rather than showing an empty border.
+BORDER_STATUS_OPTION = "pane-border-status"
+BORDER_FORMAT_OPTION = "pane-border-format"
+BORDER_STATUS_TOP = "top"
+BORDER_CAPTION_FORMAT = (
+    " #{?" + TERMINAL_MARK_OPTION + ",#{" + TERMINAL_MARK_OPTION + "},#{pane_index}} "
+)
+
 
 class PaneSpawnUnavailable(RuntimeError):
     """This session cannot take another pane right now — spawn a window instead."""
@@ -1169,7 +1182,44 @@ class TmuxClient:
         }
         if window_shell:
             kwargs["window_shell"] = window_shell
-        return session.new_window(**kwargs).panes[0]
+        window = session.new_window(**kwargs)
+        TmuxClient._caption_panes(window, host_window_name)
+        return window.panes[0]
+
+    @staticmethod
+    def _window_sets_own_border(window: Window) -> bool:
+        """Whether this window carries a border setting of its own.
+
+        Read the way ``_pane_mark`` reads a mark: through ``show-options``
+        without ``-A``, so tmux's default does not answer for the window, and
+        without libtmux's accessor, which raises for an option the window does
+        not set.
+        """
+        prefix = f"{BORDER_STATUS_OPTION} "
+        return any(
+            line.startswith(prefix) for line in window.cmd("show-options", "-w").stdout or []
+        )
+
+    @staticmethod
+    def _caption_panes(window: Window, host_window_name: str) -> None:
+        """Caption each pane with its mark, unless the window sets its own border.
+
+        Scoped to this window, and skipped for a window that already carries a
+        border setting: that leaves one somebody arranged by hand alone, and it
+        is also why a window CAO opened before captions existed gets them on
+        the next spawn into it rather than never — the window outlives
+        cao-server.
+
+        Captions are cosmetic. A tmux that refuses the options must not cost
+        the caller its terminal.
+        """
+        try:
+            if TmuxClient._window_sets_own_border(window):
+                return
+            window.set_option(BORDER_STATUS_OPTION, BORDER_STATUS_TOP)
+            window.set_option(BORDER_FORMAT_OPTION, BORDER_CAPTION_FORMAT)
+        except Exception as e:
+            logger.warning(f"Could not caption panes in window '{host_window_name}': {e}")
 
     @staticmethod
     def _split_host_window(
@@ -1260,9 +1310,18 @@ class TmuxClient:
                     session, host_window_name, working_directory, window_shell, pane_env
                 )
             else:
-                pane = self._split_host_window(
-                    host_window, working_directory, window_shell, pane_env, pane_layout
-                )
+                try:
+                    pane = self._split_host_window(
+                        host_window, working_directory, window_shell, pane_env, pane_layout
+                    )
+                finally:
+                    # After the split is attempted, never before: a caption costs
+                    # a row per pane, and how many panes a window holds is what
+                    # decides whether this terminal fits or falls back to a window
+                    # of its own -- cosmetics must not move a terminal. After the
+                    # attempt that placement is already settled, so a full window
+                    # still gets captions for the panes it does hold.
+                    self._caption_panes(host_window, host_window_name)
             pane.set_option(TERMINAL_MARK_OPTION, terminal_name)
 
             logger.info(

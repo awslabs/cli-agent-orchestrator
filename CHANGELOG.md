@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- pane-mode windows caption each pane with the terminal running in it.
+  `pane_window` gets `pane-border-status` and a border format reading the
+  `@cao_terminal` mark, so the caption survives an agent whose TUI sets its own
+  pane title. Set on that window only, and skipped for a window that carries a
+  `pane-border-status` of its own, so an arrangement by hand is left alone. A
+  tmux that refuses the options costs a warning rather than the spawn (#74)
 - built-in `workflow_scout` role (`@builtin`, `fs_read`, `execute_bash`,
   `@cao-mcp-server`). The shipped scout profile previously resolved through
   the unknown-role fallback to unrestricted `["*"]`. It now resolves to this

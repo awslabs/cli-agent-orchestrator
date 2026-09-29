@@ -298,6 +298,20 @@ every lookup resolves through it. Set that option only at pane scope — pane
 options inherit from window options, and a value set globally would make every
 pane answer to the same name.
 
+That name is also what the window shows. The first pane terminal turns on
+`pane-border-status` for `pane_window` and formats the border with the mark, so
+every pane is captioned with the terminal running in it. The caption reads the
+mark rather than the pane title because a program in the pane can set its own
+title: an agent whose TUI does that turns a title-based caption into whatever
+the agent wants, while the mark is out of its reach.
+
+Both options are set on `pane_window` alone, and only when that window carries
+no `pane-border-status` of its own -- so a window you arranged yourself keeps
+its borders, `pane-border-status off` stays off, and a window CAO opened before
+this existed is captioned on the next spawn into it rather than never. A pane
+you split by hand carries no mark and is captioned with its index. The captions
+cost one row per pane, which counts against the capacity above.
+
 `pane_window` does not have to exist: the first pane-mode terminal in a session
 creates it and takes its first pane, and the ones after it split that window.
 
