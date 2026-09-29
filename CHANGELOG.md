@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `cao session set-env SESSION KEY=VALUE...` and `POST /sessions/{session_name}/env`
+  re-register a live session's forwarded env vars (`cao launch --env`) after a
+  cao-server restart wipes them from server memory, so workers spawned in that
+  session afterwards inherit them again. The merge is on top of what the server holds
+  (per-key overwrite) and atomic. It is validated by the same shared validator as
+  `cao launch --env`, bounded on the merged map, and denies code-execution vectors
+  (`LD_*`, `DYLD_*`, `BASH_ENV`, `ENV`, `PROMPT_COMMAND`, `ZDOTDIR`, `NODE_OPTIONS`,
+  `PYTHONPATH`, `PYTHONSTARTUP`, `PERL5OPT`, `RUBYOPT`, `PATH`). That denylist is not
+  a security boundary, and the launch path does not apply it. Requires `cao:write` or
+  `cao:admin` when auth is enabled (#668)
 - built-in `workflow_scout` role (`@builtin`, `fs_read`, `execute_bash`,
   `@cao-mcp-server`). The shipped scout profile previously resolved through
   the unknown-role fallback to unrestricted `["*"]`. It now resolves to this
