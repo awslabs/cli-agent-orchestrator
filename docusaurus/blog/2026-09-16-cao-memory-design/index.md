@@ -5,12 +5,21 @@ tags: [deep-dive]
 description: How CAO gives agents one shared memory layer across sessions, models, and CLI providers.
 ---
 
-A coding agent can solve a hard problem. But its session is temporary. The next agent may
-repeat the same investigation.
+Agents often repeat work that another agent already finished. A new session may need the same
+project context. Another provider may reread the same documents. A proven workflow may be
+discovered again from scratch.
 
-CAO memory gives every supported agent the same memory tools. An agent can remember a fact
-with one CLI provider and recall it later with another. The memory belongs to CAO, not to a
-specific model or CLI.
+CAO memory saves conclusions that make the next task faster. It is more than conversation
+history. It can hold project decisions, user preferences, reusable instructions, document
+findings, and workflow lessons.
+
+The result is closer to a scoped project wiki than a transcript archive. Markdown keeps the
+knowledge readable. Search and typed relationships connect related topics. Obsidian can
+project those relationships into a browsable graph.
+
+CAO gives every supported agent the same memory tools. An agent can remember a fact with one
+CLI provider and recall it later with another. The memory belongs to CAO, not to a specific
+model or CLI.
 
 This post explains how that shared layer works. For commands and configuration, see the
 [original CAO memory reference](https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/memory.md).
@@ -101,6 +110,19 @@ SQLite relationship state, not a second source of truth.
 
 Some SQLite data can be rebuilt from Markdown. Some cannot. For example, a rejected
 relationship is a human decision. That decision must remain in SQLite.
+
+## What causes CAO to save a memory
+
+CAO does not save every conversation by default. A memory is saved when an agent calls
+`memory_store`. A user can trigger that call with a direct request such as, "Remember that
+this project uses Python 3.12."
+
+An agent can also save a reusable fact while working when its instructions allow that
+action. The opt-in learning loop can store a lesson after a supervisor records a validated
+outcome and starts retrospection. It does not run automatically at session end.
+
+CAO has no general automatic conversation-capture step today. This avoids turning every
+message, guess, or secret into long-lived memory.
 
 ## Save first, organize later
 
@@ -344,3 +366,11 @@ the native wiki. SQLite, BM25, and graph state become rebuildable views of the v
 CAO writes only inside one managed folder. Other mapped folders are read-only sources.
 Release one has no file watcher. External edits need reconciliation before indexes and
 relationships are current.
+
+## Summary
+
+CAO memory reduces repeated work by preserving reusable conclusions instead of archiving
+every conversation. Every supported agent uses the same MCP tools and CAO-owned scope rules.
+Markdown keeps the content readable, while SQLite tracks metadata and relationship state.
+Bounded injection, explicit recall, retention, repair, and workflow replay keep that knowledge
+useful and controlled across sessions, models, and CLI providers.
