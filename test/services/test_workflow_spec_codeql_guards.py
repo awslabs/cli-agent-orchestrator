@@ -44,3 +44,19 @@ def test_lock_identity_stats_only_the_trusted_parent() -> None:
         ]
         assert len(identity_calls) == 1
         assert ast.unparse(identity_calls[0].args[1]) == "safe_base"
+
+
+def test_create_existence_check_uses_contained_target() -> None:
+    """Create admission must not reintroduce the unchecked name-derived path."""
+    exists_calls = [
+        call
+        for call in _calls(svc.create_workflow)
+        if isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Attribute)
+        and isinstance(call.func.value.value, ast.Name)
+        and call.func.value.value.id == "os"
+        and call.func.value.attr == "path"
+        and call.func.attr == "exists"
+    ]
+    assert len(exists_calls) == 1
+    assert ast.unparse(exists_calls[0].args[0]) == "lock_target"

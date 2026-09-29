@@ -1162,7 +1162,7 @@ def create_workflow(name: str, source: str, scan_dir: Optional[str] = None) -> S
     # target identity.
     lock_target = _safe_spec_path(target_path, safe_base)
     with strict_identity_lock(_workflow_lock_identity(lock_target, safe_base), Path(lock_target)):
-        if os.path.exists(target_path):
+        if os.path.exists(lock_target):
             raise FileExistsError(f"workflow '{name}' already exists; use update to change it")
         _check_tier_collision(name, safe_base)  # -> TierCollisionError (409)
         spec = _validated_script_spec(name, source, target_path)
