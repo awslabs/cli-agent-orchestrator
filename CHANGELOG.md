@@ -146,6 +146,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   availability and is `["*"]` unless the profile sets it. Applying the CAO
   policy to Kiro at launch, and refusing restricted roles on providers that
   cannot enforce them, are separate decisions. OpenCode is the one native provider whose policy is the INSTALLED agent's: the gate now says `native at install time` and that launch overrides do not change it, instead of `Blocked: (none)` beside a native promise; the third copy of the "providers with native tool denial" list (docs/cursor-cli.md) and the prompt-only provider prose in docs/tool-restrictions.md now agree with the table, and the Kiro e2e case that asserted blocking now asserts the opposite directly (a restricted Kiro supervisor can run bash), so an environmental failure cannot pass as the expected result; on the author's machine the case has not yet produced a result (kiro-cli 2.24.1 timed out waiting for its agent prompt), so the classification rests on the launch flags and Kiro's documentation, not on an observed run (#824)
+- **The local API bearer was sent to other nodes.** `handoff`/`assign` with a
+  `target_host`, `delete_terminal` with a `target_host`, `get_handoff_result`
+  with a `target_host`, and a remote worker's `send_message` back to its
+  supervisor's `CAO_CALLBACK_URL` all attached
+  `CAO_AUTH_LOCAL_TOKEN` to requests aimed at another host. The token now goes
+  only to this node's own `API_BASE_URL`; cross-node requests carry no
+  `Authorization` header (the elastic worker gateway headers are unaffected).
+  No change when authentication is off. Behaviour change when it is on: a
+  multi-node deployment that gave every node the same `CAO_AUTH_LOCAL_TOKEN`
+  was authenticating these cross-node calls by accident, and they now fail
+  with 401 on the remote node; the token is documented as this node's
+  loopback credential only (#822)
+
+- **Both MCP servers now pin `transport="stdio"`.** FastMCP otherwise honours
+  `FASTMCP_TRANSPORT` from the environment, and an `http` value would have
+  turned a stdio tool into a loopback listener with no MCP-level auth in front
+  of its API hop (#822)
+- **The credential gate on federated memory writes and `--redact` exports
+  missed common key formats.** It now recognises Anthropic and OpenAI API
+  keys, GitHub fine-grained and OAuth/app tokens, Slack tokens, JSON Web
+  Tokens, Slack bot/user/app-level (`xapp-`) tokens and AWS secret access
+  keys (next to an `aws ... secret`/`access` context word or a
+  `SecretAccessKey` key), and it no longer lets an invisible character inside
+  a prefix hide a credential: the whole Unicode format category (zero-width
+  characters, bidi marks, soft hyphen, invisible operators; frozen at Unicode
+  16.0 so Python 3.10 and 3.11, whose own tables are older, catch the same
+  code points) plus the variation selectors, not a short list. Parsed
+  documents keep their key
+  context: the execution manifest and step output redact a 40-character value
+  under a `SecretAccessKey`-style key, a value whose key makes the pair read
+  as a credential assignment (`{"password": …}`, `{"api_key": …}`), and the
+  `value` of a `{name: AWS_SECRET_ACCESS_KEY, value: …}` entry, none of which
+  the text pattern can see once key and value are scanned apart. The graph export gate
+  scans the parsed view (`scan_json_for_secrets`) rather than its
+  `json.dumps` form, whose default `ensure_ascii` had turned a hidden
+  character into a `\u` escape before the gate could strip it.
+  Vendor patterns are matched before the generic `bearer`/`secret` ones, so
+  the reported pattern name is the specific one (#821)
+
+- **Atomic file writes read the process umask by setting it to 0.** The
+  writer behind profile and archive updates (`utils/atomic_file`) and the
+  vault writer behind federated memory notes (`services/vault/writer`) both
+  derived a new file's mode with `os.umask(0)` followed by a restore. The
+  umask is process-wide and cao-server is threaded, so a file created with
+  the default mode by any other thread inside that window could be born
+  world-writable. A new file's temp is now created with `O_EXCL` and mode
+  0666 so the kernel applies the umask itself; an existing file's mode is
+  preserved as before, and the umask is never touched (#821)
+
+- **The blocked-path list for working directories and archive targets was
+  exact-match only.** `/etc/passwd` passed with `allow_file`, and an existing
+  directory such as `/etc/ssl` was a valid working directory. System
+  configuration, kernel and device pseudo-filesystems, boot files, the
+  system binary and library directories and the crontab spool (`/etc`,
+  `/proc`, `/sys`, `/dev`, `/boot`, `/bin`, `/sbin`, `/usr/bin`, `/usr/sbin`,
+  `/lib`, `/lib64`, `/usr/lib`, `/usr/lib64`, `/root`, `/var/spool/cron`, and
+  `/private/etc` on macOS; the `/usr/lib*` entries are what makes the `/lib`
+  rule hold on usr-merged Linux, where `/lib` resolves to `/usr/lib`) are now refused at any
+  depth, with `/dev/shm` carved out. `/tmp`, `/var`, `/home`-style roots stay
+  exact-only because projects legitimately live beneath them; a cao-server
+  that runs as root must keep its projects outside `/root` (#821)
+- **CI referenced GitHub Actions by mutable tag**, including in the jobs that
+  hold `RELEASE_DEPLOY_KEY`, `CODECOV_TOKEN` and the Pages OIDC token; five
+  steps ran `npm install` rather than `npm ci` against committed lockfiles, and
+  no `uv` command was held to the committed lock: a PR that changed
+  `pyproject.toml` without updating `uv.lock` had `uv run` re-resolve and
+  install the new dependencies. All 66 tag references across `ci.yml`,
+  `release.yml`, `gh-pages.yml`, `secret-scan.yml` and the four provider test
+  workflows are pinned to the commit each tag resolved to (tag kept as a
+  comment), `npm ci` is used throughout, every workflow that runs `uv` sets
+  `UV_LOCKED=1` so `uv sync`, `uv run` (including inside `make`) and
+  `uv export` fail on a stale lock instead of re-resolving, and the `uv sync`
+  and `uv export` commands spell `--locked` as well (`publish-to-pypi.yml`
+  gains the same). `.github/dependabot.yml` now exists so the SHA pins move;
+  a test asserts every `uses:` is a full SHA and every uv workflow carries the
+  lock policy. `cargo-deny.yml`'s actions were already pinned (#820)
 
 ### Changed
 
