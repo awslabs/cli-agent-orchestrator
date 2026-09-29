@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import json
 import time
+from contextlib import contextmanager
 from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
 from cli_agent_orchestrator.services.herdr_inbox_service import (
@@ -573,6 +574,99 @@ class TestHerdrInboxServiceReconcile:
 
         mock_delete.assert_not_called()
 
+    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_reconcile_revalidates_replacement_under_session_lock(
+        self, mock_snap, mock_list_terminals, mock_delete
+    ):
+        """A replacement created after discovery must not be deleted from a stale snapshot.
+
+        The first snapshot represents the old workspace just before a replacement
+        session/window is created. The destructive DB cross-check must take the
+        same per-session lifecycle lock as creation, re-read DB rows, then consult
+        fresh Herdr state while still holding that lock.
+        """
+
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        initial = {
+            "panes": [],
+            "tabs": [],
+            "workspaces": [{"workspace_id": "ws-old", "label": "my-session"}],
+        }
+        replacement = {
+            "panes": [
+                {
+                    "pane_id": "pane-new",
+                    "terminal_id": "tid-new",
+                    "workspace_id": "ws-new",
+                }
+            ],
+            "tabs": [
+                {
+                    "label": "replacement-window",
+                    "tab_id": "ws-new:1",
+                    "workspace_id": "ws-new",
+                }
+            ],
+            "workspaces": [{"workspace_id": "ws-new", "label": "my-session"}],
+        }
+        mock_snap.side_effect = [initial, replacement]
+
+        lock_state = {"held": False}
+
+        @contextmanager
+        def fake_lifecycle_lock(session_name):
+            assert session_name == "my-session"
+            assert not lock_state["held"]
+            lock_state["held"] = True
+            try:
+                yield
+            finally:
+                lock_state["held"] = False
+
+        def rows_for_replacement(session_name):
+            assert session_name == "my-session"
+            assert lock_state["held"], "DB worklist must be frozen under the lifecycle lock"
+            return [{"id": "tid-new", "tmux_window": "replacement-window"}]
+
+        mock_list_terminals.side_effect = rows_for_replacement
+
+        with patch(
+            "cli_agent_orchestrator.services.session_lock.session_lifecycle_lock",
+            fake_lifecycle_lock,
+        ):
+            _run_async(service._reconcile())
+
+        assert mock_snap.call_count >= 2
+        mock_delete.assert_not_called()
+
+    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_reconcile_fresh_recheck_failure_never_proves_ghost(
+        self, mock_snap, mock_list_terminals, mock_delete
+    ):
+        """An unreadable fresh snapshot must defer, never delete from stale evidence."""
+
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        mock_snap.side_effect = [
+            {
+                "panes": [],
+                "tabs": [],
+                "workspaces": [{"workspace_id": "ws-old", "label": "my-session"}],
+            },
+            None,
+        ]
+        mock_list_terminals.return_value = [
+            {"id": "tid-maybe-live", "tmux_window": "replacement-window"}
+        ]
+
+        _run_async(service._reconcile())
+
+        assert mock_snap.call_count >= 2
+        mock_delete.assert_not_called()
+
     @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
     @patch("cli_agent_orchestrator.clients.database.delete_terminal")
     @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
@@ -769,6 +863,39 @@ class TestHerdrInboxServiceStartupDbCleanup:
         _run_async(service._startup_db_cleanup())
 
         mock_retain.assert_called_once_with("tid-absent", on_cleanup_deferred=ANY)
+
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service._retain_deferred_failure_tombstone")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_deferred_init_failure")
+    @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
+    @patch(
+        "cli_agent_orchestrator.clients.database."
+        "list_pending_deferred_init_external_owner_terminal_ids"
+    )
+    def test_periodic_tombstone_rediscovery_recovers_after_initial_db_failure(
+        self, mock_list, mock_meta, mock_failure, mock_retain
+    ):
+        """A DB outage must not make an absent-workspace tombstone undiscoverable forever."""
+
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        mock_list.side_effect = [RuntimeError("database is locked"), ["tid-retry"]]
+        mock_meta.return_value = {
+            "id": "tid-retry",
+            "deferred_init_external_owner": True,
+            "deferred_init_failure": {
+                "phase": "deferred_init",
+                "kind": "interrupted_init",
+                "message": "interrupted",
+            },
+            "deferred_init_runtime_reclaimed": False,
+        }
+        mock_failure.return_value = mock_meta.return_value["deferred_init_failure"]
+        mock_retain.return_value = True
+
+        assert service._rediscover_deferred_failure_tombstones() is False
+        mock_retain.assert_not_called()
+
+        assert service._rediscover_deferred_failure_tombstones() is True
+        mock_retain.assert_called_once_with("tid-retry", on_cleanup_deferred=ANY)
 
 
 class TestHerdrInboxServiceSingleSubscribePerConnection:

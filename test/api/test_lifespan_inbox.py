@@ -208,3 +208,48 @@ class TestLifespanInboxWiring:
             # Assert (shutdown — after context exit): no herdr task was created.
             mocks.herdr_cls.assert_not_called()
             assert _find_task(tasks, mocks.herdr_cls.return_value.start.return_value) is None
+
+    @pytest.mark.asyncio
+    async def test_incomplete_deferred_recovery_starts_retry_task_and_cancels_it(self) -> None:
+        """A transient startup DB failure schedules bounded recovery retry wiring."""
+
+        tasks: list = []
+        backend = MagicMock()  # tmux-like: no extra Herdr service needed here
+        retry_called = MagicMock(name="retry_called")
+        retry_sources: list = []
+
+        async def fake_retry() -> None:
+            retry_called()
+
+        def retry_factory():
+            source = fake_retry()
+            retry_sources.append(source)
+            return source
+
+        retry_mock = MagicMock(name="retry_recovery", side_effect=retry_factory)
+
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.terminal_service."
+                "recover_interrupted_deferred_init_external_owners",
+                new_callable=AsyncMock,
+                return_value=False,
+            ) as recover,
+            patch(
+                "cli_agent_orchestrator.api.main.terminal_service."
+                "retry_interrupted_deferred_init_external_owners",
+                new=retry_mock,
+            ),
+            _patched_lifespan(backend, tasks),
+        ):
+            async with lifespan(app):
+                recover.assert_awaited_once_with()
+                retry_mock.assert_called_once_with()
+                assert len(retry_sources) == 1
+                retry_task = _find_task(tasks, retry_sources[0])
+                assert retry_task is not None
+                retry_task.cancel.assert_not_called()
+
+            retry_task.cancel.assert_called_once()
+            # The fake create_task closes rather than runs the coroutine.
+            retry_called.assert_not_called()

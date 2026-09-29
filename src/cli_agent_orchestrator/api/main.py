@@ -1283,7 +1283,16 @@ async def lifespan(app: FastAPI):
     # Deferred-init tasks are process-local.  Recover any external-owner rows
     # left pending by a prior cao-server crash/restart into durable ERROR before
     # background cleanup can mistake them for ordinary ghosts.
-    await terminal_service.recover_interrupted_deferred_init_external_owners()
+    deferred_init_recovery_task: Optional[asyncio.Task] = None
+    recovery_complete = await terminal_service.recover_interrupted_deferred_init_external_owners()
+    if not recovery_complete:
+        # A transient SQLite/read failure during startup used to strand the
+        # missed rows forever. Retry only until one complete scan succeeds.
+        # terminal_service's current-process fence prevents these retries from
+        # classifying newly-created live deferred inits as restart survivors.
+        deferred_init_recovery_task = asyncio.create_task(
+            terminal_service.retry_interrupted_deferred_init_external_owners()
+        )
     _seed_default_skills_at_startup()
     _reconcile_memory_at_startup()
     registry = PluginRegistry()
@@ -1376,6 +1385,13 @@ async def lifespan(app: FastAPI):
             pass
         set_herdr_inbox_service(None)
         logger.info("Herdr inbox service stopped")
+
+    if deferred_init_recovery_task is not None:
+        deferred_init_recovery_task.cancel()
+        try:
+            await deferred_init_recovery_task
+        except asyncio.CancelledError:
+            pass
 
     # Cancel consumer tasks on shutdown
     status_monitor_task.cancel()

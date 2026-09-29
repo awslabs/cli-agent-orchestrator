@@ -206,6 +206,34 @@ _CURRENT_COMPOSER_PROBE_MAX_CHARS = 64
 # silently leaving a worker uninitialized. Tasks drop themselves on completion.
 _deferred_init_tasks: set = set()
 
+# External-owner deferred-init rows survive provider startup failures so Bridge
+# and other external observers can read a durable verdict. Restart recovery
+# scans those rows and converts ones stranded by a PREVIOUS cao-server process
+# into interrupted_init failures. A retry of that scan after startup must not
+# mistake a worker being initialized by THIS process for a crash survivor.
+#
+# The fence is set before an external-owner row is inserted (inside the same
+# creation critical section) and is cleared only after its deferred-init task
+# settles. A threading lock is used because row creation itself runs in
+# asyncio.to_thread while recovery/task callbacks run on the event loop.
+_active_deferred_init_external_owner_ids: set[str] = set()
+_active_deferred_init_external_owner_lock = threading.RLock()
+
+
+def _mark_deferred_init_external_owner_active(terminal_id: str) -> None:
+    with _active_deferred_init_external_owner_lock:
+        _active_deferred_init_external_owner_ids.add(terminal_id)
+
+
+def _clear_deferred_init_external_owner_active(terminal_id: str) -> None:
+    with _active_deferred_init_external_owner_lock:
+        _active_deferred_init_external_owner_ids.discard(terminal_id)
+
+
+def _is_deferred_init_external_owner_active(terminal_id: str) -> bool:
+    with _active_deferred_init_external_owner_lock:
+        return terminal_id in _active_deferred_init_external_owner_ids
+
 
 def inject_memory_context(
     first_message: str, terminal_id: str, frozen_memory: str | None = None
@@ -1312,6 +1340,13 @@ async def create_terminal(
                     deferred_delete_on_failure = _deferred_failure_delete_from_creation(
                         caller_id, effective_env
                     )
+                    if deferred_delete_on_failure is False:
+                        # Restart recovery may be retried after server startup.
+                        # Fence this external-owner row BEFORE it becomes
+                        # visible in SQLite so a concurrent recovery pass never
+                        # mistakes this process's live initialization for a
+                        # crash-stranded row from the previous process.
+                        _mark_deferred_init_external_owner_active(terminal_id)
 
                 # From here the backend resource EXISTS, so every remaining step
                 # is guarded: on failure the resource is rolled back under this
@@ -1358,6 +1393,7 @@ async def create_terminal(
                         request_fingerprint=request_fingerprint,
                     )
                 except BaseException:
+                    _clear_deferred_init_external_owner_active(terminal_id)
                     _roll_back_backend_create_locked(
                         session_name,
                         created_window_name,
@@ -1392,6 +1428,7 @@ async def create_terminal(
                     # the shielded task still completes on the loop. The
                     # ORIGINAL cancellation is re-raised below either way.
                     pass
+            _clear_deferred_init_external_owner_active(terminal_id)
             raise
 
         # Step 4/5: Set up the FIFO event-driven output pipeline for pipe-pane
@@ -1464,7 +1501,7 @@ async def create_terminal(
             # is not reliable enough. Cross-node callback ownership is likewise
             # explicit in the launch env at this point.
             assert deferred_delete_on_failure is not None
-            _schedule_deferred_init(
+            deferred_task = _schedule_deferred_init(
                 provider_instance,
                 terminal_id,
                 initial_message,
@@ -1473,6 +1510,12 @@ async def create_terminal(
                 initial_caller_id=caller_id,
                 delete_on_failure=deferred_delete_on_failure,
             )
+            # A handful of unit/integration seams patch the private scheduler
+            # with a non-Task mock. Production always returns an asyncio.Task;
+            # if the seam replaced it, release the pre-insert fence here so one
+            # test cannot leak process-local recovery state into another.
+            if deferred_delete_on_failure is False and not isinstance(deferred_task, asyncio.Task):
+                _clear_deferred_init_external_owner_active(terminal_id)
         else:
             await provider_instance.initialize()
 
@@ -1538,6 +1581,8 @@ async def create_terminal(
     except Exception as e:
         # Cleanup on failure: clean up FIFO reader, status monitor, provider, and session
         logger.error(f"Failed to create terminal: {e}")
+        if terminal_id is not None:
+            _clear_deferred_init_external_owner_active(terminal_id)
         try:
             if terminal_id is not None:
                 fifo_manager.stop_reader(terminal_id)
@@ -2040,7 +2085,7 @@ async def _clear_deferred_init_external_owner(terminal_id: str) -> None:
     await asyncio.to_thread(_publish_deferred_init_complete_fallback, terminal_id)
 
 
-async def recover_interrupted_deferred_init_external_owners() -> None:
+async def recover_interrupted_deferred_init_external_owners() -> bool:
     """Turn restart-stranded external deferred inits into durable failures.
 
     Deferred-init tasks live only in the cao-server process.  After a restart,
@@ -2051,18 +2096,28 @@ async def recover_interrupted_deferred_init_external_owners() -> None:
     instead of a permanently pending tombstone/404 ambiguity.
     """
 
+    # A False return means the durable enumeration was incomplete and a
+    # startup retry must run. Current-process active workers are skipped below.
     try:
         terminal_ids = await asyncio.to_thread(
             list_pending_deferred_init_external_owner_terminal_ids
         )
     except Exception as exc:  # noqa: BLE001 — startup remains resilient
         logger.warning("Could not list interrupted deferred-init terminals: %s", exc)
-        return
+        return False
 
+    complete_scan = True
     for terminal_id in terminal_ids:
+        if _is_deferred_init_external_owner_active(terminal_id):
+            logger.debug(
+                "Skipping restart recovery for current-process deferred-init terminal %s",
+                terminal_id,
+            )
+            continue
         try:
             metadata = await asyncio.to_thread(get_terminal_metadata, terminal_id)
         except Exception as exc:  # noqa: BLE001 — retry on next restart/cleanup pass
+            complete_scan = False
             logger.warning(
                 "Could not inspect deferred-init terminal %s during restart recovery: %s",
                 terminal_id,
@@ -2090,6 +2145,34 @@ async def recover_interrupted_deferred_init_external_owners() -> None:
             registry=None,
             delete_on_failure=False,
         )
+    return complete_scan
+
+
+async def retry_interrupted_deferred_init_external_owners(
+    *,
+    initial_delay: float = 1.0,
+    max_delay: float = 30.0,
+) -> None:
+    """Retry an incomplete startup recovery scan until one full pass succeeds.
+
+    This is intentionally not an eternal polling loop. Once the previous
+    process's durable rows have been scanned successfully there is no restart
+    cohort left to discover. Retrying only after an incomplete pass closes the
+    transient SQLite hole without continuously reclassifying live workers.
+    """
+
+    delay = max(0.0, float(initial_delay))
+    cap = max(delay, float(max_delay))
+    while True:
+        await asyncio.sleep(delay)
+        try:
+            if await recover_interrupted_deferred_init_external_owners():
+                return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — maintenance must remain best-effort
+            logger.warning("Deferred-init restart recovery retry failed: %s", exc)
+        delay = min(cap, max(0.1, delay * 2 if delay else 0.1))
 
 
 def _persist_deferred_init_failure(
@@ -2489,7 +2572,7 @@ def _schedule_deferred_init(
     *,
     initial_caller_id: Optional[str] = None,
     delete_on_failure: bool | None = None,
-) -> None:
+) -> asyncio.Task | None:
     """Kick off provider.initialize() in the background and, on success,
     deliver the initial message via send_input.
 
@@ -2673,10 +2756,21 @@ def _schedule_deferred_init(
         loop = asyncio.get_running_loop()
     except RuntimeError:
         logger.error(f"Deferred init for {terminal_id}: no running event loop; init skipped")
-        return
+        _clear_deferred_init_external_owner_active(terminal_id)
+        return None
     task = loop.create_task(_run())
+    if delete_on_failure is False:
+        # Direct callers of this private scheduler may not have come through
+        # create_terminal's pre-insert fence. Marking again is idempotent.
+        _mark_deferred_init_external_owner_active(terminal_id)
     _deferred_init_tasks.add(task)
-    task.add_done_callback(_deferred_init_tasks.discard)
+
+    def _on_done(done_task: asyncio.Task) -> None:
+        _deferred_init_tasks.discard(done_task)
+        _clear_deferred_init_external_owner_active(terminal_id)
+
+    task.add_done_callback(_on_done)
+    return task
 
 
 def get_terminal(terminal_id: str) -> Dict:

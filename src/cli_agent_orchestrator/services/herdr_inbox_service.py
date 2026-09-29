@@ -344,6 +344,7 @@ class HerdrInboxService:
             await asyncio.sleep(10.0)
             self._retry_pending_closed_sessions()
             self._retry_pending_tombstone_runtime_cleanup()
+            self._rediscover_deferred_failure_tombstones()
             try:
                 await self.check_kiro_supplements()
             except Exception:
@@ -451,6 +452,74 @@ class HerdrInboxService:
             if not retained or not deferred:
                 self._pending_tombstone_runtime_cleanup.discard(terminal_id)
 
+    def _rediscover_deferred_failure_tombstones(self) -> bool:
+        """Re-scan retained external-owner rows for durable failures.
+
+        Startup recovery can persist an interrupted-init failure AFTER Herdr's
+        one-time startup cleanup if SQLite was temporarily unavailable. Querying
+        the small external-owner cohort on each maintenance tick lets Herdr find
+        that newly durable tombstone even when its workspace vanished entirely.
+
+        A merely-pending current-process deferred init is never dismantled: it
+        has no durable failure yet, and the process-local active fence is checked
+        as an additional guard. Returns False only when the DB scan itself was
+        incomplete; the next maintenance tick retries automatically.
+        """
+
+        from cli_agent_orchestrator.clients.database import (
+            get_terminal_metadata,
+            list_pending_deferred_init_external_owner_terminal_ids,
+        )
+        from cli_agent_orchestrator.services.terminal_service import (
+            _is_deferred_init_external_owner_active,
+            get_deferred_init_failure,
+        )
+
+        try:
+            terminal_ids = list_pending_deferred_init_external_owner_terminal_ids()
+        except Exception as exc:  # noqa: BLE001 — maintenance retries next tick
+            logger.warning(
+                "Deferred-init tombstone rediscovery could not list retained rows: %s",
+                exc,
+            )
+            return False
+
+        complete_scan = True
+        for terminal_id in terminal_ids:
+            if _is_deferred_init_external_owner_active(terminal_id):
+                continue
+            try:
+                metadata = get_terminal_metadata(terminal_id)
+            except Exception as exc:  # noqa: BLE001 — retry this row next tick
+                complete_scan = False
+                logger.warning(
+                    "Deferred-init tombstone rediscovery could not inspect %s: %s",
+                    terminal_id,
+                    exc,
+                )
+                continue
+            if not metadata or metadata.get("deferred_init_runtime_reclaimed"):
+                continue
+            try:
+                failure = get_deferred_init_failure(
+                    terminal_id, metadata.get("deferred_init_failure")
+                )
+            except Exception as exc:  # noqa: BLE001 — sidecar/DB read is uncertain
+                complete_scan = False
+                logger.warning(
+                    "Deferred-init tombstone rediscovery could not read failure for %s: %s",
+                    terminal_id,
+                    exc,
+                )
+                continue
+            if failure is None:
+                continue
+            _retain_deferred_failure_tombstone(
+                terminal_id,
+                on_cleanup_deferred=self._pending_tombstone_runtime_cleanup.add,
+            )
+        return complete_scan
+
     async def _socket_loop(self) -> None:
         """Connect to herdr socket and listen for events with reconnect.
 
@@ -543,6 +612,7 @@ class HerdrInboxService:
             get_terminal_metadata,
             list_terminals_by_session,
         )
+        from cli_agent_orchestrator.services.session_lock import session_lifecycle_lock
 
         # One socket call replaces the former pane-list + workspace-list +
         # tab-list subprocess fan-out. All three data structures below are derived
@@ -570,51 +640,66 @@ class HerdrInboxService:
             if ws.get("workspace_id") and ws.get("label")
         }
 
-        # workspace_id -> set of live tab labels (= CAO window names), from
-        # snapshot.tabs.
-        live_tabs_by_workspace: Dict[str, set] = {}
-        for tab in snapshot.get("tabs", []):
-            ws_id = tab.get("workspace_id", "")
-            label = tab.get("label", "")
-            if ws_id and label:
-                live_tabs_by_workspace.setdefault(ws_id, set()).add(label)
-
         # DB cross-check: find terminals in DB whose tab no longer exists in herdr.
         # This catches ghost records from previous server runs where _pane_to_terminal
         # starts empty (so the stale-pane diff below produces nothing).
-        for ws_id, session_name in self._workspace_to_session.items():
-            live_labels = live_tabs_by_workspace.get(ws_id, set())
-            try:
-                db_terminals = list_terminals_by_session(session_name)
-            except Exception as exc:  # noqa: BLE001 — stale-pane pass below can still recover
-                logger.warning(
-                    "Reconcile: could not list DB terminals for %s: %s", session_name, exc
-                )
+        #
+        # The first snapshot is DISCOVERY ONLY. Session/window labels are
+        # reusable: a replacement can be created after that snapshot and before
+        # the DB read. Freeze creation with the same per-session lifecycle lock,
+        # enumerate the current DB worklist, and then take a fresh scoped Herdr
+        # snapshot before any destructive action. Unknown fresh liveness always
+        # defers instead of turning stale evidence into a delete.
+        processed_sessions: Set[str] = set()
+        for session_name in self._workspace_to_session.values():
+            if session_name in processed_sessions:
                 continue
-            for term in db_terminals:
-                window = term.get("tmux_window", "")
-                if window and window not in live_labels:
-                    if _retain_deferred_failure_tombstone(
-                        term["id"], on_cleanup_deferred=self._pending_tombstone_runtime_cleanup.add
-                    ):
-                        logger.info(
-                            "Reconcile: retaining deferred-init terminal %s "
-                            "(%s:%s) as external-owner tombstone",
-                            term["id"],
-                            session_name,
-                            window,
-                        )
-                        continue
-                    logger.info(
-                        f"Reconcile: deleting ghost terminal {term['id']} "
-                        f"({session_name}:{window}) — tab not in herdr"
+            processed_sessions.add(session_name)
+            with session_lifecycle_lock(session_name):
+                try:
+                    db_terminals = list_terminals_by_session(session_name)
+                except Exception as exc:  # noqa: BLE001 — stale-pane pass can still recover
+                    logger.warning(
+                        "Reconcile: could not list DB terminals for %s: %s",
+                        session_name,
+                        exc,
                     )
-                    try:
-                        delete_terminal(term["id"])
-                    except Exception as e:
-                        logger.warning(
-                            f"Reconcile: failed to delete ghost terminal {term['id']}: {e}"
+                    continue
+
+                live_labels = self._fresh_live_tab_labels_for_session(session_name)
+                if live_labels is None:
+                    logger.warning(
+                        "Reconcile: could not establish fresh tab liveness for %s; "
+                        "deferring DB ghost cleanup",
+                        session_name,
+                    )
+                    continue
+
+                for term in db_terminals:
+                    window = term.get("tmux_window", "")
+                    if window and window not in live_labels:
+                        if _retain_deferred_failure_tombstone(
+                            term["id"],
+                            on_cleanup_deferred=self._pending_tombstone_runtime_cleanup.add,
+                        ):
+                            logger.info(
+                                "Reconcile: retaining deferred-init terminal %s "
+                                "(%s:%s) as external-owner tombstone",
+                                term["id"],
+                                session_name,
+                                window,
+                            )
+                            continue
+                        logger.info(
+                            f"Reconcile: deleting ghost terminal {term['id']} "
+                            f"({session_name}:{window}) — absent from fresh Herdr state"
                         )
+                        try:
+                            delete_terminal(term["id"])
+                        except Exception as e:
+                            logger.warning(
+                                f"Reconcile: failed to delete ghost terminal {term['id']}: {e}"
+                            )
 
         # Find stale panes: stored pane_id no longer in herdr's live pane list.
         #
@@ -911,6 +996,49 @@ class HerdrInboxService:
         except (subprocess.SubprocessError, json.JSONDecodeError, KeyError, OSError) as e:
             logger.warning("_live_tab_labels: could not query herdr (%s)", e)
             return None
+
+    def _fresh_live_tab_labels_for_session(self, session_name: str) -> Optional[Set[str]]:
+        """Return fresh tab labels for one CAO session, or None if identity is unreadable.
+
+        Session labels are reusable, so destructive reconciliation cannot reuse
+        labels captured by an older snapshot. This helper takes a fresh Herdr
+        snapshot and scopes tabs through the workspace ids whose CURRENT label
+        matches the session name. Any malformed snapshot structure fails closed.
+        """
+
+        snapshot = self._fetch_snapshot()
+        if snapshot is None:
+            return None
+        workspaces = snapshot.get("workspaces")
+        tabs = snapshot.get("tabs")
+        if not isinstance(workspaces, list) or not isinstance(tabs, list):
+            return None
+
+        workspace_ids: Set[str] = set()
+        for workspace in workspaces:
+            if not isinstance(workspace, dict):
+                return None
+            if workspace.get("label") != session_name:
+                continue
+            workspace_id = workspace.get("workspace_id")
+            if not isinstance(workspace_id, str) or not workspace_id:
+                return None
+            workspace_ids.add(workspace_id)
+
+        if not workspace_ids:
+            return set()
+
+        labels: Set[str] = set()
+        for tab in tabs:
+            if not isinstance(tab, dict):
+                return None
+            if tab.get("workspace_id") not in workspace_ids:
+                continue
+            label = tab.get("label")
+            if not isinstance(label, str) or not label:
+                return None
+            labels.add(label)
+        return labels
 
     def _resolve_session_from_herdr(self, workspace_id: str) -> Optional[str]:
         """Resolve a workspace_id to its session name from live herdr state.

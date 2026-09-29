@@ -111,6 +111,8 @@ class TestCreateTerminal:
     ):
         """The real terminal layer sends the model to provider construction and
         the first task to the established deferred-init scheduler."""
+        from cli_agent_orchestrator.services import terminal_service
+
         mock_gen_id.return_value = "test1234"
         mock_gen_session.return_value = "cao-session"
         mock_gen_window.return_value = "developer-abcd"
@@ -123,6 +125,12 @@ class TestCreateTerminal:
         mock_provider = AsyncMock()
         mock_provider_manager.create_provider.return_value = mock_provider
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+
+        def assert_external_owner_fenced_before_insert(*args, **kwargs):
+            del args, kwargs
+            assert terminal_service._is_deferred_init_external_owner_active("test1234")
+
+        mock_db_create.side_effect = assert_external_owner_fenced_before_insert
 
         result = await create_terminal(
             "codex",
@@ -146,6 +154,9 @@ class TestCreateTerminal:
             initial_caller_id=None,
             delete_on_failure=False,
         )
+        # The scheduler is mocked in this test, so create_terminal releases the
+        # process-local fence instead of leaking it into later tests.
+        assert not terminal_service._is_deferred_init_external_owner_active("test1234")
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service._schedule_deferred_init")
@@ -3173,10 +3184,12 @@ class TestDeferredInitFailureNotification:
             delete_on_failure=False,
         )
         (task,) = set(terminal_service._deferred_init_tasks) - before_tasks
+        assert terminal_service._is_deferred_init_external_owner_active("worker99")
         await task
 
         mock_send.assert_called_once()
         mock_surface.assert_awaited_once()
+        assert not terminal_service._is_deferred_init_external_owner_active("worker99")
         assert mock_surface.call_args.kwargs["kind"] == "provider_error_after_delivery"
         assert mock_surface.call_args.kwargs["delete_on_failure"] is False
 
@@ -3428,6 +3441,72 @@ class TestDeferredInitFailureNotification:
         assert surface.call_args.kwargs["kind"] == "interrupted_init"
         assert surface.call_args.kwargs["exception_type"] == "ServerRestart"
         assert surface.call_args.kwargs["delete_on_failure"] is False
+
+    @pytest.mark.asyncio
+    async def test_restart_recovery_reports_incomplete_scan_for_retry(self, monkeypatch):
+        from cli_agent_orchestrator.services import terminal_service
+
+        pending = MagicMock(side_effect=RuntimeError("database is locked"))
+        monkeypatch.setattr(
+            terminal_service,
+            "list_pending_deferred_init_external_owner_terminal_ids",
+            pending,
+        )
+
+        complete = await terminal_service.recover_interrupted_deferred_init_external_owners()
+
+        assert complete is False
+
+    @pytest.mark.asyncio
+    async def test_restart_recovery_skips_current_process_deferred_init(self, monkeypatch):
+        from cli_agent_orchestrator.services import terminal_service
+
+        monkeypatch.setattr(
+            terminal_service,
+            "list_pending_deferred_init_external_owner_terminal_ids",
+            MagicMock(return_value=["worker99"]),
+        )
+        metadata = MagicMock(
+            return_value={
+                "id": "worker99",
+                "deferred_init_external_owner": True,
+                "deferred_init_failure": None,
+            }
+        )
+        monkeypatch.setattr(terminal_service, "get_terminal_metadata", metadata)
+        surface = AsyncMock()
+        monkeypatch.setattr(terminal_service, "_surface_deferred_init_failure", surface)
+
+        terminal_service._mark_deferred_init_external_owner_active("worker99")
+        try:
+            complete = await terminal_service.recover_interrupted_deferred_init_external_owners()
+        finally:
+            terminal_service._clear_deferred_init_external_owner_active("worker99")
+
+        assert complete is True
+        metadata.assert_not_called()
+        surface.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_restart_recovery_retry_loop_retries_until_scan_succeeds(self, monkeypatch):
+        from cli_agent_orchestrator.services import terminal_service
+
+        recover = AsyncMock(side_effect=[False, False, True])
+        sleep = AsyncMock()
+        monkeypatch.setattr(
+            terminal_service,
+            "recover_interrupted_deferred_init_external_owners",
+            recover,
+        )
+        monkeypatch.setattr(terminal_service.asyncio, "sleep", sleep)
+
+        await terminal_service.retry_interrupted_deferred_init_external_owners(
+            initial_delay=0.01,
+            max_delay=0.02,
+        )
+
+        assert recover.await_count == 3
+        assert sleep.await_count == 3
 
     @pytest.mark.asyncio
     async def test_successful_init_missing_row_does_not_create_completion_sidecar(
