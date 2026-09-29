@@ -114,6 +114,9 @@ from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroCapabilityError,
     KiroPhase0KASError,
 )
+from cli_agent_orchestrator.runtime_channel.registry import RemoteRuntimeError
+from cli_agent_orchestrator.runtime_channel.server import router as runtime_channel_router
+from cli_agent_orchestrator.runtime_channel.token import runtime_token
 from cli_agent_orchestrator.security.auth import (
     SCOPE_ADMIN,
     SCOPE_READ,
@@ -1332,6 +1335,10 @@ async def lifespan(app: FastAPI):
     # Start flow daemon as background task
     daemon_task = asyncio.create_task(flow_daemon())
 
+    # Read the runtime-channel token now, so it leaves this process's
+    # environment before any tmux server (and so any agent pane) starts.
+    runtime_token()
+
     # Register event loop with event bus for thread-safe publishing
     loop = asyncio.get_running_loop()
     bus.set_loop(loop)
@@ -1501,6 +1508,8 @@ app = FastAPI(
     version=SERVER_VERSION,
     lifespan=lifespan,
 )
+# Execution runtimes (#745): WS /runtime/channel and the /runtimes routes.
+app.include_router(runtime_channel_router)
 
 # Methods whose request could change server state. The Origin check only
 # guards these — GET/HEAD/OPTIONS stay open (reads leak nothing stateful, and
@@ -3510,6 +3519,8 @@ async def delete_session(
         return {"success": True, **result}
     except HTTPException:
         raise
+    except RemoteRuntimeError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -3950,6 +3961,8 @@ async def send_terminal_input(
             orchestration_type=orchestration_type,
         )
         return {"success": success}
+    except RemoteRuntimeError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except TerminalInputBlockedError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
@@ -3981,6 +3994,8 @@ async def send_terminal_key(
         # Blocking tmux send-keys — off the loop.
         success = await asyncio.to_thread(terminal_service.send_special_key, terminal_id, key)
         return {"success": success}
+    except RemoteRuntimeError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -4002,6 +4017,8 @@ async def get_terminal_output(
         # transcript can't stall the whole server.
         output = await asyncio.to_thread(terminal_service.get_output, terminal_id, mode)
         return TerminalOutputResponse(output=output, mode=mode)
+    except RemoteRuntimeError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except OutputExtractionError as e:
         # Ordered before the ValueError arm it subclasses, same as run_step: the
         # terminal and the route both resolved -- only the response marker was
@@ -4073,6 +4090,8 @@ async def exit_terminal(
         # Blocking tmux I/O — off the loop.
         await asyncio.to_thread(terminal_service.exit_terminal_cli, terminal_id)
         return {"success": True}
+    except RemoteRuntimeError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -7154,6 +7173,8 @@ async def delete_terminal(
         return {"success": True}
     except HTTPException:
         raise
+    except RemoteRuntimeError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:

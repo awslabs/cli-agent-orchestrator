@@ -34,6 +34,7 @@ from cli_agent_orchestrator.clients.database import (
     get_session_incarnations,
     list_terminals_by_session,
     list_terminals_in_sessions,
+    session_is_remote,
     update_terminals_session_incarnation,
 )
 from cli_agent_orchestrator.constants import SESSION_PREFIX
@@ -515,6 +516,35 @@ def get_session(session_name: str) -> Dict:
         raise
 
 
+def _delete_remote_session(session_name: str, registry: PluginRegistry | None) -> Optional[Dict]:
+    """Tear down a session whose terminals run in an execution runtime (#745).
+
+    Returns None for a local session. A remote session's tmux lives in its
+    runtime, so each terminal is deleted there (``terminal_service.delete_terminal``
+    routes it and emits its ``post_kill_terminal``) and the local tmux is never
+    consulted. A ``RemoteRuntimeError`` (runtime not connected, no answer)
+    propagates to the caller.
+    """
+    if not session_is_remote(session_name):
+        return None
+    from cli_agent_orchestrator.services import terminal_service
+
+    result: Dict = {"deleted": [], "errors": []}
+    for terminal in list_terminals_by_session(session_name):
+        if not terminal_service.delete_terminal(terminal["id"], registry=registry):
+            result["errors"].append(
+                {"terminal_id": terminal["id"], "error": "cleanup deferred; retry delete_session"}
+            )
+    if not result["errors"]:
+        result["deleted"].append(session_name)
+    dispatch_plugin_event(
+        registry,
+        "post_kill_session",
+        PostKillSessionEvent(session_id=session_name, session_name=session_name),
+    )
+    return result
+
+
 def delete_session(session_name: str, registry: PluginRegistry | None = None) -> Dict:
     """Delete session and cleanup, reconciling tmux and the registry atomically.
 
@@ -618,6 +648,9 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
             f"'{SESSION_PREFIX}'); refusing to delete a session CAO did not create"
         )
     result: Dict = {"deleted": [], "errors": []}
+    remote = _delete_remote_session(session_name, registry)
+    if remote is not None:
+        return remote
     # Terminals whose row was actually dropped, with the metadata their
     # post_kill_terminal payload needs. Collected under the lock, dispatched
     # after it is released.

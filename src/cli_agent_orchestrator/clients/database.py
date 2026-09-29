@@ -101,6 +101,10 @@ class TerminalModel(Base):
     # distinguish the old rows from failures that belong to the CURRENT live
     # session. NULL is reserved for rows created before this column existed.
     session_incarnation_id = Column(String, nullable=True)
+    # The execution runtime this terminal runs in (#745); NULL for a terminal on
+    # this host. Its own column rather than a ``metadata`` key, because an agent
+    # can rewrite its metadata but must not be able to move its own placement.
+    runtime_id = Column(String, nullable=True)
     last_active = Column(DateTime, default=datetime.now)
 
     # ORDERING CONTRACT: the two session-scoped reads -- ``list_terminals_by_session``
@@ -651,6 +655,18 @@ def init_db() -> None:
     # Appended LAST (issue #447, ``handoff_results``). Its own new table, no shared
     # columns with anything above, so registry order is immaterial here too.
     _migrate_add_handoff_results()
+
+
+#: The tables the terminal service writes for panes on this host. An execution
+#: runtime (``cao-bridge``) needs only these; orchestration state stays central.
+RUNTIME_TABLES = ("terminals", "inbox", "idempotency_keys")
+
+
+def init_runtime_db() -> None:
+    """Initialize only the pane tables, for an execution runtime (#745)."""
+    Base.metadata.create_all(bind=engine, tables=[Base.metadata.tables[t] for t in RUNTIME_TABLES])
+    _restrict_db_file_permissions()
+    _migrate_terminals_schema()
 
 
 def _restrict_db_file_permissions() -> None:
@@ -1857,6 +1873,10 @@ def _migrate_terminals_schema() -> None:
             conn.execute("ALTER TABLE terminals ADD COLUMN model_honored BOOLEAN")
             conn.commit()
             logger.info("Migration: added model_honored column to terminals table")
+        if "runtime_id" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN runtime_id TEXT")
+            conn.commit()
+            logger.info("Migration: added runtime_id column to terminals table")
         conn.close()
     except Exception as e:
         logger.warning(f"Migration check for terminals schema failed: {e}")
@@ -1883,6 +1903,7 @@ def create_terminal(
     new_session_incarnation: bool = False,
     model: Optional[str] = None,
     model_honored: Optional[bool] = None,
+    runtime_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record.
 
@@ -1939,6 +1960,7 @@ def create_terminal(
             metadata_json=_json.dumps(metadata) if metadata else None,
             deferred_init_external_owner=bool(deferred_init_external_owner),
             session_incarnation_id=session_incarnation_id,
+            runtime_id=runtime_id,
         )
         db.add(terminal)
         if idempotency_key:
@@ -1981,6 +2003,7 @@ def create_terminal(
             "deferred_init_external_owner": bool(deferred_init_external_owner),
             "deferred_init_runtime_reclaimed": False,
             "session_incarnation_id": session_incarnation_id,
+            "runtime_id": terminal.runtime_id,
         }
 
 
@@ -2094,6 +2117,7 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
                 getattr(terminal, "deferred_init_runtime_reclaimed", False)
             ),
             "session_incarnation_id": getattr(terminal, "session_incarnation_id", None),
+            "runtime_id": terminal.runtime_id,
             "last_active": terminal.last_active,
         }
 
@@ -2581,6 +2605,25 @@ def list_all_terminals() -> List[Dict[str, Any]]:
             }
             for t in terminals
         ]
+
+
+def list_terminal_ids_on_runtime(runtime_id: str) -> List[str]:
+    """Ids of the terminals whose central row places them on ``runtime_id``."""
+    with SessionLocal() as db:
+        rows = db.query(TerminalModel.id).filter(TerminalModel.runtime_id == runtime_id).all()
+        return [row[0] for row in rows]
+
+
+def session_is_remote(tmux_session: str) -> bool:
+    """True when a terminal of ``tmux_session`` runs in an execution runtime (#745)."""
+    with SessionLocal() as db:
+        row = (
+            db.query(TerminalModel.id)
+            .filter(TerminalModel.tmux_session == tmux_session)
+            .filter(TerminalModel.runtime_id.isnot(None))
+            .first()
+        )
+        return row is not None
 
 
 def list_pending_receiver_ids_by_provider(provider: str) -> List[str]:
