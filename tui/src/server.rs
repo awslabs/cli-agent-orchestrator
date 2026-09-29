@@ -589,6 +589,10 @@ fn route(id: CommandId) -> Option<Route> {
         CommandId::SessionStatus => {
             templated(Method::Get, "/terminals/{terminal_id}", &["terminal_id"])
         }
+        // HIDE, so routeless: `POST /sessions/{session_name}/env` exists (PR #668), but a HIDE
+        // command is unreachable through `commands()` and the route table's own test forbids
+        // a HIDE row carrying a route. Wiring it would be the reclassification, not a fix.
+        CommandId::SessionSetEnv => None,
 
         // ── `cao plugin *` — HIDE, all four ───────────────────────────────────────────────
         // Routeless on purpose, not for want of endpoints: `/plugins` exists (and now carries a
@@ -2670,7 +2674,7 @@ mod tests {
 
     /// **23 routes for the 24 IN-APP commands, and `profile find` is the one without.**
     ///
-    /// The distribution is settled ground truth — 24 IN-APP / 18 HANDOFF / 49 HIDE = 91 — and
+    /// The distribution is settled ground truth — 24 IN-APP / 18 HANDOFF / 54 HIDE = 96 — and
     /// every number below is a **hard-coded literal**. Deriving any of them from `route()` or
     /// from the catalog would compare production against itself, which is the vacuous shape this
     /// project has hit repeatedly.
@@ -2734,7 +2738,7 @@ mod tests {
             .count();
         assert_eq!(
             in_app, 24,
-            "the settled distribution is 24 IN-APP / 18 HANDOFF / 49 HIDE = 91; if this moved, \
+            "the settled distribution is 24 IN-APP / 18 HANDOFF / 54 HIDE = 96; if this moved, \
              the 23-route figure above needs re-deriving rather than adjusting"
         );
     }

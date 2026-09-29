@@ -179,6 +179,11 @@ from cli_agent_orchestrator.services.workflow_journal import (
 from cli_agent_orchestrator.services.worktree_service import WorktreeError
 from cli_agent_orchestrator.telemetry import init_telemetry, shutdown_telemetry
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
+from cli_agent_orchestrator.utils.forwarded_env import (
+    ForwardedEnvError,
+    check_forwarded_env_budget,
+    validate_forwarded_env,
+)
 from cli_agent_orchestrator.utils.logging import install_access_log_redaction, setup_logging
 from cli_agent_orchestrator.utils.skills import (
     SkillNameError,
@@ -373,6 +378,17 @@ def _validate_resume_session_id(value: str) -> None:
             "invalid resume_session_id: expected 8-64 chars of [A-Za-z0-9._-] "
             "starting with an alphanumeric"
         )
+
+
+class SetSessionEnvBody(BaseModel):
+    """JSON body for POST /sessions/{session_name}/env.
+
+    Same wire shape as the launch path: env values travel in the body — not
+    the query string — so secrets never land in cao-server's HTTP access log
+    (issue #248).
+    """
+
+    env_vars: Dict[str, str]
 
 
 def _validate_model_id(value: str) -> None:
@@ -3423,6 +3439,74 @@ async def get_session(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get session: {str(e)}",
         )
+
+
+@app.post("/sessions/{session_name}/env")
+async def set_session_env_endpoint(
+    session_name: str,
+    body: SetSessionEnvBody,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Re-hydrate operator-forwarded env vars for an existing session.
+
+    The per-session env map (``cao launch --env``) lives only in cao-server
+    process memory and is wiped by a server restart — workers spawned in the
+    session AFTER the restart would silently lose vars like provider
+    credentials forwarded at launch. This endpoint lets an operator (or an
+    external launcher) re-register them without recreating the session.
+
+    Semantics: merge-on-top of whatever the server currently holds for the
+    session (per-key overwrite). Values are validated by the same shared
+    validator as ``cao launch --env`` and the ops-MCP ``launch_session`` tool
+    (``utils/forwarded_env.py``: POSIX names, blocked prefixes, byte caps, NUL
+    and non-UTF-8 values, entry count, argv budget) and rejected loudly here
+    rather than silently dropped at window creation. The entry-count and argv
+    budget also bound the MERGED map, since merges accumulate across calls.
+    The read-merge-write is one critical section, so concurrent calls cannot
+    lose each other's keys. Already running terminals are unaffected — their
+    env was fixed into the tmux window at creation; the map only feeds FUTURE
+    windows.
+
+    Unlike the launch path, this route also denies well-known code-execution
+    vectors (``LD_*``/``DYLD_*``, shell-startup vars, interpreter options,
+    ``PATH``): it changes what every later worker in an already-running
+    session inherits. That is a denylist, not a security boundary — see
+    ``FORWARDED_ENV_EXEC_DENYLIST``.
+    """
+    from cli_agent_orchestrator.clients.tmux import TmuxLookupError
+    from cli_agent_orchestrator.services.session_env import merge_session_env
+
+    try:
+        validate_tmux_name(session_name, "session_name")
+        # deny_exec_vectors: this route mutates a LIVE session's map, inherited by
+        # every worker spawned in it afterwards. POST /sessions does not opt in.
+        delta = validate_forwarded_env(body.env_vars, deny_exec_vectors=True)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    try:
+        exists = get_backend().session_exists(session_name)
+    except TmuxLookupError as e:
+        # tmux could not be read at all: the answer is UNKNOWN, not "absent" (404)
+        # and not a server bug (500). Transient and retryable, so say so.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"could not determine whether session '{session_name}' exists; retry: {e}",
+        )
+    if not exists:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Session '{session_name}' not found",
+        )
+
+    try:
+        merged = merge_session_env(session_name, delta, validate=check_forwarded_env_budget)
+    except ForwardedEnvError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{e}, counting the vars session '{session_name}' already holds",
+        )
+    return {"session_name": session_name, "env_keys": sorted(merged.keys())}
 
 
 @app.delete("/sessions/{session_name}")

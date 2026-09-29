@@ -10,6 +10,7 @@ import requests
 
 from cli_agent_orchestrator.constants import API_BASE_URL
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.terminal import poll_until_done
 
 # Default poll timeout for sync send (seconds). Pass --timeout to override.
@@ -197,6 +198,47 @@ def status(session_name, terminal_id, workers, as_json):
                 )
         else:
             click.echo("\nNo worker terminals")
+
+
+@session.command("set-env")
+@click.argument("session_name")
+@click.argument("pairs", nargs=-1, required=True, metavar="KEY=VALUE...")
+def set_env(session_name, pairs):
+    """Re-hydrate forwarded env vars for a live session.
+
+    The per-session env map (``cao launch --env``) lives only in cao-server
+    memory and is wiped by a server restart; workers spawned after that lose
+    the forwarded vars. This re-registers them (merge-on-top, per-key
+    overwrite) without recreating the session. Values travel in the request
+    body so secrets stay out of the server's HTTP access log.
+    """
+    from cli_agent_orchestrator.cli.commands.launch import _parse_env_pairs
+
+    env_vars = _parse_env_pairs(pairs)
+    try:
+        response = requests.post(
+            f"{API_BASE_URL}/sessions/{quote(session_name, safe='')}/env",
+            json={"env_vars": env_vars},
+            timeout=get_server_settings()["mcp_request_timeout"],
+        )
+        response.raise_for_status()
+        data = response.json()
+    except requests.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.response.json().get("detail", "")
+        except Exception:
+            pass
+        raise click.ClickException(detail or str(e))
+    except requests.exceptions.RequestException as e:
+        # Connection refused / timeout: the likeliest failure for a command whose whole
+        # purpose is running right after a cao-server restart. Not an HTTPError subclass,
+        # so it needs its own arm to avoid escaping as a raw traceback.
+        raise click.ClickException(f"Failed to connect to cao-server: {e}")
+    click.echo(
+        f"Session '{data['session_name']}' env re-hydrated "
+        f"({len(env_vars)} set, now holding: {', '.join(data['env_keys'])})"
+    )
 
 
 @session.command()

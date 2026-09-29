@@ -8,6 +8,7 @@ import requests
 from click.testing import CliRunner
 
 from cli_agent_orchestrator.cli.commands.session import session
+from cli_agent_orchestrator.constants import API_BASE_URL
 
 
 @pytest.fixture
@@ -617,3 +618,134 @@ class TestSendSync:
         runner.invoke(session, ["send", "cao-test", "question"])
 
         mock_exit.assert_any_call(130)
+
+
+def _http_error(status_code, json_body=None, json_raises=None):
+    """A ``requests.HTTPError`` whose ``.response`` carries a (possibly broken) JSON body."""
+    err_resp = MagicMock(status_code=status_code)
+    if json_raises is not None:
+        err_resp.json.side_effect = json_raises
+    else:
+        err_resp.json.return_value = json_body
+    return requests.HTTPError(f"{status_code} Client Error", response=err_resp)
+
+
+class TestSetEnv:
+    """``cao session set-env`` — the CLI wrapper over ``POST /sessions/{name}/env``."""
+
+    @patch("cli_agent_orchestrator.cli.commands.session.requests.post")
+    def test_success_reports_the_keys_the_server_now_holds(self, mock_post, runner):
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = {"session_name": "cao-test", "env_keys": ["KEEP", "TOKEN"]}
+        mock_post.return_value = resp
+
+        result = runner.invoke(session, ["set-env", "cao-test", "TOKEN=s3cret"])
+
+        assert result.exit_code == 0, result.output
+        assert (
+            "Session 'cao-test' env re-hydrated (1 set, now holding: KEEP, TOKEN)" in result.output
+        )
+        # The value is never echoed back — only key names are printed.
+        assert "s3cret" not in result.output
+
+    @patch("cli_agent_orchestrator.cli.commands.session.requests.post")
+    def test_values_travel_only_in_the_json_body(self, mock_post, runner):
+        """The PR's own security point: secrets must not reach the URL (and so the access log)."""
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = {"session_name": "cao-test", "env_keys": ["A", "TOKEN"]}
+        mock_post.return_value = resp
+
+        result = runner.invoke(session, ["set-env", "cao-test", "TOKEN=s3cret", "A=b=c"])
+
+        assert result.exit_code == 0, result.output
+        mock_post.assert_called_once()
+        url = mock_post.call_args.args[0]
+        kwargs = mock_post.call_args.kwargs
+        assert url == f"{API_BASE_URL}/sessions/cao-test/env"
+        assert "?" not in url and "s3cret" not in url
+        assert "params" not in kwargs
+        assert kwargs["json"] == {"env_vars": {"TOKEN": "s3cret", "A": "b=c"}}
+
+    @patch("cli_agent_orchestrator.cli.commands.session.requests.post")
+    def test_http_error_surfaces_the_server_detail(self, mock_post, runner):
+        resp = MagicMock()
+        resp.raise_for_status.side_effect = _http_error(
+            400, {"detail": "env key 'LD_PRELOAD' is a code-execution vector"}
+        )
+        mock_post.return_value = resp
+
+        result = runner.invoke(session, ["set-env", "cao-test", "LD_PRELOAD=/x.so"])
+
+        assert result.exit_code == 1
+        assert "Error: env key 'LD_PRELOAD' is a code-execution vector" in result.output
+        assert "Traceback" not in result.output
+
+    @patch("cli_agent_orchestrator.cli.commands.session.requests.post")
+    def test_http_error_without_a_json_detail_falls_back_to_the_error_text(self, mock_post, runner):
+        """A non-JSON error body (a proxy's HTML 502, say) must not mask the HTTP error."""
+        resp = MagicMock()
+        resp.raise_for_status.side_effect = _http_error(502, json_raises=ValueError("not json"))
+        mock_post.return_value = resp
+
+        result = runner.invoke(session, ["set-env", "cao-test", "A=b"])
+
+        assert result.exit_code == 1
+        assert "Error: 502 Client Error" in result.output
+        assert "Traceback" not in result.output
+
+    @patch("cli_agent_orchestrator.cli.commands.session.requests.post")
+    def test_http_error_with_an_empty_detail_falls_back_to_the_error_text(self, mock_post, runner):
+        resp = MagicMock()
+        resp.raise_for_status.side_effect = _http_error(404, {})
+        mock_post.return_value = resp
+
+        result = runner.invoke(session, ["set-env", "cao-missing", "A=b"])
+
+        assert result.exit_code == 1
+        assert "Error: 404 Client Error" in result.output
+
+    @patch("cli_agent_orchestrator.cli.commands.session.requests.post")
+    def test_malformed_pair_is_rejected_before_any_request(self, mock_post, runner):
+        result = runner.invoke(session, ["set-env", "cao-test", "NOEQUALS"])
+
+        assert result.exit_code == 1
+        assert "expects KEY=VALUE" in result.output
+        mock_post.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            requests.exceptions.ConnectionError("Connection refused"),
+            requests.exceptions.Timeout("read timed out"),
+        ],
+        ids=["connection-refused", "timeout"],
+    )
+    @patch("cli_agent_orchestrator.cli.commands.session.requests.post")
+    def test_transport_failure_is_a_clean_click_error(self, mock_post, failure, runner):
+        """The likeliest failure right after a restart is a server that is not back yet.
+
+        Neither ``ConnectionError`` nor ``Timeout`` is an ``HTTPError``, so catching only the
+        latter let them escape as a raw traceback."""
+        mock_post.side_effect = failure
+
+        result = runner.invoke(session, ["set-env", "cao-test", "A=b"])
+
+        assert result.exit_code == 1
+        assert isinstance(result.exception, SystemExit), repr(result.exception)
+        assert "Failed to connect to cao-server" in result.output
+
+    @patch(
+        "cli_agent_orchestrator.cli.commands.session.get_server_settings",
+        return_value={"mcp_request_timeout": 42},
+    )
+    @patch("cli_agent_orchestrator.cli.commands.session.requests.post")
+    def test_request_carries_the_configured_timeout(self, mock_post, _settings, runner):
+        """Same bound as the launch path's env POST, so a wedged server cannot hang the CLI."""
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = {"session_name": "cao-test", "env_keys": ["A"]}
+        mock_post.return_value = resp
+
+        result = runner.invoke(session, ["set-env", "cao-test", "A=b"])
+
+        assert result.exit_code == 0, result.output
+        assert mock_post.call_args.kwargs["timeout"] == 42

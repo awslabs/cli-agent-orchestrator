@@ -148,6 +148,13 @@ See [Skills](skills.md) for discovery, installation, and catalog behavior.
 ### Sessions and terminals
 
 - `/sessions*` creates, lists, inspects, and deletes sessions.
+- `POST /sessions/{session_name}/env` merges forwarded env vars (JSON body
+  `{"env_vars": {...}}`) into a live session's in-memory map, so workers
+  spawned in it afterwards inherit them. Use it after a cao-server restart has
+  wiped that map; `cao session set-env` wraps it. Requires `cao:write` or
+  `cao:admin`. Unlike `POST /sessions`, it rejects invalid entries and denies
+  code-execution vectors such as `LD_PRELOAD` and `PATH`. See
+  [Re-hydrating after a cao-server restart](tmux.md#re-hydrating-after-a-cao-server-restart).
 - `/sessions/{session_name}/terminals*` creates and lists session terminals.
   The list is ordered oldest-first, and index 0 is the session's conductor —
   `cao session status`/`list` rely on that. Sort client-side on `last_active`

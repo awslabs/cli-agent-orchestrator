@@ -50,7 +50,35 @@ Rejected at the CLI boundary:
 - Keys outside `[A-Za-z_][A-Za-z0-9_]*` (non-POSIX names break the shell).
 - Values ≥ 2048 bytes (per-var cap that keeps the tmux argv under the kernel limit — see PR #246).
 
-Forwarded vars are held in process memory on cao-server and dropped when the session is deleted; restarting cao-server wipes them.
+Forwarded vars are held in process memory on cao-server and dropped when the session is deleted. Restarting cao-server wipes them. The tmux sessions themselves outlive the server process, but workers spawned in them afterwards start without the vars. To restore them, see [Re-hydrating after a cao-server restart](#re-hydrating-after-a-cao-server-restart).
+
+### Re-hydrating after a cao-server restart
+
+`cao session set-env` re-registers forwarded vars for a live session, so workers spawned in it from then on inherit them again. You do not need to recreate the session:
+
+```bash
+cao session set-env cao-my-task \
+  MNEMOSYNE_DIR=/root/mnemosyne \
+  ISAAC_CHANNEL=room:engineering
+```
+
+- **Merge-on-top.** Each `KEY=VALUE` overwrites that key and leaves every other key the server holds for the session in place. The command prints the key names the session now holds, never values.
+- **Future workers only.** A terminal that is already running keeps the environment its tmux window was created with, and set-env does not change it.
+- **Same delivery as `--env`.** Values travel in the request body, not the URL, so they stay out of cao-server's HTTP access log.
+
+It is a thin client over `POST /sessions/{session_name}/env`, which external launchers can call directly. The endpoint takes the body `{"env_vars": {"KEY": "value", ...}}` and requires the `cao:write` or `cao:admin` scope when auth is enabled. The session name is the prefixed one, as everywhere else. Responses:
+
+| Status | Meaning |
+|---|---|
+| `200` | Merged. Body: `{"session_name": ..., "env_keys": [...]}` (key names only). |
+| `400` | An entry breaks a validation rule (see below), or the session name is invalid. Nothing is stored. |
+| `404` | No such session. |
+| `503` | tmux could not be read, so it is unknown whether the session exists. Retry. |
+
+The endpoint validates with the same shared validator as `cao launch --env` and the ops-MCP tool (`utils/forwarded_env.py`), so it rejects the same keys and values rather than letting the server drop them silently at window creation. It adds two checks of its own:
+
+- **Code-execution vectors are denied.** Setting a var on a running session changes what every later worker in it inherits, so this endpoint also rejects `LD_*` and `DYLD_*` (dynamic linker), `BASH_ENV`, `ENV`, `PROMPT_COMMAND` and `ZDOTDIR` (shell startup), `NODE_OPTIONS`, `PYTHONPATH`, `PYTHONSTARTUP`, `PERL5OPT` and `RUBYOPT` (interpreter injection), and `PATH`. This is a denylist of well-known vectors, not a security boundary. It cannot be exhaustive, and with auth disabled (the default) anyone who can reach the API already has shell-equivalent access. `cao launch --env` and `POST /sessions` do not apply it.
+- **The merged map is bounded.** Merges accumulate across calls, so the 256-entry and 128 KiB argv limits also apply to the session's map after the merge.
 
 ### From the ops-MCP `launch_session` tool
 
