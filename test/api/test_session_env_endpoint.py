@@ -81,3 +81,79 @@ class TestSetSessionEnvEndpoint:
         assert bad_name.status_code == 400
         assert too_big.status_code == 400
         assert get_session_env(SESSION) == {}
+
+
+def _post_env(client, env_vars, *, session=SESSION, backend=None):
+    with patch(
+        "cli_agent_orchestrator.api.main.get_backend",
+        return_value=backend if backend is not None else _mock_backend(),
+    ):
+        return client.post(f"/sessions/{session}/env", json={"env_vars": env_vars})
+
+
+class TestSetSessionEnvValidation:
+    """The endpoint validates with the same shared validator as ``cao launch --env`` and the
+    ops-MCP ``launch_session`` tool (``utils/forwarded_env.py``), and rejects loudly."""
+
+    def teardown_method(self):
+        clear_session_env(SESSION)
+
+    def test_allowlisted_blocked_prefix_key_is_accepted(self, client):
+        """``CLAUDE`` is a blocked prefix, but the documented auth-routing flags are
+        allowlisted; dropping the allowlist would pass every other test in this file."""
+        resp = _post_env(client, {"CLAUDE_CODE_USE_BEDROCK": "1"})
+
+        assert resp.status_code == 200, resp.text
+        assert get_session_env(SESSION) == {"CLAUDE_CODE_USE_BEDROCK": "1"}
+
+    def test_value_byte_cap_boundary(self, client):
+        """2047 bytes is the largest accepted value; 2048 is rejected (the cap is ``>=``)."""
+        at_limit = _post_env(client, {"EDGE": "x" * 2047})
+        over_limit = _post_env(client, {"EDGE": "y" * 2048})
+
+        assert at_limit.status_code == 200, at_limit.text
+        assert over_limit.status_code == 400
+        assert "exceeds 2048 bytes" in over_limit.json()["detail"]
+        # The rejected request left the accepted value in place.
+        assert get_session_env(SESSION) == {"EDGE": "x" * 2047}
+
+    def test_empty_key_is_rejected(self, client):
+        resp = _post_env(client, {"": "x"})
+
+        assert resp.status_code == 400
+        assert "must match" in resp.json()["detail"]
+        assert get_session_env(SESSION) == {}
+
+    def test_invalid_session_name_is_400_before_the_backend_is_consulted(self, client):
+        backend = _mock_backend()
+
+        resp = _post_env(client, {"A": "b"}, session="bad.name", backend=backend)
+
+        assert resp.status_code == 400
+        assert "Invalid session_name" in resp.json()["detail"]
+        backend.session_exists.assert_not_called()
+
+    def test_nul_byte_value_is_rejected_without_echoing_it(self, client):
+        """A NUL survives the byte cap but breaks ``Popen`` at window creation, and libtmux
+        then logs the whole argv — values included. The shared validator rejects it."""
+        resp = _post_env(client, {"TOKEN": "s3cret\x00tail"})
+
+        assert resp.status_code == 400
+        detail = resp.json()["detail"]
+        assert "NUL byte" in detail
+        assert "s3cret" not in detail
+        assert get_session_env(SESSION) == {}
+
+    def test_overlong_key_is_rejected(self, client):
+        resp = _post_env(client, {"K" * 129: "x"})
+
+        assert resp.status_code == 400
+        assert "exceeds 128 bytes" in resp.json()["detail"]
+        assert get_session_env(SESSION) == {}
+
+    def test_too_many_entries_in_one_request_is_rejected(self, client):
+        resp = _post_env(client, {f"K{i:04d}": "x" for i in range(257)})
+
+        assert resp.status_code == 400
+        assert "exceeds the limit of 256" in resp.json()["detail"]
+        assert get_session_env(SESSION) == {}

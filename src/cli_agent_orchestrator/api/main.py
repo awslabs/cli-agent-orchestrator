@@ -179,6 +179,7 @@ from cli_agent_orchestrator.services.workflow_journal import (
 from cli_agent_orchestrator.services.worktree_service import WorktreeError
 from cli_agent_orchestrator.telemetry import init_telemetry, shutdown_telemetry
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
+from cli_agent_orchestrator.utils.forwarded_env import validate_forwarded_env
 from cli_agent_orchestrator.utils.logging import install_access_log_redaction, setup_logging
 from cli_agent_orchestrator.utils.skills import (
     SkillNameError,
@@ -3451,29 +3452,19 @@ async def set_session_env_endpoint(
     external launcher) re-register them without recreating the session.
 
     Semantics: merge-on-top of whatever the server currently holds for the
-    session (per-key overwrite). Values are validated with the same rules the
-    launch CLI applies (POSIX names, blocked prefixes, byte cap) and rejected
-    loudly here rather than silently dropped at window creation. Already
-    running terminals are unaffected — their env was fixed into the tmux
-    window at creation; the map only feeds FUTURE windows.
+    session (per-key overwrite). Values are validated by the same shared
+    validator as ``cao launch --env`` and the ops-MCP ``launch_session`` tool
+    (``utils/forwarded_env.py``: POSIX names, blocked prefixes, byte caps, NUL
+    and non-UTF-8 values, entry count, argv budget) and rejected loudly here
+    rather than silently dropped at window creation. Already running
+    terminals are unaffected — their env was fixed into the tmux window at
+    creation; the map only feeds FUTURE windows.
     """
-    from cli_agent_orchestrator.clients.tmux import TmuxClient
     from cli_agent_orchestrator.services.session_env import get_session_env, set_session_env
 
     try:
         validate_tmux_name(session_name, "session_name")
-        for key, value in body.env_vars.items():
-            if (
-                not key
-                or not (key[0].isalpha() or key[0] == "_")
-                or not all(c.isalnum() or c == "_" for c in key)
-                or not key.isascii()
-            ):
-                raise ValueError(f"invalid env var name: {key!r}")
-            if TmuxClient._is_blocked_env_key(key):
-                raise ValueError(f"env var {key!r} has a blocked prefix")
-            if len(value.encode("utf-8")) >= TmuxClient._MAX_ENV_VALUE_BYTES:
-                raise ValueError(f"env var {key!r} value exceeds the byte cap")
+        delta = validate_forwarded_env(body.env_vars)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
@@ -3483,7 +3474,7 @@ async def set_session_env_endpoint(
             detail=f"Session '{session_name}' not found",
         )
 
-    merged = {**get_session_env(session_name), **body.env_vars}
+    merged = {**get_session_env(session_name), **delta}
     set_session_env(session_name, merged)
     return {"session_name": session_name, "env_keys": sorted(merged.keys())}
 

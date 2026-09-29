@@ -5,7 +5,9 @@ env vars into a launched session -- ``cao launch --env``
 (``cli/commands/launch.py``) and the ops-MCP ``launch_session`` tool -- and
 mirror the server-side filtering in ``TmuxClient._merge_extra_env``. Keeping the
 canonical constants and the validator here stops the two client paths from
-drifting apart. See issue #248.
+drifting apart. See issue #248. ``POST /sessions/{session_name}/env``, which
+re-registers a live session's map after a cao-server restart, validates its
+body with the same function server-side.
 
 The server silently *drops* a var that violates these rules
 (``SessionEnvStore._merge_extra_env``), so each client validates at its own
