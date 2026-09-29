@@ -148,6 +148,19 @@ class TestHandshake:
         # Disconnected: the server cannot know, and says so.
         assert client.get("/terminals/abcd1234").json()["status"] == "unknown"
 
+    def test_a_terminal_the_reconnected_runtime_does_not_report_is_unknown(self, client):
+        # E.g. the runtime pod was replaced: its panes are gone and its hello
+        # no longer mentions them. The old connection's report must not linger.
+        _remote_row("abcd1234", "rt-1")
+        with client.websocket_connect("/runtime/channel", headers=WS_HEADERS) as ws:
+            ws.send_text(_hello(statuses={"abcd1234": "completed"}))
+            ws.receive_text()
+        with client.websocket_connect("/runtime/channel", headers=WS_HEADERS) as ws:
+            ws.send_text(_hello(statuses={}))
+            ws.receive_text()
+            assert client.get("/runtimes").json()["runtimes"]["rt-1"]["terminals"] == ["abcd1234"]
+            assert client.get("/terminals/abcd1234").json()["status"] == "unknown"
+
 
 class TestRuntimeNotConnected:
     def test_a_launch_is_503(self, client):

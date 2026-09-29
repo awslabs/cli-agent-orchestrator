@@ -174,6 +174,17 @@ async def test_status_is_unknown_while_the_runtime_is_disconnected():
 
 
 @pytest.mark.asyncio
+async def test_a_new_connection_starts_with_no_status_from_the_old_one():
+    registry = RuntimeRegistry()
+    first = _FakeRuntime(registry)
+    registry.place("t1", "rt-1")
+    registry.set_status("t1", "rt-1", TerminalStatus.COMPLETED)
+    registry.unregister("rt-1", first.conn)
+    _FakeRuntime(registry)
+    assert registry.get_status("t1", "rt-1") == TerminalStatus.UNKNOWN
+
+
+@pytest.mark.asyncio
 async def test_a_worker_thread_can_call_through_the_loop():
     registry = RuntimeRegistry()
     _FakeRuntime(registry, reply=lambda c: Result(op_id=c.op_id, ok=True, payload={"ok": 1}))
