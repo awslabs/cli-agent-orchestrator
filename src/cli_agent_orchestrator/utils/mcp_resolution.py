@@ -176,10 +176,11 @@ def shared_endpoint_child_env(*, persisted: bool = False) -> dict:
     :func:`resolve_cao_mcp_command`; it no longer changes token handling, because
     a path is safe to write wherever the config lands.
 
-    This is not an isolation boundary. A process running as the same OS user can
-    read the file, and provider panes never carry the value at all now (the tmux
-    forwarder blocks ``CAO_RUNTIME_TOKEN``); per-process isolation needs
-    per-runtime credentials (#774).
+    This is not an isolation boundary. cao-server and cao-bridge remove the value
+    from their environment at startup, before any tmux server starts, and the tmux
+    forwarder never passes it, so provider panes and their MCP children do not
+    inherit it. The file itself is readable by any process running as the same OS
+    user; per-process isolation needs per-runtime credentials (#774).
     """
     url = shared_endpoint_url()
     if not url:
