@@ -134,12 +134,19 @@ class RuntimeRegistry:
     def register(
         self, runtime_id: str, send_text: Callable[[str], Awaitable[None]]
     ) -> RuntimeConnection:
-        """Record a new channel for ``runtime_id``, replacing (and closing) any older one."""
+        """Record a new channel for ``runtime_id``, replacing (and closing) any older one.
+
+        Statuses reported over an earlier connection are dropped: the runtime's
+        hello on this one says what it runs now (a replaced pod runs nothing).
+        """
         conn = RuntimeConnection(runtime_id, send_text)
         with self._lock:
             previous = self._runtimes.get(runtime_id)
             self._runtimes[runtime_id] = conn
             self._loop = asyncio.get_running_loop()
+            for terminal_id, placed_on in self._placement.items():
+                if placed_on == runtime_id:
+                    self._status.pop(terminal_id, None)
         if previous is not None:
             previous.close("replaced by a new connection")
         logger.info("runtime %s connected", runtime_id)
