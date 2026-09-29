@@ -76,6 +76,20 @@ class TestMergeProfileEnv:
         assert env["OK"] == "y"
         assert ("BIG" in applied) is kept
 
+    @pytest.mark.parametrize("key", ["", "A=B", "A\nB", "1ABC", "A-B", "--session"])
+    def test_drops_a_name_that_is_not_an_env_var_name(self, key, caplog):
+        """The schema's propertyNames rejects these on every validated write;
+        a hand-placed profile file skips the validator, so the merge refuses
+        them too instead of handing tmux ``-e =x`` or herdr ``--env A-B=x``."""
+        env: dict[str, str] = {}
+        with caplog.at_level(logging.WARNING):
+            applied = merge_profile_env(env, {key: "v", "OK": "y"})
+        assert env == {"OK": "y"}
+        assert applied == ["OK"]
+        assert caplog.messages == [
+            f"Dropping profile env var {key!r} — name is not a valid environment variable name"
+        ]
+
     def test_profile_env_names_are_exactly_what_the_merge_writes(self, caplog):
         """The provider-side view (profile_env_names) cannot drift from the
         backend-side merge: same policy, and it logs nothing."""

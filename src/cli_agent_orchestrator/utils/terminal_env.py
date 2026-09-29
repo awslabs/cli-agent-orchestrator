@@ -17,10 +17,12 @@ value (:func:`within_value_cap`), and layers 2 and 3.
 Profile env is installed configuration -- a profile can already launch
 arbitrary executables through ``mcpServers.command`` -- so, unlike
 operator-forwarded env, it is not filtered by the inherited-env prefix
-blocklist (``CLAUDE*``, ``CODEX_*``, ...). Two limits still apply: the byte
-cap, which protects the backend argv limit rather than a trust boundary, and
-the runtime-owned identity keys (``RUNTIME_IDENTITY_ENV_KEYS``), which a
-profile can neither replace nor invent.
+blocklist (``CLAUDE*``, ``CODEX_*``, ...). Three limits still apply: names
+must be POSIX environment variable names; the byte cap, which protects the
+backend argv limit rather than a trust boundary; and the runtime-owned identity
+keys (``RUNTIME_IDENTITY_ENV_KEYS``), which a profile can neither replace nor
+invent. Values are otherwise handed to the backend as is: CAO does no shell or
+``~`` expansion on any backend, so a path must be absolute.
 """
 
 import logging
@@ -31,7 +33,10 @@ from cli_agent_orchestrator.constants import (
     SESSION_NAME_ENV,
     TERMINAL_ID_ENV,
 )
-from cli_agent_orchestrator.utils.forwarded_env import FORWARDED_ENV_MAX_VALUE_BYTES
+from cli_agent_orchestrator.utils.forwarded_env import (
+    FORWARDED_ENV_MAX_VALUE_BYTES,
+    is_valid_env_key,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,8 +66,17 @@ def within_value_cap(source: str, key: str, value: str) -> bool:
     return False
 
 
+_BAD_NAME = "name is not a valid environment variable name"
+
+
 def _profile_env_rejection(key: str, value: str) -> Optional[str]:
-    """Why a profile ``env:`` entry is not applied, or None if it is."""
+    """Why a profile ``env:`` entry is not applied, or None if it is.
+
+    The name check mirrors the schema's ``propertyNames`` pattern, which only
+    guards validated writes: a hand-placed profile file never meets it.
+    """
+    if not is_valid_env_key(key):
+        return _BAD_NAME
     if key in RUNTIME_IDENTITY_ENV_KEYS:
         return "name is reserved for CAO's runtime identity"
     if len(value.encode("utf-8")) >= MAX_ENV_VALUE_BYTES:
@@ -98,7 +112,8 @@ def merge_profile_env(
     for key, value in (profile_env or {}).items():
         reason = _profile_env_rejection(key, value)
         if reason is not None:
-            _log_drop("profile", key, reason)
+            # repr() a malformed name so a newline in it cannot forge a log line.
+            _log_drop("profile", repr(key) if reason is _BAD_NAME else key, reason)
             continue
         environment[key] = value
         applied.append(key)

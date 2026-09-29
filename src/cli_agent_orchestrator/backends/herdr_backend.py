@@ -26,6 +26,7 @@ from cli_agent_orchestrator.backends.base import (
 )
 from cli_agent_orchestrator.constants import BRACKETED_PASTE_INCOMPATIBLE_SHELLS
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.utils.forwarded_env import is_valid_env_key
 from cli_agent_orchestrator.utils.terminal_env import (
     apply_runtime_identity,
     merge_profile_env,
@@ -51,6 +52,23 @@ _HERDR_ALLOWED_SUBCOMMANDS = frozenset(
 # characters and NUL bytes; allows printable characters needed for filesystem
 # paths, UUIDs, labels, and JSON snippets.
 _SAFE_ARG_RE = re.compile(r"^[\w\-./: =,@(){}\[\]\"'\\~+#]+$", re.UNICODE)
+
+# The token after ``--env`` is not a structural argument: herdr hands it to the
+# launched process as an environment entry ("--env KEY=VALUE ... applies to the
+# newly launched process only", herdr CLI reference; the socket API takes an
+# ``env`` object of string values), and CAO passes it as one list-form argv
+# element, so no shell ever sees the value. Its only argument-injection risk is
+# being parsed as a flag, which a POSIX name before the ``=`` rules out (it
+# cannot start with ``-``). Control characters (C0, DEL) are refused as
+# garbage; nothing else about the value is restricted here.
+_ENV_VALUE_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _is_safe_env_pair(arg: str) -> bool:
+    """True if ``arg`` is ``NAME=value`` with a POSIX name and no control chars."""
+    name, sep, value = arg.partition("=")
+    return bool(sep) and is_valid_env_key(name) and not _ENV_VALUE_CONTROL_RE.search(value)
+
 
 # Flags that _run_herdr is allowed to pass to the herdr CLI.  Any argument
 # starting with "--" that is not in this set is rejected to prevent argument
@@ -85,9 +103,11 @@ def _sanitize_herdr_args(args: List[str]) -> List[str]:
     2. All structural arguments match a safe character set.
     3. Any ``--flag`` is in the allowed set (``--session`` is excluded since
        ``_run_herdr`` injects it from a trusted instance attribute).
-    Terminal input payloads (the text body of ``pane send-text`` / ``pane run``)
-    are exempt because they are literal content typed into a terminal pane, not
-    arguments that alter herdr's own behavior.
+    The value of an ``--env`` flag is checked as an environment pair instead
+    (see ``_is_safe_env_pair``). Terminal input payloads (the text body of
+    ``pane send-text`` / ``pane run``) are exempt because they are literal
+    content typed into a terminal pane, not arguments that alter herdr's own
+    behavior.
     """
     if not args:
         raise ValueError("herdr args must not be empty")
@@ -108,7 +128,8 @@ def _sanitize_herdr_args(args: List[str]) -> List[str]:
         structural_args = args
     prev_was_env = False
     for arg in structural_args:
-        if not _SAFE_ARG_RE.fullmatch(arg):
+        safe = _is_safe_env_pair(arg) if prev_was_env else _SAFE_ARG_RE.fullmatch(arg)
+        if not safe:
             # A rejected --env value may be a secret; redact it in the error.
             shown = _redact_env_values(["--env", arg])[1] if prev_was_env else repr(arg)
             raise ValueError(f"herdr argument contains unsafe characters: {shown}")
@@ -894,12 +915,21 @@ class HerdrBackend(TerminalBackend):
         routing ids. Native ``--env`` replaces the former shell ``export``
         injection, removing the command-line injection surface.
 
-        Note: on herdr, env VALUES pass through the herdr arg sanitizer, which
-        rejects shell metacharacters and control chars. A value containing e.g.
-        ``$ ; | & ! * ? < >`` will fail terminal creation on herdr (fail-closed),
-        whereas the tmux backend accepts such values. This is an intentional,
-        safety-conservative divergence; operator env values on herdr must be
-        sanitizer-safe.
+        How values are validated. Every ``--env`` token reaches herdr as one
+        list-form argv element and herdr gives it to the launched process as an
+        environment entry, never to a shell; ``_sanitize_herdr_args`` checks it
+        as a pair (POSIX name, no control characters -- ``_is_safe_env_pair``),
+        and CAO otherwise hands the value over as is (no shell or ``~``
+        expansion).
+
+        - Profile env (``trusted_env``) gets exactly that, so any schema-valid
+          value without control characters -- ``$ ? & % ! * < >`` included --
+          launches on herdr as it does on tmux.
+        - Operator-forwarded env keeps its stricter, fail-closed rule: a value
+          outside ``_SAFE_ARG_RE`` (e.g. containing ``$ ; | & ! * ? < >``)
+          fails terminal creation here, before any herdr call, with the value
+          redacted. The tmux backend accepts such operator values; that
+          divergence predates profile env (#502) and is kept as is.
         """
         from cli_agent_orchestrator.clients.tmux import TmuxClient
 
@@ -910,6 +940,12 @@ class HerdrBackend(TerminalBackend):
                 continue
             if not within_value_cap("forwarded", key, value):
                 continue
+            if not _SAFE_ARG_RE.fullmatch(f"{key}={value}"):
+                shown = _redact_env_values(["--env", f"{key}={value}"])[1]
+                raise TerminalBackendError(
+                    "herdr argument validation failed: herdr argument contains "
+                    f"unsafe characters: {shown}"
+                )
             env[key] = value
 
         # Profile-declared env (trusted_env) merges after operator env, and the
