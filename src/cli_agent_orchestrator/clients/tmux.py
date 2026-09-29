@@ -913,6 +913,35 @@ class TmuxClient:
                 continue
             environment[key] = value
 
+    @staticmethod
+    def _confine_profile_env_to_initial_pane(
+        session: Session, profile_keys: List[str], session_scoped_env: Dict[str, str]
+    ) -> None:
+        """Put the new session's environment back as it would be without the profile.
+
+        ``new-session -e`` does not scope a variable to the initial window: per
+        tmux(1) it "sets an environment variable for the newly created
+        session", and "when a window is created, the session and global
+        environments are merged". Left alone, a profile's ``env:`` would reach
+        every later window of the session -- other agents' terminals, and after
+        a CAO restart too, since the session environment lives in the tmux
+        server -- breaking the declaring-terminal-only contract.
+
+        By the time this runs the initial pane's process has already been
+        spawned with the profile values, so it keeps them. For each key the
+        profile set: a key the session legitimately carries (inherited slice or
+        operator env) gets that value back, and any other key is unset from the
+        session environment, so the global environment applies again exactly as
+        it would have without the profile. ``create_session`` runs under the
+        caller's session lifecycle lock, so no other CAO create in this session
+        can observe the interim state. Raises whatever libtmux raises.
+        """
+        for key in profile_keys:
+            if key in session_scoped_env:
+                session.set_environment(key, session_scoped_env[key])
+            else:
+                session.unset_environment(key)
+
     def create_session(
         self,
         session_name: str,
@@ -964,7 +993,11 @@ class TmuxClient:
             # explicit ``--env AWS_REGION=us-west-2`` wins over the inherited
             # value. See issue #248.
             self._merge_extra_env(environment, extra_env)
-            merge_profile_env(environment, trusted_env)
+            # What the session environment may keep once the initial pane is
+            # up. Profile env is for that pane only: see
+            # _confine_profile_env_to_initial_pane.
+            session_scoped_env = dict(environment)
+            profile_keys = merge_profile_env(environment, trusted_env)
             apply_runtime_identity(environment, terminal_id, session_name)
 
             # Explicit 220x50 pane size avoids the default 80x24 that tmux
@@ -1004,6 +1037,24 @@ class TmuxClient:
                     f"'{session_name}': {e}. Any partially created session has "
                     "been removed; the launch can be retried with the same name."
                 ) from e
+
+            if profile_keys:
+                try:
+                    self._confine_profile_env_to_initial_pane(
+                        session, profile_keys, session_scoped_env
+                    )
+                except Exception as scope_error:
+                    # Fail closed: a session whose later windows would inherit
+                    # this agent's credentials or config is not handed out.
+                    logger.error(
+                        f"Could not keep profile env out of session {session_name}'s "
+                        f"environment: {scope_error} — removing the session"
+                    )
+                    try:
+                        session.kill()
+                    except Exception as kill_error:  # pragma: no cover - best effort
+                        logger.warning(f"Failed to roll back session {session_name}: {kill_error}")
+                    raise
 
             # Keep mouse-wheel input inside tmux. With mouse mode disabled,
             # tmux forwards wheel events to the foreground application as
