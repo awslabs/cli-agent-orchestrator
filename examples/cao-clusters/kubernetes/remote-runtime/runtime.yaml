@@ -61,6 +61,16 @@ spec:
               value: "1"
             - name: AWS_REGION
               value: us-east-1
+            # Pin every model tier, as ../eks/supervisor.yaml does: Claude Code's
+            # default model ids may not be enabled in your account.
+            - name: ANTHROPIC_MODEL
+              value: global.anthropic.claude-opus-4-6-v1
+            - name: ANTHROPIC_DEFAULT_OPUS_MODEL
+              value: global.anthropic.claude-opus-4-6-v1
+            - name: ANTHROPIC_DEFAULT_SONNET_MODEL
+              value: global.anthropic.claude-opus-4-6-v1
+            - name: ANTHROPIC_DEFAULT_HAIKU_MODEL
+              value: global.anthropic.claude-haiku-4-5-20251001-v1:0
           volumeMounts:
             - name: state
               mountPath: /home/cao/.cao
