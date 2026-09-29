@@ -66,6 +66,37 @@ def test_an_unknown_plan_is_not_approved(db_path):
 
 
 # ---------------------------------------------------------------------------
+# The tri-state sibling (issue #696): a store FAULT is distinct from an ABSENCE
+# ---------------------------------------------------------------------------
+
+
+def test_approval_state_reports_absent_approved_and_is_consistent_with_is_approved(db_path):
+    assert approval_store.approval_state("plan-v1:missing") == approval_store.ABSENT
+    approval_store.grant("plan-v1:present", "stan")
+    assert approval_store.approval_state("plan-v1:present") == approval_store.APPROVED
+    # is_approved is the boolean view of the same fact.
+    assert approval_store.is_approved("plan-v1:present") is True
+    assert approval_store.is_approved("plan-v1:missing") is False
+
+
+def test_a_store_fault_is_unknown_not_absent(db_path, monkeypatch):
+    """A database error must answer UNKNOWN, not ABSENT — the whole point of #696.
+
+    ``is_approved`` still collapses the fault to False (fail-closed), but ``approval_state`` preserves
+    that CAO could not read the store, so the gate can refuse without calling it a missing approval.
+    """
+
+    def unreadable_store(*_args, **_kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(approval_store, "_connect", unreadable_store)
+
+    assert approval_store.approval_state("plan-v1:anything") == approval_store.UNKNOWN
+    # The boolean view stays fail-closed: a fault is not permission.
+    assert approval_store.is_approved("plan-v1:anything") is False
+
+
+# ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
 

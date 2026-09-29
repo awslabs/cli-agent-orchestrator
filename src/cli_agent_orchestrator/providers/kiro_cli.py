@@ -17,6 +17,7 @@ The provider detects the following terminal states:
 - ERROR: Agent encountered an error during processing
 """
 
+import asyncio
 import logging
 import re
 import shlex
@@ -409,7 +410,10 @@ class KiroCliProvider(BaseProvider):
         # has since flapped to IDLE/COMPLETED, treat the terminal as ready and do
         # NOT send dialog keys (a blind Down+Enter into a live prompt would be a
         # stray message). Low probability given the sticky latch, but explicit.
-        if status_monitor.get_status(self.terminal_id) != TerminalStatus.WAITING_USER_ANSWER:
+        # Off the loop: get_status() can fork a tmux capture-pane for a PROCESSING
+        # terminal (status_monitor.py's stale-PROCESSING fallback).
+        current = await asyncio.to_thread(status_monitor.get_status, self.terminal_id)
+        if current != TerminalStatus.WAITING_USER_ANSWER:
             return True
 
         # WAITING_USER_ANSWER is classified from TUI_TRUST_ALL_TOOLS_FOOTER,

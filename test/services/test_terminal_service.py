@@ -22,6 +22,18 @@ def test_grok_uses_runtime_skills_with_native_tool_enforcement():
     assert "grok_cli" not in SOFT_ENFORCEMENT_PROVIDERS
 
 
+def test_none_enforcement_providers_are_in_the_soft_set():
+    """kiro_cli (the default provider), hermes and cursor_cli apply no restriction, so
+    the create-terminal warning must fire for a restricted profile on them, and must
+    not for a provider that enforces natively."""
+    from cli_agent_orchestrator.services.terminal_service import SOFT_ENFORCEMENT_PROVIDERS
+
+    assert {"kiro_cli", "hermes", "cursor_cli"} <= SOFT_ENFORCEMENT_PROVIDERS
+    assert {"claude_code", "copilot_cli", "opencode_cli", "grok_cli"}.isdisjoint(
+        SOFT_ENFORCEMENT_PROVIDERS
+    )
+
+
 def test_minimax_code_uses_runtime_skills_with_soft_tool_enforcement():
     from cli_agent_orchestrator.services.terminal_service import (
         RUNTIME_SKILL_PROMPT_PROVIDERS,

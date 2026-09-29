@@ -35,12 +35,16 @@ def enforcement_on(monkeypatch):
 @pytest.fixture()
 def approved(monkeypatch):
     """Approve exactly ``PLAN`` and nothing else, without touching a database."""
-    monkeypatch.setattr(approval_store, "is_approved", lambda plan_id: plan_id == PLAN)
+    monkeypatch.setattr(
+        approval_store,
+        "approval_state",
+        lambda plan_id: approval_store.APPROVED if plan_id == PLAN else approval_store.ABSENT,
+    )
 
 
 @pytest.fixture()
 def nothing_approved(monkeypatch):
-    monkeypatch.setattr(approval_store, "is_approved", lambda plan_id: False)
+    monkeypatch.setattr(approval_store, "approval_state", lambda plan_id: approval_store.ABSENT)
 
 
 # ---------------------------------------------------------------------------
@@ -49,9 +53,11 @@ def nothing_approved(monkeypatch):
 
 
 def test_enforcement_is_off_by_default_so_an_unapproved_script_run_proceeds(monkeypatch):
-    """C-1 and the default. ``is_approved`` must not even be consulted."""
+    """C-1 and the default. The approval store must not even be consulted."""
     consulted = []
-    monkeypatch.setattr(approval_store, "is_approved", lambda p: consulted.append(p) or False)
+    monkeypatch.setattr(
+        approval_store, "approval_state", lambda p: consulted.append(p) or approval_store.ABSENT
+    )
     monkeypatch.setattr(approval_gate, "is_workflow_approval_required", lambda: False)
 
     ensure_plan_approved(tier="script", manifest_json=MANIFEST)  # must not raise
@@ -133,11 +139,72 @@ def test_an_unreadable_manifest_refuses(enforcement_on, approved, manifest):
     assert excinfo.value.plan_id is None
 
 
-def test_a_database_error_refuses_rather_than_permits(enforcement_on, monkeypatch):
-    """``approval_store.is_approved`` already answers False on sqlite3.Error; the gate must honour it."""
-    monkeypatch.setattr(approval_store, "is_approved", lambda p: False)
-    with pytest.raises(PlanApprovalRequiredError):
+def test_a_store_fault_is_not_reported_as_a_missing_approval(enforcement_on, monkeypatch):
+    """Issue #696 regression. A store fault must NOT reach the operator as "approve this plan".
+
+    When the approval database is unreadable, the gate cannot know whether ``plan_id`` is approved.
+    Reporting that as a missing approval hands the operator a remedy — "approve this plan identifier
+    and run again" — that cannot work, because nothing about the plan is wrong. The refusal must be
+    distinguishable from a genuine absence.
+    """
+    import sqlite3
+
+    def unreadable_store(*_args, **_kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(approval_store, "_connect", unreadable_store)
+
+    with pytest.raises(
+        Exception
+    ) as excinfo:  # noqa: PT011 - asserting on the message, not the type
         ensure_plan_approved(tier="script", manifest_json=MANIFEST)
+
+    message = str(excinfo.value)
+    assert "has not been approved" not in message, (
+        "a store fault must not be reported as a missing approval — the operator would be told to "
+        "approve a plan that may already be approved, and the remedy cannot address a database fault"
+    )
+    assert "Approve this plan identifier" not in message
+
+
+def test_a_database_error_refuses_rather_than_permits(enforcement_on, monkeypatch):
+    """A store fault refuses rather than permits — the fail-closed posture is preserved.
+
+    The refusal is now a distinct :class:`PlanApprovalUnavailableError` (issue #696) rather than
+    :class:`PlanApprovalRequiredError`, but it is still a refusal: an unreadable store never admits
+    a run.
+    """
+    import sqlite3
+
+    def unreadable_store(*_args, **_kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(approval_store, "_connect", unreadable_store)
+    with pytest.raises(approval_gate.PlanApprovalUnavailableError):
+        ensure_plan_approved(tier="script", manifest_json=MANIFEST)
+
+
+def test_an_unknown_store_state_is_a_distinct_refusal_carrying_the_plan_id(
+    enforcement_on, monkeypatch
+):
+    """Issue #696. UNKNOWN maps to its own refusal class, carries the plan_id, and is not a 400/absence.
+
+    The distinction is the whole point: a caller branching on the refusal must be able to tell "the
+    store is unreadable, retry" from "this plan is not approved, approve it".
+    """
+    monkeypatch.setattr(approval_store, "approval_state", lambda _plan_id: approval_store.UNKNOWN)
+
+    with pytest.raises(approval_gate.PlanApprovalUnavailableError) as excinfo:
+        ensure_plan_approved(tier="script", manifest_json=MANIFEST)
+
+    assert excinfo.value.plan_id == PLAN, "the refusal must still carry the plan_id for diagnosis"
+    assert not isinstance(excinfo.value, PlanApprovalRequiredError), (
+        "a store fault is a fact about the store, not about the plan — the two refusals must be "
+        "distinguishable so a caller does not apply the approve-this-plan remedy to a database fault"
+    )
+    assert not isinstance(
+        excinfo.value, ValueError
+    ), "transported as 503, so it must not be a ValueError the API's trailing 400 arm can claim"
 
 
 # ---------------------------------------------------------------------------

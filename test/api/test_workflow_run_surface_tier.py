@@ -90,6 +90,23 @@ class TestValidateTierDispatch:
         assert body["status"] == "fail"
         assert any(f["rule_id"] == "syntax" for f in body["findings"])
 
+    def test_py_arm_rejects_literal_step_id_the_run_step_route_rejects(
+        self, client, isolated_db, spec_dir
+    ):
+        path = _write_script(
+            spec_dir,
+            "bad_step_id",
+            "from cao_workflow import run_step\n"
+            "run_step('p', 'a', 'x', step_id='t006:makefile')\n",
+        )
+
+        resp = client.post("/workflows/validate", json={"path": str(path)})
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "fail"
+        assert [f["rule_id"] for f in body["findings"]] == ["invalid-step-id"]
+
     def test_unrecognized_extension_400(self, client, isolated_db, spec_dir):
         path = spec_dir / "bad.txt"
         path.write_text("hello")

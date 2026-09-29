@@ -73,6 +73,7 @@ def test_register_mcp_server_surfaces_dispatches_to_plugin(monkeypatch) -> None:
 def _no_idp(monkeypatch) -> None:
     monkeypatch.delenv("AUTH0_DOMAIN", raising=False)
     monkeypatch.delenv("CAO_AUTH_JWKS_URI", raising=False)
+    monkeypatch.delenv("CAO_AUTH_LOCAL_TOKEN", raising=False)
 
 
 def test_warns_when_enabled_without_idp(monkeypatch, caplog) -> None:
@@ -91,6 +92,17 @@ def test_no_warning_when_idp_configured(monkeypatch, caplog) -> None:
     # warning must not fire.
     monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "true")
     monkeypatch.setenv("CAO_AUTH_JWKS_URI", "https://idp.example/.well-known/jwks.json")
+    with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.plugins.builtin.mcp_apps"):
+        McpAppsPlugin().on_mcp_server(_FakeMcp())
+    assert not any("no IdP" in r.getMessage() for r in caplog.records)
+
+
+def test_no_warning_when_local_token_configured(monkeypatch, caplog) -> None:
+    # A standalone CAO_AUTH_LOCAL_TOKEN (issue #706) also switches enforcement
+    # on, so the unauthenticated-posture warning must not fire either.
+    monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "true")
+    _no_idp(monkeypatch)
+    monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", "s3cret-local-token")
     with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.plugins.builtin.mcp_apps"):
         McpAppsPlugin().on_mcp_server(_FakeMcp())
     assert not any("no IdP" in r.getMessage() for r in caplog.records)

@@ -1,6 +1,8 @@
 """Unit tests for the opencode.json read-modify-write helper."""
 
 import json
+import logging
+import shutil
 from pathlib import Path
 from unittest.mock import patch
 
@@ -8,7 +10,10 @@ import pytest
 
 import cli_agent_orchestrator.utils.opencode_config as cfg_module
 from cli_agent_orchestrator.utils.opencode_config import (
+    disable_mcp_server,
     ensure_skills_symlink,
+    entry_within_roots,
+    is_cao_owned_mcp_entry,
     read_config,
     remove_agent_tools,
     to_opencode_agent_id,
@@ -157,6 +162,24 @@ class TestTranslateMcpServerConfig:
         result = translate_mcp_server_config({"command": "srv"})
         assert "environment" not in result
         assert "env" not in result
+
+    def test_cwd_is_copied_through(self):
+        """Reproduced by review 3 on #584 — the working directory was dropped.
+
+        OpenCode's ``McpLocalConfig.cwd`` is the field its spawn honours, so a
+        plugin whose ``command``/``args`` are relative to its working directory
+        depends on this surviving translation.
+        """
+        result = translate_mcp_server_config({"command": "srv", "cwd": "/plugins/demo"})
+        assert result["cwd"] == "/plugins/demo"
+
+    def test_absent_cwd_is_not_invented(self):
+        """Inventing one would change where a profile-declared server runs."""
+        assert "cwd" not in translate_mcp_server_config({"command": "srv"})
+
+    def test_an_empty_cwd_is_dropped(self):
+        """An empty string is not a directory; emitting it would be noise."""
+        assert "cwd" not in translate_mcp_server_config({"command": "srv", "cwd": ""})
 
     def test_custom_uvx_entry_passes_through(self):
         """A user-defined uvx-based MCP server is translated verbatim.
@@ -320,6 +343,124 @@ class TestUpsertAgentTools:
         assert "developer" in data["agent"]
         assert "supervisor" in data["agent"]
 
+    def test_a_users_own_tools_keys_are_merged_not_replaced(self, tmp_config: Path):
+        """Reproduced by review 3 on #584: the whole ``tools`` map was replaced.
+
+        A user's hand-written policy on a CAO-installed agent — a denied builtin
+        and a grant for their own server — was destroyed on every install.
+        """
+        tmp_config.parent.mkdir(parents=True)
+        tmp_config.write_text(
+            json.dumps({"agent": {"developer": {"tools": {"bash": False, "user-srv*": True}}}}),
+            encoding="utf-8",
+        )
+        upsert_agent_tools("developer", ["cao-mcp-server"])
+        tools = json.loads(tmp_config.read_text())["agent"]["developer"]["tools"]
+        assert tools == {"bash": False, "user-srv*": True, "cao-mcp-server*": True}
+
+    def test_a_grant_that_leaves_the_desired_set_is_withdrawn(self, tmp_config: Path):
+        """CAO's own stale grant is removed on the next install, via the sidecar."""
+        upsert_agent_tools("developer", ["cao-mcp-server", "demo-tools"])
+        upsert_agent_tools("developer", ["cao-mcp-server"])
+        tools = json.loads(tmp_config.read_text())["agent"]["developer"]["tools"]
+        assert tools == {"cao-mcp-server*": True}
+
+    def test_an_unprovable_grant_is_left_alone_rather_than_deleted(self, tmp_config: Path):
+        """No sidecar row and no plugin-store proof ⇒ conservative: keep the key.
+
+        ``other*`` looks exactly like a grant CAO might have written, but CAO has
+        no record of writing it and nothing on disk proves it. Deleting on a guess
+        is the failure mode review 3 reported; leaving it is the safe direction.
+        """
+        tmp_config.parent.mkdir(parents=True)
+        tmp_config.write_text(
+            json.dumps({"agent": {"developer": {"tools": {"other*": True}}}}),
+            encoding="utf-8",
+        )
+        upsert_agent_tools("developer", ["cao-mcp-server"])
+        tools = json.loads(tmp_config.read_text())["agent"]["developer"]["tools"]
+        assert tools == {"other*": True, "cao-mcp-server*": True}
+
+    def test_other_agent_fields_survive_an_upsert(self, tmp_config: Path):
+        """A regression fence, not a reproduction — the base already preserved these.
+
+        Corrected after independent review: the pre-fix ``upsert_agent_tools``
+        already left sibling keys alone (it replaced only ``tools``); it was
+        ``remove_agent_tools`` that popped the whole entry. This test pins the half
+        that was already right, so the merge rewrite cannot regress it.
+        """
+        tmp_config.parent.mkdir(parents=True)
+        tmp_config.write_text(
+            json.dumps(
+                {
+                    "agent": {
+                        "developer": {
+                            "model": "custom/model",
+                            "prompt": "stay terse",
+                            "permission": {"bash": "deny"},
+                            "tools": {},
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        upsert_agent_tools("developer", ["cao-mcp-server"])
+        entry = json.loads(tmp_config.read_text())["agent"]["developer"]
+        assert entry["model"] == "custom/model"
+        assert entry["prompt"] == "stay terse"
+        assert entry["permission"] == {"bash": "deny"}
+        assert entry["tools"] == {"cao-mcp-server*": True}
+
+    def test_a_plugin_store_server_is_withdrawable_without_a_sidecar_row(
+        self, tmp_config: Path, tmp_path: Path
+    ):
+        """Pre-sidecar installs stay cleanable: containment is the second proof."""
+        store_root = tmp_path / "plugins"
+        tmp_config.parent.mkdir(parents=True)
+        tmp_config.write_text(
+            json.dumps(
+                {
+                    "mcp": {
+                        "demo-tools": {
+                            "type": "local",
+                            "command": [str(store_root / "demo" / "bin" / "srv")],
+                            "enabled": True,
+                        }
+                    },
+                    "agent": {"developer": {"tools": {"demo-tools*": True, "bash": False}}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        upsert_agent_tools("developer", ["cao-mcp-server"], plugin_store_roots=[store_root])
+        tools = json.loads(tmp_config.read_text())["agent"]["developer"]["tools"]
+        assert tools == {"bash": False, "cao-mcp-server*": True}
+
+
+class TestGrantRecord:
+    """The ``cao-grants.json`` sidecar is what makes withdrawal provable."""
+
+    def test_the_sidecar_records_the_granted_keys_beside_the_config(self, tmp_config: Path):
+        upsert_agent_tools("developer", ["cao-mcp-server", "demo-tools"])
+        sidecar = tmp_config.with_name("cao-grants.json")
+        assert sidecar.exists()
+        record = json.loads(sidecar.read_text())
+        assert record["version"] == 1
+        assert record["agents"]["developer"] == ["cao-mcp-server*", "demo-tools*"]
+
+    def test_a_corrupt_sidecar_warns_and_degrades_instead_of_raising(
+        self, tmp_config: Path, caplog
+    ):
+        """A damaged record must not fail an install — only reduce what CAO can prove."""
+        tmp_config.parent.mkdir(parents=True)
+        tmp_config.with_name("cao-grants.json").write_text("{not json", encoding="utf-8")
+        with caplog.at_level(logging.WARNING):
+            upsert_agent_tools("developer", ["cao-mcp-server"])
+        assert any("grant record" in r.getMessage() for r in caplog.records)
+        tools = json.loads(tmp_config.read_text())["agent"]["developer"]["tools"]
+        assert tools == {"cao-mcp-server*": True}
+
 
 class TestRemoveAgentTools:
     def test_removes_existing_agent(self, tmp_config: Path):
@@ -333,6 +474,20 @@ class TestRemoveAgentTools:
         remove_agent_tools("nonexistent")  # should not raise
         data = json.loads(tmp_config.read_text())
         assert "agent" not in data or "nonexistent" not in data.get("agent", {})
+
+    def test_a_true_noop_does_not_add_an_empty_agent_section(self, tmp_config: Path):
+        """Reported by independent review: the reconcile materialised ``"agent": {}``.
+
+        The pre-fix ``remove_agent_tools`` left a config with no ``agent`` section
+        completely untouched. Rewriting the file to add an empty one is a visible
+        change to a user's config in exchange for nothing.
+        """
+        write_config({"$schema": "https://opencode.ai/config.json"})
+        before = tmp_config.read_text(encoding="utf-8")
+
+        remove_agent_tools("nonexistent")
+
+        assert tmp_config.read_text(encoding="utf-8") == before
 
     def test_noop_on_completely_missing_file(self, tmp_config: Path):
         """remove_agent_tools when opencode.json does not exist yet should not raise."""
@@ -352,3 +507,268 @@ class TestRemoveAgentTools:
         data = json.loads(tmp_config.read_text())
         assert "supervisor" in data["agent"]
         assert "developer" not in data["agent"]
+
+    def test_a_users_agent_configuration_survives_removal(self, tmp_config: Path):
+        """Reproduced by review 3 on #584: the whole ``agent.<id>`` entry was popped.
+
+        Uninstalling a CAO agent discarded the user's ``model``, ``prompt`` and
+        tool policy for it. Only CAO's grant may be withdrawn.
+        """
+        upsert_agent_tools("developer", ["cao-mcp-server"])
+        data = json.loads(tmp_config.read_text())
+        data["agent"]["developer"]["model"] = "custom/model"
+        data["agent"]["developer"]["tools"]["bash"] = False
+        write_config(data)
+
+        remove_agent_tools("developer")
+        entry = json.loads(tmp_config.read_text())["agent"]["developer"]
+        assert entry["model"] == "custom/model"
+        assert entry["tools"] == {"bash": False}
+
+    def test_an_entry_holding_nothing_but_caos_grant_is_dropped_entirely(self, tmp_config: Path):
+        """No user state to preserve ⇒ restore the pre-install shape, no litter."""
+        upsert_agent_tools("developer", ["cao-mcp-server"])
+        remove_agent_tools("developer")
+        data = json.loads(tmp_config.read_text())
+        assert "developer" not in data.get("agent", {})
+        # The sidecar row goes with it, so a later install starts from a clean slate.
+        record = json.loads(tmp_config.with_name("cao-grants.json").read_text())
+        assert "developer" not in record["agents"]
+
+
+# ---------------------------------------------------------------------------
+# design.md §10a — removal (Finding 1) + install-side ownership guard (Finding 2)
+# ---------------------------------------------------------------------------
+
+
+class TestDisableMcpServer:
+    """``disable_mcp_server`` sets ``mcp.<name>.enabled`` to a JSON boolean false, in place.
+
+    The boolean *type* is the entire point of Finding 1's fix: OpenCode 1.18.15
+    gates the subprocess spawn on a strict ``enabled === false``, so a string
+    ``"false"``, a ``0``, or a ``null`` would NOT stop it from trying to launch a
+    binary whose ``PLUGIN_ROOT`` removal has just deleted. See design.md §10a and
+    ``docs/issues/573-agent-plugins/opencode-verification.md``.
+    """
+
+    def _seed(self, config_file: Path, entry: dict, *, name: str = "demo") -> None:
+        """Write an ``opencode.json`` with a single ``mcp.<name>`` entry."""
+        config_file.parent.mkdir(parents=True, exist_ok=True)
+        config_file.write_text(
+            json.dumps({"$schema": "https://opencode.ai/config.json", "mcp": {name: entry}}),
+            encoding="utf-8",
+        )
+
+    def test_writes_a_real_json_boolean_false_not_a_string(self, tmp_config: Path):
+        self._seed(tmp_config, {"type": "local", "command": ["demo-server"], "enabled": True})
+
+        disable_mcp_server("demo")
+
+        # (1) json round-trip yields the singleton ``False`` — this alone rejects
+        # "false"/0/null, none of which *is* the ``False`` object.
+        parsed = json.loads(tmp_config.read_text(encoding="utf-8"))
+        assert parsed["mcp"]["demo"]["enabled"] is False
+
+        # (2) the serialized text carries a bare ``false`` token, never a quoted
+        # string. Belt-and-braces against a future change that stringifies it.
+        text = tmp_config.read_text(encoding="utf-8")
+        assert '"enabled": false' in text
+        assert '"enabled": "false"' not in text
+
+    def test_leaves_every_other_field_untouched(self, tmp_config: Path):
+        self._seed(
+            tmp_config,
+            {
+                "type": "local",
+                "command": ["demo-server", "--root", "/plugins/demo"],
+                "environment": {"PLUGIN_ROOT": "/plugins/demo"},
+                "enabled": True,
+            },
+        )
+
+        disable_mcp_server("demo")
+
+        entry = json.loads(tmp_config.read_text())["mcp"]["demo"]
+        assert entry["command"] == ["demo-server", "--root", "/plugins/demo"]
+        assert entry["environment"] == {"PLUGIN_ROOT": "/plugins/demo"}
+        assert entry["type"] == "local"
+        assert entry["enabled"] is False
+
+    def test_noop_when_config_file_absent_leaves_it_absent(self, tmp_config: Path):
+        assert not tmp_config.exists()
+
+        disable_mcp_server("demo")  # must neither raise nor create the file
+
+        assert not tmp_config.exists()
+
+    def test_noop_when_mcp_section_absent(self, tmp_config: Path):
+        tmp_config.parent.mkdir(parents=True)
+        tmp_config.write_text(
+            json.dumps({"$schema": "https://opencode.ai/config.json"}), encoding="utf-8"
+        )
+        before = tmp_config.read_bytes()
+
+        disable_mcp_server("demo")
+
+        assert tmp_config.read_bytes() == before  # not rewritten
+
+    def test_noop_when_named_entry_absent(self, tmp_config: Path):
+        self._seed(
+            tmp_config, {"type": "local", "command": ["other"], "enabled": True}, name="other"
+        )
+        before = tmp_config.read_bytes()
+
+        disable_mcp_server("demo")  # a name that is not present
+
+        assert tmp_config.read_bytes() == before
+
+    def test_noop_when_already_disabled(self, tmp_config: Path):
+        self._seed(tmp_config, {"type": "local", "command": ["demo-server"], "enabled": False})
+        before = tmp_config.read_bytes()
+
+        disable_mcp_server("demo")
+
+        # Already ``false`` → returns before writing, so the file is byte-identical
+        # (it is not even re-serialized).
+        assert tmp_config.read_bytes() == before
+
+
+class TestEntryWithinRoots:
+    """``entry_within_roots`` is a purely lexical containment test over the entry's paths."""
+
+    def test_true_for_a_command_path_inside_a_root(self, tmp_path: Path):
+        root = tmp_path / "plugins"
+        cfg = {"command": [str(root / "demo" / "bin" / "server")]}
+        assert entry_within_roots(cfg, [root]) is True
+
+    def test_true_for_an_environment_value_inside_a_root(self, tmp_path: Path):
+        root = tmp_path / "plugin-data"
+        cfg = {"command": ["demo-server"], "environment": {"PLUGIN_DATA": str(root / "demo")}}
+        assert entry_within_roots(cfg, [root]) is True
+
+    def test_true_for_a_cwd_inside_a_root(self, tmp_path: Path):
+        root = tmp_path / "plugins"
+        cfg = {"cwd": str(root / "demo")}
+        assert entry_within_roots(cfg, [root]) is True
+
+    def test_false_when_no_path_is_inside_any_root(self, tmp_path: Path):
+        root = tmp_path / "plugins"
+        cfg = {"command": ["/usr/local/bin/user-thing"], "environment": {"HOME": "/home/user"}}
+        assert entry_within_roots(cfg, [root]) is False
+
+    def test_false_when_roots_is_empty(self, tmp_path: Path):
+        cfg = {"command": [str(tmp_path / "anything")]}
+        assert entry_within_roots(cfg, []) is False
+
+    def test_still_true_after_the_root_directory_is_deleted(self, tmp_path: Path):
+        """The post-uninstall state: ``PLUGIN_ROOT`` is gone, the recorded path is not.
+
+        Containment is decided textually (``Path.relative_to``), so deleting the
+        directory on disk cannot change the answer — which is exactly why the
+        reconcile still recognises a withdrawn plugin's orphaned entry.
+        """
+        root = tmp_path / "plugins"
+        inside = root / "demo"
+        inside.mkdir(parents=True)
+        cfg = {"command": [str(inside / "server")], "environment": {"PLUGIN_ROOT": str(inside)}}
+        assert entry_within_roots(cfg, [root]) is True
+
+        shutil.rmtree(root)
+        assert not root.exists()
+        assert entry_within_roots(cfg, [root]) is True  # unchanged — purely lexical
+
+
+class TestIsCaoOwnedMcpEntry:
+    """``is_cao_owned_mcp_entry`` decides whether CAO may overwrite an existing entry."""
+
+    def test_true_when_existing_is_byte_equal_to_the_candidate(self, tmp_path: Path):
+        """Idempotent replay: re-writing CAO's own entry is a safe no-op overwrite."""
+        entry = {"type": "local", "command": ["demo-server"], "enabled": True}
+        assert (
+            is_cao_owned_mcp_entry(dict(entry), dict(entry), plugin_store_roots=[tmp_path]) is True
+        )
+
+    def test_true_for_a_disabled_entry_whose_command_is_in_the_plugin_store(self, tmp_path: Path):
+        """Finding 1's post-removal state: a CAO-disabled plugin server, safe to re-enable."""
+        root = tmp_path / "plugins"
+        existing = {"type": "local", "command": [str(root / "demo" / "server")], "enabled": False}
+        candidate = {"type": "local", "command": [str(root / "demo" / "server")], "enabled": True}
+        assert is_cao_owned_mcp_entry(existing, candidate, plugin_store_roots=[root]) is True
+
+    def test_false_for_a_users_differing_entry(self, tmp_path: Path):
+        """The load-bearing negative: a foreign entry must never be overwritten."""
+        existing = {"type": "local", "command": ["/usr/local/bin/user-thing"], "enabled": True}
+        candidate = {"type": "local", "command": ["demo-server"], "enabled": True}
+        assert is_cao_owned_mcp_entry(existing, candidate, plugin_store_roots=[tmp_path]) is False
+
+    def test_false_for_a_disabled_entry_outside_the_plugin_store(self, tmp_path: Path):
+        """Disabled is not enough — a user may have disabled their own server."""
+        existing = {"type": "local", "command": ["/opt/user/server"], "enabled": False}
+        candidate = {"type": "local", "command": ["demo-server"], "enabled": True}
+        assert (
+            is_cao_owned_mcp_entry(existing, candidate, plugin_store_roots=[tmp_path / "plugins"])
+            is False
+        )
+
+    def test_a_pre_fix_entry_lacking_cwd_is_still_owned_through_its_environment(
+        self, tmp_path: Path
+    ):
+        """Adding ``cwd`` must not turn CAO's own older entries into collisions.
+
+        An entry written before review 3's ``cwd`` fix has no ``cwd``, so the
+        byte-equality clause now fails against the candidate. Ownership still holds
+        through the in-store clause, because the mapper injects in-store
+        ``PLUGIN_ROOT``/``PLUGIN_DATA`` into ``environment``. Without that, every
+        pre-fix plugin entry would be reported as a user collision on the next
+        refresh and never gain its ``cwd``.
+        """
+        root = tmp_path / "plugins"
+        plugin_root = root / "demo"
+        existing = {
+            "type": "local",
+            "command": ["demo-server"],
+            "enabled": True,
+            "environment": {"PLUGIN_ROOT": str(plugin_root)},
+        }
+        candidate = {**existing, "cwd": str(plugin_root)}
+        assert existing != candidate  # the byte-equality clause cannot fire
+        assert is_cao_owned_mcp_entry(existing, candidate, plugin_store_roots=[root]) is True
+
+    def test_true_for_an_enabled_store_entry_that_differs(self, tmp_path: Path):
+        """A force update to CAO's own entry must be recognised as CAO's.
+
+        This assertion was inverted before review on #584. Treating an in-store
+        *enabled* entry as user-owned meant a force update that changed the
+        command, args or env left the stale command in ``opencode.json`` and
+        dropped the agent's tool grant, because CAO skipped what was in fact its
+        own entry. A command rooted in the CAO-managed plugin store cannot be
+        user-authored.
+        """
+        root = tmp_path / "plugins"
+        existing = {"type": "local", "command": [str(root / "demo" / "server")], "enabled": True}
+        candidate = {"type": "local", "command": [str(root / "demo" / "other")], "enabled": True}
+        assert is_cao_owned_mcp_entry(existing, candidate, plugin_store_roots=[root]) is True
+
+    def test_a_v1_to_v2_force_update_is_owned_across_command_args_and_env(self, tmp_path: Path):
+        """The reviewer's reproduction, with all three fields changing at once."""
+        root = tmp_path / "plugins"
+        existing = {
+            "type": "local",
+            "command": [str(root / "demo" / "v1" / "server")],
+            "environment": {"VERSION": "1"},
+            "enabled": True,
+        }
+        candidate = {
+            "type": "local",
+            "command": [str(root / "demo" / "v2" / "server"), "--flag"],
+            "environment": {"VERSION": "2"},
+            "enabled": True,
+        }
+        assert is_cao_owned_mcp_entry(existing, candidate, plugin_store_roots=[root]) is True
+
+    def test_a_user_entry_is_still_never_overwritten(self, tmp_path: Path):
+        """The guard must not have been weakened for genuinely foreign entries."""
+        root = tmp_path / "plugins"
+        existing = {"type": "local", "command": ["/home/someone/bin/their-server"], "enabled": True}
+        candidate = {"type": "local", "command": [str(root / "demo" / "server")], "enabled": True}
+        assert is_cao_owned_mcp_entry(existing, candidate, plugin_store_roots=[root]) is False

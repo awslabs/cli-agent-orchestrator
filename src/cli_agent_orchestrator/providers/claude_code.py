@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, List, Optional
 if TYPE_CHECKING:
     from cli_agent_orchestrator.models.agent_profile import AgentProfile
 
+from cli_agent_orchestrator.agent_plugins.mcp_delivery import with_plugin_mcp as _with_plugin_mcp
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
 from cli_agent_orchestrator.models.terminal import TerminalInputBlockedError, TerminalStatus
@@ -339,7 +340,7 @@ class ClaudeCodeProvider(BaseProvider):
         if self._agent_profile is None:
             return None
         try:
-            return load_agent_profile(self._agent_profile)
+            return _with_plugin_mcp(load_agent_profile(self._agent_profile), "claude_code")
         except FileNotFoundError:
             return None
         except Exception as e:
@@ -501,7 +502,9 @@ class ClaudeCodeProvider(BaseProvider):
         # Apply tool restrictions via --disallowedTools flags.
         # --dangerously-skip-permissions bypasses prompts but --disallowedTools
         # still prevents the agent from using the blocked tools entirely.
-        if self._allowed_tools and "*" not in self._allowed_tools:
+        # Treat a present-but-empty list as deny-all (same as Grok). A falsy
+        # check used to skip the flags entirely for allowed_tools=[].
+        if self._allowed_tools is not None and "*" not in self._allowed_tools:
             from cli_agent_orchestrator.utils.tool_mapping import get_disallowed_tools
 
             disallowed = get_disallowed_tools("claude_code", self._allowed_tools)
@@ -771,13 +774,15 @@ class ClaudeCodeProvider(BaseProvider):
                 from cli_agent_orchestrator.services.status_monitor import status_monitor
 
                 logger.info("Model upgrade nudge detected (%s), declining", title)
-                # Esc, NOT Enter: "1. Yes" is the pre-selected option, so Enter
-                # would accept the upgrade and restart the CLI. Esc is also
-                # preferred over Down+Enter because it does not depend on the
-                # option ordering staying "Yes" first.
+                # Choose the numbered "No" option directly. The dialog advertises
+                # Esc as cancel, but a live elastic-worker run showed Esc leaving
+                # this prompt standing while typing "2" dismissed it immediately.
+                # The prompt is a stable two-choice migration dialog whose own
+                # rendered contract names "1. Yes" and "2. No"; selecting the
+                # explicit negative choice also persists Claude's decision.
                 status_monitor.notify_input_sent(self.terminal_id)
                 await asyncio.to_thread(
-                    get_backend().send_special_key, self.session_name, self.window_name, "Escape"
+                    get_backend().send_keys, self.session_name, self.window_name, "2"
                 )
                 upgrade_declined.add(title)
                 any_prompt_handled = True

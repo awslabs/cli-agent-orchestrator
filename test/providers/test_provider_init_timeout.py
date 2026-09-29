@@ -19,6 +19,7 @@ a longer per-profile override -- see ``TestKimiInitTimeoutWiring`` /
 ``TestAntigravityInitTimeoutWiring`` below.
 """
 
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -26,7 +27,7 @@ import pytest
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.providers.antigravity_cli import AntigravityCliProvider
 from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
-from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider
+from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider, ProviderError
 
 # claude_code module namespace (module-level imports patched here).
 _CC = "cli_agent_orchestrator.providers.claude_code"
@@ -323,6 +324,27 @@ class TestKimiInitTimeoutWiring:
     exits early, init hangs until its own outer wait times out.
     """
 
+    @pytest.fixture(autouse=True)
+    def _stub_legacy_probe(self):
+        # initialize() first resolves the Kimi dialect by asking the launch
+        # shell to dump `kimi --help`. These tests target timeout wiring, not
+        # dialect detection, and they mock the backend such that the probe
+        # sentinel never arrives -- without this stub every test here would
+        # spend 20s and then fail with UnsupportedKimiError. The probe has its
+        # own coverage in test_kimi_code_compat.py::TestKimiDialectDetection.
+        from cli_agent_orchestrator.providers.kimi_cli import (
+            KimiDialect,
+            KimiProbeResult,
+        )
+
+        probe = KimiProbeResult(
+            dialect=KimiDialect.LEGACY,
+            binary="/usr/local/bin/kimi",
+            source_home=Path("/home/user/.kimi"),
+        )
+        with patch.object(KimiCliProvider, "_resolve_dialect", return_value=probe):
+            yield
+
     @pytest.mark.asyncio
     @patch.object(KimiCliProvider, "_handle_startup_dialog")
     @patch(f"{_KIMI}.load_agent_profile")
@@ -393,9 +415,12 @@ class TestKimiInitTimeoutWiring:
         mock_load.side_effect = FileNotFoundError("nope")
 
         provider = KimiCliProvider("t1", "sess", "win", agent_profile="missing")
-        with pytest.raises(Exception):
+        with pytest.raises(ProviderError, match="Failed to load agent profile"):
             # _build_kimi_command still raises ProviderError for the same
             # missing profile -- _try_load_profile only affects the timeout.
+            # Asserted on the SPECIFIC error: a bare `pytest.raises(Exception)`
+            # also swallows an unrelated failure (e.g. a probe timeout), which
+            # would let this test pass while the behaviour under test is broken.
             await provider.initialize()
 
 

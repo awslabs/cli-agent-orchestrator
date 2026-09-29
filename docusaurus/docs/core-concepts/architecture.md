@@ -76,16 +76,24 @@ The event bus (`services/event_bus.py`) provides:
 - **Async consumption** -- consumers await on bounded `asyncio.Queue` instances.
 - **Back-pressure** -- per-subscriber queue cap (configurable via `CAO_EVENT_BUS_MAX_QUEUE_SIZE`, default 1024) with drop-and-log on overflow.
 
-## Four Control Planes
+## Control Planes
 
-CAO exposes four independent surfaces for controlling the orchestration runtime:
+CAO exposes five independent surfaces for controlling the orchestration runtime:
 
 | Control Plane | Interface | Best For |
 |---------------|-----------|----------|
 | **CLI** | `cao session`, `cao launch`, `cao shutdown` | Scripting, CI pipelines, quick shell access |
 | **Web UI** | Browser at `localhost:9889` | Visual monitoring, interactive management |
 | **cao-ops-mcp** | MCP tools from an external agent | Agent-driven agent management (a primary agent spawns and monitors CAO sessions) |
+| **Fleet CLI** | `cao fleet`, `cao worker` | Managing agents that run somewhere else, one `cao-server` per worker |
 | **Plugins** | Python observer extensions inside `cao-server` | Outbound event streaming (Discord, Slack, webhooks, audit logs) |
+
+The first three and the plugins all sit around the `cao-server` on this machine.
+The fleet CLI is the exception: it reaches the same route families on a *remote*
+`cao-server` through a cluster's worker broker, so nothing below this table is on
+its path. See [CLI Commands](../reference/cli-commands.md#cao-fleet) for the
+commands and [Control Planes](https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/control-planes.md)
+for how the surfaces compare.
 
 ## Component Stack
 

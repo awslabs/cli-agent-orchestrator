@@ -173,7 +173,7 @@ class HermesProvider(BaseProvider):
                 "configure skills and MCP servers inside the selected Hermes profile"
             )
 
-        if self._allowed_tools and "*" not in self._allowed_tools:
+        if self._allowed_tools is not None and "*" not in self._allowed_tools:
             logger.warning(
                 "Hermes provider has no CAO-native tool restriction flag; "
                 "restrictions rely on the selected Hermes profile configuration"

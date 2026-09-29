@@ -172,6 +172,45 @@ def test_the_resume_endpoint_answers_403_and_not_400_or_409():
     assert PLAN_ID in json.dumps(response.json()), "the refusal must carry the plan_id"
 
 
+def test_the_resume_endpoint_answers_503_when_the_approval_store_is_unreadable(monkeypatch):
+    """Issue #696. A store fault reaches the caller as 503, distinct from the 403 of a missing approval.
+
+    503 is the transient-fault posture: retry once the database is readable. Reporting it as 403 would
+    tell the operator to approve a plan that may already be approved, against a fault approval could not
+    even be read. The two must be distinguishable at the transport, because a caller branches on it.
+    """
+    import sqlite3
+
+    from fastapi.testclient import TestClient
+
+    from cli_agent_orchestrator.api.main import app
+
+    _insert_failed_script_run("run-503")  # inserted while the store is healthy
+    before = workflow_journal.get_run("run-503")
+
+    def unreadable_store(*_args, **_kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    # Break only the approval store's connection; the run row was already written and the journal
+    # keeps its own connection, so the admission ladder still reaches the approval gate.
+    monkeypatch.setattr(approval_store, "_connect", unreadable_store)
+
+    client = TestClient(app, base_url="http://localhost")
+    response = client.post("/workflows/runs/run-503/resume")
+
+    assert response.status_code == 503, (
+        f"expected 503, got {response.status_code}: an unreadable approval store is a transient fault "
+        "to retry, not a missing approval to grant — the two must not share a status code"
+    )
+    after = workflow_journal.get_run("run-503")
+    assert after.generation == before.generation
+    assert after.state == before.state
+    body = json.dumps(response.json())
+    assert (
+        "has not been approved" not in body
+    ), "a store fault must not be reported with the missing-approval remedy"
+
+
 # ---------------------------------------------------------------------------
 # 4. Both start arms agree
 # ---------------------------------------------------------------------------
@@ -204,3 +243,36 @@ def test_both_start_arms_reach_the_same_verdict_on_the_same_inputs():
 
     approval_store.grant(PLAN_ID, "test-account")
     approval_gate.ensure_plan_approved(tier="script", manifest_json=manifest)  # must not raise
+
+
+@pytest.mark.parametrize("endpoint", ["/workflows/runs", "/workflows/runs:submit"])
+def test_store_fault_refuses_start_before_writing_a_run(endpoint, monkeypatch):
+    """Both start endpoints must report a store fault without creating a run."""
+    import sqlite3
+
+    from fastapi.testclient import TestClient
+
+    from cli_agent_orchestrator.api.main import app
+    from cli_agent_orchestrator.models.workflow import ScriptSpec
+    from cli_agent_orchestrator.services import manifest_freeze, workflow_spec_service
+
+    spec = ScriptSpec(
+        name="store-fault",
+        path="/tmp/store-fault.py",
+        source="def main():\n    pass\n",
+        content_hash="sha256:abc",
+    )
+    monkeypatch.setattr(workflow_spec_service, "get_workflow", lambda name: spec)
+    monkeypatch.setattr(manifest_freeze, "build_manifest_json", lambda **kwargs: _manifest())
+
+    def unreadable_store():
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(approval_store, "_connect", unreadable_store)
+    response = TestClient(app, base_url="http://localhost").post(
+        endpoint, json={"name_or_path": "store-fault", "run_id": "refused-start"}
+    )
+    assert response.status_code == 503, response.text
+    assert PLAN_ID in response.json()["detail"]
+    assert "has not been approved" not in response.json()["detail"]
+    assert workflow_journal.get_run("refused-start") is None

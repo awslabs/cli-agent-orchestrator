@@ -16,10 +16,9 @@ would look recent, and **work nobody reviewed would execute with a genuine appro
 of the gate, but a corruption of the thing the gate consults. ``grant`` therefore uses ``INSERT OR IGNORE``, so
 write-once is a property of the statement rather than of a caller remembering to look first.
 
-ABSENCE MEANS UNAPPROVED, AND THAT IS WHY EVERY FAULT HERE IS SAFE. A missing table, a silent migration
-failure, a database error — all converge on "no row found". Because absence answers False rather than raising or
-defaulting open, each of those becomes a REFUSED RUN rather than an authorisation bypass. Fail-closed, the same
-direction pass 2A established for an absent manifest.
+ABSENCE AND STORE FAULTS BOTH REFUSE EXECUTION. ``approval_state`` distinguishes a missing approval
+from a database error so the gate can report the appropriate remedy. ``is_approved`` retains its
+boolean contract: both absence and an unreadable store return False.
 
 ``plan_id`` IS OPAQUE: stored and compared verbatim, never parsed, never normalised. A normalisation is how two
 distinct plans could come to share one approval, and ``plan-v1:``'s versioned prefix exists precisely so a
@@ -91,28 +90,36 @@ def grant(plan_id: str, approved_by: str) -> None:
         )
 
 
-def is_approved(plan_id: str) -> bool:
-    """Does an approval exist for ``plan_id``? TOTAL — never raises, and absence answers ``False``.
+# Keep an unreadable store distinct from a plan with no approval (issue #696).
+APPROVED = "approved"
+ABSENT = "absent"
+UNKNOWN = "unknown"
 
-    The one question this module answers. It reports a fact; it does not decide whether a run may proceed.
-    """
+
+def approval_state(plan_id: str) -> str:
+    """Return APPROVED, ABSENT, or UNKNOWN when the database cannot be read."""
     try:
         with _connect() as conn:
             row = conn.execute(
                 "SELECT 1 FROM workflow_plan_approval WHERE plan_id = ?", (plan_id,)
             ).fetchone()
-        return row is not None
     except sqlite3.Error:
-        # A database fault is not permission. Answering False keeps every failure mode fail-closed:
-        # the run is refused rather than admitted on the strength of an error.
-        return False
+        # A database fault is not "no approval". UNKNOWN keeps the run fail-closed (the gate refuses)
+        # while preserving that the cause was a store the gate could not read, not a missing approval.
+        return UNKNOWN
+    return APPROVED if row is not None else ABSENT
+
+
+def is_approved(plan_id: str) -> bool:
+    """Return whether the plan is approved; absence and database faults remain False."""
+    return approval_state(plan_id) == APPROVED
 
 
 def get_approval(plan_id: str) -> Optional[PlanApproval]:
     """The approval record for ``plan_id``, or ``None``. TOTAL — never raises.
 
     FOR DIAGNOSIS, NOT FOR DECIDING. "When, and by whom" is the first question a refused operator asks;
-    ``approval-gate`` should still route on :func:`is_approved`.
+    ``approval-gate`` routes on :func:`approval_state`.
     """
     try:
         with _connect() as conn:

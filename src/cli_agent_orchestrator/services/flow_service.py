@@ -291,7 +291,10 @@ async def execute_flow(name: str) -> bool:
             # own row was deleted, or a row was inserted during flow recycling,
             # which does not hold ``session_lifecycle_lock``.
             conductor = terminals[0] if terminals else None
-            if conductor and _is_terminal_busy(conductor["id"]):
+            # Off the loop: get_status() can fork a tmux capture-pane for a
+            # PROCESSING terminal (status_monitor.py's stale-PROCESSING
+            # fallback), and execute_flow runs on the shared event loop.
+            if conductor and await asyncio.to_thread(_is_terminal_busy, conductor["id"]):
                 logger.info(f"Flow {name}: session {session_name} is busy, skipping")
                 return False
             for t in terminals:

@@ -311,9 +311,53 @@ Two warnings for the blanket `except ShimError` in the fan-out pattern above: `S
 is a `ShimError`, so a catch-all absorbs a halt or a divergence and lets the run finish with
 a sentinel where a human decision was required. Re-raise when `.status == 409`.
 
+## Re-running one step
+
+`cao workflow step <run-id> <step-id>` re-executes **one** step of a recorded run — usually
+one that already finished (or failed) — without re-running the workflow. Authoring a long
+workflow used to
+mean a full re-run per prompt edit — fixing two sentences in step 55 of 57 cost reaching
+step 55 again. This verb closes that loop:
+
+```bash
+# re-run step 55 exactly as recorded
+cao workflow step run-abc123 draft-summary
+
+# re-run it with an edited prompt (from a file, or inline)
+cao workflow step run-abc123 draft-summary --prompt-file /tmp/better-prompt.md
+cao workflow step run-abc123 draft-summary --prompt-override 'Be terse. {{steps.research.output.notes}}'
+```
+
+The step's prompt is resolved from the **recorded** run — its journaled inputs and its
+predecessors' outputs — so a step that templates off earlier steps runs with the same
+values it saw originally. A replacement prompt replaces the *template*: `{{...}}`
+references inside it still resolve against that run, which is what makes an edited prompt
+runnable in place.
+
+The source run is **never modified**: no journal row is written, no event is emitted, and
+the recorded step's own output stays readable. Replay as many times as it takes. The
+resolved prompt is printed alongside the output, because a wrong-looking output is usually
+a prompt that resolved differently than expected.
+
+A **still-running** run is fair game too, deliberately: the same immutability is what makes
+it safe, so you can iterate on step 12's prompt while the run is still grinding through
+step 30. Concurrent replays — of the same step, even — are independent; each one gets its
+own private slot for structured output.
+
+Limits: YAML-tier runs only (a script-tier step's inputs come from the script, not from a
+spec snapshot), and a step whose predecessor never produced output cannot be replayed —
+that fails with the missing reference named rather than running with a blank. An empty
+`--prompt-override` (or an empty `--prompt-file`) is rejected rather than run: omit the flag
+to reuse the recorded prompt. A replay is not cancellable — one watched step runs to the
+step timeout. Exit code is 0 when the step ran, 1 when it failed.
+
+Replays are deliberately absent from the journal and the event stream, which is what keeps
+them non-destructive — so they are also invisible to anything reading those as an execution
+audit log. Each one is logged at INFO by the server; that is the trail.
+
 ## CLI reference
 
-All thirteen verbs live under `cao workflow`.
+All fourteen verbs live under `cao workflow`.
 
 | Verb | Flags | Description |
 | --- | --- | --- |
@@ -328,6 +372,7 @@ All thirteen verbs live under `cao workflow`.
 | `result <run_id>` | `--json` | The complete `WorkflowRunResult` for a run — the full-detail surface `run --json` no longer prints. Answers for an **in-flight** run too (the steps settled so far), not only a finished one, and works for a detached or post-restart run because it is assembled from the journal. |
 | `events <run_id>` | `--follow/--no-follow`, `--after-seq <n>`, `--json` | Stream live per-run ordered progress (SSE). `--no-follow` does a one-shot batch read. Requires the events route from issue #504 — on a build without it, both modes report that the stream is unavailable and point at `wait`/`status`, rather than claiming the run is unknown. |
 | `resume <run_id>` | `--decide STEP_ID=rerun\|skip` (repeatable), `--json` | Resume a crashed/failed run from its journal (blocks). Each step is replayed, executed, or halted. `--decide` resolves a halted step and authorises **exactly one attempt** — see Halts and `--decide` above. |
+| `step <run_id> <step_id>` | `--prompt-file <path>`, `--prompt-override <text>`, `--json` | Re-execute ONE recorded step live (blocks), resolving its prompt from the recorded run. Leaves the run untouched. The two prompt flags are mutually exclusive. YAML tier only. Exit 0 ran, 1 failed. |
 | `cancel <run_id>` | — | Cooperatively cancel a running workflow. |
 | `approve <plan_id>` | `--json` | Approve a plan identifier so runs of that plan may start. Idempotent — a repeat reports the original approver and timestamp rather than overwriting them. **There is no revoke.** Requires the `cao:admin` scope when auth is enabled. Exit 0 approved (whether newly or already), 1 rejected/unreachable. See [Plan approval](#plan-approval-script-tier) below. |
 

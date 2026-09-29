@@ -70,6 +70,7 @@ def test_workflow_run_columns(patched_db):
         "tier",
         "generation",
         "manifest_json",
+        "error",
     }
     # run_id is the primary key; the nullable columns are current_step_id/finished_at.
     assert cols["run_id"][5] == 1
@@ -93,6 +94,9 @@ def test_workflow_run_columns(patched_db):
     # proves presence, these two prove the shape a reader depends on.
     assert cols["manifest_json"][2] == "TEXT"
     assert cols["manifest_json"][4] == "NULL"
+    assert cols["error"][2] == "TEXT"
+    assert cols["error"][3] == 0
+    assert cols["error"][4] == "NULL"
 
 
 def test_workflow_run_no_loop_columns(patched_db):
@@ -295,6 +299,7 @@ def test_workflow_run_indexes_do_not_change_columns(patched_db):
         # workflow_journal._REQUIRED_RUN_COLUMNS — guarded by its own equality assertion in
         # test_workflow_journal_connection_posture.py. Three places, one column set.
         "manifest_json",
+        "error",
     }
 
 
