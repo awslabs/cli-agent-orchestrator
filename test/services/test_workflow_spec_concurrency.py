@@ -163,10 +163,10 @@ def test_two_same_hash_process_updates_have_exactly_one_winner(tmp_path: Path) -
 def test_case_variants_select_same_workflow_lock_identity(tmp_path: Path) -> None:
     safe_base = os.path.realpath(tmp_path)
     mixed_case = svc._workflow_lock_identity(
-        svc._safe_spec_path(tmp_path / "MixedCase.py", safe_base)
+        svc._safe_spec_path(tmp_path / "MixedCase.py", safe_base), safe_base
     )
     lower_case = svc._workflow_lock_identity(
-        svc._safe_spec_path(tmp_path / "mixedcase.py", safe_base)
+        svc._safe_spec_path(tmp_path / "mixedcase.py", safe_base), safe_base
     )
 
     assert mixed_case == lower_case
@@ -228,9 +228,9 @@ def test_unicode_parent_aliases_select_same_workflow_lock_identity(
     canonical_target = svc._safe_spec_path(canonical_parent / "workflow.py", str(canonical_parent))
     alias_target = svc._safe_spec_path(alias_parent / "workflow.py", str(alias_parent))
 
-    assert svc._workflow_lock_identity(canonical_target) == svc._workflow_lock_identity(
-        alias_target
-    )
+    assert svc._workflow_lock_identity(
+        canonical_target, os.path.realpath(canonical_parent)
+    ) == svc._workflow_lock_identity(alias_target, os.path.realpath(alias_parent))
 
 
 @pytest.mark.parametrize("alias_name", UNICODE_PARENT_ALIASES)
@@ -272,7 +272,9 @@ def test_distinct_physical_parents_select_distinct_workflow_lock_identities(
     first_target = svc._safe_spec_path(first_parent / "workflow.py", str(first_parent))
     second_target = svc._safe_spec_path(second_parent / "workflow.py", str(second_parent))
 
-    assert svc._workflow_lock_identity(first_target) != svc._workflow_lock_identity(second_target)
+    assert svc._workflow_lock_identity(
+        first_target, os.path.realpath(first_parent)
+    ) != svc._workflow_lock_identity(second_target, os.path.realpath(second_parent))
 
 
 def test_workflow_lock_identity_refuses_unavailable_parent_identity(
@@ -295,7 +297,7 @@ def test_workflow_lock_identity_refuses_unavailable_parent_identity(
         atomic_file.LockUnavailableError,
         match="cannot identify workflow lock parent",
     ):
-        svc._workflow_lock_identity(target)
+        svc._workflow_lock_identity(target, parent)
 
 
 def test_workflow_lock_identity_rechecks_target_containment_before_stat(
@@ -319,7 +321,7 @@ def test_workflow_lock_identity_rechecks_target_containment_before_stat(
         atomic_file.LockUnavailableError,
         match="escapes its canonical parent",
     ):
-        svc._workflow_lock_identity(target)
+        svc._workflow_lock_identity(target, parent)
 
 
 def test_workflow_lock_identity_rejects_sibling_prefix_after_realpath(
@@ -343,7 +345,7 @@ def test_workflow_lock_identity_rejects_sibling_prefix_after_realpath(
         atomic_file.LockUnavailableError,
         match="escapes its canonical parent",
     ):
-        svc._workflow_lock_identity(target)
+        svc._workflow_lock_identity(target, parent)
 
 
 def test_concurrent_reader_observes_only_complete_old_or_new_bytes(tmp_path: Path) -> None:
@@ -392,7 +394,9 @@ def test_service_lock_timeout_preserves_target_and_releases_cleanly(
     target.write_text(BASE, encoding="utf-8")
     holder_ready = threading.Event()
     release_holder = threading.Event()
-    lock_identity = svc._workflow_lock_identity(svc._safe_spec_path(target, str(tmp_path)))
+    lock_identity = svc._workflow_lock_identity(
+        svc._safe_spec_path(target, str(tmp_path)), os.path.realpath(tmp_path)
+    )
 
     def _hold() -> None:
         with atomic_file.strict_identity_lock(lock_identity, target):

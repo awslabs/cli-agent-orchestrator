@@ -23,3 +23,24 @@ def test_authoring_uses_identity_only_lock_entrypoint() -> None:
         call_names = {_call_name(call) for call in _calls(function)}
         assert "strict_identity_lock" in call_names
         assert "strict_target_lock" not in call_names
+
+
+def test_lock_identity_stats_only_the_trusted_parent() -> None:
+    """The workflow name-derived target must not influence the stat path."""
+    stat_calls = [
+        call
+        for call in _calls(svc._workflow_lock_identity)
+        if isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "os"
+        and call.func.attr == "stat"
+    ]
+    assert len(stat_calls) == 1
+    assert ast.unparse(stat_calls[0].args[0]) == "canonical_parent"
+
+    for function in (svc.create_workflow, svc.update_workflow):
+        identity_calls = [
+            call for call in _calls(function) if _call_name(call) == "_workflow_lock_identity"
+        ]
+        assert len(identity_calls) == 1
+        assert ast.unparse(identity_calls[0].args[1]) == "safe_base"

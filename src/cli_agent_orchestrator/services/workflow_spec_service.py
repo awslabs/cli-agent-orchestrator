@@ -205,7 +205,7 @@ _ASCII_CASEFOLD_TRANSLATION = str.maketrans(
 )
 
 
-def _workflow_lock_identity(canonical_target: str) -> str:
+def _workflow_lock_identity(canonical_target: str, canonical_parent: str) -> str:
     """Return the stable lock identity for a contained workflow target.
 
     Identify the existing parent directory by its physical filesystem identity,
@@ -214,19 +214,21 @@ def _workflow_lock_identity(canonical_target: str) -> str:
     to reproduce filesystem-specific Unicode rules. It also keeps the lock
     stable across atomic replacement of the target inode.
 
-    The caller must establish containment through :func:`_safe_spec_path`
-    before invoking this helper. The original target path remains unchanged for
-    every filesystem access. ASCII basename folding intentionally over-serializes
-    case-distinct workflow names on case-sensitive filesystems.
+    The caller must establish containment through :func:`_safe_spec_path` and
+    pass its separately validated base directory as ``canonical_parent``.
+    Keeping the parent stat on that trusted value prevents a workflow name from
+    influencing the filesystem lookup. The original target path remains
+    unchanged for every filesystem access. ASCII basename folding intentionally
+    over-serializes case-distinct workflow names on case-sensitive filesystems.
     """
-    parent = os.path.realpath(os.path.dirname(canonical_target))
+    parent = os.path.realpath(canonical_parent)
     real_target = os.path.realpath(canonical_target)
     if real_target != parent and not real_target.startswith(parent + os.sep):
         raise LockUnavailableError(
             "workflow lock target escapes its canonical parent; refusing unlocked access"
         )
     try:
-        parent_stat = os.stat(parent)
+        parent_stat = os.stat(canonical_parent)
     except OSError as exc:
         raise LockUnavailableError(
             "cannot identify workflow lock parent; refusing unlocked access"
@@ -1159,7 +1161,7 @@ def create_workflow(name: str, source: str, scan_dir: Optional[str] = None) -> S
     # path from creating even a lock sidecar outside the validated workflow
     # target identity.
     lock_target = _safe_spec_path(target_path, safe_base)
-    with strict_identity_lock(_workflow_lock_identity(lock_target), Path(lock_target)):
+    with strict_identity_lock(_workflow_lock_identity(lock_target, safe_base), Path(lock_target)):
         if os.path.exists(target_path):
             raise FileExistsError(f"workflow '{name}' already exists; use update to change it")
         _check_tier_collision(name, safe_base)  # -> TierCollisionError (409)
@@ -1226,7 +1228,7 @@ def update_workflow(
     """
     safe_base, target_path = _validate_write_target(name, scan_dir)
     lock_target = _safe_spec_path(target_path, safe_base)
-    with strict_identity_lock(_workflow_lock_identity(lock_target), Path(lock_target)):
+    with strict_identity_lock(_workflow_lock_identity(lock_target, safe_base), Path(lock_target)):
         if not os.path.exists(target_path):
             raise WorkflowNotFoundError(f"workflow '{name}' does not exist; use create to add it")
         _check_tier_collision(name, safe_base)
