@@ -48,10 +48,27 @@ def test_lock_identity_stats_only_the_trusted_parent() -> None:
 
 def test_create_existence_check_uses_contained_target() -> None:
     """Create admission must not reintroduce the unchecked name-derived path."""
+    contained_exists_calls = [
+        call for call in _calls(svc.create_workflow) if _call_name(call) == "_contained_spec_exists"
+    ]
+    assert len(contained_exists_calls) == 1
+    assert [ast.unparse(arg) for arg in contained_exists_calls[0].args] == [
+        "lock_target",
+        "safe_base",
+    ]
+
+
+def test_contained_exists_colocates_guard_with_sink() -> None:
+    """CodeQL's positive containment barrier must dominate exists locally."""
+    tree = ast.parse(inspect.getsource(svc._contained_spec_exists))
+    conditions = [ast.unparse(node.test) for node in ast.walk(tree) if isinstance(node, ast.If)]
+    assert "not real_path.startswith(safe_base + os.sep)" in conditions
+
     exists_calls = [
         call
-        for call in _calls(svc.create_workflow)
-        if isinstance(call.func, ast.Attribute)
+        for call in ast.walk(tree)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
         and isinstance(call.func.value, ast.Attribute)
         and isinstance(call.func.value.value, ast.Name)
         and call.func.value.value.id == "os"
@@ -59,7 +76,7 @@ def test_create_existence_check_uses_contained_target() -> None:
         and call.func.attr == "exists"
     ]
     assert len(exists_calls) == 1
-    assert ast.unparse(exists_calls[0].args[0]) == "lock_target"
+    assert ast.unparse(exists_calls[0].args[0]) == "real_path"
 
 
 def test_update_existence_check_uses_contained_target() -> None:

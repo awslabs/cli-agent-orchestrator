@@ -328,6 +328,19 @@ def _contained_spec_file(path: Union[str, Path], base_dir: Optional[str] = None)
     return real_path if os.path.isfile(real_path) else None
 
 
+def _contained_spec_exists(path: Union[str, Path], safe_base: str) -> bool:
+    """Return whether a path exists after a function-local containment check.
+
+    CodeQL's path-injection barrier does not survive a checked path being
+    returned from another function. Keep the single positive containment
+    check and ``exists`` sink together, matching the guarded read/write helpers.
+    """
+    real_path = _resolve_contained_spec_path(path, safe_base)
+    if not real_path.startswith(safe_base + os.sep):
+        raise SpecPathRefusedError(f"workflow spec path '{path}' escapes its validated directory")
+    return os.path.exists(real_path)
+
+
 def _write_contained_spec_bytes(
     path: Union[str, Path],
     data: bytes,
@@ -1162,7 +1175,7 @@ def create_workflow(name: str, source: str, scan_dir: Optional[str] = None) -> S
     # target identity.
     lock_target = _safe_spec_path(target_path, safe_base)
     with strict_identity_lock(_workflow_lock_identity(lock_target, safe_base), Path(lock_target)):
-        if os.path.exists(lock_target):
+        if _contained_spec_exists(lock_target, safe_base):
             raise FileExistsError(f"workflow '{name}' already exists; use update to change it")
         _check_tier_collision(name, safe_base)  # -> TierCollisionError (409)
         spec = _validated_script_spec(name, source, target_path)
