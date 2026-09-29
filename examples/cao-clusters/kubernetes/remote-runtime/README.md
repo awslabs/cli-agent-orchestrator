@@ -18,7 +18,8 @@ driven through the server's HTTP API. See
 Both pods use the image from [`../eks/Dockerfile`](../eks/Dockerfile), which
 contains `cao-server`, `cao-bridge`, tmux, Claude Code and `mock_cli`. Build and
 push it as described in the [EKS guide](../eks/README.md#build), then point the
-example at it:
+example at it: in `kustomization.yaml`, set `newName` to your repository and
+`newTag` to your tag. With the `kustomize` CLI installed, this does the same:
 
 ```bash
 cd examples/cao-clusters/kubernetes/remote-runtime

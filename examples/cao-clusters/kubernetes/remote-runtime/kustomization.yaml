@@ -9,8 +9,8 @@ resources:
   - namespace.yaml
   - server.yaml
   - runtime.yaml
-# Both pods run the image built from ../eks/Dockerfile. Set it with:
-#   kustomize edit set image cao-node=<registry>/<repository>:<tag>
+# Both pods run the image built from ../eks/Dockerfile: set newName and newTag
+# to it (or run: kustomize edit set image cao-node=<registry>/<repository>:<tag>).
 images:
   - name: cao-node
     newName: cao-node
