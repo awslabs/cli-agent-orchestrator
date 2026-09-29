@@ -1,5 +1,6 @@
 """Full tests for terminal service."""
 
+import asyncio
 import os
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -18,6 +19,7 @@ from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import OutputExtractionError
+from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.services.terminal_service import (
     IdempotencyKeyConflict,
     OutputMode,
@@ -1166,6 +1168,235 @@ class TestCreateTerminalIdempotencyKey:
         mock_tmux.create_session.assert_not_called()
         mock_provider_manager.create_provider.assert_not_called()
         mock_db_create.assert_not_called()
+
+
+class TestReplayDuringInitializationBehaviour:
+    """Behavioural twin of TestIdempotentReplayWaitsForInitialization that uses
+    only create_terminal itself: a real keyed synchronous create is left inside
+    provider.initialize() while a replay with the same key runs."""
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_idempotency_record")
+    async def test_replay_does_not_return_before_original_initialization_finishes(
+        self,
+        mock_lookup,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+        mock_get_terminal,
+    ):
+        mock_gen_id.return_value = "test1234"
+        mock_gen_session.return_value = "cao-session"
+        mock_gen_window.return_value = "developer-abcd"
+        mock_tmux.session_exists.return_value = False
+        mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
+        mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+        mock_get_terminal.return_value = dict(_PRIOR_ROW, id="test1234")
+
+        committed = asyncio.Event()
+        release_init = asyncio.Event()
+        mock_db_create.side_effect = lambda *a, **k: None
+
+        async def initialize():
+            committed.set()
+            await release_init.wait()
+            return True
+
+        mock_provider = AsyncMock()
+        mock_provider.initialize.side_effect = initialize
+        mock_provider_manager.create_provider.return_value = mock_provider
+        # The original sees no record; once it has committed, the replay does.
+        mock_lookup.side_effect = lambda key: (
+            _record(terminal_id="test1234") if committed.is_set() else None
+        )
+
+        original = asyncio.ensure_future(
+            create_terminal("kiro_cli", "developer", new_session=True, idempotency_key="k")
+        )
+        await asyncio.wait_for(committed.wait(), timeout=2)
+
+        replay = asyncio.ensure_future(
+            create_terminal("kiro_cli", "developer", new_session=True, idempotency_key="k")
+        )
+        await asyncio.sleep(0.1)
+        replay_returned_early = replay.done()
+
+        release_init.set()
+        await asyncio.wait_for(original, timeout=2)
+        result = await asyncio.wait_for(replay, timeout=2)
+
+        assert not replay_returned_early, "replay returned while the provider was initializing"
+        assert result.id == "test1234"
+        mock_provider_manager.create_provider.assert_called_once()
+
+
+_PRIOR_ROW = {
+    "id": "prior-terminal",
+    "name": "developer-abcd",
+    "provider": "kiro_cli",
+    "session_name": "cao-session",
+    "agent_profile": "developer",
+    "caller_id": None,
+    "allowed_tools": None,
+    "engine": None,
+    "group": None,
+    "metadata": None,
+    "status": "idle",
+    "last_active": datetime.now(),
+}
+
+
+class TestIdempotentReplayWaitsForInitialization:
+    """Review on PR #773: a keyed synchronous create commits its row before it
+    awaits provider.initialize(), so a replay used to hand back a terminal
+    whose provider was still starting, and the caller then sent input into it.
+    A replay must return only what the original returns: a ready terminal, or
+    the original's failure."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_registry(self):
+        terminal_service._pending_sync_inits.clear()
+        yield
+        terminal_service._pending_sync_inits.clear()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_idempotency_record")
+    async def test_replay_waits_until_original_initialization_settles(
+        self, mock_lookup, mock_get_terminal
+    ):
+        mock_lookup.return_value = _record(terminal_id="prior-terminal")
+        mock_get_terminal.return_value = dict(_PRIOR_ROW)
+        waiter = terminal_service._SyncInitWaiter()
+        terminal_service._pending_sync_inits["prior-terminal"] = waiter
+
+        replay = asyncio.ensure_future(
+            create_terminal("kiro_cli", "developer", new_session=True, idempotency_key="k")
+        )
+        await asyncio.sleep(0.05)
+        assert not replay.done(), "replay returned while the original was still initializing"
+
+        waiter.settle()
+        result = await asyncio.wait_for(replay, timeout=1)
+        assert result.id == "prior-terminal"
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_idempotency_record")
+    async def test_replay_surfaces_the_original_initialization_failure(
+        self, mock_lookup, mock_get_terminal
+    ):
+        mock_lookup.return_value = _record(terminal_id="prior-terminal")
+        mock_get_terminal.return_value = dict(_PRIOR_ROW)
+        waiter = terminal_service._SyncInitWaiter()
+        waiter.settle(TimeoutError("Antigravity CLI initialization timed out after 180.0 seconds"))
+        terminal_service._pending_sync_inits["prior-terminal"] = waiter
+
+        with pytest.raises(RuntimeError, match="failed to initialize"):
+            await create_terminal("kiro_cli", "developer", new_session=True, idempotency_key="k")
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_idempotency_record")
+    async def test_deferred_init_replay_still_returns_immediately(
+        self, mock_lookup, mock_get_terminal
+    ):
+        """A deferred-init original returned before initializing, so its replay
+        does too; only synchronous replays wait."""
+        mock_lookup.return_value = _record(terminal_id="prior-terminal")
+        mock_get_terminal.return_value = dict(_PRIOR_ROW)
+        terminal_service._pending_sync_inits["prior-terminal"] = terminal_service._SyncInitWaiter()
+
+        result = await asyncio.wait_for(
+            create_terminal(
+                "kiro_cli", "developer", new_session=True, idempotency_key="k", defer_init=True
+            ),
+            timeout=1,
+        )
+        assert result.id == "prior-terminal"
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_idempotency_record")
+    @pytest.mark.parametrize("init_fails", [False, True])
+    async def test_synchronous_create_registers_waiter_during_init_and_settles_it(
+        self,
+        mock_lookup,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+        init_fails,
+    ):
+        mock_lookup.return_value = None
+        mock_gen_id.return_value = "test1234"
+        mock_gen_session.return_value = "cao-session"
+        mock_gen_window.return_value = "developer-abcd"
+        mock_tmux.session_exists.return_value = False
+        mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
+        mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+        seen = {}
+
+        async def initialize():
+            waiter = terminal_service._pending_sync_inits.get("test1234")
+            seen["waiter"] = waiter
+            seen["settled_during_init"] = waiter is not None and waiter.settled.is_set()
+            if init_fails:
+                raise TimeoutError("init timed out")
+            return True
+
+        mock_provider = AsyncMock()
+        mock_provider.initialize.side_effect = initialize
+        mock_provider_manager.create_provider.return_value = mock_provider
+
+        if init_fails:
+            with pytest.raises(TimeoutError):
+                await create_terminal(
+                    "kiro_cli", "developer", new_session=True, idempotency_key="fresh-key"
+                )
+        else:
+            await create_terminal(
+                "kiro_cli", "developer", new_session=True, idempotency_key="fresh-key"
+            )
+
+        assert seen["waiter"] is not None, "no waiter registered while initializing"
+        assert seen["settled_during_init"] is False
+        assert seen["waiter"].settled.is_set()
+        assert (seen["waiter"].error is not None) is init_fails
+        assert "test1234" not in terminal_service._pending_sync_inits
 
 
 def _record(terminal_id="prior-terminal", **overrides):
