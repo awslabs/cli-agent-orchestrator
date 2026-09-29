@@ -221,5 +221,12 @@ case "${warm_mode}" in
     ;;
 esac
 
+if [ "${CAO_NODE_MODE:-server}" = "bridge" ]; then
+  # Execution runtime (#745): no cao-server in this pod. cao-bridge dials the
+  # central server and runs agents here, beside this container's tmux.
+  echo "[cao-entrypoint] starting cao-bridge as runtime ${CAO_BRIDGE_RUNTIME_ID:-?}"
+  exec cao-bridge
+fi
+
 echo "[cao-entrypoint] starting cao-server on ${BIND_HOST}:${PORT}"
 exec cao-server --host "${BIND_HOST}" --port "${PORT}"
