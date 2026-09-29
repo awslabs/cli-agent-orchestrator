@@ -1862,7 +1862,6 @@ async def agui_stream(
 
     from fastapi.responses import StreamingResponse
 
-    from cli_agent_orchestrator.clients.database import list_terminals_by_session
     from cli_agent_orchestrator.services import session_service
     from cli_agent_orchestrator.services.agui.lifecycle_tracker import ToolCallLifecycleTracker
     from cli_agent_orchestrator.services.agui_stream import (
@@ -1885,7 +1884,9 @@ async def agui_stream(
         terminals: List[Dict] = []
         for sess in sessions:
             try:
-                terminals.extend(list_terminals_by_session(sess["id"]))
+                terminals.extend(
+                    session_service.list_current_session_terminals(sess["id"], backend_exists=True)
+                )
             except Exception:
                 logger.debug("agui_stream: terminal listing failed for %s", sess.get("id"))
         return build_dashboard_snapshot(sessions, terminals, list(scopes))
@@ -2227,7 +2228,6 @@ async def agui_run(
 
     # Build the snapshot function
     def _fleet_snapshot() -> Dict:
-        from cli_agent_orchestrator.clients.database import list_terminals_by_session
         from cli_agent_orchestrator.services import session_service
         from cli_agent_orchestrator.services.ui_state_service import build_dashboard_snapshot
 
@@ -2235,7 +2235,9 @@ async def agui_run(
         terminals: List[Dict] = []
         for sess in sessions:
             try:
-                terminals.extend(list_terminals_by_session(sess["id"]))
+                terminals.extend(
+                    session_service.list_current_session_terminals(sess["id"], backend_exists=True)
+                )
             except Exception:
                 pass
         return build_dashboard_snapshot(sessions, terminals, list(_scopes))
@@ -3682,9 +3684,11 @@ async def list_terminals_in_session(
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     try:
-        from cli_agent_orchestrator.clients.database import list_terminals_by_session
+        from cli_agent_orchestrator.services.session_service import (
+            list_current_session_terminals,
+        )
 
-        return list_terminals_by_session(session_name)
+        return list_current_session_terminals(session_name)
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

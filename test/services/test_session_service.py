@@ -1032,6 +1032,63 @@ class TestGetSession:
         assert result["terminals"][1]["deferred_init_failure"] == failure
 
     @patch("cli_agent_orchestrator.services.session_service.get_deferred_init_failure")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_list_current_session_terminals_filters_old_incarnation(
+        self, mock_get_backend, mock_list_terminals, mock_failure
+    ):
+        mock_get_backend.return_value.session_exists_strict.return_value = True
+        current_failure = {"message": "current worker failed"}
+        mock_list_terminals.return_value = [
+            {
+                "id": "old-failed",
+                "deferred_init_failure": {"message": "old failure"},
+                "deferred_init_runtime_reclaimed": True,
+                "session_incarnation_id": "inc-old",
+            },
+            {
+                "id": "current-live",
+                "deferred_init_failure": None,
+                "deferred_init_runtime_reclaimed": False,
+                "session_incarnation_id": "inc-current",
+            },
+            {
+                "id": "current-failed",
+                "deferred_init_failure": current_failure,
+                "deferred_init_runtime_reclaimed": True,
+                "session_incarnation_id": "inc-current",
+            },
+        ]
+        mock_failure.side_effect = lambda terminal_id, candidate=None: {
+            "old-failed": {"message": "old failure"},
+            "current-failed": current_failure,
+        }.get(terminal_id)
+
+        rows = session_service_mod.list_current_session_terminals("cao-reused")
+
+        assert [row["id"] for row in rows] == ["current-live", "current-failed"]
+
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_list_current_session_terminals_returns_raw_rows_when_backend_is_absent(
+        self, mock_get_backend, mock_list_terminals
+    ):
+        mock_get_backend.return_value.session_exists_strict.return_value = False
+        raw_rows = [
+            {
+                "id": "old-failed",
+                "deferred_init_failure": {"message": "old failure"},
+                "deferred_init_runtime_reclaimed": True,
+                "session_incarnation_id": "inc-old",
+            }
+        ]
+        mock_list_terminals.return_value = raw_rows
+
+        rows = session_service_mod.list_current_session_terminals("cao-gone")
+
+        assert rows == raw_rows
+
+    @patch("cli_agent_orchestrator.services.session_service.get_deferred_init_failure")
     @patch("cli_agent_orchestrator.services.status_monitor.status_monitor.get_status")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
@@ -1164,6 +1221,85 @@ class TestDeleteSession:
         assert mock_delete_row.call_count == 2
         mock_delete_row.assert_any_call("terminal1", ANY, registry=ANY)
         mock_delete_row.assert_any_call("terminal2", ANY, registry=ANY)
+
+    @patch("cli_agent_orchestrator.services.session_service.get_deferred_init_failure")
+    @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_ids")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_row")
+    @patch("cli_agent_orchestrator.services.terminal_service.dismantle_terminal_runtime")
+    @patch("cli_agent_orchestrator.services.terminal_service.capture_terminal_snapshot")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_delete_session_preserves_old_incarnation_tombstone_when_name_reused(
+        self,
+        mock_get_backend,
+        mock_list_terminals,
+        mock_capture,
+        mock_dismantle,
+        mock_delete_row,
+        mock_delete_terminals_by_ids,
+        mock_failure,
+    ):
+        """Deleting the live replacement must not erase an older failure tombstone.
+
+        Session names are reusable labels.  Once durable incarnation identity
+        exists, teardown of the CURRENT live session must be scoped to that
+        incarnation, while a retained failure from an older incarnation remains
+        available to its external lifecycle owner.
+        """
+        old_failure = {
+            "phase": "deferred_init",
+            "kind": "provider_init_error",
+            "message": "old generation failed",
+        }
+        current_failure = {
+            "phase": "deferred_init",
+            "kind": "provider_init_error",
+            "message": "current sibling failed",
+        }
+        mock_get_backend.return_value.session_exists_strict.return_value = True
+        mock_get_backend.return_value.kill_session.return_value = True
+        mock_list_terminals.return_value = [
+            {
+                "id": "old-failed",
+                "deferred_init_failure": old_failure,
+                "deferred_init_runtime_reclaimed": True,
+                "session_incarnation_id": "inc-old",
+            },
+            {
+                "id": "current-live",
+                "deferred_init_failure": None,
+                "deferred_init_runtime_reclaimed": False,
+                "session_incarnation_id": "inc-current",
+            },
+            {
+                "id": "current-failed",
+                "deferred_init_failure": current_failure,
+                "deferred_init_runtime_reclaimed": True,
+                "session_incarnation_id": "inc-current",
+            },
+        ]
+        mock_failure.side_effect = lambda terminal_id, candidate=None: {
+            "old-failed": old_failure,
+            "current-failed": current_failure,
+        }.get(terminal_id)
+
+        result = delete_session("cao-reused")
+
+        assert result == {"deleted": ["cao-reused"], "errors": []}
+        mock_get_backend.return_value.kill_session.assert_called_once_with("cao-reused")
+        assert [call.args[0] for call in mock_capture.call_args_list] == [
+            "current-live",
+            "current-failed",
+        ]
+        assert [call.args[0] for call in mock_dismantle.call_args_list] == [
+            "current-live",
+            "current-failed",
+        ]
+        assert [call.args[0] for call in mock_delete_row.call_args_list] == [
+            "current-live",
+            "current-failed",
+        ]
+        mock_delete_terminals_by_ids.assert_called_once_with(["current-live", "current-failed"])
 
     @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_ids")
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_row")

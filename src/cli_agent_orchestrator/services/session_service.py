@@ -341,6 +341,49 @@ def _select_current_incarnation_rows(
     return selected, selected_failures
 
 
+def _collect_deferred_failures(
+    terminals: List[Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    """Load durable deferred-init failures for the supplied registry rows."""
+
+    failures: Dict[str, Dict[str, Any]] = {}
+    for terminal in terminals:
+        failure = get_deferred_init_failure(
+            str(terminal["id"]), terminal.get("deferred_init_failure")
+        )
+        if failure is not None:
+            failures[str(terminal["id"])] = failure
+    return failures
+
+
+def list_current_session_terminals(
+    session_name: str,
+    *,
+    backend_exists: bool | None = None,
+) -> List[Dict[str, Any]]:
+    """Return terminal rows belonging to the current live incarnation.
+
+    The database session-name read is intentionally a raw persistence primitive:
+    reconciliation and recovery need retained rows from historical incarnations
+    sharing a reusable label. Live-state consumers must not treat those rows as
+    members of the replacement session.
+
+    When the backend session is absent there is no current live incarnation to
+    select, so preserve the historical/raw behavior and return every durable row.
+    Callers that already established liveness can pass backend_exists to avoid a
+    duplicate backend probe.
+    """
+
+    terminals = list_terminals_by_session(session_name)
+    if backend_exists is None:
+        backend_exists = get_backend().session_exists_strict(session_name)
+    if not backend_exists:
+        return terminals
+    failures = _collect_deferred_failures(terminals)
+    terminals, _ = _select_current_incarnation_rows(terminals, failures)
+    return terminals
+
+
 def get_session(session_name: str) -> Dict:
     """Get session with terminals, oldest first.
 
@@ -365,13 +408,7 @@ def get_session(session_name: str) -> Dict:
         # before reclaiming it. Preserve the old not-found contract for ordinary
         # missing sessions, but synthesize a terminated session shell when the DB
         # still carries authoritative failure truth (including sidecar fallback).
-        failures: dict[str, dict[str, Any]] = {}
-        for terminal in terminals:
-            failure = get_deferred_init_failure(
-                terminal["id"], terminal.get("deferred_init_failure")
-            )
-            if failure is not None:
-                failures[str(terminal["id"])] = failure
+        failures = _collect_deferred_failures(terminals)
 
         if backend_exists:
             terminals, failures = _select_current_incarnation_rows(terminals, failures)
@@ -516,6 +553,15 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
         # included (context manager).
         with session_lifecycle_lock(session_name):
             terminals = list_terminals_by_session(session_name)
+            # A session NAME is only a reusable backend label.  Retained
+            # deferred-init failures from an older incarnation can legitimately
+            # share it with the current live replacement.  Build the teardown
+            # worklist from the durable incarnation identity before capturing or
+            # dismantling anything so deleting the replacement cannot erase the
+            # older external owner's failure evidence.  A failed sibling from
+            # the CURRENT incarnation stays in the worklist.
+            failures = _collect_deferred_failures(terminals)
+            terminals, _ = _select_current_incarnation_rows(terminals, failures)
             incarnation_ids = [t["id"] for t in terminals]
 
             # Step 2: read-only scrollback/metadata capture, which has to happen
