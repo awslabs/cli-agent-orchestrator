@@ -360,6 +360,23 @@ class TestConnection:
         assert server.sent[-1] == Status(terminal_id="abcd1234", status=TerminalStatus.PROCESSING)
 
     @pytest.mark.asyncio
+    async def test_a_result_that_could_not_be_sent_is_delivered_after_the_next_hello(self):
+        bridge = _bridge()
+        # A launch finished while the channel was down: its result had nowhere to go.
+        late = Result(op_id="op-launch", ok=True, payload={"terminal": {"id": "beef0001"}})
+        await bridge._send(late)
+        server = FakeServer()
+        serving = asyncio.ensure_future(bridge.serve(server))
+        for _ in range(100):
+            if late in server.sent:
+                break
+            await asyncio.sleep(0.01)
+        await server.close()
+        await serving
+        assert isinstance(server.sent[0], Hello)
+        assert late in server.sent
+
+    @pytest.mark.asyncio
     async def test_a_server_speaking_another_version_is_fatal(self, tmp_path):
         with pytest.raises(ChannelRefused):
             await _bridge(tmp_path).serve(FakeServer(version=PROTOCOL_VERSION + 1))

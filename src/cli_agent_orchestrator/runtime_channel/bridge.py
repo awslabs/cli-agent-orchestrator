@@ -21,7 +21,7 @@ import os
 import re
 import signal
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, Optional, Set, Tuple
+from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple
 
 import websockets
 from websockets.asyncio.client import ClientConnection, connect
@@ -64,6 +64,9 @@ class Bridge:
         self._send_lock = asyncio.Lock()
         # terminal id -> (lock, number of commands holding or awaiting it)
         self._terminal_locks: Dict[str, Tuple[asyncio.Lock, int]] = {}
+        # Results that could not be sent (no channel at the time), delivered
+        # after the next hello: the server acts on results it no longer awaits.
+        self._unsent: List[Result] = []
         # Strong references: the event loop holds only weak ones to tasks.
         self._tasks: Set["asyncio.Task[None]"] = set()
         self._stop = asyncio.Event()
@@ -72,13 +75,15 @@ class Bridge:
 
     async def _send(self, frame) -> None:
         ws = self._ws
-        if ws is None:
-            return
-        async with self._send_lock:
-            try:
-                await ws.send(encode(frame))
-            except websockets.exceptions.ConnectionClosed:
-                pass
+        if ws is not None:
+            async with self._send_lock:
+                try:
+                    await ws.send(encode(frame))
+                    return
+                except websockets.exceptions.ConnectionClosed:
+                    pass
+        if isinstance(frame, Result):
+            self._unsent.append(frame)
 
     def _status_of(self, terminal_id: str) -> TerminalStatus:
         from cli_agent_orchestrator.services.status_monitor import status_monitor
@@ -250,6 +255,9 @@ class Bridge:
         # connected yet), so send each terminal's status as it is now.
         for terminal_id in statuses:
             await self._push_status(terminal_id)
+        unsent, self._unsent = self._unsent, []
+        for result in unsent:
+            await self._send(result)
         try:
             async for raw in ws:
                 frame = decode(raw)
