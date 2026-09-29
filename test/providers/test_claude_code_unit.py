@@ -1709,6 +1709,117 @@ class TestClaudeCodeProviderModelFlag:
         assert "--model fable-5" in command
 
 
+class TestClaudeCodeProfileEnvSurvivesNestingCleanup:
+    """The launch command unsets every inherited ``CLAUDE*`` var (nested-session
+    hygiene) before starting ``claude``. A ``CLAUDE*`` var the agent's own
+    profile declared in ``env:`` is configuration, not leakage, and must reach
+    Claude -- otherwise ``env: {CLAUDE_CONFIG_DIR: ...}`` is silently undone
+    (PR #665 review, P1).
+
+    These run the real launch command in a POSIX shell, with a stub ``claude``
+    on PATH that prints the environment it was started with.
+    """
+
+    # What the backend hands the pane: the profile's value plus the vars a
+    # cao-server started inside a Claude Code session leaks into it.
+    PANE_ENV = {
+        "CLAUDE_CONFIG_DIR": "/home/u/.claude-b",
+        "CLAUDECODE": "1",
+        "CLAUDE_CODE_ENTRYPOINT": "cli",
+        "CLAUDE_CODE_USE_BEDROCK": "1",
+        "HOME": "/home/u",
+    }
+
+    @staticmethod
+    def _launch(command: str, env: dict, tmp_path: Path) -> dict:
+        import subprocess
+
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        stub = bin_dir / "claude"
+        stub.write_text("#!/bin/sh\nenv\n")
+        stub.chmod(0o755)
+        result = subprocess.run(
+            ["/bin/sh", "-c", command],
+            env={**env, "PATH": f"{bin_dir}:/usr/bin:/bin"},
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        )
+        return dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+
+    @staticmethod
+    def _profile(env=None) -> AgentProfile:
+        return AgentProfile(name="worker-b", description="d", env=env)
+
+    def test_profile_declared_claude_var_reaches_claude(self, tmp_path):
+        provider = ClaudeCodeProvider("tid", "sess", "win", "worker-b")
+        command = provider._build_claude_command(
+            self._profile({"CLAUDE_CONFIG_DIR": "/home/u/.claude-b"})
+        )
+
+        launched = self._launch(command, self.PANE_ENV, tmp_path)
+
+        assert launched["CLAUDE_CONFIG_DIR"] == "/home/u/.claude-b"
+        # Inherited nesting vars are still cleaned up...
+        assert "CLAUDECODE" not in launched
+        assert "CLAUDE_CODE_ENTRYPOINT" not in launched
+        # ...and the provider-auth allowlist is unchanged.
+        assert launched["CLAUDE_CODE_USE_BEDROCK"] == "1"
+
+    def test_undeclared_claude_var_is_still_unset(self, tmp_path):
+        """Without a profile declaration the same var is inherited leakage."""
+        provider = ClaudeCodeProvider("tid", "sess", "win", "worker-b")
+        command = provider._build_claude_command(self._profile())
+
+        launched = self._launch(command, self.PANE_ENV, tmp_path)
+
+        assert "CLAUDE_CONFIG_DIR" not in launched
+        assert "CLAUDECODE" not in launched
+
+    def test_a_declaration_the_backend_dropped_is_not_preserved(self, tmp_path):
+        """An over-cap profile value never reached the pane, so whatever
+        CLAUDE_CONFIG_DIR the pane has is inherited -- and is cleaned up."""
+        from cli_agent_orchestrator.utils.terminal_env import MAX_ENV_VALUE_BYTES
+
+        provider = ClaudeCodeProvider("tid", "sess", "win", "worker-b")
+        command = provider._build_claude_command(
+            self._profile({"CLAUDE_CONFIG_DIR": "x" * MAX_ENV_VALUE_BYTES})
+        )
+
+        launched = self._launch(command, self.PANE_ENV, tmp_path)
+
+        assert "CLAUDE_CONFIG_DIR" not in launched
+
+    def test_native_agent_profile_keeps_its_declared_var_too(self, tmp_path):
+        provider = ClaudeCodeProvider("tid", "sess", "win", "worker-b")
+        profile = AgentProfile(
+            name="worker-b",
+            description="d",
+            native_agent="my-agent",
+            env={"CLAUDE_CONFIG_DIR": "/home/u/.claude-b"},
+        )
+        command = provider._build_claude_command(profile)
+
+        launched = self._launch(command, self.PANE_ENV, tmp_path)
+
+        assert launched["CLAUDE_CONFIG_DIR"] == "/home/u/.claude-b"
+        assert "CLAUDECODE" not in launched
+
+    def test_only_plain_claude_names_reach_the_shell_pattern(self):
+        """The preserved names are spliced into a shell command; only names the
+        cleanup could ever unset (``CLAUDE[A-Z_]*``) qualify, so nothing else
+        from a profile key can reach the shell."""
+        provider = ClaudeCodeProvider("tid", "sess", "win", "worker-b")
+        command = provider._build_claude_command(
+            self._profile({"CLAUDE_X' ; touch /tmp/pwned ; '": "v", "OTHER_VAR": "v"})
+        )
+
+        assert "pwned" not in command
+        assert "OTHER_VAR" not in command
+
+
 class TestClaudeCodeProviderClaudeConfig:
     """Tests that profile.claudeConfig maps to Claude Code CLI flags."""
 

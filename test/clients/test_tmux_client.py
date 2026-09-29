@@ -373,6 +373,224 @@ class TestCreateSessionEnvironmentFiltering:
         assert "MY_CUSTOM_THING" not in env
 
 
+# ── profile env (trusted_env) ────────────────────────────────────────
+
+
+class TestProfileEnv:
+    """The agent profile's own ``env:`` reaches the terminal it declares,
+    through the shared policy in utils/terminal_env (herdr applies the same)."""
+
+    @staticmethod
+    def _session_mock():
+        mock_window = MagicMock()
+        mock_window.name = "w"
+        mock_session = MagicMock()
+        mock_session.windows = [mock_window]
+        mock_session.new_window.return_value = mock_window
+        return mock_session
+
+    def test_create_session_passes_profile_env_to_the_initial_pane(self, tmux, tmp_path):
+        tmux.server.new_session.return_value = self._session_mock()
+
+        with patch.dict(os.environ, {"HOME": "/home/u"}, clear=True):
+            tmux.create_session(
+                "ses",
+                "w",
+                "tid1",
+                str(tmp_path),
+                extra_env={"SHARED": "operator"},
+                trusted_env={"CLAUDE_CONFIG_DIR": "/home/u/.claude-b", "SHARED": "profile"},
+            )
+
+        env = tmux.server.new_session.call_args.kwargs["environment"]
+        assert env["CLAUDE_CONFIG_DIR"] == "/home/u/.claude-b"
+        assert env["SHARED"] == "profile"
+
+    # ``new-session -e`` stores its variables in the SESSION environment, which
+    # tmux merges into every later window of that session (tmux(1), GLOBAL AND
+    # SESSION ENVIRONMENT). Profile env belongs to the initial pane only
+    # (PR #665 review, P1), so create_session puts the session environment back
+    # the way it would be without the profile before it returns -- i.e. while
+    # the caller still holds the session lifecycle lock.
+
+    def test_create_session_takes_profile_env_back_out_of_the_session_env(self, tmux, tmp_path):
+        session = self._session_mock()
+        tmux.server.new_session.return_value = session
+
+        with patch.dict(os.environ, {"HOME": "/home/u", "CAO_PORT_HINT": "inherited"}, clear=True):
+            tmux.create_session(
+                "ses",
+                "w",
+                "tid1",
+                str(tmp_path),
+                extra_env={"SHARED": "operator"},
+                trusted_env={
+                    "SHARED": "profile",  # operator value restored
+                    "CAO_PORT_HINT": "profile",  # inherited value restored
+                    "PROFILE_ONLY": "secret",  # not session-scoped: unset
+                },
+            )
+
+        assert session.set_environment.call_args_list == [
+            call("SHARED", "operator"),
+            call("CAO_PORT_HINT", "inherited"),
+        ]
+        assert session.unset_environment.call_args_list == [call("PROFILE_ONLY")]
+
+    def test_create_session_without_profile_env_leaves_the_session_env_alone(self, tmux, tmp_path):
+        session = self._session_mock()
+        tmux.server.new_session.return_value = session
+
+        tmux.create_session("ses", "w", "tid1", str(tmp_path), extra_env={"SHARED": "operator"})
+
+        session.set_environment.assert_not_called()
+        session.unset_environment.assert_not_called()
+
+    def test_create_session_only_restores_keys_the_profile_actually_set(self, tmux, tmp_path):
+        """A dropped profile key (reserved, oversized) never reached the session
+        env, so there is nothing to put back -- and the runtime identity the
+        session env legitimately carries must not be unset."""
+        from cli_agent_orchestrator.utils.terminal_env import MAX_ENV_VALUE_BYTES
+
+        session = self._session_mock()
+        tmux.server.new_session.return_value = session
+
+        tmux.create_session(
+            "ses",
+            "w",
+            "tid1",
+            str(tmp_path),
+            trusted_env={
+                "CAO_TERMINAL_ID": "spoofed",
+                "BIG": "x" * MAX_ENV_VALUE_BYTES,
+                "KEPT": "v",
+            },
+        )
+
+        session.set_environment.assert_not_called()
+        assert session.unset_environment.call_args_list == [call("KEPT")]
+
+    def test_create_session_rolls_back_when_the_session_env_cannot_be_restored(
+        self, tmux, tmp_path
+    ):
+        """Fail closed: a session whose later windows would inherit another
+        agent's credentials is not handed out -- it is removed and the create
+        fails, so the caller's usual rollback and retry apply."""
+        session = self._session_mock()
+        session.unset_environment.side_effect = ValueError("tmux set-environment stderr: boom")
+        tmux.server.new_session.return_value = session
+
+        with pytest.raises(ValueError, match="boom"):
+            tmux.create_session(
+                "ses", "w", "tid1", str(tmp_path), trusted_env={"PROFILE_ONLY": "secret"}
+            )
+
+        session.kill.assert_called_once()
+
+    def test_create_window_passes_profile_env_to_the_window(self, tmux, tmp_path):
+        session = self._session_mock()
+        tmux.server.sessions.get.return_value = session
+
+        tmux.create_window(
+            "ses", "w", "tid2", str(tmp_path), trusted_env={"CLAUDE_CONFIG_DIR": "/abs/.claude-b"}
+        )
+
+        env = session.new_window.call_args.kwargs["environment"]
+        assert env["CLAUDE_CONFIG_DIR"] == "/abs/.claude-b"
+
+    def test_oversized_profile_value_is_dropped_with_the_shared_message(
+        self, tmux, tmp_path, caplog
+    ):
+        from cli_agent_orchestrator.utils.terminal_env import MAX_ENV_VALUE_BYTES
+
+        session = self._session_mock()
+        tmux.server.sessions.get.return_value = session
+
+        with caplog.at_level("WARNING"):
+            tmux.create_window(
+                "ses", "w", "tid2", str(tmp_path), trusted_env={"BIG": "x" * MAX_ENV_VALUE_BYTES}
+            )
+
+        assert "BIG" not in session.new_window.call_args.kwargs["environment"]
+        assert f"Dropping profile env var BIG — value exceeds {MAX_ENV_VALUE_BYTES} bytes" in (
+            caplog.messages
+        )
+
+
+class TestRuntimeIdentityWins:
+    """Runtime-owned identity survives spoofed values on every tmux create path
+    (PR #665 review, P2). The workflow routing ids arrive on the runtime
+    channel (extra_env); a profile may not replace or invent them, and the
+    terminal/session identity is written last."""
+
+    RUNTIME = {
+        "CAO_WORKFLOW_RUN_ID": "run-real",
+        "CAO_WORKFLOW_STEP_ID": "step-real",
+        "CAO_WORKFLOW_GENERATION": "7",
+        "CAO_CALLBACK_URL": "http://supervisor.real:9889",
+        "CAO_CALLBACK_TERMINAL_ID": "sup-real",
+    }
+    SPOOF = {
+        "CAO_TERMINAL_ID": "spoofed",
+        "CAO_SESSION_NAME": "evil",
+        "CAO_WORKFLOW_RUN_ID": "run-evil",
+        "CAO_WORKFLOW_STEP_ID": "step-evil",
+        "CAO_WORKFLOW_GENERATION": "999",
+        "CAO_CALLBACK_URL": "http://attacker:1",
+        "CAO_CALLBACK_TERMINAL_ID": "sup-evil",
+    }
+
+    def _assert_real_identity(self, env, terminal_id, session_name):
+        assert env["CAO_TERMINAL_ID"] == terminal_id
+        assert env["CAO_SESSION_NAME"] == session_name
+        for key, value in self.RUNTIME.items():
+            assert env[key] == value
+
+    def test_create_session(self, tmux, tmp_path):
+        tmux.server.new_session.return_value = TestProfileEnv._session_mock()
+
+        with patch.dict(os.environ, {"HOME": "/home/u"}, clear=True):
+            tmux.create_session(
+                "cao-real",
+                "w",
+                "tid-real",
+                str(tmp_path),
+                extra_env=self.RUNTIME,
+                trusted_env=self.SPOOF,
+            )
+
+        env = tmux.server.new_session.call_args.kwargs["environment"]
+        self._assert_real_identity(env, "tid-real", "cao-real")
+
+    def test_create_session_ignores_an_inherited_session_name(self, tmux, tmp_path):
+        """cao-server started inside another CAO terminal inherits that
+        terminal's CAO_SESSION_NAME; the ``CAO_*`` inherited slice must not
+        carry it into the new session."""
+        tmux.server.new_session.return_value = TestProfileEnv._session_mock()
+
+        with patch.dict(os.environ, {"HOME": "/h", "CAO_SESSION_NAME": "cao-parent"}, clear=True):
+            tmux.create_session("cao-real", "w", "tid-real", str(tmp_path))
+
+        env = tmux.server.new_session.call_args.kwargs["environment"]
+        assert env["CAO_SESSION_NAME"] == "cao-real"
+
+    def test_create_window(self, tmux, tmp_path):
+        session = TestProfileEnv._session_mock()
+        tmux.server.sessions.get.return_value = session
+
+        tmux.create_window(
+            "cao-real",
+            "w",
+            "tid-real",
+            str(tmp_path),
+            extra_env=self.RUNTIME,
+            trusted_env=self.SPOOF,
+        )
+
+        env = session.new_window.call_args.kwargs["environment"]
+        self._assert_real_identity(env, "tid-real", "cao-real")
+
+
 # ── create_window ────────────────────────────────────────────────────
 
 

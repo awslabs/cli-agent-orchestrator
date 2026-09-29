@@ -132,6 +132,12 @@
       "minimum": 1,
       "description": "Per-profile override, in seconds, for provider initialization. Replaces the server-wide provider_init_timeout as the hard outer cap for this profile."
     },
+    "env": {
+      "type": "object",
+      "propertyNames": {"pattern": "^[A-Za-z_][A-Za-z0-9_]*$"},
+      "additionalProperties": {"type": "string"},
+      "description": "Extra environment variables injected into this agent's terminal at launch (e.g. {\"CLAUDE_CONFIG_DIR\": \"/home/me/.claude-b\"}). Values are passed verbatim, with no shell or ~ expansion, so use absolute paths. CAO's runtime identity variables cannot be set here. Consumed by CAO at terminal creation; not passed through to provider JSON."
+    },
     "prompt": {
       "type": "string"
     },

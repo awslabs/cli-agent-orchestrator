@@ -47,6 +47,23 @@ portable and make profile listings useful.
   translations for provider files used inside a container.
 - `provider_init_timeout` (integer, seconds): per-profile provider
   initialization timeout.
+- `env` (object of string→string): extra environment variables injected into
+  this agent's terminal at launch — for example
+  `env: {CLAUDE_CONFIG_DIR: /home/me/.claude-b}` to point one `claude_code`
+  worker at an alternate config/auth directory while other agents in the same
+  session keep the default. Scoped to this agent's terminal only (not
+  persisted to the session, unlike `cao launch --env`). Because a profile is
+  installed configuration (it can already launch arbitrary executables via
+  `mcpServers.command`), these values are exempt from the forwarded-env
+  prefix blocklist; the per-value byte cap still applies. Names must match
+  `[A-Za-z_][A-Za-z0-9_]*`, and CAO's runtime identity variables
+  (`CAO_TERMINAL_ID`, `CAO_SESSION_NAME`, `CAO_WORKFLOW_RUN_ID`,
+  `CAO_WORKFLOW_STEP_ID`, `CAO_WORKFLOW_GENERATION`, `CAO_CALLBACK_URL`,
+  `CAO_CALLBACK_TERMINAL_ID`) are ignored with a warning. Values are passed
+  verbatim, with no shell or `~` expansion, so use absolute paths. Do not put
+  raw secrets here: `GET /agents/profiles/{name}` returns the resolved
+  profile, `env` values included, to any caller with read scope (see
+  [API Overview](api.md#profiles-providers-and-settings)).
 - `prompt` (string): additional provider prompt text.
 
 ### Provider configuration

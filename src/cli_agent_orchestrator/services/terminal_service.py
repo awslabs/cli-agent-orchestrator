@@ -1056,6 +1056,12 @@ async def create_terminal(
         if profile is not None and not isinstance(profile, AgentProfile):
             profile = None
 
+        # Profile-declared env for THIS terminal only. Deliberately not
+        # persisted via set_session_env: session env is shared by every
+        # window in the session, while profile env (e.g. an alternate
+        # CLAUDE_CONFIG_DIR) must stay scoped to the agent that declared it.
+        profile_env = dict(profile.env) if profile is not None and profile.env else None
+
         if provider == ProviderType.KIRO_CLI.value:
             resolved_engine = resolve_kiro_engine(
                 explicit=engine,
@@ -1264,6 +1270,7 @@ async def create_terminal(
                         terminal_id,
                         resolved_working_directory,
                         extra_env=env_vars,
+                        trusted_env=profile_env,
                     )
                     created_window_name = window_name
                     created_session, created_window = True, False
@@ -1284,6 +1291,7 @@ async def create_terminal(
                         terminal_id,
                         resolved_working_directory,
                         extra_env={**get_session_env(session_name), **(env_vars or {})},
+                        trusted_env=profile_env,
                     )
                     created_session, created_window = False, True
 

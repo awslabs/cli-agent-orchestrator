@@ -44,7 +44,7 @@ FORWARDED_ENV_PREFIX_ALLOWLIST = frozenset(
 # oversized value risks the kernel "command too long" limit (see PR #246).
 FORWARDED_ENV_MAX_VALUE_BYTES = 2048
 
-# Per-key byte cap. Keys are ASCII identifiers (see ``_is_valid_env_key``), so
+# Per-key byte cap. Keys are ASCII identifiers (see ``is_valid_env_key``), so
 # bytes == chars; this bounds a single pathological key on the argv.
 FORWARDED_ENV_MAX_KEY_BYTES = 128
 
@@ -74,7 +74,7 @@ class ForwardedEnvError(ValueError):
     """
 
 
-def _is_valid_env_key(key: str) -> bool:
+def is_valid_env_key(key: str) -> bool:
     """POSIX env-name shape: leading letter/underscore, then ASCII alnum/underscore.
 
     Stricter than ``str.isidentifier`` only in forbidding non-ASCII.
@@ -119,7 +119,7 @@ def validate_forwarded_env(mapping: Mapping[str, str]) -> Dict[str, str]:
     validated: Dict[str, str] = {}
     total_argv_bytes = 0
     for key, value in mapping.items():
-        if not _is_valid_env_key(key):
+        if not is_valid_env_key(key):
             raise ForwardedEnvError(f"env key must match [A-Za-z_][A-Za-z0-9_]* (got {key!r})")
         # Keys are guaranteed ASCII here, so byte length == character length.
         key_bytes = len(key)

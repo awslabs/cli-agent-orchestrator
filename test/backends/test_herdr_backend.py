@@ -302,6 +302,51 @@ class TestHerdrBackendCommands:
         mock_run.assert_not_called()
 
     @patch("subprocess.run")
+    def test_operator_metachar_rejection_does_not_leak_the_value(self, mock_run, backend):
+        with pytest.raises(TerminalBackendError) as exc:
+            backend.create_session("cao-x", "win-0", "tid1", "/tmp", extra_env={"TOK": "p@ss$word"})
+        assert "p@ss$word" not in str(exc.value)
+        assert "TOK=<redacted>" in str(exc.value)
+
+    # Profile env values (PR #665 review, P2). herdr gives each --env pair to
+    # the launched process as an environment entry, not to a shell -- "--env
+    # KEY=VALUE ... applies to the newly launched process only" (herdr CLI
+    # reference); the socket API takes them as an ``env`` object of string
+    # values -- and CAO passes the token as one list-form argv element. So any
+    # schema-valid value without control characters must launch, exactly as it
+    # does on tmux.
+
+    PROFILE_VALUES = {
+        "DOLLAR": "p@ss$word",
+        "URL": "https://h.example/cb?x=1&y=%20z",
+        "BANG": "hi!",
+        "GLOB": "*.log",
+        "REDIRECT": "a<b>c",
+        "SEMI_PIPE": "a;b|c",
+        "SPACED": "two words",
+    }
+
+    @patch("subprocess.run")
+    def test_create_session_launches_with_any_printable_profile_value(self, mock_run, backend):
+        mock_run.side_effect = [self._workspace_create_resp(), _completed()]
+
+        backend.create_session(
+            "cao-x", "win-0", "tid1", "/tmp", trusted_env=dict(self.PROFILE_VALUES)
+        )
+
+        cmd = mock_run.call_args_list[0][0][0]
+        for key, value in self.PROFILE_VALUES.items():
+            # One verbatim argv token, right after its own --env flag.
+            assert cmd[cmd.index(f"{key}={value}") - 1] == "--env"
+
+    @patch("subprocess.run")
+    def test_create_session_refuses_a_control_character_in_a_profile_value(self, mock_run, backend):
+        with pytest.raises(TerminalBackendError) as exc:
+            backend.create_session("cao-x", "win-0", "tid1", "/tmp", trusted_env={"K": "a\x1bb"})
+        assert "K=<redacted>" in str(exc.value)
+        mock_run.assert_not_called()
+
+    @patch("subprocess.run")
     def test_create_window_forwards_extra_env(self, mock_run, backend):
         """create_window threads extra_env into the injected exports too."""
         ws = [{"label": "cao-test", "workspace_id": "w1"}]
@@ -1366,6 +1411,107 @@ class TestBuildEnvArgs:
         assert "CAO_SESSION_NAME=cao-proj" in joined
         assert "CAO_SESSION_NAME=evil" not in joined
 
+    # --- trusted_env (the agent profile's own ``env:``) ---
+    #
+    # Same policy as the tmux backend, through the same helper
+    # (utils/terminal_env.merge_profile_env): no prefix blocklist, byte cap
+    # kept, merged after operator env.
+
+    def test_build_env_args_trusted_env_keeps_blocked_prefix_key(self):
+        """A CLAUDE* key is dropped from operator env but survives from the
+        profile -- the motivating CLAUDE_CONFIG_DIR case."""
+        from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+
+        backend = HerdrBackend.__new__(HerdrBackend)
+        pairs = backend._build_env_args(
+            terminal_id="tid",
+            session_name="cao-proj",
+            extra_env={"CLAUDE_CONFIG_DIR": "/from/operator"},
+            trusted_env={"CLAUDE_CONFIG_DIR": "/home/u/.claude-b"},
+        )
+        assert "CLAUDE_CONFIG_DIR=/home/u/.claude-b" in pairs
+        assert "CLAUDE_CONFIG_DIR=/from/operator" not in pairs
+
+    def test_build_env_args_trusted_env_wins_over_operator_env(self):
+        from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+
+        backend = HerdrBackend.__new__(HerdrBackend)
+        pairs = backend._build_env_args(
+            terminal_id="tid",
+            session_name="cao-proj",
+            extra_env={"SHARED": "operator"},
+            trusted_env={"SHARED": "profile"},
+        )
+        assert "SHARED=profile" in pairs
+        assert "SHARED=operator" not in pairs
+
+    @pytest.mark.parametrize("over", [0, 1], ids=["cap-1-accepted", "cap-dropped"])
+    def test_build_env_args_trusted_env_byte_cap_boundary(self, over, caplog):
+        from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+        from cli_agent_orchestrator.utils.terminal_env import MAX_ENV_VALUE_BYTES
+
+        backend = HerdrBackend.__new__(HerdrBackend)
+        value = "x" * (MAX_ENV_VALUE_BYTES - 1 + over)
+        with caplog.at_level("WARNING"):
+            pairs = backend._build_env_args(
+                terminal_id="tid", session_name="cao-proj", trusted_env={"BIG": value, "OK": "y"}
+            )
+        assert (f"BIG={value}" in pairs) is (over == 0)
+        assert "OK=y" in pairs
+
+    @pytest.mark.parametrize(
+        "channel, source", [("trusted_env", "profile"), ("extra_env", "forwarded")]
+    )
+    def test_byte_cap_drop_message_is_the_shared_one(self, channel, source, caplog):
+        """herdr drops an oversized value with the same words as tmux
+        (test_tmux_client pins the tmux side against the same helper)."""
+        from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+        from cli_agent_orchestrator.utils.terminal_env import MAX_ENV_VALUE_BYTES
+
+        backend = HerdrBackend.__new__(HerdrBackend)
+        with caplog.at_level("WARNING"):
+            backend._build_env_args(
+                terminal_id="t", session_name="s", **{channel: {"BIG": "x" * MAX_ENV_VALUE_BYTES}}
+            )
+        assert caplog.messages == [
+            f"Dropping {source} env var BIG — value exceeds {MAX_ENV_VALUE_BYTES} bytes"
+        ]
+
+    def test_build_env_args_runtime_identity_wins_over_profile_env(self):
+        """Runtime-owned identity survives spoofed profile values (PR #665
+        review, P2): the workflow routing ids arrive on the runtime channel
+        (extra_env) and a profile may not replace them; the terminal/session
+        identity is written last. Mirrors test_tmux_client's
+        TestRuntimeIdentityWins."""
+        from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+
+        runtime = {
+            "CAO_WORKFLOW_RUN_ID": "run-real",
+            "CAO_WORKFLOW_STEP_ID": "step-real",
+            "CAO_WORKFLOW_GENERATION": "7",
+            "CAO_CALLBACK_URL": "http://supervisor.real:9889",
+            "CAO_CALLBACK_TERMINAL_ID": "sup-real",
+        }
+        spoof = {
+            "CAO_TERMINAL_ID": "spoofed",
+            "CAO_SESSION_NAME": "evil",
+            "CAO_WORKFLOW_RUN_ID": "run-evil",
+            "CAO_WORKFLOW_STEP_ID": "step-evil",
+            "CAO_WORKFLOW_GENERATION": "999",
+            "CAO_CALLBACK_URL": "http://attacker:1",
+            "CAO_CALLBACK_TERMINAL_ID": "sup-evil",
+        }
+        backend = HerdrBackend.__new__(HerdrBackend)
+        pairs = backend._build_env_args(
+            terminal_id="tid-real", session_name="cao-real", extra_env=runtime, trusted_env=spoof
+        )
+        emitted = dict(p.split("=", 1) for p in pairs if p != "--env")
+        assert emitted["CAO_TERMINAL_ID"] == "tid-real"
+        assert emitted["CAO_SESSION_NAME"] == "cao-real"
+        for key, value in runtime.items():
+            assert emitted[key] == value
+        assert not any(v in pairs for v in (f"{k}={spoof[k]}" for k in spoof))
+
 
 class TestEnvValueRedaction:
     """P1: operator-forwarded --env values are secrets; they must never appear
@@ -1409,12 +1555,58 @@ class TestEnvValueRedaction:
         assert "s3cr3t-token" not in str(exc.value)
 
     def test_sanitizer_rejection_redacts_env_value(self):
-        """A rejected --env value (shell metachar) must be redacted in the error,
-        not interpolated raw."""
+        """A rejected --env value (control character) must be redacted in the
+        error, not interpolated raw. (A shell metacharacter is no longer a
+        sanitizer rejection -- see TestSanitizeEnvPairs -- the operator-env
+        policy refuses it earlier, in _build_env_args, also redacted.)"""
         from cli_agent_orchestrator.backends.herdr_backend import _sanitize_herdr_args
 
         with pytest.raises(ValueError) as exc:
-            _sanitize_herdr_args(["tab", "create", "--env", "API_TOKEN=s3cr3t$token"])
+            _sanitize_herdr_args(["tab", "create", "--env", "API_TOKEN=s3cr3t\x07token"])
         msg = str(exc.value)
-        assert "s3cr3t$token" not in msg
+        assert "s3cr3t" not in msg
         assert "<redacted>" in msg
+
+
+class TestSanitizeEnvPairs:
+    """The token after ``--env`` is an environment entry for the launched
+    process (herdr docs), passed as one list-form argv element. Its only
+    argument-injection risk is being read as a flag, which a POSIX name before
+    the ``=`` rules out; control characters are refused. Nothing else about the
+    value is restricted here."""
+
+    @pytest.mark.parametrize(
+        "pair",
+        ["K=p@ss$word", "URL=https://h/cb?x=1&y=%20", "K=a<b>c;d|e*f!", "K=", "_K1=two words"],
+    )
+    def test_accepts_any_printable_value_after_a_valid_name(self, pair):
+        from cli_agent_orchestrator.backends.herdr_backend import _sanitize_herdr_args
+
+        args = ["tab", "create", "--env", pair]
+        assert _sanitize_herdr_args(args) == args
+
+    @pytest.mark.parametrize(
+        "pair",
+        [
+            "--session=evil",  # would read as a flag
+            "-x=1",
+            "A-B=1",
+            "1A=1",
+            "=value",
+            "NOEQUALS",
+            "K=tab\there",
+            "K=nul\x00byte",
+            "K=del\x7fchar",
+        ],
+    )
+    def test_refuses_a_bad_name_or_a_control_character(self, pair):
+        from cli_agent_orchestrator.backends.herdr_backend import _sanitize_herdr_args
+
+        with pytest.raises(ValueError, match="unsafe characters"):
+            _sanitize_herdr_args(["tab", "create", "--env", pair])
+
+    def test_other_structural_args_keep_the_strict_pattern(self):
+        from cli_agent_orchestrator.backends.herdr_backend import _sanitize_herdr_args
+
+        with pytest.raises(ValueError, match="unsafe characters"):
+            _sanitize_herdr_args(["tab", "create", "--label", "a$b"])

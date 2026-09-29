@@ -26,6 +26,12 @@ from cli_agent_orchestrator.utils.path_validation import (
     resolve_and_validate_path,
 )
 from cli_agent_orchestrator.utils.terminal import validate_tmux_name
+from cli_agent_orchestrator.utils.terminal_env import (
+    MAX_ENV_VALUE_BYTES,
+    apply_runtime_identity,
+    merge_profile_env,
+    within_value_cap,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -876,8 +882,9 @@ class TmuxClient:
         }
     )
     # Per-var value cap (PR #246) — keeps the full tmux ``new-session -e`` /
-    # ``new-window -e`` argv under the kernel argv limit on busy hosts.
-    _MAX_ENV_VALUE_BYTES = 2048
+    # ``new-window -e`` argv under the kernel argv limit on busy hosts. The
+    # number lives in utils/terminal_env, shared with the herdr backend.
+    _MAX_ENV_VALUE_BYTES = MAX_ENV_VALUE_BYTES
 
     @classmethod
     def _is_blocked_env_key(cls, key: str) -> bool:
@@ -902,14 +909,38 @@ class TmuxClient:
             if cls._is_blocked_env_key(key):
                 logger.warning("Dropping forwarded env var with blocked prefix: %s", key)
                 continue
-            if len(value.encode("utf-8")) >= cls._MAX_ENV_VALUE_BYTES:
-                logger.warning(
-                    "Dropping forwarded env var %s — value exceeds %d bytes",
-                    key,
-                    cls._MAX_ENV_VALUE_BYTES,
-                )
+            if not within_value_cap("forwarded", key, value):
                 continue
             environment[key] = value
+
+    @staticmethod
+    def _confine_profile_env_to_initial_pane(
+        session: Session, profile_keys: List[str], session_scoped_env: Dict[str, str]
+    ) -> None:
+        """Put the new session's environment back as it would be without the profile.
+
+        ``new-session -e`` does not scope a variable to the initial window: per
+        tmux(1) it "sets an environment variable for the newly created
+        session", and "when a window is created, the session and global
+        environments are merged". Left alone, a profile's ``env:`` would reach
+        every later window of the session -- other agents' terminals, and after
+        a CAO restart too, since the session environment lives in the tmux
+        server -- breaking the declaring-terminal-only contract.
+
+        By the time this runs the initial pane's process has already been
+        spawned with the profile values, so it keeps them. For each key the
+        profile set: a key the session legitimately carries (inherited slice or
+        operator env) gets that value back, and any other key is unset from the
+        session environment, so the global environment applies again exactly as
+        it would have without the profile. ``create_session`` runs under the
+        caller's session lifecycle lock, so no other CAO create in this session
+        can observe the interim state. Raises whatever libtmux raises.
+        """
+        for key in profile_keys:
+            if key in session_scoped_env:
+                session.set_environment(key, session_scoped_env[key])
+            else:
+                session.unset_environment(key)
 
     def create_session(
         self,
@@ -918,6 +949,7 @@ class TmuxClient:
         terminal_id: str,
         working_directory: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
+        trusted_env: Optional[Dict[str, str]] = None,
     ) -> str:
         """Create detached tmux session with initial window and return window name."""
         try:
@@ -961,7 +993,12 @@ class TmuxClient:
             # explicit ``--env AWS_REGION=us-west-2`` wins over the inherited
             # value. See issue #248.
             self._merge_extra_env(environment, extra_env)
-            environment["CAO_TERMINAL_ID"] = terminal_id
+            # What the session environment may keep once the initial pane is
+            # up. Profile env is for that pane only: see
+            # _confine_profile_env_to_initial_pane.
+            session_scoped_env = dict(environment)
+            profile_keys = merge_profile_env(environment, trusted_env)
+            apply_runtime_identity(environment, terminal_id, session_name)
 
             # Explicit 220x50 pane size avoids the default 80x24 that tmux
             # assigns to detached sessions. kiro-cli 2.1.x's TUI v2 fails to
@@ -1000,6 +1037,24 @@ class TmuxClient:
                     f"'{session_name}': {e}. Any partially created session has "
                     "been removed; the launch can be retried with the same name."
                 ) from e
+
+            if profile_keys:
+                try:
+                    self._confine_profile_env_to_initial_pane(
+                        session, profile_keys, session_scoped_env
+                    )
+                except Exception as scope_error:
+                    # Fail closed: a session whose later windows would inherit
+                    # this agent's credentials or config is not handed out.
+                    logger.error(
+                        f"Could not keep profile env out of session {session_name}'s "
+                        f"environment: {scope_error} — removing the session"
+                    )
+                    try:
+                        session.kill()
+                    except Exception as kill_error:  # pragma: no cover - best effort
+                        logger.warning(f"Failed to roll back session {session_name}: {kill_error}")
+                    raise
 
             # Keep mouse-wheel input inside tmux. With mouse mode disabled,
             # tmux forwards wheel events to the foreground application as
@@ -1094,12 +1149,15 @@ class TmuxClient:
         working_directory: Optional[str] = None,
         window_shell: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
+        trusted_env: Optional[Dict[str, str]] = None,
     ) -> str:
         """Create window in session and return window name.
 
         ``extra_env`` carries operator-forwarded vars from
         ``cao launch --env`` so workers spawned via ``assign`` / ``handoff`` /
         the web UI inherit the same context as the supervisor. See issue #248.
+        ``trusted_env`` carries the agent profile's own ``env:`` declaration
+        for this terminal only (not persisted to the session).
         """
         try:
             working_directory = self._resolve_and_validate_working_directory(working_directory)
@@ -1110,7 +1168,8 @@ class TmuxClient:
 
             window_env: dict[str, str] = {}
             self._merge_extra_env(window_env, extra_env)
-            window_env["CAO_TERMINAL_ID"] = terminal_id
+            merge_profile_env(window_env, trusted_env)
+            apply_runtime_identity(window_env, terminal_id, session_name)
 
             kwargs: dict = {
                 "window_name": window_name,
@@ -1218,13 +1277,15 @@ class TmuxClient:
         window_shell: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
         pane_layout: str = DEFAULT_PANE_LAYOUT,
+        trusted_env: Optional[Dict[str, str]] = None,
     ) -> str:
         """Split ``host_window_name`` and return the new terminal's name.
 
         The terminal's name is written to the pane's mark rather than to a
         window name, because its siblings share the window. Refusing a name
         already marked in this session keeps the mark unique, which is what
-        every later lookup relies on.
+        every later lookup relies on. ``trusted_env`` carries the agent
+        profile's own ``env:`` declaration, as in ``create_window``.
         """
         try:
             if pane_layout not in PANE_LAYOUTS:
@@ -1246,9 +1307,12 @@ class TmuxClient:
                     f"Terminal '{terminal_name}' already exists in session '{session_name}'"
                 )
 
+            # new-window -e / split-window -e are scoped to the new pane, so
+            # the profile's env stays with this terminal (unlike new-session).
             pane_env: dict[str, str] = {}
             self._merge_extra_env(pane_env, extra_env)
-            pane_env["CAO_TERMINAL_ID"] = terminal_id
+            merge_profile_env(pane_env, trusted_env)
+            apply_runtime_identity(pane_env, terminal_id, session_name)
 
             host_window = self._find_window(session, session_name, host_window_name)
             if host_window is None:

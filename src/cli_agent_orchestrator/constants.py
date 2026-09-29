@@ -996,6 +996,25 @@ WORKFLOW_ENV_ALLOWLIST = frozenset(
     {"CAO_WORKFLOW_RUN_ID", "CAO_WORKFLOW_STEP_ID", "CAO_WORKFLOW_GENERATION"}
 )
 
+# Runtime-owned terminal identity (PR #665 review). CAO assigns these to a
+# terminal when it creates it and routes on them afterwards: the terminal and
+# session identity every backend injects, the workflow routing ids above
+# (``workflow_return`` posts to the run/step they name), and the supervisor
+# callback route a remote worker is created with. An agent profile's ``env:``
+# may not set any of them (``utils/terminal_env.merge_profile_env`` drops
+# them), and every backend writes the terminal/session pair last.
+TERMINAL_ID_ENV = "CAO_TERMINAL_ID"
+SESSION_NAME_ENV = "CAO_SESSION_NAME"
+RUNTIME_IDENTITY_ENV_KEYS = frozenset(
+    {
+        TERMINAL_ID_ENV,
+        SESSION_NAME_ENV,
+        *WORKFLOW_ENV_ALLOWLIST,
+        CALLBACK_URL_ENV,
+        CALLBACK_TERMINAL_ID_ENV,
+    }
+)
+
 # Pre-regex length cap on run-step env-var VALUES (U2-BR-2). Defense-in-depth,
 # not redundancy: bounds the input O(1) before any regex evaluation and bounds
 # what can be staged into a terminal environment regardless of future regex
