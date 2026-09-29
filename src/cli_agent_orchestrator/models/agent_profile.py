@@ -66,15 +66,18 @@ class AgentProfile(BaseModel):
     provider_init_timeout: Optional[int] = None
 
     # CAO-native. Extra environment variables injected into this agent's
-    # terminal environment at launch, e.g. {"CLAUDE_CONFIG_DIR": "~/.claude-b"}
-    # to point one claude_code worker at an alternate config/auth directory
-    # while other Claude agents in the same session keep the default. Unlike
+    # terminal environment at launch, e.g.
+    # {"CLAUDE_CONFIG_DIR": "/home/me/.claude-b"} to point one claude_code
+    # worker at an alternate config/auth directory while other Claude agents
+    # in the same session keep the default. Values are passed verbatim (no
+    # shell or ``~`` expansion), so paths must be absolute. Unlike
     # operator-forwarded ``cao launch --env`` vars, profile-declared env is
     # explicit installed configuration — a profile can already launch
     # arbitrary executables via ``mcpServers.command`` — so it is NOT subject
-    # to the forwarded-env prefix blocklist; the per-value byte cap still
-    # applies. Consumed by CAO at terminal creation, not passed through to
-    # provider JSON.
+    # to the forwarded-env prefix blocklist; the per-value byte cap, the
+    # env-name shape and the reserved runtime identity names still apply
+    # (utils/terminal_env). Consumed by CAO at terminal creation, not passed
+    # through to provider JSON.
     env: Optional[Dict[str, str]] = None
 
     # Q CLI agent fields (all optional, will be passed through to JSON)

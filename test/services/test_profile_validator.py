@@ -263,6 +263,24 @@ class TestCaoNativeFields:
 
         assert any(f.severity == "error" for f in findings)
 
+    def test_documented_env_example_is_valid(self) -> None:
+        """The ``env`` example from docs/agent-profile.md validates cleanly."""
+        metadata = {"name": "worker-b", "env": {"CLAUDE_CONFIG_DIR": "/home/me/.claude-b"}}
+
+        assert validate_frontmatter(metadata) == []
+
+    @pytest.mark.parametrize("key", ["", "A=B", "A\nB", "1ABC", "A-B"])
+    def test_env_name_must_be_an_env_var_name(self, key: str) -> None:
+        """A malformed name is caught at write time rather than dropped at launch."""
+        findings = validate_frontmatter({"name": "agent", "env": {key: "v"}})
+
+        assert any(f.severity == "error" and f.path == "env" for f in findings)
+
+    def test_env_value_must_be_a_string(self) -> None:
+        findings = validate_frontmatter({"name": "agent", "env": {"PORT": 8080}})
+
+        assert any(f.severity == "error" and f.path.startswith("env") for f in findings)
+
 
 class TestSchemaModelParity:
     """Guards the schema against the AgentProfile model drifting away from it.
