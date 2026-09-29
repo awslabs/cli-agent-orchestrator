@@ -160,11 +160,22 @@ CAO translates `allowedTools` into each provider's native restriction mechanism:
 
 | Provider | Enforcement | Mechanism |
 |----------|------------|-----------|
-| Kiro CLI | Hard | `allowedTools` in agent JSON (at install time) |
 | Claude Code | Hard | `--disallowedTools` flags block specific tools |
 | Copilot CLI | Hard | `--deny-tool` flags override `--allow-all` |
+| OpenCode CLI | Hard | `permission:` block written at install time from the profile; launch-time `--allowed-tools` and role overrides do not change it |
+| Grok Build CLI | Hard | `--permission-mode dontAsk` with `--allow`/`--deny` |
 | Kimi CLI | Soft | Security system prompt (no native mechanism) |
 | Codex | Soft | Security system prompt (no native mechanism) |
+| Antigravity CLI | Soft | Security system prompt (no native mechanism) |
+| OMP | Soft | Security system prompt (no native mechanism) |
+| MiniMax Code | Soft | Security bootstrap prompt (no native mechanism) |
+| Kiro CLI | None | Launched `--trust-all-tools` on every profile on the default (v2) engine; the `--v3` engine gets no such flag but the same `tools: ["*"]`; the `allowedTools` written to the agent JSON only suppresses approval prompts, and `tools` is `["*"]` unless the profile sets its own `tools` list |
+| Hermes | None | Launched `--yolo --accept-hooks`; restrict tools inside the Hermes profile |
+| Cursor CLI | None | Launched `--force`; `allowedTools` is not applied |
+
+`cao launch` prints an `Enforcement:` line with the confirmation prompt. On a
+Soft or None provider a restricted profile runs unrestricted; the server logs a
+warning at launch and the prompt says so.
 
 ### Resolution Order
 
@@ -231,7 +242,7 @@ When using CLI Agent Orchestrator:
 
 8. **Review tool summaries.** The confirmation prompt shows exactly what tools are allowed and blocked — read it before confirming.
 
-9. **Prefer hard-enforcement providers** (Kiro CLI, Claude Code, Copilot CLI) for sensitive workloads.
+9. **Prefer hard-enforcement providers** (Claude Code, Copilot CLI, Grok Build CLI, OpenCode CLI) for sensitive workloads. Kiro CLI, the default provider, does not apply the CAO tool policy at runtime.
 
 ## Dependency Management
 

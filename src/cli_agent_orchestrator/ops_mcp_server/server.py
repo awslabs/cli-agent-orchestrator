@@ -928,8 +928,13 @@ register_mcp_server_surfaces(mcp)
 
 
 def main() -> None:
-    """Run the operations MCP server."""
-    mcp.run()
+    """Run the operations MCP server over stdio.
+
+    The transport is pinned: FastMCP otherwise honours ``FASTMCP_TRANSPORT`` from
+    the environment, and an ``http`` value would turn this stdio tool into a
+    network listener with no MCP-level authentication in front of the API hop.
+    """
+    mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":

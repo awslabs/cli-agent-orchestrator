@@ -106,6 +106,7 @@ CAO owns the permission decision, so the translator only ever emits `allow` or `
 | `fs_write` | `edit`, `write` |
 | `fs_list` | `glob`, `grep` |
 | `fs_*` | `read`, `edit`, `write`, `glob`, `grep` |
+| `@builtin` | none — a selector for provider chrome, not a tool grant (as in `utils/tool_mapping.py`) |
 | `@<mcp-server-name>` | Handled in `opencode.json` (not frontmatter) |
 
 Tools not in any enabled category default to `deny`. The following tools have hardcoded policies regardless of `allowedTools`:

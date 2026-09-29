@@ -418,6 +418,40 @@ class TestExtractLastMessage:
         assert "agent reply here" in result
         assert "stray-residual" not in result
 
+    def test_extracts_reply_for_agent_name_with_spaces(self):
+        # #806: an agent whose display name contains spaces.
+        provider = make_provider()
+        output = (
+            "┃  say hello\n"
+            "┃\n"
+            "\n"
+            "     Hi there!\n"
+            "\n"
+            "     ▣  Sisyphus - Ultraworker · Big Pickle · 3.1s\n"
+        )
+        result = provider.extract_last_message_from_script(output)
+        assert "Hi there!" in result
+        assert "Sisyphus" not in result
+
+    def test_stray_marker_glyph_in_reply_does_not_truncate_it(self):
+        # A reply line starting with ▣ must not be taken for the start of the
+        # completion marker, or the lines before the real marker are lost.
+        provider = make_provider()
+        output = (
+            "┃  list the steps\n"
+            "┃\n"
+            "\n"
+            "     Steps:\n"
+            "     ▣ first item\n"
+            "     second item\n"
+            "\n"
+            "     ▣  Sisyphus - Ultraworker · Big Pickle · 3.1s\n"
+        )
+        result = provider.extract_last_message_from_script(output)
+        assert "Steps:" in result
+        assert "▣ first item" in result
+        assert "second item" in result
+
     def test_extract_raises_when_response_is_empty(self):
         """Empty content between user bar and ▣ → ValueError.
 

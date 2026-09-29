@@ -63,17 +63,52 @@ def _mcp_timeout() -> float:
 def _auth_headers() -> Dict[str, str]:
     """Return the ``Authorization`` header for the internal client->API hop, if any.
 
-    Mirrors ``mcp_server.utils._auth_headers`` / ``mcp_server.app_tools._auth_headers``:
+    Same behaviour as ``mcp_server.utils._auth_headers`` / ``mcp_server.app_tools._auth_headers``;
+    the copies are per module, and what they share is the decision that matters,
+    ``_is_local_api`` (see ``_auth_headers_for``). ``test/test_bearer_scope_boundary.py``
+    holds every ``requests`` call in ``src/`` to the rule that an unscoped helper may
+    only be paired with a URL built on ``API_BASE_URL``. This helper
     attaches the operator-provisioned ``CAO_AUTH_LOCAL_TOKEN`` when the auth layer is
     enabled, and returns an empty mapping default-off so the no-auth posture stays
     byte-for-byte unchanged. Every ``requests`` call in this module passes
     ``headers=_auth_headers() or None`` -- without this, an auth-enabled deployment's
     cao-server rejects every one of these calls with a 401 and the CLI/MCP orchestration
     surface (assign, handoff, send_message, status, result, cancel, delete_terminal)
-    cannot be used at all.
+    cannot be used at all. Calls whose base URL may be another node go through
+    ``_auth_headers_for(base_url)`` so the token never leaves this node.
     """
     token = get_local_bearer()
     return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+def _is_local_api(base_url: str) -> bool:
+    """True when ``base_url`` is this node's own cao-server (``API_BASE_URL``).
+
+    An exact string compare after trailing-slash normalisation, deliberately: it
+    is not this module's job to decide that ``localhost`` or ``::1`` names the
+    same listener as ``CAO_API_HOST``. The normal local path passes the
+    ``API_BASE_URL`` constant itself, and a differently spelled self-reference
+    fails closed (no bearer, 401) rather than leaking the token on a guess.
+    ``mcp_server.utils._auth_headers_for`` shares this predicate.
+    """
+    return base_url.rstrip("/") == API_BASE_URL.rstrip("/")
+
+
+def _auth_headers_for(base_url: str) -> Dict[str, str]:
+    """``_auth_headers()`` for the local API only; empty for any other host.
+
+    ``CAO_AUTH_LOCAL_TOKEN`` authenticates the client->API hop on THIS node.
+    Requests whose base URL came from a ``target_host`` argument or a
+    ``CAO_CALLBACK_URL`` env var go to some other host, and sending the token
+    there is a disclosure: whoever answers at that URL receives the operator's
+    bearer. Every caller here that may address another node uses this instead
+    of ``_auth_headers()``; ``get_handoff_result`` in ``mcp_server.server`` uses
+    the ``mcp_server.utils`` twin. These hops carry no credential for a remote node's own
+    auth layer; a deployment that provisioned the same token to every node was
+    authenticating cross-node calls by accident, and those calls now arrive
+    without a bearer.
+    """
+    return _auth_headers() if _is_local_api(base_url) else {}
 
 
 # Environment variable to enable/disable automatic sender terminal ID injection.
@@ -817,21 +852,25 @@ def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
         base_url = callback_url
 
     params = {"sender_id": sender_id, "message": message}
-    # BOTH header sets, and the union is not a compromise between two merge
-    # sides -- they are disjoint and independently load-bearing.
-    # `_auth_headers()` carries the local `Authorization: Bearer` an
-    # auth-enabled cao-server rejects every call without (haofeif's P2 on PR
-    # #634); `elastic_worker_gateway_headers()` carries the broker's
-    # worker-id/release-token pair an elastic worker's callback hop needs. They
-    # share no key, so neither can shadow the other, and an auth-enabled
-    # elastic deployment genuinely needs both on the same request. Each is
-    # empty when its own feature is off, so the default-off posture is still
-    # byte-for-byte `None`.
-    request_headers = {**_auth_headers(), **elastic_worker_gateway_headers()} or None
+
+    def _inbox_headers(target_base_url: str) -> Optional[Dict[str, str]]:
+        # BOTH header sets, and the union is not a compromise between two merge
+        # sides -- they are disjoint and independently load-bearing.
+        # `_auth_headers_for()` carries the local `Authorization: Bearer` an
+        # auth-enabled cao-server rejects every call without (haofeif's P2 on
+        # PR #634) -- for the LOCAL node only, since the token is this node's
+        # and must not be sent to a callback host; `elastic_worker_gateway_headers()`
+        # carries the broker's worker-id/release-token pair an elastic worker's
+        # callback hop needs. They share no key, so neither can shadow the
+        # other, and an auth-enabled elastic deployment genuinely needs both on
+        # the same request. Each is empty when its own feature is off, so the
+        # default-off posture is still byte-for-byte `None`.
+        return {**_auth_headers_for(target_base_url), **elastic_worker_gateway_headers()} or None
+
     response = requests.post(
         f"{base_url}/terminals/{receiver_id}/inbox/messages",
         params=params,
-        headers=request_headers,
+        headers=_inbox_headers(base_url),
         timeout=_mcp_timeout(),
     )
     if response.status_code == 404 and callback_url and base_url != callback_url:
@@ -841,7 +880,7 @@ def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
         response = requests.post(
             f"{callback_url}/terminals/{receiver_id}/inbox/messages",
             params=params,
-            headers=request_headers,
+            headers=_inbox_headers(callback_url),
             timeout=_mcp_timeout(),
         )
     response.raise_for_status()
@@ -936,7 +975,7 @@ async def _run_step_and_build_result(
         response = requests.post(
             f"{base_url}/terminals/run-step",
             json=payload,
-            headers=_auth_headers() or None,
+            headers=_auth_headers_for(base_url) or None,
             timeout=request_timeout,
         )
     except requests.Timeout:
@@ -1769,7 +1808,7 @@ def _delete_terminal_impl(terminal_id: str, target_host: Optional[str] = None) -
         base_url = _resolve_target_base_url(target_host) if target_host else API_BASE_URL
         response = requests.delete(
             f"{base_url}/terminals/{terminal_id}",
-            headers=_auth_headers() or None,
+            headers=_auth_headers_for(base_url) or None,
             # A remote node that is unreachable must fail on CONNECT rather than
             # hang for the full read timeout; a local delete keeps its single
             # scalar timeout so default-path behavior is unchanged.

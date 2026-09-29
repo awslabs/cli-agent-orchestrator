@@ -310,19 +310,22 @@ def test_temp_files_are_unique_per_call_not_fixed_name(tmp_path: Path) -> None:
 
     import cli_agent_orchestrator.utils.atomic_file as atomic_file_module
 
-    real_mkstemp = atomic_file_module.tempfile.mkstemp
+    # Spy on the helper that names the temp file: the first call creates a
+    # NEW target (O_EXCL create with the umask applied), the second rewrites
+    # an existing one (mkstemp), so spying on mkstemp alone would see one.
+    real_open_temp = atomic_file_module._open_unique_temp
 
-    def spying_mkstemp(*args, **kwargs):
-        fd, name = real_mkstemp(*args, **kwargs)
-        seen_names.append(name)
-        return fd, name
+    def spying_open_temp(*args, **kwargs):
+        fd, path = real_open_temp(*args, **kwargs)
+        seen_names.append(str(path))
+        return fd, path
 
-    atomic_file_module.tempfile.mkstemp = spying_mkstemp
+    atomic_file_module._open_unique_temp = spying_open_temp
     try:
         locked_atomic_rewrite(target, lambda existing: "one")
         locked_atomic_rewrite(target, lambda existing: "two")
     finally:
-        atomic_file_module.tempfile.mkstemp = real_mkstemp
+        atomic_file_module._open_unique_temp = real_open_temp
 
     assert len(seen_names) == 2
     assert seen_names[0] != seen_names[1], "temp file names must not collide across calls"
@@ -845,3 +848,35 @@ def test_delete_does_not_disturb_the_lock_file_itself(tmp_path: Path) -> None:
     assert not target.exists()
     assert lock_path.exists()
     assert LOCK_DIR in lock_path.parents
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file modes")
+def test_umask_is_never_touched(tmp_path: Path, monkeypatch) -> None:
+    """The umask is process-global and cao-server is threaded: reading it via
+    os.umask(0) + restore leaves a window in which another thread's new file is
+    born 0666. Neither the new-file nor the rewrite path may call os.umask."""
+    calls: list[int] = []
+    real_umask = os.umask
+
+    def recording_umask(mask: int) -> int:
+        calls.append(mask)
+        return real_umask(mask)
+
+    monkeypatch.setattr(os, "umask", recording_umask)
+    target = tmp_path / "AGENTS.md"
+    locked_atomic_rewrite(target, lambda existing: "first")  # new file
+    locked_atomic_rewrite(target, lambda existing: existing + " again")  # rewrite
+    assert calls == []
+    assert target.read_text(encoding="utf-8") == "first again"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file modes")
+def test_new_file_mode_follows_a_restrictive_umask_too(tmp_path: Path) -> None:
+    """The kernel, not CAO, applies the umask: a 0o077 umask yields 0600."""
+    target = tmp_path / "private.md"
+    old_umask = os.umask(0o077)
+    try:
+        locked_atomic_rewrite(target, lambda existing: "content")
+    finally:
+        os.umask(old_umask)
+    assert stat.S_IMODE(os.stat(target).st_mode) == 0o600
