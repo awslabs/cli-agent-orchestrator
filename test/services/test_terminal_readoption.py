@@ -266,6 +266,67 @@ class TestReadoptOnlyFinalizesConfirmedAbsence:
         assert held == [True]
 
 
+class TestReadoptFinalizesThroughTeardown:
+    """A finalized row is a terminal teardown whose session is already confirmed
+    gone -- the same position session teardown is in after its kill-confirm
+    (#498) -- so it runs the same halves: runtime dismantle, then the row."""
+
+    def test_finalize_cleans_up_the_provider_and_the_stale_fifo(
+        self, registry_db, backend, fifo, monkeypatch
+    ):
+        """Grok, MiniMax and Kimi Code keep private homes (Kimi's holds a copy
+        of the operator's credentials) that ``cleanup_provider`` rebuilds from
+        the row after a restart. Dropping the row first loses that route."""
+        cleaned = []
+        monkeypatch.setattr(
+            terminal_service.provider_manager,
+            "cleanup_provider",
+            lambda terminal_id: cleaned.append(terminal_id) or True,
+        )
+        backend.session_exists_strict.return_value = False
+        _seed("dead1", provider="grok_cli")
+
+        counts = readopt_terminals_at_startup(database.list_all_terminals())
+
+        assert counts == {"readopted": 0, "finalized": 1, "skipped": 0}
+        assert cleaned == ["dead1"]
+        # stop_reader also unlinks the previous server's <tid>.fifo; once the
+        # row is gone, retention cleanup would never reach it.
+        fifo.stop_reader.assert_called_once_with("dead1")
+        assert _row_ids() == []
+        # The session is confirmed gone: no tmux-facing teardown step runs.
+        backend.kill_window.assert_not_called()
+        backend.stop_pipe_pane.assert_not_called()
+
+    def test_failed_scrollback_recovery_does_not_keep_a_dead_row(
+        self, registry_db, backend, fifo, tmp_path
+    ):
+        """The recovery is a convenience: <tid>.log stays on disk regardless."""
+        backend.session_exists_strict.return_value = False
+        _seed("dead1")
+        (tmp_path / "dead1.log").mkdir()  # unreadable as a file
+
+        with patch.object(terminal_service, "TERMINAL_LOG_DIR", tmp_path):
+            counts = readopt_terminals_at_startup(database.list_all_terminals())
+
+        assert counts == {"readopted": 0, "finalized": 1, "skipped": 0}
+        assert _row_ids() == []
+
+    def test_deferred_provider_cleanup_keeps_the_row_for_a_retry(
+        self, registry_db, backend, fifo, monkeypatch
+    ):
+        monkeypatch.setattr(
+            terminal_service.provider_manager, "cleanup_provider", lambda terminal_id: False
+        )
+        backend.session_exists_strict.return_value = False
+        _seed("dead1", provider="grok_cli")
+
+        counts = readopt_terminals_at_startup(database.list_all_terminals())
+
+        assert counts == {"readopted": 0, "finalized": 0, "skipped": 1}
+        assert _row_ids() == ["dead1"]
+
+
 class TestReadoptPerRowFailures:
     """A row that fails must not take the rest of the pass with it, must be
     counted as left untouched, and must not leave half-armed state behind."""

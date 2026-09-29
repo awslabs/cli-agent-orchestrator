@@ -3093,9 +3093,11 @@ def readopt_terminals_at_startup(rows: List[Dict[str, Any]]) -> Dict[str, int]:
       fresh FIFO has stayed silent for its cold-start grace period.
     - session confirmed ABSENT (``session_exists_strict`` returned False):
       finalize — recover a ``.scrollback`` from the ANSI-stripped ``<tid>.log``
-      if none exists (crashes never ran the delete-path capture), then drop the
-      DB row so it does not linger as an orphan until retention cleanup. The
-      recovered scrollback is only what the old server logged: ``<tid>.log``
+      if none exists (crashes never ran the delete-path capture), then tear the
+      terminal down the way session teardown does once its session is confirmed
+      gone: runtime dismantle (stale FIFO, provider cleanup; a deferred cleanup
+      keeps the row for a retry), then the DB row, so it does not linger as an
+      orphan until retention cleanup. The recovered scrollback is only what the old server logged: ``<tid>.log``
       stopped growing when that server died, so whatever the agent printed
       after that is missing. It is not a full transcript.
     - could not tell — the strict session check raised, or the session is alive
@@ -3155,7 +3157,8 @@ def _readopt_terminal(backend: TerminalBackend, row: Dict[str, Any]) -> str:
         return "skipped"
 
     if not session_alive:
-        _finalize_dead_terminal(terminal_id)
+        if not _finalize_dead_terminal(terminal_id, row):
+            return "skipped"
         logger.info(f"Finalized dead terminal {terminal_id} ({session_name}:{window_name})")
         return "finalized"
 
@@ -3211,14 +3214,34 @@ def _rearm_terminal_pipeline(
     # pane's current content into the pipeline (FifoManager._rearm_stalled_pipe).
 
 
-def _finalize_dead_terminal(terminal_id: str) -> None:
-    """Finalize a terminal whose tmux session is confirmed gone."""
+def _finalize_dead_terminal(terminal_id: str, row: Dict[str, Any]) -> bool:
+    """Finalize a terminal whose tmux session is confirmed gone.
+
+    Returns False when provider cleanup was deferred and the row was kept for a
+    retry (see ``dismantle_terminal_runtime``).
+    """
     from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
-    scrollback_path = TERMINAL_LOG_DIR / f"{terminal_id}.scrollback"
-    if not scrollback_path.exists():
-        log_path = TERMINAL_LOG_DIR / f"{terminal_id}.log"
-        if log_path.exists():
-            raw = log_path.read_text(encoding="utf-8", errors="replace")
-            scrollback_path.write_text(strip_terminal_escapes(raw), encoding="utf-8")
-    db_delete_terminal(terminal_id)
+    # Best-effort: <tid>.log stays on disk either way, so a failed recovery
+    # loses nothing and must not keep a dead row alive.
+    try:
+        scrollback_path = TERMINAL_LOG_DIR / f"{terminal_id}.scrollback"
+        if not scrollback_path.exists():
+            log_path = TERMINAL_LOG_DIR / f"{terminal_id}.log"
+            if log_path.exists():
+                raw = log_path.read_text(encoding="utf-8", errors="replace")
+                scrollback_path.write_text(strip_terminal_escapes(raw), encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"Failed to recover scrollback for {terminal_id}: {e}")
+
+    # The same two halves session teardown runs once it has confirmed the
+    # session gone (#498), with kill_window=False for the same reason: there is
+    # no pane left to stop piping or to kill. Provider cleanup is the part that
+    # matters here -- it rebuilds Grok / MiniMax / Kimi Code private homes from
+    # the row, so the row must still exist when it runs. No live pane means no
+    # live working directory, so no worktree is removed.
+    if not dismantle_terminal_runtime(terminal_id, row, kill_window=False):
+        logger.warning("Terminal %s cleanup deferred; retaining its row for a retry", terminal_id)
+        return False
+    delete_terminal_row(terminal_id, row)
+    return True
