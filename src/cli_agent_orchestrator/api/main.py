@@ -3466,12 +3466,20 @@ async def set_session_env_endpoint(
     lose each other's keys. Already running terminals are unaffected — their
     env was fixed into the tmux window at creation; the map only feeds FUTURE
     windows.
+
+    Unlike the launch path, this route also denies well-known code-execution
+    vectors (``LD_*``/``DYLD_*``, shell-startup vars, interpreter options,
+    ``PATH``): it changes what every later worker in an already-running
+    session inherits. That is a denylist, not a security boundary — see
+    ``FORWARDED_ENV_EXEC_DENYLIST``.
     """
     from cli_agent_orchestrator.services.session_env import merge_session_env
 
     try:
         validate_tmux_name(session_name, "session_name")
-        delta = validate_forwarded_env(body.env_vars)
+        # deny_exec_vectors: this route mutates a LIVE session's map, inherited by
+        # every worker spawned in it afterwards. POST /sessions does not opt in.
+        delta = validate_forwarded_env(body.env_vars, deny_exec_vectors=True)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 

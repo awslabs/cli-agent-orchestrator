@@ -212,3 +212,58 @@ def test_budget_does_not_apply_the_per_key_rules():
     """It bounds size only. A stored key another path let in (``POST /sessions`` does not
     validate server-side) must not make every later merge into that session fail."""
     check_forwarded_env_budget({"CLAUDE_SECRET": "x", "1BAD": "y"})  # must not raise
+
+
+# --- deny_exec_vectors: the live-session code-execution denylist --------------------------
+
+_EXEC_VECTOR_KEYS = [
+    # dynamic linker (prefix match)
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    # shell startup
+    "BASH_ENV",
+    "ENV",
+    "PROMPT_COMMAND",
+    "ZDOTDIR",
+    # interpreter injection
+    "NODE_OPTIONS",
+    "PYTHONPATH",
+    "PYTHONSTARTUP",
+    "PERL5OPT",
+    "RUBYOPT",
+    # command resolution
+    "PATH",
+]
+
+
+@pytest.mark.parametrize("key", _EXEC_VECTOR_KEYS)
+def test_exec_vectors_are_denied_when_the_caller_opts_in(key):
+    with pytest.raises(ForwardedEnvError, match="code-execution vector"):
+        validate_forwarded_env({key: "x"}, deny_exec_vectors=True)
+
+
+@pytest.mark.parametrize("key", _EXEC_VECTOR_KEYS)
+def test_exec_vectors_are_untouched_by_default(key):
+    """Off by default, so ``cao launch --env`` and the ops-MCP ``launch_session`` tool — which
+    call the validator without the flag — behave exactly as before."""
+    assert validate_forwarded_env({key: "x"}) == {key: "x"}
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["ENVIRONMENT", "MY_PATH", "PATHS", "XLD_PRELOAD", "NODE_ENV", "PYTHONUNBUFFERED", "LD"],
+)
+def test_near_misses_are_not_denied(key):
+    """Exact names and the two linker prefixes only — not substrings."""
+    assert validate_forwarded_env({key: "x"}, deny_exec_vectors=True) == {key: "x"}
+
+
+def test_exec_vector_message_never_echoes_the_value():
+    secret = "TOP-SECRET-exec-4417"
+    with pytest.raises(ForwardedEnvError) as excinfo:
+        validate_forwarded_env({"LD_PRELOAD": secret}, deny_exec_vectors=True)
+    assert secret not in str(excinfo.value)
+    assert str(excinfo.value).startswith("env ")

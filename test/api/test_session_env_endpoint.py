@@ -7,6 +7,8 @@ lose the forwarded vars. The endpoint re-registers them for a live session.
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from cli_agent_orchestrator.services.session_env import (
     clear_session_env,
     get_session_env,
@@ -199,3 +201,40 @@ class TestSetSessionEnvMergedBudget:
         assert resp.status_code == 200, resp.text
         assert get_session_env(SESSION)["K0000"] == "rotated"
         assert len(get_session_env(SESSION)) == 256
+
+
+class TestSetSessionEnvExecVectorDenylist:
+    """This endpoint mutates a LIVE session's env map, which every worker spawned in it
+    afterwards inherits, so it denies the well-known code-execution vectors. The launch path
+    (``POST /sessions``) is deliberately unchanged."""
+
+    def teardown_method(self):
+        clear_session_env(SESSION)
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+            "BASH_ENV",
+            "PROMPT_COMMAND",
+            "NODE_OPTIONS",
+            "PATH",
+        ],
+    )
+    def test_exec_vector_is_rejected_with_a_clear_400(self, client, key):
+        resp = _post_env(client, {key: "/tmp/payload"})
+
+        assert resp.status_code == 400
+        detail = resp.json()["detail"]
+        assert key in detail and "code-execution vector" in detail
+        assert "/tmp/payload" not in detail
+        assert get_session_env(SESSION) == {}
+
+    def test_one_denied_key_rejects_the_whole_request(self, client):
+        set_session_env(SESSION, {"KEEP": "old"})
+
+        resp = _post_env(client, {"TOKEN": "fine", "LD_PRELOAD": "/x.so"})
+
+        assert resp.status_code == 400
+        assert get_session_env(SESSION) == {"KEEP": "old"}

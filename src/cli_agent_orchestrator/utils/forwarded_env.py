@@ -42,6 +42,37 @@ FORWARDED_ENV_PREFIX_ALLOWLIST = frozenset(
     }
 )
 
+# Env names that turn "set a variable" into "run code" in any process that inherits
+# them. Denied only when a caller opts in with ``deny_exec_vectors=True`` -- today
+# ``POST /sessions/{session_name}/env``, which mutates a LIVE session's map that
+# every worker spawned in it afterwards inherits. The launch paths keep their
+# existing rules.
+#
+# This is a denylist of the well-known vectors, not a security boundary: it cannot
+# be exhaustive, and with auth disabled (the default) any caller that can reach the
+# API already has local-shell-equivalent access. See docs/tmux.md.
+FORWARDED_ENV_EXEC_DENY_PREFIXES = (
+    "LD_",  # dynamic linker (glibc/musl): LD_PRELOAD, LD_LIBRARY_PATH, LD_AUDIT, ...
+    "DYLD_",  # dynamic linker (macOS): DYLD_INSERT_LIBRARIES, DYLD_LIBRARY_PATH, ...
+)
+FORWARDED_ENV_EXEC_DENYLIST = frozenset(
+    {
+        # Shell startup: a file or command the window's shell runs before the agent.
+        "BASH_ENV",
+        "ENV",
+        "PROMPT_COMMAND",
+        "ZDOTDIR",
+        # Interpreter injection: code or a module search path loaded at start-up.
+        "NODE_OPTIONS",
+        "PYTHONPATH",
+        "PYTHONSTARTUP",
+        "PERL5OPT",
+        "RUBYOPT",
+        # Command resolution: decides which binary every bare command name runs.
+        "PATH",
+    }
+)
+
 # Per-value byte cap. Forwarded vars ride the ``tmux new-session -e`` argv, so an
 # oversized value risks the kernel "command too long" limit (see PR #246).
 FORWARDED_ENV_MAX_VALUE_BYTES = 2048
@@ -95,6 +126,12 @@ def _uses_blocked_prefix(key: str) -> bool:
     return any(key.startswith(p) for p in FORWARDED_ENV_BLOCKED_PREFIXES)
 
 
+def _is_exec_vector(key: str) -> bool:
+    """Exact names, plus the two dynamic-linker prefixes. Case-sensitive, as the
+    loader, shells and interpreters are."""
+    return key in FORWARDED_ENV_EXEC_DENYLIST or key.startswith(FORWARDED_ENV_EXEC_DENY_PREFIXES)
+
+
 def check_forwarded_env_budget(mapping: Mapping[str, str]) -> None:
     """Raise ``ForwardedEnvError`` if ``mapping`` as a whole would overflow the tmux argv.
 
@@ -129,7 +166,9 @@ def check_forwarded_env_budget(mapping: Mapping[str, str]) -> None:
         )
 
 
-def validate_forwarded_env(mapping: Mapping[str, str]) -> Dict[str, str]:
+def validate_forwarded_env(
+    mapping: Mapping[str, str], *, deny_exec_vectors: bool = False
+) -> Dict[str, str]:
     """Validate an already-parsed env mapping; return it as a plain dict.
 
     Every message starts with ``env `` so a caller can prefix it (the CLI turns
@@ -140,6 +179,10 @@ def validate_forwarded_env(mapping: Mapping[str, str]) -> Dict[str, str]:
       * a key that is not a ``[A-Za-z_][A-Za-z0-9_]*`` ASCII identifier,
       * a key longer than ``FORWARDED_ENV_MAX_KEY_BYTES`` bytes,
       * a key using a blocked provider prefix (outside the allowlist),
+      * with ``deny_exec_vectors=True`` only: a key in
+        ``FORWARDED_ENV_EXEC_DENYLIST`` or starting with one of
+        ``FORWARDED_ENV_EXEC_DENY_PREFIXES`` (off by default, so the launch
+        paths are unchanged; see those constants),
       * a value containing a NUL byte (breaks ``Popen`` with "embedded null
         byte" and leaks the argv into logs),
       * a value that is not encodable as UTF-8 (e.g. a lone surrogate that
@@ -165,6 +208,11 @@ def validate_forwarded_env(mapping: Mapping[str, str]) -> Dict[str, str]:
             raise ForwardedEnvError(
                 f"env key {key!r} uses a blocked prefix "
                 f"({', '.join(FORWARDED_ENV_BLOCKED_PREFIXES)}) reserved for provider env"
+            )
+        if deny_exec_vectors and _is_exec_vector(key):
+            raise ForwardedEnvError(
+                f"env key {key!r} is a code-execution vector (dynamic linker, shell "
+                "startup, interpreter injection or PATH) and is denied here"
             )
         # A NUL passes the byte-length check but makes ``Popen`` raise
         # "embedded null byte"; libtmux logs the whole argv (values included)
