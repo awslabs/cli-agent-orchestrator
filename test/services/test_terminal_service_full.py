@@ -78,6 +78,11 @@ class TestCreateTerminal:
         result = await create_terminal("kiro_cli", "developer", new_session=True)
 
         assert result.id == "test1234"
+        assert result.session_incarnation_id
+        assert (
+            mock_db_create.call_args.kwargs["session_incarnation_id"]
+            == result.session_incarnation_id
+        )
         mock_tmux.create_session.assert_called_once()
         mock_provider.initialize.assert_called_once()
 
@@ -277,6 +282,7 @@ class TestCreateTerminal:
             metadata=None,
             working_directory=os.path.realpath(os.getcwd()),
             deferred_init_external_owner=False,
+            session_incarnation_id=result.session_incarnation_id,
             idempotency_key=None,
             # No key supplied, so no fingerprint is computed (review on PR #634).
             request_fingerprint=None,
@@ -470,7 +476,166 @@ class TestCreateTerminal:
         result = await create_terminal("kiro_cli", "developer", session_name="cao-existing")
 
         assert result.id == "test1234"
+        assert result.session_incarnation_id
+        assert (
+            mock_db_create.call_args.kwargs["session_incarnation_id"]
+            == result.session_incarnation_id
+        )
         mock_tmux.create_window.assert_called_once()
+
+    def test_existing_session_incarnation_reuses_live_generation_and_ignores_old_tombstone(
+        self, monkeypatch
+    ):
+        from cli_agent_orchestrator.services import terminal_service
+
+        monkeypatch.setattr(
+            terminal_service,
+            "list_terminals_by_session",
+            MagicMock(
+                return_value=[
+                    {
+                        "id": "old-failed",
+                        "deferred_init_failure": {"message": "old"},
+                        "deferred_init_runtime_reclaimed": True,
+                        "session_incarnation_id": "inc-old",
+                    },
+                    {
+                        "id": "live-one",
+                        "deferred_init_failure": None,
+                        "deferred_init_runtime_reclaimed": False,
+                        "session_incarnation_id": "inc-current",
+                    },
+                ]
+            ),
+        )
+        monkeypatch.setattr(
+            terminal_service,
+            "get_deferred_init_failure",
+            MagicMock(
+                side_effect=lambda terminal_id, candidate=None: (
+                    {"message": "old"} if terminal_id == "old-failed" else None
+                )
+            ),
+        )
+        update = MagicMock(return_value=True)
+        monkeypatch.setattr(terminal_service, "update_terminals_session_incarnation", update)
+
+        incarnation = terminal_service._resolve_existing_session_incarnation_locked("cao-reused")
+
+        assert incarnation == "inc-current"
+        update.assert_not_called()
+
+    def test_existing_session_incarnation_backfills_legacy_live_rows(self, monkeypatch):
+        from cli_agent_orchestrator.services import terminal_service
+
+        monkeypatch.setattr(
+            terminal_service,
+            "list_terminals_by_session",
+            MagicMock(
+                return_value=[
+                    {
+                        "id": "legacy-live-a",
+                        "deferred_init_failure": None,
+                        "deferred_init_runtime_reclaimed": False,
+                        "session_incarnation_id": None,
+                    },
+                    {
+                        "id": "legacy-live-b",
+                        "deferred_init_failure": None,
+                        "deferred_init_runtime_reclaimed": False,
+                        "session_incarnation_id": None,
+                    },
+                ]
+            ),
+        )
+        monkeypatch.setattr(
+            terminal_service, "get_deferred_init_failure", MagicMock(return_value=None)
+        )
+        update = MagicMock(return_value=True)
+        monkeypatch.setattr(terminal_service, "update_terminals_session_incarnation", update)
+
+        incarnation = terminal_service._resolve_existing_session_incarnation_locked("cao-legacy")
+
+        assert incarnation
+        update.assert_called_once_with(["legacy-live-a", "legacy-live-b"], incarnation)
+
+    def test_existing_session_incarnation_conflict_fails_closed(self, monkeypatch):
+        from cli_agent_orchestrator.services import terminal_service
+
+        monkeypatch.setattr(
+            terminal_service,
+            "list_terminals_by_session",
+            MagicMock(
+                return_value=[
+                    {
+                        "id": "live-a",
+                        "deferred_init_failure": None,
+                        "deferred_init_runtime_reclaimed": False,
+                        "session_incarnation_id": "inc-a",
+                    },
+                    {
+                        "id": "live-b",
+                        "deferred_init_failure": None,
+                        "deferred_init_runtime_reclaimed": False,
+                        "session_incarnation_id": "inc-b",
+                    },
+                ]
+            ),
+        )
+        monkeypatch.setattr(
+            terminal_service, "get_deferred_init_failure", MagicMock(return_value=None)
+        )
+
+        with pytest.raises(TerminalRecordCorruptError, match="multiple live incarnation"):
+            terminal_service._resolve_existing_session_incarnation_locked("cao-corrupt")
+
+    @pytest.mark.asyncio
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service.get_deferred_init_failure",
+        return_value=None,
+    )
+    @patch("cli_agent_orchestrator.services.terminal_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    async def test_existing_session_incarnation_conflict_prevents_window_creation(
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_window,
+        mock_backend,
+        mock_list,
+        _mock_failure,
+    ):
+        mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
+        mock_gen_id.return_value = "test1234"
+        mock_gen_window.return_value = "developer-abcd"
+        mock_backend.session_exists.return_value = True
+        mock_list.return_value = [
+            {
+                "id": "live-a",
+                "deferred_init_failure": None,
+                "deferred_init_runtime_reclaimed": False,
+                "session_incarnation_id": "inc-a",
+            },
+            {
+                "id": "live-b",
+                "deferred_init_failure": None,
+                "deferred_init_runtime_reclaimed": False,
+                "session_incarnation_id": "inc-b",
+            },
+        ]
+
+        with pytest.raises(TerminalRecordCorruptError, match="multiple live incarnation"):
+            await create_terminal(
+                "kiro_cli",
+                "developer",
+                session_name="cao-corrupt",
+                new_session=False,
+            )
+
+        mock_backend.create_window.assert_not_called()
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
@@ -2042,6 +2207,7 @@ class TestGetTerminal:
             "provider": "kiro_cli",
             "tmux_session": "cao-session",
             "agent_profile": "developer",
+            "session_incarnation_id": "inc-current",
             "last_active": datetime.now(),
         }
         mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
@@ -2050,6 +2216,7 @@ class TestGetTerminal:
 
         assert result["id"] == "test1234"
         assert result["status"] == TerminalStatus.IDLE.value
+        assert result["session_incarnation_id"] == "inc-current"
 
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_get_terminal_not_found(self, mock_get_metadata):

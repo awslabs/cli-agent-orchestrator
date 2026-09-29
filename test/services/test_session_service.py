@@ -951,12 +951,14 @@ class TestGetSession:
                 "tmux_session": "cao-reused",
                 "deferred_init_failure": {"message": "trust required"},
                 "deferred_init_runtime_reclaimed": True,
+                "session_incarnation_id": "inc-old",
             },
             {
                 "id": "new-live",
                 "tmux_session": "cao-reused",
                 "deferred_init_failure": None,
                 "deferred_init_runtime_reclaimed": False,
+                "session_incarnation_id": "inc-new",
             },
         ]
         mock_failure.side_effect = lambda terminal_id, candidate=None: (
@@ -968,6 +970,66 @@ class TestGetSession:
 
         assert [terminal["id"] for terminal in result["terminals"]] == ["new-live"]
         assert result["terminals"][0]["status"] == "idle"
+
+    @patch("cli_agent_orchestrator.services.session_service.get_deferred_init_failure")
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor.get_status")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_get_session_keeps_failed_sibling_from_current_incarnation(
+        self, mock_get_backend, mock_list_terminals, mock_get_status, mock_failure
+    ):
+        """A failed worker from the current live incarnation remains visible.
+
+        Before durable incarnation identity, the presence of any healthy row
+        caused get_session() to drop every retained failure sharing the reusable
+        session label, including a sibling that failed inside the SAME session.
+        """
+
+        mock_get_backend.return_value.session_exists.return_value = True
+        mock_get_backend.return_value.list_sessions.return_value = [{"id": "cao-current"}]
+        failure = {
+            "phase": "deferred_init",
+            "kind": "provider_init_error",
+            "message": "worker failed",
+        }
+        mock_list_terminals.return_value = [
+            {
+                "id": "conductor",
+                "tmux_session": "cao-current",
+                "deferred_init_failure": None,
+                "deferred_init_runtime_reclaimed": False,
+                "session_incarnation_id": "inc-current",
+            },
+            {
+                "id": "failed-worker",
+                "tmux_session": "cao-current",
+                "deferred_init_failure": failure,
+                "deferred_init_runtime_reclaimed": True,
+                "session_incarnation_id": "inc-current",
+            },
+            {
+                "id": "old-failed",
+                "tmux_session": "cao-current",
+                "deferred_init_failure": {"message": "old generation"},
+                "deferred_init_runtime_reclaimed": True,
+                "session_incarnation_id": "inc-old",
+            },
+        ]
+        mock_failure.side_effect = lambda terminal_id, candidate=None: {
+            "failed-worker": failure,
+            "old-failed": {"message": "old generation"},
+        }.get(terminal_id)
+        mock_get_status.return_value.value = "idle"
+
+        result = get_session("cao-current")
+
+        assert [terminal["id"] for terminal in result["terminals"]] == [
+            "conductor",
+            "failed-worker",
+        ]
+        assert result["terminals"][0]["status"] == "idle"
+        assert result["terminals"][1]["status"] == "error"
+        assert result["terminals"][1]["deferred_init_failure"] == failure
 
     @patch("cli_agent_orchestrator.services.session_service.get_deferred_init_failure")
     @patch("cli_agent_orchestrator.services.status_monitor.status_monitor.get_status")

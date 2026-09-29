@@ -285,6 +285,62 @@ def list_sessions() -> List[Dict]:
         return []
 
 
+def _select_current_incarnation_rows(
+    terminals: List[Dict[str, Any]],
+    failures: Dict[str, Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    """Select rows belonging to the current live session incarnation.
+
+    Active rows (no durable deferred failure and runtime not reclaimed) define
+    the current incarnation. Once exactly one durable incarnation id is known,
+    failed siblings carrying that SAME id remain visible while retained failures
+    from older same-name sessions are excluded.
+
+    Legacy rows created before incarnation ids existed are intentionally not
+    guessed into a generation. If active rows have no durable id, or conflicting
+    active ids are present, keep the pre-incarnation fail-closed behavior:
+    return active rows only and attach no tombstones to the live session.
+    """
+
+    active_rows = [
+        terminal
+        for terminal in terminals
+        if str(terminal["id"]) not in failures
+        and not terminal.get("deferred_init_runtime_reclaimed")
+    ]
+    if not active_rows:
+        return terminals, failures
+
+    active_incarnations = {
+        str(terminal["session_incarnation_id"])
+        for terminal in active_rows
+        if terminal.get("session_incarnation_id")
+    }
+    if len(active_incarnations) != 1:
+        if len(active_incarnations) > 1:
+            logger.error(
+                "Live session rows carry conflicting incarnation ids: %s",
+                sorted(active_incarnations),
+            )
+        return active_rows, {}
+
+    current_incarnation = next(iter(active_incarnations))
+    selected: List[Dict[str, Any]] = []
+    selected_failures: Dict[str, Dict[str, Any]] = {}
+    for terminal in terminals:
+        terminal_id = str(terminal["id"])
+        if terminal_id not in failures and not terminal.get("deferred_init_runtime_reclaimed"):
+            selected.append(terminal)
+            continue
+        if (
+            terminal_id in failures
+            and terminal.get("session_incarnation_id") == current_incarnation
+        ):
+            selected.append(terminal)
+            selected_failures[terminal_id] = failures[terminal_id]
+    return selected, selected_failures
+
+
 def get_session(session_name: str) -> Dict:
     """Get session with terminals, oldest first.
 
@@ -318,15 +374,7 @@ def get_session(session_name: str) -> Dict:
                 failures[str(terminal["id"])] = failure
 
         if backend_exists:
-            live_rows = [
-                terminal
-                for terminal in terminals
-                if str(terminal["id"]) not in failures
-                and not terminal.get("deferred_init_runtime_reclaimed")
-            ]
-            if live_rows:
-                terminals = live_rows
-                failures = {}
+            terminals, failures = _select_current_incarnation_rows(terminals, failures)
 
         if session_data is None:
             if not failures:

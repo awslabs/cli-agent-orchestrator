@@ -25,6 +25,7 @@ import os
 import re
 import threading
 import time
+import uuid
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -59,6 +60,7 @@ from cli_agent_orchestrator.clients.database import (  # Compatibility/test seam
     update_terminal_metadata,
     update_terminal_provider_variant,
     update_terminal_shell_command,
+    update_terminals_session_incarnation,
 )
 from cli_agent_orchestrator.constants import (
     CALLBACK_TERMINAL_ID_ENV,
@@ -1248,6 +1250,7 @@ async def create_terminal(
         # of seconds, and a teardown of this name must never queue behind an
         # agent launch. Everything inside is short, synchronous state mutation.
         deferred_delete_on_failure: bool | None = None
+        session_incarnation_id: str | None = None
 
         def _create_session_or_window_locked() -> Tuple[str, bool, bool]:
             """Runs under the lifecycle lock on a worker thread.
@@ -1291,7 +1294,7 @@ async def create_terminal(
             not own, leaving ITS row pointing at nothing. Under the lock the
             name goes free -> free with no observable intermediate state.
             """
-            nonlocal deferred_delete_on_failure
+            nonlocal deferred_delete_on_failure, session_incarnation_id
             assert session_name is not None  # narrowed by the caller
             with session_lifecycle_lock(session_name):
                 if new_session:
@@ -1303,6 +1306,8 @@ async def create_terminal(
                     # name may have left behind, so a no-env relaunch can't
                     # inherit them.
                     clear_session_env(session_name)
+
+                    session_incarnation_id = uuid.uuid4().hex
 
                     # Create new tmux session with initial window
                     effective_env = dict(env_vars or {})
@@ -1322,6 +1327,13 @@ async def create_terminal(
                     # lives on).
                     if not get_backend().session_exists(session_name):
                         raise ValueError(f"Session '{session_name}' not found")
+                    # Resolve the durable logical session generation before
+                    # creating a new backend object. Old retained tombstones may
+                    # share this reusable label but cannot define the current
+                    # incarnation.
+                    session_incarnation_id = _resolve_existing_session_incarnation_locked(
+                        session_name
+                    )
                     # Merge explicit per-step env_vars over the persisted session
                     # env (per-step wins on conflict): workflow routing ids like
                     # CAO_WORKFLOW_RUN_ID must reach the window even when it
@@ -1389,6 +1401,7 @@ async def create_terminal(
                         deferred_init_external_owner=bool(
                             defer_init and deferred_delete_on_failure is False
                         ),
+                        session_incarnation_id=session_incarnation_id,
                         idempotency_key=idempotency_key,
                         request_fingerprint=request_fingerprint,
                     )
@@ -1549,6 +1562,7 @@ async def create_terminal(
             group=group,
             metadata=metadata,
             deferred_init_failure=None,
+            session_incarnation_id=session_incarnation_id,
             status=initial_status,
             last_active=datetime.now(),
         )
@@ -2008,6 +2022,49 @@ def _purge_stale_session_rows_for_recreate(session_name: str) -> None:
             )
             continue
         delete_terminal_row(terminal_id, metadata, registry=None)
+
+
+def _resolve_existing_session_incarnation_locked(session_name: str) -> str:
+    """Resolve/backfill the durable incarnation of an already-live session.
+
+    Caller must hold the per-session lifecycle lock. Retained deferred-init
+    failures can share the reusable session label with a later replacement, so
+    only rows that still represent live/pending runtime are allowed to define
+    the CURRENT incarnation.
+
+    Legacy active rows with no incarnation are backfilled atomically. If one
+    active row already carries an incarnation, all legacy active siblings are
+    joined to that same value. Multiple distinct active incarnation ids are a
+    corrupt lifecycle state and fail closed before a new backend window is
+    created.
+    """
+
+    rows = list_terminals_by_session(session_name)
+    active_rows: list[dict[str, Any]] = []
+    for row in rows:
+        failure = get_deferred_init_failure(str(row["id"]), row.get("deferred_init_failure"))
+        if failure is None and not row.get("deferred_init_runtime_reclaimed"):
+            active_rows.append(row)
+
+    incarnation_ids = {
+        str(row["session_incarnation_id"])
+        for row in active_rows
+        if row.get("session_incarnation_id")
+    }
+    if len(incarnation_ids) > 1:
+        raise TerminalRecordCorruptError(
+            f"Session {session_name!r} has multiple live incarnation ids: "
+            f"{sorted(incarnation_ids)!r}"
+        )
+
+    incarnation_id = next(iter(incarnation_ids)) if incarnation_ids else uuid.uuid4().hex
+    legacy_ids = [str(row["id"]) for row in active_rows if not row.get("session_incarnation_id")]
+    if legacy_ids and not update_terminals_session_incarnation(legacy_ids, incarnation_id):
+        raise TerminalRecordCorruptError(
+            f"Could not atomically backfill session incarnation for "
+            f"{session_name!r}: {legacy_ids!r}"
+        )
+    return incarnation_id
 
 
 def _deferred_failure_delete_worker(terminal_id: str) -> bool:
@@ -2820,6 +2877,7 @@ def get_terminal(terminal_id: str) -> Dict:
             "group": metadata.get("group"),
             "metadata": public_metadata,
             "deferred_init_failure": deferred_failure,
+            "session_incarnation_id": metadata.get("session_incarnation_id"),
             "status": status,
             "last_active": metadata["last_active"],
         }

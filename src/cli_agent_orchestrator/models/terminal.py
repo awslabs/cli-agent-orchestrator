@@ -110,6 +110,13 @@ class Terminal(BaseModel):
             "Separate from consumer metadata so clients cannot overwrite lifecycle truth."
         ),
     )
+    session_incarnation_id: Optional[str] = Field(
+        None,
+        description=(
+            "Durable CAO session incarnation identifier. Session names may be reused; "
+            "this value distinguishes retained rows from a later replacement."
+        ),
+    )
     status: Optional[TerminalStatus] = Field(
         None, description="Current terminal status (live only)"
     )

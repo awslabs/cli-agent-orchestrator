@@ -79,6 +79,12 @@ class TerminalModel(Base):
     deferred_init_runtime_reclaimed = Column(
         Boolean, nullable=False, default=False, server_default=text("0")
     )
+    # Durable identity for one logical lifetime of a reusable session name.
+    # Retained deferred-init tombstones can outlive the backend session; when a
+    # later session reuses the same label this value lets read/lifecycle paths
+    # distinguish the old rows from failures that belong to the CURRENT live
+    # session. NULL is reserved for rows created before this column existed.
+    session_incarnation_id = Column(String, nullable=True)
     last_active = Column(DateTime, default=datetime.now)
 
     # ORDERING CONTRACT: the two session-scoped reads -- ``list_terminals_by_session``
@@ -1823,6 +1829,10 @@ def _migrate_terminals_schema() -> None:
             logger.info(
                 "Migration: added deferred_init_runtime_reclaimed column to terminals table"
             )
+        if "session_incarnation_id" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN session_incarnation_id TEXT")
+            conn.commit()
+            logger.info("Migration: added session_incarnation_id column to terminals table")
         conn.close()
     except Exception as e:
         logger.warning(f"Migration check for terminals schema failed: {e}")
@@ -1843,6 +1853,7 @@ def create_terminal(
     metadata: Optional[Dict[str, Any]] = None,
     working_directory: Optional[str] = None,
     deferred_init_external_owner: bool = False,
+    session_incarnation_id: Optional[str] = None,
     idempotency_key: Optional[str] = None,
     request_fingerprint: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -1886,6 +1897,7 @@ def create_terminal(
             group=_json.dumps(group) if group else None,
             metadata_json=_json.dumps(metadata) if metadata else None,
             deferred_init_external_owner=bool(deferred_init_external_owner),
+            session_incarnation_id=session_incarnation_id,
         )
         db.add(terminal)
         if idempotency_key:
@@ -1925,6 +1937,7 @@ def create_terminal(
             "metadata": metadata if metadata else None,
             "deferred_init_external_owner": bool(deferred_init_external_owner),
             "deferred_init_runtime_reclaimed": False,
+            "session_incarnation_id": session_incarnation_id,
         }
 
 
@@ -2035,6 +2048,7 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "deferred_init_runtime_reclaimed": bool(
                 getattr(terminal, "deferred_init_runtime_reclaimed", False)
             ),
+            "session_incarnation_id": getattr(terminal, "session_incarnation_id", None),
             "last_active": terminal.last_active,
         }
 
@@ -2101,6 +2115,29 @@ def update_terminal_deferred_init_runtime_reclaimed(terminal_id: str, reclaimed:
         if not terminal:
             return False
         terminal.deferred_init_runtime_reclaimed = bool(reclaimed)
+        db.commit()
+        return True
+
+
+def update_terminals_session_incarnation(terminal_ids: List[str], incarnation_id: str) -> bool:
+    """Atomically assign one session incarnation to the specified terminal rows.
+
+    Used only while the per-session lifecycle lock is held.  All requested rows
+    must still exist; otherwise no assignment is committed.  This prevents a
+    legacy-session backfill from leaving a half-tagged live incarnation after a
+    concurrent/stale-row anomaly.
+    """
+
+    unique_ids = list(dict.fromkeys(str(terminal_id) for terminal_id in terminal_ids))
+    if not unique_ids:
+        return True
+    with SessionLocal() as db:
+        terminals = db.query(TerminalModel).filter(TerminalModel.id.in_(unique_ids)).all()
+        if len(terminals) != len(unique_ids):
+            db.rollback()
+            return False
+        for terminal in terminals:
+            terminal.session_incarnation_id = str(incarnation_id)
         db.commit()
         return True
 
@@ -2317,6 +2354,7 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
                 ),
                 "deferred_init_external_owner": bool(t.deferred_init_external_owner),
                 "deferred_init_runtime_reclaimed": bool(t.deferred_init_runtime_reclaimed),
+                "session_incarnation_id": t.session_incarnation_id,
                 "last_active": t.last_active,
             }
             for t in terminals
@@ -2417,6 +2455,7 @@ def list_terminals_in_sessions(tmux_sessions: List[str]) -> List[Dict[str, Any]]
                 ),
                 "deferred_init_external_owner": bool(t.deferred_init_external_owner),
                 "deferred_init_runtime_reclaimed": bool(t.deferred_init_runtime_reclaimed),
+                "session_incarnation_id": t.session_incarnation_id,
                 "last_active": t.last_active,
             }
             for t in terminals
@@ -2444,6 +2483,7 @@ def list_all_terminals() -> List[Dict[str, Any]]:
                 ),
                 "deferred_init_external_owner": bool(t.deferred_init_external_owner),
                 "deferred_init_runtime_reclaimed": bool(t.deferred_init_runtime_reclaimed),
+                "session_incarnation_id": t.session_incarnation_id,
                 "last_active": t.last_active,
             }
             for t in terminals

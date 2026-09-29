@@ -89,6 +89,19 @@ class TestTerminalOperations:
 
             assert count_runtime_allocated_terminals() == 1
 
+    def test_session_incarnation_backfill_is_atomic_when_any_row_is_missing(self, test_db):
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            create_terminal("live0001", "cao-live", "w-live", "kimi_cli")
+
+            assert (
+                db_mod.update_terminals_session_incarnation(["live0001", "missing1"], "inc-current")
+                is False
+            )
+            assert get_terminal_metadata("live0001")["session_incarnation_id"] is None
+
+            assert db_mod.update_terminals_session_incarnation(["live0001"], "inc-current") is True
+            assert get_terminal_metadata("live0001")["session_incarnation_id"] == "inc-current"
+
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_get_terminal_metadata_found(self, mock_session_class):
         """Test getting terminal metadata that exists."""
@@ -1749,6 +1762,7 @@ class TestTerminalsSchemaMigration:
         assert "deferred_init_failure" in columns
         assert "deferred_init_external_owner" in columns
         assert "deferred_init_runtime_reclaimed" in columns
+        assert "session_incarnation_id" in columns
         assert rows == [("abc12345", None, None)], "existing rows must get NULL metadata values"
 
     def test_migration_is_idempotent(self, tmp_path, monkeypatch):
@@ -1783,6 +1797,7 @@ class TestTerminalsSchemaMigration:
         assert columns.count("deferred_init_failure") == 1
         assert columns.count("deferred_init_external_owner") == 1
         assert columns.count("deferred_init_runtime_reclaimed") == 1
+        assert columns.count("session_incarnation_id") == 1
 
     def test_group_and_metadata_columns_added_to_legacy_table(self, tmp_path, monkeypatch):
         """#432: a pre-existing terminals table (predating group/metadata) gains both
@@ -2009,6 +2024,32 @@ class TestTerminalMetadataRoundTrip:
         assert fetched is not None
         assert fetched["caller_id"] is None
         assert fetched["working_directory"] is None
+
+    def test_session_incarnation_round_trips_through_all_session_reads(self, tmp_path, monkeypatch):
+        """Durable session incarnation identity is returned by every session read."""
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        engine = create_engine(f"sqlite:///{tmp_path / 'incarnation.db'}")
+        Base.metadata.create_all(bind=engine)
+        monkeypatch.setattr(db_mod, "SessionLocal", sessionmaker(bind=engine))
+
+        created = create_terminal(
+            "abc12345",
+            "cao-s",
+            "w-0",
+            "kiro_cli",
+            session_incarnation_id="inc-123",
+        )
+        assert created["session_incarnation_id"] == "inc-123"
+
+        fetched = get_terminal_metadata("abc12345")
+        assert fetched is not None
+        assert fetched["session_incarnation_id"] == "inc-123"
+        assert list_terminals_by_session("cao-s")[0]["session_incarnation_id"] == "inc-123"
+        assert list_terminals_in_sessions(["cao-s"])[0]["session_incarnation_id"] == "inc-123"
 
 
 class TestProjectAliasMigration:
@@ -2407,6 +2448,7 @@ class TestListTerminalsInSessions:
             "deferred_init_failure",
             "deferred_init_external_owner",
             "deferred_init_runtime_reclaimed",
+            "session_incarnation_id",
             "last_active",
         }
 
