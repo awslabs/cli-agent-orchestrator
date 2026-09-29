@@ -3069,14 +3069,18 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
         raise
 
 
-async def readopt_terminals_at_startup() -> Dict[str, int]:
+def readopt_terminals_at_startup(rows: List[Dict[str, Any]]) -> Dict[str, int]:
     """Re-adopt persisted terminals after a cao-server restart.
 
     ``create_terminal`` is the only place the FIFO -> EventBus logging
     pipeline is armed, so restarting cao-server used to leave live tmux
     agents half-adopted: the pane keeps running, but its ``<tid>.log`` stops
-    growing and status detection observes nothing. For every persisted
-    terminal row:
+    growing and status detection observes nothing.
+
+    Synchronous and blocking (tmux subprocesses and SQLite for every row): the
+    lifespan runs it in a worker thread. ``rows`` is the registry snapshot the
+    lifespan takes before the server starts serving, so terminals this server
+    creates meanwhile are never touched. For every row:
 
     - tmux window still alive: re-arm the pipeline — recreate the FIFO
       reader (same probe/re-arm closures ``create_terminal`` uses) and
@@ -3093,16 +3097,19 @@ async def readopt_terminals_at_startup() -> Dict[str, int]:
     to re-arm there.
 
     Returns:
-        Counts: ``{"readopted": N, "finalized": M}``.
+        Counts: ``{"readopted": N, "finalized": M, "skipped": K}``, where
+        ``skipped`` rows were left exactly as they were.
     """
     from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
-    counts = {"readopted": 0, "finalized": 0}
+    counts = {"readopted": 0, "finalized": 0, "skipped": 0}
+    if not rows:
+        return counts
     backend = get_backend()
     if backend.supports_event_inbox():
         return counts
 
-    for row in list_all_terminals():
+    for row in rows:
         terminal_id = row["id"]
         session_name = row["tmux_session"]
         window_name = row["tmux_window"]
@@ -3144,6 +3151,7 @@ async def readopt_terminals_at_startup() -> Dict[str, int]:
                 logger.info(f"Re-adopted terminal {terminal_id} ({session_name}:{window_name})")
             except Exception as e:
                 logger.warning(f"Failed to re-adopt terminal {terminal_id}: {e}")
+                counts["skipped"] += 1
         else:
             try:
                 scrollback_path = TERMINAL_LOG_DIR / f"{terminal_id}.scrollback"
@@ -3157,5 +3165,6 @@ async def readopt_terminals_at_startup() -> Dict[str, int]:
                 logger.info(f"Finalized dead terminal {terminal_id} ({session_name}:{window_name})")
             except Exception as e:
                 logger.warning(f"Failed to finalize terminal {terminal_id}: {e}")
+                counts["skipped"] += 1
 
     return counts
