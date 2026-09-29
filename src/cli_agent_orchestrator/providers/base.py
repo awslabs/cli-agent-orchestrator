@@ -188,6 +188,17 @@ class BaseProvider(ABC):
         """
         pass
 
+    def get_error_message(self, buffer: str) -> Optional[str]:
+        """Return a provider-owned fatal error message represented by ``buffer``.
+
+        Most providers expose only a status verdict, so the default is no
+        detail. Providers may override this when they can prove that a line is
+        provider error chrome rather than assistant prose. Callers still own
+        bounding and sanitizing the returned string before persistence.
+        """
+
+        return None
+
     # Opt-in flag for pyte-rendered status detection. A provider sets this True
     # ONLY when it ships a purpose-built get_status_from_screen() calibrated for
     # a composited fixed-height viewport (not the raw byte stream). When False,

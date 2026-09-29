@@ -1232,13 +1232,33 @@ class TestKimiCliProviderPatterns:
         assert _has_terminal_error(quoted)
         assert not _has_terminal_error(quoted, execution_established=True)
         # Generic column-zero failures stay fatal even after execution evidence.
-        assert _has_terminal_error(
-            "● quoted\nError: connection failed", execution_established=True
-        )
+        assert _has_terminal_error("● quoted\nError: connection failed", execution_established=True)
         assert re.search(ERROR_PATTERN, "ConnectionError: timeout", re.MULTILINE)
         assert re.search(ERROR_PATTERN, "APIError: rate limited", re.MULTILINE)
         assert re.search(ERROR_PATTERN, "Traceback (most recent call last):", re.MULTILINE)
         assert not re.search(ERROR_PATTERN, "No errors found", re.MULTILINE)
+
+    def test_error_message_returns_real_invalid_model_detail(self):
+        provider = KimiCliProvider("t-error-detail", "s", "w")
+        output = (
+            "\x1b[2K   \x1b[38;5;210mError: Failed to start a session: "
+            'Model "bad-model" is not configured in config.toml.\x1b[39m\n'
+        )
+
+        assert provider.get_error_message(output) == (
+            'Error: Failed to start a session: Model "bad-model" is not configured in config.toml.'
+        )
+
+    def test_error_message_does_not_promote_quoted_session_error_after_execution(self):
+        provider = KimiCliProvider("t-quoted-error", "s", "w")
+        provider._execution_observed = True
+
+        assert (
+            provider.get_error_message(
+                '   Error: Failed to start a session: Model "bad-model" is not configured.'
+            )
+            is None
+        )
 
     def test_status_bar_pattern(self):
         """Test status bar detection."""

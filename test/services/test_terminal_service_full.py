@@ -3589,6 +3589,88 @@ class TestDeferredInitFailureNotification:
         assert terminal["metadata"]["origin"] == "cao-devspace-bridge"
         monitor.get_status.assert_not_called()
 
+    def test_get_terminal_defers_external_error_until_failure_is_durable(self, monkeypatch):
+        from cli_agent_orchestrator.services import terminal_service
+
+        metadata = {
+            "id": "worker99",
+            "tmux_window": "w",
+            "provider": "kimi_cli",
+            "tmux_session": "s",
+            "agent_profile": "developer",
+            "caller_id": None,
+            "allowed_tools": None,
+            "engine": None,
+            "group": None,
+            "metadata": {"origin": "cao-devspace-bridge"},
+            "deferred_init_external_owner": True,
+            "deferred_init_failure": None,
+            "last_active": None,
+        }
+        monitor = MagicMock()
+        monitor.get_status.return_value = TerminalStatus.ERROR
+        monkeypatch.setattr(terminal_service, "status_monitor", monitor)
+        monkeypatch.setattr(
+            terminal_service, "get_terminal_metadata", MagicMock(return_value=metadata)
+        )
+
+        before_persist = terminal_service.get_terminal("worker99")
+        assert before_persist["status"] == TerminalStatus.UNKNOWN.value
+        assert before_persist["deferred_init_failure"] is None
+
+        metadata["deferred_init_failure"] = {
+            "phase": "deferred_init",
+            "kind": "provider_error_after_delivery",
+            "message": 'Error: Failed to start a session: Model "bad-model" is not configured.',
+        }
+        after_persist = terminal_service.get_terminal("worker99")
+        assert after_persist["status"] == TerminalStatus.ERROR.value
+        assert "bad-model" in after_persist["deferred_init_failure"]["message"]
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service._surface_deferred_init_failure")
+    @patch("cli_agent_orchestrator.services.terminal_service._confirm_worker_started_or_resubmit")
+    @patch("cli_agent_orchestrator.services.terminal_service.send_input")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    async def test_deferred_kimi_provider_error_persists_exact_provider_detail(
+        self, mock_monitor, mock_meta, mock_send, mock_confirm, mock_surface, monkeypatch
+    ):
+        from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider
+        from cli_agent_orchestrator.services import terminal_service
+
+        provider_instance = KimiCliProvider("worker99", "s", "w")
+        provider_instance.initialize = AsyncMock(return_value=True)
+        mock_meta.return_value = {"caller_id": None}
+        mock_confirm.return_value = True
+        mock_monitor.get_status.return_value = TerminalStatus.ERROR
+        mock_monitor.get_buffer.return_value = '   Error: Failed to start a session: Model "bad-model" is not configured in config.toml.\n'
+
+        async def inline_to_thread(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        monkeypatch.setattr(terminal_service.asyncio, "to_thread", inline_to_thread)
+
+        before_tasks = set(terminal_service._deferred_init_tasks)
+        terminal_service._schedule_deferred_init(
+            provider_instance,
+            "worker99",
+            "do the task",
+            OrchestrationType.ASSIGN,
+            None,
+            initial_caller_id=None,
+            delete_on_failure=False,
+        )
+        (task,) = set(terminal_service._deferred_init_tasks) - before_tasks
+        await task
+
+        mock_send.assert_called_once()
+        mock_surface.assert_awaited_once()
+        assert mock_surface.call_args.kwargs["kind"] == "provider_error_after_delivery"
+        assert mock_surface.call_args.kwargs["message"] == (
+            'Error: Failed to start a session: Model "bad-model" is not configured in config.toml.'
+        )
+
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service._notify_caller_of_deferred_failure")
     @patch("cli_agent_orchestrator.services.terminal_service._confirm_worker_started_or_resubmit")

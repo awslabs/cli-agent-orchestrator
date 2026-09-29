@@ -85,6 +85,7 @@ from cli_agent_orchestrator.plugins import (
     PostSendMessageEvent,
 )
 from cli_agent_orchestrator.providers.base import (
+    BaseProvider,
     OutputExtractionError,
     OutputExtractionRejected,
 )
@@ -2575,6 +2576,19 @@ def _schedule_deferred_init(
                 if started and getattr(provider_instance, "requires_execution_evidence", False):
                     current_status = await asyncio.to_thread(status_monitor.get_status, terminal_id)
                     if current_status == TerminalStatus.ERROR:
+                        provider_error_message: str | None = None
+                        if isinstance(provider_instance, BaseProvider):
+                            try:
+                                error_buffer = status_monitor.get_buffer(terminal_id)
+                                provider_error_message = await asyncio.to_thread(
+                                    provider_instance.get_error_message, error_buffer
+                                )
+                            except Exception as exc:  # noqa: BLE001 - detail is diagnostic only
+                                logger.debug(
+                                    "Could not extract provider error detail for %s: %s",
+                                    terminal_id,
+                                    exc,
+                                )
                         logger.error(
                             "Deferred init for %s: provider entered ERROR after task delivery.",
                             terminal_id,
@@ -2582,7 +2596,8 @@ def _schedule_deferred_init(
                         await _surface_deferred_init_failure(
                             terminal_id,
                             kind="provider_error_after_delivery",
-                            message=(
+                            message=provider_error_message
+                            or (
                                 f"Worker {terminal_id} accepted the assigned task but the "
                                 "provider entered ERROR before producing a result. Correct "
                                 "the provider/model configuration and re-assign the task."
@@ -2679,11 +2694,25 @@ def get_terminal(terminal_id: str) -> Dict:
         # Deferred init can fail before provider status becomes meaningful. The
         # DB-backed failure marker is authoritative and survives server restart,
         # unlike StatusMonitor's in-memory latch.
-        status = (
-            TerminalStatus.ERROR.value
-            if deferred_failure is not None
-            else status_monitor.get_status(terminal_id).value
-        )
+        if deferred_failure is not None:
+            status = TerminalStatus.ERROR.value
+        else:
+            observed_status = status_monitor.get_status(terminal_id)
+            # External deferred initialization has a short two-phase window:
+            # the provider can render ERROR before the background init task has
+            # durably written ``deferred_init_failure``. Publishing that
+            # transient ERROR lets an external observer settle a generic
+            # failure and delete the terminal before the structured detail is
+            # visible. Keep the public verdict non-final until the marker (or
+            # fallback sidecar) exists; the init task reads StatusMonitor
+            # directly and is therefore not blocked by this API-facing gate.
+            if (
+                metadata.get("deferred_init_external_owner")
+                and observed_status == TerminalStatus.ERROR
+            ):
+                status = TerminalStatus.UNKNOWN.value
+            else:
+                status = observed_status.value
 
         return {
             "id": metadata["id"],

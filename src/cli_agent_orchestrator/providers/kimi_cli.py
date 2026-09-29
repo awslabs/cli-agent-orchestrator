@@ -717,8 +717,8 @@ ERROR_PATTERN = (
 INDENTED_SESSION_START_ERROR_PATTERN = r"^[^\S\n]+Error:\s+Failed to start a session:"
 
 
-def _has_terminal_error(text: str, *, execution_established: bool = False) -> bool:
-    """Whether ``text`` carries a fatal provider error.
+def _terminal_error_message(text: str, *, execution_established: bool = False) -> Optional[str]:
+    """Return the fatal provider error line represented by ``text``.
 
     ``execution_established`` is the caller's per-turn latch: True once the
     CURRENT turn has shown live execution evidence (``_execution_observed``,
@@ -729,11 +729,21 @@ def _has_terminal_error(text: str, *, execution_established: bool = False) -> bo
     provably ran, while a fresh turn (or one still awaiting its first activity)
     surfaces the real failure as ERROR.
     """
-    if re.search(ERROR_PATTERN, text, re.MULTILINE):
-        return True
+    for line in text.splitlines():
+        if re.match(ERROR_PATTERN, line):
+            return line.strip()
     if execution_established:
-        return False
-    return bool(re.search(INDENTED_SESSION_START_ERROR_PATTERN, text, re.MULTILINE))
+        return None
+    for line in text.splitlines():
+        if re.match(INDENTED_SESSION_START_ERROR_PATTERN, line):
+            return line.strip()
+    return None
+
+
+def _has_terminal_error(text: str, *, execution_established: bool = False) -> bool:
+    """Whether ``text`` carries a fatal provider error."""
+
+    return _terminal_error_message(text, execution_established=execution_established) is not None
 
 
 class KimiCliProvider(BaseProvider):
@@ -2061,6 +2071,23 @@ class KimiCliProvider(BaseProvider):
             return kt.SpinnerSemantics.CODE
         return kt.SpinnerSemantics.LEGACY
 
+    def get_error_message(self, buffer: str) -> Optional[str]:
+        """Return the exact Kimi error line that can justify ``ERROR``.
+
+        Reuse the status detector's ownership rule: an indented Kimi Code
+        session-start error is fatal only before this turn has execution
+        evidence, while a column-zero generic provider error remains fatal.
+        This prevents quoted assistant prose from becoming durable lifecycle
+        error text.
+        """
+
+        if not buffer:
+            return None
+        return _terminal_error_message(
+            strip_terminal_escapes(buffer),
+            execution_established=self._execution_observed,
+        )
+
     def get_status(self, output: str) -> TerminalStatus:
         """Get Kimi CLI status by analyzing terminal output.
 
@@ -2165,9 +2192,7 @@ class KimiCliProvider(BaseProvider):
             # ready chrome. The indented session-start shape only counts before
             # this turn has execution evidence; a top-level failure is fatal
             # regardless (see _has_terminal_error).
-            if _has_terminal_error(
-                clean_output, execution_established=self._execution_observed
-            ):
+            if _has_terminal_error(clean_output, execution_established=self._execution_observed):
                 return TerminalStatus.ERROR
 
             # Dispatch grace: for a few seconds after send_input(), trust the
