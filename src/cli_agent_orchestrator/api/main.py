@@ -3936,8 +3936,12 @@ async def get_terminal_working_directory(
 ) -> WorkingDirectoryResponse:
     """Get the current working directory of a terminal's pane."""
     try:
-        working_directory = terminal_service.get_working_directory(terminal_id)
+        working_directory = await asyncio.to_thread(
+            terminal_service.get_working_directory, terminal_id
+        )
         return WorkingDirectoryResponse(working_directory=working_directory)
+    except RemoteRuntimeError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -7427,6 +7431,10 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
     metadata = get_terminal_metadata(terminal_id)
     if not metadata:
         await websocket.close(code=4004, reason="Terminal not found")
+        return
+    if metadata.get("runtime_id"):
+        # Its pane lives in an execution runtime; attach is not relayed yet (#745).
+        await websocket.close(code=4004, reason="Terminal runs in an execution runtime")
         return
 
     # Defence-in-depth: re-validate the names from the DB before they

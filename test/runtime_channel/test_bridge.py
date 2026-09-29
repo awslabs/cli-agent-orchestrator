@@ -181,6 +181,12 @@ class TestExecute:
         }
 
     @pytest.mark.asyncio
+    async def test_the_working_directory_is_read_beside_the_pane(self, monkeypatch):
+        monkeypatch.setattr(terminal_service, "get_working_directory", lambda tid: f"/w/{tid}")
+        command = Command(op_id="op-wd", type="working_directory", terminal_id="abcd1234")
+        assert await _bridge().execute(command) == {"working_directory": "/w/abcd1234"}
+
+    @pytest.mark.asyncio
     async def test_output_uses_the_requested_mode(self, monkeypatch):
         monkeypatch.setattr(terminal_service, "get_output", lambda tid, mode: f"{tid}:{mode.value}")
         result = await _bridge().execute(_command(CommandType.OUTPUT, mode="last"))

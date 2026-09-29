@@ -87,6 +87,7 @@ class _FakeRuntime:
         self.sent = []
         self.reply = reply
         self.conn = registry.register(runtime_id, self.send_text)
+        registry.activate(self.conn)  # as the server does once its hello is sent
 
     async def send_text(self, text):
         command = decode(text)

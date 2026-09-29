@@ -178,6 +178,7 @@ class TestRuntimeNotConnected:
             ("post", "/terminals/abcd1234/key?key=Enter"),
             ("get", "/terminals/abcd1234/output"),
             ("post", "/terminals/abcd1234/exit"),
+            ("get", "/terminals/abcd1234/working-directory"),
             ("delete", "/terminals/abcd1234"),
             ("delete", "/sessions/cao-remote1"),
         ],
@@ -309,6 +310,32 @@ class TestRemoteTerminal:
         assert runtime.received[0].payload == {"agent_profile": "developer", "provider": "mock_cli"}
         assert runtime.received[1].payload["message"] == "hi"
         assert runtime.received[3].payload == {"mode": "last"}
+
+    def test_the_working_directory_comes_from_the_runtime(self, http, start_runtime):
+        _remote_row("abcd1234", "rt-1")
+        runtime = start_runtime(script=lambda command: {"working_directory": "/work/repo"})
+        response = http.get("/terminals/abcd1234/working-directory")
+        assert response.status_code == 200, response.text
+        assert response.json() == {"working_directory": "/work/repo"}
+        assert [(c.type.value, c.terminal_id) for c in runtime.received] == [
+            ("working_directory", "abcd1234")
+        ]
+
+    def test_a_reconnect_during_a_delete_leaves_no_placement_behind(
+        self, http, start_runtime, monkeypatch
+    ):
+        _remote_row("abcd1234", "rt-1")
+        start_runtime(script=_answer)
+        real = terminal_service.delete_terminal_row
+
+        def reconnect_meanwhile(terminal_id, metadata, registry=None):
+            # A reconnect's hello still finds the row, and places the terminal.
+            registry_mod.runtime_registry.place(terminal_id, "rt-1")
+            return real(terminal_id, metadata, registry=registry)
+
+        monkeypatch.setattr(terminal_service, "delete_terminal_row", reconnect_meanwhile)
+        assert http.delete("/terminals/abcd1234").status_code == 200
+        assert runtimes_of(http)["rt-1"]["terminals"] == []
 
     def test_an_orchestrated_message_keeps_its_sender_and_type(self, start_runtime):
         _remote_row("abcd1234", "rt-1")
@@ -458,6 +485,54 @@ class TestUnrecordedTerminals:
         assert response.status_code == 504
         assert (delete.type, delete.terminal_id) == (CommandType.DELETE, "beef0001")
         assert database.get_terminal_metadata("beef0001") is None
+
+
+class TestHandshakeOrdering:
+    def test_no_command_reaches_a_runtime_before_the_server_hello(self, http, server, monkeypatch):
+        stalled, release = threading.Event(), threading.Event()
+        real = server_mod.list_terminal_ids_on_runtime
+
+        def slow(runtime_id):
+            stalled.set()
+            release.wait(5)
+            return real(runtime_id)
+
+        monkeypatch.setattr(server_mod, "list_terminal_ids_on_runtime", slow)
+        monkeypatch.setattr(server_mod, "LAUNCH_TIMEOUT", 0.5)
+
+        async def scenario():
+            async with _dial(server) as ws:
+                await ws.send(_hello())
+                await asyncio.to_thread(stalled.wait, 5)
+                # A launch while the server is still handling the runtime's hello.
+                response = await asyncio.to_thread(
+                    http.post, "/runtimes/rt-1/terminals", json={"agent_profile": "developer"}
+                )
+                release.set()
+                return response, decode(await asyncio.wait_for(ws.recv(), 5))
+
+        response, first = asyncio.run(scenario())
+        assert response.status_code == 503, response.text
+        assert isinstance(first, Hello), first
+
+
+class TestAttach:
+    @pytest.mark.asyncio
+    async def test_attaching_to_a_remote_terminal_is_refused_without_local_tmux(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from cli_agent_orchestrator.api.main import terminal_ws
+
+        _remote_row("abcd1234", "rt-1")
+        ws = MagicMock()
+        ws.client = MagicMock(host="127.0.0.1")
+        ws.headers = {}
+        ws.accept = AsyncMock()
+        ws.close = AsyncMock()
+        await terminal_ws(ws, "abcd1234")
+        ws.close.assert_awaited_once()
+        assert ws.close.call_args.kwargs.get("code") == 4004
+        assert "execution runtime" in ws.close.call_args.kwargs.get("reason", "")
 
 
 class TestLaunchAcrossAReconnect:

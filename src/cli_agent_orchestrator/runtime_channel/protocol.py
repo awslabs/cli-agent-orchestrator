@@ -25,6 +25,7 @@ class CommandType(str, Enum):
     INPUT = "input"
     KEY = "key"
     OUTPUT = "output"
+    WORKING_DIRECTORY = "working_directory"
     EXIT = "exit"
     DELETE = "delete"
 

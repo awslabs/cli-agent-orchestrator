@@ -113,6 +113,7 @@ async def runtime_channel(ws: WebSocket) -> None:
         for terminal_id, reported in hello.statuses.items():
             runtime_registry.set_status(terminal_id, runtime_id, reported, conn=conn)
         await ws.send_text(server_hello)
+        runtime_registry.activate(conn)
         # The hello lists every terminal the runtime runs.
         for terminal_id in hello.statuses:
             if not runtime_registry.is_placed(terminal_id, runtime_id):
