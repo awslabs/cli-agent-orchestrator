@@ -1,0 +1,314 @@
+"""cao-bridge, the execution runtime's side of the channel (#745)."""
+
+import asyncio
+from types import SimpleNamespace
+
+import pytest
+import websockets
+from websockets.datastructures import Headers
+from websockets.http11 import Response
+
+import cli_agent_orchestrator.runtime_channel.bridge as bridge_mod
+from cli_agent_orchestrator.models.inbox import OrchestrationType
+from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.runtime_channel.bridge import Bridge, ChannelRefused
+from cli_agent_orchestrator.runtime_channel.protocol import (
+    PROTOCOL_VERSION,
+    Command,
+    CommandType,
+    Hello,
+    Result,
+    Status,
+    decode,
+    encode,
+)
+from cli_agent_orchestrator.services import terminal_service
+from cli_agent_orchestrator.services.event_bus import bus
+
+
+class FakeServer:
+    """One accepted channel, from the runtime's side."""
+
+    def __init__(self, frames=(), version=PROTOCOL_VERSION):
+        self.sent = []
+        self._frames = [encode(f) for f in frames]
+        self._hello = encode(Hello(protocol_version=version, runtime_id="server"))
+        self.closed = asyncio.Event()
+
+    async def send(self, text):
+        self.sent.append(decode(text))
+
+    async def recv(self):
+        return self._hello
+
+    def __aiter__(self):
+        return self._iterate()
+
+    async def _iterate(self):
+        for frame in self._frames:
+            yield frame
+        await self.closed.wait()
+
+    async def close(self):
+        self.closed.set()
+
+
+def _bridge(tmp_path=None):
+    ready = tmp_path / "ready" if tmp_path else None
+    bridge = Bridge("ws://server/runtime/channel", "rt-1", "token", ready_file=ready)
+    bridge._current_statuses = lambda: {"abcd1234": TerminalStatus.IDLE}
+    return bridge
+
+
+def _command(type_, terminal_id="abcd1234", **payload):
+    return Command(op_id=f"op-{type_.value}", type=type_, terminal_id=terminal_id, payload=payload)
+
+
+class TestExecute:
+    @pytest.mark.asyncio
+    async def test_launch_starts_a_local_terminal_and_reports_plain_fields(self, monkeypatch):
+        calls = {}
+
+        async def create_terminal(**kwargs):
+            calls.update(kwargs)
+            return SimpleNamespace(id="beef0001")
+
+        monkeypatch.setattr(terminal_service, "create_terminal", create_terminal)
+        monkeypatch.setattr(
+            terminal_service,
+            "get_terminal",
+            lambda tid: {
+                "id": tid,
+                "name": "developer-beef",
+                "provider": SimpleNamespace(value="mock_cli"),
+                "session_name": "cao-beef",
+                "agent_profile": "developer",
+                "allowed_tools": ["@builtin"],
+                "status": TerminalStatus.IDLE,
+                "last_active": "not sent",
+            },
+        )
+        result = await _bridge().execute(
+            _command(CommandType.LAUNCH, None, agent_profile="developer", provider="mock_cli")
+        )
+        assert calls == {
+            "provider": "mock_cli",
+            "agent_profile": "developer",
+            "new_session": True,
+            "working_directory": None,
+        }
+        assert result == {
+            "terminal": {
+                "id": "beef0001",
+                "name": "developer-beef",
+                "provider": "mock_cli",
+                "session_name": "cao-beef",
+                "agent_profile": "developer",
+                "allowed_tools": ["@builtin"],
+                "status": "idle",
+            }
+        }
+
+    @pytest.mark.asyncio
+    async def test_launch_without_a_provider_uses_the_profiles_provider(self, monkeypatch):
+        import cli_agent_orchestrator.utils.agent_profiles as agent_profiles
+
+        seen = {}
+
+        async def create_terminal(**kwargs):
+            seen.update(kwargs)
+            return SimpleNamespace(id="beef0001")
+
+        monkeypatch.setattr(
+            agent_profiles, "resolve_provider", lambda profile, default: "claude_code"
+        )
+        monkeypatch.setattr(terminal_service, "create_terminal", create_terminal)
+        monkeypatch.setattr(terminal_service, "get_terminal", lambda tid: {"id": tid})
+        await _bridge().execute(_command(CommandType.LAUNCH, None, agent_profile="developer"))
+        assert seen["provider"] == "claude_code"
+
+    @pytest.mark.asyncio
+    async def test_input_keeps_the_sender_and_orchestration_type(self, monkeypatch):
+        seen = {}
+
+        def send_input(terminal_id, message, **kwargs):
+            seen.update(terminal_id=terminal_id, message=message, **kwargs)
+            return True
+
+        monkeypatch.setattr(terminal_service, "send_input", send_input)
+        result = await _bridge().execute(
+            _command(
+                CommandType.INPUT,
+                message="do it",
+                sender_id="sup00001",
+                orchestration_type="assign",
+                frozen_memory=None,
+            )
+        )
+        assert result == {"success": True}
+        assert seen == {
+            "terminal_id": "abcd1234",
+            "message": "do it",
+            "sender_id": "sup00001",
+            "orchestration_type": OrchestrationType.ASSIGN,
+            "frozen_memory": None,
+        }
+
+    @pytest.mark.asyncio
+    async def test_output_uses_the_requested_mode(self, monkeypatch):
+        monkeypatch.setattr(terminal_service, "get_output", lambda tid, mode: f"{tid}:{mode.value}")
+        result = await _bridge().execute(_command(CommandType.OUTPUT, mode="last"))
+        assert result == {"output": "abcd1234:last"}
+
+    @pytest.mark.asyncio
+    async def test_deleting_a_terminal_this_runtime_does_not_have_succeeds(self, monkeypatch):
+        import cli_agent_orchestrator.clients.database as database
+
+        monkeypatch.setattr(database, "get_terminal_metadata", lambda tid: None)
+        monkeypatch.setattr(
+            terminal_service, "delete_terminal", lambda tid: pytest.fail("nothing to delete")
+        )
+        result = await _bridge().execute(_command(CommandType.DELETE))
+        assert result == {"deleted": True, "absent": True}
+
+    @pytest.mark.asyncio
+    async def test_delete_reports_what_the_local_teardown_did(self, monkeypatch):
+        import cli_agent_orchestrator.clients.database as database
+
+        monkeypatch.setattr(database, "get_terminal_metadata", lambda tid: {"id": tid})
+        monkeypatch.setattr(terminal_service, "delete_terminal", lambda tid: False)
+        assert await _bridge().execute(_command(CommandType.DELETE)) == {"deleted": False}
+
+    @pytest.mark.asyncio
+    async def test_a_command_for_a_terminal_needs_its_id(self):
+        with pytest.raises(ValueError):
+            await _bridge().execute(_command(CommandType.KEY, None, key="Enter"))
+
+
+class TestHandle:
+    @pytest.mark.asyncio
+    async def test_a_failure_is_reported_as_a_failed_result(self):
+        bridge = _bridge()
+        server = FakeServer()
+        bridge._ws = server
+
+        async def boom(command):
+            raise RuntimeError("pane is gone")
+
+        bridge.execute = boom
+        await bridge.handle(_command(CommandType.OUTPUT))
+        assert server.sent == [Result(op_id="op-output", ok=False, error="pane is gone")]
+
+    @pytest.mark.asyncio
+    async def test_one_terminals_commands_run_in_order_others_do_not_wait(self):
+        bridge = _bridge()
+        bridge._ws = FakeServer()
+        release = asyncio.Event()
+        order = []
+
+        async def execute(command):
+            order.append(("start", command.op_id))
+            if command.op_id == "first":
+                await release.wait()
+            order.append(("end", command.op_id))
+            return {}
+
+        bridge.execute = execute
+        first = Command(op_id="first", type=CommandType.INPUT, terminal_id="t1", payload={})
+        second = Command(op_id="second", type=CommandType.KEY, terminal_id="t1", payload={})
+        other = Command(op_id="other", type=CommandType.KEY, terminal_id="t2", payload={})
+        tasks = [asyncio.ensure_future(bridge.handle(c)) for c in (first, second, other)]
+        await asyncio.sleep(0.05)
+        assert ("end", "other") in order, "another terminal must not wait"
+        assert ("start", "second") not in order, "the same terminal must wait"
+        release.set()
+        await asyncio.gather(*tasks)
+        assert order.index(("end", "first")) < order.index(("start", "second"))
+
+
+class TestConnection:
+    @pytest.mark.asyncio
+    async def test_hello_reports_status_then_commands_are_answered(self, tmp_path):
+        bridge = _bridge(tmp_path)
+
+        async def execute(command):
+            return {"output": "hi"}
+
+        bridge.execute = execute
+        server = FakeServer(frames=[_command(CommandType.OUTPUT, mode="full")])
+        serving = asyncio.ensure_future(bridge.serve(server))
+        for _ in range(100):
+            if len(server.sent) == 2:
+                break
+            await asyncio.sleep(0.01)
+        hello, result = server.sent
+        assert hello == Hello(
+            protocol_version=PROTOCOL_VERSION,
+            runtime_id="rt-1",
+            statuses={"abcd1234": TerminalStatus.IDLE},
+        )
+        assert result == Result(op_id="op-output", ok=True, payload={"output": "hi"})
+        assert (tmp_path / "ready").exists(), "ready while the channel is up"
+        await server.close()
+        await serving
+        assert not (tmp_path / "ready").exists()
+
+    @pytest.mark.asyncio
+    async def test_a_server_speaking_another_version_is_fatal(self, tmp_path):
+        with pytest.raises(ChannelRefused):
+            await _bridge(tmp_path).serve(FakeServer(version=PROTOCOL_VERSION + 1))
+        assert not (tmp_path / "ready").exists()
+
+    @pytest.mark.asyncio
+    async def test_a_refused_token_is_fatal_not_retried(self, monkeypatch):
+        attempts = []
+
+        def connect(url, **kwargs):
+            attempts.append(kwargs["additional_headers"])
+            raise websockets.exceptions.InvalidStatus(Response(403, "Forbidden", Headers()))
+
+        monkeypatch.setattr(bridge_mod, "connect", connect)
+        with pytest.raises(ChannelRefused):
+            await asyncio.wait_for(_bridge().run(), timeout=5)
+        assert attempts == [{"x-cao-runtime-token": "token"}]
+
+    @pytest.mark.asyncio
+    async def test_a_network_error_is_retried_with_backoff(self, monkeypatch):
+        monkeypatch.setattr(bridge_mod, "BACKOFF_INITIAL", 0.01)
+        bridge = _bridge()
+        attempts = []
+
+        def connect(url, **kwargs):
+            attempts.append(url)
+            if len(attempts) == 3:
+                bridge.stop()
+            raise OSError("connection refused")
+
+        monkeypatch.setattr(bridge_mod, "connect", connect)
+        await asyncio.wait_for(bridge.run(), timeout=5)
+        assert len(attempts) == 3
+
+
+class TestStatusForwarding:
+    @pytest.mark.asyncio
+    async def test_every_local_status_change_is_pushed(self):
+        bridge = _bridge()
+        server = FakeServer()
+        bridge._ws = server
+        previous = bus._loop
+        bus.set_loop(asyncio.get_running_loop())
+        forwarding = asyncio.ensure_future(bridge.forward_status())
+        try:
+            await asyncio.sleep(0)
+            bus.publish("terminal.abcd1234.status", {"status": "completed"})
+            bus.publish("terminal.abcd1234.status", {"status": "not-a-status"})
+            for _ in range(100):
+                if server.sent:
+                    break
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.05)
+            assert server.sent == [Status(terminal_id="abcd1234", status=TerminalStatus.COMPLETED)]
+        finally:
+            forwarding.cancel()
+            await asyncio.gather(forwarding, return_exceptions=True)
+            bus.set_loop(previous)
