@@ -149,6 +149,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   depth, with `/dev/shm` carved out. `/tmp`, `/var`, `/home`-style roots stay
   exact-only because projects legitimately live beneath them; a cao-server
   that runs as root must keep its projects outside `/root` (#821)
+- **CI referenced GitHub Actions by mutable tag**, including in the jobs that
+  hold `RELEASE_DEPLOY_KEY`, `CODECOV_TOKEN` and the Pages OIDC token; five
+  steps ran `npm install` rather than `npm ci` against committed lockfiles, and
+  no `uv` command was held to the committed lock: a PR that changed
+  `pyproject.toml` without updating `uv.lock` had `uv run` re-resolve and
+  install the new dependencies. All 66 tag references across `ci.yml`,
+  `release.yml`, `gh-pages.yml`, `secret-scan.yml` and the four provider test
+  workflows are pinned to the commit each tag resolved to (tag kept as a
+  comment), `npm ci` is used throughout, every workflow that runs `uv` sets
+  `UV_LOCKED=1` so `uv sync`, `uv run` (including inside `make`) and
+  `uv export` fail on a stale lock instead of re-resolving, and the `uv sync`
+  and `uv export` commands spell `--locked` as well (`publish-to-pypi.yml`
+  gains the same). `.github/dependabot.yml` now exists so the SHA pins move;
+  a test asserts every `uses:` is a full SHA and every uv workflow carries the
+  lock policy. `cargo-deny.yml`'s actions were already pinned (#820)
 
 ### Changed
 

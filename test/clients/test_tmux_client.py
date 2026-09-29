@@ -160,6 +160,29 @@ class TestCreateSession:
         result = tmux.create_session("ses", "my-window", "tid1", str(tmp_path))
         assert result == "my-window"
 
+    def test_exit_empty_is_retried_once_after_a_failed_set(self, tmux, tmp_path, caplog):
+        """A create right after an external ``kill-server`` can reach the old
+        server while it is still exiting, and tmux reports ``server exited
+        unexpectedly``. The set is retried once, and a retry that succeeds
+        leaves nothing to warn about."""
+        mock_window = MagicMock()
+        mock_window.name = "my-window"
+        mock_session = MagicMock()
+        mock_session.windows = [mock_window]
+        tmux.server.new_session.return_value = mock_session
+        tmux.server.cmd.side_effect = [
+            MagicMock(returncode=1, stdout=[], stderr=["server exited unexpectedly"]),
+            MagicMock(returncode=0, stdout=[], stderr=[]),
+        ]
+
+        with patch("cli_agent_orchestrator.clients.tmux.time.sleep") as mock_sleep:
+            tmux.create_session("ses", "my-window", "tid1", str(tmp_path))
+
+        exit_empty = call("start-server", ";", "set-option", "-s", "exit-empty", "off")
+        assert tmux.server.cmd.call_args_list == [exit_empty, exit_empty]
+        mock_sleep.assert_called_once_with(tmux._EXIT_EMPTY_RETRY_DELAY_S)
+        assert "exit-empty" not in caplog.text
+
     def test_create_session_window_name_none(self, tmux, tmp_path):
         mock_window = MagicMock()
         mock_window.name = None
@@ -1135,3 +1158,60 @@ class TestRealTmuxExitEmpty:
             )
         finally:
             subprocess.run(["tmux", "-L", socket_name, "kill-server"], capture_output=True)
+
+    def test_exit_empty_off_when_the_first_set_reaches_a_dying_server(self):
+        """``tmux kill-server`` returns before the old server has exited, so
+        the create that follows can connect to it just as it goes away. tmux
+        prints ``server exited unexpectedly`` and the option is never set.
+        The test above hits that window about once in 60 runs under load.
+
+        Here the dying server is a stand-in listening on the socket path: it
+        accepts one connection, closes it and removes the socket, which is
+        exactly what a real tmux client sees from a server mid-exit.
+        """
+        self._require_tmux()
+
+        import socket
+        import tempfile
+        import threading
+
+        import libtmux
+
+        from cli_agent_orchestrator.clients.tmux import TmuxClient
+
+        # Short directory: tmp_path can exceed the ~108-byte AF_UNIX path limit.
+        socket_dir = tempfile.mkdtemp(prefix="cao-tmux-")
+        socket_path = os.path.join(socket_dir, "s")
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(socket_path)
+        listener.listen(1)
+
+        def die_on_first_connect() -> None:
+            conn, _ = listener.accept()
+            conn.close()
+            listener.close()
+            os.unlink(socket_path)
+
+        dying = threading.Thread(target=die_on_first_connect, daemon=True)
+        dying.start()
+
+        client = TmuxClient()
+        client.server = libtmux.Server(socket_path=socket_path)
+
+        try:
+            client.create_session("dying-probe", "win1", "term-real-tmux-4", socket_dir)
+            dying.join(timeout=5)
+            assert not dying.is_alive(), "the stand-in server was never contacted"
+
+            result = subprocess.run(
+                ["tmux", "-S", socket_path, "show-options", "-s", "exit-empty"],
+                capture_output=True,
+                text=True,
+            )
+            assert result.stdout.strip() == "exit-empty off", (
+                "exit-empty must be 'off' even when the first set reached a server "
+                f"that was exiting; tmux said {result.stdout.strip()!r} {result.stderr!r}"
+            )
+        finally:
+            subprocess.run(["tmux", "-S", socket_path, "kill-server"], capture_output=True)
+            shutil.rmtree(socket_dir, ignore_errors=True)

@@ -10,6 +10,18 @@ permissions:
   contents: read
   security-events: write
 
+env:
+  # Every uv command in this workflow (including the ones the Makefile runs)
+  # must execute against the committed uv.lock and fail if pyproject.toml has
+  # drifted from it. The per-command --locked flags below say the same thing
+  # where a reader looks; this catches the `uv run` / `uv export` sites that
+  # have no flag. Measured on uv 0.12: the env var alone rejects a stale lock
+  # for sync, run and export; UV_FROZEN would install the OLD lock silently;
+  # and a flag beats the variable in either direction (uv prints "Ignoring
+  # UV_LOCKED because --frozen was provided" and proceeds), so the flags
+  # below are --locked, not --frozen, and must stay that way.
+  UV_LOCKED: "1"
+
 jobs:
   test:
     name: Unit Tests
@@ -20,10 +32,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -32,7 +44,7 @@ jobs:
         run: uv python install ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: uv sync --all-extras --dev
+        run: uv sync --locked --all-extras --dev
 
       - name: Run unit tests with coverage
         run: |
@@ -63,7 +75,7 @@ jobs:
         run: make check-agent-plugin
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4
         with:
           file: ./coverage.xml
           flags: unittests
@@ -77,10 +89,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "20"
           cache: "npm"
@@ -107,10 +119,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: "1.3.10"
 
@@ -137,24 +149,24 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "20"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4
 
       - name: Set up Python
         run: uv python install 3.12
 
       - name: Install Python deps (for the HTTP-only guard + coverage ratchet)
-        run: uv sync --all-extras --dev
+        run: uv sync --locked --all-extras --dev
 
       - name: Install MCP-apps deps
-        run: npm install
+        run: npm ci
         working-directory: cao_mcp_apps
 
       - name: Type check
@@ -212,15 +224,15 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "20"
 
       - name: Install MCP-apps deps
-        run: npm install
+        run: npm ci
         working-directory: cao_mcp_apps
 
       - name: Install Playwright browser (chromium)
@@ -239,10 +251,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -251,7 +263,7 @@ jobs:
         run: uv python install 3.12
 
       - name: Install dependencies
-        run: uv sync --all-extras --dev
+        run: uv sync --locked --all-extras --dev
 
       - name: Check code formatting with black
         run: uv run black --check src/ test/
@@ -272,10 +284,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -284,10 +296,10 @@ jobs:
         run: uv python install 3.12
 
       - name: Install dependencies (cao-server for the live AG-UI surface)
-        run: uv sync --all-extras --dev
+        run: uv sync --locked --all-extras --dev
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "20"
 
@@ -295,7 +307,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
       - name: Install recorder deps
-        run: npm install
+        run: npm ci
         working-directory: examples/ag-ui/ag-ui-eventsource-viewer/tools
 
       - name: Install Playwright browser (chromium)
@@ -312,7 +324,7 @@ jobs:
 
       - name: Upload demo GIF artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ag-ui-eventsource-viewer-demo
           path: docs/media/ag-ui-eventsource-viewer-demo.gif
@@ -324,10 +336,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -336,17 +348,17 @@ jobs:
         run: uv python install 3.12
 
       - name: Install dependencies (constructs + examples run under uv)
-        run: uv sync --all-extras --dev
+        run: uv sync --locked --all-extras --dev
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "20"
 
       - name: Install recorder deps
         # ffmpeg is provided by the ffmpeg-static npm package (gif-capable), so
         # no apt install is needed here.
-        run: npm install
+        run: npm ci
         working-directory: examples/ag-ui/ag-ui-construct-demos/tools
 
       - name: Install Playwright browser (chromium)
@@ -363,7 +375,7 @@ jobs:
 
       - name: Upload construct demo GIFs artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ag-ui-construct-demos
           path: docs/media/ag-ui-*-demo.gif
@@ -375,10 +387,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -387,17 +399,17 @@ jobs:
         run: uv python install 3.12
 
       - name: Install dependencies (cao runs the dog-food pipeline under uv)
-        run: uv sync --all-extras --dev
+        run: uv sync --locked --all-extras --dev
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "20"
 
       - name: Install recorder deps
         # ffmpeg is provided by the ffmpeg-static npm package (gif-capable), so
         # no apt install is needed here.
-        run: npm install
+        run: npm ci
         working-directory: examples/agent-plugins/agent-plugins-dogfood/tools
 
       - name: Install Playwright browser (chromium)
@@ -417,7 +429,7 @@ jobs:
 
       - name: Upload dog-food demo GIF artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: agent-plugins-dogfood
           path: docs/media/agent-plugins-dogfood-demo.gif
@@ -429,10 +441,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -441,10 +453,10 @@ jobs:
         run: uv python install 3.12
 
       - name: Install dependencies (cao-server + agui run plane)
-        run: uv sync --all-extras --dev
+        run: uv sync --locked --all-extras --dev
 
       - name: Set up Node.js (for the @ag-ui/client stock SDK)
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "20"
 
@@ -592,18 +604,14 @@ jobs:
       # This job runs `uv` but had NO `setup-uv` — it was the only uv-using job in the workflow
       # without it, so `uv sync` would fail with `uv: command not found`. Caught by comparing every
       # job's setup-uv presence against its uv usage rather than assuming the toolchain was there.
-      # NOTE: `@v4` is a MUTABLE tag, matching the three pre-existing setup-uv call sites in this
-      # file. The affirmed SHA-pinning rule covers actions THIS INTENT adds; pinning here while the
-      # other three stay on @v4 would be inconsistent without pinning all four. Flagged in
-      # ci-config.md as a follow-up rather than half-applied. (#321)
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
 
       - name: Install the Python project (provides cao-server for the live contract test)
-        run: uv sync --all-extras --dev
+        run: uv sync --locked --all-extras --dev
 
       - name: Start cao-server and wait for readiness
         # Poll /health rather than `sleep N`: a fixed sleep is either flaky or slow, and /health is
@@ -704,14 +712,14 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4
 
       - name: Generate requirements.txt for scanning
         run: |
-          uv export --format requirements-txt > requirements.txt
+          uv export --locked --format requirements-txt > requirements.txt
 
       # SR-4 (interview Q1): `exit-code: 1` makes this job FAIL on a CRITICAL/HIGH finding.
       # Before this, the step had no exit-code, so it uploaded SARIF and continued — meaning
@@ -759,7 +767,7 @@ jobs:
           exit-code: '0'
 
       - name: Upload Trivy scan results to GitHub Security tab
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@3ea06614dafe36dec890db3446326e0d40ce53d4 # v3
         # `always()` is load-bearing now that Trivy can fail: without it, a CRITICAL finding
         # would fail the scan step and SKIP the upload, hiding the very finding that failed
         # the build from the Security tab.
@@ -774,10 +782,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Dependency Review
-        uses: actions/dependency-review-action@v4
+        uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0
         with:
           fail-on-severity: high
           deny-licenses: GPL-3.0, AGPL-3.0
