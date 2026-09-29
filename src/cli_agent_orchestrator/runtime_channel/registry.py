@@ -98,14 +98,17 @@ class RuntimeConnection:
             raise RemoteCommandError(result.error or f"{command_type.value} failed")
         return result.payload
 
-    def resolve(self, result: Result) -> None:
+    def resolve(self, result: Result) -> bool:
+        """Deliver a result to its waiting call. False if no call is waiting for it."""
         future = self._pending.get(result.op_id)
         if future is None:
             logger.warning(
                 "runtime %s sent a result for unknown op %s", self.runtime_id, result.op_id
             )
-        elif not future.done():
+            return False
+        if not future.done():
             future.set_result(result)
+        return True
 
     def close(self, reason: str) -> None:
         """Fail every waiting call: each was sent, so its outcome is unknown."""
@@ -182,9 +185,22 @@ class RuntimeRegistry:
             self._placement.pop(terminal_id, None)
             self._status.pop(terminal_id, None)
 
-    def set_status(self, terminal_id: str, runtime_id: str, status: TerminalStatus) -> bool:
-        """Record a status report. Only the runtime a terminal is placed on may report it."""
+    def is_placed(self, terminal_id: str, runtime_id: str) -> bool:
         with self._lock:
+            return self._placement.get(terminal_id) == runtime_id
+
+    def set_status(
+        self,
+        terminal_id: str,
+        runtime_id: str,
+        status: TerminalStatus,
+        conn: Optional[RuntimeConnection] = None,
+    ) -> bool:
+        """Record a status report. Only the runtime a terminal is placed on may report
+        it and, when ``conn`` is given, only over that runtime's current connection."""
+        with self._lock:
+            if conn is not None and self._runtimes.get(runtime_id) is not conn:
+                return False
             if self._placement.get(terminal_id) != runtime_id:
                 return False
             self._status[terminal_id] = status

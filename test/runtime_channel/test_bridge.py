@@ -226,6 +226,43 @@ class TestHandle:
         assert order.index(("end", "first")) < order.index(("start", "second"))
 
 
+class TestOrdering:
+    @pytest.mark.asyncio
+    async def test_a_command_after_a_deferred_delete_still_waits_its_turn(self, monkeypatch):
+        import threading
+
+        import cli_agent_orchestrator.clients.database as database
+
+        bridge = _bridge()
+        bridge._ws = FakeServer()
+        input_started, release_input = threading.Event(), threading.Event()
+        keys = []
+
+        def send_input(terminal_id, message, **kwargs):
+            input_started.set()
+            release_input.wait(5)
+            return True
+
+        monkeypatch.setattr(database, "get_terminal_metadata", lambda tid: {"id": tid})
+        # The runtime could not finish the teardown, so the terminal stays live.
+        monkeypatch.setattr(terminal_service, "delete_terminal", lambda tid: False)
+        monkeypatch.setattr(terminal_service, "send_input", send_input)
+        monkeypatch.setattr(
+            terminal_service, "send_special_key", lambda tid, key: keys.append(key) or True
+        )
+
+        delete = asyncio.ensure_future(bridge.handle(_command(CommandType.DELETE)))
+        typed = asyncio.ensure_future(bridge.handle(_command(CommandType.INPUT, message="hi")))
+        await asyncio.wait_for(asyncio.to_thread(input_started.wait, 5), 6)
+        key = asyncio.ensure_future(bridge.handle(_command(CommandType.KEY, key="Enter")))
+        await asyncio.sleep(0.1)
+        assert keys == [], "the key must wait for the input queued ahead of it"
+        release_input.set()
+        await asyncio.wait_for(asyncio.gather(delete, typed, key), 5)
+        assert keys == ["Enter"]
+        assert bridge._terminal_locks == {}, "a lock nobody holds or awaits is dropped"
+
+
 class TestConnection:
     @pytest.mark.asyncio
     async def test_hello_reports_status_then_commands_are_answered(self, tmp_path):
@@ -252,6 +289,24 @@ class TestConnection:
         await server.close()
         await serving
         assert not (tmp_path / "ready").exists()
+
+    def test_hello_lists_every_local_terminal_even_before_its_status_is_known(self, monkeypatch):
+        import cli_agent_orchestrator.clients.database as database
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        monkeypatch.setattr(
+            database, "list_all_terminals", lambda: [{"id": "aaaa0001"}, {"id": "aaaa0002"}]
+        )
+        monkeypatch.setattr(
+            status_monitor,
+            "get_status",
+            lambda tid: TerminalStatus.IDLE if tid == "aaaa0001" else TerminalStatus.UNKNOWN,
+        )
+        bridge = Bridge("ws://server/runtime/channel", "rt-1", "token")
+        assert bridge._current_statuses() == {
+            "aaaa0001": TerminalStatus.IDLE,
+            "aaaa0002": TerminalStatus.UNKNOWN,
+        }
 
     @pytest.mark.asyncio
     async def test_a_server_speaking_another_version_is_fatal(self, tmp_path):

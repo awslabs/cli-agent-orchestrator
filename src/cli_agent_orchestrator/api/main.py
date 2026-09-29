@@ -106,7 +106,12 @@ from cli_agent_orchestrator.models.memory import (
     MemoryScopeId,
     MemoryType,
 )
-from cli_agent_orchestrator.models.terminal import Terminal, TerminalId, TerminalLimitError
+from cli_agent_orchestrator.models.terminal import (
+    LocalExecutionDisabledError,
+    Terminal,
+    TerminalId,
+    TerminalLimitError,
+)
 from cli_agent_orchestrator.models.workflow import RecoveryPolicy
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.base import OutputExtractionError
@@ -3417,6 +3422,8 @@ async def create_session(
         # Exception and NOT ValueError precisely so this arm cannot be
         # shadowed by the 400 arm below -- which, note, sits FIRST here.
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except LocalExecutionDisabledError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except TerminalLimitError as e:
         # Node is at its tracked-terminal cap (CAO_MAX_TERMINALS) — a capacity
         # rejection, not a bad request: the caller should retry on another node.
@@ -3680,6 +3687,8 @@ async def create_terminal_in_session(
         # a rejected engine is a bad request, not a missing resource. Matches
         # POST /sessions, which already returns 400 for the identical failure.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except LocalExecutionDisabledError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except TerminalLimitError as e:
         # Node is at its tracked-terminal cap (CAO_MAX_TERMINALS) — a capacity
         # rejection, not a bad request or a missing session: the caller should
@@ -4620,6 +4629,10 @@ async def run_step(
         _settle_step(None, str(e))
         await _record_job_state(job_id, "error", error_message=str(e))
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+    except LocalExecutionDisabledError as e:
+        _settle_step(None, str(e))
+        await _record_job_state(job_id, "error", error_message=str(e))
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except TerminalLimitError as e:
         # The node is at its tracked-terminal cap (CAO_MAX_TERMINALS) — surfaced
         # as 429 so a step scheduler can retry on a different node instead of

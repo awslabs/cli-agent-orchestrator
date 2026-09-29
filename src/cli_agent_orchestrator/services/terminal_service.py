@@ -78,6 +78,7 @@ from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import (
+    LocalExecutionDisabledError,
     Terminal,
     TerminalInputBlockedError,
     TerminalLimitError,
@@ -939,6 +940,17 @@ def _request_fingerprint(
     ).hexdigest()
 
 
+#: Set to 0 on a central cao-server whose agents all run in execution runtimes
+#: (#745): every local terminal creation is then refused.
+LOCAL_EXECUTION_ENV = "CAO_LOCAL_EXECUTION"
+
+
+def local_execution_enabled() -> bool:
+    """False when this process is set to run no agents itself."""
+    value = os.environ.get(LOCAL_EXECUTION_ENV, "")
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
 async def create_terminal(
     provider: str,
     agent_profile: str,
@@ -1191,6 +1203,11 @@ async def create_terminal(
             server.max_terminals; unset = unlimited) is already reached
         TimeoutError: If provider initialization times out
     """
+    if not local_execution_enabled():
+        raise LocalExecutionDisabledError(
+            f"this cao-server runs no agents ({LOCAL_EXECUTION_ENV}=0); launch in an "
+            "execution runtime with POST /runtimes/{runtime_id}/terminals"
+        )
     # Idempotency resolution runs BEFORE the terminal cap check below, and the
     # order is deliberate: a key HIT returns an already-existing terminal and
     # allocates nothing, so charging it against the cap would 429 a legitimate

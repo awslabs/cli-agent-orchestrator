@@ -13,14 +13,20 @@ exactly as before.
 |---|---|---|
 | HTTP API, authentication | yes | no; it serves nothing |
 | Central SQLite state | yes, one row per terminal, naming its runtime | pane bookkeeping only |
-| tmux, provider CLIs, agents | no, for remote terminals | yes |
+| tmux, provider CLIs, agents | no, for remote terminals; none at all with `CAO_LOCAL_EXECUTION=0` | yes |
 | Status detection | receives it | derives it beside the pane and pushes it |
+
+Set `CAO_LOCAL_EXECUTION=0` on a central server that must run no agents
+itself. Every local terminal creation is then refused; the routes that would
+start one (`POST /sessions`, `POST /sessions/{name}/terminals`,
+`POST /terminals/run-step`) return `409`.
 
 The runtime opens one WebSocket to `WS /runtime/channel`, outbound only, with
 the shared token in the `x-cao-runtime-token` header. Both sides exchange a
-hello carrying the protocol version. The runtime's hello also reports the
-current status of the terminals it runs, so a reconnect restores status
-without replaying anything.
+hello carrying the protocol version. The runtime's hello also lists every
+terminal it runs, with its current status, so a reconnect restores status
+without replaying anything. A newer connection from the same runtime replaces
+the older one, which the server then closes and no longer listens to.
 
 ## Commands
 
@@ -42,7 +48,10 @@ the runtime is disconnected, the status is `unknown`.
 
 If the server cannot record a launched terminal, it sends `delete` to the
 runtime. The `500` it then returns says whether the agent may still be
-running.
+running. The server also deletes any terminal a runtime runs that it has no
+record of: one listed in the runtime's hello, or one in a launch result that
+arrives after the launch timed out or its connection dropped. So a lost
+launch result cannot leave an agent running unseen.
 
 ## Failure outcomes
 

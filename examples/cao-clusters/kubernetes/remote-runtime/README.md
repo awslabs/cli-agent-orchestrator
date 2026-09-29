@@ -9,7 +9,7 @@ driven through the server's HTTP API. See
 
 | Object | Role |
 |---|---|
-| `StatefulSet/cao-server`, `Service/cao-server` | the API and central state, on a gp3 volume |
+| `StatefulSet/cao-server`, `Service/cao-server` | the API and central state, on a gp3 volume; `CAO_LOCAL_EXECUTION=0`, so it refuses to start agents itself |
 | `StatefulSet/cao-runtime` | `cao-bridge` beside tmux and the provider CLIs; runtime id is the pod name, `cao-runtime-0` |
 | `Secret/cao-runtime-token` | the shared channel token, mounted as a file into both pods (you create it) |
 
@@ -78,8 +78,8 @@ Use `"provider": "mock_cli"` to try the path without a model.
 
 ```bash
 kubectl delete -k .
-kubectl delete namespace cao-remote
 ```
 
-The server's state volume uses the `gp3` storage class; if that class retains
-volumes, delete the released PersistentVolume as well.
+This deletes the namespace too, and with it the token Secret. The server's
+state volume uses the `gp3` storage class; if that class retains volumes,
+delete the released PersistentVolume as well.
