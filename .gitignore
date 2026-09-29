@@ -12,6 +12,7 @@ dist/
 coverage.json
 coverage.xml
 .pytest_cache/
+.env.local
 
 # MyPy
 .mypy_cache/

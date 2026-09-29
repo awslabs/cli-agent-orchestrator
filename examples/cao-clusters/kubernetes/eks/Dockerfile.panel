@@ -1,0 +1,41 @@
+# Fleet panel image — the web control panel in examples/fleet/panel.
+#
+# Deliberately copies the source tree instead of installing the wheel that
+# examples/fleet/panel/pyproject.toml builds. The panel resolves its frontend as
+# a SIBLING of the app package:
+#
+#   _STATIC = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
+#
+# so it needs the on-disk layout `<root>/app` + `<root>/static` preserved. A
+# wheel built from `packages = ["app"]` installs only the package, putting
+# `static/` nowhere that path can find — the panel would start and then serve 404
+# for every asset. Copying the tree keeps the layout the code expects, and
+# matches how Dockerfile.broker ships a single-purpose service.
+#
+# Build from the REPOSITORY ROOT so both directories are in context:
+#   docker build -f examples/cao-clusters/kubernetes/eks/Dockerfile.panel \
+#     -t cao-fleet-panel:<tag> .
+FROM python:3.12-slim
+
+# Pinned to the floors declared in examples/fleet/panel/pyproject.toml.
+RUN pip install --no-cache-dir \
+    "fastapi>=0.110" \
+    "uvicorn[standard]>=0.29" \
+    "httpx>=0.27"
+
+# curl is what the Kubernetes probes exec: the panel's token guards the whole
+# origin, and httpGet probes cannot read a token from a secret, so they must send
+# an Authorization header themselves.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /panel
+COPY examples/fleet/panel/app /panel/app
+COPY examples/fleet/panel/static /panel/static
+
+# Same non-root uid as Dockerfile.broker. The panel only reads its own tree and
+# the mounted fleet config, so it needs no writable path.
+USER 65532:65532
+EXPOSE 9888
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "9888"]

@@ -19,6 +19,7 @@ a longer per-profile override -- see ``TestKimiInitTimeoutWiring`` /
 ``TestAntigravityInitTimeoutWiring`` below.
 """
 
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -26,7 +27,7 @@ import pytest
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.providers.antigravity_cli import AntigravityCliProvider
 from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
-from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider
+from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider, ProviderError
 
 # claude_code module namespace (module-level imports patched here).
 _CC = "cli_agent_orchestrator.providers.claude_code"
@@ -258,8 +259,18 @@ class TestStartupPromptHandlerHonorsOuterTimeout:
             0.0,  # outer_deadline = 0 + 180 = 180
             0.0,  # last_prompt_time = 0
             100.0,  # iter1 now: 100<180 (alive), gap 100<1000 -> trust prompt -> handled
+            100.0,  # last_prompt_time reset to 100 — trust no longer ends the loop
+            101.0,  # iter2 now: 101<180, gap 1<1000 -> version banner -> return
         ]
-        mock_backend.get_history.return_value = "Yes, I trust this folder"
+        # Two frames, not a constant return_value: accepting trust no longer
+        # returns (the model-upgrade nudge can render after it), so the loop needs
+        # a frame that ends it. send_special_key still fires exactly once — the
+        # trust_accepted guard stops the dismissed dialog's lingering text from
+        # being answered a second time.
+        mock_backend.get_history.side_effect = [
+            "Yes, I trust this folder",
+            "Welcome to Claude Code v2.1.235",
+        ]
 
         provider = ClaudeCodeProvider("t1", "sess", "win")
         await provider._handle_startup_prompts(idle_gap=1000, outer_timeout=180)
@@ -312,6 +323,27 @@ class TestKimiInitTimeoutWiring:
     before the real init timeout would never be dismissed -- the handler
     exits early, init hangs until its own outer wait times out.
     """
+
+    @pytest.fixture(autouse=True)
+    def _stub_legacy_probe(self):
+        # initialize() first resolves the Kimi dialect by asking the launch
+        # shell to dump `kimi --help`. These tests target timeout wiring, not
+        # dialect detection, and they mock the backend such that the probe
+        # sentinel never arrives -- without this stub every test here would
+        # spend 20s and then fail with UnsupportedKimiError. The probe has its
+        # own coverage in test_kimi_code_compat.py::TestKimiDialectDetection.
+        from cli_agent_orchestrator.providers.kimi_cli import (
+            KimiDialect,
+            KimiProbeResult,
+        )
+
+        probe = KimiProbeResult(
+            dialect=KimiDialect.LEGACY,
+            binary="/usr/local/bin/kimi",
+            source_home=Path("/home/user/.kimi"),
+        )
+        with patch.object(KimiCliProvider, "_resolve_dialect", return_value=probe):
+            yield
 
     @pytest.mark.asyncio
     @patch.object(KimiCliProvider, "_handle_startup_dialog")
@@ -383,9 +415,12 @@ class TestKimiInitTimeoutWiring:
         mock_load.side_effect = FileNotFoundError("nope")
 
         provider = KimiCliProvider("t1", "sess", "win", agent_profile="missing")
-        with pytest.raises(Exception):
+        with pytest.raises(ProviderError, match="Failed to load agent profile"):
             # _build_kimi_command still raises ProviderError for the same
             # missing profile -- _try_load_profile only affects the timeout.
+            # Asserted on the SPECIFIC error: a bare `pytest.raises(Exception)`
+            # also swallows an unrelated failure (e.g. a probe timeout), which
+            # would let this test pass while the behaviour under test is broken.
             await provider.initialize()
 
 

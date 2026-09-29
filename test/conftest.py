@@ -153,14 +153,22 @@ def _reset_backend_registry():
 
 
 @pytest.fixture(autouse=True)
-def _hermetic_cao_env(monkeypatch):
-    """Strip CAO runtime env vars that leak when the suite runs inside a CAO terminal.
+def _hermetic_cao_env(monkeypatch, tmp_path):
+    """Keep tests independent of CAO runtime identity and persisted settings.
 
-    Without this, tests that assert default values (e.g. sender_id=="supervisor")
-    fail because the real terminal's CAO_TERMINAL_ID overrides the default.
-    monkeypatch.delenv runs BEFORE the test body, so tests that explicitly
-    monkeypatch.setenv one of these after fixture setup still work correctly.
+    Settings reads use a fresh per-test file while ``CAO_HOME_DIR`` stays
+    unchanged, so tests see documented defaults without invalidating assertions
+    about the default home layout. Runtime env vars are removed before each test;
+    tests can still set them explicitly after fixture setup. In particular,
+    stripping ``CAO_TERMINAL_ID`` is load-bearing for vault-recall exclusion
+    tests as well as sender-id defaults.
     """
+    from cli_agent_orchestrator.services import settings_service
+
+    monkeypatch.setattr(settings_service, "SETTINGS_FILE", tmp_path / "settings.json")
+    monkeypatch.setattr(settings_service, "_server_settings_cache", None)
+    monkeypatch.setattr(settings_service, "_server_settings_mtime_ns", -1)
+
     # server.py defaults sender_id to "supervisor" when unset
     monkeypatch.delenv("CAO_TERMINAL_ID", raising=False)
     # server.py reads these for workflow_return context detection

@@ -228,15 +228,22 @@ class TerminalBackend(ABC):
         tail_lines: Optional[int] = None,
         strip_escapes: bool = False,
         full_history: bool = False,
+        visible_only: bool = False,
     ) -> str:
         """Get terminal output/history from a window.
 
         Args:
             session_name: Target session
             window_name: Target window
-            tail_lines: Number of lines from the end (None = backend default)
+            tail_lines: Number of lines from the end (None = backend default).
+                On tmux this INCLUDES the visible pane plus N lines of scrollback
+                above it — it is not a viewport bounded to N rows.
             strip_escapes: If True, strip ANSI escape sequences
             full_history: If True, capture entire scrollback
+            visible_only: If True, capture only the currently rendered viewport,
+                nothing from scrollback (overrides tail_lines/full_history). A
+                backend without a viewport concept may approximate with its
+                closest bounded recent read.
 
         Returns:
             Terminal output as a string

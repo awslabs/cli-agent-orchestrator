@@ -76,6 +76,87 @@ to catch secrets before they enter a commit. If a secret ever lands, follow the
 severity triage table.
 
 
+## Writing a blog post
+
+The documentation site has a [blog](https://awslabs.github.io/cli-agent-orchestrator/blog)
+for content that doesn't fit the reference docs: tutorials, design deep dives,
+and accounts of using CAO on real work. Posts live in `docusaurus/blog/` and go
+through normal pull request review.
+
+**In scope:** tutorials and how-tos, deep dives on how a subsystem works,
+orchestration patterns composed into something real, provider or MCP integration
+write-ups, and case studies — including the parts that didn't work.
+
+**Out of scope:** release announcements (`CHANGELOG.md` and GitHub Releases
+already cover those, and we deliberately don't mirror them here) and product
+marketing.
+
+**Editorial review:** [@haofeif](https://github.com/haofeif) (Haofei Feng) owns
+editorial review for the blog — request their review on your PR. The build
+enforces structure, but whether a post is worth publishing, and whether it reads
+well, is their call. If you're unsure an idea fits, ask in a
+[discussion](https://github.com/awslabs/cli-agent-orchestrator/discussions)
+before you write; that's a cheaper conversation than a rejected draft.
+
+To add a post:
+
+1. Create `docusaurus/blog/YYYY-MM-DD-short-slug/index.md`. Use a *directory*
+   rather than a bare `.md` file so images sit next to the post and can be
+   referenced relatively (`![alt](./diagram.png)`).
+2. Add front matter — `title`, `authors`, and optionally `tags`, `slug`,
+   `description`, `image`:
+
+   ```yaml
+   ---
+   title: Orchestrating a three-agent review pipeline
+   authors: [your-github-handle]
+   tags: [tutorial, orchestration-patterns]
+   description: One sentence for search results and social previews.
+   ---
+   ```
+
+3. Make sure you have an entry in [`docusaurus/blog/authors.yml`](docusaurus/blog/authors.yml)
+   — several contributors are already seeded there from public GitHub profile
+   data, so check before adding a duplicate, and correct your own name, title, or
+   avatar if the seeded values aren't what you'd want on a byline. The build
+   **fails** on an author with no entry, so this isn't optional. That file's
+   comments also cover the optional per-author listing page.
+4. Pick tags from [`docusaurus/blog/tags.yml`](docusaurus/blog/tags.yml). The
+   build **fails** on an unlisted tag; adding a new one is fine, just do it in
+   the same PR and say why. A post with no tags is also fine.
+5. Put `{/* truncate */}` after the first paragraph or two. Everything above it
+   becomes the summary on the blog index, and it must stand on its own. The build
+   **fails** without it. Use that MDX comment form, not the HTML `<!-- -->` one —
+   this site processes `.md` as MDX, where HTML comments are a syntax error.
+6. Verify locally before pushing:
+
+   ```bash
+   cd docusaurus
+   npm install
+   npm run build   # onBrokenLinks: 'throw' — a dead link fails the build
+   npm run serve   # preview the built site
+   ```
+
+Style notes, mostly borrowed from how other AWS open source projects run their
+blogs:
+
+* Write for a global audience — skip regional slang and idioms.
+* Avoid "easy" and "simple"; describe what a step actually involves instead.
+* Avoid absolute claims ("always", "never", "guarantees") and comparisons against
+  other products.
+* Run every command and code sample against a released version before you publish
+  it, and say which version you used.
+* Link to documentation pages by site route — `[handoff](/docs/patterns/handoff)`,
+  not a relative `../../docs/patterns/handoff.md` path, which Docusaurus can't
+  resolve from a blog post. `scripts/validate_markdown_links.py` skips
+  `docusaurus/blog/` for that reason; the site build is what checks these links.
+* Give images alt text, and don't include screenshots containing personal data —
+  the same scrubbing rules as test fixtures apply.
+
+Your post is contributed under the repository's Apache-2.0 license, like any
+other change.
+
+
 ## Finding contributions to work on
 Looking at the existing issues is a great way to find something to contribute on. As our projects, by default, use the default GitHub issue labels (enhancement/bug/duplicate/help wanted/invalid/question/wontfix), looking at any 'help wanted' issues is a great place to start.
 

@@ -3,18 +3,19 @@
 import asyncio
 import logging
 import os
-import re
 import time
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import Annotated, Any, Dict, List, Optional, Tuple, Union
 
 import requests
 from fastmcp import FastMCP
 from pydantic import Field
 
 from cli_agent_orchestrator.constants import (
+    ADVERTISED_URL_ENV,
     API_BASE_URL,
-    DEFAULT_PROVIDER,
     DISCOVERY_TOOL_MARKER,
+    ELASTIC_CALLBACK_URL_ENV,
+    HANDOFF_RESULTS_ROUTE,
     WORKFLOW_EVENTS_CONNECT_TIMEOUT,
     WORKFLOW_EVENTS_MCP_MAX_EVENTS,
     WORKFLOW_EVENTS_MCP_MAX_SECONDS,
@@ -22,85 +23,45 @@ from cli_agent_orchestrator.constants import (
     WORKFLOW_POLL_INTERVAL_SECONDS,
     WORKFLOW_RUN_REQUEST_TIMEOUT,
 )
+from cli_agent_orchestrator.mcp_server import utils as mcp_utils
 from cli_agent_orchestrator.mcp_server.models import HandoffResult
-from cli_agent_orchestrator.models.inbox import OrchestrationType
-from cli_agent_orchestrator.models.provider import ProviderType
+from cli_agent_orchestrator.mcp_server.utils import _auth_headers, _auth_headers_for
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.models.workflow_runtime import ReturnAck, parse_decision
+from cli_agent_orchestrator.services.elastic_worker_gateway import (
+    elastic_worker_gateway_headers,
+)
 from cli_agent_orchestrator.services.memory_service import (
     MEMORY_DISABLED_MESSAGE,
     MemoryDisabledError,
     MemoryPartialWriteError,
 )
-from cli_agent_orchestrator.services.outcome_service import LEARNING_DISABLED_MESSAGE
+from cli_agent_orchestrator.services.outcome_service import (
+    LEARNING_DISABLED_CODE,
+    LEARNING_DISABLED_MESSAGE,
+)
 from cli_agent_orchestrator.services.profile_search import DEFAULT_LIMIT
-from cli_agent_orchestrator.services.settings_service import get_server_settings
-from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
-from cli_agent_orchestrator.utils.terminal import generate_session_name
+from cli_agent_orchestrator.utils.orchestration import (
+    ENABLE_SENDER_ID_INJECTION,
+    REMOTE_CONNECT_TIMEOUT,
+    _assign_impl,
+    _current_terminal_id,
+    _delete_terminal_impl,
+    _extract_error_detail,
+    _handoff_impl,
+    _mcp_timeout,
+    _resolve_target_base_url,
+    _send_message_impl,
+)
 from cli_agent_orchestrator.utils.workflow_events import parse_sse_frames
 
 logger = logging.getLogger(__name__)
 
 
-def _mcp_timeout() -> float:
-    """Get MCP request timeout from server settings."""
-    return float(get_server_settings()["mcp_request_timeout"])
-
-
 # Environment variable to enable/disable working_directory parameter
 ENABLE_WORKING_DIRECTORY = os.getenv("CAO_ENABLE_WORKING_DIRECTORY", "false").lower() == "true"
 
-# Environment variable to enable/disable automatic sender terminal ID injection.
-# Defaults to enabled (issue #284): callback routing must not depend on the
-# supervisor LLM remembering to hand-write its terminal ID into the message.
-ENABLE_SENDER_ID_INJECTION = os.getenv("CAO_ENABLE_SENDER_ID_INJECTION", "true").lower() == "true"
-
-# Terminal count threshold for cleanup nudge
-TERMINAL_CLEANUP_NUDGE_THRESHOLD = 10
 MAX_USER_PROMPT_ANSWER_LENGTH = 4000
-_TERMINAL_ID_PATTERN = re.compile(r"^[a-f0-9]{8}$")
-
-
-def _current_terminal_id() -> Optional[str]:
-    """Return a valid CAO terminal ID from the MCP environment, if configured."""
-    terminal_id = os.environ.get("CAO_TERMINAL_ID")
-    if not terminal_id:
-        return None
-    if not _TERMINAL_ID_PATTERN.fullmatch(terminal_id):
-        raise ValueError(
-            "Invalid CAO_TERMINAL_ID: expected an 8-character lowercase hexadecimal terminal ID"
-        )
-    return terminal_id
-
-
-def _get_cleanup_nudge() -> str:
-    """Return a cleanup nudge string if the session has too many terminals, else empty string."""
-    try:
-        current_terminal_id = _current_terminal_id()
-        if not current_terminal_id:
-            return ""
-        resp = requests.get(
-            f"{API_BASE_URL}/terminals/{current_terminal_id}", timeout=_mcp_timeout()
-        )
-        if resp.status_code != 200:
-            return ""
-        session_name = resp.json().get("session_name")
-        if not session_name:
-            return ""
-        resp = requests.get(
-            f"{API_BASE_URL}/sessions/{session_name}/terminals", timeout=_mcp_timeout()
-        )
-        if resp.status_code != 200:
-            return ""
-        count = len(resp.json())
-        if count >= TERMINAL_CLEANUP_NUDGE_THRESHOLD:
-            return (
-                f" NOTE: This session has {count} terminals. "
-                f"Consider calling delete_terminal on terminals you no longer need."
-            )
-    except Exception:
-        pass
-    return ""
 
 
 # Create MCP server
@@ -129,252 +90,6 @@ Args:
 Returns:
     The skill content on success, or a dict with success=False and an error message on failure
 """
-
-
-def _resolve_child_allowed_tools(
-    parent_allowed_tools: Optional[list], child_profile_name: str
-) -> Optional[str]:
-    """Resolve allowed_tools for a child terminal via intersection.
-
-    The child gets at most the union of: what the parent allows + what the
-    child profile specifies. If the parent is unrestricted ("*"), the child
-    profile's allowedTools are used as-is.
-
-    Returns:
-        Comma-separated string of allowed tools, or None for unrestricted.
-    """
-    from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
-    from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
-
-    try:
-        child_profile = load_agent_profile(child_profile_name)
-        mcp_server_names = (
-            list(child_profile.mcpServers.keys()) if child_profile.mcpServers else None
-        )
-        child_allowed = resolve_allowed_tools(
-            child_profile.allowedTools, child_profile.role, mcp_server_names
-        )
-    except FileNotFoundError:
-        child_allowed = None
-
-    # If parent is unrestricted or has no restrictions, use child's tools
-    if parent_allowed_tools is None or "*" in parent_allowed_tools:
-        if child_allowed:
-            return ",".join(child_allowed)
-        return None
-
-    # If child has no opinion (None), inherit parent's restrictions
-    if child_allowed is None:
-        return ",".join(parent_allowed_tools)
-
-    # If child explicitly requests unrestricted ("*"), honor it
-    if "*" in child_allowed:
-        return None
-
-    # Both have restrictions: child gets its own profile tools
-    # (the child profile defines what it needs; parent's restrictions
-    # are enforced by the parent not delegating unauthorized work)
-    return ",".join(child_allowed)
-
-
-def _create_terminal(
-    agent_profile: str,
-    working_directory: Optional[str] = None,
-    engine: Optional[str] = None,
-    defer_init: bool = False,
-    initial_message: Optional[str] = None,
-    initial_message_orchestration_type: Optional[OrchestrationType] = None,
-    model: Optional[str] = None,
-    use_worktree: bool = False,
-) -> Tuple[str, str]:
-    """Create a new terminal with the specified agent profile.
-
-    Args:
-        agent_profile: Agent profile for the terminal
-        working_directory: Optional working directory for the terminal
-        defer_init: If True, tell
-            cao-server to skip the ``provider.initialize()`` wait and return
-            as soon as the tmux window and DB record exist. Provider init
-            (and, when ``initial_message`` is set, delivery of that message)
-            runs as a background task on cao-server. The tool-call round-trip
-            drops from tens of seconds to <2s, keeping it well under
-            kiro-cli 2.11's ~60s per-tool client timeout.
-        initial_message: This message is delivered to the newly created worker
-            once its provider finishes initializing. For a new session, the
-            message selects deferred initialization automatically; for an
-            existing session, ``defer_init=True`` is required.
-        initial_message_orchestration_type: Passed through to send_input for
-            plugin event emission (assign/handoff).
-        engine: Explicit Kiro engine for the child terminal.
-        model: Explicit per-call model override for the new terminal, applied
-            ahead of the agent profile's own static model field (where the
-            resolved provider supports it). Honored by both the existing-
-            session and new-session branches.
-        use_worktree: If True, the created terminal gets an isolated git
-            worktree (issue #100 Phase 1) instead of sharing
-            ``working_directory`` as given. Only meaningful on the
-            existing-session (assign) branch below -- the new-session branch
-            has no live caller today.
-
-    Returns:
-        Tuple of (terminal_id, provider)
-
-    Raises:
-        Exception: If terminal creation fails
-    """
-    provider = DEFAULT_PROVIDER
-    parent_allowed_tools = None
-
-    # Get current terminal ID from environment
-    current_terminal_id = _current_terminal_id()
-    if current_terminal_id:
-        # Get terminal metadata via API
-        response = requests.get(
-            f"{API_BASE_URL}/terminals/{current_terminal_id}", timeout=_mcp_timeout()
-        )
-        response.raise_for_status()
-        terminal_metadata = response.json()
-
-        # Treat the supervisor provider as a fallback, not an explicit override.
-        provider = resolve_provider(agent_profile, fallback_provider=terminal_metadata["provider"])
-        session_name = terminal_metadata["session_name"]
-        parent_allowed_tools = terminal_metadata.get("allowed_tools")
-
-        # If no working_directory specified, get conductor's current directory
-        if working_directory is None:
-            try:
-                response = requests.get(
-                    f"{API_BASE_URL}/terminals/{current_terminal_id}/working-directory",
-                    timeout=_mcp_timeout(),
-                )
-                if response.status_code == 200:
-                    working_directory = response.json().get("working_directory")
-                    logger.info(f"Inherited working directory from conductor: {working_directory}")
-                else:
-                    logger.warning(
-                        f"Failed to get conductor's working directory (status {response.status_code}), "
-                        "will use server default"
-                    )
-            except Exception as e:
-                logger.warning(
-                    f"Error fetching conductor's working directory: {e}, will use server default"
-                )
-
-        # Resolve child's allowed_tools via inheritance
-        child_allowed_tools = _resolve_child_allowed_tools(parent_allowed_tools, agent_profile)
-
-        # Create new terminal in existing session - always pass working_directory
-        params = {"provider": provider, "agent_profile": agent_profile}
-        # Record the creating terminal so send_message can route callbacks
-        # structurally instead of parsing IDs out of message text (issue #284).
-        params["caller_id"] = current_terminal_id
-        if working_directory:
-            params["working_directory"] = working_directory
-        if child_allowed_tools:
-            params["allowed_tools"] = child_allowed_tools
-        if provider == ProviderType.KIRO_CLI.value and engine is not None:
-            params["engine"] = engine
-        if model and model.strip():
-            params["model"] = model
-        if use_worktree:
-            params["use_worktree"] = "true"
-        # The message payload goes in the JSON body, not the query string, so
-        # prompt content isn't exposed in HTTP access logs and isn't subject to
-        # URL-length limits. Only routing flags stay in params.
-        json_body = None
-        if defer_init:
-            params["defer_init"] = "true"
-            json_body = {}
-            if initial_message is not None:
-                json_body["initial_message"] = initial_message
-            if initial_message_orchestration_type is not None:
-                json_body["initial_message_orchestration_type"] = (
-                    initial_message_orchestration_type.value
-                    if isinstance(initial_message_orchestration_type, OrchestrationType)
-                    else str(initial_message_orchestration_type)
-                )
-
-        response = requests.post(
-            f"{API_BASE_URL}/sessions/{session_name}/terminals",
-            params=params,
-            json=json_body,
-            timeout=_mcp_timeout(),
-        )
-        response.raise_for_status()
-        terminal = response.json()
-    else:
-        # Create new session with terminal.
-        # POST /sessions automatically uses deferred init when an initial
-        # message is present. A bare defer_init flag still cannot be represented
-        # on that endpoint, so reject that narrower shape rather than silently
-        # changing it to synchronous initialization.
-        if defer_init and initial_message is None:
-            raise ValueError(
-                "defer_init requires initial_message when creating a new session "
-                "(no current CAO_TERMINAL_ID)"
-            )
-        session_name = generate_session_name()
-        provider = resolve_provider(agent_profile, fallback_provider=provider)
-        params = {
-            "provider": provider,
-            "agent_profile": agent_profile,
-            "session_name": session_name,
-        }
-        if working_directory:
-            params["working_directory"] = working_directory
-        if provider == ProviderType.KIRO_CLI.value and engine is not None:
-            params["engine"] = engine
-        if model and model.strip():
-            params["model"] = model
-
-        json_body = None
-        if initial_message is not None:
-            json_body = {"initial_message": initial_message}
-            if initial_message_orchestration_type is not None:
-                json_body["initial_message_orchestration_type"] = (
-                    initial_message_orchestration_type.value
-                    if isinstance(initial_message_orchestration_type, OrchestrationType)
-                    else str(initial_message_orchestration_type)
-                )
-
-        response = requests.post(
-            f"{API_BASE_URL}/sessions",
-            params=params,
-            json=json_body,
-            timeout=_mcp_timeout(),
-        )
-        response.raise_for_status()
-        terminal = response.json()
-
-    return terminal["id"], provider
-
-
-def _send_direct_input(
-    terminal_id: str, message: str, orchestration_type: OrchestrationType
-) -> None:
-    """Send input directly to a terminal (bypasses inbox).
-
-    Args:
-        terminal_id: Terminal ID
-        message: Message to send
-        orchestration_type: Orchestration mode for plugin event emission
-
-    Raises:
-        Exception: If sending fails
-    """
-    response = requests.post(
-        f"{API_BASE_URL}/terminals/{terminal_id}/input",
-        params={
-            "message": message,
-            # "supervisor" fallback is safe here: sender_id is a display label
-            # for plugin event emission, never a routable callback address
-            # (unlike the hard-error paths added for issue #284).
-            "sender_id": os.environ.get("CAO_TERMINAL_ID", "supervisor"),
-            "orchestration_type": orchestration_type,
-        },
-        timeout=_mcp_timeout(),
-    )
-    response.raise_for_status()
 
 
 def _send_user_prompt_answer(terminal_id: str, answer: str) -> Dict[str, Any]:
@@ -511,190 +226,6 @@ def _send_terminal_input(terminal_id: str, message: str) -> None:
     response.raise_for_status()
 
 
-def _shape_handoff_message(provider: str, message: str) -> str:
-    """Return the handoff prompt, prepending the codex [CAO Handoff] banner.
-
-    Codex needs to be told this is a blocking handoff so it outputs results
-    directly rather than calling send_message back to the supervisor. The
-    banner embeds this MCP process's CAO_TERMINAL_ID — which is why prompt
-    shaping stays caller-side in the single-seam refactor (the server process
-    does not have it). Other providers get the message unchanged.
-
-    Raises:
-        ValueError: codex provider with no CAO_TERMINAL_ID — never tell a worker
-            its supervisor is terminal 'unknown' (issue #284).
-    """
-    if provider != "codex":
-        return message
-
-    supervisor_id = _current_terminal_id()
-    if not supervisor_id:
-        raise ValueError(
-            "CAO_TERMINAL_ID not set - cannot identify the supervisor terminal "
-            "for the handoff context. Run handoff from inside a CAO terminal."
-        )
-    return (
-        f"[CAO Handoff] Supervisor terminal ID: {supervisor_id}. "
-        "This is a blocking handoff — the orchestrator will automatically "
-        "capture your response when you finish. Complete the task and output "
-        "your results directly. Do NOT use send_message to notify the supervisor "
-        "unless explicitly needed — just do the work and present your deliverables.\n\n"
-        f"{message}"
-    )
-
-
-def _send_direct_input_handoff(terminal_id: str, provider: str, message: str) -> None:
-    """Send handoff payload to an agent, prepending orchestrator instructions if needed.
-
-    Retained for the assign path and any direct callers; the codex banner logic
-    lives in ``_shape_handoff_message`` so the single-seam handoff path and this
-    direct path produce byte-identical shaped prompts.
-    """
-    handoff_message = _shape_handoff_message(provider, message)
-    _send_direct_input(terminal_id, handoff_message, OrchestrationType.HANDOFF)
-
-
-class HandoffContext(NamedTuple):
-    """Supervisor-derived context for a handoff, resolved WITHOUT creating a terminal.
-
-    The worker terminal must be created in the SAME tmux session as the
-    supervisor, inherit the supervisor's allowed-tools, and record the
-    supervisor as its caller (issue #284). These are resolved caller-side from
-    the supervisor metadata so the single combined run-step call carries them.
-    """
-
-    provider: str
-    session_name: Optional[str]
-    caller_id: Optional[str]
-    allowed_tools: Optional[list]
-
-
-def _resolve_handoff_provider(agent_profile: str) -> HandoffContext:
-    """Resolve the handoff context for a worker WITHOUT creating a terminal.
-
-    Mirrors the resolution branch of the former ``_create_terminal``: a worker
-    inherits the supervisor's provider as a FALLBACK (not an override), is placed
-    in the supervisor's session, records the supervisor as ``caller_id`` (#284),
-    and inherits the supervisor's allowed-tools intersected with the child
-    profile. When NOT run inside a CAO terminal there is no supervisor: a fresh
-    session is auto-created (``session_name=None``) and no caller is recorded.
-
-    This lets the codex fast-fail and codex prompt-shaping run caller-side before
-    the single combined run-step call, while preserving the same-session /
-    caller_id / allowed_tools behavior the old six-call path had.
-    """
-    current_terminal_id = _current_terminal_id()
-    if not current_terminal_id:
-        return HandoffContext(
-            provider=resolve_provider(agent_profile, fallback_provider=DEFAULT_PROVIDER),
-            session_name=None,
-            caller_id=None,
-            allowed_tools=None,
-        )
-
-    response = requests.get(
-        f"{API_BASE_URL}/terminals/{current_terminal_id}", timeout=_mcp_timeout()
-    )
-    response.raise_for_status()
-    terminal_metadata = response.json()
-
-    provider = resolve_provider(agent_profile, fallback_provider=terminal_metadata["provider"])
-    # Resolve the child's allowed-tools via the same inheritance the old path
-    # used; _resolve_child_allowed_tools returns a comma-separated string (or
-    # None for unrestricted), which we split into the list the payload expects.
-    parent_allowed_tools = terminal_metadata.get("allowed_tools")
-    child_allowed_tools = _resolve_child_allowed_tools(parent_allowed_tools, agent_profile)
-    allowed_tools_list = child_allowed_tools.split(",") if child_allowed_tools else None
-    return HandoffContext(
-        provider=provider,
-        session_name=terminal_metadata["session_name"],
-        caller_id=current_terminal_id,
-        allowed_tools=allowed_tools_list,
-    )
-
-
-def _terminal_id_from_detail(detail: str) -> Optional[str]:
-    """Best-effort extraction of an 8-hex terminal id from an error detail.
-
-    Fallback for an older server that returns a plain-string ``detail`` instead
-    of the structured object. The current run-step endpoint returns terminal_id
-    as a structured field (see ``_parse_run_step_error``); this regex is only
-    used when that field is absent.
-    """
-    match = re.search(r"terminal ([a-f0-9]{8})\b", detail)
-    return match.group(1) if match else None
-
-
-def _parse_run_step_error(
-    response: requests.Response,
-) -> tuple[Optional[str], str, Optional[str]]:
-    """Parse a run-step error response into ``(kind, message, terminal_id)``.
-
-    The run-step endpoint returns a STRUCTURED detail object
-    ``{"message", "kind", "terminal_id"}`` so callers read the failure kind and
-    the live terminal as fields. Falls back to the legacy plain-string detail
-    (+ regex terminal-id scrape) when the structured shape is absent, so a
-    newer client still works against an older server.
-    """
-    try:
-        payload = response.json()
-    except ValueError:
-        fallback = f"status {response.status_code}"
-        return None, fallback, None
-
-    detail = payload.get("detail")
-    if isinstance(detail, dict):
-        message = detail.get("message") or f"status {response.status_code}"
-        return detail.get("kind"), message, detail.get("terminal_id")
-    if isinstance(detail, str) and detail:
-        return None, detail, _terminal_id_from_detail(detail)
-    fallback = f"status {response.status_code}"
-    return None, fallback, None
-
-
-def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
-    """Send message to another terminal's inbox (queued delivery when IDLE).
-
-    Args:
-        receiver_id: Target terminal ID
-        message: Message content
-
-    Returns:
-        Dict with message details
-
-    Raises:
-        ValueError: If CAO_TERMINAL_ID not set
-        Exception: If API call fails
-    """
-    sender_id = _current_terminal_id()
-    if not sender_id:
-        raise ValueError("CAO_TERMINAL_ID not set - cannot determine sender")
-
-    response = requests.post(
-        f"{API_BASE_URL}/terminals/{receiver_id}/inbox/messages",
-        params={
-            "sender_id": sender_id,
-            "message": message,
-        },
-        timeout=_mcp_timeout(),
-    )
-    response.raise_for_status()
-    return response.json()
-
-
-def _extract_error_detail(response: requests.Response, fallback: str) -> str:
-    """Extract a human-readable error detail from an API response."""
-    try:
-        payload = response.json()
-    except ValueError:
-        return fallback
-
-    detail = payload.get("detail")
-    if isinstance(detail, str) and detail:
-        return detail
-    return fallback
-
-
 def _load_skill_impl(name: str) -> Union[str, Dict[str, Any]]:
     """Fetch a skill body from cao-server and return content or a structured error."""
     try:
@@ -715,160 +246,19 @@ def _load_skill_impl(name: str) -> Union[str, Dict[str, Any]]:
         return {"success": False, "error": f"Failed to retrieve skill: {str(exc)}"}
 
 
-# Implementation functions
-async def _handoff_impl(
-    agent_profile: str,
-    message: str,
-    timeout: int = 600,
-    working_directory: Optional[str] = None,
-    engine: Optional[str] = None,
-    model: Optional[str] = None,
-    use_worktree: bool = False,
-) -> HandoffResult:
-    """Implementation of handoff logic.
+# Shared field descriptions for both handoff and assign's tool signatures below.
+_target_host_field_desc = (
+    "Optional remote CAO node to place the worker on (one-agent-per-pod "
+    "cluster topologies): a DNS name (e.g. 'cao-worker-0.cao-workers'), a "
+    "'host:port' pair, or a full 'http://host:port' URL of that node's "
+    "cao-server (IPv6 literals must use the bracketed-URL form). When set, "
+    "the worker terminal is created on that node in a fresh session via its "
+    "REST API; working_directory (if given) refers to the remote filesystem. "
+    "Not combinable with use_worktree (remote nodes have no shared git "
+    "checkout to provision from — same rule for assign and handoff). Omit "
+    "for the default local placement (behavior unchanged)."
+)
 
-    Single-seam refactor (issue #312, N0). This MCP-process function is an HTTP
-    client; it MUST NOT import services/clients. Its former six granular
-    round-trips (create -> poll-ready -> input -> poll-complete -> output ->
-    exit/delete) are collapsed into ONE call to the combined server-side
-    ``POST /terminals/run-step`` endpoint, whose handler runs the shared
-    ``run_agent_step`` substrate. Observable behavior is preserved (BR-8): same
-    HandoffResult shape + success/failure semantics, same codex CAO_TERMINAL_ID
-    fast-fail, same timeout contract, terminal auto-torn-down on success.
-
-    Codex prompt-shaping (the [CAO Handoff] banner) stays CALLER-SIDE here: it
-    depends on this MCP process's ``CAO_TERMINAL_ID`` env var, which the server
-    process does not have. We shape the prompt before the single call and pass
-    the already-shaped text to the substrate, which sends it verbatim. This is
-    the one behavior-equivalence risk flagged in the plan; keeping the shaping
-    caller-side is the choice that preserves the exact existing codex banner.
-    """
-    start_time = time.time()
-    terminal_id: Optional[str] = None
-
-    try:
-        # Resolve the supervisor context WITHOUT creating a terminal, so the
-        # codex fast-fail (which needs CAO_TERMINAL_ID) and the codex
-        # prompt-shaping can both run caller-side before the single combined
-        # call. The context also carries the supervisor's session_name,
-        # caller_id and inherited allowed_tools so the server creates the worker
-        # in the SAME session with #284 callback routing and tool inheritance
-        # preserved (BR-8 observable-behavior parity). The endpoint then
-        # creates + drives + tears down the terminal.
-        ctx = _resolve_handoff_provider(agent_profile)
-        provider = ctx.provider
-
-        # Fail fast for codex: its handoff banner requires CAO_TERMINAL_ID. We
-        # check before any terminal is created (no terminal_id to surface yet).
-        if provider == "codex" and not _current_terminal_id():
-            return HandoffResult(
-                success=False,
-                message=(
-                    "Handoff failed: CAO_TERMINAL_ID not set - cannot identify the "
-                    "supervisor terminal for the handoff context. Run handoff from "
-                    "inside a CAO terminal."
-                ),
-                output=None,
-                terminal_id=None,
-            )
-
-        # Shape the prompt caller-side (prepends the codex [CAO Handoff] banner
-        # when provider == codex; otherwise returns the message unchanged).
-        shaped_message = _shape_handoff_message(provider, message)
-
-        # Single combined call: create -> ready-wait -> input -> complete-wait ->
-        # extract -> teardown, all server-side via run_agent_step. session_name
-        # places the worker in the supervisor's session; caller_id/allowed_tools
-        # preserve #284 callback routing and tool inheritance.
-        payload: Dict[str, Any] = {
-            "provider": provider,
-            "agent": agent_profile,
-            "prompt": shaped_message,
-            "teardown": True,
-            "timeout": float(timeout),
-            "use_worktree": use_worktree,
-        }
-        if ctx.session_name:
-            payload["session_name"] = ctx.session_name
-        if ctx.caller_id:
-            payload["caller_id"] = ctx.caller_id
-        if ctx.allowed_tools:
-            payload["allowed_tools"] = ctx.allowed_tools
-        if working_directory:
-            payload["working_directory"] = working_directory
-        if provider == ProviderType.KIRO_CLI.value and engine is not None:
-            payload["engine"] = engine
-        if model and model.strip():
-            payload["model"] = model
-
-        # Allow the full step time plus the server-side ready-wait (up to 120s)
-        # plus headroom; the server enforces the per-step timeout internally.
-        client_timeout = float(timeout) + 180.0
-        try:
-            response = requests.post(
-                f"{API_BASE_URL}/terminals/run-step",
-                json=payload,
-                timeout=client_timeout,
-            )
-        except requests.Timeout:
-            return HandoffResult(
-                success=False,
-                message=f"Handoff timed out after {timeout} seconds",
-                output=None,
-                terminal_id=None,
-            )
-
-        if response.status_code != 200:
-            # Map the boundary's HTTPException back into a HandoffResult. The
-            # run-step endpoint returns a STRUCTURED detail object
-            # ({message, kind, terminal_id}) so we read terminal_id and the
-            # failure kind as fields rather than scraping the message.
-            kind, structured_detail, tid = _parse_run_step_error(response)
-            # worker RAN LONG (timeout) vs CRASHED (terminal reached ERROR) must
-            # be reported distinctly so a 5s crash is not mislabeled as an
-            # N-second timeout. The structured `kind` is authoritative; the
-            # status code is only the fallback when an older server omits it
-            # (504 -> timeout, 502 -> error).
-            if kind == "error" or (kind is None and response.status_code == 502):
-                msg = f"Handoff failed: worker errored ({structured_detail})"
-            elif kind == "timeout" or (kind is None and response.status_code == 504):
-                msg = f"Handoff timed out after {timeout} seconds"
-            else:
-                msg = f"Handoff failed: {structured_detail}"
-            return HandoffResult(success=False, message=msg, output=None, terminal_id=tid)
-
-        data = response.json()
-        terminal_id = data.get("terminal_id")
-        # A 200 must carry last_message; surface a malformed body as a failure
-        # rather than silently returning success-with-None.
-        if "last_message" not in data:
-            return HandoffResult(
-                success=False,
-                message="Handoff failed: malformed run-step response (no last_message)",
-                output=None,
-                terminal_id=terminal_id,
-            )
-        output = data["last_message"]
-
-        execution_time = time.time() - start_time
-        return HandoffResult(
-            success=True,
-            message=f"Successfully handed off to {agent_profile} ({provider}) in {execution_time:.2f}s"
-            + _get_cleanup_nudge(),
-            output=output,
-            terminal_id=terminal_id,
-        )
-
-    except Exception as e:
-        # Surface terminal_id when known. With the single-call design the server
-        # owns the terminal lifecycle, so on a client-side failure (e.g. the
-        # provider resolution) there is usually no terminal to surface.
-        return HandoffResult(
-            success=False, message=f"Handoff failed: {str(e)}", output=None, terminal_id=terminal_id
-        )
-
-
-# Shared by both handoff and assign's tool signatures below.
 _model_field_desc = (
     "Optional model override for the worker agent (e.g. a concrete model name/id "
     "accepted by the resolved provider's own --model flag). Takes precedence over "
@@ -915,6 +305,7 @@ if ENABLE_WORKING_DIRECTORY:
                 "repository."
             ),
         ),
+        target_host: Optional[str] = Field(default=None, description=_target_host_field_desc),
     ) -> HandoffResult:
         """Hand off a task to another agent via CAO terminal and wait for completion.
 
@@ -971,10 +362,14 @@ if ENABLE_WORKING_DIRECTORY:
             working_directory: Optional directory path where agent should execute
             model: Optional model override (not honored by every provider)
             use_worktree: If true, isolate this handoff in its own git worktree
+            target_host: Optional remote CAO node to run the worker on
 
         Returns:
             HandoffResult with success status, message, and agent output
         """
+        denied = _tool_denied_reason("handoff")
+        if denied:
+            return HandoffResult(success=False, message=denied, output=None, terminal_id=None)
         return await _handoff_impl(
             agent_profile,
             message,
@@ -983,6 +378,7 @@ if ENABLE_WORKING_DIRECTORY:
             engine=engine,
             model=model,
             use_worktree=use_worktree,
+            target_host=target_host,
         )
 
 else:
@@ -1015,6 +411,7 @@ else:
                 "supervisor's current directory to be inside a git repository."
             ),
         ),
+        target_host: Optional[str] = Field(default=None, description=_target_host_field_desc),
     ) -> HandoffResult:
         """Hand off a task to another agent via CAO terminal and wait for completion.
 
@@ -1059,10 +456,14 @@ else:
             timeout: Maximum wait time in seconds
             model: Optional model override (not honored by every provider)
             use_worktree: If true, isolate this handoff in its own git worktree
+            target_host: Optional remote CAO node to run the worker on
 
         Returns:
             HandoffResult with success status, message, and agent output
         """
+        denied = _tool_denied_reason("handoff")
+        if denied:
+            return HandoffResult(success=False, message=denied, output=None, terminal_id=None)
         return await _handoff_impl(
             agent_profile,
             message,
@@ -1071,101 +472,8 @@ else:
             engine=engine,
             model=model,
             use_worktree=use_worktree,
+            target_host=target_host,
         )
-
-
-# Implementation function for assign
-def _assign_impl(
-    agent_profile: str,
-    message: str,
-    working_directory: Optional[str] = None,
-    engine: Optional[str] = None,
-    model: Optional[str] = None,
-    use_worktree: bool = False,
-) -> Dict[str, Any]:
-    """Implementation of assign logic.
-
-    Uses the server-side deferred-init path: cao-server creates the tmux
-    window and DB record synchronously (fast, <2s), then runs
-    ``provider.initialize()`` and delivers the initial message as a
-    background task. This keeps the assign() tool-call round-trip well
-    under kiro-cli 2.11's ~60s per-tool client timeout, and lets multiple
-    concurrent assigns from the same LLM turn run their init phases in
-    parallel instead of blocking one behind the other.
-    """
-    terminal_id: Optional[str] = None
-    try:
-        # Fail fast before creating the worker terminal when CAO_TERMINAL_ID is
-        # unset — REGARDLESS of the sender-ID-injection flag. The deferred-init
-        # path only forwards the initial message on the existing-session branch
-        # of _create_terminal (an existing session requires a current terminal).
-        # Without CAO_TERMINAL_ID, _create_terminal takes the new-session branch
-        # which cannot honor defer_init/initial_message — assign would create a
-        # worker, never deliver the task, and still return success. Guarding
-        # here also avoids leaving an orphan window behind (issue #284).
-        current_terminal_id = _current_terminal_id()
-        if not current_terminal_id:
-            return {
-                "success": False,
-                "terminal_id": None,
-                "message": (
-                    "Assignment failed: CAO_TERMINAL_ID not set — assign must run "
-                    "from inside a CAO terminal so the worker joins the caller's "
-                    "session and its results can route back."
-                ),
-            }
-
-        # Compose the message the worker will see once it is ready. We do
-        # this here (not on the server) because the callback-instructions
-        # suffix depends on ``CAO_TERMINAL_ID``, which lives in this MCP
-        # subprocess's env (the supervisor-owned instance), not on the
-        # cao-server side.
-        if ENABLE_SENDER_ID_INJECTION:
-            worker_message = (
-                message
-                + f"\n\n[Assigned by terminal {current_terminal_id}. "
-                + f"When done, send results back to terminal {current_terminal_id} using send_message]"
-            )
-        else:
-            worker_message = message
-
-        # Create terminal in DEFERRED-INIT mode: cao-server returns as soon
-        # as the tmux window is up and the DB row is written; the actual
-        # provider.initialize() and initial-message delivery run as a
-        # background task on the server. The tool-call typically returns
-        # in under 2 seconds regardless of how long init takes.
-        terminal_id, _ = _create_terminal(
-            agent_profile,
-            working_directory,
-            engine=engine,
-            defer_init=True,
-            initial_message=worker_message,
-            initial_message_orchestration_type=OrchestrationType.ASSIGN,
-            model=model,
-            use_worktree=use_worktree,
-        )
-
-        return {
-            "success": True,
-            "terminal_id": terminal_id,
-            "message": (
-                f"Task assigned to {agent_profile} (terminal: {terminal_id}). "
-                f"Worker is initializing in the background; your task will be "
-                f"delivered once it is ready. "
-                f"Call delete_terminal('{terminal_id}') when you no longer need this terminal."
-                + _get_cleanup_nudge()
-            ),
-        }
-
-    except Exception as e:
-        # Surface the terminal_id when creation succeeded before the failure
-        # (e.g. the send POST failed) so the orphaned terminal can be
-        # inspected or deleted — matching the ready-timeout path above.
-        return {
-            "success": False,
-            "terminal_id": terminal_id,
-            "message": f"Assignment failed: {str(e)}",
-        }
 
 
 def _build_assign_description(enable_sender_id: bool, enable_workdir: bool) -> str:
@@ -1231,6 +539,10 @@ Args:
     desc += """
     model: Optional model override for the worker (not honored by every provider)
     use_worktree: If true, isolate this worker in its own git worktree
+    target_host: Optional remote CAO node to place the worker on (one-agent-per-pod
+        topologies). The worker is created on that node in a fresh session; results
+        route back automatically via send_message (requires CAO_ADVERTISED_URL on
+        this node). Not combinable with use_worktree.
 
 Returns:
     Dict with success status, worker terminal_id, and message"""
@@ -1273,7 +585,11 @@ if ENABLE_WORKING_DIRECTORY:
                 "resolved working directory to be inside a git repository."
             ),
         ),
+        target_host: Optional[str] = Field(default=None, description=_target_host_field_desc),
     ) -> Dict[str, Any]:
+        denied = _tool_denied_reason("assign")
+        if denied:
+            return {"success": False, "error": denied}
         return _assign_impl(
             agent_profile,
             message,
@@ -1281,6 +597,7 @@ if ENABLE_WORKING_DIRECTORY:
             engine=engine,
             model=model,
             use_worktree=use_worktree,
+            target_host=target_host,
         )
 
 else:
@@ -1306,7 +623,11 @@ else:
                 "supervisor's current directory to be inside a git repository."
             ),
         ),
+        target_host: Optional[str] = Field(default=None, description=_target_host_field_desc),
     ) -> Dict[str, Any]:
+        denied = _tool_denied_reason("assign")
+        if denied:
+            return {"success": False, "error": denied}
         return _assign_impl(
             agent_profile,
             message,
@@ -1314,95 +635,178 @@ else:
             engine=engine,
             model=model,
             use_worktree=use_worktree,
+            target_host=target_host,
         )
 
 
-# Implementation function for send_message
-def _send_message_impl(receiver_id: Optional[str], message: str) -> Dict[str, Any]:
-    """Implementation of send_message logic."""
+def _elastic_broker_config() -> Tuple[str, str]:
+    url = os.environ.get("CAO_ELASTIC_BROKER_URL", "").strip().rstrip("/")
+    token = os.environ.get("CAO_ELASTIC_BROKER_TOKEN", "").strip()
+    if not url or not token:
+        raise ValueError(
+            "elastic workers are not configured: set CAO_ELASTIC_BROKER_URL "
+            "and CAO_ELASTIC_BROKER_TOKEN on the supervisor"
+        )
+    return url, token
+
+
+# How long the elastic path waits for a freshly leased worker to answer through
+# its Service. The broker returns a lease as soon as the workload and Service objects
+# exist, so this covers the worker's whole boot plus endpoint propagation - and it
+# is the ONE place that wait now happens, instead of once in the broker (on pod
+# readiness) and then implicitly again here (on a connect timeout, unretried).
+#
+# Generous rather than tight: the failure this replaces was a 10s connect timeout
+# on a worker that was 3 seconds from being usable, and the cost of waiting too
+# long is a slow delegation, while the cost of waiting too little is a destroyed
+# worker and a failed task. The broker's own READY_TIMEOUT (300s) remains the
+# outer bound - it settles the lease `failed` whether or not anyone is waiting.
+def _elastic_ready_wait() -> float:
     try:
-        own_terminal_id = _current_terminal_id()
+        return max(0.0, float(os.environ.get("CAO_ELASTIC_WORKER_READY_WAIT", "120")))
+    except ValueError:
+        return 120.0
 
-        # Default the receiver to the recorded caller (issue #284): handoff/
-        # assign persist the creating terminal's ID on the worker's row, so a
-        # worker can reply without parsing an ID out of the task message text.
-        if not receiver_id:
-            if not own_terminal_id:
-                return {
-                    "success": False,
-                    "error": (
-                        "receiver_id not provided and CAO_TERMINAL_ID not set - cannot "
-                        "look up the recorded caller. Pass receiver_id explicitly."
-                    ),
-                }
-            response = requests.get(
-                f"{API_BASE_URL}/terminals/{own_terminal_id}", timeout=_mcp_timeout()
+
+def _release_elastic_worker(broker_url: str, broker_token: str, worker_id: str) -> bool:
+    try:
+        response = requests.delete(
+            f"{broker_url}/workers/{worker_id}",
+            headers={"X-CAO-Broker-Token": broker_token},
+            timeout=(REMOTE_CONNECT_TIMEOUT, _mcp_timeout()),
+        )
+        return response.status_code < 400 or response.status_code == 404
+    except requests.RequestException as exc:
+        logger.warning("Failed to release elastic worker %s: %s", worker_id, exc)
+        return False
+
+
+@mcp.tool()
+async def assign_elastic(
+    agent_profile: str = Field(
+        description='Agent profile for the disposable worker (for example "developer")'
+    ),
+    message: str = Field(description="Task for the disposable worker"),
+    provider: Optional[str] = Field(
+        default=None,
+        description=(
+            "Provider to install in the worker. Omit to use the broker's "
+            "configured default, which is what the deployment's image actually "
+            "contains."
+        ),
+    ),
+    engine: Optional[str] = Field(default=None, description="Optional Kiro engine override"),
+    model: Optional[str] = Field(default=None, description=_model_field_desc),
+) -> Dict[str, Any]:
+    """Provision one elastic worker and assign one task to it.
+
+    The worker must call ``complete_assignment`` exactly once after producing
+    its final result. That tool durably delivers the callback before releasing
+    this worker.
+
+    A successful return means the task was PLACED, not that it finished - the
+    result arrives later through the supervisor's inbox. So a worker that dies
+    before calling ``complete_assignment`` is indistinguishable from a slow one
+    here, and nothing on this side can tell them apart. The broker resolves it:
+    it holds the lease, reaps a worker whose pod ended or whose completion never
+    arrived, and records which happened. Query ``GET /workers`` on the broker
+    when a delegation reports success and produces no artifact.
+    """
+    # Checked before the broker is asked for a lease, so a refused caller never
+    # gets a worker provisioned on its behalf. For a bound caller this resolves
+    # the terminal context over blocking HTTP, so it runs off the event loop for
+    # the same reason as the broker POST below.
+    denied = await asyncio.to_thread(_tool_denied_reason, "assign_elastic")
+    if denied:
+        return {"success": False, "terminal_id": None, "elastic": True, "message": denied}
+    try:
+        callback_terminal_id = _current_terminal_id()
+        if not callback_terminal_id:
+            raise ValueError("assign_elastic must run from inside a CAO terminal")
+        broker_url, broker_token = _elastic_broker_config()
+        # `provider` is omitted rather than defaulted here on purpose. A default
+        # baked into this signature silently overrides the broker's, so a fleet
+        # whose image ships one provider would still be asked for another - and
+        # the failure names a CLI the caller never mentioned. The provider a
+        # worker can actually run is a property of the deployment, so the
+        # deployment decides it.
+        #
+        # The isinstance check is not defensive noise. Called through FastMCP,
+        # `provider` arrives resolved to a string or None; called directly - as
+        # the tests do - the unfilled default is the `FieldInfo` object itself,
+        # which a plain truthiness test would happily place into the request body.
+        payload: Dict[str, Any] = {
+            "agent_profile": agent_profile,
+            "callback_terminal_id": callback_terminal_id,
+        }
+        if isinstance(provider, str) and provider.strip():
+            payload["provider"] = provider.strip()
+        # `requests` is blocking, and this coroutine runs on the MCP server's
+        # event loop. Called once that costs nothing; called five times in one
+        # LLM turn - the fan-out this tool exists for - the awaits could not
+        # interleave, so five placements ran strictly one after another. Measured
+        # from the broker's access log: the five POSTs never overlapped, 16-17s
+        # apart, 76s from first to last, and a failed worker's DELETE landed
+        # before the next POST was even sent.
+        #
+        # to_thread moves the block off the loop so the gather actually gathers.
+        # It changes nothing for a single delegation - that call was never the
+        # latency, the worker's boot was - and the broker was always ready for it:
+        # `create_worker` is a sync `def`, so Starlette already runs it in its own
+        # threadpool worker.
+        response = await asyncio.to_thread(
+            lambda: requests.post(
+                f"{broker_url}/workers",
+                headers={"X-CAO-Broker-Token": broker_token},
+                json=payload,
+                timeout=(REMOTE_CONNECT_TIMEOUT, 360),
             )
-            try:
-                response.raise_for_status()
-            except requests.HTTPError as exc:
-                detail = _extract_error_detail(response, str(exc))
-                return {
-                    "success": False,
-                    "error": (
-                        f"receiver_id not provided and the caller lookup for this "
-                        f"terminal ({own_terminal_id}) failed: {detail}. Pass "
-                        "receiver_id explicitly."
-                    ),
-                }
-            receiver_id = response.json().get("caller_id")
-            if not receiver_id:
-                return {
-                    "success": False,
-                    "error": (
-                        "receiver_id not provided and this terminal has no recorded "
-                        "caller (it was not created via handoff/assign). Pass "
-                        "receiver_id explicitly."
-                    ),
-                }
-
-        # Guard against the worker sending a message to itself (issue #24).
-        # Worker agents sometimes confuse their own CAO_TERMINAL_ID with the
-        # supervisor's and end up queueing a message into their own inbox,
-        # which never reaches the supervisor. Reject that here so the worker
-        # gets a clear error and can pick the correct receiver_id instead.
-        if own_terminal_id and receiver_id == own_terminal_id:
-            return {
-                "success": False,
-                "error": (
-                    f"receiver_id ({receiver_id}) is this terminal's own CAO_TERMINAL_ID. "
-                    "send_message cannot deliver to the sender. Omit receiver_id to reply "
-                    "to the terminal that assigned this task (the recorded caller), or "
-                    "use the supervisor's terminal ID from the task message."
-                ),
-            }
-
-        # Auto-inject sender terminal ID suffix when enabled. Skipped when
-        # CAO_TERMINAL_ID is unset — never inject 'unknown' as a routable
-        # address (issue #284); _send_to_inbox raises a clear error for that
-        # case anyway.
-        if ENABLE_SENDER_ID_INJECTION and own_terminal_id:
-            message += (
-                f"\n\n[Message from terminal {own_terminal_id}. "
-                "Use send_message MCP tool for any follow-up work.]"
+        )
+        response.raise_for_status()
+        lease = response.json()
+        worker_id = str(lease["worker_id"])
+        worker_message = (
+            message + "\n\n[Elastic worker lifecycle: make every tool call you "
+            "need BEFORE you write any prose. Text that settles before your first "
+            "tool call is read as the end of your turn, and this terminal is then "
+            "killed with the task unfinished. When the task is fully complete, "
+            "call complete_assignment with your final result. Do not use "
+            "send_message for the final result; complete_assignment acknowledges "
+            "delivery before terminating this disposable worker.]"
+        )
+        # Also off the loop: _assign_impl waits for the new worker to answer and
+        # then posts the task to it, both blocking. This is the longer of the two
+        # blocks, so threading only the broker call above would have left the
+        # serialisation almost entirely in place.
+        result = await asyncio.to_thread(
+            _assign_impl,
+            agent_profile,
+            worker_message,
+            str(lease["working_directory"]),
+            engine=engine,
+            model=model,
+            target_host=str(lease["target_host"]),
+            ready_wait_seconds=_elastic_ready_wait(),
+            callback_url=os.environ.get(ELASTIC_CALLBACK_URL_ENV) or None,
+            remote_session_name=str(lease["session_name"]),
+        )
+        result["worker_id"] = worker_id
+        result["elastic"] = True
+        if not result.get("success"):
+            result["worker_released"] = await asyncio.to_thread(
+                _release_elastic_worker, broker_url, broker_token, worker_id
             )
-
-        return _send_to_inbox(receiver_id, message)
-    except requests.HTTPError as exc:
-        # e.g. the receiver terminal (a recorded caller included) was deleted
-        # before this reply — surface the API detail instead of a raw
-        # requests error string so the agent knows the address is gone.
-        detail = str(exc)
-        if exc.response is not None:
-            detail = _extract_error_detail(exc.response, detail)
+        return result
+    except Exception as exc:
         return {
             "success": False,
-            "error": f"Failed to deliver to terminal {receiver_id}: {detail}",
+            "terminal_id": None,
+            "elastic": True,
+            "message": f"Elastic assignment failed: {exc}",
         }
-    except Exception as e:
-        return {"success": False, "error": str(e)}
 
 
+# Implementation function for send_message
 @mcp.tool()
 async def send_message(
     message: str = Field(description="Message content to send"),
@@ -1431,6 +835,48 @@ async def send_message(
         Dict with success status and message details
     """
     return _send_message_impl(receiver_id, message)
+
+
+@mcp.tool()
+async def complete_assignment(
+    message: str = Field(description="Final result to deliver to the assigning supervisor"),
+) -> Dict[str, Any]:
+    """Deliver an elastic worker's final result, then release the worker itself."""
+    worker_id = os.environ.get("CAO_ELASTIC_WORKER_ID", "").strip()
+    broker_url = os.environ.get("CAO_ELASTIC_BROKER_URL", "").strip().rstrip("/")
+    release_token = os.environ.get("CAO_ELASTIC_RELEASE_TOKEN", "").strip()
+    if not worker_id or not broker_url or not release_token:
+        return {
+            "success": False,
+            "error": "complete_assignment is only available inside an elastic worker",
+        }
+
+    delivered = _send_message_impl(None, message)
+    if not delivered.get("success"):
+        return {
+            "success": False,
+            "delivered": delivered,
+            "error": "result delivery failed; worker was not released",
+        }
+    try:
+        response = requests.post(
+            f"{broker_url}/workers/{worker_id}/complete",
+            headers={"X-CAO-Release-Token": release_token},
+            timeout=(REMOTE_CONNECT_TIMEOUT, _mcp_timeout()),
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        return {
+            "success": False,
+            "delivered": delivered,
+            "error": f"result delivered but worker release failed: {exc}",
+        }
+    return {
+        "success": True,
+        "delivered": delivered,
+        "worker_id": worker_id,
+        "release_scheduled": True,
+    }
 
 
 @mcp.tool()
@@ -1511,6 +957,15 @@ def delete_terminal(
     terminal_id: str = Field(
         description="The terminal ID to delete (obtained from assign or handoff results)"
     ),
+    target_host: Optional[str] = Field(
+        default=None,
+        description=(
+            "Remote CAO node hosting the terminal (same format as assign/handoff "
+            "target_host: DNS name, host:port, or URL). Required to delete a "
+            "terminal created remotely — its record lives on that node, not "
+            "this one. Omit for local terminals (behavior unchanged)."
+        ),
+    ),
 ) -> Dict[str, Any]:
     """Delete a terminal that is no longer needed, freeing system resources.
 
@@ -1519,51 +974,125 @@ def delete_terminal(
     removes the terminal record.
 
     Handoff terminals are automatically cleaned up on success — you only need
-    to call this for assign terminals.
+    to call this for assign terminals, or for a REMOTE terminal a failed
+    handoff/assign left behind on a target_host node (on CAO_MAX_TERMINALS=1
+    worker pods a leftover terminal — including one stuck in ERROR — occupies
+    the pod's only slot until deleted).
 
     Args:
         terminal_id: The terminal ID to delete
+        target_host: Remote CAO node hosting the terminal; omit for local
 
     Returns:
         Dict with success status and message
     """
-    try:
-        response = requests.delete(
-            f"{API_BASE_URL}/terminals/{terminal_id}", timeout=_mcp_timeout()
+    # Direct (non-MCP) invocation — e.g. existing unit tests calling the
+    # function positionally — receives the pydantic FieldInfo object as the
+    # default instead of None. Normalize anything that isn't a usable host
+    # string to "local", preserving the pre-target_host behavior exactly.
+    #
+    # This normalization stays in the TOOL WRAPPER rather than moving into
+    # _delete_terminal_impl with the rest of the body: the FieldInfo leak is an
+    # artifact of FastMCP's Field default, so it is server.py's problem, and
+    # _delete_terminal_impl's other caller (`cao agent cancel --delete`) passes
+    # a real Optional[str] that needs no laundering.
+    if not isinstance(target_host, str) or not target_host.strip():
+        target_host = None
+    return _delete_terminal_impl(terminal_id, target_host=target_host)
+
+
+@mcp.tool()
+def get_handoff_result(
+    job_id: str = Field(
+        description=(
+            "The job_id returned by handoff when pending=True (transport timed "
+            "out but the job may still be running or already finished server-side)."
         )
-        if response.status_code == 409:
-            return {
-                "success": False,
-                "message": (
-                    f"Terminal {terminal_id} cleanup is pending; retry delete_terminal "
-                    "after the Grok process exits."
-                ),
-            }
+    ),
+    target_host: Optional[str] = Field(
+        default=None,
+        description=(
+            "Remote CAO node that ran the handoff (same format as "
+            "assign/handoff target_host: DNS name, host:port, or URL). Required "
+            "when the pending handoff was placed remotely -- the result row lives "
+            "in THAT node's database, not this one, so omitting it returns a "
+            "false not-found. Omit for local handoffs (behavior unchanged)."
+        ),
+    ),
+) -> Dict[str, Any]:
+    """Retrieve a durably persisted handoff result by job_id (issue #447).
+
+    Call this when a prior ``handoff`` call returned ``pending=True`` — the
+    transport timed out before the result arrived, but the work continues
+    server-side under ``job_id``. Poll this tool until ``state`` is no longer
+    ``"running"``.
+
+    Two things the request needs beyond the id, both mirroring
+    ``delete_terminal`` (PR #453 review, haofeif):
+
+    - The internal ``Authorization`` header, for a LOCAL retrieval. The
+      endpoint is scope-gated, so without it an auth-enabled deployment answers
+      401 to a caller legitimately holding the job_id. A retrieval aimed at a
+      ``target_host`` carries no bearer: ``CAO_AUTH_LOCAL_TOKEN`` is this node's
+      credential, and sending it to another host would disclose it there.
+    - ``target_host``. ``handoff(target_host=...)`` runs the step on that node
+      and persists the row in ITS database, so the supervisor's own base URL has
+      no such row.
+
+    Args:
+        job_id: The job_id from the pending handoff result.
+        target_host: Node that ran the handoff; omit for local.
+
+    Returns:
+        Dict with ``success``, ``state`` ("running"|"completed"|"error"),
+        ``terminal_id``, ``last_message`` (populated when completed), and
+        ``error_message`` (populated when errored). ``success=False`` with a
+        ``message`` when the job_id is unknown or the request failed.
+    """
+    # Direct (non-MCP) invocation gets pydantic's FieldInfo as the default rather
+    # than None. Normalized here in the tool wrapper for the same reason
+    # delete_terminal does it there: the leak is an artifact of FastMCP's Field
+    # default, so it belongs to server.py.
+    if not isinstance(target_host, str) or not target_host.strip():
+        target_host = None
+    location = f" on node {target_host}" if target_host else ""
+    try:
+        base_url = _resolve_target_base_url(target_host) if target_host else API_BASE_URL
+        path = HANDOFF_RESULTS_ROUTE.format(job_id=job_id)
+        response = requests.get(
+            f"{base_url}{path}",
+            headers=_auth_headers_for(base_url) or None,
+            # A black-holed remote node must fail on CONNECT rather than burn the
+            # full read budget; a local read keeps its single scalar timeout so
+            # default-path behavior is unchanged.
+            timeout=(REMOTE_CONNECT_TIMEOUT, _mcp_timeout()) if target_host else _mcp_timeout(),
+        )
         response.raise_for_status()
-        payload = response.json()
-        if not payload.get("success", False):
-            return {
-                "success": False,
-                "message": (
-                    f"Terminal {terminal_id} cleanup is pending; retry delete_terminal "
-                    "after the Grok process exits."
-                ),
-            }
-        return {"success": True, "message": f"Terminal {terminal_id} deleted successfully"}
+        data = response.json()
+        return {
+            "success": True,
+            "state": data.get("state"),
+            "terminal_id": data.get("terminal_id"),
+            "last_message": data.get("last_message"),
+            "error_message": data.get("error_message"),
+        }
     except requests.HTTPError as e:
         if e.response is not None and e.response.status_code == 404:
-            return {"success": False, "message": f"Terminal {terminal_id} not found"}
-        if e.response is not None and e.response.status_code == 409:
             return {
                 "success": False,
                 "message": (
-                    f"Terminal {terminal_id} cleanup is pending; retry delete_terminal "
-                    "after the Grok process exits."
+                    f"No handoff result found for job_id {job_id}{location}"
+                    + (
+                        ""
+                        if target_host
+                        else ". If the handoff was placed on a remote node, retry "
+                        "with target_host set to that node."
+                    )
                 ),
             }
-        return {"success": False, "message": f"Failed to delete terminal: {str(e)}"}
+        return {"success": False, "message": f"Failed to retrieve handoff result: {str(e)}"}
     except Exception as e:
-        return {"success": False, "message": f"Failed to delete terminal: {str(e)}"}
+        return {"success": False, "message": f"Failed to retrieve handoff result: {str(e)}"}
 
 
 def _own_terminal_id_or_error(action: str) -> Union[str, Dict[str, Any]]:
@@ -1833,19 +1362,36 @@ def _get_terminal_context_from_env() -> Optional[Dict[str, Any]]:
         return None
 
     try:
-        response = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=_mcp_timeout())
-        response.raise_for_status()
-        meta = response.json()
+        # Via mcp_utils, which attaches the internal Authorization header. The
+        # bare requests.get here did not, and GET /terminals/{id} IS scope-gated —
+        # so with auth enabled the call 401'd, this returned None, and every
+        # memory scope silently collapsed to global.
+        #
+        # A 404 (terminal genuinely not registered) is the only case that means
+        # "no context". Transport and auth failures PROPAGATE so the caller can
+        # say "cannot reach cao-server" rather than "could not resolve terminal
+        # context" — reporting a down server as a missing identity is the same
+        # class of misdirection as reporting an unreadable config as "disabled".
+        try:
+            meta = mcp_utils.get_json(f"/terminals/{terminal_id}", timeout=_mcp_timeout())
+        except requests.HTTPError as e:
+            if getattr(e.response, "status_code", None) == 404:
+                return None
+            raise
         ctx: Dict[str, Any] = {
             "terminal_id": meta["id"],
             "session_name": meta["session_name"],
             "provider": meta["provider"],
             "agent_profile": meta.get("agent_profile"),
+            "allowed_tools": meta.get("allowed_tools"),
         }
-        # Try to get working directory for project scope resolution
+        # Try to get working directory for project scope resolution. Same header
+        # reasoning as above — best-effort, so a failure degrades project scope
+        # rather than failing the call.
         try:
             wd_resp = requests.get(
                 f"{API_BASE_URL}/terminals/{terminal_id}/working-directory",
+                headers=mcp_utils._auth_headers() or None,
                 timeout=_mcp_timeout(),
             )
             if wd_resp.status_code == 200:
@@ -1853,6 +1399,11 @@ def _get_terminal_context_from_env() -> Optional[Dict[str, Any]]:
         except Exception:
             pass
         return ctx
+    except requests.RequestException:
+        # Let the caller distinguish "unreachable / unauthorized" from "no
+        # context"; the memory tools still degrade to None via their own
+        # handlers, while the outcome tools report the real cause.
+        raise
     except Exception as e:
         logger.warning(f"Failed to get terminal context for memory tools: {e}")
         return None
@@ -1877,6 +1428,101 @@ def _caller_has_store_lesson_capability(caller_profile: Optional[str]) -> bool:
     except Exception as e:  # noqa: BLE001 — authz check fails closed
         logger.warning(f"store_lesson capability lookup failed for {caller_profile!r}: {e}")
         return False
+
+
+CAO_MCP_SERVER_SELECTOR = "@cao-mcp-server"
+
+
+def _caller_effective_allowed_tools(context: Dict[str, Any]) -> Optional[List[str]]:
+    """Effective CAO allowlist for the calling terminal, or None if unresolvable.
+
+    Mirrors ``create_terminal``: a recorded ``allowed_tools`` IS the effective
+    list, while ``None`` means "resolve from the agent profile" rather than
+    "unrestricted", so the profile goes through the same
+    ``resolve_allowed_tools`` the launch path uses.
+    """
+    recorded = context.get("allowed_tools")
+    if recorded is not None:
+        return list(recorded)
+
+    profile_name = context.get("agent_profile")
+    if not profile_name:
+        return None
+
+    from cli_agent_orchestrator.agent_plugins.mcp_delivery import grantable_server_names
+    from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+    from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
+
+    profile = load_agent_profile(profile_name)
+    mcp_server_names = grantable_server_names(profile)
+    return resolve_allowed_tools(profile.allowedTools, profile.role, mcp_server_names)
+
+
+def _tool_denied_reason(tool_name: str) -> Optional[str]:
+    """Reason the calling terminal's allowlist bars ``tool_name``, or None to allow.
+
+    ``assign``, ``handoff`` and ``assign_elastic`` spawn a terminal under a
+    caller-chosen ``agent_profile``, so an agent reaching them can mint a new
+    identity with its own memory scope under any profile installed on the box
+    (#671). The
+    provider-native restrictions built by ``utils/tool_mapping`` cannot cover
+    that: ``get_disallowed_tools`` skips every ``@``-prefixed entry because MCP
+    server references have no native tool names, so CAO's own MCP surface is
+    unreachable from that mechanism by construction.
+
+    The authorization model here is the one CAO already has, not a second one.
+    The effective list is the terminal's recorded ``allowed_tools``, or the
+    profile resolution that ``None`` stands for, and these operations are
+    granted by the documented ``@cao-mcp-server`` server selector or by ``*``.
+    Bare tool names are provider-native vocabulary and never name an MCP tool.
+
+    Fails closed. An unset ``CAO_TERMINAL_ID`` is the supported operator
+    context (``cao assign`` and ``cao handoff`` run with no caller identity)
+    and allows. Once the caller claims an identity every failure to resolve it
+    denies: a malformed ID, an unreachable or unauthorized cao-server, a
+    terminal that is not registered, an unreadable profile.
+
+    ``None`` from ``_get_terminal_context_from_env`` is NOT proof of an
+    operator context. That helper also returns ``None`` for a malformed
+    ``CAO_TERMINAL_ID`` (which ``_current_terminal_id`` itself calls a hard
+    error) and from its trailing ``except Exception``. So boundness is
+    established here from the environment rather than inferred from the
+    absence of an exception.
+    """
+    if not os.environ.get("CAO_TERMINAL_ID"):
+        return None
+
+    try:
+        context = _get_terminal_context_from_env()
+    except Exception as e:  # noqa: BLE001  (an unknown result must not dispatch)
+        logger.warning(f"authorization lookup failed for '{tool_name}': {e}")
+        return f"cannot authorize '{tool_name}': the calling terminal could not be resolved ({e})"
+
+    if context is None:
+        return (
+            f"cannot authorize '{tool_name}': CAO_TERMINAL_ID is set but the calling "
+            "terminal could not be resolved"
+        )
+
+    try:
+        allowed = _caller_effective_allowed_tools(context)
+    except Exception as e:  # noqa: BLE001  (an unknown result must not dispatch)
+        logger.warning(f"allowlist resolution failed for '{tool_name}': {e}")
+        return (
+            f"cannot authorize '{tool_name}': the caller's allowed tools could not "
+            f"be resolved ({e})"
+        )
+
+    if allowed is None:
+        return f"cannot authorize '{tool_name}': the caller's allowed tools could not be resolved"
+
+    if "*" in allowed or CAO_MCP_SERVER_SELECTOR in allowed:
+        return None
+
+    return (
+        f"'{tool_name}' is not permitted: the calling terminal's allowed tools do not "
+        f"include '{CAO_MCP_SERVER_SELECTOR}'"
+    )
 
 
 @mcp.tool()
@@ -1911,19 +1557,29 @@ async def memory_store(
     Use this to persist facts, decisions, user preferences, and project conventions
     that should be available across agent sessions.
     """
+    from cli_agent_orchestrator.services.memory_gateway import remote_memory_url, store_memory
     from cli_agent_orchestrator.services.memory_service import MemoryService
 
     try:
-        service = MemoryService()
         terminal_context = _get_terminal_context_from_env()
-        memory = await service.store(
-            content=content,
-            scope=scope,
-            memory_type=memory_type,
-            key=key,
-            tags=tags or "",
-            terminal_context=terminal_context,
-        )
+        if remote_memory_url():
+            memory = await store_memory(
+                content=content,
+                scope=scope,
+                memory_type=memory_type,
+                key=key,
+                tags=tags or "",
+                terminal_context=terminal_context,
+            )
+        else:
+            memory = await MemoryService().store(
+                content=content,
+                scope=scope,
+                memory_type=memory_type,
+                key=key,
+                tags=tags or "",
+                terminal_context=terminal_context,
+            )
         return {
             "success": True,
             "key": memory.key,
@@ -1998,6 +1654,7 @@ async def memory_recall(
 
     Use this to check if relevant knowledge already exists before asking the user.
     """
+    from cli_agent_orchestrator.services.memory_gateway import recall_memory, remote_memory_url
     from cli_agent_orchestrator.services.memory_service import MemoryService
     from cli_agent_orchestrator.services.settings_service import is_memory_enabled
 
@@ -2010,18 +1667,32 @@ async def memory_recall(
         }
 
     try:
-        service = MemoryService()
         terminal_context = _get_terminal_context_from_env()
-        memories = await service.recall(
-            query=query,
-            scope=scope,
-            memory_type=memory_type,
-            limit=limit,
-            terminal_context=terminal_context,
-            search_mode=search_mode,
-            sort_by=sort_by,
-            include_related=bool(include_related) if isinstance(include_related, bool) else False,
+        kwargs = {
+            "query": query,
+            "scope": scope,
+            "memory_type": memory_type,
+            "limit": limit,
+            "terminal_context": terminal_context,
+            "search_mode": search_mode,
+            "sort_by": sort_by,
+            "include_related": (
+                bool(include_related) if isinstance(include_related, bool) else False
+            ),
+        }
+        memories = (
+            await recall_memory(**kwargs)
+            if remote_memory_url()
+            else await MemoryService().recall(**kwargs)
         )
+        # Curated recall is inserted verbatim into another terminal's context.
+        # Keep its vault/native scope set aligned with the deterministic builder:
+        # agent-scoped memories are explicit-recall-only in this release.
+        from cli_agent_orchestrator.services.vault.reader import MEMORY_MANAGER_PROFILE
+
+        if (terminal_context or {}).get("agent_profile") == MEMORY_MANAGER_PROFILE:
+            injectable_scopes = {"session", "project", "global"}
+            memories = [memory for memory in memories if memory.scope in injectable_scopes]
         return {
             "success": True,
             "memories": [
@@ -2031,7 +1702,20 @@ async def memory_recall(
                     "memory_type": m.memory_type,
                     "scope": m.scope,
                     "tags": m.tags,
-                    "file_path": m.file_path,
+                    "file_path": (
+                        getattr(m, "source_path", None)
+                        if getattr(m, "source_kind", "native") == "vault"
+                        else m.file_path
+                    ),
+                    "source_kind": getattr(m, "source_kind", "native"),
+                    "source_path": getattr(m, "source_path", None),
+                    "indexed_at": (
+                        m.indexed_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+                        if getattr(m, "indexed_at", None)
+                        else None
+                    ),
+                    "index_freshness": getattr(m, "index_freshness", None),
+                    "content_truncated": bool(getattr(m, "content_truncated", False)),
                     "updated_at": m.updated_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 }
                 for m in memories
@@ -2056,21 +1740,32 @@ async def memory_forget(
 ) -> Dict[str, Any]:
     """Remove a memory by key and scope.
 
-    Deletes the wiki topic file and removes the entry from index.md.
+    Deletes native memory files or deindexes vault-backed memory without
+    deleting the underlying vault note.
     """
+    from cli_agent_orchestrator.services.memory_gateway import forget_memory, remote_memory_url
     from cli_agent_orchestrator.services.memory_service import MemoryService
 
     try:
-        service = MemoryService()
         terminal_context = _get_terminal_context_from_env()
-        deleted = await service.forget(
-            key=key,
-            scope=scope,
-            terminal_context=terminal_context,
+        deleted = (
+            await forget_memory(
+                key=key,
+                scope=scope,
+                terminal_context=terminal_context,
+            )
+            if remote_memory_url()
+            else await MemoryService().forget(
+                key=key,
+                scope=scope,
+                terminal_context=terminal_context,
+            )
         )
         return {
             "success": True,
-            "deleted": deleted,
+            "deleted": bool(deleted),
+            "action": deleted.action,
+            "path": deleted.path,
             "key": key,
             "scope": scope,
         }
@@ -2078,6 +1773,42 @@ async def memory_forget(
         return {"success": False, "disabled": True, "error": str(e)}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+def _outcome_tool_error(
+    exc: Exception, fallback: str, *, extra: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """Translate a failed outcome-API call into the tool's error payload.
+
+    ``disabled: True`` requires a 404 **and** the gate's own
+    ``LEARNING_DISABLED_CODE`` discriminator in the body. Status alone is not
+    enough: a missing ``/outcomes`` route during a mixed-version rollout, or a
+    proxy that does not know the path, returns an ordinary
+    ``{"detail": "Not Found"}`` 404 — and ``skills/cao-learning`` instructs
+    agents to skip a ``disabled: true`` payload SILENTLY, so inferring the
+    feature state from a generic 404 drops outcomes without a trace. That is the
+    same class of misreporting this module exists to remove, so an unmarked 404
+    stays an explicit failure with no ``disabled`` key.
+
+    A 503 (settings unreadable) and a transport failure are likewise never
+    "disabled", for the same reason: an unreadable settings.json used to present
+    itself as a deliberate opt-out.
+    """
+    extra = dict(extra or {})
+    if isinstance(exc, requests.ConnectionError):
+        return {
+            "success": False,
+            "error": "Failed to connect to cao-server. The server may not be running.",
+            **extra,
+        }
+    response = getattr(exc, "response", None)
+    if response is None:
+        return {"success": False, "error": f"{fallback}: {exc}", **extra}
+
+    detail = _extract_error_detail(response, fallback)
+    if response.status_code == 404 and LEARNING_DISABLED_CODE in detail:
+        return {"success": False, "disabled": True, "error": detail, **extra}
+    return {"success": False, "error": detail, **extra}
 
 
 @mcp.tool()
@@ -2121,11 +1852,6 @@ async def report_outcome(
     Requires memory.learning_enabled=true (opt-in); otherwise returns a
     disabled payload without recording anything.
     """
-    from cli_agent_orchestrator.services.outcome_service import (
-        LearningDisabledError,
-        OutcomeService,
-    )
-
     try:
         terminal_context = _get_terminal_context_from_env()
         if not terminal_context:
@@ -2133,20 +1859,25 @@ async def report_outcome(
                 "success": False,
                 "error": "Could not resolve terminal context (CAO_TERMINAL_ID unset or unknown)",
             }
-        service = OutcomeService()
-        outcome = service.record_outcome(
-            session_name=terminal_context["session_name"],
-            task_label=task_label,
-            success=success,
-            workflow_name=workflow_name,
-            agent_profile=agent_profile or terminal_context.get("agent_profile"),
-            source_terminal_id=terminal_context["terminal_id"],
-            score=score,
-            friction_notes=friction_notes,
+        payload = mcp_utils.post_body_json(
+            "/outcomes",
+            {
+                "session_name": terminal_context["session_name"],
+                "task_label": task_label,
+                "success": success,
+                "workflow_name": workflow_name,
+                "agent_profile": agent_profile or terminal_context.get("agent_profile"),
+                "source_terminal_id": terminal_context["terminal_id"],
+                "score": score,
+                "friction_notes": friction_notes,
+            },
+            timeout=_mcp_timeout(),
         )
-        return {"success": True, "outcome_id": outcome["id"]}
-    except LearningDisabledError as e:
-        return {"success": False, "disabled": True, "error": str(e)}
+        # Only the id: the route returns the whole record, and echoing it would
+        # newly surface friction_notes back to the agent that wrote them.
+        return {"success": True, "outcome_id": payload["outcome"]["id"]}
+    except requests.RequestException as e:
+        return _outcome_tool_error(e, "Failed to record outcome")
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -2173,17 +1904,7 @@ async def list_outcomes(
     Requires memory.learning_enabled=true; returns an empty list with a
     disabled marker otherwise.
     """
-    from cli_agent_orchestrator.services.outcome_service import OutcomeService
-    from cli_agent_orchestrator.services.settings_service import is_learning_enabled
-
     try:
-        if not is_learning_enabled():
-            return {
-                "success": False,
-                "disabled": True,
-                "error": LEARNING_DISABLED_MESSAGE,
-                "outcomes": [],
-            }
         if session_name is None:
             # Fail closed: without an explicit session filter the caller's
             # own session is REQUIRED. Proceeding with None would run an
@@ -2201,13 +1922,20 @@ async def list_outcomes(
                     ),
                     "outcomes": [],
                 }
-        outcomes = OutcomeService().list_outcomes(
+        payload = mcp_utils.get_json(
+            "/outcomes",
             session_name=session_name,
             agent_profile=agent_profile,
             workflow_name=workflow_name,
-            limit=limit,
+            # Clamped, not passed through: OutcomeService clamps silently, so
+            # limit=500 works today, while the route's Query(le=200) would 422 it.
+            limit=min(max(1, int(limit)), 200),
+            timeout=_mcp_timeout(),
         )
+        outcomes = payload["outcomes"]
         return {"success": True, "outcomes": outcomes, "count": len(outcomes)}
+    except requests.RequestException as e:
+        return _outcome_tool_error(e, "Failed to list outcomes", extra={"outcomes": []})
     except Exception as e:
         return {"success": False, "error": str(e), "outcomes": []}
 
@@ -2331,14 +2059,18 @@ async def store_lesson(
 
 @mcp.tool()
 async def workflow_return(
-    output: Dict[str, Any] = Field(description="The structured JSON output for this workflow step"),
-    output_schema: Optional[Dict[str, Any]] = Field(
-        default=None,
-        description=(
-            "Optional JSON-Schema (Draft 2020-12) to validate the output against. "
-            "Pass the step's declared output_schema so the seam can validate it."
+    output: Annotated[
+        Dict[str, Any], Field(description="The structured JSON output for this workflow step")
+    ],
+    output_schema: Annotated[
+        Optional[Dict[str, Any]],
+        Field(
+            description=(
+                "Optional JSON-Schema (Draft 2020-12) to validate the output against. "
+                "Pass the step's declared output_schema so the seam can validate it."
+            )
         ),
-    ),
+    ] = None,
 ) -> Dict[str, Any]:
     """Return a structured output for the current workflow step (issue #312, N4).
 
@@ -2393,18 +2125,23 @@ async def workflow_return(
 
 @mcp.tool()
 async def workflow_run(
-    name_or_path: str = Field(description="Workflow name (indexed) or path to a spec YAML file"),
-    inputs: Optional[Dict[str, Any]] = Field(
-        default=None, description="Run inputs, validated against the spec's declared inputs"
-    ),
-    run_id: Optional[str] = Field(
-        default=None,
-        description=(
-            "Optional explicit run id (matches WORKFLOW_NAME_RE); the server mints "
-            "one if omitted. Validation and the uniqueness/admission gate are "
-            "server-side — a collision surfaces as the ok=False error envelope."
+    name_or_path: Annotated[
+        str, Field(description="Workflow name (indexed) or path to a spec YAML file")
+    ],
+    inputs: Annotated[
+        Optional[Dict[str, Any]],
+        Field(description="Run inputs, validated against the spec's declared inputs"),
+    ] = None,
+    run_id: Annotated[
+        Optional[str],
+        Field(
+            description=(
+                "Optional explicit run id (matches WORKFLOW_NAME_RE); the server mints "
+                "one if omitted. Validation and the uniqueness/admission gate are "
+                "server-side — a collision surfaces as the ok=False error envelope."
+            )
         ),
-    ),
+    ] = None,
 ) -> Dict[str, Any]:
     """Run a workflow to completion and return the aggregated result (issue #312, N5).
 
@@ -2464,20 +2201,22 @@ async def workflow_run(
 
 @mcp.tool()
 async def workflow_resume(
-    run_id: str = Field(description="The run id to resume (a crashed/failed prior run)"),
-    decisions: Optional[Dict[str, str]] = Field(
-        default=None,
-        description=(
-            "Optional per-step recovery decisions for a halted script run: "
-            "{step_id: 'rerun'|'skip'}. 'rerun' authorises re-executing the step; "
-            "'skip' authorises using its stored result. Applied before the script is "
-            "spawned; an unknown step id or value applies nothing at all. Each "
-            "decision authorises exactly ONE attempt: if that attempt crashes before "
-            "it settles, the next resume asks again rather than re-executing on old "
-            "consent, so a decision is never standing authorisation for a later "
-            "resume and must not be presented to a user as one."
+    run_id: Annotated[str, Field(description="The run id to resume (a crashed/failed prior run)")],
+    decisions: Annotated[
+        Optional[Dict[str, str]],
+        Field(
+            description=(
+                "Optional per-step recovery decisions for a halted script run: "
+                "{step_id: 'rerun'|'skip'}. 'rerun' authorises re-executing the step; "
+                "'skip' authorises using its stored result. Applied before the script is "
+                "spawned; an unknown step id or value applies nothing at all. Each "
+                "decision authorises exactly ONE attempt: if that attempt crashes before "
+                "it settles, the next resume asks again rather than re-executing on old "
+                "consent, so a decision is never standing authorisation for a later "
+                "resume and must not be presented to a user as one."
+            )
         ),
-    ),
+    ] = None,
 ) -> Dict[str, Any]:
     """Resume a crashed or failed workflow run from its durable journal (issue #312, N6).
 
@@ -2549,7 +2288,7 @@ async def workflow_resume(
 
 @mcp.tool()
 async def workflow_cancel(
-    run_id: str = Field(description="The run id to cancel (from a prior workflow_run)"),
+    run_id: Annotated[str, Field(description="The run id to cancel (from a prior workflow_run)")],
 ) -> Dict[str, Any]:
     """Cooperatively cancel a running workflow (issue #312, N5).
 
@@ -2584,17 +2323,22 @@ async def workflow_cancel(
 # ---------------------------------------------------------------------------
 @mcp.tool()
 async def workflow_start(
-    name_or_path: str = Field(description="Workflow name (indexed) or path to a spec YAML file"),
-    inputs: Optional[Dict[str, Any]] = Field(
-        default=None, description="Run inputs, validated against the spec's declared inputs"
-    ),
-    run_id: Optional[str] = Field(
-        default=None,
-        description=(
-            "Optional explicit run id (matches WORKFLOW_NAME_RE); the server mints "
-            "one if omitted. A collision surfaces as the ok=False error envelope."
+    name_or_path: Annotated[
+        str, Field(description="Workflow name (indexed) or path to a spec YAML file")
+    ],
+    inputs: Annotated[
+        Optional[Dict[str, Any]],
+        Field(description="Run inputs, validated against the spec's declared inputs"),
+    ] = None,
+    run_id: Annotated[
+        Optional[str],
+        Field(
+            description=(
+                "Optional explicit run id (matches WORKFLOW_NAME_RE); the server mints "
+                "one if omitted. A collision surfaces as the ok=False error envelope."
+            )
         ),
-    ),
+    ] = None,
 ) -> Dict[str, Any]:
     """Submit a workflow run ASYNCHRONOUSLY and return its handle immediately (issue #505, U6).
 
@@ -2641,8 +2385,65 @@ async def workflow_start(
 
 
 @mcp.tool()
+async def workflow_plan_approval(
+    run_id: Annotated[
+        str, Field(description="The run id to report on (from workflow_start / workflow_run)")
+    ],
+) -> Dict[str, Any]:
+    """Report a run's plan identifier and whether that plan is approved (issue #583 FR-8).
+
+    READ-ONLY. THERE IS DELIBERATELY NO TOOL THAT GRANTS AN APPROVAL, and that absence is the
+    control: an approval is a human decision about a plan, and a tool that let you approve the plan
+    you just wrote would make the approval gate decorative in exactly the case it was designed for.
+    Approving is ``cao workflow approve <plan_id>`` at a human's terminal, behind the ``cao:admin``
+    scope. Use this tool to tell the operator which ``plan_id`` to approve.
+
+    WHAT IS NOT IMPLEMENTED, stated because you may otherwise assume it: a plan identifier covers the
+    workflow's execution-affecting fields, so changing any of them yields a different ``plan_id`` that
+    needs its own approval. But **rejection of an update presenting a stale source hash is NOT yet
+    implemented** — do not rely on a stale-hash check having run. Six manifest fields (provider,
+    model, profile, permissions, limits, retry policy) are also **omitted rather than recorded**,
+    because script-tier steps are discovered by executing the Python and so have no run-level value at
+    freeze time; they are covered transitively by the source hash.
+
+    Approval enforcement is **off by default**. When it is off, an unapproved plan still runs, and
+    ``approved: false`` here is informational rather than a prediction that the run will be refused.
+
+    ``plan_id`` is ``null`` for a YAML run (which never freezes a manifest) and for a script run whose
+    freeze failed. That is reported distinctly from "not approved", because the two call for entirely
+    different actions.
+
+    Returns a structured envelope on EVERY path — never raises into the agent loop (EV-1).
+    """
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}/workflows/runs/{run_id}/plan",
+            timeout=_mcp_timeout(),
+        )
+    except requests.RequestException as e:
+        return {"ok": False, "error": f"could not reach cao-server: {e}"}
+
+    if response.status_code != 200:
+        detail = _extract_error_detail(response, f"status {response.status_code}")
+        return {"ok": False, "error": detail}
+
+    data = response.json()
+    return {
+        "ok": True,
+        "run_id": data.get("run_id"),
+        "tier": data.get("tier"),
+        "plan_id": data.get("plan_id"),
+        "approved": data.get("approved"),
+        "approved_at": data.get("approved_at"),
+        "approved_by": data.get("approved_by"),
+    }
+
+
+@mcp.tool()
 async def workflow_status(
-    run_id: str = Field(description="The run id to snapshot (from workflow_start / workflow_run)"),
+    run_id: Annotated[
+        str, Field(description="The run id to snapshot (from workflow_start / workflow_run)")
+    ],
 ) -> Dict[str, Any]:
     """Return a point-in-time status snapshot for a run (issue #505, U6).
 
@@ -2674,7 +2475,7 @@ async def workflow_status(
 
 @mcp.tool()
 async def workflow_result(
-    run_id: str = Field(description="The run id whose retained result to fetch"),
+    run_id: Annotated[str, Field(description="The run id whose retained result to fetch")],
 ) -> Dict[str, Any]:
     """Return the complete retained result for a run (issue #505, U6; FR-7.2).
 
@@ -2707,10 +2508,11 @@ async def workflow_result(
 
 @mcp.tool()
 async def workflow_list(
-    state: Optional[str] = Field(
-        default=None, description="Filter by run state (e.g. running, completed, failed, cancelled)"
-    ),
-    limit: int = Field(default=50, description="Max rows to return (server clamps to [1, 500])"),
+    state: Annotated[
+        Optional[str],
+        Field(description="Filter by run state (e.g. running, completed, failed, cancelled)"),
+    ] = None,
+    limit: Annotated[int, Field(description="Max rows to return (server clamps to [1, 500])")] = 50,
 ) -> Dict[str, Any]:
     """List journaled workflow runs newest-first (issue #505, U6; FR-3.5).
 
@@ -2739,7 +2541,9 @@ async def workflow_list(
 
 @mcp.tool()
 async def workflow_wait(
-    run_id: str = Field(description="The run id to follow until it reaches a terminal state"),
+    run_id: Annotated[
+        str, Field(description="The run id to follow until it reaches a terminal state")
+    ],
 ) -> Dict[str, Any]:
     """Follow a submitted run to a terminal state, then return its result (issue #505, U6).
 
@@ -2843,22 +2647,26 @@ def _classify_events_404(run_id: str, detail: str) -> tuple:
 
 @mcp.tool()
 async def workflow_events(
-    run_id: str = Field(description="The run id whose live event stream to follow"),
-    after_seq: Optional[int] = Field(
-        default=None,
-        description=(
-            "Resume strictly after this per-run seq (exact, dedupe-free). Omit to "
-            "read from the start of the run's event stream."
+    run_id: Annotated[str, Field(description="The run id whose live event stream to follow")],
+    after_seq: Annotated[
+        Optional[int],
+        Field(
+            description=(
+                "Resume strictly after this per-run seq (exact, dedupe-free). Omit to "
+                "read from the start of the run's event stream."
+            )
         ),
-    ),
-    max_events: Optional[int] = Field(
-        default=None,
-        description=(
-            "Stop after draining this many events (an MCP call cannot stream "
-            "indefinitely). Defaults to a bounded ceiling; the follower also stops "
-            "at a terminal state, whichever comes first."
+    ] = None,
+    max_events: Annotated[
+        Optional[int],
+        Field(
+            description=(
+                "Stop after draining this many events (an MCP call cannot stream "
+                "indefinitely). Defaults to a bounded ceiling; the follower also stops "
+                "at a terminal state, whichever comes first."
+            )
         ),
-    ),
+    ] = None,
 ) -> Dict[str, Any]:
     """Follow a run's live event stream, BOUNDED, and return a dict envelope (issue #505, U10).
 
@@ -3036,7 +2844,9 @@ register_mcp_server_surfaces(mcp)
 
 def main():
     """Main entry point for the MCP server."""
-    mcp.run()
+    # Pinned: FASTMCP_TRANSPORT in the pane environment must not turn the
+    # per-terminal stdio server into a network listener.
+    mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":

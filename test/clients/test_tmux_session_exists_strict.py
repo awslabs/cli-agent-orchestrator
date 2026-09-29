@@ -259,11 +259,18 @@ class TestConfirmedAnswers:
         """
         _start_session(tmux_socket, "cao-alive")
         client = _client_on(tmux_socket)
+        server_pid = _server_pid(tmux_socket)
         assert client.session_exists_strict("cao-alive") is True
 
         subprocess.run(
             ["tmux", "-S", str(tmux_socket), "kill-server"], capture_output=True, check=True
         )
+        # kill-server returns once the kill is delivered, not once the server is
+        # gone. A list-sessions that connects while it is still tearing down is
+        # answered "server exited unexpectedly", which is neither of the markers
+        # this vector is meant to exercise, so the lookup fails closed and the
+        # test flakes. Wait for the process the way every other kill here does.
+        assert _wait_until(lambda: not _process_is_alive(server_pid))
 
         assert client.session_exists_strict("cao-alive") is False
 
@@ -465,11 +472,21 @@ class TestPortableServerDetection:
             assert ladder == (tmux_module._bound_unix_socket_paths_via_lsof,)
 
     @requires_lsof
-    def test_lsof_reports_the_bound_path_even_after_it_is_unlinked(self, tmux_socket):
+    def test_lsof_reports_the_bound_path_even_after_it_is_unlinked(
+        self, tmux_socket, unrelated_tmux_server
+    ):
         """The mechanism the mac path rests on, measured against real tmux.
 
         Same property ``/proc/net/unix`` has: bound while alive, STILL bound once
         the path is unlinked, gone once the server dies.
+
+        Takes ``unrelated_tmux_server`` so some OTHER named socket is bound for
+        the whole test. ``_bound_unix_socket_paths_via_lsof`` reports an empty
+        parse as ``None`` ("cannot tell"), deliberately, so that a host with
+        nothing bound cannot read as a confirmed absence. Where the socket under
+        test is the only named unix socket present, which is the ordinary case in
+        a container, the post-kill listing is empty and the detector answers
+        ``None``, so the final ``not in`` below raises instead of evaluating.
         """
         _start_session(tmux_socket, "cao-lsof")
         server_pid = _server_pid(tmux_socket)

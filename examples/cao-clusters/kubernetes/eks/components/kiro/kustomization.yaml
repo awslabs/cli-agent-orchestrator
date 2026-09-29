@@ -1,0 +1,21 @@
+# Optional API-key mode using an image built with kiro-cli instead of Claude
+# Code. deploy.sh adds this component to the rendered root in `kiro` mode.
+#
+# This changes the provider as one unit: supervisor profile, worker default,
+# forwarded environment, and External Secrets projection. The Docker build's
+# CAO_PROFILE_PROVIDER handles the corresponding image seed.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+resources:
+  - external-secret.yaml
+patches:
+  - path: supervisor-provider.yaml
+  - path: broker-provider.yaml
+  - path: remove-pod-identity-egress.yaml
+    target:
+      kind: NetworkPolicy
+      name: cao-worker-egress
+  - path: remove-pod-identity-egress.yaml
+    target:
+      kind: NetworkPolicy
+      name: cao-supervisor-egress

@@ -206,19 +206,25 @@ async def test_idle_timeout_prompt_handler(mock_backend, mock_time, mock_sleep):
         0.0,  # last_prompt_time = 0
         18.0,  # iter1: gap 18<20 and 18<180 -> bypass handled, timer reset
         18.0,  # last_prompt_time reset to 18
-        35.0,  # iter2: gap 35-18=17<20 and 35<180 -> trust handled -> return
+        35.0,  # iter2: gap 35-18=17<20 and 35<180 -> trust handled
+        35.0,  # last_prompt_time reset to 35 — trust no longer ends the loop
+        36.0,  # iter3: gap 1<20 -> version banner -> return
     ]
+    # Third frame: accepting trust no longer returns, because the Bedrock
+    # model-upgrade nudge renders AFTER the trust dialog and would otherwise sit
+    # unanswered until init timed out. The banner is what ends the loop.
     mock_backend.get_history.side_effect = [
         "WARNING: Bypass Permissions\n1. No\n2. Yes, I accept\n",
         "Yes, I trust this folder",
+        "Welcome to Claude Code v2.1.235",
     ]
 
     provider = ClaudeCodeProvider("t1", "sess", "win")
     await provider._handle_startup_prompts(idle_gap=20.0, outer_timeout=180.0)
 
-    # Bypass: Down arrow (send_keys) + Enter (send_special_key). Trust: Enter.
-    assert mock_backend.send_keys.call_count == 1
-    assert mock_backend.send_special_key.call_count == 2
+    # Bypass: special-key Down + Enter. Trust: special-key Enter.
+    assert mock_backend.send_keys.call_count == 0
+    assert mock_backend.send_special_key.call_count == 3
 
 
 @pytest.mark.asyncio

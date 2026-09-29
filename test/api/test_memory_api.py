@@ -5,18 +5,45 @@ Endpoint logic is isolated by patching the _get_memory_service factory
 gate at the seam the endpoints read.
 """
 
+import asyncio
+import json
 from datetime import datetime, timezone
 from pathlib import Path
+from test.fixtures.vault_factory import build_vault_fixture
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
+from cli_agent_orchestrator.clients.database import Base
 from cli_agent_orchestrator.models.memory import Memory
+from cli_agent_orchestrator.services import memory_service, settings_service
+from cli_agent_orchestrator.services.memory_service import (
+    ForgetResult,
+    MemoryPartialWriteError,
+    MemoryService,
+)
+from cli_agent_orchestrator.services.vault import reader
+from cli_agent_orchestrator.services.vault import reconcile as reconcile_module
+from cli_agent_orchestrator.services.vault.config import VaultConfig
+from cli_agent_orchestrator.services.vault.status import VaultStatus
 
 MEMORY_BASE = Path("/home/user/.aws/cli-agent-orchestrator/memory")
 
 FACTORY_TARGET = "cli_agent_orchestrator.api.main._get_memory_service"
 ENABLED_TARGET = "cli_agent_orchestrator.services.settings_service.is_memory_enabled"
+
+
+def _walk_values(value):
+    if isinstance(value, dict):
+        for child in value.values():
+            yield from _walk_values(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _walk_values(child)
+    else:
+        yield value
 
 
 def _make_memory(
@@ -51,6 +78,38 @@ def _make_memory(
     )
 
 
+def _real_vault_service(tmp_path: Path, monkeypatch, keys: tuple[str, ...]):
+    """Index real vault notes and return their service and immutable byte snapshots."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'state.db'}")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine)
+    monkeypatch.setattr(reconcile_module, "SessionLocal", session_factory)
+    monkeypatch.setattr(reader, "SessionLocal", session_factory)
+    monkeypatch.setattr(reconcile_module, "_replace_vault_edges", lambda _notes, **_kwargs: None)
+    monkeypatch.setattr(reconcile_module, "_clear_stale_vault_edges", lambda *_args: None)
+    monkeypatch.setattr(reconcile_module, "_emit_audit_events", lambda *_args: None)
+    monkeypatch.setattr(memory_service, "_is_memory_enabled", lambda: True)
+
+    fixture = build_vault_fixture(tmp_path)
+    config = VaultConfig(enabled=True, vaults=[fixture.vault])
+    monkeypatch.setattr(settings_service, "get_vault_config", lambda: config)
+    service = MemoryService(base_dir=tmp_path / "native", db_engine=engine)
+    for key in keys:
+        stored = asyncio.run(
+            service.store(
+                content=f"body for {key}",
+                scope="global",
+                memory_type="reference",
+                key=key,
+            )
+        )
+        assert stored.source_kind == "vault"
+
+    reconcile_module.reconcile(fixture.vault, apply=True, run_id="api-clear-index")
+    note_paths = tuple(fixture.root / "CAO" / f"{key}.md" for key in keys)
+    return service, {path: path.read_bytes() for path in note_paths}
+
+
 @pytest.fixture
 def mock_service():
     """Patch the module-level factory with a service mock (async recall/forget)."""
@@ -81,6 +140,96 @@ class TestMemorySettingsEndpoint:
         assert body["enabled"] is False
         # learning is a child of memory: disabled memory forces it off
         assert body["learning_enabled"] is False
+
+
+class TestVaultStatusEndpoint:
+    def test_returns_content_free_counters_and_honors_vault_filter(self, client):
+        statuses = (
+            VaultStatus(
+                "alpha",
+                (("indexed", 2),),
+                (("secret_detected", 1),),
+                ("agent-scoped mapping is recall-only",),
+                3,
+                2,
+                1,
+                4,
+                (("vault_recall", 5),),
+            ),
+            VaultStatus("beta", (), (), (), 0, 0, 0, 0),
+        )
+        config = MagicMock(enabled=True)
+        with (
+            patch(
+                "cli_agent_orchestrator.services.settings_service.get_vault_config",
+                return_value=config,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.vault.status.get_vault_status",
+                return_value=(statuses[0],),
+            ) as get_status,
+        ):
+            response = client.get("/memory/vault/status?vault_id=alpha")
+
+        assert response.status_code == 200
+        assert response.json()["vaults"][0]["process_local_secret_gate_write_refusals"] == 4
+        assert response.json()["vaults"][0]["finding_counts"] == {"secret_detected": 1}
+        get_status.assert_called_once_with(config, vault_id="alpha")
+        assert [item["vault_id"] for item in response.json()["vaults"]] == ["alpha"]
+        assert not any(
+            "/" in str(value) or str(value).endswith(".md")
+            for value in _walk_values(response.json())
+        )
+
+    def test_unavailable_config_degrades_to_not_configured(self, client):
+        with patch(
+            "cli_agent_orchestrator.services.settings_service.get_vault_config",
+            side_effect=ValueError("unavailable"),
+        ):
+            response = client.get("/memory/vault/status")
+
+        assert response.status_code == 200
+        assert response.json() == {"configured": False, "vaults": []}
+
+
+class TestInternalMemoryStore:
+    def test_partial_write_returns_typed_recovery_envelope(self, mock_service):
+        from cli_agent_orchestrator.api import main
+
+        error = MemoryPartialWriteError(
+            key="partial-topic",
+            scope="global",
+            scope_id=None,
+            file_path="/safe/memory/global/wiki/global/partial-topic.md",
+        )
+        mock_service.store = AsyncMock(side_effect=error)
+
+        response = asyncio.run(
+            main.internal_memory_store(
+                main.InternalMemoryStoreRequest(
+                    **{
+                        "content": "already durable",
+                        "scope": "global",
+                        "memory_type": "reference",
+                        "key": "partial-topic",
+                    }
+                ),
+                [],
+            )
+        )
+
+        assert response.status_code == 500
+        assert json.loads(response.body) == {
+            "error_kind": "memory_metadata_partial_write",
+            "partial_write": {
+                "key": "partial-topic",
+                "scope": "global",
+                "scope_id": None,
+                "file_path": "/safe/memory/global/wiki/global/partial-topic.md",
+                "completed_phases": ["wiki", "index"],
+                "repair_command": "cao memory repair --apply",
+            },
+        }
 
 
 class TestListMemories:
@@ -265,13 +414,15 @@ class TestDeleteMemory:
     """Tests for DELETE /memory/{key}."""
 
     def test_delete_global_success(self, client, mock_service):
+        mock_service.forget.return_value = ForgetResult("deleted", "native", "topic.md")
         response = client.delete("/memory/my-key?scope=global")
 
         assert response.status_code == 200
-        assert response.json() == {"success": True}
+        assert response.json()["action"] == "deleted"
         mock_service.forget.assert_awaited_once_with(key="my-key", scope="global", scope_id=None)
 
     def test_delete_project_with_scope_id(self, client, mock_service):
+        mock_service.forget.return_value = ForgetResult("deleted", "native", "topic.md")
         response = client.delete("/memory/my-key?scope=project&scope_id=proj-abc")
 
         assert response.status_code == 200
@@ -287,10 +438,25 @@ class TestDeleteMemory:
         mock_service.forget.assert_not_awaited()
 
     def test_delete_not_found(self, client, mock_service):
-        mock_service.forget.return_value = False
+        mock_service.forget.return_value = ForgetResult("absent", "native", None)
         response = client.delete("/memory/my-key?scope=global")
         assert response.status_code == 404
         assert "not found in scope 'global'" in response.json()["detail"]
+
+    def test_delete_vault_deindex_returns_retained_file_action(self, client, mock_service):
+        mock_service.forget.return_value = ForgetResult(
+            "deindexed", "vault", "CAO/managed-topic.md"
+        )
+
+        response = client.delete("/memory/managed-topic?scope=global")
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "success": True,
+            "action": "deindexed",
+            "path": "CAO/managed-topic.md",
+            "source_kind": "vault",
+        }
 
     def test_delete_invalid_key_returns_422(self, client, mock_service):
         assert client.delete("/memory/Bad_Key?scope=global").status_code == 422
@@ -323,11 +489,43 @@ class TestClearMemories:
             _make_memory(key="one"),
             _make_memory(key="two"),
         ]
+        mock_service.forget.return_value = ForgetResult("deleted", "native", "topic.md")
         response = client.delete("/memory?scope=global")
 
         assert response.status_code == 200
         assert response.json() == {"success": True, "deleted_count": 2}
         assert mock_service.forget.await_count == 2
+
+    def test_clear_counts_vault_deindexed_results(self, client, tmp_path, monkeypatch):
+        keys = ("api-alpha", "api-beta")
+        service, note_bytes = _real_vault_service(tmp_path, monkeypatch, keys)
+        before = asyncio.run(service.recall(scope="global", limit=1000))
+
+        with patch(FACTORY_TARGET, return_value=service):
+            response = client.delete("/memory?scope=global")
+
+        after = asyncio.run(service.recall(scope="global", limit=1000))
+        assert response.status_code == 200
+        assert {memory.key for memory in before} == set(keys)
+        assert response.json() == {"success": True, "deleted_count": 2}
+        assert after == []
+        assert all(path.read_bytes() == content for path, content in note_bytes.items())
+
+    def test_clear_counts_each_success_action_once(self, client, mock_service):
+        mock_service.recall.return_value = [_make_memory(key=f"m{index}") for index in range(5)]
+        mock_service.forget.side_effect = [
+            ForgetResult("deleted", "native", "global/m0.md"),
+            ForgetResult("deindexed", "vault", "CAO/m1.md"),
+            ForgetResult("deleted_and_deindexed", "both", "CAO/m2.md"),
+            ForgetResult("absent", "native", None),
+            RuntimeError("induced failure"),
+        ]
+
+        response = client.delete("/memory?scope=global")
+
+        assert response.status_code == 200
+        assert response.json() == {"success": True, "deleted_count": 3}
+        assert mock_service.forget.await_count == 5
 
     def test_clear_requires_scope(self, client, mock_service):
         assert client.delete("/memory").status_code == 422
@@ -342,6 +540,7 @@ class TestClearMemories:
             _make_memory(key="mine", scope="project", project_dir="proj-mine"),
             _make_memory(key="other", scope="project", project_dir="proj-other"),
         ]
+        mock_service.forget.return_value = ForgetResult("deleted", "native", "topic.md")
         response = client.delete("/memory?scope=project&scope_id=proj-mine")
 
         assert response.status_code == 200
@@ -354,6 +553,7 @@ class TestClearMemories:
         mock_service.recall.return_value = [
             _make_memory(key="s-one", scope="session", scope_id="sess-1"),
         ]
+        mock_service.forget.return_value = ForgetResult("deleted", "native", "topic.md")
         response = client.delete("/memory?scope=session&scope_id=sess-1")
 
         assert response.status_code == 200
@@ -366,7 +566,10 @@ class TestClearMemories:
             _make_memory(key="one"),
             _make_memory(key="two"),
         ]
-        mock_service.forget.side_effect = [Exception("boom"), True]
+        mock_service.forget.side_effect = [
+            Exception("boom"),
+            ForgetResult("deleted", "native", "topic.md"),
+        ]
         response = client.delete("/memory?scope=global")
 
         assert response.status_code == 200

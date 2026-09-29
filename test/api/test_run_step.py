@@ -4,15 +4,17 @@ Asserts the handler delegates to run_agent_step and maps domain failures to
 HTTPException at the API boundary (SD-2.2 / project boundary-map rule).
 """
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
+from fastapi import BackgroundTasks
 
 from cli_agent_orchestrator.constants import TERMINALS_RUN_STEP_ROUTE
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
 from cli_agent_orchestrator.services.agent_step import StepExecutionError
 
 _RUN_STEP = "cli_agent_orchestrator.api.main.run_agent_step"
+_NOTIFY_TERMINAL_ENDED = "cli_agent_orchestrator.api.main._notify_elastic_terminal_ended"
 
 
 @pytest.fixture
@@ -75,6 +77,65 @@ class TestRunStepEndpoint:
 
         assert resp.status_code == 200
         assert m_run.await_args.kwargs["model"] == "fable-5"
+
+    def test_successful_one_shot_schedules_elastic_terminal_ended_signal(self):
+        from cli_agent_orchestrator.api import main
+
+        background_tasks = BackgroundTasks()
+        with patch(_NOTIFY_TERMINAL_ENDED) as notify:
+            main._schedule_elastic_terminal_ended(
+                background_tasks,
+                "abc12345",
+                teardown=True,
+                reuse_terminal_id=None,
+            )
+
+        assert len(background_tasks.tasks) == 1
+        task = background_tasks.tasks[0]
+        assert task.func is notify
+        assert task.args == ("abc12345",)
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"teardown": False},
+            {"reuse_terminal_id": "abc12345"},
+        ],
+    )
+    def test_live_or_reused_terminal_does_not_signal_terminal_ended(self, overrides):
+        from cli_agent_orchestrator.api import main
+
+        background_tasks = BackgroundTasks()
+        with patch(_NOTIFY_TERMINAL_ENDED) as notify:
+            main._schedule_elastic_terminal_ended(
+                background_tasks,
+                "abc12345",
+                teardown=overrides.get("teardown", True),
+                reuse_terminal_id=overrides.get("reuse_terminal_id"),
+            )
+
+        assert background_tasks.tasks == []
+        notify.assert_not_called()
+
+    def test_elastic_terminal_ended_signal_uses_release_token(self, monkeypatch):
+        from cli_agent_orchestrator.api import main
+        from cli_agent_orchestrator.services import terminal_service
+
+        monkeypatch.setenv("CAO_ELASTIC_WORKER_ID", "deadbeef")
+        monkeypatch.setenv("CAO_ELASTIC_BROKER_URL", "http://broker:9890/")
+        monkeypatch.setenv("CAO_ELASTIC_RELEASE_TOKEN", "release-token")
+        response = Mock(status_code=200)
+
+        with patch.object(terminal_service.requests, "post", return_value=response) as post:
+            main._notify_elastic_terminal_ended("abc12345")
+
+        post.assert_called_once_with(
+            "http://broker:9890/workers/deadbeef/terminal-ended",
+            json={"terminal_id": "abc12345"},
+            headers={"X-CAO-Release-Token": "release-token"},
+            timeout=5.0,
+        )
+        response.raise_for_status.assert_called_once_with()
 
     @pytest.mark.parametrize(
         "bad_model",

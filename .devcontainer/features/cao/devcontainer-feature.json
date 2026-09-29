@@ -1,6 +1,6 @@
 {
     "id": "cao",
-    "version": "2.4.1",
+    "version": "2.5.0",
     "name": "CLI Agent Orchestrator",
     "description": "Multi-agent orchestration framework for CLI-based AI coding agents",
     "options": {

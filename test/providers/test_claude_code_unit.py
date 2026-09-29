@@ -1416,6 +1416,26 @@ class TestClaudeCodeProviderMisc:
         assert "claude --dangerously-skip-permissions" in command
         assert "--permission-mode" not in command
 
+    def test_build_claude_command_with_resume_session_id(self):
+        """resume_session_id maps to `claude --resume <sid>` (durable-orchestra
+        recovery: re-open a prior supervisor conversation in a new CAO session)."""
+        provider = ClaudeCodeProvider(
+            "test123",
+            "test-session",
+            "window-0",
+            resume_session_id="11d55034-bb41-46ca-8686-59a9dbff16b5",
+        )
+        command = provider._build_claude_command()
+
+        assert "--resume 11d55034-bb41-46ca-8686-59a9dbff16b5" in command
+
+    def test_build_claude_command_no_resume_by_default(self):
+        """Without resume_session_id the command must not carry --resume."""
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        command = provider._build_claude_command()
+
+        assert "--resume" not in command
+
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     def test_build_claude_command_with_system_prompt(self, mock_load):
         """Test building Claude command with system prompt."""
@@ -1785,6 +1805,22 @@ class TestClaudeCodeProviderPermissionMode:
         assert "--dangerously-skip-permissions" in command
         assert "--permission-mode" not in command
 
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_empty_allowlist_emits_disallowed_tools(self, mock_load):
+        """allowed_tools=[] must deny natives, not skip --disallowedTools."""
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.permissionMode = None
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent", allowed_tools=[])
+        command = provider._build_claude_command()
+
+        assert "--disallowedTools" in command
+        assert "Bash" in command
+
 
 class TestClaudeCodeProviderYoloRootRegression:
     """Regression tests for yolo + root/non-root --dangerously-skip-permissions logic.
@@ -1848,13 +1884,28 @@ class TestClaudeCodeProviderYoloRootRegression:
         assert "--dangerously-skip-permissions" not in command
 
 
+# Live capture from a pod running claude 2.1.235 on Bedrock with every
+# ANTHROPIC_*_MODEL pinned to Opus 4.6, in an account entitled to Opus 5.
+# Reproduced verbatim (including the pre-selected "❯ 1. Yes") because the
+# handler's whole reason for sending Esc rather than Enter is that ordering.
+_UPGRADE_NUDGE_FRAME = (
+    "Newer Opus model available\n"
+    "Currently pinned: Opus 4.6\n"
+    "Latest available: Opus 5 (au.anthropic.claude-opus-5)\n"
+    "Update settings to use Opus 5? Claude Code will restart to apply.\n"
+    "❯ 1. Yes\n"
+    "  2. No\n"
+    "Enter to confirm · Esc to cancel\n"
+)
+
+
 class TestClaudeCodeProviderStartupPrompts:
-    """Tests for Claude Code startup prompt handling (trust + bypass)."""
+    """Tests for Claude Code startup prompt handling (trust + bypass + upgrade nudge)."""
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.backends.registry._backend")
     async def test_handle_startup_prompts_detected_and_accepted(self, mock_tmux):
-        """Test that trust prompt is detected and auto-accepted."""
+        """An older trust prompt with Yes preselected needs only Enter."""
         mock_tmux.get_history.return_value = (
             "\x1b[1m❯\x1b[0m 1. Yes, I trust this folder\n  2. No, don't trust\n"
         )
@@ -1862,7 +1913,28 @@ class TestClaudeCodeProviderStartupPrompts:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         await provider._handle_startup_prompts(idle_gap=2.0)
 
+        mock_tmux.send_keys.assert_not_called()
         mock_tmux.send_special_key.assert_called_once_with("test-session", "window-0", "Enter")
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_handle_startup_prompts_moves_from_no_to_trust(self, mock_tmux):
+        """Claude Code 2.1.250 preselects No, so CAO must move to Yes."""
+        mock_tmux.get_history.side_effect = [
+            "Accessing workspace: /home/cao/workspace\n"
+            "❯ No, exit\n"
+            "  Yes, I trust this folder\n"
+            "Enter to confirm · Esc to cancel\n",
+            "Welcome to Claude Code v2.1.250",
+        ]
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        await provider._handle_startup_prompts(idle_gap=5.0)
+
+        assert [call.args[2] for call in mock_tmux.send_special_key.call_args_list] == [
+            "Down",
+            "Enter",
+        ]
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.backends.registry._backend")
@@ -1914,9 +1986,12 @@ class TestClaudeCodeProviderStartupPrompts:
     @patch("cli_agent_orchestrator.backends.registry._backend")
     async def test_handle_startup_prompts_empty_output_then_detected(self, mock_tmux):
         """Test trust prompt detection after initially empty output."""
+        # Banner frame last: accepting trust keeps the loop polling (the
+        # model-upgrade nudge can follow it), so the banner is what ends it.
         mock_tmux.get_history.side_effect = [
             "",
             "❯ 1. Yes, I trust this folder\n  2. No",
+            "Welcome to Claude Code v2.1.235",
         ]
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
@@ -1938,27 +2013,96 @@ class TestClaudeCodeProviderStartupPrompts:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         await provider._handle_startup_prompts(idle_gap=5.0)
 
-        # Verify Down arrow sent via send_keys and Enter via send_special_key
-        mock_tmux.send_keys.assert_called_once()
-        mock_tmux.send_special_key.assert_called_once_with("test-session", "window-0", "Enter")
+        # Verify the menu receives real tmux key names, not pasted escape bytes.
+        assert [call.args[2] for call in mock_tmux.send_special_key.call_args_list] == [
+            "Down",
+            "Enter",
+        ]
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.backends.registry._backend")
     async def test_handle_bypass_then_trust_prompt(self, mock_tmux):
         """Test that bypass prompt is handled, then trust prompt follows."""
-        # Poll 1: bypass prompt; Poll 2: trust prompt (after bypass dismissed)
+        # Poll 1: bypass prompt; Poll 2: trust prompt (after bypass dismissed);
+        # Poll 3: banner, which is now what ends the loop — accepting trust only
+        # continues it, since the model-upgrade nudge may render next.
         mock_tmux.get_history.side_effect = [
             "WARNING: Bypass Permissions mode\n❯ 1. No, exit\n  2. Yes, I accept\n",
             "❯ 1. Yes, I trust this folder\n  2. No",
+            "Welcome to Claude Code v2.1.235",
         ]
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         await provider._handle_startup_prompts(idle_gap=5.0)
 
-        # Bypass: send_keys (Down) + send_special_key (Enter)
-        # Trust: send_special_key (Enter) — called twice total
-        assert mock_tmux.send_keys.call_count == 1  # Down arrow for bypass
-        assert mock_tmux.send_special_key.call_count == 2  # Enter for bypass + Enter for trust
+        # Bypass: Down + Enter. Trust (older layout): Enter.
+        assert [call.args[2] for call in mock_tmux.send_special_key.call_args_list] == [
+            "Down",
+            "Enter",
+            "Enter",
+        ]
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_handle_model_upgrade_nudge_selects_no_directly(self, mock_tmux):
+        """The Bedrock model-upgrade nudge explicitly selects its No option.
+
+        Live-captured frame. "1. Yes" is pre-selected, so a bare Enter would
+        accept the upgrade and restart Claude Code. A live elastic-worker run
+        also showed Esc leaving the dialog standing; typing the advertised
+        numbered "2. No" choice dismissed it and let the original task proceed.
+        """
+        mock_tmux.get_history.side_effect = [
+            _UPGRADE_NUDGE_FRAME,
+            "Welcome to Claude Code v2.1.235",
+        ]
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        await provider._handle_startup_prompts(idle_gap=5.0)
+
+        mock_tmux.send_keys.assert_called_once_with("test-session", "window-0", "2")
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_handle_model_upgrade_nudge_per_tier(self, mock_tmux):
+        """One nudge per TIER, so a second must still be answered.
+
+        The dismissed dialog's text stays in the capture buffer, which is why
+        the handler tracks declined titles rather than a single bool — a bool
+        would swallow the Sonnet dialog here and leave init blocked on it, while
+        no tracking at all would re-send Esc at every poll forever.
+        """
+        sonnet_frame = _UPGRADE_NUDGE_FRAME.replace("Opus", "Sonnet")
+        mock_tmux.get_history.side_effect = [
+            _UPGRADE_NUDGE_FRAME,
+            # Both frames present: the Opus dialog has been answered but is still
+            # in the scrollback below the new Sonnet one.
+            _UPGRADE_NUDGE_FRAME + sonnet_frame,
+            _UPGRADE_NUDGE_FRAME + sonnet_frame,
+            "Welcome to Claude Code v2.1.235",
+        ]
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        await provider._handle_startup_prompts(idle_gap=5.0)
+
+        # Twice, not once (missed tier) and not four times (re-answered scrollback).
+        assert mock_tmux.send_keys.call_count == 2
+        assert all(
+            call.args == ("test-session", "window-0", "2")
+            for call in mock_tmux.send_keys.call_args_list
+        )
+
+    def test_get_status_model_upgrade_nudge_not_waiting_user_answer(self):
+        """The nudge must not surface as WAITING_USER_ANSWER.
+
+        Its footer is "Enter to confirm · Esc to cancel", which
+        WAITING_USER_ANSWER_PATTERN matches — but the handler answers this
+        dialog itself, exactly like trust/bypass, so reporting it would ask an
+        operator to answer something that is about to answer itself.
+        """
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+
+        assert provider.get_status(_UPGRADE_NUDGE_FRAME) != TerminalStatus.WAITING_USER_ANSWER
 
     def test_get_status_trust_prompt_not_waiting_user_answer(self):
         """Test that trust prompt is NOT detected as WAITING_USER_ANSWER."""
@@ -1999,7 +2143,11 @@ class TestClaudeCodeProviderStartupPrompts:
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
         trust_output = "❯ 1. Yes, I trust this folder\n  2. No"
-        mock_tmux.get_history.side_effect = ["", trust_output, trust_output]
+        mock_tmux.get_history.side_effect = [
+            "",
+            trust_output,
+            "Welcome to Claude Code v2.1.235",
+        ]
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         with patch.object(provider, "get_status", return_value=TerminalStatus.IDLE):
             result = await provider.initialize()

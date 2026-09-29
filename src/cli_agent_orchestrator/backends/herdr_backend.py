@@ -538,12 +538,20 @@ class HerdrBackend(TerminalBackend):
         tail_lines: Optional[int] = None,
         strip_escapes: bool = False,
         full_history: bool = False,
+        visible_only: bool = False,
     ) -> str:
         """Read pane output via herdr pane read."""
         pane_id = self._resolve_pane_id_from_window(session_name, window_name)
 
         args = ["pane", "read", pane_id]
-        if full_history:
+        if visible_only:
+            # herdr has no viewport/scrollback split; approximate the "current
+            # screen" contract with a small bounded recent read. In practice this
+            # arm is unreachable from the one visible_only caller (the stale-
+            # PROCESSING capture fallback): event-inbox backends return from
+            # get_status() before that fallback is reached.
+            args.extend(["--source", "recent", "--lines", "50"])
+        elif full_history:
             pass  # no flags — returns full scrollback
         elif tail_lines:
             args.extend(["--source", "recent", "--lines", str(tail_lines)])

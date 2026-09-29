@@ -429,3 +429,43 @@ def test_prepare_runtime_refuses_symlinked_managed_ancestor(tmp_path: Path):
             provider._prepare_runtime()
 
     assert list(external.iterdir()) == []
+
+
+def test_the_profile_load_is_wrapped_in_plugin_delivery(tmp_path: Path, monkeypatch):
+    """Reproduced by review 3 on #584: MiniMax never saw installed plugins' MCP servers.
+
+    The provider key is the load-bearing assertion. ``ProviderType.MINIMAX_CODE``
+    is ``"mcode"``, not ``"minimax_code"`` — passing the module name would find no
+    ``PROVIDER_TRANSPORTS`` row and silently inherit the stdio-only default,
+    dropping every HTTP server this provider can in fact carry.
+    """
+    from cli_agent_orchestrator.models.provider import ProviderType
+
+    calls = []
+
+    def spy(profile, provider=None):
+        calls.append((profile, provider))
+        return profile
+
+    profile = AgentProfile(name="reviewer", description="Reviewer", system_prompt="Review.")
+    monkeypatch.setenv("MINIMAX_DATA_DIR", str(tmp_path / "seed"))
+    (tmp_path / "seed").mkdir()
+    provider = make_provider(agent_profile="reviewer")
+
+    with (
+        patch("cli_agent_orchestrator.providers.minimax_code.CAO_HOME_DIR", tmp_path),
+        patch("cli_agent_orchestrator.providers.minimax_code._with_plugin_mcp", spy),
+        patch(
+            "cli_agent_orchestrator.providers.minimax_code.load_agent_profile",
+            return_value=profile,
+        ),
+        patch(
+            "cli_agent_orchestrator.providers.minimax_code.shutil.which",
+            return_value="/usr/local/bin/mcode",
+        ),
+    ):
+        provider._build_command()
+
+    assert calls, "minimax built its command without passing the profile through plugin delivery"
+    assert all(key == ProviderType.MINIMAX_CODE.value for _, key in calls), calls
+    assert all(key == "mcode" for _, key in calls), "the enum value is 'mcode', not 'minimax_code'"
