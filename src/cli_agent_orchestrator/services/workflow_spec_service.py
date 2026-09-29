@@ -220,8 +220,10 @@ def _workflow_lock_identity(canonical_target: str, canonical_parent: str) -> str
     influencing the filesystem lookup. The original target path remains
     unchanged for every filesystem access. ASCII basename folding intentionally
     over-serializes case-distinct workflow names on case-sensitive filesystems.
-    Identity is ``(stat(safe_base), unresolved-name basename)``, not the resolved target's
-    parent; the writer's ``islink`` check refuses the only case where that distinction matters.
+    Identity is ``(stat(safe_base), resolved-target basename)``, not the resolved target's
+    parent, so a name symlinked into a subdirectory shares a lock with the same-named top-level
+    workflow; the writer's ``islink`` check refuses writes through such a name, so this only
+    over-serializes.
     """
     parent = os.path.realpath(canonical_parent)
     real_target = os.path.realpath(canonical_target)
