@@ -238,3 +238,26 @@ class TestSetSessionEnvExecVectorDenylist:
 
         assert resp.status_code == 400
         assert get_session_env(SESSION) == {"KEEP": "old"}
+
+
+class TestSetSessionEnvLookupFailure:
+    def teardown_method(self):
+        clear_session_env(SESSION)
+
+    def test_undeterminable_session_state_is_503_and_stores_nothing(self, client):
+        """``session_exists`` raises ``TmuxLookupError`` when tmux could not be read at all.
+        That is "unknown", not "absent" (so not 404) and not a server bug (so not a bare
+        500): it is transient and retryable, and the answer says so."""
+        from cli_agent_orchestrator.clients.tmux import TmuxLookupError
+
+        backend = _mock_backend()
+        backend.session_exists.side_effect = TmuxLookupError("list-sessions could not be parsed")
+        set_session_env(SESSION, {"KEEP": "old"})
+
+        resp = _post_env(client, {"NEW": "x"}, backend=backend)
+
+        assert resp.status_code == 503
+        detail = resp.json()["detail"]
+        assert "could not determine whether session" in detail
+        assert "retry" in detail
+        assert get_session_env(SESSION) == {"KEEP": "old"}

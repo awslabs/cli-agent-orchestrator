@@ -3473,6 +3473,7 @@ async def set_session_env_endpoint(
     session inherits. That is a denylist, not a security boundary — see
     ``FORWARDED_ENV_EXEC_DENYLIST``.
     """
+    from cli_agent_orchestrator.clients.tmux import TmuxLookupError
     from cli_agent_orchestrator.services.session_env import merge_session_env
 
     try:
@@ -3483,7 +3484,16 @@ async def set_session_env_endpoint(
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
-    if not get_backend().session_exists(session_name):
+    try:
+        exists = get_backend().session_exists(session_name)
+    except TmuxLookupError as e:
+        # tmux could not be read at all: the answer is UNKNOWN, not "absent" (404)
+        # and not a server bug (500). Transient and retryable, so say so.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"could not determine whether session '{session_name}' exists; retry: {e}",
+        )
+    if not exists:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Session '{session_name}' not found",
