@@ -80,6 +80,24 @@ class Bridge:
             except websockets.exceptions.ConnectionClosed:
                 pass
 
+    def _status_of(self, terminal_id: str) -> TerminalStatus:
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        return status_monitor.get_status(terminal_id)
+
+    async def _push_status(self, terminal_id: str) -> None:
+        """Send the terminal's current status. It is read under the send lock, so
+        the last frame the server gets for a terminal carries its newest status."""
+        ws = self._ws
+        if ws is None:
+            return
+        async with self._send_lock:
+            frame = Status(terminal_id=terminal_id, status=self._status_of(terminal_id))
+            try:
+                await ws.send(encode(frame))
+            except websockets.exceptions.ConnectionClosed:
+                pass
+
     async def forward_status(self) -> None:
         """Push every status change the local status monitor publishes."""
         queue = bus.subscribe("terminal.*.status")
@@ -87,13 +105,8 @@ class Bridge:
             while True:
                 event = await queue.get()
                 match = _STATUS_TOPIC.match(event["topic"])
-                if not match:
-                    continue
-                try:
-                    status = TerminalStatus(event["data"]["status"])
-                except (KeyError, ValueError):
-                    continue
-                await self._send(Status(terminal_id=match.group(1), status=status))
+                if match:
+                    await self._push_status(match.group(1))
         finally:
             bus.unsubscribe("terminal.*.status", queue)
 
@@ -147,8 +160,22 @@ class Bridge:
                 new_session=True,
                 working_directory=payload.get("working_directory"),
             )
-            local = await asyncio.to_thread(terminal_service.get_terminal, terminal.id)
-            return {"terminal": _jsonable(local)}
+            try:
+                local = await asyncio.to_thread(terminal_service.get_terminal, terminal.id)
+                return {"terminal": _jsonable(local)}
+            except Exception as exc:
+                # The agent runs but the server would never learn of it: stop it.
+                stopped = False
+                try:
+                    stopped = bool(
+                        await asyncio.to_thread(terminal_service.delete_terminal, terminal.id)
+                    )
+                except Exception:  # noqa: BLE001 - reported in the error below
+                    logger.exception("could not stop unreported terminal %s", terminal.id)
+                detail = f"launched terminal {terminal.id} but could not report it ({exc})"
+                if not stopped:
+                    detail += "; it may still be running"
+                raise RuntimeError(detail) from exc
 
         terminal_id = command.terminal_id
         if not terminal_id:
@@ -192,9 +219,8 @@ class Bridge:
         """Every terminal this runtime runs, with its status: the server deletes
         any it has no record of."""
         from cli_agent_orchestrator.clients.database import list_all_terminals
-        from cli_agent_orchestrator.services.status_monitor import status_monitor
 
-        return {row["id"]: status_monitor.get_status(row["id"]) for row in list_all_terminals()}
+        return {row["id"]: self._status_of(row["id"]) for row in list_all_terminals()}
 
     async def serve(self, ws: ClientConnection) -> None:
         """Run one connection: hello exchange, then commands until it closes."""
@@ -217,6 +243,10 @@ class Bridge:
         self._ws = ws
         self._mark_ready(True)
         logger.info("runtime %s connected to %s", self.runtime_id, self.server_url)
+        # Changes during the hello exchange were not forwarded (nothing was
+        # connected yet), so send each terminal's status as it is now.
+        for terminal_id in statuses:
+            await self._push_status(terminal_id)
         try:
             async for raw in ws:
                 frame = decode(raw)

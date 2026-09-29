@@ -33,6 +33,7 @@ from cli_agent_orchestrator.runtime_channel.registry import (
     LAUNCH_TIMEOUT,
     RemoteRuntimeError,
     RuntimeConnection,
+    RuntimeUnavailableError,
     runtime_registry,
 )
 from cli_agent_orchestrator.runtime_channel.token import TOKEN_HEADER, runtime_token
@@ -173,12 +174,12 @@ async def launch_on_runtime(
     """Launch a terminal in a connected execution runtime."""
     from cli_agent_orchestrator.services import terminal_service
 
+    conn = runtime_registry.connection(runtime_id)
     try:
-        result = await runtime_registry.call(
-            runtime_id,
-            CommandType.LAUNCH,
-            body.model_dump(exclude_none=True),
-            timeout=LAUNCH_TIMEOUT,
+        if conn is None:
+            raise RuntimeUnavailableError(f"runtime {runtime_id} is not connected")
+        result = await conn.call(
+            CommandType.LAUNCH, body.model_dump(exclude_none=True), timeout=LAUNCH_TIMEOUT
         )
     except RemoteRuntimeError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc))
@@ -222,7 +223,8 @@ async def launch_on_runtime(
 
     reported = info.get("status")
     if reported:
-        runtime_registry.set_status(terminal_id, runtime_id, TerminalStatus(reported))
+        # Ignored if the runtime reconnected meanwhile: its new hello is newer.
+        runtime_registry.set_status(terminal_id, runtime_id, TerminalStatus(reported), conn=conn)
     return await asyncio.to_thread(terminal_service.get_terminal, terminal_id)
 
 

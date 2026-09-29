@@ -210,6 +210,9 @@ class ScriptedRuntime(Bridge):
     def _current_statuses(self):
         return dict(self.statuses)
 
+    def _status_of(self, terminal_id):
+        return self.statuses.get(terminal_id, TerminalStatus.UNKNOWN)
+
     def push(self, frame):
         asyncio.run_coroutine_threadsafe(self._send(frame), self.loop).result(timeout=DEADLINE)
 
@@ -457,6 +460,51 @@ class TestUnrecordedTerminals:
         assert database.get_terminal_metadata("beef0001") is None
 
 
+class TestLaunchAcrossAReconnect:
+    def test_a_launch_recorded_during_a_reconnect_keeps_the_new_connections_status(
+        self, http, server, monkeypatch
+    ):
+        writing, release = threading.Event(), threading.Event()
+        real_create = database.create_terminal
+
+        def slow_create(*args, **kwargs):
+            writing.set()
+            release.wait(5)
+            return real_create(*args, **kwargs)
+
+        monkeypatch.setattr(server_mod, "db_create_terminal", slow_create)
+
+        async def scenario():
+            async with _dial(server) as old:
+                await old.send(_hello())
+                await old.recv()
+                loop = asyncio.get_running_loop()
+                request = loop.run_in_executor(
+                    None,
+                    lambda: http.post(
+                        "/runtimes/rt-1/terminals", json={"agent_profile": "developer"}
+                    ),
+                )
+                launch = await _next_command(old)
+                await old.send(
+                    encode(
+                        Result(op_id=launch.op_id, ok=True, payload={"terminal": dict(LAUNCHED)})
+                    )
+                )
+                await asyncio.to_thread(writing.wait, 5)
+                # The runtime reconnects while the row is being written.
+                async with _dial(server) as new:
+                    await new.send(_hello())
+                    await new.recv()
+                    release.set()
+                    response = await asyncio.wait_for(request, 10)
+                    return response, http.get("/terminals/beef0001").json()["status"]
+
+        response, status_now = asyncio.run(scenario())
+        assert response.status_code == 201, response.text
+        assert status_now == "unknown", "the old connection's launch status must not stand"
+
+
 class TestServerThatRunsNoAgents:
     @pytest.mark.parametrize(
         "method,path,kwargs",
@@ -483,6 +531,69 @@ class TestServerThatRunsNoAgents:
         response = getattr(client, method)(path, **kwargs)
         assert response.status_code == 409, response.text
         assert "POST /runtimes/{runtime_id}/terminals" in str(response.json()["detail"])
+
+
+class TestRemoteSessionTeardown:
+    def test_concurrent_deletes_of_one_remote_session_tear_it_down_once(self, monkeypatch):
+        from cli_agent_orchestrator.services import session_lock, session_service
+
+        _remote_row("abcd0001", "rt-1", session="cao-remote1")
+        started, release = threading.Event(), threading.Event()
+        calls = []
+
+        def delete(terminal_id, registry=None):
+            calls.append(terminal_id)
+            started.set()
+            release.wait(5)
+            return database.delete_terminal(terminal_id)
+
+        monkeypatch.setattr(terminal_service, "delete_terminal", delete)
+        results = []
+
+        def run():
+            results.append(session_service.delete_session("cao-remote1"))
+
+        first, second = threading.Thread(target=run), threading.Thread(target=run)
+        first.start()
+        assert started.wait(5)
+        second.start()
+
+        def contended():
+            with session_lock._registry_guard:
+                entry = session_lock._session_locks.get("cao-remote1")
+            return entry is not None and entry[1] >= 2
+
+        try:
+            _wait_for(contended, "the second delete to wait on the session lock", timeout=5)
+        finally:
+            release.set()
+            first.join(5)
+            second.join(5)
+        assert calls == ["abcd0001"]
+        assert [r["deleted"] for r in results] == [["cao-remote1"], ["cao-remote1"]]
+
+    def test_the_session_event_waits_for_every_terminal_to_be_gone(self, monkeypatch):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from cli_agent_orchestrator.services import session_service
+
+        _remote_row("abcd0001", "rt-1", session="cao-remote1")
+        _remote_row("abcd0002", "rt-1", session="cao-remote1")
+
+        def delete(terminal_id, registry=None):
+            if terminal_id == "abcd0002":
+                return False  # its runtime deferred the cleanup
+            return database.delete_terminal(terminal_id)
+
+        monkeypatch.setattr(terminal_service, "delete_terminal", delete)
+        registry = MagicMock()
+        registry.dispatch = AsyncMock()
+        result = session_service.delete_session("cao-remote1", registry=registry)
+        assert result["deleted"] == []
+        assert [e["terminal_id"] for e in result["errors"]] == ["abcd0002"]
+        events = [c.args[0] for c in registry.dispatch.await_args_list]
+        assert events == ["post_kill_terminal"]
+        assert registry.dispatch.await_args_list[0].args[1].terminal_id == "abcd0001"
 
 
 class TestRemoteSession:

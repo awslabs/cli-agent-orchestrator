@@ -519,29 +519,56 @@ def get_session(session_name: str) -> Dict:
 def _delete_remote_session(session_name: str, registry: PluginRegistry | None) -> Optional[Dict]:
     """Tear down a session whose terminals run in an execution runtime (#745).
 
-    Returns None for a local session. A remote session's tmux lives in its
-    runtime, so each terminal is deleted there (``terminal_service.delete_terminal``
-    routes it and emits its ``post_kill_terminal``) and the local tmux is never
-    consulted. A ``RemoteRuntimeError`` (runtime not connected, no answer)
-    propagates to the caller.
+    Returns None for a local session. Each terminal is deleted in its runtime
+    (``terminal_service.delete_terminal`` routes it); the local tmux is never
+    consulted. As for a local session, the lifecycle lock is held across the
+    teardown and plugin events are dispatched after it is released:
+    ``post_kill_terminal`` for each confirmed deletion, ``post_kill_session``
+    only once every terminal is gone. A ``RemoteRuntimeError`` (runtime not
+    connected, no answer) propagates to the caller.
     """
     if not session_is_remote(session_name):
         return None
     from cli_agent_orchestrator.services import terminal_service
 
     result: Dict = {"deleted": [], "errors": []}
-    for terminal in list_terminals_by_session(session_name):
-        if not terminal_service.delete_terminal(terminal["id"], registry=registry):
-            result["errors"].append(
-                {"terminal_id": terminal["id"], "error": "cleanup deferred; retry delete_session"}
-            )
+    torn_down: List[Dict] = []
+    try:
+        with session_lifecycle_lock(session_name):
+            for terminal in list_terminals_by_session(session_name):
+                if terminal_service.delete_terminal(terminal["id"]):
+                    torn_down.append(terminal)
+                else:
+                    result["errors"].append(
+                        {
+                            "terminal_id": terminal["id"],
+                            "error": "cleanup deferred; retry delete_session",
+                        }
+                    )
+    finally:
+        # Also when a runtime could not be reached: these are already gone.
+        for terminal in torn_down:
+            try:
+                dispatch_plugin_event(
+                    registry,
+                    "post_kill_terminal",
+                    PostKillTerminalEvent(
+                        session_id=terminal["tmux_session"],
+                        terminal_id=terminal["id"],
+                        agent_name=terminal.get("agent_profile"),
+                    ),
+                )
+            except Exception as e:  # noqa: BLE001 - one bad event must not fail the others
+                logger.warning(f"Failed to emit post_kill_terminal for {terminal['id']}: {e}")
     if not result["errors"]:
         result["deleted"].append(session_name)
-    dispatch_plugin_event(
-        registry,
-        "post_kill_session",
-        PostKillSessionEvent(session_id=session_name, session_name=session_name),
-    )
+        # A concurrent delete that already tore it down found nothing to delete.
+        if torn_down:
+            dispatch_plugin_event(
+                registry,
+                "post_kill_session",
+                PostKillSessionEvent(session_id=session_name, session_name=session_name),
+            )
     return result
 
 
