@@ -300,7 +300,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cancelled after the row committed, which killed by name too. Both rollbacks
   run off the event loop: they block on the lifecycle lock, and a same-name
   teardown holding it would otherwise have stalled every API request until it
-  finished (#823)
+  finished. The failure handler's whole cleanup (reader, status buffer, backend
+  session or window, provider, registry row, worktree) is now one operation
+  that a cancellation of the create request cannot interrupt: a cancel landing
+  while the rollback waited for the lock used to unwind the handler after the
+  backend kill but before the provider and row were removed, leaving a
+  registered provider and a row for a terminal that no longer existed; the
+  cancellation is still raised to the caller, once the cleanup is durable (#823)
 
 ### Changed
 
