@@ -1,0 +1,99 @@
+# The one cao-server. It serves the HTTP API, owns the SQLite state on its PVC,
+# and routes every operation on a remote terminal to the runtime running it. It
+# runs no agents itself.
+#
+# A single-replica StatefulSet: a rolling update deletes the old pod before it
+# creates the new one, so two servers never share the state volume.
+apiVersion: v1
+kind: Service
+metadata:
+  name: cao-server
+spec:
+  selector:
+    app.kubernetes.io/name: cao-server
+  ports:
+    - name: http
+      port: 9889
+      targetPort: 9889
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: cao-server
+spec:
+  serviceName: cao-server
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cao-server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cao-server
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: cao-server
+          image: cao-node
+          ports:
+            - name: http
+              containerPort: 9889
+          env:
+            - name: CAO_BIND_HOST
+              value: "0.0.0.0"
+            - name: CAO_API_PORT
+              value: "9889"
+            # Host names clients use to reach this server (the runtime uses the Service name).
+            - name: CAO_ALLOWED_HOSTS
+              value: "cao-server,cao-server.cao-remote.svc.cluster.local,localhost"
+            - name: CAO_HOME_DIR
+              value: /home/cao/.cao/state
+            - name: CAO_RUNTIME_TOKEN_FILE
+              value: /var/run/cao/runtime-token/token
+            # No agents run here, so there is no provider to warm up.
+            - name: CAO_WARM_PROVIDER
+              value: "0"
+          volumeMounts:
+            - name: state
+              mountPath: /home/cao/.cao
+            - name: runtime-token
+              mountPath: /var/run/cao/runtime-token
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9889
+              httpHeaders:
+                - name: Host
+                  value: localhost
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9889
+              httpHeaders:
+                - name: Host
+                  value: localhost
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              memory: 2Gi
+      volumes:
+        - name: runtime-token
+          secret:
+            secretName: cao-runtime-token
+            defaultMode: 0440
+  volumeClaimTemplates:
+    - metadata:
+        name: state
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: gp3
+        resources:
+          requests:
+            storage: 1Gi
