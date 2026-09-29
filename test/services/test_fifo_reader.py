@@ -571,6 +571,17 @@ class TestPipeLivenessWatchdog:
         assert (strikes, rearm_calls) == ([0] * 12, [])
         assert manager._liveness["term"][0] == "prompt\nline8"
 
+        # _flaky returns None after its raise, so every tick above ran on the
+        # buffer tier; one tick with a healthy screen probe closes the healthy
+        # path on the screen tier too
+        manager._fifo_screen_probe["term"] = lambda: pane["content"]
+        pane["content"] = "prompt\nline9"
+        manager._last_data_at["term"] = time.monotonic()
+        manager._check_pipe_liveness("term")
+        assert manager._liveness["term"][0] == "prompt\nline9"
+        assert manager._liveness["term"][2] == 0
+        assert rearm_calls == []
+
     def test_rearm_replays_live_pane_into_pipeline(self, tmp_path, monkeypatch):
         """After re-arm the lost bytes are gone, but the pane's CURRENT content
         is republished so the StatusMonitor buffer / GET output stop being frozen
@@ -589,10 +600,11 @@ class TestPipeLivenessWatchdog:
         manager._check_pipe_liveness("term")
 
         assert rearm_calls == [True]
-        # Single-line content has no "\n" to CRLF-convert, so the republished
-        # payload equals the raw pane content verbatim; the multi-line CRLF
-        # conversion itself is covered by test_rearm_replay_converts_lf_to_crlf.
-        assert ("terminal.term.output", {"data": pane["content"]}) in published
+        # Single-line content has no "\n" to CRLF-convert; the payload is the
+        # pane content with only the leading line separator the replay adds so
+        # it cannot glue onto a stale mid-line buffer tail. The multi-line
+        # CRLF conversion itself is covered by test_rearm_replay_converts_lf_to_crlf.
+        assert ("terminal.term.output", {"data": "\r\n" + pane["content"]}) in published
 
     def test_rearm_replay_converts_lf_to_crlf(self, tmp_path, monkeypatch):
         """Regression for the round-2 review finding: capture-pane joins lines
@@ -617,7 +629,10 @@ class TestPipeLivenessWatchdog:
         manager._check_pipe_liveness("term")
 
         assert rearm_calls == [True]
-        assert ("terminal.term.output", {"data": multiline.replace("\n", "\r\n")}) in published
+        assert (
+            "terminal.term.output",
+            {"data": "\r\n" + multiline.replace("\n", "\r\n")},
+        ) in published
         # And the raw bare-LF form must NOT have been published — that's
         # exactly the payload that staircases pyte's screen.
         assert ("terminal.term.output", {"data": multiline}) not in published
@@ -912,14 +927,16 @@ class TestPipeLivenessWatchdog:
         manager._check_pipe_liveness("term")
 
         assert manager._liveness["term"][2] == 0, "screen match must re-baseline"
+        assert manager._liveness["term"][0] == pane["content"]
         assert rearm_calls == []
 
     def test_screen_probe_matches_styled_and_soft_wrapped_pane(self, tmp_path, monkeypatch):
         """A pane tail with escapes and a soft wrap still matches the screen."""
         monkeypatch.setattr(fr, "PIPE_LIVENESS_STALL_CHECKS", 2)
         manager = self._manager(tmp_path, monkeypatch)
-        # capture-pane -e: escapes on rows, pane wraps at 80 cols (80 + 40)
-        # while the pyte grid keeps the whole 120-char row
+        # capture-pane -e keeps escapes and wraps the row at the pane width
+        # (80 + 40); the screen side holds the same content unwrapped, so the
+        # match must survive both the escapes and the wrap boundary
         pane = {"content": "prompt"}
         screen = {"content": "scrollback\nprompt"}
         rearm_calls: list = []
@@ -934,10 +951,15 @@ class TestPipeLivenessWatchdog:
         manager._check_pipe_liveness("term")
 
         assert manager._liveness["term"][2] == 0, "soft wrap must not break the match"
+        assert manager._liveness["term"][0] == pane["content"]
         assert rearm_calls == []
 
     def test_screen_probe_stale_frame_still_accumulates_strikes(self, tmp_path, monkeypatch):
-        """Bytes arrived but the screen never reached the pane's new frame."""
+        """#711: a burst arrives, the pane settles on a frame the FIFO never
+        showed, and the pipe then goes silent. The delivering interval must
+        withhold the re-baseline (re-baselining there would latch the never-
+        shown frame and hide the stall, the pre-PR bug); the silent checks
+        then strike against the preserved pre-stall baseline and re-arm."""
         monkeypatch.setattr(fr, "PIPE_LIVENESS_STALL_CHECKS", 2)
         manager = self._manager(tmp_path, monkeypatch)
         pane = {"content": "prompt\nline0"}
@@ -952,14 +974,270 @@ class TestPipeLivenessWatchdog:
         )
         manager._fifo_screen_probe["term"] = lambda: screen["content"]
 
-        manager._check_pipe_liveness("term")  # baseline
-        pane["content"] = "prompt\nline9"  # pane settled on a frame the screen never saw
-        manager._last_data_at["term"] = time.monotonic()  # burst bytes arrived in-interval
-        manager._check_pipe_liveness("term")
+        manager._check_pipe_liveness("term")  # baseline: prompt/line0
+        # Burst interval: bytes arrive but the screen never saw the settled
+        # frame -> delivering, so no strike; the baseline must NOT move.
+        pane["content"] = "prompt\nline9"
         manager._last_data_at["term"] = time.monotonic()
+        manager._check_pipe_liveness("term")
+        assert rearm_calls == []
+        assert manager._liveness["term"][2] == 0
+        assert manager._liveness["term"][0] == "prompt\nline0"
+        # The pipe goes silent while the pane sits on the never-shown frame:
+        # strikes accumulate against the preserved baseline and re-arm.
+        manager._check_pipe_liveness("term")
         manager._check_pipe_liveness("term")
 
         assert rearm_calls == [True], "stale rendered frame is a stall"
+
+    def test_screen_probe_real_pyte_display_matches_pane(self, tmp_path, monkeypatch):
+        """The screen-tier probe must survive a real ``pyte.Screen`` display —
+        fixed-width padded rows, trailing blank rows, wide grid — not just
+        pre-collapsed one-line strings (round-4 review: the two existing
+        'match' tests passed regardless of what _screen_lines produced)."""
+        import pyte
+
+        monkeypatch.setattr(fr, "PIPE_LIVENESS_STALL_CHECKS", 2)
+        manager = self._manager(tmp_path, monkeypatch)
+        screen = pyte.Screen(80, 24)
+        stream = pyte.Stream(screen)
+        stream.feed("prompt $ \r\nstep one done\r\n")
+        display = "\n".join(screen.display)
+
+        pane = {"content": "prompt $ \nstep one done"}
+        rearm_calls: list = []
+        self._enroll(
+            manager,
+            "term",
+            pane,
+            rearm_calls,
+            last_data_at=time.monotonic(),
+        )
+        manager._fifo_screen_probe["term"] = lambda: display
+
+        manager._check_pipe_liveness("term")  # baseline
+        stream.feed("step two done\r\n")
+        display = "\n".join(screen.display)
+        pane["content"] = "prompt $ \nstep one done\nstep two done"
+        manager._last_data_at["term"] = time.monotonic()
+        manager._check_pipe_liveness("term")
+
+        assert manager._liveness["term"][2] == 0, "real pyte display must match"
+        assert manager._liveness["term"][0] == pane["content"]
+        assert rearm_calls == []
+
+    def test_healthy_fallback_churn_with_real_capture_shapes_never_strikes(
+        self, tmp_path, monkeypatch
+    ):
+        """Round-4 review repro, fallback tier (kiro_cli's only path): a busy
+        pane whose two sides never compare byte-equal — capture-pane trims
+        per-row trailing whitespace while the stream keeps it, a soft-wrapped
+        row splits across pane rows but stays one line in the stream, a
+        trailing blank viewport row — must accumulate ZERO strikes while
+        bytes keep arriving. At the reviewed head this shape re-armed a
+        delivering pipe on a cadence."""
+        monkeypatch.setattr(fr, "PIPE_LIVENESS_STALL_CHECKS", 2)
+        manager = self._manager(tmp_path, monkeypatch)
+        wrap = "y" * 120
+        # capture-pane shape: rows joined by \n, per-row trailing spaces
+        # trimmed, the 120-char row soft-wrapped 80+40, trailing blank row
+        pane = {"content": f"sh-4.2$\n{wrap[:80]}\n{wrap[80:]}\nsh-4.2$\n"}
+        rearm_calls: list = []
+        # raw stream shape: CRLF line ends, trailing spaces kept, the long
+        # row NOT wrapped in the stream, SGR noise around it
+        fifo_buffer = {"content": f"sh-4.2$ \r\n\x1b[32m{wrap}\x1b[0m\r\nsh-4.2$ \r\n"}
+        self._enroll(
+            manager,
+            "term",
+            pane,
+            rearm_calls,
+            last_data_at=time.monotonic(),
+            fifo_buffer=fifo_buffer,
+        )
+
+        manager._check_pipe_liveness("term")  # baseline
+        strikes = []
+        for i in range(1, 7):
+            # churn: another command lands on the pane and in the stream,
+            # same trimmed-vs-kept and soft-wrap shapes every tick
+            pane["content"] = f"sh-4.2$\n{wrap[:80]}\n{wrap[80:]}\ncmd{i}\nsh-4.2$\n"
+            fifo_buffer["content"] += f"\r\n\x1b[32mcmd{i}\x1b[0m\r\nsh-4.2$ \r\n"
+            manager._last_data_at["term"] = time.monotonic()
+            manager._check_pipe_liveness("term")
+            strikes.append(manager._liveness["term"][2])
+
+        assert strikes == [0] * 6, "a delivering pipe must never strike"
+        assert rearm_calls == []
+
+    def test_idle_after_persistent_mismatch_rearms_once_then_reconciles(
+        self, tmp_path, monkeypatch
+    ):
+        """Round-5 review: a pane whose frame never reconciles while bytes
+        flow goes silent, strikes into exactly ONE re-arm, and the replay's
+        leading-CRLF publish must make the next check re-baseline with no
+        further re-arm. A delivering interval also resets a silent strike."""
+        monkeypatch.setattr(fr, "PIPE_LIVENESS_STALL_CHECKS", 2)
+        manager = self._manager(tmp_path, monkeypatch)
+        pane = {"content": "sh-4.2$ make"}
+        fifo_buffer = {"content": "\x1b[32mmake: running\x1b[0m\r\n"}
+        rearm_calls: list = []
+
+        # the replay lands in the rolling buffer the way StatusMonitor gets it
+        def _publish(topic, data):
+            fifo_buffer["content"] += data["data"]
+
+        monkeypatch.setattr(fr.bus, "publish", _publish)
+        self._enroll(
+            manager,
+            "term",
+            pane,
+            rearm_calls,
+            last_data_at=time.monotonic(),
+            fifo_buffer=fifo_buffer,
+        )
+
+        manager._check_pipe_liveness("term")  # baseline: sh-4.2$ make
+        assert rearm_calls == []
+
+        # delivering with a persistent mismatch: the pane cleared to a bare
+        # prompt the stream never shows as its last row
+        pane["content"] = "$"
+        for i in range(2):
+            fifo_buffer["content"] += f"more output {i}\r\n"
+            manager._last_data_at["term"] = time.monotonic()
+            manager._check_pipe_liveness("term")
+        assert rearm_calls == []
+        assert manager._liveness["term"][2] == 0, "delivering resets strikes"
+        assert manager._liveness["term"][0] == "sh-4.2$ make"
+
+        # idle: strikes against the preserved baseline, one re-arm
+        manager._check_pipe_liveness("term")
+        assert manager._liveness["term"][2] == 1
+        manager._check_pipe_liveness("term")
+        assert rearm_calls == [True], "the mismatch must cost exactly one re-arm"
+
+        # the replay published the live pane behind a leading CRLF: the next
+        # check reaches the frame by row anchor instead of striking again
+        assert fifo_buffer["content"].endswith("\r\n$")
+        manager._check_pipe_liveness("term")
+        assert manager._liveness["term"][0] == "$", "post-replay check re-baselines"
+        assert manager._liveness["term"][2] == 0
+        for _ in range(3):
+            manager._check_pipe_liveness("term")
+        assert rearm_calls == [True], "a reconciled idle pane must not re-arm again"
+
+        # a delivering interval after a silent strike resets the counter
+        pane["content"] = "$ done"
+        manager._check_pipe_liveness("term")  # silent: strike 1
+        assert manager._liveness["term"][2] == 1
+        fifo_buffer["content"] += "tail bytes\r\n"
+        manager._last_data_at["term"] = time.monotonic()
+        manager._check_pipe_liveness("term")  # delivering: evidence of life
+        assert manager._liveness["term"][2] == 0, "byte arrival clears strikes"
+        manager._check_pipe_liveness("term")  # silent: strike 1 again
+        manager._check_pipe_liveness("term")  # silent: strike 2 -> re-arm
+        assert rearm_calls == [True, True]
+
+    def test_raising_buffer_probe_degrades_instead_of_aborting(self, tmp_path, monkeypatch):
+        """A raising fifo_buffer_probe must not abort the check with a
+        per-tick traceback — it degrades to the #388 bytes-arrived tier, the
+        same way a raising screen probe falls back to the buffer."""
+        manager = self._manager(tmp_path, monkeypatch)
+        pane = {"content": "prompt"}
+        rearm_calls: list = []
+        self._enroll(
+            manager,
+            "term",
+            pane,
+            rearm_calls,
+            last_data_at=time.monotonic(),
+            fifo_buffer={"content": "anything"},
+        )
+
+        def _boom():
+            raise RuntimeError("buffer probe exploded")
+
+        manager._fifo_buffer_probe["term"] = _boom
+        pane["content"] = "prompt\nnew line"
+        manager._last_data_at["term"] = time.monotonic()
+        manager._check_pipe_liveness("term")
+        assert manager._liveness["term"][0] == "prompt\nnew line"
+        assert rearm_calls == []
+
+    def test_soft_wrapped_tail_advances_baseline_and_idle_does_not_strike(
+        self, tmp_path, monkeypatch
+    ):
+        """Round-5 review, the kiro_cli dominant case: the pane wraps a wide
+        row at its width while the stream holds the same bytes unwrapped, so
+        rows can never align. The folded comparison must reach the frame, the
+        baseline must advance during delivery, and the activity->idle
+        transition that re-armed healthy terminals at the fifth head must
+        produce zero strikes and zero re-arms."""
+        manager = self._manager(tmp_path, monkeypatch)
+        wrap = "y" * 120
+        pane = {"content": "sh-4.2$"}
+        fifo_buffer = {"content": "sh-4.2$ \r\n"}
+        rearm_calls: list = []
+        self._enroll(
+            manager,
+            "term",
+            pane,
+            rearm_calls,
+            last_data_at=time.monotonic(),
+            fifo_buffer=fifo_buffer,
+        )
+
+        manager._check_pipe_liveness("term")  # baseline: bare prompt
+        # one wide output line lands: wrapped 80+40 on the pane, one
+        # unwrapped SGR-wrapped line in the stream, then the prompt again
+        pane["content"] = f"sh-4.2$\n{wrap[:80]}\n{wrap[80:]}\nsh-4.2$"
+        fifo_buffer["content"] += f"\x1b[32m{wrap}\x1b[0m\r\nsh-4.2$ \r\n"
+        manager._last_data_at["term"] = time.monotonic()
+        manager._check_pipe_liveness("term")
+
+        assert (
+            manager._liveness["term"][0] == pane["content"]
+        ), "the folded comparison must let the baseline advance through the wrap"
+        for _ in range(3):
+            manager._check_pipe_liveness("term")  # idle on the delivered frame
+        assert manager._liveness["term"][2] == 0
+        assert rearm_calls == []
+
+    def test_screen_probe_short_pane_tail_cannot_match_stale_screen(self, tmp_path, monkeypatch):
+        """Round-5 review: a bare prompt tail whose folded form is a suffix
+        of stale screen content must NOT count as frame reached — the #711
+        miss in the opposite direction. The stall that follows is still
+        caught."""
+        monkeypatch.setattr(fr, "PIPE_LIVENESS_STALL_CHECKS", 2)
+        manager = self._manager(tmp_path, monkeypatch)
+        pane = {"content": "prompt $ build running"}
+        screen = {"content": "step one done\nstep two$"}
+        rearm_calls: list = []
+        self._enroll(
+            manager,
+            "term",
+            pane,
+            rearm_calls,
+            last_data_at=time.monotonic(),
+            fifo_buffer={"content": "raw bytes that match nothing"},
+        )
+        manager._fifo_screen_probe["term"] = lambda: screen["content"]
+
+        manager._check_pipe_liveness("term")  # baseline
+        # delivering tick: the pane clears to a bare "$"; the stale screen's
+        # folded text ends with "$" but its last row does not, and the folded
+        # suffix is below the trust floor
+        pane["content"] = "$"
+        manager._last_data_at["term"] = time.monotonic()
+        manager._check_pipe_liveness("term")
+        assert (
+            manager._liveness["term"][0] == "prompt $ build running"
+        ), "a short tail must not latch a frame the FIFO never showed"
+
+        # the pipe goes silent on the never-shown frame: still a caught stall
+        manager._check_pipe_liveness("term")
+        manager._check_pipe_liveness("term")
+        assert rearm_calls == [True], "the coincidence must not hide the stall"
 
     def test_create_reader_without_callbacks_is_not_watched(self, tmp_path, monkeypatch):
         """Backward compat: callers that omit probe/rearm (or backends without
@@ -1112,7 +1390,7 @@ class TestColdStartStallDetection:
         manager._check_pipe_liveness("term")
 
         assert rearm_calls == [True]
-        assert ("terminal.term.output", {"data": pane["content"]}) in published
+        assert ("terminal.term.output", {"data": "\r\n" + pane["content"]}) in published
 
     def test_cold_start_end_to_end_via_real_reader_thread(self, tmp_path, monkeypatch):
         """Integration-level: create_reader() seeds the cold-start state

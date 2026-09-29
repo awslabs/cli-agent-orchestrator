@@ -1209,6 +1209,22 @@ class StatusMonitor:
         with self._lock:
             return self._buffers.get(terminal_id, "")
 
+    def get_screen_display(self, terminal_id: str) -> Optional[str]:
+        """Get the composited pyte screen as text, or None when unavailable.
+
+        Collapses :meth:`_screen_lines`' deliberately distinct ``None`` (render
+        failed) and ``[]`` (no screen yet) returns — for a caller that only
+        needs "is there a rendered screen to compare against", both mean no.
+        An all-blank screen counts as unavailable too: pyte returns the full
+        padded grid, so a screen that never rendered carries no frame
+        evidence, and the caller should fall back to the raw buffer.
+        """
+        lines, _ = self._screen_lines(terminal_id)
+        if not lines:
+            return None
+        display = "\n".join(lines)
+        return display if display.strip() else None
+
     def probe_execution_evidence(self, terminal_id: str, provider) -> bool:
         """Atomically inspect current-generation execution evidence.
 

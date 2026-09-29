@@ -1729,9 +1729,8 @@ async def create_terminal(
             def _fifo_buffer_tail(t=terminal_id) -> str:
                 return status_monitor.get_buffer(t)
 
-            def _fifo_screen_display(t=terminal_id):
-                lines, _ = status_monitor._screen_lines(t)
-                return "\n".join(lines) if lines else None
+            def _fifo_screen_display(t=terminal_id) -> Optional[str]:
+                return status_monitor.get_screen_display(t)
 
             def _rearm_pipe(s=session_name, w=window_name, p=str(fifo_path)) -> None:
                 get_backend().stop_pipe_pane(s, w)

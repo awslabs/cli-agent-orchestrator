@@ -1210,6 +1210,44 @@ class TestRawDebounceArmedDetection:
         assert sm._last_status["t1"] == TerminalStatus.PROCESSING
 
 
+class TestGetScreenDisplay:
+    """The public screen read the fifo liveness probe uses. None and [] from
+    _screen_lines (render failed / no screen yet) both collapse to None — for
+    a caller asking "is there a rendered screen to compare against", both
+    mean no."""
+
+    def test_none_when_no_screen_yet(self):
+        sm = StatusMonitor()
+        assert sm._screens.get("t1") is None
+        assert sm.get_screen_display("t1") is None
+
+    def test_none_when_render_fails(self):
+        sm = StatusMonitor()
+
+        class _BrokenDisplay:
+            @property
+            def display(self):
+                raise RuntimeError("pyte mid-redraw")
+
+        sm._screens["t1"] = (_BrokenDisplay(), None)
+        assert sm.get_screen_display("t1") is None
+
+    def test_none_when_screen_is_all_blank(self):
+        sm = StatusMonitor()
+        # pyte hands back the full padded grid, so a screen that never
+        # rendered must collapse to None, not a whitespace-only string
+        sm._screens["t1"] = (type("_Blank", (), {"display": [" " * 80] * 200})(), None)
+        assert sm.get_screen_display("t1") is None
+
+    def test_screen_text_when_screen_exists(self):
+        sm = StatusMonitor()
+        with sm._lock:
+            sm._feed_screen_locked("t1", "hello\r\nworld")
+        text = sm.get_screen_display("t1")
+        assert text is not None
+        assert "hello" in text and "world" in text
+
+
 class TestProcessChunkBufferTruncation:
     """_process_chunk truncates the rolling buffer to the live
     state_buffer_max server setting, not a fixed constant."""
