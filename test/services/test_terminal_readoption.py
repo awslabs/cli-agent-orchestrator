@@ -20,7 +20,8 @@ import pytest
 from cli_agent_orchestrator.backends.base import TerminalBackend
 from cli_agent_orchestrator.backends.registry import set_backend
 from cli_agent_orchestrator.clients import database
-from cli_agent_orchestrator.services import terminal_service
+from cli_agent_orchestrator.clients.tmux import TmuxLookupError
+from cli_agent_orchestrator.services import session_lock, terminal_service
 from cli_agent_orchestrator.services.terminal_service import (
     _write_terminal_snapshot,
     readopt_terminals_at_startup,
@@ -134,6 +135,106 @@ class TestReadoptTerminalsAtStartup:
 
         assert counts == {"readopted": 0, "finalized": 0, "skipped": 0}
         assert backend.mock_calls == []
+
+
+class TestReadoptOnlyFinalizesConfirmedAbsence:
+    """Deleting a row is teardown confirmation (#498): only a CONFIRMED absence
+    may finalize. "Could not tell" must leave the row exactly as it was — the
+    next restart re-evaluates it, and retention cleanup still collects rows that
+    really are dead, whereas a wrongly deleted row orphans a live agent for good.
+    """
+
+    def test_transient_probe_failure_on_a_live_session_keeps_the_row(
+        self, registry_db, backend, fifo
+    ):
+        backend.get_history.side_effect = TmuxLookupError("list-panes did not parse")
+        _seed()
+
+        counts = readopt_terminals_at_startup(database.list_all_terminals())
+
+        assert counts == {"readopted": 0, "finalized": 0, "skipped": 1}
+        assert _row_ids() == ["t1"]
+        fifo.create_reader.assert_not_called()
+
+    def test_probe_timeout_on_a_live_session_keeps_the_row(self, registry_db, backend, fifo):
+        backend.get_history.side_effect = TimeoutError("capture-pane timed out")
+        _seed()
+
+        counts = readopt_terminals_at_startup(database.list_all_terminals())
+
+        assert counts == {"readopted": 0, "finalized": 0, "skipped": 1}
+        assert _row_ids() == ["t1"]
+
+    def test_unreadable_window_in_a_live_session_keeps_the_row(self, registry_db, backend, fifo):
+        """No strict window-level check exists, and a window lookup rides on
+        libtmux listings; a renamed or momentarily unlistable window reads as
+        "not found" without being gone."""
+        backend.get_history.side_effect = ValueError("Window 'dev-1' not found in session")
+        _seed()
+
+        counts = readopt_terminals_at_startup(database.list_all_terminals())
+
+        assert counts == {"readopted": 0, "finalized": 0, "skipped": 1}
+        assert _row_ids() == ["t1"]
+
+    def test_undecidable_session_liveness_keeps_the_row(self, registry_db, backend, fifo):
+        backend.session_exists_strict.side_effect = TmuxLookupError("socket unreadable")
+        _seed()
+
+        counts = readopt_terminals_at_startup(database.list_all_terminals())
+
+        assert counts == {"readopted": 0, "finalized": 0, "skipped": 1}
+        assert _row_ids() == ["t1"]
+        fifo.create_reader.assert_not_called()
+
+    def test_lenient_session_lookup_is_never_consulted(self, registry_db, backend, fifo):
+        """``session_exists`` collapses a lookup error into False — exactly the
+        shape that deleted live rows. It must not be what decides."""
+        backend.session_exists.return_value = False
+        _seed()
+
+        counts = readopt_terminals_at_startup(database.list_all_terminals())
+
+        assert counts == {"readopted": 1, "finalized": 0, "skipped": 0}
+        backend.session_exists.assert_not_called()
+        assert _row_ids() == ["t1"]
+
+    def test_mixed_rows_are_decided_one_by_one(self, registry_db, backend, fifo):
+        liveness = {"cao-alive": True, "cao-dead": False}
+
+        def strict(session_name):
+            if session_name not in liveness:
+                raise TmuxLookupError("socket unreadable")
+            return liveness[session_name]
+
+        backend.session_exists_strict.side_effect = strict
+        _seed("t-alive", session="cao-alive")
+        _seed("t-dead", session="cao-dead")
+        _seed("t-unknown", session="cao-unknown")
+
+        counts = readopt_terminals_at_startup(database.list_all_terminals())
+
+        assert counts == {"readopted": 1, "finalized": 1, "skipped": 1}
+        assert _row_ids() == ["t-alive", "t-unknown"]
+        assert [c.args[0] for c in fifo.create_reader.call_args_list] == ["t-alive"]
+
+    def test_each_row_is_decided_under_its_session_lifecycle_lock(self, registry_db, backend, fifo):
+        """Session teardown holds this lock across kill-confirm + sweep (#498),
+        so re-arming or finalizing a row cannot interleave with it."""
+        held = []
+
+        def strict(session_name):
+            with session_lock._registry_guard:
+                entry = session_lock._session_locks.get(session_name)
+            held.append(entry is not None and entry[0].locked())
+            return True
+
+        backend.session_exists_strict.side_effect = strict
+        _seed()
+
+        readopt_terminals_at_startup(database.list_all_terminals())
+
+        assert held == [True]
 
 
 class TestEarlySnapshot:

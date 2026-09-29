@@ -31,6 +31,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import requests
 from pydantic import ValidationError
 
+from cli_agent_orchestrator.backends.base import TerminalBackend
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
@@ -3080,16 +3081,28 @@ def readopt_terminals_at_startup(rows: List[Dict[str, Any]]) -> Dict[str, int]:
     Synchronous and blocking (tmux subprocesses and SQLite for every row): the
     lifespan runs it in a worker thread. ``rows`` is the registry snapshot the
     lifespan takes before the server starts serving, so terminals this server
-    creates meanwhile are never touched. For every row:
+    creates meanwhile are never touched. Each row is decided under its session's
+    lifecycle lock, so it cannot interleave with a session teardown (#498):
 
-    - tmux window still alive: re-arm the pipeline — recreate the FIFO
-      reader (same probe/re-arm closures ``create_terminal`` uses) and
-      stop+start pipe-pane so the pane streams into the fresh FIFO (a bare
-      pipe_pane() would toggle a still-registered pipe OFF).
-    - window gone (reboot / tmux kill / crash): finalize — recover a
-      ``.scrollback`` from the ANSI-stripped ``<tid>.log`` if none exists
-      (crashes never ran the delete-path capture), then drop the DB row so
-      it does not linger as an orphan until retention cleanup.
+    - session confirmed alive and the window readable: re-arm the pipeline —
+      recreate the FIFO reader (same probe/re-arm closures ``create_terminal``
+      uses) and stop+start pipe-pane so the pane streams into the fresh FIFO
+      (a bare pipe_pane() would toggle a still-registered pipe OFF).
+    - session confirmed ABSENT (``session_exists_strict`` returned False):
+      finalize — recover a ``.scrollback`` from the ANSI-stripped ``<tid>.log``
+      if none exists (crashes never ran the delete-path capture), then drop the
+      DB row so it does not linger as an orphan until retention cleanup. The
+      recovered scrollback is only what the old server logged: ``<tid>.log``
+      stopped growing when that server died, so whatever the agent printed
+      after that is missing. It is not a full transcript.
+    - could not tell — the strict session check raised, or the session is alive
+      but the window could not be read: leave the row untouched. Deleting a row
+      is teardown confirmation, which must never act on a lookup error (#498).
+      Leaving it costs nothing: the next restart re-evaluates it, and retention
+      cleanup still collects it if it really is dead. A window missing from a
+      live session lands here too: there is no strict window-level check, and
+      a window lookup rides on tmux listings, so "not found" is not proof (the
+      window may simply have been renamed).
 
     Providers need no re-registration: ``provider_manager.get_provider``
     rebuilds instances on demand from the DB row. Event-inbox backends
@@ -3100,8 +3113,6 @@ def readopt_terminals_at_startup(rows: List[Dict[str, Any]]) -> Dict[str, int]:
         Counts: ``{"readopted": N, "finalized": M, "skipped": K}``, where
         ``skipped`` rows were left exactly as they were.
     """
-    from cli_agent_orchestrator.utils.text import strip_terminal_escapes
-
     counts = {"readopted": 0, "finalized": 0, "skipped": 0}
     if not rows:
         return counts
@@ -3111,60 +3122,90 @@ def readopt_terminals_at_startup(rows: List[Dict[str, Any]]) -> Dict[str, int]:
 
     for row in rows:
         terminal_id = row["id"]
-        session_name = row["tmux_session"]
-        window_name = row["tmux_window"]
-
-        alive = False
         try:
-            if backend.session_exists(session_name):
-                # No dedicated window-exists query; a 1-line history read
-                # raises for a missing window and is cheap for a live one.
-                backend.get_history(session_name, window_name, tail_lines=1)
-                alive = True
-        except Exception:
-            alive = False
-
-        if alive:
-            try:
-                fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
-
-                def _probe_pane(s=session_name, w=window_name) -> str:
-                    return get_backend().get_history(s, w, tail_lines=PIPE_LIVENESS_TAIL_LINES)
-
-                def _rearm_pipe(s=session_name, w=window_name, p=str(fifo_path)) -> None:
-                    get_backend().stop_pipe_pane(s, w)
-                    get_backend().pipe_pane(s, w, p)
-
-                fifo_manager.create_reader(terminal_id, pane_probe=_probe_pane, rearm=_rearm_pipe)
-                # stop-then-start, NOT a bare pipe_pane(): after the old
-                # server died the pane may still report pane_pipe=1, and
-                # tmux's ``pipe-pane -o`` toggle would switch it OFF.
-                backend.stop_pipe_pane(session_name, window_name)
-                backend.pipe_pane(session_name, window_name, str(fifo_path))
-                # Nudge the agent's TUI so it repaints AFTER the fresh pipe
-                # attaches (same rationale as create_terminal's post-pipe
-                # Enter): pipe-pane only streams NEW output, so without a
-                # repaint the rolling status buffer stays empty and the
-                # re-adopted terminal reads UNKNOWN until it next speaks.
-                backend.send_special_key(session_name, window_name, "Enter")
-                counts["readopted"] += 1
-                logger.info(f"Re-adopted terminal {terminal_id} ({session_name}:{window_name})")
-            except Exception as e:
-                logger.warning(f"Failed to re-adopt terminal {terminal_id}: {e}")
-                counts["skipped"] += 1
-        else:
-            try:
-                scrollback_path = TERMINAL_LOG_DIR / f"{terminal_id}.scrollback"
-                if not scrollback_path.exists():
-                    log_path = TERMINAL_LOG_DIR / f"{terminal_id}.log"
-                    if log_path.exists():
-                        raw = log_path.read_text(encoding="utf-8", errors="replace")
-                        scrollback_path.write_text(strip_terminal_escapes(raw), encoding="utf-8")
-                db_delete_terminal(terminal_id)
-                counts["finalized"] += 1
-                logger.info(f"Finalized dead terminal {terminal_id} ({session_name}:{window_name})")
-            except Exception as e:
-                logger.warning(f"Failed to finalize terminal {terminal_id}: {e}")
-                counts["skipped"] += 1
+            with session_lifecycle_lock(row["tmux_session"]):
+                outcome = _readopt_terminal(backend, row)
+        except Exception as e:
+            logger.warning(f"Failed to re-adopt terminal {terminal_id}, leaving it untouched: {e}")
+            outcome = "skipped"
+        counts[outcome] += 1
 
     return counts
+
+
+def _readopt_terminal(backend: TerminalBackend, row: Dict[str, Any]) -> str:
+    """Decide one persisted row and act on it; return its ``counts`` key.
+
+    The caller holds the row's session lifecycle lock.
+    """
+    terminal_id = row["id"]
+    session_name = row["tmux_session"]
+    window_name = row["tmux_window"]
+
+    try:
+        session_alive = backend.session_exists_strict(session_name)
+    except Exception as e:
+        logger.warning(
+            f"Could not tell whether session {session_name} of terminal {terminal_id} "
+            f"is alive; leaving it untouched: {e}"
+        )
+        return "skipped"
+
+    if not session_alive:
+        _finalize_dead_terminal(terminal_id)
+        logger.info(f"Finalized dead terminal {terminal_id} ({session_name}:{window_name})")
+        return "finalized"
+
+    try:
+        # A 1-line history read is cheap for a live window and raises for one
+        # it cannot read.
+        backend.get_history(session_name, window_name, tail_lines=1)
+    except Exception as e:
+        logger.warning(
+            f"Session {session_name} is alive but window {window_name} of terminal "
+            f"{terminal_id} could not be read; leaving it untouched: {e}"
+        )
+        return "skipped"
+
+    _rearm_terminal_pipeline(backend, terminal_id, session_name, window_name)
+    logger.info(f"Re-adopted terminal {terminal_id} ({session_name}:{window_name})")
+    return "readopted"
+
+
+def _rearm_terminal_pipeline(
+    backend: TerminalBackend, terminal_id: str, session_name: str, window_name: str
+) -> None:
+    """Re-arm the FIFO -> EventBus pipeline of a terminal whose pane survived."""
+    fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
+
+    def _probe_pane(s=session_name, w=window_name) -> str:
+        return get_backend().get_history(s, w, tail_lines=PIPE_LIVENESS_TAIL_LINES)
+
+    def _rearm_pipe(s=session_name, w=window_name, p=str(fifo_path)) -> None:
+        get_backend().stop_pipe_pane(s, w)
+        get_backend().pipe_pane(s, w, p)
+
+    fifo_manager.create_reader(terminal_id, pane_probe=_probe_pane, rearm=_rearm_pipe)
+    # stop-then-start, NOT a bare pipe_pane(): after the old server died the
+    # pane may still report pane_pipe=1, and tmux's ``pipe-pane -o`` toggle
+    # would switch it OFF.
+    backend.stop_pipe_pane(session_name, window_name)
+    backend.pipe_pane(session_name, window_name, str(fifo_path))
+    # Nudge the agent's TUI so it repaints AFTER the fresh pipe attaches (same
+    # rationale as create_terminal's post-pipe Enter): pipe-pane only streams
+    # NEW output, so without a repaint the rolling status buffer stays empty
+    # and the re-adopted terminal reads UNKNOWN until it next speaks.
+    backend.send_special_key(session_name, window_name, "Enter")
+
+
+def _finalize_dead_terminal(terminal_id: str) -> None:
+    """Finalize a terminal whose tmux session is confirmed gone."""
+    from cli_agent_orchestrator.utils.text import strip_terminal_escapes
+
+    scrollback_path = TERMINAL_LOG_DIR / f"{terminal_id}.scrollback"
+    if not scrollback_path.exists():
+        log_path = TERMINAL_LOG_DIR / f"{terminal_id}.log"
+        if log_path.exists():
+            raw = log_path.read_text(encoding="utf-8", errors="replace")
+            scrollback_path.write_text(strip_terminal_escapes(raw), encoding="utf-8")
+    db_delete_terminal(terminal_id)

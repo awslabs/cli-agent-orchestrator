@@ -1348,7 +1348,7 @@ async def lifespan(app: FastAPI):
     logger.info("Event bus consumers started (StatusMonitor, LogWriter, InboxService)")
 
     # Re-adopt persisted terminals whose tmux windows survived a server restart
-    # (and finalize the ones that did not). Scheduled AFTER
+    # (and finalize the ones whose session is confirmed gone). Scheduled AFTER
     # the event bus consumers above: the re-armed FIFO readers publish into that
     # pipeline. The rows are snapshotted here, before anything else runs; the
     # blocking pass itself goes to a worker thread so the loop stays free.
