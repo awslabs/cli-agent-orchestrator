@@ -69,8 +69,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     on kiro-cli 2.8.0 to 2.25.0.
   - Costs: a fast reply that is never seen working closes at the 60s backstop.
     kiro's work sign avoids this; other providers (grok, cursor, hermes) have none
-    yet. `CAO_PYTE_STATUS=false` adds about 3s a turn for screen-calibrated
-    providers. `handoff`/`assign` still wait on status, not turns.
+    yet. With `CAO_PYTE_STATUS=false`, screen-calibrated providers are slower:
+    measured on claude_code, 3 of 7 short replies closed at the backstop (the rest
+    in 10-14s), where `main` printed the wrong text for 3 of 9 sends.
+    `handoff`/`assign` still wait on status, not turns.
 
 - **Workflow script run-step refusals now retain their typed reason in run
   records.** When a structured HTTP error includes a string `detail.kind`,
