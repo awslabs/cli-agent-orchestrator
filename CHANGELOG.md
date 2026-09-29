@@ -47,6 +47,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Kiro CLI 2.25.0 turns never reached COMPLETED.** 2.25 prints the
+  completion marker as `▸ Credits: turn 0.20 • session 0.20 | Time: 29s`; the
+  detector wanted a number straight after `Credits:`, so every finished turn
+  fell through to the separator fallback, which the new "Trust All Tools
+  active" band defeats as well. A terminal reported PROCESSING for the whole
+  task and then IDLE forever while the pane showed the finished response, so a
+  supervisor never saw its worker complete and the Kiro e2e cases timed out.
+  The marker now accepts a word between `Credits:` and the number; fixtures cut
+  from live 2.25.0 frames pin idle, working and finished (#837)
+
 - **OpenCode agents whose display name contains spaces never reported COMPLETED.**
   The completion marker read the agent name as one `\S+` token, so a marker such
   as `▣  Sisyphus - Ultraworker · Big Pickle · 3.1s` never matched and every
