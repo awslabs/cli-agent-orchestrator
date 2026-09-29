@@ -16,10 +16,12 @@ import time
 import httpx
 import pytest
 import uvicorn
+import websockets
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from starlette.websockets import WebSocketDisconnect
+from websockets.asyncio.client import connect
 
 import cli_agent_orchestrator.clients.database as database
 import cli_agent_orchestrator.runtime_channel.registry as registry_mod
@@ -33,8 +35,10 @@ from cli_agent_orchestrator.runtime_channel import token as token_mod
 from cli_agent_orchestrator.runtime_channel.bridge import Bridge
 from cli_agent_orchestrator.runtime_channel.protocol import (
     PROTOCOL_VERSION,
+    Command,
     CommandType,
     Hello,
+    Result,
     Status,
     decode,
     encode,
@@ -355,11 +359,130 @@ class TestRemoteTerminal:
         response = http.post("/runtimes/rt-1/terminals", json={"agent_profile": "developer"})
         assert response.status_code == 500
         assert ("may still be running" in response.json()["detail"]) is (not cleaned)
+        assert runtimes_of(http)["rt-1"]["terminals"] == []
         assert [(c.type, c.terminal_id) for c in runtime.received] == [
             (CommandType.LAUNCH, None),
             (CommandType.DELETE, "beef0001"),
         ]
         assert database.get_terminal_metadata("beef0001") is None
+
+
+def runtimes_of(http):
+    return http.get("/runtimes").json()["runtimes"]
+
+
+def _dial(server):
+    """A raw channel connection, standing in for a runtime."""
+    return connect(
+        f"ws://{server}/runtime/channel", additional_headers={"x-cao-runtime-token": TOKEN}
+    )
+
+
+async def _next_command(ws, timeout=5):
+    frame = decode(await asyncio.wait_for(ws.recv(), timeout))
+    assert isinstance(frame, Command), frame
+    return frame
+
+
+class TestReplacedConnection:
+    def test_a_replaced_connection_is_closed_and_its_reports_ignored(self, http, server):
+        _remote_row("abcd1234", "rt-1")
+
+        async def scenario():
+            async with _dial(server) as old:
+                await old.send(_hello(statuses={"abcd1234": "idle"}))
+                await old.recv()
+                async with _dial(server) as new:
+                    await new.send(_hello(statuses={"abcd1234": "processing"}))
+                    await new.recv()
+                    await old.send(encode(Status(terminal_id="abcd1234", status="completed")))
+                    with pytest.raises(websockets.exceptions.ConnectionClosed):
+                        await asyncio.wait_for(old.recv(), 5)
+                    return http.get("/terminals/abcd1234").json()["status"]
+
+        assert asyncio.run(scenario()) == "processing"
+
+
+class TestUnrecordedTerminals:
+    def test_a_terminal_the_server_never_recorded_is_deleted_at_hello(self, http, server):
+        _remote_row("abcd1234", "rt-1")
+
+        async def scenario():
+            async with _dial(server) as ws:
+                await ws.send(_hello(statuses={"abcd1234": "idle", "beef0002": "unknown"}))
+                await ws.recv()
+                command = await _next_command(ws)
+                await ws.send(
+                    encode(Result(op_id=command.op_id, ok=True, payload={"deleted": True}))
+                )
+                # The recorded terminal is left alone.
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(ws.recv(), 0.5)
+                return command
+
+        command = asyncio.run(scenario())
+        assert (command.type, command.terminal_id) == (CommandType.DELETE, "beef0002")
+        assert database.get_terminal_metadata("abcd1234") is not None
+
+    def test_a_launch_that_finishes_after_the_server_gave_up_is_deleted(
+        self, http, server, monkeypatch
+    ):
+        monkeypatch.setattr(server_mod, "LAUNCH_TIMEOUT", 0.5)
+
+        async def scenario():
+            async with _dial(server) as ws:
+                await ws.send(_hello())
+                await ws.recv()
+                loop = asyncio.get_running_loop()
+                request = loop.run_in_executor(
+                    None,
+                    lambda: http.post(
+                        "/runtimes/rt-1/terminals", json={"agent_profile": "developer"}
+                    ),
+                )
+                launch = await _next_command(ws)
+                response = await asyncio.wait_for(request, 10)
+                # The agent started after all; its result arrives too late.
+                late = Result(op_id=launch.op_id, ok=True, payload={"terminal": dict(LAUNCHED)})
+                await ws.send(encode(late))
+                delete = await _next_command(ws)
+                await ws.send(
+                    encode(Result(op_id=delete.op_id, ok=True, payload={"deleted": True}))
+                )
+                return response, delete
+
+        response, delete = asyncio.run(scenario())
+        assert response.status_code == 504
+        assert (delete.type, delete.terminal_id) == (CommandType.DELETE, "beef0001")
+        assert database.get_terminal_metadata("beef0001") is None
+
+
+class TestServerThatRunsNoAgents:
+    @pytest.mark.parametrize(
+        "method,path,kwargs",
+        [
+            (
+                "post",
+                "/sessions",
+                {"params": {"agent_profile": "developer", "provider": "mock_cli"}},
+            ),
+            (
+                "post",
+                "/sessions/cao-local1/terminals",
+                {"params": {"agent_profile": "developer", "provider": "mock_cli"}},
+            ),
+            (
+                "post",
+                "/terminals/run-step",
+                {"json": {"provider": "mock_cli", "agent": "developer", "prompt": "hi"}},
+            ),
+        ],
+    )
+    def test_local_launches_are_refused(self, client, monkeypatch, method, path, kwargs):
+        monkeypatch.setenv("CAO_LOCAL_EXECUTION", "0")
+        response = getattr(client, method)(path, **kwargs)
+        assert response.status_code == 409, response.text
+        assert "POST /runtimes/{runtime_id}/terminals" in str(response.json()["detail"])
 
 
 class TestRemoteSession:

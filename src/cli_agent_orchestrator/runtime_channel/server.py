@@ -12,7 +12,7 @@
 import asyncio
 import hmac
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, status
 from pydantic import BaseModel, ValidationError
@@ -32,6 +32,7 @@ from cli_agent_orchestrator.runtime_channel.protocol import (
 from cli_agent_orchestrator.runtime_channel.registry import (
     LAUNCH_TIMEOUT,
     RemoteRuntimeError,
+    RuntimeConnection,
     runtime_registry,
 )
 from cli_agent_orchestrator.runtime_channel.token import TOKEN_HEADER, runtime_token
@@ -47,12 +48,38 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+# Strong references to teardown tasks: the event loop keeps only weak ones.
+_teardowns: Set["asyncio.Task[None]"] = set()
+
 
 def _token_matches(presented: str) -> bool:
     expected = runtime_token()
     if not expected:
         return False
     return hmac.compare_digest(presented.encode(), expected.encode())
+
+
+def _delete_unrecorded(conn: RuntimeConnection, terminal_id: str) -> None:
+    """Delete, in its runtime, a terminal the server has no record of.
+
+    That is a launch whose result was lost (or arrived after the server gave
+    up), so nothing else would ever stop it.
+    """
+
+    async def run() -> None:
+        logger.warning(
+            "runtime %s runs terminal %s, which this server never recorded; deleting it",
+            conn.runtime_id,
+            terminal_id,
+        )
+        try:
+            await conn.call(CommandType.DELETE, {}, terminal_id=terminal_id)
+        except RemoteRuntimeError as exc:
+            logger.warning("could not delete unrecorded terminal %s: %s", terminal_id, exc)
+
+    task = asyncio.create_task(run())
+    _teardowns.add(task)
+    task.add_done_callback(_teardowns.discard)
 
 
 @router.websocket("/runtime/channel")
@@ -83,15 +110,33 @@ async def runtime_channel(ws: WebSocket) -> None:
         for terminal_id in await asyncio.to_thread(list_terminal_ids_on_runtime, runtime_id):
             runtime_registry.place(terminal_id, runtime_id)
         for terminal_id, reported in hello.statuses.items():
-            runtime_registry.set_status(terminal_id, runtime_id, reported)
+            runtime_registry.set_status(terminal_id, runtime_id, reported, conn=conn)
         await ws.send_text(server_hello)
+        # The hello lists every terminal the runtime runs.
+        for terminal_id in hello.statuses:
+            if not runtime_registry.is_placed(terminal_id, runtime_id):
+                _delete_unrecorded(conn, terminal_id)
 
         while True:
             frame = decode(await ws.receive_text())
+            if conn.closed:
+                # A newer connection for this runtime replaced this one.
+                await ws.close(code=status.WS_1000_NORMAL_CLOSURE, reason="replaced")
+                break
             if isinstance(frame, Result):
-                conn.resolve(frame)
+                launched = frame.payload.get("terminal") if frame.ok else None
+                if (
+                    not conn.resolve(frame)
+                    and isinstance(launched, dict)
+                    and isinstance(launched.get("id"), str)
+                    and not runtime_registry.is_placed(launched["id"], runtime_id)
+                ):
+                    # A launch that finished after the server gave up on it.
+                    _delete_unrecorded(conn, launched["id"])
             elif isinstance(frame, Status):
-                if runtime_registry.set_status(frame.terminal_id, runtime_id, frame.status):
+                if runtime_registry.set_status(
+                    frame.terminal_id, runtime_id, frame.status, conn=conn
+                ):
                     bus.publish(
                         f"terminal.{frame.terminal_id}.status", {"status": frame.status.value}
                     )
@@ -140,6 +185,9 @@ async def launch_on_runtime(
 
     info = result["terminal"]
     terminal_id = info["id"]
+    # Placed before the row is written, so a reconnect in between does not
+    # take the terminal for an unrecorded one.
+    runtime_registry.place(terminal_id, runtime_id)
     try:
         await asyncio.to_thread(
             db_create_terminal,
@@ -156,6 +204,7 @@ async def launch_on_runtime(
         # The agent is running with no central row: tear it down so nothing is
         # left running that the server cannot see.
         logger.exception("could not record terminal %s from runtime %s", terminal_id, runtime_id)
+        runtime_registry.forget(terminal_id)
         cleaned = False
         try:
             deleted = await runtime_registry.call(
@@ -171,7 +220,6 @@ async def launch_on_runtime(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=detail
         ) from exc
 
-    runtime_registry.place(terminal_id, runtime_id)
     reported = info.get("status")
     if reported:
         runtime_registry.set_status(terminal_id, runtime_id, TerminalStatus(reported))

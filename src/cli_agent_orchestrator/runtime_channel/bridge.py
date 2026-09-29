@@ -15,12 +15,13 @@ Configuration:
 """
 
 import asyncio
+import contextlib
 import logging
 import os
 import re
 import signal
 from pathlib import Path
-from typing import Any, Dict, Optional, Set
+from typing import Any, AsyncIterator, Dict, Optional, Set, Tuple
 
 import websockets
 from websockets.asyncio.client import ClientConnection, connect
@@ -61,7 +62,8 @@ class Bridge:
         self._ready_file = ready_file
         self._ws: Optional[ClientConnection] = None
         self._send_lock = asyncio.Lock()
-        self._terminal_locks: Dict[str, asyncio.Lock] = {}
+        # terminal id -> (lock, number of commands holding or awaiting it)
+        self._terminal_locks: Dict[str, Tuple[asyncio.Lock, int]] = {}
         # Strong references: the event loop holds only weak ones to tasks.
         self._tasks: Set["asyncio.Task[None]"] = set()
         self._stop = asyncio.Event()
@@ -97,17 +99,30 @@ class Bridge:
 
     # --- commands ---
 
+    @contextlib.asynccontextmanager
+    async def _terminal_turn(self, terminal_id: str) -> AsyncIterator[None]:
+        """Wait for this terminal's earlier commands. The lock is dropped only
+        once nothing holds or awaits it."""
+        lock, users = self._terminal_locks.get(terminal_id, (asyncio.Lock(), 0))
+        self._terminal_locks[terminal_id] = (lock, users + 1)
+        try:
+            async with lock:
+                yield
+        finally:
+            lock, users = self._terminal_locks[terminal_id]
+            if users == 1:
+                del self._terminal_locks[terminal_id]
+            else:
+                self._terminal_locks[terminal_id] = (lock, users - 1)
+
     async def handle(self, command: Command) -> None:
         # One terminal's commands run in arrival order; different terminals and
         # launches run concurrently.
-        lock = None
-        if command.terminal_id:
-            lock = self._terminal_locks.setdefault(command.terminal_id, asyncio.Lock())
         try:
-            if lock is None:
+            if command.terminal_id is None:
                 payload = await self.execute(command)
             else:
-                async with lock:
+                async with self._terminal_turn(command.terminal_id):
                     payload = await self.execute(command)
             result = Result(op_id=command.op_id, ok=True, payload=payload)
         except Exception as exc:  # noqa: BLE001 - reported to the server as a failed result
@@ -168,22 +183,18 @@ class Bridge:
                 # goal, no such pane on this runtime, already holds.
                 return {"deleted": True, "absent": True}
             deleted = await asyncio.to_thread(terminal_service.delete_terminal, terminal_id)
-            self._terminal_locks.pop(terminal_id, None)
             return {"deleted": bool(deleted)}
         raise ValueError(f"unsupported command: {command.type.value}")
 
     # --- connection ---
 
     def _current_statuses(self) -> Dict[str, TerminalStatus]:
+        """Every terminal this runtime runs, with its status: the server deletes
+        any it has no record of."""
         from cli_agent_orchestrator.clients.database import list_all_terminals
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
-        statuses = {}
-        for row in list_all_terminals():
-            status = status_monitor.get_status(row["id"])
-            if status != TerminalStatus.UNKNOWN:
-                statuses[row["id"]] = status
-        return statuses
+        return {row["id"]: status_monitor.get_status(row["id"]) for row in list_all_terminals()}
 
     async def serve(self, ws: ClientConnection) -> None:
         """Run one connection: hello exchange, then commands until it closes."""

@@ -72,6 +72,15 @@ class TerminalLimitError(Exception):
     """
 
 
+class LocalExecutionDisabledError(Exception):
+    """Raised when a terminal would start beside a server set to run no agents.
+
+    A central ``cao-server`` whose agents all run in execution runtimes (#745)
+    sets ``CAO_LOCAL_EXECUTION=0``. Not a ``ValueError`` subclass, for the reason
+    ``TerminalLimitError`` gives: the API maps it to its own status (409).
+    """
+
+
 class Terminal(BaseModel):
     """Terminal model - represents a tmux window."""
 

@@ -221,6 +221,9 @@ strings. See [Control Planes](control-planes.md) for operator-facing choices.
   returns `201` with the terminal.
 - `GET /runtimes` lists the connected runtimes and the terminals placed on
   them.
+- With `CAO_LOCAL_EXECUTION=0`, routes that would start an agent beside the
+  server (`POST /sessions`, `POST /sessions/{session_name}/terminals`,
+  `POST /terminals/run-step`) return `409`.
 - The `/terminals/{terminal_id}*` operations above, and `DELETE
   /sessions/{session_name}`, route a remote terminal to its runtime. They
   return `503` when the runtime is not connected, `504` when the outcome is

@@ -30,7 +30,11 @@ class CommandType(str, Enum):
 
 
 class Hello(BaseModel):
-    """First frame in each direction. The runtime's carries its current statuses."""
+    """First frame in each direction.
+
+    The runtime's lists every terminal it runs, with its current status
+    (``unknown`` until its status monitor has one).
+    """
 
     kind: Literal["hello"] = "hello"
     protocol_version: int

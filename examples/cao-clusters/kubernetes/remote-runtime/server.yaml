@@ -1,6 +1,6 @@
 # The one cao-server. It serves the HTTP API, owns the SQLite state on its PVC,
 # and routes every operation on a remote terminal to the runtime running it. It
-# runs no agents itself.
+# runs no agents itself (CAO_LOCAL_EXECUTION below).
 #
 # A single-replica StatefulSet: a rolling update deletes the old pod before it
 # creates the new one, so two servers never share the state volume.
@@ -52,6 +52,10 @@ spec:
               value: /home/cao/.cao/state
             - name: CAO_RUNTIME_TOKEN_FILE
               value: /var/run/cao/runtime-token/token
+            # Refuse to start agents here: local launch routes return 409 and
+            # point at POST /runtimes/{runtime_id}/terminals.
+            - name: CAO_LOCAL_EXECUTION
+              value: "0"
             # No agents run here, so there is no provider to warm up.
             - name: CAO_WARM_PROVIDER
               value: "0"
