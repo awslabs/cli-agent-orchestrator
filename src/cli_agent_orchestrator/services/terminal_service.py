@@ -3087,7 +3087,10 @@ def readopt_terminals_at_startup(rows: List[Dict[str, Any]]) -> Dict[str, int]:
     - session confirmed alive and the window readable: re-arm the pipeline —
       recreate the FIFO reader (same probe/re-arm closures ``create_terminal``
       uses) and stop+start pipe-pane so the pane streams into the fresh FIFO
-      (a bare pipe_pane() would toggle a still-registered pipe OFF).
+      (a bare pipe_pane() would toggle a still-registered pipe OFF). Nothing
+      is typed into the pane: a quiet agent's status is seeded by the
+      pipe-liveness watchdog replaying the pane's current content once the
+      fresh FIFO has stayed silent for its cold-start grace period.
     - session confirmed ABSENT (``session_exists_strict`` returned False):
       finalize — recover a ``.scrollback`` from the ANSI-stripped ``<tid>.log``
       if none exists (crashes never ran the delete-path capture), then drop the
@@ -3191,11 +3194,14 @@ def _rearm_terminal_pipeline(
     # would switch it OFF.
     backend.stop_pipe_pane(session_name, window_name)
     backend.pipe_pane(session_name, window_name, str(fifo_path))
-    # Nudge the agent's TUI so it repaints AFTER the fresh pipe attaches (same
-    # rationale as create_terminal's post-pipe Enter): pipe-pane only streams
-    # NEW output, so without a repaint the rolling status buffer stays empty
-    # and the re-adopted terminal reads UNKNOWN until it next speaks.
-    backend.send_special_key(session_name, window_name, "Enter")
+    # Deliberately NO keystroke. create_terminal's post-pipe Enter lands on a
+    # bare shell; here the pane holds a live agent in an arbitrary state, where
+    # Enter is a submit -- on a permission prompt it answers the highlighted
+    # option. The status buffer is seeded from the pane's own content instead:
+    # an agent that is working streams output through the fresh pipe, and one
+    # that is quiet (idle, or parked on a prompt) never delivers a byte, which
+    # is the watchdog's cold-start case -- it re-arms the pipe and replays the
+    # pane's current content into the pipeline (FifoManager._rearm_stalled_pipe).
 
 
 def _finalize_dead_terminal(terminal_id: str) -> None:
