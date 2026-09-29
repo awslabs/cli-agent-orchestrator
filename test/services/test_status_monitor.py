@@ -1777,6 +1777,42 @@ class TestRawPathDeferralForScreenProviders:
 
         assert sm._last_status["t1"] == TerminalStatus.COMPLETED
 
+    def _working_turn_read_by_get_status(self, quiet_for):
+        """A started turn, cached PROCESSING, a buffer that paused ``quiet_for``
+        seconds ago and is not mid-burst — the state get_status() re-checks."""
+        sm = StatusMonitor()
+        sm.notify_input_sent("t1")
+        sm.notify_input_delivered("t1")
+        sm._apply_detection("t1", TerminalStatus.PROCESSING)  # seen working
+        with sm._lock:
+            sm._buffers["t1"] = "raw bytes of a live Ink frame"
+            sm._bursting["t1"] = False
+            sm._buffer_changed_at["t1"] = time.monotonic() - quiet_for
+        # The #735 misread: raw bytes of a working Ink TUI parse as finished.
+        sm._detect_status = lambda tid, buf: TerminalStatus.COMPLETED
+        return sm
+
+    @patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", False)
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_the_get_status_recheck_also_waits_for_output_to_stop(self, mock_pm):
+        """Same rule on the poll path as on the quiescence path (PR #812 review,
+        gutosantos82): a mid-turn pause shorter than the quiet window must not let
+        get_status() end the turn with the misread."""
+        mock_pm.get_provider.return_value = self._provider(True)
+        sm = self._working_turn_read_by_get_status(quiet_for=0.3)
+
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        assert sm.turn_state("t1") == (1, 0)
+
+    @patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", False)
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_the_get_status_recheck_decides_once_output_has_stopped(self, mock_pm):
+        mock_pm.get_provider.return_value = self._provider(True)
+        sm = self._working_turn_read_by_get_status(quiet_for=STALE_PROCESSING_BUFFER_QUIET_S + 0.1)
+
+        assert sm.get_status("t1") == TerminalStatus.COMPLETED
+        assert sm.turn_state("t1") == (1, 1)
+
     @patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", False)
     @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
     def test_a_raw_calibrated_provider_is_not_delayed(self, mock_pm):

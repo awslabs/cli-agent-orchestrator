@@ -2778,3 +2778,13 @@ class TestBlocksOrchestratedInputWhileWaitingUserAnswer:
     def test_blocks_orchestrated_input_while_waiting_user_answer(self):
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         assert provider.blocks_orchestrated_input_while_waiting_user_answer is True
+
+
+def test_assume_processing_on_dispatch_is_declared():
+    """#735 (PR #812 review): claude_code is the one provider that assumes
+    PROCESSING at dispatch, because its Ink TUI keeps the finished turn on screen
+    until the new spinner draws. Reverting the override must fail a test, not just
+    change behaviour; send_input's side of the wiring is pinned in
+    test_terminal_service_full."""
+    provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+    assert provider.assume_processing_on_dispatch is True

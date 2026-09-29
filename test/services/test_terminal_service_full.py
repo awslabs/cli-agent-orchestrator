@@ -2089,6 +2089,44 @@ class TestSendInput:
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_send_input_assumes_processing_when_the_provider_declares_it(
+        self,
+        mock_get_metadata,
+        mock_tmux,
+        mock_pm,
+        mock_update,
+        mock_status_monitor,
+        mock_memory_service,
+    ):
+        """The TRUE branch of assume_processing_on_dispatch (PR #812 review): a
+        provider that declares it gets notify_input_sent(assume_processing=True),
+        and the turn number that call returns is the one send_input reports. The
+        FALSE branch is pinned by the next test; a MagicMock's auto-attribute is
+        not True, which is why the flag is compared with `is True`."""
+        mock_memory_service.return_value.get_curated_memory_context.return_value = ""
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "supervisor-abcd",
+        }
+        mock_provider = mock_pm.get_provider.return_value
+        mock_provider.paste_enter_count = 1
+        mock_provider.paste_submit_delay = 2.0
+        mock_provider.assume_processing_on_dispatch = True
+        mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_status_monitor.notify_input_sent.return_value = 4
+
+        assert send_input("test1234", "hello supervisor") == 4
+
+        mock_status_monitor.notify_input_sent.assert_called_once_with(
+            "test1234", assume_processing=True
+        )
+
+    @patch("cli_agent_orchestrator.services.terminal_service.MemoryService")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_send_input_clears_rolling_buffer_preserving_arm(
         self,
         mock_get_metadata,

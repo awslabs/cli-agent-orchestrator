@@ -1329,6 +1329,33 @@ class TestGetTerminal:
         assert data["provider"] == "kiro_cli"
         mock_svc.get_terminal.assert_called_once_with("abcd1234")
 
+    def test_get_terminal_reports_turn_progress(self, client):
+        """GET /terminals/{id} carries turn and turn_completed through the response
+        model (#735). A waiter polls these to learn whether the turn its POST /input
+        named has finished; the route pairs with POST's own `turn` assertion below
+        (PR #812 review: the pair was only asserted at the service layer)."""
+        mock_terminal_dict = {
+            "id": "abcd1234",
+            "name": "test-window",
+            "session_name": "test-session",
+            "provider": "kiro_cli",
+            "agent_profile": "developer",
+            "status": "completed",
+            "turn": 3,
+            "turn_completed": 2,
+        }
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.get_terminal.return_value = mock_terminal_dict
+
+            response = client.get("/terminals/abcd1234")
+
+        assert response.status_code == 200
+        data = response.json()
+        # A ready status with turn_completed < turn: turn 3 is still in flight.
+        assert data["status"] == "completed"
+        assert data["turn"] == 3
+        assert data["turn_completed"] == 2
+
     def test_get_terminal_not_found(self, client):
         """GET /terminals/{id} returns 404 for nonexistent terminal."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:

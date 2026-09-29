@@ -1421,9 +1421,23 @@ class StatusMonitor:
                 # verdict needs no stream silence — this is the #558 escape for a
                 # TUI whose post-answer refreshes outrun the quiescence window
                 # forever, which an unconditional `not bursting` here removed
-                # (PR #812 review). Screen-calibrated providers read raw
-                # (CAO_PYTE_STATUS=false) keep the mid-stream restriction.
-                settled = True if raw_calibrated else (not bursting)
+                # (PR #812 review). A screen-calibrated provider read raw
+                # (CAO_PYTE_STATUS=false) cannot be read mid-stream at all, so it
+                # gets the same rule as _defer_raw_quiescence: settled only once
+                # output has stopped for STALE_PROCESSING_BUFFER_QUIET_S. Without
+                # it, a pause of a few hundred ms mid-turn let this re-check end
+                # the turn that the quiescence path was careful not to (PR #812
+                # review, gutosantos82).
+                if raw_calibrated:
+                    settled = True
+                else:
+                    with self._lock:
+                        changed_at = self._buffer_changed_at.get(terminal_id)
+                    settled = (
+                        not bursting
+                        and changed_at is not None
+                        and time.monotonic() - changed_at >= STALE_PROCESSING_BUFFER_QUIET_S
+                    )
                 work_evidence = self._work_evidence(provider, buffer)
             logger.debug(
                 f"get_status [{terminal_id}]: cached=PROCESSING, "
