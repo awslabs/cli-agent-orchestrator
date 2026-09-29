@@ -32,7 +32,7 @@ class CommandType(str, Enum):
 class Hello(BaseModel):
     """First frame in each direction.
 
-    The runtime's lists every terminal it runs, with its current status
+    The runtime's hello lists every terminal it runs, with its current status
     (``unknown`` until its status monitor has one).
     """
 

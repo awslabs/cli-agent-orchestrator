@@ -128,6 +128,32 @@ class TestExecute:
         assert seen["provider"] == "claude_code"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("stopped", [True, False])
+    async def test_a_launch_that_cannot_be_reported_stops_its_agent(self, monkeypatch, stopped):
+        deleted = []
+
+        async def create_terminal(**kwargs):
+            return SimpleNamespace(id="beef0001")
+
+        def get_terminal(tid):
+            raise RuntimeError("database is locked")
+
+        def delete_terminal(tid):
+            deleted.append(tid)
+            return stopped
+
+        monkeypatch.setattr(terminal_service, "create_terminal", create_terminal)
+        monkeypatch.setattr(terminal_service, "get_terminal", get_terminal)
+        monkeypatch.setattr(terminal_service, "delete_terminal", delete_terminal)
+        with pytest.raises(RuntimeError) as exc:
+            await _bridge().execute(
+                _command(CommandType.LAUNCH, None, agent_profile="developer", provider="mock_cli")
+            )
+        assert deleted == ["beef0001"]
+        assert "beef0001" in str(exc.value)
+        assert ("may still be running" in str(exc.value)) is (not stopped)
+
+    @pytest.mark.asyncio
     async def test_input_keeps_the_sender_and_orchestration_type(self, monkeypatch):
         seen = {}
 
@@ -275,10 +301,11 @@ class TestConnection:
         server = FakeServer(frames=[_command(CommandType.OUTPUT, mode="full")])
         serving = asyncio.ensure_future(bridge.serve(server))
         for _ in range(100):
-            if len(server.sent) == 2:
+            if any(isinstance(frame, Result) for frame in server.sent):
                 break
             await asyncio.sleep(0.01)
-        hello, result = server.sent
+        hello = server.sent[0]
+        (result,) = [frame for frame in server.sent if isinstance(frame, Result)]
         assert hello == Hello(
             protocol_version=PROTOCOL_VERSION,
             runtime_id="rt-1",
@@ -307,6 +334,24 @@ class TestConnection:
             "aaaa0001": TerminalStatus.IDLE,
             "aaaa0002": TerminalStatus.UNKNOWN,
         }
+
+    @pytest.mark.asyncio
+    async def test_a_status_that_changes_during_the_hello_is_sent_once_connected(self, monkeypatch):
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        bridge = _bridge()  # its hello reports abcd1234 as idle
+        # By the time the server's hello arrives, the terminal is processing.
+        monkeypatch.setattr(status_monitor, "get_status", lambda tid: TerminalStatus.PROCESSING)
+        server = FakeServer()
+        serving = asyncio.ensure_future(bridge.serve(server))
+        for _ in range(100):
+            if len(server.sent) >= 2:
+                break
+            await asyncio.sleep(0.01)
+        await server.close()
+        await serving
+        assert server.sent[0].statuses == {"abcd1234": TerminalStatus.IDLE}
+        assert server.sent[-1] == Status(terminal_id="abcd1234", status=TerminalStatus.PROCESSING)
 
     @pytest.mark.asyncio
     async def test_a_server_speaking_another_version_is_fatal(self, tmp_path):
@@ -346,7 +391,10 @@ class TestConnection:
 
 class TestStatusForwarding:
     @pytest.mark.asyncio
-    async def test_every_local_status_change_is_pushed(self):
+    async def test_every_local_status_change_is_pushed(self, monkeypatch):
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        monkeypatch.setattr(status_monitor, "get_status", lambda tid: TerminalStatus.COMPLETED)
         bridge = _bridge()
         server = FakeServer()
         bridge._ws = server
@@ -356,7 +404,7 @@ class TestStatusForwarding:
         try:
             await asyncio.sleep(0)
             bus.publish("terminal.abcd1234.status", {"status": "completed"})
-            bus.publish("terminal.abcd1234.status", {"status": "not-a-status"})
+            bus.publish("terminal.not-a-terminal.output", {"status": "idle"})
             for _ in range(100):
                 if server.sent:
                     break
