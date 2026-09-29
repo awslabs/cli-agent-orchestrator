@@ -1229,7 +1229,7 @@ def update_workflow(
     safe_base, target_path = _validate_write_target(name, scan_dir)
     lock_target = _safe_spec_path(target_path, safe_base)
     with strict_identity_lock(_workflow_lock_identity(lock_target, safe_base), Path(lock_target)):
-        if not os.path.exists(target_path):
+        if not os.path.exists(lock_target):
             raise WorkflowNotFoundError(f"workflow '{name}' does not exist; use create to add it")
         _check_tier_collision(name, safe_base)
 
