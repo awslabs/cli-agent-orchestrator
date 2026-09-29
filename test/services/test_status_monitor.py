@@ -1902,7 +1902,7 @@ class TestCapturePaneReturnHonorsTheTurnGuard:
 
 
 class TestClearedBufferEvidenceIsPinnedToItsTurn:
-    """Cleared-buffer evidence closes only the turn whose dispatch cleared it.
+    """A raw verdict applies only to the turn whose dispatch cleared its buffer.
 
     The evidence-turn is pinned when a raw verdict's context is read and
     revalidated under the lock that closes the turn: a new dispatch
@@ -1931,11 +1931,13 @@ class TestClearedBufferEvidenceIsPinnedToItsTurn:
         sm._apply_detection("t1", TerminalStatus.COMPLETED, cleared_buffer_turn=pinned)
         assert sm.turn_state("t1") == (2, 0)
 
-    def test_evidence_pinned_to_the_current_turn_closes_it(self):
-        """The bypass needs BOTH facts: ownership (the pin matches) and an
-        identity-guarded provider — one whose detector rejects replayed
-        completions itself, so this COMPLETED cannot be a re-emitted old answer
-        (round 6 replaced the forgeable word predicate with that capability)."""
+    def test_a_matching_pin_is_ownership_not_evidence_the_turn_ran(self):
+        """A correctly pinned ready verdict still waits for the turn to be seen
+        working: bytes arriving after the dispatch prove WHEN they arrived, not
+        which turn rendered them — a TUI can re-emit its retained old answer into
+        the fresh buffer. Through review round 7 a provider flag
+        (owns_completion_identity) let such a verdict close the turn at once;
+        each provider that held it could still pass a replay, so it is gone."""
         sm = StatusMonitor()
         provider = MagicMock()
         provider.supports_screen_detection = False
@@ -1943,27 +1945,11 @@ class TestClearedBufferEvidenceIsPinnedToItsTurn:
         with sm._lock:
             pinned = sm._pin_cleared_turn_locked("t1")
 
-        sm._apply_detection(
-            "t1", TerminalStatus.COMPLETED, cleared_buffer_turn=pinned, identity_guarded=True
-        )
-        assert sm.turn_state("t1") == (1, 1)
-
-    def test_ownership_alone_is_not_eligibility(self):
-        """A correctly-pinned observation from a provider WITHOUT replay
-        rejection keeps the conservative gate — arrival time is not proof the
-        turn rendered it, and such a provider cannot tell a re-emitted old
-        answer from a new one."""
-        sm = StatusMonitor()
-        provider = MagicMock()
-        provider.supports_screen_detection = False
-        self._dispatch(sm, provider)
-        with sm._lock:
-            pinned = sm._pin_cleared_turn_locked("t1")
-
-        sm._apply_detection(
-            "t1", TerminalStatus.COMPLETED, cleared_buffer_turn=pinned, identity_guarded=False
-        )
+        sm._apply_detection("t1", TerminalStatus.COMPLETED, cleared_buffer_turn=pinned)
         assert sm.turn_state("t1") == (1, 0)
+        sm._apply_detection("t1", TerminalStatus.PROCESSING, cleared_buffer_turn=pinned)
+        sm._apply_detection("t1", TerminalStatus.COMPLETED, cleared_buffer_turn=pinned)
+        assert sm.turn_state("t1") == (1, 1)
 
     def test_work_evidence_is_none_unless_the_provider_answers_a_bool(self):
         """A MagicMock's auto-attribute returns a MagicMock, not a bool, so mocked
@@ -2150,17 +2136,14 @@ class TestOwnershipSurvivesAMissingActivityMarker:
     window, its completed reply lands; a paused get_status resumes after turn 2
     has dispatched and shown busy output, and the stale COMPLETED — pin erased —
     closes turn 2 as (2, 2). An observation must keep its turn identity even when
-    activity is absent, unsupported, or the probe fails; eligibility for the
-    seen-working bypass is a different question with a different answer.
+    activity is absent, unsupported, or the probe fails.
     """
 
     def _two_turns_second_working(self):
         sm = StatusMonitor()
         provider = MagicMock()
         provider.supports_screen_detection = False
-        # A MagicMock provider is not identity-guarded (`owns_completion_identity`
-        # is compared with `is True`), so nothing here is bypass-eligible — which
-        # is the point: ownership must protect the turn on its own.
+        # Ownership must protect the turn on its own.
         provider.get_status.return_value = TerminalStatus.COMPLETED
         # Turn 1: dispatched, seen working, legitimately finished.
         sm.notify_input_sent("t1")

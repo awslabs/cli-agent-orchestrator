@@ -528,7 +528,15 @@ def test_buffer_clear_generation_accepts_coalesced_identical_completion():
     notifying Grok, mark the input received, then receive one FIFO chunk with
     both the current processing marker and a byte-identical completion.  The
     second direct status lookup models StatusMonitor's settled recheck.
+
+    PR #812 (#735): Grok still reports COMPLETED for the chunk, but a latched
+    PROCESSING is released only once the turn was seen working, or when
+    TURN_START_BACKSTOP_S expires. Grok never reports this turn busy, so the
+    recheck settles at the backstop — late, never wedged. Grok declares no
+    shows_turn_work() yet: its "Waiting for response…" line is drawn the same
+    way as answer text, so a rule that quotes could not pass is unproven.
     """
+    from cli_agent_orchestrator.services import status_monitor as sm_mod
 
     provider = make_provider()
     monitor = StatusMonitor()
@@ -551,25 +559,24 @@ def test_buffer_clear_generation_accepts_coalesced_identical_completion():
         # While cached PROCESSING, get_status performs a direct settled
         # recheck; pin the successful state through the same code path too.
         monitor._last_status["test-terminal"] = TerminalStatus.PROCESSING
-        assert monitor.get_status("test-terminal") == TerminalStatus.COMPLETED
+        assert monitor.get_status("test-terminal") == TerminalStatus.PROCESSING
+        with patch.object(sm_mod, "TURN_START_BACKSTOP_S", 0):
+            assert monitor.get_status("test-terminal") == TerminalStatus.COMPLETED
 
 
-def test_coalesced_completion_closes_the_dispatched_turn():
-    """A reply whose processing and completion arrive in ONE chunk must close its turn.
+def test_coalesced_completion_closes_the_dispatched_turn_at_the_backstop():
+    """A reply whose processing and completion arrive in ONE chunk closes late, not never.
 
-    Grok explicitly supports a FIFO chunk that carries both the current processing
-    marker and the finished answer (the coalesced test above), so a valid fast reply
-    need not ever produce a separate PROCESSING verdict. #812's first cut required a
-    separately sampled busy status before a settled ready reading could close the
-    turn; this replay left ``status=completed, turn=1, turn_completed=0`` and — the
-    terminal being quiet and the cached status ready — nothing ever re-evaluated, so
-    the advertised backstop never ran and the turn-aware CLI waiter timed out at its
-    own 300s instead of returning the finished reply (PR #812 review, haofeif).
-
-    The buffer was cleared at dispatch, so everything the detector judged arrived
-    AFTER the dispatch: a ready verdict from it is current-turn evidence, and the
-    provider's own generation guards (the neighbouring tests) own the staleness risk.
+    Grok supports a FIFO chunk that carries both the current processing marker and
+    the finished answer (the coalesced test above), so a fast reply need not ever
+    produce a separate PROCESSING verdict. #812's first cut left such a turn at
+    ``turn=1, turn_completed=0`` forever: with the terminal quiet and the cached
+    status ready, nothing re-evaluated the backstop (PR #812 review, haofeif). The
+    poll now does. Closing it at ONCE needs evidence a replay cannot fake; see
+    test_a_stale_poll_cannot_turn_a_replay_into_the_new_turns_answer for why grok's
+    own replay memory is not that evidence.
     """
+    from cli_agent_orchestrator.services import status_monitor as sm_mod
 
     provider = make_provider()
     monitor = StatusMonitor()
@@ -591,10 +598,43 @@ def test_coalesced_completion_closes_the_dispatched_turn():
         monitor.notify_input_delivered("test-terminal")
 
         monitor._process_chunk("test-terminal", coalesced)
+        assert monitor.turn_state("test-terminal") == (1, 0)
 
-        assert monitor._last_status["test-terminal"] == TerminalStatus.COMPLETED
-        # The turn the dispatch opened is CLOSED — this is what the CLI waits on.
+        # The CLI waiter polls; once the backstop has expired, that poll closes it.
+        with patch.object(sm_mod, "TURN_START_BACKSTOP_S", 0):
+            monitor.get_status("test-terminal")
         assert monitor.turn_state("test-terminal") == (1, 1)
+
+
+def test_a_stale_poll_cannot_turn_a_replay_into_the_new_turns_answer():
+    """haofeif's PR #812 round-7 interleaving, on grok: a poll reads turn 1's busy
+    bytes and stalls; turn 1 finishes; turn 2 is sent; the stalled poll then
+    reaches the provider and sets its _turn_activity_seen for turn 2. When only
+    turn 1's answer is replayed, grok reports it COMPLETED — its replay memory was
+    changed by a read the monitor already discards. The turn must stay open: the
+    monitor, not provider state, decides whether turn 2 was seen working."""
+    provider = make_provider()
+    monitor = StatusMonitor()
+    busy = "Waiting for response…\nEsc:cancel\n"
+    completed = _completed_turn("repeat exactly", "same response")
+
+    def dispatch():
+        monitor.notify_input_sent("test-terminal")
+        monitor.clear_rolling_buffer("test-terminal", provider)
+        provider.mark_input_received()
+        monitor.notify_input_delivered("test-terminal")
+
+    with patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as manager:
+        manager.get_provider.return_value = provider
+        dispatch()
+        monitor._process_chunk("test-terminal", busy)
+        monitor._process_chunk("test-terminal", completed)
+        assert monitor.turn_state("test-terminal") == (1, 1)
+
+        dispatch()
+        provider.get_status(busy)  # the stalled poll resumes after the dispatch
+        monitor._process_chunk("test-terminal", completed)  # replay of turn 1 only
+        assert monitor.turn_state("test-terminal") == (2, 1)
 
 
 def test_completion_reaches_a_poller_while_refreshes_prevent_quiescence():

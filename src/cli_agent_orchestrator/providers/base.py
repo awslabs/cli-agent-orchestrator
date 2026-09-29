@@ -214,22 +214,6 @@ class BaseProvider(ABC):
     # never probed: the terminal keeps the status the edges give it.
     supports_midburst_processing_probe: bool = False
 
-    # Whether this provider's raw detector REJECTS replayed completions by
-    # response identity: it remembers the last completed response it reported,
-    # freezes that at dispatch (mark_input_received), and refuses to classify a
-    # byte-identical post-dispatch response as a NEW completion unless it saw
-    # the turn working (grok: buffer epochs). Only such a provider's settled
-    # post-clear COMPLETED may close a turn without a separately sampled busy
-    # status — for anyone else, a re-emitted old answer is indistinguishable
-    # from a new one (#735, PR #812 rounds 2-6; word-based activity matching was
-    # tried in between and is not sufficient: a completed answer can QUOTE the
-    # working words). Kiro held this through round 6 via a response-identity
-    # veto and gave it up: a pane resize repaints the old answer with different
-    # wrapping, so its identity no longer matches and the veto passes it (see
-    # shows_turn_work instead). Checked with `is True`, like
-    # assume_processing_on_dispatch, so mocks default closed.
-    owns_completion_identity: bool = False
-
     def shows_turn_work(self, buffer: str) -> Optional[bool]:
         """Whether a raw buffer cleared at dispatch shows this turn actually running.
 
@@ -239,7 +223,16 @@ class BaseProvider(ABC):
         ``True`` marks the turn started, so a PROCESSING verdict that a repaint of
         the previous answer can also produce (kiro's "no idle prompt yet"
         fallback) no longer does. Called on the raw rolling buffer only, never on
-        a retained source. Must be pure.
+        a retained source. Must be pure: it is evaluated against the monitor's own
+        pinned snapshot, so no provider state can carry a stale poll's view into
+        the next turn.
+
+        Returning True also lets a fast reply close at once when its work sign and
+        answer arrive in one chunk. Without the signal such a reply waits for
+        StatusMonitor's TURN_START_BACKSTOP_S. Declare it only for a sign that
+        quoted answer text cannot reproduce (see kiro_cli's TUI_LIVE_WORK_PATTERN):
+        PR #812's review showed that arrival time, word matches and
+        provider-remembered answer identity all admit a replayed old answer.
         """
         return None
 
