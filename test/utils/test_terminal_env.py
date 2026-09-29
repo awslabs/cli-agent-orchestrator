@@ -14,6 +14,7 @@ from cli_agent_orchestrator.utils.terminal_env import (
     MAX_ENV_VALUE_BYTES,
     apply_runtime_identity,
     merge_profile_env,
+    profile_env_names,
     within_value_cap,
 )
 
@@ -74,6 +75,20 @@ class TestMergeProfileEnv:
         assert ("BIG" in env) is kept
         assert env["OK"] == "y"
         assert ("BIG" in applied) is kept
+
+    def test_profile_env_names_are_exactly_what_the_merge_writes(self, caplog):
+        """The provider-side view (profile_env_names) cannot drift from the
+        backend-side merge: same policy, and it logs nothing."""
+        profile_env = {
+            "CLAUDE_CONFIG_DIR": "/abs/.claude-b",
+            "CAO_WORKFLOW_RUN_ID": "spoof",
+            "BIG": "x" * MAX_ENV_VALUE_BYTES,
+            "OK": "y",
+        }
+        with caplog.at_level(logging.WARNING):
+            names = profile_env_names(profile_env)
+        assert caplog.messages == []
+        assert names == merge_profile_env({}, profile_env) == ["CLAUDE_CONFIG_DIR", "OK"]
 
     def test_wins_over_operator_env(self):
         """Profile env is more specific than session-wide operator env."""

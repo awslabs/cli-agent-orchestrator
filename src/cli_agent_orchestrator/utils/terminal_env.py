@@ -46,6 +46,9 @@ def _log_drop(source: str, key: str, reason: str) -> None:
     logger.warning("Dropping %s env var %s — %s", source, key, reason)
 
 
+_OVER_CAP = f"value exceeds {MAX_ENV_VALUE_BYTES} bytes"
+
+
 def within_value_cap(source: str, key: str, value: str) -> bool:
     """Return True if ``value`` fits the byte cap; otherwise log the drop.
 
@@ -54,8 +57,31 @@ def within_value_cap(source: str, key: str, value: str) -> bool:
     """
     if len(value.encode("utf-8")) < MAX_ENV_VALUE_BYTES:
         return True
-    _log_drop(source, key, f"value exceeds {MAX_ENV_VALUE_BYTES} bytes")
+    _log_drop(source, key, _OVER_CAP)
     return False
+
+
+def _profile_env_rejection(key: str, value: str) -> Optional[str]:
+    """Why a profile ``env:`` entry is not applied, or None if it is."""
+    if key in RUNTIME_IDENTITY_ENV_KEYS:
+        return "name is reserved for CAO's runtime identity"
+    if len(value.encode("utf-8")) >= MAX_ENV_VALUE_BYTES:
+        return _OVER_CAP
+    return None
+
+
+def profile_env_names(profile_env: Optional[Mapping[str, str]]) -> List[str]:
+    """The names :func:`merge_profile_env` writes for this ``env:``, silently.
+
+    For code outside the backends that must know which variables a terminal
+    received from its profile -- e.g. a provider's launch command, which may
+    otherwise treat them as inherited -- without re-deriving the policy.
+    """
+    return [
+        key
+        for key, value in (profile_env or {}).items()
+        if _profile_env_rejection(key, value) is None
+    ]
 
 
 def merge_profile_env(
@@ -70,10 +96,9 @@ def merge_profile_env(
     """
     applied: List[str] = []
     for key, value in (profile_env or {}).items():
-        if key in RUNTIME_IDENTITY_ENV_KEYS:
-            _log_drop("profile", key, "name is reserved for CAO's runtime identity")
-            continue
-        if not within_value_cap("profile", key, value):
+        reason = _profile_env_rejection(key, value)
+        if reason is not None:
+            _log_drop("profile", key, reason)
             continue
         environment[key] = value
         applied.append(key)

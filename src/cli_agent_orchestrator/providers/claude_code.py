@@ -25,6 +25,7 @@ from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
+from cli_agent_orchestrator.utils.terminal_env import profile_env_names
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
@@ -44,6 +45,12 @@ _SETTINGS_WRITE_LOCK = threading.Lock()
 # whenever initialize() already resolved it to None (no CAO profile found),
 # reintroducing the double-disk-read this sentinel exists to prevent.
 _UNSET: Any = object()
+
+# Names the launch command's nested-session cleanup unsets: the same shape its
+# ``sed`` extracts (``CLAUDE[A-Z_]*``). A profile-declared name must match it
+# in full to be spared -- which also keeps anything else a profile key could
+# contain out of the shell command it is spliced into.
+_CLAUDE_ENV_NAME_RE = re.compile(r"CLAUDE[A-Z_]*")
 
 
 # Custom exception for provider errors
@@ -520,15 +527,40 @@ class ClaudeCodeProvider(BaseProvider):
         # Claude Code detects these and refuses to start ("nested session").
         # Unset all matching vars except CLAUDE_CODE_USE_*,
         # CLAUDE_CODE_SKIP_*_AUTH (needed for provider authentication:
-        # Bedrock, Vertex AI, Foundry), and CLAUDE_CODE_EFFORT_LEVEL (user pref).
+        # Bedrock, Vertex AI, Foundry), CLAUDE_CODE_EFFORT_LEVEL (user pref),
+        # and any CLAUDE* var this agent's own profile declared in ``env:``
+        # (e.g. CLAUDE_CONFIG_DIR): the backend injected that one on purpose,
+        # so it is configuration, not leakage.
+        keep_pattern = (
+            "CLAUDE_CODE_USE_(BEDROCK|VERTEX|FOUNDRY)"
+            "|CLAUDE_CODE_SKIP_(BEDROCK|VERTEX|FOUNDRY)_AUTH"
+            "|CLAUDE_CODE_EFFORT_LEVEL"
+        )
+        declared = self._profile_declared_claude_env(profile)
+        if declared:
+            keep_pattern += "|^(" + "|".join(declared) + ")$"
         unset_cmd = (
             "unset $(env | sed -n 's/^\\(CLAUDE[A-Z_]*\\)=.*/\\1/p'"
-            " | grep -v -E 'CLAUDE_CODE_USE_(BEDROCK|VERTEX|FOUNDRY)"
-            "|CLAUDE_CODE_SKIP_(BEDROCK|VERTEX|FOUNDRY)_AUTH"
-            "|CLAUDE_CODE_EFFORT_LEVEL'"
+            f" | grep -v -E '{keep_pattern}'"
             ") 2>/dev/null"
         )
         return f"{unset_cmd}; {claude_cmd}"
+
+    @staticmethod
+    def _profile_declared_claude_env(profile: Optional["AgentProfile"]) -> List[str]:
+        """``CLAUDE*`` names the terminal received from its profile's ``env:``.
+
+        Uses the backends' own policy (``profile_env_names``), so a value the
+        backend dropped -- over the byte cap, say -- is not spared: whatever
+        the pane holds under that name was inherited. Only names of the exact
+        shape the cleanup unsets qualify (see ``_CLAUDE_ENV_NAME_RE``).
+        """
+        profile_env = getattr(profile, "env", None) if profile is not None else None
+        if not isinstance(profile_env, dict):
+            return []
+        return sorted(
+            name for name in profile_env_names(profile_env) if _CLAUDE_ENV_NAME_RE.fullmatch(name)
+        )
 
     @staticmethod
     def _ensure_skip_bypass_prompt_setting() -> None:
