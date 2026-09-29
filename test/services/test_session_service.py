@@ -1239,6 +1239,15 @@ class TestDeleteSession:
             MagicMock(return_value=True),
         )
 
+    @pytest.fixture(autouse=True)
+    def _local_session(self):
+        # delete_session asks first whether the session runs remotely (#745).
+        with patch(
+            "cli_agent_orchestrator.services.session_service.session_is_remote",
+            return_value=False,
+        ):
+            yield
+
     @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_ids")
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_row")
     @patch("cli_agent_orchestrator.services.terminal_service.dismantle_terminal_runtime")
