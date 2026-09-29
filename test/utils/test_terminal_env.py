@@ -8,9 +8,11 @@ import logging
 
 import pytest
 
+from cli_agent_orchestrator.constants import RUNTIME_IDENTITY_ENV_KEYS, WORKFLOW_ENV_ALLOWLIST
 from cli_agent_orchestrator.utils.forwarded_env import FORWARDED_ENV_MAX_VALUE_BYTES
 from cli_agent_orchestrator.utils.terminal_env import (
     MAX_ENV_VALUE_BYTES,
+    apply_runtime_identity,
     merge_profile_env,
     within_value_cap,
 )
@@ -78,3 +80,49 @@ class TestMergeProfileEnv:
         env = {"KIMI_MODEL_NAME": "from-operator"}
         merge_profile_env(env, {"KIMI_MODEL_NAME": "from-profile"})
         assert env["KIMI_MODEL_NAME"] == "from-profile"
+
+
+class TestRuntimeIdentity:
+    """Runtime-owned identity cannot be set from a profile (PR #665 review, P2).
+
+    A profile's ``env:`` merges after operator/runtime env, so without this a
+    profile could replace the workflow routing ids and ``workflow_return``
+    would post to the wrong run/step, or spoof the terminal/session identity.
+    """
+
+    def test_reserved_set_is_the_runtime_owned_identity(self):
+        assert RUNTIME_IDENTITY_ENV_KEYS == {
+            "CAO_TERMINAL_ID",
+            "CAO_SESSION_NAME",
+            "CAO_WORKFLOW_RUN_ID",
+            "CAO_WORKFLOW_STEP_ID",
+            "CAO_WORKFLOW_GENERATION",
+            "CAO_CALLBACK_URL",
+            "CAO_CALLBACK_TERMINAL_ID",
+        }
+
+    def test_reserved_set_covers_every_workflow_routing_key(self):
+        assert WORKFLOW_ENV_ALLOWLIST <= RUNTIME_IDENTITY_ENV_KEYS
+
+    @pytest.mark.parametrize("key", sorted(RUNTIME_IDENTITY_ENV_KEYS))
+    def test_profile_cannot_set_a_reserved_key(self, key, caplog):
+        env = {key: "runtime-value"}
+        with caplog.at_level(logging.WARNING):
+            applied = merge_profile_env(env, {key: "spoofed", "OK": "y"})
+        assert env[key] == "runtime-value"
+        assert env["OK"] == "y"
+        assert applied == ["OK"]
+        assert caplog.messages == [
+            f"Dropping profile env var {key} — name is reserved for CAO's runtime identity"
+        ]
+
+    def test_profile_cannot_introduce_a_reserved_key_the_runtime_did_not_set(self):
+        """A non-workflow terminal must not be made to claim a workflow run."""
+        env: dict[str, str] = {}
+        merge_profile_env(env, {"CAO_WORKFLOW_RUN_ID": "run-x", "CAO_WORKFLOW_STEP_ID": "s"})
+        assert env == {}
+
+    def test_apply_runtime_identity_overwrites_whatever_was_merged(self):
+        env = {"CAO_TERMINAL_ID": "spoofed", "CAO_SESSION_NAME": "evil", "OTHER": "x"}
+        apply_runtime_identity(env, "real-tid", "cao-real")
+        assert env == {"CAO_TERMINAL_ID": "real-tid", "CAO_SESSION_NAME": "cao-real", "OTHER": "x"}

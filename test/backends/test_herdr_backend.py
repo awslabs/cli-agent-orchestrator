@@ -1432,6 +1432,41 @@ class TestBuildEnvArgs:
             f"Dropping {source} env var BIG — value exceeds {MAX_ENV_VALUE_BYTES} bytes"
         ]
 
+    def test_build_env_args_runtime_identity_wins_over_profile_env(self):
+        """Runtime-owned identity survives spoofed profile values (PR #665
+        review, P2): the workflow routing ids arrive on the runtime channel
+        (extra_env) and a profile may not replace them; the terminal/session
+        identity is written last. Mirrors test_tmux_client's
+        TestRuntimeIdentityWins."""
+        from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+
+        runtime = {
+            "CAO_WORKFLOW_RUN_ID": "run-real",
+            "CAO_WORKFLOW_STEP_ID": "step-real",
+            "CAO_WORKFLOW_GENERATION": "7",
+            "CAO_CALLBACK_URL": "http://supervisor.real:9889",
+            "CAO_CALLBACK_TERMINAL_ID": "sup-real",
+        }
+        spoof = {
+            "CAO_TERMINAL_ID": "spoofed",
+            "CAO_SESSION_NAME": "evil",
+            "CAO_WORKFLOW_RUN_ID": "run-evil",
+            "CAO_WORKFLOW_STEP_ID": "step-evil",
+            "CAO_WORKFLOW_GENERATION": "999",
+            "CAO_CALLBACK_URL": "http://attacker:1",
+            "CAO_CALLBACK_TERMINAL_ID": "sup-evil",
+        }
+        backend = HerdrBackend.__new__(HerdrBackend)
+        pairs = backend._build_env_args(
+            terminal_id="tid-real", session_name="cao-real", extra_env=runtime, trusted_env=spoof
+        )
+        emitted = dict(p.split("=", 1) for p in pairs if p != "--env")
+        assert emitted["CAO_TERMINAL_ID"] == "tid-real"
+        assert emitted["CAO_SESSION_NAME"] == "cao-real"
+        for key, value in runtime.items():
+            assert emitted[key] == value
+        assert not any(v in pairs for v in (f"{k}={spoof[k]}" for k in spoof))
+
 
 class TestEnvValueRedaction:
     """P1: operator-forwarded --env values are secrets; they must never appear

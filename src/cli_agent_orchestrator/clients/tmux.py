@@ -28,6 +28,7 @@ from cli_agent_orchestrator.utils.path_validation import (
 from cli_agent_orchestrator.utils.terminal import validate_tmux_name
 from cli_agent_orchestrator.utils.terminal_env import (
     MAX_ENV_VALUE_BYTES,
+    apply_runtime_identity,
     merge_profile_env,
     within_value_cap,
 )
@@ -964,7 +965,7 @@ class TmuxClient:
             # value. See issue #248.
             self._merge_extra_env(environment, extra_env)
             merge_profile_env(environment, trusted_env)
-            environment["CAO_TERMINAL_ID"] = terminal_id
+            apply_runtime_identity(environment, terminal_id, session_name)
 
             # Explicit 220x50 pane size avoids the default 80x24 that tmux
             # assigns to detached sessions. kiro-cli 2.1.x's TUI v2 fails to
@@ -1117,7 +1118,7 @@ class TmuxClient:
             window_env: dict[str, str] = {}
             self._merge_extra_env(window_env, extra_env)
             merge_profile_env(window_env, trusted_env)
-            window_env["CAO_TERMINAL_ID"] = terminal_id
+            apply_runtime_identity(window_env, terminal_id, session_name)
 
             kwargs: dict = {
                 "window_name": window_name,
@@ -1255,7 +1256,7 @@ class TmuxClient:
 
             pane_env: dict[str, str] = {}
             self._merge_extra_env(pane_env, extra_env)
-            pane_env["CAO_TERMINAL_ID"] = terminal_id
+            apply_runtime_identity(pane_env, terminal_id, session_name)
 
             host_window = self._find_window(session, session_name, host_window_name)
             if host_window is None:

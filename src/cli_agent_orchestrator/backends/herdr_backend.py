@@ -26,7 +26,11 @@ from cli_agent_orchestrator.backends.base import (
 )
 from cli_agent_orchestrator.constants import BRACKETED_PASTE_INCOMPATIBLE_SHELLS
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.utils.terminal_env import merge_profile_env, within_value_cap
+from cli_agent_orchestrator.utils.terminal_env import (
+    apply_runtime_identity,
+    merge_profile_env,
+    within_value_cap,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -882,11 +886,13 @@ class HerdrBackend(TerminalBackend):
 
         Operator-forwarded vars are merged first, filtered with the same policy
         TmuxClient applies to its ``-e`` argv (blocked prefixes, per-value byte
-        cap). The two CAO identity vars are assigned LAST so an operator
-        ``--env CAO_TERMINAL_ID=...`` cannot override the real terminal identity
-        (mirrors TmuxClient, which forces these to win). Native ``--env``
-        replaces the former shell ``export`` injection, removing the
-        command-line injection surface.
+        cap). The agent profile's own ``env:`` (``trusted_env``) merges next,
+        and the terminal's identity (``CAO_TERMINAL_ID``, ``CAO_SESSION_NAME``)
+        is assigned LAST, both through the helpers in ``utils/terminal_env``
+        that the tmux backend applies too -- so neither channel can override
+        the real terminal identity, and a profile cannot replace the workflow
+        routing ids. Native ``--env`` replaces the former shell ``export``
+        injection, removing the command-line injection surface.
 
         Note: on herdr, env VALUES pass through the herdr arg sanitizer, which
         rejects shell metacharacters and control chars. A value containing e.g.
@@ -906,14 +912,11 @@ class HerdrBackend(TerminalBackend):
                 continue
             env[key] = value
 
-        # Profile-declared env (trusted_env) merges after operator env, through
-        # the same helper the tmux backend uses (utils/terminal_env).
+        # Profile-declared env (trusted_env) merges after operator env, and the
+        # terminal's identity is written last, through the same helpers the
+        # tmux backend uses (utils/terminal_env).
         merge_profile_env(env, trusted_env)
-
-        # CAO identity vars are assigned last so operator-forwarded --env cannot
-        # override them (mirrors TmuxClient, which forces these to win).
-        env["CAO_TERMINAL_ID"] = terminal_id
-        env["CAO_SESSION_NAME"] = session_name
+        apply_runtime_identity(env, terminal_id, session_name)
 
         args: List[str] = []
         for key, value in env.items():

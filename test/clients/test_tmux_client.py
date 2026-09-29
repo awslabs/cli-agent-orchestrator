@@ -436,6 +436,80 @@ class TestProfileEnv:
         )
 
 
+class TestRuntimeIdentityWins:
+    """Runtime-owned identity survives spoofed values on every tmux create path
+    (PR #665 review, P2). The workflow routing ids arrive on the runtime
+    channel (extra_env); a profile may not replace or invent them, and the
+    terminal/session identity is written last."""
+
+    RUNTIME = {
+        "CAO_WORKFLOW_RUN_ID": "run-real",
+        "CAO_WORKFLOW_STEP_ID": "step-real",
+        "CAO_WORKFLOW_GENERATION": "7",
+        "CAO_CALLBACK_URL": "http://supervisor.real:9889",
+        "CAO_CALLBACK_TERMINAL_ID": "sup-real",
+    }
+    SPOOF = {
+        "CAO_TERMINAL_ID": "spoofed",
+        "CAO_SESSION_NAME": "evil",
+        "CAO_WORKFLOW_RUN_ID": "run-evil",
+        "CAO_WORKFLOW_STEP_ID": "step-evil",
+        "CAO_WORKFLOW_GENERATION": "999",
+        "CAO_CALLBACK_URL": "http://attacker:1",
+        "CAO_CALLBACK_TERMINAL_ID": "sup-evil",
+    }
+
+    def _assert_real_identity(self, env, terminal_id, session_name):
+        assert env["CAO_TERMINAL_ID"] == terminal_id
+        assert env["CAO_SESSION_NAME"] == session_name
+        for key, value in self.RUNTIME.items():
+            assert env[key] == value
+
+    def test_create_session(self, tmux, tmp_path):
+        tmux.server.new_session.return_value = TestProfileEnv._session_mock()
+
+        with patch.dict(os.environ, {"HOME": "/home/u"}, clear=True):
+            tmux.create_session(
+                "cao-real",
+                "w",
+                "tid-real",
+                str(tmp_path),
+                extra_env=self.RUNTIME,
+                trusted_env=self.SPOOF,
+            )
+
+        env = tmux.server.new_session.call_args.kwargs["environment"]
+        self._assert_real_identity(env, "tid-real", "cao-real")
+
+    def test_create_session_ignores_an_inherited_session_name(self, tmux, tmp_path):
+        """cao-server started inside another CAO terminal inherits that
+        terminal's CAO_SESSION_NAME; the ``CAO_*`` inherited slice must not
+        carry it into the new session."""
+        tmux.server.new_session.return_value = TestProfileEnv._session_mock()
+
+        with patch.dict(os.environ, {"HOME": "/h", "CAO_SESSION_NAME": "cao-parent"}, clear=True):
+            tmux.create_session("cao-real", "w", "tid-real", str(tmp_path))
+
+        env = tmux.server.new_session.call_args.kwargs["environment"]
+        assert env["CAO_SESSION_NAME"] == "cao-real"
+
+    def test_create_window(self, tmux, tmp_path):
+        session = TestProfileEnv._session_mock()
+        tmux.server.sessions.get.return_value = session
+
+        tmux.create_window(
+            "cao-real",
+            "w",
+            "tid-real",
+            str(tmp_path),
+            extra_env=self.RUNTIME,
+            trusted_env=self.SPOOF,
+        )
+
+        env = session.new_window.call_args.kwargs["environment"]
+        self._assert_real_identity(env, "tid-real", "cao-real")
+
+
 # ── create_window ────────────────────────────────────────────────────
 
 
