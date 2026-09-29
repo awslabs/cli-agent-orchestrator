@@ -1965,6 +1965,33 @@ class TestClearedBufferEvidenceIsPinnedToItsTurn:
         )
         assert sm.turn_state("t1") == (1, 0)
 
+    def test_work_evidence_is_none_unless_the_provider_answers_a_bool(self):
+        """A MagicMock's auto-attribute returns a MagicMock, not a bool, so mocked
+        and undeclared providers keep the legacy "any PROCESSING starts the turn"
+        rule; a raising check counts as no evidence instead of crashing."""
+        assert StatusMonitor._work_evidence(MagicMock(), "buf") is None
+        assert StatusMonitor._work_evidence(None, "buf") is None
+        declared = MagicMock()
+        declared.shows_turn_work.return_value = True
+        assert StatusMonitor._work_evidence(declared, "buf") is True
+        broken = MagicMock()
+        broken.shows_turn_work.side_effect = RuntimeError("detector bug")
+        assert StatusMonitor._work_evidence(broken, "buf") is False
+
+    def test_processing_without_work_evidence_does_not_start_a_real_send(self):
+        """When the provider owns the answer, a PROCESSING verdict alone does not
+        start a turn opened by a real send; positive evidence does, whatever the
+        verdict it arrives with."""
+        sm = StatusMonitor()
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        self._dispatch(sm, provider)
+        sm._apply_detection("t1", TerminalStatus.PROCESSING, work_evidence=False)
+        sm._apply_detection("t1", TerminalStatus.COMPLETED, work_evidence=False)
+        assert sm.turn_state("t1") == (1, 0)
+        sm._apply_detection("t1", TerminalStatus.COMPLETED, work_evidence=True)
+        assert sm.turn_state("t1") == (1, 1)
+
     def test_a_turn_dispatched_without_a_clear_gets_no_bypass(self):
         """Provider init keystrokes and send_special_key open turns without
         clearing the buffer; their ready verdicts keep the conservative gate."""

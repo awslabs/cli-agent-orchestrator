@@ -218,14 +218,30 @@ class BaseProvider(ABC):
     # response identity: it remembers the last completed response it reported,
     # freezes that at dispatch (mark_input_received), and refuses to classify a
     # byte-identical post-dispatch response as a NEW completion unless it saw
-    # the turn working (grok: buffer epochs; kiro: _response_identity). Only
-    # such a provider's settled post-clear COMPLETED may close a turn without a
-    # separately sampled busy status — for anyone else, a re-emitted old answer
-    # is indistinguishable from a new one (#735, PR #812 rounds 2-6; word-based
-    # activity matching was tried in between and is not sufficient: a completed
-    # answer can QUOTE the working words). Checked with `is True`, like
+    # the turn working (grok: buffer epochs). Only such a provider's settled
+    # post-clear COMPLETED may close a turn without a separately sampled busy
+    # status — for anyone else, a re-emitted old answer is indistinguishable
+    # from a new one (#735, PR #812 rounds 2-6; word-based activity matching was
+    # tried in between and is not sufficient: a completed answer can QUOTE the
+    # working words). Kiro held this through round 6 via a response-identity
+    # veto and gave it up: a pane resize repaints the old answer with different
+    # wrapping, so its identity no longer matches and the veto passes it (see
+    # shows_turn_work instead). Checked with `is True`, like
     # assume_processing_on_dispatch, so mocks default closed.
     owns_completion_identity: bool = False
+
+    def shows_turn_work(self, buffer: str) -> Optional[bool]:
+        """Whether a raw buffer cleared at dispatch shows this turn actually running.
+
+        ``None`` (the default) means the provider declares no such signal, and any
+        PROCESSING verdict counts as the turn having started. A provider that
+        returns a bool owns the answer for turns opened by a real send: only
+        ``True`` marks the turn started, so a PROCESSING verdict that a repaint of
+        the previous answer can also produce (kiro's "no idle prompt yet"
+        fallback) no longer does. Called on the raw rolling buffer only, never on
+        a retained source. Must be pure.
+        """
+        return None
 
     def probe_processing_from_screen(self, screen_lines: List[str]) -> bool:
         """Report whether this half-drawn frame shows the agent actively working.

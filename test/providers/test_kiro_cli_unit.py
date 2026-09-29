@@ -451,114 +451,167 @@ class TestKiroCliProviderStatusDetection:
 
         assert status == TerminalStatus.COMPLETED
 
-    # ---- PR #812 round-6 matrix: provider-owned replay rejection ----------
-    # The reviewer-specified four cases for kiro's response-identity veto
-    # (review discussion r4110464050). Identity REJECTS replays; it is never
-    # positive evidence of completion.
+    # ---- #735: only a live work sign starts a dispatched turn ---------------
+    # Every sign below is copied byte-for-byte from a real kiro-cli session (the
+    # version is in the id). A pane resize right after a send makes kiro repaint
+    # its PREVIOUS answer; the repaint reads PROCESSING while half-received (no
+    # idle prompt yet) and COMPLETED once whole, so without this rule that pair
+    # closed the new turn with the old answer.
 
-    def _monitor_with_warm_reply(self, completed):
-        """A session that has already produced ``completed``, then dispatches."""
-        from cli_agent_orchestrator.services.status_monitor import StatusMonitor
+    LIVE_WORK_SIGNS = {
+        "spinner-2.8-2.16": "\x1b[2K\x1b[38;5;66m\u280b\x1b[39m \x1b[38;5;244mThinking..."
+        "\x1b[39m\x1b[38;5;247m (esc to cancel)",
+        "spinner-2.25": "\x1b[2K\x1b[38;5;66m\u15e2\x1b[39m \x1b[38;5;66mThinking...\x1b[39m",
+        "spinner-2.19-2.24": "\x1b[2K\x1b[38;5;66m\u2809\x1b[39m \x1b[38;5;66mThinking..."
+        "\x1b[39m",
+        "composer-2.8-2.11": "\x1b[2K\x1b[7m \x1b[0m\x1b[38;5;247mKiro is working \u00b7 "
+        "Type to steer \u00b7 Ctrl+S to queue",
+        "composer-2.16": "\x1b[2K\x1b[7m \x1b[0m\x1b[38;5;241mKiro is working \u00b7 Type to steer",
+        "composer-2.19": "\x1b[2K\x1b[7m\x1b[27m \x1b[7m\x1b[0m\x1b[38;5;241mKiro is working "
+        "\u00b7 Type to steer",
+        "composer-2.22-2.24": "\x1b[2K\u203a \x1b[7m\x1b[27m \x1b[7m\x1b[0m\x1b[38;5;241m"
+        "Kiro is working \u00b7 3s \u00b7 Type to steer",
+    }
 
+    @pytest.mark.parametrize("sign", sorted(LIVE_WORK_SIGNS))
+    def test_live_work_sign_is_recognised_on_every_verified_version(self, sign):
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
-        monitor = StatusMonitor()
-        manager = patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
-        mock_pm = manager.start()
-        mock_pm.get_provider.return_value = provider
-        # Warm turn: the provider REPORTS this completion, caching its identity.
-        provider.mark_input_received()
-        monitor._process_chunk("test1234", completed)
-        assert monitor._last_status["test1234"] == TerminalStatus.COMPLETED
-        # A real dispatch boundary, in send_input's order.
+        assert provider.shows_turn_work("\r\n" + self.LIVE_WORK_SIGNS[sign] + "\r\n") is True
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            # An answer that QUOTES the signs, as kiro 2.24 actually rendered it.
+            "\x1b[2K\x1b[38;5;66m\u2022\x1b[39m \u203a Kiro is working \u00b7 3s \u00b7 Type to steer",
+            "\r\r\n\x1b[38;5;66m\u2022\x1b[39m \u280b Thinking... (esc to cancel)",
+            # A quoted line continued inside an answer is indented.
+            "\x1b[2K  \u280b Thinking... (esc to cancel)",
+            "\x1b[2K  Kiro is working \u00b7 Type to steer \u00b7 Ctrl+S to queue",
+            # kiro's own tip line mentions the phrase too (seen on 2.24).
+            "\x1b[2K\x1b[38;5;241m  \u2570 Tip: Type while Kiro is working to steer it",
+            # The escape-stripped ghost text older fixtures carry: no live form.
+            " Kiro is working\n",
+            "",
+        ],
+    )
+    def test_quoted_or_bare_sign_text_is_not_live_work(self, text):
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        assert provider.shows_turn_work(text) is False
+
+    @staticmethod
+    def _dispatch(monitor, provider):
+        """A real send, in send_input's order."""
         monitor.notify_input_sent("test1234")
         monitor.clear_rolling_buffer("test1234", provider)
         provider.mark_input_received()
         monitor.notify_input_delivered("test1234")
-        return monitor, provider, manager
 
-    def test_matrix_a_quoted_marker_replay_is_rejected(self):
-        """Case (a): a replayed old answer must not close the new turn even when
-        that answer QUOTES the working words — word matching cannot distinguish a
-        live progress event from a quotation (the round-5 finding). Identity can:
-        a replay is byte-identical to the baseline by definition."""
+    def _monitor_after_one_reply(self):
+        """A monitor whose terminal has finished one real turn and has just been
+        sent the next message."""
+        from cli_agent_orchestrator.services.status_monitor import StatusMonitor
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        provider._initialized = True
+        monitor = StatusMonitor()
+        manager = patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+        manager.start().get_provider.return_value = provider
+        backend = patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+        backend.start()
+        self._dispatch(monitor, provider)
+        monitor._process_chunk("test1234", self.LIVE_WORK_SIGNS["spinner-2.19-2.24"])
+        monitor._process_chunk("test1234", load_fixture("kiro_cli_completed_output.txt"))
+        assert monitor.turn_state("test1234") == (1, 1)
+        self._dispatch(monitor, provider)
+        return monitor, provider, (manager, backend)
+
+    @pytest.mark.parametrize("piece", [1024, 4096, 16384])
+    def test_recorded_resize_repaint_does_not_close_the_new_turn(self, piece):
+        """The live #735 failure, replayed from a real kiro-cli 2.24.1 stream: the
+        pane was resized right after a send, and these are the first 20480 bytes
+        kiro wrote afterwards — a repaint of the PREVIOUS answer ending at the idle
+        prompt, before any work on the new message. The round-6 design closed the
+        turn here (the repaint's wrapping changed, so its identity passed the
+        veto), and `cao session send` printed the old answer. A startup banner in
+        the recording was replaced with same-length neutral text."""
+        blob = (FIXTURES_DIR / "kiro_cli_2_24_resize_repaint_after_send.bin").read_bytes()
+        monitor, provider, patches = self._monitor_after_one_reply()
+        try:
+            for i in range(0, len(blob), piece):
+                monitor._process_chunk("test1234", blob[i : i + piece].decode("utf-8", "replace"))
+            # The repaint itself parses as a finished answer, so this tests something.
+            assert provider.get_status(blob.decode("utf-8", "replace")) == TerminalStatus.COMPLETED
+            assert monitor.turn_state("test1234") == (2, 1)
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_repaint_quoting_the_work_signs_does_not_close_the_new_turn(self):
+        """A repaint of an old answer that QUOTES both signs stays a repaint."""
         completed = load_fixture("kiro_cli_completed_output.txt").replace(
             "This response includes multiple paragraphs",
-            'The literal "Thinking..." occurs in the saved response. '
-            "It also quotes Kiro is working. This response includes multiple paragraphs",
+            "\x1b[38;5;66m\u2022\x1b[39m \u280b Thinking... (esc to cancel)\r\n"
+            "  \u203a Kiro is working \u00b7 3s \u00b7 Type to steer\r\n"
+            "This response includes multiple paragraphs",
         )
-        # Preconditions: the doctored answer still parses as a completion on its
-        # own, and carries both quoted markers.
-        probe = KiroCliProvider("probe123", "s", "w", "developer")
-        assert probe.get_status(completed) == TerminalStatus.COMPLETED
-        assert "Thinking..." in completed and "Kiro is working" in completed
-
-        monitor, provider, manager = self._monitor_with_warm_reply(completed)
+        monitor, provider, patches = self._monitor_after_one_reply()
         try:
-            monitor._process_chunk("test1234", completed)  # the identical replay
-            assert provider.get_status(completed) == TerminalStatus.PROCESSING
-            assert monitor.turn_state("test1234") == (1, 0)
+            half = len(completed) // 2
+            monitor._process_chunk("test1234", completed[:half])
+            monitor._process_chunk("test1234", completed[half:])
+            assert provider.get_status(completed) == TerminalStatus.COMPLETED
+            assert monitor.turn_state("test1234") == (2, 1)
         finally:
-            manager.stop()
+            for p in patches:
+                p.stop()
 
-    def test_matrix_b_a_genuinely_different_coalesced_reply_completes(self):
-        """Case (b): a new, different answer — even one arriving coalesced with no
-        separately sampled busy status — closes its turn."""
-        completed = load_fixture("kiro_cli_completed_output.txt")
-        different = completed.replace(
-            "Here is a comprehensive response", "Here is an entirely new response"
-        )
-        monitor, provider, manager = self._monitor_with_warm_reply(completed)
+    def test_identical_answer_after_real_work_closes_the_turn(self):
+        """Asking the same question twice is fine: the work sign, not the answer's
+        content, is what separates a new turn from a repaint."""
+        monitor, _provider, patches = self._monitor_after_one_reply()
         try:
-            monitor._process_chunk("test1234", different)
-            assert monitor.turn_state("test1234") == (1, 1)
-            assert monitor._last_status["test1234"] == TerminalStatus.COMPLETED
+            monitor._process_chunk("test1234", self.LIVE_WORK_SIGNS["composer-2.22-2.24"])
+            monitor._process_chunk("test1234", load_fixture("kiro_cli_completed_output.txt"))
+            assert monitor.turn_state("test1234") == (2, 2)
         finally:
-            manager.stop()
+            for p in patches:
+                p.stop()
 
-    def test_matrix_c_an_identical_reply_after_observed_work_completes(self):
-        """Case (c): a legitimately identical NEW answer completes once the turn
-        was seen working — identity rejection is scoped to unobserved turns, so
-        "the user asked the same question again" is not punished."""
-        completed = load_fixture("kiro_cli_completed_output.txt")
-        monitor, provider, manager = self._monitor_with_warm_reply(completed)
+    def test_a_turn_with_no_work_sign_still_closes_at_the_backstop(self, caplog):
+        """If a future kiro draws its busy state differently, sends get slow, not
+        wrong or stuck — and the warning says why."""
+        import logging
+
+        from cli_agent_orchestrator.services import status_monitor as sm_mod
+
+        monitor, _provider, patches = self._monitor_after_one_reply()
         try:
-            monitor._process_chunk("test1234", " Kiro is working\n")  # observed busy
-            assert monitor._last_status["test1234"] == TerminalStatus.PROCESSING
-            monitor._process_chunk("test1234", completed)  # identical answer
-            assert monitor.turn_state("test1234") == (1, 1)
-            assert monitor._last_status["test1234"] == TerminalStatus.COMPLETED
+            with (
+                patch.object(sm_mod, "TURN_START_BACKSTOP_S", 0),
+                caplog.at_level(logging.WARNING, logger=sm_mod.logger.name),
+            ):
+                monitor._process_chunk("test1234", load_fixture("kiro_cli_completed_output.txt"))
+            assert monitor.turn_state("test1234") == (2, 2)
+            assert "work sign is not being recognised" in caplog.text
         finally:
-            manager.stop()
+            for p in patches:
+                p.stop()
 
-    def test_matrix_d_an_identical_unobserved_reply_stays_conservatively_open(self):
-        """Case (d), the explicit conservative outcome: an identical fast answer
-        whose turn was never seen working is indistinguishable from a replay, so
-        the provider keeps reporting PROCESSING and the turn stays open — it
-        resolves at the waiter's own timeout, not with a possibly-wrong answer.
-        The same trade grok makes for its stale-identical case; deliberately NOT
-        another content-word exception."""
-        completed = load_fixture("kiro_cli_completed_output.txt")
-        monitor, provider, manager = self._monitor_with_warm_reply(completed)
-        try:
-            monitor._process_chunk("test1234", completed)  # identical, no busy frame
-            assert provider.get_status(completed) == TerminalStatus.PROCESSING
-            assert monitor.turn_state("test1234") == (1, 0)
-        finally:
-            manager.stop()
+    def test_init_keystrokes_are_not_held_to_the_work_sign(self):
+        """Provider init types into the pane without a real send (no buffer
+        clear) and never draws a work sign; holding it to one timed kiro init
+        out. Such a turn keeps the old rule: any PROCESSING starts it."""
+        from cli_agent_orchestrator.services.status_monitor import StatusMonitor
 
-    def test_identity_makes_no_decision_on_truncated_extraction(self):
-        """Round-6 guidance: incomplete/truncated extraction stays out of the
-        identity decision — no veto (cannot prove a replay) and no cache update
-        (must not poison the baseline)."""
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
-        completed = load_fixture("kiro_cli_completed_output.txt")
-        provider.mark_input_received()
-        assert provider.get_status(completed) == TerminalStatus.COMPLETED
-        cached = provider._accepted_response_identity
-        assert cached is not None
-        # A buffer whose response cannot be cleanly extracted yields no identity.
-        assert provider._response_identity("") is None
-        assert provider._accepted_response_identity == cached
+        monitor = StatusMonitor()
+        with patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as manager:
+            manager.get_provider.return_value = provider
+            monitor.notify_input_sent("test1234")  # init keystrokes: no clear
+            monitor.notify_input_delivered("test1234")
+            monitor._process_chunk("test1234", " Kiro is working\n")
+            monitor._process_chunk("test1234", load_fixture("kiro_cli_completed_output.txt"))
+            assert monitor.turn_state("test1234") == (1, 1)
 
     def test_a_replayed_old_reply_after_clear_does_not_close_the_new_turn(self):
         """Kiro's TUI can re-emit its RETAINED old answer after clear_rolling_buffer;
@@ -592,7 +645,7 @@ class TestKiroCliProviderStatusDetection:
             assert monitor.turn_state("test1234") == (1, 0)
 
     def test_coalesced_working_and_completed_chunk_closes_the_dispatched_turn(self):
-        """Kiro parses one chunk holding 'Kiro is working' plus the finished answer
+        """Kiro parses one chunk holding its live work sign plus the finished answer
         as COMPLETED — a fast reply with no separate PROCESSING verdict. That
         completion must close the dispatched turn, or the turn-aware CLI waiter
         introduced for #735 hangs on a finished reply (PR #812 review, haofeif).
@@ -600,7 +653,7 @@ class TestKiroCliProviderStatusDetection:
         from cli_agent_orchestrator.services.status_monitor import StatusMonitor
 
         completed = load_fixture("kiro_cli_completed_output.txt")
-        coalesced = " Kiro is working\n" + completed
+        coalesced = self.LIVE_WORK_SIGNS["composer-2.22-2.24"] + "\r\n" + completed
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
         # The coalesced chunk itself must parse COMPLETED, or this test tests nothing.
         assert provider.get_status(coalesced) == TerminalStatus.COMPLETED
