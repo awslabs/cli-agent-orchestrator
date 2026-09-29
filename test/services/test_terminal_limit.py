@@ -69,18 +69,18 @@ class TestCreateTerminalCap:
     def test_rejects_when_at_cap(self):
         with (
             patch(f"{_TS}.get_max_terminals", return_value=1),
-            patch(f"{_TS}.list_all_terminals", return_value=[{"id": "aaaa0001"}]) as mock_list,
+            patch(f"{_TS}.count_runtime_allocated_terminals", return_value=1) as mock_count,
         ):
             with pytest.raises(TerminalLimitError, match="Terminal limit reached"):
                 asyncio.run(
                     terminal_service.create_terminal(provider="mock_cli", agent_profile="developer")
                 )
-        mock_list.assert_called_once()
+        mock_count.assert_called_once()
 
     def test_rejects_when_over_cap(self):
         with (
             patch(f"{_TS}.get_max_terminals", return_value=1),
-            patch(f"{_TS}.list_all_terminals", return_value=[{"id": "a"}, {"id": "b"}]),
+            patch(f"{_TS}.count_runtime_allocated_terminals", return_value=2),
         ):
             with pytest.raises(TerminalLimitError):
                 asyncio.run(
@@ -90,7 +90,7 @@ class TestCreateTerminalCap:
     def test_under_cap_proceeds_past_check(self):
         with (
             patch(f"{_TS}.get_max_terminals", return_value=2),
-            patch(f"{_TS}.list_all_terminals", return_value=[{"id": "aaaa0001"}]),
+            patch(f"{_TS}.count_runtime_allocated_terminals", return_value=1),
             patch(f"{_TS}.load_agent_profile", side_effect=_StopBeforeAllocation()),
         ):
             with pytest.raises(_StopBeforeAllocation):
@@ -101,19 +101,19 @@ class TestCreateTerminalCap:
     def test_unlimited_skips_terminal_listing(self):
         with (
             patch(f"{_TS}.get_max_terminals", return_value=None),
-            patch(f"{_TS}.list_all_terminals") as mock_list,
+            patch(f"{_TS}.count_runtime_allocated_terminals") as mock_count,
             patch(f"{_TS}.load_agent_profile", side_effect=_StopBeforeAllocation()),
         ):
             with pytest.raises(_StopBeforeAllocation):
                 asyncio.run(
                     terminal_service.create_terminal(provider="mock_cli", agent_profile="developer")
                 )
-        mock_list.assert_not_called()
+        mock_count.assert_not_called()
 
     def test_error_message_names_the_knob_and_counts(self):
         with (
             patch(f"{_TS}.get_max_terminals", return_value=1),
-            patch(f"{_TS}.list_all_terminals", return_value=[{"id": "aaaa0001"}]),
+            patch(f"{_TS}.count_runtime_allocated_terminals", return_value=1),
         ):
             with pytest.raises(TerminalLimitError) as excinfo:
                 asyncio.run(
