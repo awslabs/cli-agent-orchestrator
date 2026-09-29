@@ -201,6 +201,9 @@ class Bridge:
             mode = terminal_service.OutputMode(payload.get("mode", "full"))
             output = await asyncio.to_thread(terminal_service.get_output, terminal_id, mode)
             return {"output": output}
+        if command.type == CommandType.WORKING_DIRECTORY:
+            directory = await asyncio.to_thread(terminal_service.get_working_directory, terminal_id)
+            return {"working_directory": directory}
         if command.type == CommandType.EXIT:
             await asyncio.to_thread(terminal_service.exit_terminal_cli, terminal_id)
             return {}

@@ -57,6 +57,8 @@ class RuntimeConnection:
         self._send_lock = asyncio.Lock()
         self._pending: Dict[str, "asyncio.Future[Result]"] = {}
         self.closed = False
+        # Set once the hello exchange is over; commands are refused until then.
+        self.active = False
 
     async def call(
         self,
@@ -155,6 +157,12 @@ class RuntimeRegistry:
         logger.info("runtime %s connected", runtime_id)
         return conn
 
+    def activate(self, conn: RuntimeConnection) -> None:
+        """Make ``conn`` callable: the server's hello has been sent on it."""
+        with self._lock:
+            if self._runtimes.get(conn.runtime_id) is conn:
+                conn.active = True
+
     def unregister(self, runtime_id: str, conn: RuntimeConnection) -> None:
         with self._lock:
             if self._runtimes.get(runtime_id) is conn:
@@ -163,8 +171,10 @@ class RuntimeRegistry:
         conn.close("disconnected")
 
     def connection(self, runtime_id: str) -> Optional[RuntimeConnection]:
+        """The runtime's current connection, once its hello exchange is over."""
         with self._lock:
-            return self._runtimes.get(runtime_id)
+            conn = self._runtimes.get(runtime_id)
+            return conn if conn is not None and conn.active else None
 
     def list_runtimes(self) -> Dict[str, Dict[str, Any]]:
         with self._lock:
@@ -174,6 +184,7 @@ class RuntimeRegistry:
                     "terminals": sorted(t for t, r in self._placement.items() if r == runtime_id),
                 }
                 for runtime_id, conn in self._runtimes.items()
+                if conn.active
             }
 
     def place(self, terminal_id: str, runtime_id: str) -> None:

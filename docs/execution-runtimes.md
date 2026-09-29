@@ -40,6 +40,7 @@ order; different terminals run concurrently.
 | `POST /terminals/{id}/input` | `input` | send the message, keeping sender and orchestration type |
 | `POST /terminals/{id}/key` | `key` | send one special key |
 | `GET /terminals/{id}/output` | `output` | read `full` or `last` output |
+| `GET /terminals/{id}/working-directory` | `working_directory` | read the pane's working directory |
 | `POST /terminals/{id}/exit` | `exit` | exit the provider CLI |
 | `DELETE /terminals/{id}`, `DELETE /sessions/{name}` | `delete` | tear the terminal down, then the server drops its row |
 
@@ -84,8 +85,8 @@ The server never resends a command by itself.
   workflows target local terminals only.
 - `GET /sessions` and the CLI's shared-server commands do not list remote
   terminals; `GET /runtimes` does.
-- Output is read on request. There is no output streaming, PTY attach or
-  replay for a remote terminal.
+- Output is read on request. There is no output streaming or replay for a
+  remote terminal, and the PTY WebSocket refuses one (close code `4004`).
 - The memory context added to a remote terminal's first input is resolved
   in the runtime, not from the server's memory store.
 

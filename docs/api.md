@@ -224,8 +224,9 @@ strings. See [Control Planes](control-planes.md) for operator-facing choices.
 - With `CAO_LOCAL_EXECUTION=0`, routes that would start an agent beside the
   server (`POST /sessions`, `POST /sessions/{session_name}/terminals`,
   `POST /terminals/run-step`) return `409`.
-- The `/terminals/{terminal_id}*` operations above, and `DELETE
-  /sessions/{session_name}`, route a remote terminal to its runtime. They
+- The `/terminals/{terminal_id}*` operations above (input, key, output,
+  working directory, exit, delete), and `DELETE /sessions/{session_name}`,
+  route a remote terminal to its runtime. They
   return `503` when the runtime is not connected, `504` when the outcome is
   unknown, and `502` when the runtime reports a failure. See
   [Execution runtimes](execution-runtimes.md).
@@ -440,7 +441,9 @@ WebSocket close frame. The handler uses these server-side refusal codes:
 After the connection is accepted:
 
 - `4003`: terminal/backend target metadata is invalid.
-- `4004`: the terminal does not exist, or the backend cannot attach to it.
+- `4004`: the terminal does not exist, the backend cannot attach to it, or it
+  runs in an [execution runtime](execution-runtimes.md), whose panes are not
+  relayed yet.
 - A normal viewer disconnect detaches that viewer and preserves the session.
 
 Malformed JSON, missing input data, unsupported message types, and other

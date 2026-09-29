@@ -3844,6 +3844,9 @@ def get_working_directory(terminal_id: str) -> Optional[str]:
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
+        if metadata.get("runtime_id"):
+            result = _call_runtime(metadata, "working_directory", {})
+            return result.get("working_directory")
 
         working_dir = get_backend().get_pane_working_directory(
             metadata["tmux_session"], metadata["tmux_window"]
@@ -4813,8 +4816,10 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
                 return False
             from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
 
-            runtime_registry.forget(terminal_id)
-            return delete_terminal_row(terminal_id, row, registry=registry)
+            try:
+                return delete_terminal_row(terminal_id, row, registry=registry)
+            finally:
+                runtime_registry.forget(terminal_id)
         metadata = capture_terminal_snapshot(terminal_id)
         if not dismantle_terminal_runtime(terminal_id, metadata):
             logger.warning(
