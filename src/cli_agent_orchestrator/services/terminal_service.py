@@ -3106,9 +3106,10 @@ def readopt_terminals_at_startup(rows: List[Dict[str, Any]]) -> Dict[str, int]:
       terminal down the way session teardown does once its session is confirmed
       gone: runtime dismantle (stale FIFO, provider cleanup; a deferred cleanup
       keeps the row for a retry), then the DB row, so it does not linger as an
-      orphan until retention cleanup. The recovered scrollback is only what the old server logged: ``<tid>.log``
-      stopped growing when that server died, so whatever the agent printed
-      after that is missing. It is not a full transcript.
+      orphan until retention cleanup. The recovered scrollback is only what
+      the old server logged: ``<tid>.log`` stopped growing when that server
+      died, so whatever the agent printed after that is missing. It is not a
+      full transcript.
     - could not tell — the strict session check raised, or the session is alive
       but the window could not be read: leave the row untouched. Deleting a row
       is teardown confirmation, which must never act on a lookup error (#498).
