@@ -75,6 +75,13 @@ def test_no_enforcement_providers_are_the_documented_ones():
     assert {p for p, lvl in PROVIDER_ENFORCEMENT.items() if lvl == NONE} == {
         "hermes",
         "cursor_cli",
-        "kiro_cli",
         "mock_cli",
     }
+
+
+def test_install_time_providers_are_native():
+    from cli_agent_orchestrator.utils.enforcement import INSTALL_TIME_PROVIDERS
+
+    assert INSTALL_TIME_PROVIDERS == {"opencode_cli", "kiro_cli"}
+    for provider in INSTALL_TIME_PROVIDERS:
+        assert PROVIDER_ENFORCEMENT[provider] == NATIVE, provider

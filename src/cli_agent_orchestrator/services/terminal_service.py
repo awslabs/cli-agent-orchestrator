@@ -93,6 +93,9 @@ from cli_agent_orchestrator.services.elastic_worker_gateway import (
 )
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.herdr_inbox_registry import get_herdr_inbox_service
+from cli_agent_orchestrator.services.install_service import (
+    kiro_install_predates_native_enforcement,
+)
 from cli_agent_orchestrator.services.memory_gateway import (
     memory_context_for_terminal,
     remote_memory_url,
@@ -1170,6 +1173,20 @@ async def create_terminal(
                 f"'{agent_profile}' requests {allowed_tools}. Treat this worker as "
                 f"unrestricted; for enforced restrictions use one of: "
                 f"{', '.join(native_providers())}."
+            )
+        elif (
+            provider == ProviderType.KIRO_CLI.value
+            and agent_profile
+            and kiro_install_predates_native_enforcement(agent_profile, allowed_tools)
+        ):
+            # Kiro enforces the installed agent JSON's `tools`. A file written
+            # before CAO put the policy there still says ["*"], so the
+            # restriction this request carries is not what the agent runs with.
+            logger.warning(
+                f"Terminal {terminal_id}: the installed Kiro agent '{agent_profile}' has "
+                f'tools ["*"]; it predates native enforcement, so the requested '
+                f"restriction {allowed_tools} is NOT applied. Treat this worker as "
+                f"unrestricted until `cao install {agent_profile} --provider kiro_cli` is re-run."
             )
 
         # Step 3c: Create the tmux session/window and its registry row as ONE

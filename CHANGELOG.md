@@ -252,6 +252,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Kiro CLI, the default provider, now applies the CAO tool policy.** `cao
+  install --provider kiro_cli` writes the resolved `allowedTools` into the agent
+  JSON's `tools` field, which is what Kiro lets the agent *have* (`allowedTools`
+  only names what runs without a prompt, and CAO launches `--trust-all-tools`),
+  so a restricted role has no shell, write or network tool to call: on kiro-cli
+  2.25.0 a `code_supervisor` gets `read`/`glob`/`grep`/`knowledge` plus
+  `@cao-mcp-server`, and `@builtin` becomes the harmless chrome
+  (`goal`/`introspect`/`todo_list`) rather than every built-in, shell included,
+  which is what a bare `@builtin` means in Kiro. `subagent` and `use_aws` gate
+  with `execute_bash`, `code` (it can rewrite files) with `fs_write`,
+  `knowledge` with `fs_read`. Both the current names and the older
+  `fs_read`/`fs_write`/`execute_bash` aliases are written so 2.22 and 2.25
+  read the same grant; an unrestricted policy still writes `["*"]` and an
+  explicit profile `tools` list still wins. Kiro moves from **None** to
+  **Hard (install time)** in SECURITY.md and docs/tool-restrictions.md, next to
+  OpenCode: the policy is the installed agent's, and `--allowed-tools` or a
+  role override at launch does not change it. **Reinstall your Kiro profiles**:
+  one installed before this change still carries `tools: ["*"]`; `cao launch`
+  and the server warn when they find one and keep treating that terminal as
+  unrestricted. The Kiro e2e restricted case asserts bash is refused again
+  (#836, follow-up to #824)
+
 - **an unknown `role` no longer falls open to unrestricted `["*"]`.** Omitting
   `role` still uses developer defaults. A typo or a role that is not defined
   now raises `ValueError` on install, launch, and delegation, so providers no
