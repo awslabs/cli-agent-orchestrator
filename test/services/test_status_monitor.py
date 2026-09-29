@@ -2294,6 +2294,42 @@ class TestAbortTurn:
         sm._apply_detection("t1", TerminalStatus.COMPLETED)
         assert sm.turn_state("t1") == (2, 2)
 
+    def test_it_does_not_report_a_running_older_turn_finished(self):
+        """Aborting a send made while turn 1 is still working must not close turn 1:
+        its waiter would return early with a partial answer."""
+        sm = StatusMonitor()
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        sm.notify_input_sent("t1")
+        sm.clear_rolling_buffer("t1", provider)
+        sm.notify_input_delivered("t1")
+        sm._apply_detection("t1", TerminalStatus.PROCESSING)  # turn 1 working
+        second = sm.notify_input_sent("t1")
+
+        sm.abort_turn("t1", second)
+
+        assert sm.turn_state("t1") == (2, 0)
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+
+    def test_it_keeps_real_work_visible_when_the_input_landed(self):
+        """send_keys can fail after the paste and first Enter landed. If the turn
+        was already seen working, the abort changes nothing, and later genuine
+        PROCESSING readings still get through."""
+        sm = StatusMonitor()
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        sm._last_status["t1"] = TerminalStatus.COMPLETED
+        turn = sm.notify_input_sent("t1", assume_processing=True)
+        sm.clear_rolling_buffer("t1", provider)
+        sm._apply_detection("t1", TerminalStatus.PROCESSING)  # agent started
+
+        sm.abort_turn("t1", turn)
+
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        assert sm.turn_state("t1") == (1, 0)
+        sm._apply_detection("t1", TerminalStatus.COMPLETED)
+        assert sm.turn_state("t1") == (1, 1)
+
     def test_it_leaves_a_newer_turn_alone(self):
         sm = StatusMonitor()
         first = sm.notify_input_sent("t1")
@@ -2330,5 +2366,6 @@ class TestMidburstProbeWhileUnstarted:
         provider.supports_midburst_processing_probe = True
         sm.notify_input_sent("t1")
         sm._apply_detection("t1", TerminalStatus.PROCESSING)
+        sm._screen_lines = lambda tid: (["✻ Cultivating… (3s)"], None)
         sm._midburst_processing_probe("t1", provider)
         provider.probe_processing_from_screen.assert_not_called()

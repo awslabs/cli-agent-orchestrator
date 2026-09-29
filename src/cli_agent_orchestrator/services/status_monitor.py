@@ -1240,12 +1240,21 @@ class StatusMonitor:
 
         send_input opens the turn (and, for assume_processing_on_dispatch
         providers, publishes PROCESSING) before send_keys. If send_keys then
-        raises, nothing was typed, yet the open, never-started turn would make
-        the latch refuse every ready reading until TURN_START_BACKSTOP_S — a
-        minute in which InboxService, `cao session send` and handoff all see a
-        busy agent (PR #812 review, round 8). So close the turn and, if the
-        status is still the assumed PROCESSING, restore what the dispatch found.
-        A newer dispatch or a closed turn is left alone.
+        raises, the open, never-started turn would make the latch refuse every
+        ready reading until TURN_START_BACKSTOP_S — a minute in which InboxService,
+        `cao session send` and handoff all see a busy agent (PR #812 review,
+        round 8). So close the turn and restore what the dispatch found, but only
+        when nothing happened:
+
+        - If the turn was already seen working, the agent took (part of) the
+          input; leave it to finish normally.
+        - If an older turn is still open, the agent is busy; closing this turn
+          would also report the older one finished. Leave it open so it closes
+          with the older turn, as any input sent to a busy agent does.
+        - The processing revert arm is left as it is: send_keys can fail after
+          the paste and first Enter landed, and a real PROCESSING must still get
+          through.
+        - The status is restored only while it is still the assumed PROCESSING.
         """
         restored: Optional[TerminalStatus] = None
         with self._lock:
@@ -1254,8 +1263,13 @@ class StatusMonitor:
                 or self._turn_done.get(terminal_id, 0) >= turn
             ):
                 return
+            if self._turn_started.get(terminal_id, False):
+                return
+            if self._turn_done.get(terminal_id, 0) < turn - 1 and self._older_turn_running_locked(
+                terminal_id, turn
+            ):
+                return
             self._turn_done[terminal_id] = turn
-            self._allow_processing_revert[terminal_id] = False
             prior = self._pre_dispatch_status.pop(terminal_id, None)
             if (
                 prior is not None
@@ -1267,6 +1281,12 @@ class StatusMonitor:
         logger.warning(f"Terminal {terminal_id}: dispatch of turn {turn} failed; turn closed")
         if restored is not None:
             bus.publish(f"terminal.{terminal_id}.status", {"status": restored.value})
+
+    def _older_turn_running_locked(self, terminal_id: str, turn: int) -> bool:
+        """Whether the status the aborted dispatch found was a busy one. Init and
+        special-key turns are opened and never closed, so an unclosed older turn
+        number alone does not mean the agent is working. Caller holds the lock."""
+        return self._pre_dispatch_status.get(terminal_id) == TerminalStatus.PROCESSING
 
     def notify_input_delivered(self, terminal_id: str) -> None:
         """Re-stamp the current turn's delivery time now the keystrokes have landed.
