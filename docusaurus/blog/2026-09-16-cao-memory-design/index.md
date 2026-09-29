@@ -35,6 +35,8 @@ caller policy.
 This is the main reason CAO owns the memory layer. A provider-specific memory feature would
 split knowledge into separate stores. CAO keeps one store and one API.
 
+![One CAO memory layer across agents and sessions](./shared-memory-layer.svg)
+
 ## What the design must do
 
 The shared layer has five goals:
@@ -69,20 +71,7 @@ contract does not change. Only the location of the store changes.
 
 CAO uses two local stores:
 
-```text
-                         CAO memory
-                             │
-                ┌────────────┴────────────┐
-                │                         │
-        Markdown topic files             SQLite
-        --------------------             ------
-        article content                  scope identity
-        timestamped entries              timestamps
-        human-readable header            access counters
-        generated related links          provenance
-                                         compilation state
-                                         typed relationships
-```
+![How CAO memory divides content, metadata, and search](./memory-storage-architecture.svg)
 
 Markdown holds the actual memory text. Each topic has a stable key. The key identifies the
 topic and becomes part of its file name.
