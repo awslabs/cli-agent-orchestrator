@@ -3188,12 +3188,19 @@ def _rearm_terminal_pipeline(
         get_backend().stop_pipe_pane(s, w)
         get_backend().pipe_pane(s, w, p)
 
+    # Reader first, so it catches the pane from the pipe's first byte.
     fifo_manager.create_reader(terminal_id, pane_probe=_probe_pane, rearm=_rearm_pipe)
-    # stop-then-start, NOT a bare pipe_pane(): after the old server died the
-    # pane may still report pane_pipe=1, and tmux's ``pipe-pane -o`` toggle
-    # would switch it OFF.
-    backend.stop_pipe_pane(session_name, window_name)
-    backend.pipe_pane(session_name, window_name, str(fifo_path))
+    try:
+        # stop-then-start, NOT a bare pipe_pane(): after the old server died
+        # the pane may still report pane_pipe=1, and tmux's ``pipe-pane -o``
+        # toggle would switch it OFF.
+        backend.stop_pipe_pane(session_name, window_name)
+        backend.pipe_pane(session_name, window_name, str(fifo_path))
+    except Exception:
+        # Nothing will ever write to this FIFO: unregister the reader (and its
+        # watchdog enrollment) rather than leave an orphan behind.
+        fifo_manager.stop_reader(terminal_id)
+        raise
     # Deliberately NO keystroke. create_terminal's post-pipe Enter lands on a
     # bare shell; here the pane holds a live agent in an arbitrary state, where
     # Enter is a submit -- on a permission prompt it answers the highlighted

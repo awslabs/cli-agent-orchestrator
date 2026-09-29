@@ -266,6 +266,61 @@ class TestReadoptOnlyFinalizesConfirmedAbsence:
         assert held == [True]
 
 
+class TestReadoptPerRowFailures:
+    """A row that fails must not take the rest of the pass with it, must be
+    counted as left untouched, and must not leave half-armed state behind."""
+
+    @pytest.mark.parametrize("failing_step", ["stop_pipe_pane", "pipe_pane"])
+    def test_reader_is_unregistered_when_arming_the_pipe_fails(
+        self, registry_db, backend, fifo, failing_step
+    ):
+        """The reader is created first so it catches the pane from its first
+        byte; if the pipe then fails to attach, nothing will ever write to it."""
+        getattr(backend, failing_step).side_effect = RuntimeError("tmux went away")
+        _seed()
+
+        counts = readopt_terminals_at_startup(database.list_all_terminals())
+
+        assert counts == {"readopted": 0, "finalized": 0, "skipped": 1}
+        fifo.create_reader.assert_called_once()
+        fifo.stop_reader.assert_called_once_with("t1")
+        assert _row_ids() == ["t1"]
+
+    def test_a_failing_live_row_does_not_stop_the_pass(self, registry_db, backend, fifo):
+        def create_reader(terminal_id, **_callbacks):
+            if terminal_id == "t-bad":
+                raise OSError("mkfifo failed")
+
+        fifo.create_reader.side_effect = create_reader
+        _seed("t-bad", session="cao-a")
+        _seed("t-good", session="cao-b")
+
+        counts = readopt_terminals_at_startup(database.list_all_terminals())
+
+        assert counts == {"readopted": 1, "finalized": 0, "skipped": 1}
+        assert _row_ids() == ["t-bad", "t-good"]
+
+    def test_a_failing_dead_row_does_not_stop_the_pass(
+        self, registry_db, backend, fifo, monkeypatch
+    ):
+        backend.session_exists_strict.return_value = False
+        real_delete = terminal_service.db_delete_terminal
+
+        def delete(terminal_id):
+            if terminal_id == "t-bad":
+                raise RuntimeError("database is locked")
+            return real_delete(terminal_id)
+
+        monkeypatch.setattr(terminal_service, "db_delete_terminal", delete)
+        _seed("t-bad", session="cao-a")
+        _seed("t-good", session="cao-b")
+
+        counts = readopt_terminals_at_startup(database.list_all_terminals())
+
+        assert counts == {"readopted": 0, "finalized": 1, "skipped": 1}
+        assert _row_ids() == ["t-bad"]
+
+
 class TestReadoptNeverTypesIntoThePane:
     """A re-adopted pane holds a live agent in an arbitrary state, and a key is a
     submit: Enter on a permission prompt with "Yes" highlighted runs the command.
