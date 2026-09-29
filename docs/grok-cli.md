@@ -58,7 +58,11 @@ cao launch --agents developer --provider grok_cli
 Profile instructions use the normal Markdown format. The body is appended to
 Grok's native system prompt with `--rules`, together with the runtime CAO skill
 catalog. This preserves Grok's coding-agent behavior while applying the
-profile's role and protocols.
+profile's role and protocols. The text is written to `rules.md` inside the
+terminal's private `GROK_HOME` and the launch line references it with
+`"$(cat …)"`, so a long profile or skill catalog never lengthens the line
+typed into the pane (the tty cuts lines past 4096 bytes) and the permission
+flags always come first on that line.
 
 Set a default model in profile frontmatter:
 
@@ -90,8 +94,9 @@ The command has this shape:
 ```text
 env GROK_SUBAGENTS=0 GROK_WORKFLOWS=0 GROK_GOAL=0 \
   grok --no-alt-screen --no-subagents \
-  [--model MODEL] [--rules RULES] \
-  [--permission-mode dontAsk --allow RULE ... --deny RULE ...]
+  [--model MODEL] \
+  [--permission-mode dontAsk --allow RULE ... --deny RULE ... | --always-approve] \
+  [--rules "$(cat GROK_HOME/rules.md)"]
 ```
 
 - `--no-alt-screen` keeps the rendered conversation observable by CAO.

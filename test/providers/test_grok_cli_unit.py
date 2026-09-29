@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import re
 import shlex
 import signal
 import stat
@@ -746,12 +747,66 @@ def test_build_command_model_precedence_rules_and_skill_prompt(tmp_path):
             return_value=profile,
         ),
     ):
-        parts = shlex.split(provider._build_grok_command())
-    assert parts[parts.index("--model") + 1] == "explicit-model"
-    rules = parts[parts.index("--rules") + 1]
+        command = provider._build_grok_command()
+        parts = shlex.split(command)
+        assert parts[parts.index("--model") + 1] == "explicit-model"
+        rules = _rules_text(command, provider)
     assert "You are a careful worker." in rules
     assert "## Available Skills" in rules
     assert "cao-supervisor" in rules
+    provider.cleanup()
+
+
+def _rules_text(command: str, provider) -> str:
+    """Resolve the ``--rules "$(cat <file>)"`` fragment to the file's content."""
+    match = re.search(r'--rules "\$\(cat (.+?)\)"$', command)
+    assert match, command
+    rules_file = Path(shlex.split(match.group(1))[0])
+    assert rules_file.parent == provider.grok_home
+    assert stat.S_IMODE(rules_file.stat().st_mode) & 0o077 == 0
+    return rules_file.read_text(encoding="utf-8")
+
+
+def test_rules_ride_a_file_so_the_launch_line_stays_short_and_denies_come_first(tmp_path):
+    """A multi-KB profile must not push the permission flags past the tty line limit."""
+    long_skills = "## Available Skills\n" + "\n".join(
+        f"- skill-{i}: does thing {i}" for i in range(400)
+    )
+    provider = make_provider(
+        agent_profile="grok-worker",
+        allowed_tools=["fs_read", "fs_list", "@cao-mcp-server"],
+        skill_prompt=long_skills,
+    )
+    with (
+        patch("cli_agent_orchestrator.providers.grok_cli.CAO_HOME_DIR", tmp_path),
+        patch("cli_agent_orchestrator.providers.grok_cli.shutil.which", return_value="/bin/grok"),
+        patch(
+            "cli_agent_orchestrator.providers.grok_cli.load_agent_profile",
+            return_value=_profile(),
+        ),
+    ):
+        command = provider._build_grok_command()
+    rules = _rules_text(command, provider)
+    assert len(rules.encode()) > 4096  # the text itself is well past MAX_CANON
+    assert len(command.encode()) < 4096  # but the line typed into the pane is not
+    assert "skill-399" in rules and "You are a careful worker." in rules
+    assert "skill-399" not in command  # nothing of the text is inlined
+    # Every permission flag precedes the rules fragment on the line.
+    rules_at = command.index("--rules")
+    for flag in ("--permission-mode", "--allow", "--deny", "--disable-web-search"):
+        assert flag in command and command.rindex(flag) < rules_at, flag
+    provider.cleanup()
+
+
+def test_no_rules_means_no_rules_flag_and_no_file(tmp_path):
+    provider = make_provider(allowed_tools=["*"])
+    with (
+        patch("cli_agent_orchestrator.providers.grok_cli.CAO_HOME_DIR", tmp_path),
+        patch("cli_agent_orchestrator.providers.grok_cli.shutil.which", return_value="/bin/grok"),
+    ):
+        command = provider._build_grok_command()
+    assert "--rules" not in command
+    assert not (provider.grok_home / "rules.md").exists()
     provider.cleanup()
 
 

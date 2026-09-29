@@ -500,8 +500,6 @@ class GrokCliProvider(BaseProvider):
             command_parts.extend(["--model", model])
 
         rules = self._apply_skill_prompt(profile.system_prompt if profile is not None else "")
-        if rules:
-            command_parts.extend(["--rules", rules])
 
         if self._allowed_tools is not None and "*" not in self._allowed_tools:
             from cli_agent_orchestrator.utils.tool_mapping import (
@@ -536,7 +534,32 @@ class GrokCliProvider(BaseProvider):
         else:
             command_parts.append("--always-approve")
 
-        return shlex.join(command_parts)
+        command = shlex.join(command_parts)
+        if rules:
+            # The rules text (profile system prompt plus the skill catalog) is
+            # commonly several KB. The launch line is typed into a bare shell,
+            # where a line longer than the tty's canonical-mode limit
+            # (MAX_CANON, 4096 bytes on Linux) is cut by the line discipline
+            # before the shell sees it. Inlining the text made the line's
+            # length depend on the profile, and put the permission flags after
+            # it. A cut always landed inside the quoted text, leaving an
+            # unclosed quote, so the shell hung at a continuation prompt and
+            # Grok never started (fail-closed, surfacing as an init timeout);
+            # but an unrestricted launch was one shlex quirk away from losing
+            # ``--deny`` instead. The text now lives in a 0600 file inside the
+            # terminal's private GROK_HOME, and the line carries only a short
+            # ``$(cat <path>)`` substitution, expanded by the shell before
+            # exec and therefore not subject to the tty line limit. Same
+            # mechanism as the Codex provider's developer_instructions file.
+            # Double quotes keep the substitution active while suppressing
+            # word-splitting and globbing of the substituted text; it is
+            # appended raw because ``shlex.join`` would single-quote the
+            # fragment and disable the substitution. The permission flags are
+            # already on the line ahead of it, so any cut can only lose rules.
+            rules_file = home / "rules.md"
+            self._atomic_write_private(rules_file, rules)
+            command += f' --rules "$(cat {shlex.quote(str(rules_file))})"'
+        return command
 
     async def initialize(self) -> bool:
         profile = self._try_load_profile()

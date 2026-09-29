@@ -25,7 +25,7 @@ from cli_agent_orchestrator.constants import (
 )
 from cli_agent_orchestrator.mcp_server import utils as mcp_utils
 from cli_agent_orchestrator.mcp_server.models import HandoffResult
-from cli_agent_orchestrator.mcp_server.utils import _auth_headers
+from cli_agent_orchestrator.mcp_server.utils import _auth_headers, _auth_headers_for
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.models.workflow_runtime import ReturnAck, parse_decision
 from cli_agent_orchestrator.services.elastic_worker_gateway import (
@@ -1030,9 +1030,11 @@ def get_handoff_result(
     Two things the request needs beyond the id, both mirroring
     ``delete_terminal`` (PR #453 review, haofeif):
 
-    - The internal ``Authorization`` header. The retrieval endpoint is
-      scope-gated, so without it an auth-enabled deployment answers 401 to a
-      caller legitimately holding the job_id.
+    - The internal ``Authorization`` header, for a LOCAL retrieval. The
+      endpoint is scope-gated, so without it an auth-enabled deployment answers
+      401 to a caller legitimately holding the job_id. A retrieval aimed at a
+      ``target_host`` carries no bearer: ``CAO_AUTH_LOCAL_TOKEN`` is this node's
+      credential, and sending it to another host would disclose it there.
     - ``target_host``. ``handoff(target_host=...)`` runs the step on that node
       and persists the row in ITS database, so the supervisor's own base URL has
       no such row.
@@ -1059,7 +1061,7 @@ def get_handoff_result(
         path = HANDOFF_RESULTS_ROUTE.format(job_id=job_id)
         response = requests.get(
             f"{base_url}{path}",
-            headers=_auth_headers() or None,
+            headers=_auth_headers_for(base_url) or None,
             # A black-holed remote node must fail on CONNECT rather than burn the
             # full read budget; a local read keeps its single scalar timeout so
             # default-path behavior is unchanged.
@@ -2842,7 +2844,9 @@ register_mcp_server_surfaces(mcp)
 
 def main():
     """Main entry point for the MCP server."""
-    mcp.run()
+    # Pinned: FASTMCP_TRANSPORT in the pane environment must not turn the
+    # per-terminal stdio server into a network listener.
+    mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":

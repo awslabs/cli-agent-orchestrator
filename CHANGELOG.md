@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- built-in `workflow_scout` role (`@builtin`, `fs_read`, `execute_bash`,
+  `@cao-mcp-server`). The shipped scout profile previously resolved through
+  the unknown-role fallback to unrestricted `["*"]`. It now resolves to this
+  allowlist. `execute_bash` is still a full shell, so withholding `fs_write`
+  and `web_fetch` is a category restriction, not a sandbox. (#746)
 - `terminal.pane_layout` chooses how a pane-mode window is arranged after each
   spawn: `tiled` (default, unchanged behaviour), `even-vertical`,
   `even-horizontal`, or `none` to leave tmux's own splitting alone. The split
@@ -50,6 +55,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cannot begin a match and cut the lines before it out of the extracted reply
   (#806, #816)
 
+- **a custom role in `settings.json` now outranks the built-in role of the same
+  name.** The resolver consulted the built-ins first, so when CAO shipped a
+  built-in `workflow_scout` an operator's saved `workflow_scout` policy was
+  silently replaced by the built-in's list: resolution and delegated child policy
+  gained `execute_bash` and lost the listing or web-fetch tools the saved policy
+  granted, while `settings.json` read back unchanged. Settings roles are now
+  consulted first for every name, so a saved `supervisor`, `developer` or
+  `reviewer` also takes effect where it was previously ignored. A settings role
+  that shadows a built-in is logged by name (never its contents). (#746)
 - **a PTY WebSocket handshake with no peer address skipped the client-IP allowlist.**
   `/terminals/{id}/ws` checked `client_host not in WS_ALLOWED_CLIENTS` only when a
   peer address was present, so a `None` peer passed instead of failing closed. Not
@@ -79,6 +93,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   structural test now covers them; the only GETs left open are `/health`, the
   OAuth discovery document, the static profile schema/template metadata and the
   AG-UI stream, which carries its own credential.
+
+- **`@builtin` in an `allowedTools` list enabled `bash`, `edit` and `write` on
+  OpenCode.** The OpenCode permission translator expanded the selector into the
+  four standard categories, while `utils/tool_mapping.py` treats every
+  `@`-prefixed entry as a non-grant for the providers it translates. The shipped
+  `reviewer` role lists `@builtin`, so an OpenCode reviewer was not read-only.
+  The selector now grants nothing on OpenCode either; run `cao install` again
+  for existing OpenCode agents, since the `permission:` block is written at
+  install time. A profile whose `allowedTools` listed **only** `@builtin`
+  previously got `read`/`grep`/`glob` (and the write and bash tools) on
+  OpenCode and now gets none of them: add `fs_read`, `fs_list` and the rest
+  explicitly, as the shipped roles already do (#824)
 
 - **enabling `CAO_MEMORY_API_URL` rejected memory keys that work without it.**
   The `/internal/memory/store` and `/forget` routes validated the wire `key` as
@@ -113,10 +139,127 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   import executed its import-time `DB_DIR.mkdir()` in agents — and failed outright
   wherever the data dir is unreadable. The import is now lazy.
 
+- **Grok's launch line inlined the whole `--rules` text ahead of the
+  permission flags.** A profile plus skill catalog of several KB pushed the
+  line past the tty's 4096-byte limit. The cut landed inside the quoted text,
+  so the shell hung on an unclosed quote and Grok never started (an init
+  timeout, not an unrestricted run), but the `--permission-mode`/`--allow`/
+  `--deny` flags were the part of the line behind the text. The rules now live
+  in a 0600 `rules.md` inside the terminal's private `GROK_HOME`, referenced
+  from the line with `"$(cat …)"` (as the Codex provider already does for its
+  instructions), the line no longer grows with the profile, and the permission
+  flags precede it (#824)
+
+- **The launch confirmation showed a Blocked list on providers that cannot
+  enforce one.** `cao launch` printed `Allowed:`/`Blocked:` for every provider
+  and `--auto-approve` said restrictions were "still enforced", while Hermes
+  (`--yolo --accept-hooks`) and Cursor CLI (`--force`) apply no restriction at
+  all and were missing from the server's soft-enforcement set, so a restricted
+  supervisor on them ran unrestricted with nothing telling the operator. One
+  table (`utils/enforcement.py`) now classifies every provider as native,
+  prompt-only or none; the confirmation prints an `Enforcement:` line and a
+  warning on prompt-only and none providers, the empty deny list on untranslated
+  providers no longer reads as `(none)`, the server warning covers Hermes and
+  Cursor, and a test keeps the SECURITY.md and docs tables equal to the code
+  (SECURITY.md gains the seven missing rows, the docs table gains OMP). Kiro
+  CLI, the default provider, moves from "Hard" to "None": it is launched with
+  `--trust-all-tools` on every profile, and the `allowedTools` CAO writes into
+  the agent JSON only suppresses approval prompts in Kiro; `tools` decides
+  availability and is `["*"]` unless the profile sets it. Applying the CAO
+  policy to Kiro at launch, and refusing restricted roles on providers that
+  cannot enforce them, are separate decisions. OpenCode is the one native provider whose policy is the INSTALLED agent's: the gate now says `native at install time` and that launch overrides do not change it, instead of `Blocked: (none)` beside a native promise; the third copy of the "providers with native tool denial" list (docs/cursor-cli.md) and the prompt-only provider prose in docs/tool-restrictions.md now agree with the table, and the Kiro e2e case that asserted blocking now asserts the opposite directly (a restricted Kiro supervisor can run bash), so an environmental failure cannot pass as the expected result; on the author's machine the case has not yet produced a result (kiro-cli 2.24.1 timed out waiting for its agent prompt), so the classification rests on the launch flags and Kiro's documentation, not on an observed run (#824)
+- **The local API bearer was sent to other nodes.** `handoff`/`assign` with a
+  `target_host`, `delete_terminal` with a `target_host`, `get_handoff_result`
+  with a `target_host`, and a remote worker's `send_message` back to its
+  supervisor's `CAO_CALLBACK_URL` all attached
+  `CAO_AUTH_LOCAL_TOKEN` to requests aimed at another host. The token now goes
+  only to this node's own `API_BASE_URL`; cross-node requests carry no
+  `Authorization` header (the elastic worker gateway headers are unaffected).
+  No change when authentication is off. Behaviour change when it is on: a
+  multi-node deployment that gave every node the same `CAO_AUTH_LOCAL_TOKEN`
+  was authenticating these cross-node calls by accident, and they now fail
+  with 401 on the remote node; the token is documented as this node's
+  loopback credential only (#822)
+
+- **Both MCP servers now pin `transport="stdio"`.** FastMCP otherwise honours
+  `FASTMCP_TRANSPORT` from the environment, and an `http` value would have
+  turned a stdio tool into a loopback listener with no MCP-level auth in front
+  of its API hop (#822)
+- **The credential gate on federated memory writes and `--redact` exports
+  missed common key formats.** It now recognises Anthropic and OpenAI API
+  keys, GitHub fine-grained and OAuth/app tokens, Slack tokens, JSON Web
+  Tokens, Slack bot/user/app-level (`xapp-`) tokens and AWS secret access
+  keys (next to an `aws ... secret`/`access` context word or a
+  `SecretAccessKey` key), and it no longer lets an invisible character inside
+  a prefix hide a credential: the whole Unicode format category (zero-width
+  characters, bidi marks, soft hyphen, invisible operators; frozen at Unicode
+  16.0 so Python 3.10 and 3.11, whose own tables are older, catch the same
+  code points) plus the variation selectors, not a short list. Parsed
+  documents keep their key
+  context: the execution manifest and step output redact a 40-character value
+  under a `SecretAccessKey`-style key, a value whose key makes the pair read
+  as a credential assignment (`{"password": …}`, `{"api_key": …}`), and the
+  `value` of a `{name: AWS_SECRET_ACCESS_KEY, value: …}` entry, none of which
+  the text pattern can see once key and value are scanned apart. The graph export gate
+  scans the parsed view (`scan_json_for_secrets`) rather than its
+  `json.dumps` form, whose default `ensure_ascii` had turned a hidden
+  character into a `\u` escape before the gate could strip it.
+  Vendor patterns are matched before the generic `bearer`/`secret` ones, so
+  the reported pattern name is the specific one (#821)
+
+- **Atomic file writes read the process umask by setting it to 0.** The
+  writer behind profile and archive updates (`utils/atomic_file`) and the
+  vault writer behind federated memory notes (`services/vault/writer`) both
+  derived a new file's mode with `os.umask(0)` followed by a restore. The
+  umask is process-wide and cao-server is threaded, so a file created with
+  the default mode by any other thread inside that window could be born
+  world-writable. A new file's temp is now created with `O_EXCL` and mode
+  0666 so the kernel applies the umask itself; an existing file's mode is
+  preserved as before, and the umask is never touched (#821)
+
+- **The blocked-path list for working directories and archive targets was
+  exact-match only.** `/etc/passwd` passed with `allow_file`, and an existing
+  directory such as `/etc/ssl` was a valid working directory. System
+  configuration, kernel and device pseudo-filesystems, boot files, the
+  system binary and library directories and the crontab spool (`/etc`,
+  `/proc`, `/sys`, `/dev`, `/boot`, `/bin`, `/sbin`, `/usr/bin`, `/usr/sbin`,
+  `/lib`, `/lib64`, `/usr/lib`, `/usr/lib64`, `/root`, `/var/spool/cron`, and
+  `/private/etc` on macOS; the `/usr/lib*` entries are what makes the `/lib`
+  rule hold on usr-merged Linux, where `/lib` resolves to `/usr/lib`) are now refused at any
+  depth, with `/dev/shm` carved out. `/tmp`, `/var`, `/home`-style roots stay
+  exact-only because projects legitimately live beneath them; a cao-server
+  that runs as root must keep its projects outside `/root` (#821)
+- **CI referenced GitHub Actions by mutable tag**, including in the jobs that
+  hold `RELEASE_DEPLOY_KEY`, `CODECOV_TOKEN` and the Pages OIDC token; five
+  steps ran `npm install` rather than `npm ci` against committed lockfiles, and
+  no `uv` command was held to the committed lock: a PR that changed
+  `pyproject.toml` without updating `uv.lock` had `uv run` re-resolve and
+  install the new dependencies. All 66 tag references across `ci.yml`,
+  `release.yml`, `gh-pages.yml`, `secret-scan.yml` and the four provider test
+  workflows are pinned to the commit each tag resolved to (tag kept as a
+  comment), `npm ci` is used throughout, every workflow that runs `uv` sets
+  `UV_LOCKED=1` so `uv sync`, `uv run` (including inside `make`) and
+  `uv export` fail on a stale lock instead of re-resolving, and the `uv sync`
+  and `uv export` commands spell `--locked` as well (`publish-to-pypi.yml`
+  gains the same). `.github/dependabot.yml` now exists so the SHA pins move;
+  a test asserts every `uses:` is a full SHA and every uv workflow carries the
+  lock policy. `cargo-deny.yml`'s actions were already pinned (#820)
+
 ### Changed
 
 - `list_outcomes` clamps `limit` to 200 client-side; the service already clamped
   silently, so `limit=500` keeps working rather than becoming a 422.
+
+### Security
+
+- **an unknown `role` no longer falls open to unrestricted `["*"]`.** Omitting
+  `role` still uses developer defaults. A typo or a role that is not defined
+  now raises `ValueError` on install, launch, and delegation, so providers no
+  longer skip native deny flags. **Breaking:** profiles that previously
+  launched because an undefined role fell open to `["*"]` now fail closed.
+  Define the role under `agents.roles` (or the legacy flat `roles` key), or
+  omit `role` for developer defaults. An explicit `allowedTools` list still
+  wins and does not raise. (#746)
 
 
 ## [2.5.0] - 2026-08-28

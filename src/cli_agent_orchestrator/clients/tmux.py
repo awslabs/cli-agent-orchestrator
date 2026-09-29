@@ -813,8 +813,10 @@ class TmuxClient:
         return result.returncode == 0
 
     # Kept as an alias so existing callers/tests referencing the class
-    # attribute keep working; the canonical set lives in
-    # utils/path_validation.py (shared with archive export/import, D5).
+    # attribute keep working; the canonical policy lives in
+    # utils/path_validation.py (shared with archive export/import, D5). This
+    # names only the exact-match roots; the whole-subtree rules are
+    # BLOCKED_SYSTEM_SUBTREES there, and the validator below applies both.
     _BLOCKED_DIRECTORIES = BLOCKED_SYSTEM_DIRECTORIES
 
     def _resolve_and_validate_working_directory(self, working_directory: Optional[str]) -> str:

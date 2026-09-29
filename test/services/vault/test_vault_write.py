@@ -1013,6 +1013,31 @@ def test_write_preserves_existing_mode_and_uses_umask_for_new_note(tmp_path) -> 
     assert stat.S_IMODE(target.stat().st_mode) == 0o644
 
 
+def test_write_never_touches_the_process_umask(tmp_path, monkeypatch) -> None:
+    """The umask is process-global and cao-server is threaded: reading it via
+    os.umask(0) + restore left a window in which another thread's new file was
+    born 0666. Neither a new note nor a rewrite may call os.umask; the kernel
+    applies the umask to the 0666 temp on its own."""
+    fixture = build_vault_fixture(tmp_path)
+    target = fixture.root / "CAO" / "managed-note.md"
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("os.umask must not be called by the vault writer")
+
+    monkeypatch.setattr(os, "umask", forbidden)
+    _write(fixture)  # new note
+    assert target.exists()
+    _write(fixture, expected_content_sha256=writer._sha256(target.read_text(encoding="utf-8")))
+    monkeypatch.undo()
+    assert stat.S_IMODE(target.stat().st_mode) == (0o666 & ~_current_umask())
+
+
+def _current_umask() -> int:
+    current = os.umask(0)
+    os.umask(current)
+    return current
+
+
 def test_managed_target_has_query_recognized_normalization_and_containment_contract() -> None:
     """Keep the query-recognized normalized candidate flowing to descriptor sinks."""
     tree = ast.parse(

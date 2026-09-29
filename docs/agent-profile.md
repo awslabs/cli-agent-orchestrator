@@ -32,7 +32,7 @@ portable and make profile listings useful.
 
 - `provider` (string): provider preference for this profile.
 - `role` (string): named tool-access role, such as `supervisor`, `developer`,
-  or `reviewer`.
+  `reviewer`, or `workflow_scout`.
 - `allowedTools` (array of strings): explicit CAO tool allowlist; when present,
   it overrides the role defaults.
 - `capabilities` (array of strings): profile-discovery statements, with at most
@@ -97,7 +97,9 @@ relying on a duplicated compatibility catalog here.
 
 If neither `role` nor `allowedTools` is set, CAO resolves the profile with the
 default developer permissions. An explicit `allowedTools` list overrides role
-defaults. Launch-time options can then alter those resolved restrictions.
+defaults, including when `role` is unrecognized. An unrecognized `role` with
+no `allowedTools` raises `ValueError` instead of falling open to `["*"]`.
+Launch-time options can then alter those resolved restrictions.
 
 See [Tool Restrictions](tool-restrictions.md) for built-in roles, the tool
 vocabulary, launch overrides, provider enforcement, and limitations.

@@ -101,14 +101,19 @@ for _provider, _mapping in TOOL_MAPPING.items():
 
 
 def _get_role_defaults(role: str) -> List[str] | None:
-    """Look up allowedTools for a role (built-in or custom from settings)."""
+    """Look up allowedTools for a role: settings.json first, then the built-ins.
+
+    Operator configuration outranks shipped defaults, the same rule by which an
+    explicit ``allowedTools`` outranks ``role``. The order matters when a name
+    exists in both places: a saved ``workflow_scout`` policy of ``["fs_read",
+    "fs_list"]`` must keep resolving to that list after CAO ships a built-in of
+    the same name, not gain ``execute_bash`` on upgrade. A settings role that
+    shadows a built-in is logged by name so the override is visible.
+
+    Every role resolution now reads settings.json, where built-ins used to
+    resolve without touching disk; custom roles already paid that read.
+    """
     from cli_agent_orchestrator.constants import ROLE_TOOL_DEFAULTS
-
-    # Check built-in roles first
-    if role in ROLE_TOOL_DEFAULTS:
-        return list(ROLE_TOOL_DEFAULTS[role])
-
-    # Check custom roles from settings.json
     from cli_agent_orchestrator.services.settings_service import _load
 
     settings = _load()
@@ -119,8 +124,16 @@ def _get_role_defaults(role: str) -> List[str] | None:
     else:
         # Legacy flat format: {"roles": {...}}
         custom_roles = settings.get("roles", {})
-    if role in custom_roles:
+    if isinstance(custom_roles, dict) and role in custom_roles:
+        if role in ROLE_TOOL_DEFAULTS:
+            logger.warning(
+                f"Role {role!r} is defined in settings.json and shadows the built-in "
+                "role of the same name; the settings.json definition is used."
+            )
         return list(custom_roles[role])
+
+    if role in ROLE_TOOL_DEFAULTS:
+        return list(ROLE_TOOL_DEFAULTS[role])
 
     return None
 
@@ -134,8 +147,11 @@ def resolve_allowed_tools(
 
     Resolution order:
     1. profile_allowed_tools (explicit in profile or --allowed-tools CLI)
-    2. Role-based defaults (built-in or custom from settings.json)
-    3. Unrestricted ["*"] (backward compatible — no role/allowedTools = no restrictions)
+    2. Role defaults: a custom role from settings.json, else the built-in of that name
+    3. Developer defaults when role and allowedTools are both omitted
+
+    An unrecognized role raises ValueError. A typo must not be more
+    privileged than omitting the field.
 
     MCP server names are appended as ``@server_name`` to a list CAO chose, so
     declaring a server in ``mcpServers`` is enough to use it. They are NOT
@@ -154,12 +170,10 @@ def resolve_allowed_tools(
         if role_defaults is not None:
             allowed = role_defaults
         else:
-            logger.warning(
-                "Unknown role '%s' — falling back to unrestricted. "
-                "Define custom roles in settings.json under 'roles'.",
-                role,
+            raise ValueError(
+                f"Unknown role {role!r}. Define it in settings.json under "
+                "'roles', or omit role for developer defaults."
             )
-            allowed = ["*"]
     else:
         # No role, no allowedTools — default to developer (secure default)
         from cli_agent_orchestrator.constants import ROLE_TOOL_DEFAULTS

@@ -10,11 +10,30 @@ from unittest.mock import MagicMock, patch
 import pytest
 import requests
 
+from cli_agent_orchestrator.constants import API_BASE_URL
 from cli_agent_orchestrator.mcp_server.utils import (
+    _auth_headers_for,
     get_json,
     get_terminal_record,
     post_body_json,
 )
+
+
+class TestAuthHeadersFor:
+    """The MCP server's bearer goes to this node's API and nowhere else."""
+
+    @patch("cli_agent_orchestrator.mcp_server.utils.get_local_bearer", return_value="tok")
+    def test_attaches_only_for_the_local_api(self, _bearer):
+        assert _auth_headers_for(API_BASE_URL) == {"Authorization": "Bearer tok"}
+        assert _auth_headers_for(API_BASE_URL + "/") == {"Authorization": "Bearer tok"}
+        assert _auth_headers_for("http://worker-7:9889") == {}
+        # Same port, different spelling of the host: not provably this node.
+        assert _auth_headers_for("http://localhost:9889") == {}
+
+    @patch("cli_agent_orchestrator.mcp_server.utils.get_local_bearer", return_value=None)
+    def test_empty_when_auth_is_off(self, _bearer):
+        assert _auth_headers_for(API_BASE_URL) == {}
+        assert _auth_headers_for("http://worker-7:9889") == {}
 
 
 class TestGetTerminalRecord:

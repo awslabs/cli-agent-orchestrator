@@ -109,6 +109,12 @@ from cli_agent_orchestrator.services.settings_service import get_max_terminals
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.enforcement import NATIVE as NATIVE_ENFORCEMENT
+from cli_agent_orchestrator.utils.enforcement import (
+    PROVIDER_ENFORCEMENT,
+    enforcement_for,
+    native_providers,
+)
 from cli_agent_orchestrator.utils.path_validation import resolve_and_validate_path
 from cli_agent_orchestrator.utils.skills import build_skill_catalog
 from cli_agent_orchestrator.utils.terminal import (
@@ -283,14 +289,12 @@ RUNTIME_SKILL_PROMPT_PROVIDERS = {
     ProviderType.MINIMAX_CODE.value,
 }
 
-# Providers whose tool restrictions are prompt-level text only (no native
-# blocking mechanism) — a restricted policy on these is advisory, not enforced.
+# Providers that cannot enforce a restricted tool policy natively: either the
+# restriction is prompt-level text only, or (hermes, cursor_cli) nothing is
+# passed at all and the provider auto-approves. Derived from the single table in
+# utils/enforcement.py so this set, the launch gate and the docs agree.
 SOFT_ENFORCEMENT_PROVIDERS = {
-    ProviderType.KIMI_CLI.value,
-    ProviderType.CODEX.value,
-    ProviderType.ANTIGRAVITY_CLI.value,
-    ProviderType.OMP.value,
-    ProviderType.MINIMAX_CODE.value,
+    provider for provider, level in PROVIDER_ENFORCEMENT.items() if level != NATIVE_ENFORCEMENT
 }
 
 
@@ -1162,10 +1166,10 @@ async def create_terminal(
         ):
             logger.warning(
                 f"Terminal {terminal_id}: provider '{provider}' cannot enforce tool "
-                f"restrictions (soft/prompt-level only) but profile '{agent_profile}' "
-                f"requests {allowed_tools}. Treat this worker as unrestricted; for "
-                f"enforced restrictions use claude_code, grok_cli, kiro_cli, or "
-                f"copilot_cli."
+                f"restrictions ({enforcement_for(provider)} enforcement) but profile "
+                f"'{agent_profile}' requests {allowed_tools}. Treat this worker as "
+                f"unrestricted; for enforced restrictions use one of: "
+                f"{', '.join(native_providers())}."
             )
 
         # Step 3c: Create the tmux session/window and its registry row as ONE
