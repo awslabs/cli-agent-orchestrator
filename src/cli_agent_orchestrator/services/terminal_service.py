@@ -317,15 +317,20 @@ def _write_terminal_snapshot(
     agent_profile: Optional[str],
     provider: str,
     working_directory: Optional[str],
-    allowed_tools: Optional[list],
+    allowed_tools: Optional[list[str]],
     caller_id: Optional[str],
 ) -> None:
     """Write (or refresh) TERMINAL_LOG_DIR/<tid>.snapshot.json.
 
-    Called at terminal creation (early snapshot, so crashes still leave
-    restore metadata behind) and again at clean deletion (which refreshes
-    working_directory with the pane's live value). Best-effort: snapshot
-    failures never break the caller.
+    The single writer of the snapshot format. ``create_terminal`` calls it at
+    creation (Step 3d: an early snapshot, so a crash still leaves restore
+    metadata behind) and ``capture_terminal_snapshot`` calls it again at
+    deletion, refreshing ``working_directory`` with the pane's live value.
+
+    The file is created owner-only (0600) from its first byte, and an existing
+    file is tightened too; ``constants.py`` creates the log directory 0700, so
+    this is defense in depth. Best-effort: snapshot failures never break the
+    caller.
     """
     try:
         import json as _json
@@ -341,7 +346,13 @@ def _write_terminal_snapshot(
             "caller_id": caller_id,
         }
         snapshot_path = TERMINAL_LOG_DIR / f"{terminal_id}.snapshot.json"
-        snapshot_path.write_text(_json.dumps(snapshot, indent=2), encoding="utf-8")
+        # The mode in os.open only applies when O_CREAT creates the file, so an
+        # existing one (an older release's, or the creation-time snapshot being
+        # refreshed) is tightened with fchmod before anything is written.
+        fd = os.open(snapshot_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            os.fchmod(f.fileno(), 0o600)
+            f.write(_json.dumps(snapshot, indent=2))
     except Exception as e:
         logger.warning(f"Failed to write snapshot for {terminal_id}: {e}")
 
@@ -1405,8 +1416,9 @@ async def create_terminal(
 
         # Step 3d: Early snapshot. Delete-time snapshotting only covers CLEAN
         # deletions; a crash / tmux kill / reboot used to leave nothing behind.
-        # The snapshot's fields are static launch metadata, so write it now —
-        # the delete path refreshes it later with the live working directory.
+        # The snapshot's fields are static launch metadata, so write it now;
+        # capture_terminal_snapshot refreshes it through the same writer at
+        # deletion, with the pane's live working directory.
         _write_terminal_snapshot(
             terminal_id,
             session_name=session_name,
@@ -2879,20 +2891,17 @@ def capture_terminal_snapshot(terminal_id: str) -> Optional[Dict]:
         scrollback_path = TERMINAL_LOG_DIR / f"{terminal_id}.scrollback"
         scrollback_path.write_text(scrollback, encoding="utf-8")
 
-        import json as _json
-
-        snapshot = {
-            "terminal_id": terminal_id,
-            "session_name": metadata["tmux_session"],
-            "window_name": metadata["tmux_window"],
-            "agent_profile": metadata.get("agent_profile"),
-            "provider": metadata["provider"],
-            "working_directory": live_working_directory,
-            "allowed_tools": metadata.get("allowed_tools"),
-            "caller_id": metadata.get("caller_id"),
-        }
-        snapshot_path = TERMINAL_LOG_DIR / f"{terminal_id}.snapshot.json"
-        snapshot_path.write_text(_json.dumps(snapshot, indent=2), encoding="utf-8")
+        # Refresh the creation-time snapshot with the live working directory.
+        _write_terminal_snapshot(
+            terminal_id,
+            session_name=metadata["tmux_session"],
+            window_name=metadata["tmux_window"],
+            agent_profile=metadata.get("agent_profile"),
+            provider=metadata["provider"],
+            working_directory=live_working_directory,
+            allowed_tools=metadata.get("allowed_tools"),
+            caller_id=metadata.get("caller_id"),
+        )
     except Exception as e:
         logger.warning(f"Failed to snapshot terminal {terminal_id}: {e}")
 

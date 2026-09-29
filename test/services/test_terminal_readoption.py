@@ -12,9 +12,11 @@ SQLite registry, so "the row was kept" and "the row was deleted" are observed
 in the store itself rather than inferred from a mocked delete.
 """
 
+import contextlib
 import json
+import stat
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -449,36 +451,116 @@ class TestReadoptNeverTypesIntoThePane:
         backend.send_keys.assert_not_called()
 
 
+_SNAPSHOT_FIELDS = dict(
+    session_name="cao-s",
+    window_name="dev-9",
+    agent_profile="developer",
+    provider="claude_code",
+    working_directory="/repo",
+    allowed_tools=["fs_read"],
+    caller_id=None,
+)
+
+
 class TestEarlySnapshot:
     def test_write_terminal_snapshot(self, tmp_path):
         with patch.object(terminal_service, "TERMINAL_LOG_DIR", tmp_path):
-            _write_terminal_snapshot(
-                "t9",
-                session_name="cao-s",
-                window_name="dev-9",
-                agent_profile="developer",
-                provider="claude_code",
-                working_directory="/repo",
-                allowed_tools=["fs_read"],
-                caller_id=None,
-            )
+            _write_terminal_snapshot("t9", **_SNAPSHOT_FIELDS)
 
         snapshot = json.loads((tmp_path / "t9.snapshot.json").read_text())
-        assert snapshot["terminal_id"] == "t9"
-        assert snapshot["session_name"] == "cao-s"
-        assert snapshot["provider"] == "claude_code"
-        assert snapshot["allowed_tools"] == ["fs_read"]
+        assert snapshot == {"terminal_id": "t9", **_SNAPSHOT_FIELDS}
+
+    def test_snapshot_is_written_owner_only(self, tmp_path):
+        """Defense in depth: the log dir is 0700 today, but the file should not
+        rely on that alone."""
+        with patch.object(terminal_service, "TERMINAL_LOG_DIR", tmp_path):
+            _write_terminal_snapshot("t9", **_SNAPSHOT_FIELDS)
+
+        assert stat.S_IMODE((tmp_path / "t9.snapshot.json").stat().st_mode) == 0o600
+
+    def test_refreshing_a_snapshot_tightens_an_existing_file(self, tmp_path):
+        """O_CREAT's mode only applies to new files; a snapshot written by an
+        older release (or refreshed at delete) must end up 0600 too."""
+        existing = tmp_path / "t9.snapshot.json"
+        existing.write_text("{}")
+        existing.chmod(0o644)
+
+        with patch.object(terminal_service, "TERMINAL_LOG_DIR", tmp_path):
+            _write_terminal_snapshot("t9", **_SNAPSHOT_FIELDS)
+
+        assert stat.S_IMODE(existing.stat().st_mode) == 0o600
+        assert json.loads(existing.read_text())["terminal_id"] == "t9"
 
     def test_write_terminal_snapshot_never_raises(self, tmp_path):
         """Best-effort contract: a bad log dir must not break the caller."""
         with patch.object(terminal_service, "TERMINAL_LOG_DIR", tmp_path / "missing" / "nested"):
-            _write_terminal_snapshot(
-                "t10",
-                session_name="s",
-                window_name="w",
-                agent_profile=None,
-                provider="claude_code",
-                working_directory=None,
-                allowed_tools=None,
-                caller_id=None,
-            )  # no exception
+            _write_terminal_snapshot("t10", **_SNAPSHOT_FIELDS)  # no exception
+
+    def test_delete_path_refreshes_the_snapshot_through_the_same_writer(self, registry_db, backend):
+        """One writer of the snapshot format: the delete-time capture refreshes
+        it with the pane's live working directory via the same helper."""
+        _seed("t1")
+        backend.get_pane_working_directory.return_value = "/live/cwd"
+        backend.get_history.return_value = "scrollback"
+
+        with patch.object(terminal_service, "_write_terminal_snapshot") as writer:
+            metadata = terminal_service.capture_terminal_snapshot("t1")
+
+        assert metadata["live_working_directory"] == "/live/cwd"
+        writer.assert_called_once_with(
+            "t1",
+            session_name="cao-s",
+            window_name="dev-1",
+            agent_profile="developer",
+            provider="claude_code",
+            working_directory="/live/cwd",
+            allowed_tools=None,
+            caller_id=None,
+        )
+
+
+_TS = "cli_agent_orchestrator.services.terminal_service."
+
+
+@pytest.mark.asyncio
+async def test_create_terminal_writes_the_early_snapshot_with_the_resolved_cwd():
+    """Step 3d snapshots the EFFECTIVE launch directory (after worktree
+    substitution and path resolution), not whatever the caller passed."""
+    with contextlib.ExitStack() as stack:
+
+        def p(name, **kwargs):
+            return stack.enter_context(patch(_TS + name, **kwargs))
+
+        for name in (
+            "get_herdr_inbox_service",
+            "db_create_terminal",
+            "generate_session_name",
+            "build_skill_catalog",
+            "dispatch_plugin_event",
+            "update_terminal_shell_command",
+        ):
+            p(name)
+        p("generate_terminal_id", return_value="t-new")
+        p("generate_window_name", return_value="developer-base")
+        p("load_agent_profile", return_value=None)
+        p("_resolve_working_directory", return_value="/resolved/launch/cwd")
+        writer = p("_write_terminal_snapshot")
+        backend = p("get_backend").return_value
+        backend.session_exists.return_value = True
+        backend.create_window.return_value = "developer-wxyz"
+        backend.supports_event_inbox.return_value = True
+        provider_manager = p("provider_manager")
+        provider_manager.create_provider.return_value.initialize = AsyncMock(return_value=True)
+
+        await terminal_service.create_terminal(
+            provider="claude_code",
+            agent_profile="developer",
+            session_name="cao-s",
+            working_directory="relative/dir",
+        )
+
+    writer.assert_called_once()
+    assert writer.call_args.args == ("t-new",)
+    assert writer.call_args.kwargs["working_directory"] == "/resolved/launch/cwd"
+    assert writer.call_args.kwargs["session_name"] == "cao-s"
+    assert writer.call_args.kwargs["window_name"] == "developer-wxyz"
