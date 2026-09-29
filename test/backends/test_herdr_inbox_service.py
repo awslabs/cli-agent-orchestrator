@@ -1200,6 +1200,23 @@ class TestHerdrInboxServiceLifecycleEvents:
         mock_retain.assert_called_once_with("tid-pending", metadata)
         mock_dismantle.assert_called_once_with("tid-pending", metadata, kill_window=False)
 
+    @patch("cli_agent_orchestrator.services.terminal_service.dismantle_terminal_runtime")
+    @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service."
+        "_is_deferred_init_external_owner_active",
+        return_value=True,
+    )
+    def test_current_process_pending_external_owner_is_retained_without_runtime_cleanup(
+        self, _mock_active, mock_meta, mock_dismantle
+    ):
+        """Startup/reconcile discovery must not dismantle a live deferred initializer."""
+
+        assert _retain_deferred_failure_tombstone("tid-active") is True
+
+        mock_meta.assert_not_called()
+        mock_dismantle.assert_not_called()
+
     @patch.object(HerdrInboxService, "_label_still_live", return_value=False)
     @patch("cli_agent_orchestrator.services.herdr_inbox_service._retain_deferred_failure_tombstone")
     @patch("cli_agent_orchestrator.clients.database.delete_terminal")

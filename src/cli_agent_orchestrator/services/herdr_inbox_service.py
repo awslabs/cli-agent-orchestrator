@@ -50,10 +50,22 @@ def _retain_deferred_failure_tombstone(
         update_terminal_deferred_init_runtime_reclaimed,
     )
     from cli_agent_orchestrator.services.terminal_service import (
+        _is_deferred_init_external_owner_active,
         capture_terminal_snapshot,
         dismantle_terminal_runtime,
         should_retain_deferred_failure_tombstone,
     )
+
+    # A current-process external-owner worker can legitimately appear in a
+    # stale startup/reconcile discovery window while its deferred initializer
+    # is still running.  Its DB row has the same ownership bit as a crash-
+    # stranded tombstone, so durable metadata alone cannot distinguish them.
+    # The process-local active fence is authoritative for this one case:
+    # retain the row, but do NOT dismantle the live provider/FIFO/worktree.
+    # Once the init task settles the fence is cleared; a durable failure can
+    # then be reclaimed by the normal retry/rediscovery path.
+    if _is_deferred_init_external_owner_active(terminal_id):
+        return True
 
     try:
         metadata = get_terminal_metadata(terminal_id)
