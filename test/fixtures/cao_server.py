@@ -367,6 +367,43 @@ def _seed_packaged_skills(home_dir: Path) -> None:
             shutil.copy2(entry, target)
 
 
+def _seed_workflow_settings(home_dir: Path) -> None:
+    """Turn workflow approval enforcement OFF in the redirected HOME (issue #583 Bolt 3).
+
+    ``approval-enforcement-default`` flipped ``workflow.require_approval`` to default ON, so a
+    script-tier run started against a freshly-seeded HOME is refused with 403 unless its plan has been
+    approved. The real-server tests exercise the run LIFECYCLE — submit, drive, cancel, list, resume,
+    detached observation — and none of them is about approval.
+
+    THIS HAS TO BE A FILE RATHER THAN AN ENVIRONMENT VARIABLE, and that is the asymmetry working as
+    designed rather than an inconvenience: ``CAO_WORKFLOW_REQUIRE_APPROVAL`` may only turn the gate
+    ON, so no ``extra_env`` knob can turn it off. A test harness that wants the gate off has to say so
+    in ``settings.json``, exactly as an operator would.
+
+    Seeded per server home, so it cannot leak into the developer's real ``~/.aws/``. A test that WANTS
+    the gate on either overwrites this file or approves the plan.
+    """
+    import json as _json
+
+    dest = home_dir / ".aws" / "cli-agent-orchestrator"
+    dest.mkdir(parents=True, exist_ok=True)
+    settings_path = dest / "settings.json"
+    existing = {}
+    if settings_path.exists():
+        try:
+            loaded = _json.loads(settings_path.read_text())
+            if isinstance(loaded, dict):
+                existing = loaded
+        except ValueError:
+            existing = {}
+    workflow_section = existing.get("workflow")
+    if not isinstance(workflow_section, dict):
+        workflow_section = {}
+    workflow_section.setdefault("require_approval", False)
+    existing["workflow"] = workflow_section
+    settings_path.write_text(_json.dumps(existing, indent=2))
+
+
 def _seed_omp_e2e_state(home_dir: Path) -> None:
     """Seed non-secret OMP setup state and assign profiles for real OMP E2E tests.
 
@@ -406,6 +443,7 @@ def _start_cao_server(
     """
     home_dir.mkdir(parents=True, exist_ok=True)
     _seed_packaged_skills(home_dir)
+    _seed_workflow_settings(home_dir)
     _seed_omp_e2e_state(home_dir)
     log_path = home_dir / "server.log"
     log_handle = open(log_path, "ab")  # noqa: SIM115 — handle lifetime is in stop()

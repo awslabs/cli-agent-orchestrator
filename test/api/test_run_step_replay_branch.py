@@ -57,7 +57,9 @@ from one run would change the verdict of the next.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
+import json
 import sqlite3
 from pathlib import Path
 from typing import Optional
@@ -72,8 +74,15 @@ from cli_agent_orchestrator.clients.database import (
 from cli_agent_orchestrator.constants import TERMINALS_RUN_STEP_ROUTE
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
 from cli_agent_orchestrator.models.workflow import RecoveryPolicy, StepResultEnvelope
-from cli_agent_orchestrator.models.workflow_runtime import RunState
-from cli_agent_orchestrator.services import step_replay, workflow_journal, workflow_service
+from cli_agent_orchestrator.models.workflow_runtime import RunState, WorkflowRunResult
+from cli_agent_orchestrator.services import (
+    launch_guard,
+    script_runner,
+    settings_service,
+    step_replay,
+    workflow_journal,
+    workflow_service,
+)
 from cli_agent_orchestrator.services.script_runner import ScriptRunRecord
 from cli_agent_orchestrator.services.step_fingerprint import StepCallFields, compute
 from cli_agent_orchestrator.services.step_replay import ReplayDecision, ReplayVerdict
@@ -134,6 +143,8 @@ def _register_run(
     *,
     generation: str = "1",
     script_tier: bool = True,
+    spec_snapshot: str = '{"source":"","launch_guard":null}',
+    working_directory: Optional[str] = None,
 ) -> Optional[ScriptRunRecord]:
     """Journal a ``workflow_run`` row and (optionally) register a live script record.
 
@@ -145,7 +156,7 @@ def _register_run(
     workflow_journal.insert_run(
         run_id=run_id,
         workflow_name="wf",
-        spec_snapshot="steps: []",
+        spec_snapshot=spec_snapshot,
         inputs_json="{}",
         state="running",
         started_at=TS,
@@ -166,9 +177,22 @@ def _register_run(
         started_at=TS,
         finished_at=None,
         tier="script",
+        working_directory=working_directory,
     )
     workflow_service.run_registry[run_id] = record
     return record
+
+
+def _guarded_snapshot(agent: str = "developer") -> str:
+    return json.dumps(
+        {
+            "source": "",
+            "launch_guard": {
+                "profiles": {agent: launch_guard._profile_digest(agent)},
+                "memory_enabled": settings_service.is_memory_enabled(),
+            },
+        }
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -653,6 +677,47 @@ class TestTheHoist:
     EFFECTIVE one: the posted value is ``None`` in every call and the difference
     is the caller terminal's CWD."""
 
+    def test_script_step_defaults_to_run_root_for_execution_and_fingerprint(self, client):
+        run_id = "run-root-default"
+        root = "/run/root"
+        body = _body(env_vars=_env(run_id))
+        _register_run(run_id, working_directory=root)
+        fingerprints = []
+
+        def _decide(r_id, s_id, fingerprint, policy):
+            fingerprints.append(fingerprint)
+            return ReplayDecision(
+                verdict=ReplayVerdict.EXECUTE,
+                envelope=None,
+                reason=None,
+                rule=None,
+            )
+
+        async def _run(*args, **kwargs):
+            kwargs["on_step_terminal_ready"]("fresh-terminal", fingerprints[-1])
+            return _ok_result()
+
+        with (
+            patch(_DECIDE, side_effect=_decide),
+            patch(_RUN_STEP, new=AsyncMock(side_effect=_run)) as m_run,
+        ):
+            response = client.post(TERMINALS_RUN_STEP_ROUTE, json=body)
+
+        assert response.status_code == 200, response.text
+        assert m_run.await_args.kwargs["working_directory"] == root
+        assert fingerprints == [_route_fingerprint(body, effective_working_directory=root)]
+
+    def test_explicit_step_root_overrides_run_root_without_conflict(self, client):
+        run_id = "run-root-explicit"
+        body = _body(env_vars=_env(run_id), working_directory="/step/root")
+        _register_run(run_id, working_directory="/run/root")
+
+        with patch(_RUN_STEP, new=AsyncMock(return_value=_ok_result())) as m_run:
+            response = client.post(TERMINALS_RUN_STEP_ROUTE, json=body)
+
+        assert response.status_code == 200
+        assert m_run.await_args.kwargs["working_directory"] == "/step/root"
+
     def test_two_effective_directories_do_not_replay_each_other(self, client):
         run_id = "run-hoist-a"
         body_one = _body(env_vars=_env(run_id), caller_id="sup-one")
@@ -713,10 +778,15 @@ class TestTheHoist:
 
     def test_the_resolution_runs_once(self, client):
         """The route resolved, so ``run_agent_step``'s own inheritance guard must
-        not fire — no flag, no second lookup."""
+        not fire — no flag, no second lookup.
+
+        This deliberately keeps the pre-guard approval-off snapshot shape. It
+        caught the regression where a null guard was rejected before the current
+        approval posture was consulted.
+        """
         run_id = "run-hoist-b"
         body = _body(env_vars=_env(run_id), caller_id="sup-one")
-        _register_run(run_id)  # no step row -> EXECUTE, so the whole path runs
+        _register_run(run_id)  # launch_guard=null is a pre-upgrade approval-off run
 
         create, send, delete, out, exit_cli, wait, status_p, _unused = _patch_terminal_layer()
         with (
@@ -728,6 +798,13 @@ class TestTheHoist:
             wait,
             status_p,
             patch(_GET_WD, return_value="/cwd/one") as m_get_wd,
+            patch(
+                "cli_agent_orchestrator.services.launch_guard.settings_service."
+                "resolve_workflow_approval_posture",
+                return_value=settings_service.WorkflowApprovalPosture(
+                    False, settings_service.GATE_SOURCE_FILE
+                ),
+            ),
         ):
             resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=body)
 
@@ -741,7 +818,10 @@ class TestTheHoist:
         permanent false DIVERGED."""
         run_id = "run-hoist-c"
         body = _body(env_vars=_env(run_id), caller_id="sup-one", model="fable-5")
-        _register_run(run_id)
+        _register_run(
+            run_id,
+            spec_snapshot=_guarded_snapshot(),
+        )
 
         gate_fingerprints: list = []
         stored_fingerprints: list = []
@@ -818,6 +898,220 @@ class TestReplayedTerminalId:
 # BR-2/SR-5 — the branch engages for script-tier calls ONLY.
 # ---------------------------------------------------------------------------
 class TestTheScriptTierGuard:
+    def test_resumed_run_keeps_launch_guard_for_its_next_agent_step(self, client, monkeypatch):
+        run_id = "run-resume-guard-drift"
+        frozen_guard = {
+            "profiles": {"developer": "sha256:frozen"},
+            "memory_enabled": False,
+        }
+        workflow_journal.insert_run(
+            run_id=run_id,
+            workflow_name="wf",
+            spec_snapshot=json.dumps(
+                {
+                    "source": "print('resume')\n",
+                    "launch_guard": frozen_guard,
+                }
+            ),
+            inputs_json="{}",
+            state="failed",
+            started_at=TS,
+            tier="script",
+            generation="1",
+        )
+        monkeypatch.setattr(
+            script_runner.approval_gate,
+            "ensure_plan_approved",
+            lambda **kwargs: None,
+        )
+        monkeypatch.setattr(
+            launch_guard.settings_service,
+            "resolve_workflow_approval_posture",
+            lambda: settings_service.WorkflowApprovalPosture(
+                True, settings_service.GATE_SOURCE_FILE
+            ),
+        )
+        monkeypatch.setattr(
+            launch_guard.settings_service,
+            "is_memory_enabled",
+            lambda: False,
+        )
+        observed = {}
+        create, send, delete, out, exit_cli, wait, status_p, get_wd = _patch_terminal_layer()
+
+        async def _drive_resumed_step(record, script_path, env):
+            observed["response"] = client.post(
+                TERMINALS_RUN_STEP_ROUTE,
+                json=_body(env_vars=_env(run_id, "s1", record.generation)),
+            )
+            return WorkflowRunResult(
+                run_id=run_id,
+                workflow_name="wf",
+                state=RunState.FAILED,
+                started_at=record.started_at,
+            )
+
+        monkeypatch.setattr(script_runner, "_drive_process", _drive_resumed_step)
+
+        # The profile changes before resume admission. Resume must keep the
+        # frozen guard rather than recapturing the changed launch inputs.
+        monkeypatch.setattr(
+            launch_guard.agent_profiles,
+            "list_agent_profiles",
+            lambda: [{"name": "developer"}],
+        )
+        monkeypatch.setattr(
+            launch_guard,
+            "_profile_digest",
+            lambda agent: "sha256:changed",
+        )
+        with (
+            create as create_terminal,
+            send,
+            delete,
+            out,
+            exit_cli,
+            wait,
+            status_p,
+            get_wd,
+        ):
+            asyncio.run(script_runner.resume_script_run(run_id))
+
+        response = observed["response"]
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"]["kind"] == "plan_inputs_changed"
+        assert "profile 'developer' changed" in response.json()["detail"]["message"].lower()
+        assert _raw_row(run_id, "s1") is None
+        create_terminal.assert_not_awaited()
+
+    def test_approval_off_allows_two_agent_steps_and_creates_both_terminals(self, client):
+        run_id = "run-guard-disabled-two-steps"
+        _register_run(run_id)  # launch_guard=null: shape journaled before this fix
+        first = _body(env_vars=_env(run_id, "s1"), prompt="first")
+        second = _body(env_vars=_env(run_id, "s2"), prompt="second")
+        create, send, delete, out, exit_cli, wait, status_p, get_wd = _patch_terminal_layer()
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.launch_guard.settings_service."
+                "resolve_workflow_approval_posture",
+                return_value=settings_service.WorkflowApprovalPosture(
+                    False, settings_service.GATE_SOURCE_FILE
+                ),
+            ),
+            create as m_create,
+            send,
+            delete,
+            out,
+            exit_cli,
+            wait,
+            status_p,
+            get_wd,
+        ):
+            first_response = client.post(TERMINALS_RUN_STEP_ROUTE, json=first)
+            second_response = client.post(TERMINALS_RUN_STEP_ROUTE, json=second)
+
+        assert first_response.status_code == 200, first_response.text
+        assert second_response.status_code == 200, second_response.text
+        assert m_create.await_count == 2
+        assert _raw_row(run_id, "s1") is not None
+        assert _raw_row(run_id, "s2") is not None
+
+    @pytest.mark.parametrize(
+        ("suffix", "snapshot", "message"),
+        [
+            (
+                "disabled-marker",
+                json.dumps({"source": "", "launch_guard": {"approval_required": False}}),
+                "approval enforcement was turned on after this run started",
+            ),
+            (
+                "legacy-missing",
+                json.dumps({"source": ""}),
+                "recorded launch state is unreadable",
+            ),
+        ],
+    )
+    def test_approval_on_rejects_unbound_run_before_step_settlement(
+        self, client, suffix, snapshot, message
+    ):
+        run_id = f"run-guard-{suffix}"
+        _register_run(run_id, spec_snapshot=snapshot)
+        body = _body(env_vars=_env(run_id))
+        create, send, delete, out, exit_cli, wait, status_p, get_wd = _patch_terminal_layer()
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.launch_guard.settings_service."
+                "resolve_workflow_approval_posture",
+                return_value=settings_service.WorkflowApprovalPosture(
+                    True, settings_service.GATE_SOURCE_FILE
+                ),
+            ),
+            create as m_create,
+            send,
+            delete,
+            out,
+            exit_cli,
+            wait,
+            status_p,
+            get_wd,
+        ):
+            response = client.post(TERMINALS_RUN_STEP_ROUTE, json=body)
+
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"]["kind"] == "plan_inputs_changed"
+        assert message in response.json()["detail"]["message"]
+        assert _raw_row(run_id) is None
+        m_create.assert_not_awaited()
+
+    @pytest.mark.parametrize("drift", ["profile", "memory"])
+    def test_approved_launch_input_drift_fails_closed_before_step_settlement(self, client, drift):
+        run_id = f"run-guard-{drift}"
+        guard = {
+            "profiles": {"developer": "sha256:frozen"},
+            "memory_enabled": False,
+        }
+        _register_run(
+            run_id,
+            spec_snapshot=json.dumps({"source": "", "launch_guard": guard}),
+        )
+        job_id = "a" * 32 if drift == "profile" else "b" * 32
+        body = _body(env_vars=_env(run_id), job_id=job_id)
+        create, send, delete, out, exit_cli, wait, status_p, get_wd = _patch_terminal_layer()
+        current_digest = "sha256:changed" if drift == "profile" else "sha256:frozen"
+        current_memory = drift == "memory"
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.launch_guard._profile_digest",
+                return_value=current_digest,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.launch_guard.settings_service.is_memory_enabled",
+                return_value=current_memory,
+            ),
+            patch(
+                "cli_agent_orchestrator.api.main._record_job_state",
+                new=AsyncMock(),
+            ) as record_job,
+            create as m_create,
+            send,
+            delete,
+            out,
+            exit_cli,
+            wait,
+            status_p,
+            get_wd,
+        ):
+            response = client.post(TERMINALS_RUN_STEP_ROUTE, json=body)
+
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"]["kind"] == "plan_inputs_changed"
+        assert _raw_row(run_id) is None
+        m_create.assert_not_awaited()
+        assert record_job.await_args_list[-1].args[:2] == (job_id, "error")
+
     def test_yaml_tier_call_reaches_run_agent_step_with_no_gate_call(self, client):
         """Both env vars present, but no live ``ScriptRunRecord`` — which is what a
         YAML-tier run looks like to this guard."""

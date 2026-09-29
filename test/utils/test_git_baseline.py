@@ -1,8 +1,8 @@
 """Tests for the run's repository baseline derivation (issue #583 Bolt 2, unit ``manifest-freeze``).
 
-The contract under test is TOTALITY. Deriving a baseline must never be the reason a run cannot start, so
-every failure mode — not a repository, ``git`` absent, unreadable directory, hung process — has to answer a
-recorded absence rather than raise or block. Four of the six tests here exist for that alone.
+The contract under test is TOTALITY with a determinate distinction: a non-repository is an approvable
+recorded state, while ``git`` absence, unreadable directories, and timeouts remain unavailable rather
+than being mistaken for that state.
 """
 
 import os
@@ -253,7 +253,112 @@ def test_untracked_hash_budget_exhaustion_records_an_unavailable_baseline(tmp_pa
 
 def test_records_absence_outside_a_repository(tmp_path):
     """A workspace outside git is entirely ordinary, not a fault."""
+    assert git_baseline.derive_baseline(str(tmp_path)) == {
+        "available": True,
+        "repository": False,
+    }
+
+
+def test_plain_directory_proof_does_not_depend_on_git_stderr(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda args, **kwargs: subprocess.CompletedProcess(
+            args, 128, stdout="", stderr="localized or empty diagnostic"
+        ),
+    )
+
+    assert git_baseline.derive_baseline(str(tmp_path)) == {
+        "available": True,
+        "repository": False,
+    }
+
+
+def test_failed_probe_with_git_marker_is_not_treated_as_plain_directory(monkeypatch, tmp_path):
+    (tmp_path / ".git").mkdir()
+    actual_run = subprocess.run
+
+    def _failed_probe(args, *rest, **kwargs):
+        if "rev-parse" in args and "--is-inside-work-tree" in args:
+            return subprocess.CompletedProcess(args, 128, stdout="", stderr="arbitrary")
+        return actual_run(args, *rest, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", _failed_probe)
     assert git_baseline.derive_baseline(str(tmp_path)) == {"available": False}
+
+
+def test_broken_git_marker_is_not_treated_as_plain_directory(monkeypatch, tmp_path):
+    (tmp_path / ".git").symlink_to(tmp_path / "missing")
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda args, **kwargs: subprocess.CompletedProcess(
+            args, 128, stdout="", stderr="not classified by text"
+        ),
+    )
+
+    assert git_baseline.derive_baseline(str(tmp_path)) == {"available": False}
+
+
+def test_inherited_git_dir_cannot_redirect_the_selected_root(monkeypatch, tmp_path):
+    declared = tmp_path / "declared"
+    redirected = tmp_path / "redirected"
+    declared.mkdir()
+    redirected.mkdir()
+    _initialise_repository(declared)
+    _initialise_repository(redirected)
+    (redirected / "f.txt").write_text("redirected", encoding="utf-8")
+    subprocess.run(["git", "add", "f.txt"], cwd=redirected, check=True)
+    subprocess.run(["git", "commit", "-qm", "redirected"], cwd=redirected, check=True)
+
+    expected = git_baseline.derive_baseline(str(declared))
+    monkeypatch.setenv("GIT_DIR", str(redirected / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(redirected))
+
+    assert git_baseline.derive_baseline(str(declared)) == expected
+
+
+def test_git_environment_is_snapshotted_once_and_all_invocations_are_neutral(monkeypatch, tmp_path):
+    _initialise_repository(tmp_path)
+    monkeypatch.setenv("GIT_DIR", "/redirect")
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.fsmonitor")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "evil")
+    actual_run = subprocess.run
+    observed = []
+
+    def _record(args, *rest, **kwargs):
+        if args and args[0] == "git":
+            observed.append((tuple(args), kwargs["env"]))
+        return actual_run(args, *rest, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", _record)
+    baseline = git_baseline.derive_baseline(str(tmp_path))
+
+    assert baseline["available"] is True
+    assert observed
+    assert len({id(environment) for _args, environment in observed}) == 1
+    for args, environment in observed:
+        assert args[1:4] == ("--no-optional-locks", "-c", "core.fsmonitor=false")
+        assert "GIT_DIR" not in environment
+        assert "GIT_CONFIG_COUNT" not in environment
+        assert "GIT_CONFIG_GLOBAL" not in environment
+        assert "GIT_CONFIG_NOSYSTEM" not in environment
+        assert environment["GIT_TERMINAL_PROMPT"] == "0"
+        assert environment["GIT_OPTIONAL_LOCKS"] == "0"
+        assert environment["LC_ALL"] == "C"
+        assert environment["LANG"] == "C"
+
+
+def test_baseline_does_not_write_the_index(tmp_path):
+    _initialise_repository(tmp_path)
+    index = tmp_path / ".git" / "index"
+    before = (index.read_bytes(), index.stat().st_mtime_ns)
+
+    baseline = git_baseline.derive_baseline(str(tmp_path))
+
+    assert baseline["available"] is True
+    assert (index.read_bytes(), index.stat().st_mtime_ns) == before
 
 
 def test_records_absence_when_git_is_missing(monkeypatch, tmp_path):

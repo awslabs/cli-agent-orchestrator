@@ -53,6 +53,7 @@ from cli_agent_orchestrator.models.workflow_runtime import (
 )
 from cli_agent_orchestrator.services import (
     approval_gate,
+    launch_guard,
     manifest_freeze,
     terminal_service,
     workflow_journal,
@@ -129,6 +130,32 @@ class ScriptRunRecord:
     started_at: str
     finished_at: Optional[str]
     tier: str = "script"
+    working_directory: Optional[str] = None
+
+
+def run_root_for(env: Optional[Dict[str, str]]) -> Optional[str]:
+    """Return the recorded root for the script run named by a step environment."""
+    run_id = (env or {}).get("CAO_WORKFLOW_RUN_ID")
+    record = run_registry.get(run_id) if isinstance(run_id, str) else None
+    return record.working_directory if isinstance(record, ScriptRunRecord) else None
+
+
+def build_script_snapshot(
+    spec: Any,
+    *,
+    working_directory: str,
+    launch_guard: Optional[Dict[str, Any]],
+) -> str:
+    """Serialize the durable source snapshot and its launch-time drift guard."""
+    return json.dumps(
+        {
+            "source": spec.source,
+            "path": spec.path,
+            "content_hash": getattr(spec, "content_hash", None),
+            "working_directory": working_directory,
+            "launch_guard": launch_guard,
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1029,7 +1056,11 @@ async def _finalize(
 # Shared drive: spawn -> concurrent drain -> reap -> exit interp -> finalize
 # ---------------------------------------------------------------------------
 async def _drive_process(
-    record: ScriptRunRecord, script_path: str, env: Dict[str, str]
+    record: ScriptRunRecord,
+    script_path: str,
+    env: Dict[str, str],
+    *,
+    working_directory: Optional[str] = None,
 ) -> WorkflowRunResult:
     """Spawn, drain both pipes concurrently, reap under the bound, interpret exit.
 
@@ -1042,6 +1073,7 @@ async def _drive_process(
             sys.executable,
             script_path,
             env=env,
+            cwd=working_directory,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -1140,7 +1172,13 @@ async def _persist_generation_best_effort(record: ScriptRunRecord) -> None:
 # ---------------------------------------------------------------------------
 # A1 — run_script_workflow (S1 flow, M1 + M2 run-path gate)
 # ---------------------------------------------------------------------------
-async def run_script_workflow(spec: Any, inputs: Dict[str, Any], run_id: str) -> WorkflowRunResult:
+async def run_script_workflow(
+    spec: Any,
+    inputs: Dict[str, Any],
+    run_id: str,
+    *,
+    working_directory: Optional[str] = None,
+) -> WorkflowRunResult:
     """Run a script workflow to completion, awaited inline (A1, S1, US-B1/B4/B5).
 
     ``spec`` is the resolved ``ScriptSpec`` (U5/C4) — duck-typed here (U5 owns the
@@ -1171,10 +1209,12 @@ async def run_script_workflow(spec: Any, inputs: Dict[str, Any], run_id: str) ->
     # --- Step 0b: approval gate (issue #583 Bolt 2, ``approval-gate``) ---
     # Built ONCE here and handed to the INSERT below unchanged, so the manifest that is CHECKED is
     # byte-identical to the one STORED — and ADR-583-4's one-write discipline is preserved.
+    root = os.path.realpath(working_directory if working_directory is not None else os.getcwd())
     manifest_json = await asyncio.to_thread(
         manifest_freeze.build_manifest_json,
         source_hash=spec.content_hash,
         inputs=inputs,
+        cwd=root,
     )
     # Placed here, and not lower, for two reasons that are both about leaving nothing behind:
     #   * BEFORE the registry write and the journal INSERT, so a refused start leaves no live record
@@ -1186,6 +1226,7 @@ async def run_script_workflow(spec: Any, inputs: Dict[str, Any], run_id: str) ->
     #     nothing.
     # No-ops entirely when enforcement is disabled, which is the default.
     approval_gate.ensure_plan_approved(tier="script", manifest_json=manifest_json)
+    guard = await asyncio.to_thread(launch_guard.capture)
 
     # --- Step 1: register the live record + journal the durable run row ---
     record = ScriptRunRecord(
@@ -1200,6 +1241,7 @@ async def run_script_workflow(spec: Any, inputs: Dict[str, Any], run_id: str) ->
         started_at=_now(),
         finished_at=None,
         tier="script",
+        working_directory=root,
     )
     # M3 (traceability): a registered record lives for the process lifetime — it is
     # NOT evicted on finalize, mirroring the base YAML registry, so a bounded
@@ -1208,12 +1250,10 @@ async def run_script_workflow(spec: Any, inputs: Dict[str, Any], run_id: str) ->
     run_registry[run_id] = record
 
     # The durable spec_snapshot carries the frozen source (resume reads it back).
-    spec_snapshot = json.dumps(
-        {
-            "source": spec.source,
-            "path": spec.path,
-            "content_hash": getattr(spec, "content_hash", None),
-        }
+    spec_snapshot = build_script_snapshot(
+        spec,
+        working_directory=root,
+        launch_guard=guard,
     )
     try:
         await asyncio.to_thread(
@@ -1251,13 +1291,17 @@ async def run_script_workflow(spec: Any, inputs: Dict[str, Any], run_id: str) ->
     env = build_env(run_id, "1", inputs, resume=False)
     _active_drives.add(run_id)
     try:
-        return await _drive_process(record, spec.path, env)
+        return await _drive_process(record, spec.path, env, working_directory=root)
     finally:
         _active_drives.discard(run_id)
 
 
 async def run_script_workflow_prepared(
-    record: ScriptRunRecord, spec_path: str, env: Dict[str, str]
+    record: ScriptRunRecord,
+    spec_path: str,
+    env: Dict[str, str],
+    *,
+    working_directory: Optional[str] = None,
 ) -> WorkflowRunResult:
     """Drive an already-linted, already-journaled, already-registered script run (U2, ADR-3).
 
@@ -1279,7 +1323,9 @@ async def run_script_workflow_prepared(
     """
     _active_drives.add(record.run_id)
     try:
-        return await _drive_process(record, spec_path, env)
+        if working_directory is None:
+            return await _drive_process(record, spec_path, env)
+        return await _drive_process(record, spec_path, env, working_directory=working_directory)
     finally:
         _active_drives.discard(record.run_id)
 
@@ -1378,6 +1424,9 @@ async def resume_script_run(
             source = snapshot["source"]
             if not isinstance(source, str):
                 raise ValueError("spec_snapshot.source is not a string")
+            working_directory = snapshot.get("working_directory")
+            if working_directory is not None and not isinstance(working_directory, str):
+                raise ValueError("spec_snapshot.working_directory is not a string")
         except (ValueError, TypeError, KeyError) as e:
             raise ResumeCorruptError(f"run '{run_id}' snapshot is corrupt: {e}") from e
 
@@ -1463,6 +1512,7 @@ async def resume_script_run(
             started_at=row.started_at,
             finished_at=None,
             tier="script",
+            working_directory=working_directory,
         )
 
         # --- Execution: bump + PERSIST generation BEFORE spawn (INV-6, load-bearing) ---
@@ -1484,7 +1534,15 @@ async def resume_script_run(
 
         env = _build_env(run_id, record.generation, journaled_inputs, resume=True)
         snapshot_path = _materialize_snapshot(run_id, source)
-        result = await _drive_process(record, snapshot_path, env)
+        if working_directory is None:
+            result = await _drive_process(record, snapshot_path, env)
+        else:
+            result = await _drive_process(
+                record,
+                snapshot_path,
+                env,
+                working_directory=working_directory,
+            )
     finally:
         _active_drives.discard(run_id)
         _delete_temp_file(snapshot_path)  # ALWAYS deleted after reap (BR-30)

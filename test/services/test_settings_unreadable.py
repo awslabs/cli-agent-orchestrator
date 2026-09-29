@@ -161,6 +161,32 @@ class TestLoadStaysLenient:
         assert _load() == {}
 
 
+@pytest.mark.parametrize(
+    "contents,approval_source",
+    [
+        (b"\xff", "read-failure-fallback"),
+        (b"{not json", "read-failure-fallback"),
+        (b"[]", "invalid-settings-fallback"),
+    ],
+)
+def test_learning_and_approval_preserve_their_failure_diagnostics(
+    settings_file: Path, monkeypatch: Any, contents: bytes, approval_source: str
+) -> None:
+    """The merged loader must serve both controls without weakening approval."""
+    from cli_agent_orchestrator.services import settings_service
+
+    monkeypatch.delenv("CAO_WORKFLOW_REQUIRE_APPROVAL", raising=False)
+    monkeypatch.delenv("CAO_MEMORY_LEARNING_ENABLED", raising=False)
+    settings_file.write_bytes(contents)
+
+    assert settings_service._load() == {}
+    assert settings_service.settings_readable() is False
+    learning = settings_service.learning_status()
+    assert (learning.enabled, learning.unreadable) == (False, True)
+    approval = settings_service.resolve_workflow_approval_posture()
+    assert (approval.required, approval.source) == (True, approval_source)
+
+
 class TestSettingsReadable:
     def test_true_when_absent(self, settings_file: Path) -> None:
         from cli_agent_orchestrator.services.settings_service import settings_readable

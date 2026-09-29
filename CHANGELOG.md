@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Conversational workflow authoring: `cao workflow create` / `update` and the `workflow_create`,
+  `workflow_update`, `workflow_get` and `workflow_validate` MCP tools (#583 Bolt 3) (#699). Spec writes
+  are atomic and serialized per workflow, so two concurrent creates cannot both succeed and an update
+  with a stale `--expected-hash` is rejected at commit time. Lint warnings are shown on the default CLI
+  output. Every `cao workflow` HTTP verb and every workflow MCP tool forward
+  `CAO_AUTH_LOCAL_TOKEN` when API authentication is enabled. The Python workflow SDK's
+  run-step transport does not yet receive that credential; subprocess credential delivery
+  remains a separate security-boundary decision.
+
 - `terminal.pane_layout` chooses how a pane-mode window is arranged after each
   spawn: `tiled` (default, unchanged behaviour), `even-vertical`,
   `even-horizontal`, or `none` to leave tmux's own splitting alone. The split
@@ -106,6 +115,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wherever the data dir is unreadable. The import is now lazy.
 
 ### Changed
+
+- **Breaking / migration:** workflow approval enforcement now defaults ON for script-tier runs
+  (#583 Bolt 3) (#699). The first run of each script plan is refused until
+  `cao workflow approve <plan_id>`; to keep the previous behaviour set
+  `workflow.require_approval: false` in `settings.json`. Script runs journaled before this upgrade
+  cannot launch further agent steps while approval enforcement is on; start a new run. With
+  approval enforcement off, those runs continue. Plan identifiers keep the `plan-v1:` scheme.
+
+- Script runs execute in, and fingerprint, one project root (#699): the run request's optional
+  `working_directory`, defaulting to cao-server's working directory. The CLI sends its current
+  directory (or `--working-directory`) and the MCP tools send the calling terminal's directory, so
+  script runs started from those clients now run in the caller's directory instead of cao-server's.
+  Agent steps that name neither a working directory nor a caller default to the run's root. A project
+  root outside Git is now an approvable plan instead of `plan_identity_unavailable`. Approvals granted
+  for a plan fingerprinted against a different directory must be granted again.
+
+- A script run refuses to launch further agent steps (HTTP 409, `kind: plan_inputs_changed`) when an
+  agent profile or the memory-enabled setting changed after the run's approval check (#699).
+
+- `cao workflow get` / `update` / `delete` validate and percent-encode workflow names;
+  `cao workflow validate --json` returns the `{ok: false, ...}` envelope on failure; `cao workflow
+  delete` gains `--json` (#699).
 
 - `list_outcomes` clamps `limit` to 200 client-side; the service already clamped
   silently, so `limit=500` keeps working rather than becoming a 422.
@@ -1073,5 +1104,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bump to v0.51.0, update method name (#31)
 
 - accept optional U+03BB (λ) after % in kiro and q CLIs (#44)
-
-

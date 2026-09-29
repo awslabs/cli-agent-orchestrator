@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 from typing import List, Optional
 
@@ -73,6 +74,20 @@ def _patched_journal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", db_path, raising=True)
     _migrate_workflow_run()
     _migrate_workflow_run_step()
+    # issue #583 Bolt 3 (``approval-enforcement-default``): the approval gate now defaults ON, and
+    # every test in this module drives a script run whose plan is not approved. These are tests of the
+    # RUNNER -- spawn, reap, sentinel scanning, resume admission, TOCTOU -- not of approval, so the
+    # gate is turned off here through the real setting. Doing it in the fixture rather than per test
+    # keeps the runner's own behaviour the only variable, and using the setting rather than patching
+    # ``ensure_plan_approved`` out means the gate's disabled path stays genuinely exercised.
+    import json as _json
+
+    from cli_agent_orchestrator.services import settings_service as _settings
+
+    _gate_off = tmp_path / "settings.json"
+    _gate_off.write_text(_json.dumps({"workflow": {"require_approval": False}}))
+    monkeypatch.setattr(_settings, "SETTINGS_FILE", _gate_off)
+    monkeypatch.delenv("CAO_WORKFLOW_REQUIRE_APPROVAL", raising=False)
     # Isolate the process-local registry between tests.
     from cli_agent_orchestrator.services import workflow_service
 
@@ -168,6 +183,7 @@ def _install_fake_spawn(monkeypatch: pytest.MonkeyPatch, process: _FakeProcess) 
     async def _fake_exec(*args, **kwargs):
         captured["args"] = args
         captured["env"] = kwargs.get("env")
+        captured["cwd"] = kwargs.get("cwd")
         return process
 
     monkeypatch.setattr(
@@ -278,11 +294,24 @@ async def test_lint_fail_raises_before_any_spawn(monkeypatch: pytest.MonkeyPatch
 
 
 @pytest.mark.asyncio
-async def test_happy_completed_result_shape_and_sentinel(monkeypatch: pytest.MonkeyPatch):
+async def test_happy_completed_result_shape_and_sentinel(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
     """M1 + A6: exit 0 -> COMPLETED, tier-neutral shape, sentinel output parsed."""
     proc = _FakeProcess(exit_rc=0, stdout=b'log line\nCAO_WORKFLOW_OUTPUT:{"answer": 42}\n')
     captured = _install_fake_spawn(monkeypatch, proc)
-    result = await run_script_workflow(_FakeScriptSpec(), {}, "run-ok")
+    manifest_cwds = []
+    monkeypatch.setattr(
+        script_runner.manifest_freeze,
+        "build_manifest_json",
+        lambda **kwargs: manifest_cwds.append(kwargs["cwd"]) or None,
+    )
+    result = await run_script_workflow(
+        _FakeScriptSpec(),
+        {},
+        "run-ok",
+        working_directory=str(tmp_path),
+    )
 
     assert isinstance(result, WorkflowRunResult)
     assert result.state == RunState.COMPLETED
@@ -298,6 +327,10 @@ async def test_happy_completed_result_shape_and_sentinel(monkeypatch: pytest.Mon
     # F3: the journaled started_at is the SAME timestamp as the record's, not a
     # second independent _now() call.
     assert row.started_at == result.started_at
+    assert script_runner.run_registry["run-ok"].working_directory == os.path.realpath(tmp_path)
+    assert captured["cwd"] == os.path.realpath(tmp_path)
+    assert manifest_cwds == [os.path.realpath(tmp_path)]
+    assert json.loads(row.spec_snapshot)["working_directory"] == os.path.realpath(tmp_path)
     # Constructed env is the exact 6-key allowlist (INV-2 + BR-A5), no resume flag.
     env = captured["env"]
     assert set(env) == {
@@ -313,6 +346,43 @@ async def test_happy_completed_result_shape_and_sentinel(monkeypatch: pytest.Mon
 
 
 @pytest.mark.asyncio
+async def test_blocking_run_persists_launch_guard(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        script_runner.launch_guard.settings_service,
+        "is_workflow_approval_required",
+        lambda: True,
+    )
+    monkeypatch.setattr(script_runner.approval_gate, "ensure_plan_approved", lambda **kwargs: None)
+    monkeypatch.setattr(
+        script_runner.launch_guard.agent_profiles,
+        "list_agent_profiles",
+        lambda: [{"name": "developer"}],
+    )
+    monkeypatch.setattr(
+        script_runner.launch_guard.agent_profiles,
+        "_read_agent_profile_source",
+        lambda name: "profile source",
+    )
+    monkeypatch.setattr(
+        script_runner.launch_guard.settings_service,
+        "is_memory_enabled",
+        lambda: True,
+    )
+    _install_fake_spawn(monkeypatch, _FakeProcess(exit_rc=0))
+
+    await run_script_workflow(
+        _FakeScriptSpec(),
+        {},
+        "run-guard-persisted",
+        working_directory=str(tmp_path),
+    )
+
+    snapshot = json.loads(workflow_journal.get_run("run-guard-persisted").spec_snapshot)
+    assert snapshot["launch_guard"]["memory_enabled"] is True
+    assert set(snapshot["launch_guard"]["profiles"]) == {"developer"}
+
+
+@pytest.mark.asyncio
 async def test_crash_nonzero_exit_failed_kind_error(monkeypatch: pytest.MonkeyPatch):
     """Nonzero exit -> FAILED with a redacted durable diagnostic and a swept worker."""
     swept = {"run": None}
@@ -323,7 +393,7 @@ async def test_crash_nonzero_exit_failed_kind_error(monkeypatch: pytest.MonkeyPa
 
     monkeypatch.setattr(script_runner, "_reconcile_orphans", _fake_sweep)
     proc = _FakeProcess(exit_rc=1, stderr=f"Traceback: boom with {aws_key}\n".encode())
-    _install_fake_spawn(monkeypatch, proc)
+    captured = _install_fake_spawn(monkeypatch, proc)
 
     result = await run_script_workflow(_FakeScriptSpec(), {}, "run-crash")
     assert result.state == RunState.FAILED
@@ -721,7 +791,9 @@ async def test_resume_happy_materializes_and_deletes_temp(monkeypatch: pytest.Mo
     workflow_journal.insert_run(
         run_id="run-resume",
         workflow_name="wf",
-        spec_snapshot=json.dumps({"source": source, "path": "/tmp/wf.py"}),
+        spec_snapshot=json.dumps(
+            {"source": source, "path": "/tmp/wf.py", "working_directory": "/recorded/root"}
+        ),
         inputs_json="{}",
         state="failed",
         started_at="2026-07-08T00:00:00Z",
@@ -740,6 +812,8 @@ async def test_resume_happy_materializes_and_deletes_temp(monkeypatch: pytest.Mo
     env = captured["env"]
     assert env["CAO_WORKFLOW_RESUME"] == "1"
     assert env["CAO_WORKFLOW_GENERATION"] == "4"
+    assert captured["cwd"] == "/recorded/root"
+    assert script_runner.run_registry["run-resume"].working_directory == "/recorded/root"
     # The exec'd path is the engine-owned materialized temp file, NOT the on-disk
     # author file — and it is deleted in the finally after reap (BR-30).
     exec_path = captured["args"][1]
@@ -1218,16 +1292,19 @@ async def test_run_script_workflow_prepared_drives_without_reinsert(
     monkeypatch.setattr(workflow_journal, "insert_run", _fail_insert)
 
     proc = _FakeProcess(exit_rc=0, stdout=b'CAO_WORKFLOW_OUTPUT:{"ok": true}\n')
-    _install_fake_spawn(monkeypatch, proc)
+    captured = _install_fake_spawn(monkeypatch, proc)
 
     record = _make_record("run-prep-script", process=None, generation="1")
     workflow_service.run_registry["run-prep-script"] = record
 
     env = build_env("run-prep-script", "1", {})
-    result = await run_script_workflow_prepared(record, "/tmp/wf.py", env)
+    result = await run_script_workflow_prepared(
+        record, "/tmp/wf.py", env, working_directory="/prepared/root"
+    )
 
     assert result.state == RunState.COMPLETED
     assert result.output == {"ok": True}
+    assert captured["cwd"] == "/prepared/root"
     # DR-2: liveness mark cleared on exit.
     assert "run-prep-script" not in workflow_service._active_drives
 

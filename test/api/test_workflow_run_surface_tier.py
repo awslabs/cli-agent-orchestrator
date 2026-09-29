@@ -35,6 +35,17 @@ def isolated_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", db_path, raising=True)
     _migrate_workflow_index()
     _migrate_workflow_run()
+    # issue #583 Bolt 3 (``approval-enforcement-default``): enforcement defaults ON, so a script-tier
+    # submit is refused with 403 before it reaches the tier dispatch these tests assert. Turned off
+    # through the real setting, since the env var may only turn the gate on.
+    import json as _json
+
+    from cli_agent_orchestrator.services import settings_service as _settings
+
+    gate_off = tmp_path / "settings.json"
+    gate_off.write_text(_json.dumps({"workflow": {"require_approval": False}}))
+    monkeypatch.setattr(_settings, "SETTINGS_FILE", gate_off)
+    monkeypatch.delenv("CAO_WORKFLOW_REQUIRE_APPROVAL", raising=False)
     return db_path
 
 
@@ -199,7 +210,7 @@ class TestRunTierDispatch:
         )
         monkeypatch.setattr(workflow_service, "_check_run_id_available", lambda rid: None)
 
-        async def _fake_run(spec_arg, inputs, run_id):
+        async def _fake_run(spec_arg, inputs, run_id, *, working_directory=None):
             from cli_agent_orchestrator.models.workflow_runtime import (
                 RunState,
                 WorkflowRunResult,
@@ -243,7 +254,7 @@ class TestRunTierDispatch:
 
         called = {"hit": False}
 
-        async def _should_not_run(spec_arg, inputs, run_id):
+        async def _should_not_run(spec_arg, inputs, run_id, *, working_directory=None):
             called["hit"] = True
             raise AssertionError("run_script_workflow must not be called after a 409 pre-check")
 
@@ -268,7 +279,7 @@ class TestRunTierDispatch:
 
         finding = LintFinding(rule_id="syntax", severity="error", line=1, message="bad")
 
-        async def _raise(spec_arg, inputs, run_id):
+        async def _raise(spec_arg, inputs, run_id, *, working_directory=None):
             raise script_runner.ScriptLintError([finding])
 
         monkeypatch.setattr(script_runner, "run_script_workflow", _raise)
@@ -290,7 +301,7 @@ class TestRunTierDispatch:
         )
         monkeypatch.setattr(workflow_service, "_check_run_id_available", lambda rid: None)
 
-        async def _raise(spec_arg, inputs, run_id):
+        async def _raise(spec_arg, inputs, run_id, *, working_directory=None):
             raise KeyError("run_id became unavailable")
 
         monkeypatch.setattr(script_runner, "run_script_workflow", _raise)
@@ -308,7 +319,7 @@ class TestRunTierDispatch:
         )
         monkeypatch.setattr(workflow_service, "_check_run_id_available", lambda rid: None)
 
-        async def _raise(spec_arg, inputs, run_id):
+        async def _raise(spec_arg, inputs, run_id, *, working_directory=None):
             raise ValueError("bad script run input")
 
         monkeypatch.setattr(script_runner, "run_script_workflow", _raise)
@@ -341,7 +352,7 @@ class TestSubmitTierDispatch:
 
         called = {"hit": False}
 
-        async def _prepared(record, spec_path, env):
+        async def _prepared(record, spec_path, env, *, working_directory=None):
             called["hit"] = True
             workflow_journal.update_run_state(record.run_id, RunState.COMPLETED.value, "t")
             from cli_agent_orchestrator.models.workflow_runtime import WorkflowRunResult
@@ -612,6 +623,17 @@ class TestCancellationLifecycle:
         db_path = tmp_path / "wf.db"
         monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", db_path, raising=True)
         monkeypatch.setattr(workflow_service, "run_registry", {})
+        # issue #583 Bolt 3 (``approval-enforcement-default``): enforcement defaults ON, so a
+        # script-tier submit is refused with 403 before it reaches the tier dispatch these tests
+        # assert. Turned off through the real setting, since the env var may only turn it on.
+        import json as _json
+
+        from cli_agent_orchestrator.services import settings_service as _settings
+
+        gate_off = tmp_path / "settings.json"
+        gate_off.write_text(_json.dumps({"workflow": {"require_approval": False}}))
+        monkeypatch.setattr(_settings, "SETTINGS_FILE", gate_off)
+        monkeypatch.delenv("CAO_WORKFLOW_REQUIRE_APPROVAL", raising=False)
         return db_path
 
     def _live_yaml_record(self, run_id, state):

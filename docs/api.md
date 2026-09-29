@@ -232,7 +232,8 @@ than calling these routes directly.
 
 - `/workflows*` validates and inspects workflow specifications.
 - `POST /workflows/runs` starts a run **inline** and holds the connection until it
-  finishes, returning the complete result.
+  finishes, returning the complete result. Its optional `working_directory` field selects
+  the script run's project root; it is ignored for YAML workflows.
 - `POST /workflows/runs:submit` starts a run **asynchronously**: it returns `202` with
   `{run_id, state, links}` as soon as the run is durably journaled, then drives the run in
   the background. The `links` map always carries `self`/`status`/`result`/`cancel`;
@@ -264,7 +265,8 @@ than calling these routes directly.
   terminal-layer failures too, not only step timeouts: a provider that never initializes
   and a completed step whose output cannot be extracted are both reported as data, since
   neither says the request was bad. The 4xx/422 list is exactly the preflight checks —
-  every one of them is decided before the step runs.
+  every one of them is decided before the step runs. Approval-relevant profile or memory
+  drift returns `409` with `detail.kind: "plan_inputs_changed"` before the step launches.
 - `GET /workflows/runs/{run_id}/events` returns the run's ordered event timeline with
   any **declared** gaps. One content-negotiated path, two arms: send
   `Accept: text/event-stream` (or `?stream=true`) for a live SSE follow, otherwise a

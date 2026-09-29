@@ -1,6 +1,7 @@
 """Tests for settings_service module."""
 
 import json
+import threading
 from pathlib import Path
 from unittest.mock import patch
 
@@ -18,6 +19,7 @@ from cli_agent_orchestrator.services.settings_service import (
     set_extra_agent_dirs,
     set_extra_skill_dirs,
 )
+from cli_agent_orchestrator.utils import atomic_file
 
 
 @pytest.fixture
@@ -75,6 +77,54 @@ class TestLoad:
         assert result == data
 
 
+class TestWorkflowApprovalPosture:
+    """Approval enforcement defaults on and malformed configuration cannot weaken it."""
+
+    @pytest.mark.parametrize(
+        ("contents", "source"),
+        [
+            ("{not valid json", settings_service.GATE_SOURCE_READ_FAILURE),
+            (json.dumps([]), "invalid-settings-fallback"),
+            (
+                json.dumps({"workflow": "not an object"}),
+                "invalid-settings-fallback",
+            ),
+            (
+                json.dumps({"workflow": {"require_approval": None}}),
+                "invalid-settings-fallback",
+            ),
+            (
+                json.dumps({"workflow": {"require_approval": "false"}}),
+                "invalid-settings-fallback",
+            ),
+            (
+                json.dumps({"workflow": {"require_approval": 0}}),
+                "invalid-settings-fallback",
+            ),
+        ],
+    )
+    def test_malformed_configuration_fails_closed(
+        self, settings_file, monkeypatch, contents, source
+    ):
+        monkeypatch.delenv("CAO_WORKFLOW_REQUIRE_APPROVAL", raising=False)
+        settings_file.write_text(contents)
+
+        posture = settings_service.resolve_workflow_approval_posture()
+
+        assert posture.required is True
+        assert posture.source == source
+
+    def test_explicit_boolean_false_is_the_only_file_opt_out(self, settings_file, monkeypatch):
+        monkeypatch.delenv("CAO_WORKFLOW_REQUIRE_APPROVAL", raising=False)
+        settings_file.write_text(json.dumps({"workflow": {"require_approval": False}}))
+
+        posture = settings_service.resolve_workflow_approval_posture()
+
+        assert posture == settings_service.WorkflowApprovalPosture(
+            False, settings_service.GATE_SOURCE_FILE
+        )
+
+
 def test_get_memory_settings_drops_unvalidated_vault_data(settings_file):
     settings_file.write_text(
         json.dumps({"memory": {"vault": {"root": "/etc/shadow", "mappings": []}}})
@@ -116,6 +166,88 @@ class TestSave:
         _save({"old": True})
         _save({"new": True})
         assert json.loads(settings_file.read_text()) == {"new": True}
+
+    def test_save_atomically_replaces_and_preserves_mode(self, settings_file, monkeypatch):
+        settings_file.write_text('{"old": true}')
+        settings_file.chmod(0o640)
+        monkeypatch.setattr(atomic_file, "LOCK_DIR", settings_file.parent / "locks")
+        real_replace = atomic_file.os.replace
+        replacements = []
+
+        def _record_replace(source, target):
+            replacements.append((Path(source), Path(target)))
+            real_replace(source, target)
+
+        monkeypatch.setattr(atomic_file.os, "replace", _record_replace)
+
+        _save({"new": True})
+
+        assert len(replacements) == 1
+        assert replacements[0][1] == settings_file
+        assert json.loads(settings_file.read_text()) == {"new": True}
+        assert settings_file.stat().st_mode & 0o777 == 0o640
+
+    def test_save_preserves_settings_symlink_and_target_mode(self, settings_file, monkeypatch):
+        target = settings_file.with_name("dotfiles-settings.json")
+        target.write_text('{"old": true}')
+        target.chmod(0o640)
+        settings_file.symlink_to(target)
+        monkeypatch.setattr(atomic_file, "LOCK_DIR", settings_file.parent / "locks")
+        lock_path_before = atomic_file._lock_path_for(settings_file)
+
+        _save({"new": True})
+
+        assert settings_file.is_symlink()
+        assert json.loads(target.read_text()) == {"new": True}
+        assert target.stat().st_mode & 0o777 == 0o640
+        assert atomic_file._lock_path_for(settings_file) == lock_path_before
+
+    def test_save_through_dangling_settings_symlink(self, settings_file, monkeypatch):
+        target = settings_file.with_name("dotfiles-settings.json")
+        settings_file.symlink_to(target)
+        monkeypatch.setattr(atomic_file, "LOCK_DIR", settings_file.parent / "locks")
+
+        _save({"new": True})
+
+        assert settings_file.is_symlink()
+        assert json.loads(target.read_text()) == {"new": True}
+
+    def test_concurrent_writes_and_reads_surface_writer_errors(self, settings_file, monkeypatch):
+        """Exercise concurrent access; replace and mode assertions pin atomicity."""
+        monkeypatch.setattr(atomic_file, "LOCK_DIR", settings_file.parent / "locks")
+        _save({"iteration": -1, "payload": "x" * 4096})
+        finished = threading.Event()
+        failures = []
+
+        def _writer():
+            try:
+                for iteration in range(150):
+                    _save({"iteration": iteration, "payload": str(iteration) * 4096})
+            except Exception as exc:  # noqa: BLE001 - captured for the test thread
+                failures.append(exc)
+            finally:
+                finished.set()
+
+        def _reader():
+            while not finished.is_set():
+                try:
+                    value = json.loads(settings_file.read_text())
+                    assert isinstance(value["iteration"], int)
+                    assert isinstance(value["payload"], str)
+                except Exception as exc:  # noqa: BLE001 - captured for the test thread
+                    failures.append(exc)
+                    return
+
+        writer = threading.Thread(target=_writer)
+        reader = threading.Thread(target=_reader)
+        reader.start()
+        writer.start()
+        writer.join(timeout=10)
+        reader.join(timeout=10)
+
+        assert not writer.is_alive()
+        assert not reader.is_alive()
+        assert failures == []
 
 
 class TestGetAgentDirs:

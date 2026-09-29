@@ -7,6 +7,11 @@ live in `~/.aws/cli-agent-orchestrator/workflows/` and are run **by their
 stem**: `<name>.py` there runs as `cao workflow run <name>`. There is no
 `--script` flag, and a path outside that directory is rejected.
 
+Script runs execute in one project root: the run request's `working_directory`, defaulting
+to the calling terminal's directory (MCP), the current directory (CLI), or cao-server's
+directory (direct REST). The same directory is fingerprinted for approval and used for agent
+steps that name no directory. Resume reuses the recorded root.
+
 It covers the `cao_workflow` shim's contract, when to reach for a script
 instead of YAML, the determinism obligation resume relies on, how to declare
 a recovery policy, and the resume boundary itself.
@@ -58,7 +63,7 @@ emit_output({"reviewed": True})
   wraps the underlying `urllib` error), `ShimHTTPError` (non-2xx response,
   carries `.status`/`.body`). All four (`ShimError` plus these three
   subclasses) are importable from `cao_workflow` directly:
-  `from cao_workflow import run_step, ShimHTTPError`.
+  `from cao_workflow import step, ShimHTTPError`.
 - **`step_id` is required for concurrent fan-out.** If you call `step` or
   `run_step` from more than one thread (e.g. via `concurrent.futures`), pass an
   explicit, stable `step_id` per call. See "Fan-out and `step_id`" below —
@@ -129,7 +134,17 @@ an explicit, stable `step_id` per call:
 
 ```python
 def _run_shard(shard):
-    return run_step("kiro_cli", "reviewer", f"review {shard}", step_id=f"shard-{shard}")
+    return step(
+        "claude_code",                    # headless: kiro_cli currently hangs a step (SKILL.md R5)
+        "reviewer",
+        f"review {shard}",
+        step_id=f"shard-{shard}",         # explicit and stable — the rule above
+        # A reviewer READS the shard and returns findings inline, so re-running it has the same
+        # effect as running it once. That is what makes "idempotent" an honest claim HERE — it is
+        # a statement about this step, not a default. A step that filed a ticket or sent mail
+        # would need "manual", and CAO would halt and ask rather than repeat it.
+        recovery="idempotent",
+    )
 
 with ThreadPoolExecutor(max_workers=3) as pool:
     futures = [pool.submit(_run_shard, s) for s in ("alpha", "beta", "gamma")]

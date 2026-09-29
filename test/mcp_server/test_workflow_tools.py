@@ -33,6 +33,63 @@ def _resp(status_code, json_body):
 
 
 class TestWorkflowRun:
+    def test_explicit_root_is_sent_on_first_request(self):
+        with patch(
+            "cli_agent_orchestrator.mcp_server.server.requests.post",
+            return_value=_resp(200, {"run_id": "run1", "state": "completed", "steps": []}),
+        ) as post:
+            asyncio.run(workflow_run("wf", working_directory="/project"))
+
+        assert post.call_count == 1
+        assert post.call_args.kwargs["json"]["working_directory"] == "/project"
+
+    def test_terminal_root_is_resolved_before_first_request(self):
+        events = []
+
+        def _root(path):
+            events.append(("get", path))
+            return {"working_directory": "/terminal/project"}
+
+        def _post(*args, **kwargs):
+            events.append(("post", kwargs["json"]))
+            return _resp(200, {"run_id": "run1", "state": "completed", "steps": []})
+
+        with (
+            patch.dict("os.environ", {"CAO_TERMINAL_ID": "term/one"}),
+            patch("cli_agent_orchestrator.mcp_server.server.mcp_utils.get_json", _root),
+            patch("cli_agent_orchestrator.mcp_server.server.requests.post", _post),
+        ):
+            asyncio.run(workflow_run("wf"))
+
+        assert events == [
+            ("get", "/terminals/term%2Fone/working-directory"),
+            (
+                "post",
+                {
+                    "name_or_path": "wf",
+                    "inputs": {},
+                    "working_directory": "/terminal/project",
+                },
+            ),
+        ]
+
+    def test_failed_terminal_root_lookup_omits_field_and_posts_once(self):
+        with (
+            patch.dict("os.environ", {"CAO_TERMINAL_ID": "term-one"}),
+            patch(
+                "cli_agent_orchestrator.mcp_server.server.mcp_utils.get_json",
+                side_effect=requests.ConnectionError("down"),
+            ),
+            patch(
+                "cli_agent_orchestrator.mcp_server.server.requests.post",
+                return_value=_resp(200, {"run_id": "run1", "state": "completed", "steps": []}),
+            ) as post,
+        ):
+            asyncio.run(workflow_run("wf"))
+
+        assert post.call_count == 1
+        assert "working_directory" not in post.call_args.kwargs["json"]
+
     def test_success_envelope(self):
         body = {
             "run_id": "run1",
