@@ -95,6 +95,40 @@ def _uses_blocked_prefix(key: str) -> bool:
     return any(key.startswith(p) for p in FORWARDED_ENV_BLOCKED_PREFIXES)
 
 
+def check_forwarded_env_budget(mapping: Mapping[str, str]) -> None:
+    """Raise ``ForwardedEnvError`` if ``mapping`` as a whole would overflow the tmux argv.
+
+    ``validate_forwarded_env`` bounds one request. A map *accumulated* across
+    requests -- ``POST /sessions/{session_name}/env`` merges each body on top of
+    what the server already holds -- needs the same entry-count and aggregate argv
+    bounds applied to the merged result, or repeated calls could grow it past the
+    limit those bounds exist to protect.
+
+    Size only, deliberately: the per-key rules are ``validate_forwarded_env``'s job
+    on the incoming delta. Re-applying them to keys already stored would let one
+    key another path admitted (``POST /sessions`` does not validate server-side)
+    fail every later merge into that session. Messages match
+    ``validate_forwarded_env``'s for the same two rules.
+    """
+    if len(mapping) > FORWARDED_ENV_MAX_ENTRIES:
+        raise ForwardedEnvError(
+            f"env var count {len(mapping)} exceeds the limit of {FORWARDED_ENV_MAX_ENTRIES}"
+        )
+    # ``surrogatepass`` so a value no validator vetted (see above) is still measured
+    # rather than raising here; the per-value rules are not this function's concern.
+    total_argv_bytes = sum(
+        len(key.encode("utf-8", "surrogatepass"))
+        + len(value.encode("utf-8", "surrogatepass"))
+        + _ARGV_ENTRY_OVERHEAD
+        for key, value in mapping.items()
+    )
+    if total_argv_bytes > FORWARDED_ENV_MAX_TOTAL_BYTES:
+        raise ForwardedEnvError(
+            f"env vars exceed the total argv budget of {FORWARDED_ENV_MAX_TOTAL_BYTES} "
+            "bytes (tmux argv limit)"
+        )
+
+
 def validate_forwarded_env(mapping: Mapping[str, str]) -> Dict[str, str]:
     """Validate an already-parsed env mapping; return it as a plain dict.
 

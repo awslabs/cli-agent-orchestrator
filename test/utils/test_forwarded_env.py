@@ -8,6 +8,7 @@ from cli_agent_orchestrator.utils.forwarded_env import (
     FORWARDED_ENV_MAX_TOTAL_BYTES,
     FORWARDED_ENV_MAX_VALUE_BYTES,
     ForwardedEnvError,
+    check_forwarded_env_budget,
     validate_forwarded_env,
 )
 
@@ -167,3 +168,47 @@ def test_aggregate_argv_budget_just_under_allowed():
     mapping = {f"K{i:04d}": "x" * value_bytes for i in range(n_entries)}
     assert n_entries * per_entry <= FORWARDED_ENV_MAX_TOTAL_BYTES  # confirm we are under budget
     assert validate_forwarded_env(mapping) == mapping
+
+
+# --- check_forwarded_env_budget: the same two bounds, applied to an accumulated map --------
+
+
+def test_budget_allows_exactly_max_entries_and_rejects_one_more():
+    at_cap = {f"K{i}": "x" for i in range(FORWARDED_ENV_MAX_ENTRIES)}
+    check_forwarded_env_budget(at_cap)  # must not raise
+    with pytest.raises(ForwardedEnvError, match="exceeds the limit"):
+        check_forwarded_env_budget({**at_cap, "ONE_MORE": "x"})
+
+
+def _largest_set_under_the_argv_budget():
+    value_bytes = FORWARDED_ENV_MAX_VALUE_BYTES - 9
+    per_entry = 5 + value_bytes + 3  # ``K0000`` + value + ``-e`` and ``=``
+    n_entries = FORWARDED_ENV_MAX_TOTAL_BYTES // per_entry
+    return {f"K{i:04d}": "x" * value_bytes for i in range(n_entries)}, value_bytes
+
+
+def test_budget_brackets_the_aggregate_argv_limit():
+    fits, value_bytes = _largest_set_under_the_argv_budget()
+    check_forwarded_env_budget(fits)  # must not raise
+    overflows = {**fits, "K9999": "x" * value_bytes}
+    with pytest.raises(ForwardedEnvError, match="total argv budget"):
+        check_forwarded_env_budget(overflows)
+
+
+def test_budget_agrees_with_the_request_validator_on_both_sides_of_the_limit():
+    """Two implementations of one limit drift unless something compares them."""
+    fits, value_bytes = _largest_set_under_the_argv_budget()
+    overflows = {**fits, "K9999": "x" * value_bytes}
+
+    assert validate_forwarded_env(fits) == fits
+    check_forwarded_env_budget(fits)
+    with pytest.raises(ForwardedEnvError, match="total argv budget"):
+        validate_forwarded_env(overflows)
+    with pytest.raises(ForwardedEnvError, match="total argv budget"):
+        check_forwarded_env_budget(overflows)
+
+
+def test_budget_does_not_apply_the_per_key_rules():
+    """It bounds size only. A stored key another path let in (``POST /sessions`` does not
+    validate server-side) must not make every later merge into that session fail."""
+    check_forwarded_env_budget({"CLAUDE_SECRET": "x", "1BAD": "y"})  # must not raise

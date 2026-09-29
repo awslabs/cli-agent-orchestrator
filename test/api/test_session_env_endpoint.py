@@ -157,3 +157,45 @@ class TestSetSessionEnvValidation:
         assert resp.status_code == 400
         assert "exceeds the limit of 256" in resp.json()["detail"]
         assert get_session_env(SESSION) == {}
+
+
+class TestSetSessionEnvMergedBudget:
+    """Merge-on-top accumulates across calls, so the bounds ``validate_forwarded_env`` puts on
+    one request must also hold for the merged map — otherwise repeated calls grow it past the
+    tmux argv limit (E2BIG at window creation, and libtmux logging the argv, values included)."""
+
+    def teardown_method(self):
+        clear_session_env(SESSION)
+
+    def test_merge_that_would_exceed_the_entry_cap_is_rejected_and_stores_nothing(self, client):
+        seeded = {f"K{i:04d}": "x" for i in range(256)}
+        set_session_env(SESSION, seeded)
+
+        resp = _post_env(client, {"ONE_MORE": "y"})
+
+        assert resp.status_code == 400
+        detail = resp.json()["detail"]
+        assert "exceeds the limit of 256" in detail
+        assert "already holds" in detail
+        assert get_session_env(SESSION) == seeded
+
+    def test_merge_that_would_exceed_the_argv_budget_is_rejected_and_stores_nothing(self, client):
+        # 65 x (5 + 2000 + 3) = 130,520 bytes fits the 131,072-byte budget; one more does not.
+        seeded = {f"K{i:04d}": "x" * 2000 for i in range(65)}
+        set_session_env(SESSION, seeded)
+
+        resp = _post_env(client, {"K9999": "y" * 2000})
+
+        assert resp.status_code == 400
+        assert "total argv budget" in resp.json()["detail"]
+        assert get_session_env(SESSION) == seeded
+
+    def test_overwriting_an_existing_key_does_not_count_twice(self, client):
+        seeded = {f"K{i:04d}": "x" for i in range(256)}
+        set_session_env(SESSION, seeded)
+
+        resp = _post_env(client, {"K0000": "rotated"})
+
+        assert resp.status_code == 200, resp.text
+        assert get_session_env(SESSION)["K0000"] == "rotated"
+        assert len(get_session_env(SESSION)) == 256

@@ -179,7 +179,11 @@ from cli_agent_orchestrator.services.workflow_journal import (
 from cli_agent_orchestrator.services.worktree_service import WorktreeError
 from cli_agent_orchestrator.telemetry import init_telemetry, shutdown_telemetry
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
-from cli_agent_orchestrator.utils.forwarded_env import validate_forwarded_env
+from cli_agent_orchestrator.utils.forwarded_env import (
+    ForwardedEnvError,
+    check_forwarded_env_budget,
+    validate_forwarded_env,
+)
 from cli_agent_orchestrator.utils.logging import install_access_log_redaction, setup_logging
 from cli_agent_orchestrator.utils.skills import (
     SkillNameError,
@@ -3456,11 +3460,14 @@ async def set_session_env_endpoint(
     validator as ``cao launch --env`` and the ops-MCP ``launch_session`` tool
     (``utils/forwarded_env.py``: POSIX names, blocked prefixes, byte caps, NUL
     and non-UTF-8 values, entry count, argv budget) and rejected loudly here
-    rather than silently dropped at window creation. Already running
-    terminals are unaffected — their env was fixed into the tmux window at
-    creation; the map only feeds FUTURE windows.
+    rather than silently dropped at window creation. The entry-count and argv
+    budget also bound the MERGED map, since merges accumulate across calls.
+    The read-merge-write is one critical section, so concurrent calls cannot
+    lose each other's keys. Already running terminals are unaffected — their
+    env was fixed into the tmux window at creation; the map only feeds FUTURE
+    windows.
     """
-    from cli_agent_orchestrator.services.session_env import get_session_env, set_session_env
+    from cli_agent_orchestrator.services.session_env import merge_session_env
 
     try:
         validate_tmux_name(session_name, "session_name")
@@ -3474,8 +3481,13 @@ async def set_session_env_endpoint(
             detail=f"Session '{session_name}' not found",
         )
 
-    merged = {**get_session_env(session_name), **delta}
-    set_session_env(session_name, merged)
+    try:
+        merged = merge_session_env(session_name, delta, validate=check_forwarded_env_budget)
+    except ForwardedEnvError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{e}, counting the vars session '{session_name}' already holds",
+        )
     return {"session_name": session_name, "env_keys": sorted(merged.keys())}
 
 
