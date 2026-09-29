@@ -1916,6 +1916,64 @@ class TestCreateTerminalEnvVars:
         assert "CLAUDE_CONFIG_DIR" not in (kwargs["extra_env"] or {})
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.terminal_service.set_session_env")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    async def test_profile_env_reaches_new_session_as_trusted_env(
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+        mock_set_session_env,
+        mock_delete_terminals_by_session,
+    ):
+        """Session-create variant: the initial terminal's profile env reaches
+        create_session as ``trusted_env``, stays out of ``extra_env``, and is
+        not persisted with the session's forwarded env."""
+        mock_load_profile.return_value = AgentProfile(
+            name="developer",
+            description="Developer",
+            env={"CLAUDE_CONFIG_DIR": "/home/u/.claude-b"},
+        )
+        self._wire_happy_mocks(
+            mock_gen_id,
+            mock_gen_session,
+            mock_gen_window,
+            mock_tmux,
+            mock_provider_manager,
+            mock_fifo_dir,
+            session_exists=False,
+        )
+
+        await create_terminal(
+            "kiro_cli",
+            "developer",
+            new_session=True,
+            env_vars={"FOO": "bar"},
+        )
+
+        kwargs = mock_tmux.create_session.call_args.kwargs
+        assert kwargs["trusted_env"] == {"CLAUDE_CONFIG_DIR": "/home/u/.claude-b"}
+        assert kwargs["extra_env"] == {"FOO": "bar"}
+        mock_set_session_env.assert_called_once_with("cao-session", {"FOO": "bar"})
+
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.get_session_env")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
