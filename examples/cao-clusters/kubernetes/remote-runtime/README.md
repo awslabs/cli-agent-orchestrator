@@ -12,6 +12,11 @@ driven through the server's HTTP API. See
 | `StatefulSet/cao-server`, `Service/cao-server` | the API and central state, on a gp3 volume; `CAO_LOCAL_EXECUTION=0`, so it refuses to start agents itself |
 | `StatefulSet/cao-runtime` | `cao-bridge` beside tmux and the provider CLIs; runtime id is the pod name, `cao-runtime-0` |
 | `Secret/cao-runtime-token` | the shared channel token, mounted as a file into both pods (you create it) |
+| `NetworkPolicy/cao-server-ingress`, `NetworkPolicy/cao-runtime-ingress` | only the runtime may reach the server's API; the runtime accepts no ingress |
+
+The API has no authentication by default, so the NetworkPolicies are the
+boundary around it. They take effect only on a cluster whose CNI enforces
+NetworkPolicy (on EKS, enable network policy in the VPC CNI).
 
 ## Build
 

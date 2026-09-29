@@ -101,15 +101,17 @@ class RuntimeConnection:
         return result.payload
 
     def resolve(self, result: Result) -> bool:
-        """Deliver a result to its waiting call. False if no call is waiting for it."""
+        """Deliver a result to its waiting call. False if no call is waiting for it
+        any more (it timed out or was cancelled): the caller must act on it."""
         future = self._pending.get(result.op_id)
-        if future is None:
+        if future is None or future.done():
             logger.warning(
-                "runtime %s sent a result for unknown op %s", self.runtime_id, result.op_id
+                "runtime %s sent a result for an op nobody awaits: %s",
+                self.runtime_id,
+                result.op_id,
             )
             return False
-        if not future.done():
-            future.set_result(result)
+        future.set_result(result)
         return True
 
     def close(self, reason: str) -> None:

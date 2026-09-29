@@ -142,6 +142,22 @@ async def test_a_disconnect_fails_waiting_calls_as_unknown():
 
 
 @pytest.mark.asyncio
+async def test_a_result_for_a_call_that_already_gave_up_is_unclaimed():
+    registry = RuntimeRegistry()
+    runtime = _FakeRuntime(registry, reply=None)
+    call = asyncio.ensure_future(registry.call("rt-1", CommandType.LAUNCH, {}, timeout=10))
+    await asyncio.sleep(0)
+    conn = registry.connection("rt-1")
+    (waiting,) = conn._pending.values()
+    # The caller gave up (timeout or cancellation) but has not cleaned up yet.
+    waiting.cancel()
+    late = Result(op_id=runtime.sent[0].op_id, ok=True, payload={"terminal": {"id": "beef0001"}})
+    assert conn.resolve(late) is False, "nobody will act on it, so the caller must"
+    with pytest.raises(asyncio.CancelledError):
+        await call
+
+
+@pytest.mark.asyncio
 async def test_a_reported_failure_is_502():
     registry = RuntimeRegistry()
     _FakeRuntime(registry, reply=lambda c: Result(op_id=c.op_id, ok=False, error="no pane"))
