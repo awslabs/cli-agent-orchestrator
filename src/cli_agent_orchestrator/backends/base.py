@@ -51,6 +51,11 @@ class TerminalBackend(ABC):
             window_name: Name for the initial window/tab
             terminal_id: Unique terminal identifier to inject into the environment
             working_directory: Optional starting directory
+            trusted_env: The agent profile's own ``env:``. It must reach the
+                initial window's process only, never the session: later
+                windows of the session must not inherit it. Apply it with
+                ``utils.terminal_env.merge_profile_env`` after ``extra_env``,
+                then ``apply_runtime_identity`` last.
 
         Returns:
             The actual window name assigned by the backend
@@ -150,6 +155,8 @@ class TerminalBackend(ABC):
             terminal_id: Unique terminal identifier to inject into the environment
             working_directory: Optional starting directory
             window_shell: Optional shell command to run instead of default shell
+            trusted_env: The agent profile's own ``env:``, for this window's
+                process only; applied as in ``create_session``.
 
         Returns:
             The actual window name assigned by the backend
