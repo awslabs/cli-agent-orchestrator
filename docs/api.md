@@ -174,8 +174,14 @@ See [Skills](skills.md) for discovery, installation, and catalog behavior.
   first does not fix it; it only changes how often you lose.
 
   `turn_completed < turn` means a turn is in flight whatever `status` shows. Both
-  fields are live-only and absent for a terminal read from persistence. A server
-  that omits them is older than this contract.
+  counters live in the server's memory: they start at 0 for a terminal the server
+  has not dispatched to, and reset when the server restarts (the CLI waiters detect
+  a counter lower than the turn they wait for and fall back). Do not send to a busy
+  terminal and expect two separate answers: claude_code and kiro-cli fold input that
+  arrives mid-turn into the running turn and reply once, so both turns finish
+  together and `?mode=last` shows that one reply. `cao session send` refuses to send
+  while the terminal is busy. A server that omits the fields is older than this
+  contract.
 - Terminal creation accepts `use_worktree` (bool, default `false`, issue #100
   Phase 1): provisions an isolated `git worktree` on its own branch instead of
   sharing `working_directory` as given, requiring the resolved directory to be

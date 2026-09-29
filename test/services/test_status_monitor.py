@@ -2223,3 +2223,49 @@ class TestOwnershipSurvivesAMissingActivityMarker:
 
         assert sm.turn_state("t1") == (2, 1)
         assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+
+
+class TestRound8TurnOwnership:
+    """PR #812 review round 8: an OLD turn's bytes must not close a NEW turn."""
+
+    @staticmethod
+    def _send(sm, provider, assume=False):
+        turn = sm.notify_input_sent("t1", assume_processing=assume)
+        sm.clear_rolling_buffer("t1", provider)
+        sm.notify_input_delivered("t1")
+        return turn
+
+    def test_a_read_taken_before_the_clear_is_discarded(self):
+        """A chunk read after notify_input_sent but before clear_rolling_buffer has
+        no turn pin yet still holds the previous turn's bytes — here, its work
+        sign and answer. Applied after the clear, it closed the new turn at once.
+        The buffer epoch snapshotted with the read now discards it."""
+        sm = StatusMonitor()
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        provider.observe_execution_output = None
+        provider.shows_turn_work.return_value = True  # the old bytes hold a work sign
+        provider.get_status.return_value = TerminalStatus.COMPLETED
+        with (
+            patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as pm,
+            patch(
+                "cli_agent_orchestrator.services.status_monitor.get_server_settings",
+                return_value={"state_buffer_max": 100000},
+            ),
+        ):
+            pm.get_provider.return_value = provider
+            self._send(sm, provider)
+            sm._process_chunk("t1", "turn 1: work sign, answer, idle prompt")
+            assert sm.turn_state("t1") == (1, 1)
+
+            sm.notify_input_sent("t1")
+            real_detect = sm._detect_status
+
+            def detect_while_send_input_continues(tid, buf):
+                sm.clear_rolling_buffer("t1", provider)  # send_input's next step
+                sm.notify_input_delivered("t1")
+                return real_detect(tid, buf)
+
+            sm._detect_status = detect_while_send_input_continues
+            sm._process_chunk("t1", "\x1b[?25h")  # a cursor refresh, read pre-clear
+            assert sm.turn_state("t1") == (2, 1)

@@ -325,6 +325,7 @@ class StatusMonitor:
             # so a verdict from this content can only ever be applied to the turn
             # it belongs to (see _pin_cleared_turn_locked).
             cleared_turn = None if use_screen else self._pin_cleared_turn_locked(terminal_id)
+            epoch = self._buffer_epochs.get(terminal_id, 0)
             if use_screen:
                 self._feed_screen_locked(terminal_id, chunk)
 
@@ -334,7 +335,7 @@ class StatusMonitor:
             # (catches PROCESSING transition), then waits for output to settle
             # before re-detecting (catches IDLE/COMPLETED without running costly
             # regex on every single chunk during bursts).
-            self._schedule_raw_detection(terminal_id, buffer, provider, cleared_turn)
+            self._schedule_raw_detection(terminal_id, buffer, provider, cleared_turn, epoch)
             return
 
         self._schedule_screen_detection(terminal_id, provider)
@@ -348,6 +349,7 @@ class StatusMonitor:
         observed: bool = True,
         cleared_buffer_turn: Optional[int] = None,
         work_evidence: Optional[bool] = None,
+        buffer_epoch: Optional[int] = None,
     ) -> None:
         """Apply the sticky-latch rules to a freshly detected status and publish
         on change. Shared by the raw and pyte detection paths.
@@ -384,6 +386,13 @@ class StatusMonitor:
         ``work_evidence`` is the provider's answer to shows_turn_work() for the
         same raw buffer, or None when it declares no such signal or the verdict
         came from a retained source. See _note_turn_progress_locked.
+
+        ``buffer_epoch`` is the rolling buffer's clear counter, snapshotted with
+        the buffer a raw verdict was derived from (None for retained sources). A
+        raw observation whose epoch no longer matches judged bytes that a later
+        clear discarded, so it is dropped — this also covers a read taken after
+        notify_input_sent but before clear_rolling_buffer, which carries no turn
+        pin yet still holds the previous turn's bytes (PR #812 review, round 8).
         """
         with self._lock:
             changed = self._apply_detection_locked(
@@ -393,6 +402,7 @@ class StatusMonitor:
                 observed=observed,
                 cleared_buffer_turn=cleared_buffer_turn,
                 work_evidence=work_evidence,
+                buffer_epoch=buffer_epoch,
             )
         if changed:
             # Publish outside the lock — subscribers must never be able to
@@ -409,6 +419,7 @@ class StatusMonitor:
         observed: bool = True,
         cleared_buffer_turn: Optional[int] = None,
         work_evidence: Optional[bool] = None,
+        buffer_epoch: Optional[int] = None,
     ) -> bool:
         """Sticky-latch core of _apply_detection. Caller MUST hold self._lock.
 
@@ -436,6 +447,12 @@ class StatusMonitor:
                 f"_apply_detection [{terminal_id}]: discarding {detected.value} — the "
                 f"observation is pinned to turn {cleared_buffer_turn} but the terminal "
                 f"is on turn {self._turn.get(terminal_id, 0)}"
+            )
+            return False
+        if buffer_epoch is not None and buffer_epoch != self._buffer_epochs.get(terminal_id, 0):
+            logger.debug(
+                f"_apply_detection [{terminal_id}]: discarding {detected.value} — the "
+                "rolling buffer it was read from has since been cleared"
             )
             return False
 
@@ -898,6 +915,7 @@ class StatusMonitor:
         buffer: str,
         provider=None,
         cleared_buffer_turn: Optional[int] = None,
+        buffer_epoch: Optional[int] = None,
     ) -> None:
         """Edge-debounce detection on the raw rolling buffer.
 
@@ -932,6 +950,7 @@ class StatusMonitor:
                 self._detect_status(terminal_id, buffer),
                 cleared_buffer_turn=cleared_turn,
                 work_evidence=self._work_evidence(provider, buffer),
+                buffer_epoch=buffer_epoch,
             )
             return
 
@@ -976,6 +995,7 @@ class StatusMonitor:
                 settled=raw_calibrated,
                 cleared_buffer_turn=cleared_turn,
                 work_evidence=self._work_evidence(provider, buffer),
+                buffer_epoch=buffer_epoch,
             )
 
         self._arm_quiesce_timer(loop, terminal_id, self._on_raw_quiescent)
@@ -1088,6 +1108,7 @@ class StatusMonitor:
             # Same critical section as the buffer snapshot — see
             # _pin_cleared_turn_locked for why the pin may not be taken later.
             cleared_turn = self._pin_cleared_turn_locked(terminal_id)
+            epoch = self._buffer_epochs.get(terminal_id, 0)
         try:
             quiesce_provider = provider_manager.get_provider(terminal_id)
         except Exception:
@@ -1100,6 +1121,7 @@ class StatusMonitor:
                 detected,
                 cleared_buffer_turn=cleared_turn,
                 work_evidence=self._work_evidence(quiesce_provider, buffer),
+                buffer_epoch=epoch,
             )
 
         loop = self._loop or self._running_loop()
@@ -1109,6 +1131,7 @@ class StatusMonitor:
                 self._detect_status(terminal_id, buffer),
                 cleared_buffer_turn=cleared_turn,
                 work_evidence=self._work_evidence(quiesce_provider, buffer),
+                buffer_epoch=epoch,
             )
         else:
             self._spawn_tracked(loop, _detect_and_apply())
@@ -1367,9 +1390,11 @@ class StatusMonitor:
                 # as is the evidence pin — see _pin_cleared_turn_locked.
                 bursting = self._bursting.get(terminal_id, False)
                 cleared_turn = self._pin_cleared_turn_locked(terminal_id)
+                epoch = self._buffer_epochs.get(terminal_id, 0)
             else:
                 buffer = ""
                 bursting = False
+                epoch = None
                 # Backstop liveness for a QUIET terminal (PR #812 review): the
                 # backstop is otherwise only evaluated when a detection verdict
                 # arrives, and a terminal whose cached status is already ready
@@ -1416,7 +1441,7 @@ class StatusMonitor:
                 # A pyte screen read mid-burst is a half-drawn frame; a retained
                 # screen is never post-dispatch evidence, so it carries no turn
                 # pin and no work evidence.
-                settled, cleared_turn = (not bursting), None
+                settled, cleared_turn, epoch = (not bursting), None, None
                 work_evidence = None
             else:
                 fresh = self._detect_status(terminal_id, buffer)
@@ -1454,6 +1479,7 @@ class StatusMonitor:
                     settled=settled,
                     cleared_buffer_turn=cleared_turn,
                     work_evidence=work_evidence,
+                    buffer_epoch=epoch,
                 )
                 # Report what the latch ACCEPTED, not what this read proposed. A
                 # verdict refused as unsettled must not be handed to the caller
