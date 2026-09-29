@@ -1366,6 +1366,72 @@ class TestBuildEnvArgs:
         assert "CAO_SESSION_NAME=cao-proj" in joined
         assert "CAO_SESSION_NAME=evil" not in joined
 
+    # --- trusted_env (the agent profile's own ``env:``) ---
+    #
+    # Same policy as the tmux backend, through the same helper
+    # (utils/terminal_env.merge_profile_env): no prefix blocklist, byte cap
+    # kept, merged after operator env.
+
+    def test_build_env_args_trusted_env_keeps_blocked_prefix_key(self):
+        """A CLAUDE* key is dropped from operator env but survives from the
+        profile -- the motivating CLAUDE_CONFIG_DIR case."""
+        from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+
+        backend = HerdrBackend.__new__(HerdrBackend)
+        pairs = backend._build_env_args(
+            terminal_id="tid",
+            session_name="cao-proj",
+            extra_env={"CLAUDE_CONFIG_DIR": "/from/operator"},
+            trusted_env={"CLAUDE_CONFIG_DIR": "/home/u/.claude-b"},
+        )
+        assert "CLAUDE_CONFIG_DIR=/home/u/.claude-b" in pairs
+        assert "CLAUDE_CONFIG_DIR=/from/operator" not in pairs
+
+    def test_build_env_args_trusted_env_wins_over_operator_env(self):
+        from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+
+        backend = HerdrBackend.__new__(HerdrBackend)
+        pairs = backend._build_env_args(
+            terminal_id="tid",
+            session_name="cao-proj",
+            extra_env={"SHARED": "operator"},
+            trusted_env={"SHARED": "profile"},
+        )
+        assert "SHARED=profile" in pairs
+        assert "SHARED=operator" not in pairs
+
+    @pytest.mark.parametrize("over", [0, 1], ids=["cap-1-accepted", "cap-dropped"])
+    def test_build_env_args_trusted_env_byte_cap_boundary(self, over, caplog):
+        from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+        from cli_agent_orchestrator.utils.terminal_env import MAX_ENV_VALUE_BYTES
+
+        backend = HerdrBackend.__new__(HerdrBackend)
+        value = "x" * (MAX_ENV_VALUE_BYTES - 1 + over)
+        with caplog.at_level("WARNING"):
+            pairs = backend._build_env_args(
+                terminal_id="tid", session_name="cao-proj", trusted_env={"BIG": value, "OK": "y"}
+            )
+        assert (f"BIG={value}" in pairs) is (over == 0)
+        assert "OK=y" in pairs
+
+    @pytest.mark.parametrize(
+        "channel, source", [("trusted_env", "profile"), ("extra_env", "forwarded")]
+    )
+    def test_byte_cap_drop_message_is_the_shared_one(self, channel, source, caplog):
+        """herdr drops an oversized value with the same words as tmux
+        (test_tmux_client pins the tmux side against the same helper)."""
+        from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+        from cli_agent_orchestrator.utils.terminal_env import MAX_ENV_VALUE_BYTES
+
+        backend = HerdrBackend.__new__(HerdrBackend)
+        with caplog.at_level("WARNING"):
+            backend._build_env_args(
+                terminal_id="t", session_name="s", **{channel: {"BIG": "x" * MAX_ENV_VALUE_BYTES}}
+            )
+        assert caplog.messages == [
+            f"Dropping {source} env var BIG — value exceeds {MAX_ENV_VALUE_BYTES} bytes"
+        ]
+
 
 class TestEnvValueRedaction:
     """P1: operator-forwarded --env values are secrets; they must never appear

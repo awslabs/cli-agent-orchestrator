@@ -26,6 +26,11 @@ from cli_agent_orchestrator.utils.path_validation import (
     resolve_and_validate_path,
 )
 from cli_agent_orchestrator.utils.terminal import validate_tmux_name
+from cli_agent_orchestrator.utils.terminal_env import (
+    MAX_ENV_VALUE_BYTES,
+    merge_profile_env,
+    within_value_cap,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -876,8 +881,9 @@ class TmuxClient:
         }
     )
     # Per-var value cap (PR #246) — keeps the full tmux ``new-session -e`` /
-    # ``new-window -e`` argv under the kernel argv limit on busy hosts.
-    _MAX_ENV_VALUE_BYTES = 2048
+    # ``new-window -e`` argv under the kernel argv limit on busy hosts. The
+    # number lives in utils/terminal_env, shared with the herdr backend.
+    _MAX_ENV_VALUE_BYTES = MAX_ENV_VALUE_BYTES
 
     @classmethod
     def _is_blocked_env_key(cls, key: str) -> bool:
@@ -902,39 +908,7 @@ class TmuxClient:
             if cls._is_blocked_env_key(key):
                 logger.warning("Dropping forwarded env var with blocked prefix: %s", key)
                 continue
-            if len(value.encode("utf-8")) >= cls._MAX_ENV_VALUE_BYTES:
-                logger.warning(
-                    "Dropping forwarded env var %s — value exceeds %d bytes",
-                    key,
-                    cls._MAX_ENV_VALUE_BYTES,
-                )
-                continue
-            environment[key] = value
-
-    @classmethod
-    def _merge_trusted_env(
-        cls, environment: Dict[str, str], trusted_env: Optional[Dict[str, str]]
-    ) -> None:
-        """Merge profile-declared env vars into ``environment`` in place.
-
-        Unlike ``_merge_extra_env`` (operator-forwarded ``--env``, which
-        mirrors the inherited-env hygiene filter), these values come from an
-        installed agent profile — explicit configuration at the same trust
-        level as the profile's own ``mcpServers`` commands — so the prefix
-        blocklist does not apply. The per-value byte cap is kept because it
-        protects the backend argv limit, not a trust boundary. Merged after
-        operator env so the more specific per-agent declaration wins on
-        conflict (CAO identity vars are still forced last by the caller).
-        """
-        if not trusted_env:
-            return
-        for key, value in trusted_env.items():
-            if len(value.encode("utf-8")) >= cls._MAX_ENV_VALUE_BYTES:
-                logger.warning(
-                    "Dropping profile env var %s — value exceeds %d bytes",
-                    key,
-                    cls._MAX_ENV_VALUE_BYTES,
-                )
+            if not within_value_cap("forwarded", key, value):
                 continue
             environment[key] = value
 
@@ -989,7 +963,7 @@ class TmuxClient:
             # explicit ``--env AWS_REGION=us-west-2`` wins over the inherited
             # value. See issue #248.
             self._merge_extra_env(environment, extra_env)
-            self._merge_trusted_env(environment, trusted_env)
+            merge_profile_env(environment, trusted_env)
             environment["CAO_TERMINAL_ID"] = terminal_id
 
             # Explicit 220x50 pane size avoids the default 80x24 that tmux
@@ -1142,7 +1116,7 @@ class TmuxClient:
 
             window_env: dict[str, str] = {}
             self._merge_extra_env(window_env, extra_env)
-            self._merge_trusted_env(window_env, trusted_env)
+            merge_profile_env(window_env, trusted_env)
             window_env["CAO_TERMINAL_ID"] = terminal_id
 
             kwargs: dict = {

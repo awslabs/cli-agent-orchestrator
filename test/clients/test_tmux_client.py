@@ -373,6 +373,69 @@ class TestCreateSessionEnvironmentFiltering:
         assert "MY_CUSTOM_THING" not in env
 
 
+# ── profile env (trusted_env) ────────────────────────────────────────
+
+
+class TestProfileEnv:
+    """The agent profile's own ``env:`` reaches the terminal it declares,
+    through the shared policy in utils/terminal_env (herdr applies the same)."""
+
+    @staticmethod
+    def _session_mock():
+        mock_window = MagicMock()
+        mock_window.name = "w"
+        mock_session = MagicMock()
+        mock_session.windows = [mock_window]
+        mock_session.new_window.return_value = mock_window
+        return mock_session
+
+    def test_create_session_passes_profile_env_to_the_initial_pane(self, tmux, tmp_path):
+        tmux.server.new_session.return_value = self._session_mock()
+
+        with patch.dict(os.environ, {"HOME": "/home/u"}, clear=True):
+            tmux.create_session(
+                "ses",
+                "w",
+                "tid1",
+                str(tmp_path),
+                extra_env={"SHARED": "operator"},
+                trusted_env={"CLAUDE_CONFIG_DIR": "/home/u/.claude-b", "SHARED": "profile"},
+            )
+
+        env = tmux.server.new_session.call_args.kwargs["environment"]
+        assert env["CLAUDE_CONFIG_DIR"] == "/home/u/.claude-b"
+        assert env["SHARED"] == "profile"
+
+    def test_create_window_passes_profile_env_to_the_window(self, tmux, tmp_path):
+        session = self._session_mock()
+        tmux.server.sessions.get.return_value = session
+
+        tmux.create_window(
+            "ses", "w", "tid2", str(tmp_path), trusted_env={"CLAUDE_CONFIG_DIR": "/abs/.claude-b"}
+        )
+
+        env = session.new_window.call_args.kwargs["environment"]
+        assert env["CLAUDE_CONFIG_DIR"] == "/abs/.claude-b"
+
+    def test_oversized_profile_value_is_dropped_with_the_shared_message(
+        self, tmux, tmp_path, caplog
+    ):
+        from cli_agent_orchestrator.utils.terminal_env import MAX_ENV_VALUE_BYTES
+
+        session = self._session_mock()
+        tmux.server.sessions.get.return_value = session
+
+        with caplog.at_level("WARNING"):
+            tmux.create_window(
+                "ses", "w", "tid2", str(tmp_path), trusted_env={"BIG": "x" * MAX_ENV_VALUE_BYTES}
+            )
+
+        assert "BIG" not in session.new_window.call_args.kwargs["environment"]
+        assert f"Dropping profile env var BIG — value exceeds {MAX_ENV_VALUE_BYTES} bytes" in (
+            caplog.messages
+        )
+
+
 # ── create_window ────────────────────────────────────────────────────
 
 

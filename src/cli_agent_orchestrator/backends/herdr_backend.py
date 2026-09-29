@@ -26,6 +26,7 @@ from cli_agent_orchestrator.backends.base import (
 )
 from cli_agent_orchestrator.constants import BRACKETED_PASTE_INCOMPATIBLE_SHELLS
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.utils.terminal_env import merge_profile_env, within_value_cap
 
 logger = logging.getLogger(__name__)
 
@@ -901,19 +902,13 @@ class HerdrBackend(TerminalBackend):
             if TmuxClient._is_blocked_env_key(key):
                 logger.warning("Dropping forwarded env var with blocked prefix: %s", key)
                 continue
-            if len(value.encode("utf-8")) >= TmuxClient._MAX_ENV_VALUE_BYTES:
-                logger.warning("Dropping forwarded env var %s -- exceeds byte cap", key)
+            if not within_value_cap("forwarded", key, value):
                 continue
             env[key] = value
 
-        # Profile-declared env (trusted_env) merges after operator env — same
-        # policy as TmuxClient._merge_trusted_env: no prefix blocklist (it is
-        # installed configuration, not inherited leakage), byte cap kept.
-        for key, value in (trusted_env or {}).items():
-            if len(value.encode("utf-8")) >= TmuxClient._MAX_ENV_VALUE_BYTES:
-                logger.warning("Dropping profile env var %s -- exceeds byte cap", key)
-                continue
-            env[key] = value
+        # Profile-declared env (trusted_env) merges after operator env, through
+        # the same helper the tmux backend uses (utils/terminal_env).
+        merge_profile_env(env, trusted_env)
 
         # CAO identity vars are assigned last so operator-forwarded --env cannot
         # override them (mirrors TmuxClient, which forces these to win).
