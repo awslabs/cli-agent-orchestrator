@@ -765,6 +765,91 @@ class TestHerdrInboxServiceStartupDbCleanup:
     @patch("cli_agent_orchestrator.clients.database.delete_terminal")
     @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
     @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_startup_cleanup_revalidates_replacement_under_session_lock(
+        self, mock_snap, mock_list, mock_delete, _mock_all
+    ):
+        """Startup cleanup must not delete a replacement created after discovery."""
+
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        mock_snap.side_effect = [
+            {
+                "panes": [],
+                "workspaces": [{"workspace_id": "ws-old", "label": "my-session"}],
+                "tabs": [],
+            },
+            {
+                "panes": [
+                    {
+                        "pane_id": "pane-new",
+                        "terminal_id": "tid-new",
+                        "workspace_id": "ws-new",
+                    }
+                ],
+                "workspaces": [{"workspace_id": "ws-new", "label": "my-session"}],
+                "tabs": [
+                    {
+                        "label": "replacement-window",
+                        "tab_id": "ws-new:1",
+                        "workspace_id": "ws-new",
+                    }
+                ],
+            },
+        ]
+
+        lock_state = {"held": False}
+
+        @contextmanager
+        def fake_lifecycle_lock(session_name):
+            assert session_name == "my-session"
+            lock_state["held"] = True
+            try:
+                yield
+            finally:
+                lock_state["held"] = False
+
+        def replacement_rows(session_name):
+            assert session_name == "my-session"
+            assert lock_state["held"]
+            return [{"id": "tid-new", "tmux_window": "replacement-window"}]
+
+        mock_list.side_effect = replacement_rows
+        with patch(
+            "cli_agent_orchestrator.services.session_lock.session_lifecycle_lock",
+            fake_lifecycle_lock,
+        ):
+            _run_async(service._startup_db_cleanup())
+
+        assert mock_snap.call_count >= 2
+        mock_delete.assert_not_called()
+
+    @patch("cli_agent_orchestrator.clients.database.list_all_terminals", return_value=[])
+    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch(
+        "cli_agent_orchestrator.clients.database.list_terminals_by_session",
+        side_effect=RuntimeError("database is locked"),
+    )
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_startup_cleanup_session_db_failure_is_deferred_not_fatal(
+        self, mock_snap, _mock_list, mock_delete, mock_all
+    ):
+        """A transient per-session DB failure must not kill Herdr maintenance startup."""
+
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        mock_snap.return_value = {
+            "panes": [],
+            "workspaces": [{"workspace_id": "ws-abc", "label": "my-session"}],
+            "tabs": [],
+        }
+
+        _run_async(service._startup_db_cleanup())
+
+        mock_delete.assert_not_called()
+        mock_all.assert_called_once()
+
+    @patch("cli_agent_orchestrator.clients.database.list_all_terminals", return_value=[])
+    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
     def test_startup_cleanup_deletes_ghost_from_snapshot(
         self, mock_snap, mock_list, mock_delete, _mock_all
     ):

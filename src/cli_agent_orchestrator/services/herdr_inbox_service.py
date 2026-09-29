@@ -255,6 +255,7 @@ class HerdrInboxService:
             list_all_terminals,
             list_terminals_by_session,
         )
+        from cli_agent_orchestrator.services.session_lock import session_lifecycle_lock
 
         snapshot = self._fetch_snapshot()
         if snapshot is None:
@@ -268,46 +269,65 @@ class HerdrInboxService:
             if ws.get("workspace_id") and ws.get("label")
         }
 
-        # workspace_id -> set of live tab labels (= CAO window names)
-        live_tabs_by_workspace: Dict[str, set] = {}
-        for tab in snapshot.get("tabs", []):
-            ws_id = tab.get("workspace_id", "")
-            label = tab.get("label", "")
-            if ws_id and label:
-                live_tabs_by_workspace.setdefault(ws_id, set()).add(label)
-
         deleted = 0
         visited_terminal_ids: Set[str] = set()
-        for ws_id, session_name in workspace_to_session.items():
-            live_labels = live_tabs_by_workspace.get(ws_id, set())
-            db_terminals = list_terminals_by_session(session_name)
-            for term in db_terminals:
-                visited_terminal_ids.add(str(term["id"]))
-                window = term.get("tmux_window", "")
-                if window and window not in live_labels:
-                    if _retain_deferred_failure_tombstone(
-                        term["id"], on_cleanup_deferred=self._pending_tombstone_runtime_cleanup.add
-                    ):
-                        logger.info(
-                            "Startup DB cleanup: retaining deferred-init terminal %s "
-                            "(%s:%s) as external-owner tombstone",
-                            term["id"],
-                            session_name,
-                            window,
-                        )
-                        continue
-                    logger.info(
-                        f"Startup DB cleanup: deleting ghost terminal {term['id']} "
-                        f"({session_name}:{window}) — tab not in herdr"
+        # The startup snapshot is discovery only, just like _reconcile's first
+        # snapshot. HerdrInboxService.start() is spawned as a background task
+        # from FastAPI lifespan, so a request can create a replacement session
+        # after this snapshot but before the DB read. Freeze that name with the
+        # same lifecycle lock as creation, enumerate the CURRENT rows, then take
+        # a fresh scoped snapshot before deleting anything.
+        for session_name in set(workspace_to_session.values()):
+            with session_lifecycle_lock(session_name):
+                try:
+                    db_terminals = list_terminals_by_session(session_name)
+                except Exception as exc:  # noqa: BLE001 — maintenance retries elsewhere
+                    logger.warning(
+                        "Startup DB cleanup: could not list terminals for %s; "
+                        "deferring ghost cleanup: %s",
+                        session_name,
+                        exc,
                     )
-                    try:
-                        delete_terminal(term["id"])
-                        deleted += 1
-                    except Exception as e:
-                        logger.warning(
-                            f"Startup DB cleanup: failed to delete ghost terminal "
-                            f"{term['id']}: {e}"
+                    continue
+
+                live_labels = self._fresh_live_tab_labels_for_session(session_name)
+                if live_labels is None:
+                    logger.warning(
+                        "Startup DB cleanup: could not establish fresh tab liveness "
+                        "for %s; deferring ghost cleanup",
+                        session_name,
+                    )
+                    continue
+
+                for term in db_terminals:
+                    terminal_id = str(term["id"])
+                    visited_terminal_ids.add(terminal_id)
+                    window = term.get("tmux_window", "")
+                    if window and window not in live_labels:
+                        if _retain_deferred_failure_tombstone(
+                            terminal_id,
+                            on_cleanup_deferred=self._pending_tombstone_runtime_cleanup.add,
+                        ):
+                            logger.info(
+                                "Startup DB cleanup: retaining deferred-init terminal %s "
+                                "(%s:%s) as external-owner tombstone",
+                                terminal_id,
+                                session_name,
+                                window,
+                            )
+                            continue
+                        logger.info(
+                            f"Startup DB cleanup: deleting ghost terminal {terminal_id} "
+                            f"({session_name}:{window}) — absent from fresh Herdr state"
                         )
+                        try:
+                            delete_terminal(terminal_id)
+                            deleted += 1
+                        except Exception as e:
+                            logger.warning(
+                                f"Startup DB cleanup: failed to delete ghost terminal "
+                                f"{terminal_id}: {e}"
+                            )
 
         # A workspace may have vanished completely while cao-server was down,
         # in which case it is absent from both snapshot.workspaces and tabs and
