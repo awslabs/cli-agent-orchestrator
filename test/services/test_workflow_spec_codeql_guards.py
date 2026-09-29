@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import ast
 import inspect
+from pathlib import Path
+
+import pytest
 
 from cli_agent_orchestrator.services import workflow_spec_service as svc
 
@@ -89,3 +92,37 @@ def test_update_existence_check_uses_contained_target() -> None:
         "lock_target",
         "safe_base",
     ]
+
+
+def test_contained_exists_refuses_an_escaping_symlink(tmp_path: Path) -> None:
+    outside = tmp_path.parent / "outside.py"
+    link = tmp_path / "escape.py"
+    link.symlink_to(outside)
+
+    with pytest.raises(svc.SpecPathRefusedError, match="escapes its validated directory"):
+        svc._contained_spec_exists(link, str(tmp_path))
+
+
+def test_contained_exists_refuses_the_base_itself(tmp_path: Path) -> None:
+    with pytest.raises(svc.SpecPathRefusedError, match="escapes its validated directory"):
+        svc._contained_spec_exists(tmp_path, str(tmp_path))
+
+
+def test_contained_exists_returns_false_for_an_in_base_dangling_symlink(
+    tmp_path: Path,
+) -> None:
+    link = tmp_path / "dangling.py"
+    link.symlink_to(tmp_path / "missing-target.py")
+
+    assert svc._contained_spec_exists(link, str(tmp_path)) is False
+
+
+def test_contained_exists_returns_true_for_an_in_base_regular_file(tmp_path: Path) -> None:
+    target = tmp_path / "workflow.py"
+    target.write_text("INPUTS = {}\n")
+
+    assert svc._contained_spec_exists(target, str(tmp_path)) is True
+
+
+def test_contained_exists_returns_false_for_an_in_base_missing_name(tmp_path: Path) -> None:
+    assert svc._contained_spec_exists(tmp_path / "missing.py", str(tmp_path)) is False

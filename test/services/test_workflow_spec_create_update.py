@@ -167,6 +167,26 @@ def test_update_refuses_a_missing_spec_and_creates_nothing(tmp_path: Path) -> No
     assert _entries(tmp_path) == []
 
 
+def test_create_refuses_a_symlinked_name_that_resolves_to_the_scan_directory(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "loop.py"
+    target.symlink_to(tmp_path, target_is_directory=True)
+
+    with pytest.raises(svc.SpecPathRefusedError, match="escapes its validated directory"):
+        svc.create_workflow("loop", GOOD, scan_dir=str(tmp_path))
+
+
+def test_update_refuses_a_symlinked_name_that_resolves_to_the_scan_directory(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "loop.py"
+    target.symlink_to(tmp_path, target_is_directory=True)
+
+    with pytest.raises(svc.SpecPathRefusedError, match="escapes its validated directory"):
+        svc.update_workflow("loop", GOOD, "0" * 64, scan_dir=str(tmp_path))
+
+
 def test_refuses_a_cross_tier_collision_before_writing(tmp_path: Path) -> None:
     """BR-3A3-4 / SR-3A3-4 — otherwise the created spec is unreachable on arrival.
 
