@@ -1,9 +1,8 @@
-"""Static script linter (issue #312, Bolt 2 / U1, C2; extended by issue #583).
+"""Static script linter (issue #312, extended by issues #583 and #753).
 
 Issue #312 established the module and its first four rules; issue #583's
 ``recovery-decision-intake`` added the three recovery-policy rules catalogued
-below. Rule ids and ``BR-n`` citations therefore come from TWO rule sets, so
-each is named with its source rather than left bare.
+below; issue #753 adds literal step-id validation.
 
 A pure, dependency-free function of the source text: one ``ast.parse`` plus
 exactly one ``ast.walk`` — no filesystem, no network, no state, and **no
@@ -12,8 +11,7 @@ guarantee). Path safety is the caller's job; ``display_path`` is used only
 for message rendering. ``lint_script`` never raises on bad input — a syntax
 error is a finding, not an exception (U1-BR-6).
 
-Rule catalogue — seven rules (U1 business-rules.md; the three
-recovery-policy rules are issue #583's business-rules.md):
+Rule catalogue — eight rules:
 - ``syntax`` (ERROR) — ``ast.parse`` failed; anchored at ``e.lineno`` or 1.
 - ``disallowed-import`` (ERROR) — static or literal-string dynamic import
   whose first dotted segment is in ``SCRIPT_LINT_DISALLOWED_IMPORT_PREFIXES``
@@ -50,6 +48,10 @@ recovery-policy rules are issue #583's business-rules.md):
   "never validated"; that was false, corrected by PR #628's review.) ``step()``
   is the surface that checks early, and this rule is the only layer that can see
   the difference statically.
+- ``invalid-step-id`` (ERROR) — a CAO ``step()`` or ``run_step()`` call whose
+  explicit ``step_id=`` is a string literal that does not match the shared
+  ``WORKFLOW_NAME_RE`` accepted by the server. Computed ids are left to the
+  existing runtime validation because static analysis cannot resolve them.
 
 ``status == "fail"`` iff at least one ERROR finding (U1-BR-1); ERRORs are
 mirrored into the legacy ``errors`` list as ``"line N: [rule_id] message"``
@@ -77,15 +79,18 @@ from __future__ import annotations
 
 import ast
 import logging
-from typing import List, Literal
+import re
+from typing import List, Literal, Sequence
 
 from cli_agent_orchestrator.constants import (
     SCRIPT_LINT_DISALLOWED_IMPORT_PREFIXES,
     SCRIPT_LINT_NONDETERMINISM_MODULES,
+    WORKFLOW_NAME_RE,
 )
 from cli_agent_orchestrator.models.workflow import LintFinding, ScriptValidationResult
 
 logger = logging.getLogger(__name__)
+_NAME_RE = re.compile(WORKFLOW_NAME_RE)
 
 
 def lint_script(source: str, display_path: str) -> ScriptValidationResult:
@@ -156,7 +161,17 @@ def _walk_tree(tree: ast.AST, findings: List[LintFinding]) -> None:
     their attribute access and why every ``rule_id`` below must appear in
     ``LintFinding``'s ``Literal``.
     """
-    for node in ast.walk(tree):
+    nodes = list(ast.walk(tree))
+    cao_modules, cao_steps, cao_run_steps = _cao_workflow_bindings(tree, nodes)
+    for node in nodes:
+        if isinstance(node, ast.Call) and _is_bound_cao_step_call(
+            node.func,
+            cao_modules,
+            cao_steps,
+            cao_run_steps,
+        ):
+            _check_literal_step_id(node, findings)
+
         if isinstance(node, ast.Import):
             for alias in node.names:
                 _check_module(alias.name, node.lineno, findings)
@@ -252,6 +267,97 @@ def _walk_tree(tree: ast.AST, findings: List[LintFinding]) -> None:
                 )
 
 
+def _cao_workflow_bindings(
+    tree: ast.AST,
+    nodes: Sequence[ast.AST],
+) -> tuple[set[str], set[str], set[str]]:
+    """Return top-level names explicitly imported from ``cao_workflow``.
+
+    The literal-id rule is blocking, so name shape alone is insufficient:
+    another package may export ``run_step`` and a script may define its own
+    ``step``. Top-level imports cover the supported authoring forms while any
+    name rebound elsewhere in the script is treated as ambiguous and left to
+    the existing runtime validation.
+    """
+    module_names: set[str] = set()
+    step_names: set[str] = set()
+    run_step_names: set[str] = set()
+    if not isinstance(tree, ast.Module):
+        return module_names, step_names, run_step_names
+
+    cao_import_aliases: set[int] = set()
+    for top_node in tree.body:
+        if isinstance(top_node, ast.Import):
+            for alias in top_node.names:
+                if alias.name == "cao_workflow":
+                    bound_name = _import_bound_name(alias)
+                    module_names.add(bound_name)
+                    cao_import_aliases.add(id(alias))
+        elif (
+            isinstance(top_node, ast.ImportFrom)
+            and top_node.level == 0
+            and top_node.module == "cao_workflow"
+        ):
+            for alias in top_node.names:
+                bound_name = alias.asname or alias.name
+                if alias.name == "step":
+                    step_names.add(bound_name)
+                    cao_import_aliases.add(id(alias))
+                elif alias.name == "run_step":
+                    run_step_names.add(bound_name)
+                    cao_import_aliases.add(id(alias))
+
+    ambiguous = (
+        (module_names & step_names)
+        | (module_names & run_step_names)
+        | (step_names & run_step_names)
+    )
+    for node in nodes:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                if alias.name == "*":
+                    ambiguous.update(module_names | step_names | run_step_names)
+                    continue
+                bound_name = _import_bound_name(alias)
+                if id(alias) not in cao_import_aliases:
+                    ambiguous.add(bound_name)
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            ambiguous.add(node.id)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            ambiguous.add(node.name)
+        elif isinstance(node, ast.arg):
+            ambiguous.add(node.arg)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            ambiguous.add(node.name)
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
+            ambiguous.add(node.name)
+
+    return (
+        module_names - ambiguous,
+        step_names - ambiguous,
+        run_step_names - ambiguous,
+    )
+
+
+def _import_bound_name(alias: ast.alias) -> str:
+    """Return the local name created by one import alias."""
+    return alias.asname or alias.name.split(".", 1)[0]
+
+
+def _is_bound_cao_step_call(
+    func: ast.expr,
+    module_names: set[str],
+    step_names: set[str],
+    run_step_names: set[str],
+) -> bool:
+    """Match a CAO step call only when its top-level import establishes provenance."""
+    if isinstance(func, ast.Name):
+        return func.id in step_names or func.id in run_step_names
+    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+        return func.value.id in module_names and func.attr in {"step", "run_step"}
+    return False
+
+
 def _is_dynamic_import_call(func: ast.expr) -> bool:
     """Match ``importlib.import_module(...)``, bare ``import_module(...)``
     (from-import shape), and ``__import__(...)`` on a best-effort static basis."""
@@ -315,6 +421,31 @@ def _is_run_step_call(func: ast.expr) -> bool:
     if isinstance(func, ast.Name):
         return func.id == "run_step"
     return False
+
+
+def _check_literal_step_id(node: ast.Call, findings: List[LintFinding]) -> None:
+    """Reject a literal step id the shared server-side identifier rule rejects."""
+    for keyword in node.keywords:
+        if keyword.arg != "step_id":
+            continue
+        value = keyword.value
+        if (
+            isinstance(value, ast.Constant)
+            and isinstance(value.value, str)
+            and not _NAME_RE.fullmatch(value.value)
+        ):
+            findings.append(
+                LintFinding(
+                    rule_id="invalid-step-id",
+                    severity="error",
+                    line=node.lineno,
+                    message=(
+                        "step_id literal is invalid "
+                        "(must be a 1-64 char [A-Za-z0-9_-] identifier)"
+                    ),
+                )
+            )
+        return
 
 
 def _check_module(dotted: str, lineno: int, findings: List[LintFinding]) -> None:

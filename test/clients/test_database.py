@@ -1,26 +1,33 @@
 """Tests for the database client."""
 
+import sqlite3
 import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
+from cli_agent_orchestrator.clients import database as db_mod
 from cli_agent_orchestrator.clients.database import (
     Base,
     FlowModel,
+    IdempotencyKeyModel,
     InboxModel,
+    MemoryMetadataModel,
     TerminalModel,
     create_flow,
     create_inbox_message,
     create_terminal,
     delete_flow,
+    delete_idempotency_key,
     delete_terminal,
     delete_terminals_by_session,
     get_flow,
+    get_idempotency_record,
     get_inbox_messages,
     get_pending_messages,
     get_terminal_group,
@@ -31,6 +38,7 @@ from cli_agent_orchestrator.clients.database import (
     list_pending_receiver_ids_older_than,
     list_siblings_by_group_prefix,
     list_terminals_by_session,
+    list_terminals_in_sessions,
     update_flow_enabled,
     update_flow_run_times,
     update_last_active,
@@ -218,7 +226,7 @@ class TestTerminalOperations:
         mock_terminal.last_active = datetime.now()
 
         mock_query = MagicMock()
-        mock_query.filter.return_value.all.return_value = [mock_terminal]
+        mock_query.filter.return_value.order_by.return_value.all.return_value = [mock_terminal]
         mock_session.query.return_value = mock_query
         mock_session_class.return_value = mock_session
 
@@ -328,6 +336,237 @@ class TestTerminalOperations:
         result = delete_terminals_by_session("cao-session")
 
         assert result == 2
+
+
+class TestIdempotencyKey:
+    """Tests for the idempotency-key mapping (review on PR #634, issue #616).
+
+    A caller-supplied key lets a retry (e.g. a killed ``cao agent handoff``)
+    reattach to the terminal a prior, already-committed call already
+    produced instead of creating a second one.
+    """
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_create_terminal_with_key_persists_both_rows(self, mock_session_class):
+        """The idempotency row is added in the SAME session as the terminal
+        row -- one extra add(), the SAME shared commit()."""
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        mock_session_class.return_value = mock_session
+
+        create_terminal(
+            "test123",
+            "cao-session",
+            "window-0",
+            "kiro_cli",
+            "developer",
+            idempotency_key="retry-key-1",
+        )
+
+        assert mock_session.add.call_count == 2
+        added_terminal = mock_session.add.call_args_list[0][0][0]
+        added_key_row = mock_session.add.call_args_list[1][0][0]
+        assert isinstance(added_terminal, TerminalModel)
+        assert isinstance(added_key_row, IdempotencyKeyModel)
+        assert added_key_row.key == "retry-key-1"
+        assert added_key_row.terminal_id == "test123"
+        mock_session.commit.assert_called_once()
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_create_terminal_without_key_adds_only_the_terminal_row(self, mock_session_class):
+        """Default (no key): today's exact behavior, unchanged -- a single add()."""
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        mock_session_class.return_value = mock_session
+
+        create_terminal("test123", "cao-session", "window-0", "kiro_cli", "developer")
+
+        mock_session.add.assert_called_once()
+
+    def test_get_idempotency_record_returns_none_for_an_unused_key(self, test_db):
+        """The DB layer's own contract for a miss (review on PR #634)."""
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            assert get_idempotency_record("never-seen") is None
+
+    def test_fingerprint_round_trips_through_a_real_database(self, test_db):
+        """The WRITE->READ seam, against real SQLite (review on PR #634).
+
+        Both halves of this were already pinned in isolation -- the service
+        asserts the fingerprint it hands to ``create_terminal``, and the
+        comparison logic is unit-tested against a stubbed lookup -- but nothing
+        exercised the seam BETWEEN them. A column that is written but not read
+        back (or read from the wrong attribute) would leave every stored
+        fingerprint blank, every comparison a mismatch, and every retry a 409,
+        while both halves' own tests stayed green. A mock cannot catch that;
+        only a real write followed by a real read can.
+        """
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            create_terminal(
+                "term-fp",
+                "cao-session",
+                "window-0",
+                "kiro_cli",
+                "developer",
+                idempotency_key="fp-key",
+                request_fingerprint="deadbeef",
+            )
+
+            record = get_idempotency_record("fp-key")
+
+        assert record is not None
+        assert record.terminal_id == "term-fp"
+        # The exact value survives -- not merely "something non-empty", which a
+        # column defaulting to "" would also satisfy.
+        assert record.request_fingerprint == "deadbeef"
+
+    def test_a_key_persisted_without_a_fingerprint_reads_back_blank(self, test_db):
+        """The `or ""` in create_terminal, pinned.
+
+        `request_fingerprint` is NOT NULL with no server default, so a caller
+        that supplies a key but no fingerprint must still produce a readable
+        row rather than an IntegrityError. It reads back blank, which every
+        real comparison then mismatches -- the deliberate fail-loud choice
+        (there is no skip-on-blank branch to test).
+        """
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            create_terminal(
+                "term-blank",
+                "cao-session",
+                "window-0",
+                "kiro_cli",
+                "developer",
+                idempotency_key="blank-key",
+            )
+
+            record = get_idempotency_record("blank-key")
+
+        assert record is not None
+        assert record.request_fingerprint == ""
+
+    def test_same_key_twice_is_atomic_second_attempt_persists_nothing(self, test_db):
+        """The core atomicity property: two create_terminal calls with the
+        SAME key but (inevitably) DIFFERENT generated terminal_ids -- the
+        second's commit fails on the idempotency_keys table's primary key,
+        and BOTH of its inserts roll back together, not just the
+        conflicting one. Needs a REAL in-memory SQLite engine (not a mock):
+        a mock has no transaction to roll back, so this is exactly the
+        property a mock-based test cannot exercise."""
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            create_terminal(
+                "term-first",
+                "cao-session",
+                "window-0",
+                "kiro_cli",
+                "developer",
+                idempotency_key="shared-key",
+            )
+
+            with pytest.raises(IntegrityError):
+                create_terminal(
+                    "term-second",
+                    "cao-session",
+                    "window-1",
+                    "kiro_cli",
+                    "developer",
+                    idempotency_key="shared-key",
+                )
+
+            # The winner's mapping and terminal both survive the second
+            # call's failed transaction.
+            assert get_idempotency_record("shared-key").terminal_id == "term-first"
+            assert get_terminal_metadata("term-first") is not None
+            # The loser's terminal row must NOT exist. If it did, the two
+            # inserts were not actually atomic -- only the idempotency insert
+            # rolled back, leaving an orphan terminal row with no
+            # idempotency mapping and no caller aware it was ever created.
+            assert get_terminal_metadata("term-second") is None
+
+    def test_different_keys_create_independent_terminals(self, test_db):
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            create_terminal(
+                "term-a",
+                "cao-session",
+                "window-0",
+                "kiro_cli",
+                "developer",
+                idempotency_key="key-a",
+            )
+            create_terminal(
+                "term-b",
+                "cao-session",
+                "window-1",
+                "kiro_cli",
+                "developer",
+                idempotency_key="key-b",
+            )
+
+            assert get_idempotency_record("key-a").terminal_id == "term-a"
+            assert get_idempotency_record("key-b").terminal_id == "term-b"
+            assert get_terminal_metadata("term-a") is not None
+            assert get_terminal_metadata("term-b") is not None
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_delete_idempotency_key_matching_terminal_id(self, mock_session_class):
+        """Review on PR #634: this is what lets create_terminal's
+        stale-mapping fallthrough clear a dangling row before recreating,
+        instead of colliding with it on the next insert."""
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        mock_query = MagicMock()
+        mock_query.filter.return_value.delete.return_value = 1
+        mock_session.query.return_value = mock_query
+        mock_session_class.return_value = mock_session
+
+        assert delete_idempotency_key("stale-key", "long-gone-terminal") is True
+        mock_session.commit.assert_called_once()
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_delete_idempotency_key_no_match_returns_false(self, mock_session_class):
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        mock_query = MagicMock()
+        mock_query.filter.return_value.delete.return_value = 0
+        mock_session.query.return_value = mock_query
+        mock_session_class.return_value = mock_session
+
+        assert delete_idempotency_key("never-seen", "some-terminal") is False
+
+    def test_delete_idempotency_key_guard_skips_a_mapping_already_replaced(self, test_db):
+        """The compare-and-delete guard: if the row no longer points to the
+        terminal_id the caller expected (a concurrent winner already
+        replaced it), this must delete nothing -- NOT blindly remove
+        whatever the current mapping is."""
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            create_terminal(
+                "term-winner",
+                "cao-session",
+                "window-0",
+                "kiro_cli",
+                "developer",
+                idempotency_key="shared-key",
+            )
+
+            assert delete_idempotency_key("shared-key", "term-stale-guess") is False
+            # The real, current mapping survives untouched.
+            assert get_idempotency_record("shared-key").terminal_id == "term-winner"
+
+    def test_delete_idempotency_key_removes_a_real_row(self, test_db):
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            create_terminal(
+                "term-old",
+                "cao-session",
+                "window-0",
+                "kiro_cli",
+                "developer",
+                idempotency_key="reused-key",
+            )
+
+            assert delete_idempotency_key("reused-key", "term-old") is True
+            assert get_idempotency_record("reused-key") is None
 
 
 class TestGroupAndMetadata:
@@ -1454,6 +1693,7 @@ class TestTerminalsSchemaMigration:
             rows = conn.execute("SELECT id, caller_id, working_directory FROM terminals").fetchall()
         assert "caller_id" in columns
         assert "working_directory" in columns
+        assert "provider_variant" in columns
         assert rows == [("abc12345", None, None)], "existing rows must get NULL metadata values"
 
     def test_migration_is_idempotent(self, tmp_path, monkeypatch):
@@ -1484,6 +1724,7 @@ class TestTerminalsSchemaMigration:
         assert columns.count("caller_id") == 1
         assert columns.count("working_directory") == 1
         assert columns.count("allowed_tools") == 1
+        assert columns.count("provider_variant") == 1
 
     def test_group_and_metadata_columns_added_to_legacy_table(self, tmp_path, monkeypatch):
         """#432: a pre-existing terminals table (predating group/metadata) gains both
@@ -1634,6 +1875,7 @@ class TestTerminalsSchemaMigration:
                 assert row is not None
                 assert row["group"] is None, "pre-migration rows must read group as NULL"
                 assert row["metadata"] is None, "pre-migration rows must read metadata as NULL"
+                assert row["provider_variant"] is None
 
             # Original pre-migration data must survive untouched.
             assert aaaa["tmux_session"] == "cao-sess-1"
@@ -1654,6 +1896,7 @@ class TestTerminalsSchemaMigration:
             columns = [row[1] for row in conn.execute("PRAGMA table_info(terminals)")]
         assert columns.count("group") == 1
         assert columns.count("metadata") == 1
+        assert columns.count("provider_variant") == 1
 
 
 class TestTerminalMetadataRoundTrip:
@@ -1768,3 +2011,434 @@ class TestProjectAliasMigration:
         with sqlite3.connect(str(db_file)) as conn:
             rows = conn.execute("SELECT alias, project_id FROM project_aliases").fetchall()
         assert rows == [("a1", "p1")], "current-schema table must be left intact"
+
+
+class TestMemoryScopeNullUniquenessMigration:
+    """Partial unique index for NULL scope_id rows (issue #657).
+
+    SQLite treats NULL != NULL in a UNIQUE index, so the table-level
+    uq_memory_key_scope never fired for global/federated memories; the
+    partial index covers exactly those rows. Real SQLite throughout — the
+    NULL-distinctness being asserted is engine behavior no mock can exercise.
+    """
+
+    def _mem(self, key, file_path, scope="global", scope_id=None):
+        return MemoryMetadataModel(
+            key=key,
+            memory_type="project",
+            scope=scope,
+            scope_id=scope_id,
+            file_path=file_path,
+            tags="",
+        )
+
+    def _legacy_db(self, tmp_path, monkeypatch, dupe_paths=()):
+        """A legacy pre-#657 database: fresh schema, partial index dropped,
+        optionally seeded with duplicate global rows the old constraint let
+        in. DATABASE_FILE is pointed at it."""
+        db_file = tmp_path / "legacy.db"
+        engine = create_engine(f"sqlite:///{db_file}")
+        Base.metadata.create_all(bind=engine)
+        engine.dispose()
+        with sqlite3.connect(str(db_file)) as conn:
+            conn.execute("DROP INDEX IF EXISTS uq_memory_key_scope_null")
+            for path in dupe_paths:
+                conn.execute(
+                    "INSERT INTO memory_metadata (id, key, memory_type, scope, scope_id, "
+                    "file_path, tags, access_count) "
+                    f"VALUES ('{path}', 'd', 'project', 'global', NULL, '{path}', '', 0)"
+                )
+            conn.commit()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.constants.DATABASE_FILE", db_file, raising=False
+        )
+        return db_file
+
+    def test_fresh_database_rejects_duplicate_global_rows(self):
+        """Two (key, global, NULL) rows must collide — the reporter's case.
+        The scoped sibling of the same key stays distinct: that is what
+        keeping scope_id nullable (not the sentinel) buys."""
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(bind=engine)
+        with sessionmaker(bind=engine)() as s:
+            s.add(self._mem("shared", "/a.md"))
+            s.commit()
+            s.add(self._mem("shared", "/b.md"))
+            with pytest.raises(IntegrityError):
+                s.commit()
+            s.rollback()
+            s.add(self._mem("shared", "/c.md", scope="session", scope_id="t1"))
+            s.commit()  # distinct (key, scope, scope_id) — accepted
+            rows = s.query(MemoryMetadataModel).order_by(MemoryMetadataModel.scope).all()
+        assert [r.scope for r in rows] == ["global", "session"]
+
+    def test_existing_database_gains_the_index(self, tmp_path, monkeypatch):
+        """A pre-index database gets uq_memory_key_scope_null on init."""
+        db_file = self._legacy_db(tmp_path, monkeypatch)
+        db_mod._migrate_memory_scope_null_uniqueness()
+
+        with sqlite3.connect(str(db_file)) as conn:
+            names = {r[1] for r in conn.execute("PRAGMA index_list('memory_metadata')")}
+        assert "uq_memory_key_scope_null" in names
+
+    def test_duplicate_seed_skips_index_then_recovers_after_repair(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """Fail-soft path (both seeded-duplicate cases from the issue): with
+        duplicates present the index is skipped with a warning naming them
+        and pointing at cao memory repair, and rows are kept; re-running
+        after the repair creates the index."""
+        db_file = self._legacy_db(tmp_path, monkeypatch, dupe_paths=("/1.md", "/2.md"))
+        with caplog.at_level("WARNING"):
+            db_mod._migrate_memory_scope_null_uniqueness()  # skips, warns
+
+        assert any("uq_memory_key_scope_null" in r.message for r in caplog.records)
+        assert any("cao memory repair" in r.message for r in caplog.records)
+        with sqlite3.connect(str(db_file)) as conn:
+            names = {r[1] for r in conn.execute("PRAGMA index_list('memory_metadata')")}
+            rows = conn.execute("SELECT COUNT(*) FROM memory_metadata").fetchone()[0]
+        assert "uq_memory_key_scope_null" not in names
+        assert rows == 2, "duplicates must be left for `cao memory repair`, never deleted here"
+
+        # The repair the warning advertises: the reconciliation service's
+        # dedupe path clears the stale sibling, then re-invokes the migrator.
+        # The seeded rows carry key='d', so the canonical topic is 'd.md'.
+        from cli_agent_orchestrator.services.memory_reconciliation import (
+            MemoryReconciliationService,
+        )
+
+        base_dir = tmp_path / "memory"
+        topic = base_dir / "global" / "wiki" / "global" / "d.md"
+        topic.parent.mkdir(parents=True, exist_ok=True)
+        topic.write_text(
+            "# d\n"
+            "<!-- id: 11111111-1111-1111-1111-111111111111 | scope: global | "
+            "type: reference | tags:  -->\n\n"
+            "## 2026-07-15T01:00:00Z\ndurable body\n",
+            encoding="utf-8",
+        )
+        with sqlite3.connect(str(db_file)) as conn:
+            conn.execute(
+                "UPDATE memory_metadata SET file_path = ? WHERE file_path = '/1.md'",
+                (str(topic),),
+            )
+            conn.commit()
+        engine = create_engine(f"sqlite:///{db_file}")
+        try:
+            report = MemoryReconciliationService(base_dir, engine).apply()
+            assert report.counts["dedupe_metadata"] == 1
+        finally:
+            engine.dispose()
+        with sqlite3.connect(str(db_file)) as conn:
+            names = {r[1] for r in conn.execute("PRAGMA index_list('memory_metadata')")}
+            rows = conn.execute("SELECT COUNT(*) FROM memory_metadata").fetchone()[0]
+        assert rows == 1, "the canonical row survives the advertised repair"
+        assert "uq_memory_key_scope_null" in names, "repair re-attempts the index in-run"
+
+
+class TestListTerminalsInSessions:
+    """Real-SQLite tests for the batched terminal read (issue #629).
+
+    Mocked-``SessionLocal`` tests cannot cover what matters here — that the
+    ``IN`` filter and the ``ORDER BY`` are actually applied by SQL — so these
+    run against a real database.
+    """
+
+    @pytest.fixture
+    def db(self, tmp_path, monkeypatch):
+        engine = create_engine(
+            f"sqlite:///{tmp_path / 'terminals.db'}",
+            connect_args={"check_same_thread": False},
+        )
+        Base.metadata.create_all(bind=engine)
+        Local = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.clients.database.SessionLocal",
+            Local,
+        )
+        return Local
+
+    @staticmethod
+    def _add(Local, terminal_id, tmux_session, agent_profile="developer"):
+        with Local() as s:
+            s.add(
+                TerminalModel(
+                    id=terminal_id,
+                    tmux_session=tmux_session,
+                    tmux_window=f"win-{terminal_id}",
+                    provider="kiro_cli",
+                    agent_profile=agent_profile,
+                    working_directory=f"/w/{terminal_id}",
+                    last_active=datetime.now(),
+                )
+            )
+            s.commit()
+
+    def test_returns_only_the_requested_sessions(self, db):
+        """Rows for other sessions are not read — this is what bounds the query.
+
+        Rows for sessions tmux no longer reports are only swept at server
+        startup by ``cleanup_service.cleanup_old_data``, so on a long-uptime
+        server they accumulate. A whole-table read would make every caller pay
+        for them.
+        """
+        self._add(db, "a1", "cao-alpha")
+        self._add(db, "b1", "cao-beta")
+        for n in range(25):
+            self._add(db, f"dead{n:02d}", f"cao-dead-{n}")
+
+        result = list_terminals_in_sessions(["cao-alpha", "cao-beta"])
+
+        assert {t["id"] for t in result} == {"a1", "b1"}
+        assert {t["tmux_session"] for t in result} == {"cao-alpha", "cao-beta"}
+
+    def test_no_session_names_does_not_query(self, db):
+        """An empty request short-circuits rather than degenerating to a scan.
+
+        ``IN ()`` is a SQLAlchemy warning and an empty result anyway; the guard
+        makes it explicit and free.
+        """
+        self._add(db, "a1", "cao-alpha")
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal") as mock_local:
+            assert list_terminals_in_sessions([]) == []
+            mock_local.assert_not_called()
+
+    # ``indexed`` is not a detail — it is what makes this test discriminating.
+    # Without an index on ``tmux_session`` an UNORDERED read already scans in
+    # rowid order, so the unindexed case alone would pass with no ``ORDER BY``
+    # at all: it pins "not ordered by id" but not "ordered at all". The indexed
+    # case closes that, because the index makes an unordered probe return the
+    # lower-sorting worker first. Both cases are run so a reader can see which
+    # guarantee each one buys.
+    @pytest.mark.parametrize("indexed", [False, True], ids=["no_index", "with_index"])
+    def test_session_creator_is_first_not_the_lowest_uuid(self, db, indexed):
+        """The conductor wins the ownership pick even when its id sorts last.
+
+        ``_enrich_session_ownership`` takes a session's *first* terminal, so this
+        order decides which terminal's agent_profile/working_directory is
+        reported as the session's. Ordering by ``id`` would decide it by
+        ``uuid4().hex[:8]`` — a deterministic *random* terminal.
+
+        The ids are the ones from the #703 review, and the insertion order is the
+        REACHABLE one: the creator is inserted first (a child cannot be spawned
+        by a caller that has no row yet — the MCP handoff 404s on
+        ``GET /terminals/{caller_id}``) but its uuid sorts ABOVE the child's. So
+        ``ORDER BY id`` fails this, and with ``indexed`` so does no ORDER BY.
+        """
+        self._add(db, "f0000000", "cao-alpha", agent_profile="supervisor")
+        self._add(db, "10000000", "cao-alpha", agent_profile="developer")
+        if indexed:
+            with db() as s:
+                s.execute(text("CREATE INDEX ix_probe ON terminals (tmux_session, id)"))
+                s.commit()
+            # Sanity: with the index, an unordered read really does put the
+            # worker first — so this case is exercising the ORDER BY and not
+            # asserting a no-op. Which index shapes reorder is unintuitive and
+            # is a property of these ids rather than a general rule: measured
+            # for this pair, ``(tmux_session, id)`` and ``(tmux_session DESC,
+            # id)`` reorder the probe while ``(tmux_session, id DESC)`` and
+            # ``(tmux_session)`` alone do not. Hence the guard below rather than
+            # an assumption.
+            # Probe with the SAME column list the production read selects. A
+            # bare ``SELECT id`` gets a covering-index plan, which could keep
+            # reordering after the production plan stopped — leaving the real
+            # assertions below vacuous while this guard still passed.
+            with db() as s:
+                probe = [
+                    r[0]
+                    for r in s.execute(
+                        text(
+                            "SELECT id, tmux_session, tmux_window, provider, agent_profile, "
+                            "working_directory, engine, last_active FROM terminals "
+                            "WHERE tmux_session = 'cao-alpha'"
+                        )
+                    )
+                ]
+            assert (
+                probe[0] == "10000000"
+            ), "index no longer reorders; case has stopped discriminating"
+
+        for read in (
+            list_terminals_in_sessions(["cao-alpha"]),
+            list_terminals_by_session("cao-alpha"),
+        ):
+            assert [t["id"] for t in read] == ["f0000000", "10000000"]
+            assert read[0]["agent_profile"] == "supervisor"
+
+    def test_order_is_creation_order_not_recent_activity(self, db):
+        """Activity must not reorder a session. Pins the case against ``last_active``.
+
+        ``last_active`` is the obvious-looking "cleanup" for an implicit rowid
+        order — a real, declared column instead of a storage detail — and it is
+        exactly wrong. It is written only on input delivery
+        (``send_input``/``send_special_key``), so the conductor, which receives
+        operator input plus every worker callback, ends up with the LATEST value
+        and sorts LAST. ``TerminalModel`` argues this in prose; without this test
+        nothing enforces it, because every other test here happens to write
+        ``last_active`` in creation order, which makes the two orderings agree.
+
+        One keystroke to the conductor is enough to tell them apart: after it,
+        ``ORDER BY last_active`` returns the worker first while creation order
+        does not move. It also covers any write that re-inserts the row rather
+        than updating it in place (a delete-plus-insert reassigns rowid), which
+        the source-level upsert guard cannot see.
+        """
+        self._add(db, "f0000000", "cao-alpha", agent_profile="supervisor")
+        self._add(db, "10000000", "cao-alpha", agent_profile="developer")
+
+        update_last_active("f0000000")  # the conductor receives one keystroke
+
+        for read in (
+            list_terminals_in_sessions(["cao-alpha"]),
+            list_terminals_by_session("cao-alpha"),
+        ):
+            assert [t["id"] for t in read] == ["f0000000", "10000000"]
+            assert read[0]["agent_profile"] == "supervisor"
+
+    def test_rowid_reuse_after_deletion_does_not_reorder(self, db):
+        """Deleting the newest terminal and adding another keeps the creator first.
+
+        ``rowid`` is not ``AUTOINCREMENT``, so a deleted row's rowid can be handed
+        out again — the one property that could plausibly make insertion order an
+        unsafe key. It cannot invert a session's order, because SQLite assigns
+        ``max(rowid)+1`` over the whole table and so a new row outranks every
+        LIVE row, including all of its own session's.
+        """
+        self._add(db, "f0000000", "cao-alpha", agent_profile="supervisor")
+        self._add(db, "20000000", "cao-alpha", agent_profile="developer")
+        delete_terminal("20000000")  # frees the max rowid
+        self._add(db, "10000000", "cao-alpha", agent_profile="developer")
+
+        result = list_terminals_in_sessions(["cao-alpha"])
+
+        assert [t["id"] for t in result] == ["f0000000", "10000000"]
+        assert result[0]["agent_profile"] == "supervisor"
+
+    def test_matches_the_per_session_read_shape_and_order(self, db):
+        """Same keys AND same order as ``list_terminals_by_session``.
+
+        Callers are documented as interchangeable, and an ordered batched read
+        beside an unordered per-session read is exactly what let the two
+        disagree about the conductor. Uses a multi-row session whose creation
+        order disagrees with id order, so a single-row check cannot pass this by
+        proving nothing.
+        """
+        self._add(db, "zzz", "cao-alpha", agent_profile="supervisor")
+        self._add(db, "aaa", "cao-alpha")
+        # A row in ANOTHER session, so "same result" is a real claim: without it,
+        # dropping either read's session filter is indistinguishable from keeping
+        # it, and only a mock call-shape assertion elsewhere notices.
+        self._add(db, "other", "cao-beta")
+
+        batched = list_terminals_in_sessions(["cao-alpha"])
+        per_session = list_terminals_by_session("cao-alpha")
+
+        assert batched == per_session
+        assert [t["id"] for t in batched] == ["zzz", "aaa"]
+        # Keys pinned absolutely, not just against each other — a key dropped
+        # from BOTH projections would otherwise pass while breaking consumers.
+        assert set(batched[0]) == {
+            "id",
+            "tmux_session",
+            "tmux_window",
+            "provider",
+            "agent_profile",
+            "working_directory",
+            "engine",
+            "last_active",
+        }
+
+    def test_an_upsert_would_break_the_ordering_contract(self, db):
+        """Demonstrates the one operation that moves a row within its session.
+
+        ``INSERT OR REPLACE`` (and any upsert on the primary key) is a delete
+        plus an insert, so the replaced row is assigned a NEW rowid and jumps to
+        the END of its session — which would silently make a session report the
+        wrong conductor. This is not a bug being asserted as correct: it is the
+        documented limit of the ordering contract on ``TerminalModel``, pinned so
+        the consequence is visible rather than folded into a comment.
+
+        The companion guard below is what actually prevents it: this test shows
+        WHY that guard exists.
+        """
+        self._add(db, "f0000000", "cao-alpha", agent_profile="supervisor")
+        self._add(db, "10000000", "cao-alpha", agent_profile="developer")
+        assert [t["id"] for t in list_terminals_by_session("cao-alpha")] == [
+            "f0000000",
+            "10000000",
+        ]
+
+        with db() as s:
+            s.execute(
+                text(
+                    "INSERT OR REPLACE INTO terminals "
+                    "(id, tmux_session, tmux_window, provider, agent_profile) "
+                    "VALUES ('f0000000', 'cao-alpha', 'win-f0000000', 'kiro_cli', 'supervisor')"
+                )
+            )
+            s.commit()
+
+        assert [t["id"] for t in list_terminals_by_session("cao-alpha")] == [
+            "10000000",
+            "f0000000",
+        ], "an upsert must be understood to move the row; if this ever passes unchanged, re-read the contract"
+
+
+def test_no_upsert_against_the_terminals_table():
+    """No code path may upsert ``terminals`` — it would silently reassign rowid.
+
+    The ownership contract (index 0 of a terminals read is a session's oldest
+    surviving row) rests on rowid being insertion order. A replace is a delete
+    plus an insert, so the row gets a NEW rowid and jumps to the end of its
+    session, handing the conductor slot to a worker — silently, with no test
+    failing anywhere near the change. A comment on the model cannot prevent that,
+    so this scans the source instead: same shape as ``test/test_no_ffi_guard.py``,
+    a cheap structural guard for an invariant no unit test can express. Use an
+    ``UPDATE``.
+
+    Covers the three spellings that actually reassign rowid, each required to
+    name ``terminals`` directly. Deliberately does NOT cover ``Session.merge``:
+    it emits an UPDATE for an existing primary key, so the rowid — and the order
+    — survive. Verified rather than assumed.
+
+    Known limitation: a docstring that spells one of these statements verbatim
+    against ``terminals`` will trip this. ``#`` comments are skipped (which is
+    why the ``TerminalModel`` contract can discuss the hazard), so use one, or
+    break up the phrase.
+    """
+    import re
+
+    src_root = Path(__file__).resolve().parents[2] / "src"
+    assert src_root.is_dir(), src_root
+
+    quote = r"""["'`]?"""
+    upsert = re.compile(
+        # SQL text: the table name must follow the verb, so an upsert on some
+        # other table cannot be dragged in by the word "terminals" appearing
+        # nearby -- which a proximity window did, making the pre-existing
+        # workflow_run_step upsert safe only by distance.
+        rf"(?:INSERT\s+OR\s+REPLACE\s+INTO|REPLACE\s+INTO)\s+{quote}terminals\b"
+        # SQLAlchemy construct: the table is not adjacent, so fall back to
+        # requiring TerminalModel/terminals in the same statement.
+        r"|on_conflict_do_update[^\n]*",
+        re.I,
+    )
+    offenders = []
+    for path in src_root.rglob("*.py"):
+        text_ = path.read_text(encoding="utf-8", errors="replace")
+        for match in upsert.finditer(text_):
+            line_no = text_.count("\n", 0, match.start()) + 1
+            line = text_.splitlines()[line_no - 1]
+            if line.lstrip().startswith("#"):
+                continue
+            if match.group(0).lower().startswith("on_conflict") and not re.search(
+                r"TerminalModel|\bterminals\b", match.group(0), re.I
+            ):
+                continue
+            offenders.append(f"{path.relative_to(src_root)}:{line_no}: {line.strip()}")
+
+    assert not offenders, (
+        "upsert against terminals would break the ownership ordering contract "
+        "(see TerminalModel); use UPDATE instead:\n  " + "\n  ".join(offenders)
+    )

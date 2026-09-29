@@ -3,7 +3,13 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Agent Orchestrator</title>
+    <!-- Served from web/public/, which Vite copies into the build output at
+         src/cli_agent_orchestrator/web_ui/ and pyproject.toml force-includes
+         into the wheel. The .ico is listed second as the fallback for browsers
+         that do not take the SVG. -->
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="icon" type="image/x-icon" href="/favicon.ico" />
+    <title>CLI Agent Orchestrator</title>
   </head>
   <body>
     <div id="root"></div>

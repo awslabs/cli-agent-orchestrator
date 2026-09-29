@@ -63,11 +63,10 @@ class TestHandleStartupPromptsBranches:
 
         await provider._handle_startup_prompts(idle_gap=1.0)
 
-        # Down arrow sent via send_keys, Enter via send_special_key
-        mock_backend.send_keys.assert_called_once()
-        mock_backend.send_special_key.assert_called_once_with(
-            provider.session_name, provider.window_name, "Enter"
-        )
+        assert [call.args[2] for call in mock_backend.send_special_key.call_args_list] == [
+            "Down",
+            "Enter",
+        ]
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.claude_code.asyncio.sleep")
@@ -96,7 +95,15 @@ class TestHandleStartupPromptsBranches:
             "❯ 1. Yes, I trust this folder\n"
             "  2. No, exit\n"
         )
-        mock_backend.get_history.side_effect = [echoed_launch_cmd, trust_frame]
+        # A third frame is required because accepting trust no longer ends the
+        # handler: the model-upgrade nudge can render after it, so the loop keeps
+        # polling until the banner (or the idle gap). Without the banner frame
+        # here the mock's side_effect list runs dry mid-loop.
+        mock_backend.get_history.side_effect = [
+            echoed_launch_cmd,
+            trust_frame,
+            "Welcome to Claude Code v2.1.235",
+        ]
 
         await provider._handle_startup_prompts(idle_gap=5.0)
 

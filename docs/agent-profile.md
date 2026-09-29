@@ -32,7 +32,7 @@ portable and make profile listings useful.
 
 - `provider` (string): provider preference for this profile.
 - `role` (string): named tool-access role, such as `supervisor`, `developer`,
-  or `reviewer`.
+  `reviewer`, or `workflow_scout`.
 - `allowedTools` (array of strings): explicit CAO tool allowlist; when present,
   it overrides the role defaults.
 - `capabilities` (array of strings): profile-discovery statements, with at most
@@ -63,9 +63,18 @@ portable and make profile listings useful.
 - `mcpServers` (object): MCP server definitions. Each entry defines either
   `command` (with optional `args`, `env`, `timeout`) for a server CAO launches,
   or `url` for a remote one, with `type` naming its transport (for example
-  `http` or `sse`). An entry defining neither is invalid.
+  `http` or `sse`) and optional `headers` for a remote server that
+  authenticates. An entry defining neither is invalid. For a worked example
+  of a remote-URL MCP server, see
+  [examples/youcom-search](../examples/youcom-search/README.md); for one that
+  authenticates with a header and keeps the key out of the committed profile,
+  see [examples/serply-research](../examples/serply-research/README.md).
 - `tools` (array), `toolAliases` (object), and `toolsSettings` (object):
-  provider tool configuration.
+  provider tool configuration. `tools` is the provider's own tool catalog and
+  is passed through to it; it is not the CAO allowlist and does not restrict
+  what an agent may call. Use `allowedTools` or `role` for that, including for
+  CAO's own MCP tools, which are granted by the `@cao-mcp-server` selector.
+  See [Tool Restrictions](tool-restrictions.md).
 - `resources` (array), `hooks` (object), and `useLegacyMcpJson` (boolean):
   provider-native configuration passed through where supported.
 - `model` (string): provider model selection.
@@ -97,7 +106,9 @@ relying on a duplicated compatibility catalog here.
 
 If neither `role` nor `allowedTools` is set, CAO resolves the profile with the
 default developer permissions. An explicit `allowedTools` list overrides role
-defaults. Launch-time options can then alter those resolved restrictions.
+defaults, including when `role` is unrecognized. An unrecognized `role` with
+no `allowedTools` raises `ValueError` instead of falling open to `["*"]`.
+Launch-time options can then alter those resolved restrictions.
 
 See [Tool Restrictions](tool-restrictions.md) for built-in roles, the tool
 vocabulary, launch overrides, provider enforcement, and limitations.

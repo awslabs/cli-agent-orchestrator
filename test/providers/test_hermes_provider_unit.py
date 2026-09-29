@@ -292,9 +292,9 @@ class TestHermesInitialization:
     @patch("cli_agent_orchestrator.providers.hermes.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.hermes.wait_until_status")
     @patch("cli_agent_orchestrator.providers.hermes.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.hermes.tmux_client")
+    @patch("cli_agent_orchestrator.providers.hermes.get_backend")
     async def test_initialize_success(
-        self, mock_tmux, mock_wait_shell, mock_wait_status, mock_load
+        self, mock_backend_factory, mock_wait_shell, mock_wait_status, mock_load
     ):
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
@@ -304,7 +304,7 @@ class TestHermesInitialization:
         result = await provider.initialize()
 
         assert result is True
-        mock_tmux.send_keys.assert_called_once_with(
+        mock_backend_factory.return_value.send_keys.assert_called_once_with(
             "sess", "win", "test-worker chat --yolo --accept-hooks --source cao"
         )
 
@@ -321,9 +321,9 @@ class TestHermesInitialization:
     @patch("cli_agent_orchestrator.providers.hermes.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.hermes.wait_until_status")
     @patch("cli_agent_orchestrator.providers.hermes.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.hermes.tmux_client")
+    @patch("cli_agent_orchestrator.providers.hermes.get_backend")
     async def test_initialize_hermes_timeout(
-        self, mock_tmux, mock_wait_shell, mock_wait_status, mock_load
+        self, mock_backend_factory, mock_wait_shell, mock_wait_status, mock_load
     ):
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = False

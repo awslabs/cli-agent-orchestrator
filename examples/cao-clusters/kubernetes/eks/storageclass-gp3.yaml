@@ -1,0 +1,30 @@
+# StorageClass for the supervisor's EBS-backed CAO state claim.
+#
+# A fresh EKS cluster ships only `gp2`, backed by the legacy in-tree provisioner,
+# so without this the state PVCs never bind and the pods stay Pending.
+#
+# `efs-sc`, the other class the manifests name, is defined in storage.yaml.
+#
+# On a cluster that already defines `gp3`, drop this file from kustomization.yaml:
+# a StorageClass's provisioner, parameters and reclaimPolicy are immutable, so
+# applying over an existing one is rejected and fails the whole apply.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gp3
+  labels:
+    app.kubernetes.io/part-of: cao-elastic-fleet
+provisioner: ebs.csi.aws.com
+# An EBS volume lives in one Availability Zone. Binding before the pod is
+# scheduled can place the volume in an AZ the pod cannot run in, leaving the pod
+# Pending indefinitely.
+volumeBindingMode: WaitForFirstConsumer
+# Keep the volume when its PVC is deleted, so removing the fleet does not discard
+# the session database and terminal logs. The cost is that deleting a PVC leaves
+# a released PV and a billable EBS volume behind, to be removed by hand. Switch to
+# Delete if you would rather teardown left nothing.
+reclaimPolicy: Retain
+allowVolumeExpansion: true
+parameters:
+  type: gp3
+  encrypted: "true"

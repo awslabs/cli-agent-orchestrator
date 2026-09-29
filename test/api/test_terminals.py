@@ -457,6 +457,38 @@ class TestTerminalCreationWithWorkingDirectory:
             assert response.status_code == 400
             assert "not inside a git repository" in response.json()["detail"]
 
+    def test_create_terminal_in_session_forwards_idempotency_key(self, client):
+        """Review on PR #634, issue #616."""
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+        ):
+            mock_svc.create_terminal = AsyncMock(
+                return_value=Terminal(
+                    id="abcd5678",
+                    name="test-window",
+                    session_name="test-session",
+                    provider="kiro_cli",
+                    agent_profile="analyst",
+                )
+            )
+
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "analyst",
+                    "idempotency_key": "retry-1",
+                },
+            )
+
+            assert response.status_code == 201
+            call_kwargs = mock_svc.create_terminal.call_args.kwargs
+            assert call_kwargs.get("idempotency_key") == "retry-1"
+
     def test_create_terminal_rejects_initial_message_without_defer_init(self, client):
         """initial_message is only delivered on the deferred-init path; sending
         it with defer_init=false must 400 rather than silently drop the payload."""
@@ -715,6 +747,61 @@ class TestWebSocketLocalhostRestriction:
         ws.close.assert_awaited_once()
         kwargs = ws.close.call_args.kwargs
         assert kwargs.get("code") == 4003
+
+    @pytest.mark.asyncio
+    async def test_websocket_endpoint_rejects_null_peer_address(self):
+        """A handshake with no peer address (``websocket.client`` is None) fails
+        CLOSED with 4003.
+
+        Uvicorn always populates the ASGI ``client`` for TCP, so a null peer
+        arises only when a trusted forwarding proxy rewrote ``scope["client"]``
+        from a forwarded header. That is exactly the shape where the previous
+        ``client_host is not None`` guard let an unattributable peer SKIP the
+        allowlist instead of being refused.
+        """
+        from cli_agent_orchestrator.api.main import terminal_ws
+
+        ws = MagicMock()
+        ws.client = None
+        ws.headers = {}
+        ws.accept = AsyncMock()
+        ws.close = AsyncMock()
+
+        with patch(
+            "cli_agent_orchestrator.api.main.WS_ALLOWED_CLIENTS",
+            ["127.0.0.1", "::1", "localhost"],
+        ):
+            await terminal_ws(ws, "abcd1234")
+
+        ws.accept.assert_not_called()
+        ws.close.assert_awaited_once()
+        assert ws.close.call_args.kwargs.get("code") == 4003
+
+    @pytest.mark.asyncio
+    async def test_websocket_endpoint_wildcard_still_admits_null_peer(self):
+        """The explicit ``*`` opt-out keeps working for a null peer: it disables
+        the IP check outright, so the handshake proceeds to the terminal lookup
+        (4004 here, never 4003)."""
+        from cli_agent_orchestrator.api.main import terminal_ws
+
+        ws = MagicMock()
+        ws.client = None
+        ws.headers = {}
+        ws.accept = AsyncMock()
+        ws.close = AsyncMock()
+
+        with (
+            patch("cli_agent_orchestrator.api.main.WS_ALLOWED_CLIENTS", ["*"]),
+            patch(
+                "cli_agent_orchestrator.api.main.get_terminal_metadata",
+                return_value=None,
+            ),
+        ):
+            await terminal_ws(ws, "abcd1234")
+
+        ws.accept.assert_awaited_once()
+        ws.close.assert_awaited_once()
+        assert ws.close.call_args.kwargs.get("code") == 4004
 
     @pytest.mark.asyncio
     async def test_websocket_endpoint_rejects_invalid_tmux_metadata(self):

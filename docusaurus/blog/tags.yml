@@ -1,0 +1,41 @@
+# Predefined blog tags.
+#
+# `onInlineTags: 'throw'` in docusaurus.config.ts means a post can only use tags
+# listed here, which keeps the taxonomy small instead of growing a near-duplicate
+# tag per post. Needing a new tag is fine — add it in the same PR and explain why
+# in the PR description. Posts may also carry no tags at all.
+
+tutorial:
+  label: Tutorial
+  permalink: /tutorial
+  description: Step-by-step walkthroughs of a task you can follow end to end.
+
+deep-dive:
+  label: Deep dive
+  permalink: /deep-dive
+  description: How something works under the hood, and why it was built that way.
+
+orchestration-patterns:
+  label: Orchestration patterns
+  permalink: /orchestration-patterns
+  description: Working with handoff, assign, and send-message in real workflows.
+
+providers:
+  label: Providers
+  permalink: /providers
+  description: Running CAO against a specific CLI agent provider.
+
+mcp:
+  label: MCP
+  permalink: /mcp
+  description: The CAO MCP server, and integrating CAO with other MCP clients.
+
+case-study:
+  label: Case study
+  permalink: /case-study
+  description: An account of using CAO on real work, including what didn't work.
+
+community:
+  label: Community
+  permalink: /community
+  description: Project news, contributor spotlights, and events.

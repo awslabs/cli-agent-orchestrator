@@ -122,24 +122,19 @@
   border-color: rgba(255, 255, 255, 0.15);
 }
 
-/* Title */
-.heroTitle {
-  font-size: 4.5rem;
-  font-weight: 900;
-  letter-spacing: -0.045em;
-  line-height: 1.05;
-  margin-bottom: 1rem;
-  background: linear-gradient(135deg, #0c4a6e 0%, #0ea5e9 50%, #06b6d4 100%);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
+/* Title, set as the logo lockup rather than text. The h1 is a plain wrapper:
+   every visual property belongs to the image, and the light/dark swap is done
+   by ThemedImage in index.tsx, not here. */
+.heroLogo {
+  margin: 0 0 1.25rem;
 }
 
-[data-theme='dark'] .heroTitle {
-  background: linear-gradient(135deg, #fff 0%, #ff69b4 30%, #a855f7 60%, #3b82f6 100%);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
+.heroLockup {
+  display: block;
+  width: 100%;
+  max-width: 600px;
+  height: auto;
+  margin: 0 auto;
 }
 
 /* Tagline */
@@ -508,10 +503,6 @@
 
 /* ===== Responsive ===== */
 @media (max-width: 996px) {
-  .heroTitle {
-    font-size: 3.25rem;
-  }
-
   .featuresGrid {
     grid-template-columns: repeat(2, 1fr);
   }
@@ -522,8 +513,9 @@
     padding: 4rem 0 3rem;
   }
 
-  .heroTitle {
-    font-size: 2.5rem;
+  /* Hold the lockup back on phones so it does not tower over the tagline. */
+  .heroLockup {
+    max-width: 440px;
   }
 
   .heroTagline {

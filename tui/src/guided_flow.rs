@@ -120,8 +120,8 @@ use crate::types::{Profile, Provider, SessionParams};
 /// FR-2.1 and FR-2.3 the same mechanism — the three guided steps first, the other nine reachable
 /// behind the collapsed section (BR-10) rather than absent.
 ///
-/// Written as a prefix rather than a full 12-name list so it stays correct for the other 60
-/// commands, none of which FR-2.1 says anything about. (#321)
+/// Written as a prefix rather than a full 12-name list so it stays correct for every other
+/// command, none of which FR-2.1 says anything about. (#321)
 pub const GUIDED_STEP_ORDER: [&str; 3] = ["--agents", "--provider", "--session-name"];
 
 /// The expected shape of one `--env` pair, quoted verbatim in the rejection message (BR-23).
@@ -582,7 +582,7 @@ impl GuidedFlow {
     /// How many leading fields are guided steps; the rest are the collapsed section (FR-2.3).
     ///
     /// Counted from the fields actually present rather than from [`GUIDED_STEP_ORDER`]'s length,
-    /// because 51 of the 61 commands have none of the three. **Hidden-by-default is not the same
+    /// because most commands have none of the three. **Hidden-by-default is not the same
     /// as absent** (BR-10): everything past this index is still in [`GuidedFlow::fields`] and
     /// still settable, which is what "reachable without leaving the form" means.
     pub fn guided_field_count(&self) -> usize {
@@ -765,7 +765,7 @@ impl GuidedFlow {
     ///
     /// # Only `cao launch` has a `SessionParams`
     ///
-    /// `SessionParams` is the launch request; the other 60 commands have nothing to build. A
+    /// `SessionParams` is the launch request; every other command has nothing to build. A
     /// caller asking for one from a different form is a programming error and gets
     /// [`Error::Invalid`] rather than a struct assembled from whatever fields happened to share a
     /// name — which is the failure mode a permissive implementation would have.
@@ -1670,8 +1670,8 @@ mod tests {
 
     /// The "not sent" marker is scoped to `cao launch`, because the names are not unique.
     ///
-    /// `cao session send` also declares `--async` (measured: the only overlap across the 61
-    /// commands), and there the claim "POST /sessions has no parameter for this" is simply false.
+    /// `cao session send` also declares `--async` (measured: the only overlap across the whole
+    /// catalog), and there the claim "POST /sessions has no parameter for this" is simply false.
     /// A name-only predicate would print a confident wrong label — trading a silent drop for
     /// misinformation, which is not an improvement.
     #[test]
@@ -2307,7 +2307,7 @@ mod tests {
 
     /// `to_params()` refuses a form that is not `cao launch`.
     ///
-    /// `SessionParams` is the launch request and the other 60 commands have nothing to build. A
+    /// `SessionParams` is the launch request and every other command has nothing to build. A
     /// permissive implementation would assemble one from whatever fields happened to share a
     /// name, which is a request the server rejects for reasons the operator cannot see.
     #[test]

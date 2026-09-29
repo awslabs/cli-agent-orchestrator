@@ -113,7 +113,7 @@ The provider forwards a model selection in the following order of precedence:
 
 Cursor CLI v2026 does not expose a `--disallowedTools` (or equivalent) flag for hard tool enforcement, and the soft-enforcement path the provider used in earlier builds (prepending `SECURITY_PROMPT` + an allowlist to the system prompt) is **not available in v2026** because the provider no longer passes `--system-prompt` (see "Agent Profile Integration" above). The recommended path for restricted tool access on Cursor v2026 is to choose a provider that supports a native enforcement mechanism:
 
-- **Hard enforcement**: prefer Claude Code, Copilot CLI, or Kiro CLI which all support native tool denial.
+- **Hard enforcement**: prefer Claude Code, Copilot CLI, Grok Build CLI, or OpenCode CLI, which enforce the deny list natively. Kiro CLI does not: CAO launches it `--trust-all-tools`, so `allowedTools` only suppresses approval prompts there.
 - **OpenCode**: the OpenCode CLI frontmatter mechanism lets the supervisor restrict per-agent capabilities.
 - **Advisory only on Cursor v2026**: if you must use `cursor_cli` with restricted tools, configure a dedicated free-tier account + workspace and use Cursor's own permission UI to scope what the agent can do. The CAO `allowed_tools` argument is currently ignored on `cursor_cli` for v2026 and is documented as such.
 
@@ -233,3 +233,8 @@ If the supervisor completes the analysis work itself, the per-directory lock or 
 - [Cursor CLI Overview](https://cursor.com/docs/cli/overview)
 - [Cursor CLI Parameters](https://cursor.com/docs/cli/reference/parameters)
 - [Issue #264: Add support for Cursor CLI as a provider](https://github.com/awslabs/cli-agent-orchestrator/issues/264)
+
+### Agent-plugin MCP working directory
+
+Its MCP config format has no working-directory key (checked against the vendor's own MCP documentation, 2026-09-16), so CAO carries an agent plugin's declared `cwd` by launching the server through `/bin/sh -c 'cd -- "$1" && shift && exec "$@"'`. `exec` replaces the shell, the environment passes through, and argument boundaries survive because each argument stays a separate argv element. On a host with no `/bin/sh` such a server is skipped with `mcp.cwd_unsupported` rather than started in the wrong directory.
+See [Agent Plugins](agent-plugins.md) for the full per-provider table.

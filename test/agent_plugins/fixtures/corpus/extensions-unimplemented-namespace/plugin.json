@@ -1,0 +1,12 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "extensions-namespace",
+  "extensions": {
+    "com.example.client": {
+      "hooks": [
+        1,
+        2
+      ]
+    }
+  }
+}

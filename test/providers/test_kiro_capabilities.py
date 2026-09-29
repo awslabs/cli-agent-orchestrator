@@ -11,6 +11,7 @@ from cli_agent_orchestrator.providers.kiro_capabilities import (
     _flags_from_help,
     build_kiro_command,
     probe_kiro_capabilities,
+    requested_kiro_capabilities,
 )
 
 _HELP = (
@@ -351,14 +352,11 @@ def test_probe_reports_distinct_execution_failures(runner, kind):
 
 
 def test_builds_explicit_v2_and_deterministic_kas_commands():
-    assert build_kiro_command(
-        KiroEngine.V2, "developer", model="fixture-model", yolo=True, legacy_ui=True
-    ) == [
+    assert build_kiro_command(KiroEngine.V2, "developer", model="fixture-model", yolo=True) == [
         "kiro-cli",
         "chat",
         "--agent-engine",
         "v2",
-        "--legacy-ui",
         "--trust-all-tools",
         "--model",
         "fixture-model",
@@ -372,3 +370,31 @@ def test_builds_explicit_v2_and_deterministic_kas_commands():
         "--agent",
         "developer",
     ]
+
+
+def test_v2_command_never_carries_legacy_ui():
+    """--legacy-ui must never appear on a v2 command line.
+
+    kiro-cli errors out on the combination ("Conflicting options: --legacy-ui
+    cannot be used with --agent-engine=v2"), and the bare flag silently selects
+    the v1 engine, which serves no MCP tools — so an agent launched that way
+    starts fine and then cannot assign/handoff/report_outcome. Regression guard
+    for a silent 7-day self-learning outage.
+    """
+    for yolo in (False, True):
+        for model in (None, "fixture-model"):
+            command = build_kiro_command(KiroEngine.V2, "developer", model=model, yolo=yolo)
+            assert "--legacy-ui" not in command
+            assert "--agent-engine" in command
+            assert command[command.index("--agent-engine") + 1] == "v2"
+
+
+def test_legacy_ui_is_not_a_requested_capability():
+    """--legacy-ui is no longer probed for: there is no legacy retry to verify.
+
+    Requiring it would also reject wrappers that dropped the flag but are
+    otherwise fully usable by CAO.
+    """
+    for yolo in (False, True):
+        requested = requested_kiro_capabilities(KiroEngine.V2, model=None, yolo=yolo)
+        assert "ui" not in requested

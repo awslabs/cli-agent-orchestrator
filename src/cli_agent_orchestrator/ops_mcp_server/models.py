@@ -20,6 +20,10 @@ class LaunchResult(BaseModel):
         default=None,
         description="The created terminal ID",
     )
+    provider: Optional[str] = Field(
+        default=None,
+        description="The CLI provider the session was launched with",
+    )
 
 
 class ProfileListResult(BaseModel):

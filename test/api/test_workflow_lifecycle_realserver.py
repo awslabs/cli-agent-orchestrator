@@ -61,6 +61,7 @@ Style: pytest parity with ``test/api/``; black + isort (line 100). Additive, tes
 
 from __future__ import annotations
 
+import os
 import time
 import uuid
 from pathlib import Path
@@ -69,6 +70,8 @@ from typing import Optional
 
 import pytest
 import requests
+
+from cli_agent_orchestrator.constants import CAO_HOME_DIR, WORKFLOW_SPEC_DIR
 
 pytestmark = pytest.mark.integration
 
@@ -103,11 +106,15 @@ _SCRIPT_LONG = "import time\ntime.sleep(120)\n"
 def _spec_dir(server: CaoServer) -> Path:
     """The server subprocess's own ``WORKFLOW_SPEC_DIR`` under its isolated ``$HOME``.
 
-    Matches ``constants.WORKFLOW_SPEC_DIR`` (``$HOME/.aws/cli-agent-orchestrator/
-    workflows``) computed against the fixture's redirected ``$HOME`` -- so a spec
-    written here is read off the SAME disk the subprocess resolves bare names from.
+    An explicit ``CAO_HOME_DIR`` is inherited unchanged by the subprocess and
+    already reflected in the shared constant. Otherwise, map the constant's
+    home-relative path under the fixture's redirected ``$HOME``. In either case,
+    a spec written here lands on the SAME disk path the subprocess resolves.
     """
-    return server.home_dir / ".aws" / "cli-agent-orchestrator" / "workflows"
+    if os.environ.get("CAO_HOME_DIR", "").strip():
+        return WORKFLOW_SPEC_DIR
+    # Fallback only when CAO_HOME_DIR is unset; constant is home-derived at import.
+    return server.home_dir / WORKFLOW_SPEC_DIR.relative_to(CAO_HOME_DIR.parent.parent)
 
 
 def _write_script_spec(server: CaoServer, source: str, name: str) -> str:

@@ -52,12 +52,15 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from cli_agent_orchestrator.backends import TerminalBackendError, TerminalNotFoundError
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 from cli_agent_orchestrator.backends.registry import get_backend
+from cli_agent_orchestrator.cli.commands.agent_plugin import UNTRUSTED_CONTENT_WARNING
 from cli_agent_orchestrator.cli.commands.init import seed_default_skills
 from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
+    get_handoff_result,
     get_inbox_messages,
     get_terminal_metadata,
     init_db,
+    upsert_handoff_result,
 )
 from cli_agent_orchestrator.constants import (
     ALLOWED_HOSTS,
@@ -65,6 +68,7 @@ from cli_agent_orchestrator.constants import (
     CAO_HOME_DIR,
     CORS_ORIGINS,
     DEFAULT_PROVIDER,
+    HANDOFF_RESULTS_ROUTE,
     INBOX_POLLING_INTERVAL,
     INBOX_RECONCILE_INTERVAL,
     MODEL_ID_MAX_LEN,
@@ -96,12 +100,13 @@ from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.memory import (
+    LenientMemoryKey,
     MemoryKey,
     MemoryScope,
     MemoryScopeId,
     MemoryType,
 )
-from cli_agent_orchestrator.models.terminal import Terminal, TerminalId
+from cli_agent_orchestrator.models.terminal import Terminal, TerminalId, TerminalLimitError
 from cli_agent_orchestrator.models.workflow import RecoveryPolicy
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.base import OutputExtractionError
@@ -119,10 +124,15 @@ from cli_agent_orchestrator.security.auth import (
     get_authorization_servers,
     get_current_scopes,
     is_auth_enabled,
+    is_idp_configured,
     require_any_scope,
 )
 from cli_agent_orchestrator.services import (
+    approval_gate,
+    approval_provenance,
+    approval_store,
     flow_service,
+    manifest_freeze,
     secret_gate,
     session_service,
     terminal_service,
@@ -153,8 +163,10 @@ from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.services.terminal_service import (
     TERMINAL_RANGE_MAX_LENGTH,
+    IdempotencyKeyConflict,
     OutputMode,
     TerminalInputBlockedError,
+    _notify_elastic_terminal_ended,
 )
 from cli_agent_orchestrator.services.workflow_journal import (
     _TERMINAL_RUN_STATES as _JOURNAL_TERMINAL_RUN_STATES,
@@ -340,6 +352,27 @@ class CreateSessionBody(CreateTerminalBody):
     @classmethod
     def validate_metadata(cls, v: Optional[Dict]) -> Optional[Dict]:
         return _check_metadata_size(v)
+
+
+RESUME_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{7,63}\Z")
+
+
+def _validate_resume_session_id(value: str) -> None:
+    """Validate a ``resume_session_id`` at the request boundary.
+
+    The id is interpolated into the provider's shell command
+    (``claude --resume <sid>``), so the charset is restricted to the shape
+    Claude Code actually emits (UUID-like) — no whitespace, quoting, or
+    shell metacharacters.
+
+    Raises:
+        ValueError: ``value`` does not match RESUME_SESSION_ID_RE.
+    """
+    if not RESUME_SESSION_ID_RE.match(value):
+        raise ValueError(
+            "invalid resume_session_id: expected 8-64 chars of [A-Za-z0-9._-] "
+            "starting with an alphanumeric"
+        )
 
 
 def _validate_model_id(value: str) -> None:
@@ -558,6 +591,28 @@ class RunStepRequest(BaseModel):
         default=None, description="Explicit Kiro engine for this child step"
     )
 
+    job_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Caller-generated opaque identifier for this job (issue #447). "
+            "When present, the server persists state and result under this key "
+            "so the caller can retrieve the result via GET /handoff-results/{job_id} "
+            "if the transport times out before the response arrives. "
+            "Must be a 32-character lowercase hex string (uuid4().hex)."
+        ),
+    )
+
+    @field_validator("job_id")
+    @classmethod
+    def _validate_job_id(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        if not re.fullmatch(r"[0-9a-f]{32}", v):
+            raise ValueError(
+                "job_id must be a 32-character lowercase hex string (e.g. uuid4().hex)"
+            )
+        return v
+
 
 class RunStepResponse(BaseModel):
     """Response wrapping an ``AgentStepResult`` from ``run_agent_step``.
@@ -640,6 +695,19 @@ class ResumeRunRequest(BaseModel):
             "step_id -> 'rerun' (re-execute) | 'skip' (use the stored result). "
             "Applied before the script is spawned; an unknown step id or value is a "
             "400 and applies nothing at all."
+        ),
+    )
+
+
+class StepReplayRequest(BaseModel):
+    """Request body for ``POST /workflows/runs/{run_id}/steps/{step_id}:replay`` (#640)."""
+
+    prompt_override: Optional[str] = Field(
+        default=None,
+        description=(
+            "Replacement prompt TEMPLATE for this one replay; {{workflow.inputs.*}} and "
+            "{{steps.*.output.*}} references in it still resolve against the recorded "
+            "run. Omit to reuse the snapshotted step prompt."
         ),
     )
 
@@ -1095,6 +1163,11 @@ class MemorySummary(BaseModel):
     tags: str
     created_at: datetime
     updated_at: datetime
+    source_kind: str = "native"
+    source_path: Optional[str] = None
+    indexed_at: Optional[datetime] = None
+    index_freshness: Optional[str] = None
+    content_truncated: bool = False
 
 
 class MemoryDetail(MemorySummary):
@@ -1492,11 +1565,20 @@ async def oauth_protected_resource_metadata():
     Advertises the resource audience, the authorization server(s), the supported
     scopes (``cao:read``/``cao:write``/``cao:admin``), and the supported bearer
     methods so OAuth clients can discover how to obtain access. Returns HTTP 404
-    when auth is disabled (default-off), so the localhost-only posture is
-    byte-for-byte unchanged.
+    when no IdP is configured: default-off keeps its previous response
+    byte-for-byte (status and detail), and local-token mode
+    (``CAO_AUTH_LOCAL_TOKEN`` alone) answers 404 with a detail naming what is
+    missing, since there is no authorization server to advertise.
     """
-    if not is_auth_enabled():
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="auth disabled")
+    if not is_idp_configured():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                "auth disabled"
+                if not is_auth_enabled()
+                else "no OAuth authorization server configured"
+            ),
+        )
 
     audience = (
         os.getenv("CAO_AUTH_AUDIENCE", "").strip()
@@ -1714,7 +1796,8 @@ async def agui_stream(
     _require_agui_enabled()
 
     # Auth: query-parameter token (EventSource can't set headers). Default-off
-    # (no AUTH0_DOMAIN / CAO_AUTH_JWKS_URI) grants the full scope set.
+    # (no AUTH0_DOMAIN / CAO_AUTH_JWKS_URI / CAO_AUTH_LOCAL_TOKEN) grants the
+    # full scope set.
     if is_auth_enabled():
         if not access_token:
             raise HTTPException(
@@ -2224,6 +2307,7 @@ def _resolve_template_name(template: str) -> str:
 async def search_agent_profiles_endpoint(
     q: str = Query(description="Free-text capability keywords, e.g. 'monitor sqs'"),
     limit: int = Query(default=PROFILE_SEARCH_DEFAULT_LIMIT, ge=1, le=100),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> List[Dict]:
     """Rank installed agent profiles against ``q``.
 
@@ -2671,7 +2755,9 @@ async def get_agent_profile_source_endpoint(
 
 
 @app.get("/agents/providers")
-async def list_providers_endpoint() -> List[Dict]:
+async def list_providers_endpoint(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> List[Dict]:
     """List available providers with installation status."""
     import shutil
 
@@ -2725,14 +2811,25 @@ class AgentDirsUpdate(BaseModel):
 
 
 @app.get("/settings/memory")
-async def get_memory_settings_endpoint() -> Dict:
-    """Return whether the memory subsystem is enabled (for UI feature discovery)."""
+async def get_memory_settings_endpoint(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Return whether the memory subsystem is enabled (for UI feature discovery).
+
+    ``settings_readable`` is additive: False means the two flags above are
+    defaults resolved WITHOUT settings.json, not a deliberate configuration.
+    """
     from cli_agent_orchestrator.services.settings_service import (
         is_learning_enabled,
         is_memory_enabled,
+        settings_readable,
     )
 
-    return {"enabled": is_memory_enabled(), "learning_enabled": is_learning_enabled()}
+    return {
+        "enabled": is_memory_enabled(),
+        "learning_enabled": is_learning_enabled(),
+        "settings_readable": settings_readable(),
+    }
 
 
 @app.post("/settings/agent-dirs")
@@ -2766,7 +2863,9 @@ async def set_agent_dirs_endpoint(
 
 
 @app.get("/settings/skill-dirs")
-async def get_skill_dirs_endpoint() -> Dict:
+async def get_skill_dirs_endpoint(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
     """Get the global skill store path and user-added extra skill directories."""
     from cli_agent_orchestrator.constants import SKILLS_DIR
     from cli_agent_orchestrator.services.settings_service import get_extra_skill_dirs
@@ -2831,6 +2930,255 @@ async def get_skill_content(
         )
 
 
+# =============================================================================
+# Agent Plugins (Agent Plugins 1.0.0) — NOT the event-plugin system
+# =============================================================================
+# Added inline next to the /skills and /settings/skill-dirs handlers because
+# api/main.py is flat (no routers package). Naming is unresolved maintainer
+# decision M1; per requirements.md 16.5 this surface must not ship to end users
+# before that is settled, so every route below is gated on
+# CAO_AGENT_PLUGINS_ENABLED (default off) and 404s without it — the routes are
+# constructed but not executable, mirroring the AG-UI gate above. The scope
+# dependencies are authorization, not the gate: they are a no-op when auth is
+# disabled.
+
+
+def _require_plugins_enabled() -> None:
+    """Raise 404 when the agent-plugin surface is disabled (default-off).
+
+    Requirement 16.5's ship-gate. Shares one predicate with the CLI group so the
+    two surfaces cannot disagree about whether the surface is live.
+
+    Applied as a **route dependency**, not as the handler's first statement, and
+    that distinction is the gate: FastAPI validates the request body and solves
+    the scope dependency *before* the handler body runs, so an in-body check still
+    answered a malformed payload with 422 and an unauthorized caller with 401/403 —
+    both of which disclose that the gated route exists. A route-level dependency is
+    solved first, so every request to a disabled surface gets the same 404 an
+    unregistered path would (verified for a malformed body and for a failing auth
+    dependency). "First in the handler" is not "first in the request".
+    """
+
+    from cli_agent_orchestrator.agent_plugins.gate import agent_plugins_surface_enabled
+
+    if not agent_plugins_surface_enabled():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="agent plugin surface disabled",
+        )
+
+
+class PluginInstallRequest(BaseModel):
+    """Body for ``POST /plugins`` and ``POST /plugins/validate``."""
+
+    source: str
+    kind: Optional[str] = None
+    """``"path"`` or ``"git"``. Inferred from the source string when omitted."""
+
+    ref: Optional[str] = None
+    subdir: Optional[str] = None
+    force: bool = False
+
+
+def _plugin_source(body: "PluginInstallRequest"):
+    """Build a PluginSource, reusing the CLI's source-kind detection.
+
+    Shared rather than reimplemented so a source string that installs from the
+    CLI installs identically from the panel.
+    """
+    from cli_agent_orchestrator.agent_plugins.models import PluginSource
+    from cli_agent_orchestrator.cli.commands.agent_plugin import _looks_like_git
+
+    if body.kind == "git" or (body.kind != "path" and _looks_like_git(body.source)):
+        kind: Literal["path", "git"] = "git"
+    else:
+        kind = "path"
+    return PluginSource(kind=kind, location=body.source, ref=body.ref, subdir=body.subdir)
+
+
+def _with_untrusted_warning(payload: Dict) -> Dict:
+    """Attach the untrusted-content warning to an agent-plugin response.
+
+    Every response describing a plugin carries it — list, install, validate, and
+    the 422 body for an unloadable install — so a client cannot render an install
+    affordance without having been handed the text to show beside it. Requirement
+    22.1 puts the obligation on CAO, and a warning present only on the *list*
+    response is satisfiable by a client that never calls list.
+
+    That the unloadable-install 422 carries it too is the case worth stating:
+    "this plugin is not loadable" is exactly the moment a user is deciding whether
+    to try a different source, which is a decision about trust.
+    """
+    return {**payload, "untrusted_content_warning": UNTRUSTED_CONTENT_WARNING}
+
+
+@app.get("/plugins", dependencies=[Depends(_require_plugins_enabled)])
+async def list_agent_plugins(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """List installed agent plugins with findings and projected skill names.
+
+    Also reports, per plugin, which live sessions reference a skill it provides,
+    so a client can render the removal warning *before* the operator commits to
+    a DELETE.
+
+    Read-scope gated when auth is enabled, following ``GET /settings/agent-dirs``
+    and for a strictly larger version of its reason. That route is gated because it
+    discloses local filesystem layout; this one discloses that **plus** live
+    operational state: every plugin's original source path or repository URL, and
+    per plugin the terminal IDs, session names, profile names, and skill names of
+    running work. The read floor rather than write/admin, because read-only
+    callers — the web panel, a status script — are exactly who this is for.
+    """
+    from cli_agent_orchestrator.agent_plugins.installer import affected_sessions_by_plugin
+    from cli_agent_orchestrator.agent_plugins.store import InstalledPluginStore
+
+    store = InstalledPluginStore()
+    # Deliberately does NOT sweep dangling projections. This is a GET a panel
+    # polls, and `sweep_dangling_projections` mutates the filesystem — a read
+    # route that deletes things is both surprising and, on the event loop, a
+    # per-poll directory walk. The sweep still runs where it belongs: on every
+    # projection rebuild, i.e. install and removal. Read paths already tolerate a
+    # dangling link on their own (`list_skills()` gates on `is_dir()` and
+    # `SKILL.md is_file()`, both False rather than raising for a broken link), so
+    # nothing here depends on having swept first.
+    # One live-state walk for the whole response. Calling `affected_sessions`
+    # per record re-enumerated sessions, terminals and profiles for every plugin —
+    # identical work each time, on a route a panel polls.
+    affected_by_plugin = affected_sessions_by_plugin(store=store)
+
+    plugins = []
+    for record in store.list_installed():
+        entry = record.to_dict()
+        entry["affected_sessions"] = [
+            session.to_dict() for session in affected_by_plugin.get(record.name, [])
+        ]
+        plugins.append(entry)
+
+    return _with_untrusted_warning({"plugins": plugins})
+
+
+@app.post(
+    "/plugins",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(_require_plugins_enabled)],
+)
+async def install_agent_plugin(
+    body: PluginInstallRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Install an agent plugin from a local path or a git URL."""
+    from cli_agent_orchestrator.agent_plugins.installer import (
+        PluginBusyError,
+        PluginInstallError,
+        install,
+    )
+
+    try:
+        # Offloaded: a git source can block in `subprocess.run` for up to 300s and a
+        # large local source blocks in `copytree`. Run on the event loop, that window
+        # is one where the server serves no health/session request and runs no status
+        # or inbox task. `asyncio.to_thread` is the convention already used throughout
+        # this module.
+        outcome = await asyncio.to_thread(install, _plugin_source(body), force=body.force)
+    except PluginBusyError as exc:
+        # 409, not 400: nothing is wrong with the request -- it collided with
+        # another lifecycle operation and is safe to retry verbatim. Placed BEFORE
+        # the PluginInstallError branch because it subclasses it; the wider handler
+        # would otherwise answer 400 and tell the operator to change their request.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    except PluginInstallError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to install agent plugin: {exc}",
+        )
+
+    if not outcome.installed:
+        # A plugin that is not loadable is the caller's input being wrong, not a
+        # server fault: return the full report so the panel can render every
+        # finding rather than a bare error string.
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=_with_untrusted_warning(outcome.to_dict()),
+        )
+    return _with_untrusted_warning(outcome.to_dict())
+
+
+@app.post("/plugins/validate", dependencies=[Depends(_require_plugins_enabled)])
+async def validate_agent_plugin(
+    body: PluginInstallRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Validate a plugin source without installing it.
+
+    Scope-gated despite installing nothing, unlike the other ``/validate``
+    endpoints, which are pure computation over a document the caller already
+    supplied. This one **resolves the source first**: a git source is cloned and
+    a path source is copied into staging. That is real outbound network and disk
+    work performed on the caller's behalf, so exempting it on the strength of the
+    shared ``/validate`` suffix would be reading the name rather than the
+    behaviour.
+    """
+    from cli_agent_orchestrator.agent_plugins.installer import PluginInstallError, validate_source
+
+    try:
+        # Offloaded for the same reason as the install path: validating a source
+        # resolves it first, which clones or copies before any parsing happens.
+        report = await asyncio.to_thread(validate_source, _plugin_source(body))
+    except PluginInstallError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to validate agent plugin: {exc}",
+        )
+    return _with_untrusted_warning(report.to_dict())
+
+
+@app.delete("/plugins/{name}", dependencies=[Depends(_require_plugins_enabled)])
+async def uninstall_agent_plugin(
+    name: str,
+    purge_data: bool = False,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Uninstall an agent plugin.
+
+    The response reports which live sessions referenced a skill this plugin
+    provided. Note that reporting is all this endpoint can do — the
+    warn-and-confirm gate itself belongs to the client, which must render that
+    information and wait for the operator *before* issuing the DELETE.
+    """
+    from cli_agent_orchestrator.agent_plugins.installer import (
+        PluginBusyError,
+        PluginInstallError,
+        uninstall,
+    )
+
+    try:
+        # Offloaded: removal walks the store and rebuilds the skill projection,
+        # both synchronous filesystem work.
+        outcome = await asyncio.to_thread(uninstall, name, purge_data=purge_data)
+    except PluginBusyError as exc:
+        # 409, not 400: nothing is wrong with the request -- it collided with
+        # another lifecycle operation and is safe to retry verbatim. Placed BEFORE
+        # the PluginInstallError branch because it subclasses it; the wider handler
+        # would otherwise answer 400 and tell the operator to change their request.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    except PluginInstallError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to uninstall agent plugin: {exc}",
+        )
+    # Deliberately NOT warned: removal is the safe direction, and a warning about
+    # installing untrusted content beside a successful uninstall is noise that
+    # trains operators to ignore the text where it matters.
+    return outcome.to_dict()
+
+
 @app.post("/sessions", response_model=Terminal, status_code=status.HTTP_201_CREATED)
 async def create_session(
     request: Request,
@@ -2843,6 +3191,9 @@ async def create_session(
     memory_manager: Optional[str] = None,
     engine: Optional[KiroEngine] = None,
     model: Optional[str] = None,
+    use_worktree: bool = False,
+    idempotency_key: Optional[str] = None,
+    resume_session_id: Optional[str] = None,
     body: Optional[CreateSessionBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
@@ -2875,6 +3226,28 @@ async def create_session(
     the initial terminal at creation time (``group`` is also updatable later
     via ``PATCH /terminals/{id}/group``, ``metadata`` via the
     ``update_metadata`` MCP tool).
+
+    ``use_worktree`` (issue #100 Phase 1; review on PR #634): provision an
+    isolated git worktree for this terminal instead of sharing
+    ``working_directory`` as given, mirroring ``POST
+    /sessions/{name}/terminals``'s parameter of the same name. Previously only
+    that sibling endpoint threaded it through to
+    ``terminal_service.create_terminal`` -- a fresh (no existing session)
+    caller requesting a worktree had it silently dropped.
+
+    ``idempotency_key`` (review on PR #634, issue #616): a caller-supplied
+    token making a retry of this exact request safe. Supply the SAME key on
+    a retry (e.g. after the original response was lost) and this endpoint
+    returns the terminal the first, already-committed attempt created,
+    instead of creating a second one -- see
+    ``terminal_service.create_terminal``'s docstring for the mechanics.
+    Omitted (default): today's behavior, no retry protection.
+
+    The key is matched together with a fingerprint of the request, not on its
+    own, so presenting a key that a DIFFERENT request already claimed returns
+    **409 CONFLICT** rather than that other request's terminal. A key whose
+    terminal has since been torn down is stale, not conflicting, and simply
+    creates fresh.
     """
     initial_message = body.initial_message if body else None
     initial_message_orchestration_type = None
@@ -2899,6 +3272,8 @@ async def create_session(
             validate_tmux_name(effective, "session_name")
         if model is not None:
             _validate_model_id(model)
+        if resume_session_id is not None:
+            _validate_resume_session_id(resume_session_id)
         if initial_message == "":
             raise ValueError("initial_message must not be empty")
         if body and body.initial_message_orchestration_type:
@@ -2928,6 +3303,9 @@ async def create_session(
             initial_message=initial_message,
             initial_message_orchestration_type=initial_message_orchestration_type,
             model=model,
+            use_worktree=use_worktree,
+            idempotency_key=idempotency_key,
+            resume_session_id=resume_session_id,
             group=body.group if body else None,
             metadata=body.metadata if body else None,
         )
@@ -2936,6 +3314,30 @@ async def create_session(
             registry = get_plugin_registry(request)
             sidecar_provider = provider or DEFAULT_PROVIDER
             sidecar_session = result.session_name
+            # The sidecar gets its OWN key, DERIVED from the caller's (review on
+            # PR #634, issue #616). This spawn is unconditional -- it runs after
+            # create_session whether the primary was created or resolved from an
+            # existing key -- and the returned Terminal cannot say which, so two
+            # identical keyed requests used to spawn two memory_manager workers
+            # for one primary: the exact no-duplicate-workers criterion the key
+            # exists to hold.
+            #
+            # Deriving a key rather than plumbing a created-vs-reused flag out
+            # through both create endpoints is the smaller correct fix, and it is
+            # strictly stronger: the sidecar create becomes idempotent in its own
+            # right, so the second request reuses the FIRST sidecar even in the
+            # races a boolean would miss (both requests seeing "created", or the
+            # first response being lost before the flag is read). The suffix
+            # keeps it out of the primary's namespace so it can never collide
+            # with the caller's own key.
+            #
+            # Sidecar args are all derived from the primary request or its
+            # result, so a genuine retry fingerprints identically and hits;
+            # anything else 409s inside the task and is logged below like any
+            # other sidecar failure, without failing the primary.
+            sidecar_idempotency_key = (
+                f"{idempotency_key}:memory-manager-sidecar" if idempotency_key else None
+            )
 
             async def _spawn_sidecar() -> None:
                 try:
@@ -2947,6 +3349,7 @@ async def create_session(
                         session_name=sidecar_session,
                         working_directory=working_directory,
                         registry=registry,
+                        idempotency_key=sidecar_idempotency_key,
                     )
                 except Exception as e:
                     logger.warning(f"Failed to spawn memory_manager sidecar: {e}")
@@ -2955,7 +3358,24 @@ async def create_session(
 
         return result
 
+    except IdempotencyKeyConflict as e:
+        # The key was already used for a DIFFERENT request (review on PR #634,
+        # issue #616). 409, matching Stripe/AWS IdempotentParameterMismatch,
+        # rather than silently serving the first call's terminal to a caller
+        # who asked for something else. IdempotencyKeyConflict subclasses
+        # Exception and NOT ValueError precisely so this arm cannot be
+        # shadowed by the 400 arm below -- which, note, sits FIRST here.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except TerminalLimitError as e:
+        # Node is at its tracked-terminal cap (CAO_MAX_TERMINALS) — a capacity
+        # rejection, not a bad request: the caller should retry on another node.
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
     except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except WorktreeError as e:
+        # use_worktree=true against a working_directory that isn't a git
+        # repo, or the 'git worktree add' itself failed -- a client-input
+        # problem, not a server crash. Mirrors POST /sessions/{name}/terminals.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:
         raise HTTPException(
@@ -2989,7 +3409,13 @@ async def get_session(
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     try:
-        return session_service.get_session(session_name)
+        # session_service.get_session() calls status_monitor.get_status() once per
+        # terminal in the session, which for a PROCESSING terminal can shell out to a
+        # real tmux capture-pane subprocess (the stale-PROCESSING fallback). A session
+        # with N processing terminals would otherwise fork N times inline on the event
+        # loop per request — and the web UI polls this endpoint. Run it off the loop,
+        # matching GET /terminals/{id}'s established pattern for the identical hazard.
+        return await asyncio.to_thread(session_service.get_session, session_name)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -3060,6 +3486,7 @@ async def create_terminal_in_session(
     defer_init: bool = False,
     model: Optional[str] = None,
     use_worktree: bool = False,
+    idempotency_key: Optional[str] = None,
     body: Optional[CreateTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
@@ -3091,6 +3518,20 @@ async def create_terminal_in_session(
     ``defer_init`` rather than moving into the JSON body. Runs synchronously
     before the deferred-init background task (if any) is scheduled, so it
     applies the same way regardless of ``defer_init``.
+
+    ``idempotency_key`` (review on PR #634, issue #616): a caller-supplied
+    token making a retry of this exact request safe. Supply the SAME key on
+    a retry (e.g. after the original response was lost) and this endpoint
+    returns the terminal the first, already-committed attempt created,
+    instead of creating a second one -- see
+    ``terminal_service.create_terminal``'s docstring for the mechanics.
+    Omitted (default): today's behavior, no retry protection.
+
+    The key is matched together with a fingerprint of the request, not on its
+    own, so presenting a key that a DIFFERENT request already claimed returns
+    **409 CONFLICT** rather than that other request's terminal. A key whose
+    terminal has since been torn down is stale, not conflicting, and simply
+    creates fresh.
     """
     try:
         validate_tmux_name(session_name, "session_name")
@@ -3159,17 +3600,30 @@ async def create_terminal_in_session(
             engine=engine,
             model=model,
             use_worktree=use_worktree,
+            idempotency_key=idempotency_key,
         )
         return result
     except HTTPException:
         # Deliberate 4xx (e.g. the initial_message/defer_init guard, invalid
         # orchestration_type) — propagate as-is instead of masking as a 500.
         raise
+    except IdempotencyKeyConflict as e:
+        # The key was already used for a DIFFERENT request (review on PR #634,
+        # issue #616) — 409, not the 404 the generic ValueError arm below would
+        # give it. Unlike the Kiro arm, this one does not depend on preceding
+        # that arm: IdempotencyKeyConflict is not a ValueError, so no reorder
+        # of the ValueError family can shadow it.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except (KiroPhase0KASError, KiroCapabilityError) as e:
         # Both subclass ValueError, so they must precede the generic arm below —
         # a rejected engine is a bad request, not a missing resource. Matches
         # POST /sessions, which already returns 400 for the identical failure.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except TerminalLimitError as e:
+        # Node is at its tracked-terminal cap (CAO_MAX_TERMINALS) — a capacity
+        # rejection, not a bad request or a missing session: the caller should
+        # retry on another node.
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except WorktreeError as e:
@@ -3185,8 +3639,24 @@ async def create_terminal_in_session(
 
 
 @app.get("/sessions/{session_name}/terminals")
-async def list_terminals_in_session(session_name: str) -> List[Dict]:
-    """List all terminals in a session."""
+async def list_terminals_in_session(
+    session_name: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> List[Dict]:
+    """List a session's terminals, oldest first.
+
+    The order is significant and part of this endpoint's contract: **index 0 is
+    the session's oldest surviving terminal**, which is normally its conductor.
+    `cao session status` and `cao session list` rely on it to label the
+    Conductor, and they reach it through this endpoint rather than the database,
+    so the guarantee has to be stated here too.
+
+    "Normally" is deliberate: if the conductor's own terminal is deleted while
+    the session lives on, index 0 becomes the oldest remaining worker. Treat it
+    as best-effort rather than as an identity. Clients needing a different order
+    (most-recently-active first, say) should sort client-side on `last_active`
+    rather than assume this one will change.
+    """
     try:
         validate_tmux_name(session_name, "session_name")
     except ValueError as e:
@@ -3388,7 +3858,10 @@ async def get_terminal_memory_context(
 
 
 @app.get("/terminals/{terminal_id}/working-directory", response_model=WorkingDirectoryResponse)
-async def get_terminal_working_directory(terminal_id: TerminalId) -> WorkingDirectoryResponse:
+async def get_terminal_working_directory(
+    terminal_id: TerminalId,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> WorkingDirectoryResponse:
     """Get the current working directory of a terminal's pane."""
     try:
         working_directory = terminal_service.get_working_directory(terminal_id)
@@ -3557,6 +4030,68 @@ async def exit_terminal(
         )
 
 
+def _schedule_elastic_terminal_ended(
+    background_tasks: BackgroundTasks,
+    terminal_id: str,
+    *,
+    teardown: bool,
+    reuse_terminal_id: Optional[str],
+) -> None:
+    if teardown and reuse_terminal_id is None:
+        background_tasks.add_task(_notify_elastic_terminal_ended, terminal_id)
+
+
+async def _record_job_state(job_id: Optional[str], state: str, **fields: Any) -> None:
+    """Best-effort ``handoff_results`` write for a run-step call (issue #447).
+
+    No-op when the caller supplied no ``job_id`` — durability is opt-in, so a
+    request without one behaves exactly as it did before this existed. A write
+    failure is logged and swallowed: durability bookkeeping must never turn a
+    step's own outcome into a different one.
+
+    EVERY terminal exit of ``run_step`` that can follow the ``state="running"``
+    write must reach this, or the job is stranded at "running" until the
+    retention sweep deletes the row and a caller polling
+    ``GET /handoff-results`` after a transport timeout never learns the step
+    ended (PR #453 review, blocking). A new ``except`` arm on that route is
+    incomplete without a call here.
+
+    Off the loop for the same reason ``run_agent_step``'s completed-write is
+    (PR #453 review nit): the write is SQLite I/O, and the handler is async.
+
+    MODULE-LEVEL ON PURPOSE, not nested in ``run_step`` beside ``_settle_step``:
+    every arm that persists needs the same guard, and inlining it nine times
+    would both duplicate it and spend the route body's ``logger``-call budget
+    that ``run-step-replay-branch`` SR-7 pins to the two step-bookkeeping
+    guards. Nothing here closes over request state, so there is no reason for it
+    to live inside the route.
+    """
+    if not job_id:
+        return
+    try:
+        await asyncio.to_thread(upsert_handoff_result, job_id, state, **fields)
+    except Exception as exc:  # noqa: BLE001 — durability is best-effort; never fail the step
+        # PREFIX ONLY, never the whole id (PR #453 review finding 4): job_id is the
+        # SOLE retrieval capability for a row that can carry worker prompts and
+        # output, so a full id in the server log escalates any log reader to that
+        # worker's result. Eight hex chars is enough to correlate this line with a
+        # job_id its legitimate holder already has, and 96 bits short of guessing one.
+        #
+        # EXCEPTION CLASS NAME ONLY -- no ``exc_info``, no ``str(exc)``. A
+        # SQLAlchemy DBAPI error stringifies its bound parameters
+        # (``[parameters: ('<job_id>', 'running', ...)]``), so either one would
+        # reprint in full the id the line above deliberately truncates, defeating
+        # the whole point of the prefix. The class name still separates the cases
+        # an operator acts on differently (OperationalError = locked/unwritable DB,
+        # IntegrityError = key collision) without echoing any row content.
+        logger.warning(
+            "run_step: failed to persist job_id_prefix=%s as %s (%s)",
+            job_id[:8],
+            state,
+            type(exc).__name__,
+        )
+
+
 @app.post(
     TERMINALS_RUN_STEP_ROUTE,
     response_model=RunStepResponse,
@@ -3573,6 +4108,7 @@ async def exit_terminal(
 )
 async def run_step(
     request: Request,
+    background_tasks: BackgroundTasks,
     body: RunStepRequest,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> RunStepResponse:
@@ -3605,7 +4141,20 @@ async def run_step(
 
     The plugin registry is threaded so teardown's ``post_kill_terminal`` hooks
     fire (parity with the DELETE endpoint).
+
+    Durability (issue #447): when the caller supplies a ``job_id``, the handler
+    records state="running" at request start. On success, ``run_agent_step``
+    itself persists state="completed" BETWEEN extraction and teardown (not
+    here, and not after it returns) — the terminal being torn down is the only
+    other place the result lives, so persistence must land before that
+    happens, not merely before the HTTP response. On failure, this handler
+    persists state="error". A caller that misses the response due to an
+    MCP-transport timeout can retrieve the result via
+    ``GET /handoff-results/{job_id}`` at any point thereafter. Requests without
+    a ``job_id`` behave exactly as before (no persistence overhead).
     """
+    job_id = body.job_id  # None when the caller omits it (backward-compatible)
+
     # BR-31: for a script-tier run-step call, record the live terminal into the
     # shared ScriptRunRecord's step_states as soon as it exists, so U4's orphan sweep
     # can tear it down if the subprocess dies mid-call. No-op for YAML/handoff
@@ -3696,6 +4245,12 @@ async def run_step(
             )
         except KeyError as e:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+
+    # Mark the job as in-progress before the long-running substrate starts.
+    # This is best-effort; a failure here must not block execution. Placed
+    # AFTER the generation fence above so a fenced-out (stale-generation)
+    # call never leaves a job_id stuck at "running" with no terminal state.
+    await _record_job_state(job_id, "running")
 
     # ---- issue #583, unit ``run-step-replay-branch``: the replay branch ----------
     #
@@ -3874,6 +4429,7 @@ async def run_step(
             on_step_terminal_ready=on_step_terminal_ready,
             model=body.model,
             use_worktree=body.use_worktree,
+            job_id=job_id,
         )
         # Success -> transition the script step RUNNING->COMPLETED (no-op for
         # non-script callers). Before building the response so a settle failure
@@ -3883,6 +4439,18 @@ async def run_step(
             result.status.value if hasattr(result.status, "value") else str(result.status)
         )
         _settle_step(result.terminal_id, None, result.last_message, response_status)
+        _schedule_elastic_terminal_ended(
+            background_tasks,
+            result.terminal_id,
+            teardown=body.teardown,
+            reuse_terminal_id=body.reuse_terminal_id,
+        )
+
+        # NOTE (issue #447 / PR #453 review): the "completed" persist happens
+        # INSIDE run_agent_step, between extraction and teardown — not here.
+        # Persisting only after this call returns would run after the terminal
+        # (the only other copy of the result) has already been torn down,
+        # contradicting the "persist result, then tear down" requirement.
         return RunStepResponse(
             terminal_id=result.terminal_id,
             last_message=result.last_message,
@@ -3934,6 +4502,7 @@ async def run_step(
         # rather than regex-scraping the message (the future engine reads it too).
         # Transition the script step RUNNING->FAILED (no-op for non-script callers).
         _settle_step(e.terminal_id, str(e))
+        await _record_job_state(job_id, "error", terminal_id=e.terminal_id, error_message=str(e))
         code = status.HTTP_502_BAD_GATEWAY if e.kind == "error" else status.HTTP_504_GATEWAY_TIMEOUT
         raise HTTPException(
             status_code=code,
@@ -3960,6 +4529,7 @@ async def run_step(
         # status code for this exact failure instead of silently falling
         # through to the generic kind-less 500 below.
         _settle_step(None, str(e))
+        await _record_job_state(job_id, "error", error_message=str(e))
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             detail={"message": str(e), "kind": "timeout", "terminal_id": None},
@@ -3968,6 +4538,7 @@ async def run_step(
         # Ordered before the ValueError arm they subclass: an engine rejection is
         # a bad request, not an unknown terminal.
         _settle_step(None, str(e))
+        await _record_job_state(job_id, "error", error_message=str(e))
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except OutputExtractionError as e:
         # Also ordered before the ValueError arm it subclasses. The terminal and
@@ -3976,18 +4547,29 @@ async def run_step(
         # endpoint's documented contract above ("any other failure -> 500",
         # plain-string detail, no ``kind``), not 404 (issue #570).
         _settle_step(None, str(e))
+        await _record_job_state(job_id, "error", error_message=str(e))
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+    except TerminalLimitError as e:
+        # The node is at its tracked-terminal cap (CAO_MAX_TERMINALS) — surfaced
+        # as 429 so a step scheduler can retry on a different node instead of
+        # reading a kind-less 500.
+        _settle_step(None, str(e))
+        await _record_job_state(job_id, "error", error_message=str(e))
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
     except ValueError as e:
         # Unknown terminal / bad input surfaced by the terminal layer.
+        await _record_job_state(job_id, "error", error_message=str(e))
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except WorktreeError as e:
         # use_worktree=true against a working_directory that isn't a git repo,
         # or the 'git worktree add' itself failed -- a client-input problem
         # (bad/missing repo), not a server crash.
         _settle_step(None, str(e))
+        await _record_job_state(job_id, "error", error_message=str(e))
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:
         _settle_step(None, str(e))
+        await _record_job_state(job_id, "error", error_message=str(e))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to run step: {str(e)}",
@@ -4408,6 +4990,144 @@ async def _run_in_background(
         _failed_backstop("drive raised")
 
 
+class PlanApprovalRequest(BaseModel):
+    """Body of the approve-a-plan request (issue #583 Bolt 2, unit ``approval-operation``).
+
+    ``plan_id`` IS A BODY FIELD AND NEVER A PATH SEGMENT, on purpose. It contains a ``:``
+    (``plan-v1:…``) and ``approval_store`` requires it be stored and compared VERBATIM, never parsed
+    and never normalised — a normalisation is how two distinct plans could come to share one
+    approval. A path segment invites percent-encoding, decoding and normalisation from every layer
+    between the client and this handler; a body field makes verbatimness a property of the transport
+    instead of a hope.
+
+    THERE IS NO ``approved_by`` FIELD, also on purpose. Accepting one would create free text that
+    nothing can verify and that any caller could set to any value — the appearance of accountability
+    with none of the substance. It is resolved server-side instead, which at least makes it a true
+    statement about which local account performed the call.
+    """
+
+    plan_id: str
+
+
+@app.post("/workflows/plans/approve")
+async def approve_workflow_plan_endpoint(
+    body: PlanApprovalRequest,
+    # SCOPE_ADMIN ONLY, AND DELIBERATELY NARROWER THAN EVERY SIBLING WORKFLOW ENDPOINT, which accept
+    # ``SCOPE_WRITE, SCOPE_ADMIN``. DO NOT "align" this with them — widening it silently defeats the
+    # control. Approving a plan is an AUTHORISATION act rather than ordinary data mutation, and the
+    # MCP surface deliberately ships no grant tool so an agent cannot approve the plan it just wrote
+    # (issue #583 Bolt 2 ``approval-operation`` Q1). But the MCP boundary reaches the backplane over
+    # HTTP — that is exactly what ``test_http_only_boundary.py`` enforces — so if this endpoint
+    # accepted ``cao:write`` and an agent's token were write-scoped, the agent could grant by calling
+    # here directly and the missing tool would be a speed bump rather than a control.
+    #
+    # Honest caveat, recorded rather than implied away: ``require_any_scope`` is default-off, so in a
+    # default install this changes nothing. ``SCOPE_WRITE, SCOPE_ADMIN`` is equally inert there; the
+    # two differ ONLY when auth is enabled, which is the one case the distinction was asked for.
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
+) -> Dict:
+    """Approve a plan identifier so its runs may start (issue #583 FR-8).
+
+    Idempotent: approving an already-approved plan changes nothing and SAYS SO, reporting the
+    ORIGINAL ``approved_at``/``approved_by``. ``approval_store.grant`` is ``INSERT OR IGNORE``
+    because an update path could transfer an existing approval to a changed plan, so a plain
+    "success" here would leave an operator unable to tell "I have just approved this" from "this was
+    approved last week by someone else and my grant did nothing".
+
+    Success is derived from a READ-BACK rather than from the absence of an exception, because
+    ``INSERT OR IGNORE`` succeeds silently whether or not it inserted. A missing row afterwards is
+    an error, never a cheerful success — this unit's worst failure mode is a command that appears to
+    work, leaving the operator to meet the same refusal on the next run with no explanation.
+    """
+    plan_id = body.plan_id
+    if not plan_id or not plan_id.strip():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="plan_id is required")
+
+    existing = await asyncio.to_thread(approval_store.get_approval, plan_id)
+    if existing is not None:
+        logger.info(
+            "workflow plan approval: %s was already approved at %s by %s (no change)",
+            plan_id,
+            existing.approved_at,
+            existing.approved_by,
+        )
+        return {
+            "plan_id": plan_id,
+            "approved": True,
+            "changed": False,
+            "approved_at": existing.approved_at,
+            "approved_by": existing.approved_by,
+        }
+
+    approved_by = approval_provenance.local_account()
+    try:
+        await asyncio.to_thread(approval_store.grant, plan_id, approved_by)
+        recorded = await asyncio.to_thread(approval_store.get_approval, plan_id)
+    except Exception as e:  # noqa: BLE001 — surfaced, never swallowed into a false success
+        logger.error("workflow plan approval: grant for %s failed: %s", plan_id, e)
+        raise HTTPException(status_code=500, detail=f"could not record approval: {e}")
+
+    if recorded is None:
+        # A database fault that ``approval_store`` converted to a quiet None. Correct for the GATE,
+        # which must fail closed; wrong to read here as "not approved yet, all fine".
+        logger.error("workflow plan approval: grant for %s did not persist", plan_id)
+        raise HTTPException(status_code=500, detail="approval did not persist")
+
+    logger.info("workflow plan approval: %s approved by %s", plan_id, recorded.approved_by)
+    return {
+        # Echoed VERBATIM. Returning a normalised form would teach a caller that some other
+        # spelling is equivalent, which is exactly the equivalence approval_store forbids.
+        "plan_id": plan_id,
+        "approved": True,
+        "changed": True,
+        "approved_at": recorded.approved_at,
+        "approved_by": recorded.approved_by,
+    }
+
+
+@app.get("/workflows/runs/{run_id}/plan")
+async def get_workflow_run_plan_endpoint(
+    run_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Report a run's plan identifier and whether it is approved (issue #583 FR-8).
+
+    READ-ONLY, and a NEW route rather than an extension of ``GET /workflows/runs/{run_id}``: adding
+    fields to a shipped response would change a surface every existing caller already parses, which
+    C-1 forbids.
+
+    This is what the read-only MCP tool consults, so an agent that meets an approval refusal can tell
+    the operator WHICH ``plan_id`` to approve. It cannot grant one — that is the CLI's, behind
+    ``cao:admin``.
+
+    ``plan_id`` is ``None`` for a YAML run (which never freezes a manifest) and for a script run whose
+    freeze failed. Both are reported as ``None`` rather than as "unapproved", because "this run has no
+    plan identifier" and "this plan is not approved" call for entirely different operator actions.
+    """
+    # Imported locally, matching the other run-row handlers in this module (see the resume endpoint).
+    from cli_agent_orchestrator.services import workflow_journal
+
+    row = await asyncio.to_thread(workflow_journal.get_run, run_id)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'")
+
+    # Reuses the gate's extractor rather than parsing the manifest a second way: two extractors
+    # disagreeing about what a run's plan_id is would be worse than either being wrong alone.
+    plan_id = approval_gate.plan_id_from_manifest(row.manifest_json)
+    if plan_id is None:
+        return {"run_id": run_id, "tier": row.tier, "plan_id": None, "approved": None}
+
+    approval = await asyncio.to_thread(approval_store.get_approval, plan_id)
+    return {
+        "run_id": run_id,
+        "tier": row.tier,
+        "plan_id": plan_id,
+        "approved": approval is not None,
+        "approved_at": approval.approved_at if approval else None,
+        "approved_by": approval.approved_by if approval else None,
+    }
+
+
 @app.post("/workflows/runs")
 async def start_workflow_run_endpoint(
     body: WorkflowRunRequest,
@@ -4478,6 +5198,10 @@ async def start_workflow_run_endpoint(
                 status_code=422,
                 detail={"findings": workflow_spec_service.render_findings(e.findings)},
             )
+        except approval_gate.PlanApprovalUnavailableError as e:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
+        except approval_gate.PlanApprovalRequiredError as e:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
         except KeyError as e:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
         except ValueError as e:
@@ -4631,6 +5355,26 @@ async def submit_workflow_run_endpoint(
         spec_snapshot = json.dumps(
             {"source": spec.source, "path": spec.path, "content_hash": spec.content_hash}
         )
+        # Step 4b — approval gate (issue #583 Bolt 2, ``approval-gate``). Built ONCE here and handed
+        # to the INSERT below unchanged, so the manifest that is CHECKED is byte-identical to the one
+        # STORED. Gating BEFORE the INSERT means a refused start leaves no ``workflow_run`` row: every
+        # first run of a new plan is refused by design, so recording them would durably record runs
+        # that never happened. The blocking arm in ``script_runner`` gates identically at its Step 0b,
+        # because otherwise a run's approvability would depend on which route started it. No-ops
+        # entirely when enforcement is disabled, which is the default.
+        manifest_json = await asyncio.to_thread(
+            manifest_freeze.build_manifest_json,
+            source_hash=spec.content_hash,
+            inputs=resolved,
+        )
+        try:
+            approval_gate.ensure_plan_approved(tier="script", manifest_json=manifest_json)
+        except approval_gate.PlanApprovalUnavailableError as e:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
+        except approval_gate.PlanApprovalRequiredError as e:
+            # 403, distinct from this endpoint's 409 (run_id collision) and 422 (lint / corrupt), so a
+            # caller can tell "needs approval" from "the run broke".
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
         # Step 5 — the script row is a single INSERT (no seed steps), already
         # atomic on its own connection. This is the one deliberate deviation from
         # the engines' best-effort write: awaited, and its failure aborts with 500.
@@ -4645,6 +5389,15 @@ async def submit_workflow_run_endpoint(
                 started_at,
                 "script",
                 "1",
+                # issue #583 Bolt 2, ``manifest-freeze``: the frozen manifest rides the SAME
+                # INSERT as the run row (ADR-583-4's no-two-writes lesson). This is the ASYNC
+                # script arm; the blocking arm freezes in ``script_runner`` the same way, and
+                # BOTH script entry points must freeze or a run's approvability would depend on
+                # which route started it. ``build_manifest_json`` is total and returns None on
+                # failure, which writes NULL and fails CLOSED at the approval gate.
+                # ``approval-gate`` (Bolt 2 unit 7) built this value at Step 4b and has already gated
+                # on it; reusing it rather than rebuilding is what makes checked-equals-stored true.
+                manifest_json,
             )
         except sqlite3.IntegrityError:
             # TOCTOU (PR #525 review): step 0's uniqueness check and this insert are
@@ -4782,8 +5535,9 @@ async def get_workflow_run_endpoint(
     here is not. It therefore carries the same read-or-better gate as
     ``/diagnostics``, ``/events`` and ``/compare``: a FULL-route gate, not a
     per-field split, because a field split would still return ``output_json`` to
-    an unscoped caller. Default-off is unchanged — with ``CAO_AUTH_ENABLED``
-    unset the dependency returns the full scope set and enforces nothing.
+    an unscoped caller. Default-off is unchanged — with no IdP and no
+    ``CAO_AUTH_LOCAL_TOKEN`` configured the dependency returns the full scope set
+    and enforces nothing.
     Consequence for #505: its CLI/MCP status/result clients read this route (plus
     ``/events`` and ``/compare``) and must present a token carrying
     ``cao:read``/``cao:write``/``cao:admin`` once auth is enabled.
@@ -4807,8 +5561,9 @@ async def get_workflow_run_endpoint(
        ``{{steps.<id>.output.<field>}}`` templating read them back. So with capture
        at its default OFF, this route still returns step output and error verbatim.
     2. The ONLY protection is the scope dependency above, and it is INERT in the
-       default deployment: with ``CAO_AUTH_ENABLED`` unset, ``require_any_scope``
-       returns the full scope set and enforces nothing. A local CAO server therefore
+       default deployment: with no IdP and no ``CAO_AUTH_LOCAL_TOKEN`` configured,
+       ``require_any_scope`` returns the full scope set and enforces nothing. A
+       local CAO server therefore
        serves step output and error text to any caller that can reach the port.
 
     Deliberately documented rather than further gated: stripping the fields removes
@@ -5839,6 +6594,7 @@ async def get_workflow_run_result_endpoint(
         for s in steps
     ]
     error_kind = _resolve_error_kind(row, steps)
+    run_error = getattr(row, "error", None)
     result = WorkflowRunResult(
         run_id=row.run_id,
         workflow_name=row.workflow_name,
@@ -5847,6 +6603,7 @@ async def get_workflow_run_result_endpoint(
         started_at=row.started_at,
         finished_at=row.finished_at,
         kind=error_kind,
+        warnings=[run_error] if run_error else [],
     )
     body = result.model_dump()
 
@@ -6006,6 +6763,15 @@ async def resume_workflow_run_endpoint(
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'"
             )
+        except approval_gate.PlanApprovalUnavailableError as e:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
+        except approval_gate.PlanApprovalRequiredError as e:
+            # issue #583 Bolt 2, ``approval-gate``: 403, and it must be caught HERE rather than left
+            # to the arms below. ``PlanApprovalRequiredError`` is deliberately not a ``ValueError``
+            # precisely so the trailing 400 arm cannot claim it, and not a ``ResumeNotAllowedError``
+            # because 409 means "this run cannot be resumed" — a fact about the run — whereas this is
+            # a fact about the plan, and the operator's next action is completely different.
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
         except workflow_service.ResumeNotAllowedError as e:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
         except workflow_service.ResumeCorruptError as e:
@@ -6040,6 +6806,62 @@ async def resume_workflow_run_endpoint(
     except workflow_service.WorkflowEngineError as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
     return result.model_dump()
+
+
+@app.post("/workflows/runs/{run_id}/steps/{step_id}:replay")
+async def replay_workflow_step_endpoint(
+    run_id: str,
+    step_id: str,
+    body: Optional[StepReplayRequest] = None,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Re-execute ONE step of a recorded run and return its live result (issue #640).
+
+    Write-scoped because it creates a terminal and runs an agent — but READ-ONLY
+    with respect to the run it replays: the service writes no journal row and emits
+    no event for ``run_id``, so a completed or failed run can be re-probed step by
+    step, repeatedly, without disturbing what it recorded.
+
+    The step's prompt is resolved from the run's own journal (spec snapshot,
+    resolved inputs, predecessor outputs); an optional ``prompt_override`` replaces
+    the prompt TEMPLATE while keeping that resolution.
+
+    Error taxonomy mirrors the resume route: unknown run or unknown step -> 404, an
+    undeserializable spec snapshot -> 422, a script-tier run, an empty
+    ``prompt_override``, or a prompt that cannot be resolved from the recorded
+    predecessors -> 400. A step that FAILS is a 200 whose body carries ``error`` /
+    ``error_kind`` (a failed step is data, not a transport fault).
+
+    **The immutability guarantee has an audit consequence, accepted deliberately.**
+    Writing no journal row and emitting no event is what makes replay safe on a
+    recorded run — and it also means a replay execution is INVISIBLE to anything
+    treating the journal or event stream as the execution audit log, and is not
+    gated by plan approval (which gates run *starts*). That is consistent with CAO's
+    local single-operator model; the service logs each replay at INFO, which is the
+    trail. A deployment that needs replays audited should read those logs, not the
+    journal.
+    """
+    from cli_agent_orchestrator.services import workflow_service
+
+    try:
+        return await workflow_service.replay_single_step(
+            run_id,
+            step_id,
+            prompt_override=body.prompt_override if body is not None else None,
+        )
+    except KeyError as e:
+        # The service distinguishes "unknown run" from "unknown step" in the message;
+        # surface it rather than flattening both to the run-scoped default.
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e.args[0]) if e.args else f"unknown run '{run_id}'",
+        )
+    except workflow_service.ResumeCorruptError as e:
+        # 422 by literal code, matching the resume route's note on the ``status``
+        # alias drifting across Starlette versions in the CI matrix.
+        raise HTTPException(status_code=422, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 
 # ── graph layer (U4, Issue #348) ────────────────────────────────────────
@@ -6163,11 +6985,14 @@ async def export_graph_endpoint(
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
-    # Credential gate (ADR-5): scan the serialized view; on a hit, reject
-    # before the sink writes anything. secret_gate returns the pattern NAME,
-    # never the matched bytes, so the detail is safe to surface.
-    serialized = json.dumps(view.to_dict())
-    hit = secret_gate.scan_for_secrets(serialized)
+    # Credential gate (ADR-5): scan the PARSED view; on a hit, reject before
+    # the sink writes anything. secret_gate returns the pattern NAME, never
+    # the matched bytes, so the detail is safe to surface. Not json.dumps then
+    # scan: the default ensure_ascii=True turns an invisible character hiding
+    # inside a credential prefix into a literal \u escape the gate cannot
+    # strip, and the structured scan also keeps the key context a
+    # SecretAccessKey value needs.
+    hit = secret_gate.scan_json_for_secrets(view.to_dict())
     if hit is not None:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -6188,6 +7013,64 @@ async def export_graph_endpoint(
         )
 
     return {"written_files": written_files, "sink": body.sink, "dest": body.dest}
+
+
+@app.get(
+    HANDOFF_RESULTS_ROUTE,
+    summary="Retrieve a durable handoff step result (issue #447)",
+    description=(
+        "Returns the persisted state and result for a handoff job identified by "
+        "``job_id`` (generated by the MCP client and passed to ``POST /terminals/run-step`` "
+        "in the ``job_id`` field). Use this to recover a result that was not delivered "
+        "over the original request because the MCP transport timed out. "
+        "Possible ``state`` values: ``running`` (step still in progress), "
+        "``completed`` (result in ``last_message``), ``error`` (failure in ``error_message``)."
+    ),
+)
+async def get_handoff_result_endpoint(
+    job_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Retrieve a durable handoff step result by job_id (issue #447).
+
+    Returns the persisted record when found; 404 when the job_id is unknown
+    (either the caller never sent a job_id, or the record has been purged by
+    the retention sweep). Scope-gated (PR #453 review finding 4): ``last_message``
+    can carry worker output (prompts/secrets), so this follows the same
+    ``require_any_scope`` posture as other content-serving GETs (``/events``,
+    ``/memory/export``) rather than staying open. A no-op when auth is
+    disabled (the default) — ``require_any_scope`` only enforces when an IdP
+    is configured.
+    """
+    try:
+        record = get_handoff_result(job_id)
+    except Exception as exc:  # noqa: BLE001 — see the leak note below
+        # A storage failure must never hand the job_id to the ASGI error logger.
+        # This handler has no generic exception handler above it, so an escaping
+        # SQLAlchemy DBAPI error (a locked SQLite file being the realistic case)
+        # reaches uvicorn's ServerErrorMiddleware, which logs the whole traceback
+        # to ``uvicorn.error`` -- and that traceback prints the bound parameters,
+        # ``[parameters: ('<job_id>',)]``. The access-log filter in
+        # ``utils/logging.py`` scrubs the request PATH and never sees this
+        # surface, so the read path needs its own guard even though the write
+        # path is already covered (PR #453 review, read-error path).
+        # EXCEPTION CLASS NAME ONLY, and ``from None`` so nothing downstream can
+        # walk ``__cause__``/``__context__`` back to the parameter-bearing error.
+        logger.error(
+            "get_handoff_result: lookup failed for job_id_prefix=%s (%s)",
+            job_id[:8],
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Handoff result lookup failed; the record may still exist, retry shortly",
+        ) from None
+    if record is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Handoff result not found for job_id '{job_id}'",
+        )
+    return record
 
 
 @app.delete("/terminals/{terminal_id}")
@@ -6254,7 +7137,12 @@ async def create_inbox_message_endpoint(
     # Attempt immediate delivery if terminal is already IDLE.
     # If not, InboxService will deliver on next IDLE status event.
     try:
-        inbox_service.deliver_pending(receiver_id, registry=get_plugin_registry(request))
+        # deliver_pending reads status_monitor.get_status() (which can fork a tmux
+        # capture-pane via the stale-PROCESSING fallback) and, on delivery, paste-bombs
+        # the pane — blocking I/O either way, so keep it off the event loop.
+        await asyncio.to_thread(
+            inbox_service.deliver_pending, receiver_id, registry=get_plugin_registry(request)
+        )
     except Exception as e:
         logger.warning(f"Immediate delivery attempt failed for {receiver_id}: {e}")
 
@@ -6341,17 +7229,21 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
       request ``Host`` or in the trusted set (CWE-1385 cross-site WebSocket
       hijacking guard);
     * when the HTTP auth layer is enabled (``AUTH0_DOMAIN`` /
-      ``CAO_AUTH_JWKS_URI`` set — see :func:`is_auth_enabled`), the handshake
-      must carry a valid bearer token granting at least the ``cao:read``
-      scope.
+      ``CAO_AUTH_JWKS_URI`` set, or a standalone ``CAO_AUTH_LOCAL_TOKEN`` — see
+      :func:`is_auth_enabled`), the handshake must carry a valid bearer token
+      granting ``cao:write`` or ``cao:admin``. Keystroke injection is RCE;
+      ``cao:read`` is not enough. HTTP ``POST /terminals/{id}/input`` already
+      requires write. In local-token mode the bearer must equal the configured
+      token, which carries the full scope set.
 
     Token scheme: browsers cannot set request headers on a WebSocket
     handshake, so the token is accepted from either ``Authorization: Bearer
     <token>`` (native clients) or a ``?token=<token>`` query parameter (the
     bundled web viewer). The token is verified exactly like the HTTP layer —
     RS256 signature, issuer, audience and expiry via the JWKS cache — and a
-    missing/invalid token or one lacking ``cao:read`` closes the handshake
-    with code 4401 before accept. This closes the bypass where widening
+    missing/invalid token or one lacking ``cao:write`` (or ``cao:admin``)
+    closes the handshake with code 4401 before accept. This closes the bypass
+    where widening
     ``CAO_WS_ALLOWED_CLIENTS`` / ``CAO_WS_ALLOWED_ORIGINS`` for containers,
     devcontainers or Codespaces exposed full PTY control with no credential.
     Do NOT expose the server to untrusted networks (e.g. --host 0.0.0.0)
@@ -6364,12 +7256,17 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
     # A literal ``*`` in the allowlist disables the IP check (Codespaces /
     # devcontainers / remote setups where the WS client originates from an
     # IP the operator cannot enumerate ahead of time).
+    #
+    # A missing peer address fails CLOSED. The pinned uvicorn never produces
+    # one on this path: it populates ``client`` for every TCP connection, and
+    # its proxy-headers middleware rewrites the peer to a ``(host, port)``
+    # tuple even for empty or garbage forwarded values, never to ``None``. So
+    # ``None`` means some other ASGI server or middleware left the peer unset,
+    # and an unattributable peer is precisely the one this allowlist must not
+    # admit by accident. Operators who genuinely cannot enumerate peers have
+    # the ``*`` opt-out above.
     client_host = websocket.client.host if websocket.client else None
-    if (
-        "*" not in WS_ALLOWED_CLIENTS
-        and client_host is not None
-        and client_host not in WS_ALLOWED_CLIENTS
-    ):
+    if "*" not in WS_ALLOWED_CLIENTS and client_host not in WS_ALLOWED_CLIENTS:
         await websocket.close(code=4003, reason="WebSocket access is restricted to allowed clients")
         return
 
@@ -6405,9 +7302,10 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
     # identity: browsers cannot set request headers on a WebSocket handshake,
     # so the token is accepted from the Authorization header or a ``?token=``
     # query parameter. The token is verified with the same JWKS/issuer/
-    # audience/expiry logic as the HTTP layer and must grant at least
-    # ``SCOPE_READ``. Default-off (auth disabled): no token is required and
-    # behavior is byte-for-byte unchanged.
+    # audience/expiry logic as the HTTP layer and must grant ``SCOPE_WRITE``
+    # or ``SCOPE_ADMIN``. ``SCOPE_READ`` is enough to watch HTTP output, not
+    # to type into the PTY. Default-off (auth disabled): no token is required
+    # and behavior is byte-for-byte unchanged.
     if is_auth_enabled():
         token = _extract_bearer(websocket.headers.get("authorization"))
         if not token:
@@ -6428,11 +7326,12 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
             )
             await websocket.close(code=4401, reason="Unauthorized")
             return
-        if SCOPE_READ not in scopes:
+        if SCOPE_WRITE not in scopes and SCOPE_ADMIN not in scopes:
             logger.warning(
-                "Rejected WebSocket attach for terminal %r: token lacks %r scope",
+                "Rejected WebSocket attach for terminal %r: token lacks %r/%r scope",
                 terminal_id,
-                SCOPE_READ,
+                SCOPE_WRITE,
+                SCOPE_ADMIN,
             )
             await websocket.close(code=4401, reason="Unauthorized")
             return
@@ -6753,6 +7652,154 @@ def _get_memory_service():
     return MemoryService()
 
 
+def _memory_partial_write_response(error: Any) -> JSONResponse:
+    """Preserve the typed partial-write contract across the HTTP boundary."""
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={
+            "error_kind": error.error_kind,
+            "partial_write": {
+                "key": error.key,
+                "scope": error.scope,
+                "scope_id": error.scope_id,
+                "file_path": error.file_path,
+                "completed_phases": error.completed_phases,
+                "repair_command": error.repair_command,
+            },
+        },
+    )
+
+
+class InternalMemoryContext(BaseModel):
+    terminal_id: Optional[str] = None
+    session_name: Optional[str] = None
+    provider: Optional[str] = None
+    agent_profile: Optional[str] = None
+    cwd: Optional[str] = None
+
+
+class InternalMemoryStoreRequest(BaseModel):
+    content: str
+    scope: MemoryScope = MemoryScope.PROJECT
+    memory_type: MemoryType = MemoryType.PROJECT
+    # Lenient, not strict: these routes back the MCP memory tools, which have
+    # always let MemoryService._sanitize_key normalize the key. Strict validation
+    # here 422'd calls that succeed in-process, so enabling CAO_MEMORY_API_URL
+    # broke working callers. See LenientMemoryKey.
+    # Lenient, not strict: these routes back the MCP memory tools, which have
+    # always let MemoryService._sanitize_key normalize the key. Strict validation
+    # here 422'd calls that succeed in-process, so enabling CAO_MEMORY_API_URL
+    # broke working callers. See LenientMemoryKey.
+    key: Optional[LenientMemoryKey] = None
+    tags: str = ""
+    terminal_context: Optional[InternalMemoryContext] = None
+
+
+class InternalMemoryRecallRequest(BaseModel):
+    query: Optional[str] = None
+    scope: Optional[MemoryScope] = None
+    memory_type: Optional[MemoryType] = None
+    limit: int = Field(default=10, ge=1, le=100)
+    terminal_context: Optional[InternalMemoryContext] = None
+    search_mode: str = "hybrid"
+    sort_by: str = "recency"
+    include_related: bool = False
+
+
+class InternalMemoryForgetRequest(BaseModel):
+    key: LenientMemoryKey  # see InternalMemoryStoreRequest.key
+    scope: MemoryScope = MemoryScope.PROJECT
+    terminal_context: Optional[InternalMemoryContext] = None
+
+
+class InternalMemoryInjectionRequest(BaseModel):
+    terminal_context: InternalMemoryContext
+    budget_chars: int = Field(default=3000, ge=0, le=20000)
+
+
+@app.post("/internal/memory/store")
+async def internal_memory_store(
+    body: InternalMemoryStoreRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Any:
+    """Store memory on this node for a remote CAO worker."""
+    from cli_agent_orchestrator.services.memory_service import MemoryPartialWriteError
+
+    _require_memory_enabled()
+    try:
+        memory = await _get_memory_service().store(
+            content=body.content,
+            scope=body.scope.value,
+            memory_type=body.memory_type.value,
+            key=body.key,
+            tags=body.tags,
+            terminal_context=(
+                body.terminal_context.model_dump(exclude_none=True)
+                if body.terminal_context
+                else None
+            ),
+        )
+    except MemoryPartialWriteError as error:
+        return _memory_partial_write_response(error)
+    return {
+        "memory": memory.model_dump(mode="json"),
+        "action": memory.action,
+    }
+
+
+@app.post("/internal/memory/recall")
+async def internal_memory_recall(
+    body: InternalMemoryRecallRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Recall memory using context resolved by a remote worker node."""
+    _require_memory_enabled()
+    memories = await _get_memory_service().recall(
+        query=body.query,
+        scope=body.scope.value if body.scope else None,
+        memory_type=body.memory_type.value if body.memory_type else None,
+        limit=body.limit,
+        terminal_context=(
+            body.terminal_context.model_dump(exclude_none=True) if body.terminal_context else None
+        ),
+        search_mode=body.search_mode,
+        sort_by=body.sort_by,
+        include_related=body.include_related,
+    )
+    return {"memories": [memory.model_dump(mode="json") for memory in memories]}
+
+
+@app.post("/internal/memory/forget")
+async def internal_memory_forget(
+    body: InternalMemoryForgetRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Forget memory using context resolved by a remote worker node."""
+    _require_memory_enabled()
+    deleted = await _get_memory_service().forget(
+        key=body.key,
+        scope=body.scope.value,
+        terminal_context=(
+            body.terminal_context.model_dump(exclude_none=True) if body.terminal_context else None
+        ),
+    )
+    return {"deleted": deleted}
+
+
+@app.post("/internal/memory/context")
+async def internal_memory_context(
+    body: InternalMemoryInjectionRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, str]:
+    """Build the startup memory block for a terminal owned by another node."""
+    _require_memory_enabled()
+    context = _get_memory_service().get_memory_context(
+        body.terminal_context.model_dump(exclude_none=True),
+        budget_chars=body.budget_chars,
+    )
+    return {"context": context}
+
+
 def _require_memory_enabled() -> None:
     """Raise 404 when the memory subsystem is disabled.
 
@@ -6803,7 +7850,48 @@ def _to_memory_summary(mem, base_dir: Path) -> MemorySummary:
         tags=mem.tags,
         created_at=mem.created_at,
         updated_at=mem.updated_at,
+        source_kind=getattr(mem, "source_kind", "native"),
+        source_path=getattr(mem, "source_path", None),
+        indexed_at=getattr(mem, "indexed_at", None),
+        index_freshness=getattr(mem, "index_freshness", None),
+        content_truncated=bool(getattr(mem, "content_truncated", False)),
     )
+
+
+@app.get("/memory/vault/status")
+async def vault_status_endpoint(
+    vault_id: Optional[str] = None,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Return the existing read-only, content-free vault status projection."""
+    from cli_agent_orchestrator.services.settings_service import get_vault_config
+    from cli_agent_orchestrator.services.vault.binding import VaultConfigUnavailableError
+    from cli_agent_orchestrator.services.vault.status import get_vault_status
+
+    try:
+        config = get_vault_config()
+    except (VaultConfigUnavailableError, ValueError):
+        return {"configured": False, "vaults": []}
+    if not config.enabled:
+        return {"configured": False, "vaults": []}
+
+    return {
+        "configured": True,
+        "vaults": [
+            {
+                "vault_id": item.vault_id,
+                "status_counts": dict(item.status_counts),
+                "finding_counts": dict(item.finding_counts),
+                "warnings": list(item.warnings),
+                "recall_counters": dict(item.recall_counters),
+                "process_local_unmapped_project_writes": item.process_local_unmapped_project_writes,
+                "process_local_unmapped_project_identities": item.process_local_unmapped_project_identities,
+                "process_local_non_writable_write_refusals": item.process_local_non_writable_write_refusals,
+                "process_local_secret_gate_write_refusals": item.process_local_secret_gate_write_refusals,
+            }
+            for item in get_vault_status(config, vault_id=vault_id)
+        ],
+    }
 
 
 @app.get("/memory", response_model=List[MemorySummary])
@@ -7169,12 +8257,17 @@ async def delete_memory_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to delete memory: {str(e)}",
         )
-    if not deleted:
+    if deleted.action == "absent":
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Memory '{key}' not found in scope '{scope.value}'",
         )
-    return {"success": True}
+    return {
+        "success": True,
+        "action": deleted.action,
+        "path": deleted.path,
+        "source_kind": deleted.source_kind,
+    }
 
 
 @app.delete("/memory")
@@ -7214,7 +8307,12 @@ async def clear_memories_endpoint(
         try:
             # session/agent results carry scope_id natively; project results
             # need the query param (their recalled scope_id is None).
-            if await svc.forget(key=mem.key, scope=scope.value, scope_id=mem.scope_id or scope_id):
+            result = await svc.forget(
+                key=mem.key,
+                scope=scope.value,
+                scope_id=mem.scope_id or scope_id,
+            )
+            if result.action in {"deleted", "deindexed", "deleted_and_deindexed"}:
                 deleted_count += 1
         except MemoryDisabledError:
             raise HTTPException(
@@ -7242,18 +8340,35 @@ class OutcomeCreateBody(BaseModel):
 
 
 def _require_learning_enabled() -> None:
-    """Raise 404 when workflow self-learning is disabled.
+    """Raise 404 when workflow self-learning is disabled, 503 when unknown.
 
     list_outcomes() silently returns [] when disabled, so the gate must be
     explicit rather than inferred from empty results (same reasoning as
     ``_require_memory_enabled``).
-    """
-    from cli_agent_orchestrator.services.settings_service import is_learning_enabled
 
-    if not is_learning_enabled():
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Workflow self-learning is disabled"
-        )
+    The 404/503 split is the point: an unreadable settings.json resolves to
+    "disabled" internally (learning fails closed, by design), but reporting THAT
+    as 404 tells the caller a configuration story about a filesystem fault. 503
+    says "I cannot tell", which is what an operator needs to hear.
+
+    ``_require_memory_enabled`` deliberately has no 503 branch — memory fails
+    OPEN, so an unreadable file there resolves to enabled and cannot mislead.
+    """
+    from cli_agent_orchestrator.services.outcome_service import LEARNING_DISABLED_MESSAGE
+    from cli_agent_orchestrator.services.settings_service import (
+        is_learning_enabled,
+        learning_status,
+    )
+
+    if is_learning_enabled():
+        return
+    # Disabled — but WHY? learning_status() is consulted only to explain the
+    # False, never to decide it, so is_learning_enabled() remains the single
+    # decision point every override and test seam already targets.
+    st = learning_status()
+    if st.unreadable:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=st.detail)
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=LEARNING_DISABLED_MESSAGE)
 
 
 @app.post("/outcomes")
@@ -7263,6 +8378,7 @@ async def create_outcome_endpoint(
 ) -> Dict:
     """Record a workflow outcome (self-learning signal)."""
     from cli_agent_orchestrator.services.outcome_service import (
+        LEARNING_DISABLED_MESSAGE,
         LearningDisabledError,
         OutcomeService,
     )
@@ -7280,9 +8396,14 @@ async def create_outcome_endpoint(
             friction_notes=body.friction_notes,
         )
     except LearningDisabledError:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Workflow self-learning is disabled"
-        )
+        # LEARNING_DISABLED_MESSAGE, not a hand-written string: it carries
+        # LEARNING_DISABLED_CODE, which is what the MCP layer matches on before
+        # reporting `disabled: true`. This is the race path — learning was enabled
+        # when _require_learning_enabled() ran and disabled by the time the write
+        # landed — so it is genuinely the feature gate and must read as such.
+        # A bare detail here would surface as a plain error instead, making the
+        # discriminator's coverage depend on which of two gates fired.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=LEARNING_DISABLED_MESSAGE)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     return {"success": True, "outcome": outcome}
@@ -7381,9 +8502,11 @@ def main():
     # literal ``*`` is honoured and disables the check (matches the
     # existing CAO_WS_ALLOWED_CLIENTS="*" semantics).
     forwarded_ips = "*" if "*" in TRUSTED_FORWARDER_IPS else ",".join(TRUSTED_FORWARDER_IPS)
-    # Credential query params (``?access_token=``) are scrubbed from uvicorn's
-    # access log by ``install_access_log_redaction()``, installed in the app
-    # lifespan so both ``cao-server`` and ``uvicorn ...:app`` are covered.
+    # Credential query params (``?access_token=``, the WebSocket ``?token=``) are
+    # scrubbed from uvicorn's request logs -- ``uvicorn.access`` for HTTP and
+    # ``uvicorn.error`` for WebSocket handshakes -- by
+    # ``install_access_log_redaction()``, installed in the app lifespan so both
+    # ``cao-server`` and ``uvicorn ...:app`` are covered.
     uvicorn.run(
         app,
         host=host,
