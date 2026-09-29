@@ -1277,13 +1277,15 @@ class TmuxClient:
         window_shell: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
         pane_layout: str = DEFAULT_PANE_LAYOUT,
+        trusted_env: Optional[Dict[str, str]] = None,
     ) -> str:
         """Split ``host_window_name`` and return the new terminal's name.
 
         The terminal's name is written to the pane's mark rather than to a
         window name, because its siblings share the window. Refusing a name
         already marked in this session keeps the mark unique, which is what
-        every later lookup relies on.
+        every later lookup relies on. ``trusted_env`` carries the agent
+        profile's own ``env:`` declaration, as in ``create_window``.
         """
         try:
             if pane_layout not in PANE_LAYOUTS:
@@ -1305,8 +1307,11 @@ class TmuxClient:
                     f"Terminal '{terminal_name}' already exists in session '{session_name}'"
                 )
 
+            # new-window -e / split-window -e are scoped to the new pane, so
+            # the profile's env stays with this terminal (unlike new-session).
             pane_env: dict[str, str] = {}
             self._merge_extra_env(pane_env, extra_env)
+            merge_profile_env(pane_env, trusted_env)
             apply_runtime_identity(pane_env, terminal_id, session_name)
 
             host_window = self._find_window(session, session_name, host_window_name)

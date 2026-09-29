@@ -116,6 +116,7 @@ class TmuxBackend(TerminalBackend):
                         working_directory,
                         window_shell,
                         extra_env=extra_env,
+                        trusted_env=trusted_env,
                         pane_layout=self._pane_layout,
                     )
                 except PaneSpawnUnavailable as e:

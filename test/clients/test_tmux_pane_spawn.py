@@ -268,6 +268,41 @@ class TestCreatePane:
 
         assert host_window.split.call_args.kwargs["environment"]["CAO_TERMINAL_ID"] == "tid-42"
 
+    def test_carries_profile_env_into_the_split_pane(self, tmux, tmp_path):
+        """split-window -e is pane-scoped, so the profile's env stays with this
+        terminal; the runtime identity still wins over a spoofed value."""
+        _, host_window = self._session(tmux)
+
+        tmux.create_pane(
+            "ses",
+            "cao-agents",
+            "coder-3",
+            "tid-42",
+            str(tmp_path),
+            trusted_env={"CLAUDE_CONFIG_DIR": "/abs/.claude-b", "CAO_TERMINAL_ID": "spoofed"},
+        )
+
+        env = host_window.split.call_args.kwargs["environment"]
+        assert env["CLAUDE_CONFIG_DIR"] == "/abs/.claude-b"
+        assert env["CAO_TERMINAL_ID"] == "tid-42"
+        assert env["CAO_SESSION_NAME"] == "ses"
+
+    def test_carries_profile_env_into_a_new_host_window(self, tmux, tmp_path):
+        session = session_with()
+        tmux.server.sessions.get.return_value = session
+
+        tmux.create_pane(
+            "ses",
+            "cao-agents",
+            "coder-3",
+            "tid",
+            str(tmp_path),
+            trusted_env={"CLAUDE_CONFIG_DIR": "/abs/.claude-b"},
+        )
+
+        env = session.new_window.call_args.kwargs["environment"]
+        assert env["CLAUDE_CONFIG_DIR"] == "/abs/.claude-b"
+
     def test_refuses_a_name_already_marked(self, tmux, tmp_path):
         """Two panes with one mark would make every later lookup ambiguous."""
         _, host_window = self._session(tmux, existing_marks=["coder-3"])

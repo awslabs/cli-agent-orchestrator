@@ -42,6 +42,24 @@ class TestSpawnModeRouting:
 
         assert client.create_pane.call_args.kwargs["pane_layout"] == "tiled"
 
+    def test_profile_env_reaches_a_pane_mode_terminal(self, client):
+        """A profile's env: must not depend on the spawn mode."""
+        profile_env = {"CLAUDE_CONFIG_DIR": "/abs/.claude-b"}
+        backend = TmuxBackend(client=client, spawn_mode="pane")
+
+        backend.create_window("ses", "coder-3", "tid", trusted_env=profile_env)
+
+        assert client.create_pane.call_args.kwargs["trusted_env"] == profile_env
+
+    def test_profile_env_survives_the_fallback_to_a_window(self, client):
+        client.create_pane.side_effect = PaneSpawnUnavailable("no space for new pane")
+        profile_env = {"CLAUDE_CONFIG_DIR": "/abs/.claude-b"}
+        backend = TmuxBackend(client=client, spawn_mode="pane")
+
+        backend.create_window("ses", "coder-3", "tid", trusted_env=profile_env)
+
+        assert client.create_window.call_args.kwargs["trusted_env"] == profile_env
+
 
 class TestFallbackIsNarrow:
     def test_a_full_host_window_falls_back_to_a_window(self, client):
