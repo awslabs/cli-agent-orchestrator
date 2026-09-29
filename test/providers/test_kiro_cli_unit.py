@@ -498,6 +498,17 @@ class TestKiroCliProviderStatusDetection:
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
         assert provider.shows_turn_work(text) is False
 
+    def test_the_work_sign_check_is_linear_in_the_buffer(self):
+        """Runs on every chunk while a turn is unstarted, so a crafted run of colour
+        codes must not make it quadratic (it took ~1s on 32 KB; PR #812 review)."""
+        import time
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        crafted = "\x1b[2K" + "\x1b[7m" * 8000
+        start = time.perf_counter()
+        assert provider.shows_turn_work(crafted) is False
+        assert time.perf_counter() - start < 0.2
+
     @staticmethod
     def _dispatch(monitor, provider):
         """A real send, in send_input's order."""

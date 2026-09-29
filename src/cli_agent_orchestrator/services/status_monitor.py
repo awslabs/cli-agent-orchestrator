@@ -245,6 +245,9 @@ class StatusMonitor:
         # decides what "seen working" means. Turns opened without a clear
         # (provider init keystrokes, send_special_key) keep the legacy rule.
         self._turn_buffer_cleared: Dict[str, bool] = {}
+        # The status a dispatch found, kept so abort_turn() can put it back when
+        # the dispatch fails before any keystroke reached the agent.
+        self._pre_dispatch_status: Dict[str, Optional[TerminalStatus]] = {}
 
     async def run(self) -> None:
         """Subscribe to output events and detect status changes.
@@ -812,7 +815,15 @@ class StatusMonitor:
 
         now = time.monotonic()
         with self._lock:
-            if self._last_status.get(terminal_id) == TerminalStatus.PROCESSING:
+            # A latched PROCESSING normally means the work was already seen, so the
+            # probe has nothing to add. Not so while a dispatched turn is unstarted:
+            # assume_processing_on_dispatch latches PROCESSING at the paste, and a
+            # fast reply drawn in one continuous burst then never showed its spinner
+            # at an edge — the turn waited out the 60s backstop (about 1 in 20 live
+            # claude_code sends; PR #812 review, round 8).
+            if self._last_status.get(
+                terminal_id
+            ) == TerminalStatus.PROCESSING and not self._turn_unstarted_locked(terminal_id):
                 return
             last_probe = self._midburst_probe_at.get(terminal_id)
             if last_probe is not None and now - last_probe < PYTE_MIDBURST_PROBE_S:
@@ -1194,6 +1205,7 @@ class StatusMonitor:
         evidence the agent began, so it must not close the turn later.
         """
         with self._lock:
+            self._pre_dispatch_status[terminal_id] = self._last_status.get(terminal_id)
             self._allow_processing_revert[terminal_id] = True
             turn = self._turn.get(terminal_id, 0) + 1
             self._turn[terminal_id] = turn
@@ -1222,6 +1234,39 @@ class StatusMonitor:
             # stale ready frame the corroboration it needs to close the new turn.
             self._apply_detection(terminal_id, TerminalStatus.PROCESSING, observed=False)
         return turn
+
+    def abort_turn(self, terminal_id: str, turn: int) -> None:
+        """Undo a dispatch that failed before its keystrokes reached the agent.
+
+        send_input opens the turn (and, for assume_processing_on_dispatch
+        providers, publishes PROCESSING) before send_keys. If send_keys then
+        raises, nothing was typed, yet the open, never-started turn would make
+        the latch refuse every ready reading until TURN_START_BACKSTOP_S — a
+        minute in which InboxService, `cao session send` and handoff all see a
+        busy agent (PR #812 review, round 8). So close the turn and, if the
+        status is still the assumed PROCESSING, restore what the dispatch found.
+        A newer dispatch or a closed turn is left alone.
+        """
+        restored: Optional[TerminalStatus] = None
+        with self._lock:
+            if (
+                self._turn.get(terminal_id, 0) != turn
+                or self._turn_done.get(terminal_id, 0) >= turn
+            ):
+                return
+            self._turn_done[terminal_id] = turn
+            self._allow_processing_revert[terminal_id] = False
+            prior = self._pre_dispatch_status.pop(terminal_id, None)
+            if (
+                prior is not None
+                and prior != TerminalStatus.PROCESSING
+                and self._last_status.get(terminal_id) == TerminalStatus.PROCESSING
+            ):
+                self._last_status[terminal_id] = prior
+                restored = prior
+        logger.warning(f"Terminal {terminal_id}: dispatch of turn {turn} failed; turn closed")
+        if restored is not None:
+            bus.publish(f"terminal.{terminal_id}.status", {"status": restored.value})
 
     def notify_input_delivered(self, terminal_id: str) -> None:
         """Re-stamp the current turn's delivery time now the keystrokes have landed.
@@ -1304,6 +1349,7 @@ class StatusMonitor:
             self._turn_started.pop(terminal_id, None)
             self._turn_delivered_at.pop(terminal_id, None)
             self._turn_buffer_cleared.pop(terminal_id, None)
+            self._pre_dispatch_status.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
 

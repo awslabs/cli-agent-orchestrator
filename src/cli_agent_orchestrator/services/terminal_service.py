@@ -2559,25 +2559,32 @@ def send_input(
         # Give stateful providers the same explicit generation boundary as the
         # rolling byte buffer.  Grok uses this to distinguish a new,
         # byte-identical completion from a retained completion screen.
-        status_monitor.clear_rolling_buffer(terminal_id, provider)
+        try:
+            status_monitor.clear_rolling_buffer(terminal_id, provider)
 
-        # Mark the provider before send_keys rather than after it.  send_keys
-        # includes the provider-specific submit delay, during which a fast CLI
-        # can already emit its first processing and completion frames.  Those
-        # frames must be parsed as belonging to this turn, not as a stale
-        # post-clear redraw.  StatusMonitor has already armed and cleared the
-        # same dispatch boundary above.
-        if provider:
-            provider.mark_input_received()
+            # Mark the provider before send_keys rather than after it.  send_keys
+            # includes the provider-specific submit delay, during which a fast CLI
+            # can already emit its first processing and completion frames.  Those
+            # frames must be parsed as belonging to this turn, not as a stale
+            # post-clear redraw.  StatusMonitor has already armed and cleared the
+            # same dispatch boundary above.
+            if provider:
+                provider.mark_input_received()
 
-        get_backend().send_keys(
-            metadata["tmux_session"],
-            metadata["tmux_window"],
-            message,
-            enter_count=enter_count,
-            force_bracketed_paste=True,
-            submit_delay=provider.paste_submit_delay if provider else 0.3,
-        )
+            get_backend().send_keys(
+                metadata["tmux_session"],
+                metadata["tmux_window"],
+                message,
+                enter_count=enter_count,
+                force_bracketed_paste=True,
+                submit_delay=provider.paste_submit_delay if provider else 0.3,
+            )
+        except Exception:
+            # Nothing reached the agent. Close the turn rather than leave it open
+            # and never started, which held the terminal "processing" until the
+            # 60s backstop (PR #812 review, round 8).
+            status_monitor.abort_turn(terminal_id, turn)
+            raise
 
         # The turn's keystrokes have now cleared send_keys' submit delay, so the
         # agent has actually been handed the prompt. The turn-start backstop

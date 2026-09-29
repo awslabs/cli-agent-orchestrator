@@ -2089,6 +2089,42 @@ class TestSendInput:
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_send_input_aborts_the_turn_when_send_keys_fails(
+        self,
+        mock_get_metadata,
+        mock_tmux,
+        mock_pm,
+        mock_update,
+        mock_status_monitor,
+        mock_memory_service,
+    ):
+        """If send_keys raises, nothing reached the agent: the opened turn is
+        aborted (not left open until the 60s backstop) and the error still
+        propagates to the caller."""
+        mock_memory_service.return_value.get_curated_memory_context.return_value = ""
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        mock_provider = mock_pm.get_provider.return_value
+        mock_provider.paste_enter_count = 1
+        mock_provider.paste_submit_delay = 0.3
+        mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_status_monitor.notify_input_sent.return_value = 5
+        mock_tmux.send_keys.side_effect = RuntimeError("tmux: no server running")
+
+        with pytest.raises(RuntimeError, match="no server running"):
+            send_input("test1234", "hello")
+
+        mock_status_monitor.abort_turn.assert_called_once_with("test1234", 5)
+        mock_status_monitor.notify_input_delivered.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.terminal_service.MemoryService")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_send_input_assumes_processing_when_the_provider_declares_it(
         self,
         mock_get_metadata,

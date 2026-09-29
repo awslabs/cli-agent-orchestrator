@@ -2269,3 +2269,66 @@ class TestRound8TurnOwnership:
             sm._detect_status = detect_while_send_input_continues
             sm._process_chunk("t1", "\x1b[?25h")  # a cursor refresh, read pre-clear
             assert sm.turn_state("t1") == (2, 1)
+
+
+class TestAbortTurn:
+    """A dispatch that fails before its keystrokes land (PR #812 review, round 8)."""
+
+    def test_a_failed_dispatch_closes_its_turn_and_restores_the_status(self):
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.COMPLETED
+        turn = sm.notify_input_sent("t1", assume_processing=True)
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+
+        sm.abort_turn("t1", turn)
+
+        assert sm.turn_state("t1") == (1, 1)
+        assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+        # The next real send works normally.
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        sm.notify_input_sent("t1")
+        sm.clear_rolling_buffer("t1", provider)
+        sm.notify_input_delivered("t1")
+        sm._apply_detection("t1", TerminalStatus.PROCESSING)
+        sm._apply_detection("t1", TerminalStatus.COMPLETED)
+        assert sm.turn_state("t1") == (2, 2)
+
+    def test_it_leaves_a_newer_turn_alone(self):
+        sm = StatusMonitor()
+        first = sm.notify_input_sent("t1")
+        sm.notify_input_sent("t1")
+        sm.abort_turn("t1", first)
+        assert sm.turn_state("t1") == (2, 0)
+
+
+class TestMidburstProbeWhileUnstarted:
+    """assume_processing latches PROCESSING at the paste, which used to switch the
+    mid-burst probe off for exactly the turn that needed it (PR #812, round 8)."""
+
+    def test_the_probe_starts_an_assumed_processing_turn(self):
+        sm = StatusMonitor()
+        provider = MagicMock()
+        provider.supports_screen_detection = True
+        provider.supports_midburst_processing_probe = True
+        provider.probe_processing_from_screen.return_value = True
+        sm._last_status["t1"] = TerminalStatus.COMPLETED
+        sm.notify_input_sent("t1", assume_processing=True)
+        sm.clear_rolling_buffer("t1", provider)
+        sm.notify_input_delivered("t1")
+        sm._screen_lines = lambda tid: (["✻ Cultivating… (3s)"], None)
+
+        sm._midburst_processing_probe("t1", provider)  # spinner seen mid-burst
+        sm._apply_detection("t1", TerminalStatus.COMPLETED)
+
+        assert sm.turn_state("t1") == (1, 1)
+
+    def test_the_probe_stays_off_once_the_turn_was_seen(self):
+        sm = StatusMonitor()
+        provider = MagicMock()
+        provider.supports_screen_detection = True
+        provider.supports_midburst_processing_probe = True
+        sm.notify_input_sent("t1")
+        sm._apply_detection("t1", TerminalStatus.PROCESSING)
+        sm._midburst_processing_probe("t1", provider)
+        provider.probe_processing_from_screen.assert_not_called()

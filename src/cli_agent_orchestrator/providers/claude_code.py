@@ -1223,6 +1223,21 @@ class ClaudeCodeProvider(BaseProvider):
     # detector below is tuned for a COMPOSITED viewport, not the raw stream.
     supports_screen_detection = True
 
+    # The spinner test below is a pure pattern match, so the monitor may run it on
+    # half-drawn frames. It needs to: a fast reply drawn in one continuous burst
+    # shows its spinner only mid-burst, never at an edge (PR #812 review, round 8).
+    supports_midburst_processing_probe = True
+
+    def probe_processing_from_screen(self, screen_lines: List[str]) -> bool:
+        """Whether a half-drawn frame shows claude's live spinner.
+
+        Positive evidence only, with the same gerund-first pattern and bottom
+        region get_status_from_screen uses for PROCESSING, so the probe cannot
+        call busy anything the settled detector would not. Pure: no state.
+        """
+        rows = [ln.rstrip() for ln in screen_lines if ln.strip()]
+        return any(NEW_TUI_BOX_SPINNER_PATTERN.search(ln) for ln in rows[-25:])
+
     def get_status_from_screen(self, screen_lines: List[str]) -> TerminalStatus:
         """Detect status from a pyte-composited viewport (escape-free rows).
 

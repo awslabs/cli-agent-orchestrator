@@ -118,11 +118,16 @@ TUI_PROCESSING_PATTERN = r"Kiro is working|Thinking\.\.\."
 # transcript lines behind a "•" bullet or an indent, and never with the cursor
 # block. Unlike TUI_PROCESSING_PATTERN this is positive evidence only — see
 # KiroCliProvider.shows_turn_work.
+#
+# Each alternative has a single run of colour codes/spaces, so the match is linear
+# in the buffer; the composer's "must include the cursor block" test is done on the
+# captured run instead of in the pattern, where two adjacent runs around it made
+# the search quadratic (about 1s on a crafted 32 KB buffer; PR #812 review).
 TUI_LIVE_WORK_PATTERN = re.compile(
     r"\x1b\[2K(?:\x1b\[[0-9;]*m)*[⠀-⣿ᗢ-ᗧ](?:\x1b\[[0-9;]*m| )*Thinking\.\.\."
-    r"|\x1b\[2K(?:› )?(?:\x1b\[[0-9;]*m| )*\x1b\[7m(?:\x1b\[[0-9;]*m| )*"
-    r"Kiro is working ·"
+    r"|\x1b\[2K(?:› )?(?P<composer>(?:\x1b\[[0-9;]*m| )*)Kiro is working ·"
 )
+_CURSOR_BLOCK = "\x1b[7m"
 
 # TUI initialization indicator: shown during startup before chat is ready.
 # Kiro TUI renders the idle prompt placeholder ("Ask a question or describe
@@ -496,7 +501,13 @@ class KiroCliProvider(BaseProvider):
         which kiro draws while working and never while repainting an old answer —
         proves the dispatched turn ran. See TUI_LIVE_WORK_PATTERN for the forms.
         """
-        return bool(buffer) and TUI_LIVE_WORK_PATTERN.search(buffer) is not None
+        if not buffer:
+            return False
+        for match in TUI_LIVE_WORK_PATTERN.finditer(buffer):
+            composer = match.group("composer")
+            if composer is None or _CURSOR_BLOCK in composer:
+                return True
+        return False
 
     def get_status(self, output: str) -> TerminalStatus:
         """Get Kiro CLI status by analyzing terminal output.
