@@ -8,7 +8,11 @@ no alternative is configured.
 import logging
 from typing import Dict, List, Optional
 
-from cli_agent_orchestrator.backends.base import TerminalBackend, TerminalBackendError
+from cli_agent_orchestrator.backends.base import (
+    TerminalBackend,
+    TerminalBackendError,
+    TerminalCleanupResult,
+)
 from cli_agent_orchestrator.clients.tmux import (
     DEFAULT_PANE_LAYOUT,
     PaneSpawnUnavailable,
@@ -131,6 +135,18 @@ class TmuxBackend(TerminalBackend):
 
     def kill_window(self, session_name: str, window_name: str) -> bool:
         return self._client.kill_window(session_name, window_name)
+
+    def cleanup_terminal_exact(
+        self,
+        terminal_id: str,
+        session_name: Optional[str] = None,
+        window_name: Optional[str] = None,
+        *,
+        close: bool = True,
+    ) -> TerminalCleanupResult:
+        return self._client.cleanup_terminal_exact(
+            terminal_id, session_name, window_name, close=close
+        )
 
     # --- Input ---
 

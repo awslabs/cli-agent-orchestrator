@@ -3403,11 +3403,23 @@ def dismantle_terminal_runtime(
     the whole tmux SESSION gone, so the window no longer exists and both calls
     would only produce spurious warnings.
 
-    Returns False when provider cleanup was DEFERRED (Grok's private-home owner
-    could not yet be inspected/stopped), meaning the caller must keep the
-    registry row so a later DELETE can retry; True when the runtime is fully
-    dismantled. Reporting True on a deferral would turn a temporary process race
-    into a permanent private-home leak.
+    For a retained deferred-init tombstone -- ``deferred_init_external_owner``,
+    ``deferred_init_failure``, or ``deferred_init_runtime_reclaimed`` -- the two
+    label-addressed tmux steps are REPLACED by ``cleanup_terminal_exact``, which
+    keys on the terminal id instead. Session and window names are reusable, so a
+    tombstone often shares them with a later, unrelated replacement; killing "the
+    window called X" would destroy that replacement. ``kill_window=False`` makes
+    the exact call identity-proof-only (no mutation), so a caller that already
+    established the session is gone still gets a truthful verdict.
+
+    Returns False when the runtime is NOT fully dismantled and the caller must
+    keep the registry row for a durable retry. That covers a deferred provider
+    cleanup (Grok's private-home owner could not yet be inspected/stopped), a
+    FIFO reader that would not stop, and -- for tombstones -- an exact cleanup
+    that answered anything other than DELETED or ABSENT (UNKNOWN and
+    STILL_PRESENT both mean the runtime may still be live). Reporting True on a
+    deferral would turn a temporary process race into a permanent leak, or
+    record a still-live runtime as reclaimed.
 
     Ordering note: stopping the FIFO reader before killing the window is
     preferred but not load-bearing -- since issue #382 the reader loop uses a
@@ -3415,6 +3427,54 @@ def dismantle_terminal_runtime(
     end, so it can never park waiting on the pane and always observes the stop
     flag within one poll interval.
     """
+    runtime_complete = True
+
+    # A retained tombstone outlives its terminal. Before touching anything
+    # that is addressed by the terminal's session/window NAME, establish
+    # whether the live object at that name is still OURS. Label-addressed
+    # teardown stays the historical path for an ordinary live-terminal delete;
+    # for a tombstone it is exactly the mistake this contract exists to
+    # prevent. (Cross-node/elastic and local paths are otherwise unchanged.)
+    tombstone = False
+    if metadata and (
+        metadata.get("deferred_init_external_owner")
+        or metadata.get("deferred_init_failure")
+        or metadata.get("deferred_init_runtime_reclaimed")
+    ):
+        tombstone = True
+        try:
+            exact = get_backend().cleanup_terminal_exact(
+                terminal_id,
+                metadata.get("tmux_session"),
+                metadata.get("tmux_window"),
+                close=kill_window,
+            )
+        except Exception as e:  # noqa: BLE001 — unproven identity must not read as cleaned
+            runtime_complete = False
+            logger.warning(
+                "Exact cleanup of deferred-init terminal %s raised; retaining its "
+                "runtime cleanup for a durable retry: %s",
+                terminal_id,
+                e,
+            )
+        else:
+            if not exact.reclaimed:
+                runtime_complete = False
+                logger.warning(
+                    "Deferred-init terminal %s was not reclaimed exactly (%s: %s); "
+                    "retaining its runtime cleanup for a durable retry",
+                    terminal_id,
+                    exact.outcome.value,
+                    exact.detail,
+                )
+            else:
+                logger.info(
+                    "Deferred-init terminal %s exact cleanup: %s (%s)",
+                    terminal_id,
+                    exact.outcome.value,
+                    exact.detail,
+                )
+
     # Unregister from herdr inbox service
     svc = get_herdr_inbox_service()
     if svc:
@@ -3423,7 +3483,7 @@ def dismantle_terminal_runtime(
         except Exception as e:
             logger.warning(f"Failed to unregister terminal {terminal_id} from herdr inbox: {e}")
 
-    if metadata and kill_window:
+    if metadata and kill_window and not tombstone:
         # Stop pipe-pane logging. Before the FIFO steps below, so the pane stops
         # writing to the FIFO before its reader (and the FIFO file) go away.
         try:
@@ -3438,9 +3498,11 @@ def dismantle_terminal_runtime(
     # terminal whose row the by-id sweep then deleted anyway -- a reader with
     # nothing left to read from and no record it exists.
     try:
-        fifo_manager.stop_reader(terminal_id)
+        if fifo_manager.stop_reader(terminal_id) is False:
+            runtime_complete = False
     except Exception as e:
         logger.warning(f"Failed to stop FIFO reader for {terminal_id}: {e}")
+        runtime_complete = False
 
     # Clear state detector buffers for this terminal
     try:
@@ -3449,7 +3511,7 @@ def dismantle_terminal_runtime(
         logger.warning(f"Failed to clear state detector for {terminal_id}: {e}")
 
     if metadata:
-        if kill_window:
+        if kill_window and not tombstone:
             # Kill the tmux window (this terminates the agent process)
             try:
                 get_backend().kill_window(metadata["tmux_session"], metadata["tmux_window"])
@@ -3493,7 +3555,13 @@ def dismantle_terminal_runtime(
     from cli_agent_orchestrator.services.memory_service import _curator_locks
 
     _curator_locks.pop(terminal_id, None)
-    return True
+    # ``runtime_complete`` aggregates every component above that can report
+    # failure, including the exact-identity cleanup for tombstones. The caller
+    # (``_retain_deferred_failure_tombstone``) only writes the durable
+    # ``deferred_init_runtime_reclaimed`` marker when this is True, so anything
+    # short of "exactly DELETED or ABSENT, and every other step succeeded" stays
+    # retryable instead of being recorded as reclaimed.
+    return runtime_complete
 
 
 def delete_terminal_row(

@@ -197,14 +197,20 @@ class FifoManager:
 
         logger.info("Started FIFO reader for terminal %s", terminal_id)
 
-    def stop_reader(self, terminal_id: str) -> None:
+    def stop_reader(self, terminal_id: str) -> bool:
         """Stop the reader thread (if running) and delete the FIFO file.
 
-        The unlink is best-effort and runs even when no in-memory reader is
-        tracked for ``terminal_id`` — e.g. retention cleanup iterating DB
-        terminals after a server restart, where ``_readers`` is empty but stale
-        ``*.fifo`` files may still be on disk. Without it those files would
-        accumulate unbounded.
+        Returns True only when the tracked reader has actually exited and the
+        FIFO path is gone. Most callers ignore this — they tear down for side
+        effects — but the deferred-init tombstone reclaimer uses it as a hard
+        completeness signal, so a leaked reader thread or an unremovable file
+        keeps the runtime cleanup retryable instead of being recorded as done.
+
+        The unlink is best-effort about the ABSENT case and runs even when no
+        in-memory reader is tracked for ``terminal_id`` — e.g. retention cleanup
+        iterating DB terminals after a server restart, where ``_readers`` is
+        empty but stale ``*.fifo`` files may still be on disk. Without it those
+        files would accumulate unbounded.
         """
         with self._lock:
             stop_flag = self._readers.pop(terminal_id, None)
@@ -233,6 +239,7 @@ class FifoManager:
         # actually torn down at process shutdown (api/main.py's lifespan).
         fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
 
+        complete = True
         if stop_flag and thread:
             # The reader never blocks in open()/read() (non-blocking fd +
             # select with a timeout), so setting the flag is sufficient — it is
@@ -250,16 +257,23 @@ class FifoManager:
                     "within 2s; leaking a daemon thread",
                     terminal_id,
                 )
+                complete = False
             else:
                 logger.info("Stopped FIFO reader for terminal %s", terminal_id)
 
         # Best-effort unlink regardless of whether a reader was tracked — when
         # none is tracked there is no active reader holding the FIFO, so removing
-        # a stale file on disk is safe.
+        # a stale file on disk is safe. Only a genuine failure to remove it is
+        # reported; a file that is already gone is exactly the desired end state.
         try:
             fifo_path.unlink()
-        except OSError:
+        except FileNotFoundError:
             pass
+        except OSError as exc:
+            complete = False
+            logger.warning("Failed to remove FIFO for terminal %s: %s", terminal_id, exc)
+
+        return complete
 
     def _reader_loop(self, terminal_id: str, fifo_path, stop_flag: threading.Event) -> None:
         """Read chunks from FIFO and publish to the event bus.
