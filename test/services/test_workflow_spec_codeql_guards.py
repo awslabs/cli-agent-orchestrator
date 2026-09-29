@@ -81,15 +81,11 @@ def test_contained_exists_colocates_guard_with_sink() -> None:
 
 def test_update_existence_check_uses_contained_target() -> None:
     """Update admission must not reintroduce the unchecked name-derived path."""
-    exists_calls = [
-        call
-        for call in _calls(svc.update_workflow)
-        if isinstance(call.func, ast.Attribute)
-        and isinstance(call.func.value, ast.Attribute)
-        and isinstance(call.func.value.value, ast.Name)
-        and call.func.value.value.id == "os"
-        and call.func.value.attr == "path"
-        and call.func.attr == "exists"
+    contained_exists_calls = [
+        call for call in _calls(svc.update_workflow) if _call_name(call) == "_contained_spec_exists"
     ]
-    assert len(exists_calls) == 1
-    assert ast.unparse(exists_calls[0].args[0]) == "lock_target"
+    assert len(contained_exists_calls) == 1
+    assert [ast.unparse(arg) for arg in contained_exists_calls[0].args] == [
+        "lock_target",
+        "safe_base",
+    ]
