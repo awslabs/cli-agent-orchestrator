@@ -22,6 +22,7 @@ from cli_agent_orchestrator.models.terminal import Terminal
 from cli_agent_orchestrator.services.inbox_service import inbox_service
 from cli_agent_orchestrator.services.terminal_service import (
     IdempotencyKeyConflict,
+    OutputMode,
     TerminalRecordCorruptError,
 )
 from cli_agent_orchestrator.utils.skills import SkillNameError
@@ -1259,6 +1260,7 @@ class TestGetTerminal:
             "session_name": "test-session",
             "provider": "kiro_cli",
             "agent_profile": "developer",
+            "status_generation": 4,
         }
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.get_terminal.return_value = mock_terminal_dict
@@ -1269,6 +1271,7 @@ class TestGetTerminal:
         data = response.json()
         assert data["id"] == "abcd1234"
         assert data["provider"] == "kiro_cli"
+        assert data["status_generation"] == 4
         mock_svc.get_terminal.assert_called_once_with("abcd1234")
 
     def test_get_terminal_not_found(self, client):
@@ -1303,7 +1306,7 @@ class TestSendTerminalInput:
     def test_send_input_success(self, client):
         """POST /terminals/{id}/input sends message successfully."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
-            mock_svc.send_input.return_value = True
+            mock_svc.dispatch_input.return_value = (True, 7)
 
             response = client.post(
                 "/terminals/abcd1234/input",
@@ -1313,7 +1316,8 @@ class TestSendTerminalInput:
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
-        mock_svc.send_input.assert_called_once_with(
+        assert data["input_generation"] == 7
+        mock_svc.dispatch_input.assert_called_once_with(
             "abcd1234",
             "hello world",
             registry=ANY,
@@ -1324,7 +1328,7 @@ class TestSendTerminalInput:
     def test_send_input_with_orchestration_context(self, client):
         """POST /terminals/{id}/input forwards registry and orchestration metadata when provided."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
-            mock_svc.send_input.return_value = True
+            mock_svc.dispatch_input.return_value = (True, 9)
 
             response = client.post(
                 "/terminals/abcd1234/input",
@@ -1336,7 +1340,8 @@ class TestSendTerminalInput:
             )
 
         assert response.status_code == 200
-        mock_svc.send_input.assert_called_once_with(
+        assert response.json()["input_generation"] == 9
+        mock_svc.dispatch_input.assert_called_once_with(
             "abcd1234",
             "hello world",
             registry=ANY,
@@ -1347,7 +1352,7 @@ class TestSendTerminalInput:
     def test_send_input_terminal_not_found(self, client):
         """POST /terminals/{id}/input returns 404 for nonexistent terminal."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
-            mock_svc.send_input.side_effect = ValueError("Terminal not found")
+            mock_svc.dispatch_input.side_effect = ValueError("Terminal not found")
 
             response = client.post(
                 "/terminals/deadbeef/input",
@@ -1363,7 +1368,7 @@ class TestSendTerminalInput:
 
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.TerminalInputBlockedError = TerminalInputBlockedError
-            mock_svc.send_input.side_effect = TerminalInputBlockedError(
+            mock_svc.dispatch_input.side_effect = TerminalInputBlockedError(
                 "Terminal abcd1234 is waiting for a user answer"
             )
 
@@ -1378,7 +1383,7 @@ class TestSendTerminalInput:
     def test_send_input_server_error(self, client):
         """POST /terminals/{id}/input returns 500 on error."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
-            mock_svc.send_input.side_effect = Exception("TMux send failed")
+            mock_svc.dispatch_input.side_effect = Exception("TMux send failed")
 
             response = client.post(
                 "/terminals/abcd1234/input",
@@ -1460,6 +1465,16 @@ class TestGetTerminalOutput:
         data = response.json()
         assert data["output"] == "Last response"
         assert data["mode"] == "last"
+
+    def test_get_output_dispatch_generation_returns_that_turn(self, client):
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.get_output.return_value = "First turn response"
+
+            response = client.get("/terminals/abcd1234/output?mode=last&input_generation=7")
+
+        assert response.status_code == 200
+        assert response.json()["input_generation"] == 7
+        mock_svc.get_output.assert_called_once_with("abcd1234", OutputMode.LAST, 7)
 
     def test_get_output_terminal_not_found(self, client):
         """GET /terminals/{id}/output returns 404 for nonexistent terminal."""
